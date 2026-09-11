@@ -1,12 +1,30 @@
-//! Admission: who runs next, what it costs, and whether the device can take it.
+//! Admission: who runs next, what it costs, and whether the wave is better off
+//! carrying it.
 //!
-//! Three concerns, three files, no overlap:
+//! Four concerns, four files, no overlap:
 //!
 //! * [`order`] — whose turn it is. Pure policy; touches no device.
 //! * [`cost`] — what one admission takes. Arithmetic over settled state.
-//! * [`gate`] — whether it may proceed. Four rules, no fifth.
+//! * [`rate`] — what the wave's throughput does if it joins. The decision.
+//! * [`gate`] — the two lines no answer to that may cross.
 //!
 //! [`fill`] is the loop that asks them in that order.
+//!
+//! # The decision is a rate, not a fit
+//!
+//! Admission used to ask whether an offer's bytes fitted in the ground standing
+//! free above the weight floor. That question has no answer in tokens a second:
+//! a wave of 250 rows and a wave of 2,000 rows pay the *same* expert copy — a
+//! prefill forward needs every expert, resident or streamed — so the narrow one
+//! is not cheaper, it is simply slower per row. A gate that admits by fit stops
+//! widening the moment the bytes run out, which on this card was ~470 tok/s
+//! against a modelled 1,210 at the same residency.
+//!
+//! So the fill asks [`rate::WaveRate`] instead: **does the wave go faster with
+//! this in it?** Bytes have not gone away — they are what the offer *costs*,
+//! and the model reads them as the residency the admission dislodges, which is
+//! what makes a wide wave stop being worth it. What changed is that they are
+//! now one term in a throughput comparison rather than the whole question.
 //!
 //! # The shape, and why it is this shape
 //!
@@ -32,12 +50,34 @@
 pub(crate) mod cost;
 pub(crate) mod gate;
 pub(crate) mod order;
+pub mod rate;
 
 pub(crate) use cost::Cost;
 pub(crate) use gate::Headroom;
 pub(crate) use order::{Kind, Order};
+pub(crate) use rate::{Admission, WaveRate};
 
 use crate::projection::DecodePriority;
+
+/// The wave's opening terms, read once per fill from the settled device.
+///
+/// Everything [`rate::WaveRate::reset`] needs, gathered in one place so the
+/// four figures are taken from the same moment — a floor read after a purchase
+/// that a residency read preceded would let a wave admit into ground that had
+/// already moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Budget {
+    /// Resident weights as the wave opens.
+    pub resident: u64,
+    /// The residency admission may not take them under.
+    pub floor: u64,
+    /// The widest wave whose transient tier the partition could place — the
+    /// gap as it stands plus what the weight side could concede for it. A rate
+    /// the tier cannot hold is not a rate the engine can run.
+    pub max_rows: usize,
+    /// The most decodes a wave will carry.
+    pub max_decodes: usize,
+}
 
 /// The engine, as the fill needs to see it.
 pub(crate) trait Ground {
@@ -56,6 +96,27 @@ pub(crate) trait Ground {
 
     /// The device after the eviction pass — see the module header.
     fn headroom(&self) -> Headroom;
+
+    /// The wave's opening terms, from that same settled reading.
+    fn budget(&self) -> Budget;
+
+    /// Resident weights **right now**, re-read before every offer.
+    ///
+    /// Not carried forward from the last admission: residency moves inside a
+    /// fill from places admission cannot see. The expert cache grows back into
+    /// spare K/V ground at phase 0 of every forward, evicts slots mid-forward,
+    /// and concedes ground to any claim that runs the K/V side out. A wave
+    /// judged against a figure from three offers ago is judged against a card
+    /// that has since moved.
+    fn resident_weights(&self) -> u64;
+
+    /// Rows the next wave already carries before this fill adds anything: the
+    /// creep group held from the last wave, which rides the next one whole.
+    ///
+    /// Charged to the wave at the open, so the offers that follow are judged
+    /// against what the forward will actually run — and so a wave that is
+    /// already carrying rows does not also take a head unconditionally.
+    fn standing_rows(&self) -> usize;
 
     /// What admitting this band's next FIFO candidate would take, or `None`
     /// when the band has nothing left to offer.
@@ -87,35 +148,160 @@ pub(crate) struct Filled {
     pub sections: usize,
     /// The pass ran the fast path: nothing had finished, so nothing was offered.
     pub skipped: bool,
-    /// An admission was refused because it would have reached the weight zone.
+    /// An admission was refused because it would have reached the weight zone —
+    /// the floor, the tier's placeable width, or the decode cap. The producer's
+    /// backpressure signal: the device is the bound.
     pub stopped_on_weights: bool,
+    /// An admission was refused because the wave was already going as fast as
+    /// it is going to go — another row would not pay for the residency it
+    /// dislodges. **Not** backpressure: the engine is working well and the
+    /// queue behind it simply rides the next wave.
+    pub stopped_on_rate: bool,
 }
 
-/// Offer the wave's rows, in order, to whatever the device can take.
-pub(crate) fn fill<G: Ground>(ground: &mut G) -> Filled {
+/// Log one refused offer with everything that produced the answer.
+///
+/// **A refusal is the decision worth seeing, and it is the one the summary line
+/// cannot carry.** The per-fill line says a band stopped; it cannot say which
+/// item, what it would have cost, what the model projected, or which of six
+/// rules said no — and those are exactly the questions asked of a run that
+/// admitted nothing for an hour. One line per refusal, at debug, and refusals
+/// are rare on a healthy engine by construction: the band stops at the first.
+fn log_refusal(
+    kind: Kind,
+    prio: DecodePriority,
+    cost: &Cost,
+    before: u64,
+    after: u64,
+    budget: &Budget,
+    refusal: rate::Refusal,
+) {
+    tracing::debug!(
+        target: "candle_conversation::scheduler::admission",
+        kind = ?kind,
+        prio = ?prio,
+        rows = cost.rows,
+        kv_mib = cost.kv >> 20,
+        recurrent_mib = cost.recurrent >> 20,
+        tier_mib = cost.activations >> 20,
+        claimed_mib = cost.claimed_bytes() >> 20,
+        resident_before_mib = before >> 20,
+        resident_after_mib = after >> 20,
+        floor_mib = budget.floor >> 20,
+        room_mib = before.saturating_sub(budget.floor) >> 20,
+        max_rows = budget.max_rows,
+        max_decodes = budget.max_decodes,
+        refusal = ?refusal,
+        "offer refused",
+    );
+}
+
+impl Filled {
+    /// Record which kind of refusal ended a band.
+    fn note(&mut self, refusal: rate::Refusal) {
+        use rate::Refusal;
+        match refusal {
+            Refusal::Worse { .. } | Refusal::Saturated { .. } => self.stopped_on_rate = true,
+            Refusal::Floor { .. } | Refusal::Cap { .. } | Refusal::DecodeCap { .. } => {
+                self.stopped_on_weights = true
+            }
+            // The wave latched full on an earlier refusal, which was itself
+            // recorded when it happened. Nothing new to say.
+            Refusal::Full => {}
+        }
+    }
+}
+
+/// Offer the wave's rows, in order, to whatever makes the wave faster.
+///
+/// `rate` is the engine's one planner, carried across fills because what it has
+/// learned — the effective copy rate, the decode layer time — is a property of
+/// the machine, not of this wave.
+pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
     let mut out = Filled::default();
     if !ground.settled() {
         out.skipped = true;
         return out;
     }
-    // Measured once, after eviction — then spent down as admissions take from
-    // it. Re-reading the device per admission would be a query per item for a
-    // figure this pass is itself moving; charging every item against the
-    // *opening* figure would let a whole band through on one item's worth of
-    // room, which is what the arithmetic is here to prevent.
+    // Measured once, after eviction. `zone` is spent down as stores are placed,
+    // because the decode-start rule reads it; the rate model re-reads residency
+    // per offer instead (`Ground::resident_weights`), since that is the figure
+    // the whole decision turns on and it moves under the fill's feet.
     let mut room = ground.headroom();
+    let budget = ground.budget();
+    rate.reset(
+        budget.resident,
+        budget.floor,
+        budget.max_rows,
+        budget.max_decodes,
+    );
+    // **What the wave already carries, charged before anything is offered.**
+    //
+    // Two things ride the next wave whatever this fill decides: the creep group
+    // held from the last one, and — through the continuation rule below — every
+    // decode the engine is already running. Charging them first is what makes
+    // the offers behind them judged against the forward that will actually run.
+    //
+    // It is also what scopes the head waiver. The model takes its first offer
+    // unconditionally so that a wave carries *something* and a slot too large
+    // to ever fit cannot block the queue behind it forever — the rule that
+    // makes this design deadlock-free. That is meant for a wave with nothing to
+    // run, not for every fill: an engine with sixty slots in flight would
+    // otherwise take one free admission per pass, each of them allowed under
+    // the floor. So a busy engine charges the wave even when the creep is
+    // empty, and only a genuinely idle one gets the waiver.
+    let standing = ground.standing_rows();
+    if standing > 0 || ground.active() > 0 {
+        rate.charge(Admission::Prefill { tokens: standing }, budget.resident);
+    }
+    // **Which decodes this pass treats as admissions.** Only the first, and
+    // only when nothing is decoding — that one starts the expert cache warming
+    // and is genuinely new. Read once: `Ground::admit` moves a decode into this
+    // fill's taken set, never into the engine's active set, so this cannot
+    // change under the loop and re-reading it per offer would only invite the
+    // belief that it might.
+    let starting_decodes = ground.decodes_active() == 0 && ground.active() > 0;
     let mut order = Order::new();
     while let Some((prio, kind)) = order.next() {
-        // The band, FIFO, until it runs dry or the device says no. A refusal
+        // The band, FIFO, until it runs dry or the wave stops paying. A refusal
         // ends this band and not the pass: a later band's work is a different
-        // size and may still fit.
+        // size and may still be worth carrying.
         while let Some(cost) = ground.peek(kind, prio) {
             let total = cost.total();
+            // The truth as of this offer, and what this offer's claims would
+            // leave of it. The claim is region-granular and the tier is not in
+            // it — see `Cost::claimed_bytes`.
+            let before = ground.resident_weights();
+            let after = before.saturating_sub(cost.claimed_bytes());
             let allowed = match kind {
                 // A decode when none is running is the one case with its own
-                // rule — it keeps the expert cache warm.
-                Kind::Decode if ground.decodes_active() == 0 && ground.active() > 0 => {
-                    gate::may_start_decode(0, total, &room)
+                // rule — it keeps the expert cache warm. It is also the only
+                // decode that is a genuine admission rather than a
+                // continuation, so it is the only one the rate model judges.
+                Kind::Decode if starting_decodes => {
+                    if !gate::may_start_decode(0, total, &room) {
+                        // The zone is too low to keep a decode's working set
+                        // alive — a weight condition, and the producer's to
+                        // hear about.
+                        out.stopped_on_weights = true;
+                        tracing::debug!(
+                            target: "candle_conversation::scheduler::admission",
+                            zone_mib = room.zone >> 20,
+                            midpoint_mib = room.midpoint() >> 20,
+                            cost_mib = total >> 20,
+                            "first decode held back to keep the expert cache warm",
+                        );
+                        false
+                    } else {
+                        match rate.try_admit(decode_of(&cost), before, after) {
+                            rate::Admit::Admitted { .. } => true,
+                            rate::Admit::Refused(r) => {
+                                out.note(r);
+                                log_refusal(kind, prio, &cost, before, after, &budget, r);
+                                false
+                            }
+                        }
+                    }
                 }
                 // **Stepping a decode is not an admission.** [`Ground::peek`]
                 // only ever offers decodes that are already active, and their
@@ -129,36 +315,55 @@ pub(crate) fn fill<G: Ground>(ground: &mut G) -> Filled {
                 // and CD both died there — 34 of 40 waves running no forward
                 // with fifty-odd slots admitted and the queue backing up.
                 Kind::Decode => true,
-                // **Count what this pass has already taken.** A prefill admitted
-                // here does not reach `active_prefills` until the fill returns —
-                // it sits in `prefill_admitted` — so `Ground::active` reads the
-                // same value all pass. Rule 1 waives the budget when nothing is
-                // running, and without this it waives it for *every* item in the
-                // queue rather than for the head: run CJ drained to zero with 83
-                // queued, admitted **56 prefills in a single fill**, and put the
-                // weight zone from 8,180 MiB to 1,417 with every region live.
-                // The rule is "admit the next one regardless", and the next one
-                // is one.
+                // **The wave's rows are judged on what they do to its rate.**
+                // A prefill chunk earns `cost.rows` of forward width against
+                // the copy every prefill forward pays whatever its width, and
+                // costs whatever residency its K/V and store dislodge; it joins
+                // while that trade is winning.
+                //
+                // The head waiver — a wave carries at least one thing, so a
+                // slot too large to ever fit still runs rather than blocking
+                // the queue behind it forever — lives in the model, keyed on
+                // the wave being **empty** rather than on the engine being
+                // idle. That is the same rule read from the wave's side, and it
+                // is why the standing creep is charged above: without it a wave
+                // already carrying rows would take a head as well, and the
+                // waiver would fire on every fill instead of on the ones with
+                // nothing to run. (Run CJ is what firing it too often costs: 83
+                // queued, 56 prefills admitted in a single fill, the weight zone
+                // from 8,180 MiB to 1,417 with every region live.)
                 //
                 // A section is a first admission exactly as a prefill is: fresh
-                // K/V on a scratch slot, a store, a tier row — so it is gated the
-                // same way and counted the same way. Sections used to enter the
-                // wave without passing here at all, and one minute of them took
-                // the weight zone from 10,398 MiB to its hold.
-                Kind::Prefill | Kind::Section => gate::may_admit(
-                    ground.active() + out.prefills + out.sections,
-                    total,
-                    &room,
-                ),
+                // K/V on a scratch slot, a store, a tier row — so it is judged
+                // the same way and counted the same way. Sections used to enter
+                // the wave without passing here at all, and one minute of them
+                // took the weight zone from 10,398 MiB to its hold.
+                Kind::Prefill | Kind::Section => {
+                    match rate.try_admit(Admission::Prefill { tokens: cost.rows }, before, after) {
+                        rate::Admit::Admitted { .. } => true,
+                        rate::Admit::Refused(r) => {
+                            out.note(r);
+                            log_refusal(kind, prio, &cost, before, after, &budget, r);
+                            false
+                        }
+                    }
+                }
             };
             if !allowed {
-                out.stopped_on_weights = true;
                 break;
             }
             if !ground.admit(kind, prio, cost) {
+                // The allocators refused after the model said yes. The ground
+                // is genuinely gone, whatever the arithmetic made of it.
+                out.stopped_on_weights = true;
                 break;
             }
-            room.free_kv = room.free_kv.saturating_sub(total);
+            // A continuation was not judged above, so it is recorded here —
+            // after it is certain to ride the wave, and against the residency
+            // as it now stands.
+            if kind == Kind::Decode && !starting_decodes {
+                rate.charge(decode_of(&cost), ground.resident_weights());
+            }
             room.zone = room.zone.saturating_sub(cost.recurrent);
             match kind {
                 Kind::Decode => out.decodes += 1,
@@ -170,17 +375,51 @@ pub(crate) fn fill<G: Ground>(ground: &mut G) -> Filled {
     out
 }
 
+/// One decode offer as the rate model reads it: a verify block of `1 + draft`
+/// rows, so a plain decode is one row and no draft.
+fn decode_of(cost: &Cost) -> Admission {
+    Admission::Decode {
+        draft: cost.rows.saturating_sub(1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A fake device: fixed per-item costs, a fixed budget, and a record of the
-    /// order things were taken in.
+    use candle_nn::kv_cache::REGION_BYTES;
+    use rate::{DecodeModel, ExpertGeometry, RateModel};
+
+    /// One region of ground, the granularity a claim actually takes.
+    const REGION: u64 = REGION_BYTES as u64;
+    /// A floor with room above it for the tests to spend.
+    const FLOOR: u64 = 5 << 30;
+    /// Rows a prefill or section chunk puts in the forward.
+    const ROWS: usize = 128;
+
+    /// The engine's planner as these tests use it: the 35B's expert geometry on
+    /// the 4090 Mobile's link, with no minimum gain — so an offer is judged on
+    /// the floor and on whether it makes the wave slower, and the band policy
+    /// under test is not confounded by saturation.
+    fn planner() -> WaveRate {
+        WaveRate::with_link_rate(
+            25e9,
+            ExpertGeometry::QWEN36_35B_A3B,
+            RateModel::default(),
+            DecodeModel::default(),
+        )
+        .with_min_gain(0.0)
+    }
+
+    /// A fake device: a dislodge per queued item, a residency it comes out of,
+    /// and a record of the order things were taken in.
     struct Fake {
         decodes: Vec<u64>,
         prefills: Vec<u64>,
         sections: Vec<u64>,
-        free: u64,
+        /// Resident weights, spent down by what each admission claims.
+        resident: u64,
+        standing: usize,
         active: usize,
         decodes_active: usize,
         settled: bool,
@@ -191,12 +430,15 @@ mod tests {
     }
 
     impl Fake {
-        fn new(decodes: Vec<u64>, prefills: Vec<u64>, free: u64) -> Self {
+        /// `decodes` and `prefills` carry the K/V each item claims; `resident`
+        /// is the weight side it comes out of.
+        fn new(decodes: Vec<u64>, prefills: Vec<u64>, resident: u64) -> Self {
             Self {
                 decodes,
                 prefills,
                 sections: Vec::new(),
-                free,
+                resident,
+                standing: 0,
                 active: 0,
                 decodes_active: 0,
                 settled: true,
@@ -235,18 +477,37 @@ mod tests {
         }
         fn headroom(&self) -> Headroom {
             Headroom {
-                free_kv: self.free,
+                free_kv: self.resident.saturating_sub(FLOOR),
                 zone: self.zone,
                 zone_min: 4 << 30,
                 zone_max: 10 << 30,
             }
         }
+        fn budget(&self) -> Budget {
+            Budget {
+                resident: self.resident,
+                floor: FLOOR,
+                max_rows: 8_192,
+                max_decodes: 64,
+            }
+        }
+        fn resident_weights(&self) -> u64 {
+            self.resident
+        }
+        fn standing_rows(&self) -> usize {
+            self.standing
+        }
         fn peek(&mut self, kind: Kind, prio: DecodePriority) -> Option<Cost> {
             if prio != self.wants(kind) {
                 return None;
             }
+            // A decode claims nothing — its lease was bought at admission — and
+            // rides as one row; a prefill or section claims its K/V and carries
+            // a chunk's rows.
+            let rows = if kind == Kind::Decode { 1 } else { ROWS };
             self.queue(kind).first().map(|&kv| Cost {
                 kv,
+                rows,
                 ..Default::default()
             })
         }
@@ -259,7 +520,7 @@ mod tests {
             }
             let priced = self.queue(kind).remove(0);
             assert_eq!(cost.kv, priced, "admit is handed the price peek quoted");
-            self.free = self.free.saturating_sub(priced);
+            self.resident = self.resident.saturating_sub(cost.claimed_bytes());
             self.active += 1;
             if kind == Kind::Decode {
                 self.decodes_active += 1;
@@ -269,12 +530,17 @@ mod tests {
         }
     }
 
+    /// Run one fill with a fresh planner.
+    fn fill_once(f: &mut Fake) -> Filled {
+        fill(f, &mut planner())
+    }
+
     /// Nothing finished, so nothing can newly fit: the pass costs nothing.
     #[test]
     fn an_unsettled_wave_takes_the_fast_path() {
-        let mut f = Fake::new(vec![1; 4], vec![1; 4], u64::MAX);
+        let mut f = Fake::new(vec![1; 4], vec![1; 4], FLOOR + 8 * REGION);
         f.settled = false;
-        let got = fill(&mut f);
+        let got = fill_once(&mut f);
         assert_eq!(
             got,
             Filled {
@@ -301,11 +567,11 @@ mod tests {
     /// cannot be lost by a later change to how `settled` is computed.
     #[test]
     fn a_settled_ground_is_always_offered_work() {
-        let mut f = Fake::new(vec![1; 2], vec![1; 2], u64::MAX);
+        let mut f = Fake::new(vec![1; 2], vec![1; 2], FLOOR + 8 * REGION);
         f.active = 32; // busy, and nothing has completed
         f.decodes_active = 1;
         f.settled = true; // but the engine ran no forward, so: re-offer
-        let got = fill(&mut f);
+        let got = fill_once(&mut f);
         assert!(!got.skipped);
         assert!(
             got.prefills + got.decodes > 0,
@@ -314,26 +580,57 @@ mod tests {
     }
 
     /// **The head runs even when it does not fit**, so a slot too large for the
-    /// card cannot block the queue behind it forever.
+    /// card cannot block the queue behind it forever. The waiver is the rate
+    /// model's — an empty wave takes its first offer whatever it costs — and it
+    /// applies here because nothing is running.
     #[test]
     fn an_empty_engine_admits_the_head_whatever_it_costs() {
-        let mut f = Fake::new(Vec::new(), vec![u64::MAX, 1], 0);
-        let got = fill(&mut f);
+        let mut f = Fake::new(Vec::new(), vec![64 << 30, REGION], FLOOR);
+        let got = fill_once(&mut f);
         assert_eq!(got.prefills, 1, "the head lands");
         assert_eq!(f.active, 1);
+        assert_eq!(f.resident, 0, "and it took the weights under the floor");
         assert!(got.stopped_on_weights, "and the next one does not");
+        assert_eq!(f.prefills.len(), 1, "which waits, FIFO");
+    }
+
+    /// **A busy engine gets no waiver.** The rule is "a wave carries something",
+    /// and a wave that will step the decodes already running carries something
+    /// — so the prefills offered ahead of them are judged on the floor like any
+    /// other admission, rather than one riding free on every pass.
+    #[test]
+    fn a_busy_engine_takes_no_free_head() {
+        let mut f = Fake::new(Vec::new(), vec![REGION; 4], FLOOR);
+        f.active = 8;
+        f.decodes_active = 3;
+        let got = fill_once(&mut f);
+        assert_eq!(got.prefills, 0, "at the floor, nothing is free");
+        assert!(got.stopped_on_weights);
+        assert_eq!(f.resident, FLOOR, "the floor held");
+    }
+
+    /// **A held creep group is charged before anything is offered.** It rides
+    /// the next wave whole, so the offers behind it are judged against a wave
+    /// that already carries its rows — and it too denies the head waiver.
+    #[test]
+    fn a_standing_creep_group_is_charged_and_denies_the_head_waiver() {
+        let mut f = Fake::new(Vec::new(), vec![REGION; 4], FLOOR);
+        f.standing = 300; // a creep group held from the last wave
+        let got = fill_once(&mut f);
+        assert_eq!(got.prefills, 0, "the wave is not empty, so nothing is free");
+        assert!(got.stopped_on_weights);
     }
 
     /// **…and only the head**, even when the caller cannot see the admission
     /// yet.
     ///
     /// A real `Ground` does not move a prefill into its active set until the
-    /// fill returns, so `active()` reads zero for the whole pass. If the
-    /// budget-waiver keyed on that alone it would waive for every queued item:
-    /// run CJ drained to zero with 83 queued, took 56 prefills in one fill and
-    /// drove the weight zone from 8,180 MiB to 1,417. This `Fake` reproduces
-    /// that blindness deliberately — `admit` leaves `active` untouched — so the
-    /// count the gate sees has to come from the pass itself.
+    /// fill returns, so `active()` reads zero for the whole pass. A waiver
+    /// keyed on that alone would fire for every queued item: run CJ drained to
+    /// zero with 83 queued, took 56 prefills in one fill and drove the weight
+    /// zone from 8,180 MiB to 1,417. This `Fake` reproduces that blindness
+    /// deliberately — `admit` leaves `active` untouched — so the waiver has to
+    /// come from the *wave*, which the model tracks itself.
     #[test]
     fn a_ground_that_cannot_see_its_own_admissions_still_takes_only_the_head() {
         struct Blind(Fake);
@@ -350,6 +647,15 @@ mod tests {
             fn headroom(&self) -> Headroom {
                 self.0.headroom()
             }
+            fn budget(&self) -> Budget {
+                self.0.budget()
+            }
+            fn resident_weights(&self) -> u64 {
+                self.0.resident_weights()
+            }
+            fn standing_rows(&self) -> usize {
+                self.0.standing_rows()
+            }
             fn peek(&mut self, k: Kind, p: DecodePriority) -> Option<Cost> {
                 self.0.peek(k, p)
             }
@@ -357,9 +663,9 @@ mod tests {
                 self.0.admit(k, p, c)
             }
         }
-        // Ten queued, no room at all: without the pass count every one lands.
-        let mut b = Blind(Fake::new(Vec::new(), vec![1_000; 10], 0));
-        let got = fill(&mut b);
+        // Ten queued at the floor: without the wave's own count every one lands.
+        let mut b = Blind(Fake::new(Vec::new(), vec![REGION; 10], FLOOR));
+        let got = fill(&mut b, &mut planner());
         assert_eq!(got.prefills, 1, "the head, and nothing behind it");
         assert!(got.stopped_on_weights);
     }
@@ -370,11 +676,12 @@ mod tests {
     /// admissions; see `an_active_decode_steps_even_with_no_budget_left`.
     #[test]
     fn background_prefill_precedes_background_decode_and_the_budget_binds() {
-        let mut f = Fake::new(vec![10; 3], vec![10; 3], 25);
-        f.active = 1; // something already running, so rule 3 applies
-        f.decodes_active = 1; // and the decode-start rule does not
-        let got = fill(&mut f);
-        assert_eq!(got.prefills, 2, "two fit in 25 bytes of room");
+        let mut f = Fake::new(vec![0; 3], vec![REGION; 3], FLOOR + 2 * REGION);
+        f.active = 1; // something already running, so there is no head waiver
+        f.decodes_active = 1; // and the decode-start rule does not apply
+        let got = fill_once(&mut f);
+        assert_eq!(got.prefills, 2, "two regions above the floor, two prefills");
+        assert_eq!(f.resident, FLOOR, "exactly to the floor");
         assert!(got.stopped_on_weights, "the third did not");
         assert_eq!(got.decodes, 3, "and the running decodes are unaffected");
         assert_eq!(
@@ -396,22 +703,25 @@ mod tests {
     /// band without stopping the prefill band behind it.
     #[test]
     fn sections_are_gated_like_prefills_and_offered_ahead_of_background_prefill() {
-        let mut f = Fake::new(Vec::new(), vec![10; 2], 25);
-        f.sections = vec![10, 10, 10];
-        f.active = 1; // something running, so the budget binds
+        let mut f = Fake::new(Vec::new(), vec![REGION; 2], FLOOR + 2 * REGION);
+        f.sections = vec![REGION, REGION, REGION];
+        f.active = 1; // something running, so there is no head waiver
         f.decodes_active = 1;
-        let got = fill(&mut f);
-        assert_eq!(got.sections, 2, "two sections fit in 25 bytes of room");
-        assert_eq!(got.prefills, 0, "and the prefills behind them found none left");
+        let got = fill_once(&mut f);
+        assert_eq!(got.sections, 2, "two regions above the floor, two sections");
+        assert_eq!(
+            got.prefills, 0,
+            "and the prefills behind them found none left"
+        );
         assert!(got.stopped_on_weights);
         assert_eq!(f.taken, vec![Kind::Section, Kind::Section]);
         assert_eq!(f.sections.len(), 1, "the third section waits, FIFO");
 
         // With nothing running, the head — a section — is admitted regardless
-        // of budget, and only the head: the pass counts its own sections.
-        let mut f = Fake::new(Vec::new(), vec![1], 0);
-        f.sections = vec![1_000, 1_000];
-        let got = fill(&mut f);
+        // of what it costs, and only the head: the wave is no longer empty.
+        let mut f = Fake::new(Vec::new(), vec![REGION], FLOOR);
+        f.sections = vec![64 << 30, 64 << 30];
+        let got = fill_once(&mut f);
         assert_eq!((got.sections, got.prefills), (1, 0));
         assert!(got.stopped_on_weights);
     }
@@ -419,11 +729,11 @@ mod tests {
     /// A person waiting is served before any background work.
     #[test]
     fn an_interactive_decode_precedes_background_prefill() {
-        let mut f = Fake::new(vec![1; 2], vec![1; 2], 1_000);
+        let mut f = Fake::new(vec![0; 2], vec![REGION; 2], FLOOR + 4 * REGION);
         f.active = 1;
         f.decodes_active = 1;
         f.decode_prio = DecodePriority::High;
-        let got = fill(&mut f);
+        let got = fill_once(&mut f);
         assert_eq!((got.decodes, got.prefills), (2, 2));
         assert_eq!(
             f.taken,
@@ -435,17 +745,19 @@ mod tests {
     /// upper half — the margin that keeps the expert cache warm.
     #[test]
     fn the_first_decode_is_held_to_the_midpoint() {
-        let mut f = Fake::new(vec![1], Vec::new(), 1_000);
+        let mut f = Fake::new(vec![0], Vec::new(), FLOOR + 4 * REGION);
         f.active = 2;
         f.decodes_active = 0;
         f.zone = 9 << 30; // clear of the 7 GiB midpoint
-        assert_eq!(fill(&mut f).decodes, 1);
+        assert_eq!(fill_once(&mut f).decodes, 1);
 
-        let mut f = Fake::new(vec![1], Vec::new(), 1_000);
+        let mut f = Fake::new(vec![0], Vec::new(), FLOOR + 4 * REGION);
         f.active = 2;
         f.decodes_active = 0;
         f.zone = 6 << 30; // under it
-        assert_eq!(fill(&mut f).decodes, 0, "not while the zone is low");
+        let got = fill_once(&mut f);
+        assert_eq!(got.decodes, 0, "not while the zone is low");
+        assert!(got.stopped_on_weights, "and the producer hears why");
     }
 
     /// **An active decode steps whatever the budget says.** Its ground was
@@ -457,23 +769,73 @@ mod tests {
     /// queue backing up and nothing able to complete.
     #[test]
     fn an_active_decode_steps_even_with_no_budget_left() {
-        let mut f = Fake::new(vec![10; 3], vec![10; 2], 0);
+        let mut f = Fake::new(vec![0; 3], vec![REGION; 2], FLOOR);
         f.active = 8;
         f.decodes_active = 3; // already running, so the decode-start rule is out
-        let got = fill(&mut f);
+        let got = fill_once(&mut f);
         assert_eq!(got.decodes, 3, "every active decode is stepped");
         assert_eq!(got.prefills, 0, "while new work still waits for room");
         assert!(got.stopped_on_weights, "the prefill side did stop");
+        assert_eq!(f.resident, FLOOR, "and the floor held");
+    }
+
+    /// **A latched wave still steps its decodes.** The rate model closes the
+    /// wave to further *admissions* on its first refusal; a continuation is not
+    /// an admission, so the decodes behind a refused prefill band ride anyway.
+    /// This is the CB/CD wedge in one assertion: refuse them here and prefills
+    /// promote into decodes that never step, nothing completes, and no ground
+    /// ever comes back to reopen the wave.
+    #[test]
+    fn a_wave_closed_to_admissions_still_steps_its_continuations() {
+        let mut f = Fake::new(vec![0; 5], vec![64 << 30; 2], FLOOR);
+        f.active = 9;
+        f.decodes_active = 5;
+        let got = fill_once(&mut f);
+        assert_eq!(got.prefills, 0, "the wave closed to new work");
+        assert_eq!(
+            got.decodes, 5,
+            "and stepped every decode it was already running"
+        );
+        assert_eq!(f.taken, vec![Kind::Decode; 5]);
+    }
+
+    /// **A wave that has stopped paying is not a device that has run out**, and
+    /// the two are reported apart: one is the queue's turn to wait, the other
+    /// is backpressure the producer must act on.
+    #[test]
+    fn a_saturated_wave_and_a_starved_one_report_differently() {
+        // Saturated: residency to spare, but the wave is as fast as it gets.
+        let mut f = Fake::new(Vec::new(), vec![0; 64], FLOOR + 512 * REGION);
+        f.active = 1;
+        f.decodes_active = 1;
+        let got = fill(&mut f, &mut planner().with_min_gain(0.05));
+        assert!(got.prefills > 0, "it widened first");
+        assert!(got.stopped_on_rate, "then stopped paying");
+        assert!(!got.stopped_on_weights, "with the floor nowhere near");
+        assert!(f.resident > FLOOR + 500 * REGION);
+
+        // Starved: the floor is what stopped it.
+        let mut f = Fake::new(Vec::new(), vec![REGION; 64], FLOOR + 2 * REGION);
+        f.active = 1;
+        f.decodes_active = 1;
+        let got = fill_once(&mut f);
+        assert_eq!(got.prefills, 2);
+        assert!(got.stopped_on_weights);
+        assert!(!got.stopped_on_rate);
     }
 
     /// **FIFO, not cheapest-first.** An item the budget cannot take ends its
     /// band; the cheap items behind it do not jump the queue.
     #[test]
     fn a_band_stops_at_its_head_rather_than_passing_it_over() {
-        let mut f = Fake::new(Vec::new(), vec![100, 1, 1], 50);
+        let mut f = Fake::new(
+            Vec::new(),
+            vec![64 << 30, REGION, REGION],
+            FLOOR + 2 * REGION,
+        );
         f.active = 1;
         f.decodes_active = 1;
-        let got = fill(&mut f);
+        let got = fill_once(&mut f);
         assert_eq!(got.prefills, 0, "the head did not fit, so nothing did");
         assert!(got.stopped_on_weights);
         assert_eq!(f.prefills.len(), 3, "and nothing was consumed");

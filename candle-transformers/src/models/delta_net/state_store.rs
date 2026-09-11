@@ -1650,7 +1650,6 @@ mod tests {
             !store.relocate_down(64).unwrap(),
             "a CPU store has no regions to pack, and that is not a failure",
         );
-
     }
 
     /// **A store keeps its write buffers between waves.** Sitting a wave out

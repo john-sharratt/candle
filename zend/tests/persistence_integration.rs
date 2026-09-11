@@ -24,7 +24,45 @@ mod persistence {
     use zend::session::{StreamItem, ZendSession};
     use zend::types::{ChatMessage, Role};
 
-    const TIMEOUT_SECS: u64 = 600;
+    /// The bundled schema, written into the throwaway workspace so it boots as a
+    /// **mind** rather than a coding-agent workspace — see `tool_free_workspace`.
+    const PROJECTION_YAML: &str = include_str!("../src/prompts/projection.yaml");
+
+    /// Budget for the whole session: model load plus two short turns.
+    ///
+    /// **This was 600 s and the test still timed out**, because it was paying
+    /// for two startup phases it has no use for. `install_tool_catalog` seals a
+    /// section per tool (~108 s) and "Calibrating sections" then free-decodes
+    /// every authored example in the catalog — 2,998 exemplars across 859
+    /// submissions, the same ~15-minute phase a real daemon boot runs. Neither
+    /// has anything to do with whether turns reach the substrate durably, and
+    /// together they made the budget unreachable at any value.
+    ///
+    /// With both skipped the session is a model load and two 64-token turns, so
+    /// this is sized to catch a genuine hang rather than to accommodate startup.
+    const TIMEOUT_SECS: u64 = 240;
+
+    /// Lay out the throwaway workspace so the daemon boots **tool-free**.
+    ///
+    /// Two facts combine, both already load-bearing elsewhere. A workspace that
+    /// carries its own `projection.yaml` is a *mind*, and a mind draws its tool
+    /// catalog from its own `tools/` folder rather than the bundled built-ins
+    /// (`tool_def::load_effective`, asserted by
+    /// `tools_override_only_applies_to_a_mind_workspace`). So a mind with an
+    /// **empty** `tools/` has an empty catalog.
+    ///
+    /// That is what makes the phases vanish: `install_tool_catalog` loops over
+    /// zero definitions, `tool_sections` comes back empty, and the calibration
+    /// step's own guard — "Skip entirely for a tool-free projection — nothing to
+    /// calibrate" — takes the other branch. Nothing is stubbed or bypassed; this
+    /// is the supported configuration for a conversational mind, used here
+    /// because tool selection is not what this test is about.
+    fn tool_free_workspace(workspace: &std::path::Path) {
+        std::fs::create_dir_all(workspace).unwrap();
+        std::fs::write(workspace.join("projection.yaml"), PROJECTION_YAML)
+            .expect("write the mind's projection schema");
+        std::fs::create_dir_all(workspace.join("tools")).expect("empty tool catalog");
+    }
 
     fn init_tracing() {
         let _ = tracing_subscriber::fmt()
@@ -62,6 +100,12 @@ mod persistence {
     }
 
     #[test]
+    #[ignore = "Tier 3: loads the pinned Qwen3.6-35B-A3B GGUF (22 GB) and drives \
+                two live turns — a model load alone is ~29 s and the whole test \
+                is minutes, so it is GPU-exclusive and never belongs in a default \
+                sweep. Run with: cargo test -p zend --features cuda --release \
+                --test persistence_integration -- --ignored --nocapture \
+                --test-threads=1"]
     fn turns_persist_and_recover_across_a_simulated_restart() {
         init_tracing();
 
@@ -78,7 +122,7 @@ mod persistence {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&workspace).unwrap();
+        tool_free_workspace(&workspace);
 
         let ws = workspace.clone();
         let result = rt.block_on(async move {
@@ -127,6 +171,18 @@ mod persistence {
         let config = DaemonConfig {
             workspace,
             port: 0,
+            // **No summary forest.** The AVL summariser registers every new
+            // conversation and generates against it in the background, so after
+            // the two turns below the scheduler still had work queued and
+            // `shutdown` — which drains before exiting — never converged: 2,173
+            // `decode batch=…` lines in the three minutes before the old timeout
+            // fired, long after both turns had reported complete.
+            //
+            // Summarisation is orthogonal to what this test asserts (that turns
+            // reach the substrate durably and survive a reopen), and this is the
+            // flag's documented purpose — bringing the engine up without the
+            // forest running.
+            disable_summariser: true,
             ..Default::default()
         };
         let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));

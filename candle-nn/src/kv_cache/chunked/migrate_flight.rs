@@ -22,10 +22,29 @@
 //! - **Nothing invalidates a base pointer any more.** A region of the
 //!   reservation is mapped once and stays mapped at the same address for the
 //!   process lifetime; "freeing" an arena moves its region between two lists.
-//!   Defrag relocation is gone, the arena vector is not truncated, and the pool
-//!   trim went with the pool's KV. The ordering that *is* still required — not
-//!   re-tenanting a region while an earlier kernel may still be reading it —
-//!   belongs to whoever re-tenants, and lives in `region_pool::claim_region`.
+//!   The arena vector is not truncated, and the pool trim went with the pool's
+//!   KV. The ordering that *is* still required — not re-tenanting a region
+//!   while an earlier kernel may still be reading it — belongs to whoever
+//!   re-tenants, and lives in `region_pool::claim_region`.
+//!
+//!   **This clause used to read "defrag relocation is gone" as well, and that
+//!   is no longer true.** `ChunkedKvBacking::defragment_class` moves chunk
+//!   bytes between slots and `compact_arenas_down` moves whole slabs. Neither
+//!   invalidates an address — the hazard is the sharper one of a *re-tenanted*
+//!   slot, where the pointer stays valid and the bytes behind it become
+//!   somebody else's.
+//!
+//!   What replaced the lock is placement rather than exclusion: both movers run
+//!   on the persistence thread, ahead of the migrate in the same pass
+//!   (`persistence::thread`), so that reader and the movers cannot overlap by
+//!   construction. Anything that starts moving chunk bytes from another thread
+//!   reopens exactly the race this file was written for.
+//!
+//!   Kernels already queued need no separate treatment: production takes the
+//!   context's default stream for everything, so a mover's copies and the
+//!   forward kernels sit on one in-order stream and cannot overlap. A mover
+//!   that ever acquires a stream of its own loses that for free and would need
+//!   real ordering against both the forwards and the migrate.
 //! - **The table stopped being dense over storage.** It is sized from the job
 //!   list now, so every pointer in it comes from a gid the caller has pinned.
 //!   Even under the old allocator that would have made the neighbour-arena

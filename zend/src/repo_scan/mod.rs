@@ -2044,7 +2044,11 @@ mod tests {
         a.weight_hold_bytes = 5 << 30;
         assert_eq!(gate_decision(8, Some(&a)), Ok(()));
         a.weight_zone_bytes = 1 << 30;
-        assert_eq!(gate_decision(8, Some(&a)), Ok(()), "even well under the hold");
+        assert_eq!(
+            gate_decision(8, Some(&a)),
+            Ok(()),
+            "even well under the hold"
+        );
     }
 
     /// **Runaway protection, and nothing finer.** Far above any healthy state,

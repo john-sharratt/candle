@@ -70,6 +70,28 @@ mod tool_scenarios {
     // discards the calibration exemplars selection depends on). The per-query
     // growth outruns the boot cost it removes.
 
+    /// **One scenario on the card at a time.**
+    ///
+    /// Each test below boots its own `ZendSession`, and a session loads the
+    /// 22 GB checkpoint. `cargo test` runs a binary's tests on as many threads
+    /// as the machine has cores, so without this the ten of them start ten
+    /// concurrent model loads against a 16 GB card: none fits, they thrash, and
+    /// **every one hits its 900 s cap** — measured, 0 passed / 10 failed, with
+    /// the whole file taking 900 s to report ten timeouts.
+    ///
+    /// Serialised they cost 758 s in total, each well inside its own cap. The
+    /// figure above is what that measurement was of: ten *sequential* fresh
+    /// sessions, which is the only way this file was ever run successfully.
+    ///
+    /// The same guard `candle-nn` uses for its GPU tests (`gpu_serial`), which
+    /// cannot be reached from here — it is `#[cfg(test)]` inside that crate.
+    /// Poison is stepped over deliberately: a scenario that panics has already
+    /// failed, and taking the rest of the file down with it hides which.
+    fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
+        static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        GPU.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Boot a ZendSession, wait for ready, send `prompt`, return the
     /// concatenated assistant text.  Used by every scenario test.
     async fn run_query(prompt: &str, conv_id: &str) -> String {
@@ -126,6 +148,9 @@ mod tool_scenarios {
     }
 
     fn run_with_timeout<F: std::future::Future<Output = String> + Send + 'static>(f: F) -> String {
+        // Held for the whole scenario — boot, query and teardown — so the next
+        // test's model load never overlaps this one's. See `gpu_serial`.
+        let _card = gpu_serial();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

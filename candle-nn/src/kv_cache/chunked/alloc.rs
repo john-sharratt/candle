@@ -918,6 +918,22 @@ impl ChunkedKvBacking {
         self.inner.alloc_chunk_for_key(key)
     }
 
+    /// Claim a slot in a **named** arena, never creating one.
+    ///
+    /// For relocation, which must not let the pool choose: the allocator returns
+    /// the leftmost arena with room, and an arena being drained is exactly the
+    /// one with the most room, so an unnamed claim sends chunks straight back
+    /// into the donor they came from. Answers `None` when that arena is full,
+    /// which the caller reads as "leave the band where it is" rather than
+    /// falling back to a fresh arena.
+    pub(super) fn pool_allocate_from_arena(
+        &self,
+        key: super::arena::ArenaKey,
+        arena_idx: usize,
+    ) -> Option<super::gid_pool::ChunkGid> {
+        self.inner.pool.allocate_from_arena(key, arena_idx)
+    }
+
     /// Create the arenas that mid-wave refusals asked this backing for.
     ///
     /// See [`BackingInner::create_deferred_arenas`]. Between forwards only, with
@@ -1093,9 +1109,14 @@ impl BackingInner {
     /// LOCALITY optimization for the paged select/QREL walk, not a correctness
     /// requirement — each band is addressed through its own gid
     /// (`resolve_band_source`), so scattered bands read correctly, just with
-    /// worse spatial locality. Falls back to singleton allocation when no run
-    /// is available. Mirrors [`Self::alloc_chunk_for_key`]'s
-    /// register-on-exhaustion retry.
+    /// worse spatial locality.
+    ///
+    /// Three tiers, in order: a contiguous run from some arena's high-water
+    /// tail; failing that **scattered singleton slots**, which are the only way
+    /// to reach recycled space (a run cannot — see the fallback's comment);
+    /// failing that a fresh arena, which is the last resort rather than the
+    /// first. Mirrors [`Self::alloc_chunk_for_key`]'s register-on-exhaustion
+    /// retry.
     pub(super) fn alloc_chunk_run_for_key(
         &self,
         key: super::arena::ArenaKey,
@@ -1119,7 +1140,61 @@ impl BackingInner {
             self.replenish_if_nearly_dry(key, len);
             return Ok(gids);
         }
-        // No existing arena has tail room: register a fresh one and claim from
+
+        // **Scattered slots before a fresh arena — the doc above is the
+        // contract, and it was not being honoured.**
+        //
+        // A run is claimed from the high-water tail ONLY: `try_claim_run` says
+        // so in as many words, because "recycled singleton slots are never
+        // consecutive-by-contract". `hwm` never retreats, so an arena that once
+        // filled and then had its turns evicted sits at (say) 88 live against a
+        // 2,048 high-water mark — 1,960 free slots that no run can ever use
+        // again. Going straight to a fresh arena from here means the workload
+        // can only ever consume never-before-used ground, and the recycled space
+        // accumulates untouched.
+        //
+        // Measured on run 59's class 8192 (R16, the active unsealed K format,
+        // allocated in runs): 46 arenas holding 5,896 of 94,208 slots — 6.3%
+        // occupancy — with 33 of them under 100 live slots apiece, and the count
+        // climbing 79 → 130 arenas in four minutes of ingest. Relocation could
+        // not answer it: it claims singletons, so it consolidates *into* exactly
+        // the recycled space that runs are forbidden from touching, while every
+        // new turn stamps another arena.
+        //
+        // Contiguity is a locality optimization and this function's own header
+        // says it is "not required for correctness — each band is addressed
+        // through its own gid". So when the choice is scattered slots or a new
+        // arena, scattered wins: the QREL walk loses some spatial locality, the
+        // span stops growing.
+        let scattered = self.pool.allocate_n_for(key, len);
+        if scattered.len() == len {
+            // **Every unique arena, not just the first.** A run comes from one
+            // arena by construction, so the contiguous path above can materialise
+            // `gids[0]`'s and be done. Scattered slots have no such property:
+            // `allocate_n_for` walks arenas in rank order and a claim routinely
+            // spans several. An arena that is registered in the pool but not yet
+            // materialised in storage resolves to `base_ptr == 0`, and a write
+            // through that lands at the foot of the reservation — silently, on
+            // another tenant's ground. `alloc_chunks_for_key_bulk` does this same
+            // sweep for the same reason.
+            let mut seen: ahash::HashSet<usize> =
+                ahash::HashSet::with_capacity_and_hasher(4, ahash::RandomState::new());
+            for gid in &scattered {
+                let ai = gid.arena_idx();
+                if seen.insert(ai) {
+                    self.ensure_arena_exists(ai, key)?;
+                }
+            }
+            self.replenish_if_nearly_dry(key, len);
+            return Ok(scattered);
+        }
+        // A short answer is the pool genuinely running out, not a contiguity
+        // refusal. Drop the partial claim so the slots go back before a fresh
+        // arena is stamped — holding them would price the new arena against
+        // ground this call is about to abandon.
+        drop(scattered);
+
+        // No existing arena has room at all: register a fresh one and claim from
         // it BY INDEX. The old shape — register, then re-walk the whole pool —
         // raced: between registration and the re-walk, concurrent claimers (the
         // scheduler's prefills and the persistence thread's elevations allocate

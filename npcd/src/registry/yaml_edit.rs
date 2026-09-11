@@ -212,6 +212,10 @@ type Shape = serde_yaml::Value;
 /// sequence that gained or lost an entry, or a mapping whose key set moved, has
 /// no node-for-node correspondence to walk, so the collection is rewritten
 /// whole — as block YAML, so an authored list stays an authored list.
+// The walk carries the document, where it is, where it came from, and what it
+// has touched — each a distinct concern, and bundling them into a context
+// struct would rename the arguments without removing one.
+#[allow(clippy::too_many_arguments)]
 fn descend<'a>(
     doc: &'a Document,
     route: Route<'a>,
@@ -959,14 +963,12 @@ groups:
 ";
         // Everything but two keys removed at once.
         let out = splice(original, &obj(json!({ "id": "world", "window": 9000 })));
-        match out {
-            // Whichever way the crate behaves, the contract here is the same:
-            // an answer, and a correct one.
-            Some(text) => {
-                let back: Value = serde_yaml::from_str(&text).expect("parses");
-                assert_eq!(back, json!({ "id": "world", "window": 9000 }), "{text}");
-            }
-            None => {}
+        // Whichever way the crate behaves, the contract here is the same: an
+        // answer, and a correct one. Declining to splice is a valid answer, so
+        // only a `Some` has anything to check.
+        if let Some(text) = out {
+            let back: Value = serde_yaml::from_str(&text).expect("parses");
+            assert_eq!(back, json!({ "id": "world", "window": 9000 }), "{text}");
         }
     }
 

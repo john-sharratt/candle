@@ -395,6 +395,17 @@ mod tests {
                     queue.push(here);
                     continue;
                 }
+                // **Skip what a tool wrote, not what an author did.** Running
+                // the zend daemon over this workspace drops a `.substrate.yaml`
+                // in every directory it ingests, and that file records the
+                // folder's *own* path and a hash of its contents — so the two
+                // copies are different by construction and always will be.
+                // Comparing them reports drift in a shared library because
+                // somebody ran the daemon, which is a fact about the machine
+                // rather than about the trees.
+                if name.to_string_lossy().starts_with('.') {
+                    continue;
+                }
                 let name = here.to_string_lossy().replace('\\', "/");
                 let mirror = zend.join(&here);
                 if !mirror.exists() {

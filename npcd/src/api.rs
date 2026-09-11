@@ -79,6 +79,10 @@ pub struct Authored {
 }
 
 impl Authored {
+    // One argument per store this holds. They are independent collections with
+    // nothing in common but their owner, so grouping them would invent a type
+    // that means "the arguments to this constructor".
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         worlds: Registry,
         personalities: Registry,

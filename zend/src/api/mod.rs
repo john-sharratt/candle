@@ -26,6 +26,8 @@ use crate::session::ZendSession;
 pub mod chat;
 pub mod conversations;
 pub mod files;
+mod holdings;
+mod kvmap;
 mod memory;
 pub mod models;
 pub mod profile;
@@ -84,6 +86,10 @@ pub fn router(session: Arc<ZendSession>) -> Router {
         .route("/v1/models", get(models::list))
         .route("/v1/status", get(status::status))
         .route("/v1/memory", get(memory::dump))
+        // What is holding the span and why — the attribution `/v1/memory`'s
+        // totals cannot give.
+        .route("/v1/holdings", get(holdings::dump))
+        .route("/v1/kvmap", get(kvmap::dump))
         .route("/v1/repo_map", get(repo_map::completeness))
         .route("/v1/telemetry", get(telemetry::telemetry))
         // Reading this RESETS the counters, so two calls bracket a window.

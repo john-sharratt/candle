@@ -65,6 +65,15 @@ pub mod projection;
 pub mod profile {
     pub use candle_transformers::models::profile::{pipeline_snapshot_and_reset, ProfileSnapshot};
 }
+/// The KV span's per-arena occupancy, for diagnosing fragmentation.
+///
+/// Re-exported rather than reimplemented, for the same reason as
+/// [`profile`]: the arenas live in `candle-nn`'s gid pool and a second view
+/// assembled here would be a second source of truth for one set of atomics.
+/// Read without an engine lock, so an HTTP handler can take it mid-decode.
+pub mod kv_arenas {
+    pub use candle_nn::kv_cache::{global_arena_map, ArenaOccupancy};
+}
 pub mod prompts;
 pub mod provenance;
 pub(crate) mod scheduler;
@@ -95,11 +104,13 @@ pub use projection::{
     BucketKind, OptionalState, ProjectionBucket, ProjectionEvent, SelectionState, NO_THINK_SELECTOR,
 };
 pub use scheduler::branch_checkpoint_counts;
+pub use scheduler::holdings;
 pub use scheduler::memory_report;
 pub use scheduler::phase_ring;
 pub use scheduler::provenance_capture_path_counts;
 pub use scheduler::recurrent_state_cost;
 pub use scheduler::relief_trace;
+pub use scheduler::wave_rate;
 pub use sequence_handle::SequenceId;
 pub use stats::TurnStats;
 pub use token_buffer::TokenBuffer;

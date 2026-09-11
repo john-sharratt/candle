@@ -1990,6 +1990,99 @@ impl Substrate {
             .collect()
     }
 
+    /// Hot residences a relocation pass may rewrite, oldest-attended first.
+    ///
+    /// **Least-recently-used first, the opposite end from the drain.** Chunks
+    /// are relocated to pack the span downward, and a residence the decode is
+    /// about to attend is the worst candidate: it pays the copy and then gets
+    /// elevated or demoted anyway. The LRU tail is the ground most likely to sit
+    /// still long enough for the move to be worth making.
+    ///
+    /// Pinned residences are skipped for the same reason
+    /// [`Self::snapshot_pending_warm`] skips them — a slot the in-flight decode
+    /// is attending must not have work piled on it from this thread.
+    ///
+    /// `limit` bounds the clone, because each entry clones a residence's whole
+    /// per-layer `SealedSequence` set and a pass that snapshots everything would
+    /// cost more in refcount traffic than it saves in ground.
+    pub fn snapshot_hot_for_relocation(
+        &self,
+        limit: usize,
+    ) -> Vec<(ResidenceIndex, Vec<SealedSequence>)> {
+        self.hot_lru
+            .iter()
+            .rev()
+            .filter(|idx| !self.working_set_pins.contains(idx))
+            // **Skip residences the hot→warm drain is about to take.**
+            //
+            // `snapshot_pending_warm` selects exactly `warm.is_none()`, and the
+            // migrate runs later in the same pass with its own snapshot taken
+            // before this one's work lands. Its `install_warm_and_hot` writes
+            // the whole residence, so anything relocated here is overwritten by
+            // the pre-relocation copy the migrate captured — the copies are made
+            // and then thrown away.
+            //
+            // Deferring costs nothing: once the residence has a warm copy it
+            // stops being pending and the next pass relocates it for real. And
+            // it is the right population either way, since the LRU tail this
+            // walks is the oldest ground and therefore the most likely to have
+            // already been drained.
+            .filter(|idx| self.residence[idx.0].warm.is_some())
+            .filter_map(|&idx| {
+                self.residence[idx.0]
+                    .hot
+                    .as_ref()
+                    .map(|hot| (idx, hot.clone()))
+            })
+            .take(limit)
+            .collect()
+    }
+
+    /// Swap in a residence's relocated hot copy.
+    ///
+    /// The bytes are identical and so is every format, so nothing downstream of
+    /// the residence changes — only which slots hold it. Dropping the previous
+    /// `Vec<SealedSequence>` here is what finally releases the old chunks, and
+    /// it happens *after* the replacement is in place, which is the ordering the
+    /// whole owner-down design rests on.
+    ///
+    /// Refuses a residence whose hot copy has gone since the snapshot: it was
+    /// demoted or evicted while the pass ran, and re-installing would resurrect
+    /// ground the engine has already decided it does not want.
+    ///
+    /// **It also refuses one whose hot copy has *changed* since.** Absence is
+    /// not the only way the snapshot goes stale: a demote followed by an elevate
+    /// leaves `hot` populated again, with a different set of sequences, and
+    /// blind assignment would overwrite that newer copy with the relocated
+    /// version of an older one — then leave `byte_size` describing neither.
+    /// `expect_chunks` is the shape the caller snapshotted, per layer; a
+    /// mismatch means this residence moved on and the pass's work is discarded
+    /// rather than forced.
+    pub fn install_relocated_hot(
+        &mut self,
+        residence: ResidenceIndex,
+        sealed: Vec<SealedSequence>,
+        expect_chunks: &[usize],
+    ) -> bool {
+        let Some(slot) = self.residence.get_mut(residence.0) else {
+            return false;
+        };
+        let Some(current) = slot.hot.as_ref() else {
+            return false;
+        };
+        if current.len() != expect_chunks.len()
+            || current
+                .iter()
+                .zip(expect_chunks)
+                .any(|(seq, n)| seq.chunks.len() != *n)
+        {
+            return false;
+        }
+        slot.byte_size = sealed_bytes(&sealed) as u64;
+        slot.hot = Some(sealed);
+        true
+    }
+
     /// Total VRAM byte footprint of hot residences that lack a warm copy — the
     /// hot→warm drain **backlog**. Cheap companion to [`Self::snapshot_pending_warm`]
     /// (which clones every hot `SealedSequence` for the migration): this only
@@ -2031,6 +2124,38 @@ impl Substrate {
             .iter()
             .map(|idx| self.residence[idx.0].byte_size)
             .sum()
+    }
+
+    /// What this conversation's **hot** (VRAM) residences hold, split by whether
+    /// eviction could actually take them:
+    /// `(hot_count, hot_bytes, evictable_count, evictable_bytes)`.
+    ///
+    /// `evictable_*` counts exactly what [`Self::evict_hot_to_free`] would
+    /// consider — a residence with both a hot and a warm copy, so dropping the
+    /// hot one loses nothing and the reload is a PCIe copy. The difference
+    /// between the two pairs is hot KV whose warm copy has not landed yet: real
+    /// VRAM that **cannot** be freed at this instant however much pressure the
+    /// engine is under, because the migration is asynchronous.
+    ///
+    /// That distinction is the whole point of reporting it. A census that shows
+    /// only "hot bytes" cannot say whether an eviction pass finding nothing is a
+    /// pass with nothing to take or a pass whose candidates are all still in
+    /// flight, and those two call for opposite responses.
+    pub fn hot_residency(&self) -> (usize, u64, usize, u64) {
+        let (mut hc, mut hb, mut ec, mut eb) = (0usize, 0u64, 0usize, 0u64);
+        for &idx in &self.hot_lru {
+            let slot = &self.residence[idx.0];
+            if slot.hot.is_none() {
+                continue;
+            }
+            hc += 1;
+            hb += slot.byte_size;
+            if slot.warm.is_some() {
+                ec += 1;
+                eb += slot.byte_size;
+            }
+        }
+        (hc, hb, ec, eb)
     }
 
     /// Count of hot residences awaiting a warm copy — the cheap COUNT companion to

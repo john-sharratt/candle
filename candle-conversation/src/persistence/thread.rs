@@ -51,7 +51,16 @@ use std::collections::HashMap;
 use sysinfo::System;
 
 /// How often the loop wakes up on its own when no triggers arrive.
-pub const DEFAULT_TICK: Duration = Duration::from_secs(5);
+///
+/// **One second, because this thread now owns the arena movers.** The tiering
+/// work it was written for is a background drain and was happy at five; the
+/// defrag and the arena compaction that moved here are the opposite — they hand
+/// ground back to the weight zone and the wave tier, and every tick they are
+/// late is a tick admission spends refusing prefills at the floor for want of
+/// ground that is sitting free in a half-empty arena. The passes are cheap when
+/// there is nothing to do (a gain gate and an occupancy read), so a faster tick
+/// costs little on an idle span and buys promptness on a busy one.
+pub const DEFAULT_TICK: Duration = Duration::from_secs(1);
 
 /// Minimum wall-clock between background **segment-maintenance** scans. The
 /// tiering phases run every pass (one per trigger / tick), but the maintenance
@@ -576,6 +585,162 @@ fn signal_vram_starvation(device: &Device, err: &candle::Error) {
     }
 }
 
+/// Residences one relocation pass will look at.
+///
+/// Each entry clones a residence's whole per-layer sealed set, so the bound is a
+/// real cost, not a formality. Sized so a pass's copies stay well inside the
+/// tick that carries them — the arena-order pass this replaces once held the
+/// scan pool for 329 seconds by refusing to bound itself.
+const RELOCATE_RESIDENCES_PER_PASS: usize = 32;
+
+/// How often the slab compaction runs, independent of [`DEFAULT_TICK`].
+///
+/// Five seconds — the tick this loop had when compaction was written for it.
+/// The tick dropped to one second so the movers could keep up with ingest, and
+/// carrying compaction along with it multiplied a whole-block-table walk per
+/// backing by five for no gain: an arena's *position* in the span changes at the
+/// pace regions are claimed and released, not at the pace chunks move.
+const COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Whether enough time has passed for another slab compaction.
+///
+/// A plain instant rather than a tick counter, so the cadence holds however the
+/// loop's own period is retuned.
+fn compaction_due() -> bool {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    match *last {
+        Some(t) if now.duration_since(t) < COMPACTION_INTERVAL => false,
+        _ => {
+            *last = Some(now);
+            true
+        }
+    }
+}
+
+/// Pack hot KV downward in the span by relocating the residences that sit
+/// highest, so the arenas above them drain and their regions go back.
+///
+/// **Driven from the owner, not from the arena.** The pass this replaces walked
+/// arenas and had to discover every holder of every chunk it moved — a proof of
+/// exhaustiveness the data structure cannot supply, and the source of every
+/// corruption this engine has shown. Here the conversation owns the sequences,
+/// hands them in, and installs what comes back; nothing else is ever rewritten,
+/// so there is nothing to miss. See `candle_nn::kv_cache::chunked::relocate`.
+///
+/// A residence whose hot copy vanished while the pass ran is dropped rather than
+/// re-installed — it was demoted or evicted, and the engine has already decided
+/// it does not want that ground.
+fn relocate_hot_downward(backings: &[ChunkedKvBacking], conversation: &Conversation) {
+    use candle_nn::kv_cache::{plan_relocation_class, RelocationPlan};
+
+    let Some(first) = backings.first() else {
+        return;
+    };
+    // One census for the pass. Room is spent as claims are made, so every owner
+    // shares the same budget and the keep set cannot be over-committed.
+    let rows = first.gpu_arena_map();
+    let mut plans: HashMap<usize, RelocationPlan> = HashMap::new();
+    let mut strides: Vec<usize> = rows.iter().map(|a| a.slot_bytes).collect();
+    strides.sort_unstable();
+    strides.dedup();
+    for stride in strides {
+        if let Some(plan) = plan_relocation_class(&rows, stride) {
+            plans.insert(stride, plan);
+        }
+    }
+    if plans.is_empty() {
+        return;
+    }
+
+    let work = conversation
+        .read()
+        .snapshot_hot_for_relocation(RELOCATE_RESIDENCES_PER_PASS);
+    if work.is_empty() {
+        return;
+    }
+
+    let mut bands = 0usize;
+    let mut chunks = 0usize;
+    let mut installed = 0usize;
+    for (idx, hot) in work {
+        if hot.len() != backings.len() {
+            continue;
+        }
+        // **One window per residence — not per layer, and not per pass.**
+        //
+        // The window is what `plan_wave_transient` waits on, so whoever holds it
+        // stalls every forward wanting to place a tier. The granularity is a
+        // straight trade and both ends of it were measured:
+        //
+        // - *Per layer* (run 58) asked ~1,536 times per pass and lost the rest
+        //   of the pass to any forward that started: 208,439 refusals against
+        //   1,062 passes, 196:1.
+        // - *Per pass* (run 59) removed every refusal by making inference wait
+        //   through 32 residences of copies and syncs instead — dirs/min fell
+        //   2.12 → 1.41 and decode 13.9 → 8.7 tok/s. Refusals are cheap;
+        //   blocking forwards is not.
+        //
+        // A residence is the unit that makes sense between them: its 48 layers
+        // are one logical piece of work, the hold is bounded by one residence's
+        // copies, and a forward waits at most that long.
+        let _window = match first.begin_relocation_pass() {
+            Ok(Some(w)) => w,
+            Ok(None) => return,
+            // A forward owns the partition. Give up the whole pass rather than
+            // spinning through the remaining residences: the next tick is a
+            // second away and the census will be fresher.
+            Err(_) => return,
+        };
+        // Per layer, because each backing owns its own arenas' records — but the
+        // residence is installed as a whole, so a layer that declines simply
+        // keeps the sequence it already had.
+        let mut next: Vec<SealedSequence> = Vec::with_capacity(hot.len());
+        let mut moved_any = false;
+        for (backing, seq) in backings.iter().zip(hot.iter()) {
+            match backing.relocate_sealed(std::slice::from_ref(seq), &mut plans) {
+                Ok(Some((mut relocated, stats))) if !relocated.is_empty() => {
+                    bands += stats.bands_moved;
+                    chunks += stats.chunks_rebuilt;
+                    moved_any = true;
+                    next.push(relocated.remove(0));
+                }
+                Ok(_) => next.push(seq.clone()),
+                Err(e) => {
+                    tracing::debug!("relocate skipped: {e}");
+                    next.push(seq.clone());
+                }
+            }
+        }
+        if moved_any {
+            // The shape the snapshot was taken against. `install_relocated_hot`
+            // refuses if the residence has changed since — a demote-then-elevate
+            // leaves `hot` populated with a *different* sequence set, and
+            // installing over that would replace newer ground with the relocated
+            // form of older ground.
+            let expect: Vec<usize> = hot.iter().map(|s| s.chunks.len()).collect();
+            if conversation
+                .write()
+                .install_relocated_hot(idx, next, &expect)
+            {
+                installed += 1;
+            }
+        }
+    }
+
+    if bands > 0 {
+        tracing::debug!(
+            target: "candle_conversation::persistence::tier",
+            bands,
+            chunks,
+            installed,
+            "relocate: hot KV packed toward the bottom of the span"
+        );
+    }
+}
+
 /// Migrate one policy-group's residences hot→warm: per layer, quantize the
 /// group's hot sequences in place (or pass them through when `policy` is
 /// `None`) and DtoH-copy the result to a format-preserving CPU warm copy.
@@ -1007,6 +1172,61 @@ fn run_pass(
                 "cache: created {n} arena(s) a wave-deferred sealing pass asked for"
             ),
             Err(e) => tracing::warn!("cache: deferred arena creation failed: {e}"),
+        }
+    }
+
+    // ── Everything that MOVES chunk bytes, on the thread that reads them ────
+    //
+    // **Here rather than on the scheduler, so there is no concurrency to
+    // exclude.** Both passes below relocate bytes inside the reservation: the
+    // defrag copies chunks between slots of one size class and frees the slots
+    // it empties, and the compaction slides whole arena slabs toward the low
+    // end. The hot→warm migrate further down this same function builds a
+    // base-pointer table, uploads it, and launches a kernel that dereferences
+    // it with no storage lock held — so a mover running underneath it hands
+    // that kernel a slot somebody else now owns. The address stays perfectly
+    // valid; the bytes are a stranger's, and the turn decodes nonsense later
+    // with nothing having faulted.
+    //
+    // `migrate_flight` records why the arena-topology `RwLock` that used to
+    // exclude these was retired: "nothing invalidates a base pointer any more"
+    // and "defrag relocation is gone". The second premise is no longer true, so
+    // the exclusion has to come back — and running the movers on this thread,
+    // ahead of the migrate in the same pass, IS the exclusion. It costs no lock
+    // and cannot be forgotten by a future caller.
+    //
+    // This seam is the one the deferred arena creation above already uses:
+    // between forwards, no KV lock held, no wave in flight, and no conversation
+    // lock taken yet. Each pass takes its own arena window and declines rather
+    // than waits if a forward has started, so a busy engine simply defers them
+    // to the next tick.
+    relocate_hot_downward(backings, conversation);
+    // **Compaction keeps its original cadence, not the tick's.**
+    //
+    // `compact_arenas_down` asks `arena_fully_reachable` per arena, and that
+    // walks the whole block table under a read lock — for every one of the 48
+    // backings. It was written against a 5-second tick; this loop now runs at
+    // one second for the movers' sake, which silently made it five times the
+    // work on the thread that also owns the hot→warm drain. Slab positions do
+    // not change fast enough to need a second-by-second answer, so the interval
+    // is pinned here rather than inherited.
+    if compaction_due() {
+        let mut packed = 0usize;
+        for backing in backings.iter() {
+            match backing.compact_arenas_down() {
+                Ok(n) => packed += n,
+                Err(e) => {
+                    tracing::debug!("arena compaction skipped: {e}");
+                    break;
+                }
+            }
+        }
+        if packed > 0 {
+            tracing::debug!(
+                target: "candle_conversation::persistence::tier",
+                moved = packed,
+                "arena compaction: KV arenas packed"
+            );
         }
     }
 

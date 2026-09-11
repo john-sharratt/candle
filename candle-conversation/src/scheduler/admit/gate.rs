@@ -1,14 +1,21 @@
-//! Whether one admission may proceed.
+//! The two hard lines a wave may not cross, and the ground they are measured
+//! against.
 //!
-//! Four rules, and deliberately no fifth. Everything this replaced — a byte
-//! setpoint, an AIMD budget, a queue-length mark, an open-conversation mark, a
-//! decode-derived wave width — was a proxy for the question below, and each was
-//! falsified on hardware (`docs/wave_feeder.md` §4.5–§4.11).
+//! **What a wave's rows are worth is [`super::rate`]'s question**, not this
+//! one: an offer joins the wave while it makes the wave *faster*. This file
+//! holds what is true whatever the throughput model says —
 //!
-//! The question is: **would admitting this cost us resident experts?** An
-//! engine that streams its experts is slower at everything, including finishing
-//! the work that would give the ground back, so that is the one price worth
-//! refusing to pay. Nothing else here is a throttle.
+//! * the **floor**: residency the engine refuses to spend, whatever it buys.
+//!   An engine that streams its experts is slower at everything, including
+//!   finishing the work that would give the ground back.
+//! * the **midpoint**: the margin a wave carrying no decode at all must leave
+//!   before starting one, so the expert working set stays alive.
+//!
+//! Everything the byte-fit test replaced — a setpoint, an AIMD budget, a
+//! queue-length mark, an open-conversation mark, a decode-derived wave width —
+//! was a proxy for the throughput question, and each was falsified on hardware
+//! (`docs/wave_feeder.md` §4.5–§4.11). The rate model asks it directly; these
+//! two rules are the ones no answer to it may override.
 
 /// The device as the gate needs to see it, measured **after** the wave's
 /// eviction pass so every figure is settled rather than forecast.
@@ -51,29 +58,6 @@ impl Headroom {
     }
 }
 
-/// Whether an admission may proceed, given what the wave already holds.
-///
-/// * **Nothing active — admit, whatever it costs.** A wave that admits nothing
-///   frees nothing, and a slot too large to ever fit must still run rather than
-///   block the queue behind it forever. This is what makes the design
-///   deadlock-free, and it is why the rule is *regardless of budget* rather
-///   than "against a generous budget".
-/// * **Something active — admit only while it does not reach the weights.**
-///   The cost is [`super::cost::Cost::total`]; the room is what eviction just
-///   left. Past that the elastic boundary moves into the weight zone and the
-///   admission is paid for in experts.
-/// **There is deliberately no third clause about the zone standing under its
-/// floor.** That reads as the obvious safety rail and behaves as a wedge: the
-/// zone settles just under the floor and stays there, so a gate keyed on it
-/// refuses essentially every admission and the engine only ever drains. Run BY
-/// measured the cost — effective 5,158 MiB against a 5,284 MiB floor, the queue
-/// never draining past four, two directories in ten minutes. A shortfall is a
-/// *debt*, and `WaveFill::headroom` prices it against the free list so admission
-/// throttles in proportion to it. Keep that here and this stays one question.
-pub(crate) fn may_admit(active: usize, cost: u64, h: &Headroom) -> bool {
-    active == 0 || cost <= h.free_kv
-}
-
 /// Whether a wave carrying no decode at all may start one.
 ///
 /// **This exists to keep the decode weights hot.** Prefill routes across many
@@ -107,47 +91,6 @@ mod tests {
             zone_min: 4 << 30,
             zone_max: 10 << 30,
         }
-    }
-
-    /// The rule that makes the design deadlock-free: an empty wave takes the
-    /// head whatever it costs, so a slot too large to fit still runs.
-    #[test]
-    fn an_empty_wave_admits_regardless_of_cost() {
-        assert!(may_admit(0, u64::MAX, &room(0)));
-    }
-
-    #[test]
-    fn a_busy_wave_admits_only_what_the_free_ground_covers() {
-        let h = room(1_000);
-        assert!(may_admit(3, 1_000, &h), "exactly the room is still room");
-        assert!(!may_admit(3, 1_001, &h), "one byte past is the weights");
-        assert!(may_admit(3, 0, &h));
-    }
-
-    /// **A sunk zone does not close the gate here**, and the guard is against
-    /// re-adding one: this reads like the obvious safety rail, and run BY showed
-    /// it wedges the engine at two directories in ten minutes because the zone
-    /// settles just under its floor and never climbs back out on its own. The
-    /// shortfall is priced against the free list in `WaveFill::headroom`, so by
-    /// the time a `Headroom` reaches this function the debt is already paid and
-    /// `free_kv` is the whole answer.
-    #[test]
-    fn a_sunk_zone_is_not_this_functions_business() {
-        let sunk = Headroom {
-            free_kv: 1_000,
-            zone: (4 << 30) + EVICTION_MARGIN - 1,
-            zone_min: 4 << 30,
-            zone_max: 10 << 30,
-        };
-        assert!(sunk.zone < sunk.floor(), "the zone is under its floor");
-        assert!(
-            may_admit(3, 1_000, &sunk),
-            "room already net of the debt is room, whatever the zone reads",
-        );
-        assert!(
-            !may_admit(3, 1_001, &sunk),
-            "and the free ground is still the bound",
-        );
     }
 
     #[test]

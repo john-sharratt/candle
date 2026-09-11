@@ -118,9 +118,19 @@ pub(super) fn reseed_achievable_weight() {
 /// emergency is the zone the ingest collapsed at — 4.4 GiB of 9.4 achievable,
 /// three seconds a step — and the floor sits just above it.
 ///
-/// **It is a floor, not a target.** `admit::gate` admits while an admission
-/// does not reach the weights at all, and only the decode-start rule consults
-/// the range this bounds — see `admit::gate::may_start_decode`.
+/// **It is a floor, not a target** — but it is a floor both kinds stand on.
+/// [`optimal_weight_bytes`] is what `promote_new_prefills` hands `WaveFill`,
+/// and the fill hands it to the planner as `WaveRate::reset`'s `floor_bytes`,
+/// so `judge_prefill` and `judge_decode` both refuse an admission that would
+/// land under it; the decode-start rule (`admit::gate::may_start_decode`)
+/// consults the same range separately.
+///
+/// That matters most for a prefill, whose price is dominated by one 160 MiB
+/// recurrent store: with the zone near the floor a prefill is refused for want
+/// of a store's worth of ground, however wide the rows behind it. Run 36 spent
+/// 13.5 minutes in that state — 384 refusals, `room_mib=95` against a
+/// `claimed_mib=176` — which is why the idle demote now hands stores back
+/// rather than only block tables.
 const HOLD: f64 = 0.50;
 
 /// The residency the weight side could reach, as last measured at idle — the

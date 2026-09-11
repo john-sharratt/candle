@@ -50,12 +50,10 @@ use crate::models::delta_net::{
 };
 #[cfg(feature = "cuda")]
 use crate::models::wave_buffers::wave_empty;
-#[cfg(feature = "cuda")]
-#[cfg(feature = "cuda")]
-use candle_nn::kv_cache::{
-    plan_wave_transient, WavePlan, REGION_BYTES, WAVE_FORWARD_BYTES,
-};
 use candle_nn::kv_cache::{begin_wave, LayerPhase, WaveGeneration};
+#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::{plan_wave_transient, WavePlan, REGION_BYTES, WAVE_FORWARD_BYTES};
 
 #[cfg(feature = "cuda")]
 use super::engine::wave_geometry;

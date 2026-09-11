@@ -17,8 +17,8 @@ use candle::{DType, Device, Result};
 
 use super::head_gids::ChunkBands;
 use super::{
-    Arena, ArenaStorage, ArenaStorageState, BlockTableState, ChunkMeta, CompressionPolicy,
-    GpuArenaClassStats, LiveChunkRef, SealedChunk, StoragePolicy,
+    Arena, ArenaOccupancy, ArenaStorage, ArenaStorageState, BlockTableState, ChunkMeta,
+    CompressionPolicy, GpuArenaClassStats, LiveChunkRef, SealedChunk, StoragePolicy,
 };
 // Only the CUDA-gated compress-eligibility helper needs the sealed-sequence type.
 use super::size_class::{class_for_payload, payload_bytes_for_tag, SizeClass};
@@ -923,15 +923,30 @@ impl ChunkedKvBacking {
                  arena info — refusing to write records"
             ),
         }
+        let guard = self
+            .state
+            .read()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        self.rewrite_records_from(&[arena_idx], &guard, &arena_info)
+    }
+
+    /// The record rebuild for one layer's block table — see
+    /// [`Self::rewrite_arena_records`], which is this over `self.state`.
+    ///
+    /// Taken as a parameter because layers share arenas: a defragmentation pass
+    /// moves chunks belonging to every layer out of one donor, and each of those
+    /// layers owns its own block table and its own records. Rewriting only this
+    /// backing's would leave the others naming the slot the chunk left.
+    fn rewrite_records_from(
+        &self,
+        arenas: &[usize],
+        state: &BlockTableState,
+        arena_info: &[crate::kv_cache::ResolvedArenaInfo],
+    ) -> candle::Result<()> {
         let n_kv_head = self.inner.n_kv_head;
         let head_dim = self.inner.head_dim;
         let n_palette = self.inner.n_palette();
         let rb = super::meta_pool::chunk_record_bytes(n_kv_head, head_dim, n_palette);
-
-        let state = self
-            .state
-            .read()
-            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
         let mut items: Vec<(super::meta_pool::MetaGid, Vec<u8>)> = Vec::new();
         for seq in state.sequences.iter().flatten() {
@@ -941,11 +956,16 @@ impl ChunkedKvBacking {
                     // so it reads the new base for free.
                     continue;
                 };
+                // **One pass for every arena the caller touched.** A
+                // defragmentation pass lands chunks in many arenas at once, and
+                // asking per arena turned one walk of the block tables into one
+                // per (arena × layer) — the dominant cost of the pass, and
+                // entirely avoidable since a single walk can test them all.
                 if !w
                     .gids
                     .as_slice()
                     .iter()
-                    .any(|g| g.raw() >= 0 && g.arena_idx() == arena_idx)
+                    .any(|g| g.raw() >= 0 && arenas.contains(&g.arena_idx()))
                 {
                     continue;
                 }
@@ -963,17 +983,11 @@ impl ChunkedKvBacking {
                     v_fmt: w.v_fmt.as_slice(),
                 };
                 super::meta_pool::serialize_kv_heads(
-                    &mut bytes,
-                    &src,
-                    n_kv_head,
-                    head_dim,
-                    n_palette,
-                    &arena_info,
+                    &mut bytes, &src, n_kv_head, head_dim, n_palette, arena_info,
                 );
                 items.push((handle.clone(), bytes));
             }
         }
-        drop(state);
         if items.is_empty() {
             return Ok(());
         }
@@ -1780,6 +1794,16 @@ impl ChunkedKvBacking {
     /// float side. See [`GpuArenaClassStats`].
     pub fn gpu_arena_class_stats(&self) -> GpuArenaClassStats {
         self.inner.pool.gpu_class_stats()
+    }
+
+    /// Per-arena occupancy across every GPU class — the fragmentation map.
+    ///
+    /// The class stats above answer "how much of this class is live"; this
+    /// answers "spread over how many arenas", which is the only one of the two
+    /// that distinguishes a full arena from a scattered class. See
+    /// [`ArenaOccupancy`].
+    pub fn gpu_arena_map(&self) -> Vec<ArenaOccupancy> {
+        self.inner.pool.gpu_arena_map()
     }
 
     /// True when at least one of `seq`'s chunks is still wholly in a GPU float /
@@ -2668,6 +2692,60 @@ impl ChunkedKvBacking {
     }
 }
 
+/// The device address of one chunk slot, or `None` when the arena has no slab
+/// behind it.
+///
+/// **A zero base is not a base, and the type system will not say so.**
+/// `resolve_arena_info` leaves the zero default for any arena it did not build,
+/// so `info.get(idx)` answers `Some(entry)` with `base_ptr == 0` rather than
+/// `None`. Arithmetic on that produces an address near the bottom of the
+/// reservation — mapped, owned by another tenant, and silent on write. Every
+/// slot address goes through here so the check cannot be forgotten at one of
+/// the two ends of a copy.
+///
+/// Split out as a free function because it is pure arithmetic over a lookup,
+/// which is the only part of a defragmentation pass that can be tested without
+/// a device — the same reason `region_pool`'s `tier_fits` is one.
+/// **And the slot must be inside the arena.** `GID_STRIDE` is one fixed power
+/// of two for the whole namespace, so a gid's `chunk_idx` can be perfectly
+/// in-range as an identifier and still sit past this arena's end —
+/// `chunk_capacity` is what bounds it, as that field's own docs say. Without
+/// this the address walks off the slab into the next tenant, which is the same
+/// silent write as a zero base by another route.
+pub(super) fn slot_addr(
+    info: &[crate::kv_cache::ResolvedArenaInfo],
+    arena_idx: usize,
+    chunk_idx: usize,
+    stride: usize,
+) -> Option<u64> {
+    let a = info.get(arena_idx)?;
+    if a.base_ptr == 0 || chunk_idx >= a.chunk_capacity as usize {
+        return None;
+    }
+    Some(a.base_ptr + (chunk_idx * stride) as u64)
+}
+
+/// The span's arena fragmentation map, read without an engine lock.
+///
+/// Every layer's backing shares one gid pool, so the first live backing reports
+/// the whole span's arenas — there is nothing per-layer to merge. Reads a
+/// registry of weak refs and per-arena atomics, so it is safe to call from an
+/// HTTP handler while the engine runs: the numbers are a snapshot of a moving
+/// target, which is what a fragmentation map is.
+///
+/// Empty when no backing is live (a CPU session, or before load).
+pub fn global_arena_map() -> Vec<ArenaOccupancy> {
+    let Ok(registry) = BACKING_REGISTRY.lock() else {
+        return Vec::new();
+    };
+    for weak in registry.iter() {
+        if let Some(inner) = weak.upgrade() {
+            return inner.pool.gpu_arena_map();
+        }
+    }
+    Vec::new()
+}
+
 /// Collect a combined memory report from ALL registered ChunkedKvBacking instances.
 ///
 /// Returns a Vec of `(backing_index, format_label, arena_count, total_bytes)`.
@@ -2920,4 +2998,56 @@ pub fn global_print_arena_table() {
         tombstone_count, full_count, empty_count, total_gpu_mib
     ));
     eprintln!("╚{}╝", sep);
+}
+
+#[cfg(test)]
+mod slot_addr_tests {
+    use super::slot_addr;
+    use crate::kv_cache::ResolvedArenaInfo;
+
+    fn arena(base: u64, capacity: u32) -> ResolvedArenaInfo {
+        ResolvedArenaInfo {
+            base_ptr: base,
+            chunk_byte_stride: 4096,
+            chunk_capacity: capacity,
+        }
+    }
+
+    /// The ordinary case: base plus the slot's offset.
+    #[test]
+    fn a_real_arena_resolves_to_base_plus_offset() {
+        let info = [arena(0x1000, 8)];
+        assert_eq!(slot_addr(&info, 0, 3, 4096), Some(0x1000 + 3 * 4096));
+    }
+
+    /// **A zero base is not a base.** `resolve_arena_info` leaves the zero
+    /// default for an arena it did not build, and `get(..).map(..)` answers
+    /// `Some(0)` for it — arithmetic on which aims a copy at the bottom of the
+    /// reservation, inside another tenant's ground, mapped and silent. This is
+    /// the defect that produced 110 garbage generations across runs 42 and 43.
+    #[test]
+    fn an_unbuilt_arena_has_no_slot_address() {
+        let info = [arena(0, 8)];
+        assert_eq!(
+            slot_addr(&info, 0, 3, 4096),
+            None,
+            "a zero base must refuse, not compute an address near zero",
+        );
+    }
+
+    /// A gid can name a slot past this arena's end — the raw-gid namespace is
+    /// one fixed power of two, far larger than any arena's capacity.
+    #[test]
+    fn a_slot_past_the_arenas_end_is_refused() {
+        let info = [arena(0x1000, 8)];
+        assert_eq!(slot_addr(&info, 0, 8, 4096), None, "8 slots means 0..=7");
+        assert!(slot_addr(&info, 0, 7, 4096).is_some());
+    }
+
+    /// An arena index the resolve pass never produced at all.
+    #[test]
+    fn an_unknown_arena_has_no_slot_address() {
+        let info = [arena(0x1000, 8)];
+        assert_eq!(slot_addr(&info, 5, 0, 4096), None);
+    }
 }

@@ -530,6 +530,22 @@ impl WaveBuffer {
     }
 }
 
+/// Rows the width searches will consider before giving up on the budget.
+///
+/// The doubling in [`WavePlan::max_rows_for_tier`] and
+/// [`WavePlan::max_rows_within`] climbs until a width does **not** fit, which
+/// assumes a budget some width exceeds. A caller that prices against ground the
+/// weight side might concede can hand in a budget no wave could spend, and then
+/// the search runs until the row count overflows the cost arithmetic and panics
+/// — a pure function faulting on a large argument, far from the caller that
+/// chose it.
+///
+/// A million rows is four orders of magnitude past the widest wave this engine
+/// composes (`MAX_PREFILL_TOKENS` is 8,192) and prices to tens of gigabytes, so
+/// stopping here answers "wider than anything you can run" without ever
+/// reaching the overflow.
+const ROW_SEARCH_CEILING: usize = 1 << 20;
+
 /// Prices a wave against the model's geometry.
 ///
 /// Cheap to copy and free of interior state, so admission can hold one and call
@@ -627,7 +643,7 @@ impl WavePlan {
         }
         let mut lo = 1usize;
         let mut hi = 2usize;
-        while self.tier_bytes(hi) <= budget {
+        while hi < ROW_SEARCH_CEILING && self.tier_bytes(hi) <= budget {
             lo = hi;
             hi = hi.saturating_mul(2);
         }
@@ -665,7 +681,7 @@ impl WavePlan {
         }
         let mut lo = 1usize;
         let mut hi = 2usize;
-        while self.wave_bytes(hi) <= budget {
+        while hi < ROW_SEARCH_CEILING && self.wave_bytes(hi) <= budget {
             lo = hi;
             hi = hi.saturating_mul(2);
         }

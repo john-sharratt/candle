@@ -49,6 +49,14 @@ pub struct PipelineStats {
     pub warm_slots: usize,
     /// Experts in the model, so `warm_slots` reads as a fraction.
     pub total_experts: usize,
+    /// **Gauge**: MoE layers the model has, so `total_experts` divides into an
+    /// experts-per-layer. A decode routes its top-k *per layer*, so a planner
+    /// pricing a wave's expert bytes needs the split, not the product.
+    pub moe_layers: usize,
+    /// **Gauge**: bytes one expert occupies in a resident slot. With
+    /// `total_experts` this is the whole model's expert footprint — the figure
+    /// a copy-rate model measures a forward's streaming against.
+    pub slot_bytes: usize,
     /// Speculative prefetch loads that landed in VRAM.
     pub prefetch_loads: usize,
     /// Hint-driven speculative loads.
@@ -108,10 +116,10 @@ impl PipelineStats {
 
     /// Reset the per-interval tallies. The **gauges** —
     /// `resident_vram_bytes`, `zone_cedeable_bytes`, `warm_slots`,
-    /// `total_experts`, `prefetch_depth` — survive it: they describe the
-    /// cache's shape rather than what it did since the last reset, and an
-    /// inline-mode cache (which never re-seeds them via a classify) would
-    /// otherwise read 0 forever.
+    /// `total_experts`, `moe_layers`, `slot_bytes`, `prefetch_depth` — survive
+    /// it: they describe the cache's shape rather than what it did since the
+    /// last reset, and an inline-mode cache (which never re-seeds them via a
+    /// classify) would otherwise read 0 forever.
     pub fn reset(shared: &Arc<Mutex<Self>>) {
         if let Ok(mut s) = shared.lock() {
             let gauges = (
@@ -120,6 +128,8 @@ impl PipelineStats {
                 s.warm_slots,
                 s.total_experts,
                 s.prefetch_depth,
+                s.moe_layers,
+                s.slot_bytes,
             );
             *s = Self::default();
             (
@@ -128,6 +138,8 @@ impl PipelineStats {
                 s.warm_slots,
                 s.total_experts,
                 s.prefetch_depth,
+                s.moe_layers,
+                s.slot_bytes,
             ) = gauges;
         }
     }

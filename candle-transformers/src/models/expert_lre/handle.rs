@@ -881,6 +881,8 @@ impl ExpertCache {
                 s.resident_vram_bytes = seeded;
                 s.warm_slots = warm.num_slots();
                 s.total_experts = num_moe_layers * experts_per_layer;
+                s.moe_layers = num_moe_layers;
+                s.slot_bytes = slot_bytes;
             }
         }
 

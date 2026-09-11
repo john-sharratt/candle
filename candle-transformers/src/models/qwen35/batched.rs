@@ -706,7 +706,6 @@ impl HybridBatched {
         Ok(None)
     }
 
-
     /// Scatter a snapshot into a sequence's state — the resume path.
     ///
     /// Validates the schedule hash and every layer's geometry first
@@ -1468,6 +1467,27 @@ fn needs_reset(store: &mut RecurrentStateStore, offset: usize, quiet: bool) -> b
     offset == 0 && !seeded
 }
 
+/// First layer of a snapshot carrying a non-finite value, with how many that
+/// layer holds.
+///
+/// Host-side over the exported LE F32 bytes, so it costs no readback and no
+/// sync — which is what makes it usable on both sides of the substrate round
+/// trip. A downstream all-NaN logits row cannot say whether the state was
+/// already bad when persisted or became bad in transit; checking the same bytes
+/// going out and coming back does.
+fn first_non_finite_layer(layers: &[ExportedLayerState]) -> Option<(u32, usize)> {
+    let count = |bytes: &[u8]| -> usize {
+        bytes
+            .chunks_exact(4)
+            .filter(|b| !f32::from_le_bytes([b[0], b[1], b[2], b[3]]).is_finite())
+            .count()
+    };
+    layers.iter().find_map(|l| {
+        let n = count(&l.state) + count(&l.conv_tail);
+        (n > 0).then_some((l.layer_index, n))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::config::{DeltaNetDims, Qwen35Config};
@@ -1618,25 +1638,4 @@ mod tests {
         );
         Ok(())
     }
-}
-
-/// First layer of a snapshot carrying a non-finite value, with how many that
-/// layer holds.
-///
-/// Host-side over the exported LE F32 bytes, so it costs no readback and no
-/// sync — which is what makes it usable on both sides of the substrate round
-/// trip. A downstream all-NaN logits row cannot say whether the state was
-/// already bad when persisted or became bad in transit; checking the same bytes
-/// going out and coming back does.
-fn first_non_finite_layer(layers: &[ExportedLayerState]) -> Option<(u32, usize)> {
-    let count = |bytes: &[u8]| -> usize {
-        bytes
-            .chunks_exact(4)
-            .filter(|b| !f32::from_le_bytes([b[0], b[1], b[2], b[3]]).is_finite())
-            .count()
-    };
-    layers.iter().find_map(|l| {
-        let n = count(&l.state) + count(&l.conv_tail);
-        (n > 0).then_some((l.layer_index, n))
-    })
 }
