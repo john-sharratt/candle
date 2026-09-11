@@ -1,22 +1,60 @@
 //! Strips `<think>…</think>` reasoning blocks from model-generated text.
 //!
-//! Some models (Qwen2.5, DeepSeek-R1, etc.) wrap internal chain-of-thought in
-//! `<think>…</think>` tags.  When this text is stored as a conversation summary
-//! or returned to the caller, the reasoning trace is noise.  This module
-//! removes it while preserving every other character.
+//! Some models (Qwen2.5, Qwen3.x, DeepSeek-R1) wrap internal chain-of-thought in
+//! `<think>…</think>` tags. Whether that trace is noise or content depends
+//! entirely on where the text is going, so this module has **three entry points
+//! with deliberately different rules** rather than one policy.
 //!
-//! # Rules
+//! | Function | Removes | Whitespace | Case | Caller |
+//! |---|---|---|---|---|
+//! | [`strip_think_blocks`] | every block | collapsed | insensitive | summariser output, tool results |
+//! | [`strip_think_blocks_keep_layout`] | every block | preserved | insensitive | the stored reply the GUI re-renders |
+//! | [`strip_empty_think_blocks`] | only EMPTY blocks | hugging a removal | mixed † | `build_turn_layout`, the seal path |
+//!
+//! † Block scanning is case-**sensitive** — it matches the turn-layout
+//! splitter's own convention, and the models emit lowercase. Its trailing-orphan
+//! strip is case-**insensitive**, because that path exists for spellings the
+//! model invented and has no splitter to agree with.
+//!
+//! Reach for the third by default when touching a *sealed turn*, and read the
+//! constraint below before widening what any of them delete.
+//!
+//! # The constraint: sealed text is paired with K/V by OFFSET
+//!
+//! A sealed turn stores its decoded text beside a K/V span, and consumers map
+//! between them positionally — `tool_exchange_segments` carves a code_read
+//! exchange into sub-segments by finding role markers in the text and slicing
+//! the span at the matching offsets. **Anything removed here shifts that
+//! pairing.** That is why [`strip_empty_think_blocks`] is the conservative one:
+//! it removes a collapsed block (which occupies K/V the layout describes as a
+//! `Thinking` span, so the accounting still works) and a trailing orphan close,
+//! and nothing else. It deliberately does NOT repair a block the model spelled
+//! out mid-answer in plain text, because editing the middle of the text would
+//! corrupt every offset after it to fix a cosmetic leak.
+//!
+//! # Rules for the two whole-block strippers
+//!
+//! These apply to [`strip_think_blocks`] and [`strip_think_blocks_keep_layout`]
+//! only — [`strip_empty_think_blocks`] documents its own on the function.
 //!
 //! - Tags are matched **case-insensitively** (`<THINK>`, `<Think>`, etc.).
-//! - Whitespace between a closing `</think>` and the next non-whitespace
-//!   character is collapsed to a single space, preventing double-spaces and
-//!   leading/trailing whitespace in the returned string.
 //! - An **unterminated** block (`<think>` with no matching `</think>`) is
 //!   treated as if the tag runs to the end of the string — the entire tail is
-//!   stripped.
+//!   stripped. (`strip_empty_think_blocks` does the opposite: it cannot
+//!   classify an unterminated block as empty, so it leaves the tail verbatim.)
 //! - **Nested** tags are not supported; the first `</think>` closes the most
 //!   recently opened `<think>`.
-//! - The function is `O(n)` in the length of the input.
+//! - A stray `</think>` with no opener is removed wherever it appears.
+//! - `O(n)` in the length of the input.
+//!
+//! # Why a model emits a tag it never opened
+//!
+//! With thinking suppressed the assistant grid opens on an already-closed block,
+//! so the model is outside one — and `think_close_ban_active` bans the real
+//! `</think>` id whenever the sampler is outside a segment. Wanting to close
+//! anyway, the model reaches for a spelling that is not the banned id: measured
+//! on a repo_map ingest, 2 of 22 summaries ended in a bare `</thinking>`. Both
+//! the orphan strip and its tolerant tag match exist for that shape.
 
 /// Remove all `<think>…</think>` blocks from `text`.
 ///

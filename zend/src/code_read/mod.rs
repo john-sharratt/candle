@@ -5,8 +5,11 @@
 //! scope-aware parts; each part contributes a prefilled `read_file`
 //! request, a prefilled `<tool_call>` echo, and a prefilled
 //! `<tool_response>` carrying the source with line numbers.  The
-//! whole-file summary is not decoded inline — it is the root of the
-//! async summary tree the summariser rolls up over these scope turns.
+//! whole-file summary is not decoded inline — it was to be the root of the
+//! async summary tree rolled up over these scope turns. **No such root exists
+//! today**: the summariser is disconnected (`ConversationEngine::new`), so a
+//! file is represented by its per-scope turns and nothing above them. Retrieval
+//! ranks those turns by provenance rather than reading a rolled-up digest.
 //!
 //! Refresh is per-file: content hashes ([`CodeReadState`]) decide
 //! which files changed; deleted files' conversations are tombstoned,
@@ -729,8 +732,9 @@ fn run_file_pool(
 /// otherwise prefill each carved part (read_file tool-call + response),
 /// tag the conversation with its content hash + metadata, then drop it
 /// (freeing the GPU slot; the sealed turns + tags persist in the
-/// substrate). The file summary is not decoded here — it is the async
-/// summary tree's root, rolled up later by the background summariser.
+/// substrate). The file summary is not decoded here — it was to be the async
+/// summary tree's root, rolled up later by the background summariser, which is
+/// currently disconnected. The scope turns stand on their own.
 #[allow(clippy::too_many_arguments)]
 fn process_one_file(
     engine: &Mutex<ConversationEngine>,

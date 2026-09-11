@@ -16,10 +16,12 @@
 //! 2. **read_file** — trigger the normal `code_read` ingest so the new file is
 //!    read into the substrate; wait for it (`phase` events).
 //!
-//! Summarisation of the ingested scopes then runs entirely in the **background**
-//! summariser — the upload kicks it and returns immediately, never waiting on
-//! it or reporting its progress. Phase 2 is a no-op (skipped) when the model
-//! isn't loaded yet.
+//! The upload then kicks the background summariser and returns immediately,
+//! never waiting on it or reporting its progress. **That kick currently does
+//! nothing** — the summariser is disconnected (`ConversationEngine::new`), so
+//! the scope turns are stored whole and no summary tree is rolled up over them.
+//! The upload path is unaffected either way, which is the point of it being
+//! fire-and-forget. Phase 2 is a no-op (skipped) when the model isn't loaded yet.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

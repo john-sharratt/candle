@@ -172,11 +172,21 @@ impl Dialect {
     ///
     /// The one place the "exactly one mechanism is live, decided by whether
     /// [`Self::no_think`] is empty" convention (documented on
-    /// [`Self::no_think_block`]) is turned into strings — every prompt
-    /// assembler calls this rather than re-deriving the split, so a family
-    /// that suppresses by prefilled block (Qwen3.5/3.8) can never be sent a
-    /// `/no_think` marker it would read as ordinary text and answer past.
-    /// Both strings are empty when the caller wants the model to reason.
+    /// [`Self::no_think_block`]) is turned into strings. Both strings are empty
+    /// when the caller wants the model to reason.
+    ///
+    /// **Call this rather than reading either field directly.** Reading only
+    /// `no_think` is not a partial implementation of suppression — on a family
+    /// that has no soft switch it is *no* suppression, silently, because the
+    /// field is empty by design. That was the live bug: production assembled the
+    /// user opener from `no_think` alone, so on Qwen3.5/3.8 the `no_think`
+    /// projection node emitted a zero-token segment and thinking-off was a line
+    /// of prose asking the model not to deliberate. It ignored it on 22 of 22
+    /// repo_map summaries. Both halves now come from here — the user opener
+    /// (`turn_head_text`) takes `.0`, the assistant grid
+    /// (`submit_turn_with_options`, `BoundaryMarkers::no_think_block`) takes
+    /// `.1` — so a family can neither be sent a marker it would read as ordinary
+    /// text, nor be left with nothing at all.
     pub fn thinking_suppression(&self, suppress: bool) -> (&'static str, &'static str) {
         if !suppress {
             return ("", "");

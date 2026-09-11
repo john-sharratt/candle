@@ -33,6 +33,7 @@ use crate::turn_layout::TurnLayout;
 use crate::TurnEvent;
 use candle_nn::kv_cache::{SealedChunk, SealedSequence};
 use candle_transformers::models::batched_inference::ModelCoreProperties;
+use candle_transformers::models::dialect::Dialect;
 
 /// Slice a per-layer sealing down to the chunk range `[from..to)`.
 ///
@@ -70,7 +71,15 @@ pub(crate) fn slice_per_layer_sealed(
 ///
 /// A turn is sealed once as a single contiguous unit, with the chat
 /// template's role markers baked into the K/V grid:
-/// `[user_start][no_think][user_msg][user_end][assistant_start][response]`.
+/// `[user_start][no_think][user_msg][user_end][assistant_start][closed_think][prefill][response]`
+///
+/// `no_think` and `closed_think` are the two halves of
+/// `Dialect::thinking_suppression` and are mutually exclusive — a family uses
+/// the user-turn switch or the prefilled closed block, never both, and both are
+/// absent on a thinking turn. `prefill` is a caller-supplied assistant seed
+/// (e.g. `<tool_call>`), usually absent. `assistant_content_start` sits after
+/// `closed_think` and before `prefill`: the block is scaffolding stripped from
+/// the stored text, the seed is content that stays in it.
 /// The compressor injects *content-only* halves of a turn — the user
 /// message body or the assistant response body — without those markers,
 /// so each half is derived here by windowing the sealed grid to the
@@ -304,9 +313,49 @@ pub struct GlueMarkers {
     pub assistant_end: String,
     /// The `/no_think` soft-switch, emitted as live glue right after `user_start`
     /// on a suppressed (effort-off) turn — see the scheduler's `no_think_current`
-    /// segment. Empty for non-thinking dialects. The panel renders it so its view
-    /// matches the actual prefill.
+    /// segment. `Dialect::thinking_suppression`'s first half; empty on a family
+    /// that suppresses with [`Self::no_think_block`] instead.
     pub no_think: String,
+    /// The already-closed reasoning block prefilled straight after
+    /// `assistant_start` on a suppressed turn — `thinking_suppression`'s second
+    /// half, and the mechanism for a family with no soft switch (Qwen3.5/3.8).
+    ///
+    /// Carried here for the same reason [`Self::no_think`] is: the panel renders
+    /// the framing verbatim, and this is framing. It is prefilled into the grid,
+    /// not decoded by the model, so a panel that omitted it showed less than the
+    /// turn actually contains.
+    ///
+    /// **Exactly one of the two is ever non-empty** — see
+    /// [`GlueMarkers::from_dialect`], which is the only constructor and takes
+    /// both from the one function that owns the split.
+    pub no_think_block: String,
+}
+
+impl GlueMarkers {
+    /// Read every marker off `dialect`, taking the two suppression halves from
+    /// [`Dialect::thinking_suppression`] rather than from the fields directly.
+    ///
+    /// Going through that function is what keeps the panel honest: it owns the
+    /// "exactly one mechanism is live" rule, so a family that suppresses with the
+    /// prefilled block cannot be rendered as if it used a `/no_think` switch it
+    /// does not have, and neither half can be forgotten the way the block half
+    /// once was.
+    pub fn from_dialect(dialect: &Dialect) -> Self {
+        // `true` asks for the suppressed shape — this is a description of the
+        // framing a suppressed turn *would* carry, not a claim that the current
+        // turn is suppressed. The panel labels it; the dial decides it.
+        let (switch, block) = dialect.thinking_suppression(true);
+        Self {
+            system_start: dialect.system_start.to_string(),
+            system_end: dialect.system_end.to_string(),
+            user_start: dialect.user_start.to_string(),
+            user_end: dialect.user_end.to_string(),
+            assistant_start: dialect.assistant_start.to_string(),
+            assistant_end: dialect.assistant_end.to_string(),
+            no_think: switch.to_string(),
+            no_think_block: block.to_string(),
+        }
+    }
 }
 
 /// A freshly built conversation's prompt-branch state, still to be installed
@@ -1949,8 +1998,13 @@ impl Sequence {
         }
         self.selection = selection;
 
-        // Thinking turn: no forced `no_think_block` — the trajectory carries its
-        // own `<think>` in the body, matching the decode grid exactly.
+        // **No suppression block here, unlike `submit_turn_with_options`.** That
+        // path prefills the dialect's closed block because the model is about to
+        // decode and must be steered; this one is handed the whole assistant
+        // trajectory verbatim, so the grid must reproduce what was decoded and
+        // nothing else. The trajectory carries its own `<think>` in the body when
+        // it had one, and injecting scaffolding in front of it would make the
+        // replayed grid differ from the decode it is calibrating against.
         let assistant_start_marker = self.config.dialect.assistant_start;
         let assistant_head = format!(
             "{}{}{}",
@@ -3175,16 +3229,7 @@ impl Sequence {
     /// Surfaced verbatim so the projection panel can show the glue between
     /// sections/turns without re-tokenising or re-projecting.
     pub fn glue_markers(&self) -> GlueMarkers {
-        let d = &self.config.dialect;
-        GlueMarkers {
-            system_start: d.system_start.to_string(),
-            system_end: d.system_end.to_string(),
-            user_start: d.user_start.to_string(),
-            user_end: d.user_end.to_string(),
-            assistant_start: d.assistant_start.to_string(),
-            assistant_end: d.assistant_end.to_string(),
-            no_think: d.no_think.to_string(),
-        }
+        GlueMarkers::from_dialect(&self.config.dialect)
     }
 
     /// The YAML name of this conversation's target layer (e.g. `dialogue`) — the
@@ -4743,5 +4788,80 @@ mod window_sealed_tokens_tests {
     fn cap_probe_window_tolerates_a_zero_cap() {
         let probe = vec![WideQSig::default(); 1000];
         assert_eq!(cap_probe_window(probe, 0).len(), 65);
+    }
+}
+
+#[cfg(test)]
+mod glue_marker_tests {
+    use super::GlueMarkers;
+    use candle_transformers::models::dialect::Dialect;
+
+    /// **The panel must show whichever half of suppression the family uses.**
+    ///
+    /// Qwen3.5/3.8 has no `/no_think` soft switch — it suppresses by opening the
+    /// assistant turn with the block already closed, prefilled into the grid. The
+    /// block half was once omitted here on the reasoning that a suppressed turn
+    /// "decodes its own empty block into the body", which stopped being true when
+    /// suppression became structural: the panel then rendered strictly less than
+    /// the turn contained, on exactly the family that depends on it.
+    #[test]
+    fn a_block_suppressing_dialect_carries_its_block() {
+        let g = GlueMarkers::from_dialect(&Dialect::qwen35());
+        assert_eq!(g.no_think_block, "<think>\n\n</think>\n\n");
+        assert!(
+            g.no_think.is_empty(),
+            "qwen35 has no soft switch, so the switch half must be empty"
+        );
+    }
+
+    /// The mirror: a family WITH the soft switch carries that and no block, so
+    /// the panel never shows a prefilled block the grid does not contain.
+    #[test]
+    fn a_switch_suppressing_dialect_carries_its_switch() {
+        let g = GlueMarkers::from_dialect(&Dialect::chat_ml());
+        assert_eq!(g.no_think, "/no_think\n");
+        assert!(
+            g.no_think_block.is_empty(),
+            "ChatML suppresses with the switch, so the block half must be empty"
+        );
+    }
+
+    /// **Exactly one half is live, for every dialect the engine can run.**
+    ///
+    /// This is the invariant `Dialect::thinking_suppression` exists to enforce,
+    /// and reading it through that function rather than off the fields is what
+    /// keeps it true here. A dialect with neither (Llama-family, no reasoning
+    /// markers at all) is a legitimate third case: nothing to suppress.
+    #[test]
+    fn never_both_halves_at_once() {
+        for d in [
+            Dialect::chat_ml(),
+            Dialect::qwen35(),
+            Dialect::llama2(),
+            Dialect::llama3(),
+        ] {
+            let g = GlueMarkers::from_dialect(&d);
+            assert!(
+                g.no_think.is_empty() || g.no_think_block.is_empty(),
+                "{:?}: both suppression halves are non-empty — the dialect must \
+                 pick one mechanism",
+                d.dialect_type()
+            );
+        }
+    }
+
+    /// The role markers still come straight off the dialect — the refactor to a
+    /// single constructor must not have quietly changed what the panel frames
+    /// turns with.
+    #[test]
+    fn role_markers_are_passed_through_verbatim() {
+        let d = Dialect::qwen35();
+        let g = GlueMarkers::from_dialect(&d);
+        assert_eq!(g.system_start, d.system_start);
+        assert_eq!(g.system_end, d.system_end);
+        assert_eq!(g.user_start, d.user_start);
+        assert_eq!(g.user_end, d.user_end);
+        assert_eq!(g.assistant_start, d.assistant_start);
+        assert_eq!(g.assistant_end, d.assistant_end);
     }
 }

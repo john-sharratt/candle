@@ -298,11 +298,18 @@ pub struct TurnContent {
 }
 
 /// The dialect framing markers the assembler wraps around the prompt and turns.
-/// These are the role markers the backend frames turns with, plus `no_think` —
-/// the `/no_think` soft-switch the scheduler emits as live glue right after
-/// `user_start` on a suppressed turn. The reasoning *block* is deliberately NOT
-/// here: it's never glue (a suppressed turn decodes its own empty
-/// `<think></think>` into the body), only the `/no_think` directive is.
+///
+/// These are the role markers the backend frames turns with, plus BOTH halves of
+/// thinking suppression — `no_think`, the soft-switch emitted as live glue right
+/// after `user_start`, and `no_think_block`, the already-closed
+/// `<think></think>` prefilled straight after `assistant_start`. A dialect uses
+/// exactly one of them, so on any given model one of the two is empty.
+///
+/// The block half used to be omitted here on the reasoning that it was "never
+/// glue — a suppressed turn decodes its own empty block into the body". That
+/// stopped being true when suppression became structural: the block is prefilled
+/// into the grid, never decoded, so a panel without it rendered less than the
+/// turn actually holds on precisely the family that relies on it.
 #[derive(Serialize)]
 pub struct Glue {
     pub system_start: String,
@@ -312,6 +319,7 @@ pub struct Glue {
     pub assistant_start: String,
     pub assistant_end: String,
     pub no_think: String,
+    pub no_think_block: String,
 }
 
 impl From<candle_conversation::GlueMarkers> for Glue {
@@ -324,6 +332,7 @@ impl From<candle_conversation::GlueMarkers> for Glue {
             assistant_start: m.assistant_start,
             assistant_end: m.assistant_end,
             no_think: m.no_think,
+            no_think_block: m.no_think_block,
         }
     }
 }

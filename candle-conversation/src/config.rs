@@ -45,11 +45,7 @@ use crate::tree::ConversationTreeConfig;
 ///     .with_temperature(0.7)
 ///     .with_dry_penalty(0.8, 1.75, 2, 256);
 /// ```
-// `PartialEq` groups a decode wave's rows by dial before dispatch — the kernel
-// applies one set of scalar parameters per launch, so rows sharing a launch must
-// agree on them (`group_rows_by_config`). Float fields compare bitwise-by-value,
-// which is what "the same dial" means here; no `Eq`, since `f32` has none.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct SamplingConfig {
     // ── Core Sampling ──────────────────────────────────────────────────
     /// Sampling temperature. `0.0` = argmax/greedy decoding.
@@ -714,8 +710,11 @@ impl SamplingConfig {
     /// per-span EOT close ramp + graceful/force cutoffs from `mode.eot_budget()`.
     ///
     /// `max_response_tokens` guards the short-output case. `Off`/`Quick`'s EOT
-    /// budget (~220/300) is a *dialogue backstop* — it assumes the model self-closes
-    /// an empty block from the `/no_think` glue and only caps a runaway. A short
+    /// budget (~220/300) is a *dialogue backstop* — it caps a runaway, and assumes
+    /// something upstream has already stopped a block from opening at all
+    /// (structurally, via the closed block `Dialect::thinking_suppression`
+    /// prefills; the `/no_think` glue it used to lean on is empty on families
+    /// that suppress that way). A short
     /// summary (`max_response_tokens` ≈ 100) can never reach a 300-token backstop,
     /// so when the block budget can't fit the response the steering collapses to a
     /// forced **empty** close — the budget goes to the answer, not runaway (often
@@ -877,7 +876,7 @@ impl SamplingConfig {
 ///
 /// Example: If the context contains "the cat sat on the mat" and later
 /// "the cat", the DRY penalty will penalize "sat" to prevent repetition.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct DryConfig {
     /// Base penalty multiplier. `0.0` = disabled.
     /// Applied as: `penalty = multiplier * base^(match_length - allowed_length)`

@@ -148,8 +148,11 @@ pub struct ConversationEngine {
     /// no `Option`/`Mutex` shuffle at this layer.
     persist_thread: PersistenceThread,
 
-    /// Async summariser thread — drains the per-turn pending queue,
-    /// runs §6 probes, builds the per-timeline AVL summary tree.
+    /// Async summariser thread — **always the disabled handle.** It would drain
+    /// the per-turn pending queue, run §6 probes and build the per-timeline AVL
+    /// summary tree; none of that happens, because the summariser is
+    /// disconnected (see [`Self::new`]) and no timeline enqueues. Kept as a field
+    /// so the lifecycle calls below stay honest no-ops rather than disappearing.
     /// Mirrors [`PersistenceThread`]'s lifecycle (trigger / tick /
     /// shutdown).  Spawned alongside the scheduler at engine startup;
     /// [`Self::shutdown`] joins it after the persistence thread has
@@ -331,15 +334,6 @@ impl ConversationEngine {
         );
         let persist_trigger = persist_thread.trigger_handle();
 
-        // Spawn the async summariser thread (`docs/immutable_summary_forest.md`
-        // — *Two queues*).  Drains the per-timeline pending queue every
-        // 250 ms (or on trigger), runs probes
-        // (`docs/archived/infinite_conversations.md` §6) via the
-        // scheduler-backed [`ChannelProbeRunner`], extends the
-        // per-timeline summary tree, and persists the resulting
-        // [`TreeMetadata`] records to the redo log.  Spawned after the
-        // persistence thread so its writes flow through the same
-        // workspace handle.
         // **The AVL summariser is disconnected.** It is never spawned, and no
         // timeline enqueues turns for it (`Timeline::summarize` is false for
         // every timeline) — so nothing in this engine compresses a conversation
@@ -361,8 +355,11 @@ impl ConversationEngine {
         // shape, the probe protocol, the seal path — is here to build on when
         // that work resumes. Nothing calls into it.
         let summariser_thread = SummariserThread::disabled();
-        // Hand the trigger to the scheduler so every assistant-turn
-        // seal wakes the summariser immediately — design §4 step ③.
+        // The scheduler still holds a trigger and still fires it on every
+        // assistant-turn seal (design §4 step ③). Against the disabled handle
+        // the send has no receiver and fails silently, which is why the seal
+        // path needs no knowledge of whether a summariser exists — and why
+        // re-enabling is a change in `Engine::new` alone.
         let summariser_trigger = summariser_thread.trigger_handle();
 
         // Spawn the scheduler thread.
@@ -520,13 +517,18 @@ impl ConversationEngine {
     }
 
     /// Backpressure metric — turns awaiting summariser absorption for
-    /// `timeline`.  Zero in steady state.
+    /// `timeline`. **Always zero**: the summariser is disconnected, so nothing
+    /// enqueues (see [`Self::new`]). It was zero in steady state before, too, so
+    /// this reads the same either way.
     pub fn pending_summary_len(&self, timeline: TimelineId) -> usize {
         self.conversation.pending_summary_len(timeline)
     }
 
-    /// Wake the summariser thread now instead of waiting for its next
-    /// tick — used to kick off summarisation of freshly-ingested turns promptly.
+    /// Wake the summariser thread now instead of waiting for its next tick.
+    ///
+    /// **A no-op while the summariser is disconnected** — the disabled handle has
+    /// no receiver, so the send fails silently. Callers (the ingest pipeline
+    /// kicks it after a scope lands) need no knowledge of that.
     pub fn trigger_summariser(&self) {
         self.summariser_thread.trigger();
     }
@@ -583,11 +585,18 @@ impl ConversationEngine {
             .set_timeline_compression(timeline, compression);
     }
 
-    /// Enable or disable AVL summarisation for `timeline`. Conversations default
-    /// to `true`; scratch/scaffolding timelines (e.g. the tool-summary
-    /// categorize/assign passes) set `false` before their first turn seals so
-    /// the wave-driven summariser never spends a compression decode on work that
-    /// is about to be tombstoned. See [`crate::summary_tree`].
+    /// Enable or disable AVL summarisation for `timeline`.
+    ///
+    /// **Every timeline now defaults to `false`** — the summariser is
+    /// disconnected (see [`Self::new`]), so setting `true` here would queue turns
+    /// onto `pending_summary_queue` that nothing drains. Nothing in the engine or
+    /// `zend` calls it with `true`; the remaining production callers pass `false`
+    /// on ingest timelines, which is redundant against the default but states the
+    /// intent at the site.
+    ///
+    /// It exists as the single re-enabling point: deciding *which* timelines opt
+    /// in is this call plus spawning the thread in [`Self::new`]. See
+    /// [`crate::summary_tree`].
     pub fn set_timeline_summarize(&self, timeline: TimelineId, summarize: bool) {
         self.conversation
             .set_timeline_summarize(timeline, summarize);

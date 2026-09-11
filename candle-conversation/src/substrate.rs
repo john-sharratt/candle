@@ -1162,6 +1162,12 @@ pub struct TimelineEntry {
     /// low-priority queue.  Cleared once [`Substrate::reconcile_next`] reports
     /// the forest whole.  Live appends keep the forest whole, so this stays
     /// `false` during normal operation.
+    ///
+    /// **Dormant with the summariser disconnected.** Its only readers live in
+    /// `summary_tree::summariser`, which never runs, so a flag set on cold-load
+    /// is never cleared. That is inert rather than a leak — nothing else
+    /// consults it, and there is no forest to reconcile because no summary node
+    /// is ever built.
     pub needs_reconcile: bool,
     /// Most recent score-density [`SelectionDiagnostics`] for this
     /// timeline, written by the scheduler at projection time and read
