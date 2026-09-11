@@ -1,6 +1,6 @@
 # Attentional Provenance Indexing: A Unified Architecture for Context Window Transcendence in Large Language Models
 
-**John & Claude**
+**John Sharratt**
 *March 2026*
 
 ---
