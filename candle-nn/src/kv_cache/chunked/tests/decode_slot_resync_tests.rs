@@ -116,6 +116,49 @@ fn a_write_that_spills_into_the_next_chunk_is_counted_in_both() {
     );
 }
 
+/// How many rebuilds a decode sync at `offset` performs: 1 when the live
+/// buffer had been dropped, 0 when it was reused as it stood.
+fn rebuilds_on_sync(backing: &ChunkedKvBacking, seq: usize, offset: usize) -> u64 {
+    backing.ensure_for_offset(seq, offset, 1).unwrap();
+    let info = backing.resolve_arena_info().unwrap();
+    let (_, stats) = backing.sync_decode_gpu_chunks(&[(seq, offset)], &info).unwrap();
+    stats.rebuilds
+}
+
+/// An arena that moves leaves the live buffer's inline records — the writer
+/// chunk's among them — naming the ground it left, and the decode path reuses
+/// that buffer across forwards: a decode or draft write through it lands in
+/// the old ground, and the chunk's new home reads that position unwritten.
+/// Compaction therefore drops the buffer of every sequence holding a chunk in
+/// the moved arena, and leaves the others alone.
+#[test]
+fn a_moved_arena_drops_the_decode_buffers_that_name_it() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    write_outside_decode(&mut cache, &dev, 0, 8);
+    assert_eq!(rebuilds_on_sync(&backing, seq, 8), 1, "the first sync builds the buffer");
+    let arena = backing.state.read().unwrap().sequences[seq].as_ref().unwrap().chunks_slice()[0]
+        .gids
+        .as_slice()[0]
+        .arena_idx();
+
+    assert_eq!(backing.drop_decode_buffers_in(&[arena + 1000]).unwrap(), 0);
+    assert_eq!(
+        rebuilds_on_sync(&backing, seq, 8),
+        0,
+        "an arena the sequence does not use leaves its buffer in place"
+    );
+
+    assert_eq!(backing.drop_decode_buffers_in(&[arena]).unwrap(), 1);
+    assert_eq!(
+        rebuilds_on_sync(&backing, seq, 8),
+        1,
+        "the sequence's own arena moved, so its buffer is rebuilt against the new base"
+    );
+}
+
 /// The latent wave commits at the backing rather than through a `KvCache`:
 /// `set_len`, then `refresh_decode_writer_slice`, with no block length in hand.
 /// The refresh must therefore notice a spill on its own — the writer is no

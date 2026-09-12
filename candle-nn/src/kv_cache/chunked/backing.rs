@@ -854,8 +854,10 @@ impl ChunkedKvBacking {
                 continue;
             };
             // The bytes moved; the records that name them must follow before
-            // anything reads through them.
+            // anything reads through them — the resident ones rewritten in
+            // place, the live decode buffers' inline ones rebuilt on next use.
             self.rewrite_arena_records(idx, new_base)?;
+            self.drop_decode_buffers_in(&[idx])?;
             moved += 1;
         }
         Ok(moved)
@@ -939,6 +941,39 @@ impl ChunkedKvBacking {
         self.rewrite_records_from(&[arena_idx], &guard, &arena_info)
     }
 
+    /// Drop the cached live decode buffer of every sequence in this layer that
+    /// holds a chunk in one of `arenas`, returning how many were dropped.
+    ///
+    /// The buffer serialises a record inline for every chunk without a
+    /// resident one — the live writer chunk among them — and an inline record
+    /// holds absolute band addresses, frozen when the buffer was built. The
+    /// decode path reuses the buffer across forwards, and a prefill's headers
+    /// are copied from it, so once an arena has moved, a write through it lands
+    /// in the ground the arena left while the chunk's new home reads that
+    /// position unwritten. Dropping the buffer makes the next decode sync
+    /// rebuild it against the new base.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn drop_decode_buffers_in(&self, arenas: &[usize]) -> candle::Result<usize> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let mut dropped = 0usize;
+        for seq in state.sequences.iter_mut().flatten() {
+            let holds = seq.chunks_slice().iter().any(|w| {
+                w.gids
+                    .as_slice()
+                    .iter()
+                    .any(|g| g.raw() >= 0 && arenas.contains(&g.arena_idx()))
+            });
+            if holds {
+                seq.invalidate_gpu_chunks();
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
+
     /// The record rebuild for one layer's block table — see
     /// [`Self::rewrite_arena_records`], which is this over `self.state`.
     ///
@@ -961,8 +996,11 @@ impl ChunkedKvBacking {
         for seq in state.sequences.iter().flatten() {
             for w in seq.chunks_slice() {
                 let Some(handle) = w.meta.as_ref() else {
-                    // A float writer chunk builds a scratch record per forward,
-                    // so it reads the new base for free.
+                    // No resident record: the chunk is serialised inline — per
+                    // forward in a snapshot, which reads the new base, but also
+                    // into the live decode buffer, which is reused across
+                    // forwards and is not. The caller of an arena move drops
+                    // those buffers (`drop_decode_buffers_in`).
                     continue;
                 };
                 // **One pass for every arena the caller touched.** A
