@@ -2758,7 +2758,15 @@ fn q8a128_quantize_raw_bytes_for(sum_scale: SumScale) -> Result<()> {
     let f32_dev = dev.memcpy_stod(&act)?;
     let stream = dev.cuda_stream();
     let (ptr, _g) = f32_dev.device_ptr(&stream);
-    let op = quantize_acts_q8a128(ptr, 2 /* F32 */, rows, cols, &dev, Backing::Owned, sum_scale)?;
+    let op = quantize_acts_q8a128(
+        ptr,
+        2, /* F32 */
+        rows,
+        cols,
+        &dev,
+        Backing::Owned,
+        sum_scale,
+    )?;
     assert_eq!(
         op.sum_scale, sum_scale,
         "the operand must report the convention its bytes were written in"
@@ -2821,7 +2829,9 @@ fn q8a128_quantize_raw_bytes_for(sum_scale: SumScale) -> Result<()> {
             checked += 1;
         }
     }
-    println!("q8a128 raw-byte quantize ({sum_scale:?}): {checked} per-128 tiles verified byte-exact");
+    println!(
+        "q8a128 raw-byte quantize ({sum_scale:?}): {checked} per-128 tiles verified byte-exact"
+    );
     Ok(())
 }
 
@@ -2843,9 +2853,8 @@ fn q8a128_dequant_exact() -> Result<()> {
     let f32_dev = dev.memcpy_stod(&act)?;
     let stream = dev.cuda_stream();
     let (ptr, _g) = f32_dev.device_ptr(&stream);
-    let blocks =
-        quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
-            .into_owned_data()?;
+    let blocks = quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+        .into_owned_data()?;
     let deq = dequantize_q8a128(&blocks, rows, cols, &dev)?;
     dev.synchronize()?;
 
@@ -2910,9 +2919,8 @@ fn q8a128_edge_cases() -> Result<()> {
     let f32_dev = dev.memcpy_stod(&act)?;
     let stream = dev.cuda_stream();
     let (ptr, _g) = f32_dev.device_ptr(&stream);
-    let blocks =
-        quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
-            .into_owned_data()?;
+    let blocks = quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+        .into_owned_data()?;
     dev.synchronize()?;
     let raw: Vec<u8> = dev.memcpy_dtov(&blocks.slice(..))?;
 
@@ -3113,9 +3121,8 @@ fn q8a128_unified_dispatch_matches_typed() -> Result<()> {
     let (ptr, _g) = f32_dev.device_ptr(&stream);
 
     // Typed path (dtype 2 = F32) vs unified run_quantize_block(qtype=36).
-    let typed =
-        quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
-            .into_owned_data()?;
+    let typed = quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+        .into_owned_data()?;
     let nblocks = n / 128;
     let mut unified = unsafe { dev.alloc::<u8>(nblocks.div_ceil(8) * 1152)? };
     {
@@ -3446,12 +3453,10 @@ fn q8a128_f16_bf16_paths_match_f32() -> Result<()> {
         let fdev = dev.memcpy_stod(&as_f32)?;
         let (tp, _a) = tdev.device_ptr(&stream);
         let (fp, _b) = fdev.device_ptr(&stream);
-        let blk_t =
-            quantize_acts_q8a128(tp, 0, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
-                .into_owned_data()?;
-        let blk_f =
-            quantize_acts_q8a128(fp, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
-                .into_owned_data()?;
+        let blk_t = quantize_acts_q8a128(tp, 0, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+            .into_owned_data()?;
+        let blk_f = quantize_acts_q8a128(fp, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+            .into_owned_data()?;
         dev.synchronize()?;
         let bt: Vec<u8> = dev.memcpy_dtov(&blk_t.slice(..))?;
         let bf: Vec<u8> = dev.memcpy_dtov(&blk_f.slice(..))?;
@@ -3496,12 +3501,10 @@ fn q8a128_f16_bf16_paths_match_f32() -> Result<()> {
         let fdev = dev.memcpy_stod(&as_f32)?;
         let (tp, _a) = tdev.device_ptr(&stream);
         let (fp, _b) = fdev.device_ptr(&stream);
-        let blk_t =
-            quantize_acts_q8a128(tp, 1, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
-                .into_owned_data()?;
-        let blk_f =
-            quantize_acts_q8a128(fp, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
-                .into_owned_data()?;
+        let blk_t = quantize_acts_q8a128(tp, 1, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+            .into_owned_data()?;
+        let blk_f = quantize_acts_q8a128(fp, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+            .into_owned_data()?;
         dev.synchronize()?;
         let bt: Vec<u8> = dev.memcpy_dtov(&blk_t.slice(..))?;
         let bf: Vec<u8> = dev.memcpy_dtov(&blk_f.slice(..))?;

@@ -350,11 +350,15 @@ fn function_blocks_to_lines(s: &str) -> Option<String> {
         // An unterminated block is left as text rather than guessed at: a
         // truncated decode is narration, not a call whose arguments we invent.
         let (Some(name_end), Some(body_end)) = (after.find('>'), after.find(FN_CLOSE)) else {
-            out.push_str(rest);
+            // From the block's start, NOT `rest`: the narration before it was
+            // already pushed above, so re-emitting the whole remainder would
+            // duplicate it.
+            out.push_str(&rest[at..]);
             return Some(out);
         };
         if name_end > body_end {
-            out.push_str(rest);
+            // Same as above: the prose before this block is already in `out`.
+            out.push_str(&rest[at..]);
             return Some(out);
         }
         let name = after[..name_end].trim();
@@ -528,6 +532,40 @@ mod tests {
             p.acts[0].args["about"],
             "which of the two versions she has been working from"
         );
+    }
+
+    /// **An unparseable block must not duplicate the narration before it.**
+    ///
+    /// The walk pushes the prose preceding `<function=` and then, on a block it
+    /// cannot parse, bails by emitting the remainder. Emitting `rest` there
+    /// re-emits that prose, so a character's sentence appeared TWICE and the act
+    /// was lost with it. The bail must resume at the block — `&rest[at..]` — which
+    /// makes the whole translation the identity for an unparseable input.
+    #[test]
+    fn an_unterminated_block_keeps_its_narration_exactly_once() {
+        let s = "She set the cup down. <function=ask>\n<parameter=to>\nYaelis\n";
+        let out = function_blocks_to_lines(s).expect("the text contains a function block");
+        assert_eq!(
+            out.matches("She set the cup down.").count(),
+            1,
+            "narration before an unterminated block was duplicated: {out:?}"
+        );
+        assert_eq!(out, s, "an unparseable block is left exactly as written");
+    }
+
+    /// The other bail-out: a `>` that lands AFTER `</function>`, so the name span
+    /// and the body span cross. Same rule — resume at the block, don't re-emit
+    /// the prose already written.
+    #[test]
+    fn a_crossed_name_and_body_span_keeps_its_narration_exactly_once() {
+        let s = "Prose first. <function=ask</function>trailing>";
+        let out = function_blocks_to_lines(s).expect("the text contains a function block");
+        assert_eq!(
+            out.matches("Prose first.").count(),
+            1,
+            "narration before a malformed block was duplicated: {out:?}"
+        );
+        assert_eq!(out, s, "a malformed block is left exactly as written");
     }
 
     /// **Several calls in one turn**, which is the whole reason the family's

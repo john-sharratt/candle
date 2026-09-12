@@ -1,5 +1,5 @@
 //! Store compaction — reclaim dead weight by rewriting only the **live**
-//! records into a fresh segment (`docs/segmented_substrate_log.md`).
+//! records into a fresh segment (`docs/archived/segmented_substrate_log.md`).
 //!
 //! An append-only store only grows: every superseded partial-tail snapshot,
 //! every stale `ModelSpec` / `Template`, every chunk of a deleted stream is

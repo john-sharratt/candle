@@ -1,7 +1,7 @@
 //! Deterministic 128-bit content hashing for the persistence layer.
 //!
 //! Used to content-address system-prompt section streams (§5.2 of
-//! `docs/kv_tier_migration.md`): a section's stream id is derived from a
+//! `docs/archived/kv_tier_migration.md`): a section's stream id is derived from a
 //! rolling hash chain over the section tokens, so any template change forks
 //! a new stream and an unchanged section is a durable prefix-cache hit.
 //!

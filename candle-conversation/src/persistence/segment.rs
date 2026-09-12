@@ -1,7 +1,7 @@
 //! Segment identity for the segmented redo log.
 //!
 //! The redo log is a set of ~4 GB **segment** files in `.substrate/`
-//! (`docs/segmented_substrate_log.md`). Each record's in-RAM location is
+//! (`docs/archived/segmented_substrate_log.md`). Each record's in-RAM location is
 //! addressed by `(SegmentId, offset)` rather than a bare file offset, so a
 //! read routes to the segment file that physically holds it.
 //!

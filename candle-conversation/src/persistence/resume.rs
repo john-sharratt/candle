@@ -1,5 +1,5 @@
 //! Turn-resume reconstruction — persisting and recovering a turn's KV from
-//! the redo log (§5.6, §5.7 of `docs/kv_tier_migration.md`).
+//! the redo log (§5.6, §5.7 of `docs/archived/kv_tier_migration.md`).
 //!
 //! A turn's KV is, in the substrate, an `L × C` grid of `SealedChunk`s — one
 //! `SealedSequence` per model layer (`L`), each a `C`-long chunk list. The

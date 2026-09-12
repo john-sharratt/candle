@@ -189,17 +189,17 @@ generation), `ruler_stream`, `substrate_inspect` (redo-log/manifest dump tool, n
 
 ## Related docs
 
-- `docs/conversation_builder.md` — the projection engine's design: schema, selection rules, budget reconciliation
+- `docs/archived/conversation_builder.md` — the projection engine's design: schema, selection rules, budget reconciliation
   algorithm, masking semantics.
 - `docs/attention_provenance.md` — the research paper motivating provenance-selected attention; the *shipped*
   mechanism (binary `sign(Q)` Hamming/XNOR-popcount voting over `WideQSig`) is a leaner, production-hardened
   descendant of the float INT8 dot-product design this paper describes.
-- `docs/immutable_summary_forest.md` — the append-only Merkle-Mountain-Range summary tree (`src/summary_tree/`).
+- `docs/archived/immutable_summary_forest.md` — the append-only Merkle-Mountain-Range summary tree (`src/summary_tree/`).
 - `docs/continuous_fair_waves.md` — the current scheduler design: decoupled decode/prefill cursors sharing
   per-layer MoE batches.
-- `docs/kv_tier_migration.md` — the three-tier hot/warm/cold KV migration design; two divergences from it remain
+- `docs/archived/kv_tier_migration.md` — the three-tier hot/warm/cold KV migration design; two divergences from it remain
   (warm tier is pageable, not pinned; hot→warm runs on the primary CUDA stream).
 - `docs/provenance_score_normalization.md` — normalizing BDP scan scores across candidates of differing
   "loudness"; implemented in `src/normalization/`.
-- `docs/paged_gallery_arena.md` — the VRAM-resident provenance gallery (`src/provenance/gallery_arena/`) that
+- `docs/archived/paged_gallery_arena.md` — the VRAM-resident provenance gallery (`src/provenance/gallery_arena/`) that
   removed the ~10 ms/scan pinned-upload cost.

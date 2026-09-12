@@ -211,9 +211,16 @@ fn attention_shaped_mm(device: &Device) -> Result<()> {
         let mk = |n: usize, seed: u64| -> Result<Tensor> {
             let v: Vec<f32> = (0..n)
                 .map(|i| {
-                    (((i as u64 * 6364136223846793005).wrapping_add(seed) >> 33) % 1000) as f32
-                        / 500.0
-                        - 1.0
+                    // `wrapping_mul`, not `*`: the PCG multiplier is 63 bits, so
+                    // `i * K` overflows u64 at i == 3 and a debug build panics
+                    // there — inside the generator, before the comparison below
+                    // ever runs. The test reported a failure that was never about
+                    // matmul, and in release (where `*` wraps) it silently tested
+                    // what this now says explicitly.
+                    let h = (i as u64)
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(seed);
+                    ((h >> 33) % 1000) as f32 / 500.0 - 1.0
                 })
                 .collect();
             Tensor::from_vec(v, n, device)

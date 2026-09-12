@@ -8,7 +8,7 @@
 //! frontier is on the right; this packs right because its frontier is on the
 //! left. That symmetry is the whole reason a boundary between them can move:
 //! whichever way it moves, the data it would disturb has already been pushed out
-//! of the way (`docs/elastic_vram_partition.md` §2, §6).
+//! of the way (`docs/archived/elastic_vram_partition.md` §2, §6).
 //!
 //! # Why equal-sized slots make this an array
 //!
@@ -85,7 +85,7 @@ const MIN_FIRST_WAVE_KV: usize = 384 * 1024 * 1024;
 /// exist**.
 ///
 /// The partition is meant to be recomputed exactly on every forward
-/// (`docs/elastic_vram_partition.md` §7), and a forward is a full layer sweep at
+/// (`docs/archived/elastic_vram_partition.md` §7), and a forward is a full layer sweep at
 /// 57–80 ms. At that cadence the opening position survives one decode step and
 /// is then irrelevant: the weight side should simply fill to
 /// [`MIN_ELASTIC_RESERVE`] at load and let the first forward correct it.

@@ -225,7 +225,7 @@ pub fn compute_experts_grouped(
     // synchronises.
     //
     // Refusing here costs one pass over a few thousand `u32`s against a kernel
-    // launch that cannot be undone (`docs/elastic_vram_partition.md`
+    // launch that cannot be undone (`docs/archived/elastic_vram_partition.md`
     // principle 7). The ids come from routing, and this engine has already had
     // one degenerate-routing fault — `moe_route` leaking a `bi = n_experts`
     // sentinel on `-inf`/NaN logits — whose clamp fixed the symptom while the
@@ -530,11 +530,11 @@ pub fn compute_experts_grouped(
             // Raw Σx — a language model's block sums stay far below f16's ceiling.
             let stacked_q8 =
                 match to_dynamic(&stacked_xs, Int8Mode::Precision, cuda_dev, SumScale::Raw)? {
-                DynamicActs::Int8(op) => op,
-                DynamicActs::Float(_) => {
-                    candle::bail!("q8a128 activation quantize returned a non-int8 operand")
-                }
-            };
+                    DynamicActs::Int8(op) => op,
+                    DynamicActs::Float(_) => {
+                        candle::bail!("q8a128 activation quantize returned a non-int8 operand")
+                    }
+                };
             profile.record("gemm_gather", t);
             let t = profile_now();
             let gate_out = grouped_qmatmul(

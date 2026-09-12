@@ -6,7 +6,7 @@
 //! per scanned token), `case`, the segment prefixes, and the probe — then runs
 //! the same kernel as the contiguous path in its paged mode. The host tally is
 //! shared with the contiguous path ([`needle_tally_segments`]). See
-//! `docs/paged_gallery_arena.md` §7–8.
+//! `docs/archived/paged_gallery_arena.md` §7–8.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;

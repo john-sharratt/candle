@@ -1,7 +1,7 @@
 //! Substrate persistence layer — the three-tier KV-cache storage path.
 //!
 //! This is the generalized, mandatory persistence layer specified by
-//! `docs/kv_tier_migration.md`: an append-only NVMe redo log of
+//! `docs/archived/kv_tier_migration.md`: an append-only NVMe redo log of
 //! content-addressed streams that forms a complete, self-contained
 //! substrate image. It is not optional — a substrate is always backed by
 //! its log.

@@ -7,7 +7,7 @@
 //! Critical-only sync, no-spin, the concurrency forecast and the OOM retry —
 //! went with the ladder itself (`docs/archived/arena_unification.md` §5). The
 //! `kv_floor` / `expert_budget` half went with the static partition
-//! (`docs/elastic_vram_partition.md` §9).
+//! (`docs/archived/elastic_vram_partition.md` §9).
 
 use std::sync::Arc;
 

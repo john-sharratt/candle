@@ -1,5 +1,5 @@
 //! Background maintenance for the segmented redo log — drop / compact /
-//! combine (`docs/segmented_substrate_log.md` §6).
+//! combine (`docs/archived/segmented_substrate_log.md` §6).
 //!
 //! One shared mechanism — **relocate a sealed segment's live records into the
 //! active, then unlink the segment** — with three triggers:

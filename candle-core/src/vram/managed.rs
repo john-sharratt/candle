@@ -9,7 +9,7 @@
 //! scratch_margin`, divided by `max_expert_size` to pick a resident-expert
 //! count. It went with `kv_floor`. The count is now the weight zone's capacity,
 //! `(span − MIN_ELASTIC_RESERVE) / slot_bytes`, computed once against a span
-//! whose extent is a fact (`docs/elastic_vram_partition.md` §6).
+//! whose extent is a fact (`docs/archived/elastic_vram_partition.md` §6).
 //!
 //! This file also held the managed-allocation path: `reserve` for permanent
 //! class-tagged allocations, and `allocate`, which retried an out-of-memory

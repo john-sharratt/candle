@@ -100,7 +100,7 @@ pub struct ProbeSpec {
 }
 
 /// Algorithm-level invariants the fixture must satisfy at load time
-/// (`docs/immutable_summary_forest.md` — *Invariants*).
+/// (`docs/archived/immutable_summary_forest.md` — *Invariants*).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExpectedInvariants {
     /// The persisted forest matches the canonical shape for its leaf count:

@@ -102,7 +102,7 @@ pub struct Qwen4ExpGpu {
 
 impl Qwen4ExpGpu {
     /// Load the engine from the merged GGUF. Order is load-bearing
-    /// (`docs/elastic_vram_partition.md` §4): every dense tensor resident
+    /// (`docs/archived/elastic_vram_partition.md` §4): every dense tensor resident
     /// first, then the expert cache is sized from a live measurement of what
     /// they left behind.
     pub fn load(merged: &Path, device: &Device, int8mode: Int8Mode) -> Result<Self> {

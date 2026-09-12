@@ -5243,7 +5243,7 @@ fn grouped_matmul_gemx_impl<'w>(
 
 /// Single-launch grouped MoE expert matmul over FP activations (F16/BF16/F32):
 /// FP16 tensor-core MMA with Q4_K weights dequantized on the fly. The INT8-MMA path
-/// is `grouped_matmul_gemx_q8a128` (q8a128 activations). See docs/q8_matmul_pipeline.md.
+/// is `grouped_matmul_gemx_q8a128` (q8a128 activations). See docs/archived/q8_matmul_pipeline.md.
 pub fn grouped_matmul_gemx(
     weight_ptrs: &[u64],
     weight_dtype: GgmlDType,
@@ -6675,7 +6675,7 @@ pub fn grouped_qmatmul_dev_q8a128<'w>(
 /// dispatch), output F32; `Float` runs the dequant-weight float path
 /// ([`dense_qmatmul_float`]), output matching the activation dtype. The caller stays
 /// agnostic to which numeric mode runs. `weight_len` is the quantized-weight byte length
-/// used by the float path; the int8 path ignores it. See docs/q8_matmul_pipeline.md.
+/// used by the float path; the int8 path ignores it. See docs/archived/q8_matmul_pipeline.md.
 /// KO format code for the segmented qkv kernel's `fmt` field.
 ///
 /// **This table and the switch in `qkv_segmented_f32.cu` are one mapping split across two

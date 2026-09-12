@@ -1627,8 +1627,7 @@ impl BatchedInferenceSession {
         // seals at C3) genuinely selects against different thresholds and must
         // not be folded in with the session's. In practice that is one group, or
         // two when a cap is active.
-        let mut live_per_layer: Vec<Vec<SealedSequence>> =
-            Vec::with_capacity(self.backings.len());
+        let mut live_per_layer: Vec<Vec<SealedSequence>> = Vec::with_capacity(self.backings.len());
         for (layer_idx, backing) in self.backings.iter().enumerate() {
             let _ = layer_idx;
             let mut per_seq = Vec::with_capacity(seq_indices.len());
@@ -3498,7 +3497,7 @@ pub trait ManagedBatchedModel {
     /// Widest prefill this model will run in one forward, in tokens.
     ///
     /// The smallest of three unrelated ceilings
-    /// (`docs/elastic_vram_partition.md` §7: `R = min(8192, transient-fits,
+    /// (`docs/archived/elastic_vram_partition.md` §7: `R = min(8192, transient-fits,
     /// KV-fits)`):
     ///
     /// * `MAX_PREFILL_TOKENS` — where GPU compute saturates. Above it a wider

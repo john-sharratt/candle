@@ -12,7 +12,7 @@
 //! ingest + VRAM budget-band admission), `run.rs` (top-level wave loop + wave
 //! relief), `sample.rs` (batched sampler), `projection_assembler.rs`
 //! (rebuilds a slot's prefix K/V from the substrate every projection, per
-//! `docs/conversation_builder.md`), `phase_ring.rs` (telemetry ring for
+//! `docs/archived/conversation_builder.md`), `phase_ring.rs` (telemetry ring for
 //! `/v1/phases`), `profile.rs` (feature-gated zero-cost span timer), and
 //! `kv_zero_check.rs` (feature `kv-zero-check`, audits live K/V slots).
 mod admission;
@@ -2765,7 +2765,7 @@ pub(crate) struct Scheduler {
     device: Device,
     /// Resident VRAM gallery arena for the paged belief scan (one per device,
     /// shared across conversations). `None` on non-CUDA devices — the reproject
-    /// then falls back to the CPU per-file scan. See `docs/paged_gallery_arena.md`.
+    /// then falls back to the CPU per-file scan. See `docs/archived/paged_gallery_arena.md`.
     gallery_arena: Option<Arc<GalleryArena>>,
     /// Active decode state per sequence ID.
     active_decodes: HashMap<SequenceId, DecodeState>,
@@ -2929,7 +2929,7 @@ pub(crate) struct Scheduler {
     /// Trigger handle for the async summariser thread.  Fired after
     /// every turn-seal (`docs/archived/infinite_conversations.md` §4 step ③)
     /// so the freshly-pending Normal turn is absorbed into the immutable
-    /// summary forest (`docs/immutable_summary_forest.md`) on the next
+    /// summary forest (`docs/archived/immutable_summary_forest.md`) on the next
     /// pass instead of waiting up to 250 ms
     /// for the periodic tick.  Backpressure-clearing is purely a
     /// latency optimisation — the tick alone is correct.
@@ -5662,7 +5662,6 @@ impl Scheduler {
         ])
     }
 
-
     /// Seal a re-prefilled compressed turn once the shared wave finishes its
     /// prefill. Snapshots the slot's freshly-computed (role-coherent) K/V,
     /// records the turn from its [`PendingCompressionSeal`], frees the slot, and
@@ -8252,7 +8251,7 @@ impl Scheduler {
                 // Wake the summariser thread
                 // (`docs/archived/infinite_conversations.md` §4 step ③) so the
                 // freshly-pending Normal turn gets absorbed into the immutable
-                // summary forest (`docs/immutable_summary_forest.md`) on its
+                // summary forest (`docs/archived/immutable_summary_forest.md`) on its
                 // next pass instead of waiting up to 250 ms for the periodic tick.
                 self.summariser_trigger.fire();
                 // Trim the slot's live-prefill capture cache down to

@@ -1,6 +1,6 @@
 //! The `SummaryTree` — a three-kind tagged **append-only immutable forest**
 //! (a ternary Merkle Mountain Range). Pure data structure: no substrate, no
-//! scheduler. See `docs/immutable_summary_forest.md`.
+//! scheduler. See `docs/archived/immutable_summary_forest.md`.
 //!
 //! # Shape
 //!

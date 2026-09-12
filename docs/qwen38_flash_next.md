@@ -1926,7 +1926,7 @@ kernel paid a full read of it, to add a value that was always zero.
 The seed was load-bearing once: the callers ran the scatter twice, for cache
 hits and then for newly-loaded experts. That shape was removed when
 residency-dependent grouping turned out to make decode non-deterministic
-(`docs/deepseek_decode_reproducibility.md`) and the callers merged into one
+(`docs/deepseek/deepseek_decode_reproducibility.md`) and the callers merged into one
 canonically-ordered pass — but the accumulate-from-target seed outlived it, and
 with it every caller's obligation to zero.
 

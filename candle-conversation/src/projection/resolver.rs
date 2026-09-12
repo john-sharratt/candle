@@ -217,7 +217,7 @@ pub struct Conversation {
     inner: Arc<RwLock<Substrate>>,
     allocator: Arc<TimelineAllocator>,
     /// The mandatory persistence layer — every turn is recorded into its
-    /// redo log (`docs/kv_tier_migration.md` §13.6).
+    /// redo log (`docs/archived/kv_tier_migration.md` §13.6).
     persistence: Arc<Mutex<SubstratePersistence>>,
     /// Runtime, in-memory score normalization (per-scope hit levels). NOT
     /// persisted — rebuilt from the substrate's existing turns on first use, then
@@ -1852,8 +1852,7 @@ impl Conversation {
                 let t_q = probe_q.map_or(1, |q| q.len());
                 let (normed, normed_q) = {
                     let mut cache = self.normalization.lock().unwrap();
-                    let normed =
-                        cache.normalize_with_floors(&scope, &raw_pairs, &floors, t_tail);
+                    let normed = cache.normalize_with_floors(&scope, &raw_pairs, &floors, t_tail);
                     let normed_q = fresh_q_per_file.as_ref().map(|per_file| {
                         let fq = &per_file[fi];
                         let q_pairs: Vec<(ChildKey, f32)> = (0..f.n_slots)
@@ -2484,7 +2483,7 @@ impl Conversation {
         }
         // Arm low-priority reconciliation per timeline. The summary forest is
         // immutable and its canonical ternary shape is a pure function of the
-        // leaves (`docs/immutable_summary_forest.md`), so the reload doesn't
+        // leaves (`docs/archived/immutable_summary_forest.md`), so the reload doesn't
         // re-summarise anything — it just asks the summariser to rebuild any
         // internal node that's missing (a crash between sealing leaves and their
         // parent) or non-canonical (binary nodes from the superseded AVL, which
@@ -3541,7 +3540,7 @@ impl Conversation {
 
     /// Run one **background maintenance** op on the segmented redo log — drop a
     /// fully-dead segment, compact a mostly-dead one, or combine two small
-    /// adjacent ones (`docs/segmented_substrate_log.md` §6). At most one op per
+    /// adjacent ones (`docs/archived/segmented_substrate_log.md` §6). At most one op per
     /// call; the persistence thread polls this every pass. The common no-op
     /// path is a cheap per-segment liveness scan. Holds the persistence lock
     /// and the substrate write lock for the op's duration — cold-loads and

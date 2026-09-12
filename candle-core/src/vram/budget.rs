@@ -113,7 +113,7 @@ pub struct GovernorConfig {
 /// happened once, on the card where the expert cache is what pays for decode.
 ///
 /// A single number cannot be right for both moments, which is the whole reason
-/// the boundary moves now (`docs/elastic_vram_partition.md` §1).
+/// the boundary moves now (`docs/archived/elastic_vram_partition.md` §1).
 ///
 /// **512 → 256 → 512.** What this covers is pool growth between `expert_budget` being computed
 /// and the load finishing — a load-time window, not a serving one. Two changes shrank that

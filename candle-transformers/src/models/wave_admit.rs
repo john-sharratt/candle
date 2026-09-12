@@ -7,7 +7,7 @@
 //! and its position is decided once per forward. For that position to be the
 //! *tight* one — hard against the arena frontier, leaving the whole remainder in
 //! one run adjacent to the weight side — the frontier has to be final when the
-//! tier is placed (`docs/elastic_vram_partition.md` §7). A layer that claims a
+//! tier is placed (`docs/archived/elastic_vram_partition.md` §7). A layer that claims a
 //! new arena halfway through the sweep moves the frontier under a tier that is
 //! already sitting on it.
 //!

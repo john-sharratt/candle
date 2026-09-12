@@ -71,7 +71,7 @@ The floor moved twice while this defect stood, which is itself the argument.
 Originally the pool was sized `total − vram + vram/10` from the boundary's
 **opening** position — 4004 slots, floor 6144 − 4004 = **2140**, and nothing in
 the code stated or enforced it, so a retraction could walk straight past it and
-destroy experts (`docs/elastic_vram_partition.md` §13c). The elastic-partition
+destroy experts (`docs/archived/elastic_vram_partition.md` §13c). The elastic-partition
 commit `d2cecd84` then inverted the derivation, sizing the pool from a *chosen*
 floor instead — `min_vram_expert_slots = total/4` plus churn, so 4864 slots and
 **14.1 GB** of pinned host memory on a 31.5 GB machine. That is the better of the
@@ -94,7 +94,7 @@ Those 237 free slots are simultaneously:
   `evict_for_prefetch_batch` is asked for as many experts as a layer is short
   (up to 128), with prefetch running a layer ahead
 - the **entire budget** for the elastic VRAM boundary
-  (`docs/elastic_vram_partition.md`) to retract
+  (`docs/archived/elastic_vram_partition.md`) to retract
 
 They trade one for one, and the "10% headroom" is almost exactly the two layers
 of churn the pipeline needs — leaving **nothing** for the boundary. A live
@@ -551,7 +551,7 @@ From the expert cache:
   therefore nowhere loadable from", is not expressible once `vram` and `ram` are
   independent
 
-From the elastic VRAM partition (`docs/elastic_vram_partition.md` §13c), all of
+From the elastic VRAM partition (`docs/archived/elastic_vram_partition.md` §13c), all of
 which exist solely to work around §2.2 and §2.3:
 
 - the retraction cap against free pinned slots
@@ -743,7 +743,7 @@ It costs a full drain, paid only when the boundary actually moves.
 
 **The general form is worth stating**: a cap that keeps a mechanism from
 operating also keeps its hazards untested. The three guards
-`docs/elastic_vram_partition.md` §13c added were correct, and they were also the
+`docs/archived/elastic_vram_partition.md` §13c added were correct, and they were also the
 reason that document could report the boundary as working while it had never
 moved a byte.
 

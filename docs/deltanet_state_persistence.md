@@ -3319,4 +3319,4 @@ recurrent-snapshot one, which compaction had just been taught to shrink.
 - `docs/qwen35_qwen38_models.md` §5 (turn-seal snapshots, the original design),
   §7.8 (the three invisible defects), §7.16 (F32 accumulation), §8 risk 1.
 - `docs/tool_provenance_distillation.md` — the strip-KV-keep-sigs precedent.
-- `docs/kv_tier_migration.md` §5.6-5.7, §16.12 — resume and the redo log.
+- `docs/archived/kv_tier_migration.md` §5.6-5.7, §16.12 — resume and the redo log.

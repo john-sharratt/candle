@@ -494,9 +494,9 @@ impl QMatMul {
         // The weight twin was baked in at load by `from_*_with_mode`.
         #[cfg(feature = "cuda")]
         if self.int8mode.is_int8() {
-            let out2 = self
-                .inner
-                .forward_via_int8(&xs2, self.int8mode, out_dtype, self.sum_scale)?;
+            let out2 =
+                self.inner
+                    .forward_via_int8(&xs2, self.int8mode, out_dtype, self.sum_scale)?;
             pipeline_record("qmatmul_q8", t_mm);
             return if let Some((b, s)) = reshape_back {
                 let n = out2.dim(1)?;

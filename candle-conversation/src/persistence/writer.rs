@@ -1,4 +1,4 @@
-//! Off-thread substrate writer (`docs/kv_tier_migration.md`).
+//! Off-thread substrate writer (`docs/archived/kv_tier_migration.md`).
 //!
 //! Every redo-log append that would otherwise block a caller on the persistence
 //! lock (which a segment compaction can hold across its whole relocation I/O) is

@@ -82,7 +82,12 @@ impl ScopeState {
     /// Fold a turn's raw scores into each child's hit-level EWMA, creating an
     /// unseen child at the prior. Additive: existing children not named here keep
     /// their level (call [`Self::retain`] to prune after a membership change).
-    pub(super) fn observe(&mut self, raw: &[(ChildKey, f32)], cfg: &NormConfig, probe_tokens: usize) {
+    pub(super) fn observe(
+        &mut self,
+        raw: &[(ChildKey, f32)],
+        cfg: &NormConfig,
+        probe_tokens: usize,
+    ) {
         for (k, r) in raw {
             self.children
                 .entry(k.clone())

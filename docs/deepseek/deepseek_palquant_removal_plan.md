@@ -31,7 +31,7 @@ Four independent reasons, any one fatal:
    the kernels launched `MAPPED=false` and never read it.
 
 3. **No reference counterpart, so it can only diverge.** The reference has **no**
-   adaptive/palette scheme anywhere (docs/deepseek_v4_flash.md §2.2): the window and
+   adaptive/palette scheme anywhere (docs/deepseek/deepseek_v4_flash.md §2.2): the window and
    the compressed cache both use a **fixed** FP8-E4M3(non-rope, per-64) ‖ BF16(rope)
    format, and the indexer uses fixed FP4-per-32. Matching the reference is the goal
    (we validate *against* it); an adaptive per-block format has nothing to match and
@@ -45,7 +45,7 @@ Four independent reasons, any one fatal:
 window in the reference's fixed format; keep only the band *generalization*
 (geometry), which is orthogonal to the map.
 
-## Reference format matrix (docs/deepseek_v4_flash.md §2.2, line 117/180)
+## Reference format matrix (docs/deepseek/deepseek_v4_flash.md §2.2, line 117/180)
 | Store | Layers | Format |
 |---|---|---|
 | Window ring (128 slots) | SWA, CSA, HCA | **FP8 E4M3** non-rope `[0:448)` per-64 ue8m0 · **BF16** rope `[448:512)` |

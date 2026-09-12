@@ -1076,7 +1076,7 @@ pub trait ContentResolver {
     }
 
     /// Score-density selection over a timeline's summary forest
-    /// (`docs/immutable_summary_forest.md` — *Window of attention*).
+    /// (`docs/archived/immutable_summary_forest.md` — *Window of attention*).
     /// Returns the chrono-
     /// logically ordered `(turn_index, effective_score)` list for the
     /// given timeline, fitted into `budget` tokens, or `None` when no
@@ -1183,7 +1183,7 @@ pub struct TimelineEntry {
     /// the old `tails: Vec<TurnIndex>` field used to encode separately.
     pub turns: BTreeMap<TurnIndex, TurnEntryData>,
     /// Per-turn tree metadata for the immutable summary forest
-    /// (`docs/immutable_summary_forest.md`).  Parallel to `turns`: every
+    /// (`docs/archived/immutable_summary_forest.md`).  Parallel to `turns`: every
     /// recorded turn carries exactly one [`TreeNodeMeta`] entry (defaults to a
     /// `Normal` content sub-leaf with no children).  Promoted to a
     /// `SummaryOfTurns` / `SummaryOfSummaries` by the async summariser thread
@@ -2884,7 +2884,7 @@ impl Substrate {
 
     /// The peak set — orphan summary nodes (no parent), in chronological order
     /// (oldest/leftmost-covering first), each paired with its level.  These are
-    /// the window's coarse entry points (`docs/immutable_summary_forest.md`).
+    /// the window's coarse entry points (`docs/archived/immutable_summary_forest.md`).
     pub fn peaks_of(&self, timeline: TimelineId) -> Vec<(TurnIndex, u8)> {
         let Some(tl) = self.timelines.get(&timeline) else {
             return Vec::new();
@@ -2923,7 +2923,7 @@ impl Substrate {
     ///
     /// Derived from the persisted state each call (the "dirty" bit is gone —
     /// staleness is computed, never stored).  See
-    /// `docs/immutable_summary_forest.md`.
+    /// `docs/archived/immutable_summary_forest.md`.
     pub fn reconcile_next(&self, timeline: TimelineId) -> Option<Vec<TurnIndex>> {
         let tl = self.timelines.get(&timeline)?;
         let tm = &tl.tree_meta;
@@ -4295,7 +4295,7 @@ impl Substrate {
     }
 
     /// Insert a turn reconstructed from the redo log — the substrate-reload
-    /// path (§16.12 of `docs/kv_tier_migration.md`).
+    /// path (§16.12 of `docs/archived/kv_tier_migration.md`).
     ///
     /// The caller must [`Self::register_timeline`] first. Turns must be
     /// restored in `turn_index` order so the appended `TurnIndex` matches

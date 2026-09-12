@@ -60,5 +60,5 @@ processes — see `docs/npc_mind_design.md` / `docs/theory_of_the_mind.md`):
 
 `docs/theory_of_the_mind.md`, `docs/npc_mind_design.md`,
 `docs/narrative_engine.md`, `docs/archived/tree_gen_design.md`,
-`docs/immutable_summary_forest.md` (the summary structure that
+`docs/archived/immutable_summary_forest.md` (the summary structure that
 `summarize.md`-produced segments feed into).

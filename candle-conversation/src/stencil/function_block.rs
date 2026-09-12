@@ -255,10 +255,11 @@ mod tests {
         assert!(function_blocks_to_json("just prose", &catalog()).is_none());
         assert!(function_blocks_to_json("", &catalog()).is_none());
         // A JSON call already in the canonical shape is somebody else's job.
-        assert!(
-            function_blocks_to_json(r#"<tool_call>{"name":"datetime"}</tool_call>"#, &catalog())
-                .is_none()
-        );
+        assert!(function_blocks_to_json(
+            r#"<tool_call>{"name":"datetime"}</tool_call>"#,
+            &catalog()
+        )
+        .is_none());
     }
 
     /// The shape the grammar actually emits, end to end — the literal string
@@ -311,8 +312,13 @@ mod tests {
             &catalog(),
         )
         .unwrap();
-        let start = out.find("<tool_call>").expect("the opening marker survives") + "<tool_call>".len();
-        let end = out.find("</tool_call>").expect("the closing marker survives");
+        let start = out
+            .find("<tool_call>")
+            .expect("the opening marker survives")
+            + "<tool_call>".len();
+        let end = out
+            .find("</tool_call>")
+            .expect("the closing marker survives");
         let body = out[start..end].trim();
         assert!(body.starts_with('{'), "body must open on the object: {out}");
         assert!(body.ends_with('}'), "body must close on the object: {out}");
@@ -662,7 +668,10 @@ mod tests {
         let cases: &[(&str, &[(&str, &str)])] = &[
             ("datetime", &[]),
             ("file_read", &[("path", "src/main.rs")]),
-            ("file_read", &[("path", "src/main.rs"), ("start_line", "42")]),
+            (
+                "file_read",
+                &[("path", "src/main.rs"), ("start_line", "42")],
+            ),
             ("say", &[("to", "Mira"), ("words", "she said \"no\"")]),
             ("say", &[("words", "first\nsecond")]),
             ("toggle", &[("on", "true")]),
@@ -677,7 +686,8 @@ mod tests {
             for (k, v) in *args {
                 // Compared through the same typing the catalog declares, so this
                 // asserts the value survived rather than restating the coercion.
-                let want = typed_value(v, param_type(catalog().iter().find(|t| t.name == *name), k));
+                let want =
+                    typed_value(v, param_type(catalog().iter().find(|t| t.name == *name), k));
                 assert_eq!(&call["arguments"][*k], &want, "{rendered:?} key {k}");
             }
         }

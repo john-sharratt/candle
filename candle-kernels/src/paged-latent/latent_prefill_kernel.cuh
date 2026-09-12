@@ -9,7 +9,7 @@
 // regs/thread → spill), so each pass computes 32 heads, EMITS its output to the
 // combine buffers, then reuses the same 32-register PV accumulator for the next
 // pass. The tile loop runs once per pass; sK/sVt are rebuilt per pass from the
-// L2-resident int8 keys (cheap). See docs/deepseek_prefill_tensorcore_pv.md.
+// L2-resident int8 keys (cheap). See docs/deepseek/deepseek_prefill_tensorcore_pv.md.
 //
 //   Q stage   : the pass's 32 heads, RoPE at my_pos, per-band scaleQ. There is
 //               NO sQ — the QK A-fragment is built per pass straight from L2

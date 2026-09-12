@@ -1,7 +1,7 @@
 //! The balloon-and-measure bootstrap: claim everything except a fixed reserve
 //! (touching it to force residency, which evicts other processes' cold
 //! allocations on WDDM), record the resident high-water as the capacity `C`,
-//! then free it. See `docs/elastic_vram_partition.md` §5.
+//! then free it. See `docs/archived/elastic_vram_partition.md` §5.
 
 use super::budget::GovernorConfig;
 use super::reading::{ProbeKind, VramProbe, VramReading};

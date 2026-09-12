@@ -3,7 +3,7 @@
 //! The caller's half of [`super::quantized_weights::load_quantized_model`]:
 //! the cache is sized from a live measurement of what the dense weights left
 //! behind, so it cannot be built inside the dense loop
-//! (`docs/elastic_vram_partition.md` §4). The order is fixed —
+//! (`docs/archived/elastic_vram_partition.md` §4). The order is fixed —
 //!
 //! 1. dense weights resident (the loop in `quantized_weights`);
 //! 2. measure the span, carve the weight zone, place the boundary;

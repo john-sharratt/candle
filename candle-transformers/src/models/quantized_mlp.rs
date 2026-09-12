@@ -24,9 +24,9 @@ use candle::{DType, LiveTensor, Module, Result, Tensor};
 use candle_nn::Activation;
 
 use crate::models::lora::{adapt, LayerLora};
+use crate::models::quantized_matmul::{QMatMul, WeightResidency};
 #[cfg(feature = "cuda")]
 use crate::models::qwen35::quantized_attention::lora_input;
-use crate::models::quantized_matmul::{QMatMul, WeightResidency};
 
 /// The three (or two, when gate+up are fused) projections of a gated FFN.
 #[derive(Debug, Clone)]

@@ -52,7 +52,6 @@ impl Qwen35AttentionLayer<'_> {
             ),
         }
     }
-
 }
 
 /// The activation an adapter's `A` matmul reads — **the operand the base

@@ -450,8 +450,7 @@ impl ZImageTransformer {
 
         let vb_cap = vb.pp("cap_embedder");
         let cap_norm = rms(cfg.cap_feat_dim, cfg.norm_eps, vb_cap.pp("0"))?;
-        let cap_linear =
-            zi_linear(cfg.cap_feat_dim, cfg.dim, true, mode, DTYPE, vb_cap.pp("1"))?;
+        let cap_linear = zi_linear(cfg.cap_feat_dim, cfg.dim, true, mode, DTYPE, vb_cap.pp("1"))?;
 
         let t_embedder = TimestepEmbedder::new(1024, ADALN_EMBED_DIM, mode, vb.pp("t_embedder"))?;
 

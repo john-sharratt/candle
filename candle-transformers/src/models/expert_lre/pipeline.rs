@@ -2295,7 +2295,7 @@ impl PipelineState {
         // experts happened to be resident. Residency varies run to run, float
         // addition is not associative, and the result was an engine that
         // returned different text for the same prompt
-        // (`docs/deepseek_decode_reproducibility.md`). Expert id is a function
+        // (`docs/deepseek/deepseek_decode_reproducibility.md`). Expert id is a function
         // of routing alone, so this order is the same on every run.
         //
         // The cost is the overlap this used to buy: hit experts were computed

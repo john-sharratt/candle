@@ -950,7 +950,7 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     // The cache is already sized and truncated for this wave: `wave_admit` did
     // both, for every layer, before the forward began. Nothing on this path may
     // claim a chunk — the transient tier is placed against the arena frontier
-    // and a claim here would move it (`docs/elastic_vram_partition.md` §7).
+    // and a claim here would move it (`docs/archived/elastic_vram_partition.md` §7).
     let rope_zeros = Tensor::zeros(n_seqs, DType::U32, q.device())?;
     // Flat attention output: [total_q, n_head, head_dim]. A reprojection-glue
     // forward (HD128, chunked) routes to the paged-glue kernel — it streams the

@@ -6,7 +6,7 @@
 //! version. A concrete model supplies its geometry, config defaults, GGUF metadata
 //! keys, and tensor names through the [`Arch`](arch::Arch) trait — see
 //! [`models::deepseek4`](crate::models::deepseek4) for the V4-Flash instantiation
-//! and `docs/deepseek_v4_flash.md` for the design it was derived from.
+//! and `docs/deepseek/deepseek_v4_flash.md` for the design it was derived from.
 //!
 //! The family is defined by four properties:
 //!

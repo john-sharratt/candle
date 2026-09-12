@@ -38,7 +38,7 @@ WDDM-launch-floor + MoE bound, so the sub-percent kernel win is invisible end-to
 streaming MXFP4 experts, 43 layers. RTX PRO 5000 Blackwell 72 GB (sm_120), WDDM.
 
 This document is the backlog for the round *after* the landed prefill batching (`pprep:select` 124×,
-`pprep:push` batched, writeback dead-work) — see `docs/deepseek_perf_optimization_report.md`. It is a
+`pprep:push` batched, writeback dead-work) — see `docs/deepseek/deepseek_perf_optimization_report.md`. It is a
 read-only static sweep of the forward hot path across five lenses: (1) VRAM↔RAM copies, (2) GPU syncs,
 (3) dtype conversions, (4) inefficient Rust/kernel code, (5) formula/op-sequence rewrites.
 

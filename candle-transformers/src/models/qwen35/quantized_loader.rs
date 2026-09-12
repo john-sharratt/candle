@@ -5,7 +5,7 @@
 //! the numeric mode, and standing the expert cache up against the span the
 //! dense weights leave behind.
 //!
-//! The order is fixed and structural (`docs/elastic_vram_partition.md` §4):
+//! The order is fixed and structural (`docs/archived/elastic_vram_partition.md` §4):
 //! dense weights resident → measure the span, carve the weight zone, place the
 //! boundary → fill the cache → graft it onto the layers that route. The
 //! measurement is only meaningful at that one point, which is why

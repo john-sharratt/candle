@@ -1493,7 +1493,7 @@ mod tests {
     /// **Does Llama decode reproduce itself, run to run?**
     ///
     /// The DENSE arm of the reproducibility split. DeepSeek-V4-Flash is not
-    /// reproducible (`docs/deepseek_decode_reproducibility.md`), and the
+    /// reproducible (`docs/deepseek/deepseek_decode_reproducibility.md`), and the
     /// question is where the fault lives. Llama has no experts and no
     /// `expert_lre` cache at all, so a failure here would put the fault below
     /// the MoE path entirely — in the shared attention/KV/quantized-matmul

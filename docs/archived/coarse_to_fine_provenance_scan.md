@@ -278,7 +278,7 @@ stops growing with history.
 ## Bonus: tier-prefetch hook
 
 At 10 M tokens the KV lives across the three-tier cache (GPU → RAM → NVMe; not
-yet built — see `docs/kv_tier_migration.md`). The coarse pass already computes,
+yet built — see `docs/archived/kv_tier_migration.md`). The coarse pass already computes,
 cheaply, the set of turns that *could* be relevant (those whose `UB_score`
 clears the threshold). That candidate set is exactly what the tiering layer must
 prefetch from warm/cold while the GPU decodes. Coarse-to-fine is therefore not

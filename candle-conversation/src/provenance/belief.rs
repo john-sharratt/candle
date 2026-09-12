@@ -96,30 +96,53 @@ impl ToolBelief {
         self.acc.copy_from_slice(scores);
     }
 
-    /// Hard ceiling on an accumulated belief.
+    /// Ceiling for **reporting** an accumulated belief — the GUI readout, a
+    /// projection tile, a threshold sweep's axis.
     ///
-    /// The accumulator is already a contraction — for the leader the step is
-    /// `s' = (1-β)s + fresh`, settling at `fresh/β` rather than running away —
-    /// but `fresh` is a normalized score with no upper bound of its own: a
-    /// lock-on "rides above" the 0–1000 band by design. So the settled value
-    /// tracks the input, and the input was measured at ~82,850 per projection,
-    /// giving a belief climbing toward ~207,000.
+    /// The accumulator is a contraction: for the leader the step is
+    /// `s' = (1-β)s + fresh`, settling at `fresh/β` rather than running away. But
+    /// `fresh` is a normalized score with no ceiling of its own — a lock-on
+    /// "rides above" the 0–1000 band by design — so the settled value tracks the
+    /// input, and the input was measured at ~82,850 per projection, giving a
+    /// belief climbing toward ~207,000. A number that large is useless to read.
+    ///
+    /// **It must not be clamped inside [`Self::update`], and was, for one
+    /// measured hour.** Clamping the accumulator erases the margin the selector
+    /// ranks on: with reference-scaled probes pushing several tools past the
+    /// ceiling, `datetime` (143,035 before tonight) and `aead_encrypt` (461)
+    /// both read 5,000, tied, and the budget's three seats went in arbitrary
+    /// order — a live "what time is it?" turn then answered "there's no clock
+    /// tool available in my available tools", because the tool that would have
+    /// answered it lost a coin-flip. Ranking needs the full range; only the
+    /// display needs a bound.
+    ///
+    /// Nor can the clamp sit anywhere a score is read BACK: `PriorBelief::
+    /// from_selection` seeds the next reprojection's RelLeak from the persisted
+    /// selection's score, so a clamp upstream of the leaf re-enters the
+    /// accumulator one projection later and the ties return. It belongs only
+    /// where a score is rendered for a human and never consumed again.
     ///
     /// 5,000 leaves 6.25x of headroom over `CommittedToolScope`'s `min_score` of
-    /// 800 — ample range to rank strong hits against each other — while bounding
-    /// what every downstream consumer has to represent: the GUI readout, a
-    /// persisted projection event, a threshold sweep's axis. Candidates that
-    /// saturate it tie at the top, which for a selection of at most three is a
-    /// distinction without a decision.
-    const CAP: f32 = 5_000.0;
+    /// 800, so a bounded readout still separates a strong hit from a marginal one.
+    pub const REPORT_CAP: f32 = 5_000.0;
 
-    /// Apply one projection's per-tool scores, then leak and clamp.
-    /// `scores.len()` must equal the slot count. Saturates at [`Self::CAP`].
+    /// One score as it should be REPORTED: the belief, bounded by
+    /// [`Self::REPORT_CAP`]. Never feed the result back into a belief — see that
+    /// constant's note on `PriorBelief`.
+    pub fn for_display(score: f32) -> f32 {
+        score.min(Self::REPORT_CAP)
+    }
+
+    /// Apply one projection's per-tool scores, then leak.
+    ///
+    /// Deliberately **unbounded** — the margin between a lock-on and a rival is
+    /// what the selector ranks on. See [`Self::REPORT_CAP`] for the bound, and
+    /// for what clamping here cost.
     pub fn update(&mut self, scores: &[f32]) {
         debug_assert_eq!(scores.len(), self.acc.len(), "score/slot count mismatch");
         let m = self.acc.iter().copied().fold(0.0f32, f32::max);
         for ((acc, &beta), &score) in self.acc.iter_mut().zip(self.beta.iter()).zip(scores) {
-            *acc = ((*acc - beta * m).max(0.0) + score).min(Self::CAP);
+            *acc = (*acc - beta * m).max(0.0) + score;
         }
     }
 
@@ -206,32 +229,37 @@ mod tests {
         assert_eq!(b.scores()[1], 0.0);
     }
 
-    /// **The accumulator is bounded, whatever the input.**
+    /// **The bound is on the REPORT, and the accumulator keeps its margin.**
     ///
-    /// The contraction alone bounds the belief only relative to `fresh`, and
-    /// `fresh` is a normalized score with no ceiling — measured at ~82,850 per
-    /// projection on a live tool match, which would settle near 207,000. The cap
-    /// makes the belief's range a property of the accumulator rather than of
-    /// whatever the normalizer happened to produce.
-    ///
-    /// Driven at that measured magnitude so the test fails if the cap is ever
-    /// removed or raised above it by accident.
+    /// Both halves matter and the second is the one that was broken: clamping
+    /// inside `update` tied `datetime` (143,035) with `aead_encrypt` (461) at
+    /// 5,000 apiece, and a live turn then answered "there's no clock tool
+    /// available" because the seats went in arbitrary order. So this asserts the
+    /// display is bounded AND that the underlying beliefs still rank.
     #[test]
-    fn a_huge_sustained_score_saturates_at_the_cap() {
+    fn the_report_is_bounded_but_the_belief_keeps_its_margin() {
         let mut b = ToolBelief::with_beta(2, 0.4);
-        for step in 0..200 {
-            b.update(&[82_850.0, 0.0]);
-            assert!(
-                b.scores()[0] <= ToolBelief::CAP,
-                "step {step}: belief {} passed the cap {}",
-                b.scores()[0],
-                ToolBelief::CAP,
-            );
+        // Two slots that would both saturate a display bound, an order of
+        // magnitude apart in evidence.
+        for _ in 0..200 {
+            b.update(&[82_850.0, 8_285.0]);
         }
-        assert_eq!(b.scores()[0], ToolBelief::CAP);
-        // Saturating the leader must not lift the followers: the leak still
-        // scales with the leader's mass, so the rest stay at zero.
-        assert_eq!(b.scores()[1], 0.0);
+        let (strong, weak) = (b.scores()[0], b.scores()[1]);
+
+        assert!(
+            strong > ToolBelief::REPORT_CAP && weak > ToolBelief::REPORT_CAP,
+            "both should exceed the report cap for this test to mean anything: \
+             {strong} / {weak}"
+        );
+        assert!(
+            strong > weak * 2.0,
+            "the accumulator must keep the margin the selector ranks on: \
+             {strong} vs {weak}"
+        );
+        assert_eq!(ToolBelief::for_display(strong), ToolBelief::REPORT_CAP);
+        assert_eq!(ToolBelief::for_display(weak), ToolBelief::REPORT_CAP);
+        // And a score inside the band is reported untouched.
+        assert_eq!(ToolBelief::for_display(802.2), 802.2);
     }
 
     #[test]

@@ -30,7 +30,7 @@
 //! is no compression tier between "raw turn" and "projected context", so context
 //! growth is bounded only by projection and selection.
 //!
-//! Per `docs/immutable_summary_forest.md`, each timeline's summary structure
+//! Per `docs/archived/immutable_summary_forest.md`, each timeline's summary structure
 //! is an append-only **Merkle Mountain Range**: a node's parent is fixed by
 //! arrival order and position, never by rebalancing, so once a node exists its
 //! children — and therefore its content and Q-fingerprint — never change.

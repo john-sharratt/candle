@@ -3,7 +3,7 @@
 // =============================================================================
 //
 // The migration primitive behind kv_pack (evict / gather) and kv_unpack
-// (load / scatter) — see docs/kv_tier_migration.md §9.
+// (load / scatter) — see docs/archived/kv_tier_migration.md §9.
 //
 // One CUDA block per migration-plan record. Each block copies byte_lens[r]
 // bytes from src_ptrs[r] to dst_ptrs[r]. The plan is built host-side: the

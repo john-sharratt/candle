@@ -1,6 +1,6 @@
 //! `substrate_inspect` — a read-only inspector for a substrate redo log.
 //!
-//! The substrate persistence layer (`docs/kv_tier_migration.md`) stores a
+//! The substrate persistence layer (`docs/archived/kv_tier_migration.md`) stores a
 //! conversation workspace as an append-only log of content-addressed
 //! records under `<workspace>/.substrate/substrate.log`. This tool opens
 //! such a log read-only and renders it from several angles.
@@ -66,6 +66,7 @@ use candle_conversation::substrate::{StreamRuntime, Substrate};
 use candle_conversation::summary_tree::TurnKind;
 use candle_conversation::turn_layout::TurnSegment;
 use candle_nn::kv_cache::KvFormat;
+use serde_json::json;
 use tokenizers::Tokenizer;
 
 #[derive(Parser)]
@@ -536,6 +537,18 @@ enum Cmd {
     Projections {
         /// One turn stream (decimal or `0x`-hex). Omit to dump every decoded turn.
         stream_id: Option<String>,
+        /// Emit ONE JSON object PER EVENT (JSONL) instead of the indented
+        /// human view.
+        ///
+        /// The human view spans many lines per event with no delimiter a text
+        /// tool can key on, so `awk`/`grep` pipelines over it infer record
+        /// boundaries and get them wrong — two independent passes over the same
+        /// dump disagreed by 5.8x on one field, and a section signature was
+        /// counted under two mutually exclusive buckets at once. One record per
+        /// line removes the guess: every event carries its own timeline, turn,
+        /// event index, buckets and per-collection selection.
+        #[arg(long)]
+        jsonl: bool,
     },
     /// Score one turn's stored wide-Q signature against the tag-scoped tool
     /// gallery, offline (no model / live gather). Isolates whether the belief
@@ -1027,9 +1040,9 @@ fn main() -> Result<()> {
             chunks(&mut log, parse_stream_id(&stream_id)?, preview)?
         }
         Cmd::Tokens { stream_id, ids } => tokens(&mut log, parse_stream_id(&stream_id)?, ids)?,
-        Cmd::Projections { stream_id } => {
+        Cmd::Projections { stream_id, jsonl } => {
             let only = stream_id.as_deref().map(parse_stream_id).transpose()?;
-            projections(&mut log, only)?
+            projections(&mut log, only, jsonl)?
         }
         Cmd::Meta => meta(&mut log)?,
         Cmd::Recover => recover_view(&mut log)?,
@@ -1383,7 +1396,7 @@ fn scan_bench(
 /// each turn we print every `ProjectionEvent` (one per reprojection span): the
 /// decode throughput, the token buckets, the system-prompt sections provenance
 /// selected vs skipped, and the conversation turns it pulled into the window.
-fn projections(log: &mut LogFile, only: Option<StreamId>) -> Result<()> {
+fn projections(log: &mut LogFile, only: Option<StreamId>, jsonl: bool) -> Result<()> {
     let substrate = build_substrate(log)?;
     let first_seen = first_seen_offsets(log)?;
     let mut turns: Vec<(StreamId, u64, u32)> = substrate
@@ -1397,14 +1410,18 @@ fn projections(log: &mut LogFile, only: Option<StreamId>) -> Result<()> {
     turns.sort_by_key(|(id, _, _)| first_seen.get(id).copied().unwrap_or(u64::MAX));
 
     if turns.is_empty() {
-        println!(
-            "(no turn streams{})",
-            if only.is_some() {
-                " matching that id"
-            } else {
-                ""
-            }
-        );
+        // In JSONL mode every line must parse, so a prose note would corrupt the
+        // stream — an empty result is zero lines.
+        if !jsonl {
+            println!(
+                "(no turn streams{})",
+                if only.is_some() {
+                    " matching that id"
+                } else {
+                    ""
+                }
+            );
+        }
         return Ok(());
     }
 
@@ -1421,6 +1438,12 @@ fn projections(log: &mut LogFile, only: Option<StreamId>) -> Result<()> {
             continue;
         }
         any = true;
+        if jsonl {
+            for (i, ev) in events.iter().enumerate() {
+                print_projection_event_json(timeline, idx, id, i, ev);
+            }
+            continue;
+        }
         println!(
             "\n══ turn {timeline}#{idx}  (stream {})  — {} projection event(s)",
             stream_hex(id.0),
@@ -1430,13 +1453,124 @@ fn projections(log: &mut LogFile, only: Option<StreamId>) -> Result<()> {
             print_projection_event(i, ev);
         }
     }
-    if !any {
+    if !any && !jsonl {
         println!(
             "(no projection events recorded — these are written per decoded dialogue turn; \
              section / utility ingests don't emit them)"
         );
     }
     Ok(())
+}
+
+/// One `ProjectionEvent` as a single JSON object on a single line.
+///
+/// The indented human view above spans many lines per event and carries no
+/// delimiter a text tool can key on, so pipelines over it have to INFER record
+/// boundaries. That inference is where the analysis goes wrong: two independent
+/// passes over one dump disagreed 5.8x on the same field, and one section
+/// signature was counted under both "has a tools collection" and "has none" —
+/// mutually exclusive buckets — because state leaked across records. Emitting
+/// the record structure directly removes the guess: each line carries its own
+/// timeline, turn, event index, buckets, and per-collection selection, so
+/// counting events is `wc -l` and grouping them is a field lookup.
+///
+/// Scores are the RAW belief, unbounded — a projection tile's 5,000 display cap
+/// (`ToolBelief::REPORT_CAP`) is a reporting bound and is deliberately not
+/// applied here, because this view is where a lock-on's real margin is read.
+fn print_projection_event_json(
+    timeline: u64,
+    turn: u32,
+    stream: StreamId,
+    i: usize,
+    ev: &ProjectionEvent,
+) {
+    let buckets: serde_json::Map<String, serde_json::Value> = ev
+        .buckets
+        .iter()
+        .map(|b| (b.label.clone(), json!(b.tokens)))
+        .collect();
+
+    let mut glue = Vec::new();
+    let mut sections = Vec::new();
+    let mut collections = Vec::new();
+    for item in &ev.selection.system {
+        match item {
+            SystemItem::Glue { name, tokens, .. } => {
+                glue.push(json!({ "name": name, "tokens": tokens }))
+            }
+            SystemItem::Section { name, tokens } => {
+                sections.push(json!({ "name": name, "tokens": tokens }))
+            }
+            SystemItem::Collection {
+                name,
+                sections: members,
+                ..
+            } => {
+                let rows: Vec<serde_json::Value> = members
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "name": s.name,
+                            "score": s.score,
+                            "selected": s.selected,
+                            "qualified": s.qualified,
+                            "tokens": s.tokens,
+                        })
+                    })
+                    .collect();
+                collections.push(json!({
+                    "name": name,
+                    "selected": members.iter().filter(|s| s.selected).count(),
+                    "total": members.len(),
+                    "sections": rows,
+                }));
+            }
+        }
+    }
+
+    let turns: Vec<serde_json::Value> = ev
+        .selection
+        .turns
+        .iter()
+        .map(|t| {
+            json!({
+                "layer": t.layer,
+                "group": t.group,
+                "index": t.index,
+                "role": t.role.to_string(),
+                "kind": match t.kind {
+                    TurnKind::Normal => "turn",
+                    TurnKind::SummaryOfTurns => "summary_of_turns",
+                    TurnKind::SummaryOfSummaries => "summary_of_summaries",
+                },
+                "tokens": t.tokens,
+                "score": t.score,
+                "selected": t.selected,
+                "reason": t.reason.map(|r| format!("{r:?}")),
+            })
+        })
+        .collect();
+
+    // `timeline` as a STRING: it is a u64 id, and a JSON number loses precision
+    // past 2^53 in any consumer that parses to a double (jq, JavaScript).
+    println!(
+        "{}",
+        json!({
+            "timeline": timeline.to_string(),
+            "turn": turn,
+            "stream": stream_hex(stream.0),
+            "event": i,
+            "start_token": ev.start_token,
+            "seconds": ev.seconds,
+            "materialized_tokens": ev.materialized_tokens,
+            "substrate_tokens": ev.substrate_tokens,
+            "buckets": buckets,
+            "glue": glue,
+            "sections": sections,
+            "collections": collections,
+            "turns": turns,
+        })
+    );
 }
 
 /// One `ProjectionEvent` — a projection selected at a POINT in the decode
@@ -4355,7 +4489,10 @@ fn couplings(segs: &[(u64, PathBuf, bool)], tag: Option<&str>, all: bool) -> Res
         let Some(StreamDecl::Turn(t)) = &entry.decl else {
             continue;
         };
-        turns_of.entry(t.timeline_id).or_default().insert(t.turn_index);
+        turns_of
+            .entry(t.timeline_id)
+            .or_default()
+            .insert(t.turn_index);
         let e = tags_of.entry(t.timeline_id).or_default();
         if e.is_empty() {
             *e = t.tags.clone();
@@ -4393,7 +4530,11 @@ fn couplings(segs: &[(u64, PathBuf, bool)], tag: Option<&str>, all: bool) -> Res
                 "  tl={tl}  turns={:?}  from_turn={:?}{}  tags={:?}",
                 turns.iter().copied().collect::<Vec<_>>(),
                 from.iter().copied().collect::<Vec<_>>(),
-                if tail_ok { "" } else { "  ← LAST TURN IS COUPLED" },
+                if tail_ok {
+                    ""
+                } else {
+                    "  ← LAST TURN IS COUPLED"
+                },
                 tags
             );
         }

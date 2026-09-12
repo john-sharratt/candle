@@ -76,7 +76,7 @@ central mechanisms:
   by pointwise mutual information. Given the experts active at layer `L`, it
   predicts which experts layer `L+1` will need and starts their DMA before `L`
   finishes computing — converting cold misses into overlapped loads. Measured
-  ~69% hit rate on Qwen3-30B-A3B; see `docs/markov_expert_prediction_eval.md`
+  ~69% hit rate on Qwen3-30B-A3B; see `docs/archived/markov_expert_prediction_eval.md`
   for the full offline evaluation (LOOCV promotion/eviction study) and
   `eval.rs` for the harness.
 - **Wave-batched grouped GEMM** (`pipeline.rs`, `compute.rs`,
@@ -128,7 +128,7 @@ long-context generator's `tokenizers` dependency).
 
 ## Related docs
 
-- `docs/markov_expert_prediction_eval.md` — the Markov Wave paper: promotion/eviction study and final design.
+- `docs/archived/markov_expert_prediction_eval.md` — the Markov Wave paper: promotion/eviction study and final design.
 - `docs/unified_wave_inference_engine.md` — the original decode/prefill/glue wave design.
 - `docs/continuous_fair_waves.md` — supersedes the above: decode and prefill share the layer traversal instead of time-slicing it.
 - `docs/gpu_native_moe_dispatch.md` — GPU-native MoE routing dispatch (removes the per-layer GPU→CPU readback).

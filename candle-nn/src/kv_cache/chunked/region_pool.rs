@@ -2,7 +2,7 @@
 //!
 //! One VA span per device, claimed once and never given back, covering
 //! **everything the engine owns except the dense weights**
-//! (`docs/elastic_vram_partition.md` §2):
+//! (`docs/archived/elastic_vram_partition.md` §2):
 //!
 //! ```text
 //!            while a forward runs:                between forwards:
@@ -1613,7 +1613,7 @@ fn try_claim(pool: &mut RegionPool, stream: &std::sync::Arc<CudaStream>) -> Resu
 ///
 /// # Anchored at the arena frontier `A`
 ///
-/// `docs/elastic_vram_partition.md` §7 phase 2. This leaves the whole remainder
+/// `docs/archived/elastic_vram_partition.md` §7 phase 2. This leaves the whole remainder
 /// in one contiguous run adjacent to the weight side, so the boundary can be
 /// moved to `A + T` in the same operation rather than through a control loop
 /// hunting for bytes stranded mid-span:

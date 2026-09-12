@@ -26,7 +26,7 @@
 //! # The architecture
 //!
 //! 284B total / 13B active, 43 layers, 256 routed experts (6 active) + 1 shared,
-//! MXFP4 expert weights. See `docs/deepseek_v4_flash.md` for the full design.
+//! MXFP4 expert weights. See `docs/deepseek/deepseek_v4_flash.md` for the full design.
 //!
 //! * **Latent single-KV attention** — 64 query heads read one shared 512-dim KV
 //!   vector per token (K ≡ V), with learned per-head sinks and output de-rotation

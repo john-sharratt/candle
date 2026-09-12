@@ -1356,7 +1356,7 @@ impl LoadInputs<'_, NoExperts, ResidentLayers> {
 /// # Why the cache arrives as a callback
 ///
 /// The expert cache's capacity is `(span − reserve) / slot_bytes`, and the span
-/// is *measured*, not declared (`docs/elastic_vram_partition.md` §4). That
+/// is *measured*, not declared (`docs/archived/elastic_vram_partition.md` §4). That
 /// measurement is only meaningful once every dense tensor is resident: taken
 /// before, it reads the model's own weights as free ground and hands the expert
 /// side room the KV side is about to need. Qwen3-MoE hit exactly this and its

@@ -801,8 +801,14 @@ mod tests {
         // gains quotes and the scalar question does not arise.
         let fb = ToolCallEnvelope::qwen35();
         let out = fb.render("file_read", &[("path", "a/mod.rs"), ("start_line", "1")]);
-        assert!(out.contains("<parameter=path>\na/mod.rs</parameter>"), "{out}");
-        assert!(out.contains("<parameter=start_line>\n1</parameter>"), "{out}");
+        assert!(
+            out.contains("<parameter=path>\na/mod.rs</parameter>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("<parameter=start_line>\n1</parameter>"),
+            "{out}"
+        );
         assert!(!out.contains('"'), "raw values carry no quotes: {out}");
     }
 

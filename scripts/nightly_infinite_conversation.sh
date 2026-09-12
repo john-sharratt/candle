@@ -2,7 +2,7 @@
 #
 # Nightly CI script — runs the Tier 3 cruise harness for the infinite-
 # conversation system against a persistent workspace so depth
-# accumulates across runs.  See docs/infinite_conversations.md §10.4
+# accumulates across runs.  See docs/archived/infinite_conversations.md §10.4
 # and §11.
 #
 # Schedules:

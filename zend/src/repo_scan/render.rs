@@ -583,6 +583,9 @@ fn x() {}
         let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
         let units = build_units(&m, d.path());
         let ctx = ToolContext::with_workspace(d.path());
-        assert_eq!(render_chain(&ctx, &units[0], &env()), render_chain(&ctx, &units[0], &env()));
+        assert_eq!(
+            render_chain(&ctx, &units[0], &env()),
+            render_chain(&ctx, &units[0], &env())
+        );
     }
 }

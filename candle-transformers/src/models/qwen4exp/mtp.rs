@@ -103,7 +103,7 @@ pub struct MtpHead {
 /// These exist apart from [`MtpHead`] because of **when** they must be read.
 /// The engine's load order is load-bearing: every dense tensor resident first,
 /// then the expert cache sized from a live measurement of what they left behind
-/// (`docs/elastic_vram_partition.md` §4). The head's dense side is ~30 MB —
+/// (`docs/archived/elastic_vram_partition.md` §4). The head's dense side is ~30 MB —
 /// `hc_mixer_down` and `hc_mixer_up` are `[320, 10240]` and `[10240, 320]` F32,
 /// 13.1 MB each, plus `eh_proj` and three norms, each with a transient F32
 /// dequant buffer on top — so reading it after that measurement takes ground

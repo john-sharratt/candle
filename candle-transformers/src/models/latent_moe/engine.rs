@@ -187,7 +187,7 @@ impl Engine {
         // through one authority. The reservation (`region_pool`) sizes itself
         // from `governor.usable()` at first touch — which happens BELOW, after
         // every dense tensor is resident, so the span takes exactly what is
-        // genuinely left (`docs/elastic_vram_partition.md` §4).
+        // genuinely left (`docs/archived/elastic_vram_partition.md` §4).
         let total_experts = moe_layers.len() * n_expert;
         let gb = |b: usize| b as f64 / (1usize << 30) as f64;
         #[cfg(feature = "cuda")]
@@ -374,7 +374,7 @@ impl Engine {
         // is genuinely left and the reservation (created lazily by the first
         // `span_end` call) takes it. The weight zone opens at the span's right
         // edge; its capacity in slots IS the resident-expert count — no byte
-        // budget, no headroom constant (`docs/elastic_vram_partition.md` §4,
+        // budget, no headroom constant (`docs/archived/elastic_vram_partition.md` §4,
         // `docs/expert_cache_design.md`).
         #[cfg(feature = "cuda")]
         let zone = if let Device::Cuda(cuda_dev) = device {

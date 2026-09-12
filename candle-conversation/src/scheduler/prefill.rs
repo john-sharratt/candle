@@ -475,7 +475,7 @@ impl Scheduler {
     ///
     /// # The seal's second copy is *not* charged here, and that was tried
     ///
-    /// `docs/elastic_vram_partition.md` §7 phase 1 asks admit to account for
+    /// `docs/archived/elastic_vram_partition.md` §7 phase 1 asks admit to account for
     /// "persistence's quantize destinations", and the obvious reading — a block
     /// occupies its active slot *and* its sealed destination while the
     /// compressor copies between them, so charge both — was built and reverted.
@@ -3195,16 +3195,16 @@ mod think_prefill_slice_tests {
         let grid = [9u32, OPEN, 9, 9, OPEN, 3, CLOSE, 4];
         let assistant_content_start = 4;
         assert!(
-            !prefill_leaves_think_open(
-                grid[assistant_content_start..].iter(),
-                OPEN,
-                Some(CLOSE)
-            ),
+            !prefill_leaves_think_open(grid[assistant_content_start..].iter(), OPEN, Some(CLOSE)),
             "the assistant lead closed its block; quoted user text must not override that"
         );
         // What the slice prevents: handed the user half, the very same scan does
         // arm — so the boundary is doing the work, not the scan.
-        assert!(prefill_leaves_think_open(grid[..2].iter(), OPEN, Some(CLOSE)));
+        assert!(prefill_leaves_think_open(
+            grid[..2].iter(),
+            OPEN,
+            Some(CLOSE)
+        ));
     }
 
     /// A deep opener in the assistant lead still arms. The fixed 5-token tail

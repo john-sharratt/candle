@@ -35,7 +35,7 @@ wave path (regression gate), confirming the additions are purely additive.
 
 ## What was asked
 
-Execute `docs/deepseek_turn_seal_persistence.md` end-to-end: at each DeepSeek turn seal,
+Execute `docs/deepseek/deepseek_turn_seal_persistence.md` end-to-end: at each DeepSeek turn seal,
 produce four artifacts — (A) a transient raw-window-ring snapshot, (B) closed partial
 HCA/CSA compressor groups, (C) the durable native corpus, (D) Indexer `sign(Q)` wide-Q
 signatures — and the matching resume path, with the doc's staged green checkpoints.

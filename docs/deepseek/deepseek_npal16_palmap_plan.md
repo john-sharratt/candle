@@ -272,10 +272,10 @@ compression ratio vs identity-16 and vs the 8-band 2.12×/2.7× baselines.
 
 ## Phase 6 — docs
 
-- Update `docs/deepseek_batched_paged_attention_plan.md`: "4 palette sub-bands
+- Update `docs/deepseek/deepseek_batched_paged_attention_plan.md`: "4 palette sub-bands
   (128-d)" → "16 sub-bands (32-d)"; "4 palettes × 4 k-steps" → "16 × 1 k-step";
   the `(palette<<6)|rank` note (SUB≤64 now satisfied); pal_map 2-bit → 4-bit.
-- Update `docs/deepseek_v4_flash.md` and the memory notes
+- Update `docs/deepseek/deepseek_v4_flash.md` and the memory notes
   (`deepseek-asymmetric-corpus-compression`, a new npal16-palmap note).
 
 ---

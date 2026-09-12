@@ -3640,7 +3640,7 @@ impl Sequence {
     }
 
     /// Fork onto a **specific** timeline rather than a freshly minted one —
-    /// the daemon resume path (§16.12 of `docs/kv_tier_migration.md`).
+    /// the daemon resume path (§16.12 of `docs/archived/kv_tier_migration.md`).
     ///
     /// `timeline` is registered against the parent's `(layer, group)`
     /// (idempotent). If the workspace substrate already holds turns under

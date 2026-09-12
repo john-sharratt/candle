@@ -561,8 +561,8 @@ pattern); `Conversation::enqueue_snapshot` (`resolver.rs:2675` pattern);
 seal-site producer (`scheduler/mod.rs:6390-6408`); persistence-thread gather
 (`thread.rs:1085-1121`); reload resolve (`resolver.rs:1990-2007`); device
 restore (`transfer.rs:138` pattern); tombstone gates; inspector histogram +
-skip lists + `snapshots` view; doc updates (`docs/segmented_substrate_log.md`,
-`docs/kv_tier_migration.md`).
+skip lists + `snapshots` view; doc updates (`docs/archived/segmented_substrate_log.md`,
+`docs/archived/kv_tier_migration.md`).
 
 ---
 

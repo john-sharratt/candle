@@ -183,7 +183,7 @@ fn append_pooled(
 }
 
 /// One layer's resident sliding-window ring, captured for turn-seal
-/// persistence (Artifact A of docs/deepseek_turn_seal_persistence.md).
+/// persistence (Artifact A of docs/deepseek/deepseek_turn_seal_persistence.md).
 ///
 /// **No absolute position is stored.** The window is always the contiguous tail
 /// of the turn, so on resume it is placed at `decode_pos − resident_len` — a
@@ -429,7 +429,7 @@ impl BatchedEngine {
         &self.engine
     }
 
-    /// Turn seal — **Artifact B** (docs/deepseek_turn_seal_persistence.md):
+    /// Turn seal — **Artifact B** (docs/deepseek/deepseek_turn_seal_persistence.md):
     /// close every compression layer's trailing partial `comp`/`icomp` groups
     /// into the gallery for `seq`. After this the live sliding-window tail is
     /// fully represented in the compressed corpus, so the turn can be persisted
@@ -3573,7 +3573,7 @@ mod tests {
     /// **Reproducibility gate.** Three independent greedy decodes of one prompt
     /// must produce identical token streams — greedy argmax from a fresh session
     /// is a pure function of the weights. DeepSeek-V4-Flash currently FAILS this
-    /// (see `docs/deepseek_decode_reproducibility.md`); the assertion is here so
+    /// (see `docs/deepseek/deepseek_decode_reproducibility.md`); the assertion is here so
     /// the day it passes is recorded rather than guessed at.
     ///
     /// Uses the shared `decode_reproducibility` helper, the same one the Qwen3-MoE
@@ -3627,7 +3627,7 @@ mod tests {
         }
         assert!(
             agree,
-            "decode is not reproducible run-to-run; see docs/deepseek_decode_reproducibility.md"
+            "decode is not reproducible run-to-run; see docs/deepseek/deepseek_decode_reproducibility.md"
         );
         Ok(())
     }
@@ -3697,7 +3697,7 @@ mod tests {
         assert_eq!(
             dirty_prefill, 0,
             "prefill is not bitwise repeatable: {dirty_prefill}/5 re-prefills of the same \
-             prompt diverged; see docs/deepseek_decode_reproducibility.md"
+             prompt diverged; see docs/deepseek/deepseek_decode_reproducibility.md"
         );
 
         assert_eq!(
@@ -3705,7 +3705,7 @@ mod tests {
             0,
             "a replayed decode step from identical KV state is not bitwise repeatable: \
              {dirty_repeats}/{} replays diverged; \
-             see docs/deepseek_decode_reproducibility.md",
+             see docs/deepseek/deepseek_decode_reproducibility.md",
             REPEATS - 1
         );
         Ok(())

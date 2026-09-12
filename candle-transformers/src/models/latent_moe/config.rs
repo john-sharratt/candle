@@ -4,7 +4,7 @@
 //! particular model's, and so is every name they are stored under on disk —
 //! both come from the [`Arch`] the config carries. See
 //! [`models::deepseek4`](crate::models::deepseek4) for the V4-Flash values and
-//! `docs/deepseek_v4_flash.md` for the design.
+//! `docs/deepseek/deepseek_v4_flash.md` for the design.
 
 use super::arch::Arch;
 

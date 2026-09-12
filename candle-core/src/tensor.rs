@@ -3387,8 +3387,7 @@ impl<'w> LiveTensor<'w> {
         // `None` ticket: an owned allocation from the pool, deliberately NOT the
         // source's arena — inheriting a wave ticket here would put the copy back
         // on the span it is being taken off.
-        let mut storage =
-            unsafe { self.device().alloc_uninit_from(shape, self.dtype(), None)? };
+        let mut storage = unsafe { self.device().alloc_uninit_from(shape, self.dtype(), None)? };
         self.storage()
             .copy_strided_src(&mut storage, 0, self.layout())?;
         Ok(from_storage(

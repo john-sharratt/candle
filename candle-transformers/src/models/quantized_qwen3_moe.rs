@@ -866,7 +866,7 @@ enum FeedForward {
 /// A layer's FFN before the expert cache exists.
 ///
 /// The load order is dense-weights-then-span-then-experts (see
-/// `docs/elastic_vram_partition.md` §4): the reservation is sized from a live
+/// `docs/archived/elastic_vram_partition.md` §4): the reservation is sized from a live
 /// measurement taken once every dense tensor is resident, and the expert cache
 /// is filled into the span that measurement produced. A MoE layer's
 /// `SparseMoeBlock` holds an `Arc<ExpertCache>`, so it cannot be built during
@@ -2448,7 +2448,7 @@ mod tests {
 
     /// **Does Qwen3-MoE decode reproduce itself, run to run?**
     ///
-    /// DeepSeek-V4-Flash does not (`docs/deepseek_decode_reproducibility.md`).
+    /// DeepSeek-V4-Flash does not (`docs/deepseek/deepseek_decode_reproducibility.md`).
     /// This test answers the question that result cannot: is the fault in
     /// shared infrastructure, or in DeepSeek-specific code?
     ///

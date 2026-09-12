@@ -1,4 +1,4 @@
-//! The async summariser thread (`docs/immutable_summary_forest.md`).
+//! The async summariser thread (`docs/archived/immutable_summary_forest.md`).
 //!
 //! Spawned alongside the persistence thread at engine start.  Mirrors its
 //! trigger/tick/shutdown idiom.  Builds the per-timeline **append-only
@@ -338,7 +338,7 @@ pub fn run_pass(
 ///    `SummaryOfSummaries` over them via additional probes.
 /// 4. Persist every change as `TreeMetadata` redo-log records.  Nodes are
 ///    immutable once written — no root pointer, no rotations, no dirty bit
-///    (`docs/immutable_summary_forest.md`).
+///    (`docs/archived/immutable_summary_forest.md`).
 /// `raw_tail` is how many of the timeline's newest Normal turns stay verbatim
 /// — production passes [`RAW_TAIL_TURNS`]; tests that exercise settledness and
 /// batching pass `0` so their small fixtures stay legible.
@@ -609,7 +609,7 @@ fn build_sos(
 
 /// Build at most one missing internal node toward the canonical ternary shape,
 /// clearing the reconcile hint once the forest is whole. One node per pass keeps
-/// reconciliation low-priority. See `docs/immutable_summary_forest.md`.
+/// reconciliation low-priority. See `docs/archived/immutable_summary_forest.md`.
 fn reconcile_pass(
     conversation: &Conversation,
     runner: &dyn ProbeRunner,

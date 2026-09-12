@@ -20,6 +20,7 @@ use candle_conversation::projection::{
     self, Builder, GroupSchema, Reserved, SectionId, SelectionRule, SystemItem, SystemPromptItem,
     SystemPromptSchema, TimelineId, TurnIndex,
 };
+use candle_conversation::provenance::ToolBelief;
 use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
@@ -906,7 +907,7 @@ impl InferenceState {
 
         // Reclaim is normally fully background: the segmented log's
         // persistence-thread maintenance pass drops / compacts / combines
-        // segments incrementally (`docs/segmented_substrate_log.md` §6), so a
+        // segments incrementally (`docs/archived/segmented_substrate_log.md` §6), so a
         // startup pays no whole-store rewrite. `--compact-substrate` forces the
         // eager path instead — a whole-store rewrite here, after the reload (so
         // the live set is known) and before serving. It always runs when the
@@ -4018,7 +4019,14 @@ impl ZendSession {
             }
         }
 
+        // Rank on the RAW belief, then bound what is rendered. Order first is
+        // load-bearing: a lock-on rides far above the 0-1000 normalized band, so
+        // clamping before the sort ties the leaders and the readout's ordering —
+        // the thing the margin is actually read for — becomes arbitrary.
         tiles.sort_by(|a, b| b.score.total_cmp(&a.score));
+        for tile in &mut tiles {
+            tile.score = ToolBelief::for_display(tile.score);
+        }
 
         // Diagnostic: if `scored` is 0 while `query_tokens` > 0, the probe Q was
         // captured but didn't discriminate against the gallery (cold/partial-warm

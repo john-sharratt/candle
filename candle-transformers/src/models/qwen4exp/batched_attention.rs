@@ -22,8 +22,8 @@ use candle::{DType, LiveTensor, Result, Tensor};
 use candle_nn::kv_cache::WaveGeneration;
 
 use crate::models::batched_layer::{BatchedAttentionLayer, QkvProjection, WaveRef};
-use crate::models::quantized_matmul::QMatMul;
 use crate::models::lora::LayerLora;
+use crate::models::quantized_matmul::QMatMul;
 use crate::models::qwen35::quantized_attention::project_qkv_gated;
 use crate::models::qwen35::quantized_weights::QuantAttentionWeights;
 use crate::models::rotary_layout::RotaryLayout;

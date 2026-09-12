@@ -90,7 +90,7 @@ append-only redo log at `.substrate/substrate.log`, owned by
 `candle-conversation`'s persistence layer). Hot→warm quantizes in place via
 `quantize_sealed_in_place` when a `CompressionPolicy` is active, then does a
 format-preserving device-to-host copy; warm→hot elevates back on demand. Two
-divergences from the target design remain (see `docs/kv_tier_migration.md`):
+divergences from the target design remain (see `docs/archived/kv_tier_migration.md`):
 warm residency is pageable rather than pinned, and hot→warm currently runs on
 the primary CUDA stream rather than a dedicated overlap stream.
 
@@ -119,7 +119,7 @@ features: `cudnn` (adds cuDNN-backed ops via `candle`), `metal`, `accelerate`,
 
 ## Related docs
 
-- `docs/kv_tier_migration.md` — three-tier storage design, current build status
-- `docs/coresident_kv_metadata.md` — device-resident per-chunk head metadata
+- `docs/archived/kv_tier_migration.md` — three-tier storage design, current build status
+- `docs/archived/coresident_kv_metadata.md` — device-resident per-chunk head metadata
 - `docs/attention_provenance.md` — how the provenance scan selects which
   chunks (across all tiers) participate in a given attention step
