@@ -385,7 +385,7 @@ impl Attention {
         use candle::quantized::cuda::{
             fused_moe_gather_q8a128, grouped_qmatmul, to_dynamic, DynamicActs, DynamicTensor,
         };
-        use candle::quantized::Int8Mode;
+        use candle::quantized::{Int8Mode, SumScale};
         let (ng, olr) = (self.n_groups, self.o_lora_rank);
         let per_group = (self.n_heads / ng) * self.head_dim;
         // `per_group % 1024` is the q8a1024 byte-row gather's token-contiguity
@@ -466,7 +466,8 @@ impl Attention {
             // Scope the quantized source so it is released as soon as the gather is
             // issued, rather than being held live through the matmul as well.
             let stacked = {
-                let acts = to_dynamic(&o_chunk, Int8Mode::Performance, &dev)?;
+                // Raw Σx — a language model's block sums stay far below f16's ceiling.
+                let acts = to_dynamic(&o_chunk, Int8Mode::Performance, &dev, SumScale::Raw)?;
                 let op = match &acts {
                     DynamicActs::Int8(q) => q,
                     // `Int8Mode::Performance` was requested and every weight is

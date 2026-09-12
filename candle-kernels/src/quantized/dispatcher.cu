@@ -976,8 +976,10 @@ extern "C" int run_quantized_matmul(
     int32_t ytype,
     size_t weight_bytes,  // Weight tensor size in bytes for L2 cache decision (FP path)
     int32_t force_mode2,  // int8 dense tiling: 0 = mode-1 (Bm=16), 1 = mode-2 (Bm=32 reuse). Rust decides.
-    int32_t out_dtype     // int8 dense store width: 0 = F16, 1 = BF16, 2 = F32. FP path ignores it
+    int32_t out_dtype,    // int8 dense store width: 0 = F16, 1 = BF16, 2 = F32. FP path ignores it
                           // (there the output dtype is the activation dtype).
+    int32_t sum_norm      // q8a128 Σx convention (`SumScale::as_code()`); the int8 dense path
+                          // only — the FP kernels below read no q8a128 header.
 ) {
     // Lookup table for kernel sets: [qtype][ytype][use_tc]
     // ytype: 0=F16, 1=BF16, 2=F32
@@ -1086,7 +1088,7 @@ extern "C" int run_quantized_matmul(
         void* args[] = {
             (void*)&weights, (void*)&vy, (void*)&dst,
             (void*)&ncols_x, (void*)&nrows_x, (void*)&total_batch,
-            (void*)&y_stride, (void*)&dst_stride,
+            (void*)&y_stride, (void*)&dst_stride, (void*)&sum_norm,
         };
         cudaLaunchKernel(kfn, grid, block, args, 0, nullptr);
         return QMM_OK;
@@ -1458,7 +1460,8 @@ extern "C" void run_grouped_quantized_matmul(
     int32_t qtype,
     int32_t ytype,
     int32_t n_sub,     // int8 token-tile width / 16: 2 (Bm 32), 4 (Bm 64), 8 (Bm 128)
-    int32_t row_fast)  // grid axis order: 1 = row tiles fast (see kernel entry doc)
+    int32_t row_fast,  // grid axis order: 1 = row tiles fast (see kernel entry doc)
+    int32_t sum_norm)  // q8a128 Σx convention (`SumScale::as_code()`); ytype==3 only
 {
     int kernel_row = qtype_to_matmul_kernel_index(qtype);
     if (kernel_row < 0 || ytype < 0 || ytype > 3 || num_tiles <= 0) {
@@ -1502,13 +1505,27 @@ extern "C" void run_grouped_quantized_matmul(
     dim3 grid = row_fast ? dim3(row_tiles, num_tiles, 1) : dim3(num_tiles, row_tiles, 1);
     dim3 block(WARP_SIZE, 4, 1);  // 128 threads (4 warps × 32)
 
-    void* args[] = {
-        (void*)&weight_ptrs, (void*)&tile_expert, (void*)&tile_b_start, (void*)&tile_b_cnt,
-        (void*)&vy, (void*)&dst,
-        (void*)&ncols_x, (void*)&nrows_x, (void*)&y_stride, (void*)&dst_stride,
-        (void*)&row_fast,
-    };
-    cudaLaunchKernel(kfn, grid, block, args, 0, nullptr);
+    // The int8 grouped kernels take one argument the FP ones do not: the q8a128
+    // Σx convention. The FP globals have no q8a128 header to interpret, so their
+    // signature is unchanged and their launch must NOT name it — `args[]` is
+    // positional and matched against the kernel's own parameter list.
+    if (ytype == 3) {
+        void* args[] = {
+            (void*)&weight_ptrs, (void*)&tile_expert, (void*)&tile_b_start, (void*)&tile_b_cnt,
+            (void*)&vy, (void*)&dst,
+            (void*)&ncols_x, (void*)&nrows_x, (void*)&y_stride, (void*)&dst_stride,
+            (void*)&row_fast, (void*)&sum_norm,
+        };
+        cudaLaunchKernel(kfn, grid, block, args, 0, nullptr);
+    } else {
+        void* args[] = {
+            (void*)&weight_ptrs, (void*)&tile_expert, (void*)&tile_b_start, (void*)&tile_b_cnt,
+            (void*)&vy, (void*)&dst,
+            (void*)&ncols_x, (void*)&nrows_x, (void*)&y_stride, (void*)&dst_stride,
+            (void*)&row_fast,
+        };
+        cudaLaunchKernel(kfn, grid, block, args, 0, nullptr);
+    }
 }
 
 // =============================================================================

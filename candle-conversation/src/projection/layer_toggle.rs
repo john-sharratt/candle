@@ -3,10 +3,14 @@
 //! persisting anything. Flipping a layer off makes [`super::project::run`] skip
 //! it on the next (re)projection; a restart clears every toggle.
 //!
-//! Distinct from the boot-time `DaemonConfig::disabled_layers`, which only
-//! suppresses a layer's startup INGEST — there the layer stays fully projected.
-//! This one excludes an *already-populated* layer from the assembled context so
-//! you can A/B whether that layer is what's breaking coherence.
+//! Distinct from the boot-time `DaemonConfig::disabled_layers`, which is an
+//! OPERATOR decision covering the whole process: that flag clears
+//! [`super::schema::LayerSchema::gathered`], so the layer is not ingested, not
+//! normalization-warmed, not scored and not assembled — out of service until the
+//! daemon is relaunched without it. This toggle is a DIAGNOSTIC: flipped live,
+//! forgotten on restart, and aimed at an *already-populated, otherwise healthy*
+//! layer so you can A/B whether that layer is what's breaking coherence and then
+//! flip it straight back.
 //!
 //! Keyed by layer NAME — the stable external key, since `LayerId` is only stable
 //! within one schema build. Process-global on purpose: the toggle affects the

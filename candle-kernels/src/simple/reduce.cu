@@ -544,7 +544,11 @@ __device__ __forceinline__ void rms_load4<__nv_bfloat16>(const __nv_bfloat16* p,
 template <typename T, int BLOCK_SIZE>
 __device__ void rmsnorm_q8a128_impl(
     const T* __restrict__ x, block_q8a128* __restrict__ out,
-    const T* __restrict__ alpha, const int ncols, const float eps, float* x_cache)
+    const T* __restrict__ alpha, const int ncols, const float eps, float* x_cache,
+    // `SumScale::as_code()`: 0 stores the raw Σx, 1 stores Σx/amax. A RUNTIME
+    // argument, uniform across the grid and read by one lane per 128-tile, so it
+    // adds no kernel variant and no measurable cost.
+    const int sum_norm)
 {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
@@ -622,9 +626,13 @@ __device__ void rmsnorm_q8a128_impl(
             (int8_t)__float2int_rn(n3 * id));
         if (lane == 0) {
             half2* ds = reinterpret_cast<half2*>(obytes + q8a1024_ds_off(flat));
-            // Σx normalised by amax — see blocks.cuh.
+            // Raw Σx, or Σx/amax when the caller asked — see blocks.cuh. `s` is
+            // passed through unmultiplied on the raw arm, so those bytes are
+            // unchanged. The matmul MUST be launched with the same choice; it
+            // rides there on `Q8a128Operand::sum_scale`.
+            const float s_store = sum_norm ? (s * id * (1.f / 127.f)) : s;
             ds[0] = make_half2(__float2half_rn(amax / 127.f),
-                               __float2half_rn(s * id * (1.f / 127.f)));
+                               __float2half_rn(s_store));
         }
     }
 }
@@ -632,16 +640,16 @@ __device__ void rmsnorm_q8a128_impl(
 template <typename T>
 __device__ void rmsnorm_q8a128(
     const T* x, block_q8a128* out, const T* alpha,
-    const int ncols, const int block_size, const float eps)
+    const int ncols, const int block_size, const float eps, const int sum_norm)
 {
     extern __shared__ float shared_cache[];
     switch (block_size) {
-        case 32:   rmsnorm_q8a128_impl<T, 32>(x, out, alpha, ncols, eps, shared_cache); break;
-        case 64:   rmsnorm_q8a128_impl<T, 64>(x, out, alpha, ncols, eps, shared_cache); break;
-        case 128:  rmsnorm_q8a128_impl<T, 128>(x, out, alpha, ncols, eps, shared_cache); break;
-        case 256:  rmsnorm_q8a128_impl<T, 256>(x, out, alpha, ncols, eps, shared_cache); break;
-        case 512:  rmsnorm_q8a128_impl<T, 512>(x, out, alpha, ncols, eps, shared_cache); break;
-        default:   rmsnorm_q8a128_impl<T, 1024>(x, out, alpha, ncols, eps, shared_cache); break;
+        case 32:   rmsnorm_q8a128_impl<T, 32>(x, out, alpha, ncols, eps, shared_cache, sum_norm); break;
+        case 64:   rmsnorm_q8a128_impl<T, 64>(x, out, alpha, ncols, eps, shared_cache, sum_norm); break;
+        case 128:  rmsnorm_q8a128_impl<T, 128>(x, out, alpha, ncols, eps, shared_cache, sum_norm); break;
+        case 256:  rmsnorm_q8a128_impl<T, 256>(x, out, alpha, ncols, eps, shared_cache, sum_norm); break;
+        case 512:  rmsnorm_q8a128_impl<T, 512>(x, out, alpha, ncols, eps, shared_cache, sum_norm); break;
+        default:   rmsnorm_q8a128_impl<T, 1024>(x, out, alpha, ncols, eps, shared_cache, sum_norm); break;
     }
 }
 
@@ -1022,9 +1030,11 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
 #define RMSNORM_Q8A128_OP(TYPENAME, FN_NAME) \
   extern "C" __global__ void FN_NAME(                                          \
       const TYPENAME *src, void *out, const TYPENAME *alpha,                   \
-      const int n_cols, const int block_size, const float eps) {              \
+      const int n_cols, const int block_size, const float eps,                 \
+      const int sum_norm) {                                                    \
     rmsnorm_q8a128<TYPENAME>(                                                  \
-        src, reinterpret_cast<block_q8a128*>(out), alpha, n_cols, block_size, eps); \
+        src, reinterpret_cast<block_q8a128*>(out), alpha, n_cols, block_size,  \
+        eps, sum_norm);                                                        \
   }                                                                            \
 
 #define LAYERNORM_OP(TYPENAME, FN_NAME) \

@@ -100,6 +100,7 @@ fn cuda_mm_gemx_large_n_batch1_no_row_aliasing() -> Result<()> {
                     xs_repacked.data.len,
                     0,
                     OutDType::F16 as i32,
+                    SumScale::Raw.as_code(),
                 )
             };
             assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -615,6 +616,7 @@ fn cuda_mm_q4_k_repacked() -> Result<()> {
                 xs_repacked.data.len,
                 0, // force_mode2 (tiling only; result-invariant)
                 OutDType::F16 as i32,
+                SumScale::Raw.as_code(),
             )
         };
         assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -717,6 +719,7 @@ fn cuda_mm_q4_k_repacked_model_size() -> Result<()> {
                 xs_repacked.data.len,
                 0, // force_mode2 (tiling only; result-invariant)
                 OutDType::F16 as i32,
+                SumScale::Raw.as_code(),
             )
         };
         assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -874,6 +877,7 @@ fn cuda_mm_q6_k_repacked() -> Result<()> {
                 xs_repacked.data.len,
                 0, // force_mode2 (tiling only; result-invariant)
                 OutDType::F16 as i32,
+                SumScale::Raw.as_code(),
             )
         };
         assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -1121,6 +1125,7 @@ fn cuda_mm_q4_k_gguf_vs_dequant() -> Result<()> {
                     repacked.data.len,
                     0, // force_mode2 (tiling only; result-invariant)
                     OutDType::BF16 as i32,
+                    SumScale::Raw.as_code(),
                 )
             };
             assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -1294,6 +1299,7 @@ fn cuda_mm_q4_k_fused_qkv() -> Result<()> {
                 repacked.data.len,
                 0, // force_mode2 (tiling only; result-invariant)
                 OutDType::BF16 as i32,
+                SumScale::Raw.as_code(),
             )
         };
         assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -2723,8 +2729,23 @@ fn round_ties_even_i32(x: f32) -> i32 {
 /// Quantize f32 [rows, cols] → q8a1024 blocks and assert EVERY byte of the output
 /// (each tile's `ds[4]` f16 scale+sum and all 128 qs) against a CPU reference, for a
 /// deterministic input. This pins the exact flat-grouped byte layout + values.
+///
+/// **Run for BOTH sum conventions**, because the opt-in is a change to the stored
+/// bytes and nothing else would catch it going the wrong way: the qs run and the
+/// scale field are identical either way, so a producer that ignored the flag
+/// would differ from the oracle in exactly two bytes per 128-tile — and those two
+/// bytes are the ones a matmul silently reinterprets. [`SumScale::Raw`] must also
+/// reproduce the pre-flag bytes exactly, which is what makes the default safe for
+/// every model whose thresholds were derived before this existed.
 #[test]
 fn q8a128_quantize_raw_bytes() -> Result<()> {
+    for sum_scale in [SumScale::Raw, SumScale::ByAmax] {
+        q8a128_quantize_raw_bytes_for(sum_scale)?;
+    }
+    Ok(())
+}
+
+fn q8a128_quantize_raw_bytes_for(sum_scale: SumScale) -> Result<()> {
     use half::f16;
     let dev = CudaDevice::new(0)?;
     let rows = 3usize;
@@ -2737,8 +2758,12 @@ fn q8a128_quantize_raw_bytes() -> Result<()> {
     let f32_dev = dev.memcpy_stod(&act)?;
     let stream = dev.cuda_stream();
     let (ptr, _g) = f32_dev.device_ptr(&stream);
-    let blocks = quantize_acts_q8a128(ptr, 2 /* F32 */, rows, cols, &dev, Backing::Owned)?
-        .into_owned_data()?;
+    let op = quantize_acts_q8a128(ptr, 2 /* F32 */, rows, cols, &dev, Backing::Owned, sum_scale)?;
+    assert_eq!(
+        op.sum_scale, sum_scale,
+        "the operand must report the convention its bytes were written in"
+    );
+    let blocks = op.into_owned_data()?;
     dev.synchronize()?;
     let raw: Vec<u8> = dev.memcpy_dtov(&blocks.slice(..))?;
 
@@ -2764,13 +2789,16 @@ fn q8a128_quantize_raw_bytes() -> Result<()> {
             let amax = vals.iter().fold(0f32, |m, &x| m.max(x.abs()));
             let sum: f32 = vals.iter().sum();
             let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
-            // The single {scale, sum} lives at ds[0] of the tile's meta slot. The
-            // sum field is Σx **normalised by amax** — the matmul rebuilds Σx as
-            // `ds.y · ds.x · 127`, and storing it raw overflows f16 on any
-            // activation whose block sums pass 65504 (blocks.cuh).
+            // The single {scale, sum} lives at ds[0] of the tile's meta slot.
+            // `Raw` stores Σx as it is; `ByAmax` stores Σx/amax, which the matmul
+            // rebuilds as `ds.y · ds.x · 127` — needed because a raw Σx overflows
+            // f16 on any activation whose block sums pass 65504 (blocks.cuh).
             let ds_b = ds_off(flat);
             let exp_scale = f16::from_f32(amax / 127.0);
-            let exp_sum = f16::from_f32(sum * id / 127.0);
+            let exp_sum = match sum_scale {
+                SumScale::Raw => f16::from_f32(sum),
+                SumScale::ByAmax => f16::from_f32(sum * id / 127.0),
+            };
             let got_scale = f16::from_le_bytes([raw[ds_b], raw[ds_b + 1]]);
             let got_sum = f16::from_le_bytes([raw[ds_b + 2], raw[ds_b + 3]]);
             assert_eq!(
@@ -2778,7 +2806,11 @@ fn q8a128_quantize_raw_bytes() -> Result<()> {
                 exp_scale.to_bits(),
                 "blk({r},{t}) scale"
             );
-            assert_eq!(got_sum.to_bits(), exp_sum.to_bits(), "blk({r},{t}) sum");
+            assert_eq!(
+                got_sum.to_bits(),
+                exp_sum.to_bits(),
+                "blk({r},{t}) sum under {sum_scale:?}"
+            );
             // qs: the tile's 128 int8, all quantized with the per-128 id.
             let qs_b = qs_off(flat);
             for (i, &v) in vals.iter().enumerate() {
@@ -2789,7 +2821,7 @@ fn q8a128_quantize_raw_bytes() -> Result<()> {
             checked += 1;
         }
     }
-    println!("q8a128 raw-byte quantize: {checked} per-128 tiles verified byte-exact");
+    println!("q8a128 raw-byte quantize ({sum_scale:?}): {checked} per-128 tiles verified byte-exact");
     Ok(())
 }
 
@@ -2812,7 +2844,8 @@ fn q8a128_dequant_exact() -> Result<()> {
     let stream = dev.cuda_stream();
     let (ptr, _g) = f32_dev.device_ptr(&stream);
     let blocks =
-        quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
+        quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+            .into_owned_data()?;
     let deq = dequantize_q8a128(&blocks, rows, cols, &dev)?;
     dev.synchronize()?;
 
@@ -2878,7 +2911,8 @@ fn q8a128_edge_cases() -> Result<()> {
     let stream = dev.cuda_stream();
     let (ptr, _g) = f32_dev.device_ptr(&stream);
     let blocks =
-        quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
+        quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+            .into_owned_data()?;
     dev.synchronize()?;
     let raw: Vec<u8> = dev.memcpy_dtov(&blocks.slice(..))?;
 
@@ -2895,7 +2929,7 @@ fn q8a128_edge_cases() -> Result<()> {
     }
 
     // Tile 1 — amax is the spike, so scale = 100/127 and Σx = 100 + 32×2 + Σ(i−16)
-    // = 148, stored normalised as 148/100.
+    // = 148, stored raw because that is the mode this producer was asked for.
     assert_eq!(
         scale_at(1040).to_bits(),
         f16::from_f32(100.0 / 127.0).to_bits(),
@@ -2903,8 +2937,43 @@ fn q8a128_edge_cases() -> Result<()> {
     );
     assert_eq!(
         sum_at(1040).to_bits(),
+        f16::from_f32(148.0).to_bits(),
+        "mixed tile sum, raw",
+    );
+
+    // The same tile under [`SumScale::ByAmax`] — the opt-in that divides the sum
+    // by the tile's amax so it cannot leave f16's range (see
+    // `int8_matmul_survives_block_sums_past_f16_range`). Asserted here beside the
+    // raw form because the two modes differ in exactly this one field: the scale
+    // and every quant are untouched, which is what makes the opt-in free.
+    let normed = quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned, SumScale::ByAmax)?
+        .into_owned_data()?;
+    dev.synchronize()?;
+    let n_raw: Vec<u8> = dev.memcpy_dtov(&normed.slice(..))?;
+    assert_eq!(
+        f16::from_le_bytes([n_raw[1042], n_raw[1043]]).to_bits(),
         f16::from_f32(148.0 / 100.0).to_bits(),
         "mixed tile sum, normalised by amax",
+    );
+    assert_eq!(
+        f16::from_le_bytes([n_raw[1040], n_raw[1041]]).to_bits(),
+        f16::from_f32(100.0 / 127.0).to_bits(),
+        "the scale is the same in both modes",
+    );
+    assert_eq!(
+        &n_raw[128..256],
+        &raw[128..256],
+        "and so are the quants — only `ds[0].y` moves"
+    );
+    assert_eq!(
+        f16::from_le_bytes([n_raw[1024], n_raw[1025]]).to_bits(),
+        0,
+        "zero tile scale, normalised mode"
+    );
+    assert_eq!(
+        f16::from_le_bytes([n_raw[1026], n_raw[1027]]).to_bits(),
+        0,
+        "zero tile sum stays 0 rather than dividing 0 by amax 0"
     );
 
     // The spike saturates to 127; everything else is scaled by the SAME id, so
@@ -2943,11 +3012,16 @@ fn q8a128_edge_cases() -> Result<()> {
 /// 10⁴–10⁵ and its block sums reach 2×10⁵. The first symptom was a black image
 /// eight steps later, with every weight, shape and dtype checking out.
 ///
-/// The fix normalises the field (Σx/amax, bounded by 128 whatever the magnitude
-/// — see `blocks.cuh`); this pins the property rather than the encoding, so it
-/// holds however the sum is later stored. The activation here is deliberately
-/// biased far from zero: a zero-mean one cancels to a small sum however large
-/// its elements are, and would pass even with the bug.
+/// [`SumScale::ByAmax`] normalises the field (Σx/amax, bounded by 128 whatever
+/// the magnitude — see `blocks.cuh`); this pins the property rather than the
+/// encoding, so it holds however the sum is later stored. The activation here is
+/// deliberately biased far from zero: a zero-mean one cancels to a small sum
+/// however large its elements are, and would pass even with the bug.
+///
+/// The mode is what is under test, so it is named explicitly. [`SumScale::Raw`]
+/// — what the LLM paths ask for, where block sums stay under ~10³ — genuinely
+/// does overflow on this fixture; that is the whole reason the other mode
+/// exists, not a defect in this one.
 #[test]
 fn int8_matmul_survives_block_sums_past_f16_range() -> Result<()> {
     use crate::quantized::{QMatMul, QTensor};
@@ -2991,7 +3065,12 @@ fn int8_matmul_survives_block_sums_past_f16_range() -> Result<()> {
     );
 
     let got = mm
-        .forward_via_int8(&xs, Int8Mode::Precision, crate::DType::F32)?
+        .forward_via_int8(
+            &xs,
+            Int8Mode::Precision,
+            crate::DType::F32,
+            SumScale::ByAmax,
+        )?
         .to_vec2::<f32>()?;
     // The FP reference: the same weights dequantised, same activations, f32.
     let want = xs
@@ -3035,7 +3114,8 @@ fn q8a128_unified_dispatch_matches_typed() -> Result<()> {
 
     // Typed path (dtype 2 = F32) vs unified run_quantize_block(qtype=36).
     let typed =
-        quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
+        quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+            .into_owned_data()?;
     let nblocks = n / 128;
     let mut unified = unsafe { dev.alloc::<u8>(nblocks.div_ceil(8) * 1152)? };
     {
@@ -3154,6 +3234,7 @@ fn q8a128_throughput_bench() -> Result<()> {
                     rows_i,
                     cols_i,
                     dtype,
+                    SumScale::Raw.as_code(),
                 );
             }
         }
@@ -3167,6 +3248,7 @@ fn q8a128_throughput_bench() -> Result<()> {
                     rows_i,
                     cols_i,
                     dtype,
+                    SumScale::Raw.as_code(),
                 );
             }
         }
@@ -3365,9 +3447,11 @@ fn q8a128_f16_bf16_paths_match_f32() -> Result<()> {
         let (tp, _a) = tdev.device_ptr(&stream);
         let (fp, _b) = fdev.device_ptr(&stream);
         let blk_t =
-            quantize_acts_q8a128(tp, 0, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
+            quantize_acts_q8a128(tp, 0, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+                .into_owned_data()?;
         let blk_f =
-            quantize_acts_q8a128(fp, 2, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
+            quantize_acts_q8a128(fp, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+                .into_owned_data()?;
         dev.synchronize()?;
         let bt: Vec<u8> = dev.memcpy_dtov(&blk_t.slice(..))?;
         let bf: Vec<u8> = dev.memcpy_dtov(&blk_f.slice(..))?;
@@ -3413,9 +3497,11 @@ fn q8a128_f16_bf16_paths_match_f32() -> Result<()> {
         let (tp, _a) = tdev.device_ptr(&stream);
         let (fp, _b) = fdev.device_ptr(&stream);
         let blk_t =
-            quantize_acts_q8a128(tp, 1, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
+            quantize_acts_q8a128(tp, 1, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+                .into_owned_data()?;
         let blk_f =
-            quantize_acts_q8a128(fp, 2, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
+            quantize_acts_q8a128(fp, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+                .into_owned_data()?;
         dev.synchronize()?;
         let bt: Vec<u8> = dev.memcpy_dtov(&blk_t.slice(..))?;
         let bf: Vec<u8> = dev.memcpy_dtov(&blk_f.slice(..))?;
@@ -3699,6 +3785,7 @@ fn quantize_acts_q8a128_test(
         ncols,
         dev,
         Backing::Owned,
+        SumScale::Raw,
     )?;
     dev.synchronize()?;
     Ok(out)
@@ -4633,6 +4720,7 @@ fn moe_layer_gemm_bench() -> Result<()> {
                                 Backing::Owned,
                                 n_sub,
                                 row_fast,
+                                SumScale::Raw,
                             )
                         })?;
                         Ok(())
@@ -4720,6 +4808,7 @@ fn grouped_int8_wide_tiles_match_mode2() -> Result<()> {
                 Backing::Owned,
                 n_sub,
                 row_fast,
+                SumScale::Raw,
             )
         })?;
         read_f32_tensor(&dev, &out)
@@ -4869,7 +4958,7 @@ fn qmatmul_int8mode_flag_end_to_end() -> Result<()> {
             _ => unreachable!(),
         };
         // Activation side: the same knob picks q8a128 (int8) or float.
-        let acts = to_dynamic(&act_t, mode, &dev)?;
+        let acts = to_dynamic(&act_t, mode, &dev, SumScale::Raw)?;
         let out = dense_qmatmul(
             acts.as_dynamic(),
             wptr,
@@ -4920,7 +5009,7 @@ fn ko_offline_load_forward_matches_gpu_repack() -> Result<()> {
     let q8 = QMatMul::from_qtensor(QTensor::quantize(&w_t, GgmlDType::Q8_0)?)?;
     let opt_a = q8.repack_for_optimization(Int8Mode::Performance)?;
     let y_a: Vec<f32> = opt_a
-        .forward_via_int8(&act_t, Int8Mode::Performance, act_t.dtype())?
+        .forward_via_int8(&act_t, Int8Mode::Performance, act_t.dtype(), SumScale::Raw)?
         .flatten_all()?
         .to_vec1::<f32>()?;
 
@@ -4932,7 +5021,7 @@ fn ko_offline_load_forward_matches_gpu_repack() -> Result<()> {
     let qt_b = QTensor::new(storage_b, vec![nrows, ncols])?;
     let mm_b = QMatMul::from_qtensor(qt_b)?;
     let y_b: Vec<f32> = mm_b
-        .forward_via_int8(&act_t, Int8Mode::Performance, act_t.dtype())?
+        .forward_via_int8(&act_t, Int8Mode::Performance, act_t.dtype(), SumScale::Raw)?
         .flatten_all()?
         .to_vec1::<f32>()?;
 
@@ -5082,7 +5171,7 @@ fn qmatmul_int8mode_baseline_bit_check() -> Result<()> {
             QStorage::Cuda(cs) => (cs.data_ptr(), cs.storage_size_in_bytes()),
             _ => unreachable!(),
         };
-        let acts = to_dynamic(&act_t, mode, &dev)?;
+        let acts = to_dynamic(&act_t, mode, &dev, SumScale::Raw)?;
         let out = dense_qmatmul(
             acts.as_dynamic(),
             wptr,
@@ -5161,7 +5250,7 @@ fn dense_qmatmul_int8_preserves_3d_shape() -> Result<()> {
         .map(|_| rng.random_range(-1.0f32..1.0))
         .collect();
     let act_t = crate::Tensor::from_vec(act, (b, m, ncols), &device)?;
-    let acts = to_dynamic(&act_t, Int8Mode::Performance, &dev)?;
+    let acts = to_dynamic(&act_t, Int8Mode::Performance, &dev, SumScale::Raw)?;
     let out = dense_qmatmul(
         acts.as_dynamic(),
         wptr,
@@ -5230,7 +5319,7 @@ fn rms_norm_q8a128_matches_reference() -> Result<()> {
             .broadcast_div(&rms)?
             .broadcast_mul(&alpha.to_dtype(crate::DType::F32)?)?
             .to_dtype(dtype)?;
-        let oracle_op = match to_dynamic(&normed, Int8Mode::Performance, &dev)? {
+        let oracle_op = match to_dynamic(&normed, Int8Mode::Performance, &dev, SumScale::Raw)? {
             DynamicActs::Int8(op) => op,
             DynamicActs::Float(_) => unreachable!("Performance mode yields Int8"),
         };
@@ -5238,7 +5327,10 @@ fn rms_norm_q8a128_matches_reference() -> Result<()> {
         let oracle = dev.memcpy_dtov(&oracle_deq.slice(..))?;
 
         // Fused: single kernel.
-        let fused_op = rms_norm_q8a128(&xs, &alpha, eps, &dev, Backing::Owned)?;
+        // Raw, matching the `to_dynamic` oracle this is compared against — the
+        // two must agree on the convention or the comparison measures that
+        // rather than the fusion.
+        let fused_op = rms_norm_q8a128(&xs, &alpha, eps, &dev, Backing::Owned, SumScale::Raw)?;
         let fused_deq = dequantize_q8a128(fused_op.data_slice()?, rows, cols, &dev)?;
         let fused = dev.memcpy_dtov(&fused_deq.slice(..))?;
 
@@ -5278,7 +5370,7 @@ fn silu_mul_q8a128_matches_reference() -> Result<()> {
         let u = up.to_dtype(crate::DType::F32)?;
         let sig = (g.neg()?.exp()? + 1.0)?.recip()?;
         let outf = (&g * &sig)?.mul(&u)?.to_dtype(dtype)?;
-        let oracle_op = match to_dynamic(&outf, Int8Mode::Performance, &dev)? {
+        let oracle_op = match to_dynamic(&outf, Int8Mode::Performance, &dev, SumScale::Raw)? {
             DynamicActs::Int8(op) => op,
             DynamicActs::Float(_) => unreachable!("Performance mode yields Int8"),
         };
@@ -5286,7 +5378,8 @@ fn silu_mul_q8a128_matches_reference() -> Result<()> {
         let oracle = dev.memcpy_dtov(&oracle_deq.slice(..))?;
 
         // Fused: single kernel.
-        let fused_op = silu_mul_q8a128(&gate, &up, &dev, Backing::Owned)?;
+        // Raw, matching the `to_dynamic` oracle — see the sibling rms_norm test.
+        let fused_op = silu_mul_q8a128(&gate, &up, &dev, Backing::Owned, SumScale::Raw)?;
         let fused_deq = dequantize_q8a128(fused_op.data_slice()?, rows, cols, &dev)?;
         let fused = dev.memcpy_dtov(&fused_deq.slice(..))?;
 
@@ -8359,6 +8452,7 @@ fn expert_grouped_launch_cost() -> Result<()> {
                 0, // weight_bytes=0 → L2-cached assumption (matches grouped_matmul_gemx)
                 0, // force_mode2 (tiling only; result-invariant)
                 OutDType::BF16 as i32,
+                SumScale::Raw.as_code(),
             );
         };
 
@@ -8482,6 +8576,7 @@ fn expert_grouped_single_launch_cost() -> Result<()> {
                     YType::BF16 as i32,
                     2, // FP grouped kernels ignore the int8 tile mode
                     1, // row-fast grid order
+                    SumScale::Raw.as_code(),
                 );
             }
             Ok(())
@@ -9907,7 +10002,7 @@ fn mxfp4_int8_matmul_matches_float_baseline() -> Result<()> {
             QStorage::Cuda(cs) => (cs.data_ptr(), cs.storage_size_in_bytes()),
             _ => unreachable!(),
         };
-        let acts = to_dynamic(&act_t, mode, &dev)?;
+        let acts = to_dynamic(&act_t, mode, &dev, SumScale::Raw)?;
         let out = dense_qmatmul(
             acts.as_dynamic(),
             wptr,

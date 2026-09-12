@@ -4,7 +4,7 @@
 // which is the opposite of what makes these auditable against the `.cu`.
 #![allow(clippy::too_many_arguments)]
 
-use super::{GgmlDType, Int8Mode, QStorage};
+use super::{GgmlDType, Int8Mode, QStorage, SumScale};
 use crate::backend::{BackendDevice, BackendStorage};
 
 use crate::cuda_backend::alloc_inheriting;
@@ -2965,6 +2965,9 @@ fn dense_qmatmul_float(
                         // out_dtype: the FP kernels store at the activation dtype, so this
                         // only has to be a valid code — it is not consulted.
                         OutDType::F32 as i32,
+                        // sum_norm: likewise not consulted. This is the FLOAT
+                        // activation path; there is no q8a128 header to interpret.
+                        SumScale::Raw.as_code(),
                     )
                 };
                 check_matmul_status(status, "dense_qmatmul_float")?;
@@ -5210,6 +5213,10 @@ fn grouped_matmul_gemx_impl<'w>(
                             ytype as i32,
                             2, // FP grouped kernels ignore the int8 tile mode
                             row_fast,
+                            // sum_norm: the FP grouped kernels do not take it —
+                            // this is the float activation path, which has no
+                            // q8a128 header. The launcher drops it for ytype != 3.
+                            SumScale::Raw.as_code(),
                         );
                     }
                 })?;
@@ -5500,6 +5507,14 @@ pub struct Q8a128Operand<'w> {
     pub rows: usize,      // M (flattened token count)
     pub cols: usize,      // K
     pub lead: Vec<usize>, // output leading dims; prod == rows (defaults to [rows])
+    /// How this operand's blocks store their per-128 `Σx`.
+    ///
+    /// **Unlike the matmul mode, this IS an attribute of the bytes.** The mode
+    /// only changes how a kernel tiles the same bytes, so the dispatcher derives
+    /// it; the sum convention changes what the bytes *mean*, so it travels with
+    /// them and the matmul never has to guess. Whoever quantized the activation
+    /// chose it — see [`SumScale`].
+    pub sum_scale: SumScale,
 }
 
 impl<'w> Q8a128Operand<'w> {
@@ -5521,6 +5536,7 @@ impl<'w> Q8a128Operand<'w> {
             rows: self.rows,
             cols: self.cols,
             lead: self.lead.clone(),
+            sum_scale: self.sum_scale,
         })
     }
 
@@ -5549,7 +5565,18 @@ impl<'w> Q8a128Operand<'w> {
             rows,
             cols,
             lead: vec![rows],
+            sum_scale: SumScale::default(),
         }
+    }
+
+    /// Declare how these blocks store their per-128 `Σx`.
+    ///
+    /// Set by the producer, not the consumer: a mismatch here is read as a wrong
+    /// number by the matmul, not as an error, so it belongs next to the kernel
+    /// that wrote the bytes. The default is [`SumScale::Raw`].
+    pub fn with_sum_scale(mut self, sum_scale: SumScale) -> Self {
+        self.sum_scale = sum_scale;
+        self
     }
 
     /// Wrap a contiguous `U8` [`Tensor`] of q8a1024 bytes as an operand, no copy. For producers
@@ -5560,6 +5587,7 @@ impl<'w> Q8a128Operand<'w> {
             rows,
             cols,
             lead: vec![rows],
+            sum_scale: SumScale::default(),
         }
     }
 
@@ -5632,7 +5660,56 @@ impl<'w> Q8a128Operand<'w> {
             rows: self.rows,
             cols: self.cols,
             lead: self.lead.clone(),
+            sum_scale: self.sum_scale,
         })
+    }
+
+    /// Reconstruct the float activation these blocks encode, at `dtype`.
+    ///
+    /// **The int8 round trip is the point, not a defect.** What comes back is
+    /// the activation as the *matmul* sees it — the int8 codes times their
+    /// per-128 scale — not the float that was quantized. A consumer that needs
+    /// to compute against the same operand the base projection multiplies wants
+    /// exactly that; one that needs the original float cannot get it here, and
+    /// must be handed the tensor before it was quantized.
+    ///
+    /// One kernel and one buffer at the operand's own backing, so the result
+    /// lands in the arena its source came from. This is a full-tensor pass
+    /// (hot-path invariant 1), so it belongs on a path that runs once per
+    /// projection group rather than once per matmul.
+    pub fn dequantize(
+        &self,
+        dtype: crate::DType,
+        device: &CudaDevice,
+    ) -> Result<crate::LiveTensor<'w>> {
+        let dtype_code = match dtype {
+            crate::DType::F16 => 0,
+            crate::DType::BF16 => 1,
+            crate::DType::F32 => 2,
+            d => crate::bail!("Q8a128Operand::dequantize: unsupported dtype {d:?}"),
+        };
+        let elems = self.rows * self.cols;
+        let (out_ptr, owned, out_backing) = resolve_out(dtype, self.backing(), device, elems)?;
+        self.with_device_ptr(device, |in_ptr| {
+            // SAFETY: `in_ptr` names this operand's q8a1024 blocks for
+            // `rows × cols` elements, and `out_ptr` names exactly that many
+            // elements of `dtype`.
+            unsafe {
+                run_dequantize_q8a128(
+                    in_ptr as *const std::ffi::c_void,
+                    out_ptr as *mut std::ffi::c_void,
+                    self.rows as i32,
+                    self.cols as i32,
+                    dtype_code,
+                );
+            }
+            Ok(())
+        })?;
+        // The activation's own rank, as `lead` recorded it — so an adapter reads
+        // the shape the base projection's operand had, not a flattened one.
+        let mut dims = self.lead.clone();
+        dims.push(self.cols);
+        tensor_from_owned_out(owned, out_ptr, out_backing, dims.into(), device)
     }
 
     /// Packed size of the q8a1024 blocks backing this operand.
@@ -5729,10 +5806,17 @@ impl<'w> DynamicActs<'w> {
 /// [`Int8Mode::Performance`] and [`Int8Mode::Precision`] — only the weight twin differs — so this
 /// branches solely on [`Int8Mode::is_int8`]. Paired with `QMatMul::repack_for_optimization` on the
 /// weight side; the matmul's KO⇔int8 guard keeps the two consistent.
+///
+/// `sum_scale` says how the per-128 `Σx` is stored in the blocks this produces,
+/// and rides on the operand so the matmul reads them the way they were written.
+/// [`SumScale::Raw`] is what every language model here passes and is
+/// bit-identical to the unparameterised path; a model whose activations can
+/// overflow f16 on a block sum passes [`SumScale::ByAmax`] — see [`SumScale`].
 pub fn to_dynamic<'w>(
     xs: &crate::LiveTensor<'w>,
     mode: Int8Mode,
     device: &CudaDevice,
+    sum_scale: SumScale,
 ) -> Result<DynamicActs<'w>> {
     use crate::cuda_backend::CudaStorageSlice;
     if !mode.is_int8() {
@@ -5762,17 +5846,17 @@ pub fn to_dynamic<'w>(
         CudaStorageSlice::F16(s) => {
             let v = s.slice(o1..o2);
             let (ptr, _g) = v.device_ptr(&stream);
-            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device, cuda.backing)?
+            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device, cuda.backing, sum_scale)?
         }
         CudaStorageSlice::BF16(s) => {
             let v = s.slice(o1..o2);
             let (ptr, _g) = v.device_ptr(&stream);
-            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device, cuda.backing)?
+            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device, cuda.backing, sum_scale)?
         }
         CudaStorageSlice::F32(s) => {
             let v = s.slice(o1..o2);
             let (ptr, _g) = v.device_ptr(&stream);
-            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device, cuda.backing)?
+            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device, cuda.backing, sum_scale)?
         }
         _ => crate::bail!("to_dynamic(int8): activation slice dtype must be F16/BF16/F32"),
     };
@@ -5811,6 +5895,10 @@ pub fn quantize_acts_q8a128<'w>(
     // `quantize_acts_q8a128 <- to_dynamic <- forward_via_int8`, at the top of
     // the report by both call count and bytes.
     origin: Backing,
+    // How the per-128 `Σx` is stored. One runtime argument the kernel selects a
+    // coefficient from — not a template parameter, so this adds no instantiation
+    // and the produced bytes are the only thing that differs.
+    sum_scale: SumScale,
 ) -> Result<Q8a128Operand<'w>> {
     let bytes = q8a1024_byte_len(rows, cols);
     // The same three-value resolve `rms_norm_q8a128` below uses, which is the
@@ -5826,9 +5914,10 @@ pub fn quantize_acts_q8a128<'w>(
             rows as i32,
             cols as i32,
             dtype,
+            sum_scale.as_code(),
         );
     }
-    q8a128_from_out(
+    Ok(q8a128_from_out(
         owned,
         out_ptr_planned,
         out_backing,
@@ -5836,7 +5925,8 @@ pub fn quantize_acts_q8a128<'w>(
         rows,
         cols,
         device,
-    )
+    )?
+    .with_sum_scale(sum_scale))
 }
 
 /// Fused RMSNorm → q8a128: normalize each row of `xs` `[.. × K]` by `alpha` `[K]` and emit the
@@ -5853,6 +5943,9 @@ pub fn rms_norm_q8a128<'w>(
     eps: f32,
     device: &CudaDevice,
     origin: Backing,
+    // The Σx convention this fused producer writes, carried onto the operand so
+    // the matmul reads the header the way it was written — see [`SumScale`].
+    sum_scale: SumScale,
 ) -> Result<Q8a128Operand<'w>> {
     use crate::cuda_backend::CudaStorageSlice;
     let (rows, cols) = match xs.dims() {
@@ -5934,6 +6027,7 @@ pub fn rms_norm_q8a128<'w>(
                         rows as i32,
                         cols as i32,
                         eps,
+                        sum_scale.as_code(),
                     );
                 }
             }};
@@ -5956,7 +6050,7 @@ pub fn rms_norm_q8a128<'w>(
         cols,
         device,
     )
-    .map(|o| o.with_lead(lead))
+    .map(|o| o.with_lead(lead).with_sum_scale(sum_scale))
 }
 
 /// Fused SwiGLU → q8a128: compute `silu(gate) · up` element-wise and emit the q8a128 activation
@@ -5970,6 +6064,10 @@ pub fn silu_mul_q8a128<'w>(
     up: &crate::Tensor,
     device: &CudaDevice,
     origin: Backing,
+    // The Σx convention this fused producer writes — see [`SumScale`]. **This is
+    // the site the normalised form exists for**: the SwiGLU intermediate is
+    // where the per-128 sums run away from f16's range.
+    sum_scale: SumScale,
 ) -> Result<Q8a128Operand<'w>> {
     use crate::cuda_backend::CudaStorageSlice;
     if gate.dims() != up.dims() {
@@ -6049,6 +6147,7 @@ pub fn silu_mul_q8a128<'w>(
                         out_ptr as *mut std::ffi::c_void,
                         rows as i32,
                         cols as i32,
+                        sum_scale.as_code(),
                     );
                 }
             }};
@@ -6071,7 +6170,7 @@ pub fn silu_mul_q8a128<'w>(
         cols,
         device,
     )
-    .map(|o| o.with_lead(lead))
+    .map(|o| o.with_lead(lead).with_sum_scale(sum_scale))
 }
 
 /// Quantize F32 weights `[nrows × ncols]` (row-major) → a GPU buffer in the lane-major KO
@@ -6192,6 +6291,7 @@ pub use candle_kernels::simple::moe_bucketize::{
     MAX_EXPERTS as MOE_MAX_EXPERTS, MAX_TOPK as MOE_MAX_TOPK,
 };
 
+#[allow(clippy::too_many_arguments)]
 fn grouped_matmul_gemx_q8a128<'w>(
     act_ptr: u64,
     weight_ptrs: &[u64],
@@ -6202,6 +6302,7 @@ fn grouped_matmul_gemx_q8a128<'w>(
     expert_offsets: &[i32],
     device: &CudaDevice,
     origin: Backing,
+    sum_scale: SumScale,
 ) -> Result<crate::LiveTensor<'w>> {
     let num_experts = weight_ptrs.len();
     if num_experts == 0 {
@@ -6253,6 +6354,7 @@ fn grouped_matmul_gemx_q8a128<'w>(
         origin,
         n_sub,
         row_fast,
+        sum_scale,
     )
 }
 
@@ -6272,6 +6374,10 @@ pub(crate) fn grouped_matmul_gemx_q8a128_with_mode<'w>(
     origin: Backing,
     n_sub: usize,
     row_fast: bool,
+    // The activation operand's Σx convention. Threaded rather than read off an
+    // operand because this takes a raw `act_ptr` — the caller holding the
+    // `Q8a128Operand` is the only place that knows.
+    sum_scale: SumScale,
 ) -> Result<crate::LiveTensor<'w>> {
     let num_experts = weight_ptrs.len();
     if num_experts == 0 {
@@ -6357,6 +6463,7 @@ pub(crate) fn grouped_matmul_gemx_q8a128_with_mode<'w>(
                     YType::Q8A128 as i32,
                     n_sub as i32,
                     row_fast as i32,
+                    sum_scale.as_code(),
                 );
             }
         })?;
@@ -6415,6 +6522,7 @@ pub fn grouped_qmatmul<'w>(
                 expert_offsets,
                 device,
                 origin,
+                op.sum_scale,
             )
         }),
         DynamicTensor::Float(t) => {
@@ -6547,6 +6655,9 @@ pub fn grouped_qmatmul_dev_q8a128<'w>(
                     // moe_bucketize builds 32-wide tiles (decode regime).
                     2,
                     row_fast,
+                    // Read off the operand, so the matmul interprets the header
+                    // the way whoever quantized these blocks wrote it.
+                    op.sum_scale.as_code(),
                 );
             }
             Ok(())
@@ -6658,6 +6769,9 @@ pub(crate) fn qkv_segmented_matmul<'w>(
                 n_total as i32,
                 mode2,
                 out_code,
+                // One shared operand feeds all three segments, so its convention
+                // is the launch's.
+                op.sum_scale.as_code(),
             )
         };
         check_matmul_status(status, "qkv_segmented_matmul")
@@ -6722,6 +6836,8 @@ pub(crate) fn q8a128_dense_matmul<'w>(
                 weight_len,           // weight_bytes (FP path only; int8 ignores)
                 mode2 as i32,         // 0 = mode-1, 1 = mode-2 (weight-reuse)
                 out_code,             // store width
+                // The operand's own Σx convention — the bytes say how to read them.
+                op.sum_scale.as_code(),
             )
         };
         check_matmul_status(status, "q8a128_dense_matmul")

@@ -855,6 +855,11 @@ fn sweep_layers(
     // Attention metadata, from the session's shared borrow — the hybrid's arena
     // state does not move before the layer loop reads it, so building here
     // matches the order the wave driver used when it built these.
+    //
+    // Spanned because it is the widest-scaling piece of the sweep's setup: one
+    // slot header per decode sequence, so it is ~1 ms at a handful of slots and
+    // ~20 ms at 128.
+    let g_meta = crate::models::profile::gpu_span("fwd:meta", model.device());
     #[cfg(feature = "cuda")]
     let decode_headers = if n_decode > 0 {
         let (buf, stride) = session.build_decode_metadata(&seq_ids[..n_decode], generation)?;
@@ -875,6 +880,7 @@ fn sweep_layers(
         pre_q,
         model.device(),
     )?);
+    g_meta.end();
 
     let mut contexts = assemble_wave_contexts(session, seq_ids, inputs)?;
     let contexts = contexts.as_mut_slice();
@@ -931,6 +937,7 @@ fn sweep_layers(
 
     // Combined residual: embed every row flat `[1, total, hidden]`, or resume a
     // paused wave from its persisted stream.
+    let g_embed = crate::models::profile::gpu_span("fwd:embed", dev);
     let mut x = match x_in {
         Some(resume) => resume,
         None => {
@@ -939,6 +946,7 @@ fn sweep_layers(
             TensorCat::from_cat_tensor(embed_rows(q, &packed.to_tensor(), embed_dtype)?, 0)?
         }
     };
+    g_embed.end();
 
     // The interleaved `(cos, sin)` table the paged kernels index by position.
     // Partial rotary, so it is the model's own table — `compute_rope_cs` would
@@ -1033,8 +1041,13 @@ fn sweep_layers(
     // 68 KB + 40 KB per forward is not worth that. Left as a driver allocation
     // until the head guard's lifetime is pinned down; `wave_from_vec` takes the
     // generation, so the fix is passing one rather than rewriting this.
+    // Spanned for the same reason as `fwd:meta`: one table entry per DeltaNet
+    // layer per decode sequence, so it is the other setup cost that grows with
+    // the cohort rather than with the model.
+    let g_dntab = crate::models::profile::gpu_span("fwd:dntab", dev);
     #[cfg(feature = "cuda")]
     let dn_table = crate::models::delta_net::cuda::build_wave_table(&spans, stores, None)?;
+    g_dntab.end();
 
     // Spans a speculative verify will have to rewind stash each DeltaNet
     // layer's recurrence operands as the sweep passes through it — every
@@ -1103,6 +1116,14 @@ fn sweep_layers(
         // The wave arrives at `li`: join its transfer if one is in flight, and
         // hold the handle for as long as its compute is being issued. On a
         // resident store this is an `Arc` bump.
+        // Stream-elapsed for the WHOLE layer, so it can be compared against the
+        // sum of the `dn:*` / `decode:*` sub-spans inside it. Those cover the
+        // projections, the mixer and the attention kernel but nothing between
+        // them, and at width the forward's stream time is ~5.6× their sum — this
+        // span says whether the difference sits inside layers (unspanned norms,
+        // residuals, quantize/convert kernels) or between them (a starved stream
+        // waiting on host-side per-layer work).
+        let g_layer = crate::models::profile::gpu_span("fwd:layer", dev);
         let layer = q.layers.ensure(li)?;
         // This layer's adapter pairs, or all-`None` when the wave is unadapted
         // or the adapter does not reach this layer. Seven hash lookups per
@@ -1290,6 +1311,7 @@ fn sweep_layers(
         // but the prefetch may evict the slot `layer` borrows — so releasing it
         // first would end the borrow the assert path is still inside.
         q.layers.prefetch()?;
+        g_layer.end();
     }
 
     // File the stash back, whether this sweep was whole or one window of a
@@ -1379,6 +1401,7 @@ fn sweep_layers(
     if idx.is_empty() {
         return Ok((WavePhase::Residual(x), None));
     }
+    let g_head = crate::models::profile::gpu_span("fwd:head", dev);
     let pre_norm = {
         let n_sel = idx.len();
         let sel = Tensor::from_vec(idx, n_sel, x_flat.device())?;
@@ -1412,6 +1435,7 @@ fn sweep_layers(
             q.lm_head.forward(&q.final_norm.forward(&pre_norm)?)?
         }
     };
+    g_head.end();
 
     Ok((
         WavePhase::Logits(TensorCat::from_cat_tensor(logits, 0)?),

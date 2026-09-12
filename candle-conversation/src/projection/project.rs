@@ -1209,6 +1209,22 @@ pub fn run_with_sink<R: ContentResolver>(
 
     for (li, layer) in visible_layers.iter().enumerate() {
         let layer_is_target = li == target_layer_idx;
+        // OUT OF SERVICE for the whole process (`--disable-layer`, applied via
+        // `Builder::set_layer_gathered`): the layer contributes nothing to the
+        // assembly. Its belief groups are already excluded at scoring time, but a
+        // `Sequence` (recency) group is not belief-driven and is never scored, so
+        // without this it would still emit its window — the exclusion has to be
+        // restated where the assembly walks layers, or "excluded from provenance"
+        // would hold for retrieved turns and quietly fail for recency ones.
+        //
+        // The target layer is exempt, for the same reason the diagnostic toggle
+        // below exempts it: skipping it leaves the projection with nothing to
+        // emit. Disabling the layer you are projecting FOR is not a meaningful
+        // request, and answering it with an empty context would be worse than
+        // ignoring it.
+        if !layer_is_target && !layer.gathered {
+            continue;
+        }
         // Runtime diagnostic kill switch: a non-target layer toggled off
         // contributes nothing to the assembly (its groups are never scored or
         // selected). The target layer is never skipped — that would leave the

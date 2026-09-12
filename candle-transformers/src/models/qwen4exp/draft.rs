@@ -289,6 +289,12 @@ impl Qwen4ExpBatched {
         // invariant 2 forbids. It measured ~5% of wide-rung decode. So the
         // block rows go to the verify capture, which exists only for the
         // sequences that can be rewound, and `rewind_cohort` reseeds from them.
+        //
+        // That saving is only real because `to_owned_tensor` copies the VIEW.
+        // It used to clone the view's whole storage, so the single-row narrow
+        // below bought all of `res` regardless — once per span, which is the
+        // very cost this paragraph claims to avoid. See invariant 2 in
+        // CLAUDE.md; the same bug was 76% of a 128-slot qwen35 decode step.
         for span in w.spans {
             if let Some(cap) = capture.as_deref_mut() {
                 if let Some(stash) = cap.seqs.get_mut(&span.seq) {
@@ -415,6 +421,9 @@ impl Qwen4ExpBatched {
             &h2.reshape((1, n, n_embd))?,
             candle::quantized::Int8Mode::Off,
             cuda,
+            // Raw Σx — a language model's block sums stay far below f16's
+            // ceiling. (`Off` produces no q8a128 here anyway.)
+            candle::quantized::SumScale::Raw,
         )?;
         let y2 = head
             .block
@@ -426,7 +435,12 @@ impl Qwen4ExpBatched {
 
         // ── The shared head. ──
         let narrow = head.to_shared_head(&res, eps)?;
-        let acts = to_dynamic(&narrow, m.lm_head.int8mode(), cuda)?;
+        let acts = to_dynamic(
+            &narrow,
+            m.lm_head.int8mode(),
+            cuda,
+            candle::quantized::SumScale::Raw,
+        )?;
         let logits = m
             .lm_head
             .forward_dynamic(acts.as_dynamic(), DType::F32)?

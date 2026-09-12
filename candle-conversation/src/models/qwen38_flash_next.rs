@@ -63,6 +63,17 @@ pub(super) fn qwen38_flash_next_q4ko() -> ModelSpec {
         model_repo: quantized_qwen38_moe::QWEN4EXP_REPO.into(),
         model_filename: ENGINE_GGUF.into(),
         prepared_from_source: true,
+        // Nothing to pin: the engine GGUF is built locally from
+        // `model_repo`'s published files, so there is no upstream commit that
+        // names these bytes. The prepare step's own inputs are pinned where they
+        // are read.
+        model_rev: String::new(),
+        // Used as prepared — no override displaced a preset here, so there is no
+        // base checkpoint to fall back to for tensors this one got wrong.
+        gate_donor: None,
+        // No adapter ships with this model. An adapter is opt-in per
+        // conversation; an empty list is what makes the base model the default.
+        loras: Vec::new(),
         // A locally built artifact has no published length to pin, and the
         // merge's exact size depends on which expert format was requantized.
         // Zero means "no length check", which is correct here and would not be

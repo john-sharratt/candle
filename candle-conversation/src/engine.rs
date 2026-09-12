@@ -18,7 +18,7 @@ use crate::stencil::{
 };
 // `ChannelProbeRunner` is deliberately not imported: the summariser is
 // disconnected, so nothing constructs a runner. `Substrate` comes from our side.
-use crate::substrate::{ConvCompression, Substrate};
+use crate::substrate::ConvCompression;
 use crate::summary_tree::{SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
 
@@ -1088,19 +1088,11 @@ impl ConversationEngine {
         // writes a nested function element, ChatML writes a JSON object — and a
         // literal in this function is a second opinion about that, free to
         // disagree with the checkpoint actually loaded.
-        let d = &self.config.dialect;
-        let base = ToolCallEnvelope::for_dialect(d);
-        let envelope = ToolCallEnvelope {
-            // Minus the marker the model has already emitted, plus the turn
-            // terminator on the close.
-            open: base
-                .open
-                .strip_prefix(&base.marker)
-                .unwrap_or(&base.open)
-                .to_string(),
-            close: format!("{}{}", base.close, d.assistant_end),
-            ..base
-        };
+        // The marker off the front and the turn terminator on the close, with
+        // the close ending exactly ON that terminator — see
+        // [`ToolCallEnvelope::for_assistant_turn`] for why the trailing newline
+        // in `assistant_end` cannot be allowed to ride along.
+        let envelope = ToolCallEnvelope::for_assistant_turn(&self.config.dialect);
         let spec = compile_tool_call_tree(tools, &envelope).map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
         })?;
@@ -1124,16 +1116,20 @@ impl ConversationEngine {
     /// stencil, this is inactive — `Ok(None)` — when the tokenizer lacks a
     /// single `<think>`/`</think>` token, so the model free-decodes its reasoning.
     ///
-    /// `after_close` is emitted by the grammar immediately after the block's
-    /// closing tag — see [`ThinkSteerEnvelope::after_close`]. `""` hands control
-    /// back to the decoder, which is what an assistant wants. An action loop
-    /// passes the tool-call marker, so a character that has finished thinking is
-    /// put straight into a call rather than left free to write prose at the one
-    /// join the grammar does not otherwise cover.
-    pub fn compile_think_steering(
-        &self,
-        after_close: &'static str,
-    ) -> crate::Result<Option<Arc<ThinkSteering>>> {
+    /// **The tree hands control back to the decoder at `</think>`, and cannot do
+    /// otherwise.** Emitting anything after the closing tag — a tool-call marker,
+    /// to put a character that has finished thinking straight into a call — reads
+    /// as a natural extension and breaks the index page cut. A static run's last
+    /// token is deliberately held back from the forward and rides the next decode
+    /// step, which commits it through `push_committed` and arms the cut; a marker
+    /// in any earlier slot goes through `push_forwarded`, whose cut flag is
+    /// dropped, and `run_prefill`'s `reasoning_split` declines to split when the
+    /// break token is last in the pass. The block still records its
+    /// `think_close_at`, so the turn seals with a reasoning span that is not a
+    /// union of whole pages and every LATER turn fails
+    /// `Substrate::turn_sealed_without_thinking`. See the `Off` arm in
+    /// `stencil::think` for the measured case.
+    pub fn compile_think_steering(&self) -> crate::Result<Option<Arc<ThinkSteering>>> {
         let (Some(think_open), Some(think_close)) = (
             self.tokenizer.token_to_id("<think>"),
             self.tokenizer.token_to_id("</think>"),
@@ -1149,7 +1145,6 @@ impl ConversationEngine {
             think_open,
             think_close,
             eos,
-            after_close,
         };
         let vocab = HfVocab::new(
             (*self.tokenizer).clone(),

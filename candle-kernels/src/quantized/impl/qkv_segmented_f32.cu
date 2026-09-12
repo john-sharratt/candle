@@ -68,7 +68,10 @@ template <typename dst_t, int N_SUB>
 __device__ __forceinline__ void qkv_segmented_impl(
     ::qkv_seg_t s0, ::qkv_seg_t s1, ::qkv_seg_t s2, int num_segs,
     const block_q8a128* __restrict__ act, dst_t* __restrict__ dst,
-    int ncols_x, int total_batch, int y_stride, int dst_stride) {
+    int ncols_x, int total_batch, int y_stride, int dst_stride,
+    // The activation operand's `SumScale::as_code()` — one operand is shared by
+    // every segment, so this is per-launch and not per-segment.
+    int sum_norm) {
     // Segments arrive by value in the kernel param space (≤3 for qkv) — no device-array upload.
     const ::qkv_seg_t segs[3] = {s0, s1, s2};
     constexpr int BATCH = N_SUB * 16;
@@ -98,37 +101,37 @@ __device__ __forceinline__ void qkv_segmented_impl(
         grouped_matmul_impl_int8<QKV_QK, QKV_QI_KQ, block_c_q4_KO, QKV_VDR_KQ, dst_t, N_SUB>(
             reinterpret_cast<const block_compact_t<block_c_q4_KO>*>(w), act, seg_dst,
             ncols_x, seg_n, y_stride, dst_stride, b_start, b_cnt, local_tile,
-            smem_A_i8, smem_A_ds, smem_W_flat);
+            smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
         break;
     case 1:
         grouped_matmul_impl_int8<QKV_QK, QKV_QI_KQ, block_c_q5_KO, QKV_VDR_KQ, dst_t, N_SUB>(
             reinterpret_cast<const block_compact_t<block_c_q5_KO>*>(w), act, seg_dst,
             ncols_x, seg_n, y_stride, dst_stride, b_start, b_cnt, local_tile,
-            smem_A_i8, smem_A_ds, smem_W_flat);
+            smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
         break;
     case 2:
         grouped_matmul_impl_int8<QKV_QK, QKV_QI_KQ, block_c_q6_KO, QKV_VDR_KQ, dst_t, N_SUB>(
             reinterpret_cast<const block_compact_t<block_c_q6_KO>*>(w), act, seg_dst,
             ncols_x, seg_n, y_stride, dst_stride, b_start, b_cnt, local_tile,
-            smem_A_i8, smem_A_ds, smem_W_flat);
+            smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
         break;
     case 3:
         grouped_matmul_impl_int8<QKV_QK, QKV_QI_Q8, block_c_q8_KO, QKV_VDR_Q8, dst_t, N_SUB>(
             reinterpret_cast<const block_compact_t<block_c_q8_KO>*>(w), act, seg_dst,
             ncols_x, seg_n, y_stride, dst_stride, b_start, b_cnt, local_tile,
-            smem_A_i8, smem_A_ds, smem_W_flat);
+            smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
         break;
     case 4:
         grouped_matmul_impl_int8<QKV_QK, QKV_QI_KQ, block_c_q2_KO, QKV_VDR_KQ, dst_t, N_SUB>(
             reinterpret_cast<const block_compact_t<block_c_q2_KO>*>(w), act, seg_dst,
             ncols_x, seg_n, y_stride, dst_stride, b_start, b_cnt, local_tile,
-            smem_A_i8, smem_A_ds, smem_W_flat);
+            smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
         break;
     case 5:
         grouped_matmul_impl_int8<QKV_QK, QKV_QI_KQ, block_c_q3_KO, QKV_VDR_KQ, dst_t, N_SUB>(
             reinterpret_cast<const block_compact_t<block_c_q3_KO>*>(w), act, seg_dst,
             ncols_x, seg_n, y_stride, dst_stride, b_start, b_cnt, local_tile,
-            smem_A_i8, smem_A_ds, smem_W_flat);
+            smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
         break;
     default:
         // Unreachable: `run_qkv_segmented_matmul` rejects an out-of-range `fmt` before the
@@ -148,7 +151,7 @@ template <typename dst_t, int N_SUB, int qk, int qi, typename block_q_t, int vdr
 __device__ __forceinline__ void qkv_seg_uniform_impl(
     ::qkv_seg_t s0, ::qkv_seg_t s1, ::qkv_seg_t s2, int num_segs,
     const block_q8a128* __restrict__ act, dst_t* __restrict__ dst,
-    int ncols_x, int total_batch, int y_stride, int dst_stride) {
+    int ncols_x, int total_batch, int y_stride, int dst_stride, int sum_norm) {
     const ::qkv_seg_t segs[3] = {s0, s1, s2};
     constexpr int BATCH = N_SUB * 16;
     const int b_start = blockIdx.x * BATCH;
@@ -169,7 +172,8 @@ __device__ __forceinline__ void qkv_seg_uniform_impl(
                                    int8_chunk_bytes<block_compact_t<block_q_t>>::value];
     grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, dst_t, N_SUB>(
         reinterpret_cast<const block_compact_t<block_q_t>*>(w), act, seg_dst, ncols_x, seg_n,
-        y_stride, dst_stride, b_start, b_cnt, local_tile, smem_A_i8, smem_A_ds, smem_W_flat);
+        y_stride, dst_stride, b_start, b_cnt, local_tile, smem_A_i8, smem_A_ds, smem_W_flat,
+        sum_norm);
 }
 
 } // namespace grouped_tc
@@ -178,9 +182,10 @@ __device__ __forceinline__ void qkv_seg_uniform_impl(
 #define QKV_MIXED_KERNEL(TAG, DST_T, NSUB)                                                          \
     extern "C" __global__ void LAUNCH_BOUNDS_TC16 qkv_segmented_int8_##TAG##_dense_m##NSUB(         \
         qkv_seg_t s0, qkv_seg_t s1, qkv_seg_t s2, int num_segs, const block_q8a128* act,            \
-        DST_T* dst, int ncols_x, int total_batch, int y_stride, int dst_stride) {                   \
+        DST_T* dst, int ncols_x, int total_batch, int y_stride, int dst_stride,                     \
+        int sum_norm) {                                                                             \
         grouped_tc::qkv_segmented_impl<DST_T, NSUB>(s0, s1, s2, num_segs, act, dst, ncols_x,        \
-                                                    total_batch, y_stride, dst_stride);            \
+                                                    total_batch, y_stride, dst_stride, sum_norm);   \
     }
 
 QKV_MIXED_KERNEL(f16, half, 1)
@@ -195,9 +200,10 @@ QKV_MIXED_KERNEL(f32, float, 2)
 #define QKV_UNIFORM_KERNEL(FMT, TAG, DST_T, BLOCK, QI, VDR, NSUB)                                   \
     extern "C" __global__ void LAUNCH_BOUNDS_TC16 qkv_seg_uniform_##FMT##_##TAG##_m##NSUB(          \
         qkv_seg_t s0, qkv_seg_t s1, qkv_seg_t s2, int num_segs, const block_q8a128* act,            \
-        DST_T* dst, int ncols_x, int total_batch, int y_stride, int dst_stride) {                   \
+        DST_T* dst, int ncols_x, int total_batch, int y_stride, int dst_stride,                     \
+        int sum_norm) {                                                                             \
         grouped_tc::qkv_seg_uniform_impl<DST_T, NSUB, QKV_QK, QI, BLOCK, VDR>(                      \
-            s0, s1, s2, num_segs, act, dst, ncols_x, total_batch, y_stride, dst_stride);           \
+            s0, s1, s2, num_segs, act, dst, ncols_x, total_batch, y_stride, dst_stride, sum_norm);  \
     }
 
 // Both tiling modes for one (format, output dtype).
@@ -228,7 +234,10 @@ QKV_UNIFORM_ALL(q3ko, block_c_q3_KO, QKV_QI_KQ, QKV_VDR_KQ)
 // Returns a QMM_* status; a caller that ignores it cannot tell a launch from a no-op.
 extern "C" int run_qkv_segmented_matmul(
     const void* h_segs, int num_segs, const void* act, void* dst,
-    int ncols_x, int total_n_tiles, int total_batch, int dst_stride, int mode2, int out_dtype) {
+    int ncols_x, int total_n_tiles, int total_batch, int dst_stride, int mode2, int out_dtype,
+    // The shared activation operand's `SumScale::as_code()`. One operand feeds
+    // every segment, so it is per-launch.
+    int sum_norm) {
     if (out_dtype < 0 || out_dtype > 2) {
         return QMM_BAD_OUT_DTYPE;
     }
@@ -303,7 +312,7 @@ extern "C" int run_qkv_segmented_matmul(
     }
     void* args[] = {(void*)&s0,      (void*)&s1,         (void*)&s2,       (void*)&num_segs,
                     (void*)&act,      (void*)&dst,        (void*)&ncols_x,  (void*)&total_batch,
-                    (void*)&y_stride, (void*)&dst_stride};
+                    (void*)&y_stride, (void*)&dst_stride, (void*)&sum_norm};
     cudaLaunchKernel(kfn, grid, block, args, 0, nullptr);
     return QMM_OK;
 }

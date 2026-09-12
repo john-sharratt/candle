@@ -2008,9 +2008,21 @@ impl WaveSweep for Qwen4ExpBatched {
             layer_end,
             x_in,
             act_dtype: _,
+            adapter,
         } = wave;
         if seq_ids.is_empty() {
             candle::bail!("qwen4exp wave: empty batch");
+        }
+        // Flash-Next runs its layers under the Gated Residual, which carries no
+        // adapter plumbing, so `project_qkv_gated` is called with an empty
+        // `LayerLora`. Refused rather than ignored: dropping the name here would
+        // serve the BASE model under an adapter's name, which reads as a bad
+        // fine-tune rather than as an unsupported architecture.
+        if let Some(name) = adapter {
+            candle::bail!(
+                "qwen4exp wave: Flash-Next has no LoRA support, so adapter `{name}` \
+                 cannot be applied"
+            );
         }
         let m = &self.model;
         let cfg = &m.cfg;
@@ -2682,7 +2694,14 @@ impl Qwen4ExpBatched {
             // The routed experts still run their quantized weights — only the
             // activation operand stays float. Teaching the gather the 2.5-tile
             // row is recorded §0.4 work.
-            let acts = to_dynamic(&h2_3d, candle::quantized::Int8Mode::Off, cuda)?;
+            // Raw Σx — a language model's block sums stay far below f16's
+            // ceiling. (`Off` produces no q8a128 here anyway.)
+            let acts = to_dynamic(
+                &h2_3d,
+                candle::quantized::Int8Mode::Off,
+                cuda,
+                candle::quantized::SumScale::Raw,
+            )?;
             #[cfg(feature = "tensor-assert")]
             {
                 use crate::models::qwen35::quantized_moe::shared_expert_contribution;
@@ -2798,7 +2817,12 @@ impl Qwen4ExpBatched {
             let candle::Device::Cuda(cuda) = dev else {
                 candle::bail!("qwen4exp wave runs on CUDA");
             };
-            to_dynamic(&scored, m.lm_head.int8mode(), cuda)?
+            to_dynamic(
+                &scored,
+                m.lm_head.int8mode(),
+                cuda,
+                candle::quantized::SumScale::Raw,
+            )?
         };
         let logits = m
             .lm_head

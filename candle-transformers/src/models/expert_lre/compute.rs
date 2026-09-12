@@ -17,6 +17,7 @@ use super::types::MoeInput;
 use crate::models::profile::{profile_now, ProfileAccumulator};
 use candle::cuda_backend::wave_provenance::{LeaseOrigin, WaveTicket};
 use candle::cuda_backend::Backing;
+use candle::quantized::SumScale;
 use candle::{Result, Tensor};
 #[cfg(not(feature = "cuda"))]
 use candle_nn::Module;
@@ -482,7 +483,16 @@ pub fn compute_experts_grouped(
             // B4: fused SwiGLU → q8a128 (silu(gate)·up quantized in one kernel), feeds the down GEMM.
             let t = profile_now();
             let inter_acts =
-                silu_mul_q8a128(&gate_out, &up_out, cuda_dev, gate_out.cuda_backing())?;
+                // Raw Σx — a language model's SwiGLU intermediate stays orders
+                // of magnitude below f16's 65504; the consumer below reads this
+                // operand's own `sum_scale`, so the two agree by construction.
+                silu_mul_q8a128(
+                    &gate_out,
+                    &up_out,
+                    cuda_dev,
+                    gate_out.cuda_backing(),
+                    SumScale::Raw,
+                )?;
             profile.record("gemm_silu_mul", t);
             let t = profile_now();
             let down_out = grouped_qmatmul(
@@ -517,7 +527,9 @@ pub fn compute_experts_grouped(
             let t = profile_now();
             let stacked_xs =
                 candle::quantized::cuda::fused_moe_gather(xs, &tok_ids_dev, total_batch, cuda_dev)?;
-            let stacked_q8 = match to_dynamic(&stacked_xs, Int8Mode::Precision, cuda_dev)? {
+            // Raw Σx — a language model's block sums stay far below f16's ceiling.
+            let stacked_q8 =
+                match to_dynamic(&stacked_xs, Int8Mode::Precision, cuda_dev, SumScale::Raw)? {
                 DynamicActs::Int8(op) => op,
                 DynamicActs::Float(_) => {
                     candle::bail!("q8a128 activation quantize returned a non-int8 operand")
@@ -548,7 +560,16 @@ pub fn compute_experts_grouped(
             profile.record("gemm_up", t);
             let t = profile_now();
             let inter_acts =
-                silu_mul_q8a128(&gate_out, &up_out, cuda_dev, gate_out.cuda_backing())?;
+                // Raw Σx — a language model's SwiGLU intermediate stays orders
+                // of magnitude below f16's 65504; the consumer below reads this
+                // operand's own `sum_scale`, so the two agree by construction.
+                silu_mul_q8a128(
+                    &gate_out,
+                    &up_out,
+                    cuda_dev,
+                    gate_out.cuda_backing(),
+                    SumScale::Raw,
+                )?;
             profile.record("gemm_silu_mul", t);
             let t = profile_now();
             let down_out = grouped_qmatmul(

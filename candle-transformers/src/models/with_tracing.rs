@@ -140,6 +140,13 @@ impl QMatMul {
     pub fn int8mode(&self) -> candle::quantized::Int8Mode {
         self.inner.int8mode()
     }
+
+    /// Declare how this layer's activation stores its per-128 `Σx` — see
+    /// [`candle::quantized::SumScale`]. Passes through to the inner weight.
+    pub fn with_sum_scale(mut self, sum_scale: candle::quantized::SumScale) -> Self {
+        self.inner = self.inner.with_sum_scale(sum_scale);
+        self
+    }
 }
 
 impl Module for QMatMul {

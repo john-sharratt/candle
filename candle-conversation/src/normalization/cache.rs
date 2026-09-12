@@ -31,8 +31,18 @@ impl NormalizationCache {
 
     /// Read path: normalized 0–1000 scores for a scope's children. A scope never
     /// observed yet normalizes every child against the cold-start prior. Pure.
-    pub fn normalize(&self, scope: &ScopeKey, raw: &[(ChildKey, f32)]) -> Vec<(ChildKey, f32)> {
-        self.normalize_with_floors(scope, raw, &[])
+    ///
+    /// `probe_tokens` is the length of the probe `raw` was scored with, in
+    /// signature tokens. It is required rather than optional because a raw score
+    /// is a sum over the probe and the band is a rate — see
+    /// [`NormConfig::probe_t_ref`].
+    pub fn normalize(
+        &self,
+        scope: &ScopeKey,
+        raw: &[(ChildKey, f32)],
+        probe_tokens: usize,
+    ) -> Vec<(ChildKey, f32)> {
+        self.normalize_with_floors(scope, raw, &[], probe_tokens)
     }
 
     /// [`Self::normalize`] with a caller-supplied per-child denominator floor —
@@ -43,10 +53,13 @@ impl NormalizationCache {
         scope: &ScopeKey,
         raw: &[(ChildKey, f32)],
         floors: &[f32],
+        probe_tokens: usize,
     ) -> Vec<(ChildKey, f32)> {
         match self.scopes.get(scope) {
-            Some(s) => s.normalize_with_floors(raw, floors, &self.cfg),
-            None => ScopeState::default().normalize_with_floors(raw, floors, &self.cfg),
+            Some(s) => s.normalize_with_floors(raw, floors, &self.cfg, probe_tokens),
+            None => {
+                ScopeState::default().normalize_with_floors(raw, floors, &self.cfg, probe_tokens)
+            }
         }
     }
 
@@ -69,9 +82,10 @@ impl NormalizationCache {
         raw: &[(ChildKey, f32)],
         floors: &[f32],
         min_observations: u32,
+        probe_tokens: usize,
     ) -> Vec<(ChildKey, f32)> {
         let Some(state) = self.scopes.get(scope) else {
-            return self.normalize_with_floors(parent, raw, floors);
+            return self.normalize_with_floors(parent, raw, floors, probe_tokens);
         };
         let (mut warm, mut cold): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
         for (i, (child, _)) in raw.iter().enumerate() {
@@ -82,10 +96,10 @@ impl NormalizationCache {
             }
         }
         if cold.is_empty() {
-            return state.normalize_with_floors(raw, floors, &self.cfg);
+            return state.normalize_with_floors(raw, floors, &self.cfg, probe_tokens);
         }
         if warm.is_empty() {
-            return self.normalize_with_floors(parent, raw, floors);
+            return self.normalize_with_floors(parent, raw, floors, probe_tokens);
         }
         // Mixed: normalize each half against the scope that actually knows the
         // child, then reassemble in the caller's order.
@@ -99,8 +113,9 @@ impl NormalizationCache {
         };
         let (warm_raw, warm_floors) = pick(&warm);
         let (cold_raw, cold_floors) = pick(&cold);
-        let warm_out = state.normalize_with_floors(&warm_raw, &warm_floors, &self.cfg);
-        let cold_out = self.normalize_with_floors(parent, &cold_raw, &cold_floors);
+        let warm_out =
+            state.normalize_with_floors(&warm_raw, &warm_floors, &self.cfg, probe_tokens);
+        let cold_out = self.normalize_with_floors(parent, &cold_raw, &cold_floors, probe_tokens);
         let mut out = raw.to_vec();
         for (slot, v) in warm.iter().zip(warm_out) {
             out[*slot] = v;
@@ -145,12 +160,22 @@ impl NormalizationCache {
     ///
     /// Fast on the hot path: one hash lookup rejects an already-folded source
     /// before touching any child.
-    pub fn observe(&mut self, scope: &ScopeKey, source: u64, raw: &[(ChildKey, f32)]) {
+    /// `probe_tokens` is the length of the probe `raw` was scored with. The write
+    /// path scales to the same reference the read path does — a level learned at
+    /// one probe length and a query measured at another is the unit mismatch this
+    /// carries the length to avoid. See [`NormConfig::probe_t_ref`].
+    pub fn observe(
+        &mut self,
+        scope: &ScopeKey,
+        source: u64,
+        raw: &[(ChildKey, f32)],
+        probe_tokens: usize,
+    ) {
         let state = self.scopes.entry(scope.clone()).or_default();
         if !state.mark_observed(source) {
             return;
         }
-        state.observe(raw, &self.cfg);
+        state.observe(raw, &self.cfg, probe_tokens);
     }
 
     #[cfg(test)]

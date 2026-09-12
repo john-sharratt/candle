@@ -49,9 +49,14 @@ __device__ __forceinline__ void q8a128_load4<__nv_bfloat16>(const __nv_bfloat16*
     a = lo.x; b = lo.y; c = hi.x; d = hi.y;
 }
 
+// `sum_norm`: 0 stores the raw Σx, 1 stores Σx/amax (see blocks.cuh). A RUNTIME
+// argument, uniform across the grid and read by one lane per 128-tile, so it
+// costs a predicated select on a store that happens once per tile — and, unlike
+// a template parameter, it leaves the kernel count where it was.
 template <typename T>
 __global__ void quantize_q8a128_kernel(
-    const T* __restrict__ act, block_q8a128* __restrict__ out, int rows, int cols)
+    const T* __restrict__ act, block_q8a128* __restrict__ out, int rows, int cols,
+    int sum_norm)
 {
     const int total_tiles = (int)(((int64_t)rows * cols) / 128);
     const int total_warps = (gridDim.x * blockDim.x) >> 5;
@@ -84,11 +89,14 @@ __global__ void quantize_q8a128_kernel(
         if (lane == 0) {
             // One (scale, sum) per 128-element tile (per-128). Stored at the tile slot's first half2.
             half2* ds = reinterpret_cast<half2*>(obytes + q8a1024_ds_off(tile));
-            // Σx normalised by amax: |Σx/amax| ≤ 128 whatever the activation's
-            // magnitude, where the raw Σx overflows f16 above 65504. `id` already
-            // carries the amax==0 guard, so a dead tile stores {0, 0}.
+            // Raw Σx, or Σx normalised by amax when the caller asked: |Σx/amax|
+            // ≤ 128 whatever the activation's magnitude, where the raw Σx
+            // overflows f16 above 65504. `id` already carries the amax==0 guard,
+            // so a dead tile stores {0, 0} either way. `s` is passed through
+            // unmultiplied on the raw arm, so those bytes are unchanged.
+            const float s_store = sum_norm ? (s * id * (1.f / 127.f)) : s;
             ds[0] = make_half2(__float2half_rn(amax / 127.f),
-                               __float2half_rn(s * id * (1.f / 127.f)));
+                               __float2half_rn(s_store));
         }
     }
 }

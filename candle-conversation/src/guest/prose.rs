@@ -1579,6 +1579,10 @@ impl PlacedLlama {
                 geo.arch.rope_is_interleaved(),
                 generation,
                 shared_pm,
+                // No QSA: the prose guest runs a dense stack with no trained
+                // block-selection indexer, so attention is over the whole
+                // window and there is no selection to hand the kernel.
+                None,
             )?
         } else {
             let scale = 1.0 / (geo.head_dim as f32).sqrt();
@@ -1598,6 +1602,8 @@ impl PlacedLlama {
                 &vc,
                 &self.rope_cs,
                 geo.arch.rope_is_interleaved(),
+                // No QSA — see the prefill call above.
+                None,
             )?
         };
         out.to_dtype(DType::F32)

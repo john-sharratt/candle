@@ -92,6 +92,9 @@ pub(super) fn qwen35_9b_q6() -> ModelSpec {
         // this serves.
         model_repo: quantized_qwen35::QWEN35_9B.0.into(),
         model_filename: quantized_qwen35::QWEN35_9B.2.into(),
+        // Published under this name, so resolution goes to the hub as usual —
+        // nothing here is built locally.
+        prepared_from_source: false,
         model_bytes: 7_540_192_896,
         // **The same commit the gate loads.** `QWEN35_9B` has pinned one since an upstream
         // re-upload silently invalidated a threshold tuning; taking `.0` and `.2` and dropping

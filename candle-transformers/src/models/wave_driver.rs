@@ -37,6 +37,7 @@ use super::batched_inference::{
 };
 use super::batched_model::{WaveGuard, WavePhase};
 use super::kv_cache_utils::SequenceContext;
+use super::profile::gpu_span;
 use super::tensor_cat::TensorCat;
 use candle::quantized::pinned_staging::Generation;
 
@@ -611,6 +612,11 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
         (Some(t), None) => Some(TensorCat::from_cat_tensor(t, 0)?),
         (None, _) => None,
     };
+    // The layer sweep plus the head, so the forward's stream time divides into
+    // "the model" and "everything the driver and its caller do around it". The
+    // gap between this and the caller's own forward span is where a per-row copy
+    // off the wave arena hid 76% of a 128-slot decode step.
+    let g_sweep = gpu_span("wv:sweep", dev);
     let wave = model.sweep(
         session,
         WaveGroups {
@@ -627,6 +633,7 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
             act_dtype,
         },
     );
+    g_sweep.end();
     // **A failed wave leaves no trace.** The layer sweep advances each layer's
     // usage as that layer completes, so an error anywhere in it — and the relief
     // design treats failing a wave as routine — leaves the early layers one

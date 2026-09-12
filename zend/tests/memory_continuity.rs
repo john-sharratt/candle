@@ -35,6 +35,9 @@
 mod common;
 
 use candle::Device;
+use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
+use std::sync::Arc;
+
 use common::{
     digest_of_layers, exclusive_engine_slot, memory, memory_is_empty, memory_of,
     poison_memory_record, probe_recall, say, say_n, say_opening, scenario, sealed_memory,
@@ -900,6 +903,14 @@ fn b7_scope_splice_catches_memory_up() {
     // The production round-trip, minus the parallelism: turn_sink's
     // `ingest_scopes` forks, runs `ingest_scope_roundtrip_indices` on the fork,
     // and splices the coupled pair back in scope order.
+    // The same steering the ingest passes install: `<think>` bound to
+    // `ThinkMode::Off`'s tree, so the summary decode cannot open a runaway block.
+    let triggers = session
+        .engine()
+        .compile_think_steering()
+        .expect("compile think steering")
+        .map(|ts| ts.registry_for(&TriggerRegistry::new(), ThinkMode::Off))
+        .unwrap_or_else(|| Arc::new(TriggerRegistry::new()));
     let run_once = || {
         let mut parent = session.start();
         say(&mut parent, "Turn zero. Acknowledge in one word.");
@@ -913,6 +924,7 @@ fn b7_scope_splice_catches_memory_up() {
                 "Summarise what this file does in one sentence.",
                 vec!["scope".into()],
                 64,
+                Arc::clone(&triggers),
             )
             .expect("scope round-trip");
         parent

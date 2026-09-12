@@ -17,7 +17,7 @@
 //! `forward_attn_batched` on this wrapper.
 
 use candle::quantized::cuda::{to_dynamic, DynamicActs};
-use candle::quantized::Int8Mode;
+use candle::quantized::{Int8Mode, SumScale};
 use candle::{DType, LiveTensor, Result, Tensor};
 use candle_nn::kv_cache::WaveGeneration;
 
@@ -68,7 +68,8 @@ impl BatchedAttentionLayer for Qwen4ExpAttentionLayer<'_> {
         let candle::Device::Cuda(dev) = x.device() else {
             candle::bail!("qwen4exp attention runs on CUDA");
         };
-        to_dynamic(x, mode, dev)
+        // Raw Σx — a language model's block sums stay far below f16's ceiling.
+        to_dynamic(x, mode, dev, SumScale::Raw)
     }
 
     fn ffn_norm<'w>(

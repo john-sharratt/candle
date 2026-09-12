@@ -9,6 +9,8 @@
 use std::fs;
 use std::path::Path;
 
+use candle_conversation::models::Dialect;
+use candle_conversation::stencil::ToolCallEnvelope;
 use zend::repo_scan::render::{render_chain, CHAIN_TOOLS};
 use zend::repo_scan::{build_units, walk_workspace, DirState, DirUnit};
 use zend::turn_sink::{InsertTurnSink, RecordingTurnSink};
@@ -57,8 +59,12 @@ fn record(root: &Path) -> RecordingTurnSink {
     let ctx = ToolContext::with_workspace(root);
     let force: Vec<String> = CHAIN_TOOLS.iter().map(|t| t.to_string()).collect();
     let mut sink = RecordingTurnSink::new();
+    // ChatML's envelope, matching this suite's existing JSON-shaped
+    // expectations; `render::tests::tool_calls_follow_the_dialects_call_style`
+    // is what holds the other style.
+    let env = ToolCallEnvelope::for_dialect(&Dialect::chat_ml());
     for unit in units_of(root) {
-        let (prefilled, decode_user) = render_chain(&ctx, &unit);
+        let (prefilled, decode_user) = render_chain(&ctx, &unit, &env);
         sink.ingest_chain(
             &prefilled,
             &decode_user,
@@ -95,9 +101,9 @@ fn each_directory_lists_before_it_reads() {
     assert_eq!(src.len(), 3, "request+list, listing+read, excerpt+summary");
 
     assert!(src[0].0.starts_with("Summarize the `src/` folder"));
-    assert!(src[0].1.contains("\"name\":\"file_list\""));
+    assert!(src[0].1.contains("\"name\": \"file_list\""));
     assert!(src[1].0.starts_with("<tool_response>{"), "the listing");
-    assert!(src[1].1.contains("\"name\":\"file_read\""));
+    assert!(src[1].1.contains("\"name\": \"file_read\""));
     assert!(src[2].0.contains("```rust"), "the anchor excerpt");
     assert!(src[2].1.is_empty(), "the folder summary is DECODED");
 }
@@ -171,7 +177,7 @@ fn a_directory_with_no_anchor_still_ingests() {
     write(dir.path(), "src/thing.rs", b"pub fn t() {}\n");
     let sink = record(dir.path());
     assert_eq!(sink.turns.len(), 2, "request+list, then listing+summary");
-    assert!(sink.turns[0].1.contains("\"name\":\"file_list\""));
+    assert!(sink.turns[0].1.contains("\"name\": \"file_list\""));
     assert!(sink.turns[1].0.starts_with("<tool_response>{"));
     assert!(sink.turns[1].1.is_empty(), "the summary is decoded");
 }

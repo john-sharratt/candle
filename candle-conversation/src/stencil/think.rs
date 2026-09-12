@@ -639,7 +639,7 @@ mod tests {
         assert_eq!(closed, "</think>");
         assert!(matches!(mask, StepMask::Done));
         assert!(d.is_done());
-        assert_eq!(d.stats().think_continuations, 1);
+        assert_eq!(d.stats().intercepted_closes, 1);
     }
 
     #[test]
@@ -664,7 +664,7 @@ mod tests {
         assert_eq!(closed, "</think>");
         assert!(matches!(mask, StepMask::Done));
         assert!(d.is_done());
-        assert_eq!(d.stats().think_continuations, 1);
+        assert_eq!(d.stats().intercepted_closes, 1);
     }
 
     /// `balanced_closes_on_eos_too`: an EOS sample closes the span exactly like
@@ -687,7 +687,7 @@ mod tests {
         assert_eq!(closed, "</think>");
         assert!(matches!(mask, StepMask::Done));
         assert!(d.is_done());
-        assert_eq!(d.stats().think_continuations, 1);
+        assert_eq!(d.stats().intercepted_closes, 1);
     }
 
     /// **The upper dials close on the model's FIRST close, like every other dial.**
@@ -714,7 +714,7 @@ mod tests {
         assert_eq!(closed, "</think>");
         assert!(matches!(mask, StepMask::Done));
         assert!(d.is_done());
-        assert_eq!(d.stats().think_continuations, 1);
+        assert_eq!(d.stats().intercepted_closes, 1);
     }
 
     /// `deep_closes_on_eos_too`: an EOS sample closes `Deep`'s span exactly like
@@ -733,7 +733,7 @@ mod tests {
         let (mask, closed) = step_to_decode(&mut d, &v);
         assert_eq!(closed, "</think>");
         assert!(matches!(mask, StepMask::Done));
-        assert_eq!(d.stats().think_continuations, 1);
+        assert_eq!(d.stats().intercepted_closes, 1);
     }
 
     /// The whole prefill sequence of the widest dial, in order: the block-opening
@@ -761,7 +761,7 @@ mod tests {
         }
         assert_eq!(prefills, vec!["\n".to_string(), "</think>".to_string()]);
         assert!(d.is_done());
-        assert_eq!(d.stats().think_continuations, 1);
+        assert_eq!(d.stats().intercepted_closes, 1);
     }
 
     // ── Invariant: every produced tree compiles cleanly and reaches End ──────

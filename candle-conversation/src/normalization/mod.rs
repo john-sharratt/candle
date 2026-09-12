@@ -135,6 +135,36 @@ pub struct NormConfig {
     pub floor_pctl: f32,
     /// Output scale: a hit at the hit level maps to this (1000 = full hit).
     pub scale: f32,
+    /// Reference probe length, in signature tokens, that every raw score is
+    /// scaled to before it meets the band.
+    ///
+    /// **A raw provenance score is a SUM over probe tokens**, so it grows with
+    /// the probe. The learned level is one number per child, folded at seal from
+    /// a capped tail probe, while the read path runs at every reprojection with
+    /// whatever window is current — six tokens at submit, up to the cap
+    /// mid-decode. Dividing a six-token sum by a level learned at 256 is not a
+    /// smaller measurement of the same quantity, it is a different unit, and it
+    /// was measured: the same `datetime` match scored 4,658 against a six-token
+    /// query and ~82,850 against an eighty-token one, which then rode the belief
+    /// accumulator to 143,035 on a nominal 0–1000 band.
+    ///
+    /// Scaling both the read and the write path to this reference makes the band
+    /// a RATE rather than a total, so a hit lands at [`Self::scale`] whatever the
+    /// probe length and the selection thresholds keep the meaning their sweeps
+    /// gave them. It also makes Concept F's `max(tail, question)` fusion mean
+    /// something: those two probes differ in length by an order of magnitude, so
+    /// on raw sums the longer one won structurally rather than on evidence.
+    ///
+    /// **Linear, and deliberately uncapped.** Score-per-token × reference length
+    /// is the assumption-free reading of a sum; a cap would be a tuning constant
+    /// invented without measurement. The cost is that a very short probe's
+    /// variance is amplified with its signal, so if short-window noise starts
+    /// winning selections, the answer is a measured ceiling here — not a guess.
+    ///
+    /// 256 = `reproject_max_probe_tokens`, the live probe cap and therefore the
+    /// length the existing levels were in practice learned at, so they keep their
+    /// magnitudes across this change.
+    pub probe_t_ref: usize,
 }
 
 impl Default for NormConfig {
@@ -146,6 +176,7 @@ impl Default for NormConfig {
             floor_min: 50.0,
             floor_pctl: 0.10,
             scale: 1000.0,
+            probe_t_ref: 256,
         }
     }
 }

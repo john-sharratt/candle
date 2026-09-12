@@ -12227,6 +12227,7 @@ mod tests {
             max_tokens: 64,
             sampling_config: SamplingConfig::default(),
             seal_action: SealAction::None,
+            free_tool_calls_from_penalties: false,
             prefill_assistant_text: String::new(),
             finished: false,
             decode_start: Instant::now(),

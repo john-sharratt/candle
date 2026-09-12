@@ -45,7 +45,7 @@ use candle::quantized::cuda::{
 };
 #[cfg(feature = "cuda")]
 use candle::quantized::get_vram_info;
-use candle::quantized::{gguf_file, Int8Mode, QTensor};
+use candle::quantized::{gguf_file, Int8Mode, QTensor, SumScale};
 use candle::LiveTensor;
 use candle::{DType, Device, Result, Tensor};
 #[cfg(feature = "cuda")]
@@ -543,7 +543,16 @@ impl SparseMoeBlock {
             )?;
         }
         let g_moe = gpu_span("moe:silu", &device);
-        let inter_acts = silu_mul_q8a128(&gate_out, &up_out, &cuda_dev, gate_out.cuda_backing())?;
+        // Raw Σx — a language model's SwiGLU intermediate stays orders of
+        // magnitude below f16's 65504; the down matmul reads this operand's own
+        // `sum_scale`, so the two agree by construction.
+        let inter_acts = silu_mul_q8a128(
+            &gate_out,
+            &up_out,
+            &cuda_dev,
+            gate_out.cuda_backing(),
+            SumScale::Raw,
+        )?;
         g_moe.end();
         let g_moe = gpu_span("moe:down", &device);
         let down_out = grouped_qmatmul_dev_q8a128(

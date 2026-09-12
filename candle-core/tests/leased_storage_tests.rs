@@ -34,6 +34,16 @@ fn f32_ptr(t: &Tensor) -> u64 {
     }
 }
 
+/// Element count of the *allocation* behind a contiguous F32 tensor — how many
+/// floats were really bought, as opposed to how many the shape describes.
+fn f32_slice_len(t: &Tensor) -> usize {
+    let (storage, _) = t.storage_and_layout();
+    match &*storage {
+        candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>().expect("f32 slice").len(),
+        _ => panic!("expected CUDA storage"),
+    }
+}
+
 #[test]
 fn lease_reads_the_owners_bytes() -> Result<()> {
     let dev = Device::new_cuda(0)?;
@@ -202,6 +212,55 @@ fn to_owned_qtensor_copies_off_the_lease() -> Result<()> {
         &*escaped.data()?,
         &*owner.data()?,
         "with the owner's bytes reproduced exactly"
+    );
+    Ok(())
+}
+
+/// `to_owned_tensor` copies **the view**, not the view's whole storage.
+///
+/// Every hot call site is `x.narrow(..)?.to_owned_tensor()?` — one scored row
+/// off a batched head, one sequence's span off a packed wave — so a copy sized
+/// to the parent makes owning `n` rows of an `n`-row block cost `n²` bytes and
+/// `n` full-block allocations. Asserted on the allocation itself (the CUDA
+/// slice's element count), not on the shape, because the shape was right under
+/// the old behaviour too: it kept the parent's storage AND the row's layout, so
+/// only the buffer behind it gave the waste away.
+#[test]
+fn to_owned_tensor_copies_the_view_not_the_parent() -> Result<()> {
+    let dev = Device::new_cuda(0)?;
+    let rows = 128usize;
+    let cols = 64usize;
+    let block = Tensor::from_vec(
+        (0..rows * cols).map(|i| i as f32).collect::<Vec<_>>(),
+        (rows, cols),
+        &dev,
+    )?;
+
+    let row = block.narrow(0, 100, 1)?;
+    assert_eq!(
+        row.layout().start_offset(),
+        100 * cols,
+        "the view is offset into the parent, which is the case that used to copy \
+         the parent whole"
+    );
+
+    let owned = row.to_owned_tensor()?;
+    assert_eq!(
+        f32_slice_len(&owned),
+        cols,
+        "the copy must be sized to the row, not to the {rows}-row block"
+    );
+    assert_eq!(
+        owned.layout().start_offset(),
+        0,
+        "and the row must sit at the base of its own allocation"
+    );
+    assert_eq!(
+        owned.flatten_all()?.to_vec1::<f32>()?,
+        (100 * cols..101 * cols)
+            .map(|i| i as f32)
+            .collect::<Vec<_>>(),
+        "with exactly the row's values"
     );
     Ok(())
 }

@@ -28,8 +28,15 @@ fn val(v: &[(ChildKey, f32)], k: &ChildKey) -> f32 {
 fn obs(cache: &mut NormalizationCache, scope: &ScopeKey, raw: &[(ChildKey, f32)]) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    cache.observe(scope, NEXT.fetch_add(1, Ordering::Relaxed), raw);
+    cache.observe(scope, NEXT.fetch_add(1, Ordering::Relaxed), raw, T_REF);
 }
+
+/// Probe length used by every test that is not *about* probe length.
+///
+/// Equal to `NormConfig::probe_t_ref`, so the reference scaling is exactly 1.0
+/// and each assertion below states the same claim it did before the band became
+/// a rate. The length-invariance tests pass their own lengths deliberately.
+const T_REF: usize = 256;
 
 #[test]
 fn hit_level_asymmetric_ewma() {
@@ -75,15 +82,15 @@ fn re_observing_the_same_evidence_changes_nothing() {
     let cc = ChildKey::named("cc");
     let mut cache = NormalizationCache::default();
 
-    cache.observe(&scope, TURN, &[(cc.clone(), 1000.0)]);
+    cache.observe(&scope, TURN, &[(cc.clone(), 1000.0)], T_REF);
     let level = cache.level_of(&scope, &cc).unwrap();
     assert_eq!(cache.count_of(&scope, &cc), Some(1));
 
     // Replay the same turn many times over — including with a different score,
     // which must also be ignored: the turn has already been folded.
     for _ in 0..25 {
-        cache.observe(&scope, TURN, &[(cc.clone(), 1000.0)]);
-        cache.observe(&scope, TURN, &[(cc.clone(), 10.0)]);
+        cache.observe(&scope, TURN, &[(cc.clone(), 1000.0)], T_REF);
+        cache.observe(&scope, TURN, &[(cc.clone(), 10.0)], T_REF);
     }
     approx(cache.level_of(&scope, &cc).unwrap(), level, 0.0);
     assert_eq!(
@@ -93,7 +100,7 @@ fn re_observing_the_same_evidence_changes_nothing() {
     );
 
     // Different evidence still teaches — learning is not switched off.
-    cache.observe(&scope, TURN + 1, &[(cc.clone(), 500.0)]);
+    cache.observe(&scope, TURN + 1, &[(cc.clone(), 500.0)], T_REF);
     assert_ne!(cache.level_of(&scope, &cc).unwrap(), level);
     assert_eq!(cache.count_of(&scope, &cc), Some(2));
 }
@@ -110,17 +117,23 @@ fn normalize_puts_a_hit_at_the_scale() {
 
     // A probe AT the hit level normalizes to ~scale (1000). Single child ⇒ floor
     // = its own level, so denom = level exactly.
-    let out = cache.normalize(&scope, &[(cc.clone(), level)]);
+    let out = cache.normalize(&scope, &[(cc.clone(), level)], T_REF);
     approx(val(&out, &cc), 1000.0, 0.5);
 
     // A 2× hit locks on at ~2000; a half hit lands at ~500.
     approx(
-        val(&cache.normalize(&scope, &[(cc.clone(), 2.0 * level)]), &cc),
+        val(
+            &cache.normalize(&scope, &[(cc.clone(), 2.0 * level)], T_REF),
+            &cc,
+        ),
         2000.0,
         1.0,
     );
     approx(
-        val(&cache.normalize(&scope, &[(cc.clone(), 0.5 * level)]), &cc),
+        val(
+            &cache.normalize(&scope, &[(cc.clone(), 0.5 * level)], T_REF),
+            &cc,
+        ),
         500.0,
         0.5,
     );
@@ -135,12 +148,12 @@ fn cold_child_normalizes_against_prior() {
     let x = ChildKey::turn(0);
 
     approx(
-        val(&cache.normalize(&scope, &[(x.clone(), 400.0)]), &x),
+        val(&cache.normalize(&scope, &[(x.clone(), 400.0)], T_REF), &x),
         1000.0,
         0.5,
     );
     approx(
-        val(&cache.normalize(&scope, &[(x.clone(), 200.0)]), &x),
+        val(&cache.normalize(&scope, &[(x.clone(), 200.0)], T_REF), &x),
         500.0,
         0.5,
     );
@@ -160,7 +173,7 @@ fn floor_min_caps_amplification_of_a_quiet_child() {
     let x = ChildKey::turn(0);
 
     // With the floor: 1000 * 300 / 100 = 3000. Without it would be 1000*300/10 = 30000.
-    let got = val(&cache.normalize(&scope, &[(x.clone(), 300.0)]), &x);
+    let got = val(&cache.normalize(&scope, &[(x.clone(), 300.0)], T_REF), &x);
     approx(got, 3000.0, 0.5);
     assert!(
         got < 30000.0,
@@ -233,7 +246,7 @@ fn normalization_flips_generic_vs_specific() {
     // On a cc-probe, RAW ranks root (600) above cc (500)...
     assert!(600.0 > 500.0);
     // ...but NORMALIZED flips it — the specific target wins.
-    let out = cache.normalize(&scope, &cc_probe);
+    let out = cache.normalize(&scope, &cc_probe, T_REF);
     let (root_n, cc_n) = (val(&out, &root), val(&out, &cc));
     assert!(
         cc_n > root_n,
@@ -252,9 +265,9 @@ fn deterministic() {
         // Distinct source per step: the sequence is the thing under test, and a
         // fresh cache must fold all of it.
         for (i, &r) in seq.iter().enumerate() {
-            c.observe(&scope, i as u64, &[(x.clone(), r)]);
+            c.observe(&scope, i as u64, &[(x.clone(), r)], T_REF);
         }
-        c.normalize(&scope, &[(x.clone(), 500.0)])
+        c.normalize(&scope, &[(x.clone(), 500.0)], T_REF)
     };
     assert_eq!(run(), run());
 }
@@ -274,17 +287,17 @@ fn per_child_floors_replace_the_prior_and_scope_floor() {
     // high size floor for the fragment (muted) and a small one for the
     // full-window child (its rare hit amplifies well past the flat prior).
     let raw = [(frag.clone(), 400.0), (full.clone(), 400.0)];
-    let out = cache.normalize_with_floors(&scope, &raw, &[6400.0, 2.0]);
+    let out = cache.normalize_with_floors(&scope, &raw, &[6400.0, 2.0], T_REF);
     approx(val(&out, &frag), 1000.0 * 400.0 / 6400.0, 0.1); // 62.5 — muted
     approx(val(&out, &full), 1000.0 * 400.0 / 2.0, 0.5); // 200_000 — stands out
 
     // A zero floor keeps the standard prior path for that child.
-    let out = cache.normalize_with_floors(&scope, &raw, &[6400.0, 0.0]);
+    let out = cache.normalize_with_floors(&scope, &raw, &[6400.0, 0.0], T_REF);
     approx(val(&out, &full), 1000.0 * 400.0 / 400.0, 0.1); // cold prior 400
 
     // Empty floors ⇒ identical to plain normalize.
-    let a = cache.normalize_with_floors(&scope, &raw, &[]);
-    let b = cache.normalize(&scope, &raw);
+    let a = cache.normalize_with_floors(&scope, &raw, &[], T_REF);
+    let b = cache.normalize(&scope, &raw, T_REF);
     assert_eq!(a, b);
 }
 
@@ -299,10 +312,10 @@ fn traffic_peak_dominates_the_supplied_floor() {
     // Observed traffic peaked at 5000 (regardless of the EWMA's blend).
     obs(&mut cache, &scope, &[(x.clone(), 5000.0)]);
     obs(&mut cache, &scope, &[(x.clone(), 100.0)]);
-    let out = cache.normalize_with_floors(&scope, &[(x.clone(), 5000.0)], &[100.0]);
+    let out = cache.normalize_with_floors(&scope, &[(x.clone(), 5000.0)], &[100.0], T_REF);
     approx(val(&out, &x), 1000.0, 1.0);
     // A weak hit relative to that peak mutes proportionally.
-    let out = cache.normalize_with_floors(&scope, &[(x.clone(), 500.0)], &[100.0]);
+    let out = cache.normalize_with_floors(&scope, &[(x.clone(), 500.0)], &[100.0], T_REF);
     approx(val(&out, &x), 100.0, 0.5);
 }
 
@@ -342,7 +355,7 @@ fn a_cold_child_in_a_subdivided_scope_falls_back_to_its_parent() {
     obs_n(&mut cache, &child, &[(warm.clone(), 900.0)], 12);
 
     let raw = [(warm.clone(), 900.0), (cold.clone(), 900.0)];
-    let out = cache.normalize_with_fallback(&child, &parent, &raw, &[], 8);
+    let out = cache.normalize_with_fallback(&child, &parent, &raw, &[], 8, T_REF);
 
     // Order is the caller's, not warm-then-cold.
     assert_eq!(out[0].0, warm);
@@ -366,8 +379,8 @@ fn an_unseen_subdivided_scope_is_exactly_the_parent() {
 
     let raw = [(a.clone(), 450.0)];
     assert_eq!(
-        cache.normalize_with_fallback(&child, &parent, &raw, &[], 8),
-        cache.normalize(&parent, &raw),
+        cache.normalize_with_fallback(&child, &parent, &raw, &[], 8, T_REF),
+        cache.normalize(&parent, &raw, T_REF),
     );
 }
 
@@ -391,7 +404,7 @@ fn the_warm_threshold_is_counted_per_child() {
     obs_n(&mut cache, &child, &[(b.clone(), 900.0)], 3);
 
     let raw = [(a.clone(), 900.0), (b.clone(), 900.0)];
-    let out = cache.normalize_with_fallback(&child, &parent, &raw, &[], 8);
+    let out = cache.normalize_with_fallback(&child, &parent, &raw, &[], 8, T_REF);
     approx(val(&out, &a), 1000.0, 30.0);
     // `b` fell back despite being present in the child scope.
     approx(val(&out, &b), 253.0, 20.0);
@@ -441,7 +454,7 @@ fn a_child_that_only_ever_scores_zero_never_goes_warm() {
     );
 
     let raw = [(scorer.clone(), 900.0), (silent.clone(), 900.0)];
-    let out = cache.normalize_with_fallback(&child, &parent, &raw, &[], 8);
+    let out = cache.normalize_with_fallback(&child, &parent, &raw, &[], 8, T_REF);
     approx(val(&out, &scorer), 1000.0, 30.0);
     assert!(
         val(&out, &silent) < 400.0,
@@ -471,7 +484,7 @@ fn fallback_keeps_each_childs_floor_with_that_child() {
         (cold_c.clone(), 400.0),
     ];
     let floors = [4000.0, 8000.0, 2000.0];
-    let out = cache.normalize_with_fallback(&child, &parent, &raw, &floors, 8);
+    let out = cache.normalize_with_fallback(&child, &parent, &raw, &floors, 8, T_REF);
     assert_eq!(
         out.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
         vec![cold_a.clone(), warm_b.clone(), cold_c.clone()]
@@ -495,16 +508,97 @@ fn phase_scopes_do_not_leak_into_each_other() {
     obs_n(&mut cache, &user, &[(x.clone(), 900.0)], 12);
 
     let raw = [(x.clone(), 900.0)];
-    approx(val(&cache.normalize(&user, &raw), &x), 1000.0, 60.0);
+    approx(val(&cache.normalize(&user, &raw, T_REF), &x), 1000.0, 60.0);
     // Untouched scopes still sit on the cold-start prior of 400.
     approx(
-        val(&cache.normalize(&resp, &raw), &x),
+        val(&cache.normalize(&resp, &raw, T_REF), &x),
         1000.0 * 900.0 / 400.0,
         1.0,
     );
     approx(
-        val(&cache.normalize(&parent, &raw), &x),
+        val(&cache.normalize(&parent, &raw, T_REF), &x),
         1000.0 * 900.0 / 400.0,
         1.0,
     );
+}
+
+// ── The band is a RATE, not a total ────────────────────────────────────────
+//
+// A raw provenance score is a sum over probe tokens, and the read path runs at
+// every reprojection with whatever window is current while the write path folds
+// a capped tail at seal. Dividing one by the other directly measured the same
+// `datetime` match at 4,658 on a six-token query and ~82,850 on an eighty-token
+// one, which the belief accumulator then carried to 143,035 on a nominal 0–1000
+// band. These pin the unit.
+
+/// Equal agreement PER TOKEN lands on the same band value, whatever the probe
+/// length. This is the property the whole change exists to establish.
+#[test]
+fn the_band_is_invariant_to_probe_length() {
+    let scope = ScopeKey::turn_group(9, 9);
+    let x = ChildKey::named("x");
+    let mut cache = NormalizationCache::default();
+
+    // A level learned from a full-length probe (600 over the reference window).
+    obs(&mut cache, &scope, &[(x.clone(), 600.0)]);
+
+    // 600 over 256 tokens and 150 over 64 tokens are the SAME rate.
+    let long = val(&cache.normalize(&scope, &[(x.clone(), 600.0)], 256), &x);
+    let short = val(&cache.normalize(&scope, &[(x.clone(), 150.0)], 64), &x);
+    approx(short, long, 0.5);
+}
+
+/// The converse, and the exact shape of the defect: an equal raw TOTAL from a
+/// shorter probe now scores proportionally higher, because a quarter of the
+/// tokens producing the same sum is four times the agreement per token.
+///
+/// Before this, the two were indistinguishable — which is what let a long
+/// think-block probe outrank a short question probe structurally rather than on
+/// evidence, and made Concept F's `max(tail, question)` fusion a comparison of
+/// window sizes.
+#[test]
+fn an_equal_raw_total_from_a_shorter_probe_scores_higher() {
+    let scope = ScopeKey::turn_group(10, 10);
+    let x = ChildKey::named("x");
+    let mut cache = NormalizationCache::default();
+    obs(&mut cache, &scope, &[(x.clone(), 600.0)]);
+
+    let long = val(&cache.normalize(&scope, &[(x.clone(), 600.0)], 256), &x);
+    let short = val(&cache.normalize(&scope, &[(x.clone(), 600.0)], 64), &x);
+    approx(short, 4.0 * long, long * 0.01);
+}
+
+/// The WRITE path scales too, or the fix would be half-applied: a level learned
+/// from a short probe and one learned from a long probe at the same rate must be
+/// the same level. Otherwise the denominator carries the probe length of
+/// whatever happened to teach it.
+#[test]
+fn the_write_path_learns_a_rate_not_a_total() {
+    let from_long = ScopeKey::turn_group(11, 11);
+    let from_short = ScopeKey::turn_group(12, 12);
+    let x = ChildKey::named("x");
+    let mut cache = NormalizationCache::default();
+
+    // Same rate, four-fold different probe lengths.
+    cache.observe(&from_long, 1, &[(x.clone(), 600.0)], 256);
+    cache.observe(&from_short, 2, &[(x.clone(), 150.0)], 64);
+
+    approx(
+        cache.level_of(&from_short, &x).unwrap(),
+        cache.level_of(&from_long, &x).unwrap(),
+        0.01,
+    );
+}
+
+/// A scan with no probe produces no scores to scale, and must not reach the band
+/// as an infinity — the length is treated as one token rather than dividing by
+/// zero.
+#[test]
+fn a_zero_length_probe_stays_finite() {
+    let scope = ScopeKey::turn_group(13, 13);
+    let x = ChildKey::named("x");
+    let cache = NormalizationCache::default();
+    let got = val(&cache.normalize(&scope, &[(x.clone(), 0.0)], 0), &x);
+    assert!(got.is_finite(), "a zero-length probe produced {got}");
+    assert_eq!(got, 0.0);
 }

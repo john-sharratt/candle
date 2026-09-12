@@ -219,7 +219,7 @@ impl DsparkStreamingMoe {
             fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_qmatmul_dev_q8a128,
             moe_bucketize, silu_mul_q8a128, to_dynamic, DynamicActs, GROUPED_GEMM_TILE_W,
         };
-        use candle::quantized::Int8Mode;
+        use candle::quantized::{Int8Mode, SumScale};
         let (b, s, dim) = x.dims3()?;
         let t_tok = b * s;
         let xf = x.reshape((t_tok, dim))?.to_dtype(candle::DType::F32)?; // [T, dim]
@@ -232,7 +232,8 @@ impl DsparkStreamingMoe {
         // The grouped GEMM reads the int8 Q2_KO weights, so the activation must be q8a128 (int8) —
         // the same quantization the engine's MoE path uses. A float op would mismatch the KO
         // weights (and be rejected by the KO↔int8 pairing check).
-        let op = match to_dynamic(&xf, Int8Mode::Performance, &self.cuda_dev)? {
+        // Raw Σx — a language model's block sums stay far below f16's ceiling.
+        let op = match to_dynamic(&xf, Int8Mode::Performance, &self.cuda_dev, SumScale::Raw)? {
             DynamicActs::Int8(op) => op,
             DynamicActs::Float(_) => candle::bail!("dspark moe: expected int8 activation"),
         };
@@ -277,7 +278,16 @@ impl DsparkStreamingMoe {
                 launch_tiles,
                 &self.cuda_dev,
             )?;
-            let inter_acts = silu_mul_q8a128(&gate_out, &up_out, &self.cuda_dev, Backing::Owned)?;
+            // Raw Σx — a language model's SwiGLU intermediate stays orders of
+            // magnitude below f16's 65504; the down matmul reads this operand's
+            // own `sum_scale`, so the two agree by construction.
+            let inter_acts = silu_mul_q8a128(
+                &gate_out,
+                &up_out,
+                &self.cuda_dev,
+                Backing::Owned,
+                SumScale::Raw,
+            )?;
             let down_out = grouped_qmatmul_dev_q8a128(
                 &inter_acts,
                 &self.down_ptrs[block],

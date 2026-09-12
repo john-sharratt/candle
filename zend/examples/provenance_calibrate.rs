@@ -54,13 +54,16 @@ fn main() -> anyhow::Result<()> {
         .filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
         .collect();
     let defaults = NormConfig::default();
+    // Only the env-overridable knobs are named; the rest — `scale`, and the
+    // band's reference probe length — come from the default, so a new normalizer
+    // constant does not break this harness.
     let cfg = NormConfig {
         alpha_up: env_f32("ALPHA_UP", defaults.alpha_up),
         alpha_dn: env_f32("ALPHA_DN", defaults.alpha_dn),
         hit_prior: env_f32("HIT_PRIOR", defaults.hit_prior),
         floor_min: env_f32("FLOOR_MIN", defaults.floor_min),
         floor_pctl: env_f32("FLOOR_PCTL", defaults.floor_pctl),
-        scale: defaults.scale,
+        ..NormConfig::default()
     };
 
     let mut substrate = Substrate::new();
@@ -158,7 +161,10 @@ fn main() -> anyhow::Result<()> {
             (0..n).map(|ci| (child_keys[ci].clone(), raw[ci])).collect();
 
         // READ: normalize against hit levels as they stand before this turn.
-        let norm = cache.normalize(&scope, &raw_pairs);
+        // One probe per turn feeds both the read and the write here, so the two
+        // lengths agree by construction — which is the invariant the band's
+        // reference scaling exists to hold when they do not.
+        let norm = cache.normalize(&scope, &raw_pairs, sig.len());
         let norm_by_i: Vec<f32> = norm.iter().map(|(_, v)| *v).collect(); // preserves order
 
         let mut ranked: Vec<(usize, f32)> = norm_by_i.iter().copied().enumerate().collect();
@@ -189,7 +195,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         // WRITE: fold this turn into the hit levels (seal cadence, once per turn).
-        cache.observe(&scope, turn_i as u64, &raw_pairs);
+        cache.observe(&scope, turn_i as u64, &raw_pairs, sig.len());
         for ci in 0..n {
             raw_mean[ci] += (raw[ci] - raw_mean[ci]) / (turn_i + 1) as f32;
         }

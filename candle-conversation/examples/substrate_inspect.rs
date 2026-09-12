@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use candle_conversation::persistence::accounting::RecordAccounting;
 use candle_conversation::persistence::content_hash::{turn_stream_id, ContentHash};
@@ -52,7 +52,7 @@ use candle_conversation::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, Manifest,
 };
 use candle_conversation::persistence::record::{
-    ChunkPayload, DistillMode, DistillPayload, Record, RecordType,
+    ChunkPayload, DistillMode, DistillPayload, Record, RecordType, TurnCouplingPayload,
 };
 use candle_conversation::persistence::recovery;
 use candle_conversation::persistence::resume::decode_token_ids;
@@ -450,6 +450,27 @@ enum Cmd {
     /// whether any orphan chunk record shares a disk location with a LIVE turn
     /// (zero ⇒ reclaiming orphans frees only dead KV). Directory target only.
     Orphans,
+    /// **Turn couplings** — the `TurnCoupling` records that join a turn to the
+    /// tool response after it, decoded and grouped by timeline.
+    ///
+    /// `TurnCoupling` carries its timeline in the JSON payload and leaves
+    /// `stream_id` zero, so no other view can show it: `headers` prints a row of
+    /// zeroes and `summary` only counts them. This decodes the payload, so a
+    /// chain's links can actually be read — `from_turn = n` means "turn `n + 1`
+    /// is the tool response to turn `n`".
+    ///
+    /// Cross-references each timeline's tags, so an ingest chain's links are
+    /// distinguishable from a dialogue's. Directory target only: couplings are
+    /// written before the turn they point at, so a chain's links and its turns
+    /// routinely land in different segments.
+    Couplings {
+        /// Only timelines whose tags contain this substring (e.g. `repo_map`).
+        #[arg(long)]
+        tag: Option<String>,
+        /// Print every timeline rather than a capped sample.
+        #[arg(long)]
+        all: bool,
+    },
     /// Validate the substrate end-to-end (read-only). Two passes: (1) re-verify
     /// EVERY record's CRC — catches disk / torn-write corruption; (2) check every
     /// turn's chunk-count consistency (`layers × chunks_per_layer`) — catches
@@ -928,6 +949,9 @@ fn main() -> Result<()> {
         if matches!(cli.cmd, Cmd::Orphans) {
             return orphans(&segs);
         }
+        if let Cmd::Couplings { tag, all } = &cli.cmd {
+            return couplings(&segs, tag.as_deref(), *all);
+        }
         // Validate across EVERY segment, for the same reason `dump` does: a
         // turn's chunks are rotated between segments, so a per-segment check
         // reports a straddling turn as a torn write.
@@ -985,6 +1009,9 @@ fn main() -> Result<()> {
         }
         Cmd::Orphans => {
             anyhow::bail!("orphans requires the segmented `.substrate` DIRECTORY target")
+        }
+        Cmd::Couplings { .. } => {
+            anyhow::bail!("couplings requires the segmented `.substrate` DIRECTORY target")
         }
         Cmd::Headers => headers(&mut log)?,
         Cmd::Validate { layers } => validate(&mut log, layers)?,
@@ -1847,6 +1874,7 @@ fn selection_replay(
                     scope,
                     slot as u64,
                     &[(ChildKey::named(g.names[slot].clone()), fused[slot])],
+                    probe.len(),
                 );
             }
         }
@@ -1883,7 +1911,7 @@ fn selection_replay(
         let tail = &sig[sig.len().saturating_sub(PROBE)..];
         let head = &sig[..HEAD.min(sig.len())];
         let axis = |g: &Gallery, scope: &ScopeKey, fl: &[f32]| -> (Vec<(String, f32)>, f32) {
-            let normalize = |raw: Vec<f32>| -> Vec<f32> {
+            let normalize = |raw: Vec<f32>, probe_tokens: usize| -> Vec<f32> {
                 let pairs: Vec<(ChildKey, f32)> = g
                     .names
                     .iter()
@@ -1891,15 +1919,17 @@ fn selection_replay(
                     .map(|(n, &v)| (ChildKey::named(n.clone()), v))
                     .collect();
                 cache
-                    .normalize_with_floors(scope, &pairs, fl)
+                    .normalize_with_floors(scope, &pairs, fl, probe_tokens)
                     .into_iter()
                     .map(|(_, v)| v)
                     .collect()
             };
             let (tf, mass_base) = scan(tail, g);
             let (qf, _) = scan(head, g);
-            let tn = normalize(tf);
-            let qn = normalize(qf);
+            // Tail and head are different probe lengths; each normalizes on its
+            // own so the max-fusion below compares evidence, not window size.
+            let tn = normalize(tf, tail.len());
+            let qn = normalize(qf, head.len());
             let fused: Vec<f32> = tn.iter().zip(&qn).map(|(t, q)| t.max(*q)).collect();
             let mut ranked: Vec<(String, f32)> =
                 g.names.iter().cloned().zip(fused.iter().copied()).collect();
@@ -2166,7 +2196,13 @@ fn belief_eval(
     // (order-dependent) normalization learning pass and the ranking pass share
     // one scan instead of recomputing it. Run once per gallery lens; the result
     // row `k` belongs to corpus index `probes[k]`.
-    let scan_lens = |li: usize| -> Vec<Vec<f32>> {
+    // Returns `(scores, probe_tokens)` per probe. The length travels with the
+    // scores because a raw score is a SUM over probe tokens and each lens reads
+    // a different region — which is the same fact the per-lens scopes below were
+    // introduced to work around. The normalizer takes the length directly (see
+    // `NormConfig::probe_t_ref`), so the lenses land on one band by construction
+    // rather than by being kept apart.
+    let scan_lens = |li: usize| -> Vec<(Vec<f32>, usize)> {
         probes
             .par_iter()
             .map(|&pi| {
@@ -2188,7 +2224,7 @@ fn belief_eval(
                         gslot.push(*s);
                     }
                 }
-                match scorer {
+                let scores: Vec<f32> = match scorer {
                     "margin" | "margin-id" => {
                         score_slots_margin(probe, &gwin, &gslot, n_slots, gw, &groups)
                     }
@@ -2214,13 +2250,14 @@ fn belief_eval(
                             .collect()
                     }
                     _ => score_slots(probe, &gwin, &gslot, n_slots),
-                }
+                };
+                (scores, probe.len())
             })
             .collect()
     };
-    // `per_lens[li][k]` is lens `li`'s per-slot scores for corpus index
-    // `probes[k]`.
-    let per_lens: Vec<Vec<Vec<f32>>> = (0..lenses.len()).map(scan_lens).collect();
+    // `per_lens[li][k]` is lens `li`'s `(per-slot scores, probe_tokens)` for
+    // corpus index `probes[k]`.
+    let per_lens: Vec<Vec<(Vec<f32>, usize)>> = (0..lenses.len()).map(scan_lens).collect();
 
     // Rank one probe's per-slot scores into a Trial (shared by the raw and
     // normalized paths). `fresh[s]` is slot `s`'s score on whatever scale the
@@ -2281,21 +2318,28 @@ fn belief_eval(
         for (k, &pi) in probes.iter().enumerate() {
             let mut fused = vec![f32::MIN; n_slots];
             for (li, scope) in scopes.iter().enumerate() {
+                let (scores, t_probe) = &per_lens[li][k];
                 let raw: Vec<(ChildKey, f32)> = (0..n_slots)
-                    .map(|s| (ChildKey::named(slot_names[s].clone()), per_lens[li][k][s]))
+                    .map(|s| (ChildKey::named(slot_names[s].clone()), scores[s]))
                     .collect();
                 // `normalize` preserves input order ⇒ index `s` is still slot `s`.
-                for (s, (_, v)) in cache.normalize(scope, &raw).into_iter().enumerate() {
+                for (s, (_, v)) in cache
+                    .normalize(scope, &raw, *t_probe)
+                    .into_iter()
+                    .enumerate()
+                {
                     fused[s] = fused[s].max(v);
                 }
             }
             out.push(build_trial(pi, &fused));
             let gt = corpus[pi].1;
             for (li, scope) in scopes.iter().enumerate() {
+                let (scores, t_probe) = &per_lens[li][k];
                 cache.observe(
                     scope,
                     pi as u64,
-                    &[(ChildKey::named(slot_names[gt].clone()), per_lens[li][k][gt])],
+                    &[(ChildKey::named(slot_names[gt].clone()), scores[gt])],
+                    *t_probe,
                 );
             }
         }
@@ -2307,7 +2351,7 @@ fn belief_eval(
         probes
             .par_iter()
             .enumerate()
-            .map(|(k, &pi)| build_trial(pi, &per_lens[0][k]))
+            .map(|(k, &pi)| build_trial(pi, &per_lens[0][k].0))
             .collect()
     };
 
@@ -3160,8 +3204,12 @@ fn belief_sweep(
         _ => Vec::new(),
     };
 
-    // Leave-one-out score matrix (probes × tools) + each probe's true slot.
-    let matrix: Vec<(usize, Vec<f32>)> = (0..corpus.len())
+    // Leave-one-out score matrix (probes × tools) + each probe's true slot and
+    // the LENGTH of the probe that produced the row. The length has to travel
+    // with the scores: a raw score is a sum over probe tokens, so the normalizer
+    // below needs it to put the row on the band (see `NormConfig::probe_t_ref`),
+    // and rows differ in length whenever a window is shorter than the cap.
+    let matrix: Vec<(usize, Vec<f32>, usize)> = (0..corpus.len())
         .into_par_iter()
         .map(|pi| {
             let (gt_slot, full) = &corpus[pi];
@@ -3186,7 +3234,7 @@ fn belief_sweep(
                 "hybrid" => score_slots_hybrid(probe, &gwin, &gslot, n_slots, gw, &groups),
                 _ => score_slots(probe, &gwin, &gslot, n_slots),
             };
-            (*gt_slot, fresh)
+            (*gt_slot, fresh, probe.len())
         })
         .collect();
 
@@ -3194,16 +3242,16 @@ fn belief_sweep(
     // (the Concept A threshold-migration derivation): the same causal
     // corpus-order pass as `belief-eval` — each row normalized against levels
     // learned from earlier rows only, then its own-match observed.
-    let matrix: Vec<(usize, Vec<f32>)> = if normalize {
+    let matrix: Vec<(usize, Vec<f32>, usize)> = if normalize {
         let scope = ScopeKey::collection(0, tag);
         let mut cache = NormalizationCache::new(NormConfig::default());
         let mut out = Vec::with_capacity(matrix.len());
-        for (row, (gt, fresh)) in matrix.iter().enumerate() {
+        for (row, (gt, fresh, t_probe)) in matrix.iter().enumerate() {
             let raw: Vec<(ChildKey, f32)> = (0..n_slots)
                 .map(|s| (ChildKey::named(slot_names[s].clone()), fresh[s]))
                 .collect();
             let normed: Vec<f32> = cache
-                .normalize(&scope, &raw)
+                .normalize(&scope, &raw, *t_probe)
                 .into_iter()
                 .map(|(_, v)| v)
                 .collect();
@@ -3211,8 +3259,9 @@ fn belief_sweep(
                 &scope,
                 row as u64,
                 &[(ChildKey::named(slot_names[*gt].clone()), fresh[*gt])],
+                *t_probe,
             );
-            out.push((*gt, normed));
+            out.push((*gt, normed, *t_probe));
         }
         out
     } else {
@@ -3225,12 +3274,12 @@ fn belief_sweep(
     // Ranking: how deep the budget must reach (Tool-k).
     let ranks: Vec<usize> = matrix
         .iter()
-        .map(|(gt, s)| 1 + s.iter().filter(|&&x| x > s[*gt]).count())
+        .map(|(gt, s, _)| 1 + s.iter().filter(|&&x| x > s[*gt]).count())
         .collect();
     let tool_k = |k: usize| ranks.iter().filter(|&&r| r <= k).count();
 
     // Ground-truth score distribution — the 100%-recall floor.
-    let mut gt_scores: Vec<f32> = matrix.iter().map(|(gt, s)| s[*gt]).collect();
+    let mut gt_scores: Vec<f32> = matrix.iter().map(|(gt, s, _)| s[*gt]).collect();
     gt_scores.sort_by(f32::total_cmp);
     let q = |frac: f64| gt_scores[((frac * (n - 1) as f64).round() as usize).min(n - 1)];
 
@@ -3277,7 +3326,7 @@ fn belief_sweep(
         for &ms in &grid {
             let mut hits = 0usize;
             let (mut sz_sum, mut fp_sum, mut max_fp, mut exact1) = (0usize, 0usize, 0usize, 0usize);
-            for (gt, s) in &matrix {
+            for (gt, s, _) in &matrix {
                 let (hit, size, fp) = evaluate_selection(s, *gt, ms, budget);
                 if hit {
                     hits += 1;
@@ -3312,7 +3361,7 @@ fn belief_sweep(
     let recall_at = |ms: f32, b: usize| -> bool {
         matrix
             .iter()
-            .all(|(gt, s)| evaluate_selection(s, *gt, ms, b).0)
+            .all(|(gt, s, _)| evaluate_selection(s, *gt, ms, b).0)
     };
     let hi = q(0.15);
     let steps = 300usize;
@@ -3325,7 +3374,7 @@ fn belief_sweep(
     }
     let stats_at = |ms: f32, b: usize| -> (f64, f64, f64) {
         let (mut sz, mut fp, mut ex) = (0usize, 0usize, 0usize);
-        for (gt, s) in &matrix {
+        for (gt, s, _) in &matrix {
             let (hit, size, f) = evaluate_selection(s, *gt, ms, b);
             sz += size;
             fp += f;
@@ -4267,6 +4316,128 @@ fn dump(log: &mut LogFile, only_timeline: Option<u64>, full: bool) -> Result<()>
 /// is walked under its OWN segment id, so `entry.tokens` / `entry.chunks` carry the
 /// real segment and later byte reads hit the right file. The returned `logs` map is
 /// how callers resolve those bytes across rotations.
+/// Decode every `TurnCoupling` across the store and group the links by
+/// timeline. See [`Cmd::Couplings`].
+fn couplings(segs: &[(u64, PathBuf, bool)], tag: Option<&str>, all: bool) -> Result<()> {
+    // Links first, from a raw walk: a coupling's timeline is in its payload and
+    // its `stream_id` is zero, so the substrate index cannot find them.
+    let mut links: BTreeMap<u64, BTreeSet<u32>> = BTreeMap::new();
+    let mut total = 0u64;
+    let mut undecodable = 0u64;
+    for (id, path, _) in segs {
+        let mut log = match LogFile::open_read_only(path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("warn: segment {id} open failed (skipping): {e}");
+                continue;
+            }
+        };
+        walker::walk(&mut log, SegmentId(*id), SUPERBLOCK_SIZE, |e| {
+            if e.record.header.record_type != RecordType::TurnCoupling {
+                return;
+            }
+            total += 1;
+            match TurnCouplingPayload::decode(&e.record.payload) {
+                Ok(p) => {
+                    links.entry(p.timeline_id).or_default().insert(p.from_turn);
+                }
+                Err(_) => undecodable += 1,
+            }
+        })?;
+    }
+
+    // Then the turns, so each timeline's links can be read against the turns
+    // that exist and the tags that say what kind of timeline it is.
+    let (_logs, substrate) = build_merged_substrate(segs);
+    let mut tags_of: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+    let mut turns_of: BTreeMap<u64, BTreeSet<u32>> = BTreeMap::new();
+    for (_sid, entry) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(t)) = &entry.decl else {
+            continue;
+        };
+        turns_of.entry(t.timeline_id).or_default().insert(t.turn_index);
+        let e = tags_of.entry(t.timeline_id).or_default();
+        if e.is_empty() {
+            *e = t.tags.clone();
+        }
+    }
+
+    println!("TurnCoupling records : {total}");
+    println!("  timelines linked   : {}", links.len());
+    if undecodable > 0 {
+        println!("  UNDECODABLE        : {undecodable}");
+    }
+
+    let mut shown = 0usize;
+    let mut uncoupled_tail = 0usize;
+    let mut rows = 0usize;
+    for (tl, from) in &links {
+        let tags = tags_of.get(tl).cloned().unwrap_or_default();
+        if let Some(t) = tag {
+            if !tags.iter().any(|x| x.contains(t)) {
+                continue;
+            }
+        }
+        rows += 1;
+        let turns = turns_of.get(tl).cloned().unwrap_or_default();
+        let last = turns.iter().next_back().copied();
+        // A chain couples every turn but its last, so the last turn should be
+        // the one NOT named as a `from_turn`.
+        let tail_ok = last.is_some_and(|l| !from.contains(&l));
+        if !tail_ok {
+            uncoupled_tail += 1;
+        }
+        if all || shown < 12 {
+            shown += 1;
+            println!(
+                "  tl={tl}  turns={:?}  from_turn={:?}{}  tags={:?}",
+                turns.iter().copied().collect::<Vec<_>>(),
+                from.iter().copied().collect::<Vec<_>>(),
+                if tail_ok { "" } else { "  ← LAST TURN IS COUPLED" },
+                tags
+            );
+        }
+    }
+    if !all && rows > shown {
+        println!("  … {} more timeline(s) — pass --all", rows - shown);
+    }
+    println!("  timelines shown    : {rows}");
+    if uncoupled_tail > 0 {
+        println!(
+            "  timelines whose LAST turn is itself coupled: {uncoupled_tail} \
+             (a chain couples every turn but its last)"
+        );
+    }
+
+    // Timelines with turns and tags but no links at all — an ingest chain must
+    // have them, so their absence is the interesting case.
+    let mut unlinked: Vec<u64> = turns_of
+        .keys()
+        .filter(|tl| !links.contains_key(tl))
+        .filter(|tl| {
+            tag.is_none_or(|t| {
+                tags_of
+                    .get(tl)
+                    .is_some_and(|tags| tags.iter().any(|x| x.contains(t)))
+            })
+        })
+        .copied()
+        .collect();
+    unlinked.sort_unstable();
+    println!("  timelines with turns but NO coupling: {}", unlinked.len());
+    for tl in unlinked.iter().take(if all { unlinked.len() } else { 8 }) {
+        println!(
+            "      tl={tl}  turns={:?}  tags={:?}",
+            turns_of
+                .get(tl)
+                .map(|s| s.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            tags_of.get(tl).cloned().unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
 fn build_merged_substrate(
     segs: &[(u64, PathBuf, bool)],
 ) -> (std::collections::HashMap<u64, LogFile>, Substrate) {
@@ -4384,6 +4555,9 @@ fn dump_merged(
         n_chunks: u64,
         kv_tok: u64,
         distill: Option<DistillMode>,
+        /// Timeline tombstoned — logically deleted, so the compactor reclaims
+        /// its content whatever its distill mode. See `dead`, below.
+        tombstoned: bool,
         kind: TurnKind,
         children: Vec<u32>,
         proj: Option<Vec<u8>>,
@@ -4418,6 +4592,7 @@ fn dump_merged(
             // (ProvenanceOnly) or KV (TextOnly), so it must be EXEMPT from the
             // missing-record checks (mirrors `integrity::classify_turn`).
             distill: tl.and_then(|tl| substrate.distill_mode(tl)),
+            tombstoned: tl.is_some_and(|tl| substrate.tombstoned_timelines().contains(&tl)),
             kind,
             children,
             proj,
@@ -4489,15 +4664,36 @@ fn dump_merged(
         let n_chunks = t.n_chunks;
         let n_layers = if blks > 0 { n_chunks / blks } else { 0 };
         let distilled = t.distill.is_some();
-        // Validation. A NON-distilled turn with a KV block span must carry a
-        // complete KV grid + a Tokens record; a distilled turn intentionally sheds
-        // one or the other, so it is exempt from the missing-record checks (a
-        // present-but-unreadable Tokens record is still flagged either way).
+        // **Content the compactor was entitled to reclaim is not missing — it is
+        // gone on purpose.** This mirrors the retention rule in
+        // `persistence::compaction`, which is the authority on what a turn is
+        // still supposed to hold:
+        //
+        // ```
+        // let keep_chunks = !turn_dead && distill.is_none();
+        // let keep_tokens = !turn_dead && distill != Some(DistillMode::ProvenanceOnly);
+        // ```
+        //
+        // Both halves matter, and only the distill half was checked here. The
+        // provenance corpus is archived, distilled `ProvenanceOnly` **and then
+        // tombstoned** so it leaves the live gather while its `WideQSig`s keep
+        // answering the belief scan — and a timeline can reach the same
+        // content-free end state through the tombstone alone. Measured on a
+        // healthy 35 GB store: 3,009 of 3,586 turns reported `MISSING KV` while
+        // `validate` said CLEAN and the daemon's own reload said
+        // `skipped_corrupt=0 repaired_integrity=0`. Every one was a calibration
+        // exemplar whose content had been legitimately reclaimed.
+        //
+        // That volume is not merely noise — it is what hides the real thing. The
+        // same store held SIX `repo_map` turns that genuinely lost their K/V to
+        // a hard kill mid-ingest, and they were indistinguishable in a list of
+        // three thousand.
+        let dead = t.tombstoned;
         let mut issues: Vec<String> = Vec::new();
         if tokens_unreadable {
             issues.push("TOKENS UNREADABLE".into());
         }
-        if blks > 0 && !distilled {
+        if blks > 0 && !distilled && !dead {
             if t.tokens_loc.is_none() {
                 issues.push("MISSING TOKENS".into());
             } else if !tokens_unreadable && n_tok == 0 {
@@ -4517,10 +4713,15 @@ fn dump_merged(
         }
         let verdict = if issues.is_empty() {
             n_ok += 1;
-            if distilled {
-                "OK (distilled)".to_string()
-            } else {
-                "OK".to_string()
+            // Name the exemption rather than printing a bare OK: a turn holding
+            // no content because it was reclaimed reads identically to one that
+            // never lost anything, and the difference is the whole question when
+            // hunting for damage.
+            match (t.distill, dead) {
+                (Some(m), true) => format!("OK (distilled {m:?}, tombstoned)"),
+                (Some(m), false) => format!("OK (distilled {m:?})"),
+                (None, true) => "OK (tombstoned)".to_string(),
+                (None, false) => "OK".to_string(),
             }
         } else {
             problems.push(format!(

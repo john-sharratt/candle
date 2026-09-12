@@ -265,7 +265,8 @@ extern "C" void run_quantize_q8_1(
 
 // dtype: 0=F16, 1=BF16, 2=F32 (YType ordering).
 extern "C" void run_quantize_q8a128(
-    const void* act, void* out, int32_t rows, int32_t cols, int32_t dtype)
+    const void* act, void* out, int32_t rows, int32_t cols, int32_t dtype,
+    int32_t sum_norm)
 {
     // One warp per 128-tile; 8 warps/block, grid-strided over all tiles.
     const int total_tiles = (int)(((int64_t)rows * cols) / 128);
@@ -275,11 +276,11 @@ extern "C" void run_quantize_q8a128(
     dim3 block(block_dim, 1, 1);
     switch (dtype) {
         case 0: quantize_q8a128_kernel<half><<<grid_dim, block>>>(
-            (const half*)act, (block_q8a128*)out, rows, cols); break;
+            (const half*)act, (block_q8a128*)out, rows, cols, sum_norm); break;
         case 1: quantize_q8a128_kernel<__nv_bfloat16><<<grid_dim, block>>>(
-            (const __nv_bfloat16*)act, (block_q8a128*)out, rows, cols); break;
+            (const __nv_bfloat16*)act, (block_q8a128*)out, rows, cols, sum_norm); break;
         case 2: quantize_q8a128_kernel<float><<<grid_dim, block>>>(
-            (const float*)act, (block_q8a128*)out, rows, cols); break;
+            (const float*)act, (block_q8a128*)out, rows, cols, sum_norm); break;
     }
 }
 
@@ -366,8 +367,14 @@ extern "C" void run_quantize_block(
     if (qtype == QTYPE_Q8A128V || qtype == QTYPE_Q8A128X) {
         const int ntile = ceil_div(elem_count, QK8A128);
         const int grid = (ntile + 7) / 8;
+        // Raw Σx. This unified entry is the GGML/weight-side quantize; the
+        // amax-normalised convention belongs to the ACTIVATION path, whose
+        // producer is `run_quantize_q8a128` and whose choice rides on
+        // `Q8a128Operand::sum_scale`. Pinning it here rather than plumbing a
+        // flag keeps the two entries byte-identical, which
+        // `unified_block_quantize_matches_typed_q8a128` asserts.
         quantize_q8a128_kernel<float><<<dim3(grid > 0 ? grid : 1, 1, 1), dim3(256, 1, 1)>>>(
-            src, (block_q8a128*)dst, 1, ntile * QK8A128);
+            src, (block_q8a128*)dst, 1, ntile * QK8A128, /*sum_norm=*/0);
         return;
     }
 

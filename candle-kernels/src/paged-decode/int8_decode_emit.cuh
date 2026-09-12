@@ -49,7 +49,10 @@ __device__ __forceinline__ void int8_decode_emit_row(
     int64_t gate_slot_stride,
     int row_heads,
     float* sh_amax,
-    float* sh_sum
+    float* sh_sum,
+    // `SumScale::as_code()`: 0 stores the raw Σx, 1 stores Σx/amax. A RUNTIME
+    // argument, read by one thread per 128-tile, so it adds no kernel variant.
+    int sum_norm
 ) {
     if constexpr (HEAD_DIM % 128 == 0) {
         if (q8_out != nullptr) {
@@ -100,11 +103,15 @@ __device__ __forceinline__ void int8_decode_emit_row(
             obytes[q8a1024_qs_off(flat) + (d & 127)] = (int8_t)__float2int_rn(vr * id);
             if ((d & 127) == 0) {
                 half2* ds = reinterpret_cast<half2*>(obytes + q8a1024_ds_off(flat));
-                // Σx normalised by amax — see blocks.cuh. `id` carries the
-                // amax==0 guard, and the same IEEE-division reasoning applies:
-                // the normalisation reuses `id` rather than dividing again.
+                // Raw Σx, or Σx/amax when the caller asked — see blocks.cuh.
+                // `id` carries the amax==0 guard, and the same IEEE-division
+                // reasoning applies: the normalisation reuses `id` rather than
+                // dividing again. The raw arm passes `tile_sum` through
+                // unmultiplied, so those bytes are unchanged.
+                const float s_store =
+                    sum_norm ? (tile_sum * id * (1.f / 127.f)) : tile_sum;
                 ds[0] = make_half2(__float2half_rn(__fdiv_rn(tile_amax, 127.f)),
-                                   __float2half_rn(tile_sum * id * (1.f / 127.f)));
+                                   __float2half_rn(s_store));
             }
             // The shared pair is free for the caller's next row once every
             // thread has read it.

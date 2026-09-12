@@ -510,7 +510,7 @@ pub(crate) mod tests {
             .with_int8mode(int8mode)
             .with_timeout_secs(1800);
 
-        let configs = vec![
+        let mut configs = vec![
             TestConfig {
                 mode: InferenceMode::F16,
                 use_batched: true,
@@ -636,6 +636,88 @@ pub(crate) mod tests {
             },
         ];
 
+        // **The wide C8 rung, on a card with room for it.** C8 is this sweep's
+        // width row — see its ×32 entry above — and a few hundred concurrent
+        // contexts is the aggregate-throughput measurement that width exists to
+        // produce. It is gated on total VRAM rather than pinned, because the KV
+        // of this many sessions does not fit a 16 GB or 24 GB card at this depth
+        // and the row would report an OOM on two of the three dev machines.
+        //
+        // **Additive, not a replacement.** The ×32 row stays, so the two read as
+        // a scaling curve and the number the sweep has always reported keeps its
+        // meaning. C10×10 is untouched for the same reason in reverse: that row
+        // is the calibration edge (`QWEN35_0_8B_KV_FACTORS` is tuned so C10 sits
+        // just under it), and widening the rung a threshold is derived against
+        // would silently move the thing being measured.
+        //
+        // Appended last deliberately: it is the widest row and the only one that
+        // can exhaust the device, so every row that must pass is already
+        // measured by the time it runs.
+        const WIDE_C8_MIN_VRAM_BYTES: usize = 64 * 1024 * 1024 * 1024;
+        let total_vram = match &device {
+            Device::Cuda(d) => d.mem_get_info().map(|(_free, total)| total).unwrap_or(0),
+            _ => 0,
+        };
+        let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
+        if total_vram > WIDE_C8_MIN_VRAM_BYTES {
+            println!(
+                "C8 wide rung: {:.1} GiB of VRAM clears the {:.0} GiB gate — running ×64/×128/×256\n",
+                gib(total_vram),
+                gib(WIDE_C8_MIN_VRAM_BYTES),
+            );
+            // **Three widths, because one cannot tell scaling from a ceiling.**
+            // A single wide row below ×32's says only that the number is lower,
+            // not whether width is still buying throughput, has flattened, or has
+            // gone past its useful end — and this rung has already been read
+            // wrong once in exactly that way.
+            //
+            // What it read wrong, recorded because the shape of the mistake
+            // recurs: aggregate decode used to fall away past ×64 (2,227 t/s at
+            // ×64 against 741 at ×128, and a 2.8× spread between two identical
+            // ×128 runs), and that was attributed to the memory ceiling — VRAM
+            // did sample at 99.3% of the card, which made the story fit. It was
+            // not the ceiling. `to_owned_tensor` cloned a view's whole parent
+            // storage, so taking the `[slots, vocab]` logits block off the wave
+            // arena one row at a time cost the entire block per row: O(slots²)
+            // bytes and one full-block allocation per row, which is also what put
+            // VRAM at 99.3% and made the figure irreproducible. At ×128 it was
+            // 881 ms of a 1,152 ms forward. Fixing it took ×128 from 286/957 t/s
+            // to 3,812/3,846 and left decode layer-bound (`fwd:layer` is now 78%
+            // of the forward, was 19%). See invariant 2 in CLAUDE.md.
+            //
+            // Two claims died with it. There is no memory ceiling here at these
+            // widths — KV is ~7.8 GB at ×128, not the 70 GB the sampled figure
+            // suggested — and there is no per-width warm-up: the leading and
+            // trailing ×256 rows now agree, where four identical ×128 rows once
+            // read 244/741/729/734 and the first looked 3× slow. Both symptoms
+            // were the same quadratic copy, seen cold and seen wide.
+            //
+            // The leading row is kept anyway, and stays the widest. It costs one
+            // row and it is what would show a per-width warm-up returning —
+            // `fused_attn_partial_pool` in `int8_decode_kernel.cuh` really does
+            // `cudaStreamSynchronize` + `cudaFree` + `cudaMalloc` when its
+            // process-wide high-water buffer grows, and this fixture decodes only
+            // 9 steps per row, so any such one-off lands almost entirely on the
+            // first measurement at a new width. Read the trailing three as the
+            // scaling curve and compare the two ×256 rows to confirm the rung is
+            // warm.
+            for contexts in [256, 64, 128, 256] {
+                configs.push(TestConfig {
+                    mode: InferenceMode::C8,
+                    use_batched: true,
+                    num_contexts: contexts,
+                    num_repeats: 1,
+                    test_mode: Some(TestMode::StoryRewrite),
+                });
+            }
+        } else {
+            println!(
+                "C8 wide rung: skipped — {:.1} GiB of VRAM is under the {:.0} GiB gate\n",
+                gib(total_vram),
+                gib(WIDE_C8_MIN_VRAM_BYTES),
+            );
+        }
+
         let load = || {
             let m = from_gguf_path(
                 &model_path,
@@ -703,6 +785,7 @@ pub(crate) mod tests {
                         int8mode: Some(int8mode),
                         expert_pack_dir: None,
                         mtp_path: None,
+                        gate_donor_path: None,
                     },
                 )
             },
@@ -1446,6 +1529,7 @@ pub(crate) mod tests {
                         int8mode: Some(int8mode),
                         expert_pack_dir: None,
                         mtp_path: None,
+                        gate_donor_path: None,
                     },
                 )
             },

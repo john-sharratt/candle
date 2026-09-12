@@ -433,7 +433,8 @@ fn production_pipeline_scores(
         if (dtl, didx) == (tl, idx) {
             continue;
         }
-        let raw = scan(&f.probe(dtl, didx));
+        let probe = f.probe(dtl, didx);
+        let raw = scan(&probe);
         let pairs: Vec<(ChildKey, f32)> = slots
             .iter()
             .zip(&raw)
@@ -441,7 +442,7 @@ fn production_pipeline_scores(
             .collect();
         // Each dialogue turn is its own piece of evidence; `observe` folds a
         // given source once.
-        cache.observe(&scope, (dtl << 32) ^ didx, &pairs);
+        cache.observe(&scope, (dtl << 32) ^ didx, &pairs, probe.len());
     }
     // Concept A.4 size floors (the zend content-policy values).
     let floors: Vec<f32> = slots
@@ -451,23 +452,28 @@ fn production_pipeline_scores(
             2.0 * (256.0 / t as f32).clamp(1.0, 16.0)
         })
         .collect();
-    let normalize = |raw: &[f32]| -> Vec<f32> {
+    // Each scan is normalized on the length of the probe that produced it. A raw
+    // score is a SUM over probe tokens and these two probes differ by ~4x (a
+    // capped tail against the head-64 question window), so without this the
+    // max-fusion below compares window sizes rather than evidence.
+    let normalize = |raw: &[f32], probe_tokens: usize| -> Vec<f32> {
         let pairs: Vec<(ChildKey, f32)> = slots
             .iter()
             .zip(raw)
             .map(|((name, _), &v)| (ChildKey::named(name.clone()), v))
             .collect();
         cache
-            .normalize_with_floors(&scope, &pairs, &floors)
+            .normalize_with_floors(&scope, &pairs, &floors, probe_tokens)
             .into_iter()
             .map(|(_, v)| v)
             .collect()
     };
     let all = f.sig(tl, idx);
     let q_window = &all[..64.min(all.len())];
-    let raw_tail = scan(&f.probe(tl, idx));
-    let tail = normalize(&raw_tail);
-    let question = normalize(&scan(q_window));
+    let tail_probe = f.probe(tl, idx);
+    let raw_tail = scan(&tail_probe);
+    let tail = normalize(&raw_tail, tail_probe.len());
+    let question = normalize(&scan(q_window), q_window.len());
     let fused = tail.iter().zip(&question).map(|(t, q)| t.max(*q)).collect();
 
     // Mass base: the UNGATED additive group sum of the tail scan — the gate

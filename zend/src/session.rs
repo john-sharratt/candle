@@ -206,9 +206,16 @@ struct InferenceState {
     /// stops draining; the request path stops enqueuing new title jobs.
     shutting_down: AtomicBool,
     /// Live per-layer ingest state, keyed by projection layer name. One entry
-    /// per schema ingest layer that was actually populated at boot (disabled
-    /// layers are absent). The watcher-driven refresh and the upload path both
-    /// iterate this registry; a projection with no ingest layers leaves it empty.
+    /// per schema ingest layer that was actually populated at boot — a layer
+    /// named by `--disable-layer` OR `--skip-layer` ran no ingest pass and is
+    /// therefore ABSENT, which is also what suppresses its watcher-driven
+    /// refresh: the refresh dispatch reads each layer's prior state from here and
+    /// skips any layer that has none, so "not loaded" implies "not refreshed"
+    /// without either flag being consulted a second time. The upload path also
+    /// iterates this registry, but it SEEDS a missing entry rather than skipping
+    /// it (an upload is a deliberate write, not a disk re-read), so that path
+    /// checks `disabled_layers` itself. A projection with no ingest layers leaves
+    /// this empty.
     ingest_convs: Mutex<HashMap<String, IngestConv>>,
     /// The schema's ingest layers in declaration order (identity + strategy +
     /// display label), resolved once at load. Drives the refresh dispatch —
@@ -569,6 +576,7 @@ impl InferenceState {
         tokenizer_path: PathBuf,
         workspace: PathBuf,
         disabled_layers: HashSet<String>,
+        skipped_layers: HashSet<String>,
         ingest_dirs: HashMap<String, String>,
         compact_substrate: bool,
         progress: Arc<LoadProgress>,
@@ -723,6 +731,33 @@ impl InferenceState {
         }
         let default_identity = identity.default_identity.clone();
 
+        // `--disable-layer` takes its layer OUT OF THE PROVENANCE GATHER, and the
+        // flag has to be set HERE — while there is still exactly one builder.
+        // Every schema that resolves a projection later is a copy of this one:
+        // `base_conv` is built from `proj_builder` itself, and the clone below
+        // feeds the ingest passes, the per-mode turn builders
+        // (`ModeBuilders::build`) and the watcher's `refresh_builder`. Setting
+        // `gathered` after the clone would leave the base conversation — the very
+        // schema the live dialogue projects against — still gathering the layer,
+        // which is the half that mattered.
+        //
+        // `gathered` is runtime-only and deliberately not a YAML field: the
+        // schema declares what a layer IS, and whether this boot lets it compete
+        // is an operator decision for this process only. Nothing is deleted, so
+        // dropping the flag restores the layer's turns to the gather intact.
+        //
+        // A name that is a section collection rather than a layer (`response`,
+        // `mood`) matches nothing here; its suppression is the `section_sinks`
+        // loop above, so a `false` return is expected, not an error.
+        for name in &disabled_layers {
+            if proj_builder.set_layer_gathered(name, false) {
+                tracing::info!(
+                    layer = %name,
+                    "--disable-layer: layer excluded from the provenance gather",
+                );
+            }
+        }
+
         // The dialogue layer's `system_prompt.items` start with a static
         // prelude (mode/frame/grounding/tools_intro) →
         // then the `tools` collection (90+ tool sections, top_k=3) →
@@ -832,7 +867,7 @@ impl InferenceState {
         // The thinking-block steering trees (one per non-off effort dial),
         // compiled once and reused across turns alongside the tool-call base.
         let think_steering = engine
-            .compile_think_steering("")
+            .compile_think_steering()
             .map_err(|e| anyhow::anyhow!("think steering compile: {e}"))?;
         tracing::info!(
             elapsed_ms = t_compile.elapsed().as_millis() as u64,
@@ -1674,12 +1709,62 @@ impl InferenceState {
         // most promiscuous file tops every query at an un-normalized score (the
         // observed 0% retrieval after a re-ingest). Marking here, once, from the
         // warm's own builder keeps the append-only set consistent on every load path.
+        //
+        // **This is where the two flags part company**, and the split is the whole
+        // point of having two:
+        //
+        // - `--skip-layer` means "the corpus is built, stop re-reading the disk".
+        //   The layer is otherwise FULLY LIVE, so it is marked append-only here
+        //   (hence warmed, hence normalized, hence gathered at sane scores) and its
+        //   crashed partials are retired. Only the read is skipped, below.
+        // - `--disable-layer` means "this layer is out of service". No mark, so no
+        //   normalization warm; `gathered = false` (set before the builder was
+        //   cloned, far above), so no gather; and no sweep, because sweeping
+        //   tombstones turns, which is a MUTATION — the one thing an out-of-service
+        //   layer must not suffer. Its substrate is left exactly as it stands, so
+        //   dropping the flag restores the layer whole.
+        //
+        // The append-only mark must be taken from THIS builder
+        // (`proj_builder_refresh`) — the same one whose layer ids
+        // `warm_ingest_normalization` checks — and up front, before any ingest. The
+        // per-layer marks inside the loop below run on only the branch actually
+        // taken and, on the ingest branch, via the ingest builder's id; a boot that
+        // RE-INGESTS then marks via an id the warm-up doesn't read, the warm sees 0
+        // append-only layers, every content scope stays COLD, and the most
+        // promiscuous file tops every query at an un-normalized score (the observed
+        // 0% retrieval after a re-ingest). Marking here, once, from the warm's own
+        // builder keeps the append-only set consistent on every load path.
+        //
+        // That consistency is what the mark buys, and it is expensive to lose: it
+        // is what `warm_ingest_normalization` recognises a layer by, and without it
+        // the gather divides raw scores in the millions by the `hit_prior` of 400 —
+        // a ~13,000x under-correction that put a repo_map file listing, the most
+        // promiscuous member in the corpus, at the top of an unrelated dialogue's
+        // context at a score of 13,315,007 against the live conversation's 0. A
+        // layer the operator declined to RE-READ still has a substrate full of
+        // turns that answer queries, and those turns need their levels — which is
+        // exactly why `--skip-layer` keeps the mark and `--disable-layer`, which
+        // also leaves nothing in the gather to score, does not.
         for il in &ingest_layers {
             if disabled_layers.contains(&il.name) {
                 continue;
             }
             if let Some(layer_id) = proj_builder_refresh.id_for_layer(&il.name) {
                 engine.lock().unwrap().mark_layer_append_only(layer_id);
+            }
+            // Retire crashed partials before any pool starts — a half-built chain
+            // still carries its `WideQSig`s, so until it is tombstoned it competes
+            // in the gather with a promiscuous file listing and no summary. Nothing
+            // is in flight at this point, which is why the sweep lives here and not
+            // inside the ingest passes (those run only when the read runs, which is
+            // precisely not the `--skip-layer` case that needs it).
+            match il.mode {
+                IngestMode::Folders => crate::repo_scan::retire_crashed_partials(&engine),
+                IngestMode::Files => crate::code_read::retire_crashed_partials(&engine),
+                // Raw ingest has no half-built state to retire: a record's turns
+                // are prefilled and its content hash written in the same commit,
+                // so a conversation is either absent or complete.
+                IngestMode::Raw => {}
             }
         }
         progress.set_step(LoadStep::Ingesting);
@@ -1692,8 +1777,15 @@ impl InferenceState {
             if candle_conversation::ingest_cancelled() {
                 break;
             }
+            // Both flags stop the read; they differ in everything else, and the
+            // divergence is handled in the pre-loop above (append-only mark,
+            // gather membership, crashed-partial sweep). Here they agree.
             if disabled_layers.contains(&il.name) {
-                tracing::info!(layer = %il.name, "--disable-layer: startup ingest suppressed");
+                tracing::info!(layer = %il.name, "--disable-layer: layer inert, startup ingest suppressed");
+                continue;
+            }
+            if skipped_layers.contains(&il.name) {
+                tracing::info!(layer = %il.name, "--skip-layer: layer live, startup ingest skipped");
                 continue;
             }
             // The layer's display label rides the step's `detail` sub-status.
@@ -4365,6 +4457,7 @@ impl ZendSession {
         let load_progress = Arc::clone(&self.load_progress);
         let workspace = self.config.workspace.clone();
         let disabled_layers = self.config.disabled_layers.clone();
+        let skipped_layers = self.config.skipped_layers.clone();
         let ingest_dirs = self.config.ingest_dirs.clone();
         let compact_substrate = self.config.compact_substrate;
         // Re-arm the process-scoped ingest-cancel latch for this load: it's shared
@@ -4448,6 +4541,7 @@ impl ZendSession {
                     tok_path,
                     workspace,
                     disabled_layers,
+                    skipped_layers,
                     ingest_dirs,
                     compact_substrate,
                     load_progress_for_blocking,

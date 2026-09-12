@@ -46,7 +46,7 @@ Routing patterns from the prior layer predict the current layer's expert needs. 
 | Model | Use | Notes |
 |-------|-----|-------|
 | **Qwen3-30B-A3B** | Current development/benchmarking | 30B total, 3B active, MoE |
-| **DeepSeek-V4-Flash-0731** | Native-sparse 1M-context port (in progress) | 284B total, 13B active, MXFP4 experts, K≡V latent attention; see `docs/deepseek_batched_paged_attention_plan.md` |
+| **DeepSeek-V4-Flash-0731** | Native-sparse 1M-context port (in progress) | 284B total, 13B active, MXFP4 experts, K≡V latent attention; see `docs/deepseek/deepseek_batched_paged_attention_plan.md` |
 | **Qwen3-235B-A22B** | Production Zen Code target | Requires RTX 5090 workstation |
 | **Llama-3.2-3B** | batch_test integration testing | VibeStudio/Nidum fine-tune (the base model is gated) |
 | Qwen3-8B/14B | Ablation baselines | — |
@@ -116,7 +116,7 @@ These apply repo-wide. They are deliberate standing decisions, not suggestions.
 - **TDD, extensive unit tests.** Build tests alongside the code, as the code is written — not after. Every building block must be testable in isolation. For serialization / quantization / codec code, assert against **raw expected bytes**, never error-tolerance thresholds.
 - **Design docs are authoritative.** When a design document exists for the work (e.g. `docs/*.md`), it takes precedence over discrepancies with the code. If the document is itself wrong, fix the document in the same change.
 - **Code comments describe the implementation, not the design process.** Write every comment as if the full final design is already in place. No "Phase 2 of …", no "reserved for Phase 3", no "until Phase 4 lands", no "pre-Phase-N path", no "later phases will pivot on this". The design doc lives in `docs/`; code comments explain *what this code does and why* in the present tense, against the codebase as it is. A reader who has never seen the rollout plan should be able to understand the comment.
-- **Persistence is mandatory.** The conversation substrate is always backed by its on-disk persistence layer (`candle-conversation/src/persistence/`, redo log at `.substrate/substrate.log`). There is no in-memory-only substrate mode. See `docs/kv_tier_migration.md`.
+- **Persistence is mandatory.** The conversation substrate is always backed by its on-disk persistence layer (`candle-conversation/src/persistence/`, redo log at `.substrate/substrate.log`). There is no in-memory-only substrate mode. See `docs/archived/kv_tier_migration.md`.
 - **Never `git commit` without explicit permission.** Show the diff (or summarize what will be staged + propose the message) and wait for the user to say go. Authorization for one commit does not carry forward to subsequent commits — every commit requires its own approval. This is non-negotiable.
 - **Files are touched by the file tools only — `Read`, `Grep`, and `Glob` to look, `Edit` and `Write` to change.** The shell never reads a file and never writes one. Never rewrite a file from an external process — not PowerShell, not a Python script, not `sed -i`, not a shell redirect. There is no size or repetition threshold that justifies it; for a repeated pattern use `Edit` with `replace_all`, and for genuinely distinct sites issue several `Edit` calls in one message. Three separate reasons, any one of which is sufficient:
   - **A script fails silently.** `s.replace(a, b)` that matches nothing is a no-op, so a stale or mistyped pattern applies part of a multi-site change and reports success. `Edit` verifies against the file it read and errors when the match is missing or ambiguous, which is the difference between finding out now and finding out from a compile error three steps later.
@@ -136,7 +136,7 @@ must satisfy these six invariants. They are the standing target that turns the c
 single-session rate into the compute-bound ceiling (**prefill ≥ 1000 t/s, decode ≥ 50 t/s**).
 Every violation is a place the GPU sits idle, round-trips through the host, or does work the
 architecture says is unnecessary. Full study + per-invariant violation catalogue with
-`file:line` references lives in `docs/deepseek_hot_path_invariants.md` (authoritative).
+`file:line` references lives in `docs/deepseek/deepseek_hot_path_invariants.md` (authoritative).
 
 1. **No `to_dtype` in the loop — kernels emit the final type.** Every dtype conversion on
    the hot path is a full-tensor memory pass a kernel could have avoided by writing its
@@ -160,15 +160,25 @@ architecture says is unnecessary. Full study + per-invariant violation catalogue
    > wave; and the casts that *were* no-ops sat over exactly the mismatches that would otherwise
    > have been caught at the boundary that introduced them.
 2. **No allocate-plus-copy to materialise a layout, by any spelling.** `contiguous()`,
-   `force_contiguous()`, `Tensor::cat`, and `slice_set` are the SAME operation as far as this
-   invariant is concerned — each allocates and copies so a consumer can be handed the layout it
-   prefers, and `cat`/`slice_set` cost **one launch per argument**. If a consumer needs a layout,
-   teach it to read the layout that exists (offset + stride, or a descriptor table — see 2b), or
-   produce that layout directly from the kernel that made the data.
+   `force_contiguous()`, `Tensor::cat`, `slice_set`, and `to_owned_tensor()` are the SAME
+   operation as far as this invariant is concerned — each allocates and copies so a consumer can
+   be handed the layout it prefers, and `cat`/`slice_set` cost **one launch per argument**. If a
+   consumer needs a layout, teach it to read the layout that exists (offset + stride, or a
+   descriptor table — see 2b), or produce that layout directly from the kernel that made the data.
    > This invariant was originally worded as "no `contiguous` / `force_contiguous`", naming two
    > functions rather than the operation. `cat` and `slice_set` matched neither name and were
    > never audited: a measured 892,104 of 1,079,568 copy launches per sweep — 2.5% of GPU — sat
    > entirely outside the rule. Police the operation, not the spelling.
+   >
+   > `to_owned_tensor` was the same lesson a second time, and it is the one copy the invariant
+   > cannot simply forbid: taking wave-arena data off its span is *why* the function exists, so
+   > the rule here is that it must cost the VIEW, never the view's storage. It did not. It cloned
+   > the whole parent allocation and kept the view's layout, so `x.narrow(..)?.to_owned_tensor()?`
+   > — which is what nearly every call site is — bought the entire parent per row. Owning the 128
+   > scored rows of a `[128, vocab]` logits block was 128 copies of the whole block: **881 ms of a
+   > 1,152 ms forward at 128 slots, and ~10 GB of VRAM held for 78 MB of logits.** Decode at 128
+   > slots went 286 → 3,812 t/s on the fix. The tell was a span pair — a forward whose total
+   > stream time was 4× the sum of everything inside its layer loop — not a call-graph read.
 2b. **A kernel consuming per-session or per-row data takes a DESCRIPTOR TABLE, not a packed block.**
    Requiring one dense base pointer is what forces the caller to `cat`/`slice_set` rows together,
    so the copy is the kernel's API bug, not the caller's. Pass a device table of
@@ -377,10 +387,10 @@ The most complex part of the codebase. Key files:
 > → RAM (warm, CPU arenas) → NVMe (cold, append-only redo log). hot→warm runs on
 > the persistence thread (`migrate_group_hot_to_warm` → `migrate_sealed_to_cpu_batch_async`),
 > warm→hot on demand (`elevate_to_hot`), cold is the redo log at `.substrate/substrate.log`.
-> Two divergences from the `docs/kv_tier_migration.md` target remain: warm residency
+> Two divergences from the `docs/archived/kv_tier_migration.md` target remain: warm residency
 > is *pageable* CPU arenas (not the doc's pinned `warm_pool.rs`, which was never built —
 > so warm↔hot runs at ~½ PCIe bandwidth), and the hot→warm copy runs on the primary
-> stream (no dedicated overlap stream). See `docs/kv_tier_migration.md` for the design.
+> stream (no dedicated overlap stream). See `docs/archived/kv_tier_migration.md` for the design.
 
 **`KvFormat`**: `Float(DType)` or `Quantized(QuantFormat)`. All quant blocks = 32 elements.
 

@@ -1050,6 +1050,9 @@ fn build(
             groups,
             policy: layer_policy,
             gather_scope: yl.gather_scope.into(),
+            // Declared layers are gathered; `--disable-layer` clears this at
+            // runtime via `Builder::set_layer_gathered`, never from YAML.
+            gathered: true,
             decode_priority: yl.decode_priority.into(),
             on_corrupt_turn: yl.on_corrupt_turn.into(),
             ingest_unit: yl.ingest_unit.clone(),

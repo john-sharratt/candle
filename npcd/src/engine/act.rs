@@ -505,12 +505,15 @@ mod tests {
 
     // ── the function-block syntax ───────────────────────────────────────────
 
-    /// **The shape Qwen3.5 actually emits**, end to end.
+    /// **The function-block shape, read end to end.**
     ///
-    /// Not a hypothetical: `Dialect::qwen35` is what the shipped checkpoint
-    /// resolves to, so this is the only syntax a live decode produces. Until
-    /// this existed the parser stripped `<tool_call>` and looked for JSON,
-    /// found an element instead, and every act became narration.
+    /// No longer what a live decode produces: `Dialect::qwen35` now declares
+    /// `CallStyle::JsonBlock`, because forcing the nested element form was
+    /// measured wrong for this lineage on two machines. This stays as parser
+    /// TOLERANCE rather than as the expected path — a decode whose stencil never
+    /// armed can still emit the shape the checkpoint was trained on, and the
+    /// alternative is every such act silently becoming narration, which is
+    /// exactly what happened before the translation existed.
     #[test]
     fn a_function_block_is_read_as_an_act() {
         let p = parse(

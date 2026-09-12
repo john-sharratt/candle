@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use candle::quantized::cuda::{to_dynamic, DynamicActs};
-use candle::quantized::{get_vram_info, gguf_file, Int8Mode, MmapRegistration};
+use candle::quantized::{get_vram_info, gguf_file, Int8Mode, MmapRegistration, SumScale};
 use candle::{DType, Device, Result, Tensor, D};
 use memmap2::MmapOptions;
 
@@ -519,7 +519,8 @@ impl Engine {
             Device::Cuda(d) => d.clone(),
             _ => candle::bail!("Engine::moe_forward requires a CUDA device"),
         };
-        let q8 = match to_dynamic(&normed, Int8Mode::Performance, &cuda_dev)? {
+        // Raw Σx — a language model's block sums stay far below f16's ceiling.
+        let q8 = match to_dynamic(&normed, Int8Mode::Performance, &cuda_dev, SumScale::Raw)? {
             DynamicActs::Int8(op) => op,
             DynamicActs::Float(_) => {
                 candle::bail!("q8a128 activation quantize returned a non-int8 operand")

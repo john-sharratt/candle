@@ -447,6 +447,41 @@ fn unknown_layer_name_returns_none() {
     assert!(b.id_for_layer("nonexistent").is_none());
 }
 
+/// `gathered` is RUNTIME state, never a YAML field: every declared layer starts
+/// gathered and only `set_layer_gathered` clears it.
+///
+/// The return value is how a caller learns the name was a layer at all.
+/// `--disable-layer` also names section *collections* (`response`, `mood`),
+/// which are suppressed on a different path entirely, so "not found" is an
+/// ordinary outcome there and must never be read as "cleared". And the flag
+/// restores: it is one boot's decision, not a deletion.
+#[test]
+fn every_declared_layer_is_gathered_until_the_mutator_clears_it() {
+    let mut b = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    let ground = b.id_for_layer("ground").unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    assert!(
+        b.layer(ground).unwrap().gathered,
+        "a declared layer gathers by default"
+    );
+    assert!(b.layer(dialogue).unwrap().gathered);
+
+    assert!(b.set_layer_gathered("ground", false), "known layer found");
+    assert!(!b.layer(ground).unwrap().gathered);
+    assert!(
+        b.layer(dialogue).unwrap().gathered,
+        "clearing one layer must not touch another",
+    );
+
+    // A name that is not a layer changes nothing, and says so.
+    assert!(!b.set_layer_gathered("response", false));
+    assert!(!b.layer(ground).unwrap().gathered);
+    assert!(b.layer(dialogue).unwrap().gathered);
+
+    assert!(b.set_layer_gathered("ground", true));
+    assert!(b.layer(ground).unwrap().gathered);
+}
+
 #[test]
 fn decode_priority_defaults_to_low_and_parses_normal_and_high() {
     // Unset → Low.
@@ -708,6 +743,85 @@ fn lower_layers_visible_for_dialogue_target() {
     assert!(groups.contains(&facts), "ground/facts should be visible");
     assert!(groups.contains(&conv), "target conv should be visible");
     let _ = ground;
+}
+
+/// **`--disable-layer` takes a layer out of the ASSEMBLY, not just out of
+/// scoring.**
+///
+/// The scoring-time guards keep a disabled layer's turns from competing in the
+/// belief gather, but a `Sequence` (recency) group is never scored at all — it
+/// emits its window by position. So the exclusion is restated where the
+/// assembly walks layers, and this is the test that holds it there: with
+/// `ground` disabled its turns must not reach the projection, in exactly the
+/// configuration `lower_layers_visible_for_dialogue_target` asserts the opposite
+/// of. Without the assembly-side check that test and this one can both pass
+/// while a recency group quietly keeps emitting.
+#[test]
+fn a_disabled_layer_contributes_nothing_to_the_projection() {
+    let mut b = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    let facts = b.id_for_group("facts").unwrap();
+    let conv = b.id_for_group("conversation").unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+
+    assert!(
+        b.set_layer_gathered("ground", false),
+        "the schema declares a `ground` layer, so the mutator must find it",
+    );
+
+    let mut resolver = MockResolver::new();
+    resolver.append(facts);
+    resolver.append(facts);
+    resolver.append(conv);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: conv,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+
+    let groups: Vec<GroupId> = groups_in_order(proj.sealed_turns());
+    assert!(
+        !groups.contains(&facts),
+        "a disabled layer's group reached the projection: {groups:?}",
+    );
+    assert!(
+        groups.contains(&conv),
+        "disabling one layer must not disturb the target layer",
+    );
+}
+
+/// The target layer is exempt from its own disablement. Disabling the layer you
+/// are projecting FOR is not a meaningful request, and answering it with an
+/// empty context is a worse outcome than ignoring the flag — the same exemption,
+/// for the same reason, that the diagnostic `layer_toggle` kill switch carries.
+#[test]
+fn the_target_layer_is_still_projected_when_disabled() {
+    let mut b = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    let conv = b.id_for_group("conversation").unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    assert!(b.set_layer_gathered("dialogue", false));
+
+    let mut resolver = MockResolver::new();
+    resolver.append(conv);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: conv,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+
+    let groups: Vec<GroupId> = groups_in_order(proj.sealed_turns());
+    assert!(
+        groups.contains(&conv),
+        "the target layer must project even when disabled — an empty context is \
+         a worse answer than ignoring the flag",
+    );
 }
 
 #[test]

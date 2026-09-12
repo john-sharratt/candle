@@ -259,8 +259,17 @@ where
             layer_end,
             None,
         )?;
+        // Taking the scored rows off the wave arena, which is the one thing
+        // between the sweep and this function's return that costs anything at
+        // width — one allocation and one copy per row. See `verify:fwd`.
+        let g_own = crate::models::profile::gpu_span("vw:own", session.device());
         let mut logits = step.logits_owned()?;
         logits.truncate(want);
+        // Explicitly, inside the span: dropping the result releases the head's
+        // forward-span guard, and that reclaim is the only other thing between
+        // the sweep and this function's return.
+        drop(step);
+        g_own.end();
         return Ok(VerifyWaveOutput {
             logits,
             creep_residual: co.creep_residual.clone(),

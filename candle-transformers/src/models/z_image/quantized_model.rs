@@ -36,7 +36,7 @@
 //! leaves it on the standard path reporting `Off`; it is one projection of 453,
 //! run once per step rather than per block.
 
-use candle::quantized::Int8Mode;
+use candle::quantized::{Int8Mode, SumScale};
 use candle::{DType, IndexOp, Result, Tensor, D};
 use candle_nn::{ops::silu, Module, RmsNorm};
 
@@ -44,6 +44,33 @@ use super::attention::attend;
 use super::model::{layer_norm_affineless, Config, Geometry, ADALN_EMBED_DIM};
 use crate::quantized_nn::{linear_b_mode, Linear};
 use crate::quantized_var_builder::VarBuilder;
+
+/// [`linear_b_mode`], with **this model's q8a128 sum convention**.
+///
+/// **Z-Image needs [`SumScale::ByAmax`] and a language model does not.** The
+/// q8a128 block header stores its per-128 `Σx` in f16, and `|Σx|` can reach
+/// `128 · amax`: an LLM's block sums stay under 10³ and never come near the
+/// 65504 ceiling, but this model's SwiGLU intermediate reaches ≈2×10⁵. The raw
+/// field then stores `+inf`, every dot product touching that block becomes NaN,
+/// and the only symptom is a black image — no error, no warning, nothing in the
+/// operands that reads as wrong. Normalising bounds the field at 128 whatever
+/// the activation's magnitude and costs no precision (f16's relative precision
+/// is scale-free).
+///
+/// Applied to every projection rather than only to `w2`, whose operand is the
+/// intermediate that overflows: the two conventions are numerically equivalent,
+/// so a model-wide choice costs nothing and removes the per-layer trap of
+/// getting it right on one projection and wrong on the next.
+fn zi_linear(
+    in_dim: usize,
+    out_dim: usize,
+    bias: bool,
+    mode: Int8Mode,
+    dtype: DType,
+    vb: VarBuilder,
+) -> Result<Linear> {
+    Ok(linear_b_mode(in_dim, out_dim, bias, mode, dtype, vb)?.with_sum_scale(SumScale::ByAmax))
+}
 
 /// The width every activation between the two boundary casts runs at.
 ///
@@ -89,7 +116,7 @@ struct TimestepEmbedder {
 impl TimestepEmbedder {
     fn new(mid: usize, out: usize, mode: Int8Mode, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            l1: linear_b_mode(
+            l1: zi_linear(
                 super::model::FREQ_EMBED_SIZE,
                 mid,
                 true,
@@ -97,7 +124,7 @@ impl TimestepEmbedder {
                 DTYPE,
                 vb.pp("mlp.0"),
             )?,
-            l2: linear_b_mode(mid, out, true, mode, DTYPE, vb.pp("mlp.2"))?,
+            l2: zi_linear(mid, out, true, mode, DTYPE, vb.pp("mlp.2"))?,
         })
     }
 
@@ -122,9 +149,9 @@ struct FeedForward {
 impl FeedForward {
     fn new(dim: usize, hidden: usize, mode: Int8Mode, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            w1: linear_b_mode(dim, hidden, false, mode, DTYPE, vb.pp("w1"))?,
-            w2: linear_b_mode(hidden, dim, false, mode, DTYPE, vb.pp("w2"))?,
-            w3: linear_b_mode(dim, hidden, false, mode, DTYPE, vb.pp("w3"))?,
+            w1: zi_linear(dim, hidden, false, mode, DTYPE, vb.pp("w1"))?,
+            w2: zi_linear(hidden, dim, false, mode, DTYPE, vb.pp("w2"))?,
+            w3: zi_linear(dim, hidden, false, mode, DTYPE, vb.pp("w3"))?,
             hidden,
         })
     }
@@ -241,8 +268,8 @@ impl Attention {
             // One projection of three times the width. `n_kv_heads == n_heads`
             // for this model, so the three parts are equal and the split below
             // is a plain thirds.
-            qkv: linear_b_mode(dim, 3 * dim, false, mode, DTYPE, vb.pp("qkv"))?,
-            out: linear_b_mode(dim, dim, false, mode, DTYPE, vb.pp("out"))?,
+            qkv: zi_linear(dim, 3 * dim, false, mode, DTYPE, vb.pp("qkv"))?,
+            out: zi_linear(dim, dim, false, mode, DTYPE, vb.pp("out"))?,
             q_norm: rms(head_dim, 1e-5, vb.pp("q_norm"))?,
             k_norm: rms(head_dim, 1e-5, vb.pp("k_norm"))?,
             n_heads: cfg.n_heads,
@@ -296,7 +323,7 @@ impl Block {
         let dim = cfg.dim;
         let hidden = (dim / 3) * 8;
         let ada_ln = if modulation {
-            Some(linear_b_mode(
+            Some(zi_linear(
                 ADALN_EMBED_DIM,
                 4 * dim,
                 true,
@@ -368,8 +395,8 @@ struct FinalLayer {
 impl FinalLayer {
     fn new(cfg: &Config, mode: Int8Mode, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            linear: linear_b_mode(cfg.dim, cfg.patch_dim(), true, mode, DTYPE, vb.pp("linear"))?,
-            ada_ln: linear_b_mode(
+            linear: zi_linear(cfg.dim, cfg.patch_dim(), true, mode, DTYPE, vb.pp("linear"))?,
+            ada_ln: zi_linear(
                 ADALN_EMBED_DIM,
                 cfg.dim,
                 true,
@@ -411,7 +438,7 @@ impl ZImageTransformer {
     pub fn new(cfg: Config, mode: Int8Mode, vb: VarBuilder) -> Result<Self> {
         let dev = vb.device().clone();
 
-        let x_embedder = linear_b_mode(
+        let x_embedder = zi_linear(
             cfg.patch_dim(),
             cfg.dim,
             true,
@@ -424,7 +451,7 @@ impl ZImageTransformer {
         let vb_cap = vb.pp("cap_embedder");
         let cap_norm = rms(cfg.cap_feat_dim, cfg.norm_eps, vb_cap.pp("0"))?;
         let cap_linear =
-            linear_b_mode(cfg.cap_feat_dim, cfg.dim, true, mode, DTYPE, vb_cap.pp("1"))?;
+            zi_linear(cfg.cap_feat_dim, cfg.dim, true, mode, DTYPE, vb_cap.pp("1"))?;
 
         let t_embedder = TimestepEmbedder::new(1024, ADALN_EMBED_DIM, mode, vb.pp("t_embedder"))?;
 
@@ -737,7 +764,10 @@ mod tests {
                 Ok(())
             })?;
             // What a fused producer would hand it: the operand already int8.
-            let acts = to_dynamic(&xs, mode, cuda)?;
+            // The convention production uses here — see `zi_linear`. The
+            // benchmark must quantize the way the model does or it measures a
+            // path nothing runs.
+            let acts = to_dynamic(&xs, mode, cuda, SumScale::ByAmax)?;
             let dynf = time(&|| {
                 mm.forward_dynamic(acts.as_dynamic(), DTYPE)?;
                 Ok(())

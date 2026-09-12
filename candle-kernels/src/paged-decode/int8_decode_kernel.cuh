@@ -2047,8 +2047,18 @@ __global__ void int8_decode_combine_kernel(
     // kernel's in-kernel merge so both paths produce the same bytes.
     __shared__ float sh_amax[HEAD_DIM / 32];
     __shared__ float sh_sum[HEAD_DIM / 32];
+    // Raw Σx, pinned. These bytes are an ATTENTION CONTEXT — a convex
+    // combination of V rows, so its per-128 sums are bounded by the same
+    // magnitudes the residual stream already carries and never approach f16's
+    // 65504. The Rust side wraps them with `Q8a128Operand`'s default
+    // `SumScale::Raw`, and the two must agree: a producer here that normalised
+    // while the operand reported raw would hand the matmul a header it
+    // reinterprets, which is a wrong number rather than an error. A model that
+    // ever needs otherwise threads the flag from the wrap site, as
+    // `quantize_acts_q8a128` and the fused norms do.
     int8_decode_emit_row<O, HEAD_DIM>(val, (int64_t)row, d, out, q8_out, gate,
-                                      gate_slot_stride, row_heads, sh_amax, sh_sum);
+                                      gate_slot_stride, row_heads, sh_amax, sh_sum,
+                                      /*sum_norm=*/0);
 }
 
 // SM count (cached) — used to size the split-KV factor to fill the device.
@@ -2184,6 +2194,22 @@ int launch_int8_decode_attn(
             int splits = (base_blocks > 0) ? wave_blocks / base_blocks : 1;
             if (splits < 1) splits = 1;
             if (splits > MAX_SPLITS) splits = MAX_SPLITS;
+            // **Do not oversubscribe the split past one wave to "bound each
+            // block's depth" — it was tried and it is worse.** The reasoning is
+            // seductive: at `base_blocks >= wave_blocks` the rounding above
+            // hands back 1, every block then walks its slot's whole KV, and the
+            // concurrent footprint grows with slot count. Forcing the grid to
+            // ~4 waves instead (`splits <= 1` → oversubscribe) was measured on a
+            // 110-SM card at ~660-token depth:
+            //
+            // |  slots | splits 1 (avg ms) | oversubscribed (avg ms) |
+            // |--------|-------------------|-------------------------|
+            // |     64 | 0.868             | 15.112  (splits 7) ✗    |
+            // |    128 | 34.420            | 26.819  (splits 4) ~    |
+            //
+            // 17× worse at 64 slots for a 1.3× gain at 128, and aggregate decode
+            // throughput did not move at either width. Whatever makes the wide
+            // grid slow, per-block depth is not it.
             if (sel.entries != nullptr) {
                 splits = ((int)sel.stride + INT8_TILE_ENTRIES_PER_SPLIT - 1)
                          / INT8_TILE_ENTRIES_PER_SPLIT;

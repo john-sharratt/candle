@@ -839,6 +839,27 @@ pub struct LayerSchema {
     /// Gather-tree scoping for this layer's turns (`gather_scope:` in YAML).
     /// Default [`GatherScope::Shared`].
     pub gather_scope: GatherScope,
+    /// Whether this layer's turns compete in the provenance gather — and, since
+    /// a `Sequence` group is never scored, whether the layer takes part in
+    /// projection assembly at all (`project::run` skips a non-target layer that
+    /// is not gathered, so a recency window cannot be emitted behind the
+    /// gather's back). `true` for
+    /// every layer the schema declares; set `false` at RUNTIME only, by
+    /// [`super::Builder::set_layer_gathered`].
+    ///
+    /// **Not a YAML field.** A schema declares what a projection *is*; this
+    /// records an operator's decision for one boot (`zend --disable-layer`), so
+    /// it has no place in the document. It is the difference between the two
+    /// flags: `--skip-layer` leaves a layer gathered and merely stops
+    /// populating it, so its existing turns keep answering queries and its
+    /// hit levels keep being learned; `--disable-layer` takes it out of
+    /// retrieval altogether.
+    ///
+    /// Read by [`super::Conversation::score_belief_groups`] and by both
+    /// normalization warm-ups — a layer that cannot be selected must not teach
+    /// hit levels either, or it would spend the warm-up's probe budget learning
+    /// denominators for candidates that can never be returned.
+    pub gathered: bool,
     /// Continuous-fair-wave decode priority (`decode_priority:` in YAML).
     /// Default [`DecodePriority::Low`]. The dialogue layer is `High`.
     pub decode_priority: DecodePriority,

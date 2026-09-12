@@ -2697,6 +2697,7 @@ impl Sequence {
         response_user: &str,
         tags: Vec<String>,
         max_summary_tokens: usize,
+        triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<usize> {
         let (call_idx, _resp_idx, tokens) = self.ingest_scope_roundtrip_indices(
             call_user,
@@ -2704,6 +2705,7 @@ impl Sequence {
             response_user,
             tags,
             max_summary_tokens,
+            triggers,
         )?;
         // Serial path: couple the pair here (the parallel splice couples on the
         // file timeline instead, after adopting both turns — see `adopt_turn`).
@@ -2723,6 +2725,7 @@ impl Sequence {
         response_user: &str,
         tags: Vec<String>,
         max_summary_tokens: usize,
+        triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<(u32, u32, usize)> {
         let (idxs, tokens) = self.ingest_roundtrip_chain_indices(
             &[(call_user.to_string(), call_assistant.to_string())],
@@ -2730,6 +2733,7 @@ impl Sequence {
             tags,
             max_summary_tokens,
             &["file_read".to_string()],
+            triggers,
         )?;
         match idxs.as_slice() {
             [call, resp] => Ok((*call, *resp, tokens)),
@@ -2749,6 +2753,7 @@ impl Sequence {
         tags: Vec<String>,
         max_summary_tokens: usize,
         force_tools: &[String],
+        triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<usize> {
         let (indices, tokens) = self.ingest_roundtrip_chain_indices(
             prefilled,
@@ -2756,6 +2761,7 @@ impl Sequence {
             tags,
             max_summary_tokens,
             force_tools,
+            triggers,
         )?;
         // Couple every turn except the last: each prefilled turn belongs with the
         // one that answers it, so the summariser sees the whole exchange rather
@@ -2780,6 +2786,10 @@ impl Sequence {
     ///
     /// `force_tools` names every tool a prefilled call refers to, pinned into the
     /// catalog so each call is backed by a present definition.
+    ///
+    /// `triggers` steers the summary decode. It carries the `<think>` trigger
+    /// bound to [`ThinkMode::Off`]'s tree — see the suppression note on the
+    /// decode below for why an empty registry is not enough here.
     pub fn ingest_roundtrip_chain_indices(
         &mut self,
         prefilled: &[(String, String)],
@@ -2787,6 +2797,7 @@ impl Sequence {
         tags: Vec<String>,
         max_summary_tokens: usize,
         force_tools: &[String],
+        triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<(Vec<u32>, usize)> {
         // A scope round-trip is a SUMMARIZATION task, not the dialogue agent. Drive
         // the shared system prompt into its summarizer mode via selection — the
@@ -2847,16 +2858,53 @@ impl Sequence {
         // `DecodeState::prefill_tokens` doc), so under sampling the model often opens
         // `<think>` and burns the whole `max_summary_tokens` budget on runaway —
         // frequently off-language (Chinese/Japanese) — reasoning, leaving a truncated
-        // "thought" as the stored summary. Route the summary through the SAME
-        // canonical think-close steering the dialogue path uses (`apply_think_mode`),
-        // as `ThinkMode::Off`: with the short summary budget it collapses to a forced
-        // empty block, so the budget goes to the summary, not the reasoning.
+        // "thought" as the stored summary.
+        //
+        // **Three layers, and only the last one is structural.** The caller frames
+        // the conversation as a summarizer (`thinking_effort = off` resolved into
+        // the static system prompt) and `NO_THINK_SELECTOR` adds the `/no_think`
+        // glue below — both of which the model may simply ignore, because both are
+        // text. `apply_think_mode` then programs the sampler's segment-close
+        // budget, which for `Off` at a short summary budget collapses to a forced
+        // empty block. That is enforcement, but it is *sampler* enforcement: it
+        // fires only once the model has already opened the block, and it depends on
+        // per-row close state holding across a wide ingest wave.
+        //
+        // `triggers` is the layer that cannot be ignored. It binds the `<think>`
+        // trigger to `ThinkMode::Off`'s tree, whose entire body is the static run
+        // `"\n\n</think>"` — it offers no free-decode span at all (asserted by
+        // `stencil::think::off_has_no_free_span`), so the block closes on the token
+        // after it opens and the whole budget goes to the summary. This is what
+        // `compile_think_tree` means by "suppression is structural here, not
+        // advisory", and leaving it out is what let a quarter of a `repo_map` pass
+        // seal with a runaway thought and no summary.
         let mut summary_sampling = SamplingConfig::compression();
+        // **Window the repetition penalty to the summary itself.**
+        //
+        // `compression()` leaves `repeat_last_n` at 0, which means "full history"
+        // — and an ingest chain's history is the prefilled tool responses: a JSON
+        // file listing, every entry of which carries a path like
+        // `"candle-examples/examples/clip/README.md"`. At 1.3× multiplicative,
+        // every `.` in every filename pushes the model off the `.` token, so the
+        // summary ends on a complete clause with no full stop. Measured over one
+        // pass: 31 of 61 folder summaries had no terminal period, and a summary
+        // carrying its own earlier `.` was ~1.7× more likely to lack the final one
+        // — the same effect, visible even against the much larger contribution
+        // from the listing.
+        //
+        // A window keeps what the penalty is FOR and drops what it was never
+        // meant to see: the degenerate loops it exists to break
+        // (`"valid, valid, firm, firm, …"` — see `compression`) are local to the
+        // generation, and 64 tokens is wider than any of them while being narrower
+        // than the summary, so by the time the closing period is sampled the
+        // window holds the model's own prose rather than a directory listing.
+        summary_sampling.repeat_last_n = 64;
         summary_sampling.apply_think_mode(ThinkMode::Off, &self.tokenizer, max_summary_tokens);
         let mut opts = TurnOptions {
             max_tokens: Some(max_summary_tokens),
             sampling: Some(summary_sampling),
             tags,
+            triggers,
             ..Default::default()
         };
         opts.selection.set_optional(

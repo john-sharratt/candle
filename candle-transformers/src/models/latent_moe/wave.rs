@@ -1344,7 +1344,17 @@ impl BatchedEngine {
             layer_end,
             x_in,
             act_dtype: _,
+            adapter,
         } = wave;
+        // Refused rather than ignored. Dropping the name here would serve the
+        // BASE model under an adapter's name, which reads as a bad fine-tune
+        // rather than as an unsupported architecture.
+        if let Some(name) = adapter {
+            candle::bail!(
+                "latent_moe wave: this architecture has no LoRA support, so adapter \
+                 `{name}` cannot be applied"
+            );
+        }
         let residual_in: Option<Tensor> = x_in.map(|tc| tc.to_tensor());
         // The KV↔expert boundary's GROWING direction, in the one gap it is
         // legal in: between forwards, before this wave opens any state. Spare

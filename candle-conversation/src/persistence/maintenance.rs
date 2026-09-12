@@ -302,19 +302,14 @@ pub struct MaintenancePlan {
     /// state and must be carried across byte-for-byte, exactly as `Snapshot` is.
     /// Omitting it deleted characters whenever the segment holding them was
     /// maintained.
-    npc_relocs: Vec<(StreamId, RecordLoc)>,
-    /// `(type, source_loc)` singleton records to relocate.
-    singleton_relocs: Vec<(RecordType, RecordLoc)>,
-    /// `(npc_id, source_loc)` characters to relocate.
     ///
-    /// Relocated rather than re-emitted, for the one reason that also forces
-    /// compaction's hand: an NPC's payload is owned by the daemon's registry and
-    /// is not in this process's RAM, so there is nothing here to re-encode from.
     /// Counting an NPC's bytes as live (see `live_bytes_by_segment`) is not a
     /// substitute — it only keeps a segment off the `live_bytes == 0` Drop path,
     /// while `Compact` and `Combine` qualify on a dead *ratio* and retire the
     /// segment just the same.
-    npc_relocs: Vec<(u64, RecordLoc)>,
+    npc_relocs: Vec<(StreamId, RecordLoc)>,
+    /// `(type, source_loc)` singleton records to relocate.
+    singleton_relocs: Vec<(RecordType, RecordLoc)>,
 }
 
 impl MaintenancePlan {
@@ -874,27 +869,6 @@ impl SubstratePersistence {
         let branch_updates =
             self.relocate_stream_records(RecordType::BranchCheckpoint, &live_branch)?;
 
-        // Characters — the same verbatim path, behind the same supersession
-        // check snapshots use: an edit between plan and execute rewrites the
-        // record, and relocating the stale copy would append it *after* the
-        // newer one, so the next reload's walk would install the superseded
-        // character as the winner (an edit silently rolled back).
-        //
-        // `npc_locs` is repointed here rather than through `MaintenanceResult`,
-        // because it lives on this store rather than in the substrate — nothing
-        // in `apply_to_substrate` could reach it.
-        let live_npcs: Vec<(StreamId, RecordLoc)> = plan
-            .npc_relocs
-            .iter()
-            .filter(|(sid, old)| self.npc_locs.get(&sid.0) == Some(old))
-            .copied()
-            .collect();
-        for (sid, old, new) in self.relocate_stream_records(RecordType::Npc, &live_npcs)? {
-            if self.npc_locs.get(&sid.0) == Some(&old) {
-                self.npc_locs.insert(sid.0, new);
-            }
-        }
-
         // Singletons — few (≤3); the encoding append repoints them via
         // `manifest.ingest`.
         for &(rt, old) in &plan.singleton_relocs {
@@ -909,16 +883,23 @@ impl SubstratePersistence {
         // home, so no update rides back through `apply_to_substrate`: the
         // substrate holds no opinion about a character.
         //
-        // A superseded copy needs no filter the way a `Snapshot` does. `npc_locs`
-        // is last-writer-wins and read here under the persistence lock, so it
-        // already names each character's current record; an entry pointing at a
-        // target segment is by definition the live one.
+        // **Behind the same supersession check snapshots use.** `plan.npc_relocs`
+        // was read at PLAN time; an edit between plan and execute rewrites the
+        // record, and relocating the stale copy would append it *after* the newer
+        // one, so the next reload's walk would install the superseded character as
+        // the winner — an edit silently rolled back. `npc_locs` naming a different
+        // location than the plan recorded is exactly that case, and the entry is
+        // dropped: the newer copy is not on a target segment and needs no carry.
         let mut npcs_by_seg: BTreeMap<SegmentId, Vec<(u64, RecordLoc)>> = BTreeMap::new();
-        for &(npc_id, loc) in &plan.npc_relocs {
+        for &(npc_id, loc) in plan
+            .npc_relocs
+            .iter()
+            .filter(|(sid, old)| self.npc_locs.get(&sid.0) == Some(old))
+        {
             npcs_by_seg
                 .entry(loc.segment)
                 .or_default()
-                .push((npc_id, loc));
+                .push((npc_id.0, loc));
         }
         for (source, recs) in npcs_by_seg {
             let items: Vec<RawReloc> = recs
@@ -1092,7 +1073,6 @@ impl SubstratePersistence {
             token_relocs,
             snapshot_relocs,
             branch_checkpoint_relocs,
-            npc_relocs: self.npc_relocations(&op.targets()),
             singleton_relocs,
             npc_relocs: self.npc_relocations(&op.targets()),
         };
@@ -1101,33 +1081,18 @@ impl SubstratePersistence {
         self.finish_maintenance(&plan)
     }
 
-    /// Characters physically living on `targets`.
-    ///
-    /// `npc_locs` is last-writer-wins and read under the persistence lock, so an
-    /// entry naming a target segment is that character's live record by
-    /// definition — no supersession filter is needed the way `Snapshot` needs
-    /// one. Sorted by id so a pass over identical state produces an identical
-    /// file.
-    fn npc_relocations(&self, targets: &[SegmentId]) -> Vec<(u64, RecordLoc)> {
-        let mut out: Vec<(u64, RecordLoc)> = self
-            .npc_locs
-            .iter()
-            .filter(|(_, loc)| targets.contains(&loc.segment))
-            .map(|(id, loc)| (*id, *loc))
-            .collect();
-        out.sort_unstable_by_key(|(id, _)| *id);
-        out
-    }
-
-    /// Gather the relocation worklist for `targets` — the live read-back records
-    /// (`Chunk` / `Tokens` / singletons) physically in those segments, with the
-    /// same distill/tombstone filter as [`Self::segment_liveness`]. Read-only.
     /// Character records physically inside a target segment.
     ///
     /// Read from this store's own `npc_locs` rather than the substrate, which
     /// has never held a character: their payloads belong to the daemon above.
     /// That is also why they are relocated rather than re-emitted — there is
     /// nothing in RAM here to re-encode them from.
+    ///
+    /// `npc_locs` is last-writer-wins and read under the persistence lock, so an
+    /// entry naming a target segment is that character's live record by
+    /// definition — no supersession filter is needed the way `Snapshot` needs
+    /// one. Sorted by id so a pass over identical state produces an identical
+    /// file.
     fn npc_relocations(&self, targets: &[SegmentId]) -> Vec<(StreamId, RecordLoc)> {
         let mut out: Vec<(StreamId, RecordLoc)> = self
             .npc_locs
@@ -1140,6 +1105,9 @@ impl SubstratePersistence {
         out
     }
 
+    /// Gather the relocation worklist for `targets` — the live read-back records
+    /// (`Chunk` / `Tokens` / singletons) physically in those segments, with the
+    /// same distill/tombstone filter as [`Self::segment_liveness`]. Read-only.
     fn gather_relocations(
         &self,
         substrate: &Substrate,
@@ -2626,7 +2594,7 @@ mod tests {
     /// full compaction relocates it.
     #[test]
     fn characters_survive_a_segment_compaction() {
-        use crate::persistence::record::NpcPayload;
+        use crate::persistence::record::{Modulation, NpcPayload};
 
         let dir = tmp_dir("npc");
         let npc = NpcPayload {
@@ -2640,7 +2608,6 @@ mod tests {
             world_id: "battle-cities".to_string(),
             personality_id: "commander".to_string(),
             hidden: false,
-            environment_enabled: true,
             heartbeat_ms: 1000,
             salience_gate: 0.5,
             tags: vec!["test".to_string()],
@@ -2648,6 +2615,15 @@ mod tests {
             persona_origin: "authored".to_string(),
             portrait_image_id: None,
             portrait_origin: None,
+            // The lived and authoring planes are irrelevant to what this test
+            // asserts — that a character's record is carried verbatim across a
+            // maintenance pass — so they take their unauthored values.
+            at: None,
+            mood: None,
+            beliefs: Vec::new(),
+            relationships: Vec::new(),
+            agency: Vec::new(),
+            modulation: Modulation::default(),
         };
         let decl = turn_decl(626, 0);
         let sid = decl.stream_id();

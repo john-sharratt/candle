@@ -24,6 +24,8 @@ use candle::{DType, LiveTensor, Module, Result, Tensor};
 use candle_nn::Activation;
 
 use crate::models::lora::{adapt, LayerLora};
+#[cfg(feature = "cuda")]
+use crate::models::qwen35::quantized_attention::lora_input;
 use crate::models::quantized_matmul::{QMatMul, WeightResidency};
 
 /// The three (or two, when gate+up are fused) projections of a gated FFN.
@@ -298,10 +300,11 @@ impl QuantizedMlp {
     /// drift apart. An absent pair costs one null check.
     ///
     /// The adapter's input for gate and up is the post-norm activation, and for
-    /// down it is the SwiGLU result; both must be float, which is what an
-    /// adapted layer's `Int8Mode::Off` guarantees. A pair present against a
-    /// quantized activation is a wiring error and says so rather than adapting
-    /// the wrong tensor.
+    /// down it is the SwiGLU result. `down`'s is always float — the SwiGLU output
+    /// is a real tensor whatever the layer's numeric mode — while gate/up's
+    /// exists only as q8a128 on the int8 path, and is reconstructed from those
+    /// blocks by [`lora_input`]. The layer's numeric mode is not changed by the
+    /// presence of an adapter; see [`Qwen35AttentionLayer::int8mode`].
     #[cfg(feature = "cuda")]
     pub fn forward_dynamic_adapted<'w>(
         &self,
@@ -310,21 +313,6 @@ impl QuantizedMlp {
         out_dtype: DType,
         lora: LayerLora<'_>,
     ) -> Result<LiveTensor<'w>> {
-        // Resolved once: the float the three adapters read, or `None` when this
-        // MLP is unadapted and the fused int8 activation is all that exists.
-        let lora_x = if lora.gate.is_some() || lora.up.is_some() || lora.down.is_some() {
-            match acts {
-                DynamicActs::Float(t) => Some(t.clone()),
-                DynamicActs::Int8(_) => candle::bail!(
-                    "quantized MLP is LoRA-adapted but its activations are q8a128 — \
-                     the layer's `int8mode()` must report `Off` so the float input \
-                     the adapter reads survives the norm"
-                ),
-            }
-        } else {
-            None
-        };
-
         let (mut gate, mut up) = if let Some(w) = &self.gate_up_proj {
             let mut gu = w.forward_dynamic(acts.as_dynamic(), work_dtype)?;
             let (_, _, out_dim) = gu.dims3()?;
@@ -353,9 +341,14 @@ impl QuantizedMlp {
         // PEFT trained them against. The fused-weight path above split one
         // matmul into these two halves, so a fused base and a separate-weight
         // base adapt identically.
-        if let Some(x) = &lora_x {
-            gate = adapt(lora.gate, gate, x)?;
-            up = adapt(lora.up, up, x)?;
+        //
+        // Resolved once for both, after the projections so `gate` can name the
+        // device and width — on the int8 path this reconstructs the operand from
+        // its q8a128 blocks, and doing it twice would double that.
+        if lora.gate.is_some() || lora.up.is_some() {
+            let x = lora_input(acts, &gate, "quantized MLP gate/up")?;
+            gate = adapt(lora.gate, gate, &x)?;
+            up = adapt(lora.up, up, &x)?;
         }
         let gated = (&self.act_fn.forward_live(&gate)? * &up)?;
         let out = self.down_proj.forward_live_as(&gated, out_dtype)?;

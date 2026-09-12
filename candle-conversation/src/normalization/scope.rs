@@ -6,6 +6,22 @@ use std::collections::{HashMap, HashSet};
 use super::hit_level::HitLevel;
 use super::{ChildKey, NormConfig};
 
+/// One raw score, restated as the score it would have reached over a
+/// `cfg.probe_t_ref`-token probe.
+///
+/// The single place the band's unit is fixed, applied identically on the read
+/// and the write path — which is the whole point: a level learned at one probe
+/// length and a query measured at another were previously divided against each
+/// other directly. See [`NormConfig::probe_t_ref`] for the measured
+/// consequences and for why this is linear and uncapped.
+///
+/// `probe_tokens == 0` would be a scan with no probe, which produces no scores
+/// to scale; treating it as one token keeps the function total rather than
+/// letting a division by zero reach the band as an infinity.
+fn to_ref(raw: f32, probe_tokens: usize, cfg: &NormConfig) -> f32 {
+    raw * (cfg.probe_t_ref as f32 / probe_tokens.max(1) as f32)
+}
+
 /// Per-child hit levels for a single budget scope.
 #[derive(Default)]
 pub(super) struct ScopeState {
@@ -45,6 +61,7 @@ impl ScopeState {
         raw: &[(ChildKey, f32)],
         floors: &[f32],
         cfg: &NormConfig,
+        probe_tokens: usize,
     ) -> Vec<(ChildKey, f32)> {
         let floor = self.floor(cfg);
         raw.iter()
@@ -57,7 +74,7 @@ impl ScopeState {
                 } else {
                     child.map(|h| h.level()).unwrap_or(cfg.hit_prior).max(floor)
                 };
-                (k.clone(), cfg.scale * r / denom)
+                (k.clone(), cfg.scale * to_ref(*r, probe_tokens, cfg) / denom)
             })
             .collect()
     }
@@ -65,17 +82,20 @@ impl ScopeState {
     /// Fold a turn's raw scores into each child's hit-level EWMA, creating an
     /// unseen child at the prior. Additive: existing children not named here keep
     /// their level (call [`Self::retain`] to prune after a membership change).
-    pub(super) fn observe(&mut self, raw: &[(ChildKey, f32)], cfg: &NormConfig) {
+    pub(super) fn observe(&mut self, raw: &[(ChildKey, f32)], cfg: &NormConfig, probe_tokens: usize) {
         for (k, r) in raw {
             self.children
                 .entry(k.clone())
                 .or_insert_with(|| HitLevel::new(cfg.hit_prior))
-                .observe(*r, cfg);
+                .observe(to_ref(*r, probe_tokens, cfg), cfg);
         }
     }
 
     /// Denominator floor for this scope: the `floor_pctl` percentile of current
     /// hit levels, hard-floored at `floor_min`. Empty scope ⇒ `floor_min`.
+    ///
+    /// Floors compare against reference-scaled scores (see [`to_ref`]) because
+    /// that is what the levels now hold, so nothing here needs its own scaling.
     fn floor(&self, cfg: &NormConfig) -> f32 {
         let mut levels: Vec<f32> = self
             .children

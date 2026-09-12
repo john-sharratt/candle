@@ -3359,27 +3359,44 @@ impl<'w> LiveTensor<'w> {
         self.layout.is_fortran_contiguous()
     }
 
-    /// Compared to clone, this copies the actual storage but may fail because of running out of
-    /// memory.
-    /// A `'static` deep copy of this tensor's contents.
+    /// A `'static` deep copy of this tensor's contents, compacted.
     ///
     /// The sanctioned way to let wave- or arena-scoped data outlive its owner:
-    /// the storage is cloned onto a fresh allocation, so the result borrows
+    /// the view is copied onto a fresh owned allocation, so the result borrows
     /// nothing. It really does allocate — that is the point, and it is why this
     /// is not something [`Clone`] could do (it must return `Self`, and so would
     /// inherit `'w` while quietly paying for a copy).
+    ///
+    /// **This tensor's contents, not its storage's.** The result is a contiguous
+    /// buffer of exactly `shape`, so owning one row of a wide block costs one
+    /// row. The obvious spelling — clone the storage and keep the layout, which
+    /// is what [`Storage::try_clone`] does and what this used to do — copies the
+    /// WHOLE parent for every view taken of it, and the call sites here are
+    /// overwhelmingly `x.narrow(..)?.to_owned_tensor()?`: one scored row off a
+    /// batched head, one sequence's span off a packed wave, the last KV row of a
+    /// verify block. Owning `n` rows of an `n`-row block that way is `n²` bytes
+    /// and `n` allocations of the full block. Measured on the 128-slot decode
+    /// ladder, the per-row copy of the `[128, vocab]` logits block was **881 ms
+    /// of a 1,152 ms forward** — 76% of the step, and ~10 GB of VRAM held for
+    /// 78 MB of logits.
+    ///
+    /// Use [`Self::copy`] where the source layout itself must survive the copy;
+    /// this one is for getting the values out.
     pub fn to_owned_tensor(&self) -> Result<Tensor> {
-        let tensor_ = TensorInner {
-            lease: PhantomData,
-            id: TensorId::new(),
-            storage: Arc::new(RwLock::new(self.storage().try_clone(self.layout())?)),
-            layout: self.layout.clone(),
-            op: BackpropOp::none(),
-            is_variable: false,
-            dtype: self.dtype,
-            device: self.device.clone(),
-        };
-        Ok(LiveTensor(Arc::new(tensor_)))
+        let shape = self.shape();
+        // `None` ticket: an owned allocation from the pool, deliberately NOT the
+        // source's arena — inheriting a wave ticket here would put the copy back
+        // on the span it is being taken off.
+        let mut storage =
+            unsafe { self.device().alloc_uninit_from(shape, self.dtype(), None)? };
+        self.storage()
+            .copy_strided_src(&mut storage, 0, self.layout())?;
+        Ok(from_storage(
+            storage,
+            shape.clone(),
+            BackpropOp::none(),
+            false,
+        ))
     }
 
     pub fn copy(&self) -> Result<Self> {

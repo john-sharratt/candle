@@ -46,7 +46,7 @@ use super::batched_layer::GlueMeta;
 use super::batched_model::{BatchedInference, BatchedModelCore, WaveGuard, WavePhase};
 use super::wave_driver::{drive_wave, WaveGroups, WaveSweep};
 #[cfg(feature = "cuda")]
-use crate::models::profile::pipeline_record_duration;
+use crate::models::profile::{gpu_span, pipeline_record_duration};
 use crate::models::speculative_choice::{AcceptWalk, TokenChooser};
 use crate::models::verify_wave::{issue_verify_wave, VerifyPlan, WaveCoBatch};
 
@@ -1554,7 +1554,10 @@ impl BatchedInferenceSession {
         start_new_chunk: bool,
     ) -> Result<()> {
         use candle::quantized::pinned_staging::PinnedBuf;
-        use candle_nn::kv_cache::{quantize_sealed_in_place, SealedSequence};
+        use candle_nn::kv_cache::{
+            convert_deferred_descs, quantize_layers_deferred, ChunkedKvBacking, CompressionPolicy,
+            SealedSequence,
+        };
 
         // Quantization policy, or `None` for uncompressed (F16/BF16). When it's
         // `None` we still SEAL + collapse the layout below (record_turn +
@@ -1601,38 +1604,119 @@ impl BatchedInferenceSession {
         let policy = if quantizable { policy } else { None };
 
         let mut scratch: Option<PinnedBuf> = None;
-        for &seq_idx in seq_indices {
-            // Snapshot + quantize each layer. Holding the outputs across the
-            // truncate below keeps their (refcounted) arena slots alive.
-            let mut quantized_per_layer: Vec<SealedSequence> =
-                Vec::with_capacity(self.backings.len());
-            for (layer_idx, backing) in self.backings.iter().enumerate() {
-                let live = backing.record_turn(seq_idx)?;
-                if live.chunks.is_empty() || policy.is_none() {
-                    quantized_per_layer.push(live);
-                    continue;
+
+        // ── ONE format selection across the whole cohort ────────────────────
+        //
+        // **The selection kernel's grid is `chunks × kv_heads`, so the batch axis
+        // is what fills it.** Selecting per (sequence, layer) — which this did —
+        // launches `sequences × layers` times with a 2–44 block grid each: an
+        // nsys trace of the ×128 batched-forward rung put
+        // `select_kv_format_palette4_paged` at **77.8% of all GPU time** (43.2 s
+        // over 4,644 launches, 9.3 ms each) with the two dominant shapes
+        // `grid=42` and `grid=2` — 38% and 1.8% of one wave on a 110-SM card.
+        // That is hot-path invariant 5 ("one launch over all slots, not a
+        // per-seq loop") violated on the axis that grows with width, which is
+        // why aggregate decode fell instead of holding from ×64 to ×128.
+        //
+        // `quantize_layers_deferred` already batches the selection across layers
+        // and takes a *list* of sequences per layer, so the cohort just becomes
+        // that list — the persistence thread's hot→warm drain has used it this
+        // way all along (`persistence::thread`, "ONE cross-layer selection").
+        //
+        // Grouped by resolved policy, because a capped layer (the MTP draft head
+        // seals at C3) genuinely selects against different thresholds and must
+        // not be folded in with the session's. In practice that is one group, or
+        // two when a cap is active.
+        let mut live_per_layer: Vec<Vec<SealedSequence>> =
+            Vec::with_capacity(self.backings.len());
+        for (layer_idx, backing) in self.backings.iter().enumerate() {
+            let _ = layer_idx;
+            let mut per_seq = Vec::with_capacity(seq_indices.len());
+            for &seq_idx in seq_indices {
+                per_seq.push(backing.record_turn(seq_idx)?);
+            }
+            live_per_layer.push(per_seq);
+        }
+
+        // `quantized_per_seq[seq][layer]`, seeded with the live snapshots so a
+        // layer the quantizer skips (no chunks, or no policy at all) passes
+        // through unchanged exactly as the per-sequence path did.
+        let mut quantized_per_seq: Vec<Vec<SealedSequence>> = (0..seq_indices.len())
+            .map(|s| {
+                live_per_layer
+                    .iter()
+                    .map(|per_seq| per_seq[s].clone())
+                    .collect()
+            })
+            .collect();
+
+        if let Some(session_policy) = policy.as_ref() {
+            // Resolve each layer's policy once, then bucket layers by it.
+            let layer_policies: Vec<CompressionPolicy> = (0..self.backings.len())
+                .map(|layer_idx| {
+                    self.layer_seal_cap[layer_idx]
+                        .filter(|&cap| self.config.compression_level.is_some_and(|l| cap < l))
+                        .and_then(|cap| self.config.compression_policy_at(cap))
+                        .unwrap_or(*session_policy)
+                })
+                .collect();
+            let mut groups: Vec<(CompressionPolicy, Vec<usize>)> = Vec::new();
+            for (layer_idx, lp) in layer_policies.iter().enumerate() {
+                match groups
+                    .iter_mut()
+                    .find(|(p, _)| p.compression_level == lp.compression_level)
+                {
+                    Some((_, layers)) => layers.push(layer_idx),
+                    None => groups.push((*lp, vec![layer_idx])),
                 }
-                // A capped layer seals at min(session, cap); every other layer
-                // takes the session's unchanged.
-                let pinned = self.layer_seal_cap[layer_idx]
-                    .filter(|&cap| self.config.compression_level.is_some_and(|l| cap < l))
-                    .and_then(|cap| self.config.compression_policy_at(cap));
-                let layer_policy = pinned.as_ref().unwrap_or_else(|| policy.as_ref().unwrap());
-                let out = quantize_sealed_in_place(
-                    backing,
-                    &[&live],
-                    layer_policy,
+            }
+
+            let mut descs: Vec<candle::quantized::cuda::PalHeadDesc> = Vec::new();
+            let (mut select_ms, mut alloc_ms) = (0u64, 0u64);
+            for (group_policy, layers) in &groups {
+                let backing_refs: Vec<&ChunkedKvBacking> =
+                    layers.iter().map(|&l| &self.backings[l]).collect();
+                let per_layer_seqs: Vec<Vec<&SealedSequence>> = layers
+                    .iter()
+                    .map(|&l| live_per_layer[l].iter().collect())
+                    .collect();
+                let out = quantize_layers_deferred(
+                    &backing_refs,
+                    &per_layer_seqs,
+                    group_policy,
                     &self.device,
                     &copy_stream,
                     &mut scratch,
+                    &mut descs,
+                    &mut select_ms,
+                    &mut alloc_ms,
                 )?;
-                let q = out.into_iter().next().ok_or_else(|| {
-                    candle::Error::Msg(
-                        "quantize_and_seal_sequences: quantizer returned no sequence".into(),
-                    )
-                })?;
-                quantized_per_layer.push(q);
+                // `out[i]` is group-layer `layers[i]`'s sequences, in
+                // `seq_indices` order — scatter back to (seq, layer).
+                for (gi, &layer_idx) in layers.iter().enumerate() {
+                    let layer_out = out.get(gi).ok_or_else(|| {
+                        candle::Error::Msg(
+                            "quantize_and_seal_sequences: quantizer returned no layer".into(),
+                        )
+                    })?;
+                    for (s, q) in layer_out.iter().enumerate() {
+                        quantized_per_seq[s][layer_idx] = q.clone();
+                    }
+                }
             }
+            // The selection deferred every convert; run them all as one batch per
+            // backing before anything reads the quantized bytes or drops the
+            // float sources below.
+            if !descs.is_empty() {
+                let n_kv_head = self.backings[0].n_kv_head();
+                for backing in &self.backings {
+                    convert_deferred_descs(backing, &descs, n_kv_head, &self.device)?;
+                }
+            }
+        }
+
+        for (s, &seq_idx) in seq_indices.iter().enumerate() {
+            let quantized_per_layer = std::mem::take(&mut quantized_per_seq[s]);
             // Convert kernels must finish before we drop the source float chunks
             // (truncate) and before decode reads the quantized bytes. No convert
             // kernel runs when quantization was skipped, so only sync then.
@@ -4363,6 +4447,11 @@ pub trait ManagedBatchedModel {
         chooser: &mut dyn TokenChooser,
         emits: &mut [Box<dyn FnMut(u32) -> bool + '_>],
     ) -> Result<Vec<Option<u32>>> {
+        // Everything before the forward: drafting, the plain/spec partition and
+        // the per-sequence block clones. Spanned so the step's CPU time is
+        // covered end to end — `spec:setup` + `spec:verify` + `spec:gather` +
+        // `spec:accept` should now sum to the step.
+        let t_setup = std::time::Instant::now();
         if seqs.len() != committed.len() || seqs.len() != emits.len() {
             candle::bail!(
                 "speculative_decode_step_batch: {} seqs, {} committed, {} emits",
@@ -4458,6 +4547,19 @@ pub trait ManagedBatchedModel {
         // drafted block verifies as virtual rows, in the same wave when the
         // model overrides `verify_blocks` (one launch floor per step, not
         // two).
+        pipeline_record_duration("spec:setup", t_setup.elapsed(), 1);
+        // GPU-side elapsed for the whole forward, beside the CPU-side
+        // `spec:verify` that launches it. Two stream-ordered events, so this is
+        // execution plus any starvation gap *inside* the forward.
+        //
+        // **Read it against `wv:sweep`**, which is the layer sweep plus the
+        // head. The difference is everything this step does around the model,
+        // and it is not small by construction: at 128 slots it once held 881 ms
+        // of a 1,152 ms forward, all of it `vw:own` copying the scored rows off
+        // the wave arena a row at a time. Whenever the accept walk waits far
+        // longer than the `decode:*` / `dn:*` spans account for, this pair says
+        // whether the missing time is inside the model or around it.
+        let g_fwd = gpu_span("verify:fwd", session.device());
         let t_verify = std::time::Instant::now();
         let plain_pairs: Vec<(usize, u32)> =
             plain.iter().map(|&i| (seqs[i], committed[i])).collect();
@@ -4472,6 +4574,14 @@ pub trait ManagedBatchedModel {
             max_draft,
         )?;
         pipeline_record_duration("spec:verify", t_verify.elapsed(), 1);
+        g_fwd.end();
+        // The row gather between the forward and the accept walk: one `squeeze`
+        // per scored row, a `Tensor::stack` over all of them, and the `row_of`
+        // bookkeeping. Spanned because it is the only part of the step that was
+        // neither `spec:verify` nor `spec:walk`, and at width it is the whole of
+        // the gap between them — `stack` costs one launch per row (hot-path
+        // invariant 2) and the tensor it builds is `[rows, vocab]`.
+        let t_gather = std::time::Instant::now();
         let mut plain_logits: Vec<Option<Tensor>> = vec![None; seqs.len()];
         for &i in plain.iter().rev() {
             plain_logits[i] = plain_rows.pop();
@@ -4526,6 +4636,7 @@ pub trait ManagedBatchedModel {
         // under the draft prefix that reaches it, so a chooser carrying
         // repetition penalties or a grammar stencil advances its per-sequence
         // state along exactly the path this loop commits.
+        pipeline_record_duration("spec:gather", t_gather.elapsed(), 1);
         let t_accept = std::time::Instant::now();
         let mut walk = AcceptWalk::new(&blocks);
         while !walk.finished() {

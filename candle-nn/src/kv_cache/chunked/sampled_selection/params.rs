@@ -584,10 +584,30 @@ pub const QWEN35_0_8B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFact
 /// did not pass, so the comparison is against a gate that was red, not against
 /// working compression.
 pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 0.95,
-    k_low: 0.95,
-    v_hi: 1.65,
-    v_low: 1.65,
+    // Merge, 2026-09-12: the table above is main's, measured on main. This
+    // branch's row was 1.07/1.85, and the merge first took main's 0.95/1.65 on
+    // the reasoning that the lower pair is the tighter error bound and so the
+    // safe one. **Measured here, that is backwards:**
+    //
+    // | k    | v    | C10 ×10 | ratio |
+    // |------|------|---------|-------|
+    // | 0.95 | 1.65 | 9/10 ✗  | 5.48× |
+    // | 1.07 | 1.85 | 10/10 ✓ | 5.87× |
+    //
+    // Both runs deterministic, the 0.95 row twice. So this branch's pair passes
+    // AND compresses better, and the "lower cannot cost quality" reasoning is
+    // false — the ladder is not monotone in these factors, exactly as main's own
+    // MoE row records ((1.1, 2.35) passes while (1.15, 2.35) and (1.1, 2.43)
+    // both fail).
+    //
+    // Main's table is not wrong; it is a measurement of main. A calibration row
+    // belongs to the code it was derived against, and picking between two
+    // branches' rows by their VALUES rather than by re-measuring is how a merge
+    // ships a combination neither side ever ran.
+    k_hi: 1.07,
+    k_low: 1.07,
+    v_hi: 1.85,
+    v_low: 1.85,
 };
 
 /// Qwen3.5-35B-A3B (routed hybrid).
@@ -695,19 +715,36 @@ pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactor
 /// on the passing side — 0.08 on K and 0.13 on V — rather than creeping toward
 /// the break for the last 0.05× (see the 9B row for what edge-sitting costs).
 pub const QWEN35_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    // Merge, 2026-09-12: two independent re-derivations of this row met here —
-    // 1.08/2.30 (this branch) and 1.17/2.47 (main, after Q4_0/Q4_1 were restored
-    // to the C10 candidate lists). The LOWER pair is kept deliberately: a lower
-    // factor is a tighter error bound, so it costs compression ratio and cannot
-    // cost output quality. Both rows were measured green on their own side, and
-    // neither was measured against the other's candidate list — so the safe
-    // reading is the conservative one until this is re-derived under the merged
-    // configuration. See the caution above: this row drifts on wave-width and
-    // admission changes alone.
-    k_hi: 1.08,
-    k_low: 1.08,
-    v_hi: 2.30,
-    v_low: 2.30,
+    // **Re-derived 2026-09-12 for the origin/main merge, k 1.08 → 1.00 and
+    // v 2.30 → 2.10.** This is the re-verification the caution above asks for
+    // after an admission change, and the merge is the largest one this row has
+    // seen: main restored Q4_0/Q4_1 to the shared C10 candidates.
+    //
+    // | k    | v    | C10 ×64 | ratio |
+    // |------|------|---------|-------|
+    // | 1.08 | 2.30 | 63/64 ✗ | 6.63× |  (this branch's pre-merge row)
+    // | 1.17 | 2.47 | 62/64 ✗ | 7.05× |  (main's, re-derived post-Q4)
+    // | 1.08 | 2.10 | 63/64 ✗ | 6.36× |  V alone — inert, as the note below says
+    // | 1.00 | 2.10 | 64/64 ✓ | 6.21× |
+    //
+    // Note the second row: main's pair reproduces main's reported 7.05× exactly,
+    // so the candidate list and the selection ARE behaving as main's do — the
+    // factors simply do not transfer, because the two branches' numerics differ.
+    // The third row is this model's documented V-limitation asserting itself the
+    // other way: only the JOINT move cleared ×64, exactly as the bracket above
+    // records. ×8/×16/×32 were green throughout, so a narrower rung would have
+    // called this fixed three probes early.
+    //
+    // **A lower factor is NOT automatically safe**, which is what this comment
+    // claimed when the merge first resolved it. The 9B row falsified that in the
+    // same session: main's *lower* 0.95/1.65 failed 9/10 where this branch's
+    // higher 1.07/1.85 passed 10/10 at a better ratio. The ladder is not
+    // monotone in these factors and "lower is the tighter bound, so it cannot
+    // cost quality" is not a substitute for running the gate.
+    k_hi: 1.00,
+    k_low: 1.00,
+    v_hi: 2.10,
+    v_low: 2.10,
 };
 
 /// Qwen3.6-35B-A3B (routed hybrid point release).
@@ -768,15 +805,27 @@ pub const QWEN35_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFacto
 /// C10 at 6.50/6.47/6.46/6.47× (×8/16/32/64), identical across two confirmation
 /// runs — 6.65× → 6.47× at ×64, the ratio this costs.
 pub const QWEN36_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    // Merge, 2026-09-12: kept at 1.05/2.0 (this branch) against main's 1.32/2.29.
-    // Lower is the tighter error bound, so this trades compression ratio for
-    // headroom and cannot trade away quality. Main's row was derived after
-    // Q4_0/Q4_1 returned to the C10 candidates and reports 7.05x against our
-    // 6.47x; that ratio is recoverable by re-deriving under the merged candidate
-    // set, which is the right way to reclaim it rather than adopting factors
-    // measured on the other side's configuration.
-    k_hi: 1.05,
-    k_low: 1.05,
+    // **Re-derived 2026-09-12 for the origin/main merge, k 1.05 → 1.00**, V held
+    // at 2.0. Main's row (1.32/2.29) was not taken: factors do not transfer
+    // between branches whose numerics differ — see the measured table in
+    // `QWEN35_MOE_KV_FACTORS` above, where main's pair reproduced main's ratio
+    // exactly and still failed here.
+    //
+    // | k    | v   | C10 ×64 | ratio |
+    // |------|-----|---------|-------|
+    // | 1.05 | 2.0 | 63/64 ✗ | 6.47× |  (green on four runs BEFORE the merge)
+    // | 1.00 | 2.0 | 64/64 ✓ | 6.04× |
+    //
+    // One K notch, and K alone, exactly as this row's standing advice says to
+    // probe it — the note from the 09-01 derivation ("3.6 is K-limited… the next
+    // derivation probes K first there") paid for itself immediately. ×8/×16/×32
+    // were green at both factors; only ×64 moved.
+    //
+    // That the pre-merge pair was four-runs-green and is now one session short
+    // is this row drifting on an admission change, which is precisely the
+    // failure mode its caution predicts — not a defect elsewhere.
+    k_hi: 1.00,
+    k_low: 1.00,
     v_hi: 2.0,
     v_low: 2.0,
 };

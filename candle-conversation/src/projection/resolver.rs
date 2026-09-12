@@ -934,12 +934,18 @@ impl Conversation {
                     .collect()
             };
             let raw_pairs = pairs(&fresh);
+            // Each scan's own probe length: a raw score is a SUM over probe
+            // tokens, and the tail and question windows differ by an order of
+            // magnitude, so the band has to be told which probe produced which
+            // scores. See `NormConfig::probe_t_ref`.
+            let t_tail = probe.len();
+            let t_q = probe_q.map_or(1, |q| q.len());
             let (normed, normed_q) = {
                 let mut cache = self.normalization.lock().unwrap();
-                let normed = cache.normalize(&scope, &raw_pairs);
+                let normed = cache.normalize(&scope, &raw_pairs, t_tail);
                 let normed_q = fresh_q
                     .as_deref()
-                    .map(|fq| cache.normalize(&scope, &pairs(fq)));
+                    .map(|fq| cache.normalize(&scope, &pairs(fq), t_q));
                 // Segmentation: this collection learns only from a probe inside
                 // its own gather scope. `tags: [tool]` means tool traffic teaches
                 // the tool band and dialogue traffic does not — the band stays a
@@ -947,7 +953,7 @@ impl Conversation {
                 // achieve that.
                 if let (true, Some(source)) = (observe.teaches(&coll.policy.tags), observe.source())
                 {
-                    cache.observe(&scope, source, &raw_pairs);
+                    cache.observe(&scope, source, &raw_pairs, t_tail);
                 }
                 (normed, normed_q)
             };
@@ -1331,6 +1337,15 @@ impl Conversation {
     pub fn warm_ingest_normalization(&self, schema: &Schema) {
         let mut warmed_timelines = 0usize;
         for layer in &schema.layers {
+            // Out of retrieval ⇒ nothing to warm. A hit level is a denominator
+            // for candidates this layer might return, and a non-gathered layer
+            // returns none, so warming it would spend the probe budget learning
+            // levels that can never be read. (`score_belief_groups` declines the
+            // same layer, so `warm_normalization_from_substrate` needs no guard
+            // of its own — it warms THROUGH that call.)
+            if !layer.gathered {
+                continue;
+            }
             let is_ingest = self.inner.read().unwrap().is_append_only_layer(layer.id);
             if !is_ingest {
                 continue;
@@ -1438,6 +1453,14 @@ impl Conversation {
         use crate::persistence::content_hash::turn_stream_id;
         let mut per_group: Vec<(GroupId, Vec<(TurnKey, f32)>)> = Vec::new();
         if probe.is_empty() {
+            return per_group;
+        }
+        // Taken out of retrieval for this boot (`zend --disable-layer`). Its
+        // turns are still in the substrate with their signatures intact — this
+        // declines to score them, so they cannot be selected, which is the whole
+        // of what the flag promises. Re-enabling restores them immediately; the
+        // flag is a read-time filter, not a deletion.
+        if !layer.gathered {
             return per_group;
         }
         // The substrate read guard is scoped to Phase A, never held across Phase
@@ -1822,15 +1845,21 @@ impl Conversation {
                 // the levels between this turn's normalize and observe. Learning only
                 // fires on the once-per-turn seal scan, not on every reprojection,
                 // and folds the TAIL scan's raw scores (the stored whole-turn probe).
+                // As on the collection path above: the tail and question scans
+                // are sums over probes of very different lengths, so each is
+                // normalized against the reference on its own length.
+                let t_tail = probe.len();
+                let t_q = probe_q.map_or(1, |q| q.len());
                 let (normed, normed_q) = {
                     let mut cache = self.normalization.lock().unwrap();
-                    let normed = cache.normalize_with_floors(&scope, &raw_pairs, &floors);
+                    let normed =
+                        cache.normalize_with_floors(&scope, &raw_pairs, &floors, t_tail);
                     let normed_q = fresh_q_per_file.as_ref().map(|per_file| {
                         let fq = &per_file[fi];
                         let q_pairs: Vec<(ChildKey, f32)> = (0..f.n_slots)
                             .map(|slot| (child_of(slot), fq.get(slot).copied().unwrap_or(0.0)))
                             .collect();
-                        cache.normalize_with_floors(&scope, &q_pairs, &floors)
+                        cache.normalize_with_floors(&scope, &q_pairs, &floors, t_q)
                     });
                     // A turn group's retrieval target IS the turn, so its gather
                     // scope is the group's own; `tags` on the group route the
@@ -1838,7 +1867,7 @@ impl Conversation {
                     if let (true, Some(source)) =
                         (observe.teaches(&group.policy.tags), observe.source())
                     {
-                        cache.observe(&scope, source, &raw_pairs);
+                        cache.observe(&scope, source, &raw_pairs, t_tail);
                     }
                     (normed, normed_q)
                 };

@@ -2431,11 +2431,27 @@ import { estateSwitcher } from './common/lib/estate.js';
     // thinking with no K/V: the spine-materialized prefix/suffix, a dropped
     // reasoning block) dimmed + italic so "recorded but not in this turn's K/V"
     // is visible at a glance.
-    const segMarker = (m) => ({
-      system_start: G && G.system_start, user_start: G && G.user_start,
-      assistant_start: G && G.assistant_start, im_end: G && (G.user_end || G.assistant_end),
-      no_think: G && G.no_think,
-    }[m] || ('<' + m + '>'));
+    // A marker the DIALECT leaves empty is not an unknown marker. `no_think` is
+    // empty on every Qwen3.5/3.8 checkpoint — that family suppresses thinking
+    // with the already-closed `<think></think>` block (`no_think_block`), and
+    // `Glue`'s contract is that exactly one of the two is non-empty — so `||`
+    // fell through to the placeholder and drew a `<no_think>` row for a marker
+    // that is not in the prompt at all. The turn's sealed tokens go straight
+    // from `<|im_start|>user\n` into the body; nothing was being injected, but
+    // the panel said otherwise about the one thing it exists to show verbatim.
+    //
+    // So: present-but-empty resolves to '' (the caller drops the row), and the
+    // `<name>` placeholder is kept for a marker name we genuinely do not know,
+    // which is a real signal worth seeing.
+    const segMarker = (m) => {
+      const t = {
+        system_start: (G && G.system_start) || '', user_start: (G && G.user_start) || '',
+        assistant_start: (G && G.assistant_start) || '',
+        im_end: (G && (G.user_end || G.assistant_end)) || '',
+        no_think: (G && G.no_think) || '',
+      };
+      return m in t ? t[m] : '<' + m + '>';
+    };
     // The turn's segment vector, rendered the SAME way the system prompt is:
     // boundary glue as flat `⟐` rows (so it reads identically to the system
     // framing) interleaved with the content blocks — user (purple), thinking
@@ -2448,7 +2464,11 @@ import { estateSwitcher } from './common/lib/estate.js';
       segs.forEach((s) => {
         const ethereal = s.kv == null;
         if (s.kind === 'glue') {
-          const r = glueRow(segMarker(s.marker));
+          const marker = segMarker(s.marker);
+          // Empty on this dialect ⇒ the assembler emitted nothing, so neither
+          // does the panel. See `segMarker`.
+          if (!marker) return;
+          const r = glueRow(marker);
           // Ethereal glue (the turn's opener/closer, materialized by the spine)
           // stays legible — italic marks it as "not in this turn's own grid"
           // without washing the text out.

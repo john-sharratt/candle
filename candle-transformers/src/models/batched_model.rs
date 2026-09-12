@@ -596,9 +596,19 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             layer_end,
             x_in,
             act_dtype: _,
+            adapter,
         } = wave;
         if seq_ids.is_empty() {
             candle::bail!("forward_wave: empty batch");
+        }
+        // Refused rather than ignored. Dropping the name here would serve the
+        // BASE model under an adapter's name, which reads as a bad fine-tune
+        // rather than as an unsupported architecture.
+        if let Some(name) = adapter {
+            candle::bail!(
+                "forward_wave: this architecture has no LoRA support, so adapter \
+                 `{name}` cannot be applied"
+            );
         }
         let num_layers = self.model.num_layers();
         if layer_start > layer_end || layer_end > num_layers {

@@ -17,6 +17,7 @@
 //! into memory, so the conversation shape can be verified without loading a
 //! model.
 
+use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::Sequence;
 use std::sync::Arc;
 
@@ -134,11 +135,18 @@ pub trait InsertTurnSink {
 /// pass.
 pub struct SequenceTurnSink<'a> {
     inner: &'a mut Sequence,
+    /// Decode steering for the summary turn: the `<think>` trigger bound to
+    /// [`ThinkMode::Off`]'s tree, so the block closes the token after it opens.
+    ///
+    /// Carried on the sink rather than added to the [`InsertTurnSink`] methods
+    /// because the model-less sinks below never decode — they have nothing to
+    /// steer, and a parameter they all had to ignore would say otherwise.
+    triggers: Arc<TriggerRegistry>,
 }
 
 impl<'a> SequenceTurnSink<'a> {
-    pub fn new(inner: &'a mut Sequence) -> Self {
-        Self { inner }
+    pub fn new(inner: &'a mut Sequence, triggers: Arc<TriggerRegistry>) -> Self {
+        Self { inner, triggers }
     }
 }
 
@@ -158,6 +166,7 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
                 tags,
                 max_summary_tokens,
                 force_tools,
+                Arc::clone(&self.triggers),
             )
             .map_err(|e| anyhow::anyhow!("ingest_roundtrip_chain: {e}"))
     }
@@ -203,6 +212,7 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
                 response_user,
                 tags,
                 max_summary_tokens,
+                Arc::clone(&self.triggers),
             )
             .map_err(|e| anyhow::anyhow!("ingest_scope_roundtrip: {e}"))
     }
@@ -220,6 +230,9 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
         max_summary_tokens: usize,
         on_prefilled: &crate::turn_sink::ScopeProgressFn,
     ) -> anyhow::Result<()> {
+        // Lifted out of the loop: the forks below borrow `self.inner`, so the
+        // spawn closures cannot reach `self` for the steering.
+        let triggers = Arc::clone(&self.triggers);
         for chunk in prepared.chunks(SCOPE_PARALLELISM) {
             // Cooperative shutdown: abandon the rest of THIS file's scopes at the
             // chunk boundary, so a worker returns after its in-flight chunk (~4
@@ -248,6 +261,7 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
                         .zip(chunk.iter())
                         .map(|(fork, (call_user, call_assistant, response_user))| {
                             let tags = tags.clone();
+                            let triggers = Arc::clone(&triggers);
                             s.spawn(move || {
                                 fork.ingest_scope_roundtrip_indices(
                                     call_user,
@@ -255,6 +269,7 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
                                     response_user,
                                     tags,
                                     max_summary_tokens,
+                                    triggers,
                                 )
                             })
                         })

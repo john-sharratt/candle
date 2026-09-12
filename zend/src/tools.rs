@@ -26,12 +26,13 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use candle_conversation::models::Dialect;
 use candle_conversation::projection::{
     Builder as ProjectionBuilder, GroupId, LayerId, Reserved, SectionId, SelectionRule,
 };
+use candle_conversation::stencil::{function_blocks_to_json, ToolSpec};
 use candle_conversation::think_strip::strip_think_blocks_keep_layout;
 use serde::Deserialize;
 use serde_json::Value;
@@ -264,6 +265,25 @@ fn balanced_object_spans(text: &str) -> Vec<(usize, usize)> {
 ///    fabricated tool *responses* (`{"error": ...}`) aren't mistaken for calls.
 ///
 /// Malformed blocks are silently skipped.
+///
+/// # The function-block syntax is translated, not parsed a second time
+///
+/// Qwen3.5 / Qwen3.8 put no JSON in a call at all. Their [`CallStyle`] is
+/// `FunctionBlock`, so the stencil *forces*
+/// `<function=name>\n<parameter=k>\nraw</parameter>\n</function>` — inside the
+/// ordinary `<tool_call>` markers. All three strategies above look for a `{`
+/// straight after the marker, so all three found nothing: `calls.is_empty()`
+/// read as "the model produced a final answer", the turn ended, no tool ran, and
+/// nothing logged a failure — while the GUI drew a tool card, because the
+/// markers themselves were exactly right. Every individual part worked as
+/// written and a whole class of request was inert.
+///
+/// [`function_blocks_to_json`] rewrites that body into strategy 1's shape before
+/// the passes run, so this file keeps the one syntax it has always understood
+/// and the new one lives in exactly two places: the envelope that writes it and
+/// the module that reads it.
+///
+/// [`CallStyle`]: candle_conversation::stencil::CallStyle
 pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
     use regex::Regex;
     use std::sync::OnceLock;
@@ -272,7 +292,12 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
     // blocks first so only calls in the post-think answer are extracted — the JSON
     // still streams to the client inline, it is simply never executed.
     let response_text = strip_think_blocks_keep_layout(response_text);
-    let response_text = response_text.as_str();
+    // **Translated before anything looks for a `{`.** After the think-strip
+    // rather than before it, so a call written mid-thought is already gone —
+    // translating first would spend the work rewriting text about to be
+    // discarded, and would put a dispatchable shape into deliberation.
+    let translated = function_blocks_to_json(&response_text, tool_catalog());
+    let response_text = translated.as_deref().unwrap_or(response_text.as_str());
     // Strict, well-formed match: <tool_call>...{...}...</tool_call>
     static STRICT_RE: OnceLock<Regex> = OnceLock::new();
     let strict_re = STRICT_RE.get_or_init(|| {
@@ -374,6 +399,28 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
         }
     }
     out
+}
+
+/// The tool catalog as stencil specs, resolved once.
+///
+/// **The same list the tool stencil is compiled from** (see `session.rs`), which
+/// is the property that makes the translation the grammar's exact inverse: a
+/// parameter the grammar decoded as an integer parses back as one, and a
+/// string-typed parameter whose text happens to be all digits stays a string. A
+/// looks-like-a-number guess gets that second case wrong, and gets it wrong on
+/// exactly the arguments a coding assistant passes around.
+///
+/// [`crate::tool_def::all`] is itself `OnceLock`-resolved and fixed for the
+/// process once `init` has run, so caching the derived specs here costs one
+/// schema walk per daemon rather than one per decoded turn.
+fn tool_catalog() -> &'static [ToolSpec] {
+    static SPECS: OnceLock<Vec<ToolSpec>> = OnceLock::new();
+    SPECS.get_or_init(|| {
+        crate::tool_def::all()
+            .iter()
+            .map(|d| ToolSpec::from_json_schema(&d.name, &d.parameters))
+            .collect()
+    })
 }
 
 #[derive(Deserialize)]
@@ -516,6 +563,101 @@ impl ToolHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── The function-block syntax (Qwen3.5 / Qwen3.8) ───────────────────────
+    //
+    // These drive `extract_tool_calls` with the shape the stencil FORCES on that
+    // lineage. Before the translation every one of them returned zero calls, and
+    // zero calls reads as "the model produced a final answer" — so the turn
+    // ended, no tool ran, and nothing logged a failure while the GUI drew a card
+    // from the markers. The unit tests for the translation itself live in
+    // `candle_conversation::stencil::function_block`; these assert the daemon's
+    // end of it, against the real bundled catalog.
+
+    /// The canonical forced shape, in a whole assistant turn — **and the typing
+    /// that makes it dispatchable.** `tcp_session_open` declares `host` a string
+    /// and `port` an integer, so `port` must come back as a number the tool can
+    /// deserialize rather than the string `"443"`.
+    #[test]
+    fn extract_tool_calls_reads_a_function_block_call() {
+        let text = "<tool_call>\n<function=tcp_session_open>\n\
+                    <parameter=host>\nexample.com</parameter>\n\
+                    <parameter=port>\n443</parameter>\n</function>\n</tool_call>";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].name, "tcp_session_open");
+        assert_eq!(calls[0].arguments["host"], serde_json::json!("example.com"));
+        assert_eq!(calls[0].arguments["port"], serde_json::json!(443));
+        assert!(
+            calls[0].arguments["port"].is_number(),
+            "a declared integer must not arrive as a string: {:?}",
+            calls[0].arguments,
+        );
+    }
+
+    /// A call with no arguments is a call. `datetime` takes none, and it is the
+    /// tool the whole failure was first noticed on.
+    #[test]
+    fn extract_tool_calls_reads_a_function_block_with_no_arguments() {
+        let text = "<tool_call>\n<function=datetime>\n</function>\n</tool_call>";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].name, "datetime");
+        assert_eq!(calls[0].arguments, serde_json::json!({}));
+    }
+
+    /// **The invariant the translation must not hole.** A function block written
+    /// inside the reasoning block is deliberation, exactly as a JSON call there
+    /// is — which is why the translation runs *after* the think-strip and not
+    /// before it.
+    #[test]
+    fn extract_tool_calls_ignores_a_function_block_inside_think() {
+        let text = "<think>\nI could call <function=datetime>\n</function> here.\n</think>\n\
+                    On reflection, no.";
+        assert!(
+            extract_tool_calls(text).is_empty(),
+            "a call inside the reasoning block was dispatched",
+        );
+    }
+
+    /// The counterpart: the same block *after* the reasoning closes is the
+    /// invocation, and must dispatch.
+    #[test]
+    fn extract_tool_calls_dispatches_a_function_block_after_think() {
+        let text = "<think>\nThe clock, then.\n</think>\n\
+                    <tool_call>\n<function=datetime>\n</function>\n</tool_call>";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].name, "datetime");
+    }
+
+    /// Two calls in one turn, with prose in front of them. The prose matters:
+    /// both of the translator's bail-out paths once emitted the text before a
+    /// block twice, and that is invisible when a block starts at byte zero.
+    #[test]
+    fn extract_tool_calls_reads_two_function_blocks_after_prose() {
+        let text = "Checking both.\n\
+                    <tool_call>\n<function=datetime>\n</function>\n</tool_call>\n\
+                    <tool_call>\n<function=tcp_session_open>\n\
+                    <parameter=host>\nexample.com</parameter>\n\
+                    <parameter=port>\n80</parameter>\n</function>\n</tool_call>";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0].name, "datetime");
+        assert_eq!(calls[1].name, "tcp_session_open");
+        assert_eq!(calls[1].arguments["port"], serde_json::json!(80));
+    }
+
+    /// A decode cut off mid-call dispatches nothing, rather than a call whose
+    /// missing arguments were invented for it.
+    #[test]
+    fn extract_tool_calls_ignores_a_truncated_function_block() {
+        let text = "<tool_call>\n<function=tcp_session_open>\n<parameter=host>\nexample.co";
+        assert!(
+            extract_tool_calls(text).is_empty(),
+            "a truncated call was dispatched",
+        );
+    }
 
     #[test]
     fn extract_tool_calls_finds_well_formed_block() {
