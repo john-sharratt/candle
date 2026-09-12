@@ -7675,7 +7675,26 @@ fn grouped_int8_outlier_stress() -> Result<()> {
     let expert_batches = &[8usize, 16];
     let total_batch: usize = expert_batches.iter().sum();
 
-    let mut rng = rand::rng();
+    // **Seeded, because this test was flaky and the flakiness read as a bug.**
+    //
+    // It drew from `rand::rng()`, so `rel_l2` moved run to run — 0.0837, 0.0859,
+    // 0.0862, 0.0906, 0.1006 across five observed runs — against a hard
+    // `rel < 0.10`. The spread reaches the threshold, so it fails on an unlucky
+    // draw with nothing wrong.
+    //
+    // That cost a real investigation. Six runs were split three-and-three across
+    // two builds, the two groups happened not to overlap, and the difference was
+    // read as one build genuinely degrading the kernel. Seeded, the two builds
+    // agree exactly (0.08995), so the separation was sampling noise the whole
+    // time. Three samples a side is far too few to claim a distributional
+    // difference, and an unseeded test invites exactly that mistake — which is
+    // the second reason for the seed, beyond removing the flake.
+    //
+    // Note the margin: 0.08995 against 0.10 is ~11% of headroom. If a change
+    // moves this number at all it is worth understanding rather than re-seeding.
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    let mut rng = StdRng::seed_from_u64(0x0a7_11e5);
     let mut act_data: Vec<f32> = (0..total_batch * ncols)
         .map(|_| rng.random_range(-1.0..1.0))
         .collect();

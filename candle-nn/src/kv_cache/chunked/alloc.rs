@@ -39,6 +39,9 @@ use super::head_gids::HeadGids;
 /// every machine; a pass that declines simply retries at the next boundary.
 #[cfg(feature = "cuda")]
 const ARENA_RELOCATE_FREE_MARGIN_REGIONS: usize = 2;
+
+#[cfg(feature = "tensor-assert")]
+use candle::tensor_assert::POISON_BYTE;
 #[cfg(feature = "cuda")]
 use super::region_pool;
 use super::size_class::{elems_per_chunk, SizeClass};
@@ -1098,11 +1101,114 @@ impl BackingInner {
         })
     }
 
+    /// Stamp every freshly claimed chunk slot with [`POISON_BYTE`] before its
+    /// owner has written a single token into it.
+    ///
+    /// **What this is for.** A KV band run used to be able to claim only
+    /// never-used ground: `try_claim_run` reads the high-water mark and never
+    /// touches the recycle stack, *"recycled singleton slots are never
+    /// consecutive-by-contract"*. The scattered fallback in
+    /// [`Self::alloc_chunk_run_for_key`] reaches the free list instead, so a
+    /// band run can now land on ground that recently held another sequence's
+    /// KV. The span is one reservation the driver zeroed once at startup, so
+    /// before that change a read past a chunk's written extent returned zeros —
+    /// which contribute nothing to a softmax-weighted sum and cannot produce an
+    /// `inf`. After it, the same read returns real quantized KV, which
+    /// misinterpreted yields exactly the observed fault: an attention context
+    /// reaching 448 against a true `max|V|` of 11.78, with infinities.
+    ///
+    /// Zeros are therefore a *mask*, not a safe default, and the poison removes
+    /// it. `0xFF` is chosen to be maximally loud rather than merely
+    /// recognisable: every band format reads it as garbage that cannot be
+    /// mistaken for data. As F16 and BF16, `0xFFFF` is NaN. For the quantized
+    /// formats the per-block *scale* is likewise `0xFFFF` → NaN, so the whole
+    /// block decodes to NaN rather than to a plausible magnitude. Any read of
+    /// unwritten ground then announces itself at the band that made it, instead
+    /// of arriving forty layers later as a number that merely looks wrong.
+    ///
+    /// Claims are poisoned whatever their provenance — recycled *and* virgin —
+    /// so the test does not depend on knowing which a given slot was.
+    ///
+    /// **This is not made redundant by the allocator-level poison in
+    /// `CudaDevice::alloc`.** That one fires when a *device buffer* is handed
+    /// out; an arena is one such buffer, allocated once and then subdivided into
+    /// chunk slots that this pool recycles among sequences for the rest of the
+    /// process. Every reuse after the first therefore happens entirely inside a
+    /// buffer the device allocator will never see again, which is precisely the
+    /// recycling that matters here. The two poisons cover disjoint lifetimes and
+    /// both are needed.
+    ///
+    /// Queued, not awaited: `memset_d8_sync` is `cuMemsetD8_v2`, which enqueues
+    /// on the stream. That matters — this fault stops reproducing under a
+    /// fenced build, so an instrument that synchronised here would suppress
+    /// what it is trying to catch.
+    #[cfg(feature = "tensor-assert")]
+    fn poison_claimed(&self, gids: &[super::gid_pool::ChunkGid]) {
+        use candle::cuda_backend::cudarc::driver::result::memset_d8_sync;
+        let _ = self.storage.read(|s| {
+            let arenas = s.arenas();
+            for gid in gids {
+                let Some(arena) = arenas.get(&gid.arena_idx()) else {
+                    continue;
+                };
+                let Some(base) = arena.base_ptr() else {
+                    continue;
+                };
+                let stride = arena.slot_stride();
+                // **Never write past the arena's own end.**
+                //
+                // The raw-GID namespace is sized for the densest format, so an
+                // in-namespace `chunk_idx` can still address beyond *this*
+                // arena's format-specific capacity — `prefill_utils`' slot
+                // header build refuses a chunk for exactly this reason. The
+                // span is laid out `| persist | KV regions | wave transient
+                // tier | expert weights |`, so a write past a KV arena's end
+                // does not fault: it lands on the next tenant, and expert
+                // weight ground is downstream of every KV arena. An instrument
+                // that overran here would manufacture the corruption it was
+                // added to find — NaN weights in the FFN GEMM, with the KV side
+                // showing nothing, because the KV side would be the writer
+                // rather than the victim.
+                //
+                // Loud rather than skipped: this gid was just *claimed*, not
+                // recovered from a stale record, so it is supposed to be inside
+                // its arena by construction. If this ever fires it is a real
+                // allocator fault and it is the more interesting finding.
+                if gid.chunk_idx() >= arena.chunks() {
+                    tracing::error!(
+                        target: "candle_nn::kv_cache::poison",
+                        arena = gid.arena_idx(),
+                        chunk_idx = gid.chunk_idx(),
+                        capacity = arena.chunks(),
+                        stride,
+                        "poison: a FRESHLY CLAIMED gid addresses past its arena's end — the \
+                         allocator handed out a slot this arena does not have, and a write \
+                         through it lands on the next span tenant"
+                    );
+                    continue;
+                }
+                let addr = base + gid.chunk_idx() as u64 * stride as u64;
+                // SAFETY: `addr` is this slot's own extent inside the arena it
+                // was just claimed from — `base + chunk_idx * slot_stride` for
+                // `slot_stride` bytes is the same arithmetic every reader of
+                // this slot performs.
+                let _ = unsafe { memset_d8_sync(addr, POISON_BYTE, stride) };
+            }
+            Ok::<(), candle::Error>(())
+        });
+    }
+
+    #[cfg(not(feature = "tensor-assert"))]
+    #[inline(always)]
+    fn poison_claimed(&self, _gids: &[super::gid_pool::ChunkGid]) {}
+
     pub(super) fn alloc_chunk_for_key(
         &self,
         key: super::arena::ArenaKey,
     ) -> Result<super::gid_pool::ChunkGid> {
-        self.claim_slot_promoting(key)
+        let gid = self.claim_slot_promoting(key)?;
+        self.poison_claimed(std::slice::from_ref(&gid));
+        Ok(gid)
     }
 
     /// Allocate `len` CONSECUTIVE slots in one arena of `key`. Contiguity is a
@@ -1137,6 +1243,7 @@ impl BackingInner {
         }
         if let Some(gids) = self.pool.allocate_run_for(key, len) {
             self.ensure_arena_exists(gids[0].arena_idx(), key)?;
+            self.poison_claimed(&gids);
             self.replenish_if_nearly_dry(key, len);
             return Ok(gids);
         }
@@ -1185,6 +1292,7 @@ impl BackingInner {
                     self.ensure_arena_exists(ai, key)?;
                 }
             }
+            self.poison_claimed(&scattered);
             self.replenish_if_nearly_dry(key, len);
             return Ok(scattered);
         }
@@ -1214,6 +1322,7 @@ impl BackingInner {
             key = placed;
             let _ = arena_chunks;
             if let Some(gids) = self.pool.allocate_run_for_in(key, arena_idx, len) {
+                self.poison_claimed(&gids);
                 self.replenish_if_nearly_dry(key, len);
                 return Ok(gids);
             }
@@ -1221,6 +1330,7 @@ impl BackingInner {
             // tail room elsewhere; check the whole pool before registering again.
             if let Some(gids) = self.pool.allocate_run_for(key, len) {
                 self.ensure_arena_exists(gids[0].arena_idx(), key)?;
+                self.poison_claimed(&gids);
                 self.replenish_if_nearly_dry(key, len);
                 return Ok(gids);
             }
@@ -1280,6 +1390,7 @@ impl BackingInner {
                     self.ensure_arena_exists(ai, key)?;
                 }
             }
+            self.poison_claimed(&batch);
             out.extend(batch);
         }
         // One single-slot probe for the whole batch, at the final key. The bulk

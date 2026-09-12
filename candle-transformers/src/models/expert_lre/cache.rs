@@ -234,6 +234,33 @@ impl ExpertCacheInner {
             num_slots,
             zone.slot_base(num_slots.saturating_sub(1)),
         ));
+        // Publish this grid's slot extents to the between-waves span audit.
+        //
+        // Through the shared `ZoneGeometry` rather than through `self`, for the
+        // same reason every other out-of-cache reader goes that way: the audit
+        // runs on the forward thread while the cache is owned elsewhere. The
+        // closure re-reads on every call because all of it moves — a concession
+        // changes `capacity` and `frontier` together, and a cached pair would
+        // describe the grid as it was before the boundary moved, which is
+        // precisely the state this is meant to catch.
+        //
+        // `span_end` is reconstructed rather than stored: `frontier` is
+        // `slot_base(capacity - 1)` = `span_end - capacity * slot_bytes`, so the
+        // top of the span follows from the two published numbers and the slot
+        // size.
+        #[cfg(feature = "tensor-assert")]
+        {
+            let g = geometry.clone();
+            let slot_bytes = zone.slot_bytes();
+            super::span_claims::register(move || {
+                let capacity = g.capacity();
+                if capacity == 0 || slot_bytes == 0 {
+                    return None;
+                }
+                let span_end = g.frontier() + (capacity * slot_bytes) as u64;
+                Some((span_end, slot_bytes, capacity))
+            });
+        }
         Self {
             slots: (0..num_slots).map(|_| None).collect(),
             zone,

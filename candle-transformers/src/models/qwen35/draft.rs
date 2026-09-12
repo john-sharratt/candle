@@ -206,7 +206,13 @@ pub fn head_wave_pass(
     let embed = q
         .embed
         .rows(ids, dev, wave_root(wave.as_ref()), w.act_dtype)?;
+    // The head's in-wave pass assembles its input from the trunk's shifted
+    // hidden and the wave's token embeddings — the same two inputs `step`
+    // watches, on the path that writes the head's KV during a trunk wave.
+    shifted.assert("mtp.wave.shifted");
+    embed.assert("mtp.wave.embed");
     let x = head.input.forward(&embed, &shifted)?;
+    x.assert("mtp.wave.input");
     let xt = TensorCat::from_cat_tensor(x.reshape((1, rows, hidden))?, 0)?;
 
     let layer = Qwen35AttentionLayer {
@@ -366,6 +372,9 @@ pub fn draft_cohort(
     }
     let seed_refs: Vec<&Tensor> = seeds.iter().collect();
     let seed_block = Tensor::cat(&seed_refs, 0)?;
+    // The seeds are rows of the trunk's capture buffers, read back at the last
+    // accept; a non-finite seed would enter the head's first step unseen.
+    seed_block.assert("mtp.seed");
     let q_lens = vec![1usize; n];
 
     // One position of the walk. Everything around it — the pre-ensure, the
@@ -398,6 +407,9 @@ pub fn draft_cohort(
         let embed = ctx.embed_ids(ids)?;
         let h_next = head.step(&embed, h, caches, at, &params, &ctx)?;
         let logits = ctx.lm_head.forward_live(&h_next)?;
+        // A NaN row here argmaxes to an arbitrary id, which is then embedded as
+        // the next step's token — so a bad logit is also a bad input.
+        logits.assert("mtp.logits");
         Ok((h_next, logits))
     };
     draft_walk(
@@ -565,6 +577,207 @@ mod tests {
             "a draft is not a token id: {proposed:?}"
         );
         println!("drafts {proposed:?}, layer lengths {after_draft:?}");
+        Ok(())
+    }
+
+    /// **Every position the head's layer commits was written.**
+    ///
+    /// The regression test for the stale decode slot buffer. A verify block is
+    /// written by the prefill kernel and committed on the host; the cached
+    /// decode slot buffer's writer length is advanced only by the decode
+    /// kernel. Before `KvCache::commit_written_tokens` resynced it, the next
+    /// draft step reused the buffer at the pre-verify length, wrote its token
+    /// over a committed one, and left the slot the host counted unwritten —
+    /// which the zend ingest then read as NaN in the draft head's KV layer.
+    /// Without the fix this fails within a few steps: the per-step check in
+    /// `draft_cohort` reads each draft step's own write back and finds poison.
+    ///
+    /// It drives the scheduler's step (draft → verify → accept → rollback) over
+    /// a cohort whose prompts start at different offsets within a chunk, and
+    /// reads the head's whole committed history back after every step as well.
+    ///
+    /// The step is the scheduler's (`scheduler::decode`), not the model-level
+    /// `speculative_decode_step_batch`: that one verifies through the trait's
+    /// generic `verify_block` per sequence, a path on which the head never writes
+    /// a verify span. Here the blocks ride one forward as prefill spans beside
+    /// the plain rows, between `begin_verify` and `end_verify`, exactly as in
+    /// zend.
+    ///
+    /// Int8 `Performance`, as zend runs it, so the decode attention is the q8
+    /// kernel whose fused scatter writes the head's new K/V. `tensor-assert`
+    /// because its claim poison is what makes an unwritten slot read non-finite;
+    /// without it the same hole reads zeros and this passes.
+    #[test]
+    #[cfg(feature = "tensor-assert")]
+    #[ignore = "reads the pinned Qwen3.5-9B MTP GGUF (7.5 GB) and needs a GPU. Run with: \
+                cargo test --release --features cuda,tensor-assert --lib -p candle-transformers \
+                qwen35::draft::tests::speculative_steps_leave_no_unwritten_head_position \
+                -- --ignored --nocapture"]
+    fn speculative_steps_leave_no_unwritten_head_position() -> Result<()> {
+        use super::super::quantized_loader::Qwen35LoadOptions;
+        use crate::models::batch_test::test_helpers::hf_get;
+        use crate::models::quantized_qwen35::from_gguf_path;
+        use candle::quantized::Int8Mode;
+
+        const STEPS: usize = 160;
+        const MAX_DRAFT: usize = 3;
+        // Prompt lengths spread across a chunk, so the cohort's bases reach every
+        // alignment against a 32-token boundary within a few steps.
+        const PROMPT_LENS: [usize; 4] = [24, 29, 31, 33];
+
+        /// First position of a `(1, n_kv_head, len, head_dim)` read-back that
+        /// holds a non-finite value in any head or dimension.
+        fn first_nonfinite_position(t: &Tensor) -> Result<Option<usize>> {
+            let (_, heads, len, dim) = t.dims4()?;
+            let v = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            Ok((0..len).find(|&p| {
+                (0..heads).any(|h| (0..dim).any(|d| !v[(h * len + p) * dim + d].is_finite()))
+            }))
+        }
+
+        let spec = crate::models::quantized_qwen35::QWEN35_9B;
+        let path = hf_get(spec.0, hf_hub::RepoType::Model, spec.1, spec.2)?;
+        let device = Device::new_cuda(0)?;
+        let model = from_gguf_path(
+            &path,
+            &device,
+            Qwen35LoadOptions {
+                int8mode: Some(Int8Mode::Performance),
+                expert_pack_dir: None,
+                mtp_path: None,
+                gate_donor_path: None,
+            },
+        )?;
+        let head_kv = model.mtp_kv_layer().expect("a head means a head KV layer");
+        let mut session =
+            model.create_batched_session(BatchedConfig::default().with_dtype(DType::BF16))?;
+
+        let mut seqs = Vec::with_capacity(PROMPT_LENS.len());
+        let mut prompts = Vec::with_capacity(PROMPT_LENS.len());
+        let mut committed = Vec::with_capacity(PROMPT_LENS.len());
+        for (k, &n) in PROMPT_LENS.iter().enumerate() {
+            seqs.push(session.create_sequence()?);
+            let prompt: Vec<u32> = (0..n as u32).map(|i| 1000 + 37 * k as u32 + i).collect();
+            prompts.push(Tensor::from_vec(prompt, (1, n), &device)?);
+            committed.push(2000 + k as u32);
+        }
+        model.forward_wave(
+            &mut session,
+            &[],
+            &[],
+            &seqs,
+            &prompts,
+            &[],
+            &[],
+            0,
+            model.num_layers(),
+            None,
+        )?;
+        for (&seq, &n) in seqs.iter().zip(PROMPT_LENS.iter()) {
+            session.advance_sequence(seq, n)?;
+        }
+
+        let argmax = |row: &Tensor| -> Result<u32> { row.flatten_all()?.argmax(0)?.to_scalar::<u32>() };
+        for step in 0..STEPS {
+            // Where each sequence stands before the step: what its KV rolls back
+            // to, plus however many block positions the accept keeps.
+            let poss: Vec<usize> = seqs
+                .iter()
+                .map(|&s| session.sequence_offset(s).expect("live sequence"))
+                .collect();
+            let drafts = model.speculative_draft(&mut session, &seqs, &committed, MAX_DRAFT)?;
+            let blocks: Vec<Vec<u32>> = drafts
+                .iter()
+                .zip(&committed)
+                .map(|(d, &c)| {
+                    let mut b = Vec::with_capacity(d.len() + 1);
+                    b.push(c);
+                    b.extend_from_slice(d);
+                    b
+                })
+                .collect();
+            let plain: Vec<(usize, u32)> = (0..seqs.len())
+                .filter(|&i| blocks[i].len() == 1)
+                .map(|i| (seqs[i], committed[i]))
+                .collect();
+            let spec_idx: Vec<usize> = (0..seqs.len()).filter(|&i| blocks[i].len() > 1).collect();
+            let spec_seqs: Vec<usize> = spec_idx.iter().map(|&i| seqs[i]).collect();
+            let spec_blocks: Vec<Vec<u32>> = spec_idx.iter().map(|&i| blocks[i].clone()).collect();
+
+            let plan = model
+                .begin_verify(&mut session, &plain, &spec_seqs, &spec_blocks, MAX_DRAFT)?
+                .expect("qwen35 verifies its own drafts");
+            // ONE forward: plain rows in the decode slot, verify blocks as
+            // full-sweep prefill spans — `decode_forward_cobatched`'s shape.
+            let wave = model.forward_wave(
+                &mut session,
+                &plan.decode_seqs,
+                &plan.decode_inputs,
+                &plan.verify_seqs,
+                &plan.verify_inputs,
+                &[],
+                &[],
+                0,
+                model.num_layers(),
+                None,
+            )?;
+            let (plain_rows, spec_rows) = model.end_verify(
+                &mut session,
+                &plain,
+                &spec_seqs,
+                &spec_blocks,
+                wave.logits_owned()?,
+            )?;
+
+            // Greedy accept: keep block positions while the model's own token
+            // agrees with the next proposal; the first disagreement — or the
+            // block's end — is the token committed next.
+            let mut targets = Vec::with_capacity(seqs.len());
+            let (mut p, mut s) = (0usize, 0usize);
+            for i in 0..seqs.len() {
+                let rows: Vec<Tensor> = if blocks[i].len() == 1 {
+                    p += 1;
+                    vec![plain_rows[p - 1].clone()]
+                } else {
+                    s += 1;
+                    spec_rows[s - 1].clone()
+                };
+                let mut kept = 0;
+                loop {
+                    let tok = argmax(&rows[kept])?;
+                    kept += 1;
+                    if kept == blocks[i].len() || tok != blocks[i][kept] {
+                        committed[i] = tok;
+                        break;
+                    }
+                }
+                targets.push((seqs[i], poss[i] + kept));
+            }
+            model.truncate_sequences(&mut session, &targets)?;
+
+            for &seq in &seqs {
+                let offset = session.sequence_offset(seq).expect("live sequence");
+                let lengths = layer_lengths(&session, seq);
+                assert!(
+                    lengths.iter().all(|&l| l == offset),
+                    "step {step}: sequence {seq} stands at {offset} but its layers hold \
+                     {lengths:?}"
+                );
+                let head = &session.sequence_caches(seq).expect("live slot").caches[head_kv];
+                let (k, v) = head.chunked_read_kv(0, offset)?;
+                for (side, t) in [("K", &k), ("V", &v)] {
+                    if let Some(pos) = first_nonfinite_position(t)? {
+                        panic!(
+                            "step {step}: sequence {seq}'s head layer {side} is non-finite at \
+                             position {pos} of {offset} (slot {} of its chunk, offset {} into \
+                             the current one) — a committed position no write reached",
+                            pos % 32,
+                            offset % 32
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }

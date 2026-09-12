@@ -5,7 +5,7 @@
 //   - qs[16] (uint32_t): 128 × 4-bit nibbles packed (8 nibbles per u32)
 //   - scales[2] (half): scale factors (one per 64-element group)
 //   - zeros[2] (half): zero points (one per 64-element group)
-//   - _pad (uint32): explicit padding to 80 bytes
+//   - _pad[2] (uint32): explicit padding to 80 bytes
 //
 // CPU algorithm (k_quants.rs):
 //   For each 64-element group (2 groups per block):
@@ -76,7 +76,8 @@ __device__ __forceinline__ void quantize_block_q_awq_g64(
     if (lane == 0) {
         dst->scales[0] = __float2half_rn(scale);
         dst->zeros[0] = __float2half_rn(zero);
-        dst->_pad = 0;
+        dst->_pad[0] = 0;
+        dst->_pad[1] = 0;
     }
     if (lane == 16) {
         dst->scales[1] = __float2half_rn(scale);
@@ -168,7 +169,8 @@ __device__ __forceinline__ void quantize_blocks_q_awq_g64(
         if (lane == 0) {
             block_dst->scales[0] = __float2half_rn(scale);
             block_dst->zeros[0] = __float2half_rn(zero);
-            block_dst->_pad = 0;
+            block_dst->_pad[0] = 0;
+            block_dst->_pad[1] = 0;
         }
         if (lane == 16) {
             block_dst->scales[1] = __float2half_rn(scale);

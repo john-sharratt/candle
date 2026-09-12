@@ -503,14 +503,20 @@ const _: () = assert!(std::mem::size_of::<BlockQAWQ>() == 80);
 /// - qs[16]: uint32 containing packed 4-bit weights (8 weights per u32)
 /// - scales[2]: f16 scale factors (one per 64 elements)
 /// - zeros[2]: f16 zero points (one per 64 elements)
-/// - _pad: padding to 80 bytes (16-byte aligned)
+/// - _pad[2]: padding to 80 bytes (16-byte aligned)
+///
+/// The padding is spelled out to the full 80 bytes rather than left to
+/// `align(16)`. An implicit alignment tail is bytes no field names, so no
+/// encoder writes them: the CPU encoder's tail was whatever `zeros()` left and
+/// the GPU encoder's was whatever the allocator left, and a byte-for-byte
+/// comparison of the two blocks measured the allocator, not the codec.
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C, align(16))]
 pub struct BlockQAWQ_G64 {
     pub(crate) qs: [u32; 16],    // 128 × 4-bit = 64 bytes
     pub(crate) scales: [f16; 2], // scale per 64-element group
     pub(crate) zeros: [f16; 2],  // zero per 64-element group
-    pub(crate) _pad: u32,        // padding to 80 bytes
+    pub(crate) _pad: [u32; 2],   // padding to 80 bytes
 }
 const _: () = assert!(std::mem::size_of::<BlockQAWQ_G64>() == 80);
 
@@ -6085,7 +6091,7 @@ impl GgmlType for BlockQAWQ_G64 {
                     y.qs[thread_base + t] = packed;
                 }
             }
-            y._pad = 0;
+            y._pad = [0; 2];
         }
     }
 

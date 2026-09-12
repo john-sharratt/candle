@@ -1704,7 +1704,8 @@ fn try_place(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<Placed
                 (short as usize).div_ceil(REGION_BYTES).max(1),
             ));
         }
-        if tier_poison_enabled() {
+        #[cfg(feature = "tensor-assert")]
+        {
             // SAFETY: `[base, base+len)` is mapped device memory inside the
             // reservation, and the quiesce above retired every reader of it.
             //
@@ -1714,7 +1715,9 @@ fn try_place(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<Placed
             stream
                 .context()
                 .bind_to_thread()
-                .and_then(|()| unsafe { memset_d8_sync(base, 0xCD, len) })
+                .and_then(|()| unsafe {
+                    memset_d8_sync(base, candle::tensor_assert::POISON_BYTE, len)
+                })
                 .map_err(candle::Error::wrap)?;
         }
         pool.transient_base = Some(base);
@@ -1723,19 +1726,6 @@ fn try_place(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<Placed
         // knows a tier of this size is about to want its ground back.
         pool.transient_high_water = pool.transient_high_water.max(len);
         Ok(Placed::At(base))
-    })
-}
-
-/// Whether to fill the transient tier with a poison byte as it is placed.
-///
-/// `KV_TIER_POISON=1`. Off by default: it costs a synchronous device memset of
-/// the whole tier on every forward.
-fn tier_poison_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("KV_TIER_POISON")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
     })
 }
 
@@ -2578,6 +2568,15 @@ pub struct SpanLayout {
     pub persist_carved: usize,
     /// Regions the KV side currently has.
     pub total: usize,
+    /// One past the last byte the KV side has actually **occupied**.
+    ///
+    /// Distinct from [`Self::region_end`], which is the pool's *capacity* — the
+    /// regions it owns, occupied or not. The transient tier is placed at this
+    /// frontier, so it legitimately stands on owned-but-free ground inside the
+    /// region range; anything reasoning about who holds which bytes has to use
+    /// this rather than the capacity, or the tier reads as overlapping the KV
+    /// side on every wave.
+    pub live_end: u64,
     /// The weight side's left edge: KV below, expert slots above.
     pub weight_floor: u64,
     /// The wave transient tier, while one stands.
@@ -2614,6 +2613,7 @@ pub fn span_layout(ordinal: usize) -> Option<SpanLayout> {
         region_base: pool.region_base,
         persist_carved: pool.persist_carved,
         total: pool.total,
+        live_end: pool.live_end(),
         weight_floor: pool.weight_floor,
         transient_base: pool.transient_base,
         transient_bytes: pool.transient_bytes,

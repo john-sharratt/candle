@@ -129,6 +129,22 @@ fn decline(reason: &str) {
     );
 }
 
+/// Give up the grid's fingerprint and its read-only declaration when the tables
+/// go.
+///
+/// The tables own the grid's addresses; both probes and the `readonly_regions`
+/// declaration describe those addresses and must not outlive them. Leaving
+/// either standing points a process-lifetime global at memory that has gone back
+/// to the pool — the probe then reports drift against a grid that no longer
+/// exists, and the declaration makes every later allocation at that address a
+/// panic.
+#[cfg(feature = "tensor-assert")]
+impl Drop for GpuDispatchTables {
+    fn drop(&mut self) {
+        crate::models::nan_capture::clear_integrity_probes();
+    }
+}
+
 impl GpuDispatchTables {
     /// Element offset of `moe_layer_idx`'s expert row block inside the flat
     /// tables, or `None` if the layer is outside the covered range.
@@ -799,6 +815,7 @@ mod tests {
 
     #[test]
     fn build_complete_grid_yields_tables_with_correct_bases() {
+        let _gpu = crate::models::gpu_test_lock::gpu_serial();
         let device = Device::new_cuda(0).unwrap();
         let cuda = match &device {
             Device::Cuda(d) => d.clone(),
@@ -825,6 +842,7 @@ mod tests {
 
     #[test]
     fn a_retracted_zone_invalidates_the_tables_but_a_grown_one_does_not() {
+        let _gpu = crate::models::gpu_test_lock::gpu_serial();
         let device = Device::new_cuda(0).unwrap();
         let cuda = match &device {
             Device::Cuda(d) => d.clone(),
@@ -878,6 +896,7 @@ mod tests {
 
     #[test]
     fn a_concede_then_regrow_still_invalidates_the_tables() {
+        let _gpu = crate::models::gpu_test_lock::gpu_serial();
         let device = Device::new_cuda(0).unwrap();
         let cuda = match &device {
             Device::Cuda(d) => d.clone(),
@@ -923,6 +942,12 @@ mod tests {
     /// per-layer routing readbacks. A grid AT the kernel's maximum must build.
     #[test]
     fn build_accepts_the_kernels_full_expert_id_space() {
+        // Serialised with every other GPU test in the process. `readonly_regions`
+        // is a process-global table, so a grid declared by a concurrently
+        // running test makes this one's weight allocation look like a write to
+        // read-only ground — a false positive that only appears under the
+        // parallel test harness.
+        let _gpu = crate::models::gpu_test_lock::gpu_serial();
         let device = Device::new_cuda(0).unwrap();
         let cuda = match &device {
             Device::Cuda(d) => d.clone(),
@@ -951,6 +976,7 @@ mod tests {
     /// the only symptom was every MoE layer paying a blocking routing readback.
     #[test]
     fn build_accepts_per_layer_dtypes() {
+        let _gpu = crate::models::gpu_test_lock::gpu_serial();
         let device = Device::new_cuda(0).unwrap();
         let cuda = match &device {
             Device::Cuda(d) => d.clone(),
@@ -982,6 +1008,7 @@ mod tests {
     /// single grouped GEMM call, which takes a single dtype.
     #[test]
     fn build_rejects_mixed_dtypes_inside_one_layer() {
+        let _gpu = crate::models::gpu_test_lock::gpu_serial();
         let device = Device::new_cuda(0).unwrap();
         let cuda = match &device {
             Device::Cuda(d) => d.clone(),
@@ -998,6 +1025,7 @@ mod tests {
 
     #[test]
     fn build_rejects_sparse_grid() {
+        let _gpu = crate::models::gpu_test_lock::gpu_serial();
         let device = Device::new_cuda(0).unwrap();
         let cuda = match &device {
             Device::Cuda(d) => d.clone(),
@@ -1012,6 +1040,7 @@ mod tests {
 
     #[test]
     fn build_rejects_non_ko_weights() {
+        let _gpu = crate::models::gpu_test_lock::gpu_serial();
         let device = Device::new_cuda(0).unwrap();
         let cuda = match &device {
             Device::Cuda(d) => d.clone(),

@@ -3939,7 +3939,7 @@ impl<'w> LiveTensor<'w> {
     /// observes changes what the program does, which is the one thing this must
     /// never do; internal errors are logged instead.
     #[cfg(feature = "tensor-assert")]
-    pub fn assert(&self, name: &str) -> &Self {
+    pub fn assert(&self, name: &'static str) -> &Self {
         crate::tensor_assert::assert_tensor(self, name);
         self
     }
@@ -3948,7 +3948,7 @@ impl<'w> LiveTensor<'w> {
     /// name literal compile away entirely.
     #[cfg(not(feature = "tensor-assert"))]
     #[inline(always)]
-    pub fn assert(&self, _name: &str) -> &Self {
+    pub fn assert(&self, _name: &'static str) -> &Self {
         self
     }
 
@@ -3959,7 +3959,7 @@ impl<'w> LiveTensor<'w> {
     /// a norm constant — where re-reading them every layer of every wave would
     /// be exactly the bandwidth perturbation the design avoids.
     #[cfg(feature = "tensor-assert")]
-    pub fn assert_once(&self, name: &str) -> &Self {
+    pub fn assert_once(&self, name: &'static str) -> &Self {
         if crate::tensor_assert::should_run_once(name) {
             crate::tensor_assert::assert_tensor(self, name);
         }
@@ -3968,7 +3968,7 @@ impl<'w> LiveTensor<'w> {
 
     #[cfg(not(feature = "tensor-assert"))]
     #[inline(always)]
-    pub fn assert_once(&self, _name: &str) -> &Self {
+    pub fn assert_once(&self, _name: &'static str) -> &Self {
         self
     }
 

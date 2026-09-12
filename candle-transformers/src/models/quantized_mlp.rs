@@ -331,6 +331,58 @@ impl QuantizedMlp {
 
         let (mut gate, mut up) = if let Some(w) = &self.gate_up_proj {
             let mut gu = w.forward_dynamic(acts.as_dynamic(), work_dtype)?;
+            // **The site a live run named as the origin, and the one operand
+            // nothing was watching.**
+            //
+            // A poisoned ingest ranked `mlp.gate_up_raw` as the first bad site
+            // in the whole run (`seq=1`, `nan=1024`), with no attention site bad
+            // at all — so the fault enters here rather than arriving from
+            // upstream. A bare `assert` can be ranked but never armed, so the
+            // capture slid down to `moe.shared_gated.L40` and dumped a
+            // consequence; as a `checkpoint` this can hold the arm and dump what
+            // it was made from.
+            //
+            // Its two operands are the fused weight and the activations. The
+            // weight is covered — `assert_weight_once` re-arms every wave via
+            // `tensor_assert::epoch` — and it was clean in the failing wave. The
+            // activations were not covered at all: in int8 mode they are a raw
+            // q8a128 buffer rather than a tensor, which is exactly the gap
+            // `checkpoint_q8a128` exists to close. A quantized operand's values
+            // are integers and cannot be non-finite, so if it reports bad the
+            // answer is a per-group *scale* — which is what quantizing a
+            // non-finite activation produces, and equally what reading
+            // unwritten ground produces once that ground is poisoned.
+            #[cfg(feature = "tensor-assert")]
+            if let candle::Device::Cuda(dev) = gu.device().clone() {
+                use crate::models::nan_capture::{checkpoint, checkpoint_q8a128};
+                // A `Float` operand here would make the q8a128 probe below no-op
+                // silently, which reads exactly like a clean operand. Say which
+                // it was, so the capture cannot be misread as having cleared an
+                // operand it never looked at.
+                if !matches!(acts, DynamicActs::Int8(_))
+                    && crate::models::nan_capture::is_armed("mlp.gate_up_raw")
+                {
+                    tracing::error!(
+                        target: "candle_transformers::nan_capture",
+                        "mlp.acts.int8 NOT probed: the activations are Float on this path, \
+                         so the q8a128 operand check does not apply — the operand is \
+                         UNEXAMINED, not clean"
+                    );
+                }
+                if let DynamicActs::Int8(op) = acts {
+                    let n = op.byte_len();
+                    let (rows, cols) = (op.rows, op.cols);
+                    op.with_device_ptr(&dev, |p| {
+                        // SAFETY: `p` names this operand's complete q8a128
+                        // buffer of `n` bytes, held live for the closure.
+                        unsafe {
+                            checkpoint_q8a128("mlp.acts.int8", p, rows, cols, n, &dev)
+                        }
+                    })?;
+                }
+                checkpoint("mlp.gate_up_raw", &gu, &[], &dev)?;
+            }
+            #[cfg(not(feature = "tensor-assert"))]
             gu.assert("mlp.gate_up_raw");
             let (_, _, out_dim) = gu.dims3()?;
             let half = Self::fused_half(out_dim)?;
@@ -395,7 +447,7 @@ impl QuantizedMlp {
 /// layer of every wave is exactly the bandwidth perturbation that makes a
 /// timing-sensitive fault stop reproducing.
 #[cfg(feature = "tensor-assert")]
-fn assert_weight_once(w: &QMatMul, name: &str) {
+fn assert_weight_once(w: &QMatMul, name: &'static str) {
     match w.inner() {
         candle::quantized::QMatMul::QTensor(qt) => {
             qt.assert_once(name);
@@ -408,4 +460,4 @@ fn assert_weight_once(w: &QMatMul, name: &str) {
 
 #[cfg(not(feature = "tensor-assert"))]
 #[inline(always)]
-fn assert_weight_once(_w: &QMatMul, _name: &str) {}
+fn assert_weight_once(_w: &QMatMul, _name: &'static str) {}

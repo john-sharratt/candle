@@ -5447,6 +5447,28 @@ fn q8a128_from_out<'w>(
     cols: usize,
     device: &CudaDevice,
 ) -> Result<Q8a128Operand<'w>> {
+    // **Stamp the generation, at the one place that knows it.**
+    //
+    // This is the wave-aware constructor: `resolve_u8_out` may have carved these
+    // bytes from a bump arena, in which case `backing` is a
+    // `Lease(Wave(ticket))` and the ticket carries the epoch the carve was made
+    // in. The operand itself is about to become `Q8a128Operand<'w>` with a
+    // lifetime that says nothing about that generation, so this is the last
+    // moment the epoch is knowable.
+    //
+    // The sibling path in `quantize_acts_q8a128` stamps too, but it allocates
+    // from the pool and looks its epoch up by address — which returns nothing
+    // when the address is in no arena. Operands built *here* never passed
+    // through that, which is why a capture kept reporting `made_in=None` for an
+    // operand that was plainly sitting inside `wave-ffn`.
+    #[cfg(feature = "tensor-assert")]
+    {
+        let epoch = match backing {
+            Backing::Lease(LeaseOrigin::Wave(t)) => t.epoch,
+            _ => crate::wave_provenance::EPOCH_NOT_IN_ARENA,
+        };
+        crate::wave_provenance::note_q8a128_epoch(ptr, epoch);
+    }
     match owned {
         Some(slice) => Ok(Q8a128Operand::new(slice, rows, cols)),
         None => {
@@ -5881,6 +5903,34 @@ pub fn to_dynamic<'w>(
         }
         _ => crate::bail!("to_dynamic(int8): activation slice dtype must be F16/BF16/F32"),
     };
+    // **The operand at the instant it is born — asynchronously.**
+    //
+    // The float input folds into `acts.float_in.*` just above and the consumed
+    // operand folds into `mlp.acts.int8` at the GEMM; this is the reading
+    // between them, so the drain's `seq` ordering says which of the two the
+    // buffer was already bad at. That is the whole question — the quantize
+    // kernel provably reads only `act[0..rows*cols)` (`tile*128 + lane*4`), so
+    // if the operand is sound here and non-finite at the GEMM, the buffer was
+    // OVERWRITTEN in between and the quantizer is not the fault.
+    //
+    // `assert_device_quant` is the asynchronous form: one kernel, no fence, no
+    // readback, folded into a slot the wave-end drain reads. It must be that
+    // form and not `check_now_quant` — this sits in the per-layer hot path, and
+    // a fence here is the instrument that dissolves the very race it is hunting
+    // (a heavily fenced build ran 71 minutes clean against a 5-minute
+    // production failure). Ordering the three sites by `seq` costs nothing and
+    // answers the same question a fence would.
+    #[cfg(feature = "tensor-assert")]
+    {
+        use crate::tensor_assert::{assert_device_quant, QTYPE_Q8A128V};
+        let elems = rows * cols;
+        op.with_device_ptr(device, |p| -> crate::Result<()> {
+            // SAFETY: `p` names the operand the quantize kernel just wrote,
+            // `elems` logical elements in the q8a128 packing.
+            unsafe { assert_device_quant("acts.q8a128.postquant", p, QTYPE_Q8A128V, elems, device) };
+            Ok(())
+        })?;
+    }
     // Preserve the activation's leading dims (everything but K) so the int8 matmul rebuilds
     // the output rank ([B,M,K]→[B,M,N]) exactly like the float path.
     let lead: Vec<usize> = xs.dims()[..xs.rank() - 1].to_vec();
@@ -5937,6 +5987,24 @@ pub fn quantize_acts_q8a128<'w>(
             dtype,
             sum_scale.as_code(),
         );
+    }
+    // **Stamp the generation this operand was carved in.**
+    //
+    // The return type is `Q8a128Operand<'static>`: the `'w` that binds a wave
+    // buffer to the generation whose cursor produced it is waived right here, so
+    // nothing downstream can tell whether the bytes it holds are still the ones
+    // that were quantized. Recording the epoch gives the capture a way to ask —
+    // an arena that has rewound in between has handed these exact bytes to
+    // another carve, which is invisible by address alone.
+    #[cfg(feature = "tensor-assert")]
+    {
+        // Recorded unconditionally. `None` here means the address is in no wave
+        // arena *at creation*, which is a fact worth keeping rather than an
+        // absence: if the same address is inside an arena by the time it is
+        // read, an arena was placed over memory that was already live.
+        let epoch = crate::wave_provenance::epoch_at(out_ptr_planned)
+            .unwrap_or(crate::wave_provenance::EPOCH_NOT_IN_ARENA);
+        crate::wave_provenance::note_q8a128_epoch(out_ptr_planned, epoch);
     }
     Ok(q8a128_from_out(
         owned,

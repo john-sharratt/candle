@@ -182,6 +182,11 @@ fn parse_model(name: &str) -> Result<Model, String> {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// Exit code for a panic on any thread — distinct from clean shutdown (0),
+/// Ctrl-C (130) and the GPU-poison restart (75), so a relaunch wrapper can tell
+/// "this build has a bug" from "the GPU died, try again".
+const PANIC_EXIT_CODE: i32 = 101;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // ── Panic hook ────────────────────────────────────────────────────────────
@@ -199,6 +204,27 @@ async fn main() -> anyhow::Result<()> {
         eprintln!(
             "\n=== PANIC ===\n{info}\nLast CUDA kernel: {kernel}\n{relief}\n\n{bt}\n=============\n"
         );
+        // **A panic on any thread ends the process.**
+        //
+        // Rust unwinds the panicking thread and leaves the rest running, which
+        // for this daemon means a dead scheduler inside a live process: the
+        // persistence thread keeps its loop, the HTTP layer keeps answering, and
+        // the log keeps writing at a perfectly steady rate. Nothing about it
+        // reads as "stopped". Measured: a `tensor-assert` capture killed the
+        // scheduler and the process sat there for **eight hours**, logging 3,551
+        // lines an hour, working set collapsed from 5,734 MiB to 870, holding
+        // the whole VRAM reservation and its pinned warm tier the entire time —
+        // which then makes the *next* run fail at startup on OOM.
+        //
+        // There is no state worth preserving past a panic here: the substrate is
+        // a redo log that replays, and a supervisor restart is the intended
+        // recovery (the same exit the GPU-poison watchdog performs). Exiting is
+        // also what makes an armed `nan_capture` usable — it dumps and stops,
+        // and the run is over by design rather than merely broken.
+        //
+        // After the report above, so the backtrace and the last kernel are
+        // always on disk before the process goes.
+        std::process::exit(PANIC_EXIT_CODE);
     }));
 
     // ── CLI (parsed first so we know verbosity before init) ──────────────────

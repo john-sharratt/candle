@@ -43,6 +43,8 @@ use candle::{DType, Result, Tensor};
 use candle_nn::kv_cache::{ChunkedKvBacking, KvCache};
 
 use super::batched_inference::BatchedInferenceSession;
+#[cfg(feature = "tensor-assert")]
+use super::head_hole_check::check_history;
 use super::operand_guard::expect_dtype;
 
 /// One position of the walk, for the whole cohort.
@@ -183,6 +185,9 @@ pub fn draft_walk<G>(
                      kernel would dereference a null table"
                 ))
             })?;
+            // The table this step's kernel reads, kept for the per-step check.
+            #[cfg(feature = "tensor-assert")]
+            let headers_dev = headers.dev_ptr();
 
             let (h_next, logits) = {
                 let mut data = session.caches_for_sequences_mut(seqs);
@@ -206,6 +211,22 @@ pub fn draft_walk<G>(
                 }
                 out
             };
+            // The position this step just wrote, read back once it is
+            // committed: a write the kernel dropped is named at the step that
+            // dropped it, not at the step that later reads the hole.
+            #[cfg(feature = "tensor-assert")]
+            {
+                let ends: Vec<usize> = at.iter().map(|&p| p + 1).collect();
+                check_history(
+                    session,
+                    seqs,
+                    &ends,
+                    1,
+                    kv_layer,
+                    Some(headers_dev),
+                    "a draft step's own write",
+                );
+            }
 
             // `argmax_keepdim`, not `argmax`: the latter drops the axis, and a
             // one-row cohort would come back rank-0 rather than `[1, 1]`.

@@ -206,6 +206,21 @@ fn fingerprint(
         .map_err(|e| candle::Error::Msg(format!("slot_integrity: readback: {e}")))
 }
 
+/// Withdraw this grid's read-only declaration when the fingerprint goes.
+///
+/// Declaring is only half of the contract. The spans describe memory whose
+/// contents are final *while this grid owns it*; once the grid is dropped they
+/// become ordinary pool memory that something else will allocate and write, and
+/// a declaration left standing turns every later user of that address into a
+/// panic. Reference-counted inside `release_named`, because the grid is
+/// fingerprinted twice — once for the whole-grid check a dump runs, once for
+/// the rotating shard scan — and the first to drop must not disarm the second.
+impl Drop for SlotIntegrity {
+    fn drop(&mut self) {
+        candle::readonly_regions::release_named("expert.weights");
+    }
+}
+
 impl SlotIntegrity {
     /// Take the grid's fingerprint. Call once, immediately after the fill, with
     /// the same pointer tables the GEMM will dereference.

@@ -35,49 +35,38 @@
 //! There is deliberately no stack capture: symbolising one costs milliseconds,
 //! and the arithmetic already names the buffer.
 //!
-//! Off by default and gated on an environment variable read once, so a
-//! disarmed build pays one atomic load per carve.
+//! Built in by the `wave-census` feature and absent otherwise: the switch is a
+//! compile-time constant, so an ordinary build carries none of it on the
+//! carve path.
+//!
+//! `wave-census-labels` adds the caller of each carve. It is a feature of its
+//! own because symbolising a stack per carve costs a fifth of the gate's wall
+//! clock, and the sizes alone are enough to *track* an inventory that is
+//! already written down. Reach for the labels when establishing one, not when
+//! checking it.
 
 use std::backtrace::Backtrace;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
-
-/// Whether the census is collecting.
-///
-/// `KV_WAVE_CENSUS=1`. Cached in an atomic rather than re-read, because this is
-/// consulted on the wave path's hottest allocation.
-static ENABLED: AtomicBool = AtomicBool::new(false);
-/// Whether to name the caller of each carve — `KV_WAVE_CENSUS=labels`.
-///
-/// Separate from [`ENABLED`] because symbolising a stack per carve costs a
-/// fifth of the gate's wall clock, and the sizes alone are enough to *track* an
-/// inventory that is already written down. Reach for the labels when
-/// establishing one, not when checking it.
-static LABELLED: AtomicBool = AtomicBool::new(false);
-static INIT: OnceLock<()> = OnceLock::new();
 
 /// One range handed out, and who asked for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Carve {
+    /// Byte offset of this carve from the arena's base.
+    ///
+    /// The census itself only ever needed `len` — it reports how much a phase
+    /// spent, not where. The span audit needs *where*: a carve is a live
+    /// activation buffer, and "do two of them share bytes" cannot be asked
+    /// without the offset.
+    pub start: usize,
     pub len: usize,
     /// `None` when the capture found no frame it could name — a symbol-free
     /// build, or a chain entirely inside the allocator.
     pub label: Option<String>,
 }
 
-/// Whether to record carves.
-pub(crate) fn enabled() -> bool {
-    INIT.get_or_init(|| {
-        let v = std::env::var("KV_WAVE_CENSUS").unwrap_or_default();
-        let labelled = v.eq_ignore_ascii_case("labels");
-        ENABLED.store(
-            labelled || v == "1" || v.eq_ignore_ascii_case("true"),
-            Ordering::Relaxed,
-        );
-        LABELLED.store(labelled, Ordering::Relaxed);
-    });
-    ENABLED.load(Ordering::Relaxed)
+/// Whether to record carves — the `wave-census` feature.
+pub(crate) const fn enabled() -> bool {
+    cfg!(feature = "wave-census")
 }
 
 /// Frames that belong to the allocator rather than to the code that wanted the
@@ -102,16 +91,16 @@ const ALLOCATOR_FRAMES: [&str; 7] = [
     "Backtrace",
 ];
 
-/// A short name for whatever asked for this carve, or `None` unless
-/// `KV_WAVE_CENSUS=labels`.
+/// A short name for whatever asked for this carve, or `None` without the
+/// `wave-census-labels` feature.
 ///
 /// Symbolises on every call, which costs milliseconds — a fifth of the gate's
-/// wall clock, so it is its own mode rather than part of the census. Sizes alone
-/// identify most buffers by arithmetic, but not all of them: two different
-/// buffers can be the same number of bytes, and telling those apart is the
-/// difference between declaring a site and guessing at one.
+/// wall clock, so it is its own feature rather than part of the census. Sizes
+/// alone identify most buffers by arithmetic, but not all of them: two
+/// different buffers can be the same number of bytes, and telling those apart
+/// is the difference between declaring a site and guessing at one.
 pub(crate) fn label() -> Option<String> {
-    if !LABELLED.load(Ordering::Relaxed) {
+    if !cfg!(feature = "wave-census-labels") {
         return None;
     }
     let text = format!("{}", Backtrace::force_capture());
@@ -203,7 +192,7 @@ mod tests {
         // about what the peak layer did.
         let carves: Vec<Carve> = [8192usize, 8192, 4096, 8192]
             .into_iter()
-            .map(|len| Carve { len, label: None })
+            .map(|len| Carve { start: 0, len, label: None })
             .collect();
         let mut hist: BTreeMap<usize, usize> = BTreeMap::new();
         for c in &carves {
@@ -215,14 +204,5 @@ mod tests {
         // A smoke call, so a panic in the formatting is caught by the suite
         // rather than by the run it was launched to measure.
         report("test-arena", 20480, 32768, &carves);
-    }
-
-    /// Absent the variable the census stays off, which is what keeps the carve
-    /// path free of it in every ordinary run.
-    #[test]
-    fn the_census_is_off_without_the_variable() {
-        if std::env::var("KV_WAVE_CENSUS").is_err() {
-            assert!(!enabled());
-        }
     }
 }

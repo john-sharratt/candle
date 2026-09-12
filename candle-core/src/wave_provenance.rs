@@ -113,6 +113,98 @@ static WAVE_ALLOC: OnceLock<WaveAllocFn> = OnceLock::new();
 
 /// Register the resolver for [`WaveTicket`]s. Idempotent; later calls are
 /// ignored, since there is one arena owner per process.
+/// Resolve the generation epoch of the wave arena containing a device address.
+///
+/// Installed by `candle-nn`, which owns the arenas; `None` for an address that
+/// is not in one.
+pub type EpochAtFn = fn(u64) -> Option<u64>;
+
+static EPOCH_AT: std::sync::OnceLock<EpochAtFn> = std::sync::OnceLock::new();
+
+/// Install the epoch resolver. Called once, beside [`install_wave_allocator`].
+pub fn install_epoch_at(f: EpochAtFn) {
+    let _ = EPOCH_AT.set(f);
+}
+
+/// The epoch of the arena holding `ptr`, if any.
+///
+/// **The one question the address cannot answer on its own.** A bump arena
+/// rewinds its cursor when the last generation guard drops, so a buffer carved
+/// in one generation and a different buffer carved in the next occupy the *same
+/// bytes*. Comparing the two observations of an address tells them apart:
+/// unchanged means the buffer is still the one that was carved, changed means
+/// the span was recycled underneath it.
+pub fn epoch_at(ptr: u64) -> Option<u64> {
+    (EPOCH_AT.get()?)(ptr)
+}
+
+/// Epochs observed when q8a128 activation operands were quantized, keyed by
+/// address.
+///
+/// A **ring**, not a single slot. The first cut of this kept one entry, on the
+/// reasoning that a capture only ever asks about the operand it is holding —
+/// which is false: every later quantize on the thread overwrites it, and by the
+/// time a capture fires the record belongs to a different address. It reported
+/// `made_in=None` for an operand that had certainly been recorded, which reads
+/// exactly like "never in an arena" and means the opposite.
+///
+/// Fixed size and searched linearly: it is small, it is on the hot path, and a
+/// map keyed on device addresses would outlive the addresses and grow without
+/// bound.
+const EPOCH_RING: usize = 64;
+
+/// Recorded against an operand whose address was in **no** wave arena when it
+/// was made.
+///
+/// Distinct from "not recorded", and the distinction is the whole point: an
+/// operand created outside any arena that is *inside* one by the time it is read
+/// means an arena was placed over memory already in use, which is a different
+/// and worse fault than a cursor rewind.
+pub const EPOCH_NOT_IN_ARENA: u64 = u64::MAX;
+
+thread_local! {
+    static LAST_Q8A128: std::cell::RefCell<[(u64, u64); EPOCH_RING]> =
+        const { std::cell::RefCell::new([(0, 0); EPOCH_RING]) };
+    static RING_POS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Record that the operand at `ptr` was created while its arena was at `epoch`,
+/// or [`EPOCH_NOT_IN_ARENA`] if it was in none.
+pub fn note_q8a128_epoch(ptr: u64, epoch: u64) {
+    let i = RING_POS.with(|c| {
+        let i = c.get();
+        c.set((i + 1) % EPOCH_RING);
+        i
+    });
+    LAST_Q8A128.with(|r| r.borrow_mut()[i] = (ptr, epoch));
+}
+
+/// The epoch recorded for `ptr` **most recently**, if it is still in the ring.
+///
+/// Newest first, and that order is the whole correctness of the answer. A bump
+/// arena hands its first carve of every generation the *same* address — the
+/// arena's base — so the ring routinely holds several entries for one pointer,
+/// one per generation that carved there. Scanning in array order returned
+/// whichever happened to sit at the lowest index, which after the ring wraps is
+/// an arbitrary older generation: a capture compared the live operand against a
+/// stamp five generations stale and reported `RECYCLED` for an operand that had
+/// been carved, and read, inside one guard.
+pub fn q8a128_epoch_of(ptr: u64) -> Option<u64> {
+    if ptr == 0 {
+        return None;
+    }
+    let newest = RING_POS.with(|c| c.get());
+    LAST_Q8A128.with(|r| {
+        let r = r.borrow();
+        // `newest` is the next slot to write, so the most recent entry is the one
+        // before it; walk backwards, wrapping, through every slot once.
+        (1..=EPOCH_RING)
+            .map(|k| r[(newest + EPOCH_RING - k) % EPOCH_RING])
+            .find(|(p, _)| *p == ptr)
+            .map(|(_, e)| e)
+    })
+}
+
 pub fn install_wave_allocator(f: WaveAllocFn) {
     let _ = WAVE_ALLOC.set(f);
 }
@@ -263,6 +355,50 @@ pub fn last_wave_declines() -> (u64, u64) {
         LAST_WAVE[0].load(Ordering::Relaxed),
         LAST_WAVE[1].load(Ordering::Relaxed),
     )
+}
+
+#[cfg(test)]
+mod epoch_ring_tests {
+    use super::{note_q8a128_epoch, q8a128_epoch_of, EPOCH_RING};
+
+    /// **One address, several generations: the newest stamp is the answer.**
+    ///
+    /// A bump arena gives its first carve of every generation the same address,
+    /// so the ring holds repeated pointers as a matter of course. Array-order
+    /// search returned the oldest-indexed of them and reported an operand as
+    /// `RECYCLED` against a stamp five generations stale. The ring is
+    /// `thread_local`, so this test thread starts it empty.
+    #[test]
+    fn a_reused_address_reports_its_newest_generation() {
+        const BASE: u64 = 0xcc7e_3ec00;
+        note_q8a128_epoch(BASE, 100);
+        note_q8a128_epoch(0xdead_0000, 7);
+        note_q8a128_epoch(BASE, 105);
+        assert_eq!(q8a128_epoch_of(BASE), Some(105));
+    }
+
+    /// Past a wrap the newest entry still wins, whatever slot it landed in.
+    #[test]
+    fn the_newest_stamp_wins_across_a_wrap() {
+        const BASE: u64 = 0xcc7e_3ec00;
+        // Fill the ring with stale stamps for BASE, then wrap it with others so
+        // the surviving BASE entries sit at arbitrary indices.
+        for e in 0..EPOCH_RING as u64 {
+            note_q8a128_epoch(BASE, e);
+        }
+        for k in 0..(EPOCH_RING as u64 - 3) {
+            note_q8a128_epoch(0x1000 + k, 999);
+        }
+        note_q8a128_epoch(BASE, 5_000);
+        assert_eq!(q8a128_epoch_of(BASE), Some(5_000));
+    }
+
+    #[test]
+    fn an_address_never_stamped_is_absent() {
+        note_q8a128_epoch(0x2000, 1);
+        assert_eq!(q8a128_epoch_of(0x3000), None);
+        assert_eq!(q8a128_epoch_of(0), None, "the empty-slot sentinel is never an answer");
+    }
 }
 
 #[cfg(test)]

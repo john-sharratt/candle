@@ -16,8 +16,14 @@ use std::sync::{OnceLock, RwLock};
 use super::slots::MAX_SLOTS;
 
 struct Names {
-    by_name: HashMap<String, usize>,
-    by_slot: Vec<String>,
+    /// The call site's own `&'static str`, kept rather than copied.
+    ///
+    /// A consumer that arms a capture compares the armed site against the call
+    /// site **by pointer**, so the table has to hand back the very string the
+    /// call site passes — a leaked copy of equal content would compare unequal
+    /// and the arm could never fire. See [`interned`].
+    by_name: HashMap<&'static str, usize>,
+    by_slot: Vec<&'static str>,
     /// Per-slot latch for [`super::should_run_once`]; a weight is checked the
     /// first time and never again.
     once: Vec<bool>,
@@ -38,9 +44,9 @@ fn names() -> &'static RwLock<Names> {
 /// rather than once per assert after the table fills.
 static OVERFLOWED: AtomicBool = AtomicBool::new(false);
 
-/// Indexed site names, leaked so a call site can hold a `&'static str` and a
-/// consumer can compare against it by pointer. See [`site`] and
-/// [`interned_site`].
+/// Indexed site names, leaked so a call site can hold a `&'static str`. See
+/// [`site`]. Recovering a name from a finding goes through [`interned`], which
+/// reads the slot table instead — this one holds only the indexed names.
 type SiteTable = RwLock<HashMap<(&'static str, usize), &'static str>>;
 static SITES: OnceLock<SiteTable> = OnceLock::new();
 
@@ -50,7 +56,11 @@ static SITES: OnceLock<SiteTable> = OnceLock::new();
 /// folding a further name into an existing slot would mix two tensors'
 /// statistics into one report, which is worse than not measuring it — so this
 /// says so, once, and then declines.
-pub fn slot_for(name: &str) -> Option<usize> {
+/// `name` is `&'static str` because the table retains it — see [`Names::by_name`]
+/// and [`interned`]. Every call site already passes a literal or a [`site`]
+/// result, so this costs no caller anything and refuses, at compile time, the
+/// `&format!(...)` that the harness forbids anyway.
+pub fn slot_for(name: &'static str) -> Option<usize> {
     {
         let n = names().read().ok()?;
         if let Some(&idx) = n.by_name.get(name) {
@@ -74,8 +84,8 @@ pub fn slot_for(name: &str) -> Option<usize> {
         }
         return None;
     }
-    n.by_name.insert(name.to_string(), idx);
-    n.by_slot.push(name.to_string());
+    n.by_name.insert(name, idx);
+    n.by_slot.push(name);
     n.once.push(false);
     Some(idx)
 }
@@ -105,22 +115,31 @@ pub fn site(prefix: &'static str, idx: usize) -> &'static str {
     }
 }
 
-/// The interned `&'static str` for a name previously produced by [`site`].
+/// The call site's `&'static str` for any name that has been asserted.
 ///
 /// A [`Finding`](super::Finding) carries an owned `String`, so a consumer that
 /// wants to compare against a call site by POINTER — the only comparison cheap
-/// enough to sit on a hot path — needs the original back. Returns `None` for a
-/// name that never came from `site`, which is every plain string literal.
-pub fn interned_site(name: &str) -> Option<&'static str> {
-    let table = SITES.get()?;
-    let t = table.read().ok()?;
-    t.values().find(|s| **s == name).copied()
+/// enough to sit on a hot path — needs the original back.
+///
+/// This reads the **slot** table, which holds every name ever asserted, rather
+/// than the [`site`] table, which holds only the indexed ones. That distinction
+/// was a live bug, and an expensive one: the capture in `nan_capture` drops any
+/// finding this returns `None` for, so while it consulted `SITES` the arm could
+/// land *only* on a `site()`-built name. A run whose cascade began at the plain
+/// literal `attn.ctx_raw` (`seq=1`) skipped it and every other literal, arming
+/// `moe.shared_gated.L31` at `seq=15` — the fifteenth consequence — and three
+/// successive captures faithfully dumped the wrong tensor's operands.
+///
+/// Returns `None` only for a name that has never been asserted at all.
+pub fn interned(name: &str) -> Option<&'static str> {
+    let n = names().read().ok()?;
+    n.by_name.get_key_value(name).map(|(k, _)| *k)
 }
 
 /// The name a slot was registered under, for the drain's report.
 pub fn name_of(idx: usize) -> Option<String> {
     let n = names().read().ok()?;
-    n.by_slot.get(idx).cloned()
+    n.by_slot.get(idx).map(|s| s.to_string())
 }
 
 /// How many slots have been claimed, so the drain reads no further.
@@ -156,7 +175,7 @@ pub fn rearm_once() {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_once, name_of, slot_for};
+    use super::{claim_once, interned, name_of, site, slot_for};
 
     #[test]
     fn a_name_keeps_its_slot_and_distinct_names_get_distinct_slots() {
@@ -165,6 +184,30 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(slot_for("tensor_assert::test::alpha"), Some(a));
         assert_eq!(name_of(a).as_deref(), Some("tensor_assert::test::alpha"));
+    }
+
+    /// A capture's arm is dropped for any finding [`interned`] cannot resolve,
+    /// so a name it fails on can never be captured — only ranked. While this
+    /// consulted the `site()` table alone, that silently excluded every plain
+    /// literal, which is most of the instrumented forward: the arm slid past the
+    /// origin to the first indexed name downstream of it.
+    #[test]
+    fn a_plain_literal_is_recoverable_by_pointer_not_only_an_indexed_site() {
+        const LITERAL: &str = "tensor_assert::test::plain_literal";
+        slot_for(LITERAL).expect("slot");
+        let back = interned(LITERAL).expect("a literal that has been asserted must resolve");
+        assert!(
+            std::ptr::eq(back.as_ptr(), LITERAL.as_ptr()),
+            "must hand back the call site's own string, so the arm compares equal by pointer"
+        );
+
+        // The indexed form keeps working, and resolves to `site`'s own leak.
+        let indexed = site("tensor_assert::test::indexed.L", 31);
+        slot_for(indexed).expect("slot");
+        let back = interned("tensor_assert::test::indexed.L31").expect("indexed must resolve");
+        assert!(std::ptr::eq(back.as_ptr(), indexed.as_ptr()));
+
+        assert_eq!(interned("tensor_assert::test::never_asserted"), None);
     }
 
     #[test]

@@ -1441,7 +1441,7 @@ carved 96,768,000 B of a 96,883,200 B budget — 99.88% — *before* the change;
 adding one more declared buffer (`AttnOutput`, which the fallback had been
 putting on the pool) tipped it over.
 
-`KV_WAVE_CENSUS=labels` itemised the failing generation, and at rows = 2100,
+A `wave-census-labels` build itemised the failing generation, and at rows = 2100,
 hidden = 1024 it decodes exactly:
 
 | carve | bytes | what |
@@ -1466,7 +1466,7 @@ carved one, absorbed until now by the 16 MiB `REGION_BYTES` pad.
 > float arm (`dense_qmatmul_float`) converts the activation only for a dtype
 > outside `{F16, BF16, F32}` and otherwise stores at the activation's own
 > width; the int8 arm's MMA converts on the store out of registers. So neither
-> mode upcasts, and a fresh `KV_WAVE_CENSUS=labels` on the same checkpoint
+> mode upcasts, and a fresh `wave-census-labels` build on the same checkpoint
 > shows three projection carves — 17,203,200 / 2,150,400 / 2,150,400 at 2100
 > rows — summing to exactly `qkv_cols × BF16`, which `QkvProjection` already
 > charged. No F32 carve appears anywhere in the generation.

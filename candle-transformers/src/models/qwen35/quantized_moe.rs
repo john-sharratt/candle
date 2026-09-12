@@ -52,7 +52,7 @@ pub fn shared_expert_contribution<'w>(
     shared_gate: &QMatMul,
     acts: &DynamicActs<'w>,
     out_dtype: DType,
-) -> Result<LiveTensor<'w>> {
+) -> Result<SharedExpert<'w>> {
     // One width for both: the shared expert's result is summed into the MoE
     // combine, which runs at the experts' working dtype, so there is no
     // narrower store to ask for here.
@@ -83,7 +83,33 @@ pub fn shared_expert_contribution<'w>(
     gate.assert("moe.shared.gate_sigmoid");
     // The gate is one scalar per token and `y` is `[.., hidden]`; both carry
     // the same leading dims, so the broadcast is over the last one.
-    y.broadcast_mul(&gate)
+    //
+    // **The product's operands travel with it.** `moe.shared_gated` is the site
+    // an armed capture keeps landing on, and it checks `y * sigmoid(gate)` —
+    // which, as the note above says, cannot say which operand went bad. The
+    // capture then reported `Context dumped: []` and named the product. The two
+    // asserts above *are* the operands, but they are asynchronous, so the
+    // panic's "every checkpoint upstream passed" does not cover them and the
+    // question stayed open across three runs.
+    //
+    // Returned rather than checkpointed here because the site name carries the
+    // layer index, which only the caller knows.
+    let gated = y.broadcast_mul(&gate)?;
+    Ok(SharedExpert { gated, y, gate })
+}
+
+/// The shared expert's product and the two operands it was made from.
+///
+/// `sigmoid` never manufactures a NaN from a finite input, so when the product
+/// is non-finite the answer is one of these two — and an armed capture that
+/// carries them says which, in the run that produced it, rather than in the run
+/// after next.
+pub struct SharedExpert<'w> {
+    pub gated: LiveTensor<'w>,
+    /// `shared(x)` — the expert's own output, before gating.
+    pub y: LiveTensor<'w>,
+    /// `sigmoid(w_gate · x)`, one scalar per token.
+    pub gate: LiveTensor<'w>,
 }
 
 impl Qwen35MoeBlock {
@@ -98,7 +124,8 @@ impl Qwen35MoeBlock {
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         // Shared expert first — see the module note on ownership.
-        let gated = shared_expert_contribution(&self.shared, &self.shared_gate, &acts, out_dtype)?;
+        let shared = shared_expert_contribution(&self.shared, &self.shared_gate, &acts, out_dtype)?;
+        let gated = shared.gated;
         let routed = self.routed.forward_dynamic(acts, out_dtype, wave)?;
         // The three values the layer's output is made of, checked where they
         // are still separable.
@@ -116,7 +143,14 @@ impl Qwen35MoeBlock {
             use candle::tensor_assert::site;
             if let candle::Device::Cuda(d) = routed.device() {
                 let li = self.routed.moe_layer_idx;
-                checkpoint(site("moe.shared_gated.L", li), &gated, &[], d)?;
+                // Its two operands, so the capture says WHICH went bad rather
+                // than only that the product did — see `SharedExpert`.
+                checkpoint(
+                    site("moe.shared_gated.L", li),
+                    &gated,
+                    &[("shared_y", &shared.y), ("gate_sigmoid", &shared.gate)],
+                    d,
+                )?;
                 checkpoint(site("moe.routed_sum_in.L", li), &routed, &[], d)?;
                 let sum = (&routed + &gated)?;
                 checkpoint(

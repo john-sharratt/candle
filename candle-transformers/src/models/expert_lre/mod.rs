@@ -231,6 +231,10 @@ pub use handle::{
 pub(crate) use pinned::layer_geometries;
 #[cfg(feature = "cuda")]
 pub use pipeline::grow_tally;
+/// The weight side's extents, published to the between-waves overlap audit.
+#[cfg(feature = "tensor-assert")]
+pub mod span_claims;
+
 #[cfg(feature = "cuda")]
 pub(crate) use pipeline::slot_bytes_for;
 pub use types::{

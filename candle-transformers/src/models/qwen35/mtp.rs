@@ -288,7 +288,16 @@ impl MtpHead {
                 offsets.len()
             );
         }
+        // **The draft head's inputs, watched.** Every capture of the NaN fault
+        // has landed at MoE layer 40, which is this head — yet nothing on its
+        // own path was asserted. Its inputs are the drafted token's embedding
+        // and the previous step's post-norm hidden, so a non-finite value fed
+        // back through the draft recurrence would enter here, before any
+        // attention or FFN site could see it. Asynchronous: one kernel each.
+        embed.assert("mtp.embed");
+        hidden.assert("mtp.hidden_in");
         let x = self.input.forward(embed, hidden)?;
+        x.assert("mtp.input");
         let hidden_dim = x.dim(1)?;
         // The decode entry wants `[b, 1, hidden]`; `forward_layer_batched_mixed`
         // reshapes it to the kernel's `[rows, 1, hidden]` itself via
@@ -331,7 +340,12 @@ impl MtpHead {
         // else, so its stride-indexed slot is the buffer's first.
         forward_layer_batched_mixed(&layer, &mut groups, &mut xt, x.dtype(), 0)?;
         let out = xt.to_tensor().reshape((rows, hidden_dim))?;
-        self.head_norm.forward_live(&out)
+        // The block's result, and the normed hidden that both the LM head scores
+        // and the next step is seeded from — the recurrence's only carrier.
+        out.assert("mtp.block_out");
+        let normed = self.head_norm.forward_live(&out)?;
+        normed.assert("mtp.step_out");
+        Ok(normed)
     }
 
     // `extend` / `extend_cohort` are gone. They existed to catch the head's

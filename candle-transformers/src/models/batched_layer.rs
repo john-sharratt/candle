@@ -17,7 +17,13 @@ use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{begin_wave, LayerPhase};
 
+#[cfg(feature = "tensor-assert")]
+use crate::models::decode_kv_walk::walk as walk_decode_kv;
+#[cfg(feature = "tensor-assert")]
+use crate::models::nan_capture::checkpoint_q8a128_with;
 use crate::models::operand_guard::expect_dtype;
+#[cfg(feature = "tensor-assert")]
+use candle::tensor_assert::Dump;
 #[cfg(feature = "cuda")]
 use crate::models::prefill_utils::paged_decode_attn;
 #[cfg(feature = "cuda")]
@@ -540,6 +546,20 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
         } else {
             LiveTensor::cat(&parts, 1)?
         };
+        // **The two values the post-attention norm is made from, watched.**
+        //
+        // The FFN's input operand has been captured with one whole row of NaN
+        // per-128 scales — computed NaN, not unwritten poison. RMSNorm divides a
+        // row by its own RMS, so a single `inf` anywhere in a row makes the RMS
+        // infinite and `inf × 0` turns the ENTIRE row NaN: exactly the whole-row
+        // signature every capture showed. Nothing observed the residual entering
+        // that norm on this path — `RmsNorm::forward_dynamic` hands `x` straight
+        // to the fused `rms_norm_q8a128` kernel — so an upstream non-finite value
+        // arrived there unseen.
+        //
+        // Asynchronous (one kernel, no fence), so the drain ranks them by `seq`
+        // against the operand's own site and says which went bad first.
+        h_attn.assert("layer.attn_out");
 
         // First residual: x = x + attn(h). `add_mut` reads `h_attn` in place, so
         // the residual stream never takes a wave allocation and never escapes.
@@ -555,6 +575,10 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
             "attention residual: attn(x) vs the residual stream",
         )?;
         x.add_mut(&h_attn)?;
+        // The residual as the post-attention norm will read it — see the note on
+        // `layer.attn_out` above. Bad here with `layer.attn_out` clean means the
+        // stream was already non-finite on the way in.
+        x.as_cat_tensor().assert("layer.ffn_in");
         // No `drop(h_attn)` / `drop(attn_wave)`: `h_attn` borrows the guard, so
         // the compiler refuses any order but this one. Both die at the brace.
     }
@@ -835,9 +859,75 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
         // already the gated context.
         let op = Q8a128Operand::from_tensor(outputs, b_sz, n_head * head_dim)
             .with_lead(vec![b_sz, seq_len]);
+        // **The decode attention's own output, which nothing was watching.**
+        //
+        // This is the paged read on the decode path — every decode wave and every
+        // MTP draft step — and it never exists as a float tensor: the kernel
+        // writes the (gated) context straight into q8a1024 for o_proj. The only
+        // context checks (`attn.ctx_raw`, `attn.ctx_gated`) live on the prefill
+        // path, so a drain reporting "no attention site bad" was silent about
+        // this read, not clearing it. A paged read that returns another
+        // sequence's KV shows up here first: an `inf` in a row drives that
+        // row's per-128 scale non-finite, and o_proj turns it into a whole NaN
+        // row downstream.
+        //
+        // `checkpoint_q8a128` folds the dequantized statistics asynchronously
+        // (one kernel, no fence) and only dumps once a drain has named it.
+        //
+        // Armed and bad, the capture then walks the history the kernel read for
+        // the bad rows — header, slices, records, bands — because the paged read
+        // is the one operand of this kernel that no tensor assert can see.
+        #[cfg(feature = "tensor-assert")]
+        if let Device::Cuda(capture_dev) = x_tensor.device() {
+            let (rows, cols, n) = (op.rows, op.cols, op.byte_len());
+            let history: &[&mut KvCache] = caches;
+            let mut walk_history = |d: &mut Dump, bad_rows: &[usize]| {
+                // SAFETY: `decode_headers_ptr` is the header table the decode
+                // kernel just read, one `SlotHeader` per entry of `caches` in the
+                // same order, and this wave is still open around it.
+                unsafe {
+                    walk_decode_kv(
+                        d,
+                        capture_dev,
+                        decode_headers_ptr,
+                        history,
+                        bad_rows,
+                        n_kv_head,
+                        head_dim,
+                    )
+                }
+            };
+            op.with_device_ptr(capture_dev, |p| {
+                // SAFETY: `p` names the complete q8a1024 context the decode kernel
+                // just wrote, `rows × cols` logical elements of `n` bytes.
+                unsafe {
+                    checkpoint_q8a128_with(
+                        "attn.ctx.dec.q8",
+                        p,
+                        rows,
+                        cols,
+                        n,
+                        capture_dev,
+                        &mut walk_history,
+                    )
+                }
+            })?;
+        }
         layer.output_projection(DynamicActs::Int8(op), x_tensor.dtype())?
     } else {
         let out = outputs.reshape((b_sz, 1, n_head * head_dim))?;
+        // The float form of the same read, with the operands that made it.
+        #[cfg(feature = "tensor-assert")]
+        if let Device::Cuda(capture_dev) = x_tensor.device() {
+            crate::models::nan_capture::checkpoint(
+                "attn.ctx.dec",
+                &out,
+                &[("q", &q), ("k", &k), ("v", &v)],
+                capture_dev,
+            )?;
+        }
+        #[cfg(not(feature = "tensor-assert"))]
+        out.assert("attn.ctx.dec");
         let out = apply_attention_gate(out, gate)?;
         layer.output_projection(DynamicActs::Float(out), x_tensor.dtype())?
     };
@@ -1087,8 +1177,31 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     };
 
     // The kernel's own output, before the gate and before o_proj quantizes it.
-    // A softmax-weighted combination cannot exceed `max|V|`, so `inf` here with
-    // clean operands above names the kernel's F16 epilogue rather than the data.
+    //
+    // **A softmax-weighted combination cannot exceed `max|V|`**, so this site is
+    // where the paged read is judged: if `out` carries `inf` while `q`/`k`/`v`
+    // are finite and small, the kernel read something that is not in its
+    // operands — which on this path means the arena, through a `KvHead` record
+    // or a band gid. Measured on a live 35B ingest: `inf=128 of 90112` with the
+    // surviving finite values reaching 999 against a V whose largest magnitude
+    // anywhere was ~9.
+    //
+    // Carried as a `checkpoint` with its operands rather than a bare `assert`
+    // so an armed capture can answer *what produced it*. The bare form can be
+    // ranked by the wave-end drain but never armed, so the capture landed
+    // downstream — `moe.shared_gated.L11`, with `Context dumped: []` — naming a
+    // site that had merely inherited the value. Free until a drain has named
+    // this site: the default arm is the same asynchronous assert it replaces.
+    #[cfg(feature = "tensor-assert")]
+    if let Device::Cuda(capture_dev) = q.device() {
+        crate::models::nan_capture::checkpoint(
+            "attn.ctx_raw",
+            &out_packed,
+            &[("q", &q), ("k", &k), ("v", &v)],
+            capture_dev,
+        )?;
+    }
+    #[cfg(not(feature = "tensor-assert"))]
     out_packed.assert("attn.ctx_raw");
     // Project per-token: [total_q, n_head*head_dim] -> [total_q, hidden_out].
     // (n_head*head_dim may differ from n_embd, e.g. Qwen3-MoE.)
@@ -1734,6 +1847,11 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn float_fallback_prefill_hd256_matches_reference() -> Result<()> {
+        // Serialised against the other GPU tests: `readonly_regions` is a
+        // process-global table, so an expert grid declared by a concurrently
+        // running test turns this one's ordinary allocation into a reported
+        // write to read-only ground.
+        let _gpu = crate::models::gpu_test_lock::gpu_serial();
         use crate::models::prefill_utils::compute_rope_cs;
         use candle::DType;
         use candle_nn::kv_cache::ChunkedKvBacking;

@@ -43,8 +43,8 @@
 //! mark, in carve order, with the caller that asked for it. Every variant below
 //! was read off that census on Qwen3-30B-A3B rather than inferred from the
 //! source, and the totals in the tests are pinned against it. **A change to the
-//! attention or FFN chain is a change to this list**, and `KV_WAVE_CENSUS=1`
-//! over the gate is how to find out what it should say.
+//! attention or FFN chain is a change to this list**, and a `wave-census`
+//! build over the gate is how to find out what it should say.
 //!
 //! # A phase at a time, and the chains that can run in it
 //!
@@ -1684,7 +1684,7 @@ mod tests {
     }
 
     /// The gated attention chain, pinned **carve for carve** against
-    /// `KV_WAVE_CENSUS=labels` on the 0.8B at its peak attention generation —
+    /// a `wave-census-labels` build on the 0.8B at its peak attention generation —
     /// 2100 rows, thirteen carves totalling 88,435,200 B.
     ///
     /// Stated as the measurement rather than as the plan's own arithmetic,
@@ -1806,8 +1806,8 @@ mod tests {
 
     /// **The DeltaNet chain against its measured generation, to the byte.**
     ///
-    /// `KV_WAVE_CENSUS=labels` on the 0.8B at 2100 rows: five carves, 21,772,800
-    /// B, `0 B lost to alignment`. That total is the assertion — a chain priced
+    /// A `wave-census-labels` build on the 0.8B at 2100 rows: five carves,
+    /// 21,772,800 B, `0 B lost to alignment`. That total is the assertion — a chain priced
     /// from a list of shapes is only as good as the list, and the sum is what
     /// says nothing was left off it and nothing imagined onto it.
     ///
@@ -2109,7 +2109,7 @@ mod tests {
     /// **A speculative replay's staged operands, against its measured
     /// generation.**
     ///
-    /// `KV_WAVE_CENSUS=labels` on Qwen3.5-9B: six carves, 1,482,480 B, at 30
+    /// A `wave-census-labels` build on Qwen3.5-9B: six carves, 1,482,480 B, at 30
     /// staged rows over 6 spans — `conv_dim` 8192 and `value_dim` 4096 in F32,
     /// two `n_v_heads`-wide scalars, and the span table's 4 pointers and 2
     /// extents per span.
@@ -2201,7 +2201,7 @@ mod tests {
     }
 
     /// Per-row cost of the attention chain a **prefill** group runs, as
-    /// `KV_WAVE_CENSUS=1` measured it on Qwen3-30B-A3B: twelve carves, and every
+    /// a `wave-census` build measured it on Qwen3-30B-A3B: twelve carves, and every
     /// one of them a whole number of bytes per row.
     ///
     /// ```text

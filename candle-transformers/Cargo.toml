@@ -61,6 +61,9 @@ cuda = ["candle/cuda", "candle-nn/cuda", "dep:cudarc", "dep:candle-kernels"]
 kernel-lineinfo = ["cuda", "candle/kernel-lineinfo", "candle-nn/kernel-lineinfo"]
 # `Tensor::assert` / `QTensor::assert` — see `candle-core/Cargo.toml`.
 tensor-assert = ["cuda", "candle/tensor-assert", "candle-nn/tensor-assert"]
+# The transient-span census — see `candle-nn/Cargo.toml`.
+wave-census = ["candle-nn/wave-census"]
+wave-census-labels = ["wave-census", "candle-nn/wave-census-labels"]
 forbidden_allocations = [
     "candle/forbidden_allocations",
     "candle-nn/forbidden_allocations",

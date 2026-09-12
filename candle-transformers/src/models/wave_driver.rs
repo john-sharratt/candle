@@ -37,6 +37,8 @@ use super::batched_inference::{
     WaveStep,
 };
 use super::batched_model::{WaveGuard, WavePhase};
+#[cfg(feature = "tensor-assert")]
+use super::head_hole_check::check_committed_rows;
 use super::kv_cache_utils::SequenceContext;
 use super::profile::gpu_span;
 use super::tensor_cat::TensorCat;
@@ -629,6 +631,34 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
         (Some(t), None) => Some(TensorCat::from_cat_tensor(t, 0)?),
         (None, _) => None,
     };
+    // **Who owns which bytes, checked before a single layer runs.**
+    //
+    // Every other instrument here answers "is this value finite", which catches
+    // the symptom after the fact. This one asks whether any two tenants of the
+    // reservation share memory, and it can answer *before* a bad number exists
+    // — a tier standing above `weight_floor`, a floor lowered through a live
+    // tier, an arena outside the region range. None of those fault: every
+    // address in the span is mapped, so a trespass reads and writes another
+    // tenant's live data and surfaces as a wrong number many layers later.
+    //
+    // Placed here rather than at the wave's end because the partition is what
+    // the wave is about to be laid out against, and because a failed wave
+    // returns early — an audit on the way out would skip exactly the waves
+    // worth auditing. Host-side only: no device work, no synchronisation, so it
+    // does not perturb the ordering the faults it hunts depend on.
+    #[cfg(feature = "tensor-assert")]
+    if let candle::Device::Cuda(d) = dev {
+        // Registered once, not per wave: the closures are identical every time,
+        // and `register` takes a write lock and boxes each one, which is real
+        // work on a path that runs for every wave of every forward. The audit
+        // itself re-reads live state on each call, so nothing is lost by
+        // installing the providers a single time.
+        static REGISTERED: std::sync::Once = std::sync::Once::new();
+        REGISTERED.call_once(|| {
+            candle_nn::kv_cache::span_claims::register_zones(d.cuda_context().ordinal())
+        });
+        candle::span_audit::audit("wave-open");
+    }
     // The layer sweep plus the head, so the forward's stream time divides into
     // "the model" and "everything the driver and its caller do around it". The
     // gap between this and the caller's own forward span is where a per-row copy
@@ -797,6 +827,16 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
                 );
             }
             candle::tensor_assert::epoch(&dev)?;
+            // Only a wave whose head ran has committed its rows to the last
+            // layer, and the drain above has already synchronised, so reading
+            // them back costs no fence — see `head_hole_check`. The contexts
+            // are re-assembled, as the rollback above does: the sweep's session
+            // borrow has ended, and the session's offsets are still the ones
+            // this wave wrote from.
+            if step.logits.is_some() {
+                let contexts = assemble_wave_contexts(session, &all_seqs, &all_inputs)?;
+                check_committed_rows(&contexts, &all_seqs, n_decode, n_prefill);
+            }
         }
     }
 

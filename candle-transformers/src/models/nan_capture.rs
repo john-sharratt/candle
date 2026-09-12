@@ -58,13 +58,17 @@
 
 use candle::quantized::cuda::{ko_repacked_bytes, Q8a128Operand};
 use candle::quantized::GgmlDType;
-use candle::tensor_assert::{check_now, check_now_quant, Dump, Finding, QTYPE_Q8A128V};
+use candle::tensor_assert::{
+    assert_device_quant, check_now, check_now_quant, Dump, Finding, QTYPE_Q8A128V,
+};
 use candle::{cuda_backend::CudaDevice, LiveTensor, Result, Shape};
 
+use super::decode_kv_walk::{nonfinite_rows, read_device};
 use super::expert_lre::slot_integrity::{check_watch, watching};
 use cudarc::driver::{CudaSlice, DevicePtr};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Once;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Once, OnceLock, RwLock};
 
 /// Where the dump goes.
 ///
@@ -94,6 +98,28 @@ fn integrity_probe() -> &'static std::sync::RwLock<Option<IntegrityProbe>> {
 pub fn set_integrity_probe(f: impl Fn() -> Vec<String> + Send + Sync + 'static) {
     if let Ok(mut p) = integrity_probe().write() {
         *p = Some(Box::new(f));
+    }
+}
+
+/// Drop both resident-weight probes.
+///
+/// **The counterpart the registrations never had.** Both hold a fingerprint of
+/// the expert grid — raw device addresses plus the bytes expected at them — in a
+/// process-lifetime global. When the grid goes away those addresses become
+/// ordinary pool memory, and a probe still holding them reads whatever now lives
+/// there and reports drift against a grid that no longer exists.
+///
+/// It also keeps the grid's read-only declaration alive: `SlotIntegrity` gives
+/// that up on drop, and an `Arc` parked in a global means the drop never runs.
+/// That is what made 23 of the transformers suite's tests fail under
+/// `tensor-assert` — each passing alone, then dying in the suite because an
+/// earlier test's grid was still declared.
+pub fn clear_integrity_probes() {
+    if let Ok(mut p) = integrity_probe().write() {
+        *p = None;
+    }
+    if let Ok(mut s) = shard_scan().write() {
+        *s = None;
     }
 }
 
@@ -226,6 +252,52 @@ pub fn watch_layer(dev: &CudaDevice, layer: usize) {
 /// [`checkpoint`] for why that matters more than it looks.
 static ARMED_SITE: AtomicUsize = AtomicUsize::new(0);
 
+/// The drain order stamp of the currently armed site, so the arm can move to an
+/// earlier one — see [`arm_from_drain`]. `u32::MAX` means nothing is armed.
+///
+/// Not atomic with [`ARMED_SITE`], deliberately: a torn pair costs one capture
+/// at the wrong site on a diagnostic path, where taking a lock on every finding
+/// would cost the budget the asynchronous locate exists to protect.
+static ARMED_SEQ: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// The sites that can actually honour an arm — those that pay a fence and dump
+/// when named, as opposed to the far more numerous bare `assert` sites.
+///
+/// The drain ranks *every* asserted site, and most of the forward is bare
+/// asserts. Arming one of those is worse than arming nothing: the arm is taken,
+/// no call site ever tests it, and the capture is silently disabled for the rest
+/// of the run while the log claims a site was armed. So an arm is only ever
+/// placed on a site that has announced itself here by being reached.
+fn capture_sites() -> &'static RwLock<HashSet<usize>> {
+    static C: OnceLock<RwLock<HashSet<usize>>> = OnceLock::new();
+    C.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
+/// Announce `name` as a site that captures when armed.
+///
+/// Called on every pass through a checkpoint, so the read-lock fast path is the
+/// one that matters; the write happens once per site per process. Keyed by the
+/// `&'static str`'s address, the same identity [`armed_for`] compares.
+fn register_capture_site(name: &'static str) {
+    let p = name.as_ptr() as usize;
+    if let Ok(s) = capture_sites().read() {
+        if s.contains(&p) {
+            return;
+        }
+    }
+    if let Ok(mut s) = capture_sites().write() {
+        s.insert(p);
+    }
+}
+
+/// Whether an arm placed on `name` would ever be honoured.
+fn can_capture(name: &'static str) -> bool {
+    capture_sites()
+        .read()
+        .map(|s| s.contains(&(name.as_ptr() as usize)))
+        .unwrap_or(false)
+}
+
 /// Register the arming callback. Idempotent; safe to call from any checkpoint.
 ///
 /// The drain reports bad sites first-bad-first by the kernel's own ticket, so
@@ -235,7 +307,30 @@ fn arm_from_drain() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         candle::tensor_assert::on_bad(|f: &Finding| {
-            if ARMED_SITE.load(Ordering::Relaxed) != 0 {
+            // **The arm moves earlier, and only earlier.**
+            //
+            // It used to latch once, on the first bad finding of the first
+            // failing wave, and never move again. That is wrong whenever the
+            // waves do not all fail the same way: a wave whose earliest bad site
+            // is downstream arms *that*, and a later wave whose fault begins at
+            // the true origin can no longer claim the arm. The capture then
+            // fences at a site that merely inherited a non-finite value and
+            // reports it as the first corruption.
+            //
+            // Measured twice on the 35B: the drain ranked `attn.ctx_raw` as BAD
+            // #1 with `origin=attn.ctx_raw`, while the arm sat on
+            // `moe.shared_gated.L{11,27}` from an earlier wave and dumped
+            // `Context dumped: []` — naming a consequence and losing the
+            // operands that would have explained the cause.
+            //
+            // `seq` is the drain's order stamp for the first bad observation, so
+            // a smaller one is strictly closer to the origin. Re-arming on it
+            // converges on the earliest site the run has ever faulted at, rather
+            // than on whichever wave happened to fail first.
+            let Some(seq) = f.seq else {
+                return;
+            };
+            if seq >= ARMED_SEQ.load(Ordering::Relaxed) {
                 return;
             }
             // Recover the interned `&'static str` for this name so the armed
@@ -243,19 +338,39 @@ fn arm_from_drain() {
             let Some(s) = candle::tensor_assert::interned(&f.name) else {
                 return;
             };
-            if ARMED_SITE
-                .compare_exchange(0, s.as_ptr() as usize, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
+            // **Only a site that captures may hold the arm.** A bare `assert`
+            // can be ranked but never tests `armed_for`, so arming one takes the
+            // arm out of circulation and disables the capture for the rest of
+            // the run. Say so instead: an earlier-seq site with no checkpoint is
+            // precisely the place a checkpoint should be added, and naming it is
+            // how the chain converges by accretion.
+            if !can_capture(s) {
                 tracing::error!(
                     target: "candle_transformers::nan_capture",
-                    site = %f.name, nan = f.nan, inf = f.inf,
-                    "capture ARMED at the first bad site — the next wave reaching it pays one \
-                     fence and dumps its operands"
+                    site = %f.name, seq, nan = f.nan, inf = f.inf,
+                    "EARLIER than the armed site, but no checkpoint watches it — it can be \
+                     ranked and not captured. Put a `checkpoint` here to capture its operands."
                 );
+                return;
             }
+            ARMED_SEQ.store(seq, Ordering::SeqCst);
+            ARMED_SITE.store(s.as_ptr() as usize, Ordering::SeqCst);
+            tracing::error!(
+                target: "candle_transformers::nan_capture",
+                site = %f.name, seq, nan = f.nan, inf = f.inf,
+                "capture ARMED at the earliest bad site seen so far — the next wave reaching \
+                 it pays one fence and dumps its operands"
+            );
         });
     });
+}
+
+/// Whether a drain has named `name`, for a caller that must decide whether a
+/// probe of its own is worth running — see `QuantizedMlp::forward_dynamic`,
+/// which uses it to report an operand it could *not* examine rather than skip
+/// one in silence.
+pub fn is_armed(name: &'static str) -> bool {
+    armed_for(name)
 }
 
 /// Whether `name` is the site a drain has named. One relaxed load and a compare.
@@ -281,6 +396,7 @@ pub fn checkpoint(
     dev: &CudaDevice,
 ) -> Result<()> {
     arm_from_drain();
+    register_capture_site(name);
     // **Free until a drain has already named this site.**
     //
     // The synchronous form costs a device fence, and this fault is one a fence
@@ -352,12 +468,50 @@ pub unsafe fn checkpoint_q8a128(
     byte_len: usize,
     dev: &CudaDevice,
 ) -> Result<()> {
+    // SAFETY: the caller's contract, passed through unchanged.
+    unsafe { checkpoint_q8a128_with(name, ptr, rows, cols, byte_len, dev, &mut |_, _| Ok(())) }
+}
+
+/// [`checkpoint_q8a128`] with a context hook.
+///
+/// `context` runs once, on the armed path only, after the operand has been
+/// found bad and its bytes are in the dump. It is handed the rows whose scales
+/// are non-finite, so the site that produced the operand can add what only it
+/// can reach — the decode attention walks the KV its kernel read — without this
+/// module knowing how. Unarmed, the hook costs nothing: it is never called.
+///
+/// # Safety
+///
+/// As [`checkpoint_q8a128`].
+pub unsafe fn checkpoint_q8a128_with(
+    name: &'static str,
+    ptr: u64,
+    rows: usize,
+    cols: usize,
+    byte_len: usize,
+    dev: &CudaDevice,
+    context: &mut dyn FnMut(&mut Dump, &[usize]) -> Result<()>,
+) -> Result<()> {
     arm_from_drain();
-    // Armed like [`checkpoint`], and more strongly so: this one dequantizes the
-    // operand into staging before it can look at it, which is a full pass over
-    // the buffer on top of the fence. Unarmed it does nothing at all — there is
-    // no asynchronous form for a raw quantized buffer, so the drain cannot name
-    // this site and it is reached only when an adjacent tensor site names it.
+    register_capture_site(name);
+    // **The asynchronous locate, exactly as [`checkpoint`] does it.**
+    //
+    // `assert_device_quant` folds this buffer's dequantized statistics into
+    // `name`'s slot with one kernel — no fence, no readback, no ordering change
+    // — so the wave-end drain ranks this site alongside every tensor site, gives
+    // it a `seq`, and can arm it on its own merits.
+    //
+    // This used to gate on `armed_for(name)` with nothing folding into that
+    // slot, under a note claiming a raw quantized buffer had no asynchronous
+    // form and could only be reached when a neighbouring tensor site named it.
+    // That was wrong — the form is [`assert_device_quant`], right here — and the
+    // cost was total: an arm that could never be set meant this checkpoint had
+    // never once fired, at any of its call sites, in its entire existence.
+    //
+    // Only after the locate does the fence apply, and only at the one site a
+    // drain has already named. The dequant-into-staging pass this performs is
+    // far too expensive to run unarmed.
+    unsafe { assert_device_quant(name, ptr, QTYPE_Q8A128V, rows * cols, dev) };
     if !armed_for(name) {
         return Ok(());
     }
@@ -368,6 +522,18 @@ pub unsafe fn checkpoint_q8a128(
         })
     };
     if !bad {
+        // **A pass is a finding, so it is said out loud.**
+        //
+        // Silence here is indistinguishable from never having run, and this
+        // checkpoint spent its whole existence never running (it gated on an arm
+        // that could not be set). Reading a quiet return as "the operand is
+        // clean" would repeat that mistake with more confidence.
+        tracing::error!(
+            target: "candle_transformers::nan_capture",
+            site = name, rows, cols, byte_len,
+            "operand CLEAN at the armed site — the non-finite value is NOT in this \
+             operand, so it enters at or after the consumer that armed the capture"
+        );
         return Ok(());
     }
     let f = found.expect("check_now_quant reports bad only through the callback");
@@ -376,6 +542,87 @@ pub unsafe fn checkpoint_q8a128(
     d.note("checkpoint", name);
     d.note("rows", rows);
     d.note("cols", cols);
+    // **Who else claims these bytes, asked while the operand is still live.**
+    //
+    // This operand is written correctly and read back non-finite, so something
+    // overwrites it between the two. The between-waves audit cannot see that:
+    // it runs when the bump cursor has just reset, so no activation carve
+    // exists to collide with anything. Asked here, at the fault, with the wave
+    // mid-flight, every tenant's extents are real.
+    //
+    // A single owner — this buffer's own arena — is the expected answer and
+    // says the collision is not a partition error. Two owners names the
+    // trespasser outright.
+    // **Was the span recycled under this operand?**
+    //
+    // The address cannot answer it: a bump arena rewinds when the last guard
+    // drops, so the buffer that was quantized and the buffer that replaced it
+    // occupy the same bytes. The epoch can — it bumps on every rewind, so
+    // `made_in != now` means this operand's ground was handed to another carve
+    // between the quantize and this read, and what is being examined is not what
+    // was written.
+    let made_in = candle::wave_provenance::q8a128_epoch_of(ptr);
+    let now = candle::wave_provenance::epoch_at(ptr);
+    d.note("epoch.made_in", format!("{made_in:?}"));
+    d.note("epoch.at_use", format!("{now:?}"));
+    match (made_in, now) {
+        // Made outside any arena, read inside one: an arena was placed over
+        // ground that was already holding a live buffer. Worse than a rewind,
+        // because no amount of lifetime discipline on the operand would prevent
+        // it — the arena moved onto memory it never owned.
+        (Some(candle::wave_provenance::EPOCH_NOT_IN_ARENA), Some(b)) => {
+            d.note("epoch.verdict", "ARENA_PLACED_OVER_LIVE_POOL_MEMORY");
+            tracing::error!(
+                target: "candle_transformers::nan_capture",
+                at_use = b,
+                "ARENA PLACED OVER LIVE MEMORY: this operand was allocated when its address                  belonged to NO wave arena, and by the time it was read an arena covers it.                  The tier was placed on top of a buffer that was already in use"
+            );
+        }
+        // Made outside any arena and still outside one: the operand is pool
+        // memory throughout, so neither the rewind nor the placement story
+        // applies and the writer is elsewhere.
+        (Some(candle::wave_provenance::EPOCH_NOT_IN_ARENA), None) => {
+            d.note("epoch.verdict", "pool-memory-throughout");
+            tracing::error!(
+                target: "candle_transformers::nan_capture",
+                "the operand is pool memory and was never in a wave arena — the arena                  lifetime stories do not apply"
+            );
+        }
+        (Some(a), Some(b)) if a != b => {
+            d.note("epoch.verdict", "RECYCLED");
+            tracing::error!(
+                target: "candle_transformers::nan_capture",
+                made_in = a, at_use = b, rewinds = b.saturating_sub(a),
+                "USE AFTER REWIND: the arena rewound between this operand being quantized and                  being read, so these bytes belong to a later carve — the operand was never                  corrupted, it was REPLACED"
+            );
+        }
+        (Some(a), Some(b)) => {
+            d.note("epoch.verdict", "same-generation");
+            tracing::error!(
+                target: "candle_transformers::nan_capture",
+                made_in = a, at_use = b,
+                "the arena has NOT rewound since this operand was quantized — the bytes are                  still its own, so something wrote them without owning them"
+            );
+        }
+        _ => {
+            d.note("epoch.verdict", "unknown");
+            tracing::error!(
+                target: "candle_transformers::nan_capture",
+                ?made_in, ?now,
+                "epoch unavailable — the operand is not in a wave arena, or was made on                  another thread"
+            );
+        }
+    }
+    let owners = candle::span_audit::who_owns(ptr, byte_len);
+    d.note("owners.count", owners.len());
+    for (i, o) in owners.iter().enumerate() {
+        d.note(&format!("owners.{i:02}"), o);
+    }
+    tracing::error!(
+        target: "candle_transformers::nan_capture",
+        site = name, ptr = format!("{ptr:#x}"), byte_len, owners = owners.len(),
+        "operand owners at the fault: {owners:?}"
+    );
     d.note("out_dtype", "F32");
     d.note("out_shape", format!("[{rows}, {cols}]"));
     note_stats(&mut d, &f);
@@ -385,7 +632,23 @@ pub unsafe fn checkpoint_q8a128(
     // quantizer allocated would dump the wrong extent.
     // SAFETY: the caller's contract — `ptr` names a full q8a128 buffer of
     // `byte_len` bytes.
-    unsafe { d.device_ptr("stacked", dev, ptr, byte_len)? };
+    let stacked = unsafe { read_device(dev, ptr, byte_len)? };
+    d.bytes("stacked", &stacked)?;
+    // Which rows, read from the scales themselves. On a decode operand a row is
+    // a sequence, and that is what the context hook needs to know to follow.
+    let bad_rows = match nonfinite_rows(&stacked, rows, cols) {
+        Ok(r) => r,
+        Err(e) => {
+            d.note("bad_rows.error", e);
+            Vec::new()
+        }
+    };
+    d.note("bad_rows", format!("{bad_rows:?}"));
+    // A hook that fails must not cost the capture: its error is recorded beside
+    // everything else and the dump still completes.
+    if let Err(e) = context(&mut d, &bad_rows) {
+        d.note("context.error", e);
+    }
     let dir = d.finish()?;
     panic!(
         "FIRST CORRUPTION at checkpoint {name} → {} (nan={} inf={} of {} finite=[{:?}, {:?}]). \
@@ -463,6 +726,7 @@ pub struct GemmCall<'a> {
 pub fn capture_gate_gemm(call: &GemmCall<'_>, dev: &CudaDevice) -> Result<()> {
     arm_from_drain();
     let site = candle::tensor_assert::site("moe.capture.gate_out.L", call.layer);
+    register_capture_site(site);
     // Asynchronous by default so the GEMM keeps its throughput; the fence and
     // the 400 MB dump are paid only once a drain has named this site. See
     // [`checkpoint`].

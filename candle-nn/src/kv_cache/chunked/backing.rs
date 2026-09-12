@@ -25,6 +25,8 @@ use super::{
 use super::size_class::{class_for_payload, payload_bytes_for_tag, SizeClass};
 #[cfg(feature = "cuda")]
 use super::SealedSequence;
+#[cfg(feature = "tensor-assert")]
+use super::writer_len_audit;
 use crate::kv_cache::arena_table::{ArenaFormatTag, ArenaLocation, PerHeadEntry};
 // `N_PALETTE` is referenced by the intra-doc links throughout this file and by
 // the CUDA table builders; without `cuda` only the doc links are left, and they
@@ -1381,6 +1383,9 @@ impl ChunkedKvBacking {
             let t_sync = std::time::Instant::now();
             let (result, sync_kind) = if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
                 seq.validate_decode_state(seq_idx, seq_offset)?;
+                // Every row here is live — see `writer_len_audit`.
+                #[cfg(feature = "tensor-assert")]
+                writer_len_audit::audit(self.layer_idx, seq_idx, seq_offset, seq);
                 let synced =
                     seq.sync_decode_gpu_chunks(n_kv_head, head_dim, seq_offset, arena_info)?;
                 pins.push(seq.gpu_chunk_pins());
@@ -1456,6 +1461,12 @@ impl ChunkedKvBacking {
             }
             let (result, sync_kind) = if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
                 seq.validate_decode_state(seq_idx, seq_offset)?;
+                // A snapshot row is serialised below the layer's length on
+                // purpose; only a live row must match it — see `writer_len_audit`.
+                #[cfg(feature = "tensor-assert")]
+                if !want_snapshot {
+                    writer_len_audit::audit(self.layer_idx, seq_idx, seq_offset, seq);
+                }
                 let ((live_ptr, n_slices, write_slice), kind) =
                     seq.sync_decode_gpu_chunks(n_kv_head, head_dim, seq_offset, arena_info)?;
                 let ptr = if want_snapshot {
@@ -2834,6 +2845,64 @@ pub(super) fn global_release_empty_arenas() -> usize {
         }
     }
     freed
+}
+
+/// Publish every materialised KV arena to the span audit, as a leaf of the KV
+/// zone.
+///
+/// Walks [`BACKING_REGISTRY`], which is every live backing in the process —
+/// one per attending layer — because arenas belong to backings and no single
+/// object can see them all. Each arena is a **leaf**: it is one contiguous
+/// allocation, and two of them sharing a byte, or one lying outside the region
+/// range the pool thinks it owns, are both faults the zone-level check cannot
+/// see.
+///
+/// Cost is proportional to the arena count, which is the largest of the
+/// providers — a run that has grown to a few hundred arenas contributes a few
+/// hundred claims. That is still a sub-millisecond walk of already-resident
+/// host state with no device work, and it runs once per wave.
+///
+/// Arenas without a base pointer are skipped rather than claimed at zero: a
+/// registered-but-unmaterialised arena owns nothing, and claiming it at address
+/// zero would collide it with every other unmaterialised arena.
+/// Process-wide, not per device: [`BACKING_REGISTRY`] is not keyed by ordinal,
+/// so this reports every backing there is. On a single-GPU host that is exactly
+/// the set wanted; on a multi-GPU one it would also report the other device's
+/// arenas, whose addresses cannot collide with this device's anyway. Taking an
+/// ordinal and ignoring it would be worse — a parameter that looks like it
+/// filters and does not.
+#[cfg(feature = "tensor-assert")]
+pub fn push_arena_claims(out: &mut Vec<candle::span_audit::Claim>) {
+    use candle::span_audit::{Claim, ClaimKind, Tenant};
+    let Ok(registry) = BACKING_REGISTRY.lock() else {
+        return;
+    };
+    for (layer_idx, weak) in registry.iter().enumerate() {
+        let Some(inner) = weak.upgrade() else {
+            continue;
+        };
+        let _ = inner.storage.read(|s| {
+            for (idx, arena) in s.arenas().iter() {
+                let Some(base) = arena.base_ptr() else {
+                    continue;
+                };
+                if base == 0 {
+                    continue;
+                }
+                let bytes = arena.slot_stride().saturating_mul(arena.chunks());
+                if bytes == 0 {
+                    continue;
+                }
+                out.push(Claim::new(
+                    format!("kv/L{layer_idx}/arena{idx}"),
+                    Tenant::KvRegion,
+                    ClaimKind::Leaf,
+                    base,
+                    bytes,
+                ));
+            }
+        });
+    }
 }
 
 /// Get the total GPU memory used by all registered arena backings (bytes).

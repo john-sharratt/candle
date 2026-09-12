@@ -50,6 +50,12 @@ cuda = ["candle/cuda"]
 kernel-lineinfo = ["cuda", "candle/kernel-lineinfo"]
 # `Tensor::assert` / `QTensor::assert` — see `candle-core/Cargo.toml`.
 tensor-assert = ["cuda", "candle/tensor-assert"]
+# Itemise each transient span's peak layer phase, carve by carve — see
+# `kv_cache::chunked::wave_census`. A measurement build, not a default.
+wave-census = []
+# The census with the caller of every carve named. Symbolises a backtrace per
+# carve, which costs about a fifth of the wall clock.
+wave-census-labels = ["wave-census"]
 forbidden_allocations = ["candle/forbidden_allocations"]
 verbose = []
 dont_check = []

@@ -2723,7 +2723,7 @@ impl Qwen4ExpBatched {
                     &acts,
                     DType::F32,
                 )?;
-                probe(li, "moe.shared", &sh);
+                probe(li, "moe.shared", &sh.gated);
             }
             let y2 = layer
                 .moe

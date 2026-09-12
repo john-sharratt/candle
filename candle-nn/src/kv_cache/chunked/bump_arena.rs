@@ -475,13 +475,24 @@ fn bump<'a>(
     }
     inner.cursor = end;
     inner.dirty = true;
-    if wave_census::enabled() {
+    // **Recorded for the census, and for the span audit.**
+    //
+    // The census is opt-in and reports how much a phase spent. The audit needs
+    // the same records for a different question — whether any two live carves
+    // share bytes, or one has escaped the tier — so under `tensor-assert` they
+    // are kept whether or not the census asked for them. `label` is the
+    // expensive half (a backtrace symbolisation) and stays gated on the census;
+    // the audit names a carve by its arena and offset, which costs nothing.
+    if wave_census::enabled() || cfg!(feature = "tensor-assert") {
         // The carve is recorded whether or not a frame could be named: a census
         // that dropped the unattributable ones would under-count the phase,
         // which is the one thing it exists to get right.
         inner.census.push(Carve {
+            start,
             len,
-            label: wave_census::label(),
+            label: wave_census::enabled()
+                .then(wave_census::label)
+                .flatten(),
         });
     }
     inner.forward_peak = inner.forward_peak.max(end);
@@ -527,13 +538,14 @@ fn bump_locked(inner: &mut Inner, name: &'static str, len: usize, align: usize) 
     }
     inner.cursor = end;
     inner.dirty = true;
-    if wave_census::enabled() {
-        // The carve is recorded whether or not a frame could be named: a census
-        // that dropped the unattributable ones would under-count the phase,
-        // which is the one thing it exists to get right.
+    // Recorded for the census and for the span audit — see the twin in `bump`.
+    if wave_census::enabled() || cfg!(feature = "tensor-assert") {
         inner.census.push(Carve {
+            start,
             len,
-            label: wave_census::label(),
+            label: wave_census::enabled()
+                .then(wave_census::label)
+                .flatten(),
         });
     }
     inner.forward_peak = inner.forward_peak.max(end);
@@ -1702,6 +1714,7 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
     // wave arena can exist, so it is the earliest point the resolver could be
     // useful and the latest it could be needed.
     candle::cuda_backend::wave_provenance::install_wave_allocator(resolve_wave_alloc);
+    candle::cuda_backend::wave_provenance::install_epoch_at(epoch_at_ptr);
     let ordinal = stream.context().ordinal() as u32;
     let arena_idx = phase_index(phase) as u32;
     let stream = stream.clone();
@@ -2039,6 +2052,34 @@ fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> Option<
     bump_raw(&inner, name, bytes, align)
 }
 
+/// The generation epoch of the wave arena containing `ptr`.
+///
+/// Walks the domains rather than taking a ticket, because the caller is holding
+/// a bare address: the whole point is to ask about a buffer whose provenance the
+/// type system no longer carries — a `Q8a128Operand<'static>`, say, whose `'w`
+/// was waived at its constructor.
+///
+/// Comparing this across two moments is what distinguishes "still the buffer
+/// that was carved" from "the span rewound and these bytes were handed to
+/// somebody else". The address is identical in both cases, so nothing else can.
+fn epoch_at_ptr(ptr: u64) -> Option<u64> {
+    let map = wave_domains().lock().ok()?;
+    for domain in map.values() {
+        for arena in domain.arenas.iter() {
+            let Ok(inner) = arena.inner.lock() else {
+                continue;
+            };
+            if inner.capacity == 0 {
+                continue;
+            }
+            if ptr >= inner.base && ptr < inner.base + inner.capacity as u64 {
+                return Some(inner.epoch);
+            }
+        }
+    }
+    None
+}
+
 /// Whether any wave generation is open on `ordinal`.
 ///
 /// **The one thing the moving boundary must never do is move mid-wave.** A
@@ -2049,6 +2090,82 @@ fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> Option<
 /// `renegotiate_boundary` is called from, and this is what lets
 /// `set_weight_floor` check it rather than
 /// trust it (principle 7: refuse rather than corrupt).
+/// Publish this device's live activation extents to the span audit.
+///
+/// Two kinds of claim per phase arena:
+///
+/// * the arena itself, as a **container** — it is expected to hold its own
+///   carves, and the interesting question is whether it sits inside the tier
+///   the partition placed for it;
+/// * every carve handed out in the current generation, as a **leaf**. Two
+///   leaves sharing a byte means one wave buffer was handed out twice, and a
+///   leaf crossing its arena's edge means a carve escaped the span it was
+///   priced against.
+///
+/// Both are tenants of [`Tenant::TransientTier`] rather than of a separate
+/// activation tenant, because that is where they physically live: the bump
+/// arenas are carved out of the transient tier, so calling them a different
+/// tenant would report every healthy carve as a trespass into the tier.
+///
+/// Only carves of the **current** generation are reported. The cursor resets
+/// when the last guard drops, and `census` is cleared with it, so a finished
+/// wave contributes nothing — a stale extent here would collide with whatever
+/// the next wave carves at the same offset, which is the standard false
+/// positive for this kind of instrument.
+#[cfg(feature = "tensor-assert")]
+pub fn push_activation_claims(ordinal: usize, out: &mut Vec<candle::span_audit::Claim>) {
+    use candle::span_audit::{Claim, ClaimKind, Tenant};
+    let map = lock_domains();
+    let Some(domain) = map.get(&ordinal) else {
+        return;
+    };
+    for arena in domain.arenas.iter() {
+        let Ok(inner) = arena.inner.lock() else {
+            continue;
+        };
+        if inner.capacity == 0 {
+            continue;
+        }
+        // The arena's own state travels in the name, because it is what
+        // separates the two readings of "the operand is carve #0":
+        //
+        // * a **live** generation with the cursor well past the operand means it
+        //   really is this generation's first carve and is still owned;
+        // * `live == 0`, or a cursor barely past it, means the generation has
+        //   closed or just rewound — and the bytes being read belong to a carve
+        //   made after the operand was handed out.
+        //
+        // `epoch` bumps on every rewind, so comparing it across two observations
+        // says directly whether the span was recycled in between.
+        out.push(Claim::new(
+            format!(
+                "{} (epoch={} live={} cursor={} of {})",
+                arena.name, inner.epoch, inner.live, inner.cursor, inner.capacity
+            ),
+            Tenant::TransientTier,
+            ClaimKind::Container,
+            inner.base,
+            inner.capacity,
+        ));
+        for (i, c) in inner.census.iter().enumerate() {
+            if c.len == 0 {
+                continue;
+            }
+            let label = match &c.label {
+                Some(l) => format!("{}#{i} {l}", arena.name),
+                None => format!("{}#{i}", arena.name),
+            };
+            out.push(Claim::new(
+                label,
+                Tenant::TransientTier,
+                ClaimKind::Leaf,
+                inner.base + c.start as u64,
+                c.len,
+            ));
+        }
+    }
+}
+
 pub fn wave_is_live(ordinal: usize) -> bool {
     // One definition of "a wave is running", shared by the arena gate and the
     // boundary latch. Arena liveness alone is FALSE at every phase boundary —
@@ -2609,6 +2726,66 @@ mod wave_tests {
         // Nothing to assert about life after `drop(guard)`: `a` and `b` borrow
         // it, so a program that used them afterwards would not compile. That is
         // the property this used to check at run time.
+        Ok(())
+    }
+
+    /// **The span audit sees what the allocator actually handed out.**
+    ///
+    /// Tested against the real bump allocator rather than a mirror of its
+    /// arithmetic, because the property under test is not "does `aligned_start`
+    /// round up" — that is checked elsewhere — but "do the claims the audit
+    /// publishes describe the ranges a live wave is using". A reimplementation
+    /// of the cursor would agree with itself no matter what `bump` did.
+    ///
+    /// Two things follow from one wave's carves, and both matter: the audit must
+    /// find the carves (a provider that reports nothing is indistinguishable
+    /// from a clean system), and it must find them **disjoint** — one
+    /// generation's ranges never overlap, which is the property that removes any
+    /// need for slot bookkeeping, and a false positive here would bury every
+    /// real finding under it.
+    #[test]
+    #[cfg(feature = "tensor-assert")]
+    fn the_audit_sees_a_live_waves_real_carves_and_calls_them_disjoint() -> Result<()> {
+        use super::push_activation_claims;
+        use candle::span_audit::{find_overlaps, ClaimKind, Tenant};
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let guard = begin_wave(&s, LayerPhase::Attention)?;
+        let a = guard.alloc(1000, 256)?;
+        let b = guard.alloc(2000, 256)?;
+        let c = guard.alloc(64, 16)?;
+
+        let ordinal = s.context().ordinal();
+        let mut claims = Vec::new();
+        push_activation_claims(ordinal, &mut claims);
+
+        // Every carve is published, at the address the allocator returned.
+        for (label, r) in [("a", &a), ("b", &b), ("c", &c)] {
+            assert!(
+                claims
+                    .iter()
+                    .any(|cl| cl.kind == ClaimKind::Leaf && cl.base == r.ptr && cl.len == r.len),
+                "carve {label} at {:#x}+{} is missing from the audit's claims",
+                r.ptr,
+                r.len
+            );
+        }
+        // The arena they came from is published as the container that holds
+        // them, so a carve escaping its span would read as a straddle rather
+        // than as an unexplained leaf.
+        assert!(
+            claims.iter().any(|cl| cl.kind == ClaimKind::Container
+                && cl.tenant == Tenant::TransientTier
+                && cl.base <= a.ptr
+                && a.ptr < cl.end()),
+            "the arena containing the carves is not claimed"
+        );
+        // And the real allocator's output must audit clean.
+        let overlaps = find_overlaps(&claims);
+        assert!(
+            overlaps.is_empty(),
+            "a live wave's own carves must not report as overlapping: {overlaps:?}"
+        );
         Ok(())
     }
 

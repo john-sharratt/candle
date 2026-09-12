@@ -130,9 +130,9 @@ fn analyse_rows(
     let mut covered_rows = 0usize;
     for t in 0..launch_tiles.min(starts.len()).min(cnts.len()) {
         let (s, c) = (starts[t].max(0) as usize, cnts[t].max(0) as usize);
-        for row in s..(s + c).min(nrows) {
-            if !covered[row] {
-                covered[row] = true;
+        for seen in covered.iter_mut().take((s + c).min(nrows)).skip(s) {
+            if !*seen {
+                *seen = true;
                 covered_rows += 1;
             }
         }
@@ -141,11 +141,11 @@ fn analyse_rows(
     let mut bad_covered = 0usize;
     let mut bad_uncovered = 0usize;
     let mut first_bad_covered: Option<usize> = None;
-    for row in 0..nrows {
+    for (row, &is_covered) in covered.iter().enumerate() {
         if !row_bad(row) {
             continue;
         }
-        if covered[row] {
+        if is_covered {
             bad_covered += 1;
             first_bad_covered.get_or_insert(row);
         } else {

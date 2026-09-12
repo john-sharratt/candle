@@ -182,21 +182,7 @@ fn declare_all(spans: &[(u64, usize)], name_of: impl Fn(usize) -> String) {
         v.push((base, end, name_of(i)));
     }
     v.sort_unstable_by_key(|(b, _, _)| *b);
-    let lo = v.first().map(|(b, _, _)| *b).unwrap_or(u64::MAX);
-    let hi = v.iter().map(|(_, e, _)| *e).max().unwrap_or(0);
-    let bytes = v.iter().map(|(b, e, _)| e - b).sum();
-    let t = Box::new(Table {
-        bases: v.iter().map(|(b, _, _)| *b).collect(),
-        ends: v.iter().map(|(_, e, _)| *e).collect(),
-        names: v.into_iter().map(|(_, _, n)| n).collect(),
-        lo,
-        hi,
-        bytes,
-    });
-    // Leaked deliberately: a region's life is the process's, readers hold no
-    // reference count, and there is no safe moment to free a table a
-    // lock-free reader may still be inside.
-    TABLE.store(Box::leak(t), Ordering::Release);
+    rebuild(v);
 }
 
 /// Declare many spans at once, merging adjacent and overlapping ones first.
@@ -234,6 +220,15 @@ pub fn declare_merged(name: &str, spans: &mut [(u64, usize)]) -> usize {
     }
     // One rebuild for the whole set rather than one per span.
     declare_all(&merged, |i| format!("{name}[{i}]"));
+    // Count this declarer, so `release_named` only withdraws when the last one
+    // is gone.
+    {
+        let mut d = match declarers().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *d.entry(name.to_string()).or_insert(0) += 1;
+    }
     merged.len()
 }
 
@@ -263,6 +258,88 @@ pub fn release_below(base: u64) {
         }
         v.push((b.max(base), e, n.clone()));
     }
+    rebuild(v);
+}
+
+/// Live declarers per name, so a release only fires when the last one goes.
+///
+/// `declare_merged` is called from more than one place for the same object —
+/// the expert grid fingerprints itself twice, once for the dump's whole-grid
+/// check and once for the rotating shard scan — and the declaration is
+/// idempotent, so both see the same spans. Without a count the first of the two
+/// to drop would withdraw protection while the other was still using it.
+fn declarers() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    static D: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    D.get_or_init(Default::default)
+}
+
+/// Withdraw every region declared under `name`, when the last declarer goes.
+///
+/// **The counterpart `declare_merged` never had.** A declaration describes
+/// memory whose contents are final *while its owner still owns it*; when the
+/// owner is dropped the bytes become ordinary pool memory that something else
+/// will legitimately allocate and write. With no way to withdraw, the guard
+/// goes on blaming whoever reuses the address — and because it panics, one
+/// stale declaration takes down every later user of that ground.
+///
+/// That is not hypothetical: it made the whole `candle-transformers` suite
+/// unrunnable under `tensor-assert`. Twenty-three attention tests failed, all at
+/// the guard and none on their own numbers — each passed in isolation, then
+/// died in the suite because an earlier test had declared an expert grid,
+/// dropped it, and left the declaration standing. `release_below` could not help:
+/// it withdraws by address when a boundary moves, and nothing here moved.
+///
+/// Returns the number of regions withdrawn.
+pub fn release_named(name: &str) -> usize {
+    {
+        let mut d = match declarers().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        match d.get_mut(name) {
+            Some(n) if *n > 1 => {
+                *n -= 1;
+                return 0;
+            }
+            Some(_) => {
+                d.remove(name);
+            }
+            // Releasing something never declared is a no-op rather than an
+            // error: a caller that failed partway through construction still
+            // runs its own cleanup.
+            None => return 0,
+        }
+    }
+    let _w = match writer().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let Some(cur) = table() else { return 0 };
+    // `declare_merged` names its regions `{name}[{i}]`, so the prefix is what
+    // identifies the set. Matching on the bracket too keeps `expert.weights`
+    // from also withdrawing a hypothetical `expert.weights.staging`.
+    let prefix = format!("{name}[");
+    let mut v: Vec<(u64, u64, String)> = Vec::with_capacity(cur.bases.len());
+    let mut dropped = 0usize;
+    for ((b, e), n) in cur.bases.iter().zip(&cur.ends).zip(&cur.names) {
+        if n.starts_with(&prefix) {
+            dropped += 1;
+            continue;
+        }
+        v.push((*b, *e, n.clone()));
+    }
+    if dropped > 0 {
+        rebuild(v);
+    }
+    dropped
+}
+
+/// Publish `v` as the live table.
+///
+/// Shared by every mutator so the derived fields — the bounding box and the
+/// byte total the hot path rejects against — cannot drift between them.
+fn rebuild(v: Vec<(u64, u64, String)>) {
     let lo = v.first().map(|(b, _, _)| *b).unwrap_or(u64::MAX);
     let hi = v.iter().map(|(_, e, _)| *e).max().unwrap_or(0);
     let bytes = v.iter().map(|(b, e, _)| e - b).sum();
@@ -274,6 +351,8 @@ pub fn release_below(base: u64) {
         hi,
         bytes,
     });
+    // Leaked deliberately: readers hold no reference count, and there is no
+    // safe moment to free a table a lock-free reader may still be inside.
     TABLE.store(Box::leak(t), Ordering::Release);
 }
 

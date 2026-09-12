@@ -79,6 +79,19 @@ mod size_class;
 pub(crate) mod slot_state_arena;
 /// Where the tier may stand and what the KV side may reach. Pure arithmetic, and
 /// outside the `cuda` gate so it can be exercised on any machine.
+/// The KV side's extents, published to the between-waves overlap audit.
+/// Gated with the audit itself — without `tensor-assert` there is nothing to
+/// publish to.
+#[cfg(feature = "tensor-assert")]
+pub mod span_claims;
+/// Checks a live decode row's offset against the layer it is serialised for.
+#[cfg(feature = "tensor-assert")]
+mod writer_len_audit;
+/// Band addresses from the host block table, for captures that read KV raw.
+#[cfg(feature = "tensor-assert")]
+mod band_map;
+#[cfg(feature = "tensor-assert")]
+pub use band_map::{BandAddr, BlockBands, WriterIndices};
 pub mod span_geometry;
 mod types;
 // Instrumentation for the bump arenas' high-water marks: its only caller is

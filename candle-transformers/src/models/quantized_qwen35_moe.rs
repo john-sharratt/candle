@@ -392,12 +392,15 @@ mod tests {
 
         let t = 6usize;
         let x = Tensor::randn(0f32, 1.0, (1, t, cfg.hidden_size), &device)?;
+        // The product is what this pins against the reference; the operands it
+        // now carries are for the capture, not for parity.
         let got = shared_expert_contribution(
             &shared,
             &shared_gate,
             &DynamicActs::Float(x.clone()),
             DType::F32,
-        )?;
+        )?
+        .gated;
 
         // Reference: the SwiGLU through the MLP's plain FP path (a different
         // code path from `forward_dynamic`, over the same weights), gated by

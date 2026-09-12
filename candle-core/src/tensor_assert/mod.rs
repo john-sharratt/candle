@@ -75,9 +75,36 @@ pub use drain::{drain, find, report, Finding};
 // `check_now` is defined below; re-exported here so the site-level API reads as
 // one surface.
 pub use dump::{Dump, Replay};
-pub use names::{interned_site as interned, rearm_once, site};
+pub use names::{interned, rearm_once, site};
 pub use scratch::QTYPE_Q8A128V;
 pub use slots::AssertSlot;
+
+/// The byte every freshly allocated, **uninitialised** device buffer is stamped
+/// with while this feature is on.
+///
+/// One constant for the whole workspace, because the value is load-bearing and
+/// a second opinion about it would weaken the signal. `0xFF` is chosen to be
+/// maximally loud rather than merely recognisable — every numeric
+/// interpretation of it is unmistakable garbage:
+///
+/// * `0xFFFF` is **NaN** as F16 and as BF16, and `0xFFFFFFFF` is NaN as F32, so
+///   a float read of unwritten ground is non-finite at the operation that made
+///   it — which is exactly what the assert harness is watching for.
+/// * For the quantized block formats the per-block *scale* is itself an F16 or
+///   F32 field, so it decodes to NaN too and the whole block follows, rather
+///   than one poisoned weight being averaged away into a plausible magnitude.
+/// * As `i8`/`u8` payload it is `-1`/`255`, the extremes of the range.
+///
+/// A subtler pattern would be better for *identifying* which buffer leaked, but
+/// worse at the job that matters: making the read fail loudly and immediately
+/// instead of producing a number that survives to be believed.
+///
+/// Zeros are the dangerous default this replaces. Fresh device memory is
+/// zero-filled by the driver the first time and holds the previous tenant's
+/// bytes thereafter, so a read-before-write is invisible until the allocator
+/// recycles ground that was in use — which makes the bug look like it was
+/// introduced by whatever change altered allocation, rather than by the read.
+pub const POISON_BYTE: std::ffi::c_uchar = 0xFF;
 
 fn assert_dtype(dt: DType) -> AssertDType {
     match dt {
@@ -95,7 +122,7 @@ fn assert_dtype(dt: DType) -> AssertDType {
 /// Fold `t`'s statistics into `name`'s slot. Never synchronises, never
 /// allocates, never fails loudly — a probe must not be able to break the
 /// program it observes, so every internal error is logged and swallowed.
-pub fn assert_tensor(t: &LiveTensor<'_>, name: &str) {
+pub fn assert_tensor(t: &LiveTensor<'_>, name: &'static str) {
     if let Err(e) = try_assert_tensor(t, name) {
         tracing::warn!(
             target: "candle_core::tensor_assert",
@@ -105,7 +132,7 @@ pub fn assert_tensor(t: &LiveTensor<'_>, name: &str) {
     }
 }
 
-fn try_assert_tensor(t: &LiveTensor<'_>, name: &str) -> Result<()> {
+fn try_assert_tensor(t: &LiveTensor<'_>, name: &'static str) -> Result<()> {
     let Some(slot_idx) = names::slot_for(name) else {
         return Ok(());
     };
@@ -194,7 +221,7 @@ fn try_assert_tensor(t: &LiveTensor<'_>, name: &str) -> Result<()> {
 /// `ptr` must name at least `elem_count` elements of `dtype` on `device`, live
 /// for the duration of the launch. The kernel only reads.
 pub unsafe fn assert_device_ptr(
-    name: &str,
+    name: &'static str,
     ptr: u64,
     dtype: AssertDType,
     elem_count: usize,
@@ -210,7 +237,7 @@ pub unsafe fn assert_device_ptr(
 }
 
 fn try_assert_device_ptr(
-    name: &str,
+    name: &'static str,
     ptr: u64,
     dtype: AssertDType,
     elem_count: usize,
@@ -263,7 +290,7 @@ fn try_assert_device_ptr(
 /// `ptr` must name a complete `qtype` buffer of `elem_count` logical elements
 /// on `device`, live for the duration of the launch.
 pub unsafe fn assert_device_quant(
-    name: &str,
+    name: &'static str,
     ptr: u64,
     qtype: i32,
     elem_count: usize,
@@ -279,7 +306,7 @@ pub unsafe fn assert_device_quant(
 }
 
 fn try_assert_device_quant(
-    name: &str,
+    name: &'static str,
     ptr: u64,
     qtype: i32,
     elem_count: usize,
@@ -327,7 +354,7 @@ fn try_assert_device_quant(
 /// Runs the dequant kernels on the default stream, so this belongs at load time
 /// or an epoch boundary, not inside a wave. Prefer
 /// [`LiveQTensor::assert_once`].
-pub fn assert_qtensor(q: &LiveQTensor<'_>, name: &str) {
+pub fn assert_qtensor(q: &LiveQTensor<'_>, name: &'static str) {
     if let Err(e) = try_assert_qtensor(q, name) {
         tracing::warn!(
             target: "candle_core::tensor_assert",
@@ -337,7 +364,7 @@ pub fn assert_qtensor(q: &LiveQTensor<'_>, name: &str) {
     }
 }
 
-fn try_assert_qtensor(q: &LiveQTensor<'_>, name: &str) -> Result<()> {
+fn try_assert_qtensor(q: &LiveQTensor<'_>, name: &'static str) -> Result<()> {
     let Some(slot_idx) = names::slot_for(name) else {
         return Ok(());
     };
@@ -404,7 +431,7 @@ fn try_assert_qtensor(q: &LiveQTensor<'_>, name: &str) -> Result<()> {
 ///
 /// `on_bad` receives the finding for this tensor alone. Returns whether it was
 /// bad, so a caller that would rather branch than close over state can.
-pub fn check_now(t: &LiveTensor<'_>, name: &str, on_bad: impl FnOnce(&Finding)) -> bool {
+pub fn check_now(t: &LiveTensor<'_>, name: &'static str, on_bad: impl FnOnce(&Finding)) -> bool {
     match try_check_now(t, name, on_bad) {
         Ok(bad) => bad,
         Err(e) => {
@@ -418,7 +445,7 @@ pub fn check_now(t: &LiveTensor<'_>, name: &str, on_bad: impl FnOnce(&Finding)) 
     }
 }
 
-fn try_check_now(t: &LiveTensor<'_>, name: &str, on_bad: impl FnOnce(&Finding)) -> Result<bool> {
+fn try_check_now(t: &LiveTensor<'_>, name: &'static str, on_bad: impl FnOnce(&Finding)) -> Result<bool> {
     let Some(slot_idx) = names::slot_for(name) else {
         return Ok(false);
     };
@@ -466,7 +493,7 @@ fn try_check_now(t: &LiveTensor<'_>, name: &str, on_bad: impl FnOnce(&Finding)) 
 /// `ptr` must name a complete `qtype` buffer of `elem_count` logical elements
 /// on `device`.
 pub unsafe fn check_now_quant(
-    name: &str,
+    name: &'static str,
     ptr: u64,
     qtype: i32,
     elem_count: usize,
@@ -487,7 +514,7 @@ pub unsafe fn check_now_quant(
 }
 
 fn try_check_now_quant(
-    name: &str,
+    name: &'static str,
     ptr: u64,
     qtype: i32,
     elem_count: usize,
@@ -519,7 +546,7 @@ fn try_check_now_quant(
 }
 
 /// Whether `name`'s one-shot latch is still unfired, claiming it if so.
-pub fn should_run_once(name: &str) -> bool {
+pub fn should_run_once(name: &'static str) -> bool {
     match names::slot_for(name) {
         Some(idx) => names::claim_once(idx),
         None => false,

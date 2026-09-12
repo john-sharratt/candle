@@ -113,7 +113,74 @@ impl CudaDevice {
     ) {
     }
 
+    /// Stamp a freshly allocated **uninitialised** buffer with [`POISON_BYTE`].
+    ///
+    /// `alloc`'s contract is that the caller writes every element it goes on to
+    /// read. Nothing enforces it, and the failure is silent in the worst way:
+    /// device memory the driver hands back is zero-filled the first time and
+    /// holds the previous tenant's bytes every time after, so a buffer that is
+    /// read before it is written behaves perfectly until the allocator happens
+    /// to recycle ground that was in use — at which point the same code reads
+    /// someone else's live data and produces a wrong number with no fault.
+    ///
+    /// That is not hypothetical here. A KV band run could originally claim only
+    /// never-used ground, so a read past a chunk's written extent returned
+    /// zeros — which contribute nothing to a softmax-weighted sum and cannot
+    /// produce an `inf`. Once the allocator began reaching the free list, the
+    /// identical read returned real quantized KV and the corruption appeared, in
+    /// a commit that had introduced no new read at all. Zeros were acting as a
+    /// mask.
+    ///
+    /// Poisoning removes the mask everywhere, not just where it was found. Any
+    /// read of an unwritten element now announces itself immediately, at the
+    /// operation that made it, instead of surfacing many layers later as a
+    /// plausible-looking magnitude.
+    ///
+    /// Queued, not awaited — `memset_d8_async` enqueues on the allocating
+    /// stream, so the fill is ordered before any kernel the caller launches on
+    /// it without costing a synchronisation. That matters: the faults this
+    /// exists to catch stop reproducing under a fenced build, so an instrument
+    /// that synchronised here would suppress what it is meant to expose.
+    #[cfg(feature = "tensor-assert")]
+    fn poison_fresh_allocation<T>(slice: &cudarc::driver::CudaSlice<T>, bytes: usize) {
+        use cudarc::driver::{DevicePtr, DriverError};
+        if bytes == 0 {
+            return;
+        }
+        let stream = slice.stream().clone();
+        let (base, _g) = slice.device_ptr(&stream);
+        // SAFETY: `base` names exactly `bytes` bytes just returned by the
+        // allocator, and the fill is ordered on the stream that owns them.
+        let r: std::result::Result<(), DriverError> = unsafe {
+            cudarc::driver::result::memset_d8_async(
+                base,
+                crate::tensor_assert::POISON_BYTE,
+                bytes,
+                stream.cu_stream(),
+            )
+        };
+        if let Err(e) = r {
+            // A poison that silently fails is a diagnostic that silently lies:
+            // the run would then read zeros again and "prove" the absence of a
+            // bug this fill was added to expose.
+            tracing::error!(
+                target: "candle_core::poison",
+                bytes, error = %e,
+                "poison: could not stamp a fresh uninitialised allocation — \
+                 unwritten reads in this run are NOT being caught"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "tensor-assert"))]
+    #[inline(always)]
+    fn poison_fresh_allocation<T>(_slice: &cudarc::driver::CudaSlice<T>, _bytes: usize) {}
+
     /// `len` elements of device memory, **uninitialised**.
+    ///
+    /// Under `tensor-assert` the buffer is stamped with [`POISON_BYTE`] first —
+    /// see [`Self::poison_fresh_allocation`]. It is still uninitialised as far
+    /// as this contract is concerned; the poison only makes a violation loud.
     ///
     /// # Safety
     ///
@@ -134,6 +201,7 @@ impl CudaDevice {
         forbidden_alloc::record("CudaDevice::alloc", len * std::mem::size_of::<T>());
         let s = self.stream.alloc::<T>(len).w()?;
         Self::guard_fresh_allocation("CudaDevice::alloc", &s, len * std::mem::size_of::<T>());
+        Self::poison_fresh_allocation(&s, len * std::mem::size_of::<T>());
         Ok(s)
     }
 

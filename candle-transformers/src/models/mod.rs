@@ -121,6 +121,14 @@ pub mod mpt;
 /// `tensor-assert` only.
 #[cfg(all(feature = "cuda", feature = "tensor-assert"))]
 pub mod nan_capture;
+/// Reads back the KV chain a paged decode kernel followed, for a capture that
+/// found its output bad. `tensor-assert` only.
+#[cfg(all(feature = "cuda", feature = "tensor-assert"))]
+pub mod decode_kv_walk;
+/// Reads back the positions a wave just committed to its last KV layer and
+/// names any it never wrote. `tensor-assert` only.
+#[cfg(all(feature = "cuda", feature = "tensor-assert"))]
+pub mod head_hole_check;
 pub mod nvembed_v2;
 pub mod olmo;
 pub mod olmo2;

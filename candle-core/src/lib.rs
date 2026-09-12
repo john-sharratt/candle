@@ -100,6 +100,32 @@ pub mod quantized;
 #[path = "readonly_regions.rs"]
 pub mod readonly_regions;
 
+/// Who owns which bytes of the device reservation — see [`span_audit`].
+///
+/// Gated like `readonly_regions` and for the same reason: it is a between-waves
+/// audit of the whole partition, and it must cost the production build nothing.
+#[cfg(feature = "tensor-assert")]
+pub mod span_audit;
+
+#[cfg(not(feature = "tensor-assert"))]
+pub mod span_audit {
+    //! Stubs. See the gated module for what this is when it is armed.
+
+    /// No-op: no provider is ever registered, so nothing is ever walked.
+    #[inline(always)]
+    pub fn register<F>(_name: &'static str, _f: F) {}
+
+    /// No-op.
+    #[inline(always)]
+    pub fn unregister(_name: &'static str) {}
+
+    /// No-op, reporting no overlaps because nothing was registered.
+    #[inline(always)]
+    pub fn audit(_context: &str) -> Vec<()> {
+        Vec::new()
+    }
+}
+
 #[cfg(not(feature = "tensor-assert"))]
 pub mod readonly_regions {
     //! Stubs. See the gated module for what this is when it is armed.
@@ -117,6 +143,12 @@ pub mod readonly_regions {
     /// No-op: nothing was declared, so nothing can be released.
     #[inline(always)]
     pub fn release_below(_base: u64) {}
+
+    /// No-op, reporting nothing withdrawn because nothing was declared.
+    #[inline(always)]
+    pub fn release_named(_name: &str) -> usize {
+        0
+    }
 
     /// Always `(0, 0)` — nothing declared, nothing covered.
     #[inline(always)]

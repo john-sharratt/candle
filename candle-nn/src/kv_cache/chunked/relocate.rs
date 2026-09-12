@@ -104,7 +104,34 @@ impl ChunkedKvBacking {
         let Device::Cuda(cuda) = self.device() else {
             return Ok(None);
         };
-        Ok(Some(enter_arena_window(&cuda.cuda_stream())?))
+        let window = enter_arena_window(&cuda.cuda_stream())?;
+        // **Drain every stream before any ground moves.**
+        //
+        // The window stops a *new* forward from starting; it says nothing about
+        // work already in flight. Relocation copies bands to new slots and then
+        // frees the old ones host-side, and a freed slot is immediately
+        // re-claimable — so without this, ground can be handed to another
+        // sequence while the GPU still has queued work reading it, and that read
+        // returns whatever the new owner has since written.
+        //
+        // It has to be the **context**, not `cuda_stream()`. The expert cache
+        // holds a `CU_STREAM_NON_BLOCKING` copy stream for DMA overlap, and a
+        // non-blocking stream is by definition not ordered against the null
+        // stream everything else runs on. Synchronising one stream would leave
+        // exactly the transfer least ordered with this pass still in flight —
+        // and after a weight-side concession its destination may be ground the
+        // KV side now owns.
+        //
+        // Affordable **because of where this sits**: between forwards, on the
+        // persistence thread, once per residence — never inside a wave. The
+        // measured cost of getting that granularity wrong is in
+        // `persistence::thread`'s note above the caller: widening the hold to a
+        // whole pass took dirs/min from 2.12 to 1.41. A drain at the start of a
+        // residence, when the queue is shortest, is the cheap end of that trade.
+        cuda.cuda_context()
+            .synchronize()
+            .map_err(candle::Error::wrap)?;
+        Ok(Some(window))
     }
 
     #[cfg(feature = "cuda")]

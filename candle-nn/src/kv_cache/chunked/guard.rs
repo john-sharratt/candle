@@ -198,6 +198,7 @@ mod tests {
             region_base,
             persist_carved: 4 * REGION_BYTES,
             total,
+            live_end: region_base + (total * REGION_BYTES) as u64,
             weight_floor: region_base + (total * REGION_BYTES) as u64,
             transient_base: None,
             transient_bytes: 0,

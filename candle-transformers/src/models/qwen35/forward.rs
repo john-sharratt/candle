@@ -1595,13 +1595,24 @@ fn sweep_layers(
     let logits = {
         #[cfg(feature = "cuda")]
         {
+            // **The trunk's last two values, watched.** Nothing asserted the
+            // residual entering the final norm or the logits leaving the LM
+            // head, so a non-finite value here reached `argmax` unseen — and a
+            // NaN row argmaxes to an arbitrary token, which is the degenerate
+            // output the corruption surfaces as. Same whole-row mechanism as the
+            // FFN norm: one `inf` in a row of `pre_norm` makes that row's RMS
+            // infinite and the normed row NaN.
+            pre_norm.assert("head.pre_norm");
             let acts = q.final_norm.forward_dynamic(
                 &pre_norm,
                 q.lm_head.int8mode(),
                 wave_root(head_span.as_ref()),
             )?;
-            q.lm_head
-                .forward_dynamic(acts.as_dynamic(), pre_norm.dtype())?
+            let logits = q
+                .lm_head
+                .forward_dynamic(acts.as_dynamic(), pre_norm.dtype())?;
+            logits.assert("head.logits");
+            logits
         }
         #[cfg(not(feature = "cuda"))]
         {

@@ -119,13 +119,14 @@ typedef struct __align__(16) {
 static_assert(sizeof(block_q_awq) == 80, "block_q_awq must be 80 bytes");
 
 // BlockQAWQG64: 4-bit AWQ with group size 64 (80 bytes, 16-byte aligned)
-// Layout matches Rust: qs[16] (u32), scales[2] (f16), zeros[2] (f16), _pad (u32) + alignment
+// Layout matches Rust: qs[16] (u32), scales[2] (f16), zeros[2] (f16), _pad[2] (u32)
+// Every byte is a named field, so the encoder writes all 80; an implicit
+// alignment tail would be left holding whatever the allocator had there.
 typedef struct __align__(16) {
     uint32_t qs[16];     // 64 bytes: 128 × 4-bit nibbles packed as u32 (8 per u32)
     half scales[2];      // 4 bytes: scale factors (one per 64 elements)
     half zeros[2];       // 4 bytes: zero points (one per 64 elements)
-    uint32_t _pad;       // 4 bytes: explicit padding
-    // alignment padding adds 4 more bytes to reach 80
+    uint32_t _pad[2];    // 8 bytes: padding to 80 bytes total
 } block_q_awq_g64;
 static_assert(sizeof(block_q_awq_g64) == 80, "block_q_awq_g64 must be 80 bytes");
 

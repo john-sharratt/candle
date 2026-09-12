@@ -1807,14 +1807,14 @@ impl<'w> LiveQTensor<'w> {
     /// the default stream, so it belongs at load time or an epoch boundary
     /// rather than inside a wave. Prefer [`Self::assert_once`] for weights.
     #[cfg(feature = "tensor-assert")]
-    pub fn assert(&self, name: &str) -> &Self {
+    pub fn assert(&self, name: &'static str) -> &Self {
         crate::tensor_assert::assert_qtensor(self, name);
         self
     }
 
     #[cfg(not(feature = "tensor-assert"))]
     #[inline(always)]
-    pub fn assert(&self, _name: &str) -> &Self {
+    pub fn assert(&self, _name: &'static str) -> &Self {
         self
     }
 
@@ -1822,7 +1822,7 @@ impl<'w> LiveQTensor<'w> {
     /// current epoch — the form weights should use, since a weight does not
     /// change between forwards.
     #[cfg(feature = "tensor-assert")]
-    pub fn assert_once(&self, name: &str) -> &Self {
+    pub fn assert_once(&self, name: &'static str) -> &Self {
         if crate::tensor_assert::should_run_once(name) {
             crate::tensor_assert::assert_qtensor(self, name);
         }
@@ -1831,7 +1831,7 @@ impl<'w> LiveQTensor<'w> {
 
     #[cfg(not(feature = "tensor-assert"))]
     #[inline(always)]
-    pub fn assert_once(&self, _name: &str) -> &Self {
+    pub fn assert_once(&self, _name: &'static str) -> &Self {
         self
     }
 
