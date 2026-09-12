@@ -4061,7 +4061,6 @@ fn a_failed_repack_does_not_free_its_leased_destination() -> Result<()> {
 // test is its own process, which is the only place that measurement means
 // anything.
 
-
 /// **The host-banded read must match the device one for every source it accepts**, not just
 /// the float ones that motivated it.
 ///

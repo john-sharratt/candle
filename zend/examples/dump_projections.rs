@@ -98,7 +98,7 @@ fn main() -> anyhow::Result<()> {
             let mut bare_sections: Vec<String> = Vec::new();
             for item in &ev.selection.system {
                 match item {
-                    SystemItem::Collection { name, sections } => {
+                    SystemItem::Collection { name, sections, .. } => {
                         for s in sections {
                             if s.selected {
                                 selected.push((name.clone(), s.name.clone(), s.tokens));

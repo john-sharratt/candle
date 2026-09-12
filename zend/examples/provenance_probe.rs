@@ -336,7 +336,7 @@ fn projection_probe_cases(substrate: &Substrate, back: usize) -> Vec<ProbeCase> 
         let asst = d.assistant_content_start() as usize;
         for ev in &events {
             let Some(tool) = ev.selection.system.iter().find_map(|item| match item {
-                SystemItem::Collection { name, sections } if name == "tools" => {
+                SystemItem::Collection { name, sections, .. } if name == "tools" => {
                     sections.iter().find(|s| s.selected).map(|s| s.name.clone())
                 }
                 _ => None,

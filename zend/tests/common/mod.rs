@@ -431,7 +431,7 @@ pub fn say_opening(conv: &mut Sequence, text: &str) -> (String, String) {
                 SystemItem::Section { name, tokens } => {
                     let _ = write!(s, "sec:{name}({tokens}) ");
                 }
-                SystemItem::Collection { name, sections } => {
+                SystemItem::Collection { name, sections, .. } => {
                     let _ = write!(s, "coll:{name}[");
                     for sec in sections.iter().filter(|sec| sec.selected) {
                         let _ = write!(s, "{}({}) ", sec.name, sec.tokens);

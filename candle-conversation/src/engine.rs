@@ -841,6 +841,21 @@ impl ConversationEngine {
             .map_err(ConversationError::Model)
     }
 
+    /// Mark `timeline` as scratch: its turns never reach cold storage.
+    ///
+    /// Sets `no_cold_persist` on every residence the timeline holds, so a
+    /// conversation opened for one question and thrown away costs GPU and RAM
+    /// for as long as it runs and nothing on disk afterwards. The alternative —
+    /// writing it and tombstoning it — pays the whole write and then asks
+    /// compaction to take it back.
+    ///
+    /// Call it immediately after minting, before the first turn seals: a turn
+    /// that has already been written is already on the cold path and this does
+    /// not retract it.
+    pub fn mark_timeline_transient(&self, timeline: TimelineId) {
+        self.conversation.mark_timeline_transient(timeline);
+    }
+
     /// Whether `timeline` is archived. Unlike [`Self::known_conversations`]
     /// — which omits internal conversations that never set a `conv_id` — this
     /// reads the flag directly, so it works for reserved/utility timelines too.

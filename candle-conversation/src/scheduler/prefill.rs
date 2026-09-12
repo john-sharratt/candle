@@ -2618,7 +2618,7 @@ impl Scheduler {
             .sampling_states
             .remove(&work.sequence_id)
             .expect("sampling state must exist for active sequence");
-        sampling_state.end_turn();
+        sampling_state.end_turn(work.sampling.cross_turn_window);
         sampling_state.record_context_tokens(&work.tokens, self.sampler.max_recent_len());
 
         // Send prefill progress: complete (single-prefill path needs this;
@@ -2678,13 +2678,14 @@ impl Scheduler {
         };
 
         // Detect think-mode entry: the model opens its OWN `<think>` as the first
-        // decoded token (we never prefill one). The `work.tokens` check covers a
-        // caller-supplied assistant prefill that itself opens a think block.
+        // decoded token, or the assistant prefill leaves one open. "Leaves open"
+        // is not "contains" — see [`prefill_leaves_think_open`].
         let initial_inside_think_block = {
             let tid = work.sampling.segment_open_token_id;
             if tid >= 0 {
                 let tok = tid as u32;
-                let prefill_has_think = work.tokens.iter().rev().take(5).any(|&t| t == tok);
+                let close = u32::try_from(work.sampling.segment_close_token_id).ok();
+                let prefill_has_think = prefill_leaves_think_open(work.tokens.iter(), tok, close);
                 // The block opens either way: the common case is the model
                 // sampling its OWN `<think>` as the first token; the rarer case is
                 // a caller-supplied assistant prefill that already opens one.  In
@@ -3027,6 +3028,37 @@ impl Scheduler {
     }
 }
 
+/// Whether an assistant prefill leaves a think block **open** at the point
+/// decode takes over.
+///
+/// **Containing `<think>` is not the question.** Qwen3.5 suppresses reasoning by
+/// prefilling an already-closed block, `<think>\n\n</think>\n\n`, so the open
+/// marker is in every suppressed turn's prefill by construction — and the
+/// sampler's segment state only ever sees *sampled* tokens, so the prefilled
+/// close never reaches it. Asked "is `<think>` among the last few tokens", the
+/// check answered yes on exactly the turns where thinking had been turned off,
+/// and the sampler then decoded the whole answer believing it was inside a
+/// think block: the ban on `</think>` outside a block lifted, and any
+/// `force_segment_close_after` fired a closer into the prose. Measured on an
+/// unstencilled reflection turn: `The belt is</think>`, nine tokens, the answer
+/// ended by a forced close of a block that had closed before it began.
+///
+/// The most recent marker decides, which is the rule that holds whatever the
+/// prefill is: a closed block, a closed block followed by a tool-call opener, a
+/// bare `<think>` for a turn that is meant to reason, or an earlier turn's
+/// markers further back in the buffer. The scan stops at the first marker from
+/// the end, so it costs a handful of comparisons on every real prefill.
+fn prefill_leaves_think_open<'a>(
+    tokens: impl DoubleEndedIterator<Item = &'a u32>,
+    open: u32,
+    close: Option<u32>,
+) -> bool {
+    tokens
+        .rev()
+        .find(|&&t| t == open || Some(t) == close)
+        .is_some_and(|&t| t == open)
+}
+
 #[cfg(test)]
 mod setpoint_tests {
     use super::{setpoint_regions, VramPhase};
@@ -3069,5 +3101,68 @@ mod warm_budget_tests {
     fn default_slack_clears_a_healthy_drain_pipeline() {
         let slack = warm_pipeline_slack_bytes();
         assert!(slack >= 768 * 1024 * 1024, "slack {slack} too small");
+    }
+}
+
+#[cfg(test)]
+mod prefill_think_tests {
+    use super::prefill_leaves_think_open;
+
+    const OPEN: u32 = 89;
+    const CLOSE: u32 = 90;
+    const NL: u32 = 10;
+    const TOOL_CALL: u32 = 91;
+    const WORD: u32 = 5;
+
+    fn open(tokens: &[u32]) -> bool {
+        prefill_leaves_think_open(tokens.iter(), OPEN, Some(CLOSE))
+    }
+
+    /// **The suppression prefill is a closed block, and it must read as one.**
+    ///
+    /// The regression this exists for: Qwen3.5's `<think>\n\n</think>\n\n`
+    /// contains the open marker, and the check that asked "does it contain one"
+    /// put every think-suppressed turn's sampler inside a block it would never
+    /// see close.
+    #[test]
+    fn a_prefilled_closed_block_leaves_nothing_open() {
+        assert!(!open(&[WORD, OPEN, NL, CLOSE, NL]));
+    }
+
+    /// The acting turn's prefill: the closed block, then straight into the call.
+    #[test]
+    fn a_closed_block_followed_by_a_call_opener_leaves_nothing_open() {
+        assert!(!open(&[WORD, OPEN, NL, CLOSE, NL, TOOL_CALL]));
+    }
+
+    /// A turn that is meant to reason prefills a bare `<think>`, and it must.
+    #[test]
+    fn a_bare_open_marker_leaves_the_block_open() {
+        assert!(open(&[WORD, NL, OPEN]));
+    }
+
+    #[test]
+    fn a_prefill_with_no_markers_leaves_nothing_open() {
+        assert!(!open(&[WORD, NL, WORD]));
+        assert!(!open(&[]));
+    }
+
+    /// The most recent marker decides, so an earlier turn's closed block
+    /// further back in the buffer cannot mask a fresh open, and cannot fake one.
+    #[test]
+    fn only_the_most_recent_marker_counts() {
+        assert!(open(&[OPEN, WORD, CLOSE, WORD, NL, OPEN]));
+        assert!(!open(&[OPEN, WORD, CLOSE, WORD, OPEN, NL, CLOSE, NL]));
+    }
+
+    /// A vocabulary with no close token cannot close a block, so an open marker
+    /// anywhere behind the boundary leaves it open.
+    #[test]
+    fn without_a_close_token_an_open_marker_stays_open() {
+        assert!(prefill_leaves_think_open(
+            [WORD, OPEN, NL, CLOSE].iter(),
+            OPEN,
+            None
+        ));
     }
 }

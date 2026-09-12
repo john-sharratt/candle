@@ -21,7 +21,7 @@
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use candle_core::quantized::{cuda, ko_quant, get_vram_info, GgmlDType, QStorage, QTensor};
+use candle_core::quantized::{cuda, get_vram_info, ko_quant, GgmlDType, QStorage, QTensor};
 use candle_core::{CudaDevice, DType, Device, Error, Result, Shape, Tensor};
 
 static VRAM_MEASUREMENT: Mutex<()> = Mutex::new(());
@@ -308,14 +308,8 @@ fn a_host_banded_repack_matches_the_device_one_without_materialising_the_source(
     device.synchronize()?;
 
     let (free_before, _) = get_vram_info()?;
-    let twin = cuda::repack_ko_from_host(
-        &dev,
-        &host,
-        &shape,
-        GgmlDType::BF16,
-        GgmlDType::Q8_KO,
-        None,
-    )?;
+    let twin =
+        cuda::repack_ko_from_host(&dev, &host, &shape, GgmlDType::BF16, GgmlDType::Q8_KO, None)?;
     device.synchronize()?;
     let (free_after, _) = get_vram_info()?;
 

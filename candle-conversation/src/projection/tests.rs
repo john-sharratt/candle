@@ -4316,6 +4316,118 @@ layers:
     );
 }
 
+/// A selector holds a set: `select_all` names several, `select` replaces the
+/// set with one, and `get` reads the first.
+#[test]
+fn a_selector_holds_a_set_and_select_replaces_it() {
+    use crate::projection::SelectionState;
+    let mut s = SelectionState::new();
+    assert!(s.members("tool").is_empty());
+    assert_eq!(s.get("tool"), None);
+    s.select_all("tool", ["b", "a"]);
+    assert_eq!(s.members("tool"), &["b".to_string(), "a".to_string()]);
+    assert_eq!(s.get("tool"), Some("b"));
+    s.select("tool", "c");
+    assert_eq!(s.members("tool"), &["c".to_string()]);
+    s.select_all("tool", Vec::<String>::new());
+    assert!(s.members("tool").is_empty());
+    assert_eq!(s.get("tool"), None);
+}
+
+/// **A `Named` selector naming a set emits every member of it** — in the
+/// collection's declaration order, not the order named, with the collection's
+/// `member_glue` as a real token between consecutive members and never before
+/// the first. A name that is not a member is skipped, and one named twice
+/// emits once. This is what lets a caller show a collection's members by a
+/// fact it has and provenance does not: which acts a character can take here.
+#[test]
+fn collection_named_emits_every_member_of_the_set_in_declaration_order() {
+    use crate::projection::{ProjectionMode, ProjectionSegment, SealedKind, SelectionState};
+    const YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: collection
+      name: tools
+      selection: { kind: named, selector: tool }
+      member_glue: "\n"
+      sections:
+        - id: datetime
+          content: "datetime def"
+        - id: web_search
+          content: "web_search def"
+        - id: calc
+          content: "calc def"
+layers:
+  - name: dialogue
+    window: 4000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget: { priority: 100 }
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+    let mut b = Builder::from_yaml(YAML).unwrap();
+    // Mock tokenizer: one byte → one token, so the glue "\n" is [10].
+    b.tokenize_templates(|s: &str| Ok::<_, ()>(s.bytes().map(u32::from).collect()))
+        .unwrap();
+    let target = ProjectionTarget {
+        layer: b.id_for_layer("dialogue").unwrap(),
+        group: b.id_for_group("convo").unwrap(),
+        timeline: TimelineId::for_test(1),
+    };
+    let datetime = b.id_for_system_section("datetime").unwrap();
+    let calc = b.id_for_system_section("calc").unwrap();
+    let resolver = MockResolver::new();
+
+    let mut sel = SelectionState::new();
+    sel.select_all("tool", ["calc", "nonexistent", "datetime", "calc"]);
+    let p = b.project_with_selection(target, &resolver, ProjectionMode::Decode, &sel);
+    let ids: Vec<SectionId> = p.sealed_sections().map(|s| s.id).collect();
+    assert_eq!(ids, vec![datetime, calc], "declaration order, once each");
+
+    let pos = |id: SectionId| {
+        p.segments
+            .iter()
+            .position(
+                |s| matches!(s, ProjectionSegment::Sealed(SealedKind::Section(r)) if r.id == id),
+            )
+            .unwrap()
+    };
+    let (first, second) = (pos(datetime), pos(calc));
+    assert_eq!(second, first + 2, "exactly one segment between the members");
+    assert!(
+        matches!(&p.segments[first + 1], ProjectionSegment::Generated { tokens, .. } if tokens.as_ref() == &vec![10u32]),
+        "the glue is the newline token: {:?}",
+        p.segments[first + 1]
+    );
+    assert!(
+        first == 0 || !matches!(&p.segments[first - 1], ProjectionSegment::Generated { .. }),
+        "no glue leads the first member"
+    );
+
+    // An empty set names nothing, so nothing emits — glue included.
+    let mut none = SelectionState::new();
+    none.select_all("tool", Vec::<String>::new());
+    let p_none = b.project_with_selection(target, &resolver, ProjectionMode::Decode, &none);
+    assert_eq!(p_none.sealed_sections().count(), 0);
+    assert!(
+        !p_none
+            .segments
+            .iter()
+            .any(|s| matches!(s, ProjectionSegment::Generated { tokens, .. } if tokens.as_ref() == &vec![10u32])),
+        "glue with no members around it"
+    );
+}
+
 #[test]
 fn top_k_force_tool_pin_overrides_belief_then_falls_back() {
     use crate::projection::{ProjectionMode, SelectionState, FORCE_TOOL_SELECTOR};
@@ -6533,6 +6645,53 @@ layers:
             !matches!(&proj.segments[a - 1], ProjectionSegment::Generated { tokens, .. } if tokens.as_ref() == &vec![10u32]),
             "glue must not lead the first selected tool"
         );
+    }
+
+    /// A collection embedded in a section tree resolves `Named` the way a
+    /// top-level one does — the members its selector holds and nothing else —
+    /// rather than selecting nothing because the tree path is score-based.
+    #[test]
+    fn a_tree_collection_emits_the_members_its_named_selector_holds() {
+        use crate::projection::{ProjectionMode, SelectionState};
+        let yaml = COLLECTION_TREE_YAML.replace(
+            "          selection: { kind: top_k, k: 2 }",
+            "          selection: { kind: named, selector: pick }",
+        );
+        assert_ne!(
+            yaml, COLLECTION_TREE_YAML,
+            "the fixture's selection line moved"
+        );
+        let b = Builder::from_yaml(&yaml).unwrap();
+        let tree = dialogue_tree(&b);
+        let tc = tree
+            .nodes
+            .iter()
+            .find(|n| n.name == "tools")
+            .and_then(|n| n.collection.as_ref())
+            .unwrap();
+        let tool_a = tc.member_variant(0, 0).unwrap().id;
+        let tool_b = tc.member_variant(1, 0).unwrap().id;
+        let resolver = MockResolver::new();
+        let project = |sel: &SelectionState| -> Vec<SectionId> {
+            b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, sel)
+                .sealed_sections()
+                .map(|s| s.id)
+                .collect()
+        };
+
+        let mut sel = SelectionState::new();
+        sel.select("no_think", "present");
+        sel.select("effort", "balanced");
+        let unset = project(&sel);
+        assert!(
+            !unset.contains(&tool_a) && !unset.contains(&tool_b),
+            "an unset selector names nothing"
+        );
+
+        sel.select_all("pick", ["tool_b"]);
+        let picked = project(&sel);
+        assert!(picked.contains(&tool_b), "{picked:?}");
+        assert!(!picked.contains(&tool_a), "{picked:?}");
     }
 
     /// An `optional_group` gates a whole sub-tree (markers + collection + inject

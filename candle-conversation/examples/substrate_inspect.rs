@@ -1437,7 +1437,7 @@ fn print_projection_event(i: usize, ev: &ProjectionEvent) {
             SystemItem::Section { name, tokens } => {
                 println!("      [section] {name} ({tokens} tok)")
             }
-            SystemItem::Collection { name, sections } => {
+            SystemItem::Collection { name, sections, .. } => {
                 let sel = sections.iter().filter(|s| s.selected).count();
                 println!(
                     "      [collect] {name}: {sel}/{} sections selected",

@@ -2923,7 +2923,6 @@ impl CudaStorage {
         // Keep the allocated GPU buffers alive until after the kernel call
         let values_dev_f64: Option<CudaSlice<f64>>;
         let values_dev_f32: Option<CudaSlice<f32>>;
-        
 
         let values_ptr: *const std::ffi::c_void = if self.dtype() == DType::F64 {
             let values_f64_vec: Vec<f64> = values.iter().map(|&v| v as f64).collect();

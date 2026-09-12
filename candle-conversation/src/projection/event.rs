@@ -163,6 +163,15 @@ pub enum SystemItem {
     Collection {
         name: String,
         sections: Vec<SelectedSection>,
+        /// The collection's `member_glue`, prefilled BETWEEN consecutive
+        /// selected members (never before the first) — so a consumer rebuilding
+        /// the materialized text interleaves it exactly as the projection did.
+        /// Empty when the collection declares none.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        member_glue: String,
+        /// Tokens in one `member_glue` run; `0` when empty.
+        #[serde(default)]
+        member_glue_tokens: u32,
     },
 }
 
@@ -383,11 +392,20 @@ pub fn staged_ingest_event(
         .iter()
         .map(|item| match item {
             SystemItem::Glue { tokens, .. } | SystemItem::Section { tokens, .. } => *tokens,
-            SystemItem::Collection { sections, .. } => sections
-                .iter()
-                .filter(|s| s.selected)
-                .map(|s| s.tokens)
-                .sum(),
+            SystemItem::Collection {
+                sections,
+                member_glue_tokens,
+                ..
+            } => {
+                let picked: Vec<u32> = sections
+                    .iter()
+                    .filter(|s| s.selected)
+                    .map(|s| s.tokens)
+                    .collect();
+                // One glue run between each consecutive pair of members.
+                let glue = member_glue_tokens * picked.len().saturating_sub(1) as u32;
+                picked.iter().sum::<u32>() + glue
+            }
         })
         .sum();
     let turn_tokens: u32 = turns.iter().map(|t| t.tokens).sum();
@@ -710,8 +728,17 @@ fn build_selection(
                     system.push(SystemItem::Section { name, tokens });
                 }
                 if c.sections.iter().any(|s| selected.contains(&s.id)) {
+                    // Mirror the projection exactly: it interleaves member glue
+                    // only when the tokens exist, so report it on the same
+                    // condition rather than on the string being non-empty.
+                    let (member_glue, member_glue_tokens) = match &c.member_glue_tokens {
+                        Some(t) => (c.member_glue.clone(), t.len() as u32),
+                        None => (String::new(), 0),
+                    };
                     system.push(SystemItem::Collection {
                         name: c.name.clone(),
+                        member_glue,
+                        member_glue_tokens,
                         sections: c
                             .sections
                             .iter()
@@ -1317,7 +1344,7 @@ layers:
         }
         // The code_read collection shows BOTH members, file_b flagged skipped.
         match &sel.system[1] {
-            SystemItem::Collection { name, sections } => {
+            SystemItem::Collection { name, sections, .. } => {
                 assert_eq!(name, "code_read");
                 assert_eq!(sections.len(), 2);
                 let a = sections.iter().find(|s| s.name == "file_a").unwrap();

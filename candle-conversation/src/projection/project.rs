@@ -377,7 +377,7 @@ impl PriorBelief {
     pub fn from_selection(sel: &super::ProjectionSelection) -> PriorBelief {
         let mut pb = PriorBelief::default();
         for item in &sel.system {
-            if let super::SystemItem::Collection { name, sections } = item {
+            if let super::SystemItem::Collection { name, sections, .. } = item {
                 for s in sections {
                     pb.set(name, &s.name, s.score, s.selected, s.qualified);
                 }
@@ -903,11 +903,20 @@ impl OptionalState {
     }
 }
 
-/// Runtime override of section-tree selectors for one projection.
+/// Runtime override of the selectors one projection resolves.
 ///
-/// Maps a selector id (a dimension node's declared name) to the chosen option
-/// id.  Any selector absent from the map falls back to its authored default, so
-/// an empty state reproduces the schema defaults exactly.
+/// Maps a selector id to what it chose: a section-tree dimension's option id,
+/// or the names of the members a [`SelectionRule::Named`] collection shows. Any
+/// selector absent from the map falls back to its authored default, so an empty
+/// state reproduces the schema defaults exactly.
+///
+/// **A selector holds a set.** A dimension chooses one option and most callers
+/// name one member — [`Self::select`] — but a collection whose members come and
+/// go with the state of the world has to show several at once, chosen by the
+/// caller rather than scored: a character's acts are the ones its body can do
+/// *here*, which is a fact the caller has and provenance does not.
+/// [`Self::select_all`] sets such a set; [`Self::get`] reads its first name,
+/// which is the whole of it for every single-valued selector.
 ///
 /// Selector and option ids are `String`s by necessity — they are authored in
 /// the projection YAML, so the override map is data-driven and can't be a closed
@@ -916,7 +925,7 @@ impl OptionalState {
 /// accessors rather than bare string literals.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SelectionState {
-    chosen: HashMap<String, String>,
+    chosen: HashMap<String, Vec<String>>,
 }
 
 impl SelectionState {
@@ -927,8 +936,26 @@ impl SelectionState {
 
     /// Select a selector's option by id.  Returns `&mut self` for chaining.
     pub fn select(&mut self, selector: impl Into<String>, option: impl Into<String>) -> &mut Self {
-        self.chosen.insert(selector.into(), option.into());
+        self.chosen.insert(selector.into(), vec![option.into()]);
         self
+    }
+
+    /// Choose several members at once — a [`SelectionRule::Named`] collection
+    /// emits them in its own declaration order, whatever order they are named
+    /// in. An empty set chooses nothing. Replaces whatever the selector held.
+    pub fn select_all<S: Into<String>>(
+        &mut self,
+        selector: impl Into<String>,
+        names: impl IntoIterator<Item = S>,
+    ) -> &mut Self {
+        self.chosen
+            .insert(selector.into(), names.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Every name a selector holds — empty when it is unset.
+    pub fn members(&self, selector: &str) -> &[String] {
+        self.chosen.get(selector).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Set an `optional` selector to a typed [`OptionalState`].  Returns
@@ -938,9 +965,10 @@ impl SelectionState {
         self.select(selector, state.as_id())
     }
 
-    /// The chosen option id for a selector, if one was set.
+    /// The chosen option id for a selector — the first of its set — if one was
+    /// set.
     pub fn get(&self, selector: &str) -> Option<&str> {
-        self.chosen.get(selector).map(String::as_str)
+        self.members(selector).first().map(String::as_str)
     }
 
     /// The typed state of an `optional` selector.  `None` when the selector is
@@ -1836,8 +1864,13 @@ fn emit_system_prompt_items<R: ContentResolver>(
                 for node in &tree.nodes {
                     if let Some(tc) = &node.collection {
                         let active_key = tree.pack(&selection, node.ancestor_dims);
-                        let selected =
-                            select_tree_collection_segments(tc, active_key, resolver, &scoring);
+                        let selected = select_tree_collection_segments(
+                            tc,
+                            active_key,
+                            resolver,
+                            &scoring,
+                            selection_state,
+                        );
                         record(&tc.collection, selected);
                     }
                 }
@@ -2048,6 +2081,7 @@ fn select_collection_indices<R: ContentResolver>(
     coll: &SectionCollection,
     resolver: &R,
     scoring: &CollectionScoring,
+    selection_state: &SelectionState,
 ) -> Vec<usize> {
     if coll.sections.is_empty() {
         return Vec::new();
@@ -2105,13 +2139,27 @@ fn select_collection_indices<R: ContentResolver>(
             })
             .map(|(i, _, _)| vec![i])
             .unwrap_or_default(),
-        // `Named` is a score-independent by-name pick that needs the projection's
-        // `SelectionState` to resolve the selector. It is only used on the
-        // top-level `tools` collection (handled by the belief path
-        // `select_collection_sections`); the score-based tree-node path never sees
-        // it, so select nothing.
-        SelectionRule::Named { .. } => Vec::new(),
+        // Score-independent: whatever the runtime selector names.
+        SelectionRule::Named { selector } => named_indices(coll, selector, selection_state),
     }
+}
+
+/// The declaration indices of the members a [`SelectionRule::Named`] selector
+/// names, in declaration order — the order the collection was authored in, not
+/// the order the caller happened to list them. A name that is not a member is
+/// skipped, and a name listed twice emits once.
+fn named_indices(
+    coll: &SectionCollection,
+    selector: &str,
+    selection_state: &SelectionState,
+) -> Vec<usize> {
+    let named = selection_state.members(selector);
+    coll.sections
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| named.contains(&s.name))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Emit the collection's `member_glue` (a live-prefilled structural token, e.g. a
@@ -2157,6 +2205,7 @@ fn select_collection_sections<R: ContentResolver>(
         SelectionRule::AlwaysVisible => {
             let mut out = Vec::with_capacity(coll.sections.len());
             for s in &coll.sections {
+                push_member_glue(&mut out, coll);
                 push_section_segment(&mut out, s);
             }
             out
@@ -2177,6 +2226,7 @@ fn select_collection_sections<R: ContentResolver>(
                 let mut out = Vec::new();
                 for name in target.split(FORCE_TOOL_SEPARATOR).map(str::trim) {
                     if let Some(s) = coll.sections.iter().find(|s| s.name == name) {
+                        push_member_glue(&mut out, coll);
                         push_section_segment(&mut out, s);
                         scores.set_section(s.id, coll.score_threshold.max(1.0), true);
                     }
@@ -2238,12 +2288,14 @@ fn select_collection_sections<R: ContentResolver>(
             for (s, b) in coll.sections.iter().zip(&beliefs) {
                 scores.set_section(s.id, b.score, b.qualified);
                 if b.selected {
+                    push_member_glue(&mut out, coll);
                     push_section_segment(&mut out, s);
                 }
             }
             // Default fallback: if the belief loop selected no member, emit the
             // collection's declared default section (by name) so the collection
-            // always contributes at least one section. Fires only when empty.
+            // always contributes at least one section. Fires only when empty, so
+            // there is nothing for glue to separate it from.
             if out.is_empty() {
                 if let Some(def) = &coll.default {
                     if let Some(s) = coll.sections.iter().find(|s| s.name == def.tag) {
@@ -2270,23 +2322,23 @@ fn select_collection_sections<R: ContentResolver>(
                 });
             let mut out = Vec::new();
             if let Some((s, _)) = best {
+                push_member_glue(&mut out, coll);
                 push_section_segment(&mut out, s);
             }
             out
         }
         SelectionRule::Named { selector } => {
-            // Explicit by-name pick: emit exactly the member whose `name` matches
-            // the runtime selector value. Score-independent.
+            // Explicit by-name pick: every member the runtime selector names, in
+            // the collection's declaration order. Score-independent.
             let mut out = Vec::new();
-            if let Some(target) = selection_state.get(selector) {
-                if let Some(s) = coll.sections.iter().find(|s| s.name == target) {
-                    push_section_segment(&mut out, s);
-                }
+            for i in named_indices(coll, selector, selection_state) {
+                push_member_glue(&mut out, coll);
+                push_section_segment(&mut out, &coll.sections[i]);
             }
             tracing::trace!(
                 collection = %coll.name,
                 selector = %selector,
-                target = selection_state.get(selector).unwrap_or(""),
+                named = selection_state.members(selector).len(),
                 selected = out.len(),
                 "projection (named)"
             );
@@ -2295,6 +2347,7 @@ fn select_collection_sections<R: ContentResolver>(
         SelectionRule::Sequence { .. } => {
             let mut out = Vec::with_capacity(coll.sections.len());
             for s in &coll.sections {
+                push_member_glue(&mut out, coll);
                 push_section_segment(&mut out, s);
             }
             out
@@ -2310,8 +2363,9 @@ fn select_tree_collection_segments<R: ContentResolver>(
     active_key: u32,
     resolver: &R,
     scoring: &CollectionScoring,
+    selection_state: &SelectionState,
 ) -> Vec<ProjectionSegment> {
-    let selected = select_collection_indices(&tc.collection, resolver, scoring);
+    let selected = select_collection_indices(&tc.collection, resolver, scoring, selection_state);
     let mut out = Vec::with_capacity(selected.len());
     for i in selected {
         if let Some(v) = tc.member_variant(i, active_key) {

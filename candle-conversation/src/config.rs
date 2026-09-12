@@ -113,6 +113,15 @@ pub struct SamplingConfig {
     /// `0.0` = disabled.
     pub cross_turn_penalty: f32,
 
+    /// How many of the sequence's most recent turns [`Self::cross_turn_penalty`]
+    /// sees. `0` = every turn since the conversation opened.
+    ///
+    /// The penalty is flat — a token used once costs what one used a hundred
+    /// times does — so without a bound it ends up on a character's whole
+    /// vocabulary and stops distinguishing anything. See
+    /// [`Self::for_character_dialogue`].
+    pub cross_turn_window: usize,
+
     // ── EOS Control ────────────────────────────────────────────────────
     /// Additive boost to the EOS token logit.
     /// Positive values encourage stopping; negative values discourage.
@@ -230,6 +239,39 @@ pub struct SamplingConfig {
     // ── RNG ────────────────────────────────────────────────────────────
     /// RNG seed for reproducible sampling.
     pub seed: u64,
+
+    /// The temperature/top_p pair this checkpoint publishes for each think
+    /// mode, swapped in by [`Self::set_think_mode`].
+    ///
+    /// `None` for a family that publishes one pairing for both modes, or whose
+    /// numbers here were matched to a measured reference run rather than read
+    /// off a card — then the think mode moves budgets and steering only, and
+    /// whatever temperature the caller set is left alone.
+    pub mode_sampling: Option<ModeSampling>,
+
+    /// The think mode whose pair `temperature` / `top_p` currently hold, as set
+    /// by [`Self::set_think_mode`]. `None` until one is applied, which means the
+    /// thinking row — the arch table's own default.
+    ///
+    /// Recorded so that editing a row re-adopts the right one whatever order a
+    /// caller applies things in, rather than leaving the old numbers standing
+    /// until some later turn happens to re-apply a mode.
+    pub think_mode: Option<crate::stencil::ThinkMode>,
+}
+
+/// The two temperature/top_p pairs a checkpoint publishes, one per think mode.
+///
+/// Qwen document these separately and they are not close: Qwen3.5 asks for
+/// `1.0 / 0.95` while it is reasoning and `0.7 / 0.8` while it is not. Carrying
+/// both on the config is what lets a per-turn think mode pick, rather than a
+/// process committing to one of them at load and running the other mode on the
+/// wrong numbers all day.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModeSampling {
+    /// `(temperature, top_p)` for a turn that reasons in a `<think>` block.
+    pub thinking: (f32, f32),
+    /// `(temperature, top_p)` for a think-suppressed turn.
+    pub instruct: (f32, f32),
 }
 
 impl Default for SamplingConfig {
@@ -247,6 +289,7 @@ impl Default for SamplingConfig {
             dry: None,
             repeat_last_n: 0,
             cross_turn_penalty: 0.0,
+            cross_turn_window: 0,
             eos_boost: 0.0,
             dynamic_eos_boost: false,
             eos_ramp_start: 0,
@@ -267,6 +310,8 @@ impl Default for SamplingConfig {
             banned_tokens: Vec::new(),
             stencil: Vec::new(),
             seed: 42,
+            mode_sampling: None,
+            think_mode: None,
         }
     }
 }
@@ -386,6 +431,26 @@ impl SamplingConfig {
             .with_eos_failsafe(800, 1000)
     }
 
+    /// `(temperature, top_p)` Qwen publish for a Qwen3.5-lineage **thinking**
+    /// turn, general tasks.
+    ///
+    /// Named rather than inlined because the two rows below differ by nothing a
+    /// reader can check at a glance — a transposed digit between them is a model
+    /// decoding on the other mode's card, which is silent.
+    const QWEN35_THINKING: (f32, f32) = (1.0, 0.95);
+
+    /// `(temperature, top_p)` Qwen publish for a Qwen3.5-lineage **instruct**
+    /// (think-suppressed) turn, general tasks.
+    const QWEN35_INSTRUCT: (f32, f32) = (0.7, 0.8);
+
+    /// `(temperature, top_p)` a cast decodes on when it is not reasoning — see
+    /// [`Self::for_character_dialogue`].
+    const CHARACTER_DIALOGUE: (f32, f32) = (1.0, 0.95);
+
+    /// How many turns back a cast's cross-turn penalty looks — see
+    /// [`Self::for_character_dialogue`].
+    const CHARACTER_CROSS_TURN_WINDOW: usize = 4;
+
     pub fn for_gguf_architecture(arch: &str) -> Self {
         match arch {
             // All Qwen3 models — dense and MoE — share the same official config.
@@ -403,12 +468,24 @@ impl SamplingConfig {
 
             // **Qwen3.5 and later — their own published sampling, the same steering.**
             //
-            // Qwen publish `temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5`
-            // for this generation and name the presence penalty as what "reduces endless
-            // repetitions". The difference from the Qwen3 row above is visible in the
-            // output, not just on paper: with the fallback's values the life generator
-            // produced an invented world, and with these it produced the character, on
-            // canon, at the right dates.
+            // Qwen publish a *pair* of settings for this generation, one per think
+            // mode, and they are not close: `1.0 / 0.95` while it reasons, `0.7 / 0.8`
+            // while it does not, with `top_k=20, presence_penalty=1.5,
+            // repetition_penalty=1.0` common to both. The presence penalty is what
+            // their card names as reducing "endless repetitions".
+            //
+            // This arm returns the **thinking** row, because that is what a config
+            // with no think mode applied yet should be; [`Self::set_think_mode`]
+            // swaps in the other from [`ModeSampling`] the moment a turn declares
+            // itself suppressed. Both rows were previously the non-thinking one —
+            // `non_thinking_for_gguf_architecture` derives from this arm and
+            // overrode only budgets — so the reasoning numbers existed nowhere and
+            // a thinking turn decoded on the instruct card.
+            //
+            // The difference from the Qwen3 row above is visible in the output, not
+            // just on paper: with the fallback's values the life generator produced
+            // an invented world, and with these it produced the character, on canon,
+            // at the right dates.
             //
             // **Being absent from this table is silent and catastrophic**, which is why
             // the list is long. The `_` arm below leaves `top_k` unset, the `</think>`
@@ -427,9 +504,13 @@ impl SamplingConfig {
             // cost of a string nobody emits is one alternation, and the cost of a
             // missing one is the paragraph above.
             "qwen35" | "qwen35moe" | "qwen36" | "qwen36moe" | "qwen38" | "qwen38moe" => {
-                Self::top_k_top_p(20, 0.8, 0.7)
+                Self::top_k_top_p(20, Self::QWEN35_THINKING.1, Self::QWEN35_THINKING.0)
                     .with_presence_penalty(1.5)
                     .with_repeat_penalty(1.0)
+                    .with_mode_sampling(ModeSampling {
+                        thinking: Self::QWEN35_THINKING,
+                        instruct: Self::QWEN35_INSTRUCT,
+                    })
                     .with_qwen_thinking_steering()
             }
 
@@ -465,9 +546,18 @@ impl SamplingConfig {
             // family has no thinking mode", which is false for every one of them —
             // `builder.rs` reads `<think>` straight out of their chat templates and
             // reports `thinking=true` in the same load.
+            //
+            // **`with_mode_sampling(Off)` is what makes this row differ in its
+            // sampled numbers at all.** Everything here is derived from the thinking
+            // arm, and for a long time the derivation touched only budgets — so the
+            // "non-thinking parameters" this function's own doc comment promises
+            // were, in temperature and top_p, the thinking ones. The families that
+            // publish a pair now carry it, and the swap reads the mode off
+            // [`ModeSampling`]; the ones that do not are unchanged by the call.
             "qwen3" | "qwen3moe" | "qwen2moe" | "qwen35" | "qwen35moe" | "qwen36" | "qwen36moe"
             | "qwen38" | "qwen38moe" => Some(
                 Self::for_gguf_architecture(arch)
+                    .with_mode_sampling_for(crate::stencil::ThinkMode::Off)
                     .with_no_segment_close()
                     // **`500` is the ramp's END, not its length.** The kernel
                     // computes `span = max(ramp_len - ramp_start, 1)`, so `100`
@@ -701,24 +791,56 @@ impl SamplingConfig {
     ///
     /// **Lighter than `presence_penalty` on purpose.** It is a blunt instrument:
     /// the kernel takes `min(count, 1)`, so a token used once is penalised
-    /// exactly as hard as one used a hundred times, and the counts accumulate
-    /// all day without decay. Set high it would push a character out of its own
-    /// vocabulary — its name, the words its persona is written in — for no
-    /// reason beyond having used them.
+    /// exactly as hard as one used a hundred times. Set high it would push a
+    /// character out of its own vocabulary — its name, the words its persona is
+    /// written in — for no reason beyond having used them.
     ///
-    /// **It also saturates, and that is worth knowing before relying on it.**
-    /// Once most of a character's working vocabulary has been used, the penalty
-    /// is close to a uniform shift, and softmax is shift-invariant — so it does
-    /// most of its work early in a day and fades. It will not break a
-    /// distribution that has already collapsed: a character whose window holds
-    /// ten copies of one act is choosing the next token at p ≈ 1, and 0.2 of a
-    /// logit against that is nothing. That collapse is a context problem, not a
-    /// sampling one, and it is fixed where the context is built.
+    /// **It looks back a finite number of turns:**
+    /// [`Self::CHARACTER_CROSS_TURN_WINDOW`], four. It used to see every turn
+    /// since the conversation opened, and a flat penalty that never forgets
+    /// saturates: once most of a character's working vocabulary has been used it
+    /// is a uniform shift, softmax is shift-invariant, and it stops telling one
+    /// act from another. The cast was seen looping with it nominally on — one
+    /// character walked between two rooms twenty times running. Four turns
+    /// covers a two-act oscillation twice over, and is short enough that a word
+    /// out of use is cheap again a few turns later.
+    ///
+    /// It still will not break a distribution that has already collapsed: a
+    /// character whose window holds ten copies of one act is choosing the next
+    /// token at p ≈ 1, and 0.2 of a logit against that is nothing. That collapse
+    /// is a context problem, not a sampling one, and it is fixed where the
+    /// context is built. What the window does is keep one from forming.
+    /// # The think-off row is widened, not left on the card
+    ///
+    /// Qwen's card gives a think-suppressed turn `0.7 / 0.8`, and a cast is
+    /// think-suppressed on almost every turn. On that row the cast loops: over
+    /// about ninety turns measured live, one character walked between two rooms
+    /// twenty times running without answering the question every perception
+    /// reminded it of, and another asked one question more than a dozen times in
+    /// fresh words. It is the failure recorded against this row before — a
+    /// character handed a situation much like the last one lands on the same act
+    /// out of a nucleus that narrow.
+    ///
+    /// So the **instruct row** becomes [`Self::CHARACTER_DIALOGUE`], `1.0 /
+    /// 0.95`, and the thinking row stays as the card has it. It is set on the row
+    /// rather than on `temperature` because the think mode is applied per turn
+    /// and adopts its row each time — a value written straight into
+    /// `temperature` would be overwritten by the first turn that declared a
+    /// mode. A family with no per-mode rows has the one pair, and takes it
+    /// directly.
+    ///
+    /// The rest is about dialogue rather than the checkpoint: the presence
+    /// penalty cut to a fifth of the card's, with the repetition load moved onto
+    /// DRY and `cross_turn_penalty`.
     pub fn for_character_dialogue(mut self) -> Self {
-        self.temperature = 1.0;
-        self.top_p = 0.95;
+        match self.mode_sampling.as_mut() {
+            Some(modes) => modes.instruct = Self::CHARACTER_DIALOGUE,
+            None => (self.temperature, self.top_p) = Self::CHARACTER_DIALOGUE,
+        }
+        self.adopt_mode_pair();
         self.presence_penalty = 0.3;
         self.cross_turn_penalty = 0.2;
+        self.cross_turn_window = Self::CHARACTER_CROSS_TURN_WINDOW;
         self.with_dry_penalty(1.0, 1.75, 2, 512)
     }
 
@@ -907,11 +1029,76 @@ impl SamplingConfig {
         max_response_tokens: usize,
     ) {
         self.resolve_thinking_tokens(tokenizer);
+        self.set_think_mode(mode, max_response_tokens);
+    }
+
+    /// [`Self::apply_think_mode`] without the tokenizer, as a builder.
+    ///
+    /// **This is the per-turn entry point.** The thinking token ids are resolved
+    /// once at engine start and do not change, so a caller that already holds a
+    /// resolved config can switch a single turn's mode without taking the engine
+    /// lock for a tokenizer it does not need — which is what makes a per-turn
+    /// think mode affordable at all.
+    pub fn with_think_mode(
+        mut self,
+        mode: crate::stencil::ThinkMode,
+        max_response_tokens: usize,
+    ) -> Self {
+        self.set_think_mode(mode, max_response_tokens);
+        self
+    }
+
+    /// Everything a think mode decides except the token ids: the sampled pair,
+    /// the in-segment steering, and the close budget.
+    fn set_think_mode(&mut self, mode: crate::stencil::ThinkMode, max_response_tokens: usize) {
         self.segment_suppress_penalty = mode.suppress_penalty();
         if mode == crate::stencil::ThinkMode::Off {
             self.segment_temp_boost = 0.0;
         }
+        self.set_mode_sampling(mode);
         self.set_think_close_budget(mode, max_response_tokens);
+    }
+
+    /// Record the checkpoint's per-mode temperature/top_p pairs, and adopt the
+    /// one for the current mode — the thinking row, when none has been applied.
+    ///
+    /// Adopting rather than only recording keeps the arch table's return value
+    /// honest: what [`Self::for_gguf_architecture`] hands back is what a turn
+    /// decodes on when nothing has declared a mode yet, and for these families
+    /// that is the reasoning row.
+    pub fn with_mode_sampling(mut self, modes: ModeSampling) -> Self {
+        self.mode_sampling = Some(modes);
+        self.adopt_mode_pair();
+        self
+    }
+
+    /// Adopt the published temperature/top_p for one think mode, changing
+    /// nothing else.
+    ///
+    /// A no-op on a config with no [`ModeSampling`] — a family that publishes a
+    /// single pairing keeps whatever the caller set.
+    pub fn with_mode_sampling_for(mut self, mode: crate::stencil::ThinkMode) -> Self {
+        self.set_mode_sampling(mode);
+        self
+    }
+
+    fn set_mode_sampling(&mut self, mode: crate::stencil::ThinkMode) {
+        self.think_mode = Some(mode);
+        self.adopt_mode_pair();
+    }
+
+    /// Put the current mode's published pair into `temperature` / `top_p`.
+    ///
+    /// A no-op on a config with no [`ModeSampling`]: a family that publishes a
+    /// single pairing keeps whatever the caller set.
+    fn adopt_mode_pair(&mut self) {
+        let Some(modes) = self.mode_sampling else {
+            return;
+        };
+        (self.temperature, self.top_p) = match self.think_mode {
+            Some(crate::stencil::ThinkMode::Off) => modes.instruct,
+            _ => modes.thinking,
+        };
     }
 
     /// The tokenizer-independent half of [`Self::apply_think_mode`]: program the
@@ -1940,6 +2127,117 @@ mod sampling_config_tests {
         assert!(run(8) > 20.0, "an eight-token loop must be unreachable");
     }
 
+    /// **Both of Qwen's published rows exist, and they are the right way round.**
+    ///
+    /// The lineage publishes a temperature and nucleus per think mode — `1.0/0.95`
+    /// reasoning, `0.7/0.8` not — and the table carried the *instruct* row under
+    /// both, because the non-thinking arm derives from the thinking one and
+    /// overrode only budgets. So the reasoning numbers were nowhere in the
+    /// repository and a deliberating turn decoded on the instruct card, silently:
+    /// both rows are valid sampling, and nothing fails when the wrong one is used.
+    #[test]
+    fn each_think_mode_gets_its_own_published_temperature() {
+        let thinking = SamplingConfig::for_gguf_architecture("qwen35");
+        let instruct = SamplingConfig::non_thinking_for_gguf_architecture("qwen35")
+            .expect("this family has a non-thinking mode");
+
+        assert_eq!((thinking.temperature, thinking.top_p), (1.0, 0.95));
+        assert_eq!((instruct.temperature, instruct.top_p), (0.7, 0.8));
+        // The rest of the card is common to both rows; only the pair moves.
+        assert_eq!(thinking.top_k, instruct.top_k);
+        assert_eq!(thinking.presence_penalty, instruct.presence_penalty);
+    }
+
+    /// The mode swap runs in both directions and is reversible.
+    ///
+    /// A per-turn switch that only widened would leave a cast on the reasoning
+    /// row for the rest of the process the first time one character deliberated.
+    #[test]
+    fn a_turns_think_mode_moves_the_sampled_pair_both_ways() {
+        use crate::stencil::ThinkMode;
+        let base = SamplingConfig::for_gguf_architecture("qwen35");
+
+        let off = base.clone().with_think_mode(ThinkMode::Off, 4096);
+        assert_eq!((off.temperature, off.top_p), (0.7, 0.8));
+
+        let back = off.clone().with_think_mode(ThinkMode::Balanced, 4096);
+        assert_eq!((back.temperature, back.top_p), (1.0, 0.95));
+
+        // And every reasoning dial is the same row — the pair is about whether
+        // there is a think block, not how long it is.
+        for mode in [ThinkMode::Quick, ThinkMode::Deep, ThinkMode::Exhaustive] {
+            let m = base.clone().with_think_mode(mode, 4096);
+            assert_eq!((m.temperature, m.top_p), (1.0, 0.95), "{mode:?}");
+        }
+    }
+
+    /// **A family with no published pair is left alone by the swap.**
+    ///
+    /// `qwen3`'s numbers were matched to a measured LM Studio reference run, not
+    /// read off a card, so there is no second row to move to — and a mode switch
+    /// that invented one would quietly undo that matching.
+    #[test]
+    fn a_family_without_a_published_pair_keeps_its_measured_numbers() {
+        use crate::stencil::ThinkMode;
+        let base = SamplingConfig::for_gguf_architecture("qwen3");
+        assert!(base.mode_sampling.is_none());
+
+        let (t, p) = (base.temperature, base.top_p);
+        for mode in [ThinkMode::Off, ThinkMode::Deep] {
+            let m = base.clone().with_think_mode(mode, 4096);
+            assert_eq!((m.temperature, m.top_p), (t, p), "{mode:?}");
+        }
+    }
+
+    /// **The cast decodes on the wide pair, whichever order things are applied in.**
+    ///
+    /// The think mode is applied per turn and adopts its row each time, so the
+    /// dialogue tuning lives on the row — and the config records which row it is
+    /// on, so tuning one that was already think-off takes effect at once rather
+    /// than on whichever later turn next re-applies a mode. The reflection and
+    /// `open_conversation` read the config directly, and would otherwise have
+    /// decoded on the card's narrow row while the probe did not.
+    #[test]
+    fn the_cast_decodes_on_the_wide_pair_in_both_modes() {
+        use crate::stencil::ThinkMode;
+        let base = SamplingConfig::for_gguf_architecture("qwen35");
+
+        let tuned_first = base
+            .clone()
+            .for_character_dialogue()
+            .with_think_mode(ThinkMode::Off, 4096);
+        let mode_first = base
+            .clone()
+            .with_think_mode(ThinkMode::Off, 4096)
+            .for_character_dialogue();
+        for cast in [&tuned_first, &mode_first] {
+            assert_eq!((cast.temperature, cast.top_p), (1.0, 0.95));
+            assert_eq!(cast.presence_penalty, 0.3);
+            assert_eq!(cast.cross_turn_penalty, 0.2);
+            assert!(cast.dry.is_some());
+        }
+
+        // A deliberating turn is on the card's thinking row — the same pair here.
+        let deliberating = mode_first.with_think_mode(ThinkMode::Deep, 4096);
+        assert_eq!((deliberating.temperature, deliberating.top_p), (1.0, 0.95));
+        // And coming back out of it lands on the cast's row, not the card's.
+        let back = deliberating.with_think_mode(ThinkMode::Off, 4096);
+        assert_eq!((back.temperature, back.top_p), (1.0, 0.95));
+
+        // A caller that is not a cast keeps the card's instruct row.
+        let assistant = base.with_think_mode(ThinkMode::Off, 4096);
+        assert_eq!((assistant.temperature, assistant.top_p), (0.7, 0.8));
+    }
+
+    /// A family with one published pairing has no rows to widen, so the cast
+    /// takes the pair directly — as every family did before per-mode rows.
+    #[test]
+    fn a_family_without_rows_takes_the_dialogue_pair_directly() {
+        let cast = SamplingConfig::for_gguf_architecture("qwen3").for_character_dialogue();
+        assert!(cast.mode_sampling.is_none());
+        assert_eq!((cast.temperature, cast.top_p), (1.0, 0.95));
+    }
+
     /// **Something has to reach across a turn boundary.**
     ///
     /// DRY is span-scoped — the kernel resets its window at every `<think>` and
@@ -1961,7 +2259,17 @@ mod sampling_config_tests {
         );
         assert!(
             c.cross_turn_penalty < c.presence_penalty,
-            "a flat all-day penalty must not outweigh the within-turn one"
+            "a flat cross-turn penalty must not outweigh the within-turn one"
+        );
+        assert!(
+            c.cross_turn_window > 0,
+            "a flat penalty that never forgets ends up on the whole vocabulary and tells no act \
+             from any other"
+        );
+        assert_eq!(
+            SamplingConfig::for_gguf_architecture("qwen35").cross_turn_window,
+            0,
+            "callers that are not a cast keep the unbounded default"
         );
     }
 

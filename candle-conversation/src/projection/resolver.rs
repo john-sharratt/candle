@@ -185,7 +185,7 @@ fn subwindow_bounds(len: usize, seams: &[usize]) -> Vec<(usize, usize)> {
 /// The name of the section a projection selected inside `collection`, if any.
 fn selected_in_collection(sel: &ProjectionSelection, collection: &str) -> Option<String> {
     sel.system.iter().find_map(|item| match item {
-        SystemItem::Collection { name, sections } if name == collection => {
+        SystemItem::Collection { name, sections, .. } if name == collection => {
             sections.iter().find(|s| s.selected).map(|s| s.name.clone())
         }
         _ => None,
@@ -4021,6 +4021,8 @@ mod tests {
         let sel = ProjectionSelection {
             system: vec![SystemItem::Collection {
                 name: "tools".into(),
+                member_glue: String::new(),
+                member_glue_tokens: 0,
                 sections: vec![
                     SelectedSection {
                         name: "a".into(),
