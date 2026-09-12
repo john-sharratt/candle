@@ -8,8 +8,11 @@
 //! and leave the one the host counted unwritten (see
 //! `KvCache::commit_written_tokens`).
 //!
-//! Two places ask:
+//! Three places ask:
 //!
+//! * [`check_prefill_write`], straight after the paged prefill kernel, for the
+//!   narrow rows that open a fresh chunk: whether the kernel's own write reached
+//!   the band the host names, with the kernel's record beside the host's.
 //! * [`check_committed_rows`], after a wave whose head ran: each decode and
 //!   prefill row has just committed `offset .. offset + input_len` to every
 //!   layer its sweep reached, the last included, and its tail is read back. A
@@ -35,7 +38,8 @@ use candle_nn::kv_cache::{BlockBands, KvCache};
 
 use super::batched_inference::BatchedInferenceSession;
 use super::decode_kv_walk::{
-    band_payload_bytes, parse_slices, parse_slot_header, read_device, scan_band, RECORD_BYTES,
+    band_payload_bytes, head_record_bytes, parse_record, parse_slices, parse_slot_header,
+    read_device, scan_band, RECORD_BYTES,
 };
 use super::kv_cache_utils::SequenceContext;
 
@@ -185,12 +189,173 @@ fn check_row(cache: &KvCache, dev: &CudaDevice, offset: usize, len: usize) -> Re
     }))
 }
 
+/// Prefill rows of at most this many new tokens are read back as soon as the
+/// kernel that wrote them has run. Every hole found in a prefill row has been a
+/// 2-token block opening a fresh chunk, and the read costs a synchronisation
+/// per layer, so wide rows are left to the wave-end check.
+const PREFILL_ROWS_READ_AT_WRITE: usize = 4;
+
+/// Read each narrow prefill row's new positions straight back after the paged
+/// prefill kernel wrote them, while the header table it wrote through is alive.
+///
+/// The wave-end check finds such a hole but cannot say when it was made: the
+/// header upload is gone by then. Here a missing position means the kernel's
+/// own write did not reach the band the host block table names, and the report
+/// sets the kernel's record for that chunk beside the host's band addresses —
+/// which says whether it wrote through the wrong pointers. A position present
+/// here and missing at wave end was replaced afterwards.
+///
+/// Only rows whose first new position opens a chunk are read: that is where
+/// every prefill hole has been, and it keeps the synchronisation off the
+/// speculative verify blocks that fill a chunk a few rows at a time.
+pub(crate) fn check_prefill_write(
+    caches: &[&mut KvCache],
+    offsets: &[usize],
+    q_lens: &[usize],
+    headers: u64,
+    dev: &CudaDevice,
+    n_kv_head: usize,
+    head_dim: usize,
+) {
+    for (row, cache) in caches.iter().enumerate() {
+        let (offset, len) = (offsets[row], q_lens[row]);
+        if len == 0 || len > PREFILL_ROWS_READ_AT_WRITE {
+            continue;
+        }
+        let kc = cache.k_cache();
+        let (Some(backing), Some(batch)) = (kc.chunked_backing(), kc.chunked_batch_idx()) else {
+            continue;
+        };
+        let Ok(blocks) = backing.band_map(batch) else {
+            continue;
+        };
+        let windows: Vec<(u16, u32)> = blocks.iter().map(|b| (b.offset, b.usage)).collect();
+        let opens_a_chunk = matches!(
+            slot_of(&windows, offset),
+            Some((blk, slot)) if slot == windows[blk].0 as usize
+        );
+        if !opens_a_chunk {
+            continue;
+        }
+        match check_row(cache, dev, offset, len) {
+            Ok(RowCheck::Hole(h)) => {
+                let record = record_vs_host(dev, headers, row, h.chunk, cache, n_kv_head, head_dim);
+                panic!(
+                    "PREFILL WRITE MISSING: the paged prefill kernel wrote positions {offset}..{} \
+                     of batch row {row}, and position {} reads unwritten straight after it (the \
+                     layer holds {}). Unwritten: {:?}. Position {} is chunk {} slot {}. Written \
+                     slots by chunk, from the hole's: {:?}. Last chunk windows (offset, tokens): \
+                     {:?}. Writer: {}. The kernel's record for that chunk: {record}. Recent \
+                     block-table mutations of this layer, oldest first: {}.",
+                    offset + len,
+                    h.positions[0],
+                    h.held,
+                    h.positions,
+                    h.positions[0],
+                    h.chunk,
+                    h.slot,
+                    h.written,
+                    h.tail,
+                    writer_of(cache),
+                    mutations_of(cache),
+                )
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                target: "candle_transformers::head_hole_check",
+                row,
+                offset,
+                "prefill write check could not read this row: {e}"
+            ),
+        }
+    }
+}
+
+/// The kernel's `KvHead` record for chunk `chunk` of header row `row`, head 0's
+/// K band addresses, beside the addresses the host block table names for it.
+fn record_vs_host(
+    dev: &CudaDevice,
+    table: u64,
+    row: usize,
+    chunk: usize,
+    cache: &KvCache,
+    n_kv_head: usize,
+    head_dim: usize,
+) -> String {
+    let read = || -> Result<String> {
+        // SAFETY: `table` is the header table the kernel just read, alive until
+        // the prefill call returns; one 16-byte header per batch row.
+        let hdr = parse_slot_header(&unsafe {
+            read_device(dev, table + (row * RECORD_BYTES) as u64, RECORD_BYTES)?
+        })?;
+        // SAFETY: the header names `n_slices` 16-byte slices at `slices_ptr`.
+        let slices = parse_slices(&unsafe {
+            read_device(dev, hdr.slices_ptr, hdr.n_slices as usize * RECORD_BYTES)?
+        })?;
+        let Some(slice) = slices.get(chunk) else {
+            return Ok(format!("the header holds {} slices, none at {chunk}", slices.len()));
+        };
+        let kc = cache.k_cache();
+        let (Some(backing), Some(batch)) = (kc.chunked_backing(), kc.chunked_batch_idx()) else {
+            return Ok("not chunked".to_string());
+        };
+        let blocks = backing.band_map(batch)?;
+        let Some(block) = blocks.get(chunk) else {
+            return Ok(format!("the host table holds {} chunks, none at {chunk}", blocks.len()));
+        };
+        let n_palette = (block.k.len() / n_kv_head.max(1)).max(1);
+        let bytes = head_record_bytes(head_dim, n_palette) * n_kv_head;
+        // SAFETY: `kvheads_ptr` names the chunk's `KvHead[n_kv_head]` record,
+        // `bytes` long, which the kernel just dereferenced.
+        let heads = parse_record(
+            &unsafe { read_device(dev, slice.kvheads_ptr, bytes)? },
+            n_kv_head,
+            head_dim,
+            n_palette,
+        )?;
+        let device_k = heads.first().map(|h| h.k_ptr.clone()).unwrap_or_default();
+        let host_k: Vec<u64> = block.k.iter().take(n_palette).map(|b| b.ptr).collect();
+        let (device_k_fmt, device_v_fmt) = heads
+            .first()
+            .map(|h| (h.k_fmt.clone(), h.v_fmt.clone()))
+            .unwrap_or_default();
+        let host_k_fmt: Vec<u8> = block.k.iter().take(n_palette).map(|b| b.fmt).collect();
+        let host_v_fmt: Vec<u8> = block.v.iter().take(n_palette).map(|b| b.fmt).collect();
+        Ok(format!(
+            "header n_slices {} write_slice {}; slice {chunk} (offset {}, len {}, rope {}) record \
+             at {:#x}: head 0 K bands {device_k:x?} on the device, {host_k:x?} in the host table \
+             — {}; head 0 formats K {device_k_fmt:?} V {device_v_fmt:?} on the device, K \
+             {host_k_fmt:?} V {host_v_fmt:?} in the host table",
+            hdr.n_slices,
+            hdr.write_slice,
+            slice.offset,
+            slice.len,
+            slice.rope,
+            slice.kvheads_ptr,
+            if device_k == host_k { "the same" } else { "DIFFERENT" },
+        ))
+    };
+    read().unwrap_or_else(|e| format!("unreadable ({e})"))
+}
+
 /// A layer's writer boundary and writer chunk, as the host holds them.
 fn writer_of(cache: &KvCache) -> String {
     let kc = cache.k_cache();
     match (kc.chunked_backing(), kc.chunked_batch_idx()) {
         (Some(backing), Some(batch)) => match backing.writer_indices(batch) {
             Ok(w) => format!("{w:?}"),
+            Err(e) => format!("unreadable ({e})"),
+        },
+        _ => "not chunked".to_string(),
+    }
+}
+
+/// The layer's recent block-table mutations, oldest first.
+pub(crate) fn mutations_of(cache: &KvCache) -> String {
+    let kc = cache.k_cache();
+    match (kc.chunked_backing(), kc.chunked_batch_idx()) {
+        (Some(backing), Some(batch)) => match backing.block_table_mutations(batch) {
+            Ok(m) => format!("{m:?}"),
             Err(e) => format!("unreadable ({e})"),
         },
         _ => "not chunked".to_string(),
@@ -262,7 +427,8 @@ pub(crate) fn check_committed_rows(
                      chunk {} slot {}. Written slots by chunk, from the hole's: {:?}. Last chunk \
                      windows (offset, tokens): {:?}. Head layer writer: {}. First KV layer \
                      writer: {}; over the same positions it reads: {first_verdict}. Wave: \
-                     {n_decode} decode rows, {n_prefill} prefill rows.",
+                     {n_decode} decode rows, {n_prefill} prefill rows. Recent block-table \
+                     mutations of the head layer, oldest first: {}.",
                     h.positions[0],
                     seqs[i],
                     ctx.offset,
@@ -277,6 +443,7 @@ pub(crate) fn check_committed_rows(
                     h.tail,
                     writer_of(cache),
                     first.map_or_else(|| "none".to_string(), writer_of),
+                    mutations_of(cache),
                 )
             }
             // An instrument that cannot read its data must not take the wave

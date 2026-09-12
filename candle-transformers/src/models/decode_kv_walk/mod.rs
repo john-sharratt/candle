@@ -33,7 +33,8 @@ pub(crate) use rows::nonfinite_rows;
 
 pub(crate) use band::{band_payload_bytes, scan_band};
 pub(crate) use headers::{parse_slices, parse_slot_header, RECORD_BYTES};
-use record::{expected_ptr, head_record_bytes, parse_record};
+use record::expected_ptr;
+pub(crate) use record::{head_record_bytes, parse_record};
 
 use candle::cuda_backend::CudaDevice;
 use candle::tensor_assert::Dump;

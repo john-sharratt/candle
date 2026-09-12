@@ -73,7 +73,7 @@ pub use chunked::span_geometry;
 pub use chunked::span_claims;
 /// Band addresses from the host block table, for captures that read KV raw.
 #[cfg(feature = "tensor-assert")]
-pub use chunked::{BandAddr, BlockBands, WriterIndices};
+pub use chunked::{BandAddr, BlockBands, BlockTableMutation, WriterIndices};
 pub use chunked::wave_plan::{
     ffn_work_dtype, BufferShape, Chain, DeltaNetWidths, Encoding, LayerPhase, ModelGeometry,
     WaveBuffer, WavePlan, WaveWidth, BUMP_ALIGNMENT,

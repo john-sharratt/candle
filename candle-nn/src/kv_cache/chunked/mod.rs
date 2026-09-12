@@ -92,6 +92,8 @@ mod writer_len_audit;
 mod band_map;
 #[cfg(feature = "tensor-assert")]
 pub use band_map::{BandAddr, BlockBands, WriterIndices};
+#[cfg(feature = "tensor-assert")]
+pub use types::BlockTableMutation;
 pub mod span_geometry;
 mod types;
 // Instrumentation for the bump arenas' high-water marks: its only caller is

@@ -10,6 +10,7 @@
 use candle::Result;
 
 use super::backing::ChunkedKvBacking;
+use super::types::BlockTableMutation;
 use crate::kv_cache::{ArenaFormatTag, ResolvedArenaInfo};
 
 /// One band's device address and storage format tag.
@@ -106,6 +107,19 @@ impl ChunkedKvBacking {
             writer: seq.decode_write_chunk_idx(),
             chunks: seq.chunks_slice().len(),
         })
+    }
+
+    /// `batch_idx`'s most recent block-table mutations, oldest first — what
+    /// last reshaped this layer's table, for a report that has found it wrong.
+    pub fn block_table_mutations(&self, batch_idx: usize) -> Result<Vec<BlockTableMutation>> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let Some(Some(seq)) = state.sequences.get(batch_idx) else {
+            candle::bail!("block table mutations: slot {batch_idx} is not allocated");
+        };
+        Ok(seq.mutations())
     }
 }
 

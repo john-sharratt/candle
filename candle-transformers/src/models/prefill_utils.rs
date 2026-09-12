@@ -19,6 +19,8 @@ use {
     half::{bf16, f16},
 };
 
+#[cfg(feature = "tensor-assert")]
+use crate::models::head_hole_check::{check_prefill_write, mutations_of};
 #[cfg(feature = "cuda")]
 use crate::models::prefill_capture::maybe_capture;
 use crate::models::qsa_selection::QsaSelection;
@@ -279,11 +281,17 @@ fn build_slot_headers(
         if q_lens[slot_i] > 0 {
             if let Some(&(false, k_tag, v_tag)) = writable.get(w) {
                 let tokens = layout.chunks[w].1;
+                // What put it there, where the block-table history is kept.
+                #[cfg(feature = "tensor-assert")]
+                let history = mutations_of(cache);
+                #[cfg(not(feature = "tensor-assert"))]
+                let history = String::from("kept under tensor-assert only");
                 candle::bail!(
                     "slot header build: batch slot {slot_i}'s write chunk {w} ({tokens} tokens) \
                      is in a format the paged stores cannot write (K tag {k_tag}, V tag \
                      {v_tag}) — every token of this prefill would be dropped without a fault. \
-                     A sealed chunk with room left in it is standing in the writer region."
+                     A sealed chunk with room left in it is standing in the writer region. \
+                     Recent block-table mutations of this layer, oldest first: {history}."
                 );
             }
         }
@@ -624,6 +632,12 @@ fn paged_prefill_batched_impl<'w>(
     // a verify block is exactly this commit on a sequence mid-decode.
     for ((cache, &off), &add) in caches.iter_mut().zip(offsets.iter()).zip(q_lens.iter()) {
         cache.commit_written_tokens(off, add)?;
+    }
+    // The narrow rows' new positions, read straight back while the header
+    // table they were written through is alive — see `check_prefill_write`.
+    #[cfg(feature = "tensor-assert")]
+    if let Device::Cuda(dev) = q.device() {
+        check_prefill_write(caches, offsets, q_lens, headers_ptr, dev, n_kv_head, head_dim);
     }
 
     // After each prefill layer, eagerly quantize all fully-sealed chunks so that

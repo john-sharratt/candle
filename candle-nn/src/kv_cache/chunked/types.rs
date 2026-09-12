@@ -30,7 +30,33 @@ use super::meta_pool::MetaGid;
 use crate::kv_cache::arena_table::{ArenaFormatTag, ResolvedArenaInfo};
 #[cfg(feature = "cuda")]
 use candle::cuda_backend::cudarc::driver::CudaStream;
+#[cfg(feature = "tensor-assert")]
+use std::collections::VecDeque;
 use std::sync::Arc;
+
+/// Block-table mutations each sequence keeps under `tensor-assert`.
+#[cfg(feature = "tensor-assert")]
+const MUTATIONS_KEPT: usize = 24;
+
+/// One structural change to a sequence's block table, kept under
+/// `tensor-assert` so a report that finds the table wrong can say what last
+/// reshaped it.
+#[cfg(feature = "tensor-assert")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockTableMutation {
+    /// The mutator that ran.
+    pub site: &'static str,
+    /// The block it touched — the last, for a range, since the tail is where
+    /// writes go.
+    pub blk: usize,
+    /// Blocks in the table afterwards.
+    pub blocks: usize,
+    /// The writer boundary afterwards.
+    pub writer_start: usize,
+    /// Palette 0's K format tag of that block afterwards; `Invalid` when there
+    /// is no such block.
+    pub k_tag: u8,
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ChunkMeta — packed per-block metadata for paged attention kernels
@@ -557,6 +583,9 @@ pub(crate) struct SequenceState {
     /// every non-windowed slot (dialogue/section KV never evicts its front), so
     /// those paths are byte-identical to a `base_pos == 0` derivation.
     base_pos: u32,
+    /// The most recent structural changes to this table, oldest first.
+    #[cfg(feature = "tensor-assert")]
+    mutations: VecDeque<BlockTableMutation>,
 }
 
 impl SequenceState {
@@ -567,7 +596,39 @@ impl SequenceState {
             gpu_chunks: GpuChunks::new(stream),
             writer_start_idx: 0,
             base_pos: 0,
+            #[cfg(feature = "tensor-assert")]
+            mutations: VecDeque::new(),
         }
+    }
+
+    /// Append one entry to the mutation ring — see [`BlockTableMutation`].
+    #[cfg(feature = "tensor-assert")]
+    fn record(&mut self, site: &'static str, blk: usize) {
+        let k_tag = self
+            .chunks
+            .get(blk)
+            .and_then(|c| c.k_fmt.first().copied())
+            .unwrap_or(ArenaFormatTag::Invalid.as_u8());
+        if self.mutations.len() == MUTATIONS_KEPT {
+            self.mutations.pop_front();
+        }
+        self.mutations.push_back(BlockTableMutation {
+            site,
+            blk,
+            blocks: self.chunks.len(),
+            writer_start: self.writer_start_idx,
+            k_tag,
+        });
+    }
+
+    #[cfg(not(feature = "tensor-assert"))]
+    #[inline(always)]
+    fn record(&mut self, _site: &'static str, _blk: usize) {}
+
+    /// The most recent structural changes to this table, oldest first.
+    #[cfg(feature = "tensor-assert")]
+    pub(super) fn mutations(&self) -> Vec<BlockTableMutation> {
+        self.mutations.iter().copied().collect()
     }
 
     #[cfg(not(feature = "cuda"))]
@@ -588,6 +649,7 @@ impl SequenceState {
     #[inline]
     pub(crate) fn set_writer_start_idx(&mut self, idx: usize) {
         self.writer_start_idx = idx;
+        self.record("set_writer_start_idx", idx);
     }
 
     /// Move the writer boundary past every chunk in the writer region the
@@ -701,6 +763,7 @@ impl SequenceState {
             // emitting a stale `kvheads_ptr`.
             cw.meta = None;
         }
+        self.record("set_block_gids", blk);
     }
 
     /// Compute the ABSOLUTE RoPE base position for block `blk`: the count of
@@ -1023,12 +1086,14 @@ impl SequenceState {
     pub(crate) fn push_chunk(&mut self, cw: ChunkWindow) {
         self.chunks.push(cw);
         self.gpu_chunks.as_mut().clear();
+        self.record("push_chunk", self.chunks.len() - 1);
     }
 
     /// Clear all chunks and clear the GPU buffer.
     pub(crate) fn clear_chunks(&mut self) {
         self.chunks.clear();
         self.gpu_chunks.as_mut().clear();
+        self.record("clear_chunks", 0);
     }
 
     /// Drain the first `n` chunks (RAII-drops their GIDs) and clear the GPU buffer.
@@ -1038,19 +1103,23 @@ impl SequenceState {
         if n > 0 {
             self.gpu_chunks.as_mut().clear();
         }
+        self.record("drain_front_chunks", n);
     }
 
     /// Prepend `prefix` before all existing chunks; GPU buffer is cleared.
     pub(crate) fn prepend_chunks(&mut self, mut prefix: Vec<ChunkWindow>) {
+        let prepended = prefix.len();
         prefix.extend(std::mem::take(&mut self.chunks));
         self.chunks = prefix;
         self.gpu_chunks.as_mut().clear();
+        self.record("prepend_chunks", prepended.saturating_sub(1));
     }
 
     /// Replace all chunks with `new_chunks` and clear the GPU buffer.
     pub(crate) fn replace_chunks(&mut self, new_chunks: Vec<ChunkWindow>) {
         self.chunks = new_chunks;
         self.gpu_chunks.as_mut().clear();
+        self.record("replace_chunks", self.chunks.len().saturating_sub(1));
     }
 
     /// Drain all chunks from index `at` onward into a `Vec`.  GPU buffer is
@@ -1058,6 +1127,7 @@ impl SequenceState {
     pub(crate) fn split_off_chunks(&mut self, at: usize) -> Vec<ChunkWindow> {
         let tail = self.chunks.split_off(at);
         self.gpu_chunks.as_mut().clear();
+        self.record("split_off_chunks", at);
         tail
     }
 
@@ -1068,6 +1138,7 @@ impl SequenceState {
             self.chunks.truncate(n);
             self.gpu_chunks.as_mut().clear();
         }
+        self.record("truncate_chunks", n);
     }
 
     /// Extend with additional `ChunkWindow`s and invalidate the cached GPU
@@ -1081,6 +1152,7 @@ impl SequenceState {
     pub(crate) fn extend_chunks(&mut self, iter: impl IntoIterator<Item = ChunkWindow>) {
         self.chunks.extend(iter);
         self.gpu_chunks.as_mut().clear();
+        self.record("extend_chunks", self.chunks.len().saturating_sub(1));
         self.seal_unwritable_writer_region();
     }
 
