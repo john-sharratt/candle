@@ -824,23 +824,27 @@ impl SequenceState {
         self.gpu_chunks.as_mut().clear();
     }
 
-    /// Re-serialise the WRITER REGION's slices — every chunk from the writer
-    /// boundary to the current writer — in the cached decode GPU buffer after
-    /// a prefill wrote tokens without the decode kernel's self-increment (a
-    /// prompt, a stencil static run, a think-steer continuation).
+    /// Bring the cached decode GPU buffer up to date after a commit made
+    /// outside the decode kernel — a prefill, a glue writeback, a speculative
+    /// verify block, a stencil static run.
     ///
-    /// The prefill write path keeps host state authoritative: `set_len`
-    /// tops up usages from the writer boundary through consecutive chunks to
-    /// the sequence length. The buffer, built before the prefill from the
-    /// same chunks (their chunks are allocated up front, so no append clears
-    /// it during the prefill), still carries their pre-prefill lengths, so
-    /// every chunk in that region is patched under the guard (async H→D on
-    /// drop) — the chunks below the boundary are shared and unwritten. This
-    /// is O(chunks the prefill wrote) against dropping and re-uploading the
-    /// entire per-layer table, which at depth costs megabytes of pinned
-    /// realloc and a stream sync per layer. A missing buffer is left for the
-    /// next decode sync's full rebuild; a shape mismatch (defensive) falls
-    /// back to full invalidation.
+    /// The decode kernel advances the buffer's writer length itself, on the
+    /// device; `set_len` advances only the host. Left alone, the next decode
+    /// reuses the buffer at the pre-commit length, writes its token over a
+    /// committed one, and leaves a slot the host counts unwritten.
+    ///
+    /// `set_len` tops up usages from the writer boundary through consecutive
+    /// chunks to the sequence length, so a commit that crossed into a later
+    /// chunk left every chunk it filled on the way stale, not only the writer.
+    /// The buffer, built from the same chunks (they are allocated up front, so
+    /// no append clears it during the write), therefore has the WRITER
+    /// REGION's slices — every chunk from the writer boundary to the current
+    /// writer — re-serialised under the guard (async H→D on drop); the chunks
+    /// below the boundary are shared and unwritten. This is O(chunks the
+    /// commit wrote) against dropping and re-uploading the entire per-layer
+    /// table, which at depth costs megabytes of pinned realloc and a stream
+    /// sync per layer. A missing buffer is left for the next decode sync's full
+    /// rebuild; a shape mismatch (defensive) falls back to full invalidation.
     pub(crate) fn refresh_decode_writer_slice(
         &mut self,
         n_kv_head: usize,

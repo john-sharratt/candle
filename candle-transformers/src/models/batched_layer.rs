@@ -1218,7 +1218,7 @@ fn paged_prefill_float_fallback(
         let t_kv = profile_now();
         KvCache::ensure_chunked_capacity_batch(std::slice::from_mut(cache), &[offset], len)?;
         cache.chunked_write_kv(offset, &ks, &vs)?;
-        cache.set_current_seq_len(offset + len)?;
+        cache.commit_written_tokens(offset, len)?;
         pipeline_record("prefill_fb:kv_write", t_kv);
 
         // Assemble the prefix to attend, **without re-reading what we just
@@ -1323,7 +1323,7 @@ fn prefill_attention_simple(
                 seq_len,
             )?;
             cache.chunked_write_kv(offset, &k_seq, &v_seq)?;
-            cache.set_current_seq_len(offset + seq_len)?;
+            cache.commit_written_tokens(offset, seq_len)?;
 
             // Read all data from 0 to offset+seq_len
             let total_len = offset + seq_len;

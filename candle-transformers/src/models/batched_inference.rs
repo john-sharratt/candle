@@ -963,15 +963,15 @@ impl BatchedInferenceSession {
     /// kernel's self-increment (a stencil static-run injection, a think-steer
     /// continuation prefill).
     ///
-    /// The decode hot path trusts the cached GPU slot buffer, whose tail
+    /// The decode hot path trusts the cached GPU slot buffer, whose writer
     /// length self-increments only on decode steps — without this refresh the
-    /// injected tokens sit beyond the buffer's stale tail length, invisible to
-    /// subsequent decode attention (and progressively clobbered by the next
-    /// decode writes). Only the WRITER chunk's slice is re-serialised (O(1)
-    /// per layer); a prefill that crossed a chunk boundary already dropped the
-    /// buffer at the mutation site, and a sequence that has not decoded yet
-    /// has none — both rebuild fully on the next decode sync. No-op on
-    /// contiguous backings.
+    /// next decode reuses a buffer that still ends where the injection began,
+    /// writes its token over the first injected one, and leaves a slot the
+    /// host counts unwritten. The writer slice is re-serialised in place (O(1)
+    /// per layer) while the writer is still the chunk the buffer was built
+    /// for; an injection that crossed into a later chunk drops the buffer for
+    /// a full rebuild on the next decode sync, as does a sequence that has not
+    /// decoded yet. No-op on contiguous backings.
     pub fn refresh_decode_slot_state(&self, seq_idx: usize) -> Result<()> {
         for backing in &self.backings {
             backing.refresh_decode_writer_slice(&[(seq_idx, 0)])?;

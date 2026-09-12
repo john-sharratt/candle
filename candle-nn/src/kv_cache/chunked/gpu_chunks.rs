@@ -511,6 +511,14 @@ impl GpuChunksGuard<'_> {
         rope_base: u32,
         arena_info: &[ResolvedArenaInfo],
     ) -> candle::Result<()> {
+        // The pinned buffer is rewritten in place below, and a copy enqueued
+        // from it earlier may not have run yet: it would then carry these new
+        // bytes to the device ahead of their time, to kernels that were meant
+        // to see the old ones. `resize`, `clear` and `Drop` fence for the same
+        // reason; this path is taken on every commit made outside the decode
+        // kernel, so it must too. Waits on that one copy's event, which has
+        // normally long completed.
+        self.inner.fence_pending_upload();
         let n_palette = chunk_n_palette(chunk, n_kv_head);
         let chunk_byte_size = token_slice_serialized_size(n_kv_head, head_dim, n_palette);
         // The LIVE entry count, not one derived from the buffer length. Both

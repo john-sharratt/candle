@@ -7,6 +7,7 @@
 use ahash::{HashMap, HashMapExt};
 use candle::quantized::GgmlDType;
 use std::cmp;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use candle::quantized::pinned_staging::{Generation, PinnedStager};
@@ -1137,12 +1138,13 @@ impl ChunkedKvBacking {
 
     /// Drop the sequence's cached GPU slot-state buffer so the next metadata
     /// build re-serialises it from the authoritative CPU chunk state (the
-    /// REBUILD path). Needed when host bookkeeping (`set_len` after a
-    /// truncate) has changed slice lens/rope bases without touching the
-    /// serialized buffer — `set_len` deliberately never writes the pinned DMA
-    /// source (see its comment), so a later build's REUSE path would snapshot
-    /// stale lens. The speculative-verify wave calls this before building its
-    /// virtual-slot headers.
+    /// REBUILD path). Needed when host bookkeeping has changed slice lengths or
+    /// windows below the writer boundary — `set_len` after a truncate, a block
+    /// re-windowed in place — without touching the serialized buffer:
+    /// `set_len` deliberately never writes the pinned DMA source (see its
+    /// comment), and [`Self::refresh_decode_writer_slice`] only re-serialises
+    /// the writer region, so a later build's REUSE path would snapshot stale
+    /// lengths.
     pub fn invalidate_decode_slot(&self, batch_idx: usize) {
         if let Ok(mut state) = self.state.write() {
             if let Some(Some(seq)) = state.sequences.get_mut(batch_idx) {
@@ -1181,39 +1183,40 @@ impl ChunkedKvBacking {
         Some(chunks)
     }
 
-    /// Patch each sequence's cached decode slot-state slices from the writer
-    /// boundary to the writer after a prefill wrote tokens into them — see
-    /// [`super::types::SequenceState::refresh_decode_writer_slice`]. O(chunks
-    /// the prefill wrote) per sequence per layer; sequences with no cached
-    /// buffer (never decoded, or cleared by a chunk-boundary append) rebuild
-    /// fully on the next decode sync instead.
-    /// Free token capacity of `batch_idx`'s current decode WRITE chunk — how
-    /// many appended tokens it can still hold before the next append crosses
-    /// into a fresh chunk. The caller that extends a slot by `n` tokens uses
-    /// this to pick between the O(1) writer-slice patch (`n` fits) and full
-    /// invalidation (`n` spans into a new chunk, whose serialized
-    /// predecessors would otherwise keep their pre-extension lengths).
-    /// `None` when the slot is unallocated or empty.
-    pub fn decode_writer_room(&self, batch_idx: usize) -> Option<usize> {
-        let state = self.state.read().ok()?;
-        let seq = state.sequences.get(batch_idx)?.as_ref()?;
-        let chunks = seq.chunks_slice();
-        if chunks.is_empty() {
-            return None;
-        }
-        let wi = seq.decode_write_chunk_idx().min(chunks.len() - 1);
-        let cw = &chunks[wi];
-        Some(CHUNK_SIZE.saturating_sub(cw.offset as usize + cw.usage as usize))
-    }
-
+    /// Bring each sequence's cached decode slot buffer up to date after a
+    /// commit made outside the decode kernel — see
+    /// [`super::types::SequenceState::refresh_decode_writer_slice`]. Every
+    /// slice from the writer boundary to the writer is re-serialised in place,
+    /// O(chunks the commit wrote) per sequence per layer; sequences with no
+    /// cached buffer (never decoded, or cleared by a chunk-boundary append)
+    /// rebuild fully on the next decode sync instead.
     pub fn refresh_decode_writer_slice(&self, batch_entries: &[(usize, usize)]) -> Result<()> {
         let n_kv_head = self.inner.n_kv_head;
         let head_dim = self.inner.head_dim;
-        let arena_info = self.resolve_arena_info()?;
         let mut state = self
             .state
             .write()
             .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        // Only the writer regions' arenas. The patch re-serialises the chunks
+        // from each sequence's writer boundary to its writer, and it runs per
+        // layer on every commit made outside the decode kernel — a verify block
+        // among them — so a resolve of every arena there is would be paid
+        // ~layers × sequences times a step for pointers nothing reads. Taken
+        // under the state lock, so the region cannot change between naming its
+        // arenas and serialising it.
+        let needed: HashSet<usize> = batch_entries
+            .iter()
+            .filter_map(|&(seq_idx, _)| state.sequences.get(seq_idx)?.as_ref())
+            .filter_map(|seq| {
+                let wi = seq.decode_write_chunk_idx();
+                seq.chunks_slice().get(seq.writer_start_idx().min(wi)..=wi)
+            })
+            .flat_map(|region| region.iter())
+            .flat_map(|cw| cw.gids.as_slice().iter())
+            .filter(|g| !g.is_empty())
+            .map(|g| g.arena_idx())
+            .collect();
+        let arena_info = self.resolve_arena_info_for(&needed)?;
         for &(seq_idx, _) in batch_entries {
             if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
                 seq.refresh_decode_writer_slice(n_kv_head, head_dim, &arena_info)?;
