@@ -14,7 +14,7 @@ use {
     candle::cuda_backend::cudarc::driver::{DevicePtr, DeviceRepr},
     candle_kernels::paged_glue::{run_paged_glue_bf16, run_paged_glue_fp16},
     candle_kernels::paged_prefill::*,
-    candle_nn::kv_cache::ChunkedKvBacking,
+    candle_nn::kv_cache::{ArenaFormatTag, ChunkedKvBacking},
     core::ffi::c_void,
     half::{bf16, f16},
 };
@@ -175,9 +175,25 @@ fn build_slot_headers(
     for (slot_i, cache) in caches.iter().enumerate() {
         let writer_start_idx = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
         let mut chunks: Vec<(u16, u16)> = Vec::new();
+        // Per chunk: whether the paged stores write into it, and palette 0's K
+        // and V tags for the refusal below.
+        let mut writable: Vec<(bool, u8, u8)> = Vec::new();
         cache.k_cache().chunked_visit_live_chunks(|it| {
             for c in it {
                 chunks.push((c.offset, c.token_count));
+                let k_ok = c
+                    .k_fmt
+                    .iter()
+                    .all(|&t| ArenaFormatTag::from_u8(t).takes_active_k_writes());
+                let v_ok = c
+                    .v_fmt
+                    .iter()
+                    .all(|&t| ArenaFormatTag::from_u8(t).takes_active_v_writes());
+                writable.push((
+                    k_ok && v_ok,
+                    c.k_fmt.first().copied().unwrap_or(u8::MAX),
+                    c.v_fmt.first().copied().unwrap_or(u8::MAX),
+                ));
             }
         });
         let layout = SlotTokenLayout::new(chunks, writer_start_idx, CHUNK_SIZE);
@@ -250,6 +266,26 @@ fn build_slot_headers(
                  token layout but slice {buf_write} by the slot-state buffer",
                 layout.write_slice
             );
+        }
+        // The chunk this slot's first new token lands in must be one the paged
+        // stores write: `store_kv_chunk_arena` returns without a word for a
+        // sealed format, so a quantized chunk with room left in it, standing
+        // where the writer should be, drops every token of the prefill — in
+        // every layer, with nothing faulting. Refuse and name it instead. The
+        // writer is the layout's, the same rule the kernel's `write_slice`
+        // follows; a layout with no writer is `assert_write_region_capacity`'s
+        // to refuse.
+        let w = layout.write_slice as usize;
+        if q_lens[slot_i] > 0 {
+            if let Some(&(false, k_tag, v_tag)) = writable.get(w) {
+                let tokens = layout.chunks[w].1;
+                candle::bail!(
+                    "slot header build: batch slot {slot_i}'s write chunk {w} ({tokens} tokens) \
+                     is in a format the paged stores cannot write (K tag {k_tag}, V tag \
+                     {v_tag}) — every token of this prefill would be dropped without a fault. \
+                     A sealed chunk with room left in it is standing in the writer region."
+                );
+            }
         }
         layout.assert_write_region_capacity(q_lens[slot_i], CHUNK_SIZE);
         write_slices.push(layout.write_slice);

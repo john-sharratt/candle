@@ -121,7 +121,7 @@ fn a_write_that_spills_into_the_next_chunk_is_counted_in_both() {
 fn rebuilds_on_sync(backing: &ChunkedKvBacking, seq: usize, offset: usize) -> u64 {
     backing.ensure_for_offset(seq, offset, 1).unwrap();
     let info = backing.resolve_arena_info().unwrap();
-    let (_, stats) = backing.sync_decode_gpu_chunks(&[(seq, offset)], &info).unwrap();
+    let (_, _, stats) = backing.sync_decode_gpu_chunks(&[(seq, offset)], &info).unwrap();
     stats.rebuilds
 }
 
@@ -161,9 +161,9 @@ fn a_moved_arena_drops_the_decode_buffers_that_name_it() {
 
 /// The latent wave commits at the backing rather than through a `KvCache`:
 /// `set_len`, then `refresh_decode_writer_slice`, with no block length in hand.
-/// The refresh must therefore notice a spill on its own — the writer is no
-/// longer the chunk the buffer was built for — and not patch the new writer
-/// while the full predecessor still reads 30.
+/// The refresh must therefore cover a spill on its own — re-serialising the
+/// whole writer region, the filled predecessor as well as the new writer — and
+/// not patch the new writer while the full predecessor still reads 30.
 #[test]
 fn a_backing_refresh_after_a_spill_counts_both_chunks() {
     let _gpu = gpu_serial();

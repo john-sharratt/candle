@@ -1611,7 +1611,13 @@ impl BatchedInferenceSession {
             let _ = layer_idx;
             let mut per_seq = Vec::with_capacity(seq_indices.len());
             for &seq_idx in seq_indices {
-                per_seq.push(backing.record_turn(seq_idx)?);
+                // The empty writer, and any pad pushed after it, goes: sealed it
+                // would be a quantized chunk with room left in it, which a later
+                // tail restore can stand where writes land (`drop_empty_tail`).
+                // The fresh writer pushed below replaces it.
+                let mut live = backing.record_turn(seq_idx)?;
+                live.drop_empty_tail();
+                per_seq.push(live);
             }
             live_per_layer.push(per_seq);
         }
