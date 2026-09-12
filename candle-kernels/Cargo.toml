@@ -19,10 +19,10 @@ default = []
 # (the embedded PTX source text) being 490 KB of that. Two thirds of every
 # archive, statically linked into every test binary that touches CUDA.
 #
-# Turn it on for one debugging session — when a kernel faults and the address
-# alone does not say where — then turn it off again:
-#
-#     cargo test -p candle-transformers --features cuda,kernel-lineinfo ...
+# **Not the way faults are found here.** A device-side fault is a write that went
+# somewhere it should not have, and `readonly_regions` behind `tensor-assert`
+# names the writer at the moment of the write — before the corruption, with the
+# tenant's name. Reach for that; see CLAUDE.md.
 #
 # The build script hashes the compile arguments, so flipping this rebuilds the
 # kernels and flipping it back restores the cached small ones.

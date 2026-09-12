@@ -61,6 +61,7 @@ fn deepseek_spec(model_path: &std::path::Path) -> ModelSpec {
     let model_bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
     ModelSpec {
         arch: ModelArch::DeepSeekV4,
+        loras: Vec::new(),
         chat_format: DialectType::DeepSeek,
         dialect: Dialect::deepseek(),
         model_repo: String::new(), // local file only — never downloaded
@@ -71,6 +72,11 @@ fn deepseek_spec(model_path: &std::path::Path) -> ModelSpec {
         // The path is handed over directly, so nothing resolves it.
         prepared_from_source: false,
         model_bytes,
+        // Local file only, so there is no revision to pin and no repo an
+        // override could displace — the two fields a downloaded checkpoint uses
+        // to stay the bytes the gate measured.
+        model_rev: String::new(),
+        gate_donor: None,
         tokenizer_repo: "deepseek-ai/DeepSeek-V4-Flash-0731".to_string(),
         tokenizer_rev: String::new(),
         default_system_prompt: "You are a concise, factual assistant.".to_string(),

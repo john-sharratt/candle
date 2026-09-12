@@ -378,11 +378,14 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
 
 #[derive(Deserialize)]
 struct RawCall {
-    /// `function` is accepted as an alias for `name`: Qwen3-30B-A3B
+    /// `function` and `tool` are accepted as aliases for `name`. Qwen3-30B-A3B
     /// occasionally emits `{"function":"<tool>", "arguments":{...}}` instead
-    /// of `{"name":"<tool>", ...}`.  Tolerating it costs nothing and
-    /// recovers an otherwise-lost tool call.
-    #[serde(alias = "function")]
+    /// of `{"name":"<tool>", ...}`; Qwen3.6-35B-A3B, asked outright to emit a
+    /// call, produces `{"tool": "datetime", "arguments": {}}` — right shape,
+    /// right tool, wrong key, and without the alias the whole call is dropped.
+    /// Tolerating them costs nothing (the bare pass still requires the name to
+    /// resolve in the registry) and recovers an otherwise-lost tool call.
+    #[serde(alias = "function", alias = "tool")]
     name: String,
     #[serde(default)]
     arguments: Option<Value>,
@@ -645,6 +648,23 @@ some text
         assert_eq!(calls.len(), 1, "aliased bare call not recovered: {calls:?}");
         assert_eq!(calls[0].name, "file_create");
         assert!(registry::find(&calls[0].name).is_some());
+    }
+
+    #[test]
+    fn extract_tool_calls_bare_json_accepts_the_tool_key() {
+        // Verbatim shape from Qwen3.6-35B-A3B when told to emit a call: the
+        // right tool under the key `"tool"` instead of `"name"`, with no tags.
+        // Without the alias the entire call is silently dropped and the model
+        // answers from memory instead.
+        let text = "<think>\nI need the current time.\n</think>\n\n\
+                    {\n  \"tool\": \"datetime\",\n  \"arguments\": {}\n}";
+        let calls = extract_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "`tool`-keyed bare call not recovered: {calls:?}"
+        );
+        assert_eq!(calls[0].name, "datetime");
     }
 
     #[test]

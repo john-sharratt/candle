@@ -151,6 +151,44 @@ extern "C" {
         mode: i32,
     );
 
+    /// Widen a contiguous F16 buffer into a separate F32 one.
+    ///
+    /// **Out-of-place, unlike [`run_cast_mut`].** The in-place form needs a buffer sized for
+    /// the wider of the two types, which for a widening cast means the *destination's* size —
+    /// so an F16 tensor would have to be read into an f32-sized allocation before the cast, and
+    /// the allocation is the thing the caller is trying to avoid. Reading from the source and
+    /// writing to a small band is what lets `dequantize_f32_into` treat a float source exactly
+    /// like a quantized one.
+    ///
+    /// `num_dims = 0` and `info = null` means contiguous, which is the only shape this is
+    /// called with: the caller bands over whole rows.
+    ///
+    /// # Parameters
+    /// - `inp`: source, `numel` F16 values
+    /// - `out`: destination, `numel` f32 values
+    ///
+    /// # Safety
+    /// Both pointers must be device memory valid for `numel` elements of their own type.
+    pub fn run_cast_f16_f32(
+        inp: *const c_void,
+        out: *mut f32,
+        numel: usize,
+        num_dims: usize,
+        info: *const usize,
+    );
+
+    /// Widen a contiguous BF16 buffer into a separate F32 one. See [`run_cast_f16_f32`].
+    ///
+    /// # Safety
+    /// Both pointers must be device memory valid for `numel` elements of their own type.
+    pub fn run_cast_bf16_f32(
+        inp: *const c_void,
+        out: *mut f32,
+        numel: usize,
+        num_dims: usize,
+        info: *const usize,
+    );
+
     /// Returns 1 if cooperative launch is supported on the current device, 0 otherwise.
     pub fn cast_mut_supports_cooperative() -> i32;
 

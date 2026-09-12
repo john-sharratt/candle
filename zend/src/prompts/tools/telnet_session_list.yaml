@@ -1,4 +1,29 @@
 name: telnet_session_list
+questions:
+- enumerate the Telnet sessions with their device hosts
+- show every open telnet terminal id
+- list the telnet connections to network gear
+- which Telnet session is on the core switch
+- do I already have a telnet terminal to that router
+- is the Telnet session I opened still connected
+- how many telnet terminals am I holding open
+- which telnet session id goes with the firewall
+- I lost the Telnet session id for the next command
+- checking I'm not opening a second terminal to the switch
+- want to see which telnet connections are lingering
+- reviewing the terminal sessions to the network devices
+- list the Telnet sessions
+- what telnet terminals are open
+- show telnet session ids
+- any Telnet connections alive
+- which Telnet sessions are open
+- what network devices am I telnetted into
+- list my telnet terminal sessions
+- am I still connected to the switch over telnet
+- show the open Telnet session ids and hosts
+- how many telnet terminals are live
+- give me the telnet session for the router
+- list the plaintext terminal connections
 category: Telnet sessions
 description: Enumerate the Telnet terminal sessions currently open to network devices in this conversation.
 high_risk: true

@@ -121,8 +121,8 @@ fn d_google_token() -> String {
 pub struct Server {
     #[serde(default = "d_bind")]
     pub bind: SocketAddr,
-    #[serde(default = "d_cache")]
-    pub cache_control: String,
+    #[serde(default)]
+    pub cache: Cache,
     #[serde(default)]
     pub backoff: Backoff,
     /// Upstream response headers are streamed, never collected — but a request
@@ -134,18 +134,65 @@ pub struct Server {
 fn d_bind() -> SocketAddr {
     "127.0.0.1:8080".parse().unwrap()
 }
-fn d_cache() -> String {
-    "no-store".into()
-}
 fn d_connect_timeout_ms() -> u64 {
     5_000
+}
+
+/// How long a static file may be reused before the browser asks again.
+///
+/// # Why two numbers and not one
+///
+/// This was a single `cache_control` string, and it was `no-cache` — keep the
+/// copy, but revalidate every time. That is always *correct*, and it makes every
+/// asset cost a round trip on every load to be told nothing changed. With the
+/// bodies already down to nothing, those round trips became the whole cost: a
+/// console boot is fifteen of them.
+///
+/// The two numbers split the files by how much a stale one matters.
+///
+/// - **`short`** — the documents and the code: HTML, JavaScript, CSS. These are
+///   edited during a session, and `--content` serves them from disk precisely so
+///   a refresh shows the change. A minute is short enough that no edit is lost
+///   for long and long enough that clicking around costs nothing.
+/// - **`long`** — images, icons and fonts. They change rarely, and a stale one
+///   is a slightly old picture rather than a page running code that disagrees
+///   with the API it is talking to.
+///
+/// **The ETag still applies to both.** These say when to *ask*, not what the
+/// answer is: once the age is up the request carries `If-None-Match` and an
+/// unchanged file is still `304` with no body. See [`crate::asset`].
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cache {
+    /// Seconds for HTML, JS and CSS.
+    #[serde(default = "d_short")]
+    pub short_secs: u32,
+    /// Seconds for images and fonts.
+    #[serde(default = "d_long")]
+    pub long_secs: u32,
+}
+
+fn d_short() -> u32 {
+    60
+}
+fn d_long() -> u32 {
+    900
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self {
+            short_secs: d_short(),
+            long_secs: d_long(),
+        }
+    }
 }
 
 impl Default for Server {
     fn default() -> Self {
         Self {
             bind: d_bind(),
-            cache_control: d_cache(),
+            cache: Cache::default(),
             backoff: Backoff::default(),
             connect_timeout_ms: d_connect_timeout_ms(),
         }
@@ -217,6 +264,21 @@ pub struct Site {
     pub fallback: String,
     #[serde(default)]
     pub api: Vec<Route>,
+    /// Send every request for this site's hosts somewhere else, permanently.
+    ///
+    /// A site with this set serves nothing of its own: the path and query are
+    /// appended to the target and answered `301`, before routing, before
+    /// content, before sign-in. `roots` and `api` on such a site are dead, and
+    /// the startup table says so.
+    ///
+    /// This is how the alternate domains for one brand are consolidated —
+    /// `tokera.net` and the rest onto `tokera.com`. **Redirected, not cloned**:
+    /// serving the same pages on six hostnames splits a brand against itself
+    /// (search engines pick one and the copies count for nothing) and turns one
+    /// deploy into six chances to serve a stale one. A `301` puts every link
+    /// and every typed address onto the one name.
+    #[serde(default)]
+    pub redirect: Option<String>,
     /// Directory holding the source documents this site publishes as papers.
     ///
     /// Deliberately **not** a content root: only documents named in the site's
@@ -462,12 +524,32 @@ impl Config {
                 }
             }
             // A site with no roots is a pure gateway — legal, and how a proxy
-            // that owns no content is expressed.
-            if site.roots.is_empty() && site.api.is_empty() {
+            // that owns no content is expressed. A redirected one owns nothing
+            // either, and answers everything: the 301 *is* its content.
+            if site.roots.is_empty() && site.api.is_empty() && site.redirect.is_none() {
                 bail!(
-                    "site `{}` has neither roots nor api routes — it can answer nothing",
+                    "site `{}` has neither roots, api routes nor a redirect — it can answer nothing",
                     site.name
                 );
+            }
+            // The reverse, which is the mistake worth naming: a redirect wins
+            // over both, so anything alongside it is dead configuration that
+            // reads as though it were serving.
+            if site.redirect.is_some() && !(site.roots.is_empty() && site.api.is_empty()) {
+                bail!(
+                    "site `{}` has a redirect as well as roots or api routes — the redirect \
+                     answers first, so those would never be reached",
+                    site.name
+                );
+            }
+            if let Some(to) = &site.redirect {
+                if !to.starts_with("http://") && !to.starts_with("https://") {
+                    bail!(
+                        "site `{}`: redirect `{to}` must be an http(s) URL — it becomes a \
+                         `Location` header, which needs an absolute one",
+                        site.name
+                    );
+                }
             }
         }
         Ok(())

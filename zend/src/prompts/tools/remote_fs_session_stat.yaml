@@ -1,4 +1,29 @@
 name: remote_fs_session_stat
+questions:
+- stat /srv/app/config.yaml on the SFTP host
+- get size and mtime for that remote path without downloading it
+- check the permissions on /var/log/app.log over SFTP
+- what are the timestamps on the remote artefact
+- does that path exist on the remote machine
+- is the remote entry a file or a directory
+- has the remote file changed since yesterday
+- is the remote file world-readable
+- deciding whether the download is worth it before pulling it
+- confirming the deploy actually replaced the file
+- checking the remote log has grown since the restart
+- verifying ownership before the service tries to read it
+- stat that remote path
+- metadata for the SFTP file
+- check the remote file's size
+- stat that path over SFTP to see if it exists
+- how big is that file on the remote server
+- stat the remote path over SFTP without downloading it
+- when was the remote log last modified
+- check the permissions on that file on the SFTP host
+- does /srv/app/config.yaml exist on the remote machine
+- is that remote path a file or a directory
+- get the metadata for the remote file, don't transfer it
+- what are the timestamps on that file over SFTP
 category: Remote filesystem
 description: Retrieve metadata — size, type, permissions, timestamps — for one file or directory on a remote host over SFTP, without transferring contents.
 high_risk: true

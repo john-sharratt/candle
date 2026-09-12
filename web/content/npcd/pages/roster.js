@@ -12,7 +12,8 @@
 import { API } from '../lib/api.js';
 import { h, mount, ago } from '../lib/dom.js';
 import { go, link } from '../lib/router.js';
-import { avatar, stateDot, bandChip, pending, empty, STATE_LABEL } from '../lib/ui.js';
+import { avatar, stateDot, bandChip, pending, empty, STATE_LABEL, MODE_LABEL, MODE_ICON } from '../lib/ui.js';
+import * as sessions from '../lib/sessions.js';
 
 const VIEW_KEY = 'npcd.roster.view';
 
@@ -48,6 +49,50 @@ export async function render() {
       h('div', { class: 'sub' }, 'Characters you own or have been given access to.')),
     h('div', { class: 'row' },
       link('/npc/new', { class: 'btn primary' }, '+ New NPC'))));
+
+  /* ── the conversations you are in ──────────────────────────────────────────
+   *
+   * Above the cast, because it is the answer to "where was I". A conversation
+   * outlives the page you were watching it from (`lib/sessions.js`), so coming
+   * back here has to show it — otherwise leaving the console to look at Pulse
+   * feels like ending it, which is exactly what it used to do.
+   *
+   * Only when there is one. An empty band saying you are not talking to anybody
+   * is a permanent apology for a state that is not a problem. */
+  const talking = h('div', {});
+
+  function paintTalking(live) {
+    if (!live.length) return mount(talking);
+    mount(talking,
+      h('div', { class: 'pane-hd' }, 'Carry on'),
+      h('div', { class: 'list talking' }, live.map(talkingRow)));
+  }
+
+  function talkingRow(s) {
+    /* What this browser has on screen, which is not the same as everything that
+     * was said — the daemon is the record, and a page reloaded since is holding
+     * none of it. So the line says "on screen", and a session with nothing on it
+     * invites you back rather than claiming nothing happened. */
+    const turns = s.log.filter((e) => e.t === 'mine' || (e.t === 'act' && e.observable)).length;
+    // To the character's own page, not to a console: being in a room is a fact
+    // about you that lives beside everything else about them.
+    return h('div', { class: 'npc-row', onClick: () => go(`/npc/${s.npcId}/presence`) },
+      h('div', { class: 'avatar' }, MODE_ICON[s.mode] || '◍'),
+      h('div', { style: 'min-width:0' },
+        h('div', { class: 'row', style: 'gap:7px' },
+          h('span', { class: 'dot active' }),
+          h('span', { class: 'npc-name' }, s.npc?.name || s.npcId),
+          h('span', { class: 'chip' }, MODE_LABEL[s.mode] || s.mode)),
+        h('div', { class: 'npc-meta' },
+          turns ? `${turns} turn${turns === 1 ? '' : 's'} on screen` : 'pick up where you were')),
+      h('button', {
+        class: 'btn sm ghost danger',
+        title: 'End this conversation — the character stops being told it has company',
+        onClick: (e) => { e.stopPropagation(); sessions.close(s.ix); },
+      }, 'End'));
+  }
+
+  el.appendChild(talking);
 
   el.appendChild(h('div', { class: 'filters' },
     tagInput, nameInput, worldSel, stateSel,
@@ -152,6 +197,14 @@ export async function render() {
 
   await refresh();
 
+  /* Paint what this page load already knows about, then again once the daemon
+   * has confirmed the ids carried across a reload — the console's assets are
+   * embedded in the binary, so a rebuild reloads the page out from under a
+   * conversation that is still running. */
+  paintTalking(sessions.list());
+  const unwatchTalking = sessions.subscribe(paintTalking);
+  sessions.restore();
+
   // An event for an NPC the current filter excludes is dropped: it is not on
   // screen, and re-listing to find out whether it now matches is the polling
   // this replaced.
@@ -160,5 +213,5 @@ export async function render() {
     if (row) row.apply(ev);
   });
 
-  return { el, teardown: () => sub.close() };
+  return { el, teardown: () => { sub.close(); unwatchTalking(); } };
 }

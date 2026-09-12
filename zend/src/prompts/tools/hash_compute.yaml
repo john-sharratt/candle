@@ -1,4 +1,29 @@
 name: hash_compute
+questions:
+- sha512 this blob and give it to me in base64
+- blake3 digest of the file contents below
+- md5 the string "hello world"
+- compute sha3_256 over these bytes
+- do these two inputs hash to the same value
+- does this match the checksum published on the release page
+- which digest should I use for a content address here
+- how long is a sha3_512 output in hex
+- verifying a download against the vendor's published hash
+- I need a stable fingerprint for this content
+- deduplicating records by hashing the payload
+- proving the file hasn't changed since we archived it
+- sha256 this
+- hash it
+- checksum please
+- digest of the above
+- what's the sha256 of this string
+- give me the md5 checksum of this data
+- compute a blake3 digest for this file content
+- hash this with sha512 and show it in base64
+- I need the sha1 fingerprint of this payload
+- checksum this text so I can compare it
+- produce a sha3_256 digest of the message below
+- what does this hash to under sha256
 category: Security utilities
 description: Compute a one-shot cryptographic digest — a fixed-size fingerprint — of data, using sha256, sha512, sha1, md5, sha3_256, sha3_512, or blake3. Returns the digest as hex or base64 for content fingerprinting and integrity checks.
 parameters:

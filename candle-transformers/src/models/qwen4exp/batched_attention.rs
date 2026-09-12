@@ -23,6 +23,7 @@ use candle_nn::kv_cache::WaveGeneration;
 
 use crate::models::batched_layer::{BatchedAttentionLayer, QkvProjection, WaveRef};
 use crate::models::quantized_matmul::QMatMul;
+use crate::models::lora::LayerLora;
 use crate::models::qwen35::quantized_attention::project_qkv_gated;
 use crate::models::qwen35::quantized_weights::QuantAttentionWeights;
 use crate::models::rotary_layout::RotaryLayout;
@@ -100,6 +101,8 @@ impl BatchedAttentionLayer for Qwen4ExpAttentionLayer<'_> {
         acts: &DynamicActs<'w>,
         out_dtype: DType,
     ) -> Result<QkvProjection<'w>> {
+        // Unadapted: qwen4exp's sweep runs its layers under the Gated Residual,
+        // which has no adapter plumbing of its own, so no LoRA reaches here.
         project_qkv_gated(
             self.w,
             self.rotary,
@@ -108,6 +111,7 @@ impl BatchedAttentionLayer for Qwen4ExpAttentionLayer<'_> {
             self.head_dim,
             acts,
             out_dtype,
+            LayerLora::default(),
         )
     }
 

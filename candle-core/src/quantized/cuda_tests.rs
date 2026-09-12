@@ -2737,7 +2737,8 @@ fn q8a128_quantize_raw_bytes() -> Result<()> {
     let f32_dev = dev.memcpy_stod(&act)?;
     let stream = dev.cuda_stream();
     let (ptr, _g) = f32_dev.device_ptr(&stream);
-    let blocks = quantize_acts_q8a128(ptr, 2 /* F32 */, rows, cols, &dev)?.into_owned_data()?;
+    let blocks = quantize_acts_q8a128(ptr, 2 /* F32 */, rows, cols, &dev, Backing::Owned)?
+        .into_owned_data()?;
     dev.synchronize()?;
     let raw: Vec<u8> = dev.memcpy_dtov(&blocks.slice(..))?;
 
@@ -2763,10 +2764,13 @@ fn q8a128_quantize_raw_bytes() -> Result<()> {
             let amax = vals.iter().fold(0f32, |m, &x| m.max(x.abs()));
             let sum: f32 = vals.iter().sum();
             let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
-            // The single {scale, sum} lives at ds[0] of the tile's meta slot.
+            // The single {scale, sum} lives at ds[0] of the tile's meta slot. The
+            // sum field is Σx **normalised by amax** — the matmul rebuilds Σx as
+            // `ds.y · ds.x · 127`, and storing it raw overflows f16 on any
+            // activation whose block sums pass 65504 (blocks.cuh).
             let ds_b = ds_off(flat);
             let exp_scale = f16::from_f32(amax / 127.0);
-            let exp_sum = f16::from_f32(sum);
+            let exp_sum = f16::from_f32(sum * id / 127.0);
             let got_scale = f16::from_le_bytes([raw[ds_b], raw[ds_b + 1]]);
             let got_sum = f16::from_le_bytes([raw[ds_b + 2], raw[ds_b + 3]]);
             assert_eq!(
@@ -2807,7 +2811,8 @@ fn q8a128_dequant_exact() -> Result<()> {
     let f32_dev = dev.memcpy_stod(&act)?;
     let stream = dev.cuda_stream();
     let (ptr, _g) = f32_dev.device_ptr(&stream);
-    let blocks = quantize_acts_q8a128(ptr, 2, rows, cols, &dev)?.into_owned_data()?;
+    let blocks =
+        quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
     let deq = dequantize_q8a128(&blocks, rows, cols, &dev)?;
     dev.synchronize()?;
 
@@ -2872,7 +2877,8 @@ fn q8a128_edge_cases() -> Result<()> {
     let f32_dev = dev.memcpy_stod(&act)?;
     let stream = dev.cuda_stream();
     let (ptr, _g) = f32_dev.device_ptr(&stream);
-    let blocks = quantize_acts_q8a128(ptr, 2, rows, cols, &dev)?.into_owned_data()?;
+    let blocks =
+        quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
     dev.synchronize()?;
     let raw: Vec<u8> = dev.memcpy_dtov(&blocks.slice(..))?;
 
@@ -2888,7 +2894,8 @@ fn q8a128_edge_cases() -> Result<()> {
         assert_eq!(q, 0, "zero tile qs[{i}]");
     }
 
-    // Tile 1 — amax is the spike, so scale = 100/127 and Σx = 100 + 32×2 + Σ(i−16).
+    // Tile 1 — amax is the spike, so scale = 100/127 and Σx = 100 + 32×2 + Σ(i−16)
+    // = 148, stored normalised as 148/100.
     assert_eq!(
         scale_at(1040).to_bits(),
         f16::from_f32(100.0 / 127.0).to_bits(),
@@ -2896,8 +2903,8 @@ fn q8a128_edge_cases() -> Result<()> {
     );
     assert_eq!(
         sum_at(1040).to_bits(),
-        f16::from_f32(148.0).to_bits(),
-        "mixed tile sum",
+        f16::from_f32(148.0 / 100.0).to_bits(),
+        "mixed tile sum, normalised by amax",
     );
 
     // The spike saturates to 127; everything else is scaled by the SAME id, so
@@ -2924,6 +2931,91 @@ fn q8a128_edge_cases() -> Result<()> {
     Ok(())
 }
 
+/// **An activation whose per-128 block sums exceed f16's range must still
+/// matmul.** The block's `ds[0].y` carries the sum feeding the affine weight's
+/// min term, and both `ds` fields are f16 — so storing Σx raw put `+inf` in
+/// every block whose 128 values sum past 65504, and each dot product touching
+/// one became NaN.
+///
+/// That is not a synthetic bound. An LLM's activations keep block sums under
+/// ~10³ and never came near it, which is why the format survived this long; but
+/// Z-Image's transformer is sandwich-normed, so its SwiGLU intermediate runs at
+/// 10⁴–10⁵ and its block sums reach 2×10⁵. The first symptom was a black image
+/// eight steps later, with every weight, shape and dtype checking out.
+///
+/// The fix normalises the field (Σx/amax, bounded by 128 whatever the magnitude
+/// — see `blocks.cuh`); this pins the property rather than the encoding, so it
+/// holds however the sum is later stored. The activation here is deliberately
+/// biased far from zero: a zero-mean one cancels to a small sum however large
+/// its elements are, and would pass even with the bug.
+#[test]
+fn int8_matmul_survives_block_sums_past_f16_range() -> Result<()> {
+    use crate::quantized::{QMatMul, QTensor};
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let (n, k, m) = (128usize, 256usize, 16usize);
+    let mut rng = StdRng::seed_from_u64(0x2f0e_b10c);
+
+    // Q8_0 → Q8_KO: an *affine* twin, so the min term — and therefore the block
+    // sum — actually takes part in the dot product. A centred format would not
+    // read the field at all.
+    let w: Vec<f32> = (0..n * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+    let mut q = QCudaStorage::zeros(&dev, n * k, GgmlDType::Q8_0)?;
+    q.quantize(&CudaStorage::wrap_cuda_slice(
+        dev.memcpy_stod(&w)?,
+        dev.clone(),
+    ))?;
+    let shape = crate::Shape::from((n, k));
+    let w_ref = QTensor::new(
+        QStorage::Cuda(q.repack_ko(&shape, GgmlDType::Q8_KO)?),
+        shape.clone(),
+    )?;
+    let src = QTensor::new(QStorage::Cuda(q), shape)?;
+    let mm = QMatMul::from_qtensor(w_ref)?;
+
+    // Each 128-element block sums to ~128 × 1000 = 1.3×10⁵, twice f16's 65504,
+    // while amax/127 (~8.7) stays comfortably inside it — so the scale field is
+    // fine and only the sum overflows, which is exactly the production shape of
+    // the bug.
+    let act: Vec<f32> = (0..m * k)
+        .map(|_| 1000.0 + rng.random_range(-100.0..100.0))
+        .collect();
+    let xs = crate::Tensor::from_vec(act, (m, k), &device)?;
+    let block_sum = xs.narrow(1, 0, 128)?.sum(1)?.min(0)?.to_scalar::<f32>()?;
+    assert!(
+        block_sum > 65504.0,
+        "fixture does not reach the f16 ceiling it exists to cross: {block_sum}"
+    );
+
+    let got = mm
+        .forward_via_int8(&xs, Int8Mode::Precision, crate::DType::F32)?
+        .to_vec2::<f32>()?;
+    // The FP reference: the same weights dequantised, same activations, f32.
+    let want = xs
+        .matmul(&src.dequantize(&device)?.t()?.contiguous()?)?
+        .to_vec2::<f32>()?;
+
+    let mut num = 0f64;
+    let mut den = 0f64;
+    for (g_row, w_row) in got.iter().zip(want.iter()) {
+        for (&g, &w) in g_row.iter().zip(w_row.iter()) {
+            assert!(g.is_finite(), "int8 output is {g}, not a number");
+            num += ((g - w) as f64).powi(2);
+            den += (w as f64).powi(2);
+        }
+    }
+    let rel = (num / den).sqrt();
+    assert!(
+        rel < 0.01,
+        "int8 vs f32 rel_l2 = {rel} beyond the 8-bit budget"
+    );
+    println!("int8 with block sums {block_sum:.0} (f16 max 65504): rel_l2 = {rel:.5}");
+    Ok(())
+}
+
 /// Citizenship: q8a128 must be reachable through the *unified* QType dispatch
 /// (`run_quantize_block`/`run_dequantize_block` at qtype = QTYPE_Q8A128 = 36),
 /// producing byte-identical results to its dedicated typed path. This pins the
@@ -2942,7 +3034,8 @@ fn q8a128_unified_dispatch_matches_typed() -> Result<()> {
     let (ptr, _g) = f32_dev.device_ptr(&stream);
 
     // Typed path (dtype 2 = F32) vs unified run_quantize_block(qtype=36).
-    let typed = quantize_acts_q8a128(ptr, 2, rows, cols, &dev)?.into_owned_data()?;
+    let typed =
+        quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
     let nblocks = n / 128;
     let mut unified = unsafe { dev.alloc::<u8>(nblocks.div_ceil(8) * 1152)? };
     {
@@ -3271,8 +3364,10 @@ fn q8a128_f16_bf16_paths_match_f32() -> Result<()> {
         let fdev = dev.memcpy_stod(&as_f32)?;
         let (tp, _a) = tdev.device_ptr(&stream);
         let (fp, _b) = fdev.device_ptr(&stream);
-        let blk_t = quantize_acts_q8a128(tp, 0, rows, cols, &dev)?.into_owned_data()?;
-        let blk_f = quantize_acts_q8a128(fp, 2, rows, cols, &dev)?.into_owned_data()?;
+        let blk_t =
+            quantize_acts_q8a128(tp, 0, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
+        let blk_f =
+            quantize_acts_q8a128(fp, 2, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
         dev.synchronize()?;
         let bt: Vec<u8> = dev.memcpy_dtov(&blk_t.slice(..))?;
         let bf: Vec<u8> = dev.memcpy_dtov(&blk_f.slice(..))?;
@@ -3317,8 +3412,10 @@ fn q8a128_f16_bf16_paths_match_f32() -> Result<()> {
         let fdev = dev.memcpy_stod(&as_f32)?;
         let (tp, _a) = tdev.device_ptr(&stream);
         let (fp, _b) = fdev.device_ptr(&stream);
-        let blk_t = quantize_acts_q8a128(tp, 1, rows, cols, &dev)?.into_owned_data()?;
-        let blk_f = quantize_acts_q8a128(fp, 2, rows, cols, &dev)?.into_owned_data()?;
+        let blk_t =
+            quantize_acts_q8a128(tp, 1, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
+        let blk_f =
+            quantize_acts_q8a128(fp, 2, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
         dev.synchronize()?;
         let bt: Vec<u8> = dev.memcpy_dtov(&blk_t.slice(..))?;
         let bf: Vec<u8> = dev.memcpy_dtov(&blk_f.slice(..))?;
@@ -3595,7 +3692,14 @@ fn quantize_acts_q8a128_test(
     let f32_dev = dev.memcpy_stod(act_data)?;
     let stream = dev.cuda_stream();
     let (ptr, _g) = f32_dev.device_ptr(&stream);
-    let out = quantize_acts_q8a128(ptr, 2 /* F32 */, total_batch, ncols, dev)?;
+    let out = quantize_acts_q8a128(
+        ptr,
+        2, /* F32 */
+        total_batch,
+        ncols,
+        dev,
+        Backing::Owned,
+    )?;
     dev.synchronize()?;
     Ok(out)
 }
@@ -3866,8 +3970,8 @@ fn q2_ko_int8_grouped_matches_f32_ref() -> Result<()> {
 /// constructor, so the slice could not be dropped. Banding the repack added two fallible steps
 /// inside that window, and nothing failed — because nothing exercised the window. This does.
 ///
-/// The provocation is an `F16` source: it has no `QType`, so `dequantize_f32_into` refuses on
-/// the first band, which is *after* `dest_slice` and before the destination is written. The
+/// The provocation is a source `dequantize_f32_into` refuses on the first band, which is
+/// *after* `dest_slice` and before the destination is written. The
 /// detector is recycling pressure — a freed block goes back to the CUDA pool, and a same-sized
 /// request immediately afterwards is very likely to be handed it, so a lease that was wrongly
 /// freed shows up as a clobbered sentinel rather than as a silent success.
@@ -3891,10 +3995,16 @@ fn a_failed_repack_does_not_free_its_leased_destination() -> Result<()> {
         p
     };
 
-    // An F16 source: tileable shape, so it reaches the band loop, and no `QType`, so the loop's
-    // first dequantize refuses.
+    // A source with a tileable shape, so it reaches the band loop, and no `QType`, so the
+    // loop's first dequantize refuses.
+    //
+    // **This was F16, and F16 stopped working as a provocation** when the float formats gained
+    // a widening arm in `dequantize_f32_into` — they now repack like any block format, which
+    // is the whole point of that change. `P2` is a pure arena-routing format with no matmul
+    // path at all, so it is refused for a reason that will not be engineered away: a weight is
+    // never a palette index.
     let w = crate::Tensor::zeros((nrows, ncols), crate::DType::F32, &device)?;
-    let src = crate::quantized::QTensor::quantize(&w, GgmlDType::F16)?;
+    let src = crate::quantized::QTensor::quantize(&w, GgmlDType::P2)?;
     let storage = match src.storage() {
         crate::quantized::QStorage::Cuda(s) => s,
         _ => panic!("expected CUDA storage"),
@@ -3906,7 +4016,7 @@ fn a_failed_repack_does_not_free_its_leased_destination() -> Result<()> {
             GgmlDType::Q4_KO,
             Some((lease_ptr, LeaseOrigin::Foreign)),
         )
-        .expect_err("an F16 source has no QType and must not repack");
+        .expect_err("a P2 source has no QType and must not repack");
     let msg = err.to_string();
     assert!(
         msg.contains("unsupported dtype"),
@@ -3930,34 +4040,20 @@ fn a_failed_repack_does_not_free_its_leased_destination() -> Result<()> {
     Ok(())
 }
 
-/// Why the KO repack's scratch has to be a bounded band — the history behind the
-/// two tests below, which check it computationally and end to end.
-///
-/// **Two assertions, and the first is the point of the change.** `repack_ko` is
-/// dequantize-then-requantize composed through an f32 buffer, and that buffer used to be the
-/// whole tensor: 4,850 MiB for the 27B's `[248320, 5120]` head. Not merely large but
-/// *permanent* — `dense_span` sized the span's `cuMemAddressReserve` smaller by exactly that
-/// figure, and a reservation cannot grow, so a buffer alive for one tensor during load cost a
-/// third of the card until the process exited. Repacking a row band at a time caps the
-/// intermediate at `REPACK_BAND_BYTES` whatever the tensor's size.
-///
-/// So `ko_repack_scratch_is_a_bounded_band` measures free VRAM across the repack and requires
-/// the dip to stay near the twin.
-/// The tensor is deliberately shaped so a whole-tensor f32 (256 MiB) dwarfs both the twin
-/// (34 MiB) and the band (48 MiB) — a regression that reinstated the old buffer could not hide
-/// inside the bound, and one that merely enlarged the band would have to grow it fivefold.
-///
-/// The second assertion is that the output did not change: byte-identical to the CPU codec
-/// over the same dequantized source. Banding rearranges *when* each chunk is written and
-/// scatters the results into place, which is exactly the kind of change that can produce a
-/// correctly-sized, plausibly-valued, wrong tensor — so the comparison is on bytes.
 /// **The band is bounded whatever the tensor — asserted without a device.**
 ///
-/// This is the property `ko_repack_scratch_is_a_bounded_band` exists to protect:
-/// the repack's f32 intermediate is one row band, so it does not scale with the
-/// tensor. That test measures it end to end through free VRAM, which is
-/// device-wide and therefore only meaningful on a quiet card; this one computes
-/// the same number the allocation uses and so runs anywhere, every time.
+/// The history this protects: `repack_ko` is dequantize-then-requantize composed through an
+/// f32 buffer, and that buffer used to be the whole tensor — 4,850 MiB for the 27B's
+/// `[248320, 5120]` head. Not merely large but *permanent*: `dense_span` sized the span's
+/// `cuMemAddressReserve` smaller by exactly that figure, and a reservation cannot grow, so a
+/// buffer alive for one tensor during load cost a third of the card until the process exited.
+/// Repacking a row band at a time caps the intermediate at `REPACK_BAND_BYTES` whatever the
+/// tensor's size.
+///
+/// `candle-core/tests/vram_bounds.rs` measures that end to end, through free VRAM. This one
+/// computes the same number the allocation uses, so it needs no device and no quiet card —
+/// it runs anywhere, every time, which is what makes it the primary guard rather than the
+/// backstop.
 ///
 /// The regression it would catch is the one that motivated the banding: a
 /// whole-tensor f32, which at 8192×8192 is 256 MiB and grows with the model.
@@ -3992,178 +4088,243 @@ fn ko_repack_band_is_bounded_regardless_of_tensor_size() {
     );
 }
 
-/// End-to-end confirmation that the band is what actually reaches the card.
+// The three repack-band tests that used to sit here now live in
+// `candle-core/tests/vram_bounds.rs`. They bracket an operation with
+// `get_vram_info`, which reports free memory for the whole card, so every
+// allocation the other tests in this binary made inside that window landed in
+// the delta — 1,226 MiB measured against a 258 MiB entitlement, failing at
+// random while the same three passed under `--test-threads=1`. An integration
+// test is its own process, which is the only place that measurement means
+// anything.
+
+
+/// **The host-banded read must match the device one for every source it accepts**, not just
+/// the float ones that motivated it.
 ///
-/// **`#[ignore]` because it needs an exclusive device.** It measures free VRAM
-/// either side of a repack, and `cuMemGetInfo` reports the whole card — so with
-/// `cargo test`'s default threading a sibling test's allocation lands in the
-/// delta and is blamed on the repack. Measured at 4,640 MiB against a 34 MiB
-/// twin while the suite ran alongside it; 64 MiB alone. The invariant itself is
-/// covered without a device by
-/// [`ko_repack_band_is_bounded_regardless_of_tensor_size`]; this is the
-/// end-to-end check, run deliberately:
-///
-/// ```text
-/// cargo test -p candle-core --features cuda --lib -- --ignored --test-threads=1 \
-///     ko_repack_scratch_is_a_bounded_band
-/// ```
+/// The loader routes *every* repackable projection through `repack_ko_from_host` when it has
+/// the mapping, so a bug that only shows on block-quantized sources is a bug in most of the
+/// model — and the first version of this file tested BF16 alone, which is how a whole
+/// checkpoint's worth of weights went unchecked.
 #[test]
-#[ignore = "measures device-wide free VRAM; needs --test-threads=1 and an otherwise idle card"]
-fn ko_repack_scratch_is_a_bounded_band() -> Result<()> {
+fn a_host_banded_repack_matches_the_device_one_for_quantized_sources_too() -> Result<()> {
     let dev = CudaDevice::new(0)?;
-    // Big enough that a whole-tensor f32 dwarfs both the source and the twin, so the bound
-    // below is not competing with allocator granularity: 8192×8192 is 256 MiB of f32 against a
-    // 37.7 MiB Q4_K source and a 35.7 MiB Q4_KO twin.
-    let (nrows, ncols) = (8192usize, 8192usize);
-    let n = nrows * ncols;
-    let f32_bytes = n * 4;
-
     let device = crate::Device::Cuda(dev.clone());
-    let w: Vec<f32> = (0..n).map(|i| ((i % 251) as f32 - 125.0) * 0.003).collect();
-    let w_t = crate::Tensor::from_vec(w, (nrows, ncols), &device)?;
-    let src = crate::quantized::QTensor::quantize(&w_t, GgmlDType::Q4_K)?;
-    let shape = src.shape().clone();
-    let storage = match src.storage() {
-        crate::quantized::QStorage::Cuda(s) => s,
-        _ => panic!("expected CUDA storage"),
-    };
 
-    // **`get_vram_info` is DEVICE-WIDE, so this only measures the repack on a
-    // quiet device.** `cuMemGetInfo` reports the whole card's free bytes; there
-    // is no pool-scoped alternative. `cargo test` runs this file's 94 CUDA tests
-    // across threads by default, so a sibling allocating between the two reads
-    // lands in this delta and is blamed on the repack — measured at **4,640 MiB
-    // against a 34 MiB twin**, which read as "the scratch is back on the card"
-    // and is not remotely what happened. Alone, the same code measures 64 MiB.
-    //
-    // So the device is checked for quiet either side of the window, and the
-    // measurement is retried when it is not. The FIRST quiet attempt is the one
-    // used, because it is the only cold one — the CUDA pool keeps the repack's
-    // bands after attempt one, and a later attempt would under-report by
-    // exactly the thing the bound is meant to catch.
-    let quiet = |dev: &CudaDevice| -> Result<Option<usize>> {
-        dev.cuda_stream()
-            .synchronize()
-            .map_err(crate::Error::wrap)?;
-        let (a, _) = crate::quantized::get_vram_info()?;
-        dev.cuda_stream()
-            .synchronize()
-            .map_err(crate::Error::wrap)?;
-        let (b, _) = crate::quantized::get_vram_info()?;
-        Ok((a == b).then_some(a))
-    };
-
-    const ATTEMPTS: usize = 8;
-    let mut measured = None;
-    for _ in 0..ATTEMPTS {
-        let Some(free_before) = quiet(&dev)? else {
-            continue;
-        };
-        // One repack per attempt. A discarded attempt drops its twin, so the
-        // next one starts from the same footing.
-        let twin = storage.repack_ko(&shape, GgmlDType::Q4_KO)?;
-        let Some(free_after) = quiet(&dev)? else {
-            continue;
-        };
-        measured = Some((free_before, free_after, twin));
-        break;
-    }
-    let Some((free_before, free_after, twin)) = measured else {
-        panic!(
-            "could not get a quiet device in {ATTEMPTS} attempts — another test on this \
-             card allocated inside every measurement window, so the VRAM delta would \
-             measure that and not the repack. Re-run with `--test-threads=1`."
-        )
-    };
-
-    // What the device is *entitled* to hold across the repack: the twin it produced, plus the
-    // f32 band and the KO band that produced it. The source was already resident before the
-    // measurement, so it is not in the delta. Slack covers CUDA pool granularity, which rounds
-    // allocations up generously.
-    const SLACK: usize = 2 * crate::quantized::cuda::REPACK_BAND_BYTES;
-    let twin_bytes = crate::quantized::cuda::ko_repacked_bytes(&shape, GgmlDType::Q4_KO)?;
-    let used = free_before.saturating_sub(free_after);
-    let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
-    println!(
-        "repack VRAM delta {:.1} MiB | twin {:.1} | an on-device f32 would add {:.1}",
-        mib(used),
-        mib(twin_bytes),
-        mib(f32_bytes),
-    );
-    assert!(
-        used <= twin_bytes + SLACK,
-        "repack held {:.1} MiB of VRAM; the twin is {:.1} MiB and the f32 intermediate would \
-         be {:.1} MiB. The scratch is back on the card — and the span concedes that much \
-         permanently, because `cuMemAddressReserve` sizes it once and cannot grow.",
-        mib(used),
-        mib(twin_bytes),
-        mib(f32_bytes),
-    );
-
-    // And the twin is still what the CPU codec produces from the same dequantized source —
-    // byte for byte. Moving where the intermediate lives must not move a single output bit,
-    // and only a byte comparison says so; a size check would pass on any kernel at all.
-    assert_eq!(twin.dtype(), GgmlDType::Q4_KO);
-    let got: Vec<u8> = twin.data()?;
-    let deq = storage.dequantize(n)?;
-    let src_f32: Vec<f32> = dev
-        .memcpy_dtov(deq.as_cuda_slice::<f32>()?)
-        .map_err(crate::Error::wrap)?;
-    let want = crate::quantized::ko_quant::quantize_ko(&src_f32, nrows, ncols, GgmlDType::Q4_KO);
-    assert_eq!(
-        got.len(),
-        want.len(),
-        "twin byte length changed: {} vs {}",
-        got.len(),
-        want.len()
-    );
-    // Locate the first differing byte rather than `assert_eq!`-ing the vectors.
-    // A 34 MiB byte-vector comparison that fails prints both operands in full,
-    // which is tens of millions of numbers and answers nothing; what identifies
-    // the fault is *which chunk* diverged — the band it fell in, and whether the
-    // divergence starts at a band boundary.
-    let chunk_bytes = crate::quantized::ko_quant::ko_chunk_bytes(GgmlDType::Q4_KO);
-    let row_groups = nrows / 8;
-    let k_blocks = ncols / 128;
-    if let Some(i) = (0..got.len()).find(|&i| got[i] != want[i]) {
-        let chunk = i / chunk_bytes;
-        let (k_blk, g) = (chunk / row_groups, chunk % row_groups);
-        let diffs = (0..got.len()).filter(|&i| got[i] != want[i]).count();
-        let bad_chunks: std::collections::BTreeSet<usize> = (0..got.len())
-            .filter(|&i| got[i] != want[i])
-            .map(|i| i / chunk_bytes)
+    // Shapes and formats a real checkpoint actually carries, including a non-square
+    // projection and a source whose blocks are 256 wide.
+    for (nrows, ncols, dtype, ko) in [
+        (4096usize, 4096usize, GgmlDType::Q6_K, GgmlDType::Q6_KO),
+        (12288, 4096, GgmlDType::Q6_K, GgmlDType::Q6_KO),
+        (4096, 12288, GgmlDType::Q4_K, GgmlDType::Q5_KO),
+        (2048, 4096, GgmlDType::Q8_0, GgmlDType::Q8_KO),
+    ] {
+        let n = nrows * ncols;
+        let w: Vec<f32> = (0..n)
+            .map(|i| ((i % 313) as f32 - 156.0) * 0.00390625)
             .collect();
-        let bad_groups: std::collections::BTreeSet<usize> =
-            bad_chunks.iter().map(|c| c % row_groups).collect();
-        // Which plane: a divergence confined to `dm` is the (scale, min) pair,
-        // i.e. float rounding in the observer; one in `ql` is the codes, i.e. a
-        // layout or permutation fault. They have nothing to do with each other,
-        // and the byte offset is the only thing that separates them.
-        let in_dm = (0..got.len())
-            .filter(|&i| got[i] != want[i])
-            .filter(|&i| i % chunk_bytes >= 512)
-            .count();
-        let max_delta = (0..got.len())
-            .filter(|&i| got[i] != want[i])
-            .map(|i| got[i].abs_diff(want[i]))
-            .max()
-            .unwrap_or(0);
-        panic!(
-            "the banded repack changed the twin's bytes: {diffs} of {} differ, in {} of {} \
-             chunks; {in_dm} of them in the dm (scale,min) plane and {} in ql (codes). \
-             Largest byte delta {max_delta}.\nfirst at byte {i} (chunk {chunk} = k_blk \
-             {k_blk}, row-group {g}, offset {} in chunk): got {} want {}\nrow-groups \
-             touched: {:?}{}",
+        let w_t = crate::Tensor::from_vec(w, (nrows, ncols), &device)?;
+        let src = crate::quantized::QTensor::quantize(&w_t, dtype)?;
+        let shape = src.shape().clone();
+        let host: Vec<u8> = src.data()?.to_vec();
+
+        let want = {
+            let storage = match src.storage() {
+                crate::quantized::QStorage::Cuda(s) => s,
+                _ => panic!("expected CUDA storage"),
+            };
+            storage.repack_ko(&shape, ko)?.data()?
+        };
+        let got: Vec<u8> =
+            crate::quantized::cuda::repack_ko_from_host(&dev, &host, &shape, dtype, ko, None)?
+                .data()?;
+
+        assert_eq!(
             got.len(),
-            bad_chunks.len(),
-            k_blocks * row_groups,
-            diffs - in_dm,
-            i % chunk_bytes,
-            got[i],
-            want[i],
-            bad_groups.iter().take(16).collect::<Vec<_>>(),
-            if bad_groups.len() > 16 { " …" } else { "" },
+            want.len(),
+            "{dtype:?} [{nrows}, {ncols}] → {ko:?}: twin length differs"
         );
+        assert_eq!(
+            got, want,
+            "{dtype:?} [{nrows}, {ncols}] → {ko:?}: the host-banded read produced different \
+             bytes from the device one. Every projection in a mapped load takes this path."
+        );
+    }
+    Ok(())
+}
+
+/// **A float source's KO twin must hold the source's numbers, not merely agree with itself.**
+///
+/// Every other test around this path compares the host-banded read against the device one. That
+/// catches a *disagreement* and is blind to the case where both routes are wrong together —
+/// which is the case that matters here, because they share `dequantize_f32_into` and the float
+/// arms of it are the newest code in the file.
+///
+/// So this one is semantic: quantize to a KO twin, pull the bytes back, and reconstruct them
+/// with `ko_quant::dequant_ko` — a CPU reference implementation that shares nothing with the
+/// CUDA path. If the widen reads at the wrong stride, swaps the halves of a bf16 word, or
+/// widens the wrong element count, the reconstruction is wrong and no amount of host/device
+/// agreement hides it.
+///
+/// `Q8_0` is here as the control. It is what the reference checkpoint carries for `ssm_out`
+/// and is known-good in production, so a failure on the float rows *with* `Q8_0` passing is a
+/// float-widen bug, and a failure on all four is a bug in the repack proper.
+///
+/// # Why this path is worth its own test
+///
+/// A float weight had no KO twin at all until recently: `to_ko` bailed, and the loader left
+/// float projections on the FP path (see `quantized_qwen35.rs`, which records that being the
+/// prime suspect behind the 0.8B's KV factors sitting ~3× tighter than its siblings'). Giving
+/// floats a twin routed a whole class of weight through the int8 kernels for the first time,
+/// and the checkpoints that carry them — third-party conversions with BF16 `ssm_*` tensors
+/// where the reference has `F32`/`Q8_0` — are exactly the ones that generate word salad.
+#[test]
+fn a_float_sources_ko_twin_reconstructs_its_source_values() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+
+    // A DeltaNet output projection's proportions, small enough to reconstruct on the CPU.
+    let (nrows, ncols) = (512usize, 1024usize);
+    let n = nrows * ncols;
+    // Deliberately not symmetric about zero and not a round power of two: an affine twin with
+    // a sign error or a dropped `min` still reconstructs symmetric data passably.
+    let w: Vec<f32> = (0..n)
+        .map(|i| ((i % 397) as f32 - 120.0) * 0.011_718_75)
+        .collect();
+    let w_t = crate::Tensor::from_vec(w.clone(), (nrows, ncols), &device)?;
+
+    for dtype in [
+        GgmlDType::Q8_0,
+        GgmlDType::F32,
+        GgmlDType::F16,
+        GgmlDType::BF16,
+    ] {
+        let cast = match dtype {
+            GgmlDType::F16 => w_t.to_dtype(crate::DType::F16)?,
+            GgmlDType::BF16 => w_t.to_dtype(crate::DType::BF16)?,
+            _ => w_t.clone(),
+        };
+        let src = crate::quantized::QTensor::quantize(&cast, dtype)?;
+        assert_eq!(
+            src.dtype(),
+            dtype,
+            "{dtype:?}: source did not keep its format"
+        );
+        let shape = src.shape().clone();
+        let host: Vec<u8> = src.data()?.to_vec();
+
+        // **Both routes, because the loader picks between them on a condition unrelated to
+        // correctness.** `host_banded` takes the mapping when there is one; `QMatMul::build`
+        // repacks the device tensor when there is not. A weight is equally live either way, so
+        // a float bug in one of them is a float bug in half the loads — and testing only the
+        // host route is how this test first passed while the model still generated garbage.
+        let device_twin = {
+            let storage = match src.storage() {
+                crate::quantized::QStorage::Cuda(s) => s,
+                _ => panic!("expected CUDA storage"),
+            };
+            storage.repack_ko(&shape, GgmlDType::Q8_KO)?.data()?
+        };
+        let host_twin: Vec<u8> = crate::quantized::cuda::repack_ko_from_host(
+            &dev,
+            &host,
+            &shape,
+            dtype,
+            GgmlDType::Q8_KO,
+            None,
+        )?
+        .data()?;
+
+        // The source's own loss plus Q8's. BF16 keeps 8 mantissa bits, so it dominates its row;
+        // the others are bounded by the Q8 grid over this data's range.
+        let tol = match dtype {
+            GgmlDType::BF16 => 0.12,
+            GgmlDType::F16 => 0.05,
+            _ => 0.05,
+        };
+        for (route, bytes) in [("host-banded", &host_twin), ("device", &device_twin)] {
+            let back =
+                crate::quantized::ko_quant::dequant_ko(bytes, nrows, ncols, GgmlDType::Q8_KO);
+            assert_eq!(
+                back.len(),
+                n,
+                "{dtype:?} via {route}: reconstruction has the wrong length"
+            );
+
+            let mut worst = 0f32;
+            let mut worst_at = 0usize;
+            for (i, (g, s)) in back.iter().zip(w.iter()).enumerate() {
+                let d = (g - s).abs();
+                if d > worst {
+                    worst = d;
+                    worst_at = i;
+                }
+            }
+            assert!(
+                worst <= tol,
+                "{dtype:?} → Q8_KO via {route}: reconstruction is wrong. Worst element \
+                 {worst_at}: twin says {}, source says {} (off by {worst}, tolerance {tol}). \
+                 The twin does not hold this weight's numbers, so every matmul against it is \
+                 wrong.",
+                back[worst_at],
+                w[worst_at]
+            );
+        }
+
+        assert_eq!(
+            host_twin, device_twin,
+            "{dtype:?} → Q8_KO: the two routes produced different bytes, so which one a load \
+             happens to take changes the weights"
+        );
+    }
+    Ok(())
+}
+
+/// The widening arm itself, in isolation and against every float format.
+///
+/// `dequantize_f32_into` is what makes a float source readable by the banded repack, and it is
+/// a *cast* where the quantized arms are dequant kernels — F32 is not even that, it is a copy.
+/// Three different routines behind one signature is three chances to widen the wrong number of
+/// elements or read at the wrong stride, and the band loop hides an off-by-one inside the
+/// second band where a single-band test would never look. So the tensor is deliberately larger
+/// than one band.
+#[test]
+fn the_float_widen_matches_its_source_across_band_boundaries() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    // 24 MiB of f32 — several bands at 48 MiB per band's worth of f32? No: bands are sized in
+    // f32 bytes, so 32 M elements is 128 MiB of f32 and crosses the boundary twice.
+    let n = 32 * 1024 * 1024usize;
+    let (nrows, ncols) = (n / 4096, 4096);
+    let w: Vec<f32> = (0..n)
+        .map(|i| ((i % 509) as f32 - 254.0) * 0.0078125)
+        .collect();
+    let w_t = crate::Tensor::from_vec(w.clone(), (nrows, ncols), &device)?;
+
+    for dtype in [GgmlDType::F32, GgmlDType::F16, GgmlDType::BF16] {
+        let cast = match dtype {
+            GgmlDType::F16 => w_t.to_dtype(crate::DType::F16)?,
+            GgmlDType::BF16 => w_t.to_dtype(crate::DType::BF16)?,
+            _ => w_t.clone(),
+        };
+        let q = crate::quantized::QTensor::quantize(&cast, dtype)?;
+        assert_eq!(q.dtype(), dtype);
+        let back = q.dequantize(&device)?.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(back.len(), n, "{dtype:?} widened the wrong element count");
+
+        // The tolerance is the format's own, not the kernel's: F32 is exact, F16 and BF16 lose
+        // mantissa bits at conversion and nothing downstream can recover them. A single
+        // tolerance for all three would either fail F32's exactness or hide a BF16 bug.
+        let tol = match dtype {
+            GgmlDType::F32 => 0.0,
+            GgmlDType::F16 => 1e-3,
+            _ => 1e-2,
+        };
+        for (i, (g, s)) in back.iter().zip(w.iter()).enumerate() {
+            assert!(
+                (g - s).abs() <= tol,
+                "{dtype:?} element {i}: widened {g}, source {s}"
+            );
+        }
     }
     Ok(())
 }

@@ -300,11 +300,15 @@ extern "C" {
     /// - `h_out`: Output height
     /// - `w_scale`: Width scale factor
     /// - `h_scale`: Height scale factor
+    /// - `dst_numel`: Total destination elements, `b_size * c * w_out * h_out`.
+    ///   Sizes the launch. `info` is device memory, so the host cannot derive
+    ///   this from it — the caller that built the shape has to pass it.
     /// - `info`: Pointer to dims and strides info
     /// - `src`: Source tensor
     /// - `dst`: Destination tensor
     pub fn run_upsample_nearest2d(
         dtype: i32,
+        dst_numel: usize,
         w_out: usize,
         h_out: usize,
         w_scale: f64,
@@ -618,6 +622,7 @@ impl ConvDispatcher {
     /// - `info` must point to a valid dims/strides array
     pub unsafe fn upsample_nearest2d(
         dtype: ConvDType,
+        dst_numel: usize,
         w_out: usize,
         h_out: usize,
         w_scale: f64,
@@ -626,7 +631,17 @@ impl ConvDispatcher {
         src: *const c_void,
         dst: *mut c_void,
     ) {
-        run_upsample_nearest2d(dtype as i32, w_out, h_out, w_scale, h_scale, info, src, dst)
+        run_upsample_nearest2d(
+            dtype as i32,
+            dst_numel,
+            w_out,
+            h_out,
+            w_scale,
+            h_scale,
+            info,
+            src,
+            dst,
+        )
     }
 }
 

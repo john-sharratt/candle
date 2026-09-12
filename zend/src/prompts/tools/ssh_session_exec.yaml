@@ -1,4 +1,29 @@
 name: ssh_session_exec
+questions:
+- run systemctl status nginx over the SSH session
+- execute "journalctl -u api -n 200" on the remote host
+- check free -m on the box I'm ssh'd into
+- run the health script at /opt/bin/check.sh over ssh
+- what's the exit code of that remote command
+- is the process actually running on that server
+- how much disk is left on the SSH host
+- what does the remote config file contain
+- the service says it's up but I want to see for myself
+- need to confirm the deploy landed on the actual machine
+- checking the file the automation was supposed to write
+- diagnosing this from the server rather than the dashboard
+- run that over ssh
+- exec on the remote host
+- run that command on the ssh box
+- ssh command please
+- run df -h on the SSH session
+- check the service status on that remote box over ssh
+- execute uptime on the server I'm logged into
+- tail the nginx log on the remote host via SSH
+- run this command through the open ssh session
+- what's the disk usage on the remote machine
+- list /var/log on the SSH-connected server
+- execute the deploy script over ssh and show me the output
 category: SSH sessions
 description: Run a command on a remote server through an open SSH session. Returns stdout, stderr, exit code, working directory, and duration. Use ssh_open first. Every command requires confirmation.
 high_risk: true

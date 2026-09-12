@@ -1430,7 +1430,11 @@ fn r5(f: &Fixture) {
                     let w = s.windows[0];
                     let probe = &w[w.len().saturating_sub(MAX_PROBE_TOKENS)..];
                     let raw = scan(probe, grouped_sum);
-                    cache.observe(&scope, &[(ChildKey::named(slots[i].label.clone()), raw[i])]);
+                    cache.observe(
+                        &scope,
+                        i as u64,
+                        &[(ChildKey::named(slots[i].label.clone()), raw[i])],
+                    );
                 }
             } else {
                 let mut dialogue: Vec<(u64, u64)> = f.events.keys().copied().collect();
@@ -1442,7 +1446,7 @@ fn r5(f: &Fixture) {
                         .zip(&raw)
                         .map(|(s, &v)| (ChildKey::named(s.label.clone()), v))
                         .collect();
-                    cache.observe(&scope, &pairs);
+                    cache.observe(&scope, (tl << 32) ^ idx, &pairs);
                 }
             }
             for replace_floors in [true, false] {

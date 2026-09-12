@@ -69,6 +69,7 @@ use super::quantized_weights::QuantLayer;
 use crate::models::batched_layer::{
     forward_layer_batched_mixed, BatchedAttentionParams, WaveAttnGroup,
 };
+use crate::models::lora::LayerLora;
 use crate::models::quantized_matmul::QMatMul;
 use crate::models::rotary_layout::RotaryLayout;
 use crate::models::tensor_cat::TensorCat;
@@ -299,6 +300,20 @@ impl MtpHead {
             n_kv_head: ctx.n_kv_head,
             head_dim: ctx.head_dim,
             rotary: ctx.rotary,
+            // **The speculation head is never adapted, and that is correct.**
+            //
+            // It loads as `blk.{num_layers}`, one past the trunk, and a
+            // 32-layer adapter has nothing at index 32 — so this is what
+            // `Adapter::layer` would return anyway, stated rather than
+            // discovered.
+            //
+            // The consequence is a property of speculation, not a compromise:
+            // the head only *proposes*, and the trunk — adapted — verifies. A
+            // rejected draft costs a slot, never a wrong token, so an adapted
+            // conversation decodes exactly the distribution its adapter
+            // describes. What it loses is acceptance rate, because the drafter
+            // is guessing at a distribution it was not trained on.
+            lora: LayerLora::default(),
         };
         let mut groups = [WaveAttnGroup {
             caches,

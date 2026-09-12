@@ -297,46 +297,87 @@ pub fn pages_in_per_sec() -> Option<f64> {
 
 // ── Host-RAM KV budget ───────────────────────────────────────────────────────
 
-/// The host-RAM budget: what the warm KV tier may occupy.
+/// How the host's RAM is partitioned between everything that wants it.
 ///
 /// A *budget*, not a pressure signal. The old throttle compared OS "available"
 /// against an absolute floor — a number our own mmap'd weights push down as the
 /// page cache fills, so the throttle punished the system for its weights being
-/// resident. This reserves the weights explicitly and budgets the remainder:
+/// resident. This reserves the weights explicitly and partitions the remainder:
 ///
 /// ```text
 ///   buffer           = max(pct% × total, 4 GiB)      — caps the WEIGHTS only
 ///   weights_reserved = min(weights_mmap, total − buffer)
-///   kv_warm_budget   = total − pinned − weights_reserved − os_keep
+///   tier_pool        = total − weights_reserved − PAGEABLE_RESERVE − os_keep
+///   kv_warm_budget   = tier_pool × KV_WARM_SHARE_PCT%
+///   expert_pinned    = tier_pool − kv_warm_budget
 /// ```
 ///
-/// The buffer is **inclusive of warm KV**: it exists solely so the weights
-/// cannot claim the whole machine — warm KV, the OS, and everything else share
-/// what the weights leave behind. It is NOT subtracted again when computing the
-/// warm budget; only the small fixed `os_keep` floor is, so warm growth cannot
-/// starve the OS outright.
+/// # One pool, split once — because there are TWO warm tiers
 ///
-/// The weights are reserved IN FULL even though they are file-backed: evicting
-/// weight pages to hold warm KV trades cheap-tier capacity for hard faults on
-/// the inference path. Only when the model is bigger than `total − buffer` is
-/// it capped — a machine that cannot hold its model resident must swap by
-/// definition, and the budget states that instead of hiding it.
+/// The expert cache pins a host pool and the KV cache holds warm arenas, and
+/// they are the two largest host consumers by an order of magnitude. They used
+/// to be sized independently, each against a snapshot that did not contain the
+/// other, which over-committed the machine by roughly the size of the pageable
+/// region:
 ///
-/// Dev box, expert tier resident: `31.5 − 14.4 pinned − 0.7 weights − 1 os
-/// ≈ 15.4 GiB` of warm budget. The weights term is small because the MoE loader
-/// declares only the GGUF's *live* pages — its expert regions move to the pack
-/// file at startup and are never read again. 186 GB box:
-/// `186 − 12 − 18 − 1 ≈ 155 GiB`.
+/// - the expert tier sizes FIRST, while `pinned` is only the embedding, so the
+///   KV budget it was handed as a ceiling computed to nearly the whole machine
+///   and never bound — leaving it bounded only by launch-time free RAM minus a
+///   constant that had been measured on a gate barely exercising warm KV;
+/// - the KV budget was then recomputed with the expert pool pinned, but did not
+///   subtract the pageable buffer, so it believed it could grow into the region
+///   holding the page cache, the mapped checkpoint, and every other process.
+///
+/// Measured on the 16 GB box (31.5 GiB host) during a tool calibration: expert
+/// tier took 13.5 GiB at launch, warm KV grew to 7.1 GiB, and the machine
+/// reached 0.9 GiB free while paging at 1,302 pages/sec — with the KV tier still
+/// reporting `over_budget = false` at half its budget. The sum of what the two
+/// tiers each believed they could have was 28 GiB on a machine whose measured
+/// need for everything else is 9.5 GiB.
+///
+/// So the partition is computed ONCE, from the machine's fixed quantities, and
+/// both tiers take their slice from it.
+///
+/// # `pinned_bytes` is reported, never subtracted
+///
+/// It is observability only. Subtracting the live pinned gauge is exactly what
+/// made the old budget depend on *when* it was called: before the expert pool
+/// existed it read one number and after it read another, and the expert tier
+/// consumed the first while the KV tier was handed the second. A partition that
+/// depends on call order is not a partition.
+///
+/// # The weights are reserved in full
+///
+/// Even though they are file-backed: evicting weight pages to hold warm bytes
+/// trades cheap-tier capacity for hard faults on the inference path. Only when
+/// the model is bigger than `total − buffer` is it capped — a machine that
+/// cannot hold its model resident must swap by definition, and the budget states
+/// that instead of hiding it.
+///
+/// Dev box (31.5 GiB, 2.4 GiB live weight pages): `31.5 − 2.4 − 10 − 1 = 18.1`
+/// GiB of tier pool → 7.2 KV / 10.9 expert, leaving 10 GiB genuinely pageable.
+/// The weights term is small because the MoE loader declares only the GGUF's
+/// *live* pages — its expert regions move to the pack file at startup and are
+/// never read again.
 #[derive(Debug, Clone, Copy)]
 pub struct HostRamBudget {
     pub total_bytes: u64,
     pub buffer_bytes: u64,
+    /// Live pinned gauge — **reported, not used**. See the type docs.
     pub pinned_bytes: u64,
     pub weights_reserved_bytes: u64,
     /// Whether the weights had to be capped below their full size (the machine
     /// cannot hold the model resident; weight pages will swap).
     pub weights_capped: bool,
+    /// Host RAM held back from BOTH tiers for the page cache, the mapped
+    /// checkpoint, other processes, and the engine's own non-pinned
+    /// allocations. See [`PAGEABLE_RESERVE`].
+    pub pageable_reserve_bytes: u64,
+    /// What the two warm tiers share. The sum of the two budgets below.
+    pub tier_pool_bytes: u64,
     pub kv_warm_budget_bytes: u64,
+    /// What the expert cache's warm tier may page-lock.
+    pub expert_pinned_budget_bytes: u64,
 }
 
 /// Weights-cap buffer percentage: `CANDLE_HOST_RAM_BUFFER_PCT`, default 30 (of
@@ -368,6 +409,58 @@ fn buffer_pct() -> u64 {
 /// all, and the GiB it releases goes to the tier that has a use for it.
 const OS_KEEP_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Host RAM that must stay pageable, whatever else happens.
+///
+/// The page cache, the mapped checkpoint, every other process's working set,
+/// and the engine's own non-pinned allocations all live here. Pinning into it
+/// does not fail — measured directly: a probe took the entire pinnable half of
+/// a 31.5 GiB box without the driver once refusing, and free RAM ended at
+/// 0.02 GiB. **There is no natural stopping point**, which is why this bound is
+/// stated rather than discovered, and why an allocate-until-refusal probe cannot
+/// find it: refusal never comes, the machine just starts thrashing.
+/// `candle-core/tests/pinned_ceiling_probe.rs` re-measures it on any machine
+/// this needs revisiting on.
+///
+/// # An absolute floor, not a fraction
+///
+/// This was `total / 2`, from a measured failure at 76 % on a 194 GB machine
+/// (148 GB locked, 66 GB of other commit pushed to pagefile). A fraction reads
+/// the right way on that machine and the wrong way on a small one: on a 31.5 GiB
+/// box half is 15.76 GiB reserved against an OS and application set measured at
+/// 9.5 GiB, so the rule bound the warm tier for no reason anyone could point
+/// at — the tier stopped growing while 6 GiB sat unused and unusable.
+///
+/// What the OS and the surrounding applications need does not scale with how
+/// much RAM is installed, so the reserve is an absolute quantity. 10 GiB covers
+/// the 9.5 GiB measured here with room, and on a large machine it lets pinning
+/// go far past half — which is correct, and is what the 194 GB case was really
+/// telling us: 46 GB pageable was too little there too.
+///
+/// It lives here, beside the partition that applies it, rather than beside the
+/// expert tier that used to own it: it bounds BOTH warm tiers, and a reserve
+/// only one of them subtracts is not a reserve.
+pub const PAGEABLE_RESERVE: u64 = 10 * 1024 * 1024 * 1024;
+
+/// The warm KV tier's share of the tier pool, as a percentage.
+///
+/// **Both tiers are caches with cold tiers**, so this split is a performance
+/// trade rather than a correctness one — what matters for correctness is that
+/// the two shares SUM to the pool. An expert miss is a synchronous read from the
+/// pack file on the pipeline thread; a warm-KV miss is a read from the redo log.
+///
+/// The expert side takes the clear majority because it gates decode throughput
+/// directly, and because it must not shrink: at 30 % the 31.5 GiB dev box yields
+/// 12.7 GiB of expert budget, slightly **more** than the 13.5 GiB the tier used
+/// to take before the partition existed once its own page-lock ceiling is
+/// applied — the honest accounting costs no residency.
+///
+/// The KV side needs far less than its peak occupancy suggested. That peak —
+/// 7.1 GiB across a full tool calibration — was almost entirely K/V already
+/// marked for distillation and waiting on a compactor
+/// (`Substrate::release_distilled_kv`); released at the mark, the tier holds
+/// only live conversation history.
+const KV_WARM_SHARE_PCT: u64 = 30;
+
 /// Pure budget arithmetic — see [`HostRamBudget`]. Exposed separately from
 /// [`host_ram_budget`] so both machines' numbers pin down in unit tests without
 /// touching the process-global gauges.
@@ -382,19 +475,34 @@ pub fn host_ram_budget_from(
     let buffer = (total / 100 * pct).max(FOUR_GIB);
     let weights_cap = total.saturating_sub(buffer);
     let weights_reserved = weights_mmap.min(weights_cap);
-    // The buffer is NOT subtracted here — it capped the weights, and warm KV
-    // lives inside the region it protected. Only the OS floor comes out.
-    let kv = total
-        .saturating_sub(pinned)
+    // What the two warm tiers share, after the machine's fixed obligations.
+    //
+    // `pinned` is deliberately absent: a partition that changes with the live
+    // pinned gauge changes with WHEN it is called, which is the whole defect
+    // this replaced — the expert tier read it before pinning and the KV tier
+    // after, so each was sized against a machine that did not contain the other.
+    // Non-tier pins (the host-mapped embedding, the routing buffer) are small,
+    // fixed, and covered by the margin `PAGEABLE_RESERVE` carries over the 9.5
+    // GiB it was measured against; the expert tier subtracts them again from its
+    // own page-lock ceiling, which is where that belongs.
+    let tier_pool = total
         .saturating_sub(weights_reserved)
+        .saturating_sub(PAGEABLE_RESERVE)
         .saturating_sub(os_keep);
+    let kv = tier_pool / 100 * KV_WARM_SHARE_PCT;
     HostRamBudget {
         total_bytes: total,
         buffer_bytes: buffer,
         pinned_bytes: pinned,
         weights_reserved_bytes: weights_reserved,
         weights_capped: weights_reserved < weights_mmap,
+        pageable_reserve_bytes: PAGEABLE_RESERVE,
+        tier_pool_bytes: tier_pool,
         kv_warm_budget_bytes: kv,
+        // The remainder, not a second percentage: the two must SUM to the pool
+        // or the partition leaks, and a rounding gap between two independently
+        // computed percentages is exactly how that happens quietly.
+        expert_pinned_budget_bytes: tier_pool - kv,
     }
 }
 
@@ -439,20 +547,53 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
-    /// The dev box: 31.5 GB RAM, 11.05 GB pinned, 17.3 GB weights. The buffer
-    /// caps the weights only (they fit: 17.3 < 31.5 − 9.45); warm KV then gets
-    /// what pinned + weights + the OS floor leave — small but REAL, not zero.
+    /// **The partition must fit the machine.** Everything the budget hands out,
+    /// plus everything it reserves, is exactly the machine — no more.
+    ///
+    /// This is the assertion the old budget could not make. It computed
+    /// `kv_warm = total − pinned − weights − os_keep` and left the pageable
+    /// buffer inside that figure, so on the dev box it handed the KV tier 15.4
+    /// GiB *on top of* an expert pool that had already page-locked 14.4 — 30 GiB
+    /// of promises against 31.5 GiB of RAM, with nothing left for the page
+    /// cache, the mapped checkpoint, or any other process. The old test asserted
+    /// `kv_warm_budget > 15 GiB` and so pinned the over-commit in place.
     #[test]
-    fn dev_box_gets_a_real_warm_budget() {
-        // The dev box with the expert cache resident: 14.4 GiB pinned for the
-        // warm expert tier, and only the GGUF's *live* pages declared as
-        // weights — its expert regions move to the pack file at startup and are
-        // never read again, so declaring the whole 17.3 GiB mapping (which this
-        // test used to) reserved RAM for bytes nothing faults back in.
+    fn the_partition_never_promises_more_than_the_machine_has() {
+        for total_gib in [16.0f64, 31.5, 64.0, 186.0] {
+            let total = (total_gib * GIB as f64) as u64;
+            let weights = (2.4 * GIB as f64) as u64;
+            let b = host_ram_budget_from(total, 0, weights, 30, OS_KEEP_BYTES);
+            let promised = b.expert_pinned_budget_bytes
+                + b.kv_warm_budget_bytes
+                + b.weights_reserved_bytes
+                + b.pageable_reserve_bytes
+                + OS_KEEP_BYTES;
+            assert!(
+                promised <= total,
+                "on a {total_gib} GiB box the budget promises {promised} of {total}",
+            );
+            // And the two tier shares are exactly the pool — a rounding gap
+            // between them is capacity that silently belongs to nobody.
+            assert_eq!(
+                b.expert_pinned_budget_bytes + b.kv_warm_budget_bytes,
+                b.tier_pool_bytes,
+                "the two tier budgets must sum to the pool on a {total_gib} GiB box",
+            );
+        }
+    }
+
+    /// The dev box, stated in full so the numbers that broke the machine are
+    /// written down: 31.5 GiB with 2.4 GiB of live weight pages.
+    ///
+    /// Only the GGUF's *live* pages count as weights — its expert regions move
+    /// to the pack file at startup and are never read again, so declaring the
+    /// whole 17.3 GiB mapping would reserve RAM for bytes nothing faults back in.
+    #[test]
+    fn dev_box_splits_its_tier_pool() {
         let total = (31.5 * GIB as f64) as u64;
-        let pinned = (14.4 * GIB as f64) as u64;
-        let weights = (0.7 * GIB as f64) as u64;
-        let b = host_ram_budget_from(total, pinned, weights, 30, OS_KEEP_BYTES);
+        let weights = (2.4 * GIB as f64) as u64;
+        let b = host_ram_budget_from(total, 0, weights, 30, OS_KEEP_BYTES);
+
         assert_eq!(
             b.buffer_bytes,
             total / 100 * 30,
@@ -460,53 +601,123 @@ mod tests {
         );
         assert!(!b.weights_capped);
         assert_eq!(
-            b.kv_warm_budget_bytes,
-            total - pinned - weights - OS_KEEP_BYTES
+            b.tier_pool_bytes,
+            total - weights - PAGEABLE_RESERVE - OS_KEEP_BYTES,
         );
+        // ~18.1 GiB of pool → ~5.4 KV / ~12.7 expert.
+        let kv = b.kv_warm_budget_bytes as f64 / GIB as f64;
+        let ex = b.expert_pinned_budget_bytes as f64 / GIB as f64;
+        assert!((5.2..5.7).contains(&kv), "KV share reads {kv:.2} GiB");
+        assert!((12.4..13.0).contains(&ex), "expert share reads {ex:.2} GiB");
+        // **The expert tier must not shrink to pay for the honest accounting.**
+        // Before the partition it took 13.5 GiB on this machine by sizing from
+        // launch-time free RAM, and the whole point of releasing distilled K/V
+        // at the mark rather than at compaction is that the KV side no longer
+        // needs the 7.1 GiB its peak occupancy once suggested. If a future split
+        // pushes the expert budget back under this, decode throughput pays for
+        // it — measured 14 % fewer resident experts at a 40 % KV share.
         assert!(
-            b.kv_warm_budget_bytes > 15 * GIB,
-            "the warm KV tier should have real room once the pack owns the \
-             expert bytes, got {}",
-            b.kv_warm_budget_bytes
+            b.expert_pinned_budget_bytes >= (12.4 * GIB as f64) as u64,
+            "the expert tier held ~13.5 GiB before the partition; {ex:.2} GiB \
+             would cost resident experts",
         );
     }
 
-    /// The OS floor is a constant, not a knob. It bounds warm **KV** growth
-    /// only — the expert cache's warm tier is bounded by available RAM, which is
-    /// far tighter — so a change here is a change to how much the KV tier may
-    /// take before it starts paging.
+    /// **`pinned` may not move the partition.** The defect this replaced was an
+    /// ordering one: the expert tier read the budget before page-locking its
+    /// pool and the KV tier read it after, so each was sized against a machine
+    /// that did not contain the other. A partition that changes with the live
+    /// pinned gauge is not a partition.
+    #[test]
+    fn the_partition_is_the_same_before_and_after_the_pool_is_pinned() {
+        let total = (31.5 * GIB as f64) as u64;
+        let weights = (2.4 * GIB as f64) as u64;
+        let before = host_ram_budget_from(total, 0, weights, 30, OS_KEEP_BYTES);
+        let after = host_ram_budget_from(
+            total,
+            (13.5 * GIB as f64) as u64,
+            weights,
+            30,
+            OS_KEEP_BYTES,
+        );
+        assert_eq!(
+            before.kv_warm_budget_bytes, after.kv_warm_budget_bytes,
+            "the KV share moved once the expert pool was pinned",
+        );
+        assert_eq!(
+            before.expert_pinned_budget_bytes, after.expert_pinned_budget_bytes,
+            "the expert share moved once the expert pool was pinned",
+        );
+        assert_eq!(before.tier_pool_bytes, after.tier_pool_bytes);
+        // Reported, though — it is still what the machine actually holds.
+        assert_eq!(after.pinned_bytes, (13.5 * GIB as f64) as u64);
+    }
+
+    /// A machine too small to hold its model still yields a coherent partition
+    /// rather than underflowing into a huge one.
+    #[test]
+    fn a_machine_smaller_than_its_reserves_yields_an_empty_pool() {
+        let total = 8 * GIB;
+        let weights = 6 * GIB;
+        let b = host_ram_budget_from(total, 0, weights, 30, OS_KEEP_BYTES);
+        assert!(b.weights_capped, "the model cannot fit beside the buffer");
+        assert_eq!(
+            b.tier_pool_bytes, 0,
+            "no pool is left, and it must read as zero rather than wrap",
+        );
+        assert_eq!(b.kv_warm_budget_bytes, 0);
+        assert_eq!(b.expert_pinned_budget_bytes, 0);
+    }
+
+    /// The OS floor is a constant, not a knob. It comes out of the tier pool
+    /// before either share is taken, so a change here changes how much BOTH
+    /// warm tiers may hold.
     #[test]
     fn the_os_floor_is_one_gib() {
         assert_eq!(OS_KEEP_BYTES, GIB);
     }
 
-    /// The 186 GB box: weights fully reserved and a huge warm budget remains —
-    /// the buffer does NOT come out of it (inclusive semantics).
+    /// The 186 GB box: the reserve stays an absolute 10 GiB, so a large machine
+    /// puts nearly all of itself into the tier pool.
+    ///
+    /// The KV share is far smaller than the 154 GiB the old budget handed out —
+    /// deliberately, because that figure was never real: the expert tier was
+    /// taking its own pool out of the same RAM at the same time. 47 GiB of warm
+    /// KV beside 109 GiB of pinned experts is the honest version of the same
+    /// machine.
     #[test]
-    fn big_box_budget_is_not_reduced_by_the_buffer() {
+    fn big_box_splits_a_large_pool() {
         let b = host_ram_budget_from(186 * GIB, 12 * GIB, 18 * GIB, 30, 2 * GIB);
         assert!(!b.weights_capped);
-        let expect = 186 * GIB - 12 * GIB - 18 * GIB - 2 * GIB;
         assert_eq!(
-            b.kv_warm_budget_bytes, expect,
-            "buffer must not be subtracted"
+            b.tier_pool_bytes,
+            186 * GIB - 18 * GIB - PAGEABLE_RESERVE - 2 * GIB,
         );
-        assert!(b.kv_warm_budget_bytes > 150 * GIB);
+        assert!(b.kv_warm_budget_bytes > 45 * GIB);
+        assert!(b.expert_pinned_budget_bytes > 105 * GIB);
+        assert_eq!(
+            b.kv_warm_budget_bytes + b.expert_pinned_budget_bytes,
+            b.tier_pool_bytes,
+        );
     }
 
     /// A model bigger than `total − buffer` is capped — the machine must swap
-    /// weights, and the budget says so explicitly. The freed region then counts
-    /// toward warm KV (it is genuinely available RAM).
+    /// weights, and the budget says so explicitly.
+    ///
+    /// **And then there is nothing left to give.** The old budget handed the KV
+    /// tier the 2.8 GiB between the capped weights and the OS floor, ignoring
+    /// that the page cache and the mapped checkpoint have to live somewhere. A
+    /// 16 GiB machine asked to hold a 30 GiB model has no warm tier at all, and
+    /// saying so is more useful than a budget it can only meet by thrashing.
     #[test]
-    fn oversized_weights_are_capped_and_flagged() {
+    fn oversized_weights_leave_no_tier_pool() {
         let b = host_ram_budget_from(16 * GIB, 0, 30 * GIB, 30, 2 * GIB);
         assert!(b.weights_capped);
         // buffer = max(30% x 16, 4) = 4.8 GiB; cap = 11.2 GiB.
         assert_eq!(b.weights_reserved_bytes, 16 * GIB - (16 * GIB / 100 * 30));
-        assert_eq!(
-            b.kv_warm_budget_bytes,
-            16 * GIB - b.weights_reserved_bytes - 2 * GIB
-        );
+        assert_eq!(b.tier_pool_bytes, 0);
+        assert_eq!(b.kv_warm_budget_bytes, 0);
+        assert_eq!(b.expert_pinned_budget_bytes, 0);
     }
 
     /// The rate derivation needs two samples and never goes negative.

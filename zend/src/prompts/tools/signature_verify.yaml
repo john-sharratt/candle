@@ -1,4 +1,29 @@
 name: signature_verify
+questions:
+- verify this p256_sha256 signature against the public key below
+- check the ed25519 signature over the release manifest
+- does this signature validate for that exact byte string
+- confirm the signed challenge came from the key holder
+- is the artefact genuinely signed by the vendor
+- would the signature still verify if a byte changed
+- which public key does this signature belong to
+- is this signature over the message or over its hash
+- deciding whether to trust this downloaded package
+- the update refuses to install and I suspect the signature
+- confirming the partner's webhook really came from them
+- auditing whether these commits are properly signed
+- verify that signature
+- check the signature against the pubkey
+- is that signature authentic
+- validate the signature
+- is this ed25519 signature valid for that message
+- check the signature against this public key
+- verify this release was really signed by the key below
+- did the holder of this pubkey actually sign this
+- confirm the p256 signature on this payload is authentic
+- validate this signature for me
+- check whether this signed message has been altered
+- verify the signature matches the public key and data
 category: Cryptography
 description: Check whether a digital signature over a message was genuinely produced by the holder of a given public key (ed25519 or p256_sha256). Returns whether the signature is authentic.
 parameters:

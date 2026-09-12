@@ -1,4 +1,29 @@
 name: remote_fs_session_put
+questions:
+- upload the config I wrote to /etc/app/config.yaml on the SFTP host
+- push the tarball up to /srv/releases on the remote server
+- copy this script onto the remote machine over SFTP
+- transfer the built binary to the deploy host
+- does the file need to exist locally before the SFTP upload
+- will the upload overwrite what's already on the remote path
+- what permissions will the uploaded file land with
+- did the transfer to the remote host succeed
+- deploying the new config to the server
+- shipping the patched binary to the box for testing
+- putting the fixture where the remote job expects it
+- the server needs this file before the next run
+- upload it to the SFTP host
+- push that file to the server
+- send it over SFTP
+- copy it up to the remote machine
+- upload that file to the remote server over SFTP
+- push the config I just wrote up to /etc on the host
+- copy this script to the remote machine
+- send the build artefact to the server via sftp
+- transfer the file I created onto the remote filesystem
+- deploy this file to the remote host over SFTP
+- put the archive up on the server
+- upload it to /srv/app on the SFTP host
 category: Remote filesystem
 description: Upload a file from the session VFS to the remote SFTP filesystem. The file must exist in the VFS (use write first).
 high_risk: true

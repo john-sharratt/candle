@@ -1,4 +1,29 @@
 name: hash_scan
+questions:
+- input "admin" and digest 21232f..., which algorithm
+- try every hash over this string and tell me which matches
+- work out the algorithm from this input/output pair
+- match this 64-hex digest against the known functions
+- is this md5 or sha1, given it's 32 hex characters
+- could this digest have come from sha3 rather than sha2
+- which function do these legacy hashes use
+- does any supported algorithm reproduce this value
+- the old system stored hashes with no algorithm column
+- migrating a password table and the format is undocumented
+- I have a leaked hash and its plaintext, identify the scheme
+- verifying which digest the vendor actually used
+- identify this hash
+- what made this digest
+- which algorithm is it
+- hash type
+- which algorithm produced this digest
+- I know the input and the hash — what hashed it
+- identify the hash function behind this fingerprint
+- work out whether this digest is md5 or sha1
+- what algorithm turns this string into that hash
+- figure out which hash matches this known value
+- tell me the hash type given this input and output pair
+- reverse-engineer the digest algorithm from this example
 category: Security utilities
 description: Given a candidate input (`data`) and a digest (`known_hash`), identify which algorithm produced the digest by recomputing the input's hash under every supported algorithm and matching. Returns the algorithm name when found. Always call this tool to identify the algorithm; never deduce it from the digest yourself.
 parameters:

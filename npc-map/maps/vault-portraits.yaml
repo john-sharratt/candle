@@ -1,0 +1,77 @@
+id: vault-portraits
+kind: level
+within: creators-vault
+ordinal: 6
+name: the portrait level
+summary: >
+  Where a character gets a face. The hold an easel takes is the same one a
+  casting station takes, so a character cannot be painted and rewritten at
+  once — which is the right order anyway, since the face comes from the
+  background.
+character: >
+  A portrait is judged against the ones beside it, so this is the level where
+  what everybody else is doing matters most to what you are doing.
+lacks:
+  - way off this level except the lift and the stair
+spine:
+  name: the ring
+  loop: true
+  through: [ring-north, ring-east, ring-south, ring-west]
+nodes:
+  - { id: ring-north, kind: passage, name: the north run }
+  - { id: ring-east, kind: passage, name: the east run }
+  - { id: ring-south, kind: passage, name: the south run }
+  - { id: ring-west, kind: passage, name: the west run }
+  - { id: cross-upper, kind: passage, name: the upper cross run, off: [ring-east, ring-west] }
+  - { id: cross-lower, kind: passage, name: the lower cross run, off: [ring-east, ring-west] }
+
+  - id: core
+    kind: core
+    name: the lift and the stair
+    plural: true
+    off: [ring-north]
+
+  - id: north-studio
+    kind: work
+    name: the north studio
+    off: [ring-north]
+    parts: [{ part: easel, count: 6 }]
+
+  - id: middle-studio
+    kind: work
+    name: the middle studio
+    off: [cross-upper]
+    parts: [{ part: easel, count: 6 }]
+
+  - id: south-studio
+    kind: work
+    name: the south studio
+    off: [cross-upper]
+    parts: [{ part: easel, count: 4 }]
+
+  - id: plate-room
+    kind: store
+    name: the plate room
+    off: [cross-lower]
+    parts: [plate-rack]
+
+  - id: palette-room
+    kind: store
+    name: the palette room
+    off: [cross-lower]
+    parts: [house-palette]
+    habit: consulted more than it is visited
+
+  - id: gallery
+    kind: social
+    name: the gallery
+    off: [ring-south]
+    parts: [hung-faces, { part: seat, count: 8 }]
+    habit: busy whenever a plate is filed
+
+  - id: likeness
+    kind: social
+    name: the likeness table
+    stand: at
+    off: [ring-south]
+    parts: [likeness-table, { part: seat, count: 6 }]

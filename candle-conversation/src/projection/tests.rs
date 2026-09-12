@@ -327,6 +327,30 @@ layers:
           historical_top_k: 8
 "#;
 
+/// **Lifting repetition penalties inside tool calls is opt-in, and silence
+/// means no.**
+///
+/// It suits a schema whose tool arguments are quotations — paths, identifiers,
+/// numbers that are only right when they repeat. It is the reverse for a schema
+/// whose arguments are prose: a cast decoded every utterance with presence,
+/// frequency, repeat and DRY all off, and one character said the same sentence
+/// word for word for a hundred turns. A default of "on" would keep doing that
+/// to any schema that had not heard of the flag.
+#[test]
+fn tool_calls_keep_their_penalties_unless_the_schema_asks_otherwise() {
+    let quiet = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    assert!(
+        !quiet.schema().free_tool_calls_from_penalties,
+        "a schema that says nothing must keep the penalties it configured"
+    );
+
+    let asked = Builder::from_yaml(&format!(
+        "free_tool_calls_from_penalties: true\n{SIMPLE_YAML}"
+    ))
+    .unwrap();
+    assert!(asked.schema().free_tool_calls_from_penalties);
+}
+
 #[test]
 fn yaml_parses_and_assigns_ids() {
     let b = Builder::from_yaml(SIMPLE_YAML).unwrap();
@@ -4028,6 +4052,120 @@ layers:
     assert!(
         sp < op,
         "summary must emit before the <tools> open marker: {order:?}"
+    );
+}
+
+/// The GENERIC half of a collection's framing — the prose that says the facility
+/// exists, and the catalog summary that names its members — must survive a
+/// projection in which provenance selected NOTHING. Only the detailed per-member
+/// definitions, and the structural markers wrapping them, follow selection.
+///
+/// This is the regression that made zend's first turn of every conversation
+/// unusable: scores are all zero at a turn's opening projection (it runs before
+/// the turn is prefilled, so there is no decode-Q), the `min` budget declines to
+/// force-fill from an all-zero belief, and every tool-related item hung off
+/// `depends_on` — "materialised ≥1 this pass". The model was told it had no
+/// tools and answered from memory.
+#[test]
+fn configured_gate_keeps_overview_and_summary_when_nothing_is_selected() {
+    use super::project::{ProjectionSegment, SealedKind};
+    use candle_transformers::models::dialect::Dialect;
+
+    let yaml = r#"
+system_prompt:
+  items:
+    - kind: section
+      id: tools_overview
+      depends_on_configured: tools
+      content: "overview"
+    - kind: section
+      id: no_tools
+      depends_on_unconfigured: tools
+      content: "no tools"
+    - kind: template
+      id: tools_open
+      dialect: tool_block_open
+      depends_on: tools
+    - kind: collection
+      name: tools
+      selection: { kind: top_k, k: 1 }
+      score_threshold: 10.0
+      sections:
+        - id: tool_a
+          content: "A"
+        - id: tool_b
+          content: "B"
+    - kind: template
+      id: tools_close
+      dialect: tool_block_close
+      depends_on: tools
+layers:
+  - name: dialogue
+    window: 4000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+    let dlct = Dialect::chat_ml();
+    let mut b = Builder::from_yaml_with_vars_and_dialect(yaml, &[], Some(&dlct)).unwrap();
+    b.tokenize_templates::<std::convert::Infallible, _>(|s| Ok(s.bytes().map(u32::from).collect()))
+        .unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let tools = b.id_for_system_collection("tools").unwrap();
+    let summary = SectionId::reserved(Reserved::ToolSummary);
+    b.set_collection_summary_section(tools, summary).unwrap();
+    let overview = b.id_for_system_section("tools_overview").unwrap();
+    let no_tools = b.id_for_system_section("no_tools").unwrap();
+    let tools_open = b.id_for_system_section("tools_open").unwrap();
+
+    // Every member scores 0 — the opening-projection condition. The threshold
+    // keeps them all out, so the collection materialises nothing.
+    let resolver = MockResolver::new().with_section_tokens(summary, 100);
+    let proj = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: convo,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+    let ids: Vec<SectionId> = proj
+        .segments
+        .iter()
+        .filter_map(|seg| match seg {
+            ProjectionSegment::Sealed(SealedKind::Section(s)) => Some(s.id),
+            _ => None,
+        })
+        .collect();
+
+    // The generic half survives: the facility is configured, so say so.
+    assert!(
+        ids.contains(&overview),
+        "overview must emit with tools configured but none selected: {ids:?}"
+    );
+    assert!(
+        ids.contains(&summary),
+        "catalog summary must emit with tools configured but none selected: {ids:?}"
+    );
+    // The detailed half does not: no members, so no markers to wrap them.
+    assert!(
+        !ids.contains(&tools_open),
+        "the <tools> marker must stay gated on selection: {ids:?}"
+    );
+    // And the "tools are off" variant must NOT fire — tools are on, just unpicked.
+    assert!(
+        !ids.contains(&no_tools),
+        "the no-tools variant must key on configuration, not selection: {ids:?}"
     );
 }
 

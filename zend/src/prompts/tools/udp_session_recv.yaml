@@ -1,4 +1,29 @@
 name: udp_session_recv
+questions:
+- receive one datagram on the UDP socket and show the sender
+- read the DNS response packet off the UDP session
+- grab the next UDP datagram and its source address
+- pull the NTP reply off the connectionless socket
+- has a datagram arrived on the UDP socket yet
+- who sent that datagram
+- how big was the UDP packet that came back
+- is the UDP listener getting anything at all
+- I sent a query and want the datagram that answers it
+- checking whether the service replies over UDP at all
+- confirming the collector echoes something back
+- capturing one packet to see the response format
+- take one packet off the UDP socket
+- receive on the UDP socket
+- what packet came back over UDP
+- get the next datagram
+- read the incoming UDP datagram
+- what packet came back on the UDP socket
+- receive one datagram and tell me who sent it
+- grab the UDP response from the server
+- read the next packet off the UDP session
+- did anything arrive on the UDP socket
+- pull the DNS reply datagram off the wire
+- get the sender address and payload of the next UDP packet
 category: UDP sessions
 description: Read one incoming UDP datagram, returning its packet payload and the sender's address.
 high_risk: true

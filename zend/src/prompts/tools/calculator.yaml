@@ -1,4 +1,29 @@
 name: calculator
+questions:
+- 918273 divided by 4657 to six decimal places
+- compute 1.07 to the power of 30
+- evaluate (3.2e6 * 45) / (7 - 2.5)
+- what's arctan(1.5) in radians
+- if I invest 12000 at 4.8% compounded monthly, what's the total after 7 years
+- how many seconds are there in 3.7 years
+- what percentage is 8834 of 120500
+- is 2^31 - 1 actually prime, and what's its value
+- I need the exact figure, not an estimate, for this multiplication
+- the spreadsheet total looks wrong, work it out properly
+- I don't trust your mental arithmetic on this one
+- give me the precise answer, there's money riding on it
+- 44839 * 12
+- sqrt of 2750000
+- do the sums on this for me
+- crunch these numbers exactly
+- what's 8472 times 9391
+- work out 15% of 62400 for me
+- what is the cube root of 91125
+- calculate sin(0.75) plus cos(1.2)
+- how many is 4839 divided by 17, exactly
+- evaluate 2^24 minus 3^11
+- what's the natural log of 88000
+- add up 1249, 8830, 44 and 90211
 category: Utilities & web
 description: 'Evaluate an arithmetic or scientific expression and return the exact result. Use for: arithmetic the model would otherwise compute mentally and get wrong, multi-digit multiplication or division, percentage calculations, square roots, trigonometry, evaluating formulas with parentheses and standard functions. Supports +, -, *, /, %, ^, sqrt, sin, cos, tan, ln, log (base 10), log2, exp, abs, min, max, floor, ceil, round. Triggered by "calculate", "compute", "what is X times Y", "how much is", "what''s the square root of", or any explicit math problem. Returns the numeric result, plus a `result_display` rendering (digit-grouped, with magnitude) for large or tiny values — quote `result_display` when reporting such a result. Use unit_convert for unit conversions; use random for generating random values.'
 parameters:

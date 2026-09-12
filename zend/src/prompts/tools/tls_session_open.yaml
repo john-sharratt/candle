@@ -1,4 +1,29 @@
 name: tls_session_open
+questions:
+- open a TLS connection to ldaps.corp.example:636
+- start an encrypted session to the SMTPS server on 465
+- connect over TLS to the MQTT broker on 8883
+- open a certificate-verified channel to that IMAPS host
+- does that service want TLS from the first byte
+- what certificate does the TLS peer present
+- should I use TLS here or plain TCP
+- will the TLS handshake succeed with the default trust store
+- the mail server only accepts implicit TLS
+- checking the certificate chain the endpoint serves
+- the protocol isn't HTTP but it is TLS-wrapped
+- debugging why the client can't complete the TLS handshake
+- open a TLS connection
+- start an encrypted session
+- connect over TLS
+- new TLS channel
+- open a TLS connection to the IMAPS server on 993
+- connect over TLS to that LDAPS endpoint
+- start an encrypted TLS session to the SMTPS host
+- open a certificate-verified channel to the MQTT broker on 8883
+- I need a TLS socket to that service, not plain TCP
+- establish an encrypted connection to port 636
+- open TLS to this host and verify its certificate
+- connect securely over TLS to the mail server
 category: TLS sessions
 description: Open a TLS-encrypted TCP connection. Use for LDAPS, IMAPS, SMTPS, MQTTS, or any TLS service. For HTTP over TLS, prefer http_session_open. Returns session_id for subsequent sends/receives.
 high_risk: true

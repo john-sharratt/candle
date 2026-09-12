@@ -32,9 +32,26 @@ server:
   # must not take the real one.
   bind: "0.0.0.0:80"
 
-  # `no-store` while iterating. The failure this prevents is a cached page
-  # talking to a newer API; set a real max-age once assets are hashed.
-  cache_control: "no-store"
+  # How long a static file may be reused before the browser asks again.
+  #
+  # Two tiers, split by how much a stale copy matters rather than by how often
+  # the file changes:
+  #
+  #   short — HTML, JavaScript, CSS. A page running last minute's code against
+  #           this minute's API is the failure worth bounding, and `--content`
+  #           serves these from disk so a refresh can show an edit.
+  #   long  — images, icons, fonts. A stale one is a slightly old picture.
+  #
+  # Both still carry an ETag, so these say when to *ask*, not what the answer
+  # costs: once the age is up the request is conditional and an unchanged file
+  # is `304` with no body.
+  #
+  # This was one value, and it went from `no-store` (re-download everything,
+  # every refresh) to `no-cache` (no bytes, but fifteen round trips a load) to
+  # this. `web/src/asset.rs` has the reasoning.
+  cache:
+    short_secs: 60
+    long_secs: 900
 
   # A daemon that is down is not retried on every request: the window opens at
   # 250ms and doubles to 10s, requests inside it fail fast with an error page
@@ -130,13 +147,18 @@ sites:
   # which is why `/` is `exact`: a bare `/` prefix would swallow them all.
   - name: tokera
     default: true
-    hosts: ["tokera.com", "www.tokera.com", "tokera.localhost"]
+    hosts: ["tokera.com", "tokera.localhost"]
     roots: ["content/tokera", "content/common"]
     papers: "../docs"
     api:
       - {prefix: /, exact: true, upstream: local}
       - {prefix: /blog, upstream: local}
       - {prefix: /papers, upstream: local}
+      # Generated, not files — from the same walk that renders the index, so
+      # they cannot fall behind it. `exact`, because they are single addresses
+      # and a prefix would claim names beside them.
+      - {prefix: /robots.txt, exact: true, upstream: local}
+      - {prefix: /sitemap.xml, exact: true, upstream: local}
 
   # ── battlecities.net — the game's own site ──────────────────────────────
   # A handful of static files: a title image, a download link, and the icon set
@@ -154,8 +176,15 @@ sites:
   # the game's build output rather than repository content, so the link 404s
   # until a release is dropped alongside these files.
   - name: battlecities
-    hosts: ["battlecities.net", "www.battlecities.net", "battlecities.localhost"]
+    hosts: ["battlecities.net", "battlecities.localhost"]
     roots: ["content/battlecities"]
+
+  # `www.` for the game, sent to the name without it — same reasoning as
+  # `tokera-alt` below, and the same reason it is its own entry: a redirect site
+  # has one target, and this one is not tokera.com.
+  - name: battlecities-alt
+    hosts: ["www.battlecities.net"]
+    redirect: "https://battlecities.net"
 
   # ── bot.tokera.com — the NPC console ────────────────────────────────────
   # A pure gateway, like zend below: no roots, everything forwarded, navigation
@@ -197,3 +226,49 @@ sites:
     api:
       - prefix: /
         upstream: "http://192.168.0.5:8081"
+
+  # ── the other Tokera names ──────────────────────────────────────────────
+  # Every alternate domain for the brand, sent to the one that is the brand.
+  #
+  # **Redirected, not cloned**, and the difference matters. Serving the same
+  # pages on six hostnames splits the name against itself: a search engine
+  # picks one as canonical and the copies count for nothing, so the effect of
+  # publishing six is to compete with yourself for the one result you want.
+  # It also turns one deploy into six chances to serve a stale one. A `301`
+  # does the opposite — every link, every bookmark and every typed address is
+  # consolidated onto `tokera.com`, which is the only thing that makes a name
+  # rank.
+  #
+  # The `www.` form of each is here too. They are separate hostnames as far as
+  # DNS and a search engine are concerned, and a name that resolves but does
+  # not answer is worse than one that does not resolve at all.
+  #
+  # These need DNS pointing here and a certificate covering them — Cloudflare
+  # holds both, and a name absent from either fails before it reaches this
+  # file.
+  #
+  # `tokera.com` itself is NOT in this list: it is the target. Its `www.` form
+  # is, though — it was served rather than redirected, which is the same split
+  # as any of the others. The pages already declare `tokera.com` canonical, so
+  # nothing depended on `www.` answering with content; the `301` says the same
+  # thing in the stronger way, and consolidates links rather than merely hinting
+  # at where they should have pointed.
+  #
+  # Sign-in is unaffected. A redirect is resolved before routing, so a visitor
+  # arriving at `www.` lands on the apex first and signs in there — which is the
+  # only host Google will call back to anyway, since `redirect_uri` names it
+  # exactly and a mismatch is refused at the provider.
+  - name: tokera-alt
+    hosts:
+      - "www.tokera.com"
+      - "tokera.com.au"
+      - "www.tokera.com.au"
+      - "tokera.info"
+      - "www.tokera.info"
+      - "tokera.net"
+      - "www.tokera.net"
+      - "tokera.sh"
+      - "www.tokera.sh"
+      - "tokera.co.uk"
+      - "www.tokera.co.uk"
+    redirect: "https://tokera.com"

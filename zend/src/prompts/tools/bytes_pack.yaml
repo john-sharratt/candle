@@ -1,4 +1,29 @@
 name: bytes_pack
+questions:
+- pack 1, 65535 and 3.14 with the format <HHf
+- build the 12-byte header, big-endian, u32 magic then u64 length
+- encode these fields as >IIQ and give me the hex
+- serialise this record with a 16-byte fixed-width name field
+- how many bytes will this struct layout come to
+- what does this record look like on the wire
+- is my format string right for these values
+- does the endianness matter for the header I described
+- I need to send this to a C program that reads a packed struct
+- the protocol spec says the frame starts with a length prefix
+- build me a test packet for the parser I'm writing
+- our firmware expects these values as raw binary, not JSON
+- pack it
+- struct-encode the values below
+- I'm hand-crafting a frame to poke at this daemon
+- make the bytes for this header, I'll append the body myself
+- pack these three integers into little-endian binary
+- build me a big-endian header with a u16 length and a u32 offset
+- serialise 1, 2.5 and "abc" into a byte buffer
+- encode these values as a binary struct with format <IHB
+- I need the wire bytes for this record layout
+- turn these numbers into a packed binary blob
+- lay these fields out as big-endian bytes
+- construct the binary frame for this struct definition
 category: Byte encoding
 description: 'Pack structured values into binary bytes using a format string (like Python struct). Format: optional < (little-endian) or > (big-endian), then type chars: B(u8), H(u16), I/L(u32), Q(u64), b(i8), h(i16), i/l(i32), q(i64), f(f32), d(f64), Ns(N-byte string). Always call this tool to pack the values; never assemble the bytes yourself.'
 parameters:

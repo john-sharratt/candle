@@ -48,7 +48,7 @@ Routing patterns from the prior layer predict the current layer's expert needs. 
 | **Qwen3-30B-A3B** | Current development/benchmarking | 30B total, 3B active, MoE |
 | **DeepSeek-V4-Flash-0731** | Native-sparse 1M-context port (in progress) | 284B total, 13B active, MXFP4 experts, K≡V latent attention; see `docs/deepseek_batched_paged_attention_plan.md` |
 | **Qwen3-235B-A22B** | Production Zen Code target | Requires RTX 5090 workstation |
-| **Llama-3.2-3B** | batch_test integration testing | VibeStudio/Nidum uncensored fine-tune |
+| **Llama-3.2-3B** | batch_test integration testing | VibeStudio/Nidum fine-tune (the base model is gated) |
 | Qwen3-8B/14B | Ablation baselines | — |
 
 Qwen3 thresholds are model-specific and must be re-derived for each variant. When a new model is added, re-derive the `PRODUCTION_*` constants via measurement.
@@ -118,12 +118,13 @@ These apply repo-wide. They are deliberate standing decisions, not suggestions.
 - **Code comments describe the implementation, not the design process.** Write every comment as if the full final design is already in place. No "Phase 2 of …", no "reserved for Phase 3", no "until Phase 4 lands", no "pre-Phase-N path", no "later phases will pivot on this". The design doc lives in `docs/`; code comments explain *what this code does and why* in the present tense, against the codebase as it is. A reader who has never seen the rollout plan should be able to understand the comment.
 - **Persistence is mandatory.** The conversation substrate is always backed by its on-disk persistence layer (`candle-conversation/src/persistence/`, redo log at `.substrate/substrate.log`). There is no in-memory-only substrate mode. See `docs/kv_tier_migration.md`.
 - **Never `git commit` without explicit permission.** Show the diff (or summarize what will be staged + propose the message) and wait for the user to say go. Authorization for one commit does not carry forward to subsequent commits — every commit requires its own approval. This is non-negotiable.
-- **Only the `Edit` and `Write` tools may modify files.** Never rewrite a file from an external process — not PowerShell, not a Python script, not `sed -i`, not a shell redirect. There is no size or repetition threshold that justifies it; for a repeated pattern use `Edit` with `replace_all`, and for genuinely distinct sites issue several `Edit` calls in one message. Three separate reasons, any one of which is sufficient:
+- **Files are touched by the file tools only — `Read`, `Grep`, and `Glob` to look, `Edit` and `Write` to change.** The shell never reads a file and never writes one. Never rewrite a file from an external process — not PowerShell, not a Python script, not `sed -i`, not a shell redirect. There is no size or repetition threshold that justifies it; for a repeated pattern use `Edit` with `replace_all`, and for genuinely distinct sites issue several `Edit` calls in one message. Three separate reasons, any one of which is sufficient:
   - **A script fails silently.** `s.replace(a, b)` that matches nothing is a no-op, so a stale or mistyped pattern applies part of a multi-site change and reports success. `Edit` verifies against the file it read and errors when the match is missing or ambiguous, which is the difference between finding out now and finding out from a compile error three steps later.
   - **A script destroys on interruption.** `open(path, 'w')` truncates before it writes. If the machine dies in that window the file is gone rather than merely unchanged — and on NTFS the size metadata can land while the data does not, leaving a file of exactly the right length filled with `NUL`. That happened: a hard reset during this work left `candle-transformers/src/models/batched_model.rs` as 32,689 zero bytes, and ~6.7 KB of uncommitted changes had to be reconstructed from call sites. Editor writes leave the file untouched on failure.
   - **A script is opaque.** Tool edits are tracked, so "what touched this file" is a lookup. Script writes are not, so the same question becomes forensics.
   - PowerShell has an extra failure of its own on top: `Set-Content`, `Out-File`, and `[System.IO.File]::WriteAllText` default to encodings that mangle UTF-8 multi-byte content via a CP1252 round-trip — em-dashes (`—`), box-drawing characters (`┌─└`), arrows (`→`, `≤`, `≥`), curly quotes, and anything else outside ASCII silently become mojibake like `â€"` or `â”Œâ”€`, hard to spot at edit time and easy to ship to commit. Even `-Encoding utf8` doesn't fix it, because the read side may already have decoded the file as CP1252.
-  - External processes are fine for **reading** state (`grep`, `sed -n`, `git show`) and for running builds and tests. The prohibition is on writes.
+  - The shell is for **running things** — builds, tests, `git`, a daemon, a CLI. It is not for touching files. Reading and searching go through `Read`, `Grep`, and `Glob`, never `cat`/`head`/`tail`/`sed -n`/`type`/`Get-Content` and never `grep`/`rg`/`find`/`Select-String`/`Get-ChildItem -Recurse`. There is no size or convenience threshold that reverses this, and "just this once to check a line" is the exact case it covers. Two reasons: a shell read is untracked, so the file state the editing tools verify against is not updated and the next `Edit` is matching against a file nobody recorded looking at; and a shell read is a decode, so it mangles the same UTF-8 the write path does — an em-dash or a box-drawing character comes back as mojibake and gets copied straight into the next edit. Output that is genuinely a *command's* (a test log, `git show`, `nvidia-smi`, `cargo build`) is the shell's to produce; redirect it to a file and open that with `Read` when it is long.
+  - **Do not verify behaviour by writing a throwaway script.** A PowerShell or Python harness that drives the HTTP API to prove something works is a test that nobody can run again, in a language the project does not use, with its own bugs — a CP1252 decode in one such harness produced 777 fake failures and six fake file corruptions, and every one of them was the harness. Write the check as a `#[test]` next to the code instead: it runs in CI, it fails on the line that broke, and it is still there next month. The shell's part is `cargo test`. (Driving the *live daemon* with `curl` to confirm a route answers is fine — that is one command, not a program.)
 - **Never mask a command's exit status.** `cmd | grep -E "^error"`, `| head`, `| tail`, and `cmd; echo DONE` all report success for a command that failed — `head` can `SIGPIPE` the writer mid-output, and a `;` chain runs the echo unconditionally. A build or test result read through a filter is not evidence. Let the command's own exit code decide, and when filtering output for brevity, check the status separately (`cmd > log 2>&1; echo "EXIT=$?"`, then read the log).
 
 ---
@@ -285,6 +286,12 @@ cargo test -p candle-nn kv_cache    # single module
 cargo test --features cuda          # GPU tests
 cargo test --release
 
+# A feature-gated test that is not built is reported as `filtered out`, not as a
+# gap, so `-p candle-conversation` alone silently drops every `hub` test — and
+# the same test then passes or fails depending on whether another `-p` in the
+# same invocation unified the feature in. Run the crate with it explicitly:
+cargo test -p candle-conversation --features hub --lib
+
 # Linting (enforced in CI)
 cargo fmt --all -- --check
 cargo clippy --workspace --tests --examples -- -D warnings
@@ -397,27 +404,28 @@ All weight loading uses `VarBuilder`:
 3. Add FFI binding in `candle-kernels/src/lib.rs`
 4. Call from `candle-core/src/cuda_backend/` via `unsafe`
 
-### Debugging a faulting kernel — `kernel-lineinfo`
+### Debugging a faulting kernel
 
-The kernels build **without** `--generate-line-info`, so a device-side fault
-gives you an address and no source location. When you need the file and line —
-an illegal access whose origin is not obvious, a `compute-sanitizer` run — build
-with the feature for that session and drop it again afterwards:
+**Use the `tensor-assert` harness, below.** A device-side fault is a write that
+went somewhere it should not have, and `readonly_regions` is built to catch
+exactly that: declare the ground that must never be written again, and the guard
+names the writer *at the moment of the write* — before the corruption, with the
+tenant's name, on the thread that did it. That is a better answer than an address
+to decode after the fact, and it is what this repository has instead of a
+debugger workflow.
 
-```bash
-cargo test -p candle-transformers --features cuda,kernel-lineinfo <test> -- --nocapture
-```
+Narrow the same way everything else here is narrowed: `Tensor::assert` to bound
+the window, `on_bad` to compose the next question inside it, `check_now` at the
+one site an armed capture has named. The method is in the harness section — test,
+narrow, test, narrow — and the two dangers it records (an instrument that fences
+suppresses the race it hunts; a stale declared region blames an innocent
+allocation) apply to fault hunting most of all.
 
-**Do not leave it on.** It costs nothing at runtime and two thirds of the build
-on disk: a measured cubin holds 175 KB of `.text` SASS against 592 KB of debug
-sections, `.nv_debug_ptx_txt` (the embedded PTX source text) being 490 KB of
-that. Those archives are statically linked into *every* CUDA test binary, and
-cargo keeps every generation of every binary it has ever produced.
-
-Which is the other half of the same story: `target/` grows tens of GB per build
-generation and cargo has no garbage collector. `cargo prune` (`target-prune`)
-sweeps superseded generations — it keeps the two newest of each artifact, so
-alternating feature sets do not thrash. `cargo prune -- --dry-run` reports first.
+A note on disk, which is the other half of any debugging session: `target/` grows
+tens of GB per build generation and cargo has no garbage collector. `cargo prune`
+(`target-prune`) sweeps superseded generations — it keeps the two newest of each
+artifact, so alternating feature sets do not thrash. `cargo prune -- --dry-run`
+reports first.
 
 ---
 

@@ -107,6 +107,13 @@ impl Ring {
         self.samples.len()
     }
 
+    /// Whether nothing has been sampled yet, or everything has aged out. Both
+    /// read the same from outside, and both mean there is nothing to report.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
     /// Add a sample and drop whatever has aged out.
     pub fn push(&mut self, s: Sample) {
         let now = s.at;

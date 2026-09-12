@@ -105,3 +105,39 @@ aside,
         font-size: 18px;
     }
 }
+
+/* The description under the title.
+ *
+ * The page was a title image and a download link, which reads as a holding
+ * page and gives a search engine nothing to rank — alt text on one image is
+ * not content. This is the same copy tokera.com uses for the game, set in a
+ * reading column so it is a page rather than a caption. */
+.about {
+    max-width: 34rem;
+    margin: 2.5rem auto 0;
+    padding: 0 1.25rem 3rem;
+}
+
+.about p {
+    margin: 0 0 1.1em;
+}
+
+.about strong {
+    color: #ddd;
+}
+
+.about ul {
+    margin: 0 0 1.4em;
+    padding-left: 1.2em;
+}
+
+.about .meta {
+    font-size: .9em;
+    color: #888;
+    border-top: 1px solid #333;
+    padding-top: 1.1em;
+}
+
+.about a {
+    color: #c98a3e;
+}

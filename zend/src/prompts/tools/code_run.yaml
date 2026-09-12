@@ -1,4 +1,29 @@
 name: code_run
+questions:
+- run this JS and print the result of the reduce
+- execute this and tell me what it logs
+- run a snippet that parses this date string and formats it
+- evaluate this regex against those sample inputs in JS
+- does this function actually return what I think
+- what happens if I pass null into this
+- will this throw on an empty array
+- is my off-by-one here real, run it and see
+- I want to verify the algorithm before porting it
+- checking my logic on a few edge cases
+- easier to just run it than reason about it
+- prove this transformation does what the comment claims
+- run it
+- exec this JS
+- try this
+- what does this print
+- run this javascript snippet and show me the output
+- execute this JS one-liner for me
+- can you actually run this function and tell me what it returns
+- evaluate this bit of javascript in the sandbox
+- write and run a script that sorts this array
+- run some JS to reshape this JSON for me
+- execute this loop and give me the result
+- try this javascript and tell me if it throws
 category: Code execution
 description: Execute a JavaScript snippet in an embedded, sandboxed engine (no filesystem, network, or process access). Runs in-process on a pure-Rust VM — no Node or external interpreter required. Use for arithmetic/logic the model would get wrong, data transformation, string processing, JSON manipulation, and quick algorithms. `console.log` output is returned in stdout; the final expression's value in result. Returns stdout, stderr, exit_code (0 on success, 1 if the script throws), duration, and result.
 high_risk: true

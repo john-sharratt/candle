@@ -39,6 +39,7 @@ use candle_nn::kv_cache::{
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
 use super::batched_layer::GlueMeta;
@@ -468,6 +469,14 @@ struct SequenceState {
     active: bool,
     /// KvCaches for this sequence (one cache per layer).
     caches: KvCaches,
+    /// The LoRA adapter this sequence decodes through, by name, or `None` for
+    /// the base model.
+    ///
+    /// Per sequence rather than per session because one resident model serves
+    /// both: the adapter is never merged into the weights, so an adapted and an
+    /// unadapted conversation differ only in this field. A wave admits one
+    /// value of it — see [`BatchedInferenceSession::wave_adapter`].
+    adapter: Option<Arc<str>>,
 }
 
 /// Assemble a [`GlueMeta`] from the wave's per-slot glue descriptors for a
@@ -852,9 +861,76 @@ impl BatchedInferenceSession {
             offset: 0,
             active: true,
             caches,
+            // A new slot decodes through the base model until something says
+            // otherwise. The caller opts in with `set_sequence_adapter` before
+            // the sequence's first wave.
+            adapter: None,
         });
 
         Ok(idx)
+    }
+
+    /// Choose the LoRA adapter this sequence decodes through, by name, or
+    /// `None` for the base model.
+    ///
+    /// Set before the sequence's first wave and left alone after: the KV already
+    /// written by an adapted prefill was produced by adapted projections, and
+    /// continuing it unadapted would attend adapted keys with unadapted queries.
+    pub fn set_sequence_adapter(
+        &mut self,
+        seq_idx: usize,
+        adapter: Option<Arc<str>>,
+    ) -> Result<()> {
+        match self.sequences.get_mut(seq_idx).and_then(|s| s.as_mut()) {
+            Some(s) => {
+                s.adapter = adapter;
+                Ok(())
+            }
+            None => candle::bail!("set_sequence_adapter: sequence {seq_idx} is not allocated"),
+        }
+    }
+
+    /// The adapter `seq_idx` decodes through.
+    pub fn sequence_adapter(&self, seq_idx: usize) -> Option<&str> {
+        self.sequences
+            .get(seq_idx)
+            .and_then(|s| s.as_ref())
+            .and_then(|s| s.adapter.as_deref())
+    }
+
+    /// The one adapter this wave's sequences share.
+    ///
+    /// **A wave is adapter-homogeneous by construction**, because the adapter
+    /// changes the projections every sequence in the wave flows through
+    /// together: one set of matmuls runs over the whole batch, so two sequences
+    /// wanting different adapters cannot be in it. The scheduler groups by
+    /// adapter and loops the waves; this is where that contract is enforced,
+    /// and a mixed wave is refused rather than silently given one group's
+    /// adapter — which would apply the wrong fine-tune to somebody's
+    /// conversation and read as the model behaving oddly.
+    /// Returns the name by `Arc` rather than by reference so the caller can
+    /// hold it across the mutable borrow of the session's caches that
+    /// immediately follows — an `Arc<str>` clone is a refcount bump.
+    pub fn wave_adapter(&self, seqs: &[usize]) -> Result<Option<Arc<str>>> {
+        let mut chosen: Option<Option<Arc<str>>> = None;
+        for &s in seqs {
+            let a = self
+                .sequences
+                .get(s)
+                .and_then(|q| q.as_ref())
+                .and_then(|q| q.adapter.clone());
+            match &chosen {
+                None => chosen = Some(a),
+                Some(prev) if *prev == a => {}
+                Some(prev) => candle::bail!(
+                    "wave mixes LoRA adapters: sequence {s} wants {:?} but an earlier \
+                     sequence in the same wave wants {:?} — waves must be grouped by adapter",
+                    a,
+                    prev
+                ),
+            }
+        }
+        Ok(chosen.flatten())
     }
 
     /// Refresh the persistent decode GPU slot-state for `seq_idx` across every
@@ -4581,6 +4657,18 @@ pub trait ManagedBatchedModel {
         0
     }
 
+    /// The other direction: let the weight side take back KV regions standing
+    /// free. See `BatchedModel::reclaim_spare_ground`.
+    ///
+    /// **Only legal between forwards** — a boundary move evicts and relocates
+    /// expert slots. The scheduler's guest drain is the caller: after a
+    /// co-resident model has been unloaded and its span ground returned, the
+    /// weight side should take back whatever the drain's eviction made it
+    /// concede, rather than waiting for the pressure signal to swing the other
+    /// way. On a quiet world that may be a long time, and until it does the
+    /// model runs with a smaller expert working set for no reason.
+    fn reclaim_spare_ground(&self) {}
+
     /// Live VRAM held by the model's weights (fixed base + time-varying resident
     /// experts), for the whole-card VRAM decomposition. `None` if unavailable.
     fn resident_weight_bytes(&self) -> Option<usize> {
@@ -4794,6 +4882,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn request_kv_ground(&self, regions: usize) -> u64 {
         self.model().request_kv_ground(regions)
+    }
+
+    fn reclaim_spare_ground(&self) {
+        self.model().reclaim_spare_ground()
     }
 
     fn resident_weight_bytes(&self) -> Option<usize> {

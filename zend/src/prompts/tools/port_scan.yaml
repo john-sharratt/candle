@@ -1,4 +1,29 @@
 name: port_scan
+questions:
+- check 22, 80 and 443 on 10.0.0.7
+- is 5432 accepting connections on the db host
+- probe ports 8080 through 8090 on that box
+- see whether 6379 is reachable from here
+- did the service actually bind its port
+- is anything listening on the admin port
+- which of these ports got through the firewall
+- is the port closed or is it filtered
+- the deploy claims success but nothing answers on the port
+- I opened a firewall rule and want to confirm it works
+- checking exposure before we put this on the internet
+- the health check fails and I want to know if the socket is even up
+- port check
+- is 443 open
+- scan those ports
+- can I connect to that port
+- is port 443 open on that host
+- check whether the service is listening on 8080
+- scan these ports and tell me which are open
+- is a firewall blocking 22 on this server
+- did the deployment actually start listening
+- check ports 80, 443 and 3306 on this address
+- which of these TCP ports accept connections
+- verify the database port is reachable on that host
 category: Network diagnostics
 description: 'Check whether specific TCP ports are open on a host by attempting connections. Use for: verifying a service is listening, checking whether a firewall is blocking a port, service discovery on known-candidate ports, confirming a deployment started correctly. Triggered by "is port X open on", "check if the service is running on", "scan these ports", "is SSH/HTTP/database accessible on". Returns open/closed status per port with a configurable timeout per attempt. Provide up to 100 ports per call. Use ping_icmp first to confirm the host is reachable.'
 high_risk: true

@@ -2,11 +2,11 @@
 //!
 //! Every `*.yaml` under `src/prompts/tools/` (embedded at compile time) is one
 //! tool definition following `src/prompts/tool.schema.json`: name, category,
-//! description, high-risk flag, the `parameters` JSON Schema, and ChatML
-//! selection-calibration `examples`. These drive everything the prompt and
-//! calibration need — the tool catalog surfaced into the `tools` collection, the
-//! constrained-decode stencil, the safe-subset for Restricted mode, and the
-//! per-tool trajectories.
+//! description, high-risk flag, the `parameters` JSON Schema, ChatML
+//! selection-calibration `examples`, and the plain-question `questions` seeds.
+//! These drive everything the prompt and calibration need — the tool catalog
+//! surfaced into the `tools` collection, the constrained-decode stencil, the
+//! safe-subset for Restricted mode, and the per-tool trajectories.
 //!
 //! This is the definition half of the tool system, and the only half the model
 //! ever sees: the `description` and `parameters` here are what get rendered into
@@ -50,6 +50,23 @@ pub struct ToolDef {
     /// prompt for an uncalibrated tool. Prefilled by the calibration phase.
     #[serde(default)]
     pub examples: Vec<String>,
+    /// Extra ways a user might ASK for this tool — one plain question each, no
+    /// reasoning block and no answer.
+    ///
+    /// Routing happens on the question. An `examples` trajectory is ~95% think
+    /// block and call, so its question — the part a live probe resembles — is a
+    /// few percent of the exemplar; the phase lens
+    /// (`docs/provenance_score_normalization.md` §3.4) reads exactly that
+    /// region, and these are entries that are *only* that region — so a tool can
+    /// carry many more phrasings than it could afford as full examples.
+    ///
+    /// **All of a tool's questions are calibrated in ONE submission**, stuffed
+    /// into a single prefill grid and carved back into one turn each
+    /// (`candle_conversation::stuffed_grid`). They are therefore resumed as a
+    /// unit: the group's marker covers every question, so editing any one of
+    /// them regenerates the whole set.
+    #[serde(default)]
+    pub questions: Vec<String>,
 }
 
 impl ToolDef {
@@ -66,15 +83,16 @@ impl ToolDef {
     }
 
     /// Content marker for one calibration case: this tool paired with one of its
-    /// examples. Covers **everything that shapes the exemplar** — the projected
-    /// [`Self::json_line`] (name, description, parameters: exactly the text the
-    /// model reads when choosing a tool) and the example trajectory itself.
+    /// trajectories — an `examples` entry or a rendered `questions` one. Covers
+    /// **everything that shapes the exemplar**: the projected [`Self::json_line`]
+    /// (name, description, parameters — exactly the text the model reads when
+    /// choosing a tool) and the trajectory itself.
     ///
     /// The calibration phase keys its resume cache on this, so editing a
-    /// description, a parameter's description, or an example changes the marker
-    /// and the case re-runs against the current text. Hashing the example alone
-    /// would leave a reworded tool answering the belief scan with signatures
-    /// captured against wording that no longer exists.
+    /// description, a parameter's description, an example, or a question changes
+    /// the marker and that case re-runs against the current text. Hashing the
+    /// trajectory alone would leave a reworded tool answering the belief scan
+    /// with signatures captured against wording that no longer exists.
     pub fn calibration_marker(&self, example: &str) -> String {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
@@ -200,7 +218,60 @@ mod tests {
             high_risk: false,
             parameters: params,
             examples: vec!["list the files<|im_end|>".to_string()],
+            questions: vec!["what files are here".to_string()],
         }
+    }
+
+    /// A tool's question GROUP and its examples are distinct cases, so the
+    /// resume cache cannot confuse them and editing one leaves the other alone.
+    ///
+    /// The group's marker covers every question at once because the group is
+    /// regenerated as a unit: all of a tool's questions go in as ONE stuffed
+    /// prefill, so a per-question marker could never be resumed independently.
+    #[test]
+    fn a_question_groups_marker_differs_from_an_examples() {
+        let d = def("List the files.", serde_json::json!({}));
+        assert_ne!(
+            d.calibration_marker(&d.questions.join("\u{0}")),
+            d.calibration_marker(&d.examples[0])
+        );
+    }
+
+    /// **Editing ANY question in the group must move the group's marker.**
+    /// Otherwise a reworded question resumes against exemplars captured from
+    /// text that no longer exists — the same staleness the whole-definition hash
+    /// prevents, one level down.
+    #[test]
+    fn a_question_groups_marker_moves_when_any_question_changes() {
+        let mut d = def("List the files.", serde_json::json!({}));
+        d.questions = vec!["what files are here".into(), "show me the directory".into()];
+        let baseline = d.calibration_marker(&d.questions.join("\u{0}"));
+
+        // Reword the SECOND question — the one a marker built from only the
+        // first, or from the count, would miss.
+        let mut edited = d.clone();
+        edited.questions[1] = "show me this directory".into();
+        assert_ne!(
+            edited.calibration_marker(&edited.questions.join("\u{0}")),
+            baseline,
+        );
+
+        // Adding one moves it too.
+        let mut added = d.clone();
+        added.questions.push("list everything".into());
+        assert_ne!(
+            added.calibration_marker(&added.questions.join("\u{0}")),
+            baseline,
+        );
+
+        // Reordering moves it as well: order decides which block a question
+        // lands in, so two orderings are genuinely different corpora.
+        let mut swapped = d.clone();
+        swapped.questions.swap(0, 1);
+        assert_ne!(
+            swapped.calibration_marker(&swapped.questions.join("\u{0}")),
+            baseline,
+        );
     }
 
     /// The calibration marker must move whenever anything the model reads about
@@ -342,6 +413,132 @@ mod tests {
                 "tool {:?} parameters is not an object JSON Schema",
                 def.name
             );
+        }
+    }
+
+    /// **Every tool carries question-only seeds, and they really are questions.**
+    ///
+    /// A tool with none is invisible to any probe shaped like a question until
+    /// its full trajectories happen to match — which is the failure the seeds
+    /// exist to remove, and it is silent: the catalog still renders, the tool
+    /// still executes, it just stops being *selected*. The shape assertions
+    /// catch a trajectory pasted in by mistake, which would prefill an authored
+    /// answer instead of a bare question.
+    #[test]
+    fn every_tool_seeds_the_question_gallery() {
+        for def in all() {
+            assert!(
+                def.questions.len() >= 16,
+                "tool {:?} has {} question seeds; the schema requires at least 16",
+                def.name,
+                def.questions.len()
+            );
+            for q in &def.questions {
+                assert!(
+                    !q.trim().is_empty(),
+                    "tool {:?} has a blank question",
+                    def.name
+                );
+                for marker in ["<|im_end|>", "<|im_start|>", "<think>", "<tool_call>"] {
+                    assert!(
+                        !q.contains(marker),
+                        "tool {:?} question contains {marker:?} — a question is plain \
+                         text; calibration adds the ChatML framing itself",
+                        def.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// **No two seeds may be the same or near-identical.**
+    ///
+    /// A seed earns its prefill only by covering phrasing the others do not. Two
+    /// questions that differ by a filler word occupy two gallery slots, cost two
+    /// prefills, and match the same probes — so the corpus grows without the
+    /// coverage growing, which is the exact failure a bulk expansion invites.
+    /// Jaccard over content tokens catches the paraphrase a diff review misses.
+    #[test]
+    fn question_seeds_are_distinct_from_one_another() {
+        fn content(q: &str) -> HashSet<String> {
+            q.to_lowercase()
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|w| w.len() > 1)
+                .map(str::to_string)
+                .collect()
+        }
+        let mut seen: HashSet<String> = HashSet::new();
+        for def in all() {
+            let sets: Vec<HashSet<String>> = def.questions.iter().map(|q| content(q)).collect();
+            for (i, a) in sets.iter().enumerate() {
+                assert!(
+                    seen.insert(def.questions[i].to_lowercase()),
+                    "tool {:?} repeats the question {:?}",
+                    def.name,
+                    def.questions[i]
+                );
+                for (j, b) in sets.iter().enumerate().skip(i + 1) {
+                    if a.is_empty() || b.is_empty() {
+                        continue;
+                    }
+                    let overlap = a.intersection(b).count() as f32;
+                    let union = a.union(b).count() as f32;
+                    assert!(
+                        overlap / union < 0.8,
+                        "tool {:?}: {:?} and {:?} are near-identical ({:.0}% token \
+                         overlap) — a paraphrase costs a prefill and adds no coverage",
+                        def.name,
+                        def.questions[i],
+                        def.questions[j],
+                        100.0 * overlap / union,
+                    );
+                }
+            }
+        }
+    }
+
+    /// **A seed must name something that distinguishes its own tool.**
+    ///
+    /// "close it" is a valid English request and a useless exemplar: fifteen
+    /// tools close something, so the seed pulls every one of them toward every
+    /// closing probe. That is precisely the promiscuous gallery entry the
+    /// hit-level normalizer exists to discount, and it is cheaper not to author
+    /// it. The check is deliberately weak — one token that at most a quarter of
+    /// the catalog uses — because the goal is to reject the genuinely contentless
+    /// seed, not to police phrasing.
+    #[test]
+    fn every_question_seed_names_something_distinctive() {
+        let defs = all();
+        let mut doc_freq: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let words = |q: &str| -> Vec<String> {
+            q.to_lowercase()
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|w| w.len() > 2)
+                .map(str::to_string)
+                .collect()
+        };
+        for def in defs {
+            let mut here: HashSet<String> = HashSet::new();
+            for q in &def.questions {
+                here.extend(words(q));
+            }
+            for w in here {
+                *doc_freq.entry(w).or_default() += 1;
+            }
+        }
+        let cap = defs.len() / 4;
+        for def in defs {
+            for q in &def.questions {
+                let ws = words(q);
+                assert!(
+                    ws.iter().any(|w| doc_freq[w] <= cap),
+                    "tool {:?}: {q:?} uses only words common across the catalog — it \
+                     cannot route to this tool rather than its siblings. Name the \
+                     protocol, object or verb that makes this tool the answer.",
+                    def.name,
+                );
+            }
         }
     }
 }

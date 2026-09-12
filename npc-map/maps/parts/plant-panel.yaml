@@ -1,0 +1,13 @@
+id: plant-panel
+kind: fixture
+name: the plant panel
+short: >
+  What the vault does for itself, shown as a wall of readings nobody is allowed
+  to operate.
+long: >
+  Air, power, light, water, the presses, the lifts, the doors. All of it runs
+  without a Maker touching it, which is exactly the danger: a system nobody
+  operates is a system nobody understands, and the first sign of trouble is
+  always a reading that has been slightly wrong for a long time. The panel is
+  read, not driven. Anyone can look at it; the skill is in noticing the figure
+  that has quietly drifted, and in knowing which drifts matter.

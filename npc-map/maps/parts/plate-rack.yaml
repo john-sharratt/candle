@@ -1,0 +1,10 @@
+id: plate-rack
+kind: fixture
+name: the plate rack
+short: >
+  A finished face is filed in the rack, and the list beside it names every
+  character who still has none.
+long: >
+  Where a finished portrait is filed, and beside it the standing list of
+  characters with no face yet. Taking one off that list claims the character
+  for whichever easel you go to next.

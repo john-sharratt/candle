@@ -9,6 +9,7 @@ members = [
     "candle-transformers",
     "candle-wasm-examples/*",
     "candle-wasm-tests",
+    "npc-map",
     "npcd",
     "web",
     "tensor-tools",
@@ -160,8 +161,16 @@ debug = true
 # **Named packages rather than `[profile.dev]` wholesale.** Optimising everything
 # rebuilds every crate in the workspace and every dependency, which costs more
 # build time than it saves in run time for the crates that have no hot loops —
-# and, on this machine, filled the disk. These four are where the compute is: the
+# and, on this machine, filled the disk. These are where the compute is: the
 # tensor ops, the KV cache, the model code, and the test binaries that link them.
+#
+# `image` is here for `npcd`'s reference-picture tests, which push a 5×3 matrix of
+# real pictures through a Lanczos3 resampler. It is worth **17%** and not the
+# order of magnitude the others are worth, because `imageops::resize` is generic
+# and monomorphises into `npcd` — so most of that codegen is built at `npcd`'s
+# own opt-level, not `image`'s, and no setting on a dependency can reach it.
+# Measured, five runs each: 522 ms → 435 ms. Optimising `npcd` itself would get
+# the rest and cost more compile time than the 87 ms is worth.
 #
 # `debug` is left at the profile default, so backtraces and debugger support are
 # unaffected; overflow checks and `debug_assert!` are `dev` settings and stay on.
@@ -181,6 +190,12 @@ opt-level = 2
 opt-level = 2
 
 [profile.dev.package.half]
+opt-level = 2
+
+[profile.dev.package.image]
+opt-level = 2
+
+[profile.test.package.image]
 opt-level = 2
 
 [profile.test.package.candle-core]

@@ -1,4 +1,29 @@
 name: udp_session_send
+questions:
+- send this syslog line as a UDP datagram to the collector
+- fire the DNS query packet over the UDP socket
+- transmit these hex bytes as one datagram
+- push a StatsD counter line out over UDP
+- does the UDP send get any acknowledgement
+- will this fit in a single datagram
+- what peer did that UDP packet go to
+- should I send text or hex on the UDP socket
+- testing whether the log collector picks anything up
+- injecting a metric to see if the dashboard moves
+- probing the service with a handcrafted UDP packet
+- replaying a captured datagram at the listener
+- send that UDP datagram
+- fire a packet over UDP
+- transmit on the UDP socket
+- send it connectionless
+- send this datagram over UDP
+- fire a UDP packet with this hex payload at the peer
+- transmit this syslog line as a UDP datagram
+- send the DNS query packet over UDP
+- push this payload out as one UDP datagram
+- write these bytes to the UDP socket, no ack expected
+- send a fire-and-forget UDP message to that address
+- emit this datagram on the open UDP session
 category: UDP sessions
 description: Transmit one fire-and-forget UDP datagram to a peer, payload as text or hex. No delivery acknowledgement.
 high_risk: true

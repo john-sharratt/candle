@@ -1,4 +1,29 @@
 name: notes_list
+questions:
+- list notes under the runbook- prefix
+- show every note tagged adr with its timestamps
+- enumerate my note keys and their tags
+- browse notes beginning with incident-
+- how many notes have I accumulated
+- which notes were written most recently
+- are there notes under a prefix I've forgotten about
+- what tags am I actually using
+- taking stock of what I've recorded so far
+- want an index before I start writing another
+- checking whether a key is already taken
+- reviewing my notes for anything stale
+- list my notes
+- show note keys
+- browse notes
+- index of notes
+- what notes do I have saved
+- list my notes tagged infra
+- browse the notes starting with "deploy"
+- show me all my note keys
+- which notes exist under the project prefix
+- give me an index of my stored notes
+- list note keys and their tags
+- what have I written notes about
 category: Notes
 description: Browse stored notes by key prefix or tag, returning each note's key, tags, and timestamps — metadata only, not the body text. Use to discover which notes exist before reading one.
 parameters:

@@ -99,7 +99,6 @@ fn npc(r: Row<'_>) -> Value {
             "pending_events": pending,
             "salience_gate": 0.42
         },
-        "environment_enabled": true,
         "monitor": { "overlap": overlap, "band": band },
         "owner_id": "u_8812",
         "access": "owner",
@@ -384,8 +383,8 @@ pub fn tools() -> Value {
         json!({ "name": name, "category": cat, "description": desc, "source": src,
                 "calibrated": cal, "writes_layers": ["action"], "modes": modes })
     };
-    let all = json!(["physical", "video_call", "voice_call", "instant_message"]);
-    let msg = json!(["video_call", "instant_message"]);
+    let all = json!(["physical", "instant_message"]);
+    let msg = json!(["instant_message"]);
     json!({ "uncalibrated": 1, "tools": [
         t("speak", "speech", "Say something. Carries intent, not words — the narrator renders it.", "generic", true, all.clone()),
         t("send_image", "messaging", "Send a picture to a named interlocutor. Messaging modes only.", "generic", true, msg),
@@ -502,8 +501,9 @@ pub fn script() -> Vec<Value> {
                 "rendered": if text.is_empty() { Value::Null } else { json!({"text": text}) },
                 "world_ms": world_ms(), "at_ms": now_ms() })
     };
-    let all = json!(["physical", "video_call", "voice_call", "instant_message"]);
-    let vis = json!(["physical", "video_call"]);
+    let all = json!(["physical", "instant_message"]);
+    // Something you can only make out by being there to see it.
+    let vis = json!(["physical"]);
     let none = json!([]);
     vec![
         a(
@@ -571,22 +571,6 @@ pub fn script() -> Vec<Value> {
                          eastern line buckles. Somewhere below, a horn.",
                 "covers_acts": ["a_88212","a_88213","a_88214"], "world_ms": world_ms(), "at_ms": now_ms() }),
     ]
-}
-
-pub fn environment(_npc: &str) -> Value {
-    json!({
-        "enabled": true,
-        "window_turns": 24,
-        "system_prompt": "You describe what happens around a character in Ardh: a northern \
-                          frontier three years after an inconclusive war. Keep to what could be \
-                          perceived from where they stand. Never narrate their thoughts or \
-                          decide their actions. Change the world slowly and only for a reason.",
-        "recent": [
-            { "world_ms": world_ms() - 600_000, "text": "Wind off the ridge; the light going amber." },
-            { "world_ms": world_ms() - 300_000, "text": "A horn, twice, from below the eastern slope." },
-            { "world_ms": world_ms() - 60_000,  "text": "The line east of the mill gives ground." }
-        ]
-    })
 }
 
 pub fn status() -> Value {

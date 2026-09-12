@@ -1,0 +1,14 @@
+id: order-table
+kind: fixture
+name: the table
+short: >
+  The standing orders lie on it. Reading them is a thing anyone may do at any
+  time; taking one is not, and an order stays taken until it is finished or
+  given back.
+long: >
+  The table the standing orders lie on. Several stand at once, and reading
+  them costs nothing and blocks nobody — any number can be round the table.
+  Taking one is a claim: it is yours until you finish it or give it back, and
+  while you hold it nobody else can. Orders change while Makers are away
+  working, and nobody is interrupted when they do; the table is simply
+  different the next time somebody looks at it.

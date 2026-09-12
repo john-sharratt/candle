@@ -7,7 +7,7 @@
 //! retrieval target IS the turn, so each candidate turn is its own slot.
 
 use candle_conversation::persistence::content_hash::turn_stream_id;
-use candle_conversation::projection::{Builder, ProjectionTarget};
+use candle_conversation::projection::{Builder, Observe, ProjectionTarget};
 use candle_conversation::provenance::{encode_wide_sigs, WideQSig};
 use candle_conversation::substrate::{ProjectionScores, TurnPartWrite};
 use candle_conversation::turn::Role;
@@ -103,7 +103,7 @@ fn score_belief_groups_self_matches_the_probed_turn() {
         &probe,
         None,
         &mut scores,
-        false,
+        Observe::No,
         None,
     );
 
@@ -183,7 +183,7 @@ fn score_belief_groups_scores_a_coupled_pair_as_one_exchange() {
         &probe,
         None,
         &mut scores,
-        false,
+        Observe::No,
         None,
     );
 
@@ -297,7 +297,8 @@ fn score_beliefs_scores_a_group_in_a_non_target_layer() {
         timeline: dlg_tl,
     };
     let probe = vec![sig(fills[1])];
-    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, None, false, None);
+    let (scores, cands) =
+        conv.score_beliefs(builder.schema(), target, &probe, None, Observe::No, None);
 
     // The non-target clusters group was scored, and the probed turn wins.
     let s0 = scores.turn(mem_tl, TurnIndex(0));
@@ -369,7 +370,8 @@ fn append_only_target_masks_belief_groups_self_local() {
         timeline: dlg_tl,
     };
     let probe = vec![sig(fills[1])];
-    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, None, false, None);
+    let (scores, cands) =
+        conv.score_beliefs(builder.schema(), target, &probe, None, Observe::No, None);
 
     // The clusters group's turns (on mem_tl) are masked to the target timeline
     // (dlg_tl), which has none — so nothing is scored and no candidates surface.
@@ -444,7 +446,8 @@ fn score_belief_groups_scores_every_conversation_in_a_multi_file_group() {
         timeline: dlg_tl,
     };
     let probe = vec![sig(fills[1])];
-    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, None, false, None);
+    let (scores, cands) =
+        conv.score_beliefs(builder.schema(), target, &probe, None, Observe::No, None);
 
     // The probed turn (index 1) wins in EVERY file — including `file_b`, the
     // second-registered one, which the old collapse never scored.
@@ -552,7 +555,7 @@ fn score_belief_groups_gpu_matches_cpu_and_caches() {
             &probe,
             None,
             &mut scores,
-            false,
+            Observe::No,
             arena,
         );
         let mut v = Vec::new();
@@ -683,8 +686,8 @@ fn score_belief_collections_gpu_matches_cpu() {
     let coll = sp.collection_named("tools").expect("tools collection");
 
     let arena = candle_conversation::provenance::GalleryArena::new(&device, 24, 3).unwrap();
-    let cpu = conv.score_belief_collections(sp, &probe, None, false, None);
-    let gpu = conv.score_belief_collections(sp, &probe, None, false, Some(&arena));
+    let cpu = conv.score_belief_collections(sp, &probe, None, Observe::No, None);
+    let gpu = conv.score_belief_collections(sp, &probe, None, Observe::No, Some(&arena));
 
     let mut cpu_scores = Vec::new();
     let mut gpu_scores = Vec::new();
@@ -711,7 +714,7 @@ fn score_belief_collections_gpu_matches_cpu() {
         assert_eq!(gamma, 0.0, "gamma has no gallery exemplars");
     }
     // A second GPU scan hits the arena's index cache and must be identical.
-    let gpu2 = conv.score_belief_collections(sp, &probe, None, false, Some(&arena));
+    let gpu2 = conv.score_belief_collections(sp, &probe, None, Observe::No, Some(&arena));
     for s in &coll.sections {
         assert_eq!(
             gpu.section(s.id).to_bits(),
@@ -744,7 +747,7 @@ fn score_belief_groups_ignores_recency_groups_and_empty_probe() {
         &[],
         None,
         &mut scores,
-        false,
+        Observe::No,
         None,
     );
     assert!(candidates.is_empty(), "empty probe → no scan");

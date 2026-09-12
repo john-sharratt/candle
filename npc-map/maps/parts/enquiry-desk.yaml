@@ -1,0 +1,15 @@
+id: enquiry-desk
+kind: station
+name: the enquiry desk
+binds: an open enquiry
+short: >
+  Questions from outside the vault arrive at the enquiry desk, and are answered
+  out of what the vault holds or admitted to be unanswerable.
+long: >
+  The one place where the record faces outward. A question comes in — from a
+  player, from a world, from whoever is downstream of all this — and it is
+  almost never phrased in the vault's own terms. Answering means working out
+  what is actually being asked, finding whether the vault holds it, and saying
+  plainly when it does not. An enquiry that cannot be answered is the most
+  valuable thing that arrives here, because it names a hole nobody inside had
+  noticed.

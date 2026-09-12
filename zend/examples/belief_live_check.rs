@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use candle_conversation::models::Dialect;
 use candle_conversation::persistence::streams::StreamId;
 use candle_conversation::persistence::SubstratePersistence;
-use candle_conversation::projection::{Builder, Conversation, SystemPromptItem};
+use candle_conversation::projection::{Builder, Conversation, Observe, SystemPromptItem};
 use candle_conversation::provenance::decode_wide_sigs;
 use candle_conversation::substrate::Substrate;
 
@@ -78,7 +78,7 @@ fn main() -> anyhow::Result<()> {
     // read-only diagnostic, and folding hit levels into the normalization band
     // is the once-per-turn seal scan's job; no arena, so the CPU scan runs (same
     // ranking as the GPU gallery path).
-    let scores = conv.score_belief_collections(sp, &probe, None, false, None);
+    let scores = conv.score_belief_collections(sp, &probe, None, Observe::No, None);
 
     // 6. Report the top scored tools.
     let mut ranked: Vec<(String, f32)> = Vec::new();

@@ -66,6 +66,9 @@ pub mod paged_latent;
 #[path = "delta-net/api.rs"]
 pub mod delta_net;
 
+#[path = "dit-attn/api.rs"]
+pub mod dit_attn;
+
 #[cfg(test)]
 mod built_arch_tests {
     use super::*;

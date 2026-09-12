@@ -174,10 +174,24 @@ That gives two mocks, at different depths, and both are wanted:
 | `web --authoritative` (`web::mock`) | the daemon | routing, error pages, the ws tunnel, real sockets | console development against real HTTP |
 
 The server-side mock lives in `web/src/mock/npcd/` — beside the files it serves, for the same
-reason `api.mock.js` does: a console and its fixtures ship together. `npcd` calls the same
-router today, because a mock daemon is all `npcd` is until there is an engine to put behind it.
-When there is, `npcd` grows its own `api.rs` against these routes and the fixture stays where it
-is, still serving `--authoritative`.
+reason `api.mock.js` does: a console and its fixtures ship together.
+
+**`npcd` no longer calls it.** It did, as a `fallback_service` under its own routers, so every
+path the real ones had not claimed was answered with invented data — for any character id,
+including ones that did not exist. `npcd` now answers its whole `/v1` surface itself, in three
+routers (`api`, `ops`, `engine`) with no fallback beneath them, and a path none of them claims
+is a genuine `404`. The fixture is still built and still serves `web --authoritative`, which is
+what it was written for.
+
+That split is worth stating as a rule, because it is what keeps the console honest:
+
+| | |
+|---|---|
+| `api` | real today — the corpus, the mind, the cast, the authoring plane, accounts, portraits |
+| `ops` | real today — status, telemetry, memory, substrate storage, the log stream |
+| `engine` | wired, and honest: **empty** where empty is the measurement, **`null`** where nothing has measured, **`503 no_engine`** where the request asks for work |
+
+Nothing in any of the three answers with something it did not measure.
 
 ### Extensionless paths fall back; assets do not
 
@@ -537,9 +551,8 @@ defend against anyone with server access. The UI therefore says "hidden" and nev
   /v1/generate/npc                            whole NPC, one call
   /v1/generate/{job_id}                       poll a generation job
 
-  /v1/image/generate                          text-to-image job
-  /v1/image/{image_id}                        fetch bytes
-  /v1/image/models                            available image models, load state
+  /v1/image/generate                          text-to-image; NDJSON, image in the last line
+  /v1/image/models                            the configured image guest, load state
   /v1/image/queue                             drain queue: depth, position, next run
 
   /v1/commands                                slash-command catalog (schema-described)
@@ -563,7 +576,6 @@ defend against anyone with server access. The UI therefore says "hidden" and nev
   /v1/npc/{id}/memory                         consolidated memory
   /v1/npc/{id}/modulation                     affect, threat, curiosity
   /v1/npc/{id}/tick                           force a tick; read tick config
-  /v1/npc/{id}/environment                    simulator state, toggle, system prompt
   /v1/npc/{id}/substrate[/layer/{name}]       introspection
   /v1/npc/{id}/projection[/{tick}]            what the gather actually selected
   /v1/npc/{id}/monitor                        metacognition health
@@ -604,7 +616,6 @@ Npc {
     "pending_events": 3,
     "salience_gate": 0.42
   },
-  "environment_enabled": true,
   "monitor": { "overlap": 0.19, "band": "healthy" | "fixated" | "runaway" },
   "owner_id":   "u_8812",
   "access":     "owner" | "editor" | "viewer",   // the caller's access
@@ -785,7 +796,6 @@ POST /v1/npc
   // character with an empty persona and no error, because an absent persona is
   // legal — so the two names have to be the same one.
   "persona_description": "Fifty-three, a former staff sergeant.",
-  "environment_enabled": null,      // null → default by origin (see below)
   "seed": {
     "relationships": [ … ],
     "beliefs":       [ … ],
@@ -796,15 +806,10 @@ POST /v1/npc
 → 201 { Npc }
 ```
 
-`environment_enabled: null` resolves by **origin**: the GUI sends `true`, an API client that
-omits it gets `false`. A character created in the GUI has no world attached and would
-otherwise perceive nothing; an API caller presumably has its own world simulation and does
-not want a second one inventing events underneath it. Clients that care set it explicitly.
-
 ```
 GET    /v1/npc?world_id=&personality_id=&state=&tag=&q=&limit=&cursor=
 GET    /v1/npc/{id}
-PATCH  /v1/npc/{id}          { name?, persona_description?, state?, environment_enabled?,
+PATCH  /v1/npc/{id}          { name?, persona_description?, state?,
                                heartbeat_ms?, salience_gate?, tags?, hidden? }
 PUT    /v1/npc/{id}/tags     { "tags": ["campaign-2", "moonlight"] }
 PUT    /v1/npc/{id}/hidden   { "hidden": true }
@@ -1013,27 +1018,353 @@ Portraits are either uploaded or generated. Generation needs a diffusion model, 
 new subsystem with a real constraint attached.
 
 ```
-POST /v1/image/generate
-{ "prompt": "…", "negative": "…", "size": "768x768", "seed": null,
-  "model": "flux-schnell-q8" }
-→ 202 { GenerationJob }        // kind: "image"
+POST /v1/image/generate                     → NDJSON stream
+{ "prompt": "…", "width": 512, "height": 512, "steps": 8, "seed": null }
 
-GET  /v1/image/{image_id}                   → image bytes (immutable, cacheable)
-GET  /v1/image/models                       → available models + load state
+  { "event": "loading" }                              the model crossing the link
+  { "event": "step", "done": 3, "total": 9,
+    "what": "denoising" }                             one line per unit of work
+  { "event": "done", "width": …, "height": …,
+    "seed": …, "png_base64": "…" }                    terminal; the whole image
+  { "event": "error", "error": "no_room",
+    "detail": "…", "retry": true }                    terminal; the alternative
+
+GET  /v1/image/models                       → the configured guest + load state
 POST /v1/npc/{id}/portrait                  multipart upload
 PUT  /v1/npc/{id}/portrait                  { "image_id": "…" }
 ```
 
+**A stream, not a job to poll.** A drain is one indivisible stop-the-world event: a caller that
+reconnected mid-drain would learn only that it was still running, which is why there is no job
+id and no polling route. But it is also *seconds long*, and the console draws a progress bar
+from the counts above — so the connection stays open and the units come across as they finish.
+The image arrives whole in the terminal line, base64 rather than as `image/png` bytes, so the
+seed travels with it.
+
+**There is no `negative`, and the size is two numbers.** The model is guidance-distilled
+(below), so there is no unconditioned branch for a negative prompt to push away from and the
+field would accept text and change nothing. Sides are integers because both must be multiples
+of 16 — the latent is the image over 8 and the transformer patches that by 2 — and a `"768x768"`
+string is a parsing step that can only ever produce the same two numbers.
+
 ### The models are already in the tree
 
-No external service is required. `candle-transformers` ships `flux` (**including
-`quantized_model.rs`**), `stable_diffusion`, `stable_diffusion_3`, and `wuerstchen`, with
-working examples for each. The module is a loader, a scheduler, and an API over models that
-already exist here.
+No external service is required. `candle-transformers` ships the model families and the loader,
+scheduler and API are built over what is already here.
 
-**Quantized Flux Schnell is the default.** Schnell is a few-step model, so a portrait is
-seconds rather than a minute, and the quantized weights are what make it viable at all next to
-a 30B MoE.
+**Z-Image-Turbo is the model.** A 6B NextDiT with a Qwen3-4B text encoder and the FLUX
+autoencoder, quantized per card (`z_image::quant_choice`) and placed in guest ground as
+repacked int8 twins. It is guidance-distilled, its schedule is trained at **eight steps**, and
+the daemon asks for **twelve**. That is what makes a portrait a couple of seconds of drain
+rather than a minute of it, and it is the whole reason a generator that stops every character's
+thinking is an acceptable thing to run at all.
+
+### What distillation costs: the seed does not choose the face
+
+A guidance-distilled model is trained to reach the modal answer in as few evaluations as it can,
+and **faces are the densest mode there is**. The symptom is specific and was hit here: draws with
+different seeds return the same face wearing different clothes against different backgrounds. It
+is a property of the released checkpoint rather than a fault in this port — the upstream
+discussion closes on *"that's the problem with distilled models"*, and a third-party diversity
+adapter exists for exactly this.
+
+**Measured on the 3090, one prompt ("a portrait photograph of a person, head and shoulders,
+plain background"), seeds 11 / 22 / 33:**
+
+| | Result |
+|---|---|
+| 8 steps, three seeds | The same young man, same shirt, same pose, three times. |
+| 12 steps, the same three seeds | The same young man again. A given seed's face is unchanged from its 8-step draw; only fine detail moves. |
+| 12 steps, **one seed**, two described subjects | Two entirely different people. |
+
+So the intuitive fix is the wrong one. Spending steps against the collapse does nothing: the
+first Euler step is not what is deciding the identity — **the conditioning is**, and the noise
+barely touches it. The step count is a detail-versus-drain trade and nothing more, which is why
+the daemon's twelve is justified on refinement rather than on variety.
+
+Two knobs commonly blamed are inert here for the same reason as the negative prompt:
+
+- `cfg_truncation` **1.0 → 0.7** applies CFG for the first 70% of timesteps and drops to
+  unconditional after. It is a knob on the *guidance branch*. Turbo runs at
+  `guidance_scale = 0.0` and has no such branch, so there is nothing to truncate.
+- A negative prompt: nothing to push away from. See the API block above.
+
+What works is outside the sampler: varying the prompt (an age, a build, a feature), or a
+diversity adapter on the transformer. The Images page takes the first route with its style
+presets — and it is why a cast whose descriptions all read "a guard at the north gate" will come
+back as one man however the seeds differ. On this model the writing is the casting.
+
+### The decode is tiled, so its peak does not scale with the image
+
+The autoencoder — not the denoise — is the peak of a drain. It upsamples to 128 channels at the
+image's **full resolution** and a residual block holds several of those at once, so its working
+set grows with the image's *area*, and it comes from the CUDA pool, which a co-resident guest
+gets little of.
+
+That produced a deterministic failure: **the first draw of a session above roughly one megapixel
+died with `CUDA_ERROR_OUT_OF_MEMORY`, and the retry succeeded** — because the failed attempt's
+allocations went back to the pool already carved to decoder shapes. Measured on the 3090: all
+twelve denoise steps passed, `trim_pool_after_load` recovered **544 MiB** against the ~3 GiB the
+decode wanted, and it died 0.8 s later.
+
+`guest::tiled_decode` decodes in overlapping tiles and cross-fades the joins, so **the peak is
+one 512×512 tile whatever the output is** — a bigger image costs proportionally more time
+instead of failing. A latent that fits one tile is decoded in a single call with no blending, so
+the 512×512 path costs exactly what it did before.
+
+> **The bump allocator cannot back a decode, and this is why.** The obvious fix is to serve the
+> decode from the guest's own ground, which is span the drain already reserved. `GuestGround` is
+> a **bump** allocator with no free — right for weights, which are written once and read until
+> the drain ends. A decoder's intermediates are allocated and dropped continuously, so a bump
+> cursor holds the *sum* of every intermediate rather than the peak: tens of gigabytes. Backing a
+> decode from ground means building a freeing allocator over the span, which is what the pool
+> already is. Separately, `conv2d` and `upsample_nearest2d` carry no arena provenance at all, so
+> every one of them would need converting first.
+
+Measured after tiling, all as the **first** draw of a fresh daemon — the case that used to fail:
+
+| Size | Before | After |
+|---|---|---|
+| 512 × 512 | 6.7 s | 6.7 s |
+| 1024 × 1024 | 38.6 s | **19.7 s** |
+| 1248 × 832 | **out of memory** | 21.0 s |
+| 832 × 1248 | out of memory (first draw) | 18.5 s |
+
+The 1024 speedup is not tiling being faster arithmetic — it is the decode no longer thrashing
+the pool for allocations it could not get.
+
+### The diversity adapter, fused
+
+The second route is `F16/z-image-turbo-sda` — a LoKr trained to recover what the distillation
+removed. It is **fused into the weights offline**, not applied at run time, by the `z-image-fuse`
+example:
+
+```bash
+cargo run --release --example z-image-fuse -- \
+    --checkpoint …/z_image_turbo-Q8_0.gguf \
+    --out        …/z_image_turbo-Q8_0-sda.gguf
+```
+
+The output is an ordinary GGUF, so a deployment chooses by pointing `guests.yaml`'s
+`transformer:` at one file or the other. **There is no code path to select and nothing in the
+denoise loop that knows the adapter exists** — which is the whole reason to fuse rather than
+apply. A LoKr delta is `kron(w1, w2)`, full-size and built from small factors; it *could* be
+applied live via `(A ⊗ B)·vec(X) = vec(B·X·Aᵀ)` at about an eighth of the base arithmetic, but
+the base runs int8 on the tensor cores while an adapter path would run bf16, so every step of
+every draw would pay for it while the estate waits.
+
+The cost of fusing is one extra rounding: an adapted tensor is dequantised, added to, and
+quantised again, and is written back in the rung it arrived in. Tensors the adapter does not
+touch are passed through still quantised. See `z_image::adapter`, which fuses both of the
+factorisations the ai-toolkit ecosystem stores: LoKr (`ΔW = kron(w1, w2)`, the SDA file) and
+plain LoRA (`ΔW = B·A`). A LoRA file with no `alpha` tensors is ai-toolkit's convention for
+`alpha = rank`, so its scale is 1.0 — the same number as the LoKr's, for the opposite reason.
+
+**Measured on the Q8_0 checkpoint:** 240 adapter modules land on 180 tensors — 30 layers ×
+(qkv, out, w1, w2, w3, adaLN), the three `to_q`/`to_k`/`to_v` deltas stacking row-wise into the
+GGUF's fused `qkv`. Mean `‖Δ‖/‖W‖` is **0.0124** and the largest is **0.0521**, which is what a
+trained adapter should look like and is the check that the scale was read correctly: LoKr stores
+`alpha = 1e10` as a full-rank sentinel, and taking it for a multiplier would scale every delta by
+10¹⁰. The converter refuses to write a checkpoint whose worst delta exceeds the weight it
+modifies, because that failure produces a file that loads and is ruined.
+
+Same prompt, seeds 11/22/33, at 12 steps: the stock checkpoint returns one man three times; the
+fused one returns three different people. The aesthetic shifts with it — away from the modal
+glamour shot and toward something plainer — which is the trade being made, not a defect.
+
+**A request picks its checkpoint.** `ImageRequest` carries a `lora` enum — `diversity` (the
+default, the standing SDA-fused file) or `restricted` — and the image guest, which reloads its
+weights every drain anyway, simply loads the variant the drain's oldest image job names
+(`transformer` / `transformer_restricted` in `guests.yaml`). An enum rather than a path, so a
+request can never name an arbitrary file; a variant the deployment did not configure is refused
+by name before any weights move, and a job queued behind a drain standing on the other
+checkpoint is refused with a retry message rather than drawn on the wrong weights. `restricted`
+is additionally an admin's ask: the handler re-checks the role itself (not just the route
+table's minimum) because the flag also waives the prompt-compliance gate — the admin's own
+judgement stands in for it. The Images page shows the checkbox only to admins; the daemon
+refuses the flag from anyone else regardless.
+
+### Starting from a picture
+
+A draw may carry a **reference**: `ImageRequest.reference` is RGB8 at exactly the draw's own size,
+plus a `hold` in `0 ..= 0.95`. The guest encodes it through the VAE, mixes noise at
+`σ = 1 − hold`, and joins the flow schedule there instead of starting from noise. This is
+**SDEdit**, and the distinction from instruction editing is not pedantry: the model is never told
+what changed, it is handed a partly dissolved picture and asked to complete it under the prompt.
+Composition, pose, palette and framing carry across; "give him a hat" does not, and an
+implementation that appears to do it is doing it by luck. That wants reference conditioning
+(Z-Image-Edit's shared spatial RoPE), which is not released.
+
+Four things make the result good, none of which needs a second model:
+
+- **The walk is cut out of the same curve.** `sampling::sigmas_from(n, shift, start)` converts the
+  start back to its raw position and takes the linspace over `r₀ … r₀/n`, so a partial walk has the
+  shape a full draw would have had over that stretch. `sigmas_from(n, shift, 1.0)` reproduces
+  `sigmas(n, shift)` entry for entry, and a test asserts it rather than trusting it.
+- **The step count follows the distance.** `steps_from` gives the walk the fraction of the budget it
+  covers, so a light touch is *quicker* rather than paying a full draw's time for a fraction of its
+  distance. Floored at `DISTILLED_STEPS` (8), because below the count the model is distilled at,
+  Euler error stops being a matter of finish.
+- **`hold` moves the schedule position, not sigma** (`sampling::sigma_at`). This one was measured
+  the hard way. The shift is steeply non-linear — at `shift = 3`, σ = 0.85 is already a third of the
+  way through the walk — so a dial mapped straight onto sigma crushes its entire useful range into
+  its bottom eighth: holds of 0.15, 0.30 and 0.45 all returned the reference essentially untouched,
+  and everything interesting happened between σ = 0.92 and σ = 0.80. Raw position is the honest
+  axis because it *is* the step budget, which makes the dial mean one thing in both places:
+  `steps ≈ asked × (1 − hold)`, verified live at 17/24 for hold 0.3 and 10/24 for hold 0.6.
+
+  Calibrated on that axis: **0.25** carries framing, scale and ground while the prompt still decides
+  the subject; 0.30 has the reference's own subject contesting it; past ~0.45 the words cannot
+  change the face. The knee is sharp, so the default sits on the side where the prompt still wins.
+- **The encoder's mode, not a sample.** The noise this latent carries is chosen by the hold; a
+  second helping from the encoder's Gaussian would sit on top of it. `DiagonalGaussianDistribution::mode()`.
+- **The encode is tiled**, like the decode — `guest::tiled::encode_tiled`. The encoder starts at
+  128 channels at full resolution, so a 1248×832 reference wants what a 1248×832 decode wants and
+  would have failed in the same place.
+
+The upload is decoded, size-checked and **cover-cropped to the draw's size at the HTTP boundary**
+(`npcd::refimage`), never in the guest: a drain evicts the engine's whole working set before the
+guest loads, so a truncated JPEG discovered inside one costs every character its resident KV to
+find out. `GuestRequest::check` then enforces `pixels.len() == width·height·3` at submission.
+
+### The dials
+
+Two, and there are no others to offer honestly. `shift` is the schedule's own re-weighting
+(`MIN_SHIFT`..`MAX_SHIFT`, default the deployment's 3.0) — raising it spends more budget deciding
+what the picture is, lowering it spends more resolving how it looks. `hold` is the reference
+strength. There is deliberately **no guidance / prompt-strength dial**: Turbo runs at
+`guidance_scale = 0.0` with no unconditioned branch, so a slider weighing the prompt against one
+would be weighing against something never computed — the same bug as the negative-prompt field that
+is also absent. The console sends `shift` only once the dial has been moved, so a deployment that
+set its own in `guests.yaml` keeps it.
+
+### Removing a background
+
+`POST /v1/image/cutout` takes a PNG and gives back one with alpha. **No model, no drain, no
+engine** — it is a flood fill on the host, so it lives in the always-on route table and answers on
+a daemon whose engine has not finished loading.
+
+`POST /v1/image/cutout` runs a **salient-object network** over the picture and returns the alpha it
+emits. That is the whole of it: no colour threshold, no flood fill, no trimap, no green screen. The
+network was trained to know what a subject *is*, which is the one thing a colour algorithm cannot
+be told.
+
+**Three attempts preceded it, and the two that were abandoned are worth recording.** The first was
+a colour keyer — flood-fill the backdrop from the frame, fit a plane through it, refine the edge.
+It failed on its own domain: measured on this daemon's own portraits, a light-grey knit came within
+**24** of the wall behind it while the wall's own gradient spread **22.7**, two overlapping
+distributions that no threshold separates, so the shoulder speckled. Worse, it refused every
+picture with a real background in it, because all it could ask was "is the frame one colour".
+
+The second was to arrange the problem away with a chroma key — put `on a solid chroma key green
+screen background` in the prompt and key that. It worked, and it is still the trick film uses, but
+it only helps pictures you are about to draw and it changes the picture to get there.
+
+The third, considered and rejected as over-built, was extracting cross-attention from the image
+transformer — it is a bidirectional DiT, so the image-patch rows of the score matrix localise each
+caption word. That needed capture hooks through `Block::forward`, a bf16-only path because the int8
+attention is fused, and measurement to find which blocks carry clean signal, all to *recover*
+information a 44 MB published network simply has.
+
+### How it runs
+
+**A guest, like prose and image** (`candle_conversation::guest::matte`) — not a special case beside
+them. Its weights are placed in span ground through the same `place_bytes` primitive
+`GroundVars` uses for the image guest's autoencoder, and it is served in a drain between two of the
+engine's waves. That mattered: on the CPU the same graph takes **11.9 s** and on the card
+**0.23 s**, with the two agreeing to within 1 of 255 on every alpha — so the CPU path is the oracle
+and the card is what ships. End to end through the route, including evict-load-run-unload, is
+**0.7–0.9 s**.
+
+The graph is evaluated as it shipped, through `candle-onnx`, rather than rebuilt as candle modules:
+the export folds batch-norm into the convolutions and renames every tensor to `onnx::Conv_1896`, so
+a hand-written architecture would mean mapping 238 anonymous tensors by position. **That changes
+nothing about where the weights live** — `GroundVars` only adds a `VarBuilder` backend on top of the
+placement, and an ONNX graph has no `VarBuilder` to be a backend for.
+
+Four fixes to `candle-onnx` were needed and each is a real bug: `protoc` is vendored so the
+workspace builds without a system tool; `Resize` gained **linear** mode (it had only nearest, and
+every segmentation decoder upsamples bilinearly — nearest there is a staircase where the alpha edge
+should be); `sizes` now takes precedence over `scales` per the spec, which traced PyTorch exports
+need; and initializers and `Constant` nodes are placed on the evaluation's device.
+
+**One measured trap.** IS-Net does *not* use ImageNet normalisation — its reference is mean 0.5,
+std 1.0. Fed ImageNet's statistics it returned a portrait with holes punched through the hair and a
+green-screen shot that was 100% transparent: it reads as a broken model and is a wrong constant.
+Both families' statistics live in a `Family` enum carried in `guests.yaml`, never sniffed from the
+file name.
+
+### What was deleted
+
+All of it: the flood fill, the plane-fitted backdrop, the morphological opening, the frontier alpha
+ramp, the despill, the green-screen toggle, and the tolerance dial. The dial existed only because a
+threshold had to be guessed. Everything below is kept for the record of what was tried and why it
+could not work.
+
+The general problem is segmentation; the old approach assumed the problem in front of us was not.
+These pictures were drawn by this daemon from prompts that overwhelmingly say "plain background",
+so the algorithm was a four-connected fill from the frame. Each correction below was forced by a
+real picture:
+
+- **Connectivity, not colour matching**, so a backdrop-coloured pocket inside the subject survives
+  rather than being punched out.
+- **The backdrop is a fitted plane, not a colour.** This is the load-bearing one. Measured on a
+  real portrait: the frame's own deviation from its median reaches 22.7 (the wall's light falls
+  off across the shot) while the jumper's brightest threads come within 24. Those overlap, so *no*
+  single-colour threshold separates them — the fill walks up the bright yarn and speckles the
+  shoulder. Taking the gradient out leaves a residual of a few units, and each pixel is then
+  compared to the backdrop where it actually is. A plane and no more: it is fitted from a
+  one-pixel frame, so anything with more freedom would be fitting the subject.
+- **Judge the frame by share, not spread.** A head-and-shoulders portrait has shoulders across the
+  bottom edge — a quarter of the frame — so a uniformity test calls the plainest backdrop the
+  model draws "busy". It did, on a real draw: 129 of 255, refused. What matters is that *most* of
+  the frame agrees, because that is what the fill needs seeds from.
+- **An opening severs thin leaks.** Where colour cannot separate, shape can: the leaks into the
+  knit are one or two pixels wide, so eroding and dilating by one removes them and leaves every
+  wider region exactly where it was.
+- **The ramp only applies on the frontier.** Partial alpha means "part subject, part backdrop",
+  which is a claim about an edge pixel. Interior background goes fully transparent whatever its
+  colour distance says — otherwise the wall comes back as a half-transparent ghost wherever the
+  plane is a shade off, which a plane will be behind a head.
+- **Decontamination** against the local backdrop: an edge pixel is `α·F + (1−α)·B`, so solving for
+  `F` removes the pale halo that otherwise appears the moment the cutout is placed on another
+  ground.
+
+It refuses rather than guesses, and the two refusals are different: a frame that is mostly not one
+colour (`422 no_background`) and a fill that took more than 92% of the picture, which is the
+full-bleed case where the frame *is* the subject.
+
+**The known limit, pinned by a fixture rather than left to be rediscovered.** A desert canyon at
+sunset is *not* refused: 64% of its frame is within tolerance of its own median, because the dark
+sky above and the dark sand below happen to be the same brown. It keys 73% of the picture and the
+result is meaningless. The guard asks "is there a plain backdrop at the frame", a question about
+the edge, and answers it correctly — knowing there is no subject behind it is the segmentation
+problem this deliberately does not solve. Nor can the threshold be raised to catch it: the
+canyon's 64% sits *below* a real green screen's 66%, so any bar that refuses the one refuses the
+other. What follows is a product decision — the button is for pictures with a backdrop, and the
+console says so.
+
+### Testing it on real pictures
+
+`npcd/tests/images/` holds five 512×512 draws from this daemon, each documented with the prompt and
+seed that made it, so any of them can be regenerated exactly. They pinned every constant the colour
+keyer had, and they are what the network was chosen against — squares of flat colour prove
+arithmetic, only a real draw proves a model.
+
+| fixture | what it is for |
+|---|---|
+| `grey_portrait` | **The one that settled it.** A light-grey knit against a light wall — the case the colour keyer could not do at any threshold, and the network cuts cleanly, hair wisps and all |
+| `green_curls` | The hardest matte there is — thousands of strands with background showing between the curls |
+| `green_hood` | A dark subject; a duller green than the curls, which is what proved the old keyer inferred its key rather than assuming one |
+| `green_lantern` | Not a person, and warm-coloured; its glass is genuinely see-through, which is where any matte has to make a choice |
+| `busy_canyon` | A landscape with no subject at all. The colour keyer deleted 73% of it and called that success; a network is at least honest about finding nothing |
+
+`guest_routes` asserts every fixture decodes to exactly the `width · height · 3` the guest requires
+— the boundary invariant that keeps a malformed upload from being discovered inside a drain, after
+the engine's working set has already been evicted for it.
+
+Measured live through the route, including evict-load-run-unload: **0.7–0.9 s** at 512×512, and the
+`lifted` fractions match the CPU oracle's to four decimal places.
 
 ### It runs as misc work between waves
 
@@ -1199,6 +1530,20 @@ PUT  /v1/npc/{id}/modulation                    { affect?, threat?, curiosity? }
 
 Every write here is an **authoring** act and is recorded as such — `origin: "authored"` — so
 an operator can always tell an authored belief from one the evidence process earned.
+
+> **Where this is stored, and why it is not a record type of its own.** All of it lives on the
+> character's own `NpcPayload` and supersedes with it (`npcd/src/npcs.rs`). Three reasons: it is
+> operator-scale — tens of entries, not the thousands an engine accumulates; its lifetime *is*
+> the character's; and the write path, the supersession rule and the compaction handling are
+> the ones already there and already tested. The engine's own belief traffic is a different
+> problem with a different volume and will want its own records; this is what somebody types
+> when they build a world.
+>
+> **The engine's half is absent, not zero.** A belief carries the `confidence` and `threshold`
+> an operator stated; its `disconfirmation`, whether it is `under_pressure`, and its confidence
+> `history` are measurements the evidence process makes, and come back `null` until it has made
+> them. Same for a strategy's `salience`. A `disconfirmation: 0` would read as *weighed and
+> unshaken*, which is a claim a daemon with no engine cannot make.
 
 > **The invariant these endpoints depend on.** The belief write-protection in the mind
 > document is against the *model*, not the *operator*. The action plane — what the NPC's own
@@ -1425,20 +1770,24 @@ Heartbeat comment frames every 15s keep intermediaries from closing an idle stre
 
 ## 20. Environment, tools, introspection, worlds
 
-### Environment simulator
+### Environment simulator — removed
 
-```
-GET  /v1/npc/{id}/environment
-→ { "enabled": true, "system_prompt": "…", "window_turns": 24,
-    "recent": [ { "world_ms": …, "text": "…" } ] }
-PUT  /v1/npc/{id}/environment      { "enabled"?, "system_prompt"?, "window_turns"? }
-POST /v1/npc/{id}/environment/inject   { "text": "…", "world_ms"? }
-```
+A character with no game attached perceives nothing, and the plan was to generate events for it:
+a simulator with its own system prompt and a sliding window, writing into the `world` layer.
 
-Its own system prompt and a sliding window — `Sequence { recent: N }`, no historical top-k,
-because the environment's job is continuity of the immediate scene rather than recall of
-everything that ever happened. Long-run world memory belongs to the `world` layer, which the
-simulator writes into.
+**It was never built.** What existed was the storage and the controls — `environment_enabled` and
+`environment_prompt` on the record, `GET`/`PUT /v1/npc/{id}/environment`, a checkbox in the create
+wizard and another on the character page — and nothing that read any of it. The routes saved a
+setting, the console displayed it, and no engine ever consulted it. A control that looks like a
+decision and changes nothing is worse than an absent feature, because it invites somebody to plan
+around behaviour that does not exist.
+
+So the record fields, the routes, and both controls are gone. Nothing was lost: there was no
+behaviour to lose. `NpcPayload` carries no `deny_unknown_fields`, so records already written with
+the two fields still decode — the values are simply ignored.
+
+When this is actually built, it comes back as a whole thing: the fields, the routes, the controls
+**and** the engine that reads them, landing together. The design above is the starting point.
 
 ### Tools
 
@@ -1489,6 +1838,29 @@ instrument that makes answering them possible.
 > nothing. Both listings are read-only in that one respect: they show what the
 > mind holds, and gain an entry when an author writes a file.
 
+**A world may name its cast.** Craft being shared by every world is the standing default and
+stays it — a world that declares no cast admits every personality, which is what keeps adding
+the key to one world from emptying the rest.
+
+```yaml
+# worlds/<id>.yaml
+personalities: [cindy-tan]        # only these may be created in this world
+```
+
+It sits on the world, beside `selects` and `excludes`, for the reason those do: **a world is a
+filter, and what it admits is written on the world.** One file answers "who belongs to this
+setting", rather than the answer being assembled by reading seventy-four personality files.
+
+This is **not** the `hidden` flag and does not overlap with it. `hidden` answers "should this
+appear in a listing" — a question about screen shares, revealed by naming the document in the
+filter or by an admin holding RIGHT ALT. A cast answers which world a character is *of*, which
+no keypress should be able to change. The two are read at different moments and neither
+substitutes for the other.
+
+The daemon is the authority: it refuses a create naming a personality the world does not cast
+(`personality_not_of_world`), so the form's filtering exists to keep a refused pairing from
+being offered, not to enforce anything.
+
 ```
 GET        /v1/world                     GET|PUT|DELETE /v1/world/{wid}
 GET|PUT    /v1/world/{wid}/time          { "world_ms", "scale", "paused" }
@@ -1500,6 +1872,185 @@ Every `GET` here is open; every `PUT` and `DELETE` needs `admin` (§8.1a). A doc
 than 256 KiB is refused — twenty times the biggest real personality, and small enough that the
 API is not a way to fill a disk one save at a time. A name already taken by something that is
 not a plain file is refused rather than followed, because `write` follows a symlink.
+
+### The corpus — browsing and editing everything that was authored
+
+The documents above are the ones with a *shape*: a world and a personality are parsed,
+validated, and patched key-by-key so an author's comments survive a save. That covers two
+folders. The mind holds far more that has no schema at all — **1,818 pages** of canon, the 596
+responses and 116 moods, and the settings — and until this existed the only way to change any
+of it was a text editor on the machine the daemon runs on.
+
+```
+GET    /v1/mind/list?world=&id=        what is inside a place
+GET    /v1/mind/entry?id=              { id, title, text, chars }
+PUT    /v1/mind/entry?id=&new=1        { text }  →  201 created / 200 updated
+DELETE /v1/mind/entry?id=              204
+GET    /v1/mind/fields?id=             { id, title, fields[] }  —  422 not_fields
+PUT    /v1/mind/fields?id=             { values }  —  409 cannot_patch
+```
+
+**`id` is an address, not a path.** `canon/ammo/bolt`, never
+`layers/world/ammo/bolt.md`. This is the whole design and it is worth being plain about why:
+an API that says the second has published its storage as its contract, and every token in it
+is a promise — that canon lives under `layers/`, that a topic is a directory, that prose is
+markdown. `npcd/src/mind/address.rs` is the only place that knows any of that.
+
+An address is a **section** and a chain of **names**. There are nine sections and a client
+cannot invent a tenth:
+
+| Section | Holds | Stored as |
+|---|---|---|
+| `canon` | the setting itself | Markdown |
+| `agency` `beliefs` `memory` | what characters want, hold true, remember | Markdown |
+| `responses` `moods` | the shapes and registers of a reply | YAML |
+| `characters` `worlds` | who they are, and where | YAML |
+| `settings` | how the mind is configured | a named set |
+
+Three things follow, and each removes a class of mistake rather than merely tidying:
+
+- **The section supplies the extension**, so a caller never states a storage question and can
+  never get it wrong. `canon/x` becomes Markdown; `characters/x` becomes YAML. There is no
+  address that can name an executable, because there is nowhere in an address to put one.
+- **Anything that is not a section is unaddressable.** `node_modules`, the daemon's own
+  `.substrate`, a scratch folder — these are not filtered out of a listing, they cannot be
+  *named*. That is a stronger guarantee than a deny-list, and it does not need maintaining.
+- **A topic is one thing.** `ammo.md` is the overview and `ammo/` holds the entries — one idea
+  stored as two files — so `canon/ammo` addresses both: listing it gives the entries, reading
+  it gives the overview, and `has_text` says whether there is one. Nothing suggests two files,
+  because to a reader there are not.
+
+**Reading needs `user`, not `unauthenticated`** — the one place this surface is stricter than
+the documents above, and the reason is enumeration. `GET /v1/personality/cindy-tan` answers
+somebody who already knows the id; listing hands out the corpus a level at a time, which is
+exactly the browsing `hidden` exists to prevent. Writing needs `admin`, like every other change
+to something on disk.
+
+**A world is a lens, and the daemon holds it.** `?world=` narrows by that world's own three
+fields — `selects` gates the canon topics, `excludes` gates the section categories in
+`responses` and `moods`, the cast gates `characters` and the per-character `beliefs` and
+`memory`. The filter is applied as each level is read, so anything a world excludes is never
+named on the wire, and addressing an excluded topic directly is refused rather than served.
+Omitting `?world=` shows the whole corpus, which is what editing it wants.
+
+A canon topic exists twice on disk and `selects` names it once, so the extension comes off
+before the comparison. Getting that wrong hid 37 of a real world's 66 topics while leaving
+every folder in place.
+
+### A document as fields, not as a file
+
+`/v1/mind/entry` hands over a document's text, and for prose that is the right answer — a canon
+page is prose from its first byte to its last. A section is not. `responses/accept_then_move_on`
+is five keys, one of which is sixteen four-turn conversations, and showing that as a textarea of
+YAML asks the person editing the wording of a reply to also be a serialisation format's
+proof-reader: their job becomes indentation, block scalars, and not breaking the `examples:`
+list.
+
+So `/v1/mind/fields` answers the same document as a list of fields, in the order the file writes
+them, and `422 not_fields` for one that is not a mapping. Each field is a `key`, a `label`, a
+`kind`, a `value`, and a `note`:
+
+| Kind | Value | Edited as |
+|---|---|---|
+| `line` | a short string | an input |
+| `text` | prose | a textarea |
+| `number` | a number | a numeric input — and a **number** on the way back |
+| `bool` | true or false | a checkbox |
+| `choice` | one of a fixed vocabulary | a select |
+| `list` | short strings | chips, add and remove |
+| `conversations` | `[{ note, turns: [{ role, content, thinking }] }]` | the conversation editor |
+| `group` | a mapping | these same controls, nested |
+| `rows` | a list of mappings | one titled card each |
+| `raw` | anything unmodelled | that value's YAML, and only that value |
+
+`group` and `rows` make the form recursive, and that is what carries a value
+with structure. A projection layer's `budget` is a priority and a ceiling and
+sometimes an `adaptive` pair inside that; its `groups` are a list of mappings
+with a `selection` inside each. Flat, they are two YAML boxes. As themselves,
+they are a dozen inputs with names on them.
+
+`number` is not cosmetic. A window typed into a text input comes back as the
+string `"8000"`, which is a different document that looks identical — and the
+splice below would faithfully write the quotes.
+
+`choice` is offered **only where the value is already one of the vocabulary's
+words**. `gather_scope` and `decode_priority` are fixed by the engine and a typo
+in either is a layer it cannot load, so a select is right; but these are also
+ordinary words, and a document elsewhere with its own `kind` must not be told
+its value is invalid by a form that has never heard of it.
+
+`raw` is the honest escape hatch. A form that silently dropped the part of a document it did not
+understand would be worse than one that admits it, so an unmodelled shape round-trips as its own
+YAML text and a malformed edit is refused with its key named — never written out as a quoted
+string that changes the value's type.
+
+**The `note` is the author's own comment.** 701 of the 712 section files carry one above a key,
+and they are the best documentation the corpus has — *"FIXED SHAPE: 4 turns, user → assistant →
+user → assistant. Final assistant turn is the decode point"*. The field carries it, so the
+guidance is where the editing happens instead of only in a file nobody opens.
+
+**A save patches; it never re-serialises.** The values go through
+`npcd/src/registry/yaml_edit.rs`, which compares the new document to the old one *all the way
+down* and emits an op at the deepest node that differs — editing one turn's wording is a change
+to `examples[1].turns[0].content`, so the diff is that block scalar and every other byte of the
+file is untouched. Where the shape itself changed, and there is no entry-for-entry
+correspondence left to walk, that collection is rewritten as **block** YAML in the key order the
+file already used, with prose as the literal blocks it was written as. Both halves matter for
+the same reason: a save whose diff is the whole file cannot be reviewed by the person whose file
+it is.
+
+The result is then parsed and compared to what was asked for, and a mismatch **refuses the save**
+with `409 cannot_patch` rather than falling back to writing the document out whole. That fallback
+is precisely what would cost the file its comments, which is the thing this path exists to
+protect; the console offers the text editor instead.
+
+### A document can have addressable parts — the projection layers
+
+Most of the corpus is a file per thing. The projection schema is not: its **nine
+layers** live in one seven-hundred-line document, and each is a window, a score
+threshold, a budget, a summarisation prompt and a set of selection groups. As
+one document the only way to change a layer's budget is to find it in a
+textarea.
+
+So a settings document may declare that one of its keys holds *parts*, and each
+part gets an address:
+
+```
+settings/projection            the schema — lists its layers, and reads whole
+settings/projection/world       one layer, which opens as fields
+```
+
+This is the same idea as a canon topic having both entries and a body. Nothing
+about the routes is special: `list`, `entry` and `fields` all work through the
+address, and `npcd/src/mind/parts.rs` is the only place that knows a layer is an
+item in a list rather than a file.
+
+**A save is spliced into the document that holds it.** The whole schema goes
+through `yaml_edit` with just that layer replaced, so changing one layer's
+`window` is a one-line diff and the other six hundred and ninety lines are the
+bytes they were — including the `# ── Environment ──` banner the author wrote
+above each layer.
+
+**A part can be edited but not added or removed**, and the address model is what
+enforces it: an address names a part that exists, so there is no address for a
+tenth layer and none for deleting the ninth. That is deliberate rather than
+missing. Adding or removing an item changes the length of the list, which leaves
+no entry-for-entry correspondence to walk and so rewrites the list whole —
+taking every banner comment with it. Adding a layer is an act for the whole
+document, where the author can see the comments they are moving; `settings/projection`
+still opens as text for exactly that.
+
+Delete on a part is refused rather than falling through to the document. A layer
+is not `projection.yaml`, and deleting the schema because somebody pressed Delete
+on a layer would be the worst kind of surprise.
+
+**Three rules bound what can be touched**, enforced in `npcd/src/mind/`:
+
+| Rule | Why |
+|---|---|
+| Names still have to survive becoming a file name | `..`, `\`, `:`, NUL, control characters and reserved device names are refused, and the resolved path is checked to still be under the mind — an address is a nicer spelling of a path, never a way around one |
+| Writes are atomic | a temporary beside the target, `fsync`, then rename — the mind is not under version control, and a truncating write that is interrupted leaves the file *gone* rather than unchanged |
+| Deleting takes only what was named | removing a topic's text keeps everything inside it; those have addresses of their own. One button must never become a recursive delete |
 
 ### Hidden documents, and the whole word that reveals them
 
@@ -2308,11 +2859,20 @@ which is both noise and, for the one user who cares, a prompt at exactly the wro
 │  New character                            ① Identity  ② Face  ③ Inner life │
 ├────────────────────────────────────────────────────────────────────────────┤
 │    ┌─────────────────┐                                                     │
-│    │                 │     Generating from the description                 │
-│    │   [ portrait ]  │     ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░  62%              │
-│    │    generating   │                                                     │
-│    │                 │     Model [ sdxl-turbo ▾ ]   seed 441028  [ ⟳ ]     │
-│    └─────────────────┘                                                     │
+│    │                 │     A portrait, from the personality                │
+│    │   [ portrait ]  │     Keeper was authored with a portrait and the      │
+│    │   from Keeper   │     prompt that drew it.                            │
+│    │                 │     ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  ready            │
+│    └─────────────────┘     Model [ guest-image ▾ ]           [ ⟳ ]         │
+│                                                                            │
+│    The prompt this portrait is drawn from                                  │
+│    ┌──────────────────────────────────────────────────────────────────┐   │
+│    │ a portrait of an ancient guardian filling the frame, the          │   │
+│    │ weathered face of an elderly man with deeply lined skin, close    │   │
+│    │ cropped grey hair, a short grey beard, clear pale blue eyes …     │   │
+│    └──────────────────────────────────────────────────────────────────┘   │
+│    Authored on this personality. Editing it here changes this character’s  │
+│    portrait only — the personality keeps its own.                          │
 │                                                                            │
 │    ┌──────────────────────────────────────────────────────────────────┐   │
 │    │  or drop an image here / [ Upload a portrait ]                    │   │
@@ -2322,18 +2882,95 @@ which is both noise and, for the one user who cares, a prompt at exactly the wro
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-There is no prompt field. The portrait derives from the description, so a prompt box would be a
-second place to say who the character is and a guaranteed source of drift.
+**The prompt is shown, and it comes from the personality.** A personality may be authored with a
+`portrait:` block — the picture it was given and the words that drew it (see *A personality's own
+portrait* below). Choosing that personality opens this step already showing that face, with that
+prompt in an editable box; **Generate** draws another one from those words.
+
+This reverses an earlier rule that there be no prompt field at all, on the grounds that the
+portrait derived from the description and a second field would be a source of drift. The drift risk
+is real, but it was paying for a worse problem: a description is written to be *read* — it becomes
+the character's identity in the system prompt — and a prompt is written to be *drawn*. Framing,
+lens, light and wardrobe belong in one and not the other, and forcing a single sentence to serve
+both produced a worse version of each with no way to keep a portrait somebody had spent an
+afternoon getting right.
+
+What replaces the old guarantee is *where the prompt lives*: authored beside the character in the
+mind, under the same review as everything else in that file — not typed into a box that vanishes
+when the page closes. A character with no authored prompt still falls back to the description, so
+nothing about the old behaviour is lost for a personality nobody has art-directed.
+
+The box is prefilled with exactly what the daemon would have used anyway, so sending it back
+unchanged is the same request as sending nothing. Clearing it falls back rather than drawing from
+an empty string.
+
+### A personality's own portrait
+
+```yaml
+# personalities/keeper.yaml
+portrait:
+  image: portraits/keeper.png
+  prompt: |
+    a portrait of an ancient guardian filling the frame, …
+```
+
+`prompt` is the art direction, inherited by every character struck from this personality.
+
+`image` is a file **beside the personality in the mind**, not an id in a daemon's image store. The
+store is content-addressed and local, so an id in an authored document would name bytes that exist
+on the machine that drew them and nowhere else — a fresh clone of the mind would show a broken
+portrait. A file travels with the personality because it is part of it.
+
+At startup the daemon reads each such file once and puts it into the image store, and the listing
+carries the resulting `portrait.image_id` alongside the author's own fields. Content addressing
+makes that idempotent: a restart re-ingests the same bytes to the same id and writes nothing. The
+minted id is **derived, never written back** — the registry holds the document as authored, so a
+save cannot round-trip a local id into the mind.
+
+`image` is a path out of a file that is editable through the console, so it is treated as hostile:
+a plain relative path under the personalities directory and nothing else. No `..`, no absolute
+root, no drive letter, no backslash, and only an extension the image store can serve back. The
+check is on the path's *shape*, before any join, so there is no canonicalisation race to lose. A
+personality whose portrait cannot be read is logged and skipped — the character still serves, and
+falls back to its initial exactly as one with no portrait at all does.
+
+### Which words a draw uses
+
+Three sources, in this order:
+
+| Rung | Source | Where it comes from |
+|---|---|---|
+| 1 | the request | the console's prompt box, edited for this one character |
+| 2 | the personality | `portrait.prompt` in its YAML |
+| 3 | the description | `persona.description`, through the portrait framing |
+
+Blank is absent at every rung: a cleared box, or a `prompt:` somebody started and left empty, falls
+through to the next rung rather than being sent to the model as an empty string. The prompt chosen
+is compliance-checked whichever rung supplied it — gating only `/v1/image/generate` would leave the
+character editor as the way around it.
+
+A prompt sent in a request is **not stored on the character**. A prompt worth keeping belongs in
+the personality document, where it is authored and reviewed; the record keeps the picture rather
+than the words.
 
 **A progress bar, not a warning.** Generation waits for the wave boundary and the reclaim, which
 is a real delay, but that is the system working normally and the UI treats it as such. The bar
 reflects queue position and generation progress; **Skip** stays available so nobody is blocked,
 and the job continues in the background either way.
 
-### Regeneration follows the description
+### Regeneration follows the words the portrait was drawn from
 
 > **Editing the description regenerates the portrait** — queued as misc work, running at the
-> next wave boundary — **unless the user has uploaded one.**
+> next wave boundary — **unless the user has uploaded one, or the personality supplies its own
+> prompt.**
+
+A personality's authored prompt outranks the description (see *Which words a draw uses*), so for a
+character struck from an art-directed personality, editing the description changes what the
+character *is* without changing what it *looks like*. That is the intended behaviour: the prompt is
+the thing the picture tracks, and it is a different sentence.
+
+Where the description is still the source — every personality without a `portrait:` block — the
+rule below is unchanged.
 
 An uploaded portrait is a deliberate choice and outranks the generator permanently. It is never
 replaced by regeneration; `origin: "uploaded"` is sticky until the user explicitly asks for a
@@ -2364,10 +3001,6 @@ Drag-and-drop anywhere on the panel switches to upload.
 │   │ [✓] Hess — commander        trust +0.6  affect +0.2          ✎ ✕ │    │
 │   │ [✓] Ilse — merchant         trust +0.1  affect +0.4          ✎ ✕ │    │
 │   └──────────────────────────────────────────────────────────────────┘    │
-│                                                                            │
-│   Environment simulator  [✓] on                                            │
-│   ⓘ No world simulation is attached, so this generates what happens        │
-│     around the character. Turn it off if your own game drives events.      │
 │                                                                            │
 │                                  [ ← Back ]            [ Create ]          │
 └────────────────────────────────────────────────────────────────────────────┘
@@ -2781,10 +3414,10 @@ brooding character lives, and the point of the instrument is to let you push an 
 characterful near-edge *deliberately* while seeing when it is about to tip past character into
 incoherence.
 
-## 38. Environment, worlds, personalities, tools
+## 38. Worlds, personalities, tools
 
-**Environment panel** (`/npc/{id}/environment`) — a toggle with its consequence stated, a
-system-prompt editor, the sliding window's recent turns, and a world-event injector.
+The environment panel that stood at the head of this section is gone with the feature — see
+*Environment simulator — removed* in §20.
 
 ### Worlds — `/world` and `/world/{wid}`
 

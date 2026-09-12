@@ -28,6 +28,7 @@ use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
 use web::auth::{Role, Roles};
 
+use crate::engine::loading::LoadProgress;
 use crate::guard::Api;
 use crate::logs::{LogBus, LogLine};
 use crate::substrate::SubstrateDir;
@@ -45,14 +46,36 @@ pub struct Ops {
     /// When this process started, for `/v1/status`. Wall clock, because the
     /// console prints it as an uptime a person reads.
     pub started_at_ms: u64,
+    /// The engine's load state, so `/v1/status` can drive the loading screen.
+    ///
+    /// Shared with the loader thread rather than owned: this route is answering
+    /// while that thread is still working, which is the whole point of binding
+    /// the port before the model is loaded.
+    pub loading: Arc<LoadProgress>,
 }
 
 impl Ops {
     /// Builds the state and starts the sampler, because a `Telemetry` that is
     /// not being sampled is an empty history that looks like a broken page.
     /// Requires a Tokio runtime.
-    pub fn new(logs: Arc<LogBus>, data_dir: &Path, roles: Roles) -> Arc<Self> {
+    pub fn new(
+        logs: Arc<LogBus>,
+        data_dir: &Path,
+        roles: Roles,
+        loading: Arc<LoadProgress>,
+    ) -> Arc<Self> {
         let telemetry = Telemetry::new();
+        // **The sampler reads the load progress, so the ingest shows up on the
+        // performance page while it runs.**
+        //
+        // `Telemetry`'s engine fields were a stub — "nothing fills this in yet"
+        // — so `/v1/telemetry` reported `prefill_tps: null` throughout a
+        // half-hour world load, and the only way to see whether the ingest was
+        // fast or slow was to poll `/v1/status` and do the arithmetic by hand.
+        // The rate is already computed where it is measured; this is the
+        // sampler being told where to find it, rather than a second place that
+        // computes it.
+        telemetry.watch_loading(Arc::clone(&loading));
         telemetry.spawn_sampler();
         Arc::new(Self {
             telemetry,
@@ -63,6 +86,7 @@ impl Ops {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
+            loading,
         })
     }
 }
@@ -117,14 +141,28 @@ pub fn router(state: Arc<Ops>) -> Router {
 /// all, which the console reads as "not up yet" — the honest distinction being
 /// between *no answer* and *this answer*, rather than a progress figure this
 /// process cannot produce.
+/// `GET /v1/status` — what the console's loading screen reads.
+///
+/// Unauthenticated on purpose: it is the first request the shell makes, before
+/// it knows who is looking, and a loading screen that cannot render until you
+/// have signed in is a loading screen nobody sees. It gives away the daemon's
+/// build and its phase, and nothing about anybody's data.
 async fn status(State(s): State<Arc<Ops>>) -> Response {
+    let loading = s.loading.snapshot();
     Json(json!({
-        "state": "ready",
-        "detail": "no engine loaded — authored content, accounts and telemetry are real",
+        // `ready` means the engine is up and the cast is thinking. While the
+        // model is loading this is `loading`, and the shell keeps its overlay
+        // up rather than dropping into an app whose every route would 503.
+        "state": if loading.is_none() { "ready" } else { "loading" },
+        "detail": match &loading {
+            Some(l) => l.label.to_string(),
+            None => "engine ready".to_string(),
+        },
+        "loading": loading,
         "started_at_ms": s.started_at_ms,
         "build": concat!("npcd-", env!("CARGO_PKG_VERSION")),
         "mode": "server-headless",
-        "engine_connected": false,
+        "engine_connected": loading.is_none(),
     }))
     .into_response()
 }
@@ -240,7 +278,45 @@ mod tests {
             LogBus::new(),
             Path::new("."),
             serde_yaml::from_str("admins:\n  - sub: admin\n").unwrap(),
+            // A fresh progress: these tests exercise the routes' grading, and a
+            // daemon mid-load is the state they would actually be hit in.
+            Arc::new(LoadProgress::new()),
         )
+    }
+
+    /// The loading screen is the first thing a person sees on a restart, and it
+    /// is served before anybody has signed in — so `/v1/status` has to answer
+    /// while the engine is still loading, and has to say so.
+    /// `GET` a route on a fresh router built from `s`, as JSON.
+    async fn get_json(s: &Arc<Ops>, uri: &str) -> serde_json::Value {
+        let res = router(Arc::clone(s))
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{uri}");
+        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_load_phase_before_the_engine_is_up() {
+        let s = ops();
+        let body = get_json(&s, "/v1/status").await;
+        assert_eq!(body["state"], "loading");
+        assert_eq!(body["engine_connected"], false);
+        assert_eq!(body["loading"]["current"], "model");
+        assert_eq!(body["loading"]["label"], "Loading model");
+
+        s.loading.mark_ready();
+        let ready = get_json(&s, "/v1/status").await;
+        assert_eq!(ready["state"], "ready");
+        assert_eq!(ready["engine_connected"], true);
+        // Absent once ready — the shell keys "drop the overlay" off this being
+        // null, so a lingering object would leave a loading screen over a
+        // working daemon.
+        assert!(ready["loading"].is_null());
     }
 
     /// These four report on the *machine* rather than on anybody's data, so the

@@ -18,14 +18,15 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Json,
 };
 // Only the test-only `router` builds one directly; `main` goes through `api`.
 #[cfg(test)]
 use axum::Router;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use web::auth::session::Identity;
@@ -33,10 +34,23 @@ use web::auth::session::Identity;
 use web::auth::{Role, Roles};
 
 use crate::accounts::{self, Accounts, NameError, PatchError};
+use crate::clock::{self, Clock};
 use crate::collections::{self, Libraries};
+use crate::engine::runtime::Runtime;
 use crate::guard::Api;
+use crate::guest_routes;
 use crate::identity::require;
-use crate::npcs::{Filter, NpcError, Npcs};
+use crate::images::{ImageError, Images};
+use crate::lifegen::narrate as lifegen_narrate;
+use crate::lifegen::routes as lifegen;
+use crate::mind::catalog::CatalogError;
+use crate::mind::doc::{DocError, Wrote};
+use crate::mind::{
+    catalog as mind_catalog, parts as mind_parts, section as mind_section, Address, Mind, MindPath,
+    Scope,
+};
+use crate::npcs::{self, Filter, NpcError, Npcs};
+use crate::portrait;
 use crate::registry::{self, PutError, Registry};
 use crate::visibility;
 
@@ -59,9 +73,55 @@ pub struct Authored {
     /// The response and mood libraries, read once from the mind. No lock: they
     /// are authored in files and nothing here writes them.
     pub libraries: Libraries,
+    /// Uploaded portraits, on disk. No lock: it holds a path, and the writes
+    /// are content-addressed and atomic — two uploads of the same image are the
+    /// same file, and of different ones are different names.
+    pub images: Images,
+    /// `personality_id -> image_id` for the portraits personalities were
+    /// authored with — see [`crate::personality_portrait`].
+    ///
+    /// Read once at startup and never written, so no lock. It is *derived* from
+    /// the personality registry rather than stored in it: the registry holds the
+    /// document as authored, and an id minted by this daemon's image store is
+    /// not something the author wrote. Keeping it out here is what stops a save
+    /// round-tripping a local id back into the mind.
+    pub personality_portraits: BTreeMap<String, String>,
+    /// The mind directory, for the file editor. No lock: it holds a path, and
+    /// the filesystem is the thing being shared — two saves to one document
+    /// race in the OS whatever this does, and each is atomic (see
+    /// [`crate::mind::doc`]).
+    pub mind: Mind,
+    /// The engine.
+    ///
+    /// Always present, and always *there before the model is*. The daemon binds
+    /// its port and serves the console while the weights are still loading, so
+    /// what varies is not whether this exists but what it can answer — see
+    /// [`Runtime::is_ready`].
+    ///
+    /// `Option` only so the tests can stand this state up without an engine.
+    pub runtime: Option<Arc<Runtime>>,
+    /// Life generations, running and finished — see [`crate::lifegen`].
+    ///
+    /// Not behind a lock and not built at startup from anything: it is a
+    /// registry that starts empty and fills as an operator generates lives, and
+    /// it holds its own mutex over the one map it owns. Kept here rather than on
+    /// the runtime because a generation is an *authoring* action against the
+    /// mind directory — the engine is something it borrows, not something it
+    /// belongs to.
+    pub lifegen: crate::lifegen::job::Jobs,
 }
 
 impl Authored {
+    /// Nine arguments, and they stay nine.
+    ///
+    /// Every one is a distinct thing the daemon read at startup from a different
+    /// place — two registries, the account store, the cast, the role table, the
+    /// libraries, the mind, the portrait store and the portraits personalities
+    /// were authored with. Bundling them into a struct to satisfy an arity
+    /// threshold would be the same nine fields written twice, named once for the
+    /// builder and once here, with a second place for them to disagree. Called
+    /// exactly once, from `main`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         worlds: Registry,
         personalities: Registry,
@@ -69,15 +129,57 @@ impl Authored {
         npcs: Npcs,
         roles: Roles,
         libraries: Libraries,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+        mind: Mind,
+        images: Images,
+        personality_portraits: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
             worlds: RwLock::new(worlds),
             personalities: RwLock::new(personalities),
             accounts: RwLock::new(accounts),
             npcs: RwLock::new(npcs),
             roles,
             libraries,
-        })
+            images,
+            personality_portraits,
+            mind,
+            runtime: None,
+            lifegen: crate::lifegen::job::Jobs::new(),
+        }
+    }
+
+    /// The same state with an engine behind it.
+    ///
+    /// The runtime is built first — it needs only the mind directory — and the
+    /// two things it needs *from* this state, the world clock and the persona
+    /// source, are installed afterwards through
+    /// [`Runtime::set_clock`]/[`Runtime::set_persona_source`]. That ordering is
+    /// what breaks the cycle: `Authored` needs the runtime to answer routes, and
+    /// the runtime needs `Authored` to know what time it is for a character.
+    ///
+    /// It was a rebuild-by-unwrap once, which panicked in exactly the case it
+    /// was written for: the clock closure captures a clone of this state, so by
+    /// the time the runtime existed the `Arc` already had two holders and
+    /// `try_unwrap` could never succeed.
+    pub fn with_runtime(mut self, runtime: Arc<Runtime>) -> Arc<Self> {
+        self.runtime = Some(runtime);
+        Arc::new(self)
+    }
+
+    /// What time it is in a character's world — the async route in.
+    ///
+    /// `Runtime::world_ms` reaches the same answer through a closure that takes
+    /// `blocking_read`, which is correct on the tick thread and **panics**
+    /// inside the runtime. A handler must come this way instead. Both end at
+    /// `clock::world_ms_for`, so there is one lookup and two ways to hold the
+    /// locks for it.
+    pub async fn world_ms(&self, npc_id: u64) -> u64 {
+        crate::clock::world_ms_for(
+            &*self.npcs.read().await,
+            &*self.worlds.read().await,
+            npc_id,
+            now_ms() as i64,
+        )
     }
 }
 
@@ -110,6 +212,9 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             Role::Admin,
             put(put_world).delete(delete_world),
         )
+        // The narrative clock. Admin for the same reason the document is: every
+        // character in the world dates what they remember by it.
+        .route("/v1/world/:wid/time", Role::Admin, put(put_world_time))
         .route(
             "/v1/personality",
             Role::Unauthenticated,
@@ -125,6 +230,123 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             Role::Admin,
             put(put_personality).delete(delete_personality),
         )
+        // The anchor, the facets and the doctrine, from the document itself.
+        .route(
+            "/v1/personality/:aid/collections",
+            Role::Unauthenticated,
+            get(personality_collections),
+        )
+        // A character's life: the plan, the strata, and generating them.
+        //
+        // **Admin throughout, including the reads.** Every other authored
+        // document is readable by a signed-in user, but a life plan carries the
+        // seed — the arc, the shape, the world events a life is hung on — which
+        // is the authoring intent behind a character rather than anything the
+        // character is. And every write here puts prose into the substrate that
+        // a character will think it remembers, which is a larger act than
+        // editing a page of canon.
+        // **Co-resident models, and why they are `Admin`.**
+        //
+        // A guest job stops the world: the scheduler evicts the engine's KV
+        // working set to make room, and every character in every world stops
+        // thinking until it finishes. That is a legitimate thing for an operator
+        // to ask for and not a thing to expose to a player — the ask is cheap to
+        // make and expensive to serve, which is the shape of request that needs
+        // a hand on it rather than a rate limit.
+        // Separating a picture from its background.
+        //
+        // **`user`, because the split is by audience and not by cost.** Every
+        // console image route is `user` — `/v1/image/generate` included, and
+        // that one stops the world for ten to twenty-five seconds — while the
+        // raw `/v1/guest/*` operator routes are `admin`. This serves the Images
+        // page, which is itself a `user` page, so `admin` here would be the one
+        // console image route that refused the people the page is for.
+        //
+        // What bounds the exposure is not the role: a matte is one forward at a
+        // fixed size, `GuestRequest::check` caps the picture, and the queue
+        // serialises drains. It is the cheapest world-stopping thing this
+        // daemon offers, by an order of magnitude.
+        .route(
+            "/v1/image/cutout",
+            Role::User,
+            post(guest_routes::post_cutout),
+        )
+        .route("/v1/guest", Role::Admin, get(guest_routes::get_guests))
+        .route(
+            "/v1/guest/image",
+            Role::Admin,
+            post(guest_routes::post_image),
+        )
+        .route(
+            "/v1/guest/prose",
+            Role::Admin,
+            post(guest_routes::post_prose),
+        )
+        // One stratum of a life, rewritten in the narrator's voice through the
+        // prose guest. The ladder (`/generate`) stays on the main engine, which
+        // is the right shape for a five-hundred-node fan-out; this is the other
+        // case — one node, on demand, in a voice the acting model does not have.
+        .route(
+            "/v1/life/:who/node/:key/narrate",
+            Role::Admin,
+            post(lifegen_narrate::post_narrate),
+        )
+        .route("/v1/life/catalog", Role::Admin, get(lifegen::get_catalog))
+        .route("/v1/life/:who", Role::Admin, get(lifegen::get_life))
+        .route("/v1/life/:who/seed", Role::Admin, put(lifegen::put_seed))
+        .route(
+            "/v1/life/:who/node/:key",
+            Role::Admin,
+            put(lifegen::put_node),
+        )
+        .route("/v1/life/:who/day", Role::Admin, post(lifegen::post_day))
+        .route(
+            "/v1/life/:who/day/:date",
+            Role::Admin,
+            delete(lifegen::delete_day),
+        )
+        .route(
+            "/v1/life/:who/day/:date/consequences",
+            Role::Admin,
+            put(lifegen::put_consequences),
+        )
+        .route(
+            "/v1/life/:who/generate",
+            Role::Admin,
+            post(lifegen::post_generate),
+        )
+        .route("/v1/life/:who/job", Role::Admin, get(lifegen::get_job))
+        .route(
+            "/v1/life/:who/cancel",
+            Role::Admin,
+            post(lifegen::post_cancel),
+        )
+        // The authored corpus — canon, craft, characters, settings. Addressed
+        // by what things ARE (`canon/ammo/bolt`), never by where they are
+        // stored; see [`crate::mind::address`].
+        //
+        // Reading is `User` rather than open, unlike the documents above. The
+        // difference is enumeration: `/v1/personality/cindy-tan` answers
+        // somebody who already knows the id, while listing hands out the whole
+        // corpus a level at a time, which is exactly the browsing the `hidden`
+        // flag exists to prevent. The console is a signed-in tool, so this
+        // costs nothing that was available anyway.
+        .route("/v1/mind/list", Role::User, get(mind_list))
+        .route("/v1/mind/entry", Role::User, get(mind_entry))
+        .route(
+            "/v1/mind/entry",
+            Role::Admin,
+            put(put_mind_entry).delete(delete_mind_entry),
+        )
+        // The same entry as fields rather than as text, so it can be edited by
+        // somebody who does not know YAML. A save patches the values into the
+        // document that is there, keeping the authoring comments above every
+        // key — see [`crate::mind::section`].
+        .route("/v1/mind/fields", Role::User, get(mind_fields))
+        .route("/v1/mind/fields", Role::Admin, put(put_mind_fields))
+        // The nine layers, from the mind's own schema rather than from a second
+        // copy of them — see [`schema_layers`].
+        .route("/v1/schema/layers", Role::User, get(schema_layers))
         // The cast. These replace the console's fixture: a character here is a
         // record in the substrate owned by the signed-in account. `User` is the
         // bar; *ownership* is the rest of the answer and is checked per-record
@@ -142,6 +364,49 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         // console does not have to send a whole character to add one tag.
         .route("/v1/npc/:nid/tags", Role::User, put(put_npc_tags))
         .route("/v1/npc/:nid/hidden", Role::User, put(put_npc_hidden))
+        // The authoring plane (§16). `User` is the bar; ownership is the rest
+        // of the answer and is checked per record.
+        .route("/v1/npc/:nid/beliefs", Role::User, get(get_beliefs))
+        .route(
+            "/v1/npc/:nid/beliefs/:bid",
+            Role::User,
+            put(put_belief).delete(delete_belief),
+        )
+        .route(
+            "/v1/npc/:nid/relationships",
+            Role::User,
+            get(get_relationships),
+        )
+        .route(
+            "/v1/npc/:nid/relationships/:eid",
+            Role::User,
+            put(put_relationship),
+        )
+        .route("/v1/npc/:nid/agency", Role::User, get(get_agency))
+        .route("/v1/npc/:nid/agency/:sid", Role::User, put(put_strategy))
+        .route(
+            "/v1/npc/:nid/modulation",
+            Role::User,
+            get(get_modulation).put(put_modulation),
+        )
+        // A portrait is a file, and needs no engine — see [`crate::images`].
+        .route("/v1/npc/:nid/portrait", Role::User, put(put_portrait))
+        // Drawing one does need an engine, and stops every character thinking
+        // while it runs. `User` rather than `Admin` all the same: it is a
+        // portrait of *your own* character, the route refuses anything you do
+        // not own, and making it admin-only would mean nobody could ever use
+        // the button on the character they just created.
+        .route(
+            "/v1/npc/:nid/portrait/generate",
+            Role::User,
+            post(portrait::post_generate),
+        )
+        // `/v1/image/models` and `/v1/generate/description` are **not** here.
+        // They already exist in `engine::routes` as the placeholders the console
+        // was written against, and that is where their real implementations now
+        // live — a second registration is not an override, it is an
+        // "overlapping method route" panic at startup.
+        .route("/v1/image/:iid", Role::User, get(get_image))
         // An account and its profile are the caller's own, so `User` and then
         // the record is keyed by their subject — there is no id in these paths
         // to belong to somebody else.
@@ -196,7 +461,7 @@ fn caller(s: &Arc<Authored>, headers: &HeaderMap) -> Result<Identity, Box<Respon
 ///
 /// Every NPC route needs it: ownership is authorization (§8.2), so there is no
 /// such thing as an anonymous read of a character.
-async fn owner_of(
+pub async fn owner_of(
     s: &Arc<Authored>,
     headers: &HeaderMap,
 ) -> Result<(Identity, String), Box<Response>> {
@@ -233,7 +498,7 @@ async fn owner_of(
 /// `NotFound` covers both "no such id" and "not yours" on purpose: a 403 would
 /// confirm that an id exists, which is enough to enumerate somebody else's cast
 /// one guess at a time — the §8.3 leak by another route.
-fn npc_err(e: NpcError) -> Response {
+pub(crate) fn npc_err(e: NpcError) -> Response {
     match e {
         NpcError::NotFound => err(StatusCode::NOT_FOUND, "npc_not_found", "no such character"),
         NpcError::Invalid(field) => err(
@@ -290,7 +555,7 @@ async fn list_npcs(
 /// listing, against a map that is already in memory. A slug whose file is gone
 /// keeps no name and the page falls back to showing the slug, which is the
 /// honest thing to show for a reference that no longer resolves.
-fn name_personality(npc: &mut Value, reg: &Registry) {
+pub(crate) fn name_personality(npc: &mut Value, reg: &Registry) {
     let Some(id) = npc.get("personality_id").and_then(Value::as_str) else {
         return;
     };
@@ -344,13 +609,84 @@ async fn create_npc(
     if let Some(r) = missing_ref(&s, &body).await {
         return r;
     }
-    match s.npcs.write().await.create(&id, &owner, &body, now_ms()) {
+    // **Bound to a local so the write guard drops before the arm runs.** As a match scrutinee
+    // the guard is a temporary that lives to the end of the whole `match`, and the `Ok` arm
+    // calls `world_ms`, which takes `npcs.read()`. `tokio::sync::RwLock` is not reentrant, so
+    // that read never resolves: the request hangs *holding the write lock*, every later reader
+    // and writer queues behind it, and the tick thread — which reaches the same lock through
+    // the clock and persona closures — stops with it. The daemon wedges on the first character
+    // created while it is running.
+    //
+    // Invisible to the suite because `Authored::new` leaves `runtime: None`, so the block that
+    // calls `world_ms` only ever executes in production.
+    let created = s.npcs.write().await.create(&id, &owner, &body, now_ms());
+    match created {
         Ok(mut v) => {
+            // Put the new character into the loop straight away.
+            //
+            // The cast is woken at startup, so without this a character created
+            // while the daemon runs never ticks — it exists, it is listed, and
+            // it is not alive. The failure reads as the engine ignoring it, and
+            // the only fix a person would find is a restart. `wake` is
+            // idempotent, so doing it here costs nothing on the startup path.
+            if let Some(rt) = s.runtime.as_ref() {
+                if let Some(id) = v.get("npc_id").and_then(npc_id_of) {
+                    let world_ms = s.world_ms(id).await;
+                    rt.scheduler.wake(id, 0, world_ms);
+                    tracing::info!("npc {id}: created and woken");
+
+                    // And given a body, if its world has anywhere to stand. A
+                    // character whose world is authored but unmapped is a
+                    // character with lore and no body — which is most of them,
+                    // and not a failure.
+                    let name = v.get("name").and_then(Value::as_str).unwrap_or_default();
+                    let world = v
+                        .get("world_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    // Where this kind of character belongs, from its
+                    // personality — a Maker starts in the vault, a soldier in a
+                    // city, and they are the same world. Absent for a
+                    // personality with no particular home, which arrives at the
+                    // world's own door.
+                    let home = {
+                        let personalities = s.personalities.read().await;
+                        v.get("personality_id")
+                            .and_then(Value::as_str)
+                            .and_then(|p| personalities.get(p))
+                            .and_then(|r| r.body.get("home"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    };
+                    // No remembered room: this character has just been created
+                    // and has never stood anywhere. It arrives at the door.
+                    match rt.embody_in_world(id, world, home.as_deref(), name, None, 0) {
+                        Ok(true) => tracing::info!("npc {id}: standing in `{world}`"),
+                        Ok(false) => {}
+                        // Not fatal to the create: the character exists and is
+                        // thinking. Loud, because a character that should have
+                        // a body and has not is invisible otherwise — it looks
+                        // exactly like one whose world was never mapped.
+                        Err(e) => tracing::error!("npc {id}: no body in `{world}` — {e:#}"),
+                    }
+                }
+            }
             name_personality(&mut v, &*s.personalities.read().await);
             (StatusCode::CREATED, Json(v)).into_response()
         }
         Err(e) => npc_err(e),
     }
+}
+
+/// A character id off the wire.
+///
+/// The id is serialised as a **string**, because a `u64` past 2^53 does not
+/// survive a JavaScript client — so reading it back out of a response body is a
+/// string parse, not `as_u64`, and using the latter here silently found nothing.
+fn npc_id_of(v: &Value) -> Option<u64> {
+    v.as_str()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| v.as_u64())
 }
 
 /// The 400 for a create that names a world or personality this daemon does not
@@ -392,6 +728,43 @@ async fn missing_ref(s: &Arc<Authored>, body: &Value) -> Option<Response> {
         };
         if !known {
             return Some(err(StatusCode::BAD_REQUEST, code, &name));
+        }
+    }
+
+    // Both documents exist. The character also has to belong to the world it is
+    // being created in: a personality is written for one world and names it in
+    // `world:`, so any other pairing is a character in a setting it has no
+    // canon for.
+    //
+    // Checked here rather than left to the console's filtering, because the
+    // console is presentation: a create posted by curl, by a script, or by a
+    // page held open while a personality was re-homed would otherwise write a
+    // character that fails at spawn, long after the page that made it closed —
+    // exactly the failure the reference check above exists to prevent.
+    let (world, personality) = (named("world_id"), named("personality_id"));
+    if !world.is_empty() && !personality.is_empty() {
+        // The world's cast, if it names one. A world that names none admits
+        // everyone — the standing default, and what stops the first world to
+        // declare a cast from emptying every other.
+        let cast: Option<Vec<String>> = s.worlds.read().await.get(&world).and_then(|r| {
+            r.body
+                .get("personalities")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+        });
+        if let Some(cast) = cast {
+            if !cast.iter().any(|c| c == &personality) {
+                return Some(err(
+                    StatusCode::BAD_REQUEST,
+                    "personality_not_of_world",
+                    &format!("`{world}` does not cast `{personality}`"),
+                ));
+            }
         }
     }
     None
@@ -473,6 +846,282 @@ async fn patch_one(s: Arc<Authored>, headers: HeaderMap, nid: String, patch: Val
     }
 }
 
+/* ── the authoring plane (§16) ───────────────────────────────────────────────
+ *
+ * What an operator says a character believes, who they know, what they are
+ * trying to do, and where their affect sits. Every write here is an authoring
+ * act and comes back marked `origin: "authored"`, so it stays distinguishable
+ * from whatever the evidence process later earns.
+ *
+ * All of it is stored on the character's own record and supersedes with it —
+ * see [`crate::npcs`]. `User` is the bar and *ownership* is the rest of the
+ * answer, checked per record in `Npcs`, because a role cannot express "yours".
+ *
+ * The reads report the engine's measurements as **absent**: a belief has no
+ * disconfirmation until something weighed evidence against it. These used to
+ * fall through to the fixture, which answered with three invented beliefs for
+ * every character — including ones that do not exist. */
+
+/// Every belief an operator has stated.
+async fn get_beliefs(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(nid): Path<String>,
+) -> Response {
+    read_npc(s, headers, nid, npcs::beliefs_wire).await
+}
+
+async fn put_belief(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path((nid, bid)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    write_npc(s, headers, nid, move |n, id, owner, now| {
+        n.put_belief(id, owner, &bid, &body, now)
+    })
+    .await
+}
+
+async fn delete_belief(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path((nid, bid)): Path<(String, String)>,
+) -> Response {
+    let (_, owner) = match owner_of(&s, &headers).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let Ok(npc_id) = nid.parse::<u64>() else {
+        return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
+    };
+    match s
+        .npcs
+        .write()
+        .await
+        .delete_belief(npc_id, &owner, &bid, now_ms())
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => err(StatusCode::NOT_FOUND, "belief_not_found", &bid),
+        Err(e) => npc_err(e),
+    }
+}
+
+async fn get_relationships(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(nid): Path<String>,
+) -> Response {
+    read_npc(s, headers, nid, npcs::relationships_wire).await
+}
+
+async fn put_relationship(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path((nid, eid)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    write_npc(s, headers, nid, move |n, id, owner, now| {
+        n.put_relationship(id, owner, &eid, &body, now)
+    })
+    .await
+}
+
+async fn get_agency(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(nid): Path<String>,
+) -> Response {
+    read_npc(s, headers, nid, npcs::agency_wire).await
+}
+
+async fn put_strategy(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path((nid, sid)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    write_npc(s, headers, nid, move |n, id, owner, now| {
+        n.put_strategy(id, owner, &sid, &body, now)
+    })
+    .await
+}
+
+async fn get_modulation(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(nid): Path<String>,
+) -> Response {
+    read_npc(s, headers, nid, npcs::modulation_wire).await
+}
+
+async fn put_modulation(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(nid): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    write_npc(s, headers, nid, move |n, id, owner, now| {
+        n.put_modulation(id, owner, &body, now)
+    })
+    .await
+}
+
+/// One read of a character, rendered by whichever view asked.
+async fn read_npc(
+    s: Arc<Authored>,
+    headers: HeaderMap,
+    nid: String,
+    view: fn(&candle_conversation::persistence::record::NpcPayload) -> Value,
+) -> Response {
+    let (_, owner) = match owner_of(&s, &headers).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let Ok(npc_id) = nid.parse::<u64>() else {
+        return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
+    };
+    match s.npcs.read().await.visible_to(npc_id, &owner) {
+        Some(n) => Json(view(n)).into_response(),
+        None => err(StatusCode::NOT_FOUND, "npc_not_found", "no such character"),
+    }
+}
+
+/// One authoring write, whichever it is.
+///
+/// The write itself is a closure over `Npcs` so the lock is taken once, here,
+/// and every one of these routes supersedes the record the same way.
+async fn write_npc<F>(s: Arc<Authored>, headers: HeaderMap, nid: String, write: F) -> Response
+where
+    F: FnOnce(&mut Npcs, u64, &str, u64) -> Result<Value, NpcError>,
+{
+    let (_, owner) = match owner_of(&s, &headers).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let Ok(npc_id) = nid.parse::<u64>() else {
+        return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
+    };
+    let mut npcs = s.npcs.write().await;
+    match write(&mut npcs, npc_id, &owner, now_ms()) {
+        Ok(mut v) => {
+            name_personality(&mut v, &*s.personalities.read().await);
+            Json(v).into_response()
+        }
+        Err(e) => npc_err(e),
+    }
+}
+
+/// Upload a portrait for a character.
+///
+/// The raw image as the body, not a multipart form: there is one file and no
+/// other fields, so a boundary-encoded envelope would be ceremony around a byte
+/// string. The format is decided from the bytes — see [`crate::images`].
+///
+/// The console called this "uploaded" and then dropped the file: `create()`
+/// posted a name, a world, a personality and a description, and the image
+/// existed only as an object URL that went away with the tab. The record has
+/// carried `portrait_image_id` the whole time with nothing to put in it.
+/// Where the bytes came from, for [`crate::npcs::Npcs::set_portrait`].
+///
+/// Defaults to `uploaded`, which is what a file chosen from disk is. The create
+/// step needs the other value: it draws a portrait through the image guest and
+/// shows it *before* there is a character to attach it to, then sends the bytes
+/// it already has once the character exists. Those bytes are a generated
+/// portrait and have to be recorded as one — filed as `uploaded`, the character
+/// could never be redrawn afterwards, because [`crate::portrait::post_generate`]
+/// refuses to replace an uploaded portrait without `force`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortraitOrigin {
+    #[serde(default)]
+    origin: Option<String>,
+}
+
+async fn put_portrait(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(nid): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<PortraitOrigin>,
+    body: axum::body::Bytes,
+) -> Response {
+    // Two values, and anything else is refused rather than stored: the string
+    // is written onto the record and read back as a rule about what may
+    // overwrite it, so a third value would be a portrait nothing can classify.
+    let origin =
+        match q.origin.as_deref() {
+            None | Some("uploaded") => "uploaded",
+            Some("generated") => "generated",
+            Some(other) => return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "bad_origin",
+                    "detail": format!("origin must be `uploaded` or `generated`, not `{other}`"),
+                })),
+            )
+                .into_response(),
+        };
+    let id = match s.images.put(&body) {
+        Ok(id) => id,
+        Err(e) => return image_err(e),
+    };
+    // Recorded on the character, so the portrait survives a restart and the
+    // console can find it again from the listing.
+    //
+    // Through `set_portrait`, not `patch`: an image id is minted here from the
+    // bytes just stored, and `patch` takes what a person types. A caller must
+    // not be able to name one — every id in the store is valid, so there would
+    // be nothing to reject.
+    write_npc(s, headers, nid, move |n, npc_id, owner, now| {
+        n.set_portrait(npc_id, owner, id, origin, now)
+    })
+    .await
+}
+
+/// Serve an uploaded image.
+///
+/// `User`, like everything else about a character. Not `unauthenticated`: an id
+/// is a content hash and unguessable, but "unguessable" is not a permission,
+/// and these are pictures of somebody's characters.
+async fn get_image(State(s): State<Arc<Authored>>, Path(id): Path<String>) -> Response {
+    match s.images.get(&id) {
+        Ok((bytes, mime)) => {
+            let mut res = bytes.into_response();
+            let h = res.headers_mut();
+            if let Ok(v) = HeaderValue::from_str(mime) {
+                h.insert(header::CONTENT_TYPE, v);
+            }
+            // Content-addressed, so the bytes at an id never change and this can
+            // be cached hard. The one place in this daemon where that is true.
+            h.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            );
+            res
+        }
+        Err(e) => image_err(e),
+    }
+}
+
+fn image_err(e: ImageError) -> Response {
+    match e {
+        ImageError::NotAnImage => err(StatusCode::BAD_REQUEST, "not_an_image", &e.to_string()),
+        ImageError::TooLarge(_) => err(StatusCode::PAYLOAD_TOO_LARGE, "too_large", &e.to_string()),
+        ImageError::NotFound => err(StatusCode::NOT_FOUND, "image_not_found", &e.to_string()),
+        ImageError::Io(io) => {
+            // The path is not in the reply: it is the estate's own shape, and a
+            // stranger who can provoke a failed write should not get a map of
+            // the disk out of it.
+            tracing::error!(error = %io, "image store failed");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "io_error",
+                "the image could not be stored",
+            )
+        }
+    }
+}
+
 /// Delete: one superseding record with `state: "tombstoned"`. The id stays
 /// taken, because the acts the character already committed still name it.
 async fn delete_npc(
@@ -488,7 +1137,33 @@ async fn delete_npc(
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     match s.npcs.write().await.delete(npc_id, &owner, now_ms()) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // Take the character out of the engine too. Without this its loop
+            // keeps ticking against an authored record that no longer resolves —
+            // the persona source returns `None`, so it thinks about nothing for
+            // ever, and its conversation is never retired.
+            if let Some(rt) = s.runtime.as_ref() {
+                rt.scheduler.retire(npc_id);
+                // And what its body was waiting on, or a world running for a
+                // week keeps a row per act for every character it ever had.
+                rt.cooldowns.forget(npc_id);
+                // **And the questions it was part of, in both directions.**
+                //
+                // A question is an obligation the percept repeats every turn
+                // until the two of them speak — so one left behind by somebody
+                // who no longer exists is one the other character is told about
+                // for ever and can never discharge, because there is nobody in
+                // the room answering to that name. That is the exact shape of
+                // defect the obligation was added to remove.
+                if let Some((hosted, body)) = rt.body_of(npc_id) {
+                    hosted.with_sim(|s| s.ledger.forget_questions(&body));
+                }
+                if let Some(minds) = rt.minds.read().unwrap().as_ref() {
+                    minds.retire_npc(npc_id);
+                }
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => npc_err(e),
     }
 }
@@ -702,7 +1377,7 @@ async fn put_unique_name(
 /// The console reads `world_id` and `personality_id`; the file knows only its own
 /// name. Joining the two here keeps the id out of the authored document, where
 /// it would be a second place for the same fact to live and disagree.
-fn with_id(key: &str, id: &str, body: &Value) -> Value {
+pub(crate) fn with_id(key: &str, id: &str, body: &Value) -> Value {
     let mut out = body.clone();
     if let Some(map) = out.as_object_mut() {
         map.insert(key.to_string(), json!(id));
@@ -710,13 +1385,448 @@ fn with_id(key: &str, id: &str, body: &Value) -> Value {
     out
 }
 
-fn err(status: StatusCode, code: &str, detail: &str) -> Response {
+pub fn err(status: StatusCode, code: &str, detail: &str) -> Response {
     (status, Json(json!({ "error": code, "detail": detail }))).into_response()
+}
+
+// ── the mind's files ────────────────────────────────────────────────────────
+
+/// Everything a mind request needs, or the refusal that says why not.
+///
+/// The three handlers below all begin the same way — is there a mind, does the
+/// path parse, which world is this scoped to — so it happens once. The scope is
+/// resolved here too, which is what stops a handler forgetting to apply it.
+async fn mind_request(
+    s: &Arc<Authored>,
+    q: &std::collections::HashMap<String, String>,
+) -> Result<(std::path::PathBuf, Option<Address>, Scope), Box<Response>> {
+    let Some(root) = s.mind.root() else {
+        return Err(Box::new(err(
+            StatusCode::NOT_FOUND,
+            "no_mind",
+            "this daemon was started without --mind, so it has no authored content to edit",
+        )));
+    };
+    // `?id=` is an address in the corpus — `canon/ammo/bolt` — not a path. The
+    // absent case is the corpus itself.
+    let addr = Address::parse(q.get("id").map(String::as_str).unwrap_or_default())
+        .map_err(|e| err(StatusCode::BAD_REQUEST, "unknown_address", &e.to_string()))?;
+
+    // `?world=` is optional. Absent means the whole mind, which is the right
+    // default for an editor: a world is a lens on one corpus, and somebody
+    // editing the corpus should not have to choose a lens first.
+    let scope = match q.get("world").map(String::as_str).filter(|w| !w.is_empty()) {
+        None => Scope::unscoped(),
+        Some(wid) => match s.worlds.read().await.get(wid) {
+            Some(r) => Scope::of_world(&r.body),
+            None => {
+                return Err(Box::new(err(StatusCode::BAD_REQUEST, "unknown_world", wid)));
+            }
+        },
+    };
+    Ok((root.to_path_buf(), addr, scope))
+}
+
+/// The section category of a `responses/` or `moods/` file, from the libraries
+/// already in memory.
+///
+/// The scope needs it to apply a world's `excludes`, and reading it from the
+/// loaded library rather than from disk keeps a directory listing a directory
+/// listing — otherwise browsing `responses/` would open 596 files to decide
+/// what to show.
+fn category_lookup(s: &Arc<Authored>) -> impl Fn(&MindPath) -> Option<String> + '_ {
+    move |path: &MindPath| {
+        let area = path.area()?;
+        let name = path.name();
+        // Only a file directly inside the folder is a section.
+        if path.segments().len() != 2 {
+            return None;
+        }
+        let id = name.strip_suffix(".yaml")?;
+        let library = match area {
+            "responses" => &s.libraries.responses,
+            "moods" => &s.libraries.moods,
+            _ => return None,
+        };
+        library
+            .sections
+            .iter()
+            .find(|sec| sec.id == id)
+            .map(|sec| sec.category.clone())
+    }
+}
+
+/// What is inside a place in the corpus.
+///
+/// With no `?id=`, the corpus itself — the nine sections. A caller never names
+/// a directory, so there is no directory to be refused: a folder that is not
+/// part of the corpus has no address at all.
+async fn mind_list(
+    State(s): State<Arc<Authored>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let (root, addr, scope) = match mind_request(&s, &q).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let cat = category_lookup(&s);
+    let (id, title, parent, has_text, children) = match &addr {
+        None => (
+            String::new(),
+            "The mind".to_owned(),
+            None,
+            false,
+            Ok(mind_catalog::sections(&root, &scope, &cat)),
+        ),
+        Some(a) => (
+            a.as_str(),
+            a.title(),
+            a.parent().map(|p| p.as_str()),
+            // Whether *this* has text of its own, which is what lets a topic be
+            // opened as well as opened into.
+            a.entry_path()
+                .and_then(|p| p.resolve(&root).ok())
+                .map(|f| f.is_file())
+                .unwrap_or(false),
+            mind_catalog::children(&root, a, &scope, &cat),
+        ),
+    };
+    match children {
+        Ok(nodes) => Json(json!({
+            "id": id,
+            "title": title,
+            "parent": parent,
+            "has_text": has_text,
+            "scoped": !scope.is_unscoped(),
+            "children": nodes.iter().map(mind_catalog::Node::wire).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => catalog_err(e),
+    }
+}
+
+/// The addressed thing, and everything needed to act on it.
+///
+/// Every write handler begins the same way and the scope check is the part that
+/// must not be forgotten, so it happens here once. `None` — the corpus itself —
+/// is refused: there is no text at the root to read, write or remove.
+async fn mind_entry_of(
+    s: &Arc<Authored>,
+    q: &std::collections::HashMap<String, String>,
+) -> Result<(std::path::PathBuf, Address), Box<Response>> {
+    let (root, addr, scope) = mind_request(s, q).await?;
+    let Some(addr) = addr else {
+        return Err(Box::new(err(
+            StatusCode::BAD_REQUEST,
+            "unknown_address",
+            "name something in the mind",
+        )));
+    };
+    let cat = category_lookup(s);
+    // Asked of whichever path the address has, so a topic is checked by its
+    // tag and an entry by its own file.
+    let path = addr.collection_path().or_else(|| addr.entry_path());
+    if let Some(p) = path {
+        if !scope.admits(&p, &cat) {
+            return Err(Box::new(err(
+                StatusCode::FORBIDDEN,
+                "out_of_scope",
+                "this world does not include that",
+            )));
+        }
+    }
+    Ok((root, addr))
+}
+
+/// Read the text of an entry, or a topic's overview.
+async fn mind_entry(
+    State(s): State<Arc<Authored>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let (root, addr) = match mind_entry_of(&s, &q).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    match mind_catalog::read(&root, &addr) {
+        Ok(d) => Json(json!({
+            "id": addr.as_str(),
+            "title": addr.title(),
+            "text": d.text,
+            "chars": d.text.chars().count(),
+        }))
+        .into_response(),
+        Err(e) => doc_err(e),
+    }
+}
+
+/// Write an entry — creating it, or replacing what is there.
+///
+/// `?new=1` refuses to land on something that exists, which is what "add"
+/// needs: a create that overwrote would take somebody's work with no error.
+async fn put_mind_entry(
+    State(s): State<Arc<Authored>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let (root, addr) = match mind_entry_of(&s, &q).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let Some(text) = body.get("text").and_then(Value::as_str) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_field",
+            "`text` is missing or is not a string",
+        );
+    };
+    let must_be_new = matches!(q.get("new").map(String::as_str), Some("1" | "true"));
+    match mind_catalog::write(&root, &addr, text, must_be_new) {
+        Ok(Wrote::Created) => (
+            StatusCode::CREATED,
+            Json(json!({ "id": addr.as_str(), "title": addr.title(), "created": true })),
+        )
+            .into_response(),
+        Ok(Wrote::Updated) => {
+            Json(json!({ "id": addr.as_str(), "title": addr.title(), "created": false }))
+                .into_response()
+        }
+        Err(e) => doc_err(e),
+    }
+}
+
+/// The projection layers, as the schema declares them.
+///
+/// Read from the mind's own `projection.yaml` — the same document
+/// `settings/projection` edits, through the same reader — so there is no second
+/// copy of the nine layers to drift from the first. There was: the console's
+/// fixture answered this route with hand-written specs, and by the time anybody
+/// looked it had `action` at budget priority 95 where the schema said 100.
+/// Nothing could have noticed, because the two were never compared.
+///
+/// The layers go out in the schema's **own vocabulary** — `name`,
+/// `gather_scope`, `budget`, `groups` — rather than translated into a shape of
+/// this route's own. A translation is one more place for the two to disagree,
+/// and the author's words are the ones the editor shows.
+async fn schema_layers(State(s): State<Arc<Authored>>) -> Response {
+    let Some(root) = s.mind.root() else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "no_mind",
+            "this daemon has no mind directory, so it declares no layers",
+        );
+    };
+    // The address, and the keys that say where its parts live. Asking the
+    // address rather than writing `layers` here keeps this route honest if the
+    // schema is ever held under a different key.
+    let addr = match Address::parse("settings/projection") {
+        Ok(Some(a)) => a,
+        _ => {
+            tracing::error!("the projection schema has no address");
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "io_error",
+                "could not address the projection schema",
+            );
+        }
+    };
+    let Some((list_key, id_key)) = addr.parts() else {
+        tracing::error!("the projection schema declares no parts");
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "io_error",
+            "the projection schema declares no layers",
+        );
+    };
+    let doc = match mind_catalog::read(root, &addr) {
+        Ok(d) => d,
+        Err(e) => return doc_err(e),
+    };
+    match mind_parts::list(&doc.text, list_key, id_key) {
+        Ok(items) => Json(json!({
+            "layers": items.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "malformed_schema",
+            &e.to_string(),
+        ),
+    }
+}
+
+/// An entry as editable fields, rather than as its text.
+///
+/// A document that is not a mapping — a list, a bare scalar — has no fields, and
+/// says so with `not_fields` rather than an error the console would show as a
+/// failure. It is a fact about the document, and the console offers the text
+/// editor instead.
+async fn mind_fields(
+    State(s): State<Arc<Authored>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let (root, addr) = match mind_entry_of(&s, &q).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let doc = match mind_catalog::read(&root, &addr) {
+        Ok(d) => d,
+        Err(e) => return doc_err(e),
+    };
+    // Whichever key is the address is the one that cannot be edited: `id` for a
+    // section, `name` for a projection layer.
+    let id_key = addr.part().map(|p| p.id_key).unwrap_or("id");
+    match mind_section::parse(&doc.text, id_key) {
+        Ok(fields) => Json(json!({
+            "id": addr.as_str(),
+            "title": addr.title(),
+            "fields": fields.iter().map(mind_section::Field::wire).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "not_fields",
+            &e.to_string(),
+        ),
+    }
+}
+
+/// Save an entry from its fields, keeping every comment in the file.
+///
+/// The values are patched into the document that is already there rather than
+/// serialised over it — see [`crate::mind::section`]. Nothing about the file
+/// changes except the values that changed, so the authoring notes above each
+/// key survive an edit made by somebody who never saw them.
+async fn put_mind_fields(
+    State(s): State<Arc<Authored>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let (root, addr) = match mind_entry_of(&s, &q).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let Some(values) = body.get("values").and_then(Value::as_object) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_field",
+            "`values` is missing or is not an object",
+        );
+    };
+    let wanted = match mind_section::to_document(values) {
+        Ok(m) => m,
+        Err(why) => return err(StatusCode::BAD_REQUEST, "invalid_field", &why),
+    };
+
+    // A *part* — one layer of the projection schema — is written straight
+    // through. What it reads as is a rendering of that layer alone, with no
+    // comments of its own to protect; the splice that keeps the file's comments
+    // happens where they are, when the part goes back into the document that
+    // holds it. See [`crate::mind::parts`].
+    if addr.part().is_some() {
+        let text = match serde_yaml::to_string(&Value::Object(wanted)) {
+            Ok(t) => t,
+            Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_field", &e.to_string()),
+        };
+        return match mind_catalog::write(&root, &addr, &text, false) {
+            Ok(_) => Json(json!({ "id": addr.as_str(), "title": addr.title() })).into_response(),
+            Err(e) => doc_err(e),
+        };
+    }
+
+    let current = match mind_catalog::read(&root, &addr) {
+        Ok(d) => d,
+        Err(e) => return doc_err(e),
+    };
+    // `splice` returns `None` when it cannot patch — the document does not
+    // parse, or its own read-back check found the result did not say what was
+    // asked. Refused rather than falling back to a whole rewrite: the fallback
+    // would silently cost the file its comments, which is the one thing this
+    // path exists to protect.
+    let Some(next) = registry::yaml_edit::splice(&current.text, &wanted) else {
+        return err(
+            StatusCode::CONFLICT,
+            "cannot_patch",
+            "this document could not be edited field by field without rewriting it, \
+             which would lose its comments — edit it as text instead",
+        );
+    };
+    match mind_catalog::write(&root, &addr, &next, false) {
+        Ok(_) => Json(json!({ "id": addr.as_str(), "title": addr.title() })).into_response(),
+        Err(e) => doc_err(e),
+    }
+}
+
+/// Remove an entry's text.
+///
+/// A topic keeps whatever is inside it — those have addresses of their own, and
+/// one button must not become a recursive delete.
+async fn delete_mind_entry(
+    State(s): State<Arc<Authored>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let (root, addr) = match mind_entry_of(&s, &q).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    match mind_catalog::remove(&root, &addr) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => doc_err(e),
+    }
+}
+
+/// A listing failure, as a status and a code the console can branch on.
+fn catalog_err(e: CatalogError) -> Response {
+    match e {
+        CatalogError::NotFound => err(StatusCode::NOT_FOUND, "not_found", &e.to_string()),
+        CatalogError::OutOfScope => err(StatusCode::FORBIDDEN, "out_of_scope", &e.to_string()),
+        CatalogError::Io(io) => {
+            tracing::error!(error = %io, "mind listing failed");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "io_error",
+                "could not read that part of the mind",
+            )
+        }
+    }
+}
+
+/// A document failure, likewise.
+fn doc_err(e: DocError) -> Response {
+    match e {
+        // A path error cannot come from an address that parsed — the names were
+        // checked when it did — so this is a bug rather than a bad request, and
+        // it is reported as one rather than blamed on the caller.
+        DocError::Path(p) => {
+            tracing::error!(error = %p, "an address resolved to a path the rules refuse");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "io_error",
+                "could not resolve that",
+            )
+        }
+        DocError::NotFound => err(StatusCode::NOT_FOUND, "not_found", &e.to_string()),
+        DocError::IsADirectory => err(StatusCode::BAD_REQUEST, "not_a_document", &e.to_string()),
+        DocError::NotText => err(StatusCode::BAD_REQUEST, "not_text", &e.to_string()),
+        DocError::TooLarge(_) => err(StatusCode::PAYLOAD_TOO_LARGE, "too_large", &e.to_string()),
+        DocError::Exists => err(StatusCode::CONFLICT, "already_exists", &e.to_string()),
+        DocError::CannotPatch => err(StatusCode::CONFLICT, "cannot_patch", &e.to_string()),
+        DocError::Io(io) => {
+            // The path is deliberately not in the reply: an I/O message can
+            // carry the absolute location of the mind on disk, which is the
+            // estate's internal shape and not the caller's business.
+            tracing::error!(error = %io, "mind write failed");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "io_error",
+                "could not write that",
+            )
+        }
+    }
 }
 
 /// Wall-clock milliseconds, for stamping a record. A clock before the epoch is
 /// not a reason to refuse a write, so it reads as zero.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -737,6 +1847,30 @@ fn with_count(mut v: Value, counts: &BTreeMap<&str, usize>, id: &str) -> Value {
     v
 }
 
+/// Whether this request may see hidden documents.
+///
+/// `?reveal=1` asks; **being an admin is what answers**. The parameter is a
+/// request, never a grant — an unauthenticated caller appending it to the URL
+/// gets the same listing as one who did not, because the role is read from the
+/// gateway's headers on this request and not from anything the client says.
+///
+/// The console sends it while an admin holds RIGHT ALT, which is the whole of
+/// the gesture: the key is a convenience for someone who already has the role,
+/// so that a listing being screen-shared does not contain what a screenshot
+/// should not. It is discretion, not access control — `GET /v1/world/earth`
+/// still answers anyone who knows the id, exactly as it did before.
+fn revealing(
+    s: &Arc<Authored>,
+    headers: &HeaderMap,
+    q: &std::collections::HashMap<String, String>,
+) -> bool {
+    if !matches!(q.get("reveal").map(String::as_str), Some("1" | "true")) {
+        return false;
+    }
+    let id = crate::identity::identify(headers).ok();
+    s.roles.of(id.as_ref()).at_least(Role::Admin)
+}
+
 /// Every world, minus the hidden ones the filter has not named.
 ///
 /// `q` is the console's filter box. A world with `hidden: true` is left out
@@ -745,15 +1879,17 @@ fn with_count(mut v: Value, counts: &BTreeMap<&str, usize>, id: &str) -> Value {
 /// a list the client was first sent in full.
 async fn list_worlds(
     State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let query = q.get("q").map(String::as_str).unwrap_or_default();
+    let reveal = revealing(&s, &headers, &q);
     let npcs = s.npcs.read().await;
     let counts = npcs.counts_by(|n| n.world_id.as_str());
     let reg = s.worlds.read().await;
     let worlds: Vec<Value> = reg
         .iter()
-        .filter(|r| visibility::listable(&r.id, &r.body, query))
+        .filter(|r| reveal || visibility::listable(&r.id, &r.body, query))
         .map(|r| with_count(with_id("world_id", &r.id, &r.body), &counts, &r.id))
         .collect();
     Json(json!({ "worlds": worlds })).into_response()
@@ -763,13 +1899,67 @@ async fn get_world(State(s): State<Arc<Authored>>, Path(wid): Path<String>) -> R
     let npcs = s.npcs.read().await;
     let counts = npcs.counts_by(|n| n.world_id.as_str());
     match s.worlds.read().await.get(&wid) {
-        Some(r) => Json(with_count(
-            with_id("world_id", &r.id, &r.body),
-            &counts,
-            &r.id,
-        ))
-        .into_response(),
+        Some(r) => {
+            let mut body = with_count(with_id("world_id", &r.id, &r.body), &counts, &r.id);
+            // The narrative clock, computed rather than stored: what is on disk
+            // is an anchor, and the time now is a function of how long ago it
+            // was taken. See [`crate::clock`].
+            if let Some(map) = body.as_object_mut() {
+                let now = now_ms() as i64;
+                map.insert("time".into(), Clock::of_world(&r.body, now).wire(now));
+            }
+            Json(body).into_response()
+        }
         None => err(StatusCode::NOT_FOUND, "world_not_found", &wid),
+    }
+}
+
+/// Move a world's clock, or change how fast it runs.
+///
+/// Every character in the world dates what they remember by this, so it is an
+/// admin's — the same bar as editing the world document, which is where it is
+/// written.
+///
+/// Both operations in one route because the console offers them together and
+/// they are the same write: the body may carry `world_ms` to jump to, `scale`
+/// to change the pace, `paused`, or any combination. What is absent is left
+/// alone rather than defaulted, so a request that only pauses does not silently
+/// reset the speed.
+async fn put_world_time(
+    State(s): State<Arc<Authored>>,
+    Path(wid): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(current) = s.worlds.read().await.get(&wid).map(|r| r.body.clone()) else {
+        return err(StatusCode::NOT_FOUND, "world_not_found", &wid);
+    };
+
+    let now = now_ms() as i64;
+    let mut clock = Clock::of_world(&current, now);
+
+    // The pace first, so a request that changes both banks the elapsed run at
+    // the old speed before the jump replaces the anchor.
+    let scale = body.get("scale").and_then(Value::as_f64);
+    let paused = body.get("paused").and_then(Value::as_bool);
+    if scale.is_some() || paused.is_some() {
+        let scale = scale.unwrap_or(clock.scale);
+        if !scale.is_finite() || scale < 0.0 {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_field",
+                "`scale` is world time per real time, and cannot be negative",
+            );
+        }
+        clock = clock.set_pace(scale, paused.unwrap_or(clock.paused), now);
+    }
+    if let Some(to) = body.get("world_ms").and_then(Value::as_i64) {
+        clock = clock.jump_to(to, now);
+    }
+
+    let next = Value::Object(clock::with_clock(&current, clock));
+    match s.worlds.write().await.put(&wid, next) {
+        Ok(()) => Json(clock.wire(now)).into_response(),
+        Err(e) => registry_err(e),
     }
 }
 
@@ -797,6 +1987,27 @@ async fn world_collections(State(s): State<Arc<Authored>>, Path(wid): Path<Strin
     Json(s.libraries.world_wire(&excludes)).into_response()
 }
 
+/// What a personality contributes to a projection, from its own document.
+///
+/// The counterpart of [`world_collections`], and the last of the two
+/// collection views to stop being invented — see
+/// [`collections::personality_wire`].
+async fn personality_collections(
+    State(s): State<Arc<Authored>>,
+    Path(aid): Path<String>,
+) -> Response {
+    let Some(body) = s
+        .personalities
+        .read()
+        .await
+        .get(&aid)
+        .map(|r| r.body.clone())
+    else {
+        return err(StatusCode::NOT_FOUND, "personality_not_found", &aid);
+    };
+    Json(collections::personality_wire(&body)).into_response()
+}
+
 async fn put_world(
     State(s): State<Arc<Authored>>,
     Path(wid): Path<String>,
@@ -817,16 +2028,24 @@ async fn delete_world(State(s): State<Arc<Authored>>, Path(wid): Path<String>) -
 /// the day a character is meant to be discreet the flag is already the answer.
 async fn list_personalities(
     State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let query = q.get("q").map(String::as_str).unwrap_or_default();
+    let reveal = revealing(&s, &headers, &q);
     let npcs = s.npcs.read().await;
     let counts = npcs.counts_by(|n| n.personality_id.as_str());
     let reg = s.personalities.read().await;
     let personalities: Vec<Value> = reg
         .iter()
-        .filter(|r| visibility::listable(&r.id, &r.body, query))
-        .map(|r| with_count(with_id("personality_id", &r.id, &r.body), &counts, &r.id))
+        .filter(|r| reveal || visibility::listable(&r.id, &r.body, query))
+        .map(|r| {
+            with_portrait_image(
+                with_count(with_id("personality_id", &r.id, &r.body), &counts, &r.id),
+                &s,
+                &r.id,
+            )
+        })
         .collect();
     Json(json!({ "personalities": personalities })).into_response()
 }
@@ -835,14 +2054,39 @@ async fn get_personality(State(s): State<Arc<Authored>>, Path(aid): Path<String>
     let npcs = s.npcs.read().await;
     let counts = npcs.counts_by(|n| n.personality_id.as_str());
     match s.personalities.read().await.get(&aid) {
-        Some(r) => Json(with_count(
-            with_id("personality_id", &r.id, &r.body),
-            &counts,
+        Some(r) => Json(with_portrait_image(
+            with_count(with_id("personality_id", &r.id, &r.body), &counts, &r.id),
+            &s,
             &r.id,
         ))
         .into_response(),
         None => err(StatusCode::NOT_FOUND, "personality_not_found", &aid),
     }
+}
+
+/// Add the servable id for the portrait this personality was authored with.
+///
+/// Written into the `portrait` block beside the author's own `image:` and
+/// `prompt:` rather than at the top level, so the console reads one object for
+/// everything about the picture. The author's path stays exactly as written —
+/// this only adds the id the image route answers to, which is a fact about this
+/// daemon's store and not about the document.
+fn with_portrait_image(mut v: Value, s: &Authored, id: &str) -> Value {
+    let Some(image_id) = s.personality_portraits.get(id) else {
+        return v;
+    };
+    let Some(map) = v.as_object_mut() else {
+        return v;
+    };
+    map.entry(crate::personality_portrait::FIELD)
+        .or_insert_with(|| json!({}));
+    if let Some(p) = map
+        .get_mut(crate::personality_portrait::FIELD)
+        .and_then(Value::as_object_mut)
+    {
+        p.insert("image_id".to_string(), json!(image_id));
+    }
+    v
 }
 
 async fn put_personality(
@@ -952,9 +2196,19 @@ mod tests {
     /// Shared state, for a test that makes several requests against one store.
     /// `router` consumes its state, so the `Arc` is what gets reused.
     fn state(base: std::path::PathBuf) -> Arc<Authored> {
-        Authored::new(
+        // The real ingest, against the test's own personalities directory, so a
+        // test that seeds a personality with a portrait exercises the path the
+        // daemon takes rather than a hand-built map that cannot disagree with it.
+        let personalities = Registry::load("personality", base.join("personalities")).unwrap();
+        let images = Images::new(&base);
+        let personality_portraits = crate::personality_portrait::ingest(
+            &personalities,
+            &base.join("personalities"),
+            &images,
+        );
+        Arc::new(Authored::new(
             Registry::load("world", base.join("worlds")).unwrap(),
-            Registry::load("personality", base.join("personalities")).unwrap(),
+            personalities,
             Accounts::load(base.join("accounts")).unwrap(),
             // A real substrate, in the test's own directory — the registry has
             // no in-memory mode, and one that only existed for tests would be a
@@ -967,7 +2221,36 @@ mod tests {
             // No mind, so no libraries — the collections route answers with
             // two empty collections, which is the truth for a test directory.
             crate::collections::Libraries::load(&crate::projection::Source::resolve(None).unwrap()),
-        )
+            // The mind editor points at the test's own directory, so a test
+            // that writes a document writes it here and nowhere near a real
+            // one. `mind_state` below is the same thing with content seeded.
+            Mind::new(Some(base.clone())),
+            images,
+            personality_portraits,
+        ))
+    }
+
+    /// State whose mind directory holds a small tree to browse and edit.
+    ///
+    /// Seeded to the shape of the real mind — a world layer with tags, the two
+    /// section folders, the two document folders — so a test asserting the
+    /// world filter is asserting against the layout the filter was written for.
+    fn mind_state(base: std::path::PathBuf) -> Arc<Authored> {
+        for dir in [
+            "layers/world/ammo",
+            "layers/world/armor",
+            "layers/memory/cindy-tan",
+            "layers/memory/commander",
+            "responses",
+            "moods",
+        ] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        std::fs::write(base.join("layers/world/ammo/bolt.md"), "a bolt").unwrap();
+        std::fs::write(base.join("layers/world/armor/plate.md"), "a plate").unwrap();
+        std::fs::write(base.join("layers/memory/cindy-tan/first.md"), "hers").unwrap();
+        std::fs::write(base.join("layers/memory/commander/first.md"), "his").unwrap();
+        state(base)
     }
 
     /// The headers the gateway sets for a signed-in caller.
@@ -1017,6 +2300,28 @@ mod tests {
             b = b.header(k, v);
         }
         b.body(Body::from(body.to_string())).unwrap()
+    }
+
+    /// A request whose body is bytes rather than JSON — a portrait upload.
+    fn bytes(path: &str, method: &str, sub: &str, body: Vec<u8>) -> Request<Body> {
+        let mut b = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/octet-stream");
+        for (k, v) in signed_in(sub) {
+            b = b.header(k, v);
+        }
+        b.body(Body::from(body)).unwrap()
+    }
+
+    /// The response body as bytes, for the routes that do not answer JSON.
+    async fn call_raw(app: Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, bytes.to_vec())
     }
 
     #[tokio::test]
@@ -1400,11 +2705,19 @@ mod tests {
             json!({ "name": "Battle Cities", "public": true }),
         );
         assert_eq!(call(router(state.clone()), w).await.0, StatusCode::OK);
+        // `world` is not optional: a character is written for one world and
+        // every create is checked against it, so a fixture without one is a
+        // personality no world can host — see
+        // `a_character_can_only_be_created_in_the_world_it_belongs_to`.
         let p = send(
             "/v1/personality/commander",
             "PUT",
             ADMIN,
-            json!({ "name": "Commander", "anchor": "Position is read before people are." }),
+            json!({
+                "name": "Commander",
+                "world": "battle-cities",
+                "anchor": "Position is read before people are.",
+            }),
         );
         assert_eq!(call(router(state.clone()), p).await.0, StatusCode::OK);
     }
@@ -1457,6 +2770,103 @@ mod tests {
         assert_eq!(list["items"].as_array().unwrap().len(), 1);
     }
 
+    /// **A restricted draw is an admin's ask, twice over.** The route table
+    /// puts `/v1/guest/image` at `admin`; the handler *also* requires `admin`
+    /// for `lora: restricted` specifically, because that flag waives the
+    /// prompt's compliance gate and must not ride along if the route's level
+    /// is ever relaxed. This pins the contract from the outside: a caller
+    /// below admin never draws restricted, and an admin's ask gets past
+    /// authorisation — to the engine check, since a test daemon has none.
+    #[tokio::test]
+    async fn a_restricted_draw_needs_the_admin_role() {
+        let st = state(tmp("restricted-draw"));
+        let body = json!({ "prompt": "a lantern", "lora": "restricted" });
+        let (s, _) = call(
+            router(st.clone()),
+            send("/v1/guest/image", "POST", "g1", body.clone()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, b) = call(
+            router(st.clone()),
+            send("/v1/guest/image", "POST", ADMIN, body),
+        )
+        .await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{b}");
+    }
+
+    /// **A cutout is a guest job, so it needs an engine.** It used to be a
+    /// flood fill on the host and answered without one; it is a network now,
+    /// and on a daemon with no engine the honest answer is the same 503 every
+    /// other guest route gives rather than a colour algorithm's guess.
+    #[tokio::test]
+    async fn a_cutout_needs_an_engine_like_every_other_guest() {
+        use base64::Engine as _;
+        let st = state(tmp("cutout-route"));
+
+        let mut img = image::RgbImage::from_pixel(32, 32, image::Rgb([250, 250, 250]));
+        for y in 8..24 {
+            for x in 8..24 {
+                img.put_pixel(x, y, image::Rgb([20, 30, 60]));
+            }
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+
+        let (s, out) = call(
+            router(st.clone()),
+            send(
+                "/v1/image/cutout",
+                "POST",
+                "g1",
+                json!({ "png_base64": b64 }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{out}");
+    }
+
+    /// A malformed upload is still the caller's mistake, and is still answered
+    /// **before** anything is queued — a drain evicts the engine's working set,
+    /// and finding out inside one that a file was not a picture is the failure
+    /// the boundary decode exists to prevent.
+    #[tokio::test]
+    async fn a_cutout_of_something_that_is_not_a_picture_is_refused_at_the_boundary() {
+        let st = state(tmp("cutout-junk"));
+        let (s, out) = call(
+            router(st),
+            send(
+                "/v1/image/cutout",
+                "POST",
+                "g1",
+                json!({ "png_base64": "bm90IGEgcGljdHVyZQ==" }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{out}");
+        assert_eq!(out["error"], "bad_reference");
+    }
+
+    /// The console's own draw route (`/v1/image/generate`) sits at `user`, so
+    /// the handler's re-check is the ONLY thing between an ordinary user and
+    /// the restricted checkpoint with its waived prompt gate. Called directly
+    /// here, exactly as that route calls it.
+    #[tokio::test]
+    async fn a_users_restricted_ask_is_refused_by_the_handler_itself() {
+        let st = state(tmp("restricted-handler"));
+        let mut headers = axum::http::HeaderMap::new();
+        for (k, v) in signed_in("g1") {
+            headers.insert(k, v.parse().unwrap());
+        }
+        let body: crate::guest_routes::ImageBody =
+            serde_json::from_value(json!({ "prompt": "a lantern", "lora": "restricted" })).unwrap();
+        let res = crate::guest_routes::post_image(State(st), headers, Json(body)).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
     /// **The whole route table, written down.**
     ///
     /// `guard::Api` makes it impossible to *forget* a role — the compiler
@@ -1485,14 +2895,85 @@ mod tests {
                 ("/v1/world/:wid", "unauthenticated"),
                 ("/v1/world/:wid/collections", "unauthenticated"),
                 ("/v1/world/:wid", "admin"),
+                ("/v1/world/:wid/time", "admin"),
                 ("/v1/personality", "unauthenticated"),
                 ("/v1/personality/:aid", "unauthenticated"),
                 ("/v1/personality/:aid", "admin"),
+                // Read-only, from the personality's own document — open for the
+                // same reason reading the document is.
+                ("/v1/personality/:aid/collections", "unauthenticated"),
+                // A flood fill on the host — no model, no drain, no engine — so
+                // it sits in this table rather than the engine's and answers on
+                // a daemon that has none.
+                ("/v1/image/cutout", "user"),
+                // The co-resident models. `admin` including the read, because a
+                // guest job **stops the world**: the scheduler evicts the
+                // engine's KV working set to make room, and every character in
+                // every world stops thinking until it finishes. A request that
+                // costs one line to make and a minute of the whole estate to
+                // serve wants a hand on it rather than a rate limit.
+                ("/v1/guest", "admin"),
+                ("/v1/guest/image", "admin"),
+                ("/v1/guest/prose", "admin"),
+                // One stratum of a life, in the narrator's voice. `admin` with
+                // the rest of `/v1/life` — it writes prose into the substrate
+                // that a character will believe it remembers.
+                ("/v1/life/:who/node/:key/narrate", "admin"),
+                // A character's authored life. **`admin` for the reads too**,
+                // which is the one place this table departs from the pattern
+                // above it, and deliberately: the plan carries the SEED — the
+                // arc, the shape, the world events a life hangs on — which is
+                // the authoring intent behind a character rather than anything
+                // the character is. Every write puts prose into the substrate
+                // that a character will believe it remembers, which is a larger
+                // act than editing a page of canon.
+                ("/v1/life/catalog", "admin"),
+                ("/v1/life/:who", "admin"),
+                ("/v1/life/:who/seed", "admin"),
+                ("/v1/life/:who/node/:key", "admin"),
+                ("/v1/life/:who/day", "admin"),
+                ("/v1/life/:who/day/:date", "admin"),
+                ("/v1/life/:who/day/:date/consequences", "admin"),
+                ("/v1/life/:who/generate", "admin"),
+                ("/v1/life/:who/job", "admin"),
+                ("/v1/life/:who/cancel", "admin"),
+                // The authored corpus. `user` to read rather than open, because
+                // this one *enumerates* — see the route's own comment.
+                ("/v1/mind/list", "user"),
+                ("/v1/mind/entry", "user"),
+                ("/v1/mind/entry", "admin"),
+                ("/v1/mind/fields", "user"),
+                ("/v1/mind/fields", "admin"),
+                // The schema's own layers, read from the mind. `user` for the
+                // same reason the three rows above are: it is a reading of the
+                // corpus, and reading the corpus is a signed-in act.
+                ("/v1/schema/layers", "user"),
                 // The cast: signed in, then ownership per record.
                 ("/v1/npc", "user"),
                 ("/v1/npc/:nid", "user"),
                 ("/v1/npc/:nid/tags", "user"),
                 ("/v1/npc/:nid/hidden", "user"),
+                // The authoring plane. Every one of these is a write to the
+                // caller's own character, so `user` plus the ownership check
+                // inside — never `admin`, which would mean an operator could
+                // not author their own cast.
+                ("/v1/npc/:nid/beliefs", "user"),
+                ("/v1/npc/:nid/beliefs/:bid", "user"),
+                ("/v1/npc/:nid/relationships", "user"),
+                ("/v1/npc/:nid/relationships/:eid", "user"),
+                ("/v1/npc/:nid/agency", "user"),
+                ("/v1/npc/:nid/agency/:sid", "user"),
+                ("/v1/npc/:nid/modulation", "user"),
+                // A portrait, and the bytes back. `user` rather than open: an
+                // id is a content hash and unguessable, and unguessable is not
+                // a permission.
+                ("/v1/npc/:nid/portrait", "user"),
+                // Drawing one, and what it can be drawn with. `user` like the
+                // upload: it is a portrait of the caller's own character, and
+                // admin-only would mean nobody could use the button on the
+                // character they just made.
+                ("/v1/npc/:nid/portrait/generate", "user"),
+                ("/v1/image/:iid", "user"),
                 // The caller's own account.
                 ("/v1/me", "user"),
                 ("/v1/me/profile", "user"),
@@ -1611,8 +3092,7 @@ mod tests {
                     "persona_description": "Sixty-one now, and slower.",
                     "heartbeat_ms": 300_000,
                     "salience_gate": 0.7,
-                    "state": "suspended",
-                    "environment_enabled": false
+                    "state": "suspended"
                 }),
             ),
         )
@@ -1661,7 +3141,6 @@ mod tests {
         assert_eq!(back["tick"]["heartbeat_ms"], 300_000);
         assert_eq!(back["tick"]["salience_gate"], 0.7);
         assert_eq!(back["state"], "suspended");
-        assert_eq!(back["environment_enabled"], false);
         assert_eq!(back["tags"], json!(["north", "command"]));
         assert_eq!(back["hidden"], true);
         assert_eq!(
@@ -1809,6 +3288,1516 @@ mod tests {
         // control.
         let (s, _) = call(router(st), get("/v1/world/earth", None)).await;
         assert_eq!(s, StatusCode::OK);
+    }
+
+    /// A character can only be created in the world it belongs to.
+    ///
+    /// The console filters the pairing out of the create form, but the console
+    /// is presentation. This is the daemon refusing it — a create posted by
+    /// curl, or by a page held open while a personality was re-homed, must not
+    /// write a character into a setting it has no canon for.
+    #[tokio::test]
+    async fn a_character_can_only_be_created_in_the_world_it_belongs_to() {
+        let st = state(tmp("hostable"));
+        for (path, body) in [
+            (
+                "/v1/world/earth",
+                json!({ "name": "Earth", "personalities": ["cindy-tan"] }),
+            ),
+            (
+                "/v1/world/battle-cities",
+                json!({ "name": "Battle Cities", "personalities": ["commander"] }),
+            ),
+            // Casts nobody, so it admits everybody — the standing default, and
+            // what keeps the first world to declare a cast from emptying the
+            // rest.
+            ("/v1/world/sandbox", json!({ "name": "Sandbox" })),
+            ("/v1/personality/cindy-tan", json!({ "name": "Cindy Tan" })),
+            ("/v1/personality/commander", json!({ "name": "Commander" })),
+        ] {
+            let r = send(path, "PUT", ADMIN, body);
+            assert_eq!(
+                call(router(st.clone()), r).await.0,
+                StatusCode::OK,
+                "{path}"
+            );
+        }
+
+        let create = |world: &str, personality: &str| {
+            send(
+                "/v1/npc",
+                "POST",
+                ADMIN,
+                json!({ "name": "X", "world_id": world, "personality_id": personality }),
+            )
+        };
+
+        // Each in its own world.
+        for (world, who) in [("earth", "cindy-tan"), ("battle-cities", "commander")] {
+            let (s, _) = call(router(st.clone()), create(world, who)).await;
+            assert_eq!(s, StatusCode::CREATED, "{who} refused in {world}");
+        }
+
+        // And in the other's, refused both ways round — naming both sides, so
+        // the reader is not left guessing which of the two they got wrong.
+        for (world, who) in [("battle-cities", "cindy-tan"), ("earth", "commander")] {
+            let (s, v) = call(router(st.clone()), create(world, who)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{world} cast {who}");
+            assert_eq!(v["error"], "personality_not_of_world");
+            let detail = v["detail"].as_str().unwrap_or_default();
+            for expected in [world, who] {
+                assert!(
+                    detail.contains(expected),
+                    "detail omitted {expected}: {detail}"
+                );
+            }
+        }
+
+        // A world that casts nobody admits everybody. This is the default the
+        // cast worlds are an exception to, and it is what makes adding the key
+        // to one world safe: it must not turn a full list into an empty one
+        // everywhere it has not been written yet.
+        for who in ["cindy-tan", "commander"] {
+            let (s, _) = call(router(st.clone()), create("sandbox", who)).await;
+            assert_eq!(s, StatusCode::CREATED, "sandbox refused {who}");
+        }
+    }
+
+    // ── the corpus ──────────────────────────────────────────────────────────
+
+    /// With no address, the corpus is its nine sections — not a folder listing.
+    #[tokio::test]
+    async fn the_corpus_opens_on_its_sections() {
+        let base = tmp("mind-sections");
+        let st = mind_state(base);
+        let (s, v) = call(router(st), get("/v1/mind/list", Some("google-1"))).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["title"], "The mind");
+        assert_eq!(v["parent"], Value::Null);
+        assert_eq!(v["scoped"], false, "no ?world= means the whole mind");
+
+        let ids: Vec<&str> = v["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "canon",
+                "eras",
+                "stories",
+                "memory",
+                "responses",
+                "moods",
+                "characters",
+                "worlds",
+                "settings"
+            ]
+        );
+        assert_eq!(v["children"][0]["title"], "World knowledge");
+        assert!(
+            v["children"][0]["blurb"].is_string(),
+            "a section says what it is"
+        );
+    }
+
+    /// **The abstraction, asserted.** Nothing on the wire is a file: no
+    /// extension, no directory, no `layers/`. A reader sees topics and entries.
+    #[tokio::test]
+    async fn nothing_on_the_wire_is_a_file() {
+        let base = tmp("mind-nofiles");
+        let st = mind_state(base);
+
+        for place in ["", "canon", "canon/ammo", "characters", "settings"] {
+            let (s, v) = call(
+                router(st.clone()),
+                get(&format!("/v1/mind/list?id={place}"), Some("google-1")),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "listing {place}");
+            let body = v.to_string();
+            for leak in [
+                ".md",
+                ".yaml",
+                "layers/",
+                "personalities/",
+                "is_dir",
+                "\"ext\"",
+            ] {
+                assert!(
+                    !body.contains(leak),
+                    "`{leak}` leaked while listing {place}"
+                );
+            }
+        }
+
+        // And the same of an entry.
+        let (_, v) = call(
+            router(st),
+            get("/v1/mind/entry?id=canon/ammo/bolt", Some("google-1")),
+        )
+        .await;
+        assert_eq!(v["id"], "canon/ammo/bolt");
+        assert_eq!(v["title"], "Bolt");
+        assert!(
+            v["chars"].is_number(),
+            "a length, not a byte count of a file"
+        );
+        let body = v.to_string();
+        for leak in [".md", "layers/", "bytes"] {
+            assert!(!body.contains(leak), "`{leak}` leaked from an entry");
+        }
+    }
+
+    /// A topic stored as a page beside a folder is one thing with text of its
+    /// own, and the console never learns there were two files.
+    #[tokio::test]
+    async fn a_topic_is_one_thing_that_both_holds_and_says() {
+        let base = tmp("mind-topic");
+        let st = mind_state(base.clone());
+        std::fs::write(base.join("layers/world/ammo.md"), "all about ammo").unwrap();
+
+        let (_, v) = call(
+            router(st.clone()),
+            get("/v1/mind/list?id=canon", Some("google-1")),
+        )
+        .await;
+        let ammo = v["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "canon/ammo")
+            .expect("listed");
+        assert_eq!(ammo["kind"], "collection");
+        assert_eq!(ammo["count"], 1, "one entry inside");
+        assert_eq!(ammo["has_text"], true, "and an overview of its own");
+        assert_eq!(
+            v["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|c| c["title"] == "Ammo")
+                .count(),
+            1,
+            "one row, not a folder and a file"
+        );
+
+        // Opening it gives the overview; listing it gives the entries.
+        let (_, v) = call(
+            router(st.clone()),
+            get("/v1/mind/entry?id=canon/ammo", Some("google-1")),
+        )
+        .await;
+        assert_eq!(v["text"], "all about ammo");
+        let (_, v) = call(
+            router(st),
+            get("/v1/mind/list?id=canon/ammo", Some("google-1")),
+        )
+        .await;
+        assert_eq!(v["has_text"], true);
+        assert_eq!(v["children"][0]["id"], "canon/ammo/bolt");
+    }
+
+    /// The whole round trip, through the API, ending on disk — which is the
+    /// requirement: a save that only updated a listing would be a save that did
+    /// not happen.
+    #[tokio::test]
+    async fn an_entry_is_read_written_and_removed_through_the_api() {
+        let base = tmp("mind-doc");
+        let st = mind_state(base.clone());
+        let entry = "/v1/mind/entry?id=canon/ammo/bolt";
+
+        let (s, v) = call(router(st.clone()), get(entry, Some("google-1"))).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["text"], "a bolt");
+        assert_eq!(v["title"], "Bolt");
+
+        let (s, v) = call(
+            router(st.clone()),
+            send(entry, "PUT", ADMIN, json!({ "text": "a longer bolt" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["created"], false);
+        // The address became a file, and the bytes reached the disk — the whole
+        // requirement, asserted where the abstraction meets the filesystem.
+        assert_eq!(
+            std::fs::read_to_string(base.join("layers/world/ammo/bolt.md")).unwrap(),
+            "a longer bolt"
+        );
+
+        let (s, _) = call(router(st.clone()), send(entry, "DELETE", ADMIN, json!({}))).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        assert!(!base.join("layers/world/ammo/bolt.md").exists());
+        let (s, _) = call(router(st), get(entry, Some("google-1"))).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    /// Adding an item creates the file and any folder above it, and `?new=1`
+    /// refuses to land on something that is already there.
+    #[tokio::test]
+    async fn adding_an_item_creates_it_and_will_not_overwrite() {
+        let base = tmp("mind-add");
+        let st = mind_state(base.clone());
+        // No extension anywhere: the caller names the thing, and the section
+        // decides how it is stored.
+        let entry = "/v1/mind/entry?id=canon/ammo/shell&new=1";
+
+        let (s, v) = call(
+            router(st.clone()),
+            send(entry, "PUT", ADMIN, json!({ "text": "a shell" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        assert_eq!(v["created"], true);
+        assert_eq!(v["id"], "canon/ammo/shell");
+        assert_eq!(
+            std::fs::read_to_string(base.join("layers/world/ammo/shell.md")).unwrap(),
+            "a shell"
+        );
+
+        // Again, and it is refused rather than taking the first one's place.
+        let (s, v) = call(
+            router(st.clone()),
+            send(entry, "PUT", ADMIN, json!({ "text": "different" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert_eq!(v["error"], "already_exists");
+        assert_eq!(
+            std::fs::read_to_string(base.join("layers/world/ammo/shell.md")).unwrap(),
+            "a shell",
+            "the first write survived"
+        );
+
+        // A whole new topic, in one call.
+        let (s, _) = call(
+            router(st.clone()),
+            send(
+                "/v1/mind/entry?id=canon/brand/new&new=1",
+                "PUT",
+                ADMIN,
+                json!({ "text": "x" }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        assert!(base.join("layers/world/brand/new.md").is_file());
+
+        // The section decides the format, so the same shape of address lands as
+        // YAML where the section is structured.
+        let (s, _) = call(
+            router(st),
+            send(
+                "/v1/mind/entry?id=characters/new-hire&new=1",
+                "PUT",
+                ADMIN,
+                json!({ "text": "id: new-hire" }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        assert!(base.join("personalities/new-hire.yaml").is_file());
+    }
+
+    /// **The security property.** Every spelling of "leave the mind" is refused
+    /// at the API, and the file outside it is never touched.
+    #[tokio::test]
+    async fn the_mind_editor_cannot_reach_outside_the_mind() {
+        let base = tmp("mind-escape");
+        let st = mind_state(base.clone());
+        let outside = base.parent().unwrap().join("npcd-api-escape-witness.md");
+        let _ = std::fs::remove_file(&outside);
+        std::fs::write(&outside, "untouched").unwrap();
+
+        // Two families, and the address makes them different failures.
+        //
+        // The first four are not addresses at all — `layers` and `..` are not
+        // sections, so there is nothing to resolve. The rest parse as a section
+        // and a name, and are stopped by the name rules that outlive the
+        // abstraction: an address is a nicer spelling of a path, never a way
+        // around one.
+        for id in [
+            "..",
+            "layers/world/ammo/bolt",
+            "../npcd-api-escape-witness",
+            "/etc/passwd",
+            "c:/windows/system32/drivers/etc/hosts",
+            "canon/../../npcd-api-escape-witness",
+            "canon/..%2F..%2Fnpcd-api-escape-witness",
+            "canon/..\\..\\npcd-api-escape-witness",
+            "canon/nul",
+            "settings/package",
+        ] {
+            let uri = format!("/v1/mind/entry?id={id}");
+            let (s, _) = call(router(st.clone()), get(&uri, Some("google-1"))).await;
+            assert!(
+                s == StatusCode::BAD_REQUEST || s == StatusCode::NOT_FOUND,
+                "GET {id} answered {s}"
+            );
+            let (s, _) = call(
+                router(st.clone()),
+                send(&uri, "PUT", ADMIN, json!({ "text": "owned" })),
+            )
+            .await;
+            assert!(
+                s == StatusCode::BAD_REQUEST || s == StatusCode::NOT_FOUND,
+                "PUT {id} answered {s}"
+            );
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "untouched",
+            "a file outside the mind was modified"
+        );
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    /// Only `.md` and `.yaml`. A PUT that could name any extension would let
+    /// the editor drop a file the daemon later reads as something else.
+    #[tokio::test]
+    async fn an_address_cannot_choose_how_it_is_stored() {
+        let base = tmp("mind-ext");
+        let st = mind_state(base.clone());
+
+        // A caller cannot ask for an extension, because an address has no place
+        // to put one — `canon/x.exe` is a *name*, so it becomes `x.exe.md` and
+        // is still markdown in the canon folder. Nothing executable can be
+        // written anywhere, by anyone, by any spelling.
+        let (s, _) = call(
+            router(st.clone()),
+            send(
+                "/v1/mind/entry?id=canon/x.exe&new=1",
+                "PUT",
+                ADMIN,
+                json!({ "text": "x" }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        assert!(base.join("layers/world/x.exe.md").is_file());
+        assert!(!base.join("layers/world/x.exe").exists(), "an executable");
+
+        // And a section that stores YAML stores YAML, whatever the name says.
+        let (s, _) = call(
+            router(st),
+            send(
+                "/v1/mind/entry?id=characters/y.md&new=1",
+                "PUT",
+                ADMIN,
+                json!({ "text": "id: y" }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        assert!(base.join("personalities/y.md.yaml").is_file());
+    }
+
+    /// Reading needs a session; writing needs an admin. The mind is not under
+    /// version control, so a bad write is prose somebody wrote, gone.
+    #[tokio::test]
+    async fn reading_needs_a_session_and_writing_needs_an_admin() {
+        let base = tmp("mind-roles");
+        let st = mind_state(base);
+        let entry = "/v1/mind/entry?id=canon/ammo/bolt";
+
+        // Anonymous: refused even to read, because listing enumerates.
+        let (s, _) = call(router(st.clone()), get(entry, None)).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        let (s, _) = call(router(st.clone()), get("/v1/mind/list", None)).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+        // A signed-in user reads.
+        let (s, _) = call(router(st.clone()), get(entry, Some("google-1"))).await;
+        assert_eq!(s, StatusCode::OK);
+
+        // And does not write.
+        for (method, body) in [("PUT", json!({ "text": "no" })), ("DELETE", json!({}))] {
+            let (s, _) = call(
+                router(st.clone()),
+                send(entry, method, "google-not-an-admin", body),
+            )
+            .await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{method} by a plain user");
+        }
+    }
+
+    /// The world's own filters apply to the file tree, so browsing inside a
+    /// world shows that world's corpus and not the whole mind.
+    #[tokio::test]
+    async fn a_world_scopes_what_the_corpus_shows() {
+        let base = tmp("mind-scope");
+        let st = mind_state(base);
+        let w = send(
+            "/v1/world/battle-cities",
+            "PUT",
+            ADMIN,
+            json!({ "name": "Battle Cities", "selects": ["ammo"], "personalities": ["commander"] }),
+        );
+        assert_eq!(call(router(st.clone()), w).await.0, StatusCode::OK);
+
+        let ids = |v: &Value| -> Vec<String> {
+            v["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // `selects` gates the canon topics.
+        let (s, v) = call(
+            router(st.clone()),
+            get(
+                "/v1/mind/list?world=battle-cities&id=canon",
+                Some("google-1"),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["scoped"], true);
+        assert_eq!(ids(&v), ["canon/ammo"], "armor is not selected");
+
+        // The cast gates the per-character memory.
+        let (_, v) = call(
+            router(st.clone()),
+            get(
+                "/v1/mind/list?world=battle-cities&id=memory",
+                Some("google-1"),
+            ),
+        )
+        .await;
+        assert_eq!(ids(&v), ["memory/commander"]);
+
+        // Naming an excluded topic directly is not a way past it.
+        let (s, v) = call(
+            router(st.clone()),
+            get(
+                "/v1/mind/list?world=battle-cities&id=canon/armor",
+                Some("google-1"),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(v["error"], "out_of_scope");
+
+        // Nor is opening an entry inside it, or writing one.
+        let entry = "/v1/mind/entry?world=battle-cities&id=canon/armor/plate";
+        let (s, _) = call(router(st.clone()), get(entry, Some("google-1"))).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, _) = call(
+            router(st.clone()),
+            send(entry, "PUT", ADMIN, json!({ "text": "owned" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        // Unscoped, both are there — the filter is the world's, not a property
+        // of the thing.
+        let (_, v) = call(router(st), get("/v1/mind/list?id=canon", Some("google-1"))).await;
+        assert_eq!(ids(&v), ["canon/ammo", "canon/armor"]);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_world_is_refused_rather_than_ignored() {
+        let base = tmp("mind-badworld");
+        let st = mind_state(base);
+        let (s, v) = call(
+            router(st),
+            get("/v1/mind/list?world=atlantis", Some("google-1")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(v["error"], "unknown_world");
+    }
+
+    /// A daemon with no `--mind` says so once, rather than failing five ways.
+    #[tokio::test]
+    async fn without_a_mind_the_editor_says_it_has_nothing_to_edit() {
+        let base = tmp("mind-none");
+        let st = Arc::new(Authored::new(
+            Registry::load("world", base.join("worlds")).unwrap(),
+            Registry::load("personality", base.join("personalities")).unwrap(),
+            Accounts::load(base.join("accounts")).unwrap(),
+            Npcs::load(&base).unwrap(),
+            serde_yaml::from_str(&format!("admins:\n  - sub: {ADMIN}\n")).unwrap(),
+            crate::collections::Libraries::load(&crate::projection::Source::resolve(None).unwrap()),
+            Mind::new(None),
+            Images::new(&base),
+            BTreeMap::new(),
+        ));
+        let (s, v) = call(router(st), get("/v1/mind/list", Some("google-1"))).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert_eq!(v["error"], "no_mind");
+    }
+
+    /// A folder is never removed through this API: one click must not become a
+    /// recursive delete.
+    #[tokio::test]
+    async fn deleting_a_topic_removes_its_text_and_keeps_what_is_inside() {
+        let base = tmp("mind-rmdir");
+        let st = mind_state(base.clone());
+        std::fs::write(base.join("layers/world/ammo.md"), "overview").unwrap();
+
+        let (s, _) = call(
+            router(st.clone()),
+            send("/v1/mind/entry?id=canon/ammo", "DELETE", ADMIN, json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        // The overview is gone; the entries under it are not. One button must
+        // never become a recursive delete.
+        assert!(!base.join("layers/world/ammo.md").exists());
+        assert!(base.join("layers/world/ammo/bolt.md").is_file());
+
+        // It is still a topic, now without text of its own.
+        let (_, v) = call(router(st), get("/v1/mind/list?id=canon", Some("google-1"))).await;
+        let ammo = v["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "canon/ammo")
+            .expect("still listed");
+        assert_eq!(ammo["has_text"], false);
+        assert_eq!(ammo["count"], 1);
+    }
+
+    /// A section file, with the shape and the comments a real one has.
+    fn seed_section(base: &std::path::Path) {
+        std::fs::create_dir_all(base.join("responses")).unwrap();
+        std::fs::write(
+            base.join("responses/accept.yaml"),
+            r#"id: accept
+category: accept
+description: Accepting what was offered.
+
+# The frozen structural mode — its KV is loaded once the section is selected.
+template: |
+  The tactical self is gone.
+
+# Provenance lead-ins. FIXED SHAPE: 4 turns. Target: 16.
+examples:
+  - note: Late apology.
+    turns:
+      - role: user
+        content: |
+          "I'm late."
+      - role: assistant
+        thinking: |
+          They take it lightly.
+"#,
+        )
+        .unwrap();
+    }
+
+    /// A document arrives as fields, in file order, each with the control it
+    /// wants — and the author's comment attached to the field it describes.
+    #[tokio::test]
+    async fn an_entry_can_be_read_as_fields() {
+        let base = tmp("mind-fields");
+        seed_section(&base);
+        let st = mind_state(base);
+
+        let (s, v) = call(
+            router(st),
+            get("/v1/mind/fields?id=responses/accept", Some("google-1")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let fields = v["fields"].as_array().unwrap();
+        let keys: Vec<&str> = fields.iter().map(|f| f["key"].as_str().unwrap()).collect();
+        assert_eq!(
+            keys,
+            ["id", "category", "description", "template", "examples"]
+        );
+
+        let by = |k: &str| fields.iter().find(|f| f["key"] == k).unwrap().clone();
+        assert_eq!(by("id")["readonly"], true, "the id is the address");
+        assert_eq!(by("category")["kind"], "line");
+        assert_eq!(by("template")["kind"], "text");
+        assert_eq!(by("examples")["kind"], "conversations");
+
+        // The author's own note, on the field it is about.
+        assert!(by("template")["note"]
+            .as_str()
+            .unwrap()
+            .contains("frozen structural mode"));
+        assert!(by("examples")["note"]
+            .as_str()
+            .unwrap()
+            .contains("FIXED SHAPE"));
+
+        // The conversation, as turns.
+        let turns = by("examples")["value"][0]["turns"].clone();
+        assert_eq!(turns[0]["role"], "user");
+        assert!(turns[0]["content"].as_str().unwrap().contains("I'm late"));
+        assert_eq!(turns[1]["role"], "assistant");
+        assert!(turns[1]["thinking"].is_string());
+    }
+
+    /// **The property the whole field editor rests on.** Saving from a form
+    /// must not cost the file its comments — 701 of 712 real section files have
+    /// them, and they are the corpus's best documentation.
+    #[tokio::test]
+    async fn saving_fields_keeps_every_comment_in_the_file() {
+        let base = tmp("mind-fields-save");
+        seed_section(&base);
+        let st = mind_state(base.clone());
+        let before = std::fs::read_to_string(base.join("responses/accept.yaml")).unwrap();
+
+        // Edit a scalar and add a turn to the conversation — the two things the
+        // form does — and send back every field, as the console would.
+        let (s, _) = call(
+            router(st.clone()),
+            send(
+                "/v1/mind/fields?id=responses/accept",
+                "PUT",
+                ADMIN,
+                json!({ "values": {
+                    "id": "accept",
+                    "category": "acceptance",
+                    "description": "Accepting what was offered.",
+                    "template": "The tactical self is gone.\n",
+                    "examples": [{
+                        "note": "Late apology.",
+                        "turns": [
+                            { "role": "user", "content": "\"I'm late.\"\n" },
+                            { "role": "assistant", "content": "A tip of the head.\n" },
+                            { "role": "assistant", "thinking": "They take it lightly.\n" },
+                        ],
+                    }],
+                }}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        let after = std::fs::read_to_string(base.join("responses/accept.yaml")).unwrap();
+        for comment in [
+            "# The frozen structural mode",
+            "# Provenance lead-ins. FIXED SHAPE: 4 turns. Target: 16.",
+        ] {
+            assert!(after.contains(comment), "lost `{comment}`\n---\n{after}");
+        }
+        assert_ne!(after, before, "nothing was written");
+
+        // And the edits are really there, read back through the same door.
+        let (_, v) = call(
+            router(st),
+            get("/v1/mind/fields?id=responses/accept", Some("google-1")),
+        )
+        .await;
+        let fields = v["fields"].as_array().unwrap();
+        let by = |k: &str| fields.iter().find(|f| f["key"] == k).unwrap().clone();
+        assert_eq!(by("category")["value"], "acceptance");
+        assert_eq!(
+            by("examples")["value"][0]["turns"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3,
+            "the added turn survived"
+        );
+    }
+
+    /// Not every document is a set of fields, and that is a fact rather than a
+    /// failure — the console offers the text editor for those.
+    #[tokio::test]
+    async fn a_document_that_is_not_fields_says_so() {
+        let base = tmp("mind-notfields");
+        let st = mind_state(base.clone());
+        std::fs::write(base.join("layers/world/ammo/bolt.md"), "# just prose\n").unwrap();
+        let (s, v) = call(
+            router(st),
+            get("/v1/mind/fields?id=canon/ammo/bolt", Some("google-1")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(v["error"], "not_fields");
+    }
+
+    /// The projection schema, as it really is: banner comments between the
+    /// layers, a nested budget, and a list of selection groups.
+    fn seed_projection(base: &std::path::Path) {
+        std::fs::write(
+            base.join("projection.yaml"),
+            r#"# The projection schema.
+layers:
+  # ── World ──────────────────────────────────────────────────────────────────
+  - name: world
+    description: |
+      Shared knowledge about the setting.
+    window: 8000
+    score_threshold: 0.30
+    gather_scope: shared
+    decode_priority: low
+    budget:
+      priority: 70
+      adaptive:
+        gain: 2.0
+    groups:
+      - id: canon
+        selection: { kind: top_k, k: 6 }
+
+  # ── Beliefs ────────────────────────────────────────────────────────────────
+  - name: beliefs
+    description: |
+      What the character holds to be true.
+    window: 4000
+    gather_scope: conversation
+    budget:
+      priority: 90
+"#,
+        )
+        .unwrap();
+    }
+
+    /// **A projection layer is an entry like any other.**
+    ///
+    /// It is not a file — the nine of them live in one seven-hundred-line
+    /// document — so this is the whole of what makes them editable: the schema
+    /// lists its layers, each one opens on its own, and it arrives as controls
+    /// rather than as YAML. Nothing about the route is special; the address
+    /// does the work.
+    #[tokio::test]
+    async fn a_projection_layer_lists_and_opens_as_fields() {
+        let base = tmp("mind-layers");
+        seed_projection(&base);
+        let st = mind_state(base);
+
+        // The schema holds its layers, in the order the document writes them.
+        let (s, v) = call(
+            router(st.clone()),
+            get("/v1/mind/list?id=settings/projection", Some("google-1")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let ids: Vec<&str> = v["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            ["settings/projection/world", "settings/projection/beliefs"]
+        );
+
+        let (s, v) = call(
+            router(st),
+            get(
+                "/v1/mind/fields?id=settings/projection/world",
+                Some("google-1"),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let fields = v["fields"].as_array().unwrap();
+        let by = |k: &str| fields.iter().find(|f| f["key"] == k).unwrap().clone();
+
+        // The name is the address, so it is shown and not editable.
+        assert_eq!(by("name")["readonly"], true);
+        assert_eq!(by("window")["kind"], "number");
+        assert_eq!(by("window")["value"], 8000);
+        assert_eq!(by("description")["kind"], "text");
+        // A vocabulary the engine fixes is a select, not a place to make a typo.
+        assert_eq!(by("gather_scope")["kind"], "choice");
+        assert_eq!(
+            by("gather_scope")["choices"],
+            json!(["conversation", "shared"])
+        );
+        assert_eq!(
+            by("decode_priority")["choices"],
+            json!(["low", "normal", "high"])
+        );
+
+        // A mapping is its own fields, all the way down.
+        assert_eq!(by("budget")["kind"], "group");
+        let budget = by("budget")["fields"].clone();
+        let bf = |k: &str| {
+            budget
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["key"] == k)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(bf("priority")["kind"], "number");
+        assert_eq!(bf("adaptive")["kind"], "group");
+        assert_eq!(bf("adaptive")["fields"][0]["key"], "gain");
+
+        // And a list of mappings is rows of fields.
+        assert_eq!(by("groups")["kind"], "rows");
+        assert_eq!(by("groups")["rows"][0][0]["value"], "canon");
+    }
+
+    /// **The authoring plane persists, and reports the engine's part absent.**
+    ///
+    /// These eight routes used to fall through to the console's fixture, which
+    /// answered with three invented beliefs, three relationships and three
+    /// strategies — the same nine for every character, including ones that did
+    /// not exist. The console's `+ Author` button was a toast saying an engine
+    /// was required, for a write that needs no engine at all: §16 calls this
+    /// the authoring plane precisely because it is what a person types.
+    #[tokio::test]
+    async fn the_authoring_plane_is_written_and_kept() {
+        let st = state(tmp("authoring"));
+        let a = "google-1";
+        call(router(st.clone()), get("/v1/me", Some(a))).await;
+        author(&st).await;
+
+        let (s, npc) = call(
+            router(st.clone()),
+            send(
+                "/v1/npc",
+                "POST",
+                a,
+                json!({ "name": "Varek", "world_id": "battle-cities", "personality_id": "commander" }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        let id = npc["npc_id"].as_str().unwrap().to_string();
+
+        // A character nobody has authored holds nothing — not three fixtures.
+        let (s, v) = call(
+            router(st.clone()),
+            get(&format!("/v1/npc/{id}/beliefs"), Some(a)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["beliefs"].as_array().unwrap().len(), 0);
+
+        // State one.
+        let (s, _) = call(
+            router(st.clone()),
+            send(
+                &format!("/v1/npc/{id}/beliefs/hess_word"),
+                "PUT",
+                a,
+                json!({ "statement": "Hess keeps his word.", "confidence": 0.72 }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        let (_, v) = call(
+            router(st.clone()),
+            get(&format!("/v1/npc/{id}/beliefs"), Some(a)),
+        )
+        .await;
+        let b = &v["beliefs"][0];
+        assert_eq!(b["statement"], "Hess keeps his word.");
+        assert_eq!(b["confidence"], 0.72);
+        assert_eq!(b["origin"], "authored");
+        // The evidence process has not run, so its measurements are absent
+        // rather than zero — a belief with `disconfirmation: 0` reads as
+        // weighed and unshaken, which is a claim nothing here can make.
+        assert!(b["disconfirmation"].is_null());
+        assert!(b["under_pressure"].is_null());
+        assert!(b["history"].is_null());
+
+        // A dial set is a dial kept, and the other two are not reset by it.
+        let (_, v) = call(
+            router(st.clone()),
+            send(
+                &format!("/v1/npc/{id}/modulation"),
+                "PUT",
+                a,
+                json!({ "threat": 0.66 }),
+            ),
+        )
+        .await;
+        assert_eq!(v["modulation"]["threat"], 0.66);
+        assert_eq!(v["modulation"]["curiosity"], 0.5, "an untouched dial moved");
+
+        // A strategy under a parent that does not exist is refused, rather than
+        // silently becoming a root and losing the nesting.
+        let (s, _) = call(
+            router(st.clone()),
+            send(
+                &format!("/v1/npc/{id}/agency/flank"),
+                "PUT",
+                a,
+                json!({ "statement": "Flank east.", "parent_id": "nope" }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // Out-of-range dials are refused, not clamped.
+        let (s, _) = call(
+            router(st.clone()),
+            send(
+                &format!("/v1/npc/{id}/modulation"),
+                "PUT",
+                a,
+                json!({ "threat": 4.0 }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // And none of it belongs to anybody else.
+        let (s, _) = call(
+            router(st.clone()),
+            send(
+                &format!("/v1/npc/{id}/beliefs/hess_word"),
+                "PUT",
+                "google-2",
+                json!({ "statement": "Not yours." }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+
+        // **A portrait is stored and attached.** The upload used to be dropped
+        // by the console; then, briefly, it was dropped by the daemon —
+        // `patch` has no `portrait_image_id` field, so a write through it was
+        // a silent no-op that answered 200.
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[7u8; 32]);
+        let (s, v) = call(
+            router(st.clone()),
+            bytes(&format!("/v1/npc/{id}/portrait"), "PUT", a, png.clone()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let image_id = v["portrait"]["image_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no portrait on the record: {v}"))
+            .to_string();
+        assert_eq!(v["portrait"]["origin"], "uploaded");
+
+        // And it comes back, byte for byte.
+        let (s, got) = call_raw(
+            router(st.clone()),
+            get(&format!("/v1/image/{image_id}"), Some(a)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(got, png, "the bytes served are not the bytes uploaded");
+
+        // A client cannot name an image id itself — that would let one point at
+        // an upload it does not own, and every id in the store is valid.
+        let (_, v) = call(
+            router(st.clone()),
+            send(
+                &format!("/v1/npc/{id}"),
+                "PATCH",
+                a,
+                json!({ "portrait_image_id": "img_0000000000000000.png" }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            v["portrait"]["image_id"], image_id,
+            "PATCH accepted a portrait id from the caller"
+        );
+
+        // Deleting one leaves the character.
+        let (s, _) = call(
+            router(st.clone()),
+            send(
+                &format!("/v1/npc/{id}/beliefs/hess_word"),
+                "DELETE",
+                a,
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        let (_, v) = call(router(st), get(&format!("/v1/npc/{id}/beliefs"), Some(a))).await;
+        assert_eq!(v["beliefs"].as_array().unwrap().len(), 0);
+    }
+
+    /// **The portrait button reaches the image guest, and says so when there is
+    /// none.**
+    ///
+    /// This state has no engine at all, which is the honest shape for a router
+    /// test — what it pins is that the route exists, is reachable by the
+    /// character's owner, refuses a stranger, and comes back with a machine-
+    /// readable reason rather than a 404. Before this route the console called
+    /// `/v1/image/models`, got a 404, and *inferred* "no image model is
+    /// loaded"; a guess that happened to be right is still a guess.
+    #[tokio::test]
+    async fn a_portrait_can_be_asked_for_and_the_refusal_is_legible() {
+        let st = state(tmp("portrait-generate"));
+        let a = "google-1";
+        call(router(st.clone()), get("/v1/me", Some(a))).await;
+        author(&st).await;
+
+        let (s, npc) = call(
+            router(st.clone()),
+            send(
+                "/v1/npc",
+                "POST",
+                a,
+                json!({
+                    "name": "Hess", "world_id": "battle-cities",
+                    "personality_id": "commander",
+                    "persona_description": "a quartermaster in his fifties, scarred left hand",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{npc}");
+        let id = npc["npc_id"].as_str().expect("created").to_string();
+
+        // The models catalogue is **not** asserted here: it lives in
+        // `engine::routes` — where the placeholder it replaced already was —
+        // and this `router()` builds `api::routes` alone. Reaching for it from
+        // here is what a duplicate registration looks like just before axum
+        // panics at startup with "overlapping method route", which is exactly
+        // how it was found.
+
+        // The draw is refused, with a reason a console can branch on.
+        let (s, v) = call(
+            router(st.clone()),
+            send(
+                &format!("/v1/npc/{id}/portrait/generate"),
+                "POST",
+                a,
+                json!({}),
+            ),
+        )
+        .await;
+        assert!(
+            s == StatusCode::NOT_IMPLEMENTED || s == StatusCode::SERVICE_UNAVAILABLE,
+            "a daemon with no image guest answered {s} to a portrait request: {v}"
+        );
+        assert!(
+            v["error"].is_string(),
+            "the refusal carries no machine-readable code: {v}"
+        );
+
+        // And it is somebody's own character: a stranger cannot draw over it.
+        let (s, _) = call(
+            router(st),
+            send(
+                &format!("/v1/npc/{id}/portrait/generate"),
+                "POST",
+                "google-2",
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::NOT_FOUND,
+            "a stranger could ask for a portrait of somebody else's character"
+        );
+    }
+
+    /// **The narrate route is reachable and refuses legibly.**
+    ///
+    /// Its companion to the portrait test above, and the same shape: this state
+    /// has no engine, so what is pinned is that the route exists, that it is
+    /// admin-gated with the rest of `/v1/life`, that a bad node key is refused
+    /// before anything else happens, and that a missing prose guest comes back
+    /// as a code a console can branch on rather than as a 404 it has to guess
+    /// from.
+    #[tokio::test]
+    async fn a_life_stratum_can_be_narrated_and_the_refusal_is_legible() {
+        let base = tmp("narrate");
+        let st = mind_state(base);
+        // Admin, with the rest of `/v1/life`: this route writes prose into the
+        // substrate that a character will believe it remembers.
+        let a = ADMIN;
+        call(router(st.clone()), get("/v1/me", Some(a))).await;
+        author(&st).await;
+
+        // An ordinary user cannot reach it at all.
+        let (s, _) = call(
+            router(st.clone()),
+            send(
+                "/v1/life/commander/node/story/narrate",
+                "POST",
+                "google-1",
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "narrate is not admin-gated");
+
+        // A character the registry does not know is refused as *that*, rather
+        // than as a life with no plan — the two have different fixes.
+        let (_, v) = call(
+            router(st.clone()),
+            send("/v1/life/nobody/node/story/narrate", "POST", a, json!({})),
+        )
+        .await;
+        assert_eq!(v["error"], "personality_not_found", "{v}");
+
+        // A real character with no plan yet says so, and says it before
+        // reaching the guest: there is nothing to narrate, so nothing should be
+        // evicted to find that out.
+        let (_, v) = call(
+            router(st.clone()),
+            send(
+                "/v1/life/commander/node/story/narrate",
+                "POST",
+                a,
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            v["error"], "no_life_plan",
+            "a character with no plan was reported as something else: {v}"
+        );
+
+        // An unknown field is refused rather than ignored — a caller sending a
+        // `prompt` is asking for something this route deliberately does not
+        // offer, and narrating from the plan instead would look like it was
+        // honoured. This is what `Option<Json<_>>` silently defeated: axum turns
+        // a parse failure into `None`, so the defaults answered 200.
+        let (s, _) = call(
+            router(st),
+            send(
+                "/v1/life/commander/node/story/narrate",
+                "POST",
+                a,
+                json!({ "prompt": "make it up" }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an unknown field was accepted"
+        );
+    }
+
+    /// **The narrative clock writes, and the world remembers it.**
+    ///
+    /// This route used to be the console's fixture answering `{"ok":true}` to
+    /// everything, under a console dialog that said it affected every character
+    /// in the world. It moved nothing.
+    #[tokio::test]
+    async fn the_world_clock_is_set_and_kept() {
+        let base = tmp("world-clock");
+        std::fs::create_dir_all(base.join("worlds")).unwrap();
+        std::fs::write(
+            base.join("worlds/ardh.yaml"),
+            "# The world's own header, which a save must not eat.\nid: ardh\nname: Ardh\n",
+        )
+        .unwrap();
+        let st = mind_state(base.clone());
+
+        // A world that has never been set still reports a clock: started now,
+        // at real time, which is what an author who has not thought about it
+        // means.
+        let (s, v) = call(router(st.clone()), get("/v1/world/ardh", None)).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["time"]["scale"], 1.0);
+        assert_eq!(v["time"]["paused"], false);
+        assert!(v["time"]["world_ms"].as_i64().unwrap() > 0);
+
+        // Jump it somewhere and speed it up.
+        let (s, v) = call(
+            router(st.clone()),
+            send(
+                "/v1/world/ardh/time",
+                "PUT",
+                ADMIN,
+                json!({ "world_ms": 5_000_000, "scale": 60 }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["scale"], 60.0);
+        assert!(v["world_ms"].as_i64().unwrap() >= 5_000_000);
+
+        // It is on disk as an anchor, and the header survived the write.
+        let text = std::fs::read_to_string(base.join("worlds/ardh.yaml")).unwrap();
+        assert!(text.contains("# The world's own header"), "{text}");
+        assert!(text.contains("at_ms"), "no anchor written:\n{text}");
+
+        // And it is still there on the next read, having advanced rather than
+        // reset.
+        let (_, v) = call(router(st.clone()), get("/v1/world/ardh", None)).await;
+        assert_eq!(v["time"]["scale"], 60.0);
+        assert!(v["time"]["world_ms"].as_i64().unwrap() >= 5_000_000);
+
+        // Pausing keeps the pace it was running at, so resuming does not land
+        // on 1×.
+        let (_, v) = call(
+            router(st.clone()),
+            send(
+                "/v1/world/ardh/time",
+                "PUT",
+                ADMIN,
+                json!({ "paused": true }),
+            ),
+        )
+        .await;
+        assert_eq!(v["paused"], true);
+        assert_eq!(v["scale"], 60.0, "pausing forgot the pace");
+
+        // Setting the clock is an admin's.
+        let (s, _) = call(
+            router(st),
+            send(
+                "/v1/world/ardh/time",
+                "PUT",
+                "google-plain-user",
+                json!({ "scale": 1 }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+    }
+
+    /// **A personality's collections come from its own document.**
+    ///
+    /// The fixture this replaces invented an anchor, four identity facets and a
+    /// doctrine, and served the same five for every character — on the page an
+    /// author opens to check what they wrote.
+    #[tokio::test]
+    async fn a_personalitys_collections_are_read_from_its_document() {
+        let base = tmp("persona-collections");
+        std::fs::create_dir_all(base.join("personalities")).unwrap();
+        std::fs::write(
+            base.join("personalities/keeper.yaml"),
+            "id: keeper\ncategory: identity\nanchor: |\n  You keep the tower.\n\
+             personality:\n  voice: |\n    Short sentences.\n  processing: |\n    Weigh what you saw.\n",
+        )
+        .unwrap();
+        let st = mind_state(base);
+
+        let (s, v) = call(router(st), get("/v1/personality/keeper/collections", None)).await;
+        assert_eq!(s, StatusCode::OK);
+        let cols = v["collections"].as_array().unwrap();
+        let by = |n: &str| cols.iter().find(|c| c["name"] == n).unwrap().clone();
+
+        // The anchor, as itself.
+        let anchor = by("identity_anchor");
+        assert_eq!(anchor["sections"][0]["id"], "anchor");
+        assert!(anchor["sections"][0]["template"]
+            .as_str()
+            .unwrap()
+            .contains("You keep the tower"));
+
+        // One section per facet the document declares — not a fixed four.
+        let identity = by("identity");
+        let ids: Vec<&str> = identity["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["processing", "voice"]);
+        assert!(identity["sections"][0]["chars"].as_u64().unwrap() > 0);
+
+        // No doctrine in this document, so no doctrine collection — 69 of the
+        // mind's 74 personalities are in that position, and five empty rows on
+        // each of them is not a reading of anything.
+        assert!(cols.iter().all(|c| c["name"] != "doctrine"));
+    }
+
+    /// **`/v1/schema/layers` is the schema, not a copy of it.**
+    ///
+    /// It used to be answered by the console's fixture, with the nine layers
+    /// written out a second time — and they drifted: the fixture had `action`
+    /// at budget priority 95 where the schema said 100. Nothing compared them,
+    /// so nothing could report it. Reading the same document the editor writes
+    /// is what makes that impossible rather than merely unlikely.
+    #[tokio::test]
+    async fn the_layer_schema_is_read_from_the_mind_itself() {
+        let base = tmp("schema-layers");
+        seed_projection(&base);
+        let st = mind_state(base.clone());
+
+        let (s, v) = call(
+            router(st.clone()),
+            get("/v1/schema/layers", Some("google-1")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let layers = v["layers"].as_array().expect("layers");
+        assert_eq!(layers.len(), 2);
+        // The schema's own vocabulary, verbatim — not translated into a shape
+        // this route invented, which would be the second copy all over again.
+        assert_eq!(layers[0]["name"], "world");
+        assert_eq!(layers[0]["window"], 8000);
+        assert_eq!(layers[0]["gather_scope"], "shared");
+        assert_eq!(layers[0]["budget"]["priority"], 70);
+        assert_eq!(layers[0]["groups"][0]["id"], "canon");
+
+        // And it follows the file. An edit through the layer editor is visible
+        // here on the next read, because there is only the one document.
+        let (s, _) = call(
+            router(st.clone()),
+            send(
+                "/v1/mind/fields?id=settings/projection/world",
+                "PUT",
+                ADMIN,
+                // Every field, as the console sends them — the form holds the
+                // whole layer and puts it all back.
+                json!({ "values": {
+                    "name": "world",
+                    "description": "Shared knowledge about the setting.\n",
+                    "window": 12345,
+                    "score_threshold": 0.30,
+                    "gather_scope": "shared",
+                    "decode_priority": "low",
+                    "budget": { "priority": 70, "adaptive": { "gain": 2.0 } },
+                    "groups": [{ "id": "canon", "selection": { "kind": "top_k", "k": 6 } }],
+                } }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, v) = call(router(st), get("/v1/schema/layers", Some("google-1"))).await;
+        assert_eq!(
+            v["layers"][0]["window"], 12345,
+            "the route kept its own copy"
+        );
+    }
+
+    /// Saving a layer changes that layer, and the document it lives in keeps
+    /// every banner comment between the others.
+    #[tokio::test]
+    async fn saving_a_layer_leaves_the_rest_of_the_schema_alone() {
+        let base = tmp("mind-layer-save");
+        seed_projection(&base);
+        let st = mind_state(base.clone());
+        let before = std::fs::read_to_string(base.join("projection.yaml")).unwrap();
+
+        let (s, _) = call(
+            router(st.clone()),
+            send(
+                "/v1/mind/fields?id=settings/projection/world",
+                "PUT",
+                ADMIN,
+                json!({ "values": {
+                    "name": "world",
+                    "description": "Shared knowledge about the setting.\n",
+                    "window": 9000,
+                    "score_threshold": 0.30,
+                    "gather_scope": "shared",
+                    "decode_priority": "low",
+                    "budget": { "priority": 70, "adaptive": { "gain": 2.0 } },
+                    "groups": [{ "id": "canon", "selection": { "kind": "top_k", "k": 6 } }],
+                } }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        let after = std::fs::read_to_string(base.join("projection.yaml")).unwrap();
+        assert!(after.contains("window: 9000"), "{after}");
+        assert!(after.contains("# ── World ─"), "{after}");
+        assert!(after.contains("# ── Beliefs ─"), "lost a comment:\n{after}");
+        assert!(after.contains("# The projection schema."), "{after}");
+        // One line, and only one.
+        let b: Vec<&str> = before.lines().collect();
+        let a: Vec<&str> = after.lines().collect();
+        assert_eq!(a.len(), b.len(), "\n{after}");
+        let moved: Vec<usize> = (0..b.len()).filter(|&i| b[i] != a[i]).collect();
+        assert_eq!(moved.len(), 1, "changed lines {moved:?}:\n{after}");
+
+        // Delete on a layer must never reach the schema it is part of.
+        let (s, _) = call(
+            router(st),
+            send(
+                "/v1/mind/entry?id=settings/projection/world",
+                "DELETE",
+                ADMIN,
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert!(base.join("projection.yaml").exists(), "the schema went");
+    }
+
+    /// Reading fields is a signed-in read; saving them is an admin's write —
+    /// the same rule as the text they are a view of.
+    #[tokio::test]
+    async fn the_field_editor_follows_the_same_roles() {
+        let base = tmp("mind-fields-roles");
+        seed_section(&base);
+        let st = mind_state(base);
+        let uri = "/v1/mind/fields?id=responses/accept";
+
+        let (s, _) = call(router(st.clone()), get(uri, None)).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        let (s, _) = call(router(st.clone()), get(uri, Some("google-1"))).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(
+            router(st),
+            send(uri, "PUT", "google-plain-user", json!({ "values": {} })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+    }
+
+    /// `?reveal=1` is a request, and the role is what answers it.
+    ///
+    /// The console sends it while an admin holds RIGHT ALT. The parameter
+    /// itself grants nothing: an anonymous caller or an ordinary user can
+    /// append it to the URL and gets exactly the listing they would have got
+    /// without it, because the role is read from the gateway's headers on this
+    /// request rather than from anything the client says.
+    #[tokio::test]
+    async fn reveal_shows_hidden_documents_to_an_admin_and_to_nobody_else() {
+        let st = state(tmp("reveal"));
+        for (id, body) in [
+            ("battle-cities", json!({ "name": "Battle Cities" })),
+            ("earth", json!({ "name": "Earth", "hidden": true })),
+        ] {
+            let r = send(&format!("/v1/world/{id}"), "PUT", ADMIN, body);
+            assert_eq!(call(router(st.clone()), r).await.0, StatusCode::OK);
+        }
+        let ids = |v: &Value| -> Vec<String> {
+            v["worlds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|w| w["world_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // The admin, holding the key.
+        for q in ["?reveal=1", "?reveal=true"] {
+            let (_, v) = call(
+                router(st.clone()),
+                get(&format!("/v1/world{q}"), Some(ADMIN)),
+            )
+            .await;
+            assert!(
+                ids(&v).contains(&"earth".to_string()),
+                "`{q}` hid it from an admin"
+            );
+        }
+
+        // Everybody else, asking for exactly the same thing.
+        for who in [None, Some("google-someone-else")] {
+            let (_, v) = call(router(st.clone()), get("/v1/world?reveal=1", who)).await;
+            assert_eq!(ids(&v), ["battle-cities"], "reveal granted to {who:?}");
+        }
+
+        // And an admin who is *not* asking still gets the discreet listing —
+        // the point is a screen share, and being an admin is the normal state
+        // for whoever is sharing it.
+        let (_, v) = call(router(st.clone()), get("/v1/world", Some(ADMIN))).await;
+        assert_eq!(ids(&v), ["battle-cities"]);
+
+        // A value that is not the opt-in is not the opt-in.
+        for q in ["?reveal=0", "?reveal=", "?reveal=yes"] {
+            let (_, v) = call(
+                router(st.clone()),
+                get(&format!("/v1/world{q}"), Some(ADMIN)),
+            )
+            .await;
+            assert_eq!(ids(&v), ["battle-cities"], "`{q}` revealed a hidden world");
+        }
     }
 
     /// A world admits a subset of the shared craft libraries. Same files, two

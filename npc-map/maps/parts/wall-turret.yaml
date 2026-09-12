@@ -1,0 +1,20 @@
+id: wall-turret
+kind: fixture
+name: wall turret
+short: >
+  A wall turret fires under whatever policy it was last set to, and keeps
+  firing under it until somebody changes it.
+long: >
+  An emplacement on the rampart, laid and fed by the tower rather than by hand.
+  Nobody aims it — the fire control does that, far faster than anybody watching
+  could — so what a body does at one is set the policy it works under: whether
+  it fires at all, what it prefers, and how freely it spends ammunition. A
+  turret told to hold fire holds it through anything, which is occasionally the
+  whole point and occasionally a disaster.
+modes:
+  - hold fire
+  - free fire
+  - nearest first
+  - air only
+  - ground only
+  - conserve ammunition

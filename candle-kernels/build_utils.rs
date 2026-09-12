@@ -143,7 +143,7 @@ const QUANTIZED_KERNELS: [&str; 46] = [
 ];
 
 // Flash-attention kernels: 12 total
-const FLASH_KERNELS: [&str; 22] = [
+const FLASH_KERNELS: [&str; 23] = [
     // Batched sampling (1 api + 4 variants)
     "src/sampling/batched_sampling_api.cu",
     "src/sampling/batched_sampling_f32.cu",
@@ -178,6 +178,9 @@ const FLASH_KERNELS: [&str; 22] = [
     // Gated DeltaNet (Qwen3.5/3.8 hybrid layers): one F32 entry TU over the
     // decode-step/conv-step and fused-prefill-scan kernel headers
     "src/delta-net/delta_net_api_f32.cu",
+    // Dense int8 attention for diffusion transformers: unmasked, unpaged,
+    // per-row scales — see the file header for why none of the paged kernels fit
+    "src/dit-attn/dit_attn_int8.cu",
 ];
 
 /// Provenance BDP scan — the scalar backend, the b1 tensor-core (BMMA) backend
@@ -263,22 +266,22 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
             .map(|sm| format!("-gencode=arch=compute_{sm},code=sm_{sm}")),
     );
 
-    // **`kernel-lineinfo` — off unless a kernel is faulting and the address does
-    // not say where.**
+    // **`kernel-lineinfo` — off, and not how a fault is found here.**
+    //
+    // A device-side fault in this repository is hunted with the `tensor-assert`
+    // harness: `readonly_regions` declares the ground that must never be written
+    // again and names the *writer* at the moment of the write, on the thread
+    // that did it, before the corruption — rather than leaving an address to
+    // decode afterwards. See CLAUDE.md.
     //
     // `--generate-line-info` costs nothing at runtime and is two thirds of the
     // build's output on disk. Measured across a cubin: 175 KB of `.text` SASS
     // against 592 KB of debug sections, `.nv_debug_ptx_txt` — the embedded PTX
     // source text — being 490 KB of that on its own. Those archives are
     // statically linked into every CUDA test binary, and cargo keeps every
-    // generation of every binary, so the multiplier is large.
-    //
-    // What it buys, when it is on, is `compute-sanitizer` and `cuda-gdb` naming
-    // the kernel file and line behind an illegal address instead of leaving a
-    // bare pointer. That is worth a rebuild for one session and not worth
-    // carrying the rest of the time. Since the compile args are hashed, turning
-    // it on rebuilds the affected archive groups and turning it off restores the
-    // cached small ones.
+    // generation of every binary, so the multiplier is large. Since the compile
+    // args are hashed, turning it on rebuilds the affected archive groups and
+    // turning it off restores the cached small ones.
     if std::env::var_os("CARGO_FEATURE_KERNEL_LINEINFO").is_some() {
         base_args.push("--generate-line-info".to_string());
     }
@@ -503,6 +506,24 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
         groups.push(ArchiveGroup {
             name: "paged_glue".to_string(),
             kernels: glue_kernels,
+            compile_args: decode_args.clone(),
+            include_dirs: flash_includes.clone(),
+        });
+    }
+
+    // Dense int8 attention for diffusion transformers — unmasked, unpaged, and
+    // therefore nothing the paged kernels above can serve. Its own group so a
+    // change to it does not invalidate their archives, which are the expensive
+    // ones.
+    {
+        let dit_kernels: Vec<String> = FLASH_KERNELS
+            .iter()
+            .filter(|k| k.contains("dit-attn"))
+            .map(|s| s.to_string())
+            .collect();
+        groups.push(ArchiveGroup {
+            name: "dit_attn".to_string(),
+            kernels: dit_kernels,
             compile_args: decode_args.clone(),
             include_dirs: flash_includes.clone(),
         });

@@ -1,0 +1,102 @@
+id: vault-chronicle
+kind: level
+within: creators-vault
+ordinal: 2
+name: the chronicle
+summary: >
+  Where the world's history is kept true. Whoever holds an era reads every
+  other one while they work, because history is only consistent against the
+  rest of itself.
+character: >
+  Eras overlap, so two Makers working next to each other are usually working
+  on the same argument from different ends.
+lacks:
+  - way off this level except the lift and the stair
+spine:
+  name: the ring
+  loop: true
+  through: [ring-north, ring-east, ring-south, ring-west]
+nodes:
+  - { id: ring-north, kind: passage, name: the north run }
+  - { id: ring-east, kind: passage, name: the east run }
+  - { id: ring-south, kind: passage, name: the south run }
+  - { id: ring-west, kind: passage, name: the west run }
+  - { id: cross-upper, kind: passage, name: the upper cross run, off: [ring-east, ring-west] }
+  - { id: cross-lower, kind: passage, name: the lower cross run, off: [ring-east, ring-west] }
+
+  - id: core
+    kind: core
+    name: the lift and the stair
+    plural: true
+    off: [ring-north]
+
+  - id: early-range
+    kind: work
+    name: the early range
+    off: [ring-north]
+    parts: [{ part: chronicle-terminal, count: 6 }]
+
+  - id: middle-range
+    kind: work
+    name: the middle range
+    off: [cross-upper]
+    parts: [{ part: chronicle-terminal, count: 6 }]
+
+  - id: late-range
+    kind: work
+    name: the late range
+    off: [cross-upper]
+    parts: [{ part: chronicle-terminal, count: 4 }]
+
+  - id: stacks
+    kind: store
+    name: the stacks
+    plural: true
+    off: [cross-lower]
+    parts: [archive, timeline-wall]
+    habit: quiet
+
+  - id: sorting-room
+    kind: work
+    name: the sorting room
+    off: [cross-lower]
+    parts: [appraisal-bench, { part: seat, count: 2 }]
+    character: >
+      Everything bound for the stacks is weighed here first, and most of it is
+      turned away. The refusals are written down beside the bench, which is why
+      the room is argued in more than it is worked in.
+
+  - id: catalogue-room
+    kind: work
+    name: the catalogue
+    off: [cross-lower]
+    parts: [catalogue, { part: chronicle-terminal, count: 2 }]
+    character: >
+      The stacks answer nothing on their own. Whoever is in here is writing for
+      a reader who does not yet know what they are looking for.
+
+  - id: mending-room
+    kind: work
+    name: the mending room
+    off: [ring-west]
+    parts: [mending-bench]
+    habit: quiet
+    character: >
+      Slow, close work on entries that have gone stale or now point at nothing.
+      A repair is always left visible.
+
+  - id: reading-room
+    kind: social
+    name: the reading room
+    off: [ring-south]
+    parts: [{ part: seat, count: 8 }]
+    character: >
+      Its armchairs stand among the shelves, which is where an argument about
+      a date usually ends up.
+
+  - id: concordance
+    kind: social
+    name: the concordance table
+    stand: at
+    off: [ring-south]
+    parts: [concordance-table, { part: seat, count: 4 }]

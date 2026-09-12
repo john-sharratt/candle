@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- One page, so this is a file rather than something generated. tokera.com's
+     is built from the posts and papers on disk because it changes whenever they
+     do; this changes when somebody adds a page to a site that has one. -->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://battlecities.net/</loc>
+    <changefreq>monthly</changefreq>
+    <priority>1.0</priority>
+  </url>
+</urlset>

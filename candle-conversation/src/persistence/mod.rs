@@ -49,7 +49,7 @@ pub mod writer;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
 use thiserror::Error;
 
@@ -105,10 +105,113 @@ pub type Result<T> = std::result::Result<T, PersistenceError>;
 /// [`segmented_log`].
 pub const SUBSTRATE_DIR: &str = ".substrate";
 
+/// A plain character record, for the tests in this module and in
+/// [`maintenance`] that need one to survive something.
+#[cfg(test)]
+pub(crate) fn test_npc(id: u64, name: &str) -> NpcPayload {
+    NpcPayload {
+        npc_id: id,
+        owner_id: "u1".to_string(),
+        revision: 1,
+        created_ms: 1_000,
+        updated_ms: 1_000,
+        state: "active".to_string(),
+        name: name.to_string(),
+        world_id: "battle-cities".to_string(),
+        personality_id: "maker".to_string(),
+        hidden: false,
+        heartbeat_ms: 60_000,
+        salience_gate: 0.5,
+        tags: Vec::new(),
+        persona_description: String::new(),
+        persona_origin: "authored".to_string(),
+        portrait_image_id: None,
+        portrait_origin: None,
+        at: None,
+        mood: None,
+        beliefs: Vec::new(),
+        relationships: Vec::new(),
+        agency: Vec::new(),
+        modulation: record::Modulation::default(),
+    }
+}
+
+/// A substrate the host process opened, for the engine to adopt rather than
+/// open a second time.
+///
+/// **One process, one writable handle per `.substrate/`.** [`log_file::LogFile::open`]
+/// takes the file read-write and takes no lock, so a second
+/// [`SubstratePersistence`] over the same directory is a second append cursor
+/// *and* a second [`SubstratePersistence::npc_locs`] view. The two writers
+/// choose offsets neither told the other about, and — because
+/// [`compaction::collect_live_records`] can only carry forward what the
+/// compacting handle's own walk recorded — a compaction drops every
+/// header-keyed record the other handle appended after it opened.
+///
+/// That is not theoretical: `npcd` opened one handle for its character registry
+/// and let the engine open another for conversation turns, and every character
+/// created while the daemon ran vanished at the next restart. The ones that
+/// predated both opens survived, which made the loss look intermittent instead
+/// of mechanical. See
+/// [`tests::a_second_writable_handle_drops_the_records_it_never_saw`].
+///
+/// So a host that writes records of its own — `npcd` writes
+/// [`RecordType::Npc`] — opens the substrate **once** and hands this pair over,
+/// instead of naming a directory and letting the engine open its own. Both
+/// sides then append through the same cursor and compact against the same view.
+#[derive(Clone)]
+pub struct SharedSubstrate {
+    pub substrate: Arc<RwLock<Substrate>>,
+    pub persistence: Arc<Mutex<SubstratePersistence>>,
+}
+
+/// Names the directory rather than the contents. A substrate's interesting
+/// state is megabytes of index and arena bookkeeping, and this appears inside
+/// the `Debug` for a whole engine config — the useful fact at that scale is
+/// *which* log it is, and taking the lock to say more would let a stray
+/// `{:?}` deadlock against a writer.
+impl std::fmt::Debug for SharedSubstrate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let dir = self
+            .persistence
+            .try_lock()
+            .ok()
+            .map(|p| p.dir().to_path_buf());
+        match dir {
+            Some(d) => f.debug_tuple("SharedSubstrate").field(&d).finish(),
+            None => f.write_str("SharedSubstrate(<in use>)"),
+        }
+    }
+}
+
+impl SharedSubstrate {
+    /// Wrap a freshly-opened pair. The caller does the walk — typically through
+    /// [`SubstratePersistence::open_in_with_substrate_and_sink`], so its own
+    /// record classes are collected in the same pass.
+    pub fn new(substrate: Substrate, persistence: SubstratePersistence) -> Self {
+        Self {
+            substrate: Arc::new(RwLock::new(substrate)),
+            persistence: Arc::new(Mutex::new(persistence)),
+        }
+    }
+
+    /// Open the substrate under `dir` and share it. The one-liner for a host
+    /// with no records of its own to collect on the walk.
+    pub fn open_in(dir: &Path) -> Result<Self> {
+        let mut substrate = Substrate::new();
+        let persistence = SubstratePersistence::open_in_with_substrate(dir, &mut substrate)?;
+        Ok(Self::new(substrate, persistence))
+    }
+}
+
 /// The persistence layer behind a substrate — owns the active redo log, the
 /// inherited read-only logs, and the in-RAM manifest.
 ///
 /// Persistence is mandatory: a substrate cannot exist without one.
+///
+/// **Exactly one of these may exist per `.substrate/` directory in a process.**
+/// See [`SharedSubstrate`] for what a second one costs and how a host that
+/// needs its own writes avoids opening it.
 pub struct SubstratePersistence {
     /// The segmented redo log — the active append segment plus the sealed
     /// segment set under `.substrate/`. Replaces the single monolithic log:
@@ -853,6 +956,11 @@ impl SubstratePersistence {
 
     /// Every character's current record location, keyed by `npc_id`.
     ///
+    /// The `.substrate/` directory this store's segments live in.
+    pub fn dir(&self) -> &Path {
+        self.segments.dir()
+    }
+
     /// Locations rather than payloads, because the payloads are not held here —
     /// the registry that owns them lives in the daemon. Compaction and segment
     /// liveness both read this to know which bytes are still worth keeping.
@@ -1783,6 +1891,7 @@ impl SubstratePersistence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::projection::TimelineId;
     use log_file::{LogFile, SUPERBLOCK_SIZE};
     use segment::FIRST_SEGMENT;
     use streams::{SectionDecl, TurnDecl};
@@ -1817,6 +1926,206 @@ mod tests {
         }
         // A fresh store mints the first active segment.
         assert!(dir.join(SUBSTRATE_DIR).join("seg-0000000001.log").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every character record in the store, by id, as a fresh open sees them.
+    fn cast_on_disk(dir: &Path) -> Vec<u64> {
+        let mut seen = Vec::new();
+        let mut substrate = Substrate::new();
+        SubstratePersistence::open_in_with_substrate_and_sink(dir, &mut substrate, |entry| {
+            if entry.record.header.record_type == RecordType::Npc {
+                seen.push(entry.record.header.stream_id);
+            }
+        })
+        .unwrap();
+        seen.sort_unstable();
+        seen.dedup();
+        seen
+    }
+
+    /// **Two writable handles on one substrate lose the records neither told
+    /// the other about.**
+    ///
+    /// This is the `npcd` daemon's shape reproduced exactly. The character
+    /// registry opens the substrate to rebuild its cast; the engine opens the
+    /// *same* directory a moment later for conversation turns. Both hold a
+    /// writable handle, and each built its [`SubstratePersistence::npc_locs`]
+    /// from the records present at *its own* open.
+    ///
+    /// Nothing tells one handle about the other's appends. So a character
+    /// created while the daemon runs is written through the registry's handle
+    /// and is invisible to the engine's — and [`compaction::collect_live_records`]
+    /// reads only the `npc_locs` of the handle doing the compacting. The
+    /// character is not carried forward, and the next restart has never heard of
+    /// it.
+    ///
+    /// Characters that predate *both* opens are in both views and survive, which
+    /// is why the loss presented as intermittent rather than total: it is
+    /// precisely the runtime-created ones that go.
+    ///
+    /// This is the failure [`SharedSubstrate`] exists to make unrepresentable —
+    /// held here as the record of *why*, and asserted in the shape the daemon
+    /// actually failed in.
+    #[test]
+    fn a_second_writable_handle_drops_the_records_it_never_saw() {
+        let dir = tmp_dir("two_owners");
+
+        // A character that predates both opens — the control.
+        {
+            let mut registry = SubstratePersistence::open_in(&dir).unwrap();
+            registry.write_npc(&test_npc(1, "Perrin")).unwrap();
+            registry.commit().unwrap();
+        }
+
+        // Boot, in the daemon's order: the registry opens, then the engine
+        // opens the same directory — the bug, reproduced deliberately.
+        let mut registry = SubstratePersistence::open_in(&dir).unwrap();
+        let mut engine_substrate = Substrate::new();
+        let mut engine =
+            SubstratePersistence::open_in_with_substrate(&dir, &mut engine_substrate).unwrap();
+
+        // Runtime: a character is created. Character records are the registry's,
+        // so it is the registry's handle that appends and fsyncs it.
+        registry.write_npc(&test_npc(2, "Wyneth")).unwrap();
+        registry.commit().unwrap();
+        assert_eq!(
+            cast_on_disk(&dir),
+            vec![1, 2],
+            "the new character is durable the moment it is committed"
+        );
+
+        // The engine runs a routine compaction against its own view.
+        engine.compact(&mut engine_substrate, None).unwrap();
+        drop(registry);
+        drop(engine);
+
+        assert_eq!(
+            cast_on_disk(&dir),
+            vec![1],
+            "the character created after the second handle opened is dropped by \
+             that handle's compaction — it was never in its `npc_locs`"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A tool round-trip's coupling survives compaction.**
+    ///
+    /// [`RecordType::TurnCoupling`] is a resident payload-keyed record, exactly
+    /// like `Label` / `DebugId` / `TreeMetadata`: the accounting excludes it from
+    /// supersession and the walker replays it into
+    /// [`crate::substrate::Substrate::couplings_of`], which means compaction has
+    /// to re-synthesise it from RAM. Every one of its siblings is re-emitted by
+    /// [`compaction::collect_live_records`]; this one was not, so each
+    /// compaction silently unjoined every tool call from its response and
+    /// [`crate::summary_tree::exchange`] began grouping the two halves of a
+    /// round-trip as separate exchanges.
+    ///
+    /// For `npcd` that is a character's act and the world's answer to it coming
+    /// apart in the summary tree.
+    #[test]
+    fn a_turn_coupling_survives_compaction() {
+        let dir = tmp_dir("coupling");
+        let turn = |idx: u32, seq: u32| {
+            StreamDecl::Turn(TurnDecl {
+                timeline_id: 1,
+                turn_index: idx,
+                turn_id_day: 0,
+                turn_id_seq: seq,
+                role: 1,
+                block_start: 0,
+                block_end: 32,
+                layer_id: 1,
+                group_id: 1,
+                anchored_prefix: Vec::new(),
+                view: Vec::new(),
+                segments: Vec::new(),
+                tags: Vec::new(),
+            })
+        };
+
+        // A tool call at turn 0 and its response at turn 1, joined.
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            for (idx, seq) in [(0u32, 1u32), (1, 2)] {
+                let id = sp.declare_stream(&turn(idx, seq)).unwrap();
+                sp.append_tokens(id, b"token-bytes").unwrap();
+                sp.commit_stream(id, 0).unwrap();
+            }
+            sp.write_turn_coupling(1, 0).unwrap();
+            sp.commit().unwrap();
+        }
+
+        let timeline = TimelineId::from_raw(1).unwrap();
+        {
+            let mut substrate = Substrate::new();
+            let sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            assert!(
+                substrate.couplings_of(timeline).contains(&0),
+                "the coupling is durable before any compaction"
+            );
+            drop(sp);
+        }
+
+        // Compact, then reopen: the coupling must still be there.
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.compact(&mut substrate, None).unwrap();
+        }
+        let mut substrate = Substrate::new();
+        SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        assert!(
+            substrate.couplings_of(timeline).contains(&0),
+            "compaction must carry the coupling forward — without it a tool call \
+             and its response stop being one exchange"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The fix: one handle, shared, and the compaction carries the whole cast.
+    ///
+    /// Identical to the test above except that the engine *adopts* the
+    /// registry's [`SharedSubstrate`] instead of opening the directory again.
+    /// One append cursor, one `npc_locs` — so the character created at runtime
+    /// is in the view the compactor reads.
+    #[test]
+    fn one_shared_handle_carries_a_runtime_created_record_through_compaction() {
+        let dir = tmp_dir("one_owner");
+
+        {
+            let mut registry = SubstratePersistence::open_in(&dir).unwrap();
+            registry.write_npc(&test_npc(1, "Perrin")).unwrap();
+            registry.commit().unwrap();
+        }
+
+        // Boot: the registry opens once, and the engine takes that same handle.
+        let shared = SharedSubstrate::open_in(&dir).unwrap();
+        let engine = shared.clone();
+
+        // Runtime: a character is created, through the registry's side.
+        {
+            let mut p = shared.persistence.lock().unwrap();
+            p.write_npc(&test_npc(2, "Wyneth")).unwrap();
+            p.commit().unwrap();
+        }
+
+        // The engine compacts — the same lock, the same view.
+        {
+            let mut p = engine.persistence.lock().unwrap();
+            let mut s = engine.substrate.write().unwrap();
+            p.compact(&mut s, None).unwrap();
+        }
+        drop(shared);
+        drop(engine);
+
+        assert_eq!(
+            cast_on_disk(&dir),
+            vec![1, 2],
+            "a shared handle compacts against a view that includes every \
+             character, whenever it was created"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

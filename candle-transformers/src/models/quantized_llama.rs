@@ -1435,11 +1435,60 @@ mod tests {
     )]
 
     use super::*;
+    use crate::model_overrides::{self, Checkpoint};
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
     use crate::models::batched_inference::InferenceMode;
     use crate::models::dialect::Dialect;
     #[allow(unused_imports)]
     use candle_nn::kv_cache::CacheIntegrityResult;
+
+    /// The Llama-3.2-3B checkpoint these gates run against.
+    ///
+    /// **A conversion, not the base model**, because Meta's own repository is
+    /// gated behind HuggingFace authentication and a gate that cannot be run
+    /// without credentials is a gate most people cannot run.
+    ///
+    /// Resolved through [`model_overrides`], the same mechanism the serving
+    /// presets use, so a machine can substitute its own conversion — a
+    /// different quant, a fine-tune, a locally-mirrored copy — without editing
+    /// this file. The key is `Llama3_2_3B` under `checkpoints:` in
+    /// `models.override.yaml`.
+    ///
+    /// Substituting is low-risk here, which is why the indirection is offered
+    /// rather than a pin being insisted on: the story-rewrite gate's expected
+    /// output is *derived from its own prompt* (the task is to rewrite a passage
+    /// substituting the protagonist's name), not recorded from a particular set
+    /// of weights. Any model that can do the task passes; there is no golden
+    /// string to re-derive.
+    fn llama3_2_3b() -> Checkpoint {
+        model_overrides::checkpoint(
+            "Llama3_2_3B",
+            Checkpoint::new(
+                "bartowski/Llama-3.2-3B-Instruct-GGUF",
+                "main",
+                "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+            ),
+        )
+    }
+
+    /// Fetch [`llama3_2_3b`] and return its local path.
+    fn llama3_2_3b_path() -> Result<std::path::PathBuf> {
+        let ck = llama3_2_3b();
+        let api = crate::models::batch_test::test_helpers::api()
+            .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
+        api.repo(hf_hub::Repo::with_revision(
+            ck.repo.clone(),
+            hf_hub::RepoType::Model,
+            ck.revision.clone(),
+        ))
+        .get(&ck.filename)
+        .map_err(|e| {
+            candle::Error::Msg(format!(
+                "Failed to download {}/{} ({}): {e}. This test requires internet access.",
+                ck.repo, ck.filename, ck.revision
+            ))
+        })
+    }
 
     /// **Does Llama decode reproduce itself, run to run?**
     ///
@@ -1764,16 +1813,7 @@ mod tests {
         println!("\n=== Loading Model ===\n");
 
         // Download model from HuggingFace
-        let api = crate::models::batch_test::test_helpers::api()
-            .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
-
-        let repo = api.model("VibeStudio/Nidum-Llama-3.2-3B-Uncensored-GGUF".to_string());
-        let model_path = repo.get("model-Q4_K_M.gguf").map_err(|e| {
-            candle::Error::Msg(format!(
-                "Failed to download model: {}. This test requires internet access.",
-                e
-            ))
-        })?;
+        let model_path = llama3_2_3b_path()?;
 
         println!("Model downloaded to: {:?}", model_path);
 
@@ -2086,7 +2126,7 @@ mod tests {
         // Default to the production weight-twin selection (`Int8Mode::auto` —
         // Precision on int8-MMA GPUs): the C-ladder validates KV-cache
         // compression, so the weight error must not consume the error budget.
-        // Measured on Nidum-Llama-3.2-3B: Performance's same-width KO twin
+        // Measured on this file's Llama-3.2-3B checkpoint: Performance's same-width KO twin
         // alone flips C6–C8 StoryRewrite (C8 6/10 vs 10/10 at Precision, which
         // matches the FP16 reference).
         let int8mode = match std::env::var("INT8MODE").ok().as_deref() {
@@ -2488,15 +2528,7 @@ mod tests {
             );
 
             // Download model (same as the gated test — should already be cached).
-            let api = crate::models::batch_test::test_helpers::api()
-                .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
-            let repo = api.model("VibeStudio/Nidum-Llama-3.2-3B-Uncensored-GGUF".to_string());
-            let model_path = repo.get("model-Q4_K_M.gguf").map_err(|e| {
-                candle::Error::Msg(format!(
-                    "Failed to download model: {}. This test requires internet access.",
-                    e
-                ))
-            })?;
+            let model_path = llama3_2_3b_path()?;
             println!("Model path: {:?}", model_path);
 
             let raw = ModelWeights::from_gguf_by_path_v3(&model_path, &device)?;
@@ -2681,12 +2713,7 @@ mod tests {
             Device::new_cuda(0).map_err(|e| candle::Error::Msg(format!("CUDA required: {}", e)))?;
 
         // Download model
-        let api = crate::models::batch_test::test_helpers::api()
-            .map_err(|e| candle::Error::Msg(format!("HF API: {}", e)))?;
-        let repo = api.model("VibeStudio/Nidum-Llama-3.2-3B-Uncensored-GGUF".to_string());
-        let model_path = repo
-            .get("model-Q4_K_M.gguf")
-            .map_err(|e| candle::Error::Msg(format!("Download failed: {}", e)))?;
+        let model_path = llama3_2_3b_path()?;
 
         let raw = ModelWeights::from_gguf_by_path_v3(&model_path, &device)?;
         let inv_freq = raw

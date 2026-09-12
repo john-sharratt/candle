@@ -1,4 +1,29 @@
 name: hkdf_expand_label
+questions:
+- expand-label this secret with "s hs traffic" and the transcript hash
+- derive the server write key with label "key", 16 bytes
+- HKDF-Expand-Label for "iv" at length 12
+- produce the exporter master secret from this handshake secret
+- what does label "finished" give from this base key
+- is the context supposed to be the transcript hash here
+- which label produces the application traffic secret
+- how many bytes should the derived IV be
+- stepping through the TLS 1.3 schedule to debug a handshake
+- our implementation's traffic keys don't match the peer's
+- checking the derived secrets against a Wireshark keylog
+- reproducing the key schedule from a captured session
+- expand-label this
+- derive the traffic secret
+- TLS 1.3 expand step
+- label-expand from this PRK
+- derive the TLS 1.3 client handshake traffic secret
+- run HKDF-Expand-Label with the label "key" on this secret
+- expand this PRK into a named traffic secret
+- do the TLS 1.3 key-schedule expand step for me
+- give me the derived secret for label "c ap traffic"
+- expand-label this handshake secret into the write key
+- work through the TLS 1.3 key schedule from this secret
+- what does HKDF-Expand-Label give for this label and context
 category: Cryptography
 description: 'HKDF-Expand-Label from the TLS 1.3 key schedule: expand a pseudorandom key into named traffic secrets using a labeled, versioned context. Use for TLS 1.3 key-schedule analysis.'
 parameters:

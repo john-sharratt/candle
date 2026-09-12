@@ -1,0 +1,15 @@
+id: carrier
+kind: fixture
+name: armoured carrier
+short: >
+  The armoured carrier is parked until somebody drives it, and carries whoever
+  is aboard when it goes.
+long: >
+  A tracked box with enough plate on it to survive the open ground once. It sits
+  parked in the pool, and driving it is a state it is put into rather than a
+  journey somebody steers — where it goes is the tower's business and getting
+  aboard is the body's.
+modes:
+  - parked
+  - driving
+  - disembarking

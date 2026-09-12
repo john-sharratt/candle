@@ -1,4 +1,29 @@
 name: web_search
+questions:
+- search for "tokio runtime blocking best practices"
+- find recent posts about CUDA 13 breaking changes
+- look up benchmarks comparing these two databases
+- search for the changelog of that crate
+- what's the current recommended way to do this
+- has anyone written about this failure mode
+- which library do people actually use for this now
+- is there newer guidance than the 2023 blog post
+- I need current information, not what you remember
+- checking whether this API still exists upstream
+- looking for prior art before we build it ourselves
+- want to know if this is a known issue
+- search the web
+- google it
+- look this up online
+- find articles on this
+- search the web for the latest Rust release notes
+- look up what people are saying about that library
+- find me some documentation on this API
+- google this error message
+- what's the current news on that topic
+- search online for a comparison of these two tools
+- find articles about this from the last month
+- look this up on the web, I need current information
 category: Utilities & web
 description: 'Search the web for information using a query string and return ranked results with title, URL, snippet, and relevance score. Use for: looking up current information, finding articles or documentation, researching a topic, locating a URL when only the topic is known, getting recent news, identifying who or what something is. Triggered by "search for", "look up", "find information about", "what is X", "who is", "recent news on", "google", "search the web". Returns up to 10 ranked results. For DNS records use dns_lookup; for fetching a specific URL already known, use web_fetch; for authenticated API calls use http_session_*.'
 parameters:

@@ -1,0 +1,94 @@
+id: vault-command
+kind: level
+within: creators-vault
+ordinal: 1
+name: the command level
+summary: >
+  Where orders are taken, where things enter the vault, and where the outside
+  asks its questions. Nothing the world is made of is written here.
+character: >
+  The only level with no making on it, and the only one everybody crosses.
+lacks:
+  - workstation for making anything on this level
+spine:
+  name: the ring
+  loop: true
+  through: [ring-north, ring-east, ring-south, ring-west]
+nodes:
+  - { id: ring-north, kind: passage, name: the north run }
+  - { id: ring-east, kind: passage, name: the east run }
+  - { id: ring-south, kind: passage, name: the south run }
+  - { id: ring-west, kind: passage, name: the west run }
+  - { id: cross-run, kind: passage, name: the cross run, off: [ring-east, ring-west] }
+
+  - id: core
+    kind: core
+    name: the lift and the stair
+    plural: true
+    off: [ring-north]
+    character: >
+      The car and the stairwell share one shaft at the corner, so two Makers
+      arriving at once do not wait on each other.
+
+  - id: command-room
+    kind: work
+    name: the command room
+    off: [ring-north]
+    parts: [order-table, creators-chair, { part: seat, count: 16 }]
+    habit: busy whenever orders have changed
+
+  - id: dispatch
+    kind: store
+    name: the dispatch room
+    off: [cross-run]
+    parts: [dispatch-board]
+
+  - id: receiving
+    kind: store
+    name: the receiving room
+    off: [cross-run]
+    parts: [accession-desk, stores]
+    character: >
+      Everything entering the vault stops here to have its origin written down,
+      and everything not in use is racked here. Both jobs are the same job:
+      knowing where a thing came from and where it is.
+
+  - id: enquiry
+    kind: social
+    name: the enquiry room
+    off: [ring-south]
+    parts: [enquiry-desk, { part: seat, count: 4 }]
+    habit: busy in bursts
+    character: >
+      The only room in the vault that faces outward. Questions arrive in
+      somebody else's words and have to be answered in the vault's, or admitted
+      to be unanswerable.
+
+  - id: plant
+    kind: store
+    name: the plant room
+    off: [ring-west]
+    parts: [plant-panel]
+    habit: quiet
+    character: >
+      The vault runs itself from in here and asks nothing of anybody, which is
+      why a Maker standing at the panel is either bored or worried.
+
+  - id: anteroom
+    kind: social
+    name: the anteroom
+    off: [ring-south]
+    parts: [{ part: seat, count: 16 }]
+    habit: rarely empty
+    character: >
+      Everybody passes through and most stop, which is why more gets settled
+      here than in any room built for settling things.
+
+  - id: long-bench
+    kind: social
+    name: the long bench
+    off: [ring-south]
+    parts: [{ part: seat, count: 12 }]
+    character: >
+      It is where a Maker sits with nothing in hand, which on this level is
+      most of them, most of the time.

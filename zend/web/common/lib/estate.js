@@ -10,8 +10,8 @@
  * # This list exists three times
  *
  * Rust renders it for tokera.com, this module renders it for the npcd console,
- * and `zend/web/lib/estate.js` is a copy for zend, which embeds its own assets
- * and cannot read this directory. Three copies of one list is exactly the thing
+ * and `zend/web/common/lib/estate.js` is a copy for zend, which embeds its own
+ * assets and cannot read this directory. Three copies of one list is the thing
  * that drifts, so two tests pin it: `web/src/site/tokera/page.rs` compares the
  * Rust constant against this file, and `zend`'s copy is compared byte for byte.
  * Edit this file first and let the tests tell you what else to change.

@@ -1,4 +1,29 @@
 name: http_request
+questions:
+- POST /v1/charges with this JSON on the HTTP session
+- DELETE /projects/42 through the API session
+- send a HEAD request to /health on the open HTTP session
+- PATCH the user record with these fields over the API session
+- what status code does that endpoint return
+- does the API session's auth header reach this route
+- what's in the response body for that GET
+- does it paginate, and what's on page two
+- checking whether the endpoint is behaving after the deploy
+- reproducing the failing API call the client reported
+- pulling the resource list before we reconcile
+- exercising the REST API to confirm the fix
+- GET that endpoint
+- POST this to the API
+- call the API session
+- make the HTTP request
+- GET /users/me on the open HTTP session
+- POST this JSON body to the /orders endpoint
+- send a DELETE to that resource through the API session
+- call the GraphQL endpoint with this query
+- do a PUT to update the record via the HTTP session
+- fetch /v1/status with these query parameters
+- issue a PATCH request with this payload
+- make an authenticated GET against the API session
 category: HTTP sessions
 description: 'Issue an HTTP request through an existing session — GET, POST, PUT, PATCH, DELETE, HEAD, or OPTIONS — with optional headers, query parameters, and body. Use for: REST API calls, GraphQL queries, posting JSON data, fetching authenticated resources, anything needing cookies or auth state across calls. Triggered by "call the API", "POST to", "GET from", "send a request to", "hit the endpoint", "submit to". Returns status, headers, body (text) or body_b64 (binary), final URL, and duration. GET/HEAD/OPTIONS skip confirmation; POST/PUT/PATCH/DELETE confirm. For one-shot public page retrieval use web_fetch instead.'
 high_risk: true

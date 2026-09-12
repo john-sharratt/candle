@@ -107,6 +107,9 @@ pub struct Forward<'a> {
     /// set it, and this gateway cannot tell that from a client that simply says
     /// so.
     pub secure: bool,
+    /// The cache policy to apply **only where the upstream stated none** — see
+    /// [`crate::asset::relay_cache`].
+    pub cache: crate::config::Cache,
 }
 
 pub async fn forward(f: Forward<'_>, req: Request) -> Response {
@@ -286,6 +289,8 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
         // hop instead of forwarding the upstream's.
         out.headers_mut()
             .insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+    } else {
+        crate::asset::relay_cache(out.headers_mut(), f.cache);
     }
     out
 }

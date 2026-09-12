@@ -1,4 +1,29 @@
 name: cred_list
+questions:
+- list the credentials with their types and default hosts
+- show every stored secret's metadata, not the values
+- enumerate the ssh_key entries in the store
+- what credential names can I pass to the session tools
+- do I already have something saved for that host
+- which of my credentials is a TOTP secret
+- when was each of these credentials created
+- is there a database login stored, and under what name
+- I need the right credential name before I open the session
+- checking what's available so I don't re-enter a password
+- auditing what secrets this workspace can reach
+- want to know if the old key is still in there before rotating
+- list credentials
+- what's in the store
+- show saved logins
+- credential inventory
+- what credentials do I have saved
+- list the stored logins
+- show me which SSH keys are in the credential store
+- do I have a credential for that database already
+- what's in my credential store
+- list saved credentials with their types and usernames
+- which API tokens have I stored
+- show the credential names I can use
 category: Credentials
 description: List all credentials available to the current user, returning metadata only — names, types, usernames, default hosts, creation dates — never the secret material itself. Use to discover what credentials exist before opening a session, to find a credential name by its friendly name, to check what's been saved, or to verify a credential is still present. Triggered by "what credentials do I have", "list saved logins", "show my keys", "do I have a credential for", "what's stored". An optional type filter narrows to a specific kind (e.g. ssh_key, http_bearer).
 high_risk: true

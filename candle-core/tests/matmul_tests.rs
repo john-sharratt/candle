@@ -192,3 +192,63 @@ test_device!(
 );
 test_device!(squeeze_mm, squeeze_mm_cpu, squeeze_mm_gpu, squeeze_mm_metal);
 test_device!(mm_layout, mm_layout_cpu, mm_layout_gpu, mm_layout_metal);
+
+/// **A 4-D matmul whose batch dims are both 1, against a transposed operand.**
+///
+/// This is the shape Stable Diffusion's VAE self-attention runs at: one image,
+/// one head, every latent position attending to every other. The operands are
+/// `(1, 1, hw, c)` and the transpose of the same, so the right-hand side is
+/// non-contiguous *and* every batch dim is 1 — the "squeezed layout" that
+/// `gemm_config` has dedicated match arms for, and that the stale TODO in
+/// `stable_diffusion::attention` still refers to a workaround for.
+///
+/// `squeeze_mm` and `mm_layout` above cover 3-D and small cases. Nothing covered
+/// a 4-D batch of ones at a width where the batch stride is large enough to be
+/// mis-selected, which is where a wrong stride reads the same block repeatedly
+/// and paints a periodic pattern rather than failing.
+fn attention_shaped_mm(device: &Device) -> Result<()> {
+    for &(hw, c) in &[(256usize, 64usize), (1024, 128), (4096, 64)] {
+        let mk = |n: usize, seed: u64| -> Result<Tensor> {
+            let v: Vec<f32> = (0..n)
+                .map(|i| {
+                    (((i as u64 * 6364136223846793005).wrapping_add(seed) >> 33) % 1000) as f32
+                        / 500.0
+                        - 1.0
+                })
+                .collect();
+            Tensor::from_vec(v, n, device)
+        };
+        let q = mk(hw * c, 1)?.reshape((1, 1, hw, c))?;
+        let k = mk(hw * c, 7)?.reshape((1, 1, hw, c))?;
+
+        // What the attention block does: matmul straight against a transpose.
+        let got = q.matmul(&k.t()?)?;
+        // The same product with the transpose materialised first, which no
+        // backend can shortcut.
+        let want = q.matmul(&k.t()?.contiguous()?)?;
+
+        let (a, b) = (
+            got.flatten_all()?.to_vec1::<f32>()?,
+            want.flatten_all()?.to_vec1::<f32>()?,
+        );
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            worst < 1e-3,
+            "matmul (1,1,{hw},{c}) x transposed differs from the contiguous form by {worst} — \
+             the batch stride was chosen wrongly for a squeezed layout, so the product repeats \
+             one block instead of walking the operand"
+        );
+    }
+    Ok(())
+}
+
+test_device!(
+    attention_shaped_mm,
+    attention_shaped_mm_cpu,
+    attention_shaped_mm_gpu,
+    attention_shaped_mm_metal
+);

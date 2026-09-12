@@ -850,6 +850,17 @@ impl GgmlDType {
                 Self::Q5_0 | Self::Q5_1 | Self::Q5_K => Self::Q5_KO,
                 Self::Q6_K => Self::Q6_KO,
                 Self::Q8_0 | Self::Q8_1 | Self::Q8_K => Self::Q8_KO,
+                // **A float source gets the widest twin there is**, and both modes agree
+                // because there is no wider KO grid than Q8_KO to step up to — the `Q8_*`
+                // row above lands here for the same reason.
+                //
+                // `repack_ko_into` builds it directly: `dequantize_f32_into` widens a float
+                // band with a cast where it would dequantize a quantized one, so the route
+                // is the same banded one. That is why this row exists at all — without it
+                // `to_ko` failed on a float projection and the caller fell back to
+                // dequantizing the whole tensor and re-quantizing it to `Q8_0`, which is
+                // four whole-tensor buffers where the banded route needs 48 MiB.
+                Self::F32 | Self::F16 | Self::BF16 => Self::Q8_KO,
                 // MXFP4 keeps its native 4-bit E2M1 nibbles (exact byte permutation, no
                 // requant to a wider grid; the kernel folds each per-32 E8M0 sub exactly),
                 // so it fits in RAM where Q6_KO/Q8_KO don't, with no weight-side loss.
@@ -863,6 +874,17 @@ impl GgmlDType {
                 Self::Q5_0 | Self::Q5_1 | Self::Q5_K => Self::Q6_KO,
                 Self::Q6_K => Self::Q6_KO,
                 Self::Q8_0 | Self::Q8_1 | Self::Q8_K => Self::Q8_KO,
+                // **A float source gets the widest twin there is**, and both modes agree
+                // because there is no wider KO grid than Q8_KO to step up to — the `Q8_*`
+                // row above lands here for the same reason.
+                //
+                // `repack_ko_into` builds it directly: `dequantize_f32_into` widens a float
+                // band with a cast where it would dequantize a quantized one, so the route
+                // is the same banded one. That is why this row exists at all — without it
+                // `to_ko` failed on a float projection and the caller fell back to
+                // dequantizing the whole tensor and re-quantizing it to `Q8_0`, which is
+                // four whole-tensor buffers where the banded route needs 48 MiB.
+                Self::F32 | Self::F16 | Self::BF16 => Self::Q8_KO,
                 // Same 4-bit per-sub twin as Performance — the per-sub fold is already
                 // weight-exact, so there is no wider grid to step up to.
                 Self::MXFP4 => Self::MXFP4_KO,
@@ -1846,6 +1868,20 @@ impl<'w> LiveQTensor<'w> {
         }
     }
 
+    /// Whether `repack_ko_into` can build this tensor's KO twin directly — see
+    /// [`crate::quantized::cuda::repackable_to_ko`]. Wider than
+    /// [`Self::supports_gemx_repacking`]: a float source has no GEMX kernel but is widened
+    /// band-by-band by the same banded route.
+    #[cfg(feature = "cuda")]
+    pub fn repackable_to_ko(&self) -> bool {
+        crate::quantized::cuda::repackable_to_ko(self.dtype())
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn repackable_to_ko(&self) -> bool {
+        false
+    }
+
     #[cfg(not(feature = "cuda"))]
     pub fn supports_gemx_repacking(&self) -> bool {
         false
@@ -2577,9 +2613,46 @@ impl QMatMul {
         dst: Option<(u64, crate::cuda_backend::wave_provenance::LeaseOrigin)>,
         narrow: Option<GgmlDType>,
     ) -> Result<QMatMul> {
-        let qt = self
-            .qtensor()
-            .ok_or_else(|| crate::Error::Msg("repack_for_optimization: not a QTensor".into()))?;
+        let qt = self.qtensor().ok_or_else(|| {
+            crate::Error::Msg(
+                "repack_for_optimization: not a QTensor. A source that arrives already float is \
+                 dequantized into a plain tensor by `QMatMul::from_qtensor`, so its quantized \
+                 storage is gone by the time it reaches here — repack it with \
+                 `QTensor::repack_ko` *before* building the QMatMul."
+                    .into(),
+            )
+        })?;
+        qt.repack_ko(mode, dst, narrow)
+            .and_then(QMatMul::from_qtensor)
+    }
+}
+
+impl QTensor {
+    /// Build this weight's KO twin, straight from its storage.
+    ///
+    /// # Why this is on the tensor and not on the matmul
+    ///
+    /// [`QMatMul::repack_for_optimization_narrowed`] used to hold this code, and it could not
+    /// serve a **float** source: `QMatMul::from_qtensor` dequantizes an F32/F16/BF16 weight
+    /// into a plain `Tensor`, so by the time the repack ran there was no quantized storage
+    /// left to repack and it failed with "not a QTensor".
+    ///
+    /// That mattered once `dequantize_f32_into` learned to widen a float band, because the
+    /// banded repack can now read a float source perfectly well — the only thing standing in
+    /// the way was the detour through a type that had already thrown the source away. So the
+    /// work lives here, where the storage still exists, and the matmul entry point delegates.
+    ///
+    /// Both loaders reach the same kernel by the same rules: one from a device source, one
+    /// from mapped bytes (`cuda::repack_ko_from_host`). A weight's twin does not depend on
+    /// which of them built it.
+    #[cfg(feature = "cuda")]
+    pub fn repack_ko(
+        &self,
+        mode: Int8Mode,
+        dst: Option<(u64, crate::cuda_backend::wave_provenance::LeaseOrigin)>,
+        narrow: Option<GgmlDType>,
+    ) -> Result<QTensor> {
+        let qt = self;
         // Expects a COMPACT source weight: re-running on an already-KO-optimized weight would
         // double-process it (and `to_ko`/`repack_gemx` have no KO source). Guard explicitly.
         if qt.dtype().is_ko() {
@@ -2629,13 +2702,15 @@ impl QMatMul {
             }
             _ => crate::bail!("repack_for_optimization requires CUDA storage"),
         };
-        QMatMul::from_qtensor(QTensor {
+        Ok(QTensor {
             storage: new_storage,
             shape,
             lease: PhantomData,
         })
     }
+}
 
+impl QMatMul {
     /// Matmul against a GEMX-repacked weight (see [`QTensor::repack_gemx`]),
     /// whose K/128 blocks carry embedded scales so no external scale tensor is
     /// needed.
@@ -3225,6 +3300,13 @@ mod ggml_dtype_lock_tests {
             (GgmlDType::Q8_K, GgmlDType::Q8_KO, GgmlDType::Q8_KO),
             // MXFP4 keeps its native nibbles in both modes — an exact permutation, no requant.
             (GgmlDType::MXFP4, GgmlDType::MXFP4_KO, GgmlDType::MXFP4_KO),
+            // A float source is widened band-by-band by `dequantize_f32_into` and quantized
+            // straight into its twin, so it needs no intermediate and both modes agree on the
+            // widest grid. A checkpoint that carves one tensor out at higher precision —
+            // `…NEO-IMATRIX-MAX…` keeps `output.weight` at F16 — takes this row.
+            (GgmlDType::F32, GgmlDType::Q8_KO, GgmlDType::Q8_KO),
+            (GgmlDType::F16, GgmlDType::Q8_KO, GgmlDType::Q8_KO),
+            (GgmlDType::BF16, GgmlDType::Q8_KO, GgmlDType::Q8_KO),
         ];
         for (src, perf, prec) in table {
             assert_eq!(src.to_ko(Performance).unwrap(), perf, "{src:?} Performance");

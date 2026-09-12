@@ -1,0 +1,14 @@
+id: stores
+kind: fixture
+name: the stores
+short: >
+  Where things are kept when nobody is using them, and where they have to be put
+  back.
+long: >
+  Racks, drawers, and a running list of what is in them. A vault where anything
+  can be set down anywhere loses things at a steady rate, and the loss is
+  invisible until somebody needs the thing. So stores has one rule, which is
+  that a thing has a place and goes back to it, and one recurring cost, which is
+  that somebody has to walk the racks against the list and find out what has
+  drifted. What turns up in the wrong drawer usually says something about who
+  was working on what.

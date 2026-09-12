@@ -12,7 +12,7 @@
 
 use axum::response::{Html, IntoResponse, Response};
 
-use super::page::{self, Meta, Nav, Width};
+use super::page::{self, Kind, Meta, Nav, Width};
 
 /// Measured, from `docs/unbounded_agents.md` §9 and `docs/palquant.md` §4.
 const STATS: [(&str, &str); 4] = [
@@ -331,6 +331,10 @@ pub async fn show() -> Response {
                       behind them, and earlier work on WebAssembly.",
         nav: Nav::Home,
         width: Width::Wide,
+        path: "/",
+        kind: Kind::Site,
+        image: None,
+        published: None,
     };
 
     let tiles = WORK.iter().map(tile).collect::<String>();

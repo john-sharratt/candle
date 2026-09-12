@@ -11,7 +11,7 @@ All six `.txt` files are raw PowerShell transcripts of the same test —
 `candle_transformers::models::quantized_llama::tests::test_parallel_batched_forwarding_llama3`
 (the `batch_test` story-rewrite harness, see
 `candle-transformers/src/models/batch_test/README.md`) against
-`VibeStudio/Nidum-Llama-3.2-3B-Uncensored-GGUF` — run three times each before
+the VibeStudio/Nidum Llama-3.2-3B fine-tune — run three times each before
 and after a prefill-kernel change. Each run prints a comparison table across
 KV storage modes (`F32`, `F16`, `R16`, `C0`, `C1`) reporting `t/s` (bulk and
 single-session), throughput delta vs. the `F32` baseline, `%Quantized`, and

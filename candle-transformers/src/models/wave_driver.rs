@@ -98,6 +98,21 @@ pub struct WaveGroups<'a> {
     /// norms were materialised BF16 from the session while the activations
     /// arrived F16 from the cache.
     pub act_dtype: DType,
+    /// The LoRA adapter every sequence in this wave decodes through, by name,
+    /// or `None` for the base model.
+    ///
+    /// One value for the wave, not one per sequence: the adapter alters the
+    /// projections the whole batch flows through together, so a wave is
+    /// adapter-homogeneous by construction and the scheduler loops waves by
+    /// adapter rather than batching across them.
+    /// [`BatchedInferenceSession::wave_adapter`] derives it and refuses a mixed
+    /// wave.
+    ///
+    /// A model that does not implement adapters ignores this; a model that does
+    /// resolves the name against what it has loaded, and fails if it cannot —
+    /// running unadapted because a name did not match is the failure mode this
+    /// is shaped to prevent.
+    pub adapter: Option<&'a str>,
 }
 
 /// The per-model half of a wave: run one layer range over assembled contexts.
@@ -527,6 +542,11 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     // The wave's declared activation width; it belongs to the session, not to
     // the caches.
     let act_dtype = session.activation_dtype();
+    // Same reason, and one more: this refuses a wave whose sequences disagree
+    // about their adapter. The projections run once over the whole batch, so
+    // there is no such thing as half an adapted wave — better to fail here than
+    // to give one group's conversations another group's fine-tune.
+    let wave_adapter = session.wave_adapter(&all_seqs)?;
 
     // Residual token order. The sweep packs per-token hidden states in INTERNAL
     // order `[orig-decode | single-prefills | multi-prefills | glue]` (the
@@ -596,6 +616,7 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
         WaveGroups {
             n_decode,
             n_prefill,
+            adapter: wave_adapter.as_deref(),
             seq_ids: &all_seqs,
             inputs: &all_inputs,
             pending_glue,

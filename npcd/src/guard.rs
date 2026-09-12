@@ -123,26 +123,12 @@ impl<S> Api<S> {
     }
 }
 
-/// Put a role in front of a whole service — the fallback, in practice.
-///
-/// The fallback is the quietest surface in the daemon: it answers every path
-/// the real routes did not claim, so a route deleted from [`Api`] does not stop
-/// being served, it starts being served by whatever is behind it. Naming a role
-/// for it is the same discipline applied to the one route nobody registers.
-pub fn behind<S>(roles: Roles, min: Role, service: Router<S>) -> Router<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
-    service.layer(middleware::from_fn(move |req: Request, next: Next| {
-        let roles = roles.clone();
-        async move {
-            match require(req.headers(), &roles, min) {
-                Ok(_) => next.run(req).await,
-                Err(refusal) => *refusal,
-            }
-        }
-    }))
-}
+// `behind` — a role in front of a whole service — lived here, and its only
+// caller was the fallback that served the console's fixture. That fallback is
+// gone (see `main.rs`): every path is a declared route now, so there is nothing
+// left to put a role in front of, and a function kept for a use that no longer
+// exists is a use nobody has read. It comes back with its caller if one ever
+// needs it.
 
 #[cfg(test)]
 mod tests {
@@ -217,24 +203,5 @@ mod tests {
                 },
             ]
         );
-    }
-
-    /// The fallback is a route too, and the one nobody thinks of.
-    #[tokio::test]
-    async fn a_guarded_fallback_refuses_what_it_should() {
-        let inner: Router<()> = Router::new().route("/anything", get(|| async { "ok" }));
-        let app = behind(roles(), Role::Admin, inner).with_state(());
-        let res = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/anything")
-                    .header("x-tokera-user", "nobody")
-                    .header("x-tokera-provider", "google")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 }

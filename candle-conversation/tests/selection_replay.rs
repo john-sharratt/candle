@@ -439,7 +439,9 @@ fn production_pipeline_scores(
             .zip(&raw)
             .map(|((name, _), &v)| (ChildKey::named(name.clone()), v))
             .collect();
-        cache.observe(&scope, &pairs);
+        // Each dialogue turn is its own piece of evidence; `observe` folds a
+        // given source once.
+        cache.observe(&scope, (dtl << 32) ^ didx, &pairs);
     }
     // Concept A.4 size floors (the zend content-policy values).
     let floors: Vec<f32> = slots

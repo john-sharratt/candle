@@ -131,6 +131,93 @@ normalizes into the same ~0–1000 band, selection thresholds become **uniform
 across scopes** (the "800 for tools vs 200 for repo_map" problem dissolves).
 Per-node thresholds remain *available* (varied now, a good uniform default later).
 
+### 3.4 Subdividing a scope by phase — tried, measured, REMOVED
+
+> **Status: not in the engine.** The phase lens was built, A/B'd, and found to be
+> a regression; it shipped `None`-by-default and was then deleted rather than
+> left as an off-by-default second scoring path. `ScanPolicy::phase_lens`,
+> `PhaseSpans`, `MIN_PHASE_OBSERVATIONS` and the `CollectionPhase` fusion are all
+> gone from the code. What survives is `turn_layout::phase_span_of`, which the
+> **offline** analysis path (`substrate_inspect --probe-phase` /
+> `--gallery-phase`) uses to re-run the comparison on any corpus.
+>
+> This section is kept because the measurement is the useful part, and because
+> anyone reading §20.3's 65.6-vs-21.5 will otherwise rebuild it.
+
+A turn is `user question → <think>…</think> → response`, and those regions do not
+carry the same retrieval signal. Measured for tool routing
+(`tool_selection_provenance_results.md` §20.3): routing on the `user` phase scores
+**65.6**, on `user+think` **63.4**, on `think+resp` **21.5** — the task
+description is what maps onto a tool definition, while by the time the model is
+emitting the `<tool_call>` JSON it has already committed. Scored as one window,
+which is what the whole-turn scan does, a live question is matched against an
+exemplar that is ~95% think block and call, so the region carrying the link
+contributes a few percent of the evidence and the rest is surface the gate has to
+suppress.
+
+**That reasoning did not survive contact with the corpus.** Fusing the `user`
+lens with the whole-window scan moved Tool-1 74.5% → **73.6%** and exact-1
+70.0% → 68.9%; its only real gain was total misses 6.3% → **5.7%**. Reading ~6% of
+each exemplar finds evidence where the whole window found none and dilutes the
+ranking where the whole window was already right — which is the shape of those
+numbers exactly. §20.3 does not transfer: it measured a CCA-rotated call→def
+routing, not this BDP self-retrieval.
+
+The design below is what was built, retained as the record of the attempt.
+
+So a collection also normalizes **per phase**:
+`CollectionPhase { group, name, phase }`. Three rules make the subdivision safe:
+
+1. **Fuse, don't filter.** Every lens produces scores on the same 0–1000 band and
+   the section takes the **max** across them. A lens can add evidence; none can
+   veto another. The whole-turn scan is therefore a floor, and the phase lens can
+   only raise a section the question actually matches.
+2. **A cold sub-scope falls back to its parent, it does not divide by noise.**
+   Subdividing splits the traffic, so a phase scope is cold for far longer than
+   the undivided one — and dividing by a learning-starved level does not blur the
+   ranking, it *inverts* it (§A.4 measured normalization dropping code Top-1
+   57.1% → 47.5% on cold levels). `normalize_with_fallback` therefore splits a
+   scope's children per child: those with ≥ `MIN_PHASE_OBSERVATIONS` (8, matching
+   the warm-up's probes per member) normalize on the phase scope, the rest on the
+   undivided collection, in one call.
+3. **Each lens is learned on the band it is read on.** The phase lens is probed
+   with the **pinned question window** (Concept F) and the undivided scope with
+   the whole probe — live *and* in the warm-up, which pairs each exemplar's whole
+   signature with its own user span. A phase level learned from a whole-turn probe
+   would sit on a different band from the one a live query lands on, and the
+   max-fusion would then be decided by that mismatch rather than by the evidence.
+
+**Why it was removed rather than left off.** An off-by-default lens is a second
+scoring path that nothing exercises: it cannot be trusted without re-measuring,
+it has to be kept compiling and correct against every change to the path that IS
+used, and its cost is paid in reading — the gallery walk built spans for every
+exemplar on every reprojection whether or not a node had named a phase. The
+repo's standing rule is that a path is either the path or it is not landed. The
+full table is in `tool_selection_provenance_results.md` §26.
+
+Re-run the A/B offline before rebuilding any of it:
+
+```
+substrate_inspect belief-eval --tag tool --normalize \
+    --probe-phase user --gallery-phase whole,user
+```
+
+`--probe-phase user` is load-bearing. With a whole-turn probe the exemplar carries
+its own `<tool_call>` JSON, which contains the tool's name, so the scan matches on
+the answer and the whole-window baseline reads 97.4% — a number no live query can
+reach, because live the call has not been emitted yet.
+
+The offline harness reads all three spans straight from the decls, so the
+comparison stays available per corpus without any of it living in the engine.
+
+**No new persistence.** The spans come from `TurnDecl.segments`, already written at
+seal, read through `turn_layout::phase_span_of`. Signatures are captured one per
+real token, 1:1 with that grid, so a segment's K/V span indexes a signature window
+directly. On the GPU the lens is a `start`/`end` on the existing `PagedWindow`:
+residency is shared with the whole-turn scan (same pages, no extra upload) and the
+scan index is keyed on `(sid, fingerprint, len, start, end, case)`, so the two
+scans cache separately and cannot serve each other's regions.
+
 ---
 
 ## 4. Module design
@@ -163,12 +250,20 @@ nothing per candidate and the cache can reason about them (§4.3 eviction):
     specific timeline. A re-scan mints a new timeline → a new scope.
   - `Collection { group: u64, name: String }` — a section collection (tool
     catalog); its gallery is stable, so no timeline.
+  - `CollectionPhase { group: u64, name: String, phase: Phase }` — the same
+    competition scored over only the `user` / `thinking` / `response` region of
+    each exemplar (§3.4). Its parent is the `Collection` scope of the same
+    `(group, name)`, which is what a child it has not yet learned falls back to.
   - `SubWindow { turn: u64 }` — a sub-window within one turn (future).
 - `ChildKey` — a candidate within a scope: `Turn(u64)` (turn index — allocation-
   free, stable within a gallery version) or `Named(String)` (tool / section name,
   how `belief_gallery` already keys collection members via `slot_of(tag)`).
-- `HitLevel { level: f32, count: u32 }` — the EWMA state for one child.
-- `ScopeState { children: HashMap<ChildKey, HitLevel> }` — one scope's state.
+- `HitLevel { level: f32, count: u32, peak: f32 }` — the EWMA state for one child,
+  plus the highest raw score it has ever been observed at (the Concept A.4
+  traffic-peak denominator) and how many distinct observations shaped it (what a
+  subdivided scope consults before trusting it, §3.4).
+- `ScopeState { children: HashMap<ChildKey, HitLevel>, observed: HashSet<u64> }` —
+  one scope's state, plus the evidence ids already folded into it (§4.2).
 - `NormalizationCache { cfg: NormConfig, scopes: HashMap<ScopeKey, ScopeState> }`.
 
 Turn groups key the child by index rather than by path *tag*: tag-keying (so
@@ -189,9 +284,24 @@ the scan (`score_belief_groups` / `score_belief_collections`):
    For each child, `1000 × raw / max(hit_level, floor)`; a child absent from the
    scope (never seen) uses the cold-start prior. Pure read; does not mutate. Runs
    on **every reprojection**, so selection always sees normalized scores.
-2. `observe(scope, &[(child, raw)])` — write path. Fold each raw into the child's
-   hit-level EWMA (creating it at the prior if new). Runs **once per turn, at
-   seal** — hooked into `Conversation::last_turn_belief_scores`
+2. `observe(scope, source, &[(child, raw)])` — write path. Fold each raw into the
+   child's hit-level EWMA (creating it at the prior if new). **Idempotent per
+   observation:** `source` identifies the evidence (the turn this scoring pass came
+   from) and a scope folds each source exactly once, so re-observing it is a no-op
+   — one hash lookup rejects it before any child is touched.
+
+   That idempotency is what lets the levels be rebuilt on **every load, from
+   empty**, against a substrate already on disk, while the same scopes keep
+   learning from live traffic afterwards. Without it the two paths fight: a replay
+   drags every level toward whatever it re-feeds, so the levels a load reproduces
+   differ from the ones originally learned and the ranking they drive drifts on
+   nothing but a restart. Deduplicating on the *score* instead would be wrong — a
+   promiscuous child scores about the same on everything, so it would be recorded
+   once and never learn that it is loud across all traffic, which is exactly what
+   the hit level exists to discount.
+
+   Runs **once per turn, at seal** — hooked into
+   `Conversation::last_turn_belief_scores`
    ([conversation.rs](../candle-conversation/src/conversation.rs)), which already
    re-scores the just-sealed turn's **whole-turn sig** against every gallery. This
    is exactly the probe §85 calibrated against.
@@ -220,13 +330,20 @@ window all operate on the normalized scale.
 
 Because a turn group's scope is keyed by `(group, timeline)`, a **re-scan** simply
 produces a *new* scope — the regenerated clusters start fresh at the cold-start
-prior (correct: their content changed) and rebuild over subsequent queries. The
-old scope must not linger, or the cache would leak one `ScopeState` per historical
-re-scan. So `NormalizationCache::observe` **evicts a group's stale-timeline
-scopes**: after observing `TurnGroup { group, timeline }`, it drops any
-`TurnGroup { group, timeline: other }`. The cache therefore holds **one scope per
-active turn group** at steady state. This runs once per turn (at seal) over a
-handful of scopes — cheap.
+prior (correct: their content changed) and rebuild over subsequent queries.
+
+**Every `(group, timeline)` scope is retained independently.** An earlier version
+evicted a group's *other* timelines on each observe, to hold one scope per active
+group. That assumed one active timeline per group. It is true of a re-scanned
+single cluster and **catastrophic for `code_reading`**, which has many
+simultaneously-active timelines — one per ingested file — each needing its own
+learned levels so a cross-file query can rescale them onto the common band and
+compare them fairly. The eviction wiped every file but the last, leaving the cache
+empty for all the others, so normalization degenerated to a flat `scale/prior`
+multiple of the raw score and a promiscuous low-entropy file won every query.
+
+Stale scopes from a re-scan are therefore left in place: dead once their timeline
+is inactive, bounded by the re-scan count, and one small `ScopeState` each.
 
 *Within* one gallery version the membership is fixed (a re-scan makes a new scope,
 not a mutated one), so there is no per-child add/drop reconciliation to do. When

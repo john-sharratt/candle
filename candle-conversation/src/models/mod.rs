@@ -48,8 +48,10 @@
 mod builder;
 mod dialect;
 mod hermes3;
+pub mod overrides;
 mod qwen2;
 mod qwen3;
+mod qwen35_dense;
 mod qwen36_moe;
 mod qwen38_flash_next;
 mod qwen3_moe;
@@ -103,6 +105,21 @@ pub enum ModelArch {
     /// requant — `qwen4exp/convert.rs`), the same posture as
     /// [`Self::DeepSeekV4`]'s offline KO artifact.
     Qwen4Exp,
+    /// `qwen35::HybridBatched` over a **dense** checkpoint of the same lineage —
+    /// the same DeltaNet/attention stack with the mixture taken out.
+    ///
+    /// Separate from [`ModelArch::Qwen35Hybrid`] because the loaders are not
+    /// interchangeable, and each refuses the other's checkpoint by design: a
+    /// routed file loaded densely would silently drop its experts, and a dense
+    /// file loaded through the routed path would stand up an expert cache over
+    /// weights that have none. Both refusals are correct, and having one arch
+    /// for both is what makes them reachable — `npcd` hit exactly that, five
+    /// minutes into a load, with a `is a dense checkpoint` error from the routed
+    /// loader.
+    ///
+    /// The GGUF arch string does not distinguish them; the presence of MoE
+    /// metadata does, and each loader checks it.
+    Qwen35Dense,
 }
 
 impl ModelArch {
@@ -133,9 +150,11 @@ impl ModelArch {
     /// invalidate that calibration without re-deriving it.
     pub fn native_activation_dtype(self) -> Option<DType> {
         match self {
-            // Qwen3.8-Flash-Next declares `"dtype": "bfloat16"` like the rest
-            // of the hybrid lineage, and its gate ladder runs BF16.
-            Self::Qwen35Hybrid | Self::Qwen4Exp => Some(DType::BF16),
+            // Every member of the lineage — routed, dense, and Flash-Next. The
+            // activation width is the stack's: the mixture does not change it,
+            // and Qwen3.8-Flash-Next declares `"dtype": "bfloat16"` like the
+            // rest, with a gate ladder that runs BF16.
+            Self::Qwen35Hybrid | Self::Qwen35Dense | Self::Qwen4Exp => Some(DType::BF16),
             Self::Qwen3 | Self::Qwen3Moe | Self::Qwen2 | Self::Llama | Self::DeepSeekV4 => None,
         }
     }
@@ -208,6 +227,19 @@ pub enum Model {
     /// [`qwen38_flash_next`] and [`ModelSpec::prepared_from_source`].
     Qwen38_FlashNext_Q4KO,
 
+    /// Qwen3.5-9B Q6_K — the lineage's **dense** member (~7.5 GB), same hybrid
+    /// attention/DeltaNet stack with the mixture taken out.
+    ///
+    /// A hundred characters thinking about different things is the case where a
+    /// routed model's expert amortisation is weakest, and the dense one has no
+    /// expert cache to thrash — so a character costs the same whether it is the
+    /// only one awake or one of a hundred.
+    ///
+    /// This is `npcd`'s model. A deployment wanting a fine-tune of it in its
+    /// place says so in `models.override.yaml` rather than adding a variant
+    /// here — see [`overrides`].
+    Qwen35_9B_Q6,
+
     // ── Qwen2 ──────────────────────────────────────────────────────────
     /// Qwen2-0.5B-Instruct Q4_0 — tiny, great for CI and testing (~0.4 GB).
     Qwen2_0_5B,
@@ -247,6 +279,27 @@ pub enum Model {
 // ModelSpec
 // ────────────────────────────────────────────────────────────────────────────
 
+/// One PEFT LoRA adapter's coordinates.
+///
+/// The adapter directory is a whole HF repo — PEFT writes `adapter_config.json`
+/// and `adapter_model.safetensors` side by side, and the loader reads both — so
+/// this names a repo rather than a file, which is the one place a LoRA's
+/// coordinates differ from a GGUF's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoraSpec {
+    /// What a conversation calls it in
+    /// [`Conversation::set_lora`](crate::Conversation::set_lora). Local to this
+    /// deployment and deliberately short — the repo name is not a usable handle.
+    pub name: String,
+    /// HuggingFace repository holding the PEFT files.
+    pub repo: String,
+    /// Pinned revision, for the reason [`ModelSpec::tokenizer_rev`] gives at
+    /// length: an unpinned repo names a moving target, and an adapter that
+    /// silently changes under a deployment changes what its characters say with
+    /// nothing in this codebase changing. `"main"` where a pin is not available.
+    pub revision: String,
+}
+
 /// Immutable metadata for a model variant.
 ///
 /// Returned by [`Model::spec`]. For built-in presets the string fields are
@@ -256,6 +309,18 @@ pub enum Model {
 pub struct ModelSpec {
     /// Weight-loader architecture.
     pub arch: ModelArch,
+    /// PEFT LoRA adapters loaded alongside this model's weights.
+    ///
+    /// Loaded once with the checkpoint and shared by every conversation that
+    /// opts into one — nothing is merged, so the base stays quantized and one
+    /// resident model serves adapted and unadapted conversations at the same
+    /// time. A conversation chooses by name with
+    /// [`Conversation::set_lora`](crate::Conversation::set_lora); the default is
+    /// the base model.
+    ///
+    /// Empty for most presets. Non-empty means "this model always has these
+    /// available", not "every conversation uses them".
+    pub loras: Vec<LoraSpec>,
     /// Chat template format.
     pub chat_format: DialectType,
     /// Dialect used to construct chat messages
@@ -281,11 +346,38 @@ pub struct ModelSpec {
     /// prepare step", and retrying it on every start is worse. The resolver
     /// looks in the local cache and, failing that, says what to run.
     pub prepared_from_source: bool,
+    /// Pinned revision of [`Self::model_repo`], as [`Self::tokenizer_rev`] pins the tokenizer's.
+    ///
+    /// **The weights are the one coordinate it was still possible to leave unpinned.** A repo
+    /// and a filename name a moving target: resolution falls back to `refs/main`, so an
+    /// upstream re-upload changes the weights a deployment serves with nothing in this
+    /// codebase changing — and this lineage has already been bitten by exactly that once, on
+    /// the gate side, where "an upstream re-upload silently invalidated a threshold tuning".
+    /// The gates pinned a commit in response; the serving path kept resolving `main`, so the
+    /// gate and the daemon could load different bytes from the same repo name.
+    ///
+    /// Empty means unpinned, which is right for a custom model built from a local file and is
+    /// a gap anywhere else. A preset pins one wherever a verified commit exists for it.
+    pub model_rev: String,
     /// Exact on-disk size of the GGUF file in bytes. Presets pin the
     /// published file's length; custom models read it from the local file.
     /// Downloaders use it for progress totals when the server omits
     /// Content-Length.
     pub model_bytes: u64,
+    /// The checkpoint this one replaced, as `(repo, rev, filename)`, when it replaced one.
+    ///
+    /// **Not a second model — a source of last resort for tensors the primary got wrong.**
+    /// The DeltaNet recurrent gates (`ssm_alpha`/`ssm_beta`) must be F32, and a conversion
+    /// whose quant rules do not know this architecture stores them like any other 2-D weight;
+    /// the model then loads cleanly and generates incoherent text from its first token. The
+    /// base checkpoint still has them, and they are the tensors a fine-tune has least reason
+    /// to have moved.
+    ///
+    /// Set by [`overrides`] when a local override replaces a preset's checkpoint, so it is
+    /// always the preset the override displaced. `None` for a preset used as published — a
+    /// stock conversion has nothing to repair — and for a custom model, which has no base.
+    /// Nothing is fetched unless the primary is found to need it.
+    pub gate_donor: Option<(String, String, String)>,
     /// HuggingFace repository containing `tokenizer.json`.
     pub tokenizer_repo: String,
     /// Pinned revision of [`Self::tokenizer_repo`], as the gates pin theirs.
@@ -332,8 +424,46 @@ impl Model {
         ModelBuilder::from_spec(spec)
     }
 
-    /// Full specification for this model variant.
+    /// Full specification for this model variant, **with any local override
+    /// applied**.
+    ///
+    /// Every consumer of a preset goes through here — the builder, the loader,
+    /// npcd's console — so this is the one place an override has to be applied
+    /// for it to be applied everywhere. [`Self::preset_spec`] is the same answer
+    /// without the override, which only the override machinery and its tests
+    /// want.
     pub fn spec(self) -> ModelSpec {
+        let key = self.override_key();
+        let spec = self.preset_spec();
+        match key {
+            Some(k) => overrides::apply(&k, spec),
+            // `Custom` is already whatever the caller said it was. Overriding it
+            // would mean a file on disk silently rewriting a spec the caller
+            // constructed by hand, which is the opposite of what `Custom` is
+            // for.
+            None => spec,
+        }
+    }
+
+    /// The variant's name as `models.override.yaml` addresses it, or `None` for
+    /// [`Model::Custom`], which is not overridable.
+    ///
+    /// Taken from `Debug` rather than a hand-written match. A match would be a
+    /// second list of every variant, and when the two drifted the symptom would
+    /// be an override key that quietly stopped matching — a config file that
+    /// looks right, parses, and does nothing. Every overridable variant is a
+    /// unit variant, so its `Debug` output *is* the identifier;
+    /// `every_variants_override_key_is_its_identifier` holds that true.
+    pub fn override_key(&self) -> Option<String> {
+        match self {
+            Model::Custom(_) => None,
+            other => Some(format!("{other:?}")),
+        }
+    }
+
+    /// Full specification for this model variant, as the repository declares it
+    /// and before any local override.
+    pub fn preset_spec(self) -> ModelSpec {
         match self {
             // Qwen3
             Model::Qwen3_8B_Q4 => qwen3::qwen3_8b_q4(),
@@ -344,6 +474,7 @@ impl Model {
             // Qwen3 MoE
             Model::Qwen36_35B_A3B_Q4 => qwen36_moe::qwen36_35b_a3b_q4(),
             Model::Qwen38_FlashNext_Q4KO => qwen38_flash_next::qwen38_flash_next_q4ko(),
+            Model::Qwen35_9B_Q6 => qwen35_dense::qwen35_9b_q6(),
             Model::Qwen3_30B_A3B_Q4 => qwen3_moe::qwen3_30b_a3b_q4(),
             Model::Qwen3_30B_A3B_Q6 => qwen3_moe::qwen3_30b_a3b_q6(),
             // Qwen2
@@ -427,6 +558,7 @@ impl std::fmt::Display for ModelArch {
             ModelArch::DeepSeekV4 => write!(f, "DeepSeekV4"),
             ModelArch::Qwen4Exp => write!(f, "Qwen4Exp"),
             ModelArch::Qwen35Hybrid => write!(f, "Qwen35Hybrid"),
+            ModelArch::Qwen35Dense => write!(f, "Qwen35Dense"),
         }
     }
 }

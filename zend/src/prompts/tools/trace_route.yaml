@@ -1,4 +1,29 @@
 name: trace_route
+questions:
+- traceroute to 1.1.1.1
+- show every hop between here and the Frankfurt endpoint
+- map the path to that CDN edge with per-hop latency
+- trace to the database host and mark where it jumps
+- which hop is adding all the latency
+- how many routers are between us and them
+- does the traffic leave our network before it fails
+- where exactly does the path stop responding
+- pings get through but throughput is terrible, find the bad link
+- the connection dies partway and I want to see where
+- suspect the upstream transit provider, prove it
+- routing looks asymmetric, let's see the forward path
+- trace it
+- traceroute that
+- show me the hops
+- where does it break
+- traceroute to that host and show me every hop
+- where along the path is the traffic slowing down
+- map the router path to this server
+- which hop is dropping packets on the way there
+- show me the network route to this address
+- trace the path packets take to reach the API
+- how many hops away is this host, and what are they
+- find where the route to this domain breaks
 category: Network diagnostics
 description: Map the router-by-router path packets take to reach a host, reporting every intermediate hop and its latency. Use to locate where along the route traffic fails or slows.
 high_risk: true

@@ -1,4 +1,29 @@
 name: http_session_close
+questions:
+- close HTTP session id 2 and drop its cookie jar
+- shut the API session down and release the connection pool
+- end the web session against the admin portal
+- terminate the HTTP session before we switch tokens
+- can I close the API session now that we're done
+- will closing the HTTP session log me out of the site
+- is it safe to drop this API session mid-workflow
+- do I need to close the HTTP session before opening another
+- finished with that REST API for now
+- switching to production credentials, so the old HTTP session must go
+- want the cookies cleared before I test the login flow again
+- cleaning up the API sessions I opened while debugging
+- log out of the API session
+- release the HTTP keep-alive connections for that session
+- drop the HTTP web session
+- end the API connection
+- close the HTTP session
+- disconnect from that API, I'm finished
+- log out of the web session and drop the cookies
+- end the API session before we switch credentials
+- shut the HTTP client session down
+- release the connection pool for that API
+- close out the REST session
+- terminate the HTTP session with that base URL
 category: HTTP sessions
 description: Release the cookie jar and connection pool for an HTTP session. Idempotent. Use when finished with an API workflow or before starting a fresh session with different auth. Triggered by "close the HTTP session", "disconnect from the API", "end the session", "log out of the API".
 high_risk: true

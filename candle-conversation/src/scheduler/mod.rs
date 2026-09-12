@@ -18,6 +18,7 @@
 mod admission;
 mod decode;
 pub mod exported_state;
+mod guest_room;
 #[cfg(feature = "kv-zero-check")]
 pub(crate) mod kv_zero_check;
 pub mod memory_report;
@@ -41,6 +42,7 @@ use crate::persistence::cold_load::{
     preallocate_pinned_scratch, ColdLoadStager, PINNED_PREALLOC_BYTES,
 };
 use crate::persistence::content_hash::{section_stream_id, turn_stream_id, ContentChain};
+use crate::stuffed_grid::CarvedRegion;
 // Only the K/V-digest request carries these, and it is a test-helper probe.
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::persistence::content_hash::{ContentHash, ContentHasher};
@@ -52,16 +54,18 @@ use crate::projection::event::{group_name_of, layer_name_of_group};
 use crate::projection::Content;
 use crate::projection::{
     decode_events, encode_events, summary_node_event, Builder, CompressionPrompt, Conversation,
-    GroupKey, PriorBelief, ProjectionMode, ProjectionSegment, ProjectionTarget, ResolvedSection,
-    ResolvedTurn, SealedKind, SectionId, SelectionState, SystemPromptItem, TimelineId, TurnId,
-    TurnIndex, TurnKey,
+    GroupKey, Observe, PriorBelief, ProjectionMode, ProjectionSegment, ProjectionTarget,
+    ResolvedSection, ResolvedTurn, SealedKind, SectionId, SelectionState, SystemPromptItem,
+    TimelineId, TurnId, TurnIndex, TurnKey,
 };
 use crate::provenance::{
     encode_wide_sigs_with, extract_q_vector_r16, fold_fits, fold_provenance_fitted, FoldParams,
     GalleryArena, WideQSig,
 };
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
-use crate::stencil::{Healed, StencilDriver, StepMask, TriggerRegistry, TOOL_CALL_TREE_LABEL};
+use crate::stencil::{
+    Healed, StencilDriver, StencilTree, StepMask, TriggerRegistry, TOOL_CALL_TREE_LABEL,
+};
 use crate::substrate::{ResidenceIndex, TurnPartWrite};
 use crate::summary_tree::scope::Scope;
 use crate::summary_tree::{
@@ -151,7 +155,10 @@ pub(crate) enum SchedulerRequest {
     /// [`Self::NewSequence`].
     ///
     /// Returns `Err(...)` if the timeline is not registered.
-    #[allow(dead_code)] // public scheduler API; used by Phase 2 resume callers
+    ///
+    /// Reached through [`crate::ConversationEngine::resume_conversation_with_projection`],
+    /// which is what a mind that never stops living opens its conversation with
+    /// after a restart.
     ResumeSequence {
         conversation: Conversation,
         timeline: TimelineId,
@@ -189,6 +196,15 @@ pub(crate) enum SchedulerRequest {
     /// never sees the view ids change.  The caller just streams events
     /// from `event_tx`.
     SubmitTurn {
+        /// Present when this submission is a STUFFED prefill: many turns laid
+        /// into one grid, each to be sealed to its own block range
+        /// ([`SealAction::TurnGroup`]). `None` is the ordinary one-turn
+        /// submission, whose turn is the slot's tail.
+        ///
+        /// The regions come from [`crate::stuffed_grid`], which guarantees they
+        /// partition the grid's blocks; the seal trusts that and does not
+        /// re-derive it.
+        seal_group: Option<Arc<Vec<CarvedTurn>>>,
         sequence_id: SequenceId,
         /// Projection inputs.  When `Some`, the scheduler runs
         /// `projection.project(target, &substrate)` at handler
@@ -269,6 +285,14 @@ pub(crate) enum SchedulerRequest {
         /// their trigger token (e.g. `<tool_call>`).  An empty registry means no
         /// constrained decoding — the turn free-decodes.
         triggers: Arc<TriggerRegistry>,
+        /// A grammar this turn *begins inside* — see [`TurnOptions::turn_grammar`].
+        /// Its opening scaffold is already appended to `tokens`; the driver is
+        /// armed at the prefill boundary so the first sampled token is masked.
+        turn_grammar: Option<Arc<StencilTree>>,
+        /// Whether the schema asked for repetition penalties to be lifted inside
+        /// tool calls — see
+        /// [`crate::projection::Schema::free_tool_calls_from_penalties`].
+        free_tool_calls_from_penalties: bool,
     },
 
     /// Free a sequence slot.
@@ -280,6 +304,19 @@ pub(crate) enum SchedulerRequest {
     /// so the next prefill starts from scratch.
     ResetSequence {
         sequence_id: SequenceId,
+        response_tx: Sender<Result<(), ConversationError>>,
+    },
+
+    /// Choose the LoRA adapter this sequence decodes through, by name, or
+    /// `None` for the base model.
+    ///
+    /// Sent before the sequence's first turn. Changing it mid-conversation is
+    /// refused by the handler: the KV already written was produced by the
+    /// projections in force when it was written, and continuing with different
+    /// ones would attend those keys with queries from another model.
+    SetSequenceAdapter {
+        sequence_id: SequenceId,
+        adapter: Option<Arc<str>>,
         response_tx: Sender<Result<(), ConversationError>>,
     },
 
@@ -585,6 +622,20 @@ pub(crate) enum SchedulerRequest {
         timelines: Vec<TimelineId>,
         response_tx: Sender<Result<usize, ConversationError>>,
     },
+
+    /// Nothing to do — wake the loop so it looks around.
+    ///
+    /// **Guest work needs this and nothing else does.** An idle scheduler parks
+    /// in `rx.recv()`, and everything else that produces work arrives *through*
+    /// that channel, so the block is also the wake. The guest queue is the one
+    /// producer that is not a `SchedulerRequest`: a job submitted to an idle
+    /// daemon sat in the queue forever, because the loop was parked below the
+    /// point that polls it and nothing was ever going to arrive to unpark it.
+    ///
+    /// Handled as a no-op that returns to the top of the loop, where the guest
+    /// poll is. Sent after the job is queued, so the loop either sees the work
+    /// on its own or is woken to it — there is no ordering in which both miss.
+    Wake,
 
     /// Shut down the scheduler.
     Shutdown,
@@ -1307,6 +1358,10 @@ struct DecodeState {
     /// suppressed so the generic call body can't re-orient the committed tool.
     /// Migrates with the decode state across view swaps.
     in_tool_call: bool,
+    /// Whether this turn's schema asked for repetition penalties to be lifted
+    /// while a tool call runs. Off unless the schema names it — see
+    /// [`crate::projection::Schema::free_tool_calls_from_penalties`].
+    free_tool_calls_from_penalties: bool,
     /// Tool-call stencils available this turn, keyed by trigger token.  Empty
     /// registry = free decode.  Carried from the turn's `SubmitTurn`.
     triggers: Arc<TriggerRegistry>,
@@ -1655,6 +1710,18 @@ pub(crate) enum SealAction {
     /// seal stashed in [`Scheduler::pending_compression_seals`], and replies to
     /// the summariser. `max_decode_tokens` is 0 — prefill + seal, no decode.
     CompressionTurn { job_id: u64 },
+    /// Seal SEVERAL turns carved out of one prefilled slot.
+    ///
+    /// A stuffed prefill lays many cases down in a single forward
+    /// ([`crate::stuffed_grid`]); this seals each one to its own block range, so
+    /// each gets its own substrate turn and its own `sign(Q)` gallery window.
+    /// Every region but the last names an explicit [`SealEnd::At`] — without
+    /// one, the first seal would run to the slot's end and swallow the rest.
+    ///
+    /// Ordered, and sealed in order: a turn's substrate index is assigned as it
+    /// is written, so out-of-order seals would record the group's turns in a
+    /// sequence that does not match their K/V.
+    TurnGroup(Arc<Vec<CarvedTurn>>),
 }
 
 /// Content the substrate pins on a `SealAction::Turn` write — the
@@ -1676,6 +1743,18 @@ pub(crate) struct TurnContent {
     /// order.  Must match the K/V chunk grid 1-1; consumed by
     /// `persist_tokens_only` for cross-process replay.
     pub token_ids: TokenBuffer,
+}
+
+/// One turn carved out of a stuffed prefill: where its K/V sits in the shared
+/// slot, and what the substrate pins on it.
+///
+/// `region` comes from [`crate::stuffed_grid::plan_stuffed_grid`], which
+/// guarantees the regions of a group partition the slot's blocks — no block in
+/// two windows, none left out.
+#[derive(Debug, Clone)]
+pub(crate) struct CarvedTurn {
+    pub region: CarvedRegion,
+    pub content: TurnContent,
 }
 
 /// A section whose hot bytes are in their native (prefill-output) form
@@ -1749,6 +1828,13 @@ pub(super) struct PrefillWork {
     /// Tool-call stencils carried through prefill and installed on the
     /// [`DecodeState`] at decode start.  Empty registry = no constrained decode.
     pub(super) triggers: Arc<TriggerRegistry>,
+    /// A grammar the turn begins inside — see [`TurnOptions::turn_grammar`].
+    /// Armed at the prefill boundary, before the first token is sampled.
+    pub(super) turn_grammar: Option<Arc<StencilTree>>,
+    /// Whether this turn's schema asked for repetition penalties to be lifted
+    /// while a tool call is emitted — see
+    /// [`crate::projection::Schema::free_tool_calls_from_penalties`].
+    pub(super) free_tool_calls_from_penalties: bool,
 }
 
 /// An in-flight prefill, partially advanced. Lives across scheduler
@@ -1769,6 +1855,56 @@ pub(super) struct ActivePrefill {
     pub(super) error: Option<ConversationError>,
     /// Wall-clock when prefill processing actually started (first chunk).
     pub(super) prefill_start: Option<Instant>,
+}
+
+/// Where a seal's block range ends.
+///
+/// A seal captures `[seal_block_from, end)` — the K/V it persists, the
+/// per-layer slice it detaches, and the per-token `sign(Q)` window it gathers
+/// for the provenance gallery all read that one range.
+///
+/// **Named rather than an `Option<usize>` on purpose.** Every seal in the tree
+/// today is the tail of its slot, so "to the end" was implicit and there was no
+/// upper bound to get wrong. That stops being true the moment a slot holds more
+/// than one sealable region — several turns prefilled in a single forward, say —
+/// and the failure is silent: the first seal's range runs past its own turn and
+/// swallows every block behind it, so one turn's gallery window contains all of
+/// them and the rest seal empty. A bare `None` at a call site reads as "no
+/// preference"; [`SealEnd::SlotEnd`] reads as the claim it actually is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SealEnd {
+    /// Through the last block the slot holds — this region is the slot's tail,
+    /// and nothing is appended behind it before the seal runs.
+    SlotEnd,
+    /// Stop at this exclusive block index. For a region with more sealable
+    /// blocks behind it on the same slot.
+    At(usize),
+}
+
+/// Resolve a seal's block range against the slot as it actually stands.
+///
+/// `block_count` is the slot's authoritative chunk total and `chunk_len` the
+/// snapshot's; the range is clamped to both because a snapshot taken a moment
+/// earlier can be the shorter of the two, and indexing past it would panic a
+/// slice. Returns `None` when the range is empty — the caller treats that as
+/// "nothing to seal" and, for a turn, warns loudly, because an empty range means
+/// the turn's K/V is gone and the seal would silently drop it.
+///
+/// Pure, so the clamping is testable without a session or a device.
+fn resolve_seal_range(
+    from: usize,
+    end: SealEnd,
+    block_count: usize,
+    chunk_len: usize,
+) -> Option<(usize, usize)> {
+    let slot_end = block_count.min(chunk_len);
+    let to = match end {
+        SealEnd::SlotEnd => slot_end,
+        // Clamped, never trusted: a caller's bound is computed from a token
+        // count and the slot is the authority on how many blocks exist.
+        SealEnd::At(to) => to.min(slot_end),
+    };
+    (to > from).then_some((from, to))
 }
 
 /// An in-flight section ingest — CPU setup is done, awaiting the batched
@@ -1812,6 +1948,16 @@ pub(super) enum WaveMember {
     /// chunk is advanced + sealed). Rides the cohort's creep so its expert loads
     /// co-batch with decode + the dialogue prefills.
     Section { seq_id: usize, advance: usize },
+}
+
+impl WaveMember {
+    /// The session sequence this member occupies, whichever kind it is.
+    pub(super) fn seq_id(&self) -> usize {
+        match self {
+            WaveMember::Prefill { seq_id } => *seq_id,
+            WaveMember::Section { seq_id, .. } => *seq_id,
+        }
+    }
 }
 
 // ————————————————————————————————————————————————————————————————————————————
@@ -2696,6 +2842,16 @@ pub(crate) struct Scheduler {
     /// fallback). In-memory only: a daemon restart begins from an empty belief
     /// and the first turn's reprojections rebuild it.
     carried_beliefs: HashMap<SequenceId, PriorBelief>,
+    /// The co-resident models that borrow the card between waves, and the
+    /// backlog they are waiting on.
+    ///
+    /// Polled once per pass of the loop — one atomic load, answering "no" on
+    /// almost every pass — and drained between forwards when it is not empty.
+    /// Shared with the engine, which is what the API submits through. A
+    /// deployment with no guests configured carries an empty registry and a
+    /// queue nothing ever pushes to; see [`crate::guest`].
+    guests: Arc<crate::guest::Guests>,
+
     /// Pending mid-decode view swaps, queued during `batch_decode_step`
     /// (which holds shared/exclusive borrows on `active_decodes`) and
     /// drained immediately after the batch completes.  Values are
@@ -3010,6 +3166,7 @@ impl Scheduler {
         persist_trigger: PersistenceTrigger,
         summariser_trigger: SummariserTrigger,
         boundary_markers: projection_assembler::BoundaryMarkers,
+        guests: Arc<crate::guest::Guests>,
     ) -> Self {
         let device = model.device().clone();
 
@@ -3162,6 +3319,7 @@ impl Scheduler {
             ephemeral_sigs: HashMap::new(),
             turn_views: HashMap::new(),
             carried_beliefs: HashMap::new(),
+            guests,
             pending_reprojections: Vec::new(),
             slot_tokens: HashMap::new(),
             slot_projection_state: HashMap::new(),
@@ -3352,6 +3510,7 @@ impl Scheduler {
             }
 
             SchedulerRequest::SubmitTurn {
+                seal_group,
                 sequence_id,
                 projection_inputs,
                 prefill_tokens,
@@ -3371,6 +3530,8 @@ impl Scheduler {
                 reprojection,
                 disable_reprojection,
                 triggers,
+                turn_grammar,
+                free_tool_calls_from_penalties,
             } => {
                 // The sequence acts as the parent slot for a carved
                 // view inside this handler — rebind for clarity.
@@ -3399,7 +3560,13 @@ impl Scheduler {
                     SealAction::None
                 } else {
                     match (&projection_inputs, slot_target) {
-                        (Some(_), Some(_)) => SealAction::Turn,
+                        // A stuffed prefill seals region by region. Same
+                        // preconditions as a single turn — it still needs a
+                        // projection and a substrate target to write into.
+                        (Some(_), Some(_)) => match seal_group {
+                            Some(turns) => SealAction::TurnGroup(turns),
+                            None => SealAction::Turn,
+                        },
                         _ => SealAction::None,
                     }
                 };
@@ -3829,6 +3996,8 @@ impl Scheduler {
                     projection_offsets,
                     staged_composition,
                     triggers,
+                    turn_grammar,
+                    free_tool_calls_from_penalties,
                 });
                 true
             }
@@ -3909,6 +4078,35 @@ impl Scheduler {
                 true
             }
 
+            SchedulerRequest::SetSequenceAdapter {
+                sequence_id,
+                adapter,
+                response_tx,
+            } => {
+                // **Only on an empty slot.** The KV already in this sequence was
+                // written by whichever projections were in force at the time,
+                // and the adapter changes them — so switching mid-conversation
+                // would attend adapted keys with unadapted queries, or the
+                // reverse. Nothing about the shapes objects; the answers just
+                // quietly degrade, which is why this is refused rather than
+                // documented.
+                let offset = self.session.sequence_offset(sequence_id.0);
+                let result = if offset.unwrap_or(0) > 0 {
+                    Err(ConversationError::Model(candle::Error::Msg(format!(
+                        "sequence {} already holds {} tokens of KV — a LoRA must be \
+                         chosen before a conversation's first turn, not after",
+                        sequence_id.0,
+                        offset.unwrap_or(0)
+                    ))))
+                } else {
+                    self.session
+                        .set_sequence_adapter(sequence_id.0, adapter)
+                        .map_err(ConversationError::Model)
+                };
+                let _ = response_tx.send(result);
+                true
+            }
+
             SchedulerRequest::IngestSection {
                 sequence_id,
                 section_id,
@@ -3932,6 +4130,7 @@ impl Scheduler {
                                 .perform_seal_and_write(
                                     sequence_id,
                                     seal_block_from,
+                                    SealEnd::SlotEnd,
                                     &SealAction::Section {
                                         section_id,
                                         tokens: Arc::new(tokens.to_vec()),
@@ -4330,6 +4529,10 @@ impl Scheduler {
                 let _ = response_tx.send(Ok(demoted));
                 true
             }
+
+            // Nothing to do. Returning to the top of the loop *is* the work —
+            // that is where the guest queue is polled.
+            SchedulerRequest::Wake => true,
 
             SchedulerRequest::Shutdown => false,
         }
@@ -4948,6 +5151,8 @@ impl Scheduler {
             max_tokens,
             sampling_config: config,
             seal_action: SealAction::CompressionPass { job_id },
+            // A compression pass emits no tool calls.
+            free_tool_calls_from_penalties: false,
             prefill_assistant_text: String::new(),
             finished: false,
             decode_start: Instant::now(),
@@ -5252,6 +5457,8 @@ impl Scheduler {
             projection_offsets: Vec::new(),
             staged_composition: None,
             triggers: Arc::new(TriggerRegistry::new()),
+            turn_grammar: None,
+            free_tool_calls_from_penalties: false,
         });
         Ok(())
     }
@@ -5451,6 +5658,7 @@ impl Scheduler {
             },
         ])
     }
+
 
     /// Seal a re-prefilled compressed turn once the shared wave finishes its
     /// prefill. Snapshots the slot's freshly-computed (role-coherent) K/V,
@@ -6406,10 +6614,23 @@ impl Scheduler {
                 // want it strip at the point of use (the summariser strips its own
                 // output), and the KV already carries the reasoning tokens either
                 // way. Stripping here would silently drop reasoning on F5/reload.
-                let text = self
-                    .tokenizer
-                    .decode(&state.generated_tokens, skip)
-                    .unwrap_or_default();
+                //
+                // **The written half comes first.** An assistant prefill — a
+                // seeded `<tool_call>`, a turn grammar's opening scaffold — is
+                // assistant content that happens to have been written instead of
+                // sampled. Reporting only the sampled half hands the caller a
+                // fragment starting mid-syntax: it prefilled `{"name": "` to
+                // commit the shape, and then cannot parse the shape back,
+                // because the part it supplied is missing. The substrate had the
+                // same hole, storing a turn whose text began in the middle of
+                // its own JSON.
+                let text = format!(
+                    "{}{}",
+                    state.prefill_assistant_text,
+                    self.tokenizer
+                        .decode(&state.generated_tokens, skip)
+                        .unwrap_or_default()
+                );
                 // Snapshot stats before any view finalize, since the view
                 // slot is dropped during finalize and its sequence stats
                 // become unavailable.
@@ -6645,6 +6866,18 @@ impl Scheduler {
                 // without a second round trip.
                 let seal_result = match &state.seal_action {
                     SealAction::None => None,
+                    // A stuffed prefill carries its own per-region content,
+                    // built when the grid was planned — the generic
+                    // `TurnContent` assembled below describes the whole slot and
+                    // would give every region the same text and the same tokens.
+                    SealAction::TurnGroup(turns) => {
+                        let turns = Arc::clone(turns);
+                        // `seal_block_from` is where THIS submission's own region
+                        // starts on the slot — past the projection's materialised
+                        // system prompt. The carve's block offsets are relative to
+                        // the stuffed grid, so they are rebased onto it.
+                        self.perform_carved_turn_seals(seal_slot, seal_block_from, &turns)
+                    }
                     action => {
                         // Bundle the per-half display text and the
                         // combined token sequence the seal pinned
@@ -6696,15 +6929,14 @@ impl Scheduler {
                             full_tokens.extend_from_slice(forwarded_generated);
                             full_tokens.extend_from_slice(&state.post_decode_tokens);
 
-                            // Prefill turns (repo_map / code_reading) supply the
-                            // assistant half verbatim and never decode, so `text`
-                            // is empty — store the supplied content. Decode turns
-                            // leave it empty and fall back to the decoded `text`.
-                            let assistant_text = if state.prefill_assistant_text.is_empty() {
-                                text.clone()
-                            } else {
-                                state.prefill_assistant_text.clone()
-                            };
+                            // `text` is already written-then-decoded, so it is the
+                            // whole assistant half either way: a prefill turn
+                            // (repo_map / code_reading) supplies it verbatim and
+                            // never decodes, and a decode turn with a seeded
+                            // prefix carries both parts. Choosing between them —
+                            // which this did — silently dropped the decoded half
+                            // of any turn that had both.
+                            let assistant_text = text.clone();
                             let total = full_tokens.len() as u32;
                             let layout = self.build_turn_layout(
                                 state.user_content_start,
@@ -6728,6 +6960,7 @@ impl Scheduler {
                         self.perform_seal_and_write(
                             seal_slot,
                             seal_block_from,
+                            SealEnd::SlotEnd,
                             action,
                             turn_content,
                         )
@@ -7096,6 +7329,9 @@ impl Scheduler {
         let seal = self.perform_seal_and_write(
             sequence_id,
             seal_block_from,
+            // A section ingest prefills onto the end of its slot and seals
+            // straight away, so the section is the tail.
+            SealEnd::SlotEnd,
             &SealAction::Section {
                 section_id,
                 tokens,
@@ -7422,6 +7658,84 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Seal every turn of a stuffed prefill, each to its own block range.
+    ///
+    /// # Two coordinate spaces, and the bug that lives between them
+    ///
+    /// [`crate::stuffed_grid`] numbers its regions from the start of the GRID,
+    /// because that is the only thing it can see. The seal numbers blocks from
+    /// the start of the SLOT — and the slot opens with the projection's
+    /// materialised system prompt, so the grid does not begin at block 0.
+    /// `grid_base_block` is where it does begin (the submission's own
+    /// `seal_block_from`), and every region is rebased onto it here.
+    ///
+    /// Passing the grid-relative indices straight through is not a crash. The
+    /// seals run, report success, and record 24 turns per group — each with a
+    /// block range pointing at the prelude and at nothing, so every turn seals
+    /// **zero K/V** and captures an empty `sign(Q)` window. Measured on a full
+    /// build: 93 groups all reporting `sealed=24 of=24`, and roughly half the
+    /// question corpus silently inert. `turn-audit` is what finds it — it
+    /// cross-references each turn's sealed KV token count against its
+    /// `token_ids` length, which is the assertion a unit test of the planner
+    /// alone cannot make.
+    ///
+    /// Returns the LAST region's result, which is what rides the `Done` event:
+    /// the group's turns are written in slot order, so the last is the one a
+    /// caller's post-actions (cold store, resume marker) key on.
+    ///
+    /// **A failed region does not abort the group.** Each region is an
+    /// independent turn with its own K/V; giving up on the rest because one
+    /// failed would discard exemplars that are perfectly good, and the group is
+    /// re-run wholesale on the next load anyway. Every failure is logged with
+    /// its region so a systematically bad carve is visible as a run of them
+    /// rather than a single line.
+    fn perform_carved_turn_seals(
+        &mut self,
+        seal_slot: SequenceId,
+        grid_base_block: usize,
+        turns: &[CarvedTurn],
+    ) -> Option<SealResult> {
+        let mut last = None;
+        let mut sealed = 0usize;
+        for (i, turn) in turns.iter().enumerate() {
+            match self.perform_seal_and_write(
+                seal_slot,
+                grid_base_block + turn.region.block_from,
+                // Every region names its own end — including the last, whose
+                // blocks are the slot's tail anyway. Naming it costs nothing and
+                // means no region's correctness depends on its position in the
+                // group, so reordering or dropping one cannot silently widen
+                // another's window.
+                SealEnd::At(grid_base_block + turn.region.block_to),
+                &SealAction::Turn,
+                Some(turn.content.clone()),
+            ) {
+                Ok(Some(result)) => {
+                    sealed += 1;
+                    last = Some(result);
+                }
+                Ok(None) => tracing::warn!(
+                    region = i,
+                    blocks = ?(turn.region.block_from, turn.region.block_to),
+                    "carved turn seal found an empty block range — the region's \
+                     K/V is not on the slot, so this exemplar is lost",
+                ),
+                Err(e) => tracing::warn!(
+                    region = i,
+                    blocks = ?(turn.region.block_from, turn.region.block_to),
+                    "carved turn seal failed: {e}",
+                ),
+            }
+        }
+        tracing::debug!(
+            target: "candle_conversation::scheduler",
+            sealed,
+            of = turns.len(),
+            "sealed a stuffed prefill's carved turns",
+        );
+        last
+    }
+
     /// `turn_content`, when `seal_action == SealAction::Turn`, carries
     /// the role / text / token IDs the substrate pins on the new turn
     /// entry so the on-disk record can be reconstructed later without
@@ -7430,6 +7744,7 @@ impl Scheduler {
         &mut self,
         seal_slot: SequenceId,
         seal_block_from: usize,
+        seal_end: SealEnd,
         seal_action: &SealAction,
         turn_content: Option<TurnContent>,
     ) -> Result<Option<SealResult>, ConversationError> {
@@ -7446,17 +7761,28 @@ impl Scheduler {
         // back-to-back section injection.  See
         // `BatchedInferenceSession::sequence_block_count`.
         let block_count = self.session.sequence_block_count(seal_slot.0).unwrap_or(0);
-        if block_count <= seal_block_from {
+        // One resolution for the whole seal: the K/V slice, the token count and
+        // the `sign(Q)` gather below all read `[block_from, block_to)`, so a
+        // second derivation of either bound is a place they can disagree.
+        let Some((block_from, block_to)) = resolve_seal_range(
+            seal_block_from,
+            seal_end,
+            block_count,
+            snapshot.chunks.len(),
+        ) else {
             // Legitimate for empty section pins; for a dialogue turn it means
             // the turn's K/V range is gone and the seal would silently drop
             // the turn — always worth a loud trace.
             if matches!(seal_action, SealAction::Turn) {
                 let off = self.session.sequence_offset(seal_slot.0);
                 tracing::warn!(
-                    "turn seal SKIPPED: block_count {} <= seal_block_from {} for slot {} \
-                     (offset {:?}, layout {:?}) — the turn will NOT persist",
-                    block_count,
+                    "turn seal SKIPPED: empty block range from {} to {:?} (slot holds \
+                     {} blocks, snapshot {}) for slot {} (offset {:?}, layout {:?}) — \
+                     the turn will NOT persist",
                     seal_block_from,
+                    seal_end,
+                    block_count,
+                    snapshot.chunks.len(),
                     seal_slot,
                     off,
                     self.session
@@ -7464,7 +7790,7 @@ impl Scheduler {
                 );
             }
             return Ok(None);
-        }
+        };
 
         // GPU-resident sealed sequences.  No CPU round-trip: the
         // substrate stores `Arc<Vec<SealedSequence>>` with the same
@@ -7492,8 +7818,6 @@ impl Scheduler {
         let snapshot_us = t_snap.elapsed().as_micros() as u64;
 
         let chunk_size = self.chunk_size;
-        let block_to = block_count.min(snapshot.chunks.len());
-        let block_from = seal_block_from.min(block_to);
         let turn_token_count: usize = snapshot
             .chunks
             .get(block_from..block_to)
@@ -7804,24 +8128,46 @@ impl Scheduler {
                 // `export_recurrent` returns `None` for a model with no such
                 // state, so this site is model-agnostic and Qwen3-30B pays a
                 // branch.
+                //
+                // **Asked BEFORE the export, not after.** `enqueue_recurrent_snapshot`
+                // drops an ephemeral timeline's payload, and it has to — it is the
+                // invariant, and it guards every caller. But reaching it means the
+                // ~65 MB device→host export and the encode have already happened,
+                // for bytes that are discarded on arrival. A stuffed calibration
+                // group seals 24 turns, so that was 24 exports per group and 2,998
+                // across a full build. The state is fixed-size per sequence, so a
+                // 19-token question costs exactly what a full trajectory does.
+                let ephemeral = conversation.read().is_timeline_transient(target.timeline);
                 let t_export = Instant::now();
                 // The model's other recurrence, in its own encoding. Exported at
                 // the same instant as `layers` — one seal, one state — so the
                 // two can never describe different token counts. A model with
                 // none returns `None` and the blob is empty.
-                let aux = match self.model.export_aux_state(seal_slot.0) {
-                    Ok(blob) => blob.unwrap_or_default(),
-                    Err(e) => {
-                        tracing::warn!(
-                            "auxiliary state export failed for turn {} (the turn is \
-                             sealed; resuming it will rebuild that state by prefill): {}",
-                            idx.0,
-                            e,
-                        );
-                        Vec::new()
+                //
+                // Skipped for an ephemeral timeline alongside `layers`, and for
+                // the same reason: the payload is dropped on arrival, so the
+                // export is pure cost.
+                let aux = if ephemeral {
+                    Vec::new()
+                } else {
+                    match self.model.export_aux_state(seal_slot.0) {
+                        Ok(blob) => blob.unwrap_or_default(),
+                        Err(e) => {
+                            tracing::warn!(
+                                "auxiliary state export failed for turn {} (the turn is \
+                                 sealed; resuming it will rebuild that state by prefill): {}",
+                                idx.0,
+                                e,
+                            );
+                            Vec::new()
+                        }
                     }
                 };
-                match self.model.export_recurrent(seal_slot.0) {
+                match if ephemeral {
+                    Ok(None)
+                } else {
+                    self.model.export_recurrent(seal_slot.0)
+                } {
                     Ok(Some((schedule_hash, layers))) => {
                         let payload = SnapshotPayload {
                             timeline_id: target.timeline.raw(),
@@ -7987,6 +8333,12 @@ impl Scheduler {
                 self.persist_trigger.fire();
             }
             SealAction::None => unreachable!("filtered above"),
+            SealAction::TurnGroup(_) => unreachable!(
+                "a stuffed prefill is sealed region by region through \
+                 perform_carved_turn_seals, which passes SealAction::Turn per \
+                 region; a group reaching here would seal the whole slot as one \
+                 turn and collapse every exemplar into the first"
+            ),
             SealAction::CompressionPass { .. } => {
                 unreachable!("compression passes complete in cleanup_finished, not here")
             }
@@ -8670,6 +9022,8 @@ impl Scheduler {
         }
         keep_sections.extend(extra_sections.iter().copied());
         keep_turns.extend(extra_turns.iter().copied());
+        // The publish advances the substrate's own wave clock and stamps the
+        // active set in the same write — see `Substrate::set_working_set_pins`.
         conversation
             .write()
             .set_working_set_pins(&keep_turns, &keep_sections);
@@ -9029,7 +9383,9 @@ impl Scheduler {
             policy.target,
             &probe,
             (!probe_q.is_empty()).then_some(probe_q.as_slice()),
-            false,
+            // A live reprojection only READS the levels; the turn teaches them
+            // once, at seal, where its tags are known.
+            Observe::No,
             self.gallery_arena.as_deref(),
         );
 
@@ -9782,6 +10138,158 @@ mod tests {
         assert_eq!(sigs_without_span(run, 2..9).len(), 2);
     }
 
+    /// **Grid coordinates are not slot coordinates.** A stuffed grid is
+    /// prefilled *after* the projection lays the system prompt into the slot, so
+    /// region 0 does not start at block 0. Rebasing is what turns the planner's
+    /// grid offsets into ranges the seal can use.
+    ///
+    /// The regression: passing them unrebased sealed every turn against the
+    /// prelude, producing 24 turns per group with zero K/V and empty signatures
+    /// while every seal reported success.
+    #[test]
+    fn carved_regions_rebase_onto_the_slot_past_the_prelude() {
+        use crate::stuffed_grid::{plan_stuffed_grid, CaseGrid};
+
+        // Three cases of one, two and one blocks after padding.
+        let cases: Vec<CaseGrid> = [10usize, 40, 20]
+            .iter()
+            .map(|&n| CaseGrid {
+                tokens: vec![7; n],
+                user_content_end: 1,
+                assistant_content_start: 1,
+            })
+            .collect();
+        let grid = plan_stuffed_grid(&cases, 0);
+        assert_eq!(
+            grid.regions
+                .iter()
+                .map(|r| (r.block_from, r.block_to))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (1, 3), (3, 4)],
+            "grid-relative, counted from the grid's own start",
+        );
+
+        // The slot opens with a 3-block prelude.
+        let base = 3usize;
+        let rebased: Vec<(usize, usize)> = grid
+            .regions
+            .iter()
+            .map(|r| (base + r.block_from, base + r.block_to))
+            .collect();
+        assert_eq!(
+            rebased,
+            vec![(3, 4), (4, 6), (6, 7)],
+            "slot-relative: the first region starts where the prelude ends, and \
+             NOT at the prelude's own first block",
+        );
+        // Still a partition, and still contiguous with the prelude.
+        assert_eq!(
+            rebased[0].0, base,
+            "no gap between prelude and first region"
+        );
+        for w in rebased.windows(2) {
+            assert_eq!(w[0].1, w[1].0, "regions stay adjacent after rebasing");
+        }
+    }
+
+    /// The tail case, which is every seal in the tree today: `SlotEnd` runs to
+    /// the slot's last block.
+    #[test]
+    fn a_slot_end_seal_takes_everything_from_its_start() {
+        assert_eq!(
+            resolve_seal_range(4, SealEnd::SlotEnd, 10, 10),
+            Some((4, 10))
+        );
+        assert_eq!(
+            resolve_seal_range(0, SealEnd::SlotEnd, 10, 10),
+            Some((0, 10))
+        );
+    }
+
+    /// **The bug this type exists to prevent.** A slot holding several sealable
+    /// regions — turns prefilled together in one forward — must seal each to its
+    /// own bound. Without one, the first seal's range runs to the slot's end and
+    /// swallows every region behind it: one turn's `sign(Q)` window contains all
+    /// of them and the rest seal empty.
+    #[test]
+    fn a_carved_seal_stops_at_its_own_bound() {
+        // Three 4-block regions on one 12-block slot.
+        let slot = 12;
+        assert_eq!(
+            resolve_seal_range(0, SealEnd::At(4), slot, slot),
+            Some((0, 4)),
+        );
+        assert_eq!(
+            resolve_seal_range(4, SealEnd::At(8), slot, slot),
+            Some((4, 8)),
+        );
+        // The last region may legitimately name its bound OR run to the end;
+        // both must describe the same range, or the carve and the tail path
+        // disagree about the final turn.
+        assert_eq!(
+            resolve_seal_range(8, SealEnd::At(12), slot, slot),
+            Some((8, 12)),
+        );
+        assert_eq!(
+            resolve_seal_range(8, SealEnd::SlotEnd, slot, slot),
+            Some((8, 12)),
+        );
+    }
+
+    /// The snapshot is taken a moment before the range resolves, so it can be
+    /// the shorter of the two. Both bounds clamp to it — indexing
+    /// `snapshot.chunks[from..to]` past its end would panic the seal.
+    #[test]
+    fn the_range_clamps_to_the_shorter_of_slot_and_snapshot() {
+        // Snapshot shorter than the slot.
+        assert_eq!(resolve_seal_range(0, SealEnd::SlotEnd, 10, 6), Some((0, 6)));
+        assert_eq!(resolve_seal_range(0, SealEnd::At(9), 10, 6), Some((0, 6)));
+        // Slot shorter than the snapshot.
+        assert_eq!(resolve_seal_range(0, SealEnd::SlotEnd, 6, 10), Some((0, 6)));
+        // A caller's bound is never trusted over the slot's own count: it is
+        // computed from a token total, and the slot is the authority on blocks.
+        assert_eq!(resolve_seal_range(0, SealEnd::At(999), 6, 10), Some((0, 6)));
+    }
+
+    /// An empty range is `None`, never `Some((n, n))` — the caller warns and
+    /// skips on it, and a zero-width range that reached the gather would seal a
+    /// turn with no K/V and an empty gallery window.
+    #[test]
+    fn an_empty_range_is_none_not_a_zero_width_range() {
+        // Start at or past the end.
+        assert_eq!(resolve_seal_range(10, SealEnd::SlotEnd, 10, 10), None);
+        assert_eq!(resolve_seal_range(11, SealEnd::SlotEnd, 10, 10), None);
+        // A bound at or below the start.
+        assert_eq!(resolve_seal_range(4, SealEnd::At(4), 10, 10), None);
+        assert_eq!(resolve_seal_range(4, SealEnd::At(3), 10, 10), None);
+        // An empty slot has nothing to seal however it is asked.
+        assert_eq!(resolve_seal_range(0, SealEnd::SlotEnd, 0, 0), None);
+        assert_eq!(resolve_seal_range(0, SealEnd::At(4), 0, 0), None);
+    }
+
+    /// Carving a slot must partition it: consecutive regions leave no block
+    /// unsealed and none in two windows. Walked as a real carve would walk it.
+    #[test]
+    fn consecutive_carved_ranges_partition_the_slot() {
+        let slot = 12;
+        let bounds = [3usize, 7, 12];
+        let mut from = 0usize;
+        let mut covered: Vec<usize> = Vec::new();
+        for b in bounds {
+            let (lo, hi) = resolve_seal_range(from, SealEnd::At(b), slot, slot)
+                .expect("each region is non-empty");
+            assert_eq!(lo, from, "a region must start where the previous ended");
+            covered.extend(lo..hi);
+            from = hi;
+        }
+        assert_eq!(from, slot, "the walk must consume the whole slot");
+        assert_eq!(
+            covered,
+            (0..slot).collect::<Vec<_>>(),
+            "every block exactly once, in order",
+        );
+    }
+
     #[test]
     fn carve_ms_redistributes_and_bounds() {
         // Carves in priority order, draining each bucket before the next.
@@ -10497,7 +11005,8 @@ mod tests {
     /// A scheduler over the CPU test session and a `DummyModel`, plus its
     /// request sender — for tests that drive handler-level state (belief
     /// lifecycle) rather than forwards.
-    fn make_test_scheduler() -> (Scheduler, crossbeam::channel::Sender<SchedulerRequest>) {
+    pub(super) fn make_test_scheduler() -> (Scheduler, crossbeam::channel::Sender<SchedulerRequest>)
+    {
         let (tx, rx) = crossbeam::channel::bounded(16);
         let session = make_test_session();
         let tokenizer = make_dummy_tokenizer();
@@ -10516,6 +11025,9 @@ mod tests {
             PersistenceTrigger::noop(),
             SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),
+            // No guests: these exercise the wave loop, and an empty registry is
+            // what every deployment that has not configured one carries.
+            Arc::new(crate::guest::Guests::new()),
         );
         (scheduler, tx)
     }
@@ -10548,6 +11060,9 @@ mod tests {
             PersistenceTrigger::noop(),
             SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),
+            // No guests: these exercise the wave loop, and an empty registry is
+            // what every deployment that has not configured one carries.
+            Arc::new(crate::guest::Guests::new()),
         );
         (scheduler, tx, probe)
     }
@@ -12015,6 +12530,9 @@ mod tests {
             PersistenceTrigger::noop(),
             SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),
+            // No guests: these exercise the wave loop, and an empty registry is
+            // what every deployment that has not configured one carries.
+            Arc::new(crate::guest::Guests::new()),
         );
 
         let parent_raw = scheduler.session.create_sequence().unwrap();
@@ -12078,6 +12596,9 @@ mod tests {
             PersistenceTrigger::noop(),
             SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),
+            // No guests: these exercise the wave loop, and an empty registry is
+            // what every deployment that has not configured one carries.
+            Arc::new(crate::guest::Guests::new()),
         );
 
         let parent_raw = scheduler.session.create_sequence().unwrap();

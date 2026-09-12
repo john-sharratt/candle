@@ -417,6 +417,8 @@ fn run_loop(
             // residences (the decode is actively attending them), but with the
             // scheduler stopped nothing attends anything, so every hot turn must
             // be drainable — otherwise a pinned turn stays hot-only and un-durable.
+            // Shutdown drain: an empty keep-set stamps nothing, which is right —
+            // nothing is attending, so every residence should age out.
             conversation.write().set_working_set_pins(&[], &[]);
             // Loop hot→warm→cold (maintenance off) until nothing is left hot
             // without warm or warm without cold. One `run_pass` moves a turn all
@@ -1005,6 +1007,32 @@ fn run_pass(
                 "cache: created {n} arena(s) a wave-deferred sealing pass asked for"
             ),
             Err(e) => tracing::warn!("cache: deferred arena creation failed: {e}"),
+        }
+    }
+
+    // **The counterpart to elevate** (`docs/vram_governor_design.md` §8.1).
+    // Runs here, on the same between-forward seam as the deferred arena
+    // creation above and past the device sync, so nothing is in flight: drop the
+    // hot copy of residences no wave has attended for `IDLE_DEMOTE_GRACE_EPOCHS`,
+    // and only where a warm copy already holds the same bytes. Everything it
+    // takes is excluded from the current working set twice over — by the epoch
+    // stamp and by `working_set_pins` — so a live residence cannot be taken
+    // here, and shedding a redundant copy sets no flag and leaves no state to
+    // reset: the next `elevate_to_hot` simply lifts it again.
+    //
+    // Without this the hot set only ever grew: nothing demoted a section once
+    // `elevate_to_hot` lifted it, so every shortfall was met by conceding
+    // expert-weight ground, which is one-way.
+    {
+        let shed = conversation
+            .write()
+            .demote_idle_hot(crate::substrate::IDLE_DEMOTE_GRACE_EPOCHS);
+        if shed > 0 {
+            tracing::debug!(
+                target: "candle_conversation::persistence::tier",
+                residences = shed,
+                "idle demote: dropped the hot copy of residences no wave has attended"
+            );
         }
     }
 

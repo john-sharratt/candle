@@ -1,7 +1,7 @@
 /* npcd shell — boot, theme, nav, routing. */
 
 import { API, BACKEND } from './lib/api.js';
-import { definePage, navFor, start, go, path, link, setViewerRole, can } from './lib/router.js';
+import { definePage, navFor, navOwner, start, go, path, link, setViewerRole, can } from './lib/router.js';
 import { h, mount } from './lib/dom.js';
 import { toast } from './lib/ui.js';
 import { checkBuild, takeReloadState } from './lib/build.js';
@@ -31,30 +31,63 @@ import { estateSwitcher } from './lib/estate.js';
  *   /npc/*       → GET  /v1/npc/:nid                user
  *   /worlds      → GET  /v1/world                   unauthenticated (writes are admin)
  *   /personalities → GET /v1/personality            unauthenticated (writes are admin)
+ *   /personality/:aid/life → GET /v1/life/:who      admin
  *   /performance → GET  /v1/telemetry, /v1/memory   user
  *   /substrate   → GET  /v1/substrate/storage       admin
  *   /logs        → WS   /ws/logs                    admin
  */
 definePage({ path: '/', role: 'user', nav: { section: 'main', order: 10, label: 'My NPCs' },
   load: () => import('./pages/roster.js') });
-definePage({ path: '/npc/new', role: 'user',
+definePage({ path: '/npc/new', role: 'user', under: '/',
   load: () => import('./pages/create.js') });
-definePage({ path: '/npc/:id', role: 'user', keepsRail: true,
+definePage({ path: '/npc/:id', role: 'user', keepsRail: true, under: '/',
   load: () => import('./pages/npc.js') });
-definePage({ path: '/npc/:id/:tab', role: 'user', keepsRail: true,
+definePage({ path: '/npc/:id/:tab', role: 'user', keepsRail: true, under: '/',
   load: () => import('./pages/npc.js') });
-definePage({ path: '/interaction/:ix', role: 'user',
-  load: () => import('./pages/console.js') });
+/* There is no `/interaction/:ix` page.
+ *
+ * Talking to a character is not somewhere you go — it is two tabs on the
+ * character's own page, beside everything else about them. `messages` reaches
+ * somebody who is nowhere near; `presence` is standing in their room, which is
+ * world state rather than a route (`lib/scene.js`). A console at its own
+ * address made a session into an object an operator had to manage, and put the
+ * one thing this product is for behind a modal and a page change. */
 // Worlds and personalities are READABLE by anyone — the daemon serves their
 // GETs unauthenticated — and the pages render read-only below `admin`.
 definePage({ path: '/worlds', role: 'unauthenticated', nav: { section: 'main', order: 20, label: 'Worlds' },
   load: () => import('./pages/worlds.js') });
-definePage({ path: '/world/:wid', role: 'unauthenticated',
+definePage({ path: '/world/:wid', role: 'unauthenticated', under: '/worlds',
   load: () => import('./pages/worlds.js') });
 definePage({ path: '/personalities', role: 'unauthenticated', nav: { section: 'main', order: 30, label: 'Personalities' },
   load: () => import('./pages/personalities.js') });
+/* A personality's authored life — the four-rung ladder in `npcd/src/lifegen`.
+ *
+ * `admin` throughout, unlike the personality document above it, and the daemon
+ * agrees: the plan carries the SEED, which is the authoring intent behind a
+ * character rather than anything the character is, and every write here puts
+ * prose into the substrate that a character will believe it remembers. */
+definePage({ path: '/personality/:aid/life', role: 'admin', under: '/personalities',
+  load: () => import('./pages/life.js') });
+definePage({ path: '/personality/:aid/life/:tab', role: 'admin', under: '/personalities',
+  load: () => import('./pages/life.js') });
+/* The authored corpus as files. `user` rather than `unauthenticated` unlike the
+ * two pages above, and the daemon agrees: those answer somebody who already
+ * knows an id, while this one ENUMERATES — it hands out the mind a directory at
+ * a time, which is the browsing the `hidden` flag exists to prevent. Writing
+ * still needs `admin`; the page renders read-only below it. */
+definePage({ path: '/mind', role: 'user', nav: { section: 'main', order: 35, label: 'Mind' },
+  load: () => import('./pages/mind.js') });
 definePage({ path: '/tools', role: 'user', nav: { section: 'main', order: 40, label: 'Tools' },
   load: () => import('./pages/tools.js') });
+/* The image guest with no character attached — a prompt box for artwork. `user`
+ * like the route it calls (`/v1/image/generate`), which is the same guest the
+ * portrait button borrows and blocks the estate's thinking for either way. */
+definePage({ path: '/images', role: 'user', nav: { section: 'main', order: 42, label: 'Images' },
+  load: () => import('./pages/images.js') });
+// The cast's tick loop, live. Sits beside Tools because the two are the same
+// subject from opposite ends: what a character *can* do, and what it is doing.
+definePage({ path: '/pulse', role: 'user', nav: { section: 'main', order: 45, label: 'Pulse' },
+  load: () => import('./pages/pulse.js') });
 // Names the redo log's absolute path, so it matches `/v1/substrate/storage`.
 definePage({ path: '/substrate', role: 'admin', nav: { section: 'main', order: 50, label: 'Substrate' },
   load: () => import('./pages/substrate.js') });
@@ -65,7 +98,10 @@ definePage({ path: '/probe', role: 'user', nav: { section: 'main', order: 55, la
 // Carries every save's full path and the account ids — matches `/ws/logs`.
 definePage({ path: '/logs', role: 'admin', nav: { section: 'main', order: 70, label: 'Logs' },
   load: () => import('./pages/logs.js') });
-definePage({ path: '/system', role: 'user', load: () => import('./pages/system.js') });
+// The same page as `/performance`, under an older address, so it belongs to the
+// same nav entry.
+definePage({ path: '/system', role: 'user', under: '/performance',
+  load: () => import('./pages/system.js') });
 definePage({ path: '/me', role: 'user', load: () => import('./pages/profile.js') });
 // The signed-out landing page. Necessarily reachable by nobody in particular.
 definePage({ path: '/welcome', role: 'unauthenticated', load: () => import('./pages/landing.js') });
@@ -86,12 +122,48 @@ function setTheme(t) {
 
 let menuOpen = false;
 
+/* ── one popover at a time ──────────────────────────────────────────────────
+ *
+ * The topbar holds three: the estate switcher on the left, the collapsed nav
+ * beside it, and the appearance menu on the right. Only one of them may be
+ * open, and opening one closes the rest.
+ *
+ * Each used to dismiss only *itself*, with a one-shot document click listener —
+ * and each trigger calls `stopPropagation`, so that the click which opens a
+ * popover does not immediately reach the document and close it again. Those two
+ * together meant a trigger's click never reached the document at all, so the
+ * listener that would have closed the *other* popover never ran: opening the
+ * appearance menu while the nav menu was open left both on screen, overlapping.
+ *
+ * Closing them here, at the moment of opening, needs no event to travel
+ * anywhere and so cannot be stopped by anything. */
+function closeOtherPopovers(keep) {
+  if (keep !== 'nav' && navMenuOpen) {
+    navMenuOpen = false;
+    renderNav();
+  }
+  if (keep !== 'theme' && menuOpen) {
+    menuOpen = false;
+    renderChrome();
+  }
+  if (keep !== 'estate') {
+    // A `<details>`: closing it is setting the attribute, and it owns its own
+    // open state rather than a flag here.
+    for (const d of document.querySelectorAll('details.estate[open]')) d.open = false;
+  }
+}
+
 function themeButton() {
   const t = readTheme();
   const meta = THEMES.find((x) => x[0] === t) || THEMES[0];
   const btn = h('button', {
     class: 'btn sm', title: 'Appearance',
-    onClick: (e) => { e.stopPropagation(); menuOpen = !menuOpen; renderChrome(); },
+    onClick: (e) => {
+      e.stopPropagation();
+      closeOtherPopovers('theme');
+      menuOpen = !menuOpen;
+      renderChrome();
+    },
   }, h('span', {
     class: 'sw',
     style: 'width:12px;height:12px;border-radius:4px;background:' + meta[2]
@@ -194,7 +266,11 @@ function renderNav(activePage) {
   if (!ME) { navMenuOpen = false; return mount(host); }
 
   const items = navFor('main');
-  const current = items.find((p) => activeNavPage && activeNavPage.path === p.path);
+  // Not an exact path match: a detail page is not a nav entry, so opening one
+  // used to blank the bar — you were two levels into a world with nothing on
+  // screen saying which section you were in. `navOwner` follows the page's
+  // `under` to the entry it belongs to.
+  const current = navOwner(activeNavPage, 'main');
 
   // Wide enough for the full tab strip.
   if (!vp.narrow) {
@@ -210,7 +286,12 @@ function renderNav(activePage) {
   // names where you are. Same decision zend makes for its top-right actions.
   const btn = h('button', {
     class: 'navlink nav-collapsed' + (navMenuOpen ? ' on' : ''),
-    onClick: (e) => { e.stopPropagation(); navMenuOpen = !navMenuOpen; renderNav(); },
+    onClick: (e) => {
+      e.stopPropagation();
+      closeOtherPopovers('nav');
+      navMenuOpen = !navMenuOpen;
+      renderNav();
+    },
   }, current ? current.nav.label : 'Menu', h('span', { class: 'caret' }, '▾'));
 
   mount(host, btn);
@@ -311,6 +392,44 @@ async function gatewayHasSignIn() {
   }
 }
 
+/* Drive the loading overlay from one `/v1/status` snapshot.
+ *
+ * The phases are already in the HTML; this only lights them. Three states per
+ * row — done, current, still to come — because "which phase is this stuck on"
+ * is the question somebody watching a slow start is actually asking, and a
+ * single spinner cannot answer it.
+ *
+ * Tolerant of a snapshot it does not recognise: a daemon that adds a phase
+ * should not blank the overlay of a console that has not been redeployed. An
+ * unknown `current` simply lights nothing, and the label still reads. */
+function paintLoading(loading, detail) {
+  if (!loading) return;
+  if (detail) {
+    detail.textContent = loading.detail
+      ? loading.label + ' — ' + loading.detail
+      : (loading.label || 'loading…');
+  }
+  const bar = document.getElementById('boot-bar');
+  if (bar) bar.style.width = Math.round((loading.progress || 0) * 100) + '%';
+
+  const count = document.getElementById('boot-count');
+  if (count) {
+    /* Only when there is something real to count. `0 / 0` is not progress and
+     * an absolute readout beside an empty bar reads as a stall. */
+    count.textContent = loading.total
+      ? loading.progressed.toLocaleString() + ' / ' + loading.total.toLocaleString() +
+        (loading.unit ? ' ' + loading.unit : '')
+      : '';
+  }
+
+  const done = new Set(loading.completed || []);
+  for (const li of document.querySelectorAll('#boot-steps li')) {
+    const step = li.getAttribute('data-step');
+    li.classList.toggle('done', done.has(step));
+    li.classList.toggle('now', step === loading.current);
+  }
+}
+
 async function boot() {
   document.documentElement.setAttribute('data-theme', readTheme());
   const detail = document.getElementById('boot-detail');
@@ -324,11 +443,16 @@ async function boot() {
    *
    * Only a network failure or a not-yet-ready state is worth another go. */
   let status = null;
-  for (let i = 0; i < 40; i++) {
+  /* Long enough to cover a real cold start. The old bound was 40 × 400 ms —
+   * sixteen seconds — which was ample when nothing was loaded and is nowhere
+   * near a multi-gigabyte checkpoint coming off disk onto the card. Giving up
+   * mid-load would drop a person into an app whose every route 503s, which
+   * reads as a broken daemon rather than a slow one. */
+  for (let i = 0; i < 3000; i++) {
     try {
       status = await API.getStatus();
       if (status.state === 'ready') break;
-      if (detail) detail.textContent = status.detail || (status.loading && status.loading.current) || 'loading…';
+      paintLoading(status.loading, detail);
     } catch (e) {
       if (e && (e.status === 401 || e.status === 403)) {
         // Up, and not answering this to us. Carry on to sign-in rather than
@@ -376,7 +500,16 @@ async function boot() {
    * console's own front page rather than to `https://bot.tokera.com/`, which
    * would be a full page load to arrive where you already are. */
   const estate = document.getElementById('estate');
-  if (estate) mount(estate, estateSwitcher('npcd', { homeHref: '#/welcome' }));
+  if (estate) {
+    const switcher = estateSwitcher('npcd', { homeHref: '#/welcome' });
+    mount(estate, switcher);
+    /* The switcher is a `<details>`, so it opens itself and there is no click
+     * handler to hang this on. `toggle` does not bubble, hence the listener on
+     * the element rather than on the document. */
+    switcher.addEventListener('toggle', () => {
+      if (switcher.open) closeOtherPopovers('estate');
+    });
+  }
 
   renderChrome();
   renderNav(null);   // tabs appear immediately, even if the first page fails to render
@@ -400,10 +533,14 @@ async function boot() {
   onBreakpoint(() => { renderNav(); renderChrome(); syncRailButton(); });
   syncRailButton();
 
+  // Escape closes whatever is over the page: the drawer first, since it is the
+  // one that covers everything, then any open popover. It used to close the nav
+  // menu alone, so the appearance menu and the switcher had to be dismissed by
+  // clicking away from them.
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     if (drawerOpen) return setDrawer(false);
-    if (navMenuOpen) { navMenuOpen = false; renderNav(); }
+    closeOtherPopovers(null);
   });
 
   // Not signed in → the landing page owns the viewport.

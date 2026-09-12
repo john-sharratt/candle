@@ -1,0 +1,24 @@
+# Battle Cities — the world.
+#
+# Deployed to <mind>/map/battle-cities/, beside worlds/battle-cities.yaml. The
+# id is the same on both sides on purpose: it is what every character's
+# `world_id` names, and what its canon is tagged with in layers/world/.
+#
+# This file holds no places of its own. It is the world the buildings and
+# regions stand in, and the thing that makes them one world rather than several
+# — a Maker in the vault and a soldier in a city are in the same place, at
+# different addresses.
+id: battle-cities
+kind: world
+name: Battle Cities
+summary: >
+  The world the game is set in, and the world the Makers are making. Its cities,
+  its history and its people are written down inside it, by people who live in
+  it.
+character: >
+  Everything in it was made by somebody, and some of those somebodies are still
+  at work.
+contains:
+  - creators-vault
+  - tower-redoubt
+  - the-waste

@@ -2012,6 +2012,11 @@ impl Map1 for UpsampleNearest2D {
             unsafe {
                 kernels::simple::conv::run_upsample_nearest2d(
                     dtype,
+                    // The whole destination. The dispatcher used to size its own
+                    // launch from `out_w * out_h`, which is one channel of one
+                    // batch item — everything past that came back as whatever
+                    // the allocation held.
+                    dst_el,
                     out_w,
                     out_h,
                     scale_w,
@@ -4484,19 +4489,39 @@ impl BackendStorage for CudaStorage {
             col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
         } else {
             // Make the kernel contiguous if not already the case.
+            //
+            // **And then use it.** This branch built `kernel_c` and handed the
+            // original `kernel` to the matmul, so the copy was computed and
+            // thrown away while a non-contiguous tensor was read under a layout
+            // that claims to be contiguous. The offset comes from the copy's own
+            // layout, which starts at zero, rather than from the source's.
             let mut kernel_c = unsafe {
                 self.device()
                     .alloc_uninit(kernel_l.shape(), kernel.dtype())?
             };
             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
-            let kernel_l =
-                Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
-            col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
+            let kernel_l = Layout::contiguous((n, k)).transpose(0, 1)?;
+            col.matmul(&kernel_c, (1, b * m, n, k), &col_l, &kernel_l)?
         };
         let res_l = Layout::contiguous((b, h_out, w_out, n))
             .transpose(1, 2)?
             .transpose(1, 3)?;
-        let mut res_t = unsafe { self.device().alloc_uninit(res_l.shape(), res.dtype())? };
+        // **The convolution's output, in the arena its input came from.**
+        //
+        // Everything above this line already inherits — `Im2Col::map` carries
+        // the operand's backing and the matmul takes its lhs's — so a plain
+        // `alloc_uninit` here was the one pool allocation in the chain, and it
+        // is the largest: this is the conv's whole result, at the layer's full
+        // resolution. A convolutional decoder is nothing but this line, several
+        // hundred times, which is why an image guest could seed its stage and
+        // still watch the pool drain.
+        let mut res_t = unsafe {
+            self.device().alloc_uninit_from(
+                res_l.shape(),
+                res.dtype(),
+                res.backing.inherit_ticket(),
+            )?
+        };
         res.copy_strided_src(&mut res_t, 0, &res_l)?;
         Ok(res_t)
     }
@@ -4521,49 +4546,69 @@ impl BackendStorage for CudaStorage {
         }
         let (out_w, out_h) = (params.out_w(), params.out_h());
         let dst_el = params.c_out * out_w * out_h * params.b_size;
-        let slice = match (&self.slice, &kernel.slice) {
+        // **The convolution's output, in the arena its input came from.**
+        //
+        // The im2col path below already routes every allocation in its chain;
+        // this one — the path a cudnn build actually takes — allocated all five
+        // of its arms straight from the pool and returned `Backing::Owned`, so
+        // a conv wrote its result outside the arena *and* told everything
+        // downstream it had no provenance. In a convolutional decoder that is
+        // the whole model: the guest's activations arena went almost unasked
+        // while the pool drained, and the largest single site in a traced draw
+        // was this line at 1 GiB across twelve calls.
+        //
+        // Inheritance is from `self` — the input activation, not the kernel —
+        // for the same reason a matmul takes its lhs: the weight is resident
+        // ground and its ticket would name the wrong lifetime.
+        let inherit = self.backing;
+        let (slice, backing) = match (&self.slice, &kernel.slice) {
             (S::U8(inp), S::U8(k)) => {
                 let inp = &inp.slice(inp_l.start_offset()..);
                 let k = &k.slice(kernel_l.start_offset()..);
-                let mut out = unsafe { device.alloc::<u8>(dst_el)? };
+                let (mut out, backing) =
+                    unsafe { alloc_inheriting::<u8>(&device, dst_el, inherit)? };
                 crate::cudnn::launch_conv2d::<u8, u8>(inp, inp_l, k, &mut out, params, &device)
                     .map_err(crate::Error::wrap)?;
-                S::U8(out)
+                (S::U8(out), backing)
             }
             (S::BF16(inp), S::BF16(k)) => {
                 let inp = &inp.slice(inp_l.start_offset()..);
                 let k = &k.slice(kernel_l.start_offset()..);
-                let mut out = unsafe { device.alloc::<bf16>(dst_el)? };
+                let (mut out, backing) =
+                    unsafe { alloc_inheriting::<bf16>(&device, dst_el, inherit)? };
                 // Only PSEUDO_BFLOAT16_CONFIG is supported in cudnn, there is no "true bfloat16"
                 // version.
                 // https://docs.nvidia.com/deeplearning/cudnn/latest/api/cudnn-cnn-library.html#id88
                 crate::cudnn::launch_conv2d::<bf16, f32>(inp, inp_l, k, &mut out, params, &device)
                     .map_err(crate::Error::wrap)?;
-                S::BF16(out)
+                (S::BF16(out), backing)
             }
             (S::F16(inp), S::F16(k)) => {
                 let inp = &inp.slice(inp_l.start_offset()..);
                 let k = &k.slice(kernel_l.start_offset()..);
-                let mut out = unsafe { device.alloc::<f16>(dst_el)? };
+                let (mut out, backing) =
+                    unsafe { alloc_inheriting::<f16>(&device, dst_el, inherit)? };
                 crate::cudnn::launch_conv2d::<f16, f16>(inp, inp_l, k, &mut out, params, &device)
                     .map_err(crate::Error::wrap)?;
-                S::F16(out)
+                (S::F16(out), backing)
             }
             (S::F32(inp), S::F32(k)) => {
                 let inp = &inp.slice(inp_l.start_offset()..);
                 let k = &k.slice(kernel_l.start_offset()..);
-                let mut out = unsafe { device.alloc::<f32>(dst_el)? };
+                let (mut out, backing) =
+                    unsafe { alloc_inheriting::<f32>(&device, dst_el, inherit)? };
                 crate::cudnn::launch_conv2d::<f32, f32>(inp, inp_l, k, &mut out, params, &device)
                     .map_err(crate::Error::wrap)?;
-                S::F32(out)
+                (S::F32(out), backing)
             }
             (S::F64(inp), S::F64(k)) => {
                 let inp = &inp.slice(inp_l.start_offset()..);
                 let k = &k.slice(kernel_l.start_offset()..);
-                let mut out = unsafe { device.alloc::<f64>(dst_el)? };
+                let (mut out, backing) =
+                    unsafe { alloc_inheriting::<f64>(&device, dst_el, inherit)? };
                 crate::cudnn::launch_conv2d::<f64, f64>(inp, inp_l, k, &mut out, params, &device)
                     .map_err(crate::Error::wrap)?;
-                S::F64(out)
+                (S::F64(out), backing)
             }
             (S::U32(_), S::U32(_)) => Err(CudaError::InternalError(
                 "conv2d does not support u32".to_string(),
@@ -4578,7 +4623,7 @@ impl BackendStorage for CudaStorage {
         Ok(Self {
             slice,
             device,
-            backing: Backing::Owned,
+            backing,
         })
     }
 

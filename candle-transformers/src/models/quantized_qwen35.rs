@@ -132,6 +132,7 @@ pub(crate) fn tokenizer_json() -> Result<String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::model_overrides::{self, Checkpoint};
     use crate::models::batch_test::test_helpers::hf_get;
     use crate::models::batch_test::utils::{account_model_load, TestConfig, TestMode, TestParams};
     use crate::models::batched_inference::{InferenceMode, ManagedBatchedModel};
@@ -365,6 +366,7 @@ pub(crate) mod tests {
                 int8mode: Some(Int8Mode::auto(&device)),
                 expert_pack_dir: None,
                 mtp_path: None,
+                gate_donor_path: None,
             },
         )?;
 
@@ -465,6 +467,7 @@ pub(crate) mod tests {
                     int8mode: Some(Int8Mode::Off),
                     expert_pack_dir: None,
                     mtp_path: None,
+                    gate_donor_path: None,
                 },
             )?;
             println!("{label}:");
@@ -648,6 +651,7 @@ pub(crate) mod tests {
                     int8mode: Some(int8mode),
                     expert_pack_dir: None,
                     mtp_path: None,
+                    gate_donor_path: None,
                 },
             )?;
             println!("✓ Model loaded\n");
@@ -1051,6 +1055,7 @@ pub(crate) mod tests {
                     int8mode: Some(int8mode),
                     expert_pack_dir: None,
                     mtp_path: None,
+                    gate_donor_path: None,
                 },
             )?;
             // A gate that silently fell back to plain decode would still pass
@@ -1105,7 +1110,34 @@ pub(crate) mod tests {
             .with_int8mode(int8mode)
             .with_timeout_secs(1800);
 
-        let configs = vec![
+        let configs = story_rewrite_ladder();
+
+        let load = || {
+            let m = from_gguf_path(
+                &model_path,
+                &device,
+                Qwen35LoadOptions {
+                    int8mode: Some(int8mode),
+                    expert_pack_dir: None,
+                    mtp_path: None,
+                    gate_donor_path: None,
+                },
+            )?;
+            println!("✓ Model loaded\n");
+            Ok(m)
+        };
+        params.run(configs, load)
+    }
+
+    /// Every row the dense 9B's story-rewrite gate runs: the float modes, the
+    /// plain-quantized KV, and the full C0–C10 ladder.
+    ///
+    /// Shared by the base gate and the LoRA gate rather than written twice. The
+    /// two exist to be compared — the adapted run is this same ladder over the
+    /// same prompts with the adapter switched on — and a row present in one and
+    /// missing from the other would make that comparison quietly untrue.
+    fn story_rewrite_ladder() -> Vec<TestConfig> {
+        vec![
             TestConfig {
                 mode: InferenceMode::F16,
                 use_batched: true,
@@ -1226,22 +1258,154 @@ pub(crate) mod tests {
                 num_repeats: 1,
                 test_mode: Some(TestMode::StoryRewrite),
             },
-        ];
+        ]
+    }
+
+    /// The PEFT LoRA adapter this gate runs the 9B through.
+    ///
+    /// The repository's default is a **Bambara language adapter** — the same
+    /// worked example `candle-conversation`'s 9B preset carries. Deliberately
+    /// mundane: what this gate proves is that the *adapted path runs and still
+    /// does the task*, and any well-formed PEFT adapter over the seven
+    /// projections proves exactly that. It happens to be trained against
+    /// `unsloth/Qwen3.5-9B`, the same base lineage the pinned GGUF converts.
+    ///
+    /// Overridable as `checkpoints.Qwen35_9B_LoRA` so a deployment can run the
+    /// gate against the adapter it actually serves rather than the example.
+    fn qwen35_9b_lora() -> Checkpoint {
+        model_overrides::checkpoint(
+            "Qwen35_9B_LoRA",
+            Checkpoint::new(
+                "uknowae/bambara-qwen3.5-9b",
+                "main",
+                "adapter_model.safetensors",
+            ),
+        )
+    }
+
+    /// Fetch both of a PEFT adapter's files and return the directory holding
+    /// them.
+    ///
+    /// `adapter_config.json` is fixed by PEFT; the weights file comes from the
+    /// checkpoint so an override can name a differently-packaged one. They share
+    /// a revision directory in the HF cache, so fetching each and taking the
+    /// common parent is the whole of it — asserted rather than assumed, because
+    /// a loader pointed at a directory containing only one of the two fails in a
+    /// way that reads as a corrupt adapter.
+    fn pinned_adapter(ck: &Checkpoint) -> Result<std::path::PathBuf> {
+        let cfg = hf_get(
+            &ck.repo,
+            RepoType::Model,
+            &ck.revision,
+            "adapter_config.json",
+        )?;
+        let weights = hf_get(&ck.repo, RepoType::Model, &ck.revision, &ck.filename)?;
+        let dir = cfg
+            .parent()
+            .ok_or_else(|| candle::Error::Msg(format!("{cfg:?} has no parent directory")))?;
+        if weights.parent() != Some(dir) {
+            candle::bail!("adapter files landed in different directories: {cfg:?} and {weights:?}");
+        }
+        Ok(dir.to_path_buf())
+    }
+
+    /// **The 9B story-rewrite ladder, run through a LoRA adapter.**
+    ///
+    /// The same gate as [`test_parallel_batched_forwarding_9b`] — same prompts,
+    /// same configs (both call [`story_rewrite_ladder`]), same checkpoint — with
+    /// every sequence opted into the adapter. What it proves is that the
+    /// adapted path is a *working inference path*, not merely one that loads:
+    /// the model still performs the rewrite, across the float modes and the
+    /// whole C0–C10 KV ladder.
+    ///
+    /// # What a failure here means that the base gate cannot say
+    ///
+    /// The base gate exercises none of the adapter code. This one exercises all
+    /// seven adapted projections on every layer that carries them — q/k/v/o on
+    /// the eight attention layers, gate/up/down on all thirty-two — plus the
+    /// consequence that makes them possible: an adapted layer reports
+    /// `Int8Mode::Off`, so its activations stay float through the norm and its
+    /// attention context is not emitted as q8a1024. That switch is invisible in
+    /// the output. If it ever stops happening, `project_qkv` and the MLP say so
+    /// by name instead of adapting the wrong tensor, and this is the gate that
+    /// makes them say it.
+    ///
+    /// The comparison against the base run is the point of sharing the ladder:
+    /// the adapter is a fine-tune, so the *prose* should differ while the task
+    /// is still done. A run that fails the rewrite outright is the adapter
+    /// wired wrongly; a run whose rows match the base run token for token is an
+    /// adapter that is not being applied at all.
+    ///
+    /// # This is not a gate, and the name says so
+    ///
+    /// **The adapted ladder's thresholds were never derived.** It shares
+    /// [`story_rewrite_ladder`] with the base gate, and that ladder's rungs are
+    /// calibrated against the *base* checkpoint — `QWEN35_9B_KV_FACTORS` was
+    /// measured with no adapter in the path. An adapted decode spends error
+    /// budget the calibration did not allow for, so the top rungs fail on
+    /// numbers nobody chose for them.
+    ///
+    /// A red result here therefore means "the adapted C-ladder is uncalibrated",
+    /// which was already known, and not "something broke". A check that is
+    /// always red teaches you to skip the colour, which is worse than having no
+    /// check — so it is deliberately **outside** the
+    /// `test_parallel_batched_forwarding_9b` name the gate command filters on,
+    /// and is run by naming it.
+    ///
+    /// What it is still good for, today: proving the adapter loads, reaches
+    /// every projection it should, and changes the prose without breaking the
+    /// task. The low rungs answer that. Making it a gate means deriving
+    /// adapted KV factors, which is a measurement pass, not a threshold to
+    /// nudge.
+    #[test]
+    #[ignore = "NOT A GATE — the adapted C-ladder thresholds were never derived, so the top \
+                rungs fail by construction (see the doc comment). Downloads the pinned \
+                Qwen3.5-9B GGUF plus its LoRA adapter and needs a GPU. Run deliberately with: \
+                cargo test --release --features cuda --lib -p candle-transformers \
+                quantized_qwen35::tests::lora_ladder_9b_uncalibrated \
+                -- --ignored --nocapture --test-threads=1"]
+    fn lora_ladder_9b_uncalibrated() -> Result<()> {
+        println!("\n=== Qwen3.5-9B hybrid batched forwarding — LoRA ===\n");
+        let model_path = pinned(QWEN35_9B)?;
+        let adapter = qwen35_9b_lora();
+        let adapter_dir = pinned_adapter(&adapter)?;
+        println!("adapter: {}@{}", adapter.repo, adapter.revision);
+        println!("adapter: {adapter_dir:?}");
+        let device = Device::new_cuda(0)?;
+
+        // The same resolution the base gate does, for the same reason: the
+        // table's `int8` column must name what the model actually loaded. The
+        // adapted layers override it to `Off` per layer — that is the adapter's
+        // doing and is deliberately not reflected here, because this is the
+        // mode the *checkpoint* was loaded in.
+        let int8mode = Int8Mode::auto(&device);
+        let params = TestParams::new(10, &tokenizer_json()?, Dialect::qwen35())
+            .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
+            .with_suppress_thinking(true)
+            .with_print_outputs(true)
+            .with_int8mode(int8mode)
+            .with_lora("rp")
+            .with_timeout_secs(1800);
 
         let load = || {
-            let m = from_gguf_path(
+            let mut m = from_gguf_path(
                 &model_path,
                 &device,
                 Qwen35LoadOptions {
                     int8mode: Some(int8mode),
                     expert_pack_dir: None,
                     mtp_path: None,
+                    gate_donor_path: None,
                 },
             )?;
-            println!("✓ Model loaded\n");
+            // BF16: the width this lineage's residual stream flows in, and so
+            // the width the adapter's `A` matmul consumes. Converting per
+            // projection instead would be a full-tensor pass on the hot path.
+            m.load_adapter("rp", &adapter_dir, candle::DType::BF16)?;
+            println!("✓ Model + adapter loaded\n");
             Ok(m)
         };
-        params.run(configs, load)
+        params.run(story_rewrite_ladder(), load)
     }
 
     /// **Depth on the 9B**: the batched forward at 32K and 128K of KV.
@@ -1330,6 +1494,7 @@ pub(crate) mod tests {
                 int8mode: Some(Int8Mode::Off),
                 expert_pack_dir: None,
                 mtp_path: None,
+                gate_donor_path: None,
             },
         )?;
         // BF16, not F32: the paged decode kernel is compiled for the half

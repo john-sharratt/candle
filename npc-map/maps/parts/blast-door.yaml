@@ -1,0 +1,15 @@
+id: blast-door
+kind: fixture
+name: blast door
+short: >
+  A blast door is opened, closed and locked from the panel beside it.
+long: >
+  A slab of layered plate on rails, thick enough that closing it is a decision
+  rather than a convenience. It stands open, closed or locked, and locked is
+  different from closed: a closed door is a door somebody can open, and a locked
+  one has to be argued with. Nothing about it is subtle — everyone on both sides
+  knows which of the three it is.
+modes:
+  - open
+  - closed
+  - locked

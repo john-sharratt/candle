@@ -1,4 +1,29 @@
 name: udp_session_close
+questions:
+- close UDP session 1 and unbind its port
+- release the datagram socket pointed at the collector
+- shut the connectionless socket on port 514
+- free the UDP endpoint we opened for NTP
+- can I close the UDP socket now
+- does closing a datagram socket notify the peer
+- is the port released immediately when the UDP session closes
+- do I need to unbind before rebinding the same port
+- finished sending the syslog test packets
+- another process needs that UDP port
+- done probing the service over datagrams
+- tidying up the UDP sockets I bound
+- close the UDP socket
+- unbind the datagram port
+- release the connectionless socket
+- end the UDP session
+- close the UDP socket and free the port
+- release the datagram session
+- I'm done sending UDP packets, shut it down
+- unbind the UDP port
+- drop the connectionless socket
+- terminate the UDP session for syslog
+- close out the datagram endpoint
+- free the bound UDP port on that session
 category: UDP sessions
 description: Release a UDP datagram socket and free its bound port. Connectionless — no peer is notified.
 high_risk: true

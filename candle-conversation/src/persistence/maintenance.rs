@@ -181,21 +181,81 @@ pub fn pick_maintenance_op(stats: &[SegmentStat], force: bool) -> Option<Mainten
     None
 }
 
-/// The distill/tombstone classification of a stream, matching
-/// [`super::compaction::collect_live_records`].
+/// What a stream sheds, matching [`super::compaction::collect_live_records`].
+///
+/// # Turn tombstones were missing from this, and that is why nothing compacted
+///
+/// A stream can be dead two ways and this only knew one of them. A whole
+/// timeline tombstone (a day rolling over, a character deleted) was classified;
+/// a **turn-scoped** tombstone — what `retention` writes when a conversation's
+/// tail falls past `keep_turns` — was not.
+///
+/// The compactor always knew: `collect_live_records` reads
+/// `substrate.tombstoned_turns()` and sheds the turn's chunks, tokens and sig
+/// while keeping its `StreamDecl` as a placeholder. But the two things that
+/// decide *whether the compactor ever runs* — `segment_liveness`, and the
+/// relocation planner — went through here, so every retired turn was still
+/// counted as live weight.
+///
+/// The consequence was total. A live daemon retired ~950 of every 1000 turns
+/// exactly as configured, and the dead-byte ratio it was measured against
+/// stayed at **0.0%**, so the trigger never fired once. The log reached 132 GB
+/// and stopped only when the disk did.
+#[derive(Clone, Copy)]
+struct Shed {
+    /// The whole timeline is gone — the stream goes wholesale, unless it is
+    /// also distilled (the provenance corpus).
+    timeline_dead: bool,
+    /// This one turn was retired from a timeline that is still live.
+    turn_dead: bool,
+    distill: Option<DistillMode>,
+}
+
+impl Shed {
+    /// The three gates, spelled exactly as `collect_live_records` spells them
+    /// so the planner and the compactor cannot drift apart.
+    fn keep_chunks(&self) -> bool {
+        !self.turn_dead && self.distill.is_none()
+    }
+    fn keep_tokens(&self) -> bool {
+        !self.turn_dead && self.distill != Some(DistillMode::ProvenanceOnly)
+    }
+    fn keep_sig(&self) -> bool {
+        !self.turn_dead && self.distill != Some(DistillMode::TextOnly)
+    }
+    /// Whether the stream is skipped outright rather than shed piecemeal.
+    fn dropped_wholesale(&self) -> bool {
+        self.timeline_dead && self.distill.is_none()
+    }
+}
+
 fn classify(
     entry_decl: &Option<StreamDecl>,
     tombstoned: &HashSet<u64>,
     distilled: &HashMap<u64, DistillMode>,
-) -> (bool, Option<DistillMode>) {
-    if let Some(StreamDecl::Turn(t)) = entry_decl {
-        (
-            tombstoned.contains(&t.timeline_id),
-            distilled.get(&t.timeline_id).copied(),
-        )
-    } else {
-        (false, None)
+    dead_turns: &HashSet<(u64, u32)>,
+) -> Shed {
+    match entry_decl {
+        Some(StreamDecl::Turn(t)) => Shed {
+            timeline_dead: tombstoned.contains(&t.timeline_id),
+            turn_dead: dead_turns.contains(&(t.timeline_id, t.turn_index)),
+            distill: distilled.get(&t.timeline_id).copied(),
+        },
+        _ => Shed {
+            timeline_dead: false,
+            turn_dead: false,
+            distill: None,
+        },
     }
+}
+
+/// The retired turns, keyed the way [`classify`] compares them.
+fn dead_turns_of(substrate: &Substrate) -> HashSet<(u64, u32)> {
+    substrate
+        .tombstoned_turns()
+        .iter()
+        .map(|(tl, idx)| (tl.raw(), *idx))
+        .collect()
 }
 
 /// A resident record snapshotted from the substrate for re-emission — carries
@@ -234,6 +294,15 @@ pub struct MaintenancePlan {
     snapshot_relocs: Vec<(StreamId, RecordLoc)>,
     /// `(branch stream, source_loc)` prompt branch checkpoints to relocate.
     branch_checkpoint_relocs: Vec<(StreamId, RecordLoc)>,
+    /// `(npc stream, source_loc)` character records to relocate.
+    ///
+    /// **Relocated, never re-emitted.** An NPC's payload is not in this
+    /// process's RAM — the registry that owns it lives in the daemon above — so
+    /// unlike every other resident record it cannot be rebuilt from substrate
+    /// state and must be carried across byte-for-byte, exactly as `Snapshot` is.
+    /// Omitting it deleted characters whenever the segment holding them was
+    /// maintained.
+    npc_relocs: Vec<(StreamId, RecordLoc)>,
     /// `(type, source_loc)` singleton records to relocate.
     singleton_relocs: Vec<(RecordType, RecordLoc)>,
     /// `(npc_id, source_loc)` characters to relocate.
@@ -307,6 +376,14 @@ impl MaintenanceResult {
 /// drop-safety net (re-emitted so no dropped segment holds the only copy of
 /// live metadata), including a `Tombstone` marker per tombstoned timeline and a
 /// `Distilled` marker per distilled timeline. Pure read; no I/O.
+///
+/// **Resident means "the substrate holds its decoded state".** A record class
+/// that does not — `Npc`, whose payload belongs to the daemon above, and the
+/// read-back `Chunk` / `Tokens` / `Snapshot` / `BranchCheckpoint` bulk — cannot
+/// appear here and must be *relocated* instead ([`SubstratePersistence::gather_relocations`]
+/// and the `npc_relocs` worklist). Every class must be in exactly one of those
+/// two sets: a class in neither is deleted by the first op that touches its
+/// segment, silently. `Npc` and `TurnCoupling` were each in neither.
 fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
     let tombstoned: HashSet<u64> = substrate
         .tombstoned_timelines()
@@ -320,12 +397,13 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
         .collect();
 
     let mut out: Vec<Resident> = Vec::new();
+    let dead_turns = dead_turns_of(substrate);
     for (stream_id, entry) in substrate.all_streams() {
-        let (is_tomb, distill) = classify(&entry.decl, &tombstoned, &distilled);
+        let shed = classify(&entry.decl, &tombstoned, &distilled, &dead_turns);
         // Tombstoned AND undistilled goes; tombstoned-but-distilled is the
         // provenance corpus and is retained by its mode. See the same gate in
         // `compaction::collect_live_records`.
-        if is_tomb && distill.is_none() {
+        if shed.dropped_wholesale() {
             continue;
         }
         // Orphan (no decl): re-emit nothing — its StreamDecl is gone, so its
@@ -336,7 +414,10 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
         if entry.decl.is_none() {
             continue;
         }
-        let keep_sig = distill != Some(DistillMode::TextOnly);
+        // A retired turn keeps only its `StreamDecl` placeholder; its sig and
+        // projection records are shed with the rest of its bulk, exactly as
+        // `collect_live_records` sheds them.
+        let keep_sig = shed.keep_sig();
         if let Some(decl) = &entry.decl {
             out.push(Resident {
                 rt: RecordType::StreamDecl,
@@ -419,6 +500,21 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
             payload: p.encode(),
         });
     }
+    for (tl, from_turn) in substrate.live_couplings() {
+        if tombstoned.contains(&tl) {
+            continue;
+        }
+        out.push(Resident {
+            rt: RecordType::TurnCoupling,
+            stream_id: 0,
+            chunk_index: 0,
+            payload: TurnCouplingPayload {
+                timeline_id: tl,
+                from_turn,
+            }
+            .encode(),
+        });
+    }
     for (tl, id) in substrate.live_debug_ids() {
         if tombstoned.contains(&tl) {
             continue;
@@ -463,13 +559,33 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
             .encode(),
         });
     }
-    // Turn-scoped tombstones, on the same footing as the timeline-scoped ones
-    // above. Losing one does not merely forget a deletion: the `is_tomb` gate at
-    // the top of this function reads `tombstoned_timelines`, so a turn-scoped
+    // **And the turn-scoped ones, or retirement does not survive a sweep.**
+    //
+    // This loop re-emitted only whole-timeline tombstones. A turn tombstone —
+    // what `retention` writes when a conversation's tail passes `keep_turns`,
+    // and what the `drop_turn` corrupt-turn policy writes when it condemns one —
+    // lived in whatever segment it was appended to, and when maintenance
+    // relocated that segment's live records it was not among them. The old
+    // segment was then dropped and the tombstone went with it.
+    //
+    // Losing one does not merely forget a deletion. The `is_tomb` gate at the
+    // top of this function reads `tombstoned_timelines`, so a turn-scoped
     // tombstone leaves its stream fully live and the turn's decl, tokens and KV
-    // are all carried forward. Drop the marker and the turn returns on the next
-    // reload — with the corruption that the `drop_turn` policy condemned it for.
+    // are all carried forward: retirement undid itself on a timer. The turn was
+    // marked dead, the mark was swept away, and the next reload rebuilt
+    // `tombstoned_turns` from a log that no longer mentioned it. Every retired
+    // turn came back to life — with the corruption it was condemned for, where
+    // that was the reason — its KV counted live again, and the segment holding
+    // it pinned for good.
+    //
+    // Measured on a live daemon: 37,705 turn streams on disk, 70 tombstones
+    // between them (only the ones written since the last sweep), and a 132 GB
+    // floor that compaction ran against for days without ever reclaiming.
+    // `compaction::collect_live_records` always carried these forward; this is
+    // the incremental path catching up with it.
     for &(tl, turn_index) in substrate.tombstoned_turns() {
+        // A turn of a timeline that is going wholesale needs no marker of its
+        // own — the same gate `collect_live_records` applies.
         if tombstoned.contains(&tl.raw()) {
             continue;
         }
@@ -758,6 +874,27 @@ impl SubstratePersistence {
         let branch_updates =
             self.relocate_stream_records(RecordType::BranchCheckpoint, &live_branch)?;
 
+        // Characters — the same verbatim path, behind the same supersession
+        // check snapshots use: an edit between plan and execute rewrites the
+        // record, and relocating the stale copy would append it *after* the
+        // newer one, so the next reload's walk would install the superseded
+        // character as the winner (an edit silently rolled back).
+        //
+        // `npc_locs` is repointed here rather than through `MaintenanceResult`,
+        // because it lives on this store rather than in the substrate — nothing
+        // in `apply_to_substrate` could reach it.
+        let live_npcs: Vec<(StreamId, RecordLoc)> = plan
+            .npc_relocs
+            .iter()
+            .filter(|(sid, old)| self.npc_locs.get(&sid.0) == Some(old))
+            .copied()
+            .collect();
+        for (sid, old, new) in self.relocate_stream_records(RecordType::Npc, &live_npcs)? {
+            if self.npc_locs.get(&sid.0) == Some(&old) {
+                self.npc_locs.insert(sid.0, new);
+            }
+        }
+
         // Singletons — few (≤3); the encoding append repoints them via
         // `manifest.ingest`.
         for &(rt, old) in &plan.singleton_relocs {
@@ -955,6 +1092,7 @@ impl SubstratePersistence {
             token_relocs,
             snapshot_relocs,
             branch_checkpoint_relocs,
+            npc_relocs: self.npc_relocations(&op.targets()),
             singleton_relocs,
             npc_relocs: self.npc_relocations(&op.targets()),
         };
@@ -984,6 +1122,24 @@ impl SubstratePersistence {
     /// Gather the relocation worklist for `targets` — the live read-back records
     /// (`Chunk` / `Tokens` / singletons) physically in those segments, with the
     /// same distill/tombstone filter as [`Self::segment_liveness`]. Read-only.
+    /// Character records physically inside a target segment.
+    ///
+    /// Read from this store's own `npc_locs` rather than the substrate, which
+    /// has never held a character: their payloads belong to the daemon above.
+    /// That is also why they are relocated rather than re-emitted — there is
+    /// nothing in RAM here to re-encode them from.
+    fn npc_relocations(&self, targets: &[SegmentId]) -> Vec<(StreamId, RecordLoc)> {
+        let mut out: Vec<(StreamId, RecordLoc)> = self
+            .npc_locs
+            .iter()
+            .filter(|(_, loc)| targets.contains(&loc.segment))
+            .map(|(&id, &loc)| (StreamId(id), loc))
+            .collect();
+        // Deterministic, so the same store plans the same work twice running.
+        out.sort_unstable_by_key(|(sid, _)| sid.0);
+        out
+    }
+
     fn gather_relocations(
         &self,
         substrate: &Substrate,
@@ -1009,13 +1165,14 @@ impl SubstratePersistence {
 
         let mut chunks: Vec<(StreamId, u64, ChunkLoc)> = Vec::new();
         let mut tokens: Vec<(StreamId, RecordLoc)> = Vec::new();
+        let dead_turns = dead_turns_of(substrate);
         for (stream_id, entry) in substrate.all_streams() {
-            let (is_tomb, distill) = classify(&entry.decl, &tombstoned, &distilled);
+            let shed = classify(&entry.decl, &tombstoned, &distilled, &dead_turns);
             // Same rule as the re-emit path: a tombstoned-but-DISTILLED timeline
             // is the provenance corpus, so it is relocated by its mode (the
             // per-mode gates below already withhold its chunks/tokens) rather
             // than abandoned. Only an undistilled tombstone is skipped outright.
-            if is_tomb && distill.is_none() {
+            if shed.dropped_wholesale() {
                 continue;
             }
             // Orphan (no decl): its records are unreachable on reload, so DON'T
@@ -1027,14 +1184,18 @@ impl SubstratePersistence {
             if entry.decl.is_none() {
                 continue;
             }
-            if distill.is_none() {
+            // **A retired turn is not relocated.** Moving it forward would carry
+            // the bulk into the new segment while the dead ratio never improves
+            // — perpetual churn, and the space never reclaimed. That is exactly
+            // the reasoning the orphan gate above states, for the same reason.
+            if shed.keep_chunks() {
                 for (&idx, loc) in &entry.chunks {
                     if in_target(loc.segment) {
                         chunks.push((stream_id, idx, *loc));
                     }
                 }
             }
-            if distill != Some(DistillMode::ProvenanceOnly) {
+            if shed.keep_tokens() {
                 if let Some(loc) = entry.tokens {
                     if in_target(loc.segment) {
                         tokens.push((stream_id, loc));
@@ -1120,22 +1281,26 @@ impl SubstratePersistence {
         // the segments holding only its records become reclaimable instead of
         // pinned forever.
         let mut live_streams: HashSet<u64> = HashSet::new();
+        let dead_turns = dead_turns_of(substrate);
         for (sid, entry) in substrate.all_streams() {
-            let (is_tomb, distill) = classify(&entry.decl, &tombstoned, &distilled);
-            if is_tomb {
+            let shed = classify(&entry.decl, &tombstoned, &distilled, &dead_turns);
+            if shed.timeline_dead {
                 tombstoned_streams.insert(sid.0);
                 continue;
             }
             if entry.decl.is_none() {
                 continue;
             }
+            // A turn-dead stream keeps its `StreamDecl` — the compactor emits it
+            // as a placeholder so the timeline's turn indexing survives — so it
+            // stays a live stream here and only its bulk stops counting.
             live_streams.insert(sid.0);
-            if distill.is_none() {
+            if shed.keep_chunks() {
                 for loc in entry.chunks.values() {
                     *live.entry(loc.segment).or_default() += loc.record_size;
                 }
             }
-            if distill != Some(DistillMode::ProvenanceOnly) {
+            if shed.keep_tokens() {
                 if let Some(loc) = entry.tokens {
                     *live.entry(loc.segment).or_default() += loc.record_size;
                 }
@@ -1734,6 +1899,266 @@ mod tests {
             assert_eq!(sp.read_chunk(&substrate, sid, 0).unwrap(), chunk_payload(2));
             assert_eq!(substrate.live_chunk_count(), 1);
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A character survives the maintenance of the segment holding it.**
+    ///
+    /// Maintenance is a second carry-forward path beside
+    /// [`super::compaction::collect_live_records`], with its own two sets: the
+    /// resident records it re-emits from substrate RAM, and the read-back
+    /// records it relocates verbatim. A character can only be in the second —
+    /// its payload belongs to the daemon above and is not in this process at all
+    /// — and it was in neither, so the first pass that touched its segment
+    /// deleted it.
+    ///
+    /// That is the bug that lost a Maker roughly every quarter of an hour: the
+    /// character was written into the active segment, the segment sealed, and
+    /// the next maintenance pass rewrote it out of existence. Fixing the
+    /// duplicate-handle bug was not enough on its own, because this path never
+    /// consulted `npc_locs` at all.
+    #[test]
+    fn a_character_survives_segment_maintenance() {
+        let dir = tmp_dir("npc_maintenance");
+        let sid = StreamId(303);
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            // seg 1: the character, beside a chunk that a later write supersedes
+            // — the dead weight is what makes maintenance choose this segment.
+            sp.write_npc(&crate::persistence::test_npc(7, "Wyneth"))
+                .unwrap();
+            sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(1))
+                .unwrap();
+            sp.commit().unwrap();
+            sp.seal_active().unwrap();
+            sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(2))
+                .unwrap();
+            sp.commit().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            assert_eq!(
+                sp.npc_locs.get(&7).map(|l| l.segment),
+                Some(SegmentId(1)),
+                "the character starts in the segment about to be maintained"
+            );
+            // Forced, so the test does not have to wait out the settle age —
+            // the same phased path the daemon runs, and the same path the
+            // `POST /v1/debug/maintenance` trigger takes.
+            let plan = sp
+                .plan_maintenance(&substrate, true)
+                .unwrap()
+                .expect("seg 1 carries dead weight, so a pass runs");
+            let op = plan.op();
+            let result = sp.execute_maintenance(&plan).unwrap();
+            result.apply_to_substrate(&mut substrate);
+            sp.finish_maintenance(&plan).unwrap();
+            assert!(
+                op.targets().contains(&SegmentId(1)),
+                "the pass targets the segment holding the character, got {op:?}"
+            );
+            assert_eq!(
+                sp.read_npc(7).unwrap().map(|n| n.name),
+                Some("Wyneth".to_string()),
+                "the character is readable immediately after the pass"
+            );
+        }
+        // And across a restart, which is where the loss actually showed.
+        let mut substrate = Substrate::new();
+        let mut cast = Vec::new();
+        SubstratePersistence::open_in_with_substrate_and_sink(&dir, &mut substrate, |entry| {
+            if entry.record.header.record_type == RecordType::Npc {
+                cast.push(entry.record.header.stream_id);
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            cast,
+            vec![7],
+            "the character must still be on disk after maintenance rewrote its segment"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A tool round-trip's coupling is in the resident set, so segment
+    /// maintenance re-emits it rather than dropping it with its segment.
+    ///
+    /// The maintenance twin of
+    /// [`super::super::tests::a_turn_coupling_survives_compaction`] — the two
+    /// carry-forward paths are separate lists and a record class has to be in
+    /// both.
+    #[test]
+    fn a_turn_coupling_is_in_the_resident_set() {
+        let mut substrate = Substrate::new();
+        substrate.register_timeline(
+            crate::projection::TimelineId::from_raw(9).unwrap(),
+            crate::projection::LayerId::from_raw(1).unwrap(),
+            crate::projection::GroupId::from_raw(1).unwrap(),
+        );
+        substrate.couple_turn(crate::projection::TimelineId::from_raw(9).unwrap(), 4);
+
+        let resident = gather_resident_set(&substrate);
+        let coupling = resident
+            .iter()
+            .find(|r| r.rt == RecordType::TurnCoupling)
+            .expect("the coupling must be re-emitted by segment maintenance");
+        let decoded = TurnCouplingPayload::decode(&coupling.payload).unwrap();
+        assert_eq!((decoded.timeline_id, decoded.from_turn), (9, 4));
+    }
+
+    /// **A turn tombstone is re-emitted by a sweep, so retirement is durable.**
+    ///
+    /// The failure this closes was self-erasing and therefore invisible:
+    /// `retention` marked a turn dead, the mark lived in one segment, and when
+    /// maintenance relocated that segment's live records the mark was not among
+    /// them. The segment was dropped, the tombstone went with it, and the next
+    /// reload rebuilt `tombstoned_turns` from a log that no longer mentioned the
+    /// turn — so it came back to life and its KV was pinned for good.
+    ///
+    /// Live evidence: 37,705 turn streams, 70 surviving tombstones, a 132 GB
+    /// floor that never moved.
+    #[test]
+    fn a_retired_turns_tombstone_survives_a_maintenance_sweep() {
+        let mut substrate = Substrate::new();
+        let tl = crate::projection::TimelineId::from_raw(9001).unwrap();
+        substrate.tombstone_turn(tl, 7);
+        substrate.tombstone_turn(tl, 8);
+
+        let residents = gather_resident_set(&substrate);
+        let turn_marks: Vec<u32> = residents
+            .iter()
+            .filter(|r| r.rt == RecordType::Tombstone)
+            .filter_map(|r| TombstonePayload::decode(&r.payload).ok())
+            .filter(|p| p.timeline_id == 9001)
+            .filter_map(|p| p.turn_index)
+            .collect();
+        assert!(
+            turn_marks.contains(&7) && turn_marks.contains(&8),
+            "a sweep dropped the turn tombstones: {turn_marks:?}"
+        );
+    }
+
+    /// A wholesale tombstone subsumes the turn-scoped ones it covers, so a
+    /// retired-then-retired conversation leaves nothing behind to re-emit.
+    #[test]
+    fn a_dead_timeline_leaves_no_turn_marks_to_carry_forward() {
+        let turn_marks = |substrate: &Substrate, raw: u64| {
+            gather_resident_set(substrate)
+                .iter()
+                .filter(|r| r.rt == RecordType::Tombstone)
+                .filter_map(|r| TombstonePayload::decode(&r.payload).ok())
+                .filter(|p| p.timeline_id == raw && p.turn_index.is_some())
+                .count()
+        };
+
+        let mut substrate = Substrate::new();
+        let tl = crate::projection::TimelineId::from_raw(5150).unwrap();
+        substrate.tombstone_turn(tl, 1);
+        substrate.tombstone_turn(tl, 2);
+        substrate.tombstone_timeline(tl);
+        assert_eq!(
+            turn_marks(&substrate, 5150),
+            0,
+            "a dead timeline re-emitted per-turn marks"
+        );
+
+        // **And the other order lands in the same place.** A character deleted
+        // mid-decode is tombstoned while the tick still running goes on to
+        // retire its tail, so the turn mark arrives *after* the timeline's — and
+        // a replay of the log can present the two in either order. If only one
+        // direction subsumed, the in-RAM set would depend on arrival order and
+        // a sweep would carry marks a reload would not.
+        let mut backwards = Substrate::new();
+        let tl = crate::projection::TimelineId::from_raw(5151).unwrap();
+        backwards.tombstone_timeline(tl);
+        backwards.tombstone_turn(tl, 1);
+        backwards.tombstone_turn(tl, 2);
+        assert_eq!(
+            turn_marks(&backwards, 5151),
+            0,
+            "a turn retired after its timeline died left a mark behind"
+        );
+        assert!(
+            !backwards.is_turn_tombstoned(tl, 1),
+            "the in-RAM set disagrees with what a replay of the same log rebuilds"
+        );
+    }
+
+    /// **A turn retired from a LIVE timeline stops counting as live weight.**
+    ///
+    /// This is what `retention` writes when a conversation's tail falls past
+    /// `keep_turns`, and it was invisible here: `classify` only knew whole
+    /// *timeline* tombstones, so a retired turn's chunks and tokens still
+    /// counted live, the dead ratio stayed at zero, and the compaction trigger
+    /// never fired. Measured on a live daemon: ~950 of every 1000 turns
+    /// retired exactly as configured, dead-byte ratio **0.0%**, and the log
+    /// reached 132 GB before the disk stopped it.
+    ///
+    /// The `StreamDecl` stays live on purpose — the compactor emits it as a
+    /// placeholder so the timeline's later turns keep their stream ids.
+    #[test]
+    fn a_retired_turn_stops_counting_as_live_weight() {
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
+        let dir = tmp_dir("retired_turn_liveness");
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: 4242,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 2,
+            block_start: 0,
+            block_end: 1,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: Vec::new(),
+        });
+        let sid = decl.stream_id();
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        // The decl is written as a real record: its liveness comes from the
+        // on-disk metadata map, not from the in-RAM index, and it is what must
+        // survive the turn being retired.
+        sp.declare_stream(&decl).unwrap();
+        sp.commit().unwrap();
+        substrate.apply_stream_decl(sid, decl.clone());
+        // The index entries a written turn leaves behind — what `segment_liveness`
+        // actually reads. Placed directly so the test is about the liveness rule
+        // rather than about the append path.
+        substrate.apply_chunk_loc(
+            sid,
+            0,
+            crate::persistence::manifest::ChunkLoc {
+                segment: crate::persistence::segment::FIRST_SEGMENT,
+                offset: 4096,
+                payload_len: 100,
+                record_size: 8192,
+                token_count: 32,
+                format: 4,
+            },
+        );
+
+        let before: u64 = sp.segment_liveness(&substrate).values().sum();
+        assert!(before > 0, "a live turn's chunk is live weight");
+
+        // Exactly what `retention::retire_expired` does to a tail turn.
+        substrate.tombstone_turn(crate::projection::TimelineId::from_raw(4242).unwrap(), 0);
+
+        let after: u64 = sp.segment_liveness(&substrate).values().sum();
+        assert!(
+            after < before,
+            "a retired turn still counted as live weight: {before} -> {after}"
+        );
+        assert!(
+            after > 0,
+            "the StreamDecl placeholder must stay live — the compactor emits it"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

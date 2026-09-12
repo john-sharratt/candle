@@ -27,6 +27,7 @@
 import { API } from '../lib/api.js';
 import { h, mount } from '../lib/dom.js';
 import { go } from '../lib/router.js';
+import { onReveal, revealing } from '../lib/reveal.js';
 import { empty, confirmDialog, toast, mayEdit, ro, roChip, only, roNote } from '../lib/ui.js';
 
 /* A trait key is `under_pressure` in the file and "Under pressure" on the page.
@@ -41,25 +42,78 @@ const title = (id) => String(id || '').split('-').map(label).join(' ');
 const named = (a) => a.name || title(a.personality_id);
 
 export async function render(params, q) {
-  const list = (await API.listPersonalities().catch(() => ({ personalities: [] }))).personalities || [];
-  const aid = params.aid || q.a || (list[0] && list[0].personality_id);
-  const a = list.find((x) => x.personality_id === aid);
+  /* `revealing()` is held-key AND admin, and the daemon checks the role again
+   * on its own — so this is a request, never a grant. Worlds have asked since
+   * the create page was written; personalities never did, which is why holding
+   * the key on this page revealed nothing however many hidden ones there were.
+   */
+  const listed = (await API.listPersonalities('', revealing())
+    .catch(() => ({ personalities: [] }))).personalities || [];
+  const aid = params.aid || q.a || (listed[0] && listed[0].personality_id);
+
+  /* A personality named directly is fetched directly.
+   *
+   * The listing leaves out anything `hidden` — that is what the flag means, and
+   * the daemon only includes one when a whole word of `q` names it. So picking
+   * a hidden personality out of the filter and then landing on this page found
+   * it missing from the unfiltered list and rendered "No personalities", for a
+   * document that reads perfectly well by id.
+   *
+   * The reveal is not lost by navigating, because it was never the listing that
+   * carried it: the address does. */
+  let a = listed.find((x) => x.personality_id === aid);
+  if (!a && aid) {
+    a = await API.getPersonality(aid).catch(() => null);
+  }
+  // Added to the picker so the one being read is in the list it is chosen from.
+  const list = a && !listed.some((x) => x.personality_id === a.personality_id)
+    ? [...listed, a]
+    : listed;
 
   const el = h('div', { class: 'page wide' });
+
+  /* Built here rather than inline, because it owns a reveal subscription this
+   * page has to be able to stop. A picker is only offered when there is more
+   * than one to pick from. */
+  const chooser = list.length > 1 ? picker(list, aid) : null;
+  // Always a function, so every exit from this page can hand back the same one
+  // without asking whether a picker was offered.
+  const teardown = () => {
+    if (chooser) chooser.stop();
+  };
 
   el.appendChild(h('div', { class: 'hd' },
     h('div', {},
       h('h1', {}, a ? named(a) : 'Personalities'),
       h('div', { class: 'sub' },
-        'What a character is before it has lived anything. Every character of this type shares it as a ' +
+        'What a character is before they have lived anything. Every character of this type shares it as a ' +
         'read-only prefix, so it costs one copy however many of them exist — which is also why it cannot drift.')),
-    list.length > 1 ? picker(list, aid) : null));
+    /* The way into the life editor.
+     *
+     * Admin-only, and absent rather than disabled below that: a personality is
+     * readable by anyone, but its authored life is not, and a dead button on a
+     * page somebody cannot act on is a question they have no way to answer. */
+    h('div', { class: 'row wrap' },
+      a && mayEdit() ? h('button', {
+        class: 'btn',
+        onClick: () => go('/personality/' + a.personality_id + '/life'),
+      }, 'Write their life') : null,
+      chooser && chooser.node)));
 
   if (!a) {
-    el.appendChild(empty('◈', 'No personalities',
-      'Personalities are YAML files in the mind. Point the daemon at one with --mind, or add a file to ' +
-      'its personalities/ directory.'));
-    return { el };
+    /* Two different absences, said differently.
+     *
+     * One message covered both, and told somebody who had followed a link to a
+     * personality that does not exist to point their daemon at a mind — which
+     * it already is, with seventy-three others in it.
+     */
+    el.appendChild(aid
+      ? empty('⊘', 'No such personality',
+        `Nothing in this mind is called “${aid}”. It may have been renamed, or the link may be old.`)
+      : empty('◈', 'No personalities',
+        'Personalities are YAML files in the mind. Point the daemon at one with --mind, or add a file to '
+        + 'its personalities/ directory.'));
+    return { el, teardown };
   }
 
   const count = a.npc_count || 0;
@@ -107,7 +161,7 @@ export async function render(params, q) {
         'None declared. The anchor carries this character on its own.')));
 
   el.appendChild(doctrinePanel(a, count));
-  return { el };
+  return { el, teardown };
 }
 
 /* A search box and a select, not a select alone.
@@ -134,10 +188,28 @@ function picker(list, aid) {
   });
 
   const fill = (rows) => {
+    if (!rows.length) {
+      // Visible, and saying so. An emptied select would look like the filter
+      // had not been typed yet.
+      mount(sel, h('option', { disabled: true, selected: true }, 'no match'));
+      sel.hidden = false;
+      return;
+    }
     mount(sel, rows.map((x) => h('option', {
       value: x.personality_id, selected: x.personality_id === aid,
     }, `${named(x)} · ${x.npc_count || 0}`)));
-    sel.hidden = rows.length < 2;
+    /* Hidden only when there is nothing to pick.
+     *
+     * This was `rows.length < 2`, which reads as "no picker for a single
+     * personality" — true of the *initial* list, and already decided by the
+     * caller. Applied to a search result it meant that narrowing the filter to
+     * exactly one match hid the control showing it, so the closer you got the
+     * less you saw.
+     *
+     * Worst for the case the filter exists to serve: a hidden document is
+     * revealed by typing a **whole word** of its name, which by design matches
+     * exactly one. Typing `cindy` fetched `cindy-tan` and then hid it. */
+    sel.hidden = false;
   };
   fill(list);
 
@@ -146,7 +218,10 @@ function picker(list, aid) {
   const search = async (v) => {
     // A slower request must not overwrite a newer one's answer.
     const mine = ++seq;
-    const r = await API.listPersonalities(v).catch(() => null);
+    // Asks with the reveal, so an admin holding the key sees hidden documents
+    // while narrowing rather than only on a whole word. Without the key this is
+    // exactly the request it always was.
+    const r = await API.listPersonalities(v, revealing()).catch(() => null);
     if (r && mine === seq) fill(r.personalities || []);
   };
 
@@ -158,7 +233,19 @@ function picker(list, aid) {
     },
   });
 
-  return h('div', { class: 'row' }, box, sel);
+  /* Re-ask when the key goes down or up.
+   *
+   * A refetch rather than a client-side unfilter, for the reason the search
+   * above is a server call at all: a hidden personality is never sent, so there
+   * is nothing in hand to reveal. `search` reads `revealing()` itself, so the
+   * current filter text is simply asked again under the new answer.
+   *
+   * The unsubscribe goes back to the caller and out through the page's
+   * teardown — a listener left behind would keep refetching for a page that
+   * has been replaced. */
+  const stopReveal = onReveal(() => search(box.value.trim()));
+
+  return { node: h('div', { class: 'row' }, box, sel), stop: stopReveal };
 }
 
 /* The one editable part. A publish is a real write: PUT replaces the document,

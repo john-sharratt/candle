@@ -27,6 +27,7 @@ pub(super) fn qwen36_35b_a3b_q4() -> ModelSpec {
     let chat_format = DialectType::ChatML;
     ModelSpec {
         arch: ModelArch::Qwen35Hybrid,
+        loras: Vec::new(),
         dialect: chat_format.dialect(),
         chat_format,
         // The `-MTP-` repo, not the plain one. Both publish the same quant under
@@ -49,6 +50,10 @@ pub(super) fn qwen36_35b_a3b_q4() -> ModelSpec {
         // agree token for token" was established; serving and gating reading
         // the same two constants is what stops them drifting apart, which is
         // the only way that claim stays true of what actually runs.
+        // Unpinned: no verified commit has been recorded for this conversion. See
+        // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
+        model_rev: String::new(),
+        gate_donor: None,
         tokenizer_repo: quantized_qwen36_moe::TOKENIZER_REPO.into(),
         tokenizer_rev: quantized_qwen36_moe::TOKENIZER_REV.into(),
         default_system_prompt: PROMPT.into(),

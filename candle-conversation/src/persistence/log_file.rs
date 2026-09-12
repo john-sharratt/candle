@@ -42,6 +42,26 @@ pub const FILE_FORMAT_VERSION: u32 = 2;
 /// seals, so sealed segments never carry the slack on disk.
 const GROW_EXTENT: u64 = 64 << 20;
 
+/// The extent used until the file has passed [`GROW_EXTENT`].
+///
+/// **A log that never seals never gives its tail back.** The note above is true
+/// of a segment that reaches `seal_and_rotate`, and every *long-lived* log does.
+/// A throwaway does not: an ephemeral conversation, a test substrate, a
+/// summarisation scratch log writes one record and is abandoned — and paid a
+/// full 64 MiB for it, because the very first byte rounded up to a whole
+/// extent.
+///
+/// Measured on this machine: 15,823 orphaned temp directories in `%TEMP%`, most
+/// of them one 64 MiB file holding a few kilobytes of records. 467 GB, which
+/// was half the disk.
+///
+/// Growing in 1 MiB steps until the file is itself 64 MiB costs 64 extra
+/// `set_len` calls spread over the first 64 MiB of a segment — against the 64 a
+/// 4 GiB segment already pays, and against nothing at all for the throwaways,
+/// which now cost what they use. The rarity argument the constant above rests
+/// on is a claim about *large* files, and it is untouched.
+const INITIAL_EXTENT: u64 = 1 << 20;
+
 /// Decoded superblock contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Superblock {
@@ -376,13 +396,24 @@ impl LogFile {
     }
 
     /// Grow the physical file so it holds at least `end` bytes, rounding up
-    /// to the next [`GROW_EXTENT`].
+    /// to the next extent.
+    ///
+    /// The extent is [`INITIAL_EXTENT`] until the file has passed
+    /// [`GROW_EXTENT`], and [`GROW_EXTENT`] thereafter — so a log that writes a
+    /// few kilobytes and is then abandoned costs a megabyte rather than 64, and
+    /// a segment being filled at NVMe bandwidth still grows ~64 times rather
+    /// than ~4096. See [`INITIAL_EXTENT`] for what the flat 64 MiB cost.
     fn grow_to(&mut self, end: u64) -> Result<()> {
         assert!(!self.read_only, "grow_to on a read-only LogFile");
         if end <= self.allocated {
             return Ok(());
         }
-        let target = end.div_ceil(GROW_EXTENT) * GROW_EXTENT;
+        let extent = if end <= GROW_EXTENT {
+            INITIAL_EXTENT
+        } else {
+            GROW_EXTENT
+        };
+        let target = end.div_ceil(extent) * extent;
         self.file.set_len(target)?;
         self.allocated = target;
         Ok(())
@@ -513,6 +544,47 @@ mod tests {
         p
     }
 
+    /// **A log that writes a few bytes costs a few bytes, not 64 MiB.**
+    ///
+    /// The extent was a flat 64 MiB, and the note on `GROW_EXTENT` justified the
+    /// slack by saying `seal_and_rotate` truncates it — which is true of a
+    /// segment that seals and false of every throwaway. An ephemeral
+    /// conversation, a test substrate, a summarisation scratch log writes one
+    /// record and is abandoned, paying 64 MiB for it. 15,823 of them had
+    /// accumulated in `%TEMP%` on this machine: 467 GB, half the disk.
+    #[test]
+    fn a_tiny_log_does_not_preallocate_a_whole_grow_extent() {
+        let path = tmp_path("small_extent");
+        {
+            let mut log = LogFile::create(&path).expect("create");
+            log.stage(&rec(1, 0, &[7u8; 128]));
+            log.flush().expect("flush");
+            log.commit().expect("commit");
+        }
+        let on_disk = std::fs::metadata(&path).expect("stat").len();
+        assert!(
+            on_disk <= INITIAL_EXTENT,
+            "a {on_disk}-byte log preallocated past the initial extent — every abandoned \
+             throwaway costs this much forever"
+        );
+        assert!(
+            on_disk < GROW_EXTENT,
+            "still rounding up to the full 64 MiB extent"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// And a file that has genuinely grown past the extent keeps the large one,
+    /// so the syscall-rarity argument the constant rests on still holds.
+    #[test]
+    fn a_large_log_still_grows_in_whole_extents() {
+        let mut log = LogFile::create(&tmp_path("large_extent")).expect("create");
+        // Ask for a byte past the boundary: the target must land on a 64 MiB
+        // multiple, not a 1 MiB one.
+        log.grow_to(GROW_EXTENT + 1).expect("grow");
+        assert_eq!(log.allocated, GROW_EXTENT * 2);
+    }
+
     // A generic metadata record for exercising the read/CRC plumbing. Uses
     // `Tokens` (crc32 over the whole payload) so the raw test payloads need not
     // be valid `ChunkPayload` encodings — `Chunk` records verify a golden over
@@ -582,11 +654,15 @@ mod tests {
         let r = rec(2, 0, b"x");
         {
             let mut log = LogFile::create(&path).unwrap();
-            // Physical file is grown to the first `GROW_EXTENT` up front.
-            assert!(log.allocated_len() >= GROW_EXTENT);
+            // Physical file is grown ahead by a whole extent up front — the
+            // *initial* one, since the file has not yet passed `GROW_EXTENT`.
+            // It used to be the full 64 MiB here, which is what made every
+            // abandoned throwaway cost 64 MiB; see `INITIAL_EXTENT`.
+            assert_eq!(log.allocated_len(), INITIAL_EXTENT);
             log.stage(&r);
             log.commit().unwrap();
-            // Logical end is exact, regardless of the pre-grown physical size.
+            // Logical end is exact, regardless of the pre-grown physical size —
+            // which is the property this test is named for, and is unchanged.
             assert_eq!(log.write_offset(), SUPERBLOCK_SIZE + r.len() as u64);
             assert!(log.allocated_len() >= log.write_offset());
         }

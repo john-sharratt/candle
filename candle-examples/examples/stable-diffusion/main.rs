@@ -131,6 +131,17 @@ struct Args {
     /// Force the saved image to update only the masked region
     #[arg(long)]
     only_update_masked: bool,
+
+    /// Decode a zero latent and exit, without running CLIP, the UNet or the
+    /// scheduler.
+    ///
+    /// The decoder is the last stage of the pipeline, so every fault upstream of
+    /// it also arrives as a bad image and there is no way to tell them apart
+    /// from the output alone. A zero latent has a known answer — the decoder's
+    /// own biases, which are a smooth field — so a grid or noise here is the
+    /// decoder itself, and a smooth field acquits it and points upstream.
+    #[arg(long)]
+    vae_selftest: bool,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
@@ -336,7 +347,10 @@ fn save_image(
     num_samples: usize,
     timestep_ids: Option<usize>,
 ) -> Result<()> {
-    let images = vae.decode(&(latents / vae_scale)?)?;
+    let scaled = (latents / vae_scale)?;
+    stats("vae input", &scaled)?;
+    let images = vae.decode(&scaled)?;
+    stats("vae output", &images)?;
     let images = ((images / 2.)? + 0.5)?.to_device(&Device::Cpu)?;
     let images = (images.clamp(0f32, 1.)? * 255.)?.to_dtype(DType::U8)?;
     for batch in 0..bsize {
@@ -625,6 +639,32 @@ fn run(args: Args) -> Result<()> {
         ),
     };
 
+    if args.vae_selftest {
+        let device = candle_examples::device(cpu)?;
+        let vae_weights = ModelFile::Vae.get(vae_weights, sd_version, use_f16)?;
+        let vae = sd_config.build_vae(vae_weights, &device, dtype)?;
+        let (h, w) = (sd_config.height / 8, sd_config.width / 8);
+        for (name, latent) in [
+            ("zeros", Tensor::zeros((1, 4, h, w), dtype, &device)?),
+            // A constant non-zero latent: still spatially uniform, so the answer
+            // is still a smooth field. Any structure in the output came from the
+            // decoder rather than from the input.
+            (
+                "const",
+                (Tensor::ones((1, 4, h, w), dtype, &device)? * 2.0)?,
+            ),
+        ] {
+            println!("-- vae selftest: {name} latent --");
+            stats("latent", &latent)?;
+            let out = vae.decode(&latent)?;
+            stats("decoded", &out)?;
+            let img = ((out / 2.)? + 0.5)?.to_device(&Device::Cpu)?;
+            let img = (img.clamp(0f32, 1.)? * 255.)?.to_dtype(DType::U8)?.i(0)?;
+            candle_examples::save_image(&img, format!("vae_selftest_{name}.png"))?;
+        }
+        return Ok(());
+    }
+
     let mut scheduler = sd_config.build_scheduler(n_steps)?;
     let device = candle_examples::device(cpu)?;
     // If a seed is not given, generate a random seed and print it
@@ -663,6 +703,7 @@ fn run(args: Args) -> Result<()> {
     let text_embeddings = Tensor::cat(&text_embeddings, D::Minus1)?;
     let text_embeddings = text_embeddings.repeat((bsize, 1, 1))?;
     println!("{text_embeddings:?}");
+    stats("text_embeddings", &text_embeddings)?;
 
     println!("Building the autoencoder.");
     let vae_weights = ModelFile::Vae.get(vae_weights, sd_version, use_f16)?;
@@ -741,6 +782,7 @@ fn run(args: Args) -> Result<()> {
         let mut latents = latents.to_dtype(dtype)?;
 
         println!("starting sampling");
+        stats("initial latents", &latents)?;
         for (timestep_index, &timestep) in timesteps.iter().enumerate() {
             if timestep_index < t_start {
                 continue;
@@ -784,6 +826,15 @@ fn run(args: Args) -> Result<()> {
             latents = scheduler.step(&noise_pred, timestep, &latents)?;
             let dt = start_time.elapsed().as_secs_f32();
             println!("step {}/{n_steps} done, {:.2}s", timestep_index + 1, dt);
+            // The first and last steps bound the run: if the first is already
+            // wrong the fault is upstream of the loop, and if the first is right
+            // but the last has drifted it is the scheduler or the guidance.
+            if timestep_index == 0 || timestep_index + 1 == timesteps.len() {
+                println!("  -- step {} (timestep {timestep}) --", timestep_index + 1);
+                stats("latent_model_input", &latent_model_input)?;
+                stats("noise_pred", &noise_pred)?;
+                stats("latents", &latents)?;
+            }
 
             // Replace all pixels in the unmasked region with the original pixels discarding any changes.
             if args.only_update_masked {
@@ -827,6 +878,40 @@ fn run(args: Args) -> Result<()> {
             None,
         )?;
     }
+    Ok(())
+}
+
+/// Print a tensor's distribution, for locating the stage a pipeline goes wrong.
+///
+/// A diffusion pipeline that produces noise gives no clue *where* it broke —
+/// every stage downstream of the fault produces noise too. The reference values
+/// for SD 1.5 are narrow enough to identify the culprit by eye: text embeddings
+/// sit around |mean| < 0.5 with std ~1, the initial latents are N(0,1) times the
+/// scheduler's sigma, a noise prediction is roughly N(0,1), and the VAE's output
+/// lands in about [-1, 1]. A stage whose std has collapsed toward zero or run
+/// away to hundreds is the one to look at.
+fn stats(name: &str, t: &Tensor) -> Result<()> {
+    let f = t.flatten_all()?.to_dtype(DType::F32)?;
+    let n = f.elem_count() as f64;
+    let mean = f.sum_all()?.to_scalar::<f32>()? as f64 / n;
+    let var = f
+        .broadcast_sub(&Tensor::new(mean as f32, f.device())?)?
+        .sqr()?
+        .sum_all()?
+        .to_scalar::<f32>()? as f64
+        / n;
+    let min = f.min(0)?.to_scalar::<f32>()?;
+    let max = f.max(0)?.to_scalar::<f32>()?;
+    // `mean` and `var` are computed from sums, so a single NaN or infinity
+    // anywhere in the tensor poisons both — which makes them the cheapest
+    // finiteness check available, and one that needs no elementwise predicate.
+    let finite = mean.is_finite() && var.is_finite() && min.is_finite() && max.is_finite();
+    println!(
+        "  [stats] {name:<22} shape={:?} mean={mean:+.4} std={:.4} min={min:+.4} max={max:+.4}{}",
+        t.dims(),
+        var.sqrt(),
+        if finite { "" } else { "  ** NON-FINITE **" }
+    );
     Ok(())
 }
 

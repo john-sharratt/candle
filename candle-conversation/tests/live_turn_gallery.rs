@@ -10,12 +10,14 @@
 //! belief scores and catalog-order tool selection despite a healthy on-disk
 //! corpus.
 
+use candle_conversation::normalization::Phase;
 use candle_conversation::persistence::content_hash::turn_stream_id;
 use candle_conversation::persistence::streams::StreamDecl;
 use candle_conversation::projection::{GroupId, LayerId, TimelineId};
 use candle_conversation::provenance::{encode_wide_sigs, WideQSig};
 use candle_conversation::substrate::TurnPartWrite;
 use candle_conversation::turn::Role;
+use candle_conversation::turn_layout::{phase_span_of, KvSpan, TurnLayout, TurnSegment};
 
 mod common;
 use common::open_conversation;
@@ -41,6 +43,18 @@ fn live_recorded_turn_feeds_tag_scoped_gallery_without_reload() {
             TurnPartWrite {
                 token_count: 4,
                 tags: vec!["tool".to_string(), "calculator".to_string()],
+                // A real segment layout, as the calibration seal writes: the
+                // phase lens reads its sub-ranges straight off this.
+                layout: TurnLayout::new(vec![
+                    TurnSegment::User {
+                        text: "what is 2+2".into(),
+                        kv: KvSpan::new(0, 2),
+                    },
+                    TurnSegment::Assistant {
+                        text: Some("4".into()),
+                        kv: KvSpan::new(2, 2),
+                    },
+                ]),
                 ..Default::default()
             },
             |seqs| Ok(seqs.to_vec()),
@@ -65,19 +79,28 @@ fn live_recorded_turn_feeds_tag_scoped_gallery_without_reload() {
         match decl {
             StreamDecl::Turn(t) => {
                 assert_eq!(t.tags, vec!["tool".to_string(), "calculator".to_string()]);
+                // The decl must carry the turn's SEGMENTS too, not just its
+                // tags. The offline analysis path reads phase spans straight off
+                // these (`substrate_inspect --probe-phase user`), so a turn
+                // sealed without a real user segment is invisible to it while
+                // every other assertion here still passes.
+                let user = phase_span_of(&t.segments, Phase::User)
+                    .expect("a live-sealed turn carries a real user segment");
+                assert!(user.start < user.end, "the user span must be non-empty");
             }
             other => panic!("expected a Turn decl, got {other:?}"),
         }
     }
 
     // And the tag-scoped gallery admits it immediately.
-    let (windows, slots, _sids) = conv.belief_gallery("tools", &["tool".to_string()], |name| {
+    let slot_of = |name: &str| {
         if name == "calculator" {
             Some(7)
         } else {
             None
         }
-    });
+    };
+    let (windows, slots, _sids) = conv.belief_gallery("tools", &["tool".to_string()], slot_of);
     assert_eq!(
         windows.len(),
         1,

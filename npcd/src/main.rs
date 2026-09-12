@@ -6,33 +6,40 @@
 //! runs the identical crate with `upstream:` URLs instead of `local`. Nothing
 //! here knows which of the two it is part of.
 //!
-//! That router is currently [`web::mock::npcd`] — the console's own fixture,
-//! which is the entire daemon until there is an engine to put behind it. When
-//! there is, this line names `npcd::api::router()` instead and nothing else in
-//! the file changes.
+//! That router is three, merged and with no fallback under them:
+//!
+//! | | |
+//! |---|---|
+//! | [`api`] | the authored corpus, the mind, the cast, the authoring plane, accounts, portraits |
+//! | [`ops`] | status, telemetry, memory, substrate storage, the log stream |
+//! | [`engine`] | everything an inference engine would answer — wired, and honest that there is none |
+//!
+//! **Nothing is a fixture.** Every one of these routes either does its real job
+//! or reports the absence: empty where empty is the measurement, `null` where
+//! nothing has measured, and `503 no_engine` where the request asks for work.
+//! A path none of them claims is a genuine `404`.
+//!
+//! It was not always. `main.rs` used to end in a `fallback_service` holding
+//! `web::mock::npcd` — the console's own fixture — which answered every
+//! unclaimed path with invented data, for any character id, including ones that
+//! did not exist. That fixture is still built and still served by
+//! `web --authoritative`, which is what it was written for.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use include_dir::{include_dir, Dir};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 use web::{Builder, Config, Roots};
 
-mod accounts;
-mod api;
-mod collections;
-mod guard;
-mod identity;
-mod logs;
-mod model;
-mod npcs;
-mod ops;
-mod projection;
-mod registry;
-mod substrate;
-mod telemetry;
-mod visibility;
+// The whole core is the library beside this file; the binary is a shim that
+// binds a port over it. See `lib.rs` for why the split exists.
+use npcd::{
+    accounts, api, clock, collections, engine, guard, identity, images, logs, mind, npcs, ops,
+    personality_portrait, projection, registry,
+};
 
 /// The console, compiled in. Two directories, searched in order: a request for
 /// `/lib/dom.js` falls through to the shared framework, `/pages/roster.js` does
@@ -41,7 +48,10 @@ static SITE: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../web/content/npcd");
 static COMMON: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../web/content/common");
 
 #[derive(Parser, Debug)]
-#[command(name = "npcd", about = "NPC engine daemon (mock API + console)")]
+#[command(
+    name = "npcd",
+    about = "NPC engine daemon — authored content, the cast and the console; no engine yet"
+)]
 struct Cli {
     /// Address to bind. Loopback by default — see the auth note in
     /// `docs/npc_api_gui_design.md` §8 before binding anything wider.
@@ -77,6 +87,24 @@ struct Cli {
     /// Increase log verbosity (-v debug, -vv trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Log the identity the gateway put on each request, and the role it
+    /// resolved to.
+    ///
+    /// Sign-in crosses two processes on two machines, and when it fails both
+    /// sides look correct in isolation: the gateway holds a session, the daemon
+    /// answers `401`, and neither says what arrived on the wire between them.
+    /// This prints exactly that, per request.
+    ///
+    /// Header **values are never logged** — the subject is a durable account
+    /// identifier and the assertion is a bearer token, so both would be a
+    /// credential sitting in a log file. Each header reports only `set`,
+    /// `EMPTY` or absent, which is the whole of what a routing question needs.
+    ///
+    /// Off by default and noisy when on: every request, including the
+    /// console's polls.
+    #[arg(long)]
+    log_identity: bool,
 }
 
 /// How many routes across both tables sit at exactly this role, for the
@@ -93,10 +121,20 @@ fn count<A, B>(a: &guard::Api<A>, b: &guard::Api<B>, min: web::auth::Role) -> us
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // `candle_conversation::guest` is on at every level, and it is the only
+    // engine target that is.
+    //
+    // A guest drain stops the world: every character in every estate stops
+    // thinking while a co-resident model has the card. That is an operator-
+    // visible event — it is the answer to "why did the cast go quiet for forty
+    // seconds" — and it was invisible, because the filter admits `npcd` and
+    // `web` and the drain logs from the engine. Turning the whole engine up to
+    // `info` to see it would bury it in wave telemetry; naming the one target
+    // costs a handful of lines per drain and nothing between them.
     let level = match cli.verbose {
-        0 => "npcd=info,web=info",
-        1 => "npcd=debug,web=debug",
-        _ => "npcd=trace,web=trace",
+        0 => "npcd=info,web=info,candle_conversation::guest=info",
+        1 => "npcd=debug,web=debug,candle_conversation::guest=debug",
+        _ => "npcd=trace,web=trace,candle_conversation::guest=trace",
     };
     // Every line goes two places: the terminal, and the bus the console reads
     // from `/ws/logs`. One formatter feeds both, so what an operator sees on
@@ -164,9 +202,39 @@ async fn main() -> anyhow::Result<()> {
         None => Roots::embedded(&[&SITE, &COMMON]),
     };
 
-    let data = cli
-        .data
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    // **The compiled-in default is a path on the machine that built this.**
+    //
+    // `CARGO_MANIFEST_DIR` is resolved by the compiler, so the binary carries
+    // one developer's absolute source path as its idea of where the substrate
+    // lives. On the box that built it that is exactly right and is the
+    // documented convenience; anywhere else — a binary copied to another
+    // machine, a tree that has since been moved or renamed — it names somewhere
+    // that does not exist, and the daemon would go looking for accounts and a
+    // substrate under it without ever saying so.
+    //
+    // So it is used when it is really there, and the working directory stands
+    // in when it is not. Either way the choice is logged, because "which
+    // substrate is this daemon actually writing to" is the first question asked
+    // when a cast comes up empty.
+    let data = match cli.data {
+        Some(dir) => dir,
+        None => {
+            let built_at = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            if built_at.is_dir() {
+                built_at
+            } else {
+                let here = std::env::current_dir()?;
+                tracing::warn!(
+                    "the compiled-in data directory {} is not on this machine; \
+                     falling back to the working directory {} — pass --data to be sure",
+                    built_at.display(),
+                    here.display()
+                );
+                here
+            }
+        }
+    };
+    tracing::info!("data: {} (substrate and accounts)", data.display());
 
     // Authored content, read once. Everything after this answers from memory,
     // so a URL id is a key rather than a path — see `registry`.
@@ -199,8 +267,14 @@ async fn main() -> anyhow::Result<()> {
         accounts.len(),
         data.join("accounts").display()
     );
+    // Named the other way round, because the exception list is now the longer
+    // one and a reader takes "MOCK for everything except …" as exhaustive. It
+    // was not: it omitted the cast on the substrate, the whole mind editor,
+    // `/v1/substrate/storage` and `/v1/world/:wid/collections`, all of which
+    // are real.
     tracing::info!(
-        "backend: MOCK for everything except authored content, accounts, telemetry and logs"
+        "backend: real for authored content, the mind, the cast, accounts, telemetry, \
+         storage and logs — FIXTURE for everything an engine would produce"
     );
 
     // The real routes sit *over* the mock rather than beside it: `npcd` owns
@@ -226,12 +300,13 @@ async fn main() -> anyhow::Result<()> {
         // Save is broken", and an operator should learn it here rather than
         // from a 403 an hour later.
         tracing::warn!(
-            "roles: no admins configured — worlds and personalities are read-only to everyone"
+            "roles: nobody configured — worlds and personalities are read-only to everyone"
         );
     } else {
         tracing::info!(
-            "roles: {} admin principal(s) configured",
-            roles.admins.len()
+            "roles: {} admin and {} creator principal(s) configured",
+            roles.admins.len(),
+            roles.creators.len(),
         );
     }
 
@@ -247,6 +322,53 @@ async fn main() -> anyhow::Result<()> {
         libraries.moods.with_examples(),
     );
 
+    // The registers a character may say it is in, taken here because the
+    // library itself is about to be handed to the authoring state.
+    //
+    // Captured once rather than resolved per tick, unlike the persona: the
+    // libraries are read once and do not change while the daemon runs, and this
+    // list is compiled into a decoding grammar — a set that could change under
+    // the engine would mean recompiling the stencil on a turn nobody asked to
+    // be different.
+    let feelings: Vec<String> = libraries
+        .moods
+        .sections
+        .iter()
+        .map(|s| s.id.clone())
+        .collect();
+
+    // The mind directory, for the file editor. Taken from the resolved schema
+    // rather than from `--mind` directly, so the editor and the collections
+    // read the same root — a second answer to "where is the mind" would be
+    // free to disagree the day the layout changes.
+    let mind_dir = schema.dir.clone();
+    let mind = mind::Mind::new(mind_dir.clone());
+    // A second handle for the engine. The editor and the ingest read the same
+    // schema through the same address, so they must be the same `Mind` — a
+    // second one built from the path would be a second reading of the document
+    // to drift from the first.
+    let mind_for_engine = mind.clone();
+    match mind.root() {
+        Some(root) => tracing::info!("mind: editable at {}", root.display()),
+        None => tracing::info!("mind: none — the file editor will report it has nothing to edit"),
+    }
+
+    // Portraits, beside the accounts and the substrate — things this daemon
+    // writes, rather than things a person authored.
+    let images = images::Images::new(&data);
+
+    // A personality may name a portrait it was authored with. Read those into
+    // the image store now, once, so the console can fetch them through the
+    // ordinary image route — see [`personality_portrait`] for why the picture
+    // is a file in the mind rather than an id in this daemon's store.
+    let personality_portraits =
+        personality_portrait::ingest(&personalities, &authored_dir.join("personalities"), &images);
+    tracing::info!(
+        "authored portraits: {} of {} personalities carry one",
+        personality_portraits.len(),
+        personalities.len(),
+    );
+
     let authored = api::Authored::new(
         worlds,
         personalities,
@@ -254,8 +376,140 @@ async fn main() -> anyhow::Result<()> {
         npcs,
         roles.clone(),
         libraries,
+        mind,
+        images,
+        personality_portraits,
     );
-    let ops_state = ops::Ops::new(logs, &data, roles.clone());
+
+    // ── the engine ─────────────────────────────────────────────────────────
+    //
+    // Built here and *started* after the server is bound, so the console's
+    // loading screen is being served by the time the model starts loading. A
+    // daemon that loads first and binds afterwards has nothing to show the
+    // person waiting on it, which on a multi-gigabyte checkpoint is the whole
+    // of the first minute.
+    //
+    // The runtime is built first — it needs only the mind directory — then
+    // handed to the state, then given the two resolvers that read that state
+    // back. That order is what breaks the cycle between them: `Authored` needs
+    // the runtime to answer its routes, and the runtime needs `Authored` to know
+    // what time it is for a character and who that character is.
+    let runtime = engine::runtime::Runtime::new(mind_for_engine, &data);
+    // The engine adopts the substrate the cast was just loaded from, rather than
+    // opening `--data` a second time. One `.substrate/` takes one writable
+    // handle per process; two lose records silently. See `Npcs::substrate`.
+    runtime.set_substrate(authored.npcs.read().await.substrate());
+    let authored = authored.with_runtime(runtime.clone());
+
+    // The clock resolver closes over the state rather than reading a single
+    // daemon-wide clock: worlds run at their own pace and can be paused
+    // independently, and a character has to see its own world's time.
+    // `blocking_read`, because the tick driver is a plain OS thread with no
+    // async context. **This closure must never be called from inside the
+    // runtime** — `blocking_read` there panics rather than waiting, and the
+    // route that did it answered every request with a closed connection while
+    // the loop it was showing ran perfectly underneath. The async side uses
+    // `Authored::world_ms`, which reaches the same lookup by the other route.
+    let clock_state = authored.clone();
+    runtime.set_clock(Arc::new(move |npc_id: u64| {
+        clock::world_ms_for(
+            &clock_state.npcs.blocking_read(),
+            &clock_state.worlds.blocking_read(),
+            npc_id,
+            now_ms_i64(),
+        )
+    }));
+
+    runtime.set_feelings(feelings);
+
+    // Who each character is, resolved at tick time rather than captured at
+    // startup. A belief edited through the authoring API has to reach the next
+    // tick — a persona snapshot taken here would keep every character as it was
+    // when the process began, and the mind editor would appear to do nothing.
+    let persona_state = authored.clone();
+    runtime.set_persona_source(Arc::new(move |npc_id: u64| {
+        let npcs = persona_state.npcs.blocking_read();
+        let payload = npcs.payload(npc_id)?;
+        // The world's own description, for the prompt's setting section. A
+        // character with no readable world still gets a persona — an empty
+        // setting is a thin prompt, a missing character is no prompt at all.
+        let world = persona_state
+            .worlds
+            .blocking_read()
+            .get(&payload.world_id)
+            // **`setting`, which is what a world document actually calls it.**
+            // This read `description` and so found nothing: every character has
+            // been thinking with an empty "The world you live in" section since
+            // the field was named, and nothing said so because an absent world
+            // is a legitimate state for a world with no document.
+            .and_then(|r| {
+                r.body
+                    .get("setting")
+                    .and_then(|d| d.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        Some(engine::persona::of(payload, &world))
+    }));
+
+    // Where bodies are, recorded so a restart can put them back.
+    //
+    // The world itself is not persisted — who is standing where lives in RAM
+    // and goes with the process — so this is what stops every character
+    // re-entering at the arrival door on every boot. `blocking_write`, because
+    // a world's metronome is a plain OS thread with no async context; the
+    // registry's own checkpoint gates make almost every call a map lookup, so
+    // the lock is held for nothing on a still world.
+    let place_state = authored.clone();
+    runtime.set_place_sink(Arc::new(move |npc_id: u64, at: &str| {
+        place_state
+            .npcs
+            .blocking_write()
+            .remember_place(npc_id, at, now_ms_i64() as u64);
+    }));
+
+    // And how it feels, for the same reason and by the same route: a mood is
+    // what a character *is* between one thought and the next, and holding it
+    // only in RAM meant a restart returned everybody to no register at all.
+    // Written only when the register has actually changed, so almost every call
+    // is a map lookup.
+    let mood_state = authored.clone();
+    runtime.set_mood_sink(Arc::new(move |npc_id: u64, mood: &str| {
+        mood_state.npcs.blocking_write().remember_mood(npc_id, mood);
+    }));
+
+    // The places the cast stands in, one world at a time.
+    //
+    // `map/<world_id>/` beside `worlds/<world_id>.yaml`, because a world's rooms
+    // are authored exactly like its lore and belong to the same world. Most
+    // worlds have none: a daemon whose characters have lore and no bodies is not
+    // a broken daemon, and every route above works the same either way.
+    {
+        let ids: Vec<String> = authored
+            .worlds
+            .read()
+            .await
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
+        for (id, hosted) in runtime.host_authored(&authored_dir, ids.iter().map(String::as_str)) {
+            match hosted {
+                Ok(w) => tracing::info!(
+                    "world `{id}` hosted — {} places",
+                    w.read(|w| w.map().areas().map(|a| a.nodes.len()).sum::<usize>())
+                ),
+                // Loud, and not fatal. A map that does not hold together is an
+                // authoring mistake to fix, not a reason for the console and
+                // the whole authored corpus to be unreachable — nor for the
+                // other worlds to go unhosted.
+                Err(e) => tracing::error!("world `{id}`: its map did not load: {e:#}"),
+            }
+        }
+    }
+
+    // The load progress is shared, not copied: `/v1/status` answers from it
+    // while the loader thread is still writing to it.
+    let ops_state = ops::Ops::new(logs, &data, roles.clone(), runtime.progress.clone());
 
     // The route table, at startup, with the role each route needs.
     //
@@ -265,30 +519,193 @@ async fn main() -> anyhow::Result<()> {
     // here — a write route sitting at `unauthenticated` — is the one that
     // matters, and it is the one that used to be invisible.
     let (api_routes, ops_routes) = (api::api(authored.clone()), ops::api(ops_state.clone()));
-    for r in api_routes.declared().iter().chain(ops_routes.declared()) {
+    // The surface an engine would answer — wired, and honest that there is no
+    // engine behind it. Separate from `api` because the two become true at
+    // different times: everything in `api` is real today.
+    let engine_routes = engine::api(authored.clone());
+    for r in api_routes
+        .declared()
+        .iter()
+        .chain(ops_routes.declared())
+        .chain(engine_routes.declared())
+    {
         tracing::debug!("route {r}");
     }
     tracing::info!(
-        "routes: {} guarded ({} open, {} user, {} admin), everything else behind `user`",
-        api_routes.declared().len() + ops_routes.declared().len(),
+        "routes: {} guarded ({} open, {} user, {} admin), {} awaiting an engine",
+        api_routes.declared().len() + ops_routes.declared().len() + engine_routes.declared().len(),
         count(&api_routes, &ops_routes, web::auth::Role::Unauthenticated),
         count(&api_routes, &ops_routes, web::auth::Role::User),
         count(&api_routes, &ops_routes, web::auth::Role::Admin),
+        engine_routes.declared().len(),
     );
 
-    let router = api_routes
-        .into_router(authored)
+    // Shared with the logging layer below, which needs the table on every
+    // request while the fallback owns it. `Arc` so that per-request sharing is
+    // a refcount bump rather than a copy of the admin list, and `None` when the
+    // flag is off so nothing is paid for a layer that is not installed.
+    let log_roles = cli.log_identity.then(|| Arc::new(roles.clone()));
+
+    let mut router = api_routes
+        .into_router(authored.clone())
         .merge(ops_routes.into_router(ops_state))
-        // The fallback is the quietest surface there is: it answers every path
-        // the real routes did not claim, which today is the console's fixture
-        // and tomorrow is whatever has not been migrated yet. Signed-in is the
-        // floor — the console is a signed-in tool — so a route that has not
-        // been written yet cannot be reached by a stranger before it is.
-        .fallback_service(guard::behind(
-            roles,
-            web::auth::Role::User,
-            web::mock::npcd::router(),
+        .merge(engine_routes.into_router(authored.clone()));
+
+    /* **There is no fallback.**
+     *
+     * There was, and it was `web::mock::npcd::router()` — the console's
+     * fixture, answering every path the real routes had not claimed. It
+     * answered them well: correctly-shaped, plausible, and invented. A
+     * character's beliefs came back for ids that did not exist; the world clock
+     * reported `{"ok":true}` and moved nothing; the tool catalog listed tools
+     * this daemon has never had.
+     *
+     * Every one of those paths is now a route of its own — real where the thing
+     * is real, and `no_engine` where it is not (see [`engine`]). So an
+     * unclaimed path is a genuine 404 again, which is what a 404 is for.
+     *
+     * The fixture still exists and is still built: `web --authoritative` serves
+     * it, which is what it was written for. What it no longer does is stand
+     * behind a daemon that means it. */
+
+    // Applied to the assembled router, so it covers the guarded routes, the ops
+    // routes and the fallback alike — a layer on any one of them would report
+    // only what reached that one. It does **not** see static content: the
+    // console's files are served by the builder and never enter this router, so
+    // the log is `/v1` traffic, which is the whole of what carries identity.
+    if let Some(log_roles) = log_roles {
+        tracing::info!("--log-identity: logging the gateway's headers on every API request");
+        router = router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let roles = Arc::clone(&log_roles);
+                async move {
+                    // Borrowed straight from the request rather than copied out
+                    // of it: three shared borrows that all end before `req` is
+                    // moved into `next`, so the line costs no allocation.
+                    identity::log_identity(
+                        req.headers(),
+                        &roles,
+                        req.method().as_str(),
+                        req.uri().path(),
+                    );
+                    next.run(req).await
+                }
+            },
         ));
+    }
+
+    // ── start the engine ───────────────────────────────────────────────────
+    //
+    // After the router is assembled and before `serve()` blocks. The loader
+    // runs on its own OS thread and returns immediately, so the server binds
+    // while the model is still being fetched — which is the point: the loading
+    // screen has to be reachable during the load it is describing.
+    // With the world each belongs to and the room it was last standing in:
+    // waking a character and putting it back in its body are one step, and the
+    // store already knows all three.
+    let cast: Vec<npcs::Casting> = authored.npcs.read().await.cast();
+    tracing::info!("engine: loading, {} character(s) to wake", cast.len());
+    engine::runtime::start(
+        runtime.clone(),
+        engine::runtime::LoadPlan {
+            world_ms: 0,
+            cast,
+            // Personalities, not the cast. A layer directory is named after a
+            // personality — `layers/memory/zen/` — and a world's biographies
+            // exist whether or not anybody has cast them yet.
+            characters: authored
+                .personalities
+                .read()
+                .await
+                .iter()
+                .map(|r| r.id.clone())
+                .collect(),
+            // Who each personality, character and world is, for the projection's
+            // identity collections. Read here, where the registries live; the
+            // loader thread installs them — see `engine::identity`.
+            authored: {
+                let (npcs, personalities, worlds) = (
+                    authored.npcs.read().await,
+                    authored.personalities.read().await,
+                    authored.worlds.read().await,
+                );
+                let field = |b: &serde_json::Value, k: &str| {
+                    b.get(k)
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                engine::identity::Authored {
+                    anchors: personalities
+                        .iter()
+                        .map(|p| (p.id.clone(), field(&p.body, "anchor")))
+                        .collect(),
+                    // Rendered through the same function the fallback prompt
+                    // uses, so a character reads the same words either way. The
+                    // world is not rendered in — it is its own collection,
+                    // shared by everyone standing in it.
+                    characters: npcs
+                        .cast()
+                        .iter()
+                        .filter_map(|c| {
+                            let payload = npcs.payload(c.npc_id)?;
+                            let owned = engine::persona::of(payload, "");
+                            Some((c.npc_id, engine::prompt::character(&owned.as_persona())))
+                        })
+                        .collect(),
+                    // `setting` — what a world document actually calls it.
+                    settings: worlds
+                        .iter()
+                        .map(|w| (w.id.clone(), field(&w.body, "setting")))
+                        .collect(),
+                }
+            },
+        },
+    );
+
+    // The mind watcher, so an edited world file takes effect without a restart.
+    // Held for the process's lifetime — dropping it stops the watch — which is
+    // why it is bound rather than discarded.
+    let _mind_watcher = match &mind_dir {
+        Some(dir) => match engine::watcher::spawn(
+            dir,
+            // The runtime's ledger, filled by the startup ingest — so the first
+            // edit after a boot is one changed file, not a whole-tree rewrite.
+            runtime.ledger.clone(),
+            Arc::new(|report: engine::watcher::ReloadReport| {
+                tracing::info!(
+                    "mind reloaded: +{} ~{} -{}",
+                    report.added,
+                    report.changed,
+                    report.removed
+                );
+            }),
+        ) {
+            Ok(w) => Some(w),
+            // Not fatal. A daemon that will not start because it cannot watch a
+            // directory is worse than one that runs without live reload and
+            // says so — the reload is a convenience, the engine is the product.
+            Err(e) => {
+                tracing::warn!("mind watcher not armed: {e} — edits need a restart");
+                None
+            }
+        },
+        None => None,
+    };
+
+    // Stop the tick driver on Ctrl-C, before the process goes.
+    //
+    // Not cosmetic. A character's decode writes turns to the substrate, and a
+    // driver killed mid-tick leaves the redo log with a turn whose sealing never
+    // happened. Setting the flag lets the current tick finish and the loop exit
+    // at its next quiet moment — the same reason the flag exists at all.
+    let stopping = runtime.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("interrupt received — stopping the tick driver");
+            stopping.stop();
+        }
+    });
 
     Builder::new(cfg)
         .content("npcd", roots)
@@ -300,4 +717,16 @@ async fn main() -> anyhow::Result<()> {
         .local_api("npcd", router)
         .serve()
         .await
+}
+
+/// Wall-clock milliseconds as the narrative clock takes them.
+///
+/// Signed, because [`clock::Clock`] works in `i64` throughout — a world can be
+/// jumped backwards past its own epoch, and an unsigned instant would wrap
+/// rather than clamp.
+fn now_ms_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

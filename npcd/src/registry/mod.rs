@@ -31,7 +31,11 @@
 //! does when a document is one it cannot edit.
 
 pub mod id;
-mod yaml_edit;
+/// Public because the mind's field editor patches documents the registry does
+/// not own — a canon page, a response section — and both need the same
+/// comment-preserving splice. One implementation, two callers, rather than a
+/// second one that would be free to lose comments differently.
+pub mod yaml_edit;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -115,7 +119,27 @@ pub struct Record {
     pub body: Value,
 }
 
-/// An in-memory collection of authored records backed by one directory.
+/// Who writes the files in a collection, which decides how a save is rendered.
+///
+/// This is not a preference. Preserving an author's formatting means splicing
+/// the new value into the existing text, and the splice locates what it is
+/// replacing by **building a pattern out of that text** — so its cost grows
+/// with the size of the thing being replaced, and a document holding a
+/// collection that grows without bound gets quadratically more expensive to
+/// save. That is worth paying where the comments are the most valuable thing in
+/// the file. It buys exactly nothing where no human has ever opened it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Written {
+    /// **By a person**, in an editor, with comments. Worlds and personalities:
+    /// a save changes the lines it must and leaves the rest of the file alone.
+    ByHand,
+    /// **By this daemon.** Accounts: nobody has ever commented one, so a save
+    /// serialises the document whole. Cheaper, and linear in the document
+    /// instead of quadratic in its largest collection.
+    ByDaemon,
+}
+
+/// An in-memory collection of records backed by one directory.
 #[derive(Debug)]
 pub struct Registry {
     dir: PathBuf,
@@ -124,6 +148,8 @@ pub struct Registry {
     items: BTreeMap<String, Record>,
     /// What this collection is called in errors and logs (`world`, `personality`).
     kind: &'static str,
+    /// Whether a save preserves an author's formatting. See [`Written`].
+    written: Written,
 }
 
 impl Registry {
@@ -137,7 +163,20 @@ impl Registry {
     /// One malformed world must not take the daemon down and with it every
     /// other world — the same call the blog index makes about a post with
     /// broken front matter.
+    /// Files somebody wrote by hand, so a save preserves their formatting. Use
+    /// [`Self::load_generated`] for a collection this daemon writes — see
+    /// [`Written`], which explains why the choice is a performance decision and
+    /// not only a cosmetic one.
     pub fn load(kind: &'static str, dir: impl AsRef<Path>) -> Result<Self> {
+        Self::read(kind, dir, Written::ByHand)
+    }
+
+    /// Files this daemon writes, with no comments in them to keep.
+    pub fn load_generated(kind: &'static str, dir: impl AsRef<Path>) -> Result<Self> {
+        Self::read(kind, dir, Written::ByDaemon)
+    }
+
+    fn read(kind: &'static str, dir: impl AsRef<Path>, written: Written) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         let mut items = BTreeMap::new();
 
@@ -188,11 +227,22 @@ impl Registry {
         }
 
         tracing::info!("{kind}: {} loaded from {}", items.len(), dir.display());
-        Ok(Self { dir, items, kind })
+        Ok(Self {
+            dir,
+            items,
+            kind,
+            written,
+        })
     }
 
     pub fn len(&self) -> usize {
         self.items.len()
+    }
+
+    /// Whether nothing has been registered. A registry over an empty directory
+    /// is a legitimate state — a world with no personalities authored yet.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
     }
 
     /// Look up by id. This is what a URL segment reaches — a map lookup, never
@@ -270,6 +320,14 @@ impl Registry {
             serde_yaml::to_string(body)
                 .with_context(|| format!("{}: serialising `{id}`", self.kind))
         };
+        // Nothing to preserve, so nothing to splice. This is the whole of the
+        // optimisation and it is a short-circuit rather than a faster splice:
+        // the expensive part of an in-place edit is locating the old text by
+        // pattern, and a document whose largest collection grows on every save
+        // makes that pattern grow with it. See [`Written`].
+        if self.written == Written::ByDaemon {
+            return whole();
+        }
         let Some(map) = body.as_object() else {
             return whole();
         };
@@ -427,6 +485,102 @@ mod tests {
     fn a_missing_directory_is_an_empty_registry_not_a_failure() {
         let r = Registry::load("world", tmp().join("does-not-exist")).unwrap();
         assert_eq!(r.len(), 0);
+    }
+
+    /// **A hand-written file keeps its comments; a generated one is rewritten.**
+    ///
+    /// The two halves are one test because the point is the *difference*: it is
+    /// the reason `Written` exists, and asserting either alone would leave the
+    /// other free to drift into it.
+    #[test]
+    fn an_authored_file_keeps_its_comments_and_a_generated_one_does_not() {
+        let dir = tmp();
+        let commented = "# the author's note\nname: Ardh\nsetting: A kingdom.\n";
+
+        std::fs::write(dir.join("byhand.yaml"), commented).unwrap();
+        let mut authored = Registry::load("world", &dir).unwrap();
+        authored
+            .put("byhand", json!({"name": "Ardh", "setting": "A republic."}))
+            .unwrap();
+        let after = std::fs::read_to_string(dir.join("byhand.yaml")).unwrap();
+        assert!(
+            after.contains("# the author's note"),
+            "an authored file lost its comment: {after}"
+        );
+        assert!(
+            after.contains("A republic."),
+            "the edit did not land: {after}"
+        );
+
+        std::fs::write(dir.join("bydaemon.yaml"), commented).unwrap();
+        let mut generated = Registry::load_generated("account", &dir).unwrap();
+        generated
+            .put(
+                "bydaemon",
+                json!({"name": "Ardh", "setting": "A republic."}),
+            )
+            .unwrap();
+        let after = std::fs::read_to_string(dir.join("bydaemon.yaml")).unwrap();
+        assert!(
+            !after.contains("# the author's note"),
+            "a generated file was spliced rather than rewritten, which is the \
+             expensive path this mode exists to avoid: {after}"
+        );
+        assert!(
+            after.contains("A republic."),
+            "the edit did not land: {after}"
+        );
+    }
+
+    /// **A growing collection must not make saves progressively slower.**
+    ///
+    /// This is the regression that cost 455 seconds in one test. Splicing locates
+    /// the text it replaces by building a pattern out of that text, so a document
+    /// whose largest collection grows on every save gets quadratically dearer to
+    /// write. A generated registry does not splice, so its saves stay flat.
+    ///
+    /// Asserted as a ratio against this machine's own first-ten timing rather
+    /// than a wall-clock bound, so it means the same thing on a slow box as on a
+    /// fast one. The margin is wide because it is catching an order of magnitude,
+    /// not a regression of a few percent.
+    #[test]
+    fn saving_a_generated_record_does_not_get_slower_as_it_grows() {
+        use std::time::Instant;
+
+        let dir = tmp();
+        let mut r = Registry::load_generated("account", &dir).unwrap();
+        // Small entries and a shallow history: the splice path's cost grows with
+        // the *text* of the collection, so 60 entries of 60 characters is already
+        // three orders of magnitude off the flat path and detects a reversion
+        // just as surely as 200 of 200 did — for a fiftieth of the runtime.
+        let entry = |i: usize| json!({ "revision": i, "text": "x".repeat(60) });
+
+        let mut history: Vec<Value> = Vec::new();
+        let save = |history: &Vec<Value>, r: &mut Registry| {
+            r.put("acct", json!({ "name": "A", "history": history }))
+                .unwrap();
+        };
+
+        let batch = |from: usize, to: usize, history: &mut Vec<Value>, r: &mut Registry| {
+            let at = Instant::now();
+            for i in from..to {
+                history.push(entry(i));
+                save(history, r);
+            }
+            at.elapsed()
+        };
+
+        batch(0, 5, &mut history, &mut r);
+        let early = batch(5, 15, &mut history, &mut r);
+        batch(15, 60, &mut history, &mut r);
+        let late = batch(60, 70, &mut history, &mut r);
+
+        assert!(
+            late < early * 20 + std::time::Duration::from_millis(50),
+            "saves got dramatically slower as the document grew — ten saves at \
+             70 entries took {late:?} against {early:?} at 15, which is the \
+             quadratic splice path coming back"
+        );
     }
 
     #[test]

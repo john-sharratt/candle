@@ -41,6 +41,20 @@ pub enum ScopeKey {
     TurnGroup { group: u64, timeline: u64 },
     /// A section collection (the tool catalog); its gallery is stable, no timeline.
     Collection { group: u64, name: String },
+    /// One PHASE of a section collection's gallery — the same competition scored
+    /// over only the user / thinking / response region of each exemplar.
+    ///
+    /// A hit level is a denominator, so it is only meaningful over the
+    /// distribution it was learned on. A live query is a *question*, and
+    /// `docs/tool_selection_provenance_results.md` §20.3 measured the phases as
+    /// carrying very different signal for tool routing — `user` 65.6 against
+    /// `think+resp` 21.5. Folding all three into one level therefore normalizes
+    /// the question against a denominator that is mostly not questions.
+    CollectionPhase {
+        group: u64,
+        name: String,
+        phase: Phase,
+    },
     /// A sub-window within one turn (future — file-within-listing selection).
     SubWindow { turn: u64 },
 }
@@ -55,9 +69,34 @@ impl ScopeKey {
             name: name.into(),
         }
     }
+    pub fn collection_phase(group: u64, name: impl Into<String>, phase: Phase) -> Self {
+        ScopeKey::CollectionPhase {
+            group,
+            name: name.into(),
+            phase,
+        }
+    }
     pub fn sub_window(turn: u64) -> Self {
         ScopeKey::SubWindow { turn }
     }
+}
+
+/// Which region of a turn a signature window covers.
+///
+/// A turn is `user question → <think>…</think> → assistant answer`, and those
+/// regions do not carry the same retrieval signal. Measured for tool routing
+/// (results doc §20.3): routing on `user` scores 65.6 and on `think+resp` 21.5 —
+/// "the task description is what maps to the tool definition, while by the time
+/// the model is emitting the `<tool_call>` JSON it has committed". Scoring and
+/// normalizing per phase is that finding applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Phase {
+    /// The user's message — the question being asked.
+    User,
+    /// The `<think>…</think>` reasoning block.
+    Thinking,
+    /// The assistant's answer body, including any emitted tool call.
+    Response,
 }
 
 /// Stable identity of a candidate within a scope. A turn group keys by turn index

@@ -18,12 +18,17 @@ pub(super) fn hermes3_3b_q6() -> ModelSpec {
     let chat_format = DialectType::Llama3;
     ModelSpec {
         arch: ModelArch::Llama,
+        loras: Vec::new(),
         dialect: chat_format.dialect(),
         chat_format,
         model_repo: "bartowski/Hermes-3-Llama-3.2-3B-GGUF".into(),
         model_filename: "Hermes-3-Llama-3.2-3B-Q6_K.gguf".into(),
         prepared_from_source: false,
         model_bytes: 2_643_850_336,
+        // Unpinned: no verified commit has been recorded for this conversion. See
+        // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
+        model_rev: String::new(),
+        gate_donor: None,
         tokenizer_repo: "NousResearch/Hermes-3-Llama-3.2-3B".into(),
         // Unpinned: no revision verified against this checkpoint's own token
         // table. The load-time check against it guards the pairing meanwhile.
@@ -45,12 +50,17 @@ pub(super) fn hermes3_70b_q4() -> ModelSpec {
     let chat_format = DialectType::Llama3;
     ModelSpec {
         arch: ModelArch::Llama,
+        loras: Vec::new(),
         dialect: chat_format.dialect(),
         chat_format,
         model_repo: "bartowski/Hermes-3-Llama-3.1-70B-GGUF".into(),
         model_filename: "Hermes-3-Llama-3.1-70B-Q4_K_M.gguf".into(),
         prepared_from_source: false,
         model_bytes: 42_520_393_792,
+        // Unpinned: no verified commit has been recorded for this conversion. See
+        // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
+        model_rev: String::new(),
+        gate_donor: None,
         tokenizer_repo: "NousResearch/Hermes-3-Llama-3.1-70B".into(),
         tokenizer_rev: String::new(),
         default_system_prompt: "You are a helpful assistant.".into(),

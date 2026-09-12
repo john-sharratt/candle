@@ -15,9 +15,9 @@ use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, Tur
 use super::project::ProjectionTarget;
 use super::schema::{CorruptTurnPolicy, LayerSchema, Schema, SystemPromptItem, SystemPromptSchema};
 use crate::error::ConversationError;
-use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
+use crate::normalization::{ChildKey, NormalizationCache, Phase, ScopeKey};
 use crate::persistence::content_hash::{
-    branch_checkpoint_stream_id, snapshot_stream_id, ContentHash,
+    branch_checkpoint_stream_id, snapshot_stream_id, turn_stream_id, ContentHash,
 };
 use crate::persistence::integrity::{classify_turn, TurnIntegrity};
 use crate::persistence::manifest::{self, RecordLoc};
@@ -28,7 +28,7 @@ use crate::persistence::record::{
 use crate::persistence::resume::TurnChunkGrid;
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::writer::{SubstrateWriter, WriteJob};
-use crate::persistence::SubstratePersistence;
+use crate::persistence::{SharedSubstrate, SubstratePersistence};
 use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
 use crate::provenance::gallery_arena::{PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
@@ -60,6 +60,110 @@ const WARM_REPLAY_MAX_TURNS: usize = 512;
 /// ~94% converged after 8 observes and each probe already scores against the whole
 /// timeline, so this bounds the one-time warm cost over a large corpus.
 const WARM_INGEST_PROBES_PER_TIMELINE: usize = 8;
+
+/// Self-probes per collection MEMBER when warming a section collection's hit
+/// levels from its own tag-scoped corpus
+/// ([`Conversation::warm_collection_normalization`]). Per member, not per
+/// collection: a member's level has to reflect *its own* traffic, so every tool
+/// needs probes of its own or the unprobed ones keep a cold-start level and score
+/// on a different scale from their neighbours. Same asymmetric-EWMA convergence
+/// argument as [`WARM_INGEST_PROBES_PER_TIMELINE`].
+const WARM_COLLECTION_PROBES_PER_MEMBER: usize = 8;
+
+/// Whether a scoring pass teaches the normalization levels, and — when it does —
+/// which lens the observation belongs to.
+///
+/// Normalization is per-scope by construction, so an observation is only
+/// meaningful *inside the scope it came from*. The tag set carried here is what
+/// routes it: a scope learns from a probe only when the probe belongs to that
+/// scope. A tag-scoped collection (the tool catalog scores its members against a
+/// gallery of `tool`-tagged exemplars) therefore learns from tool traffic and is
+/// untouched by dialogue traffic — which is the segmentation that keeps one lens
+/// from degrading another WITHOUT switching learning off.
+///
+/// Getting this wrong is not a small error. Attributing dialogue turns to the
+/// tool lens re-ordered its ranking rather than merely blurring it, and
+/// compounded: across 24 measured conversations the correct-answer rate fell
+/// 67% → 17% and provenance Top-1 fell 4/6 → 1/6.
+#[derive(Clone, Copy, Debug)]
+pub enum Observe<'a> {
+    /// Read-only: score without teaching anything. Live reprojection and the
+    /// interactive probe, neither of which is new evidence about a scope.
+    No,
+    /// Teach the scopes this probe belongs to. `tags` are the observed turn's
+    /// gather-scope tags; a tag-scoped node learns only when they intersect its
+    /// own. An empty slice is ordinary dialogue — it teaches the untagged
+    /// (turn-group) scopes and no tag-scoped collection.
+    ///
+    /// `source` identifies the evidence — the turn's stream id — so a scope
+    /// folds it exactly once however many times it is replayed.
+    Yes { tags: &'a [String], source: u64 },
+}
+
+impl Observe<'_> {
+    /// The evidence id to fold under, when this pass teaches anything.
+    fn source(&self) -> Option<u64> {
+        match self {
+            Observe::No => None,
+            Observe::Yes { source, .. } => Some(*source),
+        }
+    }
+
+    /// Whether a node whose gather scope is `scope_tags` learns from this pass.
+    /// An untagged node (`scope_tags` empty) is unscoped and learns from any
+    /// observing pass; a tag-scoped node learns only from a probe inside it.
+    fn teaches(&self, scope_tags: &[String]) -> bool {
+        match self {
+            Observe::No => false,
+            Observe::Yes { tags, .. } => {
+                scope_tags.is_empty() || scope_tags.iter().any(|s| tags.contains(s))
+            }
+        }
+    }
+}
+
+/// Which corpus turns warm which collection member, in a deterministic order.
+///
+/// A gallery turn carries the collection's scope tag (what bounds the gallery)
+/// plus the name of the member it was captured for; the member is therefore the
+/// tag that names an actual member. Turns carrying a scope tag but no member tag
+/// belong to the gallery without teaching any single member's level, and are
+/// skipped rather than attributed to an arbitrary one.
+///
+/// Split out of [`Conversation::warm_collection_normalization`] so the tag
+/// derivation, the per-member cap and the ordering are testable without a
+/// substrate: the result must not depend on stream-map iteration order, or the
+/// warmed levels — and hence the ranking every tool query is decided by — would
+/// differ run to run.
+fn collection_warm_plan<'a>(
+    member_names: &HashSet<&str>,
+    scope_tags: &[String],
+    turns: impl Iterator<Item = (&'a [String], u64, u32)>,
+    per_member: usize,
+) -> Vec<(String, Vec<(u64, u32)>)> {
+    let mut by_member: std::collections::BTreeMap<String, Vec<(u64, u32)>> =
+        std::collections::BTreeMap::new();
+    for (tags, timeline, index) in turns {
+        if !tags.iter().any(|t| scope_tags.contains(t)) {
+            continue;
+        }
+        let Some(member) = tags.iter().find(|t| member_names.contains(t.as_str())) else {
+            continue;
+        };
+        by_member
+            .entry(member.clone())
+            .or_default()
+            .push((timeline, index));
+    }
+    by_member
+        .into_iter()
+        .map(|(member, mut keys)| {
+            keys.sort_unstable();
+            keys.truncate(per_member);
+            (member, keys)
+        })
+        .collect()
+}
 
 /// Contiguous `[start, end)` sub-window bounds over a `len`-token sig, split at
 /// sorted, deduped `seams`. An empty `seams` yields one window `[0, len)` — the
@@ -158,6 +262,73 @@ pub struct Conversation {
     /// change misses and refills exactly once, and the phases that open many
     /// conversations all open them on a single shared prompt branch.
     branch_checkpoint: Arc<Mutex<Option<(ContentHash, Arc<BranchCheckpointPayload>)>>>,
+    /// The throwaway directory an [`Self::ephemeral`] conversation's log lives
+    /// in, removed when the last clone of that conversation drops.
+    ///
+    /// `None` for every conversation opened on a real workspace — those own a
+    /// directory somebody chose and must never delete it.
+    ///
+    /// **Without this the temp directory outlived the process.** An ephemeral
+    /// conversation is a throwaway log, and `LogFile` grows in 64 MiB extents,
+    /// so the first record written costs 64 MiB on disk — reclaimed only when a
+    /// segment *seals*, which a throwaway never does. Every ephemeral
+    /// conversation therefore left 64 MiB behind permanently: summarisation
+    /// makes them, tests make them, and 727 of them had accumulated in `%TEMP%`
+    /// on this machine, ~46 GB, alongside the same leak from the test helpers.
+    /// Held behind the same `Arc` as everything else here so a clone does not
+    /// delete the directory the original is still writing to.
+    ///
+    /// **Declared last on purpose.** Rust drops fields in declaration order, so
+    /// `writer` above goes first — draining, fsyncing and joining the writer
+    /// thread — and only then does this remove the directory. Windows refuses to
+    /// delete a directory holding an open file, so a guard that ran before the
+    /// writer released its handles would silently fail and leave the 64 MiB
+    /// behind, which is the bug it exists to fix.
+    ///
+    /// Never read, and that is the point: the whole of its behaviour is in
+    /// `Drop`. Holding it is the feature.
+    #[allow(dead_code)]
+    ephemeral_dir: Option<Arc<TempDirGuard>>,
+}
+
+/// Removes a directory when the last holder drops it.
+///
+/// Deliberately best-effort: a failure to remove a *temp* directory is not
+/// worth failing a drop over, and on Windows a file another process still has
+/// open will refuse. The alternative to best-effort is a panic in `Drop`, which
+/// aborts.
+#[derive(Debug)]
+pub struct TempDirGuard {
+    path: std::path::PathBuf,
+}
+
+impl TempDirGuard {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// The directory this guard will remove.
+    ///
+    /// Only the tests that assert the removal actually happens have any reason
+    /// to ask — production code holds the guard and never looks inside it.
+    #[cfg(test)]
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.path) {
+            // `NotFound` is the ordinary outcome when a test removed it itself.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(
+                    "temp directory {:?} not removed: {e} — it will be left on disk",
+                    self.path
+                );
+            }
+        }
+    }
 }
 
 /// Per-turn residency fingerprint for a decoded sig window: the memo's stable
@@ -222,6 +393,9 @@ impl Conversation {
             normalization_warm: Arc::new(AtomicBool::new(false)),
             writer,
             branch_checkpoint: Arc::new(Mutex::new(None)),
+            // The directory goes when the last clone of this conversation does.
+            // See the field's own note for what it cost not to have this.
+            ephemeral_dir: Some(Arc::new(TempDirGuard::new(dir))),
         }
     }
 
@@ -231,11 +405,31 @@ impl Conversation {
     /// [`SubstratePersistence::open_in_with_substrate`] and pass both
     /// here.
     pub fn from_parts(substrate: Substrate, persistence: SubstratePersistence) -> Self {
-        let maintenance = Arc::new(Mutex::new((persistence.segment_count(), None, false)));
-        let inner = Arc::new(RwLock::new(substrate));
-        let persistence = Arc::new(Mutex::new(persistence));
+        Self::from_shared(SharedSubstrate::new(substrate, persistence))
+    }
+
+    /// Adopt a substrate the host process already opened.
+    ///
+    /// The path for a host that writes records of its own into the same log —
+    /// `npcd` writes its character records there — and so must hold the *only*
+    /// writable handle to the directory. See [`SharedSubstrate`] for what a
+    /// second handle silently destroys.
+    pub fn from_shared(shared: SharedSubstrate) -> Self {
+        let SharedSubstrate {
+            substrate: inner,
+            persistence,
+        } = shared;
+        let segments = persistence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .segment_count();
+        let maintenance = Arc::new(Mutex::new((segments, None, false)));
         let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
         Self {
+            // **No guard.** This conversation's log lives in a directory the
+            // caller chose — a workspace, someone's `--data`. Removing it on
+            // drop would delete the substrate rather than a temp file.
+            ephemeral_dir: None,
             inner,
             allocator: Arc::new(TimelineAllocator::new()),
             maintenance,
@@ -526,7 +720,7 @@ impl Conversation {
         sp: &SystemPromptSchema,
         probe: &[WideQSig],
         probe_q: Option<&[WideQSig]>,
-        observe: bool,
+        observe: Observe<'_>,
         arena: Option<&GalleryArena>,
     ) -> ProjectionScores {
         let mut scores = ProjectionScores::new();
@@ -539,6 +733,23 @@ impl Conversation {
             };
             let n = coll.sections.len();
             if n == 0 {
+                continue;
+            }
+            // **A warm-up pass skips the collections it cannot teach.**
+            //
+            // `warm_collection_normalization` replays one collection's own
+            // exemplars, but hands the WHOLE system prompt to this loop, so every
+            // other collection is scanned too — and `teaches` then discards the
+            // observation because the probe's tags are not in its scope. The
+            // caller drops the returned scores (`let _ = …`), so that scan
+            // produces nothing at all: on the tool corpus it is up to 512 probes
+            // against ~3,000 exemplars, on the CPU path, at load.
+            //
+            // Only a teaching pass may be skipped this way. `Observe::No` is the
+            // LIVE reprojection, whose scores are the whole point — `teaches` is
+            // false for every collection there, so gating on `teaches` alone
+            // would silently disable tool selection.
+            if matches!(observe, Observe::Yes { .. }) && !observe.teaches(&coll.policy.tags) {
                 continue;
             }
             let slot_of = |name: &str| coll.sections.iter().position(|s| s.name == name);
@@ -593,19 +804,23 @@ impl Conversation {
             // deliberately removes the concentrated spike mass must see —
             // results doc §25).
             let scan_probe = |p: &[WideQSig]| -> (Vec<f32>, Vec<f32>) {
+                let ranged: Vec<(usize, Range<usize>)> = (0..windows.len())
+                    .map(|i| (i, 0..windows[i].len()))
+                    .collect();
+                if ranged.is_empty() {
+                    return (vec![0.0; n], vec![0.0; n]);
+                }
                 let gpu_fresh: Option<(Vec<f32>, Vec<f32>)> = arena.and_then(|arena| {
                     let make_segment = || PagedSegment {
-                        windows: windows
+                        windows: ranged
                             .iter()
-                            .zip(&slots)
-                            .zip(&sids)
-                            .map(|((w, &slot), &sid)| PagedWindow {
-                                sid,
-                                fingerprint: sig_fingerprint(w),
-                                turn: w.as_slice(),
-                                start: 0,
-                                end: w.len(),
-                                case: slot,
+                            .map(|(i, r)| PagedWindow {
+                                sid: sids[*i],
+                                fingerprint: sig_fingerprint(&windows[*i]),
+                                turn: windows[*i].as_slice(),
+                                start: r.start,
+                                end: r.end,
+                                case: slots[*i],
                             })
                             .collect(),
                         n_cases: n,
@@ -661,7 +876,15 @@ impl Conversation {
                     }
                 });
                 gpu_fresh.unwrap_or_else(|| {
-                    let wref: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
+                    // Same narrowing on the CPU path: slice each window to its
+                    // phase range so both backends score the identical region.
+                    let wref: Vec<&[WideQSig]> = ranged
+                        .iter()
+                        .map(|(i, r)| &windows[*i].as_slice()[r.clone()])
+                        .collect();
+                    // Shadows the gallery-wide slot list: `wref` holds only the
+                    // windows the lens kept, so its cases must line up with it.
+                    let slots: Vec<usize> = ranged.iter().map(|(i, _)| slots[*i]).collect();
                     match coll.policy.scan.fusion {
                         FusionMode::Additive => {
                             let v = score_slots_weighted(
@@ -698,42 +921,47 @@ impl Conversation {
                 Some(q) if coll.policy.scan.question_pin && !q.is_empty() => Some(scan_probe(q).0),
                 _ => None,
             };
-
-            // Concept A: normalize on the collection's 0–1000 hit-level band.
-            // `observe` (seal only) folds the TAIL scan's raw scores — the
-            // stored whole-turn signature, matching the turn-group learn path.
+            // Concept A: normalize on the collection's 0–1000 hit-level band,
+            // learned from the TAIL scan's raw scores (the stored whole-turn
+            // signature, matching the turn-group learn path). `observe` runs at
+            // seal only.
             let scope = ScopeKey::collection(coll.id.raw() as u64, coll.name.as_str());
-            let raw_pairs: Vec<(ChildKey, f32)> = coll
-                .sections
-                .iter()
-                .zip(&fresh)
-                .map(|(s, &v)| (ChildKey::named(s.name.clone()), v))
-                .collect();
+            let pairs = |v: &[f32]| -> Vec<(ChildKey, f32)> {
+                coll.sections
+                    .iter()
+                    .zip(v)
+                    .map(|(s, &v)| (ChildKey::named(s.name.clone()), v))
+                    .collect()
+            };
+            let raw_pairs = pairs(&fresh);
             let (normed, normed_q) = {
                 let mut cache = self.normalization.lock().unwrap();
                 let normed = cache.normalize(&scope, &raw_pairs);
-                let normed_q = fresh_q.as_ref().map(|fq| {
-                    let q_pairs: Vec<(ChildKey, f32)> = coll
-                        .sections
-                        .iter()
-                        .zip(fq)
-                        .map(|(s, &v)| (ChildKey::named(s.name.clone()), v))
-                        .collect();
-                    cache.normalize(&scope, &q_pairs)
-                });
-                if observe {
-                    cache.observe(&scope, &raw_pairs);
+                let normed_q = fresh_q
+                    .as_deref()
+                    .map(|fq| cache.normalize(&scope, &pairs(fq)));
+                // Segmentation: this collection learns only from a probe inside
+                // its own gather scope. `tags: [tool]` means tool traffic teaches
+                // the tool band and dialogue traffic does not — the band stays a
+                // view of its own world, and learning is never switched off to
+                // achieve that.
+                if let (true, Some(source)) = (observe.teaches(&coll.policy.tags), observe.source())
+                {
+                    cache.observe(&scope, source, &raw_pairs);
                 }
                 (normed, normed_q)
             };
+            // Fuse, don't filter: every lens is on the same 0–1000 band, so the
+            // strongest evidence for a section wins and no lens can veto another.
             let finals: Vec<f32> = (0..n)
                 .map(|i| {
+                    let at = |v: &Option<Vec<(ChildKey, f32)>>| {
+                        v.as_ref()
+                            .and_then(|x| x.get(i).map(|(_, v)| *v))
+                            .unwrap_or(0.0)
+                    };
                     let t = normed.get(i).map(|(_, v)| *v).unwrap_or(0.0);
-                    let q = normed_q
-                        .as_ref()
-                        .and_then(|nq| nq.get(i).map(|(_, v)| *v))
-                        .unwrap_or(0.0);
-                    t.max(q)
+                    t.max(at(&normed_q))
                 })
                 .collect();
             if tracing::enabled!(tracing::Level::DEBUG) {
@@ -803,7 +1031,7 @@ impl Conversation {
         target: ProjectionTarget,
         probe: &[WideQSig],
         probe_q: Option<&[WideQSig]>,
-        observe: bool,
+        observe: Observe<'_>,
         arena: Option<&GalleryArena>,
     ) -> (ProjectionScores, Vec<(GroupId, Vec<(TurnKey, f32)>)>) {
         let mut scores = ProjectionScores::new();
@@ -929,11 +1157,23 @@ impl Conversation {
         };
         probes.sort_by_key(|(tl, idx, _)| (*tl, *idx));
         let start = probes.len().saturating_sub(WARM_REPLAY_MAX_TURNS);
-        for (_, _, probe) in &probes[start..] {
+        for (tl, idx, probe) in &probes[start..] {
             let mut throwaway = ProjectionScores::new();
-            // Collections warm alongside turn groups (Concept A extends the
-            // hit-level band to them), so a restart doesn't reset tool scoring.
-            let _ = self.score_belief_collections(&schema.system_prompt, probe, None, true, None);
+            // These probes are the UNTAGGED dialogue turns, so they teach the
+            // unscoped turn groups and — by the routing in `Observe::teaches` —
+            // no tag-scoped collection. Both calls are made; the lens rule
+            // decides which scopes actually learn, rather than the call site
+            // guessing. That is what keeps dialogue from degrading the tool lens
+            // while leaving both free to learn from their own traffic.
+            // Keyed on the turn itself, so a replay of an already-folded turn —
+            // which is what this pass is on every boot after the first — costs
+            // one lookup and changes nothing.
+            let observe = Observe::Yes {
+                tags: &[],
+                source: turn_stream_id(*tl, *idx).0,
+            };
+            let _ =
+                self.score_belief_collections(&schema.system_prompt, probe, None, observe, None);
             for layer in &schema.layers {
                 // Background warm-up runs off the hot path → CPU (no device).
                 let _ = self.score_belief_groups(
@@ -942,11 +1182,133 @@ impl Conversation {
                     probe,
                     None,
                     &mut throwaway,
-                    true,
+                    observe,
                     None,
                 );
             }
         }
+    }
+
+    /// Warm every belief-driven section COLLECTION's hit levels from its own
+    /// tag-scoped corpus (self-match), the collection analogue of
+    /// [`Self::warm_ingest_normalization`].
+    ///
+    /// [`Self::warm_normalization_from_substrate`] already re-observes collections,
+    /// but only through **dialogue** probes (`tags.is_empty()`) — and a collection's
+    /// own corpus is tagged by construction (that tag is what scopes its gallery).
+    /// So the turns that actually teach a member's level are exactly the ones that
+    /// replay excludes, and on a workspace whose dialogue history is short or empty
+    /// — every fresh install — the collection stays COLD. That is not a small
+    /// difference: measured across a restart of the same substrate, the tool
+    /// collection's scores fell 11–30x (`datetime` 1119 → 97) and, far worse, the
+    /// MARGINS collapsed with them, so near-ties began flipping the ranking
+    /// (`sqrt of …` went from `calculator` 3521 vs 77 to `kdf_derive` 116 over
+    /// `calculator` 116). The levels are runtime-only and rebuilt empty each load
+    /// (`normalization::cache`), so without this the session that BUILDS the corpus
+    /// is the only one that scores it well — and production is never that session.
+    ///
+    /// Additive-fusion collections only, for the reason
+    /// [`Self::warm_ingest_normalization`] gives: a gated-fusion scope normalizes
+    /// traffic-relative, and self-match warming would stamp every member's peak at
+    /// its own self-match magnitude and erase exactly the contrast the gate
+    /// provides.
+    ///
+    /// Call once after the corpus is stable (load complete), never concurrently
+    /// with an ingest writer — same read-lock starvation hazard as the ingest
+    /// warm-up. The substrate lock is taken to gather signatures and released
+    /// before any scoring call.
+    pub fn warm_collection_normalization(&self, schema: &Schema) {
+        let mut warmed_members = 0usize;
+        let mut probes_run = 0usize;
+        for item in &schema.system_prompt.items {
+            let SystemPromptItem::Collection(coll) = item else {
+                continue;
+            };
+            if coll.sections.is_empty() || coll.policy.tags.is_empty() {
+                continue;
+            }
+            if coll.policy.scan.fusion != FusionMode::Additive {
+                continue;
+            }
+            // Group the corpus by the member each turn belongs to. A gallery turn
+            // carries the collection's scope tag plus the member name it was
+            // captured for, so the member is the tag that is not a scope tag —
+            // the same derivation the gallery itself uses to map turn → slot.
+            let member_names: HashSet<&str> =
+                coll.sections.iter().map(|s| s.name.as_str()).collect();
+            // Plan first (cheap, from declarations only), then fetch signatures for
+            // exactly the turns the plan keeps — the substrate lock is released
+            // before any scoring call, and the cap does not pay to decode
+            // signatures it discards.
+            let plan = {
+                let sub = self.inner.read().unwrap();
+                let decls = sub
+                    .all_streams()
+                    .filter_map(|(_sid, e)| match e.decl.as_ref() {
+                        Some(StreamDecl::Turn(d)) => {
+                            Some((d.tags.as_slice(), d.timeline_id, d.turn_index))
+                        }
+                        _ => None,
+                    });
+                collection_warm_plan(
+                    &member_names,
+                    &coll.policy.tags,
+                    decls,
+                    WARM_COLLECTION_PROBES_PER_MEMBER,
+                )
+            };
+            for (_member, keys) in plan {
+                // Each probe is an exemplar's whole signature, paired with its
+                // own QUESTION sub-window. The pair matters: the collection's
+                // undivided levels are learned on whole turns and the phase
+                // lens's on questions, which is what each is read with live. A
+                // phase level learned from a whole-turn probe would sit on a
+                // different band from the one the live query lands on, and the
+                // max-fusion would then be decided by the mismatch rather than
+                // by the evidence.
+                let sigs: Vec<(u64, Vec<WideQSig>, Vec<WideQSig>)> = {
+                    let sub = self.inner.read().unwrap();
+                    keys.iter()
+                        .filter_map(|(tl, idx)| {
+                            let sid = turn_stream_id(*tl, *idx);
+                            let sig = sub.decoded_wide_sig(sid)?;
+                            let q = sub
+                                .turn_phase_span(sid, Phase::User)
+                                .filter(|r| r.end <= sig.len())
+                                .map(|r| sig[r].to_vec())
+                                .unwrap_or_default();
+                            Some((sid.0, sig.as_ref().clone(), q))
+                        })
+                        .filter(|(_, s, _)| !s.is_empty())
+                        .collect()
+                };
+                for (source, probe, question) in &sigs {
+                    let _ = self.score_belief_collections(
+                        &schema.system_prompt,
+                        probe,
+                        (!question.is_empty()).then_some(question.as_slice()),
+                        // These probes ARE this collection's corpus — selected by
+                        // its own scope tags — so they are inside the lens, and
+                        // keyed on the turn so re-running this on every load is
+                        // free after the first.
+                        Observe::Yes {
+                            tags: &coll.policy.tags,
+                            source: *source,
+                        },
+                        None,
+                    );
+                    probes_run += 1;
+                }
+                warmed_members += 1;
+            }
+        }
+        tracing::info!(
+            members = warmed_members,
+            probes = probes_run,
+            "normalization warm-up: learned per-member hit levels for tag-scoped section \
+             collections (0 ⇒ no additive belief-driven collection had a tagged corpus — \
+             collection levels stay cold and scores are not comparable across members)"
+        );
     }
 
     /// Warm the append-only INGEST groups' per-file / per-cluster hit levels from
@@ -967,7 +1329,6 @@ impl Conversation {
     /// a promiscuous low-entropy file (a class/language list whose repetitive tokens
     /// agree with almost any probe) tops every query.
     pub fn warm_ingest_normalization(&self, schema: &Schema) {
-        use crate::persistence::content_hash::turn_stream_id;
         let mut warmed_timelines = 0usize;
         for layer in &schema.layers {
             let is_ingest = self.inner.read().unwrap().is_append_only_layer(layer.id);
@@ -998,11 +1359,14 @@ impl Conversation {
                     // This file's / cluster's own turn signatures. Gathered under a
                     // short-lived read lock so the per-turn `score_belief_groups`
                     // calls below (which take the lock themselves) never re-enter it.
-                    let sigs: Vec<Arc<Vec<WideQSig>>> = {
+                    let sigs: Vec<(u64, Arc<Vec<WideQSig>>)> = {
                         let sub = self.inner.read().unwrap();
                         let count = sub.turn_count(tl);
                         (0..count)
-                            .filter_map(|i| sub.decoded_wide_sig(turn_stream_id(tl.raw(), i)))
+                            .filter_map(|i| {
+                                let sid = turn_stream_id(tl.raw(), i);
+                                sub.decoded_wide_sig(sid).map(|s| (sid.0, s))
+                            })
                             .collect()
                     };
                     let self_target = ProjectionTarget {
@@ -1014,7 +1378,7 @@ impl Conversation {
                     // (alpha_up 0.30) is ~94% converged after 8 observes, and each
                     // call already scores against ALL the file's exchanges, so this
                     // caps the one-time warm cost without materially moving the level.
-                    for sig in sigs.iter().take(WARM_INGEST_PROBES_PER_TIMELINE) {
+                    for (source, sig) in sigs.iter().take(WARM_INGEST_PROBES_PER_TIMELINE) {
                         if sig.is_empty() {
                             continue;
                         }
@@ -1028,7 +1392,13 @@ impl Conversation {
                             sig.as_slice(),
                             None,
                             &mut throwaway,
-                            true,
+                            // Self-match warming of an ingest group: the probe is
+                            // this group's own turn, so it is inside the scope by
+                            // construction.
+                            Observe::Yes {
+                                tags: &group.policy.tags,
+                                source: *source,
+                            },
                             None,
                         );
                     }
@@ -1062,7 +1432,7 @@ impl Conversation {
         probe: &[WideQSig],
         probe_q: Option<&[WideQSig]>,
         scores: &mut ProjectionScores,
-        observe: bool,
+        observe: Observe<'_>,
         arena: Option<&GalleryArena>,
     ) -> Vec<(GroupId, Vec<(TurnKey, f32)>)> {
         use crate::persistence::content_hash::turn_stream_id;
@@ -1462,8 +1832,13 @@ impl Conversation {
                             .collect();
                         cache.normalize_with_floors(&scope, &q_pairs, &floors)
                     });
-                    if observe {
-                        cache.observe(&scope, &raw_pairs);
+                    // A turn group's retrieval target IS the turn, so its gather
+                    // scope is the group's own; `tags` on the group route the
+                    // same way collections are routed above.
+                    if let (true, Some(source)) =
+                        (observe.teaches(&group.policy.tags), observe.source())
+                    {
+                        cache.observe(&scope, source, &raw_pairs);
                     }
                     (normed, normed_q)
                 };
@@ -2414,6 +2789,12 @@ impl Conversation {
         self.read().known_conversations()
     }
 
+    /// Live conversations whose `conv_id` starts with `prefix` — see
+    /// [`crate::substrate::Substrate::conversations_with_conv_id_prefix`].
+    pub fn conversations_with_conv_id_prefix(&self, prefix: &str) -> Vec<(TimelineId, String)> {
+        self.read().conversations_with_conv_id_prefix(prefix)
+    }
+
     /// Set a conversation's `archived` lifecycle flag and persist it
     /// as a `RecordType::ConvState` record. Idempotent: if the
     /// substrate already holds the requested state, the record is
@@ -2460,6 +2841,36 @@ impl Conversation {
         p.write_tombstone(timeline.raw(), None)
             .map_err(|e| candle::Error::Msg(format!("write_tombstone: {e}")))?;
         Ok(())
+    }
+
+    /// Tombstone **one turn** of a live timeline — in-RAM and on disk — leaving
+    /// the rest of the conversation untouched.
+    ///
+    /// The difference from [`Self::tombstone_timeline`] is what survives. A
+    /// timeline tombstone retires a whole conversation; this drops one turn's
+    /// *content* while the turn itself stays in the index, so the compactor
+    /// sheds its bulk records and a reload restores it as an empty hole. Turn
+    /// numbering is therefore stable across the drop — nothing downstream has to
+    /// renumber, and nothing dangles.
+    ///
+    /// **This is what makes an endless conversation affordable.** A transcript
+    /// that never ends is a transcript no compaction pass can ever reclaim: a
+    /// sealed segment is only relocated once enough of it is dead, and turns
+    /// that stay live forever never make it dead. Retiring the tail past a depth
+    /// is what turns an unbounded log into a bounded one.
+    pub fn tombstone_turn(&self, timeline: TimelineId, turn_index: u32) -> candle::Result<()> {
+        self.write().tombstone_turn(timeline, turn_index);
+        let mut p = self.persistence.lock().unwrap();
+        p.write_turn_tombstone(timeline.raw(), turn_index, Some("retention"))
+            .map_err(|e| candle::Error::Msg(format!("write_turn_tombstone: {e}")))?;
+        Ok(())
+    }
+
+    /// Whether `(timeline, turn)` has already been dropped by a turn-scoped
+    /// tombstone. Callers retiring a tail consult this so a turn is written
+    /// once rather than on every pass.
+    pub fn is_turn_tombstoned(&self, timeline: TimelineId, turn_index: u32) -> bool {
+        self.read().is_turn_tombstoned(timeline, turn_index)
     }
 
     /// Mark a code_read scope fork's timeline as transient scratch — its sealed KV is
@@ -2808,6 +3219,22 @@ impl Conversation {
     /// produced the payload is still live on the device; the record exists for
     /// restart and fork-resume.
     pub fn enqueue_recurrent_snapshot(&self, timeline: TimelineId, payload: Vec<u8>) {
+        // **Ephemeral timelines get no snapshot.** The record exists for restart
+        // and fork-resume, and a timeline marked by
+        // `Substrate::mark_timeline_transient` is by definition never resumed:
+        // a code_read scope fork is tombstoned, a calibration exemplar is
+        // archived and then distilled to `ProvenanceOnly`. Writing it spends
+        // real bytes on state nothing will ever read.
+        //
+        // Not a micro-optimisation. Recurrent state is fixed-size **per
+        // sequence, independent of token count**, so a 19-token calibration
+        // question costs exactly as much as a full trajectory. Measured on this
+        // model: ~65 MB per turn — 2,998 exemplars would write ~195 GB of
+        // snapshots, which dwarfed even their KV and was enough on its own to
+        // fill the disk and wedge the daemon on failing fsyncs.
+        if self.read().is_timeline_transient(timeline) {
+            return;
+        }
         let stream_id = snapshot_stream_id(timeline.raw());
         self.writer
             .enqueue(WriteJob::Snapshot { stream_id, payload });
@@ -3445,8 +3872,208 @@ impl<'a> ContentResolver for TargetedRead<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{selected_in_collection, subwindow_bounds};
+    use super::{
+        collection_warm_plan, selected_in_collection, subwindow_bounds, Conversation, Observe,
+    };
+
+    fn tags(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **An ephemeral conversation takes its directory with it.**
+    ///
+    /// Its log is a throwaway, and `LogFile` grows in 64 MiB extents — the
+    /// slack is only reclaimed when a segment *seals*, which a throwaway never
+    /// does. So every ephemeral conversation used to leave 64 MiB in `%TEMP%`
+    /// permanently. Summarisation makes them, tests make them, and 727 of them
+    /// had accumulated on this machine (~46 GB) beside the same leak from the
+    /// test helpers — together half a 1 TB disk.
+    ///
+    /// The clone is not decoration: the guard sits behind the same `Arc` as
+    /// everything else on the handle, so a clone must *not* remove the
+    /// directory the original is still writing to.
+    #[test]
+    fn an_ephemeral_conversation_removes_its_temp_directory_on_the_last_drop() {
+        let conv = Conversation::ephemeral();
+        let dir = conv
+            .ephemeral_dir
+            .as_ref()
+            .expect("an ephemeral conversation owns its directory")
+            .path()
+            .to_path_buf();
+        assert!(dir.is_dir(), "the ephemeral log directory was never made");
+
+        let clone = conv.clone();
+        drop(conv);
+        assert!(
+            dir.is_dir(),
+            "dropping one clone removed the directory the other is still writing to"
+        );
+
+        drop(clone);
+        assert!(
+            !dir.exists(),
+            "the last drop left {dir:?} behind — 64 MiB per ephemeral conversation, forever"
+        );
+    }
+
+    /// A conversation opened on a real workspace holds no guard, because
+    /// removing *that* directory on drop would delete somebody's substrate
+    /// rather than a temp file.
+    #[test]
+    fn a_workspace_conversation_owns_no_directory_to_delete() {
+        let dir = std::env::temp_dir().join(format!(
+            "candle-conv-workspace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut substrate = crate::substrate::Substrate::new();
+        let persistence =
+            crate::persistence::SubstratePersistence::open_in_with_substrate(&dir, &mut substrate)
+                .expect("workspace persistence");
+        let conv = Conversation::from_parts(substrate, persistence);
+        assert!(conv.ephemeral_dir.is_none());
+        drop(conv);
+        assert!(
+            dir.is_dir(),
+            "a workspace conversation deleted the directory it was opened on"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The segmentation rule: a scope learns from a probe only when the probe is
+    /// inside it. This is what stops dialogue traffic degrading the tool lens
+    /// WITHOUT switching learning off — the failure mode that took the measured
+    /// correct-answer rate from 67% to 17% across 24 conversations.
+    #[test]
+    fn a_scope_learns_only_from_probes_inside_it() {
+        let tools = tags(&["tool"]);
+        let unscoped: Vec<String> = Vec::new();
+
+        // A tool-tagged turn teaches the tool lens.
+        let from_tool = Observe::Yes {
+            tags: &tags(&["tool", "datetime"]),
+            source: 1,
+        };
+        assert!(from_tool.teaches(&tools));
+
+        // An ordinary dialogue turn does NOT — this is the whole fix.
+        let from_dialogue = Observe::Yes {
+            tags: &[],
+            source: 2,
+        };
+        assert!(
+            !from_dialogue.teaches(&tools),
+            "dialogue must not teach a tag-scoped lens",
+        );
+
+        // …but it still teaches the unscoped scopes, so learning continues.
+        assert!(
+            from_dialogue.teaches(&unscoped),
+            "dialogue must still teach unscoped turn groups",
+        );
+
+        // A turn tagged for a DIFFERENT scope does not leak across.
+        let from_other = Observe::Yes {
+            tags: &tags(&["memory"]),
+            source: 3,
+        };
+        assert!(!from_other.teaches(&tools));
+
+        // And a read-only pass teaches nothing at all.
+        assert!(!Observe::No.teaches(&tools));
+        assert!(!Observe::No.teaches(&unscoped));
+    }
     use crate::projection::{ProjectionSelection, SelectedSection, SystemItem};
+    use std::collections::HashSet;
+
+    /// `(tags, timeline, index)` rows in the shape `collection_warm_plan` reads.
+    fn corpus(rows: &[(&[&str], u64, u32)]) -> Vec<(Vec<String>, u64, u32)> {
+        rows.iter()
+            .map(|(tags, tl, ix)| (tags.iter().map(|t| t.to_string()).collect(), *tl, *ix))
+            .collect()
+    }
+
+    fn plan(
+        members: &[&str],
+        scope: &[&str],
+        rows: &[(Vec<String>, u64, u32)],
+        per_member: usize,
+    ) -> Vec<(String, Vec<(u64, u32)>)> {
+        let names: HashSet<&str> = members.iter().copied().collect();
+        let scope: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
+        collection_warm_plan(
+            &names,
+            &scope,
+            rows.iter().map(|(t, tl, ix)| (t.as_slice(), *tl, *ix)),
+            per_member,
+        )
+    }
+
+    #[test]
+    fn warm_plan_groups_corpus_turns_by_the_member_they_teach() {
+        let rows = corpus(&[
+            (&["tool", "datetime"], 7, 1),
+            (&["tool", "calculator"], 7, 0),
+            (&["tool", "datetime"], 3, 5),
+        ]);
+        let got = plan(&["datetime", "calculator"], &["tool"], &rows, 8);
+        assert_eq!(
+            got,
+            vec![
+                ("calculator".to_string(), vec![(7, 0)]),
+                // Members in name order, keys in (timeline, index) order — NOT the
+                // order the rows arrived in, which is stream-map order live.
+                ("datetime".to_string(), vec![(3, 5), (7, 1)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn warm_plan_skips_turns_outside_the_scope_or_naming_no_member() {
+        let rows = corpus(&[
+            // A dialogue turn: no scope tag at all.
+            (&[], 1, 0),
+            // Scoped, but names no member of THIS collection — must not be
+            // attributed to an arbitrary member.
+            (&["tool"], 1, 1),
+            // A different collection's corpus.
+            (&["memory", "datetime"], 1, 2),
+            (&["tool", "datetime"], 1, 3),
+        ]);
+        let got = plan(&["datetime"], &["tool"], &rows, 8);
+        assert_eq!(got, vec![("datetime".to_string(), vec![(1, 3)])]);
+    }
+
+    #[test]
+    fn warm_plan_caps_probes_per_member_keeping_the_lowest_keys() {
+        // Ten turns for one member, cap 3. The cap is per MEMBER, and which three
+        // survive must be deterministic, not whichever three were seen first.
+        let rows = corpus(
+            &(0..10)
+                .rev()
+                .map(|i| (&["tool", "datetime"][..], 1u64, i as u32))
+                .collect::<Vec<_>>(),
+        );
+        let got = plan(&["datetime"], &["tool"], &rows, 3);
+        assert_eq!(
+            got,
+            vec![("datetime".to_string(), vec![(1, 0), (1, 1), (1, 2)])]
+        );
+    }
+
+    #[test]
+    fn warm_plan_is_empty_when_the_corpus_is_untagged() {
+        // The regression this warm-up exists for: a workspace whose only turns are
+        // dialogue produces no plan, and the caller's log line reports zero rather
+        // than silently leaving levels cold.
+        let rows = corpus(&[(&[], 1, 0), (&[], 1, 1)]);
+        assert!(plan(&["datetime"], &["tool"], &rows, 8).is_empty());
+    }
 
     #[test]
     fn subwindow_bounds_splits_and_degrades_gracefully() {

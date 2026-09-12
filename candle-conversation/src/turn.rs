@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::config::SamplingConfig;
 use crate::projection::SelectionState;
-use crate::stencil::TriggerRegistry;
+use crate::stencil::{StencilTree, TriggerRegistry};
 use crate::token_buffer::TokenBuffer;
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +72,24 @@ pub struct TurnOptions {
     /// model decodes the continuation. `None` = ordinary free decode.
     pub assistant_prefill: Option<String>,
 
+    /// A grammar the turn **begins inside**, rather than one it may enter later.
+    ///
+    /// [`Self::triggers`] answers "did the model just open a call?", which is
+    /// the right question for a reply that is mostly prose with a call in it.
+    /// It is the wrong question for a reply that *is* a grammar — an action
+    /// loop, a form to fill — because it leaves "no call at all" a reachable
+    /// outcome, and because the token it keys on is one the caller usually
+    /// wants prefilled rather than sampled. Prefilling a trigger token defeats
+    /// a trigger completely: prefilled tokens go into the turn's K/V without
+    /// passing the sampler, so neither registry check ever sees them.
+    ///
+    /// Set this instead and the driver is armed before the first sampled token.
+    /// The tree's leading static runs are appended to the assistant prefill and
+    /// written in the same pass as the rest of the prompt, and the first token
+    /// the model chooses is already under the tree's mask. `None` = the turn
+    /// starts free and may enter a grammar through `triggers`.
+    pub turn_grammar: Option<Arc<StencilTree>>,
+
     /// Section-tree selector choices for this turn (e.g. the composer
     /// thinking-effort / response-length dials).  Becomes the conversation's
     /// current selection, used by every projection until the next turn changes
@@ -139,6 +157,12 @@ impl TurnOptions {
     /// Builder: set the tool-call stencil registry for this turn.
     pub fn triggers(mut self, triggers: Arc<TriggerRegistry>) -> Self {
         self.triggers = triggers;
+        self
+    }
+
+    /// Builder: begin this turn inside `tree` (see [`Self::turn_grammar`]).
+    pub fn turn_grammar(mut self, tree: Arc<StencilTree>) -> Self {
+        self.turn_grammar = Some(tree);
         self
     }
 }

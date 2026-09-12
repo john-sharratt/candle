@@ -1,0 +1,11 @@
+id: timeline-wall
+kind: fixture
+name: the timeline wall
+short: >
+  The timeline wall runs the length of the room, showing which eras are thin
+  and every date that disagrees with another.
+long: >
+  A wall showing the whole record end to end: how much has been written in
+  each era, and every date that contradicts another. It is what a level uses
+  instead of being told what to do — the thin places and the disagreements are
+  standing there whether or not an order mentions them.

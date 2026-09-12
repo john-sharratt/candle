@@ -1,4 +1,29 @@
 name: hash_state_finalize
+questions:
+- finalise state id 3 and give me the hex digest
+- emit the digest for the streaming context and discard it
+- close the rolling hash and return base64
+- produce the final value over everything absorbed
+- what's the digest across all the chunks I sent
+- does the streamed result match the one-shot hash
+- can I still add data after finalising
+- what did the whole file come out as
+- all the parts are in, I want the answer
+- upload finished, so the checksum should be ready
+- comparing the streamed digest against the vendor's
+- done feeding it, close it out
+- finalise it
+- give me the digest
+- close the hash
+- final value please
+- that's all the data — give me the final digest
+- finish the streaming hash and print the result
+- close out the incremental hash now
+- what's the digest over everything I fed in
+- finalise the running hash state
+- emit the hash, I'm done adding chunks
+- wrap up the multi-part digest and show the hex
+- complete the streaming hash computation
 category: Hash streaming
 description: Conclude a streaming hash computation and emit the final digest over everything absorbed so far, discarding the accumulated state by default.
 parameters:

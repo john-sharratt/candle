@@ -1,4 +1,29 @@
 name: tls_session_list
+questions:
+- enumerate the TLS channels with their peer certificates
+- show every open encrypted connection id
+- list the TLS sessions and the hosts they terminate at
+- which TLS session is the LDAPS one
+- do I already have an encrypted channel to that broker
+- is the TLS connection I opened still up
+- how many certificate-verified channels am I holding
+- which TLS session id goes with the IMAPS server
+- I lost the TLS session id for the next send
+- checking I'm not opening a second encrypted channel
+- want to see which TLS connections are lingering
+- reviewing the encrypted sessions before cleanup
+- list the TLS channels
+- what encrypted connections are open
+- show TLS session ids
+- any TLS channels alive
+- which TLS connections are open
+- list my encrypted sessions and their peer certificates
+- what TLS session ids do I have
+- am I still connected to the IMAPS server over TLS
+- show the open TLS channels and their hosts
+- how many certificate-verified connections are live
+- give me the TLS session for the LDAPS host
+- list the encrypted sockets in this conversation
 category: TLS sessions
 description: Enumerate the TLS-encrypted connections currently open in this conversation, with each peer host and certificate identity.
 high_risk: true

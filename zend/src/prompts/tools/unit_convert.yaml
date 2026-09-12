@@ -1,4 +1,29 @@
 name: unit_convert
+questions:
+- 180 celsius to fahrenheit for the oven
+- convert 3.5 TiB into TB
+- 65 mph in km/h
+- how many millilitres in 1.5 US cups
+- is 100 km further than 60 miles
+- which is heavier, 12 stone or 80 kg
+- how much is a 6 foot 2 person in centimetres
+- what's 90 minutes as a decimal fraction of a day
+- the recipe is metric and my scales are imperial
+- the datasheet is in inches and our drawings are in mm
+- the disk says 500 GB but the OS shows less, reconcile those
+- I'm converting a US spec sheet for the local team
+- 84 kg in lbs
+- 26.2 miles to km
+- convert this for me
+- metric it
+- how many pounds is 84 kilograms
+- convert 26.2 miles to kilometres
+- what's 350 fahrenheit in celsius
+- how many GiB is 500 GB
+- convert 4.5 hours into minutes
+- what is 2 litres in US gallons
+- turn 1500 metres into feet
+- how many ounces in 250 grams
 category: Utilities & web
 description: 'Convert a numeric value between units of the same physical dimension — length, mass, volume, temperature, time, or data size. Use for: converting kilograms to pounds, miles to kilometres, GB to GiB, Celsius to Fahrenheit, hours to seconds. Triggered by "convert X to Y", "how many [unit] in", "what''s [value] in [other unit]", "X in metric/imperial", "express in". Recognises common aliases (celsius/C/°C) and the binary-vs-decimal distinction for data sizes (GB vs GiB). Returns the converted value, input value, from/to unit names. Cannot cross dimensions (metres to kilograms returns dimension_mismatch). For raw arithmetic without units use calculator.'
 parameters:

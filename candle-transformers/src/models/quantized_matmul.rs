@@ -23,12 +23,27 @@ fn dense_destination(
     mode: Int8Mode,
     narrow: Option<GgmlDType>,
 ) -> Option<(u64, candle::cuda_backend::wave_provenance::LeaseOrigin)> {
+    let ko_dtype = narrow.or_else(|| src.dtype().to_ko(mode).ok())?;
+    dense_destination_for(&src.device(), src.shape(), ko_dtype)
+}
+
+/// [`dense_destination`] for a twin whose source is not a `QTensor` — the host-banded load
+/// path, which never materialises one.
+///
+/// Split rather than duplicated: where a weight's bytes live is one decision, and a second
+/// copy of `claim_dense` with its own idea of the size would put weights on ground the dense
+/// block believes is free.
+#[cfg(feature = "cuda")]
+pub fn dense_destination_for(
+    device: &candle::Device,
+    shape: &candle::Shape,
+    ko_dtype: GgmlDType,
+) -> Option<(u64, candle::cuda_backend::wave_provenance::LeaseOrigin)> {
     use candle::cuda_backend::wave_provenance::LeaseOrigin;
-    let candle::Device::Cuda(cuda) = src.device() else {
+    let candle::Device::Cuda(cuda) = device else {
         return None;
     };
-    let ko_dtype = narrow.or_else(|| src.dtype().to_ko(mode).ok())?;
-    let bytes = candle::quantized::cuda::ko_repacked_bytes(src.shape(), ko_dtype).ok()?;
+    let bytes = candle::quantized::cuda::ko_repacked_bytes(shape, ko_dtype).ok()?;
     match candle_nn::kv_cache::claim_dense(&cuda.cuda_stream(), bytes) {
         Ok(ptr) => Some((ptr, LeaseOrigin::Foreign)),
         Err(e) => {
@@ -172,6 +187,28 @@ impl QMatMul {
         // take `forward_live_as`; a new fused consumer must check `int8mode()` rather than assume.
         #[cfg(feature = "cuda")]
         if mode.is_int8() {
+            // **A weight that already IS its KO twin is used as it stands.**
+            //
+            // Repacking one is not a no-op: `repackable_to_ko` does not admit a
+            // KO dtype, so the twin falls to the expensive arm below and is
+            // dequantized to a whole-tensor f32 buffer and requantized — 177 MB
+            // of pool for a `[11520, 3840]` projection, to reproduce the bytes it
+            // was handed. A caller that placed its own twins (a co-resident
+            // guest, whose weights live in span ground because the pool has
+            // nothing to give) hits that on every projection and dies on the
+            // first one the pool cannot serve.
+            //
+            // So this makes `build` idempotent, which is what a caller reasonably
+            // expects of it. `is_ko` already implies the mode: the KO twin and
+            // the int8 path imply each other, which is the invariant
+            // `from_qtensor_view` states.
+            if ws.dtype().is_ko() {
+                return Ok(Self {
+                    inner: candle::quantized::QMatMul::from_arc(ws)?,
+                    span,
+                    int8mode: mode,
+                });
+            }
             // **A shape that will not tile is a per-tensor fact, knowable up front — not a load
             // failure.** The q8a128 matmul tiles N in blocks of 32, and a narrow projection can
             // sit below it (Qwen3.5-0.8B's DeltaNet `w_alpha`/`w_beta` are `[16, hidden]` at 16
@@ -192,7 +229,19 @@ impl QMatMul {
                 _ => false,
             };
             if tileable {
-                let src = if ws.supports_gemx_repacking() {
+                // **Every source `repack_ko_into` can read goes straight to it**, including a
+                // float one: `dequantize_f32_into` widens a float band with a cast where it
+                // dequantizes a quantized one, so the banded route needs no help.
+                //
+                // The `else` is what remains — a source with neither a GEMX kernel nor a
+                // widening cast, which today is MXFP4 arriving somewhere it cannot permute.
+                // It is the expensive route and it says so: dequantizing the whole tensor,
+                // copying it again inside `QTensor::quantize`'s `force_contiguous`, and
+                // quantizing that to `Q8_0` puts four whole-tensor buffers on the pool at
+                // once. On the `[248320, 4096]` F16 head of a `…NEO-IMATRIX-MAX…` checkpoint
+                // that was 10,730 MiB against a 2,036 MiB load budget, and it OOMed a card
+                // with 14 GiB free — which is why floats no longer come this way.
+                let src = if ws.repackable_to_ko() {
                     std::sync::Arc::clone(&ws)
                 } else {
                     let f32 = ws.dequantize(&ws.device())?;
@@ -216,8 +265,13 @@ impl QMatMul {
                     // [`WeightResidency`].
                     WeightResidency::Pool => None,
                 };
-                let inner = candle::quantized::QMatMul::from_arc(src)?
-                    .repack_for_optimization_narrowed(mode, dst, narrow)?;
+                // **Repack from the source, then build the matmul — not the other way round.**
+                // `QMatMul::from_qtensor` dequantizes a float weight into a plain tensor, so
+                // building first threw away the storage the repack needs and failed with "not
+                // a QTensor" for exactly the sources `repackable_to_ko` had just promised it
+                // could take. The twin is what the matmul wants anyway.
+                let twin = src.repack_ko(mode, dst, narrow)?;
+                let inner = candle::quantized::QMatMul::from_qtensor(twin)?;
                 return Ok(Self {
                     inner,
                     span,

@@ -328,6 +328,106 @@ test_device!(ropei, ropei_cpu, ropei_gpu, ropei_metal);
 test_device!(rope, rope_cpu, rope_gpu, rope_metal);
 test_device!(rope_thd, rope_thd_cpu, rope_thd_gpu, rope_thd_metal);
 test_device!(softmax, softmax_cpu, softmax_gpu, softmax_metal);
+
+/// **`silu` against its definition, on every backend.**
+///
+/// Nothing tested this activation at all, and it sits between the last
+/// normalisation and the last convolution of Stable Diffusion's VAE decoder. A
+/// `silu` that returned zeros there would leave `conv_out` emitting only its
+/// bias — a flat field with sparse spikes, which is a picture of something
+/// rather than an error.
+fn silu_matches_its_definition(device: &Device) -> Result<()> {
+    // Spanning the saturating tails as well as the interesting middle.
+    let xs: Vec<f32> = (0..4096)
+        .map(|i| (i as f32 - 2048.0) / 64.0)
+        .chain([-60.0, -1e-7, 0.0, 1e-7, 60.0])
+        .collect();
+    let n = xs.len();
+    let t = Tensor::from_vec(xs.clone(), n, device)?;
+    let got = candle_nn::ops::silu(&t)?.to_vec1::<f32>()?;
+
+    for (i, (&x, &g)) in xs.iter().zip(&got).enumerate() {
+        // x * sigmoid(x), computed in f64 so the reference is not itself the
+        // thing under test.
+        let want = (x as f64 / (1.0 + (-x as f64).exp())) as f32;
+        // Relative, and loose enough for a device `expf` that trades the last
+        // couple of bits for speed — tight enough that a wrong curve cannot pass.
+        let tol = 1e-4 * want.abs().max(1.0);
+        assert!(
+            (g - want).abs() <= tol,
+            "silu({x}) = {g}, expected {want} (index {i})"
+        );
+    }
+    // silu is not the identity and not zero — a stub returning either would
+    // satisfy a sloppier assertion on the near-linear positive tail alone.
+    assert!(got.iter().any(|v| *v < -0.2), "no negative lobe");
+    assert!(
+        got.iter().zip(&xs).any(|(g, x)| (g - x).abs() > 0.1),
+        "silu returned its input"
+    );
+    Ok(())
+}
+
+test_device!(silu_matches_its_definition, silu_cpu, silu_gpu, silu_metal);
+
+/// **Softmax must be right on a row wider than one thread block.**
+///
+/// The test above softmaxes rows of three. A per-row softmax kernel typically
+/// assigns one block per row and reduces in shared memory, so its behaviour at a
+/// width that exceeds the block — or that is not a multiple of it — is a
+/// different code path entirely, and nothing here exercised one.
+///
+/// The widths are Stable Diffusion's VAE self-attention, which attends over
+/// every latent position: 64×64 = 4096 for a 512-pixel image, 96×96 = 9216 for a
+/// 768-pixel one. A softmax that silently truncates its reduction there
+/// produces a valid probability distribution over the wrong support, which is
+/// not detectable downstream — the image simply comes out wrong.
+#[cfg(feature = "cuda")]
+#[test]
+fn softmax_wide_rows_cuda_matches_cpu() -> Result<()> {
+    let cuda = Device::new_cuda(0)?;
+    for width in [1024usize, 4096, 9216, 5000] {
+        let rows = 3usize;
+        // Spread over a range wide enough that the max-subtraction matters: a
+        // kernel that reduces over only part of the row picks the wrong max and
+        // the error survives the normalisation.
+        let data: Vec<f32> = (0..rows * width)
+            .map(|i| ((i * 7919) % 2003) as f32 / 200.0 - 5.0)
+            .collect();
+
+        let on = |dev: &Device| -> Result<Vec<f32>> {
+            let t = Tensor::from_vec(data.clone(), (rows, width), dev)?;
+            candle_nn::ops::softmax(&t, 1)?
+                .flatten_all()?
+                .to_vec1::<f32>()
+        };
+        let (a, b) = (on(&Device::Cpu)?, on(&cuda)?);
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        // Loose enough for f32 accumulation over thousands of terms — the two
+        // backends reduce in different orders — and tight enough that a
+        // reduction covering the wrong span cannot hide: getting the max or the
+        // sum wrong moves individual probabilities by far more than this.
+        assert!(
+            worst < 1e-4,
+            "softmax over {width}-wide rows differs between CPU and CUDA by {worst}"
+        );
+        // Each row must still be a distribution — a truncated reduction shows up
+        // here even if both backends make the same mistake.
+        for r in 0..rows {
+            let sum: f32 = b[r * width..(r + 1) * width].iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-3,
+                "row {r} of a {width}-wide softmax sums to {sum}, not 1 — the reduction did not \
+                 cover the whole row"
+            );
+        }
+    }
+    Ok(())
+}
 test_device!(rms_norm, rms_norm_cpu, rms_norm_gpu, rms_norm_metal);
 test_device!(rms_norml, rms_norml_cpu, rms_norml_gpu, rms_norml_metal);
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);

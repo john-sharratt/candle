@@ -231,6 +231,80 @@ pub fn get_tensor(t: &onnx::TensorProto, name: &str) -> Result<Tensor> {
     }
 }
 
+/// Where a destination index reads from, in source coordinates.
+///
+/// ONNX's `coordinate_transformation_mode`, which is the part of `Resize` that
+/// is easy to skip and impossible to get away with: the four modes differ by
+/// half a pixel, and half a pixel of shift in every decoder stage of a
+/// segmentation network is a matte that does not line up with its picture.
+fn resize_src_coord(dst: usize, out_n: usize, in_n: usize, mode: &str) -> f32 {
+    let scale = out_n as f32 / in_n as f32;
+    match mode {
+        "asymmetric" => dst as f32 / scale,
+        "align_corners" => {
+            if out_n <= 1 {
+                0.0
+            } else {
+                dst as f32 * (in_n - 1) as f32 / (out_n - 1) as f32
+            }
+        }
+        // PyTorch's `align_corners=false`, which is what almost every exported
+        // vision model carries.
+        "pytorch_half_pixel" => {
+            if out_n <= 1 {
+                -0.5
+            } else {
+                (dst as f32 + 0.5) / scale - 0.5
+            }
+        }
+        // "half_pixel", and the default.
+        _ => (dst as f32 + 0.5) / scale - 0.5,
+    }
+}
+
+/// Linear interpolation along one axis, by gather-and-blend.
+///
+/// Two `index_select`s and a lerp rather than a dedicated kernel: it is exact,
+/// it works on every backend candle has, and the cost is two gathers per axis
+/// against a resize that is not on anybody's hot path.
+fn resize_linear_axis(t: &Tensor, dim: usize, out_n: usize, ct_mode: &str) -> Result<Tensor> {
+    let in_n = t.dim(dim)?;
+    let dev = t.device();
+    let (mut lo, mut hi, mut frac) = (
+        Vec::with_capacity(out_n),
+        Vec::with_capacity(out_n),
+        Vec::with_capacity(out_n),
+    );
+    for d in 0..out_n {
+        // Clamped into the source before it is split, so the edge pixels
+        // replicate rather than wrapping or reading out of bounds.
+        let s = resize_src_coord(d, out_n, in_n, ct_mode).clamp(0.0, (in_n - 1) as f32);
+        let f = s.floor();
+        lo.push(f as u32);
+        hi.push(((f as usize) + 1).min(in_n - 1) as u32);
+        frac.push(s - f);
+    }
+    let a = t.index_select(&Tensor::from_vec(lo, out_n, dev)?, dim)?;
+    let b = t.index_select(&Tensor::from_vec(hi, out_n, dev)?, dim)?;
+
+    let mut shape = vec![1usize; t.rank()];
+    shape[dim] = out_n;
+    let w = Tensor::from_vec(frac, out_n, dev)?
+        .reshape(shape)?
+        .to_dtype(t.dtype())?;
+    // `a·(1 − w) + b·w`.
+    a.broadcast_mul(&w.affine(-1.0, 1.0)?)? + b.broadcast_mul(&w)?
+}
+
+/// Bilinear resize of an `[N, C, H, W]` tensor.
+///
+/// Separable, so the two axes are done in turn — which is the same arithmetic
+/// as the 2-D form and half the gathers.
+fn resize_bilinear2d(t: &Tensor, out_h: usize, out_w: usize, ct_mode: &str) -> Result<Tensor> {
+    let resized = resize_linear_axis(t, 2, out_h, ct_mode)?;
+    resize_linear_axis(&resized, 3, out_w, ct_mode)
+}
+
 // This function provides a direct evaluation of the proto.
 // Longer-term, we should first convert the proto to an intermediate representation of the compute
 // graph so as to make multiple evaluations more efficient.
@@ -238,21 +312,58 @@ pub fn get_tensor(t: &onnx::TensorProto, name: &str) -> Result<Tensor> {
 // anymore.
 pub fn simple_eval(
     model: &onnx::ModelProto,
+    inputs: HashMap<String, Value>,
+) -> Result<HashMap<String, Value>> {
+    simple_eval_on(model, inputs, &Device::Cpu)
+}
+
+/// [`simple_eval`], with the graph's weights placed on `device`.
+///
+/// The initializers are parsed out of the proto on the host — they are only
+/// bytes there — and then moved, so a graph evaluated against CUDA inputs has
+/// CUDA weights to meet them. Shape-like values a node computes for itself
+/// (`Shape`, `Constant` of a dimension list) deliberately stay where they are:
+/// they are read back by the host to drive `narrow` and `reshape`, and moving
+/// them across the link only to move them back is pure cost.
+pub fn simple_eval_on(
+    model: &onnx::ModelProto,
     mut inputs: HashMap<String, Value>,
+    device: &Device,
 ) -> Result<HashMap<String, Value>> {
     let graph = match &model.graph {
         None => bail!("no graph defined in proto"),
         Some(graph) => graph,
     };
-    simple_eval_(graph, &mut inputs)
+    simple_eval_(graph, &mut inputs, device)
 }
 
 fn simple_eval_(
     graph: &onnx::GraphProto,
     values: &mut HashMap<String, Value>,
+    device: &Device,
 ) -> Result<HashMap<String, Value>> {
     for t in graph.initializer.iter() {
+        // **A weight the caller supplied wins.**
+        //
+        // Where a weight lives is the caller's business: a co-resident guest
+        // places its model in span ground, because the CUDA pool is the
+        // engine's and a model's worth of pool allocations is the largest
+        // competitor for the card it has. Overwriting those entries here — as
+        // this did — silently undoes that: the ground copy is never read, the
+        // proto is re-parsed onto the host on *every* evaluation, and the model
+        // ends up in the pool after all. Nothing fails; it is only slow, and
+        // wrong about the one thing the placement existed to control.
+        if values.contains_key(t.name.as_str()) {
+            continue;
+        }
+        // Parsed on the host because that is where the proto's bytes are, then
+        // moved once. A weight is read every forward and never written, so the
+        // copy is paid here and not per evaluation.
         let tensor = get_tensor(t, t.name.as_str())?;
+        let tensor = match device {
+            Device::Cpu => tensor,
+            _ => tensor.to_device(device)?,
+        };
         values.insert(t.name.to_string(), tensor);
     }
     for input in graph.input.iter() {
@@ -1030,7 +1141,16 @@ fn simple_eval_(
                 let output = match value.r#type() {
                     AttributeType::Tensor => {
                         let t = value.t.as_ref().unwrap();
-                        get_tensor(t, &node.name)?
+                        // On the evaluation's device, not the host. A `Constant`
+                        // is as often a *value* — a bias, a padding block a
+                        // decoder concatenates — as it is a shape, and one left
+                        // behind on the CPU meets the graph's real tensors at
+                        // the first `Concat` and fails there.
+                        let c = get_tensor(t, &node.name)?;
+                        match device {
+                            Device::Cpu => c,
+                            _ => c.to_device(device)?,
+                        }
                     }
                     rtype => bail!("unsupported 'value' type {rtype:?} for {}", node.name),
                 };
@@ -1108,7 +1228,7 @@ fn simple_eval_(
                         node.output.len()
                     );
                 }
-                let branch_out = simple_eval_(sub_graph, values)?;
+                let branch_out = simple_eval_(sub_graph, values, device)?;
                 for (i, out) in node.output.iter().enumerate() {
                     values.insert(
                         out.clone(),
@@ -2189,7 +2309,7 @@ fn simple_eval_(
                 let input = get(&node.input[0])?;
 
                 if input.rank() != 4 {
-                    bail!("Unsupported rank for nearest resize: {}", input.rank());
+                    bail!("Unsupported rank for resize: {}", input.rank());
                 }
 
                 let scales = if node.input.len() > 2 && !node.input[2].is_empty() {
@@ -2204,12 +2324,21 @@ fn simple_eval_(
                     None
                 };
 
-                let output_dims = match (scales, sizes) {
-                    (Some(_), Some(_)) => {
-                        bail!("Scales and sizes cannot both be set for Resize operation")
-                    }
-                    (Some(scales_tensor), None) => {
-                        let scale_values = scales_tensor.to_vec1::<f32>()?;
+                // **`sizes` wins when it has entries**, which is what the spec
+                // says and what real exports need: a traced PyTorch graph
+                // routinely carries both inputs with one of them empty rather
+                // than absent, and refusing that pair rejects models that are
+                // perfectly well formed.
+                let sizes = sizes.filter(|t| t.elem_count() > 0);
+                let scales = scales.filter(|t| t.elem_count() > 0);
+                let output_dims = match (sizes, scales) {
+                    (Some(sizes), _) => sizes
+                        .to_vec1::<i64>()?
+                        .iter()
+                        .map(|&d| d as usize)
+                        .collect::<Vec<_>>(),
+                    (None, Some(scales)) => {
+                        let scale_values = scales.to_vec1::<f32>()?;
                         input
                             .dims()
                             .iter()
@@ -2217,11 +2346,6 @@ fn simple_eval_(
                             .map(|(i, &d)| (d as f32 * scale_values[i]) as usize)
                             .collect::<Vec<_>>()
                     }
-                    (None, Some(sizes_tensor)) => sizes_tensor
-                        .to_vec1::<i64>()?
-                        .iter()
-                        .map(|&d| d as usize)
-                        .collect::<Vec<_>>(),
                     (None, None) => bail!("Either scales or sizes should be present"),
                 };
 
@@ -2234,24 +2358,28 @@ fn simple_eval_(
                 let nearest_mode =
                     get_attr_opt::<str>(node, "nearest_mode")?.unwrap_or("round_prefer_floor");
 
-                if mode != "nearest" {
-                    bail!("Unsupported resize mode: {}", mode);
-                }
-
-                if nearest_mode != "floor" {
-                    bail!("Unsupported nearest_mode for resize: {}", nearest_mode);
-                }
-
-                if coordinate_transformation_mode != "asymmetric" {
-                    bail!(
-                        "Unsupported coordinate_transformation_mode for resize: {}",
-                        coordinate_transformation_mode
-                    );
-                }
-
-                let h = output_dims[2];
-                let w = output_dims[3];
-                let output = input.upsample_nearest2d(h, w)?;
+                let (h, w) = (output_dims[2], output_dims[3]);
+                let output = match mode {
+                    "nearest" => {
+                        if nearest_mode != "floor" {
+                            bail!("Unsupported nearest_mode for resize: {}", nearest_mode);
+                        }
+                        if coordinate_transformation_mode != "asymmetric" {
+                            bail!(
+                                "Unsupported coordinate_transformation_mode for resize: {}",
+                                coordinate_transformation_mode
+                            );
+                        }
+                        input.upsample_nearest2d(h, w)?
+                    }
+                    // ONNX calls bilinear "linear" — the rank decides how many
+                    // axes it is over, and this op is already 4-D by the guard
+                    // above. Every segmentation decoder worth running needs it:
+                    // nearest upsampling in the reconstruction path is the
+                    // difference between an alpha edge and a staircase.
+                    "linear" => resize_bilinear2d(input, h, w, coordinate_transformation_mode)?,
+                    other => bail!("Unsupported resize mode: {}", other),
+                };
 
                 values.insert(node.output[0].clone(), output);
             }
@@ -2320,7 +2448,6 @@ fn simple_eval_(
 
                 let indices_shape = indices.dims();
                 let data_shape = data.dims();
-                let updates_shape = updates.dims();
 
                 // Last dimension of indices represents the depth of indexing
                 let k = indices_shape.last().unwrap().clone();

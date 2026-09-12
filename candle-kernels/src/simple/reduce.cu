@@ -622,7 +622,9 @@ __device__ void rmsnorm_q8a128_impl(
             (int8_t)__float2int_rn(n3 * id));
         if (lane == 0) {
             half2* ds = reinterpret_cast<half2*>(obytes + q8a1024_ds_off(flat));
-            ds[0] = make_half2(__float2half_rn(amax / 127.f), __float2half_rn(s));
+            // Σx normalised by amax — see blocks.cuh.
+            ds[0] = make_half2(__float2half_rn(amax / 127.f),
+                               __float2half_rn(s * id * (1.f / 127.f)));
         }
     }
 }

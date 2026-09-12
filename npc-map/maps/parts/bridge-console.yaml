@@ -1,0 +1,14 @@
+id: bridge-console
+kind: station
+name: bridge console
+binds: the tower itself
+short: >
+  The tower is moved, dug in and committed to a siege from the bridge console,
+  and only one body at a time may hold it.
+long: >
+  The one place the tower is spoken to as a whole rather than as a collection of
+  its parts. What it will do from here is never a fixed list: folding costs
+  energy it may not have, a tower already in the ground has to surface before it
+  can go anywhere, and a siege already under way cannot be opened twice. So the
+  console offers what the tower can afford this minute and nothing else, which is
+  how a body learns the state of the reserves without asking.

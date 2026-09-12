@@ -6,7 +6,7 @@ use crate::error::ConversationError;
 use crate::handle::{TokenDecoder, TurnEvent};
 use crate::persistence::record::DistillMode;
 use crate::persistence::thread::PersistenceThread;
-use crate::persistence::SubstratePersistence;
+use crate::persistence::SharedSubstrate;
 use crate::projection::{
     Builder, Conversation, GroupId, LayerId, ProjectionTarget, Reserved, TimelineId,
 };
@@ -16,6 +16,8 @@ use crate::stencil::{
     compile, compile_think_tree, compile_tool_call_tree, HfVocab, StencilTree, ThinkMode,
     ThinkSteerEnvelope, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
 };
+// `ChannelProbeRunner` is deliberately not imported: the summariser is
+// disconnected, so nothing constructs a runner. `Substrate` comes from our side.
 use crate::substrate::{ConvCompression, Substrate};
 use crate::summary_tree::{SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
@@ -34,6 +36,7 @@ use std::thread::JoinHandle;
 pub struct ThinkSteering {
     /// `<think>` id — the trigger the dial's tree is bound to.
     think_open: TokenId,
+    /// Empties the block the moment it opens — see [`crate::stencil::think`].
     off: Arc<StencilTree>,
     quick: Arc<StencilTree>,
     balanced: Arc<StencilTree>,
@@ -43,15 +46,25 @@ pub struct ThinkSteering {
 
 impl ThinkSteering {
     /// Derive a per-turn registry from `base` (e.g. the tool-call catalog) for
-    /// `mode`: bind the `<think>` trigger to that dial's steering tree.  The base
-    /// is untouched; the result is a fresh registry.
+    /// `mode`: bind the `<think>` trigger to that dial's steering tree.
+    /// The base is untouched; the result is a fresh registry.
     ///
-    /// [`ThinkMode::Off`] binds a tree like every other dial — one that closes
-    /// the block immediately.  It used to clear the trigger instead, on the
-    /// reasoning that the `/no_think` glue had already yielded an empty block;
-    /// the Qwen3.5/3.8 family has no such glue, so that left `Off` unenforced
-    /// and the model reasoned anyway.  Suppression belongs here, where it holds
-    /// regardless of what the dialect's markers do.
+    /// **[`ThinkMode::Off`] binds a tree too**, and this is the correction that
+    /// matters. It used to *clear* the trigger on the reasoning that the
+    /// `/no_think` glue would yield an empty block — true for Qwen3, false for
+    /// Qwen3.5 and Qwen3.8, which have no such marker at all. On those families
+    /// clearing the trigger left the model free to reason with nothing steering
+    /// it: the block ran to the token ceiling and the whole decode was discarded,
+    /// while the dial reported itself off.
+    ///
+    /// Binding `off` instead makes suppression a property of the grammar rather
+    /// than of the family's chat template, so it holds for every checkpoint and
+    /// a caller does not have to know which mechanism its model happens to use.
+    ///
+    /// **A registry has to actually be bound for any of that to hold.** A caller
+    /// that passes `TurnOptions::default()` gets an empty one and no steering at
+    /// all — which is how the ingest summariser came to reason unchecked despite
+    /// its dial reading `Off`. See `Sequence::no_think_triggers`.
     pub fn registry_for(&self, base: &TriggerRegistry, mode: ThinkMode) -> Arc<TriggerRegistry> {
         let tree = match mode {
             ThinkMode::Off => &self.off,
@@ -102,6 +115,18 @@ impl SubstrateReloadStatus {
             finished,
         )
     }
+}
+
+/// Whether a slot is being opened onto a conversation that already has turns.
+///
+/// A `bool` would read as `open(…, true)` at the two call sites that pick it,
+/// and the two cases differ in what they *mean* rather than in a setting: one
+/// mints a timeline and one continues one. See
+/// [`ConversationEngine::resume_conversation_with_projection`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Resumed {
+    No,
+    Yes,
 }
 
 /// The entry point for the conversation engine.
@@ -159,6 +184,15 @@ pub struct ConversationEngine {
     /// drained, and `Drop` falls through to the same path.
     summariser_thread: SummariserThread,
 
+    /// The co-resident models that borrow the card between waves.
+    ///
+    /// Shared with the scheduler, which polls the queue once per pass and
+    /// drains it between forwards. Held here because the *registry* is a
+    /// deployment decision made before the engine starts, and the *queue* is
+    /// what callers submit to from any thread — see [`Self::submit_guest`] and
+    /// [`crate::guest`].
+    guests: Arc<crate::guest::Guests>,
+
     /// Static model properties captured before the model moves to the scheduler thread.
     model_core: ModelCoreProperties,
 
@@ -179,10 +213,16 @@ impl ConversationEngine {
     ///   `BatchedInference<M>` for some `M: BatchedModelCore`.
     /// * `tokenizer` — HuggingFace tokenizer for encoding/decoding text.
     /// * `config` — Engine-wide configuration (VRAM budgets, EOS token, etc.).
+    /// * `guests` — The co-resident models this deployment has configured, if
+    ///   any. [`GuestRegistry::new`] is the ordinary answer and costs one atomic
+    ///   load per scheduler pass; see [`crate::guest`] for what a populated one
+    ///   buys. A parameter rather than a field on `EngineConfig` because the
+    ///   registry holds constructors — it is not `Clone`, and the config is.
     pub fn new(
         model: Box<dyn ManagedBatchedModel + Send>,
         tokenizer: tokenizers::Tokenizer,
         mut config: EngineConfig,
+        guests: crate::guest::GuestRegistry,
     ) -> crate::Result<Self> {
         // Capture model metadata before the model moves to the scheduler thread.
         let model_core = model.model_core_properties();
@@ -213,6 +253,12 @@ impl ConversationEngine {
             session_init_ms = session_start.elapsed().as_millis() as u64,
             "batched session created (KV arenas allocated)"
         );
+
+        let guests = Arc::new(crate::guest::Guests {
+            queue: Arc::new(crate::guest::GuestQueue::new()),
+            registry: guests,
+        });
+        let guests_for_scheduler = Arc::clone(&guests);
 
         let eos_tokens = config.eos_tokens.clone();
         let vocab_size = config.vocab_size;
@@ -250,31 +296,52 @@ impl ConversationEngine {
         // Open persistence and drive every record straight into the
         // substrate's in-RAM state in one walker pass — no manifest
         // mirror, no `reconstruct → collected_*` second pass.
-        let mut substrate = Substrate::new();
-        let workspace_dir: std::path::PathBuf = match config.workspace_path.as_ref() {
-            Some(p) => AsRef::<std::path::Path>::as_ref(p).to_path_buf(),
-            None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        };
+        //
+        // A host that writes its own record classes into this same log opens it
+        // first and hands the open pair over ([`SharedSubstrate`]) — one
+        // `.substrate/` admits exactly one writable handle per process. Everyone
+        // else names a directory and the engine opens it here. Resolved once,
+        // into the same pair either way, so nothing downstream knows which.
         let open_start = std::time::Instant::now();
-        let mut persistence = SubstratePersistence::open_in_with_substrate(
-            &workspace_dir,
-            &mut substrate,
-        )
-        .map_err(|e| {
-            ConversationError::from(candle::Error::Msg(format!("substrate persistence: {e}")))
-        })?;
-        tracing::info!(
-            open_ms = open_start.elapsed().as_millis() as u64,
-            log_bytes = persistence.write_offset(),
-            records = persistence.recovered_record_count(),
-            indexed = persistence.last_index().is_some(),
-            streams = substrate.all_streams().count(),
-            "substrate persistence opened"
-        );
+        let adopted = config.substrate.is_some();
+        let shared = match config.substrate.clone() {
+            Some(shared) => shared,
+            None => {
+                let workspace_dir: std::path::PathBuf = match config.workspace_path.as_ref() {
+                    Some(p) => AsRef::<std::path::Path>::as_ref(p).to_path_buf(),
+                    None => {
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    }
+                };
+                SharedSubstrate::open_in(&workspace_dir).map_err(|e| {
+                    ConversationError::from(candle::Error::Msg(format!(
+                        "substrate persistence: {e}"
+                    )))
+                })?
+            }
+        };
+        {
+            let persistence = shared.persistence.lock().unwrap_or_else(|e| e.into_inner());
+            tracing::info!(
+                open_ms = open_start.elapsed().as_millis() as u64,
+                adopted,
+                log_bytes = persistence.write_offset(),
+                records = persistence.recovered_record_count(),
+                indexed = persistence.last_index().is_some(),
+                streams = shared
+                    .substrate
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .all_streams()
+                    .count(),
+                "substrate persistence opened"
+            );
+        }
         // Persist the model identity into the substrate's `ModelSpec` record —
         // compare-and-insert, so it only appends when the model differs from
         // what the log already records. Makes the log a self-contained image.
         let singletons_start = std::time::Instant::now();
+        let mut persistence = shared.persistence.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(spec) = &config.model_spec {
             let wrote = persistence.set_model_spec(spec).map_err(|e| {
                 ConversationError::from(candle::Error::Msg(format!("persist model spec: {e}")))
@@ -304,11 +371,12 @@ impl ConversationEngine {
                 })?;
             }
         }
+        drop(persistence);
         tracing::info!(
             singletons_ms = singletons_start.elapsed().as_millis() as u64,
             "model spec + tokenizer records reconciled"
         );
-        let conversation = Conversation::from_parts(substrate, persistence);
+        let conversation = Conversation::from_shared(shared);
 
         // Register per-layer corrupt-turn policies (from the projection schema)
         // BEFORE the reload thread is spawned, so the startup reconstruct applies
@@ -391,6 +459,7 @@ impl ConversationEngine {
                     persist_trigger,
                     summariser_trigger,
                     boundary_markers,
+                    guests_for_scheduler,
                 );
                 // Localizes the startup gap between "model loaded" and the
                 // substrate progress bar moving: this is the scheduler thread
@@ -423,8 +492,60 @@ impl ConversationEngine {
             conversation,
             persist_thread,
             summariser_thread,
+            guests,
             substrate_reload_status,
         })
+    }
+
+    /// Queue work for a co-resident model and get a handle on its answer.
+    ///
+    /// The scheduler picks it up between two of its waves, evicts what it needs
+    /// to make room, serves the whole backlog for that guest, and hands the
+    /// ground back. Normal inference is blocked for the length of that drain —
+    /// see [`crate::guest`] for why that is the design rather than a cost.
+    ///
+    /// Refuses synchronously — before anything is queued and before anything is
+    /// evicted — when the request itself is not servable. A caller can block on
+    /// [`GuestReceipt::wait`] or poll `try_take`.
+    pub fn submit_guest(
+        &self,
+        request: crate::guest::GuestRequest,
+    ) -> Result<crate::guest::GuestReceipt, crate::guest::GuestError> {
+        self.submit_guest_watched(request, crate::guest::GuestSink::none())
+    }
+
+    /// The same, reporting progress to `sink` while the job runs.
+    ///
+    /// The sink is called on the scheduler thread with normal inference blocked,
+    /// so it must not block — see [`crate::guest::progress`].
+    pub fn submit_guest_watched(
+        &self,
+        request: crate::guest::GuestRequest,
+        sink: crate::guest::GuestSink,
+    ) -> Result<crate::guest::GuestReceipt, crate::guest::GuestError> {
+        let receipt = self.guests.queue.submit_watched(request, sink)?;
+        // **Wake the scheduler.** It parks in `rx.recv()` when there is nothing
+        // to do, and the guest queue is the one producer that does not arrive
+        // through that channel — so on an idle daemon a submitted job sat in
+        // the queue indefinitely, below a loop that was never going to come
+        // back round to look at it.
+        //
+        // Sent *after* the job is queued, so the loop either sees the work on
+        // its own next pass or is woken to find it. There is no ordering in
+        // which both miss: the channel buffers, so a wake that arrives while
+        // the loop is still running is waiting for it when it parks.
+        let _ = self.scheduler_tx.send(SchedulerRequest::Wake);
+        Ok(receipt)
+    }
+
+    /// The guests this deployment configured, for a status view.
+    pub fn configured_guests(&self) -> Vec<crate::guest::Guest> {
+        self.guests.registry.configured()
+    }
+
+    /// How many guest jobs are waiting.
+    pub fn guest_backlog(&self) -> usize {
+        self.guests.queue.depth()
     }
 
     /// Shared handle to the startup substrate-reload progress. The daemon's
@@ -627,6 +748,16 @@ impl ConversationEngine {
         self.conversation.warm_ingest_normalization(schema);
     }
 
+    /// Warm the belief-driven section collections' per-member hit levels from
+    /// their own tag-scoped corpus. Call after load, once the corpus is stable —
+    /// without it a collection's levels are cold on every process start but the
+    /// one that built the corpus, which changes both the scale and the RANKING of
+    /// its scores. See
+    /// [`crate::projection::Conversation::warm_collection_normalization`].
+    pub fn warm_collection_normalization(&self, schema: &crate::projection::Schema) {
+        self.conversation.warm_collection_normalization(schema);
+    }
+
     /// Merge a `(key, value)` into `timeline`'s free-form `custom`
     /// metadata bag and persist it. Used by utility ingests to tag each
     /// conversation with a content hash + descriptive fields for the
@@ -690,6 +821,19 @@ impl ConversationEngine {
         self.conversation.known_conversations()
     }
 
+    /// Live conversations whose `conv_id` starts with `prefix`, as
+    /// `(timeline, conv_id)` — tombstoned ones excluded.
+    ///
+    /// For a caller that names its conversations by a scheme rather than
+    /// listing them, and wants one scheme's members without paying for the
+    /// whole registry: [`Self::known_conversations`] materialises every
+    /// conversation the workspace has ever held, and that grows for the life of
+    /// the log while the live set stays bounded. `npcd` finds one character's
+    /// `npc-<id>-day-*` conversations this way.
+    pub fn conversations_with_conv_id_prefix(&self, prefix: &str) -> Vec<(TimelineId, String)> {
+        self.conversation.conversations_with_conv_id_prefix(prefix)
+    }
+
     /// Toggle the archived lifecycle flag for a conversation. Persists
     /// to the redo log as `RecordType::ConvState` (last-writer-wins)
     /// and updates the in-RAM substrate. Drives the daemon's
@@ -717,6 +861,46 @@ impl ConversationEngine {
         self.conversation
             .tombstone_timeline(timeline)
             .map_err(ConversationError::Model)
+    }
+
+    /// Tombstone one turn of a live timeline — see
+    /// [`crate::projection::Conversation::tombstone_turn`].
+    pub fn tombstone_turn(&self, timeline: TimelineId, turn_index: u32) -> crate::Result<()> {
+        self.conversation
+            .tombstone_turn(timeline, turn_index)
+            .map_err(ConversationError::Model)
+    }
+
+    /// Whether `(timeline, turn)` was already dropped by a turn-scoped
+    /// tombstone.
+    pub fn is_turn_tombstoned(&self, timeline: TimelineId, turn_index: u32) -> bool {
+        self.conversation.is_turn_tombstoned(timeline, turn_index)
+    }
+
+    /// Whether the whole of `timeline` has been tombstoned.
+    ///
+    /// The companion to [`Self::is_turn_tombstoned`], and what a caller about
+    /// to retire a conversation consults so an already-dead one costs a lookup
+    /// rather than another record.
+    pub fn is_timeline_tombstoned(&self, timeline: TimelineId) -> bool {
+        self.conversation.is_timeline_tombstoned(timeline)
+    }
+
+    /// How many turns `timeline` actually holds — the substrate's own count.
+    ///
+    /// **The number a retention sweep must reckon against.** `Sequence::turn_count`
+    /// is a different quantity: it is a per-sequence diagnostic that counts a
+    /// user and an assistant message separately (`+= 2` an exchange) and resets
+    /// whenever a process opens a fresh sequence. Turn *indices* advance once
+    /// per exchange, so a horizon computed from that counter runs at twice the
+    /// rate of the turns it indexes — past ~65 exchanges it exceeds the last
+    /// real turn and retires the entire conversation, which is `keep_turns`
+    /// meaning its own opposite.
+    ///
+    /// This counts turns the way the index does, so a horizon derived from it
+    /// names a turn that exists.
+    pub fn timeline_turn_count(&self, timeline: TimelineId) -> u64 {
+        self.conversation.read().turn_count(timeline) as u64
     }
 
     /// Mark `timeline` for distillation at `mode` (shed content at compaction) —
@@ -863,6 +1047,25 @@ impl ConversationEngine {
     /// to several pieces), an **empty** registry is returned — constrained
     /// decoding is simply inactive and the model free-decodes tool calls as
     /// before.  This never fails startup over a tokenizer mismatch.
+    /// Compile a stencil spec against **this engine's** vocabulary.
+    ///
+    /// The vocabulary is the tokenizer, the EOS id and the vocab size together,
+    /// and all three belong to the loaded checkpoint — so a caller that built
+    /// its own would be compiling a grammar against a model it is not running.
+    /// Exposed for callers with a tree of their own: `npcd` compiles an action
+    /// loop rather than the single-call assistant shape
+    /// [`Self::compile_tool_stencil`] builds.
+    pub fn compile_stencil(&self, spec: &crate::stencil::TreeSpec) -> crate::Result<StencilTree> {
+        let eos = self.config.eos_tokens.iter().next().copied().unwrap_or(0);
+        let vocab = HfVocab::new(
+            (*self.tokenizer).clone(),
+            eos,
+            self.config.vocab_size as u64,
+        );
+        compile(spec, &vocab)
+            .map_err(|e| ConversationError::from(candle::Error::Msg(format!("stencil: {e}"))))
+    }
+
     pub fn compile_tool_stencil(&self, tools: &[ToolSpec]) -> crate::Result<Arc<TriggerRegistry>> {
         let Some(trigger) = self.tokenizer.token_to_id("<tool_call>") else {
             tracing::warn!(
@@ -879,10 +1082,24 @@ impl ConversationEngine {
         // Without this the stencil releases control after `</tool_call>` and the
         // model free-decodes a hallucinated answer past the call. The decode
         // loop detects the EOS in the injected close run and seals the turn.
+        //
+        // **Taken from the dialect, not written here.** The shape of a call is
+        // decided by the template the weights were trained against — Qwen3.5
+        // writes a nested function element, ChatML writes a JSON object — and a
+        // literal in this function is a second opinion about that, free to
+        // disagree with the checkpoint actually loaded.
+        let d = &self.config.dialect;
+        let base = ToolCallEnvelope::for_dialect(d);
         let envelope = ToolCallEnvelope {
-            open: "\n{\"name\": \"".to_string(),
-            args_open: ", \"arguments\": {".to_string(),
-            close: "}}\n</tool_call><|im_end|>".to_string(),
+            // Minus the marker the model has already emitted, plus the turn
+            // terminator on the close.
+            open: base
+                .open
+                .strip_prefix(&base.marker)
+                .unwrap_or(&base.open)
+                .to_string(),
+            close: format!("{}{}", base.close, d.assistant_end),
+            ..base
         };
         let spec = compile_tool_call_tree(tools, &envelope).map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
@@ -903,10 +1120,20 @@ impl ConversationEngine {
 
     /// Compile the thinking-block steering trees (one per effort dial, `Off`
     /// included) once, for reuse across turns via
-    /// [`ThinkSteering::registry_for`].  Like the
-    /// tool stencil, this is inactive — `Ok(None)` — when the tokenizer lacks a
+    /// [`ThinkSteering::registry_for`].  Like the tool
+    /// stencil, this is inactive — `Ok(None)` — when the tokenizer lacks a
     /// single `<think>`/`</think>` token, so the model free-decodes its reasoning.
-    pub fn compile_think_steering(&self) -> crate::Result<Option<Arc<ThinkSteering>>> {
+    ///
+    /// `after_close` is emitted by the grammar immediately after the block's
+    /// closing tag — see [`ThinkSteerEnvelope::after_close`]. `""` hands control
+    /// back to the decoder, which is what an assistant wants. An action loop
+    /// passes the tool-call marker, so a character that has finished thinking is
+    /// put straight into a call rather than left free to write prose at the one
+    /// join the grammar does not otherwise cover.
+    pub fn compile_think_steering(
+        &self,
+        after_close: &'static str,
+    ) -> crate::Result<Option<Arc<ThinkSteering>>> {
         let (Some(think_open), Some(think_close)) = (
             self.tokenizer.token_to_id("<think>"),
             self.tokenizer.token_to_id("</think>"),
@@ -922,6 +1149,7 @@ impl ConversationEngine {
             think_open,
             think_close,
             eos,
+            after_close,
         };
         let vocab = HfVocab::new(
             (*self.tokenizer).clone(),
@@ -1029,6 +1257,131 @@ impl ConversationEngine {
         // `(layer, group)` so the seal path can write turns into the
         // right timeline without consulting the schema.
         let timeline = self.conversation.mint_timeline(layer, group);
+        self.bind_slot_to_timeline(
+            timeline,
+            Resumed::No,
+            system_prompt,
+            builder,
+            layer,
+            group,
+            config,
+            section_progress,
+        )
+    }
+
+    /// Open a **new GPU slot onto a conversation that already exists** in the
+    /// substrate, and carry on appending to it.
+    ///
+    /// # What this is for
+    ///
+    /// Every other constructor mints a fresh `TimelineId`, so a process restart
+    /// abandons whatever conversation the last one was using — the turns stay in
+    /// the log, reachable by the gather, but nothing appends to them again. For
+    /// an assistant that is right: a session ends. For a mind that never stops
+    /// living it is not. Its conversation is *the* conversation, and a restart
+    /// should rejoin it rather than start the day over with a stranger's history
+    /// filed beside it.
+    ///
+    /// # What actually resumes
+    ///
+    /// The turns, the recurrent state and the carried selection belief — the
+    /// three durable things a timeline owns. The first two are restored by
+    /// [`crate::scheduler`]'s slot-creation funnel, which reads them from the
+    /// timeline; the third is refolded from the persisted per-turn projection
+    /// events. What does not resume is GPU residence: the slot starts empty and
+    /// the next turn's projection materialises what it needs out of the
+    /// substrate, exactly as it would after any eviction.
+    ///
+    /// # What the caller still owes
+    ///
+    /// **That this timeline is the right one to continue.** Nothing here can
+    /// tell whether the schema, the prompt or the dialect has changed underneath
+    /// it since it was written, and resuming into a conversation shaped by a
+    /// different frame is worse than starting a new one — the model reads a
+    /// history it would never have produced. Tag the conversation with a
+    /// fingerprint of the frame it was opened under and check it before calling
+    /// this; `npcd`'s character loop and zend's `content_sha256` ingest cache
+    /// are both that pattern.
+    ///
+    /// Refuses an unregistered timeline, and refuses a tombstoned one — a
+    /// tombstone is the record that something decided this conversation was
+    /// finished, and silently reviving it would make that decision meaningless.
+    pub fn resume_conversation_with_projection(
+        &self,
+        timeline: TimelineId,
+        system_prompt: &str,
+        builder: Builder,
+        config: SequenceConfig,
+    ) -> crate::Result<Sequence> {
+        if self.is_timeline_tombstoned(timeline) {
+            return Err(ConversationError::Channel(format!(
+                "cannot resume conversation on timeline {timeline}: it is tombstoned",
+            )));
+        }
+        let Some((layer, group)) = self.conversation.timeline_target(timeline) else {
+            return Err(ConversationError::Channel(format!(
+                "cannot resume conversation on timeline {timeline}: not registered in the substrate",
+            )));
+        };
+        if let Some(yaml) = builder.source_yaml() {
+            if let Err(e) = self.conversation.set_template(yaml.as_bytes()) {
+                tracing::warn!("persist projection template failed: {e}");
+            }
+        }
+        self.bind_slot_to_timeline(
+            timeline,
+            Resumed::Yes,
+            system_prompt,
+            builder,
+            layer,
+            group,
+            config,
+            None,
+        )
+    }
+
+    /// [`Self::resume_conversation_with_projection`] for a conversation that
+    /// was opened from a raw prompt string.
+    ///
+    /// The synthetic single-layer schema is rebuilt from `system_prompt` the
+    /// same way [`Self::new_conversation`] builds it, so the frame the resumed
+    /// conversation projects under is the frame it was created under — provided
+    /// the caller hands over the same prompt. It cannot check that for you; see
+    /// the fingerprint note on [`Self::resume_conversation_with_projection`].
+    pub fn resume_conversation(
+        &self,
+        timeline: TimelineId,
+        system_prompt: &str,
+        config: SequenceConfig,
+    ) -> crate::Result<Sequence> {
+        let inner_prompt = {
+            let s = system_prompt
+                .strip_prefix(config.dialect.system_start)
+                .unwrap_or(system_prompt);
+            s.strip_suffix(config.dialect.system_end).unwrap_or(s)
+        };
+        let builder = Builder::for_plain_prompt(inner_prompt);
+        self.resume_conversation_with_projection(timeline, system_prompt, builder, config)
+    }
+
+    /// Allocate a slot for `timeline` and build the [`Sequence`] over it.
+    ///
+    /// The shared tail of [`Self::new_conversation_with_projection_progress`]
+    /// and [`Self::resume_conversation_with_projection`] — everything from
+    /// "the timeline exists" onwards is identical, and `resumed` chooses only
+    /// which scheduler entry point allocates the slot.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_slot_to_timeline(
+        &self,
+        timeline: TimelineId,
+        resumed: Resumed,
+        system_prompt: &str,
+        builder: Builder,
+        layer: LayerId,
+        group: GroupId,
+        config: SequenceConfig,
+        section_progress: Option<&dyn Fn(u64, u64)>,
+    ) -> crate::Result<Sequence> {
         // Register this conversation's per-conversation KV-compression
         // override (if any) before the first turn seals, so each turn
         // residence inherits it at alloc time. Utility layers set a
@@ -1063,21 +1416,53 @@ impl ConversationEngine {
         };
 
         let (response_tx, response_rx) = channel::bounded(1);
-        self.scheduler_tx
-            .send(SchedulerRequest::NewSequence {
+        let request = match resumed {
+            // A fresh conversation: any state comes from the timeline's own
+            // snapshot, which `create_sequence` reads.
+            Resumed::No => SchedulerRequest::NewSequence {
                 conversation: self.conversation.clone(),
                 target: Some(target),
-                // A fresh conversation: any state comes from the timeline's own
-                // snapshot, which `create_sequence` reads.
                 parent: None,
                 response_tx,
-            })
+            },
+            // The same funnel, entered by the door that says so. Both end in
+            // `create_sequence(conversation, Some(target))` and restore the
+            // timeline's recurrent state and carried belief; what differs is
+            // that this one re-derives `(layer, group)` from the substrate
+            // registry and fails loudly if the timeline was never registered.
+            Resumed::Yes => SchedulerRequest::ResumeSequence {
+                conversation: self.conversation.clone(),
+                timeline,
+                response_tx,
+            },
+        };
+        self.scheduler_tx
+            .send(request)
             .map_err(|_| ConversationError::SchedulerGone)?;
 
         let sequence_id = response_rx
             .recv()
             .map_err(|_| ConversationError::SchedulerGone)??;
 
+        // **Everything past the slot allocation has to hand the slot back.**
+        //
+        // A built [`Sequence`] frees its slot on drop, so the only window where
+        // one can be stranded is between the scheduler handing out `sequence_id`
+        // and a `Sequence` existing to own it. A `?` here would return through
+        // that window and leave a GPU slot allocated, its sampling state
+        // registered and its conversation handle held, with nothing left that
+        // knows the id — leaked until the process ends.
+        //
+        // Rare, and rarer still to notice: the surviving symptom is a slot count
+        // that never comes back down, which reads as a busy engine rather than
+        // as an error. Resume widens the window — a conversation whose tree
+        // rebuild fails is a new way in — so it is closed rather than reasoned
+        // about.
+        let free_slot = || {
+            let _ = self
+                .scheduler_tx
+                .send(SchedulerRequest::FreeSequence { sequence_id });
+        };
         let (conv, pending) = Sequence::new_with_projection(
             self.scheduler_tx.clone(),
             sequence_id,
@@ -1090,12 +1475,23 @@ impl ConversationEngine {
             self.model_core,
             self.conversation.clone(),
             section_progress,
-            // Single-create path keeps the first-turn priming optimization.
+            // **Primed on both paths, resume included.** Priming injects the
+            // schema's prelude *sections* and explicitly no turns, and the
+            // per-turn `apply_projection` at submit materialises the real
+            // projection regardless — so a resumed slot is warmed by this and
+            // its history still arrives the ordinary way.
             true,
-        )?;
+        )
+        .inspect_err(|_| free_slot())?;
         // A group of one — the same install path the batch create takes.
         let pending: Vec<_> = pending.into_iter().collect();
-        install_branch_states(&self.scheduler_tx, &pending, &self.conversation)?;
+        if let Err(e) = install_branch_states(&self.scheduler_tx, &pending, &self.conversation) {
+            // `conv` owns the slot by now and would free it on drop, but it is
+            // dropped here without being returned, so say what happened rather
+            // than letting a silent drop stand in for an error.
+            drop(conv);
+            return Err(e);
+        }
 
         Ok(conv)
     }
@@ -1315,6 +1711,8 @@ impl ConversationEngine {
         let (event_tx, event_rx) = channel::unbounded();
         self.scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
+                // One turn, and it is the slot's tail.
+                seal_group: None,
                 sequence_id,
                 projection_inputs: None,
                 prefill_tokens: TokenBuffer::from(tokens.to_vec()),
@@ -1335,6 +1733,8 @@ impl ConversationEngine {
                 disable_reprojection: false,
                 // Raw eval/summarisation path: no tools, no constrained decode.
                 triggers: Arc::new(TriggerRegistry::new()),
+                turn_grammar: None,
+                free_tool_calls_from_penalties: false,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
 
@@ -1417,6 +1817,13 @@ impl ConversationEngine {
     /// dropped and we must ensure the CUDA scheduler thread exits before the
     /// CUDA driver's atexit handler fires.
     pub fn shutdown(&self) -> crate::Result<()> {
+        // **Before the scheduler is asked to stop.** A caller blocked in
+        // `GuestReceipt::wait` is blocked on the scheduler thread; once that
+        // thread joins there is nobody left to answer, and the caller waits for
+        // the life of the process with its HTTP request still open. Closing
+        // first also refuses anything submitted during the teardown, so no job
+        // lands in a queue nothing will drain.
+        self.guests.queue.close();
         let _ = self.scheduler_tx.send(SchedulerRequest::Shutdown);
         let handle = self
             .scheduler_handle

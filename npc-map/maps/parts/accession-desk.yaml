@@ -1,0 +1,18 @@
+id: accession-desk
+kind: station
+name: the accession desk
+binds: the intake
+short: >
+  Where a thing formally enters the record, and where it came from is written
+  down before anything else happens to it.
+long: >
+  Taking custody is an act, not a side effect. A thing that arrives without its
+  provenance — who made it, when, out of what, on whose authority — can never
+  be trusted again, because the question "how do we know this" has no answer
+  and no amount of later work supplies one. So the first thing done to anything
+  is to write down where it came from, and only then may it be worked on.
+  Nothing skips this desk, including work a Maker made itself.
+modes:
+  - reading
+  - working
+  - offered

@@ -27,7 +27,7 @@ use super::embedding::EmbeddingTable;
 use super::expert_loader::build_expert_cache;
 use super::layer_loader::build_layer_cache;
 use super::layer_store::LayerStore;
-use super::quantized_weights::{load_quantized_model, LoadInputs, QuantModel};
+use super::quantized_weights::{load_quantized_model, undersized_gates, LoadInputs, QuantModel};
 use crate::models::batched_model::ensure_vram_governor;
 use crate::models::expert_lre::pack::repack_fingerprint;
 use crate::models::expert_lre::{ExpertCache, PINNED_LAYERS};
@@ -61,6 +61,19 @@ pub struct Qwen35LoadOptions {
     /// the model already streams that is a trade the caller should make
     /// explicitly.
     pub mtp_path: Option<PathBuf>,
+    /// The base checkpoint to read the DeltaNet recurrent gates from, when this one
+    /// quantized them.
+    ///
+    /// `ssm_alpha`/`ssm_beta` must be F32 — the recurrence accumulates their error at every
+    /// token, so a conversion that quantizes them produces a model which loads cleanly and
+    /// then generates incoherent text from its first token. Several third-party Qwen3.5
+    /// conversions do exactly that.
+    ///
+    /// Naming the checkpoint the fine-tune was built from repairs it: the gates are read from
+    /// there and everything else — attention, the FFN, the head, which is where a fine-tune's
+    /// actual behaviour lives — stays the primary's. `None` refuses such a checkpoint
+    /// instead, which is right when there is nothing to repair it from.
+    pub gate_donor_path: Option<PathBuf>,
 }
 
 /// Load a hybrid checkpoint of this lineage.
@@ -153,6 +166,36 @@ pub fn load_hybrid_gguf(
     };
     let mtp_src = mtp_mmap.as_ref().map(|(c, m)| (c, &m[..]));
 
+    // The base checkpoint, mapped only when one was named. Nothing is read from it unless the
+    // primary's recurrent gates turn out to be quantized, so naming a donor for a healthy
+    // checkpoint costs a mapping and no bytes.
+    let gate_mmap = match options.gate_donor_path.as_deref() {
+        None => None,
+        Some(p) => {
+            let f = std::fs::File::open(p)?;
+            let m = unsafe {
+                MmapOptions::new().map(&f).map_err(|e| {
+                    candle::Error::Msg(format!("qwen35: failed to mmap gate donor {p:?}: {e}"))
+                })?
+            };
+            let mut c = std::io::Cursor::new(&m[..]);
+            let content = Content::read(&mut c)?;
+            Some((content, m))
+        }
+    };
+    // **Filtered here, once, because more than one consumer reads it.** `load_quantized_model`
+    // applies the same "repair only what is broken" rule to its own copy, but the
+    // `build_layers` closure below captures *this* binding — so an unfiltered donor would
+    // reach the streamed layers while the pinned ones and the resident residues took the
+    // checkpoint's own recurrent path. That is a half-repaired recurrence, which is precisely
+    // what `donor_gates` refuses to produce, arrived at by a route that never consults it. The
+    // pack fingerprint below is computed from this too, so an unfiltered donor would also key
+    // the pack to a repair that never happened.
+    let gate_src = gate_mmap
+        .as_ref()
+        .map(|(c, m)| (c, &m[..]))
+        .filter(|_| !undersized_gates(&content).is_empty());
+
     // The embedding is the one dense tensor read per token rather than per forward, so it is
     // bound to host-mapped memory here — where the mappings are — and the GPU gathers its rows
     // from device-side ids. `None` falls back to the F32 host table inside the load.
@@ -173,6 +216,10 @@ pub fn load_hybrid_gguf(
     let inputs = LoadInputs {
         host_embed,
         mtp_src,
+        gate_src,
+        // The trunk's own mapping, so a large projection is repacked from it a band at a time
+        // rather than uploaded whole first.
+        map: Some(&mmap[..]),
         build_experts: |content: &Content,
                         cfg: &Qwen35Config|
          -> Result<Option<Arc<ExpertCache>>> {
@@ -205,8 +252,18 @@ pub fn load_hybrid_gguf(
                 // The **same** fingerprint the expert pack uses: both hold
                 // weights repacked by identical code, so a change that
                 // invalidates one must invalidate the other.
-                let identity =
-                    PackIdentity::of(&mmap_for_layers[..], int8mode, repack_fingerprint(cuda));
+                // **The donor is part of the pack's identity.** A pack is written once and
+                // reused on every later load, so one built before a gate donor was in play
+                // holds the checkpoint's own quantized recurrent path — and would keep
+                // serving it, silently undoing the repair by a cache hit. Folding the donor's
+                // length into the fingerprint makes such a pack stale instead.
+                let fp = match gate_src {
+                    None => repack_fingerprint(cuda),
+                    Some((_, bytes)) => {
+                        repack_fingerprint(cuda) ^ (bytes.len() as u64).rotate_left(17)
+                    }
+                };
+                let identity = PackIdentity::of(&mmap_for_layers[..], int8mode, fp);
                 build_layer_cache(
                     content,
                     &mut reader,
@@ -217,6 +274,7 @@ pub fn load_hybrid_gguf(
                     identity,
                     PINNED_LAYERS,
                     residues,
+                    gate_src,
                 )
             },
         ),

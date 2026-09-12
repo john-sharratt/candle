@@ -66,12 +66,18 @@ export const STATE_LABEL = {
   asleep: 'asleep', suspended: 'suspended', tombstoned: 'deleted',
 };
 
+/* The two ways to be present to a character: in the room, or at a distance.
+ *
+ * There were a video call and a voice call as well; they were the same two
+ * pieces of machinery sliced a second time and are gone — see
+ * `engine::tools::Mode`. Every reader of these tables falls back to the raw
+ * wire value, so a stored session naming a withdrawn mode reads as itself
+ * rather than as `undefined`. */
 export const MODE_LABEL = {
-  physical: 'physical encounter', video_call: 'video call',
-  voice_call: 'voice call', instant_message: 'instant message',
+  physical: 'physical encounter', instant_message: 'instant message',
 };
 
-export const MODE_ICON = { physical: '◍', video_call: '▣', voice_call: '◎', instant_message: '▤' };
+export const MODE_ICON = { physical: '◍', instant_message: '▤' };
 
 export function stateDot(state) { return h('span', { class: 'dot ' + state, title: STATE_LABEL[state] || state }); }
 

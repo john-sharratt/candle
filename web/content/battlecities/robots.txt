@@ -1,0 +1,10 @@
+# Battle Cities — one page, and it is meant to be read.
+User-agent: *
+Allow: /
+
+# The build itself. Excluded because it is a download rather than a document:
+# there is nothing in it to index, and a crawler fetching it repeatedly costs
+# bandwidth for a result nobody would want to see.
+Disallow: /battle-cities.exe
+
+Sitemap: https://battlecities.net/sitemap.xml

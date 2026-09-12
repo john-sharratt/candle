@@ -10,6 +10,11 @@
  * over position. This file is the reference implementation for the corpus that
  * the daemon-side parser must also satisfy. */
 
+/* The key a free-text command's argument is carried under. Not a parameter name
+ * anybody declared — a free-text command has one argument and no schema — so it
+ * is spelled distinctly enough that nothing mistakes it for one. */
+export const FREE_TEXT = '_rest';
+
 export function tokenize(rest) {
   const out = [];
   let i = 0;
@@ -92,6 +97,44 @@ export function parseLine(line, commands) {
   const props = (exact.parameters && exact.parameters.properties) || {};
   const order = Object.keys(props);
   const required = exact.required || [];
+
+  /* **A command with no schema takes the rest of the line, whole.**
+   *
+   * The slash catalogue is free prose — `/say Hess is at the gate` — and this
+   * parser was built for structured calls, so it tokenised that into six
+   * positionals, found no parameters to put them in, and reported "too many
+   * arguments". `complete` was then false for *every* command that takes a
+   * argument, and the composer refuses to send an incomplete line: the entire
+   * slash menu was unusable, silently, for anything but `/wake` and `/sleep`.
+   *
+   * `argument` is the daemon's own description of what the rest of the line
+   * means, and its presence is what says the command is free-text. */
+  if (!order.length) {
+    const wants = exact.argument && exact.argument !== '(nothing)';
+    const text = rest.trim();
+    return {
+      isCommand: true,
+      term: name,
+      command: exact,
+      args: wants ? { [FREE_TEXT]: text } : {},
+      fields: wants
+        ? [{
+          // A short name for the label column; the daemon's own description of
+          // what the rest of the line means goes in the hint beside it.
+          name: 'text',
+          schema: { type: 'string', description: exact.argument },
+          required: true,
+          value: text,
+          state: text ? 'satisfied' : 'missing',
+        }]
+        : [],
+      errors: [],
+      missing: wants && !text ? ['text'] : [],
+      matches: [exact],
+      complete: !wants || !!text,
+    };
+  }
+
   const toks = tokenize(rest);
 
   const args = {};

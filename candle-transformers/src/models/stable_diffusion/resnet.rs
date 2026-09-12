@@ -117,8 +117,25 @@ impl ResnetBlock2D {
         })
     }
 
+    /// **The stage that bounds a decoder's arena.**
+    ///
+    /// This block is the decoder's unit of memory: two convolutions, two group
+    /// norms — each of which is itself a handful of full-resolution
+    /// intermediates for its mean and variance — and a residual add. At 128
+    /// channels and full resolution that is on the order of ten tensors of tens
+    /// of megabytes, allocated and dropped, and a bump arena holds a
+    /// generation's *sum*. Staging here is what keeps the arena's high-water at
+    /// one block rather than at a whole decoder, and the generations nest, so
+    /// this composes with the per-block stage in
+    /// [`vae::Decoder::forward`](super::vae) rather than competing with it.
+    ///
+    /// Outside a guest arena this is the identity.
     pub fn forward(&self, xs: &Tensor, temb: Option<&Tensor>) -> Result<Tensor> {
         let _enter = self.span.enter();
+        candle_nn::kv_cache::guest_stage(xs, |xs| self.forward_staged(xs, temb))
+    }
+
+    fn forward_staged(&self, xs: &Tensor, temb: Option<&Tensor>) -> Result<Tensor> {
         let shortcut_xs = match &self.conv_shortcut {
             Some(conv_shortcut) => conv_shortcut.forward(xs)?,
             None => xs.clone(),

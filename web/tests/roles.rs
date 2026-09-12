@@ -865,10 +865,12 @@ async fn each_brand_has_its_own_site_and_its_own_mark() {
         bc.name, "battlecities",
         "battlecities.net lost its own site"
     );
-    assert_eq!(
-        cfg.site_for(Some("www.battlecities.net")).name,
-        "battlecities"
-    );
+    // `www.` is a redirect onto the bare name, not a second copy of the site —
+    // so what it must not be is *tokera*, which is where an unmatched host would
+    // land as the default.
+    let www = cfg.site_for(Some("www.battlecities.net"));
+    assert_eq!(www.name, "battlecities-alt");
+    assert_eq!(www.redirect.as_deref(), Some("https://battlecities.net"));
 
     let tk = cfg.site_for(Some("tokera.com"));
     assert_eq!(tk.name, "tokera");
@@ -889,6 +891,66 @@ async fn each_brand_has_its_own_site_and_its_own_mark() {
             .iter()
             .any(|f| root.join(f).is_file());
         assert!(found, "{} has no icon of its own", site.name);
+    }
+}
+
+/// A brand answers on exactly one address, and every other spelling of it is a
+/// `301` onto that one.
+///
+/// This is the whole of the estate's naming policy, and it is worth an assertion
+/// because the failure is silent in both directions. A `www.` host left serving
+/// content splits the name against itself — a search engine picks one of the two
+/// as canonical and the other counts for nothing, so publishing both is
+/// competing with yourself for the one result you want. A `www.` host missing
+/// from the table entirely is worse: it falls through to the default site, so
+/// `www.battlecities.net` quietly serves Tokera.
+///
+/// The loop check is the other half. A redirect whose target is itself a
+/// redirect host is an infinite bounce that no test of a single hop would catch,
+/// and the browser's own error for it names neither hostname.
+#[tokio::test]
+async fn every_alternate_spelling_redirects_to_the_one_that_is_the_brand() {
+    let cfg = shipped();
+
+    let hosts: Vec<&str> = cfg
+        .sites
+        .iter()
+        .flat_map(|s| s.hosts.iter())
+        .map(String::as_str)
+        .collect();
+
+    for host in &hosts {
+        // `.localhost` / `.test` are development spellings and answer for real.
+        if !host.starts_with("www.") {
+            continue;
+        }
+        let site = cfg.site_for(Some(host));
+        let target = site.redirect.as_deref().unwrap_or_else(|| {
+            panic!("{host} serves content instead of redirecting — it will split the brand, or fall through to the default site");
+        });
+
+        // The target must be a real address on this estate, and must not itself
+        // be one of the names that redirect.
+        let bare = target
+            .strip_prefix("https://")
+            .unwrap_or_else(|| panic!("{host} redirects to {target}, which is not https"));
+        assert!(
+            hosts.contains(&bare),
+            "{host} redirects to {bare}, which no site in this table answers for"
+        );
+        assert!(
+            cfg.site_for(Some(bare)).redirect.is_none(),
+            "{host} redirects to {bare}, which redirects again — that is a loop"
+        );
+    }
+
+    // And the apex names themselves answer, rather than having been swept into
+    // the redirect list by a careless edit.
+    for apex in ["tokera.com", "battlecities.net"] {
+        assert!(
+            cfg.site_for(Some(apex)).redirect.is_none(),
+            "{apex} redirects — the target of every other name must serve"
+        );
     }
 }
 

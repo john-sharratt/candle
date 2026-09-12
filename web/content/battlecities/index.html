@@ -4,18 +4,94 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="X-UA-Compatible" content="ie=edge">
-    <title>Battle Cities - The Awakening of Zen</title>
+    <title>Battle Cities — The Awakening of Zen</title>
+    <meta name="description"
+        content="A post-apocalyptic strategy game. A superintelligence tore the solar system apart on its way out of the galaxy; humanity gave up its body for a copy of itself, sealed in shielded towers beneath Alfa Centauri. Millennia later the towers still stand, and the minds inside have gone back to war. You own one of them.">
+    <link rel="canonical" href="https://battlecities.net/">
+    <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+
+    <meta property="og:site_name" content="Battle Cities">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="Battle Cities — The Awakening of Zen">
+    <meta property="og:description"
+        content="A post-apocalyptic strategy game. The towers still stand, the science has been lost and relearned, and the minds inside have gone back to war with each other. You own one of them.">
+    <meta property="og:url" content="https://battlecities.net/">
+    <meta property="og:image" content="https://battlecities.net/title.png">
+    <meta property="og:locale" content="en">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Battle Cities — The Awakening of Zen">
+    <meta name="twitter:description"
+        content="A post-apocalyptic strategy game where the characters remember you. In development, in Rust and Bevy.">
+    <meta name="twitter:image" content="https://battlecities.net/title.png">
+
     <link rel="stylesheet" href="./style.css">
     <link rel="icon" href="./favicon.ico" type="image/x-icon">
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png">
+    <link rel="manifest" href="./site.webmanifest">
+
+    <!-- `VideoGame`, which is the vocabulary a search engine has for this — it
+         is what puts a genre, a platform and a publisher into a result rather
+         than a line of grey text. `isPartOf` ties the game to Tokera, so the
+         two are one entity to a crawler rather than two names that happen to
+         link to each other. -->
+    <script type="application/ld+json">
+    {
+        "@context": "https://schema.org",
+        "@type": "VideoGame",
+        "name": "Battle Cities",
+        "alternateName": "Battle Cities — The Awakening of Zen",
+        "url": "https://battlecities.net/",
+        "image": "https://battlecities.net/title.png",
+        "description": "A post-apocalyptic strategy game. Humanity gave up its body for a copy of itself, sealed in shielded towers beneath Alfa Centauri. Millennia later the minds inside have gone back to war with each other, and you own one of the towers.",
+        "genre": ["Strategy", "Science fiction"],
+        "gamePlatform": "PC",
+        "applicationCategory": "Game",
+        "operatingSystem": "Windows",
+        "inLanguage": "en",
+        "publisher": { "@type": "Organization", "name": "Tokera", "url": "https://tokera.com/" },
+        "author": { "@type": "Organization", "name": "Tokera", "url": "https://tokera.com/" },
+        "isPartOf": { "@type": "WebSite", "name": "Tokera", "url": "https://tokera.com/" }
+    }
+    </script>
 </head>
 
 <body>
     <main>
         <div style="text-align:center">
-            <h1><img src="title.png" alt="Battle Cities - The Awakening of Zen" class="center" /></h1>
-            <h2><a href="battle-cities.exe">Download</a></h2>
+            <h1><img src="title.png" alt="Battle Cities — The Awakening of Zen" class="center" width="1120"
+                    height="302" /></h1>
+            <h2><a href="battle-cities.exe" rel="nofollow">Download</a></h2>
         </div>
+
+        <!-- Text, because a page whose only content is an image and a download
+             link gives a search engine nothing to rank and a reader nothing to
+             decide on. The words are the ones tokera.com already uses for the
+             game, so the two describe it the same way. -->
+        <section class="about">
+            <p>
+                A superintelligence tore the solar system apart on its way out of the galaxy. What was
+                left of humanity gave up its body for a copy of itself, sealed in shielded towers
+                beneath Alfa Centauri, while the machines it had built finished the job overhead.
+            </p>
+            <p>
+                Millennia later the towers still stand, the science has been lost and relearned, and
+                the minds inside have gone back to war with each other. <strong>You own one of
+                    them.</strong>
+            </p>
+            <ul>
+                <li>Cityscapes held by alliances behind one wall</li>
+                <li>Drop-ship invasions, and a beachhead to hold before your city can follow you in</li>
+                <li>A battle speech over the spaceport, in hologram, once a day</li>
+                <li>Characters with unbounded memory — they remember what you did, and for how long</li>
+            </ul>
+            <p class="meta">
+                In development, in Rust and Bevy. Built on the
+                <a href="https://tokera.com/">Tokera</a> inference engine — read
+                <a href="https://tokera.com/blog/battle-cities-coming-soon">how the world got this way</a>,
+                or the <a href="https://tokera.com/papers">papers</a> behind the engine that runs its
+                characters.
+            </p>
+        </section>
     </main>
 </body>
 

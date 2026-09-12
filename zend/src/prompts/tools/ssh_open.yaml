@@ -1,4 +1,29 @@
 name: ssh_open
+questions:
+- ssh to deploy@10.0.0.12 using the prod-key credential
+- open an SSH shell on build-01.internal
+- log in over SSH to the database host with my stored key
+- start a secure shell session to the jump box
+- can I get an SSH session on that machine
+- which stored key will the SSH shell log in with
+- do I need to open an SSH session before running commands
+- is SSH access set up for that host
+- I need to poke around on that server directly
+- the logs aren't shipping so I'll have to read them on the box
+- going in over SSH to check the service by hand
+- need a shell on the remote machine to debug this
+- ssh in to that host
+- open an SSH shell session
+- get me an interactive SSH shell on that host
+- connect over SSH
+- ssh into the build server for me
+- connect to prod over SSH using my stored key
+- log in to that box with the ssh credential
+- open an SSH shell on 10.0.0.5
+- get me a remote shell on the staging host
+- start an SSH session to deploy@example.com
+- I want to run some commands on that server over ssh
+- establish an SSH connection to the database host
 category: SSH sessions
 description: Open a persistent SSH shell session on a remote host using a stored credential. Use to start a working session before issuing commands, when the user names an SSH host to connect to, or before any operation phrased as "ssh in", "connect to the server", "log into". Triggered by "ssh into", "open a connection to", "connect to the bastion", "log into the server", "start a shell on", "open a session on prod". Returns session_id, host, initial working directory, and shell path. The session persists until closed or idle-timed-out (15 min default). Subsequent commands run via ssh_session_exec; close with ssh_session_close when done.
 high_risk: true

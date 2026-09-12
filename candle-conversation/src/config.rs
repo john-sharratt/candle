@@ -4,6 +4,7 @@ use candle_nn::kv_cache::{KvFormat, QuantFormat};
 use candle_transformers::models::batched_inference::BatchedConfig;
 
 use crate::models::Dialect;
+use crate::persistence::SharedSubstrate;
 use crate::projection::{CorruptTurnPolicy, LayerId};
 use crate::token_buffer::TokenBuffer;
 use crate::tree::ConversationTreeConfig;
@@ -343,6 +344,48 @@ impl SamplingConfig {
     /// - Qwen3 family: <https://huggingface.co/Qwen/Qwen3-30B-A3B/blob/main/generation_config.json>
     /// - Qwen2 family: <https://huggingface.co/Qwen/Qwen2-0.5B-Instruct/raw/main/generation_config.json>
     /// - Llama/Hermes: <https://huggingface.co/NousResearch/Hermes-3-Llama-3.1-8B/raw/main/generation_config.json>
+    /// The `<think>`-block and turn-ending steering every Qwen reasoning
+    /// architecture shares, applied on top of that generation's own sampling numbers.
+    ///
+    /// Shared rather than repeated per arm because the sampling numbers are what
+    /// differ between Qwen3 and Qwen3.5+, and the steering is what does not. A second
+    /// copy would let one generation keep a backstop the other quietly lost — and a
+    /// missing backstop does not fail, it produces an empty answer after a full-length
+    /// decode.
+    fn with_qwen_thinking_steering(self) -> Self {
+        // DRY is span-scoped: the kernel gates and windows it on `dry_lens[seq]` —
+        // the current structural span (reset at
+        // `<think>`/`</think>`/`<tool_call>`/`</tool_call>`, off inside tool calls).
+        // So it runs in both thinking AND the answer but only ever sees the current
+        // span's own tokens. That is what makes it safe on the answer: it breaks a
+        // repeating loop without penalizing verbatim reproduction of numbers,
+        // identifiers, or code lifted from the prompt or an earlier span — those live
+        // outside the span DRY can see. The thinking-only temperature boost lets
+        // reasoning sample a touch hotter while the answer stays at the reference temp.
+        self.with_segment_temp_boost(0.05)
+            .with_dry_penalty(0.8, 1.75, 2, 512)
+            .with_repeat_last_n(128)
+            // EOT ramp: nudge </think> after 200 thinking tokens, full boost by 400
+            // (segment_close_ramp_len is the ramp's absolute end, not a span).  zend overrides
+            // segment_close_ramp_start/len per turn from `ThinkMode::eot_budget()`; this is the
+            // fallback for non-steered callers.  These IDs are resolved from the
+            // tokenizer at engine startup.
+            .with_segment_close_boost(2.0, 200, 400, 5.0)
+            .with_graceful_segment_close_after(220)
+            .with_force_segment_close_after(300)
+            // EOS limits are in total generated tokens (thinking + response).
+            // Think block consumes ~200-300 tokens; leave ~500-700 for the response.
+            // EOS boost ramp starts nudging at 700 total tokens, full boost by 800
+            // (eos_ramp_len is the ramp's absolute end, not a span).
+            // graceful_eos fires at the next sentence boundary after 800 tokens;
+            // forced_eos fires unconditionally at 1000 tokens.
+            // non_thinking_for_gguf_architecture overrides these back to tighter limits.
+            // zend overrides all four per turn from `ThinkMode::eos_budget()`; this
+            // is the fallback for non-steered callers.
+            .with_dynamic_eos_boost(1.0, 700, 800, 3.0)
+            .with_eos_failsafe(800, 1000)
+    }
+
     pub fn for_gguf_architecture(arch: &str) -> Self {
         match arch {
             // All Qwen3 models — dense and MoE — share the same official config.
@@ -350,45 +393,45 @@ impl SamplingConfig {
             // EOT boost ramp params are set here; the actual <think>/<​/think>
             // token IDs are resolved automatically from the tokenizer in
             // `resolve_thinking_tokens()` during engine startup.
+            //
+            // Matched to the LM Studio reference run: temp=0.8, top_k=40,
+            // top_p=0.95, repeat_penalty=1.1.  A gentle multiplicative
+            // repeat_penalty applies batch-wide.
             "qwen3" | "qwen3moe" | "qwen2moe" => Self::top_k_top_p(40, 0.95, 0.8)
-                // Matched to the LM Studio reference run: temp=0.8, top_k=40,
-                // top_p=0.95, repeat_penalty=1.1.  A gentle multiplicative
-                // repeat_penalty applies batch-wide.
-                //
-                // DRY is span-scoped: the kernel gates and windows it on
-                // `dry_lens[seq]` — the current structural span (reset at
-                // `<think>`/`</think>`/`<tool_call>`/`</tool_call>`, off inside
-                // tool calls).  So it runs in both thinking AND the answer but
-                // only ever sees the current span's own tokens.  That is what
-                // makes it safe on the answer: it breaks a repeating loop without
-                // penalizing verbatim reproduction of numbers, identifiers, or
-                // code lifted from the prompt or an earlier span — those live
-                // outside the span DRY can see.  The thinking-only temperature
-                // boost lets reasoning sample a touch hotter while the answer
-                // stays at the reference temp.
-                .with_segment_temp_boost(0.05)
-                .with_dry_penalty(0.8, 1.75, 2, 512)
                 .with_repeat_penalty(1.1)
-                .with_repeat_last_n(128)
-                // EOT ramp: nudge </think> after 200 thinking tokens, full boost by 400
-                // (segment_close_ramp_len is the ramp's absolute end, not a span).  zend overrides
-                // segment_close_ramp_start/len per turn from `ThinkMode::eot_budget()`; this is the
-                // fallback for non-steered callers.  These IDs are resolved from the
-                // tokenizer at engine startup.
-                .with_segment_close_boost(2.0, 200, 400, 5.0)
-                .with_graceful_segment_close_after(220)
-                .with_force_segment_close_after(300)
-                // EOS limits are in total generated tokens (thinking + response).
-                // Think block consumes ~200-300 tokens; leave ~500-700 for the response.
-                // EOS boost ramp starts nudging at 700 total tokens, full boost by 800
-                // (eos_ramp_len is the ramp's absolute end, not a span).
-                // graceful_eos fires at the next sentence boundary after 800 tokens;
-                // forced_eos fires unconditionally at 1000 tokens.
-                // non_thinking_for_gguf_architecture overrides these back to tighter limits.
-                // zend overrides all four per turn from `ThinkMode::eos_budget()`; this
-                // is the fallback for non-steered callers.
-                .with_dynamic_eos_boost(1.0, 700, 800, 3.0)
-                .with_eos_failsafe(800, 1000),
+                .with_qwen_thinking_steering(),
+
+            // **Qwen3.5 and later — their own published sampling, the same steering.**
+            //
+            // Qwen publish `temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5`
+            // for this generation and name the presence penalty as what "reduces endless
+            // repetitions". The difference from the Qwen3 row above is visible in the
+            // output, not just on paper: with the fallback's values the life generator
+            // produced an invented world, and with these it produced the character, on
+            // canon, at the right dates.
+            //
+            // **Being absent from this table is silent and catastrophic**, which is why
+            // the list is long. The `_` arm below leaves `top_k` unset, the `</think>`
+            // close ramp at `0` (disabled) and no EOS failsafe — so a checkpoint that
+            // does not close its own reasoning block runs to `max_response_tokens` and
+            // the caller discards the whole decode as all-reasoning. A stock checkpoint
+            // hides that by always self-closing; an abliterated or merged one does not,
+            // and the symptom is an empty document reported as a success. `qwen35` was
+            // missing here while the entire lineage loaded through it, and three
+            // separate third-party conversions were blamed for the result first.
+            //
+            // llama.cpp currently names this whole lineage by its first release —
+            // `qwen35` / `qwen35moe` cover Qwen3.5, Qwen3.6 and Qwen3.8 alike (see
+            // `candle-transformers/src/models/qwen35/mod.rs`). The `qwen36*` and
+            // `qwen38*` spellings are listed against the day it stops doing that: the
+            // cost of a string nobody emits is one alternation, and the cost of a
+            // missing one is the paragraph above.
+            "qwen35" | "qwen35moe" | "qwen36" | "qwen36moe" | "qwen38" | "qwen38moe" => {
+                Self::top_k_top_p(20, 0.8, 0.7)
+                    .with_presence_penalty(1.5)
+                    .with_repeat_penalty(1.0)
+                    .with_qwen_thinking_steering()
+            }
 
             // Qwen2 instruct models.
             "qwen2" => Self::top_k_top_p(20, 0.8, 0.7).with_repeat_penalty(1.1),
@@ -409,16 +452,32 @@ impl SamplingConfig {
     pub fn non_thinking_for_gguf_architecture(arch: &str) -> Option<Self> {
         match arch {
             // Qwen3 family non-thinking: matched exactly to LM Studio reference run
-            // (qwen3-30b-a3b-abliterated-untied-i1 @ Q4_K_M, 2026-02-20).
+            // (a Qwen3-30B-A3B Q4_K_M conversion, 2026-02-20).
             // LM Studio params: temp=0.8, top_k=40, top_p=0.95, repeat_penalty=1.1, min_p=0.05.
             // min_p is not yet implemented in this sampler; all other params match.
             // Qwen3 non-thinking: no think block overhead, so all tokens are
             // response content.  EOS boost ramp starts at 400 tokens, full by 500.
             // graceful_eos fires at next sentence boundary after 512 tokens;
             // forced_eos fires unconditionally at 700 tokens.
-            "qwen3" | "qwen3moe" | "qwen2moe" => Some(
+            //
+            // The 3.5-and-later strings are listed for the same reason they are in
+            // [`Self::for_gguf_architecture`]: returning `None` here says "this
+            // family has no thinking mode", which is false for every one of them —
+            // `builder.rs` reads `<think>` straight out of their chat templates and
+            // reports `thinking=true` in the same load.
+            "qwen3" | "qwen3moe" | "qwen2moe" | "qwen35" | "qwen35moe" | "qwen36" | "qwen36moe"
+            | "qwen38" | "qwen38moe" => Some(
                 Self::for_gguf_architecture(arch)
                     .with_no_segment_close()
+                    // **`500` is the ramp's END, not its length.** The kernel
+                    // computes `span = max(ramp_len - ramp_start, 1)`, so `100`
+                    // here gave `100 - 400 = -300`, clamped to `1` — an
+                    // inverted ramp that collapses to a cliff: no EOS boost at
+                    // all through 400 tokens, then the full 3× multiplier from
+                    // token 401 onward. Every other call site passes an end and
+                    // gets the intended hundred-token span; only this one, the
+                    // preset the non-thinking path actually runs under, had it
+                    // backwards.
                     .with_dynamic_eos_boost(1.0, 400, 500, 3.0)
                     .with_eos_failsafe(512, 700),
             ),
@@ -558,6 +617,111 @@ impl SamplingConfig {
         self
     }
 
+    /// Retune an architecture default for **dialogue that has to be different
+    /// every time** — a character speaking, not an assistant answering.
+    ///
+    /// # The two published pairings
+    ///
+    /// Qwen publishes `temperature=0.7, top_p=0.8` for general tasks and
+    /// `temperature=1.0, top_p=0.95` for reasoning, both with `top_k=20`; its
+    /// technical report used `presence_penalty=1.5` for the Creative Writing v3
+    /// and WritingBench runs. The architecture defaults here take the first
+    /// pairing, which is the right conservative choice for an assistant and the
+    /// wrong one for a cast: 0.7 with `top_p` 0.8 is a narrow nucleus, and a
+    /// character re-answering a situation much like the last one lands on the
+    /// same sentence.
+    ///
+    /// So this takes the wider pairing and leaves `top_k` and the penalties
+    /// alone — `presence_penalty` is already at the figure Qwen used for
+    /// creative work, and raising it further is what their guidance warns
+    /// brings on language mixing.
+    ///
+    /// Applied by the caller rather than folded into the architecture default,
+    /// because the architecture does not say what the model is *for*: the same
+    /// checkpoint serving a coding assistant wants the narrow pairing, and
+    /// silently widening it there would be retuning code generation to fix
+    /// dialogue.
+    ///
+    /// # Repetition: the pressure moves from presence onto runs
+    ///
+    /// Both penalties subtract from the logit, so they are comparable in nats:
+    /// presence takes a flat `p` off **every token used at all this turn**;
+    /// DRY takes `multiplier · base^(match_len − allowed)` off the one token
+    /// that would *continue a repeated run*.
+    ///
+    /// **Presence at the architecture's 1.5 is what makes a character ramble.**
+    /// It cannot see a phrase — the twentieth repetition of a five-word clause
+    /// costs exactly what the second use of "the" costs — and its scope grows
+    /// with the utterance, so the longer a character speaks the more of its own
+    /// natural vocabulary is suppressed and the stranger the continuations it
+    /// has left. A live cast produced two hundred words of "again today
+    /// tomorrow forever more whatever comes first whichever part wins" from
+    /// exactly this: not too little pressure against repetition, too much
+    /// against *reuse*.
+    ///
+    /// Reference guidance puts presence at 0.1–0.35 where DRY is carrying the
+    /// load. 0.3 is the top of that band, because a character restating itself
+    /// is still the thing being fought — it is a fifth of the old pressure,
+    /// not none of it.
+    ///
+    /// DRY is already on from [`Self::with_qwen_thinking_steering`] and is
+    /// strengthened a little here, 0.8 → 1.0, to take up what presence gives
+    /// back — inside the 0.8–1.12 band the reference recommends. With
+    /// `base = 1.75, allowed = 2`:
+    ///
+    /// | repeated run | before (1.5 + 0.8·b^n) | after (0.3 + 1.0·b^n) |
+    /// |---|---|---|
+    /// | ordinary word | 1.50 | **0.30** |
+    /// | 3 tokens | 2.90 | 2.05 |
+    /// | 5 tokens | 5.79 | 5.66 |
+    /// | 7 tokens | 14.63 | **16.71** |
+    ///
+    /// — far less on reuse, the same in the middle, more where a run has become
+    /// a loop.
+    ///
+    /// # What this does not reach
+    ///
+    /// DRY is **span-scoped**: the kernel windows it on `dry_lens[seq]`, reset
+    /// at every `<think>`/`</think>`/`<tool_call>`/`</tool_call>`, so it sees
+    /// only the span being written. It therefore cannot see the previous
+    /// utterance, and cannot see another character's speech quoted in the
+    /// prompt — so a cast echoing each other's phrasing is invisible to it by
+    /// construction, and `range` is bounded by the span long before it reaches
+    /// 512. That scoping is deliberate and right for an assistant reproducing
+    /// identifiers from an earlier span; for dialogue it is the reason a
+    /// stronger multiplier alone will not stop two characters converging on one
+    /// another's words.
+    /// # What `cross_turn_penalty` adds, and what it does not
+    ///
+    /// DRY cannot see the previous utterance (above), so nothing here reached
+    /// across a turn boundary at all: a character repeating one sentence every
+    /// turn was invisible to every penalty on this config. `cross_turn_penalty`
+    /// is the one that does — a flat subtraction from any token the character
+    /// has already used today.
+    ///
+    /// **Lighter than `presence_penalty` on purpose.** It is a blunt instrument:
+    /// the kernel takes `min(count, 1)`, so a token used once is penalised
+    /// exactly as hard as one used a hundred times, and the counts accumulate
+    /// all day without decay. Set high it would push a character out of its own
+    /// vocabulary — its name, the words its persona is written in — for no
+    /// reason beyond having used them.
+    ///
+    /// **It also saturates, and that is worth knowing before relying on it.**
+    /// Once most of a character's working vocabulary has been used, the penalty
+    /// is close to a uniform shift, and softmax is shift-invariant — so it does
+    /// most of its work early in a day and fades. It will not break a
+    /// distribution that has already collapsed: a character whose window holds
+    /// ten copies of one act is choosing the next token at p ≈ 1, and 0.2 of a
+    /// logit against that is nothing. That collapse is a context problem, not a
+    /// sampling one, and it is fixed where the context is built.
+    pub fn for_character_dialogue(mut self) -> Self {
+        self.temperature = 1.0;
+        self.top_p = 0.95;
+        self.presence_penalty = 0.3;
+        self.cross_turn_penalty = 0.2;
+        self.with_dry_penalty(1.0, 1.75, 2, 512)
+    }
+
     /// Set the repeat window (last N tokens considered for penalties).
     /// `0` = use full history.
     pub fn with_repeat_last_n(mut self, n: i32) -> Self {
@@ -580,17 +744,33 @@ impl SamplingConfig {
     /// Enable dynamic EOS boost with ramp parameters.
     /// `boost` is the base boost; at `ramp_len` tokens it is multiplied by `max_multiplier`.
     /// `ramp_start` is the token count where the ramp begins — zero boost before that.
+    /// `ramp_end` is the **absolute token count at which the boost is full**,
+    /// not a length from `ramp_start`.
+    ///
+    /// Said here because the field it lands in is called `eos_ramp_len` and the
+    /// name is a lie: the kernel computes `span = max(ramp_end - ramp_start, 1)`
+    /// (`batched_sampling.cuh`), so a value *below* `ramp_start` inverts the
+    /// ramp and the clamp turns it into a cliff — no boost at all until
+    /// `ramp_start`, then the whole multiplier one token later. That is not a
+    /// gentler ramp; it is the opposite of one, and it reads as correct at every
+    /// call site.
     pub fn with_dynamic_eos_boost(
         mut self,
         boost: f32,
         ramp_start: i32,
-        ramp_len: i32,
+        ramp_end: i32,
         max_multiplier: f32,
     ) -> Self {
+        debug_assert!(
+            ramp_end > ramp_start,
+            "the EOS ramp ends at {ramp_end} and starts at {ramp_start} — an end below the start \
+             collapses the ramp to a cliff at `ramp_start`, which is the opposite of what a ramp \
+             is for"
+        );
         self.eos_boost = boost;
         self.dynamic_eos_boost = true;
         self.eos_ramp_start = ramp_start;
-        self.eos_ramp_len = ramp_len;
+        self.eos_ramp_len = ramp_end;
         self.eos_boost_max_multiplier = max_multiplier;
         self
     }
@@ -1311,7 +1491,18 @@ pub struct EngineConfig {
     /// Workspace root whose `.substrate/` directory backs the persistence
     /// redo log. When `None`, the engine opens the substrate under the
     /// process working directory (`SubstratePersistence::open`).
+    ///
+    /// Unread when [`Self::substrate`] carries an already-open one.
     pub workspace_path: Option<std::path::PathBuf>,
+
+    /// A substrate the host process opened and goes on writing to itself.
+    ///
+    /// `None` — the ordinary case — and the engine opens
+    /// [`Self::workspace_path`] itself. `Some` is for a host with its own
+    /// record classes in the same log: one `.substrate/` admits exactly one
+    /// writable handle per process, and a second silently loses records rather
+    /// than failing. See [`SharedSubstrate`].
+    pub substrate: Option<SharedSubstrate>,
 
     /// Serialized model identity (HF repo / filename / arch / context length).
     /// Written to the substrate's `ModelSpec` record at engine startup via
@@ -1365,6 +1556,7 @@ impl EngineConfig {
             penalty_log_path: None,
             health: DecodeHealthConfig::default(),
             workspace_path: None,
+            substrate: None,
             model_spec: None,
             tokenizer: None,
             dialect: Dialect::chat_ml(),
@@ -1593,6 +1785,74 @@ mod scheduler_config_tests {
 mod sampling_config_tests {
     use super::SamplingConfig;
 
+    /// Every architecture string the repository can load, and whether its family
+    /// reasons in a `<think>` block.
+    ///
+    /// One list, used by both directions of the test below, so an arch added to
+    /// the table without a steering arm — or given an arm it should not have —
+    /// fails here rather than in a decode months later.
+    const THINKING_ARCHES: &[&str] = &[
+        "qwen3",
+        "qwen3moe",
+        "qwen2moe",
+        "qwen35",
+        "qwen35moe",
+        "qwen36",
+        "qwen36moe",
+        "qwen38",
+        "qwen38moe",
+    ];
+
+    /// **A missing arch string is silent, so this test is the thing that speaks.**
+    ///
+    /// `for_gguf_architecture` falls through to a conservative `_` arm for anything
+    /// it does not recognise, and that arm leaves `force_segment_close_after` at `0`
+    /// — disabled. A model that then fails to close its own `<think>` block runs to
+    /// `max_response_tokens` and the caller throws the entire decode away as
+    /// all-reasoning: an empty document, reported as a success, with nothing in any
+    /// log to say what happened.
+    ///
+    /// That is not hypothetical. `qwen35` was absent from the table while the whole
+    /// Qwen3.5/3.6/3.8 lineage loaded through it, and three separate third-party
+    /// conversions were blamed for the result before the arm was found missing.
+    #[test]
+    fn every_thinking_arch_gets_a_close_backstop_and_an_eos_failsafe() {
+        for arch in THINKING_ARCHES {
+            let c = SamplingConfig::for_gguf_architecture(arch);
+            assert!(
+                c.force_segment_close_after > 0,
+                "{arch}: no </think> backstop — it fell through to the `_` arm"
+            );
+            assert!(
+                c.graceful_segment_close_after > 0,
+                "{arch}: no graceful </think> close"
+            );
+            assert!(c.forced_eos_after > 0, "{arch}: no EOS failsafe");
+            assert!(
+                c.top_k > 0,
+                "{arch}: top_k unset — the `_` arm's signature symptom"
+            );
+            assert!(
+                SamplingConfig::non_thinking_for_gguf_architecture(arch).is_some(),
+                "{arch}: reports no thinking mode, but its chat template has <think>"
+            );
+        }
+    }
+
+    /// The guard above only means something if the fallback really is bare — if the
+    /// `_` arm ever grew a backstop of its own, every assertion there would pass for
+    /// an arch that was never actually added.
+    #[test]
+    fn the_unknown_arch_fallback_is_genuinely_bare() {
+        let c = SamplingConfig::for_gguf_architecture("something-nobody-has-heard-of");
+        assert_eq!(c.force_segment_close_after, 0);
+        assert_eq!(c.top_k, 0);
+        assert!(SamplingConfig::non_thinking_for_gguf_architecture(
+            "something-nobody-has-heard-of"
+        )
+        .is_none());
+    }
+
     #[test]
     fn segment_temp_boost_defaults_to_zero() {
         assert_eq!(SamplingConfig::default().segment_temp_boost, 0.0);
@@ -1644,6 +1904,74 @@ mod sampling_config_tests {
             df > 50,
             "sanity: Deep's force budget exceeds the tiny answer budget"
         );
+    }
+
+    /// The numbers were chosen against the formula, so the formula is what the
+    /// test asserts: penalty = `multiplier · base^(match_len − allowed)`, in
+    /// the same nats presence subtracts.
+    #[test]
+    fn character_dialogue_moves_the_pressure_from_reuse_onto_runs() {
+        let base = SamplingConfig::for_gguf_architecture("qwen35");
+        let c = base.clone().for_character_dialogue();
+
+        // Reuse of a word costs a fifth of what it did.
+        assert_eq!(base.presence_penalty, 1.5);
+        assert_eq!(c.presence_penalty, 0.3);
+
+        let d = c.dry.as_ref().expect("DRY carries the repetition load");
+        let run = |n: i32| d.multiplier * d.base.powi(n - d.allowed_length);
+        let was = SamplingConfig::for_gguf_architecture("qwen35");
+        let dw = was.dry.as_ref().expect("already on before this");
+        let run_was = |n: i32| dw.multiplier * dw.base.powi(n - dw.allowed_length);
+
+        // A long run is punished harder than it was, even with presence cut.
+        assert!(
+            0.3 + run(7) > was.presence_penalty + run_was(7),
+            "a seven-token loop got easier, not harder"
+        );
+        // And an ordinary repeated word is punished far less.
+        assert!(c.presence_penalty < was.presence_penalty / 4.0);
+        // Escalation is still monotonic and still ends in an effective ban.
+        assert!(run(3) < run(5) && run(5) < run(7));
+        assert!(run(8) > 20.0, "an eight-token loop must be unreachable");
+    }
+
+    /// **Something has to reach across a turn boundary.**
+    ///
+    /// DRY is span-scoped — the kernel resets its window at every `<think>` and
+    /// `<tool_call>` — and presence and frequency are per-turn, cleared by
+    /// `end_turn`. So before this, *nothing* on a character's config could see
+    /// the previous utterance, and a character emitting one identical sentence
+    /// every turn was invisible to the whole sampler.
+    ///
+    /// Lighter than presence because it is flat: the kernel takes
+    /// `min(count, 1)`, so it cannot tell a word used once from one used a
+    /// hundred times, and it must not price a character out of its own
+    /// vocabulary.
+    #[test]
+    fn a_character_is_penalised_for_repeating_itself_across_turns() {
+        let c = SamplingConfig::for_gguf_architecture("qwen35").for_character_dialogue();
+        assert!(
+            c.cross_turn_penalty > 0.0,
+            "nothing on this config reaches past the current turn"
+        );
+        assert!(
+            c.cross_turn_penalty < c.presence_penalty,
+            "a flat all-day penalty must not outweigh the within-turn one"
+        );
+    }
+
+    /// The assistant presets are untouched: this is a dialogue setting, and a
+    /// model reproducing an identifier from an earlier turn is doing its job.
+    #[test]
+    fn cross_turn_repetition_is_only_penalised_for_characters() {
+        for arch in ["qwen3", "qwen35", "qwen3moe"] {
+            assert_eq!(
+                SamplingConfig::for_gguf_architecture(arch).cross_turn_penalty,
+                0.0,
+                "{arch} penalises an assistant for reusing a name"
+            );
+        }
     }
 
     #[test]

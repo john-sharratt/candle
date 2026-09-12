@@ -148,6 +148,12 @@ struct YamlSchema {
     /// group that declares none. Absent → [`SelectionPolicy::default_policy`].
     #[serde(default)]
     default_policy: Option<YamlPolicy>,
+    /// Turn every repetition penalty off while a tool call is being emitted.
+    ///
+    /// **Opt-in, because it is right for one kind of caller and wrong for the
+    /// other.** See [`super::schema::Schema::free_tool_calls_from_penalties`].
+    #[serde(default)]
+    free_tool_calls_from_penalties: bool,
 }
 
 /// A `policy:` block: an optional preset base plus per-field overrides and an
@@ -322,6 +328,16 @@ enum YamlSystemPromptItem {
         /// materialised **zero** members (e.g. a no-tools variant).
         #[serde(default)]
         depends_on_absent: Option<String>,
+        /// Emit whenever the named sibling Collection is CONFIGURED — has ≥ 1
+        /// member — regardless of what it selected this projection. The gate for
+        /// prose that introduces a facility, where `depends_on` would delete the
+        /// introduction on any turn provenance happened to select nothing.
+        #[serde(default)]
+        depends_on_configured: Option<String>,
+        /// Inverse of `depends_on_configured`: emit only when the named sibling
+        /// Collection has no members at all, i.e. the facility is switched off.
+        #[serde(default)]
+        depends_on_unconfigured: Option<String>,
     },
     /// References a [`DialectTemplate`] catalog entry by snake-case
     /// name.  Resolves to the dialect's string at build time and lands
@@ -1043,6 +1059,7 @@ fn build(
     let schema = Schema {
         layers,
         system_prompt,
+        free_tool_calls_from_penalties: raw.free_tool_calls_from_penalties,
     };
     Ok((schema, maps))
 }
@@ -1086,6 +1103,8 @@ fn build_system_prompt(
             priority,
             depends_on: None,
             depends_on_absent: None,
+            depends_on_configured: None,
+            depends_on_unconfigured: None,
             is_template: false,
             template_tokens: None,
         }));
@@ -1132,6 +1151,8 @@ fn build_system_prompt(
                 priority,
                 depends_on,
                 depends_on_absent,
+                depends_on_configured,
+                depends_on_unconfigured,
             } => {
                 if !section_names.insert(id.clone()) {
                     return Err(ConstructionError::DuplicateSectionName(id.clone()));
@@ -1153,6 +1174,8 @@ fn build_system_prompt(
                 };
                 let depends_on_cid = resolve_dep(depends_on)?;
                 let depends_on_absent_cid = resolve_dep(depends_on_absent)?;
+                let depends_on_configured_cid = resolve_dep(depends_on_configured)?;
+                let depends_on_unconfigured_cid = resolve_dep(depends_on_unconfigured)?;
                 items.push(SystemPromptItem::Section(SectionSchema {
                     id: sid,
                     name: id.clone(),
@@ -1160,6 +1183,8 @@ fn build_system_prompt(
                     priority: pri,
                     depends_on: depends_on_cid,
                     depends_on_absent: depends_on_absent_cid,
+                    depends_on_configured: depends_on_configured_cid,
+                    depends_on_unconfigured: depends_on_unconfigured_cid,
                     is_template: false,
                     template_tokens: None,
                 }));
@@ -1205,6 +1230,8 @@ fn build_system_prompt(
                     priority: 50.0,
                     depends_on: depends_on_cid,
                     depends_on_absent: None,
+                    depends_on_configured: None,
+                    depends_on_unconfigured: None,
                     is_template: true,
                     template_tokens: None,
                 }));
@@ -1247,6 +1274,8 @@ fn build_system_prompt(
                         priority: pri,
                         depends_on: None,
                         depends_on_absent: None,
+                        depends_on_configured: None,
+                        depends_on_unconfigured: None,
                         is_template: false,
                         template_tokens: None,
                     });
@@ -1333,6 +1362,8 @@ fn build_compression_prompt(
             priority: 50.0,
             depends_on: None,
             depends_on_absent: None,
+            depends_on_configured: None,
+            depends_on_unconfigured: None,
             is_template: false,
             template_tokens: None,
         },
@@ -1988,6 +2019,8 @@ fn build_section_tree<'a>(
                         priority: pri,
                         depends_on: None,
                         depends_on_absent: None,
+                        depends_on_configured: None,
+                        depends_on_unconfigured: None,
                         is_template: false,
                         template_tokens: None,
                     });

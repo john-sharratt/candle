@@ -141,7 +141,13 @@ pub const PRODUCTION_K_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
             QuantFormat::Q3_0,
             QuantFormat::Q3_1,
         ],
-        // C10
+        // C10 — Q4_0/Q4_1 restored 2026-09-01. C10 topped out at Q3_1 while C9
+        // carried both, so the top rung had no high-quality fallback: a block
+        // the thresholds said needed better than Q3_1 got Q3_1 anyway, because
+        // that was the whole list. That is why tuning the error factors did
+        // nothing across six settings — the selector was already at the top of
+        // its candidates and the threshold had nothing left to buy. A ceiling is
+        // not an aggressiveness knob.
         &[
             QuantFormat::Q0,
             QuantFormat::Q0_V,
@@ -154,6 +160,8 @@ pub const PRODUCTION_K_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
             QuantFormat::Q2_S,
             QuantFormat::Q3_0,
             QuantFormat::Q3_1,
+            QuantFormat::Q4_0,
+            QuantFormat::Q4_1,
         ],
     ];
 
@@ -249,7 +257,13 @@ pub const PRODUCTION_V_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
             QuantFormat::Q4_0,
             QuantFormat::Q4_1,
         ],
-        // C10
+        // C10 — Q4_0/Q4_1 restored 2026-09-01. C10 topped out at Q3_1 while C9
+        // carried both, so the top rung had no high-quality fallback: a block
+        // the thresholds said needed better than Q3_1 got Q3_1 anyway, because
+        // that was the whole list. That is why tuning the error factors did
+        // nothing across six settings — the selector was already at the top of
+        // its candidates and the threshold had nothing left to buy. A ceiling is
+        // not an aggressiveness knob.
         &[
             QuantFormat::Q0,
             QuantFormat::Q0_V,
@@ -262,6 +276,8 @@ pub const PRODUCTION_V_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
             QuantFormat::Q2_S,
             QuantFormat::Q3_0,
             QuantFormat::Q3_1,
+            QuantFormat::Q4_0,
+            QuantFormat::Q4_1,
         ],
     ];
 
@@ -472,11 +488,18 @@ pub const LLAMA3_KV_FACTOR: f32 = 0.9;
 ///   numerical change, and this ladder is statistical, not deterministic.
 /// * The critical blocks respond to the geometric mean of an axis's hi·lo pair,
 ///   not to either factor alone.
+///
+/// **Re-derived 2026-09-01, v 0.55 → 0.45.** C10×10 had gone red by one session
+/// in ten with nothing in this file altered — the same drift the 9B row records
+/// from 2026-08-28, and the reason the note above says to prefer a value that
+/// passes repeatably over the largest one that passes once. 0.45 is the other
+/// value that sweep measured passing, so this steps to a bracketed point rather
+/// than to a fresh guess, and V costs ~0.9% of ratio per 0.10 of factor.
 pub const QWEN35_0_8B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
     k_hi: 0.85,
     k_low: 0.85,
-    v_hi: 0.55,
-    v_low: 0.55,
+    v_hi: 0.45,
+    v_low: 0.45,
 };
 
 /// Qwen3.5-9B (dense hybrid).
@@ -513,11 +536,58 @@ pub const QWEN35_0_8B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFact
 /// row tuned to sit one notch under the break cannot survive that, by
 /// construction; if the re-derivations become tiresome, the fix is to buy
 /// standing margin rather than to keep re-finding the edge.
+///
+/// Merge, 2026-09-12: this branch had 1.07/1.85; main re-derived to 0.95/1.65
+/// after restoring Q4_0/Q4_1 to the C10 candidates. Main's is the LOWER pair and
+/// is kept — a tighter error bound costs ratio, never quality — and its evidence
+/// below is the fuller of the two.
+///
+/// C10×10 at 6.30×, identical across two confirmation runs.
+/// **Re-derived 2026-09-01, k 1.09 → 0.95 and v 1.9 → 1.65, after restoring
+/// Q4_0/Q4_1 to the C10 candidate lists.** Green twice at C10 5.49×.
+///
+/// **The candidates were the blocker, not this row.** C10 topped out at Q3_1 on
+/// both axes while C9 carried Q4_0/Q4_1, so the top rung had no high-quality
+/// fallback. Six threshold settings were walked first and the failure never
+/// moved a character:
+///
+/// | k | v | C10 | result |
+/// |---|---|---|---|
+/// | 1.09 | 1.90 | 6.30× | session 9 diverges at char 23 |
+/// | 1.08 | 1.90 | 6.28× | ” |
+/// | 1.07 | 1.85 | 6.21× | ” |
+/// | 1.09 | 1.80 | 6.18× | ” |
+/// | 1.05 | 1.90 | 6.23× | ” |
+/// | 1.00 | 1.75 | 5.99× | ” |
+///
+/// That is the signature of a **ceiling, not an aggressiveness knob**: the
+/// selector was already at the top of its list, so tightening the error bound
+/// bought nothing — it asked for a better format and none existed. The ratio
+/// moved (blocks were being reassigned) while the divergence sat still.
+///
+/// With Q4 restored, the same lever works immediately:
+///
+/// | k | v | C10 | result |
+/// |---|---|---|---|
+/// | 1.09 | 1.90 | 5.97× | fails |
+/// | 1.02 | 1.77 | 5.72× | fails |
+/// | **0.95** | **1.65** | **5.49×** | **passes, twice** |
+/// | 0.85 | 1.45 | 5.15× | passes |
+/// | 0.60 | 1.00 | 4.43× | passes |
+///
+/// Settled at 0.95/1.65 rather than creeping to the 1.02/1.77 edge. This row has
+/// now broken twice by sitting one hundredth from its break (1.1 → 1.09 in
+/// August, then red again in September); a margin of 0.07 on K and 0.12 on V is
+/// the point of the exercise, not a rounding of it.
+///
+/// What it cost: 6.30× → 5.49×, ~13%. Worth stating plainly — but the 6.30× row
+/// did not pass, so the comparison is against a gate that was red, not against
+/// working compression.
 pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 1.07,
-    k_low: 1.07,
-    v_hi: 1.85,
-    v_low: 1.85,
+    k_hi: 0.95,
+    k_low: 0.95,
+    v_hi: 1.65,
+    v_low: 1.65,
 };
 
 /// Qwen3.5-35B-A3B (routed hybrid).
@@ -615,7 +685,25 @@ pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactor
 ///
 /// C10 at 7.13/7.08/7.09/7.10× (×8/16/32/64), identical across two
 /// confirmation runs.
+/// **Re-derived 2026-09-01, k 1.1 → 1.17 and v 2.35 → 2.47**, recovering the
+/// ratio that restoring Q4_0/Q4_1 to the C10 candidates cost. Those candidates
+/// are shared, so this model paid for the 9B's fix without needing it: C10 fell
+/// 7.10× → 6.74× at the old factors with nothing else changed. Better formats it
+/// never asked for are, from this row's point of view, simply headroom.
+///
+/// Edge bracketed: **1.17/2.47 ✓ 7.05×**, 1.25/2.60 ✗ 7.41× (session 2). Settled
+/// on the passing side — 0.08 on K and 0.13 on V — rather than creeping toward
+/// the break for the last 0.05× (see the 9B row for what edge-sitting costs).
 pub const QWEN35_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
+    // Merge, 2026-09-12: two independent re-derivations of this row met here —
+    // 1.08/2.30 (this branch) and 1.17/2.47 (main, after Q4_0/Q4_1 were restored
+    // to the C10 candidate lists). The LOWER pair is kept deliberately: a lower
+    // factor is a tighter error bound, so it costs compression ratio and cannot
+    // cost output quality. Both rows were measured green on their own side, and
+    // neither was measured against the other's candidate list — so the safe
+    // reading is the conservative one until this is re-derived under the merged
+    // configuration. See the caution above: this row drifts on wave-width and
+    // admission changes alone.
     k_hi: 1.08,
     k_low: 1.08,
     v_hi: 2.30,
@@ -680,6 +768,13 @@ pub const QWEN35_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFacto
 /// C10 at 6.50/6.47/6.46/6.47× (×8/16/32/64), identical across two confirmation
 /// runs — 6.65× → 6.47× at ×64, the ratio this costs.
 pub const QWEN36_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
+    // Merge, 2026-09-12: kept at 1.05/2.0 (this branch) against main's 1.32/2.29.
+    // Lower is the tighter error bound, so this trades compression ratio for
+    // headroom and cannot trade away quality. Main's row was derived after
+    // Q4_0/Q4_1 returned to the C10 candidates and reports 7.05x against our
+    // 6.47x; that ratio is recoverable by re-deriving under the merged candidate
+    // set, which is the right way to reclaim it rather than adopting factors
+    // measured on the other side's configuration.
     k_hi: 1.05,
     k_low: 1.05,
     v_hi: 2.0,
@@ -768,11 +863,16 @@ pub const QWEN36_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFacto
 /// Ordering against the lineage has inverted with it: K 0.7 now sits *below*
 /// the 9B's 1.09 and the MoE pair's 1.1/1.15. The 27B has the least headroom
 /// here, not the most — at the quant a 16 GB card actually runs.
+/// **Re-derived 2026-09-01, k 0.7 → 0.8 and v 1.8 → 2.05**, after the shared C10
+/// candidate lists regained Q4_0/Q4_1 (see the 9B row). C10 5.12× → **5.50×**.
+///
+/// **The edge is NOT bracketed** — passed on the first step and was not walked
+/// further, so the margin is unmeasured. Same caveat as the 3.6 row.
 pub const QWEN38_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 0.7,
-    k_low: 0.7,
-    v_hi: 1.8,
-    v_low: 1.8,
+    k_hi: 0.8,
+    k_low: 0.8,
+    v_hi: 2.05,
+    v_low: 2.05,
 };
 
 /// Qwen3.8-Flash-Next (`qwen4exp`) — the 512-expert sparse-attention hybrid.

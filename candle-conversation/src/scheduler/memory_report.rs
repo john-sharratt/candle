@@ -224,9 +224,61 @@ pub struct AccountingSection {
     pub decline_arena_full_bytes: u64,
     /// Driver-reported in use across the whole card (`total - free`).
     pub device_in_use_bytes: u64,
-    /// `device_in_use - (span + outside)`. Anything here is held by another
-    /// process, by the driver's own context, or by an allocation this report
-    /// still does not know about — the last being the interesting case.
+    /// The **expert weight zone's extent** inside the span — `span_end −
+    /// weight_floor`, the ground the weight side is permitted to hold.
+    ///
+    /// **Capacity, not occupancy.** It counts the zone's free slots too, so it
+    /// is always ≥ [`WeightSection::resident_expert_bytes`], which is what is
+    /// actually loaded. The two answer different questions and the report needs
+    /// both: this one says how much of the span the weight side owns (and is
+    /// therefore the tenant figure that belongs beside `inside_dense_bytes` and
+    /// friends), while the resident figure says how much of that ground is in
+    /// use. Naming it `inside_expert_bytes` and calling it "resident" — as the
+    /// first version of this field did — puts two different quantities under one
+    /// heading and silently over-counts occupancy by the zone's free capacity.
+    ///
+    /// This is also the tenant that *moves*: the elastic boundary concedes it to
+    /// the KV side under pressure, so watching it fall across a run is how zone
+    /// erosion becomes visible in the report instead of only in the log.
+    pub expert_zone_bytes: u64,
+    /// The wave transient tier, **inside** the span — this forward's activation
+    /// ground, between the KV regions and the weight zone.
+    ///
+    /// Transient by construction (released between forwards), so a reading here
+    /// is a point-in-time sample rather than a standing cost. Named because it
+    /// is the fourth span tenant and its absence made the span's own arithmetic
+    /// impossible to close.
+    pub inside_transient_bytes: u64,
+    /// Device bytes in use before the span was reserved — the CUDA context, the
+    /// driver's working set, the module images, and any other process. Measured
+    /// at reservation time, which is the only moment it stands alone (the
+    /// reservation precedes the weight load).
+    ///
+    /// Published so [`Self::unaccounted_bytes`] can mean one thing instead of
+    /// three.
+    ///
+    /// **`None` when it could not be measured**, which is a real state: the
+    /// reservation runs whether or not a VRAM gauge was registered (it branches
+    /// on exactly that), so on a gauge-less run there is no baseline to take. It
+    /// is an `Option` rather than a `0` because the two readings demand opposite
+    /// conclusions — a genuine zero means the card was empty before us and
+    /// `unaccounted` is trustworthy, while an unmeasured one means
+    /// `unaccounted` has silently reverted to including the whole CUDA context,
+    /// which is the 1.4 GB of noise this field exists to remove. Reporting both
+    /// as `0` hides that distinction at exactly the moment a reader is trying to
+    /// decide whether a residual is a leak.
+    pub driver_baseline_bytes: Option<u64>,
+    /// `device_in_use - (span + outside + driver_baseline)` — **an allocation
+    /// this report does not know about, and nothing else** — but only when
+    /// [`Self::driver_baseline_bytes`] is `Some`. With `None` the baseline could
+    /// not be subtracted and this reverts to the older, inflated meaning; read
+    /// that field before reading this one.
+    ///
+    /// It used to fold in the driver baseline too, and read 1.4 GB on a 16 GB
+    /// card while being almost entirely that constant. A number that large is
+    /// unreadable as a signal: a genuine few-hundred-MB leak moves it by a
+    /// fraction and nobody can tell. With the baseline named separately this is
+    /// meant to sit near zero, and any material reading is a defect to chase.
     pub unaccounted_bytes: i64,
 }
 
@@ -564,6 +616,28 @@ impl Scheduler {
         let device_in_use_bytes = vram.as_ref().map_or(0, |v| {
             v.driver_total_bytes.saturating_sub(v.driver_free_bytes)
         });
+        // Captured at reservation time by the region pool — see
+        // `RegionStats::pre_reservation_in_use_bytes`. Without subtracting it,
+        // `unaccounted` reports the driver's own footprint as if it were a leak.
+        // One `region_stats` read for all three span figures the pool owns: the
+        // driver baseline it captured at reservation, the weight zone, and the
+        // standing transient tier.
+        // The pool records `None` when no VRAM gauge was registered at
+        // reservation, which is a different answer from "the card was empty"
+        // and has to survive to the reader — see `driver_baseline_bytes`.
+        let (driver_baseline_bytes, expert_zone_bytes, inside_transient_bytes) =
+            match self.device.location() {
+                candle::DeviceLocation::Cuda { gpu_id } => {
+                    candle_nn::kv_cache::region_stats(gpu_id).map_or((None, 0, 0), |s| {
+                        (
+                            s.pre_reservation_in_use_bytes,
+                            s.weight_bytes as u64,
+                            s.transient_bytes as u64,
+                        )
+                    })
+                }
+                _ => (None, 0, 0),
+            };
         let accounting = AccountingSection {
             span_bytes,
             outside_span_bytes,
@@ -571,12 +645,16 @@ impl Scheduler {
             inside_dense_bytes,
             inside_gallery_bytes,
             inside_recurrent_bytes,
+            expert_zone_bytes,
+            inside_transient_bytes,
             decline_no_ticket_bytes,
             decline_arena_full_bytes,
             device_in_use_bytes,
+            driver_baseline_bytes,
             unaccounted_bytes: device_in_use_bytes as i64
                 - span_bytes.unwrap_or(0) as i64
-                - outside_span_bytes as i64,
+                - outside_span_bytes as i64
+                - driver_baseline_bytes.unwrap_or(0) as i64,
         };
 
         MemoryReport {
@@ -662,11 +740,16 @@ mod tests {
             },
             experts: ExpertSection {
                 host_pinned_bytes: 11_000_000_000,
-                vram_reserved_bytes: 8_000_000_000,
+                vram_reserved_bytes: 5_100_000_000,
             },
             weights: WeightSection {
+                // OCCUPANCY, and so strictly inside the zone extent
+                // (`accounting.expert_zone_bytes` below) that holds it. A
+                // fixture with more resident experts than zone to put them in
+                // describes a machine that cannot exist, and would let a
+                // regression that wires both fields to the zone pass.
                 base_bytes: Some(1_100_000_000),
-                resident_expert_bytes: Some(8_000_000_000),
+                resident_expert_bytes: Some(5_100_000_000),
             },
             gallery: GallerySection {
                 resident_bytes: 268_435_456,
@@ -693,12 +776,27 @@ mod tests {
                 inside_gallery_bytes: 268_435_456,
                 // 16 sequences of hybrid recurrent state.
                 inside_recurrent_bytes: 2_113_929_216,
+                // The elastic weight zone — the largest span tenant on a MoE
+                // model, and the one that shrinks as the boundary concedes.
+                // The zone's EXTENT — deliberately larger than
+                // `weights.resident_expert_bytes` above, which is what is
+                // actually loaded into it.
+                expert_zone_bytes: 5_939_691_520,
+                // One forward's activation ground, released between waves.
+                inside_transient_bytes: 67_108_864,
                 // One wave's worth: provenance breaks dominating, the arena
                 // itself never refusing — the shape measured on the 3.6-35B.
                 decline_no_ticket_bytes: 205_959_852,
                 decline_arena_full_bytes: 0,
                 device_in_use_bytes: 71_015_942_144,
-                unaccounted_bytes: 71_015_942_144i64 - 68_719_476_736i64 - 234_881_024i64,
+                // The context + driver working set, measured before the span was
+                // reserved. Naming it is what leaves `unaccounted` meaning only
+                // "an allocation the report does not know about".
+                driver_baseline_bytes: Some(1_900_000_000),
+                unaccounted_bytes: 71_015_942_144i64
+                    - 68_719_476_736i64
+                    - 234_881_024i64
+                    - 1_900_000_000i64,
             },
         }
     }
@@ -765,7 +863,8 @@ mod tests {
     /// assertion is now an inequality on each part.
     #[test]
     fn the_outside_span_parts_are_contained_in_the_whole() {
-        let a = sample().accounting;
+        let r = sample();
+        let a = &r.accounting;
         assert_eq!(
             a.outside_span_bytes, a.outside_pool_bytes,
             "the CUDA pool is the whole outside set: every non-span device \
@@ -795,22 +894,99 @@ mod tests {
         // Same containment rule as the dense weights against the pool, in the
         // other half of the card: the two halves fail the same way, by summing
         // a component with the total that already includes it.
-        let named_in_span =
-            a.inside_gallery_bytes + a.inside_recurrent_bytes + a.inside_dense_bytes;
+        let named_in_span = a.inside_gallery_bytes
+            + a.inside_recurrent_bytes
+            + a.inside_dense_bytes
+            + a.expert_zone_bytes
+            + a.inside_transient_bytes;
         assert!(
             named_in_span < a.span_bytes.expect("the fixture reserves a span"),
-            "the gallery and recurrent state are tenants OF the span ({named_in_span} \
-             of {:?}), so they must fit inside it",
+            "the gallery, recurrent state, dense weights, expert zone and transient \
+             tier are tenants OF the span ({named_in_span} of {:?}), so they must fit \
+             inside it",
             a.span_bytes,
         );
-        // The residual is the card minus the two totals — and specifically NOT
-        // minus the named parts, which are already inside them.
+        // **Every large span tenant is reported.** Deliberately not a coverage
+        // ratio: the span is a *reservation*, and its unclaimed KV regions are
+        // legitimately empty, so the tenants can sum to a fraction of it and
+        // nothing is wrong. What can go wrong is a tenant having no field at
+        // all — the expert zone was exactly that, the biggest one on a MoE model
+        // and entirely absent, which left `dense + recurrent + gallery` several
+        // gigabytes short of the truth with no way to tell that from a leak.
+        //
+        // So the check is presence, not proportion: each named tenant must
+        // actually be populated, and a regression that quietly stops reading one
+        // (a renamed `region_stats` field, say) trips here rather than showing up
+        // as memory that vanished.
+        for (name, v) in [
+            ("dense", a.inside_dense_bytes),
+            ("gallery", a.inside_gallery_bytes),
+            ("recurrent", a.inside_recurrent_bytes),
+            ("expert zone", a.expert_zone_bytes),
+            ("transient", a.inside_transient_bytes),
+        ] {
+            assert!(
+                v > 0,
+                "span tenant {name:?} reports zero — the fixture exercises every \
+                 tenant, so a zero here means the field is no longer being read",
+            );
+        }
+        // **The zone is capacity; the resident figure is occupancy.** Two
+        // different questions, and the report answers both — the first version
+        // of `expert_zone_bytes` read the zone extent while documenting itself
+        // as "resident expert weights", which filed capacity under an occupancy
+        // heading and over-counted the span's tenants by the zone's free slots.
+        //
+        // The invariant is containment, `resident <= zone`, and deliberately not
+        // a strict `<`: a fully-packed zone reports the two as EQUAL, and that
+        // is the healthy steady state, not a defect — measured 6,724 MiB for
+        // both on a loaded 3.6-35B, because the elastic boundary grows the
+        // weight zone to fit exactly what loads into it.
+        //
+        // The fixture models a partially-packed zone (5.1 GB resident in 5.94 GB
+        // of ground) so the gap between the two is real here and a reading that
+        // collapses them is visible.
+        let resident = r
+            .weights
+            .resident_expert_bytes
+            .expect("the fixture reports resident experts");
+        assert!(
+            resident <= a.expert_zone_bytes,
+            "resident experts ({resident}) must fit in the zone that holds them \
+             ({}) — occupancy above capacity means one of the two is reading the \
+             wrong source",
+            a.expert_zone_bytes,
+        );
+        assert!(
+            resident < a.expert_zone_bytes,
+            "this FIXTURE is meant to have free slots in the zone, so that the \
+             containment check above is exercised rather than trivially met by \
+             equality; if the fixture changed, fix the fixture",
+        );
+        // The residual is the card minus every total we can name — the span, the
+        // pool, and the driver's own baseline — and specifically NOT minus the
+        // parts *within* those totals, which would double-count.
+        //
+        // The baseline belongs in this subtraction and used to be missing, which
+        // published the driver's footprint as if it were an unexplained
+        // allocation: 1.4 GB of "unaccounted" on a 16 GB card that was almost
+        // entirely context. A residual that large cannot be read as a signal —
+        // a real leak moves it by a fraction of itself.
+        //
+        // `expect` rather than `unwrap_or(0)`: on a fixture that names a baseline
+        // the two spellings agree, so a silent default here would let the field
+        // regress to `None` — the state where the subtraction stops happening and
+        // the residual quietly means the old thing again — without failing.
+        let baseline = a
+            .driver_baseline_bytes
+            .expect("the fixture measures a driver baseline");
         assert_eq!(
             a.unaccounted_bytes,
             a.device_in_use_bytes as i64
                 - a.span_bytes.unwrap_or(0) as i64
-                - a.outside_span_bytes as i64,
-            "the residual must be what the card holds minus what we can name",
+                - a.outside_span_bytes as i64
+                - baseline as i64,
+            "the residual must be what the card holds minus everything we can name",
         );
     }
 

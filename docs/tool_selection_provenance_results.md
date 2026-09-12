@@ -2196,3 +2196,99 @@ relaxed to the selection-level criterion. Recall-vs-code mass contrast **0.72×*
 formula. Tool guards green in both fusion modes; the 310-point additive golden digest
 unchanged; full test matrix green except the six pre-existing CUDA numeric-band failures
 (verified pre-existing at HEAD via a worktree).
+
+---
+
+## 26. The phase lens, measured — and why the corpus, not the lens, is the lever
+
+**Status:** measured 2026-08-31. Harness:
+`candle-conversation/examples/substrate_inspect.rs` (`belief-eval --probe-phase
+--gallery-phase`), leave-one-out over the live 766-exemplar tool corpus, 93 tools,
+normalization ON, `min_score 800 / budget 1..4`.
+
+§20.3 found the **user-prompt phase** carrying the tool signal (65.6) and `think+resp`
+carrying almost none (21.5), and proposed routing on it. §3.4 of
+`provenance_score_normalization.md` builds that as the **phase lens**: scan the gallery over
+one phase span of each exemplar, normalize on its own hit-level band, max-fuse. This section
+is that idea put through the production scorer.
+
+### 26.1 The baseline everyone quotes is inflated — the probe must be a question
+
+Scoring a stored exemplar against the gallery gives **Tool-1 97.4%, Tool-5 100%, MRR 0.987**.
+That number is not reachable live and should never be quoted as the tool hit rate. The probe
+is a whole turn *containing its own `<tool_call>` JSON*, and that JSON contains the tool's
+name — so the scan matches on the answer. A live probe is a question; the call has not been
+emitted yet. Re-run with `--probe-phase user`, and the same corpus and scorer give **74.5%**.
+Everything below uses the question probe.
+
+### 26.2 The lens is a wash; its one real gain is misses
+
+| gallery lens | Tool-1 | Tool-3 | Tool-5 | MRR | misses | recall | exact-1 |
+|---|---|---|---|---|---|---|---|
+| `whole` (shipped) | **74.5%** | 92.7% | **93.7%** | **0.833** | 6.3% | **77.8%** | **70.0%** |
+| `user` alone | 71.8% | 91.3% | 91.9% | 0.811 | 7.8% | 74.3% | 67.8% |
+| `whole,user` max-fused (production shape) | 73.6% | 92.7% | 93.3% | 0.829 | **5.7%** | 77.5% | 68.9% |
+
+The lens does not pay for its scan. Fused, it is −0.9 Tool-1, −0.4 Tool-5, −1.1 exact-1, and
+its only genuine gain is **total misses 6.3% → 5.7%** — 14 probes that scored *zero* for their
+own tool under the whole-window scan and score something under the lens. That is the shape you
+would predict: reading 6.4% of each exemplar finds evidence where the whole window found none,
+and dilutes the ranking where the whole window was already right.
+
+So the phase lens is **not in the engine**. It shipped off-by-default and was then removed
+outright: an off-by-default second scoring path costs correctness attention on every change to
+the path that IS used, and the gallery walk paid to build spans for every exemplar on every
+reprojection whether or not any node had named a phase. `turn_layout::phase_span_of` remains,
+and the offline harness below re-runs this A/B on any corpus without the engine carrying it —
+see `provenance_score_normalization.md` §3.4 for the removal record.
+
+§20.3's number does not transfer: it measured a CCA-rotated call→def routing, not this BDP
+self-retrieval, and the phase ordering it found is a property of that pipeline.
+
+### 26.3 The corpus was the lever all along — +10.6 Tool-1, measured
+
+The lens exists to *extract* the question from an exemplar that is ~95% think block and call.
+Measured: 14,848 question tokens out of 233,682 — **6.4%**. But a question can simply BE the
+exemplar. `ToolDef::questions` (`tool.schema.json`, 8 per tool, 744 in total) renders each
+plain question into a calibration turn with an **empty assistant body**, so the whole-window
+gallery becomes question-shaped for those entries at a fraction of the prefill cost of a full
+trajectory — and the whole-window scan, the one that already wins, is what reads them.
+
+That makes the two halves **substitutes, not complements** on this axis: the lens infers the
+question region, the seeds make the exemplar a question outright. The seeds also lift the lens
+(a denser user-phase gallery), which is why both are kept and the A/B is re-runnable per
+corpus rather than settled here.
+
+**Measured, after calibrating the seeds in** (corpus 766 → 1510 exemplars, 93 tools). The
+controlled run holds the probe set to the **766 turns that existed before** — the question-only
+exemplars carry no `response` span, so `--probe-requires response` selects exactly the original
+trajectories and leaves the new ones in the gallery as distractors. Only the gallery grew:
+
+| probe set (unchanged, 766) | gallery 766 | gallery 1510 (8 seeds/tool) | **gallery 2998 (24 seeds/tool)** |
+|---|---|---|---|
+| Tool-1 | 74.5% | 85.1% | **87.9%** |
+| Tool-3 | 92.7% | 96.5% | **97.5%** |
+| Tool-5 | 93.7% | 96.9% | **97.8%** |
+| MRR | 0.833 | 0.907 | **0.925** |
+| misses | 6.3% | 3.1% | **2.2%** |
+| recall | 77.8% | 87.1% | **89.0%** |
+| exact-1 | 70.0% | 82.4% | **85.2%** |
+
+```
+substrate_inspect belief-eval --tag tool --normalize --min-score 800 --max-budget 4 \
+    --probe-phase user --gallery-phase whole --probe-requires response
+```
+
+**Read the controlled row, not the headline one.** Scoring all 1510 probes against the 1510
+gallery gives Tool-1 80.3% / exact-1 78.9% — *lower* than the controlled 85.1% / 82.4%, because
+the seeded corpus changes the probe set as well as the gallery and the question-only probes are
+the **harder** half (a bare "close the UDP socket" has less to match on than a full trajectory).
+So the mixed number understates the effect rather than inflating it, which is the opposite of
+the usual direction and the reason `--probe-requires` exists.
+
+**Cost.** The 744 seeds added **14,089 gallery tokens** — ~19 each against ~305 for a full
+trajectory — and lifted the question region from 6.4% to 8.7% of the corpus. A calibration pass
+prefills them in minutes because each is one short turn with an empty assistant body.
+
+**And the lens stays off.** This gain is the whole-window scan alone, reading question-shaped
+exemplars. Re-run §26.2's fusion A/B against the seeded corpus before revisiting that.

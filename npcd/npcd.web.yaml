@@ -16,16 +16,41 @@
 # ============================================================================
 
 server:
-  bind: "127.0.0.1:8081"
-  cache_control: "no-store"
+  # Every interface, so the console can be reached from another machine on the
+  # estate rather than only from the box the daemon happens to run on.
+  #
+  # **What that changes about trust.** Identity arrives in `x-tokera-*` headers
+  # and `identity::identify` believes them — it has to, because the gateway in
+  # front of the DMZ deployment is what mints them after it has done the OAuth.
+  # On loopback that was safe by construction: only a process on this machine
+  # could set them. On every interface it is not, and `roles.admins` below is
+  # matched on an address anyone can type. So this binding assumes the daemon
+  # sits on a network where reaching port 8081 is itself the credential — behind
+  # the estate's gateway, or on a LAN you own. Do not put it on a public address
+  # without a gateway in front stripping and re-minting those headers.
+  bind: "0.0.0.0:8081"
+  # A minute for code, fifteen for pictures — see the note in `web/web.yaml`.
+  # Both keep their ETag, so once the age is up an unchanged file still costs a
+  # conditional request and no body, and `--content` editing shows up on the
+  # first refresh after a minute.
+  cache:
+    short_secs: 60
+    long_secs: 900
 
 # ----------------------------------------------------------------------------
 # Roles.
 #
-# Three levels — unauthenticated, user, admin — and they are how the daemon
-# decides everything. Reading is open; **only an admin may change authored
+# Four levels — unauthenticated, user, admin, creator — and they are how the
+# daemon decides everything. Reading is open; **only an admin may change authored
 # content on disk** (worlds, personalities), because those are files in a mind
 # that is not under version control and a bad write is not recoverable.
+#
+# `creators` outranks `admins`, so anybody listed there does not also need
+# listing here. It is the one role the fiction itself reads: a creator messaging
+# a character is addressed inside the world as "(The Creator)", and is a standing
+# member of every world's open channel. That is a claim about who somebody IS to
+# the inhabitants, which is why it is a level of its own and not a second admin
+# list — see `web/src/auth/role.rs`.
 #
 # Admin is deployment configuration, not a user record, and there is no API to
 # grant it. Whoever can edit this file and restart the process is already the
@@ -59,7 +84,7 @@ server:
 # the email at the provider and this line stops matching until it is edited. For
 # one admin on a personal estate that is a line in a file, not an outage.
 roles:
-  admins:
+  creators:
     - email: johnathan.sharratt@gmail.com
 
 sites:

@@ -80,53 +80,116 @@ pub struct Telemetry {
     started: Instant,
     ring: Mutex<Ring>,
     engine: Mutex<Option<Engine>>,
+    /// The startup load, when there is one — see [`Self::watch_loading`].
+    loading: Mutex<Option<Arc<crate::engine::loading::LoadProgress>>>,
     model: ModelSpec,
 }
 
 impl Telemetry {
     pub fn new() -> Arc<Self> {
         let devices = Devices::open();
-        // Decided once, from the card that is actually here. A card does not
-        // grow memory while the process runs, so re-deciding per request would
-        // only be a chance for two requests to disagree.
+        // One model, not a ladder. It used to be chosen from the card's memory,
+        // back when nothing loaded it — but the C-ladder KV thresholds are
+        // derived against exactly one checkpoint, so a selection that varied by
+        // card would silently vary the calibration with it.
+        let model = model::spec();
+        // The card is still worth logging beside the model even though it no
+        // longer decides it: "7.5 GB of weights, 24 GiB of card" is the line an
+        // operator reads to know whether this will fit before it tries.
         let (_, vram) = devices.sample_gpu();
-        let total_bytes = vram.total_mib.map(|m| m * 1024 * 1024);
-        let model = model::choose(total_bytes);
         tracing::info!(
-            "model selected: {} {} ({} total / {} active, {:.1} GB) — {}",
+            "model: {} {} ({}, {:.1} GB) — {}",
             model.name,
             model.quant,
             model.params_total,
-            model.params_active,
             model.bytes as f64 / 1e9,
             match vram.total_mib {
                 Some(m) => format!("{:.1} GiB of card memory", m as f64 / 1024.0),
                 None => "no card detected".to_owned(),
             }
         );
+        // **Say so when this is not the repository's checkpoint.** An operator
+        // reading a console that names a model they did not expect should learn
+        // why from the log rather than by going looking for a build script. The
+        // line is absent on a machine with no `models.override.yaml`, which is
+        // the ordinary case.
+        let overridden = candle_conversation::models::overrides::active_keys();
+        if !overridden.is_empty() {
+            tracing::info!(
+                "models.override.yaml is in effect for {:?} — repo {} ({} adapter(s))",
+                overridden,
+                model.repo,
+                crate::model::model().spec().loras.len()
+            );
+        }
         Arc::new(Self {
             devices,
             started: Instant::now(),
             ring: Mutex::new(Ring::new()),
             engine: Mutex::new(None),
+            loading: Mutex::new(None),
             model,
         })
     }
 
-    /// The engine's hook. Nothing calls this yet; when something does, the page
-    /// stops saying *not measured* on its own.
+    /// The same store, told when it started.
     ///
-    /// This sets the value the *next* sample will carry rather than pushing a
-    /// sample of its own. One timer owns the cadence, so an engine reporting at
-    /// its own rhythm cannot bend the time axis every other panel shares.
+    /// Only the uptime differs, and only the test for uptime uses it: asserting
+    /// that `uptime_s` counts real elapsed time otherwise means sleeping past a
+    /// whole-second boundary, which cost 1.1 s — more than half the crate's
+    /// entire test run — to check one subtraction.
+    #[cfg(test)]
+    fn started_at(started: Instant) -> Arc<Self> {
+        Arc::new(Self {
+            devices: Devices::open(),
+            started,
+            ring: Mutex::new(Ring::new()),
+            engine: Mutex::new(None),
+            loading: Mutex::new(None),
+            model: model::spec(),
+        })
+    }
+
+    /// The engine's hook: set the value the *next* sample will carry.
     ///
-    /// Allowed dead because it is the one entry point an engine calls and the
-    /// tests below drive the whole "absent until reported, then present"
-    /// behaviour through it. Deleting it to silence a warning would delete that
-    /// behaviour's only description.
-    #[allow(dead_code)]
+    /// A set rather than a push of its own sample — one timer owns the cadence,
+    /// so an engine reporting at its own rhythm cannot bend the time axis every
+    /// other panel shares.
     pub fn record(&self, e: Engine) {
         *self.engine.lock().unwrap() = Some(e);
+    }
+
+    /// Read the load progress on every sample, so a long ingest is visible on
+    /// the performance page as it happens.
+    ///
+    /// **Startup is the one phase with heavy engine work and no engine to ask.**
+    /// The `Engine` fields here were a stub, so a half-hour world load reported
+    /// `prefill_tps: null` from beginning to end and the only way to know
+    /// whether it was fast or slow was to poll `/v1/status` twice and do the
+    /// arithmetic. `LoadProgress` already counts the tokens where they are
+    /// sealed and derives the rate; this points the sampler at it rather than
+    /// computing the same number a second way.
+    ///
+    /// Pulled per sample rather than pushed per document: an ingest seals
+    /// several documents a second and the ring wants one reading every two.
+    pub fn watch_loading(&self, loading: Arc<crate::engine::loading::LoadProgress>) {
+        *self.loading.lock().unwrap() = Some(loading);
+    }
+
+    /// The engine reading for this instant: whatever an engine last reported,
+    /// or — during startup — what the load progress can say.
+    fn engine_now(&self) -> Option<Engine> {
+        if let Some(e) = self.engine.lock().unwrap().clone() {
+            return Some(e);
+        }
+        let l = self.loading.lock().unwrap().clone()?.snapshot()?;
+        // Only once tokens have been counted. A phase that prefills nothing —
+        // the model load, the calibration — has no rate to report, and a zero
+        // there reads as a stalled engine rather than as an absent one.
+        l.prefill_tps.map(|tps| Engine {
+            prefill_tps: Some(tps),
+            ..Engine::default()
+        })
     }
 
     /// Take one sample and file it. Called by the sampler task, and directly by
@@ -137,7 +200,7 @@ impl Telemetry {
             at: Instant::now(),
             vram,
             host: device::sample_host(),
-            engine: self.engine.lock().unwrap().clone(),
+            engine: self.engine_now(),
         };
         self.ring.lock().unwrap().push(s);
     }
@@ -244,6 +307,81 @@ mod tests {
         assert!(r.series.prefill_tps.is_none());
     }
 
+    /// **A long ingest is visible while it runs.**
+    ///
+    /// The engine fields were a stub, so a half-hour world load reported
+    /// `prefill_tps: null` from beginning to end — and startup is precisely the
+    /// phase with heavy engine work and no engine to ask. The only way to know
+    /// whether an ingest was fast or slow was to poll `/v1/status` twice and do
+    /// the arithmetic by hand.
+    #[test]
+    fn an_ingest_reports_its_rate_before_the_engine_exists() {
+        use crate::engine::loading::{LoadProgress, LoadStep};
+
+        let loading = Arc::new(LoadProgress::new());
+        let t = Telemetry::new();
+        t.watch_loading(Arc::clone(&loading));
+
+        // Nothing prefilled yet: absent, not zero. A zero here reads as a
+        // stalled engine rather than as one that has not started.
+        t.tick();
+        assert!(t.read().series.prefill_tps.is_none());
+
+        loading.set_step(LoadStep::Layers);
+        loading.add_prefill_tokens(4_000);
+        t.tick();
+
+        let r = t.read();
+        let series = r
+            .series
+            .prefill_tps
+            .expect("the ingest rate never appeared");
+        let latest = series.last().copied().flatten().expect("no reading");
+        assert!(
+            latest > 0.0,
+            "the ingest reported a rate of {latest} tokens/s"
+        );
+        // **And the flag stays false.** `engine_connected` means *an engine has
+        // reported*, and during startup none has — the loading counter has.
+        // Flipping it here would tell the console the engine is up while every
+        // route it would then call still answers 503. The rate belongs in the
+        // series (and in `/v1/status`'s loading block); the flag keeps meaning
+        // what it says.
+        assert!(
+            !r.engine_connected,
+            "a loading daemon claimed a live engine because its ingest was measurable"
+        );
+    }
+
+    /// A real engine's own reading wins over the load progress — once it is
+    /// answering, it knows more than the startup counter does.
+    #[test]
+    fn a_live_engine_outranks_the_loading_counter() {
+        use crate::engine::loading::{LoadProgress, LoadStep};
+
+        let loading = Arc::new(LoadProgress::new());
+        loading.set_step(LoadStep::Layers);
+        loading.add_prefill_tokens(4_000);
+        let t = Telemetry::new();
+        t.watch_loading(loading);
+
+        t.record(Engine {
+            prefill_tps: Some(1234.0),
+            ..Default::default()
+        });
+        t.tick();
+        assert_eq!(
+            t.read()
+                .series
+                .prefill_tps
+                .unwrap()
+                .last()
+                .copied()
+                .flatten(),
+            Some(1234.0)
+        );
+    }
+
     /// `record` must not itself add a sample — one timer owns the cadence, or
     /// the time axis bends whenever the engine reports at its own rhythm.
     #[test]
@@ -255,26 +393,18 @@ mod tests {
         assert_eq!(t.read().series.t.len(), 1);
     }
 
-    /// The selection has to follow the card that is actually present, and it
-    /// has to reach the wire — a console showing the wrong quant would send
-    /// somebody looking for a bug in the engine.
+    /// The model the console shows must be the one the loader fetches — a page
+    /// naming a different checkpoint sends somebody looking for a bug in the
+    /// engine.
     #[test]
-    fn the_model_matches_the_card_this_machine_has() {
+    fn the_reported_model_is_the_one_this_daemon_runs() {
         let t = Telemetry::new();
         t.tick();
         let r = t.read();
-
-        let expected = crate::model::choose(
-            r.series
-                .vram_total_mib
-                .as_ref()
-                .and_then(|c| c.last().copied().flatten())
-                .map(|m| m as u64 * 1024 * 1024),
-        );
-        assert_eq!(r.model, expected);
+        assert_eq!(r.model.repo, crate::model::spec().repo);
 
         let json = serde_json::to_value(&r).unwrap();
-        assert_eq!(json["model"]["name"], "Qwen3-30B-A3B");
+        assert_eq!(json["model"]["name"], crate::model::spec().name);
         assert!(json["model"]["quant"].as_str().unwrap().starts_with('Q'));
         assert!(json["model"]["bytes"].as_u64().unwrap() > 0);
     }
@@ -282,10 +412,17 @@ mod tests {
     /// Uptime is the one thing that is always true, and it has to move.
     #[test]
     fn uptime_is_real() {
-        let t = Telemetry::new();
-        assert_eq!(t.read().uptime_s, 0);
-        std::thread::sleep(Duration::from_millis(1_100));
-        assert!(t.read().uptime_s >= 1);
+        // Wound back rather than waited out. `uptime_s` is
+        // `started.elapsed().as_secs()`, so a store told it began 90 seconds ago
+        // proves the same arithmetic a 1.1 s sleep did — and proves it harder,
+        // because the exact number is asserted rather than "at least one".
+        let now = Telemetry::new();
+        assert_eq!(now.read().uptime_s, 0);
+
+        let began = Instant::now()
+            .checked_sub(Duration::from_secs(90))
+            .expect("this machine has been up longer than the offset");
+        assert_eq!(Telemetry::started_at(began).read().uptime_s, 90);
     }
 
     /// The sampler must actually run without anybody asking it to.

@@ -60,6 +60,49 @@ pub struct WaveTicket {
     pub epoch: u64,
 }
 
+/// The arena index a co-resident guest's own bump answers to.
+///
+/// Not one of the wave domain's per-phase arenas — a guest is not a layer — so
+/// it is resolved from its own registry. Defined here rather than beside that
+/// registry because a [`WaveTicket`] naming it is minted at the guest's
+/// *placement* sites, which are further down the stack than the owner.
+pub const GUEST_ARENA: u32 = 3;
+
+/// The epoch of a ticket that means "whichever guest generation is open now".
+///
+/// # Why a guest's weights need this and a wave's operands do not
+///
+/// An epoch exists so a ticket cannot outlive the generation it came from: a
+/// generation bumps its epoch when it rewinds, and a stale ticket then resolves
+/// to nothing instead of carving from whatever occupies that span next. That is
+/// exactly right for an operand, whose life *is* one generation.
+///
+/// A guest's weights are not operands. They are placed once at load, live for
+/// the whole drain, and are read by every stage — the encode, each denoise step,
+/// each decode tile — each of which is its own generation. A weight carrying a
+/// real epoch would route the first stage's activations into the arena and
+/// nothing after it, which is worse than never routing at all because it looks
+/// like it works.
+///
+/// So a weight carries a routing *seed* rather than a provenance: it says
+/// "allocate from the guest arena's open generation", and resolves to the pool
+/// when none is open. It never names a range and so can never alias one.
+pub const GUEST_ANY_EPOCH: u64 = u64::MAX;
+
+impl WaveTicket {
+    /// The routing seed a guest stamps on memory it placed in its own ground.
+    ///
+    /// `domain` is the stream ordinal, as for any ticket. See
+    /// [`GUEST_ANY_EPOCH`] for why the epoch is a sentinel.
+    pub fn guest(domain: u32) -> Self {
+        Self {
+            domain,
+            arena: GUEST_ARENA,
+            epoch: GUEST_ANY_EPOCH,
+        }
+    }
+}
+
 /// Carve `bytes` from the arena `ticket` names, or `None` if that generation has
 /// closed or the arena has no room.
 ///

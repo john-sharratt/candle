@@ -371,6 +371,28 @@ impl Scheduler {
             }
         }
 
+        // ── One adapter per wave ─────────────────────────────────────────────
+        //
+        // A LoRA alters the projections every row of the forward flows through
+        // together — one set of matmuls runs over the whole batch — so a wave
+        // carries one adapter or none. Keep the leading sequence's adapter and
+        // defer the rest.
+        //
+        // This is the same kind of deferral as the ingest cap above: pure
+        // scheduling, nothing dropped. Successive waves drain each adapter's
+        // cohort in turn, which is why the engine loops waves by adapter rather
+        // than trying to batch across them. Taking the *leading* sequence's
+        // adapter matters — after the priority sort that is the interactive
+        // dialogue, so a bulk adapted ingest never displaces a waiting turn.
+        //
+        // `BatchedInferenceSession::wave_adapter` refuses a mixed wave outright,
+        // so without this filter an adapted conversation would fail the forward
+        // rather than merely share it.
+        if seq_ids.len() > 1 {
+            let wanted = self.session.sequence_adapter(seq_ids[0].0);
+            seq_ids.retain(|id| self.session.sequence_adapter(id.0) == wanted);
+        }
+
         if seq_ids.is_empty() {
             // Every active decode is deferred-glue-pending, so there is no decode
             // row to run this wave — but the glue that is BLOCKING them must still
@@ -1098,8 +1120,19 @@ impl Scheduler {
                 .get(&seq_id)
                 .and_then(|s| s.stencil.as_ref())
                 .map(|d| d.tree().label());
-            let in_stencil = label.is_some();
-            let in_tool_call = label == Some(super::TOOL_CALL_TREE_LABEL);
+            // **Only when the schema asked for it.** Lifting the penalties suits
+            // a caller whose tool arguments are quotations — paths, identifiers,
+            // numbers that are only correct if they repeat. It is the opposite
+            // of what a caller wants when the argument *is* the prose: a cast
+            // whose every utterance is a `say` decoded its dialogue with
+            // presence, frequency, repeat and DRY all off, and repeated itself
+            // word for word. Off unless named.
+            let freed = self
+                .active_decodes
+                .get(&seq_id)
+                .is_some_and(|s| s.free_tool_calls_from_penalties);
+            let in_stencil = freed && label.is_some();
+            let in_tool_call = freed && label == Some(super::TOOL_CALL_TREE_LABEL);
             if let Some(ss) = self.sampling_states.get_mut(&seq_id) {
                 if in_stencil && !ss.dry_suppressed {
                     ss.enter_tool_call();

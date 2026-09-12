@@ -1,4 +1,29 @@
 name: ssh_session_poll
+questions:
+- poll process 4 on the SSH session for new output
+- check the async remote job and show whatever it has printed
+- read the latest stderr from the backgrounded ssh command
+- get the status and exit code of that remote process
+- is the remote build still running
+- did the async ssh job succeed or fail
+- how far through is it
+- has anything new come out of that process
+- waiting on the migration I started over ssh
+- checking in on the long-running remote task
+- want to know if it finished while we were talking
+- the job should be done by now, confirm it
+- poll it
+- any new output from the async ssh process yet
+- check the async job
+- status of that remote process
+- has that background ssh command finished yet
+- check on the async remote process and show new output
+- poll the running job on the SSH host
+- what's the exit code of that backgrounded command
+- is the remote build still going
+- give me the latest stdout from the async ssh process
+- check progress of the long-running ssh task
+- any new output from that background process on the server
 category: SSH sessions
 description: Poll a running async SSH process for output. Returns stdout/stderr chunks, running status, and exit code when done.
 high_risk: true

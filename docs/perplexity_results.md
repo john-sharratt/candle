@@ -37,7 +37,7 @@ Qwen3-14B and Qwen3-30B-A3B exceeded GPU VRAM at context size 2048.
 
 ## Notes
 
-- **†Llama-3.2-3B**: Uses VibeStudio/Nidum-Llama-3.2-3B-Uncensored fine-tune GGUF, not the base model (base model is gated and requires HF authentication).
+- **†Llama-3.2-3B**: Uses a GGUF conversion, not the base model (base model is gated and requires HF authentication).
 - **Llama-3.1-8B**: Not evaluated — gated model requiring HuggingFace token. No public GGUF available in cache.
 - **Token count difference**: Llama models use a different tokenizer than Qwen models, resulting in ~288K vs ~298K tokens for the same text.
 - **Qwen3 vs Qwen2 at ctx=512**: Qwen2-7B (Q4_0) outperforms Qwen3-8B (Q4_K_M) and Qwen3-14B (Q4_K_M). This may reflect quantization format differences (Q4_0 vs Q4_K_M), Qwen3's thinking-mode overhead, or instruction-tuning effects on perplexity benchmarks.
@@ -52,4 +52,4 @@ Qwen3-14B and Qwen3-30B-A3B exceeded GPU VRAM at context size 2048.
 | Qwen3-8B | `unsloth/Qwen3-8B-GGUF` | `Qwen3-8B-Q4_K_M.gguf` |
 | Qwen2-7B | `Qwen/Qwen2-7B-Instruct-GGUF` | `qwen2-7b-instruct-q4_0.gguf` |
 | Qwen2-0.5B | `Qwen/Qwen2-0.5B-Instruct-GGUF` | `qwen2-0_5b-instruct-q4_0.gguf` |
-| Llama-3.2-3B | `VibeStudio/Nidum-Llama-3.2-3B-Uncensored-GGUF` | `model-Q4_K_M.gguf` |
+| Llama-3.2-3B | `bartowski/Llama-3.2-3B-Instruct-GGUF` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` |

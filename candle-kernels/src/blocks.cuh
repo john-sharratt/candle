@@ -181,8 +181,20 @@ typedef struct {
 // weight form), but qs is contiguous and 16-byte aligned for a single wide cp.async and
 // the standard A-fragment load. The 16-byte header holds the tile's single {scale, sum} at
 // ds[0] (per-128); ds[1..3] are alignment pad, exactly aligning qs (144 = 16 + 128, both
-// 16-aligned). ds[0].x = scale (amax/127, = s_a), ds[0].y = sum (Σx, the raw float sum
-// feeding the asymmetric-weight min term).
+// 16-aligned). ds[0].x = scale (amax/127, = s_a), ds[0].y = the sum feeding the
+// asymmetric-weight min term.
+//
+// **The sum is normalised: ds[0].y holds Σx/amax, not Σx.** The matmul rebuilds
+// the true sum as `ds.y * ds.x * 127` (quantized/kernel.cuh). Both fields are f16,
+// and a raw Σx does not fit: |Σx| can reach 128·amax, so any activation whose
+// per-128 block sums pass 65504 stores +inf and every dot product touching that
+// block becomes NaN. That is not hypothetical — Z-Image's SwiGLU intermediate
+// reaches Σx ≈ 2×10⁵ where an LLM's stays under 10³, and it produced a black
+// image with no other symptom. Normalising bounds the field at |Σx/amax| ≤ 128
+// whatever the activation's magnitude, and costs no precision: f16's relative
+// precision is scale-free, so the normalised value carries the same ~2⁻¹¹ as the
+// raw one did — and rather more at the bottom, where a small raw Σx went
+// subnormal. amax == 0 stores 0, which reconstructs to 0.
 #define QK8A128 128
 typedef struct __align__(16) {
     half2  ds[4];           // ds[0] = the tile's {scale, sum} (per-128); ds[1..3] = align pad
@@ -206,7 +218,7 @@ static_assert(sizeof(block_q8a128) == 144, "block_q8a128 must be 144 bytes");
 // The packing depends ONLY on flat_tile, so it is position-independent: the
 // per-tensor (rows,cols) split is irrelevant and the n-only unified dispatch
 // produces byte-identical output to the typed path. Numerics are the per-128
-// {amax/127, Σx} (fp16) → bit-exact across the two dispatch paths.
+// {amax/127, Σx/amax} (fp16) → bit-exact across the two dispatch paths.
 #define Q8A1024_BLK_BYTES 1152
 #define Q8A1024_META_OFF  1024
 

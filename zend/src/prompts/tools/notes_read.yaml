@@ -1,4 +1,29 @@
 name: notes_read
+questions:
+- open note key runbook-deploy
+- print the full body of "architecture-decisions"
+- retrieve the note filed under oncall-contacts
+- fetch note incident-2026-07 verbatim
+- what exactly did I write in that note
+- does the note still mention the old hostname
+- what were the steps I recorded under that key
+- is there anything in the note beyond the first line
+- I know the key, I just need the contents
+- pulling up the runbook I wrote last month
+- want the original wording, not a summary
+- following the procedure I saved earlier
+- read that note
+- open that note by its key
+- show me the note body
+- pull up that note
+- read me the note called deploy-steps
+- open the note with key "release-checklist"
+- what does that note say, I know its exact key
+- pull up the full text of the note named onboarding
+- show me the body of the api-keys note
+- fetch note "meeting-2026-08" and print it
+- retrieve the contents of that stored note by key
+- give me everything in the note keyed project-brief
 category: Notes
 description: Retrieve the full body content of one stored note by its exact key. Notes persist across conversations.
 parameters:

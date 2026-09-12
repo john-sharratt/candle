@@ -1,4 +1,29 @@
 name: remote_fs_session_mkdir
+questions:
+- mkdir /srv/releases/2026-08-31 on the SFTP host
+- create /opt/app/incoming on the remote filesystem
+- make a backups directory on the remote server over SFTP
+- add a staging folder under the remote base path
+- does the remote parent directory need to exist first
+- what permissions will the new remote directory get
+- can I create nested directories over SFTP in one call
+- does the directory already exist on the remote host
+- the upload target doesn't exist on the server yet
+- preparing the release layout before pushing artefacts
+- the remote job expects an output folder that isn't there
+- setting up the directory structure on the deploy host
+- mkdir on the SFTP host
+- create that remote directory
+- make the folder on the server
+- add a directory over SFTP
+- create a directory at /srv/releases on the remote host
+- make a new folder over SFTP for the deployment
+- mkdir the backups directory on the remote server
+- I need a target directory on the SFTP host before uploading
+- create /opt/app/logs on the remote filesystem
+- add a folder on the remote machine for these files
+- make the remote directory over sftp
+- set up a new directory on the SFTP server
 category: Remote filesystem
 description: Create a new directory on a remote host's filesystem over SFTP.
 high_risk: true

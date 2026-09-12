@@ -1,0 +1,18 @@
+id: easel
+kind: station
+name: easel
+binds: one character
+short: >
+  A character's background can be read at one, and a face drawn and redrawn.
+long: >
+  An easel takes one character and holds them until you step away — the same
+  hold a character terminal takes, so a face cannot be drawn while the person
+  behind it is being rewritten. That is the right order: the background is
+  what the face is drawn from. What is hung on the walls around you is part of
+  the work, because a portrait is judged against the ones beside it, and what
+  a family or a faction must share is settled with somebody else rather than
+  decided here.
+modes:
+  - reading
+  - working
+  - offered

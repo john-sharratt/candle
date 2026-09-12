@@ -1,4 +1,29 @@
 name: code_session_exec
+questions:
+- in the open JS session, define parseRow and use it on the sample
+- run this against the array we loaded earlier in the session
+- add a memoised version of that function to the session
+- execute the next step in the sandbox, reusing the parsed data
+- what's in the variable we set two steps ago
+- did the function I defined earlier survive
+- can you reuse the dataset already in the session rather than reloading
+- does the session still have the config object
+- continuing the analysis from where we left off
+- building this up incrementally in the sandbox
+- the data's already loaded there, just transform it
+- next step of the pipeline, same session
+- run that in the session
+- exec in the sandbox
+- carry on in the REPL
+- same session, next bit
+- run this in the code session I already have open
+- execute this JS in the existing sandbox session
+- in that code session, define a helper function for me
+- using the open session, print the value of the variable from before
+- run this next step in the same javascript session
+- add this to the code session and evaluate it
+- carry on in the code session and compute the total
+- execute this snippet in session and keep the state
 category: Code execution
 description: Execute JavaScript in a persistent session. Variable/function/const definitions from earlier calls remain in scope. Returns stdout, stderr, an ok flag, the final expression's value in result, and error details when ok=false.
 high_risk: true

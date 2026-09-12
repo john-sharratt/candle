@@ -1,0 +1,10 @@
+[package]
+name = "npc-map"
+version = "0.1.0"
+edition = "2021"
+description = "Places an NPC can be, and the memory it carries of them"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }

@@ -258,14 +258,41 @@ impl Decoder {
 }
 
 impl Decoder {
+    /// **A stage per block, because a bump holds a generation's sum.**
+    ///
+    /// A decoder is the pass with the largest working set in a diffusion
+    /// pipeline — it upsamples to 128 channels at full resolution — and it gets
+    /// there through hundreds of intermediates that are each allocated, read
+    /// once and dropped. An arena has no free, so one generation spanning the
+    /// whole decoder holds every one of those at once rather than the largest,
+    /// and a guest's arena is exhausted part-way down the stack. What follows is
+    /// worse than falling back: the first carve that fails yields an owned
+    /// tensor, so nothing derived from it can inherit and the entire remainder
+    /// of the decode goes to the pool. That cascade is what a traced draw sees
+    /// as a gigabyte of convolution output allocated outside the arena.
+    ///
+    /// Staging bounds the sum to one stage's intermediates, at the cost of
+    /// materialising that stage's output — one tensor against the dozens it
+    /// allocated to produce it. Outside a guest arena
+    /// [`guest_stage`](candle_nn::kv_cache::guest_stage) is the identity, so
+    /// this costs an ordinary decode nothing.
+    ///
+    /// The up-blocks are **not** staged here. Everything inside one already is —
+    /// each resnet stages itself and the upsampler is staged where it sits — so
+    /// a block-wide generation would hold almost nothing while charging a
+    /// full-resolution copy in and out per block.
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let mut xs = self.mid_block.forward(&self.conv_in.forward(xs)?, None)?;
+        let mut xs = candle_nn::kv_cache::guest_stage(xs, |xs| {
+            self.mid_block.forward(&self.conv_in.forward(xs)?, None)
+        })?;
         for up_block in self.up_blocks.iter() {
-            xs = up_block.forward(&xs)?
+            xs = up_block.forward(&xs)?;
         }
-        let xs = self.conv_norm_out.forward(&xs)?;
-        let xs = nn::ops::silu(&xs)?;
-        self.conv_out.forward(&xs)
+        candle_nn::kv_cache::guest_stage(&xs, |xs| {
+            let xs = self.conv_norm_out.forward(xs)?;
+            let xs = nn::ops::silu(&xs)?;
+            self.conv_out.forward(&xs)
+        })
     }
 }
 
@@ -309,6 +336,18 @@ impl DiagonalGaussianDistribution {
     pub fn sample(&self) -> Result<Tensor> {
         let sample = self.mean.randn_like(0., 1.);
         &self.mean + &self.std * sample
+    }
+
+    /// The distribution's mode — its mean, with no noise drawn.
+    ///
+    /// **What image-to-image wants.** Encoding a picture to start a denoise from
+    /// it is not sampling a latent, it is *reading* one: the noise the schedule
+    /// is about to add is chosen deliberately by the strength, and a second,
+    /// undeclared helping from the encoder would sit on top of it. Diffusers
+    /// calls this `mode()` and its img2img pipelines take it for the same
+    /// reason.
+    pub fn mode(&self) -> Tensor {
+        self.mean.clone()
     }
 }
 

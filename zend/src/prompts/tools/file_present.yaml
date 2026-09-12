@@ -1,4 +1,29 @@
 name: file_present
+questions:
+- surface report.pdf and summary.csv here
+- put the generated chart up in the conversation
+- display the three log files you collected
+- show the exported spreadsheet in the interface
+- can I see the actual file rather than a description of it
+- which of those files did you manage to find and show
+- could you attach them here so I can download them
+- is the output viewable from this chat
+- I want to eyeball the result before we ship it
+- send these to me so I can forward them on
+- the reviewer needs to see the artefacts, not the summary
+- I'd like the deliverables in front of me
+- surface that file in the chat interface
+- attach them
+- put it on screen
+- let me see the files
+- show me that file in the chat
+- surface the report you generated so I can see it
+- display these two files here
+- attach the output file to this conversation
+- put the diagram up where I can look at it
+- present the config file in the UI
+- render that document for me here
+- bring up the files you just wrote
 category: Files
 description: Surface one or more files to the user in the chat interface, resolving session edits first and then the project's working directory, and reporting which paths were found and shown versus missing.
 parameters:

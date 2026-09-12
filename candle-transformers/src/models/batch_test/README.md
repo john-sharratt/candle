@@ -47,9 +47,11 @@ cargo test --release --features cuda,verbose --lib --package candle-transformers
   quantized_qwen3_moe::tests::test_ruler_eval -- --ignored --nocapture
 ```
 
-The `quantized_llama` story-rewrite tests run against
-**`VibeStudio/Nidum-Llama-3.2-3B-Uncensored-GGUF`** (per `CLAUDE.md`'s
-`Llama-3.2-3B` / batch_test integration-testing entry) via `test_helpers::api()`.
+The `quantized_llama` story-rewrite tests run against the VibeStudio/Nidum
+Llama-3.2-3B fine-tune (per `CLAUDE.md`'s `Llama-3.2-3B` / batch_test
+integration-testing entry) via `test_helpers::api()` — the repository is named
+in full at the test's call site; the base model is gated, which is why a
+fine-tune stands in for it.
 The captured `perf-investigation/baseline_run*.txt` and
 `60353239_newprefill_run*.txt` transcripts are prior runs of this same
 `test_parallel_batched_forwarding_llama3` test.

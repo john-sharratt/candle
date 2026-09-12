@@ -783,6 +783,9 @@ pub struct QuantModel {
 pub struct Loader<'a, R: Read + Seek> {
     content: &'a gguf_file::Content,
     reader: &'a mut R,
+    /// The checkpoint's mapped bytes, when the caller has them — see
+    /// [`LoadInputs::map`]. `None` falls back to reading each tensor onto the device whole.
+    map: Option<&'a [u8]>,
     device: Device,
     mode: Int8Mode,
     /// Where this load's repacked projections live.
@@ -819,6 +822,18 @@ pub struct Loader<'a, R: Read + Seek> {
     /// a per-tensor *schedule* over the streamed trunk. `narrow` wins where both apply, so the
     /// draft block keeps its own answer even though its tensors are named like a layer's.
     stream_narrow: Option<usize>,
+    /// The donor checkpoint's header and bytes, when this load is repairing a recurrent path.
+    ///
+    /// **The source, not a pre-read map, because a load has more than one `Loader`.** The
+    /// trunk's large projections are built by the layer store, which constructs its own
+    /// loaders (`layer_loader`), and a map consumed by whichever ran first would leave the
+    /// others reading the checkpoint's quantized copies while the log said otherwise. Holding
+    /// the source instead makes the substitution a property of *reading a tensor* rather than
+    /// of one loader's bookkeeping, so every path that reads a gate gets the repaired one.
+    ///
+    /// `None` for every checkpoint that stores its gates at F32, which is every stock
+    /// conversion. See [`LoadInputs::gate_src`].
+    gate_src: Option<(&'a gguf_file::Content, &'a [u8])>,
 }
 
 impl<'a, R: Read + Seek> Loader<'a, R> {
@@ -837,13 +852,66 @@ impl<'a, R: Read + Seek> Loader<'a, R> {
         Self {
             content,
             reader,
+            // A caller that reaches for `new` has a reader; the mapping arrives only through
+            // `LoadInputs`, so this route keeps the upload-then-repack path.
+            map: None,
             device: device.clone(),
             mode,
             residency,
             device_bytes: 0,
             narrow: None,
             stream_narrow: None,
+            // A caller reaching for `new` is reading one checkpoint and repairing nothing; the
+            // donor arrives through `LoadInputs` and only when the primary needs one.
+            gate_src: None,
         }
+    }
+
+    /// Give this loader the checkpoint's mapped bytes — see [`LoadInputs::map`].
+    pub(crate) fn with_map(mut self, map: Option<&'a [u8]>) -> Self {
+        self.map = map;
+        self
+    }
+
+    /// Give this loader a donor to read the recurrent path from — see [`LoadInputs::gate_src`].
+    pub(crate) fn with_gate_src(
+        mut self,
+        gate_src: Option<(&'a gguf_file::Content, &'a [u8])>,
+    ) -> Self {
+        self.gate_src = gate_src;
+        self
+    }
+
+    /// This tensor as the donor stores it, if the donor should supply it.
+    ///
+    /// `None` — the overwhelmingly common answer — means "read it from the checkpoint as
+    /// usual": there is no donor, this is not a recurrent-path tensor, or the two files
+    /// already agree on its format and there is nothing to repair.
+    ///
+    /// **The format comparison is what keeps this from being a blanket override.** A fine-tune
+    /// that stored its recurrent path exactly as the base did has changed only the values
+    /// there, and those values are its own; a differing format is what marks the tensor as one
+    /// this conversion re-quantized, which is the defect being repaired.
+    fn donated(&mut self, name: &str) -> Option<Result<QTensor>> {
+        let (donor, bytes) = self.gate_src?;
+        if !RECURRENT_PATH.iter().any(|r| name.ends_with(r)) {
+            return None;
+        }
+        let mine = self.content.tensor_infos.get(name)?;
+        let theirs = donor.tensor_infos.get(name)?;
+        if theirs.ggml_dtype == mine.ggml_dtype {
+            return None;
+        }
+        if theirs.shape.dims() != mine.shape.dims() {
+            return Some(Err(candle::Error::Msg(format!(
+                "the gate donor's `{name}` is {:?} where this checkpoint's is {:?} — these are \
+                 different models, not a checkpoint and its base",
+                theirs.shape.dims(),
+                mine.shape.dims()
+            ))));
+        }
+        let mut cursor = std::io::Cursor::new(bytes);
+        Some(donor.tensor(&mut cursor, name, &self.device))
     }
 
     /// Narrow every projection loaded until this is cleared. See [`Loader::narrow`].
@@ -860,6 +928,26 @@ impl<'a, R: Read + Seek> Loader<'a, R> {
 
 impl<R: Read + Seek> Loader<'_, R> {
     fn raw(&mut self, name: &str) -> Result<QTensor> {
+        // **Which tensor, and how big, at the moment it is read.**
+        //
+        // A load that runs out of VRAM reports `CUDA_ERROR_OUT_OF_MEMORY` and nothing else —
+        // no tensor, no size, no indication whether the card is small or one tensor is
+        // unusual. That cost a bisect against a known-good checkpoint to find out that a
+        // `…NEO-IMATRIX-MAX…` conversion carries its `output.weight` at F16, 1,940 MiB where
+        // the stock file has 834. Logged before the read so the *failing* tensor is the last
+        // line, not the one before it.
+        if let Some(info) = self.content.tensor_infos.get(name) {
+            let bytes = info.shape.elem_count() / info.ggml_dtype.block_size()
+                * info.ggml_dtype.type_size();
+            tracing::debug!(
+                target: "candle_transformers::qwen35",
+                tensor = name,
+                dtype = ?info.ggml_dtype,
+                shape = ?info.shape.dims(),
+                mib = bytes >> 20,
+                "reading"
+            );
+        }
         let t = self.content.tensor(self.reader, name, &self.device)?;
         self.device_bytes += t.storage_size_in_bytes();
         Ok(t)
@@ -875,6 +963,19 @@ impl<R: Read + Seek> Loader<'_, R> {
     /// A projection: quantized, repacked for the numeric mode.
     fn proj(&mut self, name: &str) -> Result<QMatMul> {
         let want = self.twin_for(name);
+        // **A donated gate is answered before any route that reads `content`.** The
+        // host-banded path reads the checkpoint's own mapping by offset, which for these
+        // tensors holds exactly the quantized copies being repaired — so consulting the map
+        // second would silently ignore the donor for every mapped load, which is every
+        // production one. See `Loader::gates`.
+        if let Some(qt) = self.donated(name) {
+            let qt = qt?;
+            self.device_bytes += qt.storage_size_in_bytes();
+            return QMatMul::from_qtensor_in(qt, self.mode, self.residency);
+        }
+        if let Some(m) = self.host_banded(name, want)? {
+            return Ok(m);
+        }
         let qt = self.raw(name)?;
         match want {
             None => QMatMul::from_qtensor_in(qt, self.mode, self.residency),
@@ -892,6 +993,89 @@ impl<R: Read + Seek> Loader<'_, R> {
                 }
             }
         }
+    }
+
+    /// Repack a projection **straight from the mapping**, never putting the source on the card.
+    ///
+    /// `Ok(None)` means this weight is not eligible and the caller should take the ordinary
+    /// route — that is the common answer and not a failure.
+    ///
+    /// # Why the eligibility test is these five things and not a size threshold
+    ///
+    /// Each one is a condition `QMatMul::build` would apply anyway, asked earlier because the
+    /// decision has to be made before the source is read rather than after:
+    ///
+    /// * a mapping to read from;
+    /// * an int8 mode — at `Off` there is no KO twin to build;
+    /// * `Span` residency — the pack build materialises a layer only to copy it out, and its
+    ///   `Pool` twins are not the ones competing for the load budget;
+    /// * a 2-D shape the KO matmul can tile, which is `build`'s own gate;
+    /// * a source `repack_ko_into` can read directly.
+    ///
+    /// A tensor failing any of them takes the older path and costs what it always did. There
+    /// is deliberately no "only if it is big": a rule that applies to some weights is a rule
+    /// with an untested branch, and the banded route is not slower for a small tensor — it is
+    /// one band either way.
+    #[cfg(feature = "cuda")]
+    fn host_banded(&mut self, name: &str, narrow: Option<GgmlDType>) -> Result<Option<QMatMul>> {
+        use candle::quantized::cuda::{repack_ko_from_host, repackable_to_ko};
+        use candle::quantized::ko_quant::ko_tileable;
+        use candle::quantized::{QStorage, QTensor};
+
+        let (Some(map), Device::Cuda(cuda)) = (self.map, &self.device) else {
+            return Ok(None);
+        };
+        if !self.mode.is_int8() || self.residency != WeightResidency::Span {
+            return Ok(None);
+        }
+        let Some(info) = self.content.tensor_infos.get(name) else {
+            return Ok(None);
+        };
+        let [nrows, ncols] = info.shape.dims() else {
+            return Ok(None);
+        };
+        let (nrows, ncols) = (*nrows, *ncols);
+        if !ko_tileable(nrows, ncols) || !repackable_to_ko(info.ggml_dtype) {
+            return Ok(None);
+        }
+        // The twin this weight would get anyway: the narrowing target when one is set and it
+        // can actually shrink this source, else whatever the mode picks. Same rule as `proj`'s
+        // own — a wider request leaves the tensor alone.
+        let picked = info.ggml_dtype.to_ko(self.mode)?;
+        let ko_dtype = match narrow {
+            Some(n) if n.bits_per_weight() < picked.bits_per_weight() => n,
+            _ => picked,
+        };
+
+        // The tensor's bytes where GGUF put them: whole blocks, row-major, contiguous.
+        let start = (self.content.tensor_data_offset + info.offset) as usize;
+        let len = nrows * ncols / info.ggml_dtype.block_size() * info.ggml_dtype.type_size();
+        let Some(bytes) = map.get(start..start + len) else {
+            // A mapping that does not cover the tensor is a truncated file, not a reason to
+            // silently take a different route — the ordinary path would fail on the same
+            // bytes, and saying so here names the tensor.
+            candle::bail!(
+                "{name}: the checkpoint mapping is {} bytes and this tensor needs \
+                 {start}..{}",
+                map.len(),
+                start + len
+            );
+        };
+
+        let shape = candle::Shape::from((nrows, ncols));
+        let dst =
+            crate::models::quantized_matmul::dense_destination_for(&self.device, &shape, ko_dtype);
+        let twin = repack_ko_from_host(cuda, bytes, &shape, info.ggml_dtype, ko_dtype, dst)?;
+        // The twin is what stays resident, so it is the twin that counts toward the model's
+        // device footprint — the source never had any.
+        self.device_bytes += twin.storage_size_in_bytes();
+        let qt = QTensor::new(QStorage::Cuda(twin), (nrows, ncols))?;
+        Ok(Some(QMatMul::from_qtensor_view(qt, self.mode)?))
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn host_banded(&mut self, _: &str, _: Option<GgmlDType>) -> Result<Option<QMatMul>> {
+        Ok(None)
     }
 
     /// An elementwise constant: dequantized to F32 once, at load.
@@ -1105,6 +1289,30 @@ pub struct LoadInputs<'a, F, L> {
     /// `None` reads the head from `content` if it declares one, and leaves the
     /// model without a drafter if it does not.
     pub mtp_src: Option<(&'a gguf_file::Content, &'a [u8])>,
+    /// The trunk checkpoint's own mapped bytes.
+    ///
+    /// **What lets a projection be repacked without ever existing on the device.** With it,
+    /// [`Loader::proj`] reads a band at a time straight from the mapping; without it the
+    /// tensor is uploaded whole first, which for a `[248320, 4096]` BF16 head is 1,940 MiB
+    /// that exists only to be read once and dropped — and is what OOMed a 24 GiB card with
+    /// 14 GiB free.
+    ///
+    /// `None` is the ordinary answer for a caller that has a reader and no mapping (a test
+    /// fixture, a sidecar read through a cursor); the load simply takes the older route.
+    pub map: Option<&'a [u8]>,
+    /// A checkpoint to take the DeltaNet recurrent gates from, when this one quantized them.
+    ///
+    /// **A repair for a specific, common defect and not a general weight-mixing facility.**
+    /// `ssm_alpha`/`ssm_beta` must be F32 (see [`check_recurrent_precision`]); a conversion
+    /// whose quant rules do not know this architecture stores them like any other 2-D weight
+    /// and the model then generates incoherent text from its first token. The precision is
+    /// gone from that file, but the *base* checkpoint the fine-tune was built from still has
+    /// it — and these are the tensors a fine-tune has least reason to have moved.
+    ///
+    /// Only the gates are taken, only when the primary's are not F32, and only when the
+    /// shapes agree. Everything that makes the fine-tune what it is — attention, the FFN, the
+    /// head — is the primary's throughout.
+    pub gate_src: Option<(&'a gguf_file::Content, &'a [u8])>,
     /// Builds the expert cache at the one point the span means what it says —
     /// see this module's [`load_quantized_model`] header.
     pub build_experts: F,
@@ -1125,6 +1333,13 @@ impl LoadInputs<'_, NoExperts, ResidentLayers> {
         Self {
             host_embed: None,
             mtp_src: None,
+            // A harness passes a reader, not a mapping, so the host-banded path is simply not
+            // available to it — and does not need to be: a reference load is not the one
+            // competing for the card.
+            map: None,
+            // A reference load reads a checkpoint that already satisfies the precision rule,
+            // so there is nothing to repair and no second file to repair it from.
+            gate_src: None,
             build_experts: |_, _| Ok(None),
             build_layers: None,
         }
@@ -1172,6 +1387,184 @@ impl LoadInputs<'_, NoExperts, ResidentLayers> {
 /// error beside them. That is not the fits/does-not-fit branch
 /// `docs/qwen38_layer_streaming.md` §7 forbids: every *dense* checkpoint
 /// streams, and "it fits" is the degenerate case where nothing is ever evicted.
+/// The DeltaNet gate projections, which a conversion may not quantize.
+///
+/// `ssm_alpha` and `ssm_beta` produce the per-step gates of the recurrence. Their error does
+/// not stay where it is made: the state carries it to the next token and the next, so an
+/// error small enough to be invisible in a feed-forward weight compounds along the sequence.
+/// This is the same reasoning that keeps `ssm_a`, the `dt` bias and the per-head norm gain in
+/// F32 (module docs above, design doc §8), and the checkpoints themselves declare it —
+/// `mamba_ssm_dtype: float32`.
+const RECURRENT_GATES: [&str; 2] = ["ssm_alpha.weight", "ssm_beta.weight"];
+
+/// The whole recurrent path: the gates above plus the output projection they feed.
+///
+/// **What a repair restores, which is wider than what it is diagnosed by.** The F32 rule is
+/// specific to the gates, and `ssm_out` breaks no rule by being quantized — the reference
+/// conversion stores it at `Q8_0`. But the three are one subsystem, and a recurrence assembled
+/// half from the base and half from a fine-tune that stores its half differently is a
+/// combination nobody has measured. When a donor is used at all, it supplies every tensor on
+/// this path whose format the primary changed, so the recurrence comes from one source.
+pub(crate) const RECURRENT_PATH: [&str; 3] =
+    ["ssm_alpha.weight", "ssm_beta.weight", "ssm_out.weight"];
+
+/// Refuse a checkpoint whose recurrent gates were quantized.
+///
+/// # Why this is a load failure and not a warning
+///
+/// The model loads, reports nothing, and generates word salad or degenerate repetition from
+/// its first token — with weights that measure 0.999 cosine against a checkpoint that works,
+/// because the defect is a ~1–2% error in the one place the architecture cannot absorb one.
+/// Everything about the failure points somewhere else: the tokenizer is identical, the token
+/// table is identical, the prompt is identical, and the batched gates pass. Three third-party
+/// Qwen3.5 conversions were each debugged for hours from that starting point.
+///
+/// llama.cpp's own quantizer excludes these tensors, so a checkpoint built with it is fine and
+/// never reaches this message. A conversion with custom quant rules that does not know this
+/// architecture will quantize them like any other 2-D weight, and the file gives no other sign.
+///
+/// The message names the tensor and the format because the remedy is a different conversion,
+/// not a different setting — nothing at run time can restore precision the file does not carry.
+fn check_recurrent_precision(content: &gguf_file::Content) -> Result<()> {
+    let bad = undersized_gates(content);
+    if bad.is_empty() {
+        return Ok(());
+    }
+    let (first, dtype) = &bad[0];
+    candle::bail!(
+        "this checkpoint stores the DeltaNet recurrent gates below 8-bit precision — {} of them, \
+         starting with `{first}` at {dtype:?}. The recurrence accumulates their error at \
+         every token, so the model loads cleanly and then generates incoherent text from \
+         its first token, with no other symptom. The precision is not recoverable from this \
+         file: use a conversion that keeps `ssm_alpha`/`ssm_beta` at F32 or Q8_0 (llama.cpp's \
+         own quantizer excludes them, and the checkpoint's `mamba_ssm_dtype` declares \
+         float32), or supply the base checkpoint as a gate donor so its gates are read from \
+         it instead.",
+        bad.len(),
+    )
+}
+
+/// Every recurrent gate this checkpoint stores below F32, sorted by name.
+///
+/// Sorted so the tensor a message names is stable across runs — `tensor_infos` is a hash map
+/// and would otherwise offer a different one each time.
+pub fn undersized_gates(content: &gguf_file::Content) -> Vec<(String, GgmlDType)> {
+    let mut bad: Vec<(String, GgmlDType)> = content
+        .tensor_infos
+        .iter()
+        .filter(|(name, _)| RECURRENT_GATES.iter().any(|g| name.ends_with(g)))
+        .filter(|(_, info)| !gate_precision_suffices(info.ggml_dtype))
+        .map(|(name, info)| (name.clone(), info.ggml_dtype))
+        .collect();
+    bad.sort_by(|a, b| a.0.cmp(&b.0));
+    bad
+}
+
+/// Whether a format carries enough precision for a recurrent gate.
+///
+/// **Eight bits, not F32** — and the difference is a checkpoint that would otherwise be
+/// refused for working perfectly. The rule was first written as "must be F32", generalising
+/// from one working conversion (`QWEN35_9B`, which keeps them F32) and three broken ones
+/// (`Q6_K` and `BF16`). The pinned **0.8B** is the fourth data point and it contradicts that:
+/// it stores its gates at `Q8_0` and has been the lineage's proving ground for as long as the
+/// gate has existed. A guard that refuses a model known to work is worse than no guard, and
+/// this one did until `test_parallel_batched_forwarding_0_8b` said so.
+///
+/// So the line is drawn where the evidence puts it. `Q8_0`'s per-32 block scale gives a gate
+/// weight eight mantissa bits about its own local magnitude, which is enough; `Q6_K` at 6.5
+/// bits per weight is not, and the recurrence compounds the difference over every token.
+/// Float formats clear it by construction.
+fn gate_precision_suffices(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::F32
+            | GgmlDType::F16
+            | GgmlDType::BF16
+            | GgmlDType::Q8_0
+            | GgmlDType::Q8_1
+            | GgmlDType::Q8_K
+    )
+}
+
+/// The recurrent-path tensors a donor will supply, checked but **not read**.
+///
+/// Names only. The tensors themselves are read lazily by [`Loader::donated`], once per loader
+/// that asks for one — reading them here as well would put every gate on the card a second
+/// time (~400 MiB across the trunk) purely to count them and drop them.
+///
+/// # What is checked, and why each one
+///
+/// Taking a weight from another file is only sound when it is the *same* weight, so every
+/// gate is admitted on its own evidence:
+///
+/// * the donor has a tensor of that name — a differently-named architecture supplies nothing;
+/// * at 8-bit or better — a donor with the same defect repairs nothing, and quietly accepting
+///   its `Q6_K` would leave the model broken in precisely the way this exists to prevent;
+/// * of the same shape — a donor for a different model size would otherwise load and be
+///   wrong, and shape is what catches it before a single tensor is read.
+///
+/// A gate failing any of these fails the load, naming it. Partial repair is deliberately not
+/// offered: a stack with some layers' gates restored and others still quantized is a model
+/// nobody has measured, and it would degrade in a way that reads as ordinary bad prose
+/// rather than as a fault.
+fn donor_gates(content: &gguf_file::Content, donor: &gguf_file::Content) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    // **Repair only what is broken.** A checkpoint whose gates are F32 is correct as it
+    // stands, and a donor differing from it anywhere on the recurrent path is then just a
+    // different conversion — not something to import. Without this a healthy primary paired
+    // with any donor would have its recurrence quietly replaced.
+    if undersized_gates(content).is_empty() {
+        return Ok(out);
+    }
+    // Every recurrent-path tensor whose format this checkpoint changed from the donor's —
+    // which for a fine-tune and its base means every one its conversion quantized differently.
+    // Sorted, so a failure names the same tensor on every run.
+    let mut path: Vec<(&String, &gguf_file::TensorInfo)> = content
+        .tensor_infos
+        .iter()
+        .filter(|(n, _)| RECURRENT_PATH.iter().any(|r| n.ends_with(r)))
+        .filter(|(n, i)| {
+            donor
+                .tensor_infos
+                .get(*n)
+                .is_none_or(|d| d.ggml_dtype != i.ggml_dtype)
+        })
+        .collect();
+    path.sort_by(|a, b| a.0.cmp(b.0));
+
+    for (name, want) in path {
+        let name = name.clone();
+        let Some(have) = donor.tensor_infos.get(&name) else {
+            candle::bail!(
+                "the gate donor has no `{name}`, so it cannot supply this checkpoint's \
+                 quantized recurrent gates"
+            )
+        };
+        // The precision rule is the *gates'*, and only theirs. `ssm_out` is legitimately
+        // quantized in the stock conversion (`Q8_0` in `QWEN35_9B`, `Q6_K` elsewhere), so applying
+        // it to the output projection would refuse valid donors; what `ssm_out` must not be is
+        // quantized the way the primary quantized it, which the filter above established.
+        let is_gate = RECURRENT_GATES.iter().any(|g| name.ends_with(g));
+        if is_gate && !gate_precision_suffices(have.ggml_dtype) {
+            candle::bail!(
+                "the gate donor stores `{name}` at {:?}, which is below 8-bit — it carries \
+                 the same defect as the checkpoint it is meant to repair",
+                have.ggml_dtype
+            )
+        }
+        if have.shape.dims() != want.shape.dims() {
+            candle::bail!(
+                "the gate donor's `{name}` is {:?} where this checkpoint's is {:?} — these are \
+                 different models, not a checkpoint and its base",
+                have.shape.dims(),
+                want.shape.dims()
+            )
+        }
+        out.push(name);
+    }
+    Ok(out)
+}
+
 pub fn load_quantized_model<R, F, L>(
     content: &gguf_file::Content,
     reader: &mut R,
@@ -1187,9 +1580,40 @@ where
     let LoadInputs {
         host_embed,
         mtp_src,
+        map,
+        gate_src,
         build_experts,
         build_layers,
     } = inputs;
+
+    // A checkpoint that quantized its recurrent gates is refused unless a donor was supplied
+    // to repair them. Decided before anything is read, so an unusable checkpoint costs a
+    // header rather than a full load.
+    let repairing = match (undersized_gates(content).is_empty(), gate_src) {
+        (true, _) => false,
+        (false, None) => return Err(check_recurrent_precision(content).unwrap_err()),
+        // Headers only — the tensors themselves are read lazily, per loader, by
+        // `Loader::donated`.
+        (false, Some((donor, _))) => {
+            // Validated here, once, rather than at each of the many places a gate is read:
+            // every loader below asks `Loader::donated` per tensor and would otherwise
+            // rediscover the same donor mismatch a dozen times over. A mismatch is fatal, so
+            // finding it before any weight is read is also what makes it cheap to report.
+            let n = donor_gates(content, donor)?.len();
+            // Loud, because the model being run is not the one on disk: its recurrence comes
+            // from the base checkpoint. Worth a line in every log that will ever be read back
+            // while wondering why this fine-tune behaves as it does.
+            tracing::warn!(
+                target: "candle_transformers::qwen35",
+                tensors = n,
+                "this checkpoint quantized its DeltaNet recurrent path; reading it from the \
+                 base checkpoint instead. Attention, the FFN and the head are the \
+                 checkpoint's own."
+            );
+            true
+        }
+    };
+    let gate_src = repairing.then_some(gate_src).flatten();
 
     let arch = super::loader::detect_arch(content);
     let mut cfg = Qwen35Config::from_gguf_metadata(&arch, &content.metadata)?;
@@ -1209,7 +1633,9 @@ where
     // [`narrow_resident_twin`].
     let narrow_resident = narrow_resident_twin(device, &cfg, content);
 
-    let mut g = Loader::new(content, reader, device, mode, WeightResidency::Span);
+    let mut g = Loader::new(content, reader, device, mode, WeightResidency::Span)
+        .with_map(map)
+        .with_gate_src(gate_src);
 
     // The embedding table, off the card under either residency (see
     // [`EmbeddingTable`]). Host-mapped when the caller could pin it, which is
@@ -1474,6 +1900,168 @@ where
         device: device.clone(),
         dense_bytes: g.device_bytes,
     })
+}
+
+#[cfg(test)]
+mod recurrent_precision_tests {
+    use super::{check_recurrent_precision, RECURRENT_GATES};
+    use candle::quantized::gguf_file::{Content, TensorInfo};
+    use candle::quantized::GgmlDType;
+    use candle::Shape;
+    use std::collections::HashMap;
+
+    /// A header carrying one gate at `dtype` and an ordinary weight beside it.
+    fn header(gate: GgmlDType) -> Content {
+        let mut tensor_infos = HashMap::new();
+        let mut put = |name: &str, ggml_dtype| {
+            tensor_infos.insert(
+                name.to_string(),
+                TensorInfo {
+                    ggml_dtype,
+                    shape: Shape::from((32usize, 1024usize)),
+                    offset: 0,
+                },
+            );
+        };
+        put("blk.0.ssm_alpha.weight", gate);
+        put("blk.0.ssm_beta.weight", gate);
+        // Quantized on purpose: the guard must object to the gates and to nothing else.
+        put("blk.0.attn_q.weight", GgmlDType::Q6_K);
+        put("blk.0.ssm_out.weight", GgmlDType::Q8_0);
+        Content {
+            magic: candle::quantized::gguf_file::VersionedMagic::GgufV3,
+            metadata: HashMap::new(),
+            tensor_infos,
+            tensor_data_offset: 0,
+        }
+    }
+
+    /// **Every format a checkpoint that works has been seen to use.**
+    ///
+    /// `F32` is `QWEN35_9B`'s choice and `Q8_0` is `QWEN35_0_8B`'s — and the 0.8B is why this
+    /// test exists in this shape. The rule was written as "must be F32" from the 9B alone,
+    /// which refused the 0.8B at load for storing gates the way it always has;
+    /// `test_parallel_batched_forwarding_0_8b` failed on a model that had never stopped
+    /// working. A guard that refuses those is a worse bug than the one it catches.
+    #[test]
+    fn gates_a_working_checkpoint_uses_are_accepted() {
+        for dtype in [GgmlDType::F32, GgmlDType::Q8_0] {
+            assert!(
+                check_recurrent_precision(&header(dtype)).is_ok(),
+                "{dtype:?} gates are used by a checkpoint known to generate correctly"
+            );
+        }
+    }
+
+    /// **The format that actually shipped broken.** `Q6_K` is what HauhauCS and DavidAU store
+    /// their gates as, and both loaded silently and then generated incoherent text from the
+    /// first token — HauhauCS generates correctly once the gates are read from a donor.
+    #[test]
+    fn undersized_gates_are_refused_with_the_tensor_named() {
+        for dtype in [GgmlDType::Q6_K, GgmlDType::Q4_K, GgmlDType::Q5_K] {
+            let e = check_recurrent_precision(&header(dtype))
+                .expect_err(&format!("{dtype:?} gates must be refused"));
+            let msg = e.to_string();
+            assert!(
+                msg.contains("blk.0.ssm_alpha.weight"),
+                "{dtype:?}: the message must name the offending tensor, got: {msg}"
+            );
+            assert!(
+                msg.contains("gate donor") && msg.contains("Q8_0"),
+                "{dtype:?}: the message must name both remedies, got: {msg}"
+            );
+        }
+    }
+
+    /// The guard reads whole tensor names, so a weight that merely *contains* a gate's name
+    /// is not one. `ends_with` is the rule; this is what would break if it became `contains`.
+    #[test]
+    fn only_the_gates_are_guarded() {
+        let mut c = header(GgmlDType::F32);
+        let info = c.tensor_infos["blk.0.attn_q.weight"].clone();
+        c.tensor_infos
+            .insert("blk.0.ssm_alpha.weight.scales".into(), info);
+        assert!(check_recurrent_precision(&c).is_ok());
+    }
+
+    #[test]
+    fn the_guarded_set_is_the_two_gates() {
+        assert_eq!(RECURRENT_GATES, ["ssm_alpha.weight", "ssm_beta.weight"]);
+    }
+
+    /// The message points at the repair, not only at the defect.
+    #[test]
+    fn the_refusal_names_the_donor_as_a_remedy() {
+        let e = check_recurrent_precision(&header(GgmlDType::Q6_K)).unwrap_err();
+        assert!(
+            e.to_string().contains("gate donor"),
+            "an operator who has the base checkpoint should be told it is usable: {e}"
+        );
+    }
+
+    /// **A donor is admitted per tensor, on evidence.** Substituting a weight from another
+    /// file is only sound when it is the same weight, so each of these is a refusal rather
+    /// than a silent mismatch — and each would otherwise load and be wrong in a way that
+    /// reads as bad prose rather than as a fault.
+    #[test]
+    fn a_donor_is_refused_when_it_cannot_supply_the_gates() {
+        let primary = header(GgmlDType::Q6_K);
+
+        // A donor carrying the same defect at a different width: admitted by the format
+        // filter, then refused by the gate rule. (At the *identical* width it is filtered out
+        // earlier and supplies nothing — the same outcome by a shorter route.)
+        let e = super::donor_gates(&primary, &header(GgmlDType::Q4_K)).unwrap_err();
+        assert!(e.to_string().contains("same defect"), "{e}");
+
+        // Missing the tensor entirely: a different architecture.
+        let mut bare = header(GgmlDType::F32);
+        bare.tensor_infos.remove("blk.0.ssm_alpha.weight");
+        let e = super::donor_gates(&primary, &bare).unwrap_err();
+        assert!(e.to_string().contains("has no"), "{e}");
+
+        // Right name, wrong shape: a different model size.
+        let mut wrong = header(GgmlDType::F32);
+        let info = wrong
+            .tensor_infos
+            .get_mut("blk.0.ssm_alpha.weight")
+            .unwrap();
+        info.shape = candle::Shape::from((64usize, 1024usize));
+        let e = super::donor_gates(&primary, &wrong).unwrap_err();
+        assert!(e.to_string().contains("different models"), "{e}");
+    }
+
+    /// A checkpoint that needs no repair asks nothing of a donor, so a donor that could not
+    /// have supplied anything is never consulted.
+    #[test]
+    fn a_healthy_checkpoint_reads_no_gates_from_a_donor() {
+        let got = super::donor_gates(&header(GgmlDType::F32), &header(GgmlDType::Q6_K))
+            .expect("nothing is undersized, so nothing is asked of the donor");
+        assert!(got.is_empty());
+    }
+
+    /// **The whole recurrent path is repaired, not only the gates that failed the rule.**
+    ///
+    /// `ssm_out` breaks no precision rule — the stock conversion quantizes it too — but a
+    /// recurrence assembled half from the base and half from a fine-tune that stored its half
+    /// differently is a combination nobody has measured. Half-repairing it is exactly what
+    /// this path did while `ssm_out` was still read by the layer store, and the model stayed
+    /// incoherent until the other 24 tensors came from the donor too.
+    #[test]
+    fn a_repair_covers_the_output_projection_as_well_as_the_gates() {
+        let mut primary = header(GgmlDType::Q6_K);
+        // The reference's own choice for this tensor, which is not F32 and not the primary's.
+        primary
+            .tensor_infos
+            .get_mut("blk.0.ssm_out.weight")
+            .unwrap()
+            .ggml_dtype = GgmlDType::Q6_K;
+        let donor = header(GgmlDType::F32);
+        let got = super::donor_gates(&primary, &donor).unwrap();
+        assert!(
+            got.iter().any(|n| n.ends_with("ssm_out.weight")),
+            "the output projection must be repaired alongside the gates, got {got:?}"
+        );
+    }
 }
 
 #[cfg(test)]

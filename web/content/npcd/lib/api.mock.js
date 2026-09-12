@@ -7,6 +7,10 @@
  * landing page. */
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/// Threads the mock is holding, by character. See `getMessages`: a conversation
+/// has to accumulate across calls or the tab looks right and shows nothing.
+const mockThreads = {};
 const flag = (k) => { try { return new URLSearchParams(location.search).has(k); } catch (_) { return false; } };
 const EMPTY = flag('empty');
 
@@ -16,6 +20,16 @@ const clock = (s) => `${pad2(Math.floor(s / 3600) % 24)}:${pad2(Math.floor(s / 6
 
 const WORLD_EPOCH = 412 * 86400000 + 6 * 3600000 + 14 * 60000;
 const worldMs = () => WORLD_EPOCH + (Date.now() % 3600000) * 60;
+
+/* The refusal a fixture owes for work that genuinely needs a card.
+ *
+ * Shaped exactly like the daemon's `503 no_engine`, so a page handles one case
+ * rather than two. The alternative — answering `{ok: true}` — is the failure
+ * this whole fixture was rewritten to stop: somebody believing they had saved
+ * something that nothing anywhere holds. */
+const noEngine = (what) => Object.assign(new Error(`this is the fixture — it cannot ${what}`), {
+  error: 'no_engine', detail: `this is the fixture — it cannot ${what}`, status: 503,
+});
 
 /* Narrow a listing by the console's filter box.
  *
@@ -33,7 +47,7 @@ const narrow = (rows, q, fields) => {
 const mk = (id, name, arch, archName, state, pending, band, overlap, hb, hidden, tags, desc) => ({
   npc_id: id, name, world_id: 'ardh', personality_id: arch, personality_name: archName, state,
   tick: { heartbeat_ms: hb, last_tick_ms: Date.now() - pending * 900 - 400, pending_events: pending, salience_gate: 0.42 },
-  environment_enabled: true, monitor: { overlap, band }, owner_id: 'u_8812', access: 'owner',
+  monitor: { overlap, band }, owner_id: 'u_8812', access: 'owner',
   hidden, tags, portrait: null, persona: { description: desc, origin: 'generated' },
   live_interactions: state === 'active' ? 2 : 0,
   created_ms: Date.now() - 86400000 * 12, updated_ms: Date.now() - 4000,
@@ -54,8 +68,9 @@ const NPCS = EMPTY ? [] : [
     'Ageless in the way of people who sit in booths. Has opinions about everyone who crosses, and shares them for a fee.'),
 ];
 
-const ALL_MODES = ['physical', 'video_call', 'voice_call', 'instant_message'];
-const VIS = ['physical', 'video_call'];
+const ALL_MODES = ['physical', 'instant_message'];
+// Something you can only make out by being there to see it.
+const VIS = ['physical'];
 
 const act = (id, tick, tool, intent, args, obs) =>
   ({ t: 'act', d: { act_id: id, tick, tool, intent, args, observable_in: obs, committed: true, rendered: null } });
@@ -102,6 +117,205 @@ const T = (name, category, description, source, calibrated, modes) =>
   ({ name, category, description, source, calibrated, modes: modes || ALL_MODES, writes_layers: ['action'] });
 const C = (name, group, summary, emits, properties, required) =>
   ({ name, group, summary, emits, aliases: [], parameters: { type: 'object', properties }, required });
+
+/* ── the mind, in miniature ───────────────────────────────────────────────────
+ *
+ * Keyed by address. A node with `doc` is a mapping and opens as fields; one
+ * with `text` is prose and opens as text; one with neither is a place you walk
+ * into. `notes` are the author's comments — the thing the field form shows
+ * beside each input — and `stubborn` marks the one document that refuses a
+ * field-by-field save, so the console's `cannot_patch` path is reachable.
+ *
+ * The root's children are the sections, which is why they have no parent in
+ * their address. */
+const MIND = {
+  canon: { title: 'Canon' },
+  'canon/ammo': {
+    title: 'Ammo',
+    blurb: 'What the guns eat, and what it costs',
+    text: '# Ammo\n\nEvery round is machined, and nobody in the cities machines rounds any more.\n',
+  },
+  'canon/ammo/bolt': {
+    title: 'Bolt',
+    text: '# Bolt\n\nA hand-loaded slug. Cheap, loud, and it will jam a rail gun if you are\ndesperate enough to try it.\n',
+  },
+  'canon/ammo/slug': {
+    title: 'Slug',
+    text: '# Slug\n\nThe standard round. Scarce enough that a full magazine is a statement.\n',
+  },
+  responses: { title: 'Responses' },
+  'responses/accept_then_move_on': {
+    title: 'Accept then move on',
+    blurb: 'accept',
+    notes: {
+      template: 'The frozen structural mode — its KV is loaded; the model decodes the NEXT turn into this once the section is selected.',
+      examples: 'Provenance lead-ins — the context that PRODUCES the next (accepting) reply. FIXED SHAPE: 4 turns, user → assistant → user → assistant. Final assistant turn is the decode point.',
+    },
+    doc: {
+      id: 'accept_then_move_on',
+      category: 'accept',
+      description: 'Accepting what the interlocutor offered, admitted, or refused, then letting the moment close without extracting more.',
+      template: 'Accept what the interlocutor just offered, admitted, refused, or decided, and let the\nmoment close without demanding more.\n\nTone: settled, unhurried, generous, unbothered.\n',
+      examples: [
+        {
+          note: 'Late apology, no toll charged for it.',
+          turns: [
+            { role: 'user', content: '"I\'m late — sorry, the train—" I stop myself, exhaling.\n' },
+            { role: 'assistant', content: 'A small tip of their head, already unbothered — the seat beside them is patted once, an answer in itself.\n' },
+            { role: 'user', content: '"Thank you for not making me grovel through the whole excuse."\n' },
+            { role: 'assistant', thinking: 'They will take the thanks lightly and steer straight into the evening, so lateness never becomes a debt you owe.\n' },
+          ],
+        },
+        {
+          note: 'A boundary named plainly, respected without probing.',
+          turns: [
+            { role: 'user', content: '"Can we just— not talk about my ex tonight."\n' },
+            { role: 'assistant', content: "The subject drops the instant it's named; their attention simply resettles on you.\n" },
+          ],
+        },
+      ],
+    },
+  },
+  'responses/admit_then_explain': {
+    title: 'Admit then explain',
+    blurb: 'admit',
+    // The one that cannot be patched, so the console's refusal has something to
+    // refuse. A real one is a document whose edit failed its own read-back.
+    stubborn: true,
+    doc: {
+      id: 'admit_then_explain',
+      category: 'admit',
+      description: 'Owning the thing first, without the explanation doing the owning.',
+      tags: ['fault', 'repair'],
+      template: 'Say the thing you did. Then, and only then, say why.\n',
+      examples: [],
+    },
+  },
+  settings: { title: 'Settings' },
+  // The projection schema is a collection *and* an entry: it reads whole, and
+  // its layers are addressable underneath it. Two of the nine, with the shape
+  // the real ones have — a nested budget, a summarisation prompt, and a list of
+  // selection groups.
+  'settings/projection': {
+    title: 'Projection schema',
+    text: 'default_policy:\n  preset: high_recall_scope\n\nlayers:\n  # ── World ──\n  - name: world\n    window: 8000\n',
+  },
+  'settings/projection/world': {
+    title: 'World',
+    blurb: 'the only cross-timeline layer',
+    notes: { description: 'Ingested from the canon topics a world admits.' },
+    doc: {
+      name: 'world',
+      description: 'Shared knowledge about the setting — places, factions, history.\n\nTHE ONLY CROSS-TIMELINE LAYER: one tree across every conversation.\n',
+      window: 8000,
+      score_threshold: 0.3,
+      gather_scope: 'shared',
+      decode_priority: 'low',
+      ingest_unit: 'documents',
+      budget: { priority: 70, max_percent: 20, adaptive: { gain: 2.0, max_percent: 40 } },
+      summary: {
+        turns: {
+          max_tokens: 384,
+          scope: 'union',
+          assistant: {
+            system_prompt: 'You compress documents about a world into one faithful digest.\n',
+            user_prompt: 'Digest the documents above, keeping every name exactly.\n',
+          },
+        },
+      },
+      groups: [{ id: 'canon', selection: { kind: 'top_k', k: 6 }, budget: { priority: 100 } }],
+    },
+  },
+  'settings/projection/beliefs': {
+    title: 'Beliefs',
+    doc: {
+      name: 'beliefs',
+      description: 'What the character holds to be true about the world and itself.\n',
+      window: 4000,
+      score_threshold: 0.4,
+      gather_scope: 'conversation',
+      decode_priority: 'normal',
+      ingest_unit: 'beliefs',
+      budget: { priority: 90, max_percent: 15 },
+      groups: [{ id: 'held', selection: { kind: 'top_k', k: 5 }, budget: { priority: 100 } }],
+    },
+  },
+};
+
+/* The keys with a fixed vocabulary, mirroring the daemon's — and, like it,
+ * offered only where the value is already one of them. */
+const MIND_CHOICES = {
+  gather_scope: ['conversation', 'shared'],
+  decode_priority: ['low', 'normal', 'high'],
+  on_corrupt_turn: ['drop_turn', 'drop_conversation'],
+  kind: ['conversation', 'top_k'],
+};
+
+const mindNode = (id) => (id ? MIND[id] : { title: 'The mind' });
+const mindChildren = (id) => {
+  const prefix = id ? id + '/' : '';
+  return Object.keys(MIND).filter(
+    (k) => k.startsWith(prefix) && !k.slice(prefix.length).includes('/') && k !== id,
+  );
+};
+/* A document as the text it would be stored as. Rough on purpose: the mock's
+ * job is to give the text editor something real-shaped to open, not to be a
+ * second YAML writer that can disagree with the daemon's. */
+const mindText = (node) => {
+  if (!node) return '';
+  if (node.text != null) return node.text;
+  if (!node.doc) return '';
+  return Object.entries(node.doc)
+    .map(([k, v]) => (typeof v === 'string' && v.includes('\n')
+      ? `${k}: |\n${v.replace(/\n$/, '').split('\n').map((l) => '  ' + l).join('\n')}\n`
+      : `${k}: ${JSON.stringify(v)}\n`))
+    .join('');
+};
+const mindLabel = (key) => {
+  const s = key.replace(/[_-]/g, ' ');
+  return s.charAt(0).toUpperCase() + s.slice(1);
+};
+const mindKind = (key, v) => {
+  if (typeof v === 'string') {
+    if ((MIND_CHOICES[key] || []).includes(v)) return 'choice';
+    return v.includes('\n') || v.length > 90 ? 'text' : 'line';
+  }
+  if (typeof v === 'number') return 'number';
+  if (typeof v === 'boolean') return 'bool';
+  if (Array.isArray(v)) {
+    if (!v.length || v.every((i) => typeof i === 'string')) return 'list';
+    if (v.every((i) => i && Array.isArray(i.turns))) return 'conversations';
+    if (v.every((i) => i && typeof i === 'object')) return 'rows';
+  }
+  if (v && typeof v === 'object' && Object.keys(v).length) return 'group';
+  return 'raw';
+};
+
+/* One field, the same shape the daemon sends — including the nesting, so the
+ * recursive controls are reachable with no daemon. */
+const mindField = (key, value, notes) => {
+  const kind = mindKind(key, value);
+  return {
+    key,
+    label: mindLabel(key),
+    kind,
+    value,
+    note: (notes || {})[key] || null,
+    readonly: key === 'id' || key === 'name',
+    yaml: kind === 'raw' ? JSON.stringify(value, null, 2) : null,
+    choices: kind === 'choice' ? MIND_CHOICES[key] : null,
+    fields: kind === 'group'
+      ? Object.entries(value).map(([k, v]) => mindField(k, v))
+      : null,
+    rows: kind === 'rows'
+      ? value.map((row) => Object.entries(row).map(([k, v]) => mindField(k, v)))
+      : null,
+  };
+};
+/* The same shape the live client throws, so a caller branching on `e.error`
+ * cannot tell the two apart. */
+const mindErr = (error, detail, status) =>
+  Object.assign(new Error(detail), { error, detail, status: status || 404 });
 
 export const MockAPI = {
   async getStatus() {
@@ -345,16 +559,26 @@ export const MockAPI = {
       }) };
   },
 
-  async getEnvironment() {
-    return { enabled: true, window_turns: 24,
-      system_prompt: 'You describe what happens around a character in Ardh: a northern frontier three years after an inconclusive war. Keep to what could be perceived from where they stand. Never narrate their thoughts or decide their actions.',
-      recent: [
-        { world_ms: worldMs() - 600000, text: 'Wind off the ridge; the light going amber.' },
-        { world_ms: worldMs() - 300000, text: 'A horn, twice, from below the eastern slope.' },
-        { world_ms: worldMs() - 60000, text: 'The line east of the mill gives ground.' }] };
+  /* Messaging a character on its handset.
+   *
+   * Kept in the mock so the console's Messages tab renders standalone. The
+   * thread is held in memory here rather than invented per call, because the
+   * one thing this page has to look right is a conversation *accumulating* —
+   * a mock that returned a fresh pair of lines every poll would show the tab
+   * working while hiding the only behaviour it has.
+   */
+  async getMessages(id) {
+    mockThreads[id] = mockThreads[id] || [
+      { from: 'Wren', text: 'Are you at a terminal, and what are you working on?' },
+      { from: 'Maker-01', text: 'The third era. Two entries disagree about the same spring.' },
+    ];
+    return { messages: mockThreads[id], in_a_world: true, with: 'Maker-01', as: 'Wren' };
   },
-  async setEnvironment() { return { ok: true }; },
-  async injectEnvironment() { return { ok: true }; },
+  async sendMessage(id, text) {
+    mockThreads[id] = mockThreads[id] || [];
+    mockThreads[id].push({ from: 'Wren', text });
+    return { sent: text, from: 'Wren', to: 'Maker-01', waiting_for_them: 1, can_reply: true };
+  },
 
   async listInteractions(id) {
     const base = { npc_id: id, interlocutor: { kind: 'operator', id: 'u_8812', display: 'Wren' }, state: 'live' };
@@ -439,6 +663,69 @@ export const MockAPI = {
   },
   async getPersonality(a) { return (await this.listPersonalities()).personalities.find((x) => x.personality_id === a); },
   async setPersonality() { return { ok: true }; },
+
+  /* The life ladder.
+   *
+   * The catalog is a real copy of the daemon's authoring table rather than an
+   * invention, because the console builds its consequence form from it — a
+   * fixture with different tool names would exercise a form that could never
+   * be saved against the real thing.
+   *
+   * Every life here is UNSEEDED. That is the honest fixture: the interesting
+   * half of this page is generation, which needs a card, and a mock plan full
+   * of invented prose would put a life on screen that no daemon wrote and that
+   * nothing could regenerate. The seed form is what the mock can truthfully
+   * show. */
+  async getLifeCatalog() {
+    const T = (name, writes, description, params, required, example) =>
+      ({ name, writes, description, params, required, example });
+    return {
+      tools: [
+        T('form_belief', 'beliefs',
+          'A conviction this episode produced, in the character\'s own voice.',
+          ['statement', 'confidence', 'threshold'], ['statement'],
+          '{"name":"form_belief","arguments":{"statement":"Hess burned the east granary","confidence":0.9}}'),
+        T('form_relationship', 'relationships',
+          'Someone this episode put into the character\'s life, and how they stand afterwards.',
+          ['entity_id', 'display', 'trust', 'affect', 'familiarity', 'notes'], ['entity_id'],
+          '{"name":"form_relationship","arguments":{"entity_id":"prof-lim","display":"Professor Lim"}}'),
+        T('revise_relationship', 'relationships',
+          'A relationship this episode moved. Only the named dials change.',
+          ['entity_id', 'trust', 'affect', 'familiarity', 'notes'], ['entity_id'],
+          '{"name":"revise_relationship","arguments":{"entity_id":"hess","trust":-0.7}}'),
+        T('leave_intent', 'agency',
+          'A standing intention this episode left the character with.',
+          ['intent', 'until'], ['intent'],
+          '{"name":"leave_intent","arguments":{"intent":"finish the doctorate on her own terms"}}'),
+      ],
+      cadences: [
+        { value: 'quiet', label: 'quiet', instruction: 'Mark defining days sparingly.' },
+        { value: 'even', label: 'even', instruction: 'Spread the defining days across the whole life.' },
+        { value: 'early', label: 'formed early', instruction: 'Concentrate them in the first third.' },
+        { value: 'late', label: 'formed late', instruction: 'Let the last third carry them.' },
+        { value: 'punctuated', label: 'punctuated', instruction: 'Long flat runs broken by tight clusters.' },
+      ],
+      phases: [
+        { value: 'story', label: 'Writing the life story', unit: 'story' },
+        { value: 'years', label: 'Laying out the years', unit: 'years' },
+        { value: 'months', label: 'Writing the months', unit: 'months' },
+        { value: 'days', label: 'Writing the defining days', unit: 'days' },
+      ],
+    };
+  },
+  async getLife(who) { return { who, plan: null }; },
+  /* The writes report the absence rather than pretending. A fixture that
+   * answered `{ok:true}` would leave somebody believing they had seeded a life
+   * that no daemon has. */
+  async setLifeSeed() { throw noEngine('write a life'); },
+  async setLifeNode() { throw noEngine('edit a life'); },
+  async narrateLifeNode() { throw noEngine('narrate a life'); },
+  async addLifeDay() { throw noEngine('add a day'); },
+  async removeLifeDay() { throw noEngine('remove a day'); },
+  async setLifeConsequences() { throw noEngine('set consequences'); },
+  async generateLife() { throw noEngine('generate a life'); },
+  async getLifeJob() { return null; },
+  async cancelLife() { throw noEngine('cancel a generation'); },
 
   async getLayerSchema() {
     const L = (layer, window, priority, min_percent, selection, masking, score_threshold,
@@ -582,6 +869,134 @@ export const MockAPI = {
         sections: [S('current', 'doctrine', 142, 0, 'Flank at 2:1 or not at all. Cross open ground only with a fallback named.')] },
     ] };
   },
+  /* ── the authored corpus ──────────────────────────────────────────────────
+   *
+   * A miniature mind: two sections, a topic with an overview and entries under
+   * it, and one response section with the shape the real ones have. Enough that
+   * the browser, the text editor, the field form and the conversation editor
+   * are all reachable with no daemon — including the two refusals the console
+   * branches on, `not_fields` and `cannot_patch`, which are the paths a mock
+   * that only ever succeeds would leave untested.
+   *
+   * Addresses, never paths, exactly as the daemon has it: nothing here knows
+   * where a file would live or which extension it would take. */
+  async mindList(id) {
+    await sleep(60);
+    const node = mindNode(id);
+    if (!node) throw mindErr('not_found', 'no such place');
+    return {
+      id: id || '',
+      title: node.title,
+      has_text: node.doc != null || node.text != null,
+      scoped: false,
+      children: mindChildren(id).map((cid) => {
+        const c = MIND[cid];
+        const count = mindChildren(cid).length;
+        return {
+          id: cid,
+          title: c.title,
+          // Anything holding something is a collection, whether or not it also
+          // has text of its own — a canon topic has both, and so does the
+          // projection schema.
+          kind: count ? 'collection' : 'entry',
+          count,
+          chars: mindText(c).length,
+          has_text: c.doc != null || c.text != null,
+          blurb: c.blurb || null,
+        };
+      }),
+    };
+  },
+
+  /* A portrait upload, accepted and forgotten. The fixture has no store, so it
+   * gives back an id shaped like a real one — enough for the create flow to
+   * finish without a daemon, which is what `?mock=1` is for. */
+  /* `origin` rides with the bytes, as it does live: the create step draws a
+   * portrait through the image guest and sends it here, and it has to be
+   * recorded as generated or the character could never be redrawn. */
+  async putPortrait(id, file, origin) {
+    await sleep(120);
+    if (!file || !/^image\//.test(file.type || '')) {
+      throw Object.assign(new Error('that is not an image'), { error: 'not_an_image' });
+    }
+    return {
+      npc_id: id,
+      portrait: { image_id: 'img_0011223344556677.png', origin: origin || 'uploaded' },
+    };
+  },
+
+  async getWorldKnowledge() {
+    await sleep(60);
+    return (await this.mindList('canon')).children;
+  },
+
+  async mindEntry(id) {
+    await sleep(60);
+    const node = mindNode(id);
+    if (!node || (node.doc == null && node.text == null)) {
+      throw mindErr('not_found', 'nothing written here');
+    }
+    const text = mindText(node);
+    return { id, title: node.title, text, chars: text.length };
+  },
+
+  async saveMindEntry(id, text, world, isNew) {
+    await sleep(90);
+    let node = mindNode(id);
+    // `isNew` refuses to land on something that already exists, which is what
+    // separates an add from a save.
+    if (isNew) {
+      if (node) throw mindErr('name_taken', 'something is already called that', 409);
+      const name = id.split('/').pop();
+      node = MIND[id] = { title: name.charAt(0).toUpperCase() + name.slice(1).replace(/[_-]/g, ' ') };
+    }
+    if (!node) throw mindErr('not_found', 'no such place');
+    // Saving text over a document that has fields drops the field view, which
+    // is what editing the file itself means.
+    delete node.doc;
+    node.text = text;
+    return { id, title: node.title };
+  },
+
+  async deleteMindEntry(id) {
+    await sleep(90);
+    const node = mindNode(id);
+    if (!node) throw mindErr('not_found', 'no such place');
+    delete node.doc;
+    delete node.text;
+    return null;
+  },
+
+  async mindFields(id) {
+    await sleep(60);
+    const node = mindNode(id);
+    if (!node) throw mindErr('not_found', 'no such place');
+    if (!node.doc) {
+      throw mindErr('not_fields', 'this document is not a set of fields, so it opens as text', 422);
+    }
+    return {
+      id,
+      title: node.title,
+      fields: Object.entries(node.doc).map(([key, value]) =>
+        mindField(key, value, node.notes)),
+    };
+  },
+
+  async saveMindFields(id, values) {
+    await sleep(90);
+    const node = mindNode(id);
+    if (!node || !node.doc) throw mindErr('not_found', 'no such place');
+    if (node.stubborn) {
+      throw mindErr(
+        'cannot_patch',
+        'this document could not be edited field by field without rewriting it',
+        409,
+      );
+    }
+    node.doc = { ...values };
+    return { id, title: node.title };
+  },
+
   /* Push streams, on a timer. Same contract as the live socket — backlog
    * first, then one frame at a time, and a handle that stops it — so the pane
    * has no idea which side it is talking to. */
@@ -640,7 +1055,7 @@ export const MockAPI = {
   async listTools() {
     return { uncalibrated: 1, tools: [
       T('speak', 'speech', 'Say something. Carries intent, not words — the narrator renders it.', 'generic', true),
-      T('send_image', 'messaging', 'Send a picture to a named interlocutor. Messaging modes only.', 'generic', true, ['video_call', 'instant_message']),
+      T('send_image', 'messaging', 'Send a picture to a named interlocutor. Messaging modes only.', 'generic', true, ['instant_message']),
       T('move_to', 'movement', 'Move to a named location.', 'generic', true),
       T('face', 'movement', 'Turn to face a direction or entity.', 'generic', true),
       T('follow', 'movement', 'Follow an entity.', 'generic', true),
@@ -663,6 +1078,90 @@ export const MockAPI = {
     ] };
   },
   async calibrateTools() { return { job_id: 'job_cal_1', tools: ['open_gate'] }; },
+
+  /* Pulse. The fixture's job here is to exercise the view's shapes — a
+   * preempted tick beside a quiet one, a character mid-batch, a fade counter
+   * that is not zero — because those are the states that are hard to reach on a
+   * live daemon exactly when you are trying to lay the page out. */
+  async pulse(o) {
+    const ticks = [
+      { npc_id: 1, tick: 41, at_ms: 610000, world_ms: 51_840_000, cause: 'quiet',
+        perceived: ['Time passes quietly. Nothing demands you.'], acts: [],
+        heartbeat_ms: 120000, inbox_after: 0, ms_ago: 96_000 },
+      { npc_id: 2, tick: 42, at_ms: 612400, world_ms: 51_842_000, cause: 'pending',
+        perceived: ['Hess says to you: "Where is the ledger?"'], acts: [],
+        heartbeat_ms: 32000, inbox_after: 0, ms_ago: 41_000 },
+      { npc_id: 1, tick: 43, at_ms: 615100, world_ms: 51_845_000, cause: 'preempted',
+        perceived: ['You are hurt: a crossbow bolt through the left shoulder, badly',
+                    'You overhear someone nearby say: "That is the one."'],
+        acts: [], heartbeat_ms: 4000, inbox_after: 0, ms_ago: 2_100 },
+    ];
+    const id = o && o.npc_id;
+    return { ticks: id ? ticks.filter((t) => t.npc_id === Number(id)) : ticks,
+             ready: true, population: 2 };
+  },
+  /* Takes the feed's query, as the live one does: the route reads `npc_id` and
+   * `all`, so a mock that ignored them would show the console behaving in a way
+   * the daemon does not. */
+  async pulseCensus(o) {
+    const characters = [
+      { npc_id: 1, readiness: 'preempted', inbox_depth: 2, heartbeat_ms: 4000,
+        ticks: 43, events_seen: 51, window_turns: 24, window_cap: 24, faded: 118, day: 3,
+        acted_ms_ago: 2_400 },
+      { npc_id: 2, readiness: 'quiet', inbox_depth: 0, heartbeat_ms: 120000,
+        ticks: 12, events_seen: 12, window_turns: 6, window_cap: 24, faded: 0, day: 3,
+        acted_ms_ago: 96_000 },
+    ];
+    const id = o && o.npc_id;
+    return { ready: true,
+             characters: id ? characters.filter((c) => c.npc_id === Number(id)) : characters };
+  },
+  /* Two characters in one room and one elsewhere, because the interesting
+   * shape is company: a room with two people in it is the case the panel
+   * exists to make visible. */
+  async pulseWorld() {
+    return {
+      may_see_all: true,
+      moments: [{ world_id: 'battle-cities', moments: 1204, paused: false }],
+      bound: { 'npc-1': '1', 'npc-2': '2' },
+      worlds: [{
+        world_id: 'battle-cities',
+        bodies: 2,
+        rooms: [
+          { area: 'vault-command', area_name: 'the command level', node: 'command-room',
+            name: 'the command room', kind: 'work',
+            who: [{ body: 'npc-1', name: 'Perrin Vastwood', holding: null, going_to: null },
+                  { body: 'npc-2', name: 'Wyneth Vayne', holding: null, going_to: 'anteroom' }] },
+          { area: 'vault-command', area_name: 'the command level', node: 'anteroom',
+            name: 'the anteroom', kind: 'social', who: [] },
+          { area: 'vault-casting', area_name: 'the casting level', node: 'band-one',
+            name: 'band one', kind: 'work', who: [] },
+        ],
+      }],
+    };
+  },
+  async npcWindow(_id) {
+    return {
+      cap: 24, faded: 118, empty: false,
+      turns: [
+        { speaker: 'world', at_ms: 51_840_000, replaces: null,
+          text: 'Hess says to you: "Where is the ledger?"' },
+        { speaker: 'npc', at_ms: 51_840_400, replaces: null,
+          text: '→ refuse — handing over the ledger' },
+        { speaker: 'world', at_ms: 51_845_000, replaces: null,
+          text: 'You are hurt: a crossbow bolt through the left shoulder, badly' },
+      ],
+    };
+  },
+  async pulseInject(id, line) {
+    if (line.startsWith('/') && !/^\/(say|overhear|see|notice|map|hurt|urgent|wake|sleep)\b/.test(line)) {
+      throw Object.assign(new Error('no command `' + line.split(/\s/)[0].slice(1) + '`'),
+        { error: 'bad_command', status: 400 });
+    }
+    return { delivered: true, command: line.startsWith('/') ? line.slice(1).split(/\s/)[0] : 'say',
+             salience: 0.6, preempts: /^\/(hurt|urgent|wake)\b/.test(line),
+             prose: line.replace(/^\/\w+\s*/, '') };
+  },
   async listCommands() {
     return { commands: [
       C('say', 'narration', 'Speak as yourself', 'interaction_event', { text: { type: 'string', description: 'What you say' } }, ['text']),
@@ -686,19 +1185,112 @@ export const MockAPI = {
     ] };
   },
 
-  async generateDescription() { await sleep(650); return { description: PERSONAS[personaIdx++ % PERSONAS.length], seed: 88213 + personaIdx }; },
-  async generateAttributes() {
-    await sleep(850);
-    return { beliefs: (await this.getBeliefs()).beliefs,
-      relationships: (await this.getRelationships()).relationships,
-      agency: (await this.getAgency()).agency };
+  /* Named before described, as the daemon does. The list cycles rather than
+   * repeating one fixture, because the create step's whole point is that a
+   * second press gives a different character. */
+  async generateName(b) {
+    await sleep(400);
+    const names = ['Ursula Ved', 'Aelis Maelstrom', 'Hess Corran', 'Tam Sorrel', 'Ivo Renn'];
+    return {
+      name: names[personaIdx % names.length],
+      seed: 5150 + personaIdx,
+      world_id: (b && b.world_id) || '',
+      personality_id: (b && b.personality_id) || '',
+    };
   },
-  async generateImage() { return { job_id: 'job_img_1', kind: 'image', state: 'queued', progress: 0, queue_position: 2, eta_secs: null }; },
+
+  async generateDescription() { await sleep(650); return { description: PERSONAS[personaIdx++ % PERSONAS.length], seed: 88213 + personaIdx }; },
+
+  /* Streamed like the daemon streams it, at roughly the rate it decodes.
+   *
+   * Word by word rather than all at once: the mock is what the create page's
+   * appearance is developed against, and a mock that resolved instantly would
+   * make a layout that jumps as text arrives look fine right up until it met a
+   * real card. The load pause is short because the real one is — the model swap
+   * measures ~0.3s. */
+  async generateDescriptionStream(b, onEvent) {
+    const description = PERSONAS[personaIdx++ % PERSONAS.length];
+    if (onEvent) onEvent({ event: 'loading' });
+    await sleep(300);
+    const parts = description.match(/\S+\s*/g) || [];
+    for (const part of parts) {
+      await sleep(28);
+      if (onEvent) onEvent({ event: 'token', text: part });
+    }
+    return { event: 'done', description, tokens: parts.length, seed: 88213 + personaIdx,
+             world_id: (b && b.world_id) || '', personality_id: (b && b.personality_id) || '' };
+  },
+
+  /* The daemon's shape: progress while it draws, then the bytes. Not a job to
+   * poll — it used to answer a queued job id, which nothing ever polled. A 2x2
+   * PNG stands in for the draw so the create step's preview has something real
+   * to paint.
+   *
+   * The steps are emitted on the same schedule the real guest reports them —
+   * `steps` denoise units against a total of `steps + 1`, then the decode — so a
+   * bar built against this mock is a bar that behaves live. Getting that wrong
+   * is how a progress UI ends up looking right in development and jumping from
+   * 0 to 100 against the daemon. */
+  async generateImage(b, onEvent) {
+    // A reference draw runs a fraction of the budget, so the mock reports a
+    // fraction of the steps — a bar built against a mock that always ran the
+    // full count would look right here and jump against the daemon.
+    const hold = b && b.reference ? Math.min(0.95, b.reference_hold ?? 0.45) : 0;
+    const asked = (b && b.steps) || 8;
+    const steps = hold > 0 ? Math.max(Math.min(8, asked), Math.round(asked * (1 - hold))) : asked;
+    const total = steps + 1;
+    if (onEvent) onEvent({ event: 'loading' });
+    await sleep(400);
+    if (hold > 0) {
+      if (onEvent) onEvent({ event: 'step', done: 0, total, what: 'reading the reference' });
+      await sleep(200);
+    }
+    for (let done = 1; done <= steps; done++) {
+      await sleep(90);
+      if (onEvent) onEvent({ event: 'step', done, total, what: 'denoising' });
+    }
+    if (onEvent) onEvent({ event: 'step', done: steps, total, what: 'decoding' });
+    await sleep(500);
+    // The size and seed come back as asked, because the Images page reads them
+    // off the response rather than off its own request — a mock that answered a
+    // fixed 2×2 made the caption disagree with the controls and the "reuse
+    // seed" button repeat a number nothing had drawn.
+    return {
+      event: 'done',
+      width: (b && b.width) || 512,
+      height: (b && b.height) || 512,
+      seed: b && b.seed != null ? b.seed : 4242,
+      png_base64:
+        'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAF0lEQVR4nGP8z8Dwn4GBgYGJAQ0'
+        + 'AACPPAQhKfeMLAAAAAElFTkSuQmCC',
+    };
+  },
+  /* Lifting a background. The mock hands the picture straight back, because
+   * there is nothing to flood-fill in a 2×2 placeholder — what it exercises is
+   * the page's own path: the button, the checkerboard, and the toggle back. */
+  async cutout(b) {
+    await sleep(400);
+    return { png_base64: b.png_base64, width: 512, height: 512, lifted: 0.71 };
+  },
+
+  /* The shape the daemon answers with: one co-resident image guest, or none.
+   * It used to offer three checkpoints with `loaded: false` on all of them,
+   * which is a picker over things that could not be picked — the daemon has
+   * never had a model *catalogue*, it has a guest that is configured or is not.
+   * `vram_gib` is null for the same reason it is on the live route: the guest
+   * claims span ground per drain, sized from the jobs in it. */
   async listImageModels() {
-    return { models: [
-      { id: 'sdxl-turbo', display: 'SDXL Turbo', vram_gib: 8, loaded: false, default: true },
-      { id: 'sd15', display: 'Stable Diffusion 1.5', vram_gib: 2.8, loaded: false },
-      { id: 'wuerstchen', display: 'Würstchen', vram_gib: 3.6, loaded: false }] };
+    return { models: [{
+      id: 'guest-image',
+      display: 'Z-Image-Turbo (co-resident)',
+      vram_gib: null,
+      loaded: true,
+      default: true,
+    }], resident_between_drains: false };
+  },
+  async generatePortrait(id) {
+    await sleep(1400);
+    return { ...(await this.getNpc(id)), portrait: { image_id: 'img_mock_generated.png', origin: 'generated', seed: 42 } };
   },
   async getImageQueue() { return { depth: 2, position: 1, state: 'waiting_for_vram', next_run_eta: null }; },
   imageUrl: () => null,

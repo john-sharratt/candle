@@ -1,4 +1,29 @@
 name: remote_fs_session_open
+questions:
+- open sftp://build@10.0.0.12:22/srv/releases
+- start an SFTP session to the artefact host with my ssh key
+- connect to the remote filesystem on that server over SFTP
+- open a remote-fs session rooted at /var/www
+- which credential does the SFTP connection need
+- can I browse the remote filesystem without a shell
+- does SFTP need the same key as the SSH login
+- what base path will the remote-fs session use
+- I need to move files to and from that server
+- inspecting the remote directory before deploying into it
+- the box has SFTP but I'd rather not open a full shell
+- setting up file transfer to the release host
+- open an SFTP session
+- connect the remote filesystem
+- start a remote-fs session
+- mount that host over SFTP
+- open an SFTP session to sftp://deploy@example.com/srv
+- connect to that host's filesystem over SFTP
+- I want to browse files on the remote server — open SFTP
+- start a remote filesystem session using my ssh key
+- mount the remote directory over sftp
+- open SFTP to the build host so I can transfer files
+- give me a remote-fs session on that server
+- connect over SFTP to move files around
 category: Remote filesystem
 description: 'Open a remote filesystem session via URI. Only sftp:// is supported (e.g. sftp://user@host:22/base/path). Requires an ssh_key or ssh_password credential. Operations: list_dir, stat, get (→ VFS), put (← VFS), delete, mkdir, rename. Use ssh_session_exec for arbitrary remote commands.'
 high_risk: true

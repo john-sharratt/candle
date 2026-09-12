@@ -892,3 +892,130 @@ test_device!(
     conv2d_grad_gpu,
     conv2_grad_metal
 );
+
+/// **A spatially constant input must convolve to a spatially constant output.**
+///
+/// Convolution is translation-equivariant, so away from the zero-padded border
+/// every output pixel of a constant image is the same number — the sum of the
+/// kernel times the constant, plus nothing else. Any variation in the interior
+/// is the convolution reading something that is not the input: a stride that
+/// wraps, an im2col buffer that is not fully written, or memory that was never
+/// initialised.
+///
+/// This is the shape of the failure that sent me here. Stable Diffusion's VAE
+/// decodes a *uniform* latent into a regular tiled grid, which no equivariant
+/// operator can do — so the property, not a reference value, is the thing worth
+/// asserting.
+fn conv2d_constant_input_stays_constant(dev: &Device) -> Result<()> {
+    for &(ci, co, h, w) in &[
+        (4usize, 32usize, 64usize, 64usize),
+        (128, 16, 128, 128),
+        (512, 8, 96, 96),
+    ] {
+        let x = (Tensor::ones((1, ci, h, w), candle_core::DType::F32, dev)? * 0.75)?;
+        let wt: Vec<f32> = (0..co * ci * 9)
+            .map(|i| ((i % 29) as f32 - 14.0) / 60.0)
+            .collect();
+        let wt = Tensor::from_vec(wt, (co, ci, 3, 3), dev)?;
+        let y = x.conv2d(&wt, 1, 1, 1, 1)?;
+
+        // The interior only: a padding of 1 makes the outermost ring legitimately
+        // different, and that ring is one pixel wide for a single 3x3.
+        let inner = y.narrow(2, 1, h - 2)?.narrow(3, 1, w - 2)?.contiguous()?;
+        for c in 0..co {
+            let ch = inner.i((0, c))?.flatten_all()?.to_vec1::<f32>()?;
+            let (lo, hi) = ch
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+            let spread = hi - lo;
+            assert!(
+                spread < 1e-3 * hi.abs().max(1.0),
+                "conv2d({ci}->{co}, {h}x{w}) channel {c} of a constant input spans {lo}..{hi} \
+                 — a translation-equivariant operator produced spatial structure from none"
+            );
+        }
+    }
+    Ok(())
+}
+
+test_device!(
+    conv2d_constant_input_stays_constant,
+    conv2d_constant_cpu,
+    conv2d_constant_gpu,
+    conv2d_constant_metal
+);
+
+/// **conv2d on a card must agree with the CPU at the widths a real model uses.**
+///
+/// Every conv2d test above is a toy — four channels, a 5×5 input, numbers pinned
+/// against a PyTorch transcript. Those shapes fit whatever the smallest path in
+/// the backend is, so they say nothing about the channel counts a vision model
+/// actually runs: Stable Diffusion's VAE convolves 512 channels at 96×96 and
+/// finishes with a 128→3 projection, and a diffusion pipeline whose output is
+/// flat grey is indistinguishable, from the outside, from one whose weights are
+/// wrong.
+///
+/// Compared against the CPU implementation rather than against a transcript,
+/// because the question here is agreement between two backends at shapes nobody
+/// wants to paste as literals.
+#[cfg(feature = "cuda")]
+#[test]
+fn conv2d_wide_channels_cuda_matches_cpu() -> Result<()> {
+    let cuda = Device::new_cuda(0)?;
+
+    // (in_ch, out_ch, h, w, kernel, padding) — the shapes SD's VAE decoder ends
+    // on, kept small enough spatially that the CPU reference is quick.
+    // The output channel count is kept small on the wide-spatial cases so the CPU
+    // reference stays quick: the variable under test there is the *spatial*
+    // extent, which is what an im2col buffer indexes, not the output width.
+    for &(ci, co, h, w, k, pad) in &[
+        (128usize, 3usize, 24usize, 24usize, 3usize, 1usize),
+        (512, 512, 12, 12, 3, 1),
+        (256, 128, 16, 16, 3, 1),
+        (4, 512, 12, 12, 3, 1),
+        (512, 4, 12, 12, 1, 0),
+        // The decoder's real resolutions. A 512-channel 96×96 im2col matrix is
+        // 4608 × 9216 — two orders of magnitude past anything above, and the
+        // first place an indexing expression that overflows or wraps would show.
+        (512, 8, 96, 96, 3, 1),
+        (256, 8, 192, 192, 3, 1),
+        (128, 8, 384, 384, 3, 1),
+        (128, 3, 768, 768, 3, 1),
+    ] {
+        // Deterministic, and varying along every axis: a filter that is constant
+        // across input channels hides a reduction that sums the wrong ones.
+        let xn = ci * h * w;
+        let x: Vec<f32> = (0..xn)
+            .map(|i| ((i % 71) as f32 - 35.0) / 23.0 + (i / 71 % 11) as f32 * 0.07)
+            .collect();
+        let wn = co * ci * k * k;
+        let wt: Vec<f32> = (0..wn).map(|i| ((i % 37) as f32 - 18.0) / 111.0).collect();
+
+        let run = |dev: &Device| -> Result<Vec<f32>> {
+            let x = Tensor::from_vec(x.clone(), (1, ci, h, w), dev)?;
+            let wt = Tensor::from_vec(wt.clone(), (co, ci, k, k), dev)?;
+            Ok(x.conv2d(&wt, pad, 1, 1, 1)?
+                .flatten_all()?
+                .to_vec1::<f32>()?)
+        };
+
+        let (a, b) = (run(&Device::Cpu)?, run(&cuda)?);
+        assert_eq!(a.len(), b.len());
+        // Relative to the magnitude of the result: these reduce over up to 512×9
+        // products, so an absolute tolerance would either reject good f32
+        // accumulation or accept a genuinely wrong sum.
+        let scale = a.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs() / scale)
+            .fold(0f32, f32::max);
+        assert!(
+            worst < 1e-4,
+            "conv2d({ci}->{co}, {h}x{w}, k={k}, pad={pad}) differs between CPU and CUDA by \
+             {worst} relative — a model built on this produces plausible-looking numbers that \
+             are not the convolution it asked for"
+        );
+    }
+    Ok(())
+}

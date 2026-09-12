@@ -1,4 +1,29 @@
 name: code_session_list
+questions:
+- enumerate the open javascript sandboxes with their ids
+- show me every live code interpreter session
+- list the scripting sessions in this conversation
+- what sandbox sessions can I still execute against
+- did my JS session survive, or do I need a new one
+- how many code sandboxes am I holding open
+- is there already a session I can reuse
+- which session id has the data I loaded
+- I lost track of which sandbox I was using
+- want to check I'm not leaking interpreter sessions
+- before opening another, see if one exists
+- tidying up and need to know what's still running
+- list code sessions
+- what sandboxes are open
+- any JS sessions alive
+- show session ids
+- which code sessions are open
+- list my javascript sandbox sessions
+- what code interpreter sessions do I have running
+- show me the open JS sessions and their ids
+- do I still have a code session alive
+- how many scripting sandboxes are currently running
+- give me the session ids for my code sessions
+- list the live javascript REPL sessions
 category: Code execution
 description: 'List open code execution sandbox SESSIONS for the current conversation. This does NOT list files or directories — it lists live interpreter/REPL sessions (use file_list for filesystem contents). Use for: checking which sandboxes are currently running, finding a session_id before issuing code_session_exec, seeing which languages are active, identifying stale sessions to clean up. Triggered by "what code sessions do I have", "list active sandboxes", "show running execution environments". Returns session_id, language, opened_at, last_activity, and alive flag for each session.'
 high_risk: true

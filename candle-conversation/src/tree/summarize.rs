@@ -250,6 +250,8 @@ impl SummarizationTask {
         let (event_tx, event_rx) = crossbeam::channel::unbounded();
         if scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
+                // One turn, and it is the slot's tail.
+                seal_group: None,
                 sequence_id: seq_id,
                 projection_inputs: None,
                 prefill_tokens,
@@ -270,6 +272,8 @@ impl SummarizationTask {
                 disable_reprojection: false,
                 // Summarization decodes free text only — no tool stencils.
                 triggers: Arc::new(TriggerRegistry::new()),
+                turn_grammar: None,
+                free_tool_calls_from_penalties: false,
             })
             .is_err()
         {

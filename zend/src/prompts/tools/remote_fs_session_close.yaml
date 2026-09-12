@@ -1,4 +1,29 @@
 name: remote_fs_session_close
+questions:
+- close remote-fs session 1 and tear down the SFTP transport
+- end the SFTP connection to the build host
+- shut the remote filesystem session on that server
+- disconnect the SFTP transport we opened for the deploy
+- can I close the SFTP session now
+- will closing the transport interrupt an upload in flight
+- is the file transfer finished on that remote-fs session
+- do I need to close SFTP before opening a shell to the same host
+- finished moving files to and from the server
+- the deploy is done, release the SFTP connection
+- done inspecting the remote directory
+- tidying up the remote filesystem sessions I opened
+- unmount that SFTP host
+- stop the remote-fs session on the artefact server
+- end the SFTP transport
+- drop the remote-fs connection
+- close the SFTP session
+- disconnect from the remote filesystem
+- I'm done transferring files, tear down the SFTP link
+- end the remote-fs session to that host
+- shut the SFTP transport down
+- close out the remote filesystem connection
+- drop the sftp session to the build server
+- terminate the SFTP connection
 category: Remote filesystem
 description: End a remote-filesystem session, tearing down the SFTP transport to the remote host.
 high_risk: true

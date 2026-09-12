@@ -1,4 +1,29 @@
 name: ssh_session_exec_async
+questions:
+- start "make -j16" on the SSH host in the background
+- launch the database dump over ssh without waiting
+- run the reindex asynchronously on the remote box and give me a pid
+- kick off the rsync over SSH and return straight away
+- can that remote command run without blocking me
+- will I get a process id back to poll later
+- how do I start a long ssh job and check on it afterwards
+- does the remote process survive if I do something else
+- the build takes forty minutes and I don't want to sit on it
+- starting the migration on the server while I prepare the next step
+- the backup is slow and I have other work to do
+- want it running remotely while we talk about something else
+- start it async over ssh
+- background that remote command
+- kick it off, don't wait
+- run it detached on the host
+- kick off the long build on the remote host without blocking
+- start this ssh command in the background and give me a process id
+- run the migration over SSH asynchronously
+- launch that job on the server and let it keep running
+- begin the backup over ssh, don't wait for it
+- start a long-running remote command and return immediately
+- fire off this script on the SSH host in the background
+- run this over ssh async so I can poll it later
 category: SSH sessions
 description: Start a long-running command on a remote SSH session without blocking. Returns process_id; use ssh_session_poll to check status and read output.
 high_risk: true

@@ -1,4 +1,29 @@
 name: udp_session_open
+questions:
+- open a UDP socket with default peer 10.0.0.9:514
+- bind a datagram socket for talking to the DNS server on 53
+- start a UDP endpoint for NTP on port 123
+- open a connectionless socket to the StatsD collector
+- do I want UDP or TCP for this protocol
+- does the UDP socket need a default peer set
+- what session id does the datagram socket get
+- can I send to several peers from one UDP socket
+- syslog is UDP so I need a datagram socket
+- testing whether the collector receives our metrics
+- probing a service that only speaks UDP
+- sending a DNS query by hand rather than resolving
+- open a UDP socket
+- bind a datagram socket
+- start a UDP session
+- new connectionless socket
+- open a UDP socket bound for datagrams to that host
+- I need a UDP session to talk to the DNS server on 53
+- bind a datagram socket with a default peer of 10.0.0.9:514
+- open UDP to send syslog packets
+- start a connectionless UDP socket
+- get me a UDP session for the NTP server
+- open a datagram socket, not a TCP stream
+- create a UDP endpoint for this protocol
 category: UDP sessions
 description: Open a UDP socket for datagrams. Optionally connect to a default peer. Returns session_id for subsequent sends/receives.
 high_risk: true

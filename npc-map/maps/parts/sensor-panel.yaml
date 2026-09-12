@@ -1,0 +1,12 @@
+id: sensor-panel
+kind: fixture
+name: sensor panel
+short: >
+  The sensor panel reaches places nobody is standing, if it is given a
+  coordinate to look at.
+long: >
+  A bank of returns from instruments strung around the tower and out across the
+  ground it holds. Looking through it is not the same act as looking around a
+  room: it reaches somewhere a body is not, and it wants a grid reference rather
+  than a direction. For a mind with no body it is the only way anything is ever
+  seen at all.

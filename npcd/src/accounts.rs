@@ -70,12 +70,22 @@ pub struct Accounts {
 impl Accounts {
     pub fn load(dir: impl AsRef<Path>) -> anyhow::Result<Self> {
         Ok(Self {
-            reg: Registry::load("account", dir)?,
+            // Written by this daemon, never by hand — so a save serialises the
+            // document whole instead of splicing to keep comments there are
+            // none of. See `registry::Written`: with the profile history in the
+            // file, splicing made every save quadratic in how much history the
+            // account had accumulated.
+            reg: Registry::load_generated("account", dir)?,
         })
     }
 
     pub fn len(&self) -> usize {
         self.reg.len()
+    }
+
+    /// Whether nobody has ever signed in. A fresh daemon, not a broken one.
+    pub fn is_empty(&self) -> bool {
+        self.reg.is_empty()
     }
 
     /// The record for a verified identity, created on first sight.
@@ -436,9 +446,14 @@ const AUTHORED_TEXT: [&str; 2] = ["description", "history"];
 /// Unbounded, an author who edits often eventually carries their entire writing
 /// history resident, forever, for a feature that reaches back a few steps.
 ///
-/// Generous on purpose: two hundred is far past any real use of *undo*, so the
-/// bound should never be the thing a person notices.
-const KEEP_REVISIONS: usize = 200;
+/// **Twenty, not two hundred.** The bound was set generously on the reasoning
+/// that it should never be the thing a person notices — but the cost is not
+/// linear in it. Every save rewrites the account, and the history is the largest
+/// thing in the file, so a deeper history makes *every* save more expensive
+/// rather than only the rare walk back through one. Twenty is still far past
+/// any real use of undo on a profile description, and it is the difference
+/// between a save that is instant and one that is not.
+const KEEP_REVISIONS: usize = 20;
 
 /// One line of a revision, for choosing between them.
 ///

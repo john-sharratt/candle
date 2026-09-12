@@ -565,6 +565,48 @@ enum Cmd {
         /// quadratic.
         #[arg(long, default_value_t = 0)]
         limit: usize,
+        /// Which region of each GALLERY exemplar to score against: `whole` (the
+        /// shipped whole-window scan) or `user` / `thinking` / `response`.
+        ///
+        /// Accepts a **comma-separated list** — `whole,user` runs both lenses,
+        /// normalizes each on its own hit-level band and takes the per-section
+        /// MAX, which is exactly what production's phase fusion does. That is
+        /// the number to read before changing the shipped lens set: a lens that
+        /// loses on its own can still win under fusion (it only has to beat the
+        /// other one somewhere), and a lens that wins on its own can still be
+        /// neutral under it.
+        #[arg(long, default_value = "whole")]
+        gallery_phase: String,
+        /// Which region of each PROBE to score with — same values.
+        ///
+        /// **Set this to `user` for any result meant to predict production.**
+        /// With `--probe-phase whole` a probe is a stored exemplar whose
+        /// `<tool_call>` JSON contains the tool's own name, so the scan matches
+        /// on the answer and the whole-window baseline reads far higher than it
+        /// can live: a live probe is a question, and the call has not been
+        /// emitted yet. `--probe-phase user` is the live shape, and pairing it
+        /// with each `--gallery-phase` is the controlled A/B behind the
+        /// production phase lens — leave-one-out, gate and normalizer are
+        /// otherwise identical.
+        ///
+        /// A turn with no span for the chosen phase is dropped (from the
+        /// gallery, or as a probe), and the run reports how many: a lens
+        /// measured over a third of the corpus is not a lens.
+        #[arg(long, default_value = "whole")]
+        probe_phase: String,
+        /// Probe only turns that HAVE this phase; the rest stay in the gallery
+        /// as distractors. `response` selects the full think→call trajectories
+        /// and excludes question-only exemplars, which carry no response span.
+        ///
+        /// This is what makes a grown corpus a controlled comparison. Seeding
+        /// the corpus with question-only exemplars changes the probe set as well
+        /// as the gallery, and a question-only probe matching question-only
+        /// gallery entries is an easier retrieval — so a headline number that
+        /// moved may only be reporting the easier mixture. Holding the probe set
+        /// to the turns that existed before and letting the gallery grow asks
+        /// the actual question: does the seeding help the probes we already had?
+        #[arg(long)]
+        probe_requires: Option<String>,
     },
     /// §80.3 production-faithful replay: unlike `belief-eval` (which scores ONE
     /// window per turn), this replays each turn's recorded reprojection sequence
@@ -795,6 +837,9 @@ fn run_belief(cmd: Cmd, substrate: &Substrate) -> Result<()> {
             probe_tokens,
             normalize,
             limit,
+            gallery_phase,
+            probe_phase,
+            probe_requires,
         } => belief_eval(
             substrate,
             &tag,
@@ -804,6 +849,9 @@ fn run_belief(cmd: Cmd, substrate: &Substrate) -> Result<()> {
             probe_tokens,
             normalize,
             limit,
+            &gallery_phase,
+            &probe_phase,
+            probe_requires.as_deref(),
         ),
         Cmd::BeliefReplay {
             tag,
@@ -1797,6 +1845,7 @@ fn selection_replay(
                 let (fused, _) = scan(probe, g);
                 cache.observe(
                     scope,
+                    slot as u64,
                     &[(ChildKey::named(g.names[slot].clone()), fused[slot])],
                 );
             }
@@ -1898,19 +1947,50 @@ fn belief_eval(
     probe_tokens: usize,
     normalize: bool,
     limit: usize,
+    gallery_phase: &str,
+    probe_phase: &str,
+    probe_requires: Option<&str>,
 ) -> Result<()> {
-    use candle_conversation::normalization::{ChildKey, NormConfig, NormalizationCache, ScopeKey};
+    use candle_conversation::normalization::{
+        ChildKey, NormConfig, NormalizationCache, Phase, ScopeKey,
+    };
     use candle_conversation::provenance::wide_sig::PROV_HEADS_PER_LAYER;
     use candle_conversation::provenance::{
         decode_wide_sigs, score_slots, score_slots_weighted, WideQSig,
     };
+    use candle_conversation::turn_layout::phase_span_of;
     use rayon::prelude::*;
+    use std::ops::Range;
 
     // Corpus: every tagged turn with a wide-Q window → (stream id, tool slot,
     // window). Candidates are sorted by stream id BEFORE `--limit` applies, so
     // a bounded sample is deterministic across runs (the stream map iterates in
     // hash order) and raw-vs-normalized pairs measure the same probes.
-    let mut tagged: Vec<(StreamId, &str, &Vec<u8>)> = substrate
+    // `None` = whole window (the shipped scan). The two lenses are independent:
+    // the probe side models what a live query looks like, the gallery side what
+    // the corpus is read over.
+    let parse_lens = |s: &str, what: &str| -> Result<Option<Phase>> {
+        Ok(match s {
+            "whole" => None,
+            "user" => Some(Phase::User),
+            "thinking" => Some(Phase::Thinking),
+            "response" => Some(Phase::Response),
+            other => anyhow::bail!("--{what} must be whole|user|thinking|response, got {other:?}"),
+        })
+    };
+    // One gallery lens per comma-separated name; their normalized scores are
+    // max-fused below, as production fuses its lenses.
+    let lenses: Vec<Option<Phase>> = gallery_phase
+        .split(',')
+        .map(|s| parse_lens(s.trim(), "gallery-phase"))
+        .collect::<Result<_>>()?;
+    let probe_lens = parse_lens(probe_phase, "probe-phase")?;
+    let require_lens = probe_requires
+        .map(|s| parse_lens(s, "probe-requires"))
+        .transpose()?
+        .flatten();
+
+    let mut tagged: Vec<(StreamId, &str, &Vec<u8>, &[TurnSegment])> = substrate
         .all_streams()
         .filter_map(|(sid, e)| {
             let Some(StreamDecl::Turn(t)) = &e.decl else {
@@ -1920,14 +2000,32 @@ fn belief_eval(
                 return None;
             }
             let name = t.tags.iter().find(|x| x.as_str() != tag)?;
-            Some((sid, name.as_str(), e.wide_q_sigs.as_ref()?))
+            Some((
+                sid,
+                name.as_str(),
+                e.wide_q_sigs.as_ref()?,
+                t.segments.as_slice(),
+            ))
         })
         .collect();
-    tagged.sort_by_key(|(sid, _, _)| sid.0);
+    tagged.sort_by_key(|(sid, _, _, _)| sid.0);
 
     let mut slot_names: Vec<String> = Vec::new();
-    let mut corpus: Vec<(StreamId, usize, Vec<WideQSig>)> = Vec::new();
-    for (sid, name, blob) in tagged {
+    // Per turn: the whole window, the range the GALLERY reads, and the range a
+    // PROBE reads. Under `whole` both are the full window, so the phase-narrowed
+    // path and the baseline are one code path with one slicing rule and cannot
+    // diverge.
+    #[allow(clippy::type_complexity)]
+    let mut corpus: Vec<(
+        StreamId,
+        usize,
+        Vec<WideQSig>,
+        Vec<Range<usize>>,
+        Range<usize>,
+    )> = Vec::new();
+    let mut eligible: Vec<bool> = Vec::new();
+    let mut no_span = 0usize;
+    for (sid, name, blob, segments) in tagged {
         if limit > 0 && corpus.len() >= limit {
             break;
         }
@@ -1937,6 +2035,25 @@ fn belief_eval(
         if window.is_empty() {
             continue;
         }
+        // Clamped to the signature: a distilled turn keeps its sig while its
+        // segments still describe the grid it was sealed against.
+        let span_for = |lens: Option<Phase>| -> Option<Range<usize>> {
+            match lens {
+                None => Some(0..window.len()),
+                Some(p) => {
+                    let r = phase_span_of(segments, p)?;
+                    let r = r.start.min(window.len())..r.end.min(window.len());
+                    (!r.is_empty()).then_some(r)
+                }
+            }
+        };
+        // Every lens must have a span, so all of them read the same turns and
+        // the fusion is not silently a different corpus per lens.
+        let gspans: Option<Vec<Range<usize>>> = lenses.iter().map(|l| span_for(*l)).collect();
+        let (Some(gspans), Some(pspan)) = (gspans, span_for(probe_lens)) else {
+            no_span += 1;
+            continue;
+        };
         let slot = slot_names
             .iter()
             .position(|n| n == name)
@@ -1944,7 +2061,34 @@ fn belief_eval(
                 slot_names.push(name.to_string());
                 slot_names.len() - 1
             });
-        corpus.push((sid, slot, window));
+        // Eligible as a PROBE (always a gallery member either way).
+        eligible.push(require_lens.is_none_or(|p| span_for(Some(p)).is_some()));
+        corpus.push((sid, slot, window, gspans, pspan));
+    }
+    if no_span > 0 {
+        println!(
+            "dropped {no_span} turn(s) missing a gallery-{gallery_phase} or probe-{probe_phase} \
+             span — absent from BOTH the gallery and the probe set, so this run measures a \
+             smaller corpus than the all-whole baseline"
+        );
+    }
+    {
+        let whole: usize = corpus.iter().map(|(_, _, w, _, _)| w.len()).sum();
+        let pc = |k: usize| 100.0 * k as f64 / whole.max(1) as f64;
+        let p: usize = corpus.iter().map(|(_, _, _, _, r)| r.len()).sum();
+        for (li, name) in gallery_phase.split(',').enumerate() {
+            let g: usize = corpus.iter().map(|(_, _, _, r, _)| r[li].len()).sum();
+            println!(
+                "gallery lens {}: {g} tokens ({:.1}% of the corpus)",
+                name.trim(),
+                pc(g)
+            );
+        }
+        println!(
+            "probe lens {probe_phase}: {p} tokens ({:.1}%), over {} turns",
+            pc(p),
+            corpus.len()
+        );
     }
 
     let n_slots = slot_names.len();
@@ -1962,18 +2106,32 @@ fn belief_eval(
     // (single-turn files under `--limit`), not the scorer. Such turns stay in
     // the corpus as gallery distractors; they are only excluded as PROBES.
     let mut slot_counts = vec![0usize; n_slots];
-    for (_, slot, _) in &corpus {
+    for (_, slot, _, _, _) in &corpus {
         slot_counts[*slot] += 1;
     }
     let probes: Vec<usize> = (0..corpus.len())
-        .filter(|i| slot_counts[corpus[*i].1] >= 2)
+        .filter(|i| slot_counts[corpus[*i].1] >= 2 && eligible[*i])
         .collect();
-    if probes.len() < corpus.len() {
+    // Report the two exclusion reasons separately: lumping them together
+    // attributed a `--probe-requires` hold-out to unanswerability, which reads
+    // as a corpus problem rather than the deliberate control it is.
+    let unanswerable = (0..corpus.len())
+        .filter(|i| slot_counts[corpus[*i].1] < 2 && eligible[*i])
+        .count();
+    if unanswerable > 0 {
         println!(
-            "skipping {}/{} probes whose slot has no other corpus window \
+            "skipping {unanswerable}/{} probes whose slot has no other corpus window \
              (unanswerable under leave-one-out; kept as gallery distractors)",
-            corpus.len() - probes.len(),
             corpus.len()
+        );
+    }
+    if let Some(p) = probe_requires {
+        println!(
+            "probe set held to the {} turn(s) carrying a {p:?} span; the other {} stay in \
+             the gallery as distractors — so gallery growth is measured against an \
+             UNCHANGED probe set",
+            probes.len(),
+            eligible.iter().filter(|e| !**e).count()
         );
     }
     if probes.is_empty() {
@@ -1982,7 +2140,7 @@ fn belief_eval(
     }
 
     // Fold geometry for the margin scorers.
-    let shape = &corpus[0].2[0];
+    let shape = &corpus[0].2[corpus[0].3[0].start];
     let gw = PROV_HEADS_PER_LAYER * shape.words_per_head();
     let n_groups = shape.n_heads as usize / PROV_HEADS_PER_LAYER;
     let groups: Vec<usize> = match scorer {
@@ -2006,58 +2164,69 @@ fn belief_eval(
     // gallery from all corpus windows except its own — the probe never matches
     // itself. Compute the raw per-slot scores for every probe FIRST, so the
     // (order-dependent) normalization learning pass and the ranking pass share
-    // one scan instead of recomputing it. `all_fresh[k]` belongs to corpus
-    // index `probes[k]`.
-    let all_fresh: Vec<Vec<f32>> = probes
-        .par_iter()
-        .map(|&pi| {
-            let (_, _, full) = &corpus[pi];
-            // Match the live reproject window when requested: the last N tokens.
-            let probe: &[WideQSig] = if probe_tokens > 0 && full.len() > probe_tokens {
-                &full[full.len() - probe_tokens..]
-            } else {
-                full.as_slice()
-            };
-            let mut gwin: Vec<&[WideQSig]> = Vec::with_capacity(corpus.len() - 1);
-            let mut gslot: Vec<usize> = Vec::with_capacity(corpus.len() - 1);
-            for (j, (_, s, w)) in corpus.iter().enumerate() {
-                if j != pi {
-                    gwin.push(w.as_slice());
-                    gslot.push(*s);
+    // one scan instead of recomputing it. Run once per gallery lens; the result
+    // row `k` belongs to corpus index `probes[k]`.
+    let scan_lens = |li: usize| -> Vec<Vec<f32>> {
+        probes
+            .par_iter()
+            .map(|&pi| {
+                let (_, _, window, _, pspan) = &corpus[pi];
+                let full = &window[pspan.clone()];
+                // Match the live reproject window when requested: the last N tokens
+                // OF THE LENS — truncating the whole turn would hand the phase lens
+                // a window that is mostly outside it.
+                let probe: &[WideQSig] = if probe_tokens > 0 && full.len() > probe_tokens {
+                    &full[full.len() - probe_tokens..]
+                } else {
+                    full
+                };
+                let mut gwin: Vec<&[WideQSig]> = Vec::with_capacity(corpus.len() - 1);
+                let mut gslot: Vec<usize> = Vec::with_capacity(corpus.len() - 1);
+                for (j, (_, s, w, gspans, _)) in corpus.iter().enumerate() {
+                    if j != pi {
+                        gwin.push(&w[gspans[li].clone()]);
+                        gslot.push(*s);
+                    }
                 }
-            }
-            match scorer {
-                "margin" | "margin-id" => {
-                    score_slots_margin(probe, &gwin, &gslot, n_slots, gw, &groups)
+                match scorer {
+                    "margin" | "margin-id" => {
+                        score_slots_margin(probe, &gwin, &gslot, n_slots, gw, &groups)
+                    }
+                    "hybrid" => score_slots_hybrid(probe, &gwin, &gslot, n_slots, gw, &groups),
+                    // Concept G content-gated fusion (design doc §9): per-group
+                    // scans; identity-group votes count only when the gate (content)
+                    // group agrees at all.
+                    "gated" => {
+                        let g0 =
+                            score_slots_weighted(probe, &gwin, &gslot, n_slots, &[1.0, 0.0, 0.0]);
+                        let g1 =
+                            score_slots_weighted(probe, &gwin, &gslot, n_slots, &[0.0, 1.0, 0.0]);
+                        let g2 =
+                            score_slots_weighted(probe, &gwin, &gslot, n_slots, &[0.0, 0.0, 1.0]);
+                        (0..n_slots)
+                            .map(|s| {
+                                if g0[s] > 0.0 {
+                                    g0[s] + g1[s] + g2[s]
+                                } else {
+                                    0.0
+                                }
+                            })
+                            .collect()
+                    }
+                    _ => score_slots(probe, &gwin, &gslot, n_slots),
                 }
-                "hybrid" => score_slots_hybrid(probe, &gwin, &gslot, n_slots, gw, &groups),
-                // Concept G content-gated fusion (design doc §9): per-group
-                // scans; identity-group votes count only when the gate (content)
-                // group agrees at all.
-                "gated" => {
-                    let g0 = score_slots_weighted(probe, &gwin, &gslot, n_slots, &[1.0, 0.0, 0.0]);
-                    let g1 = score_slots_weighted(probe, &gwin, &gslot, n_slots, &[0.0, 1.0, 0.0]);
-                    let g2 = score_slots_weighted(probe, &gwin, &gslot, n_slots, &[0.0, 0.0, 1.0]);
-                    (0..n_slots)
-                        .map(|s| {
-                            if g0[s] > 0.0 {
-                                g0[s] + g1[s] + g2[s]
-                            } else {
-                                0.0
-                            }
-                        })
-                        .collect()
-                }
-                _ => score_slots(probe, &gwin, &gslot, n_slots),
-            }
-        })
-        .collect();
+            })
+            .collect()
+    };
+    // `per_lens[li][k]` is lens `li`'s per-slot scores for corpus index
+    // `probes[k]`.
+    let per_lens: Vec<Vec<Vec<f32>>> = (0..lenses.len()).map(scan_lens).collect();
 
     // Rank one probe's per-slot scores into a Trial (shared by the raw and
     // normalized paths). `fresh[s]` is slot `s`'s score on whatever scale the
     // caller passes (raw or normalized 0–1000).
     let build_trial = |pi: usize, fresh: &[f32]| -> Trial {
-        let (sid, gt_slot, _) = &corpus[pi];
+        let (sid, gt_slot, _, _, _) = &corpus[pi];
         let gt_score = fresh[*gt_slot];
         let rank = 1 + fresh.iter().filter(|&&s| s > gt_score).count();
         let mut ranked: Vec<(usize, f32)> = fresh.iter().copied().enumerate().collect();
@@ -2094,35 +2263,51 @@ fn belief_eval(
         // scan, which is self-local so it only ever folds a file's own match. The
         // whole gallery is one stable scope offline, keyed by file name. Sequential
         // by necessity — the EWMA is order-dependent — but n is small and the O(n²)
-        // scan already ran in `all_fresh`. Cold-start: the first turns of each file
+        // scan already ran in `per_lens`. Cold-start: the first turns of each file
         // normalize against the prior until their level accrues (as in production
         // before a scope warms).
-        let scope = ScopeKey::collection(0, tag);
+        //
+        // One scope PER GALLERY LENS: a hit level is a denominator, and a lens
+        // reading 6% of each exemplar does not put its scores on the same scale
+        // as one reading all of it. Sharing a scope would make the fusion a
+        // comparison of scales rather than of evidence. The lenses are then
+        // max-fused on the common 0–1000 band, as production fuses them.
+        let scopes: Vec<ScopeKey> = gallery_phase
+            .split(',')
+            .map(|p| ScopeKey::collection(0, format!("{tag}/{}", p.trim())))
+            .collect();
         let mut cache = NormalizationCache::new(NormConfig::default());
         let mut out = Vec::with_capacity(probes.len());
         for (k, &pi) in probes.iter().enumerate() {
-            let raw: Vec<(ChildKey, f32)> = (0..n_slots)
-                .map(|s| (ChildKey::named(slot_names[s].clone()), all_fresh[k][s]))
-                .collect();
-            // `normalize` preserves input order ⇒ index `s` is still slot `s`.
-            let normed: Vec<f32> = cache
-                .normalize(&scope, &raw)
-                .into_iter()
-                .map(|(_, v)| v)
-                .collect();
-            out.push(build_trial(pi, &normed));
+            let mut fused = vec![f32::MIN; n_slots];
+            for (li, scope) in scopes.iter().enumerate() {
+                let raw: Vec<(ChildKey, f32)> = (0..n_slots)
+                    .map(|s| (ChildKey::named(slot_names[s].clone()), per_lens[li][k][s]))
+                    .collect();
+                // `normalize` preserves input order ⇒ index `s` is still slot `s`.
+                for (s, (_, v)) in cache.normalize(scope, &raw).into_iter().enumerate() {
+                    fused[s] = fused[s].max(v);
+                }
+            }
+            out.push(build_trial(pi, &fused));
             let gt = corpus[pi].1;
-            cache.observe(
-                &scope,
-                &[(ChildKey::named(slot_names[gt].clone()), all_fresh[k][gt])],
-            );
+            for (li, scope) in scopes.iter().enumerate() {
+                cache.observe(
+                    scope,
+                    pi as u64,
+                    &[(ChildKey::named(slot_names[gt].clone()), per_lens[li][k][gt])],
+                );
+            }
         }
         out
     } else {
+        // Raw (un-normalized) scores from different lenses are on different
+        // scales, so fusing them would be meaningless arithmetic; the raw lower
+        // bound reads the FIRST lens only.
         probes
             .par_iter()
             .enumerate()
-            .map(|(k, &pi)| build_trial(pi, &all_fresh[k]))
+            .map(|(k, &pi)| build_trial(pi, &per_lens[0][k]))
             .collect()
     };
 
@@ -2159,10 +2344,29 @@ fn belief_eval(
         },
         if normalize { "0–1000 band" } else { "raw" },
     );
-    println!("corpus:  {n} tagged turns over {n_slots} tools   (tag scope {tag:?})",);
+    // `n` is the number of PROBES, which is not the corpus size once probes are
+    // filtered (`--probe-requires`, or a slot with no second window). Printing
+    // it as the corpus made a grown-gallery run's header identical to the
+    // smaller run it was being compared against — the two experiments read as
+    // the same one, which is exactly the confusion the flag exists to avoid.
+    println!(
+        "corpus:  {} tagged turns over {n_slots} tools   (tag scope {tag:?})",
+        corpus.len()
+    );
+    println!(
+        "probes:  {n} of them{}",
+        if n == corpus.len() {
+            String::new()
+        } else {
+            format!(
+                " ({} held out as gallery-only distractors)",
+                corpus.len() - n
+            )
+        }
+    );
     println!(
         "gallery: leave-one-out — each probe scored against the other {} turns\n",
-        n - 1
+        corpus.len() - 1
     );
 
     println!("Ranking accuracy (belief argmax, policy-independent):");
@@ -2994,7 +3198,7 @@ fn belief_sweep(
         let scope = ScopeKey::collection(0, tag);
         let mut cache = NormalizationCache::new(NormConfig::default());
         let mut out = Vec::with_capacity(matrix.len());
-        for (gt, fresh) in &matrix {
+        for (row, (gt, fresh)) in matrix.iter().enumerate() {
             let raw: Vec<(ChildKey, f32)> = (0..n_slots)
                 .map(|s| (ChildKey::named(slot_names[s].clone()), fresh[s]))
                 .collect();
@@ -3005,6 +3209,7 @@ fn belief_sweep(
                 .collect();
             cache.observe(
                 &scope,
+                row as u64,
                 &[(ChildKey::named(slot_names[*gt].clone()), fresh[*gt])],
             );
             out.push((*gt, normed));

@@ -1,3 +1,8 @@
+// `chunks_exact_to_as_chunks` — a style lint that became default in a recent
+// clippy and fires on correct, unchanged code that unpacks weight and gallery
+// buffers in fixed strides. See the note in `candle-core/src/lib.rs`.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 //! Model implementations for the unbounded-context inference engine.
 //!
 //! This is the model layer of the fork: a large zoo of upstream architecture
@@ -23,6 +28,9 @@
 //! call into `models::` for weight loading (`VarBuilder`) and forward passes,
 //! and into `generation`/`pipelines` for turning logits into tokens.
 pub mod generation;
+/// The gitignored `models.override.yaml` that lets a machine run checkpoints
+/// the repository does not name.
+pub mod model_overrides;
 pub mod models;
 pub mod object_detection;
 pub mod pipelines;

@@ -967,7 +967,6 @@ pub struct NpcPayload {
     /// Omitted from default listings (§8.3). Never counted in a total — the
     /// count is what gives a hidden character away.
     pub hidden: bool,
-    pub environment_enabled: bool,
     /// Idle metabolism in milliseconds, and the salience level below which an
     /// event does not wake the character. Authored configuration, not a
     /// measurement — the *live* tick figures are excluded, see above.
@@ -981,6 +980,162 @@ pub struct NpcPayload {
     pub portrait_image_id: Option<String>,
     /// `uploaded` | `generated`; absent with the image.
     pub portrait_origin: Option<String>,
+
+    /// Where this character was last standing, as `area/node`.
+    ///
+    /// **The one piece of world state on this record, and it earns its place by
+    /// the rule stated above**: it is not something a running engine can derive.
+    /// The world — who is standing where, what has just happened — is held in
+    /// RAM by the daemon and has no persistence of its own, so on a restart
+    /// every character re-entered its world at the arrival door regardless of
+    /// where it had walked to. Two Makers who had spent an hour finding each
+    /// other were returned to the front room as strangers, while their
+    /// conversation history said otherwise.
+    ///
+    /// Position only. A journey in flight is *not* here: `Actor::at` is by
+    /// definition the last place actually reached, so nothing is lost by
+    /// dropping the rest of the route, and a character re-forms the intention
+    /// anyway. What a character is holding is not here either — nothing claims a
+    /// station yet, and a field for it would be a guess at a shape.
+    ///
+    /// `None` for a character that has never been embodied, or whose world has
+    /// no map. Written by the tick driver on a bounded cadence rather than per
+    /// move — see `npcd`'s `Npcs::remember_place`, which explains why a record
+    /// per doorway would be the wrong trade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+
+    /// The register this character last said it was in, by mood id.
+    ///
+    /// **The second piece of lived state here, and it earns its place the same
+    /// way `at` does**: a running engine cannot derive it. A mood is what a
+    /// character *is* between one thought and the next, and holding it only in
+    /// RAM meant a restart returned everybody to no register at all — so a
+    /// character that had spent the afternoon getting angrier came back with no
+    /// sign of it, while its conversation history said otherwise.
+    ///
+    /// Written when a character names one for itself and it has changed. Not an
+    /// authoring act: it bumps no revision and moves no `updated_ms`, for the
+    /// reason `at` does not — those describe what somebody *edited*, and a
+    /// roster that sorted by "recently edited" would report whoever was feeling
+    /// something.
+    ///
+    /// `None` for a character that has never said. Absent rather than a
+    /// default register, because "nobody has asked it yet" and "it is calm" are
+    /// different facts and only one of them is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mood: Option<String>,
+
+    /* ── the authoring plane (§16) ──────────────────────────────────────────
+     *
+     * What an operator says a character believes, who they know, what they are
+     * trying to do, and the dials their affect starts at. Every write here is
+     * an authoring act — `origin: "authored"` — as distinct from what the
+     * evidence process later earns.
+     *
+     * Carried on the character's own record rather than in record types of
+     * their own, for three reasons. It is operator-scale: tens of entries, not
+     * the thousands an engine would accumulate. It supersedes with the
+     * character it belongs to, which is the lifetime it actually has. And the
+     * write path is the one already here, already tested, already handled by
+     * compaction — where a new header-keyed type would need all three again.
+     *
+     * The engine's own belief traffic is a different problem with a different
+     * volume, and will want its own records. This is not that; this is what
+     * somebody types when they build a world. */
+    /* The five authoring-plane layers below carry `#[serde(default)]`, and that
+     * is a statement about meaning rather than a compatibility shim.
+     *
+     * A character nobody has written beliefs for **holds none** — which is
+     * exactly what `Npcs::create` writes, an empty vector — so an absent field
+     * and an empty one denote the same character. Without the default, a record
+     * written before these layers existed fails to decode and the walker skips
+     * it, which is how a substrate holding thirteen characters reported a cast
+     * of zero: not a corrupt log, a record whose reader had learned five new
+     * required questions and refused anything that could not answer them.
+     *
+     * The distinction worth keeping is between "absent" and "measured zero",
+     * and it does not apply here: these are authored content, and unwritten
+     * authored content is empty. Where a *measurement* is missing the engine
+     * still reports `null` rather than defaulting it — see `crate::engine`. */
+    /// Beliefs an operator wrote. Never written by the action plane — a tool
+    /// declaring `beliefs` in `writes_layers` is refused at registration.
+    #[serde(default)]
+    pub beliefs: Vec<AuthoredBelief>,
+    /// Who this character knows, and how they hold them.
+    #[serde(default)]
+    pub relationships: Vec<AuthoredRelationship>,
+    /// What they are trying to do, as a tree.
+    #[serde(default)]
+    pub agency: Vec<AuthoredStrategy>,
+    /// The affect dials an operator set.
+    #[serde(default)]
+    pub modulation: Modulation,
+}
+
+/// One authored belief.
+///
+/// Only what an operator states. `disconfirmation`, whether it is under
+/// pressure, and its confidence history are all measurements the evidence
+/// process makes, so they are not stored here and are absent on the wire until
+/// something has measured them — the same rule the live tick fields follow.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthoredBelief {
+    pub belief_id: String,
+    pub statement: String,
+    /// How strongly it is held, 0..1.
+    pub confidence: f32,
+    /// How much contrary evidence it takes to break it, 0..1.
+    pub threshold: f32,
+}
+
+/// One authored relationship.
+///
+/// A relationship is a calibration trajectory and is meant to move easily —
+/// §16 notes it carries none of the write-protection beliefs do, on either
+/// plane.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthoredRelationship {
+    pub entity_id: String,
+    /// What this character calls them.
+    pub display: String,
+    pub trust: f32,
+    pub affect: f32,
+    pub familiarity: f32,
+    pub notes: String,
+}
+
+/// One authored strategy, in a tree by `parent_id`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthoredStrategy {
+    pub strategy_id: String,
+    pub statement: String,
+    /// `None` for a root strategy.
+    pub parent_id: Option<String>,
+    /// `active` | `finished` | `abandoned`.
+    pub state: String,
+}
+
+/// The affect dials, as set. Each is −1..1 except `threat` and `curiosity`,
+/// which are 0..1 — bounds the daemon checks, not this record.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Modulation {
+    pub affect: f32,
+    pub threat: f32,
+    pub curiosity: f32,
+}
+
+impl Default for Modulation {
+    /// Neutral. A character nobody has tuned is not sad, not threatened, and
+    /// mildly curious — which is what an author who has not touched the dials
+    /// means, and is a real position rather than an absence.
+    fn default() -> Self {
+        Self {
+            affect: 0.0,
+            threat: 0.0,
+            curiosity: 0.5,
+        }
+    }
 }
 
 impl NpcPayload {
@@ -1825,7 +1980,6 @@ mod tests {
             world_id: "battle-cities".to_string(),
             personality_id: "commander".to_string(),
             hidden: false,
-            environment_enabled: true,
             heartbeat_ms: 30_000,
             salience_gate: 0.5,
             tags: vec!["campaign-2".to_string(), "north".to_string()],
@@ -1833,6 +1987,37 @@ mod tests {
             persona_origin: "generated".to_string(),
             portrait_image_id: Some("img_4471".to_string()),
             portrait_origin: Some("uploaded".to_string()),
+            // Absent, deliberately: this fixture backs the byte-pinned encoding
+            // test, and a character that has never been embodied is what those
+            // bytes were pinned against. `where_a_character_stood_round_trips`
+            // covers the field being present.
+            at: None,
+            mood: None,
+            beliefs: vec![AuthoredBelief {
+                belief_id: "hess_word".to_string(),
+                statement: "Hess keeps his word.".to_string(),
+                confidence: 0.72,
+                threshold: 0.6,
+            }],
+            relationships: vec![AuthoredRelationship {
+                entity_id: "p_17".to_string(),
+                display: "Ilse".to_string(),
+                trust: 0.4,
+                affect: 0.1,
+                familiarity: 0.8,
+                notes: "Met at the crossing.".to_string(),
+            }],
+            agency: vec![AuthoredStrategy {
+                strategy_id: "hold_ridge".to_string(),
+                statement: "Hold the eastern ridge.".to_string(),
+                parent_id: None,
+                state: "active".to_string(),
+            }],
+            modulation: Modulation {
+                affect: -0.2,
+                threat: 0.66,
+                curiosity: 0.3,
+            },
         }
     }
 
@@ -1841,6 +2026,60 @@ mod tests {
     /// record already on disk undecodable — asserting the encoding against
     /// itself cannot catch that, and this is the format's compatibility
     /// boundary.
+    /// **A record written before the authoring layers existed still decodes.**
+    ///
+    /// This is what a real substrate holds. Without the defaults, the walker
+    /// skips every one of them and a store of thirteen characters reports a cast
+    /// of zero — with a warning per record that reads as log corruption rather
+    /// than as a reader that has learned new required questions.
+    ///
+    /// A character nobody wrote beliefs for holds none, so an absent field and
+    /// an empty one denote the same character.
+    #[test]
+    fn a_record_without_the_authoring_layers_decodes_as_an_unwritten_one() {
+        let full = npc_fixture();
+        let mut v = serde_json::to_value(&full).expect("encodes");
+        let obj = v.as_object_mut().expect("an object");
+        for layer in ["beliefs", "relationships", "agency", "modulation"] {
+            assert!(obj.remove(layer).is_some(), "{layer} was not in the record");
+        }
+
+        let back: NpcPayload = serde_json::from_value(v).expect("an older record still decodes");
+        assert!(back.beliefs.is_empty());
+        assert!(back.relationships.is_empty());
+        assert!(back.agency.is_empty());
+        // And the fields that were always there are untouched.
+        assert_eq!(back.npc_id, full.npc_id);
+        assert_eq!(back.name, full.name);
+        assert_eq!(back.world_id, full.world_id);
+    }
+
+    /// **Where a character stood round-trips, and its absence is not a place.**
+    ///
+    /// The world holds no persistence of its own — who is standing where lives
+    /// in the daemon's RAM and goes with the process — so this field is the only
+    /// thing a restart has to rebuild the world from. A record written before it
+    /// existed decodes as a character that has never been embodied, which is the
+    /// truth about it: it arrives at the way in, exactly as it did before.
+    #[test]
+    fn where_a_character_stood_round_trips() {
+        let mut placed = npc_fixture();
+        placed.at = Some("vault-casting/green-room".to_string());
+        let back = NpcPayload::decode(&placed.encode()).unwrap();
+        assert_eq!(back.at.as_deref(), Some("vault-casting/green-room"));
+        assert_eq!(back, placed);
+
+        // A record from before the field existed.
+        let mut v = serde_json::to_value(npc_fixture()).unwrap();
+        assert!(
+            v.as_object_mut().unwrap().remove("at").is_none(),
+            "an unplaced character must not write the key at all — it is a \
+             per-move field on a record every compaction carries forward"
+        );
+        let older: NpcPayload = serde_json::from_value(v).unwrap();
+        assert_eq!(older.at, None);
+    }
+
     #[test]
     fn npc_payload_encodes_exact_bytes() {
         let bytes = npc_fixture().encode();
@@ -1849,11 +2088,18 @@ mod tests {
             r#""created_ms":1740200000000,"updated_ms":1740300112340,"#,
             r#""state":"active","name":"Varek","world_id":"battle-cities","#,
             r#""personality_id":"commander","#,
-            r#""hidden":false,"environment_enabled":true,"heartbeat_ms":30000,"#,
+            r#""hidden":false,"heartbeat_ms":30000,"#,
             r#""salience_gate":0.5,"tags":["campaign-2","north"],"#,
             r#""persona_description":"Fifty-three, a former staff sergeant.","#,
             r#""persona_origin":"generated","portrait_image_id":"img_4471","#,
-            r#""portrait_origin":"uploaded"}"#,
+            r#""portrait_origin":"uploaded","#,
+            r#""beliefs":[{"belief_id":"hess_word","statement":"Hess keeps his word.","#,
+            r#""confidence":0.72,"threshold":0.6}],"#,
+            r#""relationships":[{"entity_id":"p_17","display":"Ilse","trust":0.4,"#,
+            r#""affect":0.1,"familiarity":0.8,"notes":"Met at the crossing."}],"#,
+            r#""agency":[{"strategy_id":"hold_ridge","statement":"Hold the eastern ridge.","#,
+            r#""parent_id":null,"state":"active"}],"#,
+            r#""modulation":{"affect":-0.2,"threat":0.66,"curiosity":0.3}}"#,
         );
         assert_eq!(
             std::str::from_utf8(&bytes).unwrap(),

@@ -1,4 +1,29 @@
 name: code_session_close
+questions:
+- close the JS sandbox and throw away its variables
+- terminate the code interpreter session by id
+- shut down the scripting session we opened earlier
+- drop the javascript session and its accumulated state
+- do I still need that sandbox open
+- can we start clean rather than untangling this session
+- is it safe to close the code session now
+- would closing it free the slot for another
+- the session state is corrupted, easier to start over
+- finished with the analysis, no need to keep it alive
+- I want a fresh interpreter with nothing defined
+- tidying up the sandboxes I left running
+- close the JS session
+- kill the sandbox
+- end the code session
+- drop that interpreter
+- close the javascript session
+- shut down the code sandbox, I'm done with it
+- end my JS session and drop its state
+- discard the code session please
+- clean up the scripting session
+- the code session is in a bad state, close it
+- terminate the javascript interpreter session
+- free up the code session slot
 category: Code execution
 description: Close a JavaScript code session, discarding its accumulated state. Use when finished with a coding workflow, when the session state has become corrupted and needs a fresh start, or when freeing up session slots. Triggered by "close the code session", "end the sandbox", "reset the interpreter". Idempotent — closing an already-closed session returns success.
 high_risk: true

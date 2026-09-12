@@ -1,4 +1,29 @@
 name: sql_session_close
+questions:
+- close SQL session 1 and release the sqlite handle
+- end the database connection to app.db
+- shut the db session down now the queries are done
+- release the SQLite connection for that session id
+- can I close the database session safely
+- will closing the db session roll anything back
+- does the sqlite file stay locked if I leave the session open
+- do I need to close this before another process opens the db
+- finished with the reporting queries
+- another tool needs exclusive access to that database file
+- done inspecting the schema, release it
+- tidying up the database connections I opened
+- disconnect from the sqlite db
+- let go of the database file so another process can open it
+- release the sqlite connection
+- end the SQL database session
+- close the database session
+- disconnect from the SQLite database
+- release the DB connection, I'm done querying
+- end the SQL session on app.db
+- shut the database handle down
+- close out my database connection
+- terminate the sqlite session
+- free the SQL connection for that database
 category: SQL sessions
 description: End a database session, releasing its SQLite connection handle.
 high_risk: true

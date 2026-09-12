@@ -1,4 +1,29 @@
 name: http_session_list
+questions:
+- enumerate the HTTP sessions with their base URLs and credentials
+- show every open API session id in this conversation
+- list the web sessions and when they were last used
+- which HTTP session points at the staging API
+- do I already have an API session for that host
+- is the HTTP session I opened earlier still alive
+- which credential is each HTTP session using
+- how many API sessions am I holding open
+- I lost the session id and need it for the next call
+- checking I'm not opening a second session to the same API
+- want to know which environment the open session targets
+- tidying up before I switch to production credentials
+- list HTTP sessions
+- what API sessions are open
+- show web session ids
+- any HTTP sessions alive
+- list my open HTTP sessions
+- which APIs am I currently connected to
+- what HTTP session ids do I have
+- show the API sessions and their base URLs
+- do I already have a session open for that service
+- which web sessions are still active
+- give me the http session for api.example.com
+- what API connections exist right now
 category: HTTP sessions
 description: List active HTTP sessions for the current conversation — session_id, base_url, credential name, opened_at, last_activity. Use to find session_ids by base URL or to see which APIs are currently configured. Triggered by "list HTTP sessions", "what API connections are open", "show my API sessions".
 high_risk: true

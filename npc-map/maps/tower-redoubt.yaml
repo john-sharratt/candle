@@ -1,0 +1,99 @@
+# The Redoubt — a tower, and the one Companions of this world muster from.
+#
+# A building in Battle Cities beside the Creator's Vault. The vault is where the
+# world is written; this is where it is lived in.
+id: tower-redoubt
+kind: building
+name: The Redoubt
+within: battle-cities
+arrival: tower-redoubt/muster-hall
+summary: >
+  A walking fortress with a drill under it and a foundry in it. Companions are
+  outfitted here, sent out from here, and recalled back to here.
+character: >
+  Every part of it is either making something, defending something or about to
+  move, and the parts that are quiet are the ones nobody has needed yet.
+lacks:
+  - anywhere to write the record down
+# Where a recall lands. The one journey out of the waste that is not walked.
+teleport_to: tower-redoubt/muster-hall
+spine:
+  name: the spinal run
+  through: [spine-lower, spine-upper]
+nodes:
+  - { id: spine-lower, kind: passage, name: the lower run }
+  - { id: spine-upper, kind: passage, name: the upper run }
+
+  - id: core
+    kind: core
+    name: the lift
+    off: [spine-lower]
+    character: >
+      One car serving every deck, which is why the muster hall empties slowly
+      and fills all at once.
+
+  - id: muster-hall
+    kind: work
+    name: the muster hall
+    off: [spine-lower]
+    parts: [muster-board, { part: seat, count: 12 }]
+    habit: busy before a sortie and empty during one
+    character: >
+      Where orders are given and where a body comes back to. Everything that
+      goes out of the tower is standing in here first.
+
+  - id: gatehouse
+    kind: work
+    name: the gatehouse
+    off: [spine-lower]
+    parts: [blast-door]
+    character: >
+      The only way in and out on foot, and one slab of plate deciding whether
+      there is a way at all.
+
+  - id: rampart
+    kind: work
+    name: the rampart
+    off: [spine-upper]
+    parts: [{ part: wall-turret, count: 4 }]
+    habit: manned whenever anything is moving on the ground
+    character: >
+      Four emplacements looking out over open ground. Nobody aims them; what a
+      body does up here is decide what they are allowed to do without being
+      asked.
+
+  - id: foundry
+    kind: work
+    name: the foundry
+    off: [spine-lower]
+    parts: [{ part: fabricator, count: 8 }]
+    habit: never idle for long
+    character: >
+      Eight bays and eight queues, and the stockpile is what decides which of
+      them can run.
+
+  - id: bridge
+    kind: work
+    name: the bridge
+    off: [spine-upper]
+    parts: [bridge-console, sensor-panel, { part: seat, count: 4 }]
+    character: >
+      Where the tower is spoken to as one thing. What it will do from here
+      depends entirely on what it can currently afford to do.
+
+  - id: motor-pool
+    kind: store
+    name: the motor pool
+    off: [spine-lower]
+    parts: [carrier]
+    habit: quiet
+
+  - id: barracks
+    kind: social
+    name: the barracks
+    off: [spine-upper]
+    parts: [{ part: seat, count: 16 }]
+    habit: full at night
+    character: >
+      The one room in the tower with nothing in it that does a job, which is
+      why more is said here than anywhere else.

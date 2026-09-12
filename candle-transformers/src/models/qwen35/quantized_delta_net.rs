@@ -15,12 +15,14 @@
 
 use candle::Result;
 #[cfg(feature = "cuda")]
-use candle::{DType, Device};
+use candle::{quantized::Int8Mode, DType, Device};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{begin_wave, LayerPhase};
 
 #[cfg(feature = "cuda")]
 use super::quantized_weights::{QuantFfn, QuantLayer};
+#[cfg(feature = "cuda")]
+use crate::models::lora::LayerLora;
 #[cfg(feature = "cuda")]
 use crate::models::operand_guard::expect_dtype;
 #[cfg(feature = "cuda")]
@@ -32,12 +34,18 @@ use crate::models::wave_buffers::wave_root;
 
 /// `orig_dtype` is the dtype the residual stream must come back in, captured
 /// by the caller before the mixing half ran.
+///
+/// `lora` carries this layer's adapter pairs. Only the three FFN roles are read
+/// here — a DeltaNet layer has no q/k/v/o to adapt, and the adapter this engine
+/// loads reflects that: its attention pairs exist on the eight attention layers
+/// and nowhere else, while its FFN pairs cover all thirty-two.
 #[cfg(feature = "cuda")]
 pub fn quantized_delta_net_ffn(
     layer: &QuantLayer,
     x: &mut TensorCat,
     act_dtype: DType,
     orig_dtype: DType,
+    lora: LayerLora<'_>,
 ) -> Result<()> {
     // MLP intermediates can exceed F16's range, so accumulate in BF16 there.
     let mlp_dtype = if act_dtype == DType::F16 {
@@ -57,7 +65,14 @@ pub fn quantized_delta_net_ffn(
     // per wave (18 of them on the 0.8B) undoing a widening only the SwiGLU
     // intermediates needed. The MoE combine still writes its working width.
     let h = {
-        let mode = layer.ffn_int8mode();
+        // An adapted FFN norms to float, for the reason `Qwen35AttentionLayer`'s
+        // `int8mode` states in full: the fused RMSNorm→quantize kernel emits
+        // q8a128 and the adapter's `A` matmul needs the float that went into it.
+        let mode = if lora.is_empty() {
+            layer.ffn_int8mode()
+        } else {
+            Int8Mode::Off
+        };
         // The FFN's input, before the norm quantizes it. Everything downstream
         // in this block is bounded by whether this was already bad.
         x.as_cat_tensor().assert("ffn.in");
@@ -67,7 +82,7 @@ pub fn quantized_delta_net_ffn(
             wave_root(ffn_wave.as_ref()),
         )?;
         match &layer.ffn {
-            QuantFfn::Dense(m) => m.forward_dynamic(&acts, mlp_dtype, orig_dtype)?,
+            QuantFfn::Dense(m) => m.forward_dynamic_adapted(&acts, mlp_dtype, orig_dtype, lora)?,
             QuantFfn::Moe(m) => {
                 let mut out = m.forward_dynamic(acts, mlp_dtype, ffn_wave.as_ref())?;
                 // Straddles the narrowing. The FFN computes its intermediates

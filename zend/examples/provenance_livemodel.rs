@@ -155,7 +155,7 @@ fn main() -> anyhow::Result<()> {
         let raw = score(&probe);
         let pairs: Vec<(ChildKey, f32)> =
             (0..n).map(|ci| (child_keys[ci].clone(), raw[ci])).collect();
-        cache.observe(&scope, &pairs);
+        cache.observe(&scope, *sid, &pairs);
     }
 
     println!(

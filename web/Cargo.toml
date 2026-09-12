@@ -32,6 +32,10 @@ hyper-util     = { version = "0.1", features = ["client", "client-legacy", "http
 http-body-util = "0.1"
 include_dir    = { version = "0.7" }
 mime_guess     = { version = "2" }
+# Static files go out gzipped. Not a compression *layer*: the API is proxied
+# through this server and one of its routes is an SSE stream, which a layer
+# would buffer. See `asset.rs`.
+flate2         = "1"
 
 # Long-form content. Papers and posts are markdown files rendered on the way
 # out — `latex2mathml` emits MathML, which every current browser lays out

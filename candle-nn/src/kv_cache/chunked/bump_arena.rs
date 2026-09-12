@@ -47,6 +47,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{current, ThreadId};
 
@@ -204,6 +205,45 @@ impl BumpArena {
         })
     }
 
+    /// An arena over a range the caller already owns.
+    ///
+    /// The third way a domain gets its backing, and the only one that does not
+    /// come from the transient tier. [`BumpArena::new`] carves the persistence
+    /// block; [`BumpArena::detached`] is placed into the wave tier per forward.
+    /// A co-resident guest is neither: its drain runs *between* waves with the
+    /// tier already handed back, so there is no tier to place into. What it does
+    /// hold is its own claimed ground — span regions the drain took from the KV
+    /// side and keeps until it ends — and that is what this borrows.
+    ///
+    /// The range therefore outlives every generation opened on it and dies with
+    /// the guest's ground, which is why nothing here carves or releases: the
+    /// caller's `GuestGround` owns the memory and this only hands out cursors
+    /// inside it.
+    pub(crate) fn over(
+        stream: &Arc<CudaStream>,
+        name: &'static str,
+        base: u64,
+        capacity: usize,
+        reclaim: Reclaim,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner {
+                base,
+                capacity,
+                cursor: 0,
+                live: 0,
+                dirty: false,
+                peak: 0,
+                reported_peak: HashMap::new(),
+                census: Vec::new(),
+                epoch: 0,
+                stream: stream.clone(),
+                reclaim,
+            })),
+            name,
+        }
+    }
+
     /// Open a generation reserving `planned_span` bytes at the base of the span
     /// for layout slots.
     ///
@@ -216,6 +256,7 @@ impl BumpArena {
         if inner.cursor > inner.peak {
             inner.peak = inner.cursor;
         }
+        let entry_cursor = inner.cursor;
         inner.live += 1;
         drop(inner);
         Ok(Generation {
@@ -223,6 +264,7 @@ impl BumpArena {
             name: self.name,
             domain,
             arena,
+            entry_cursor,
         })
     }
 
@@ -433,7 +475,17 @@ fn bump<'a>(
 /// the `'w` already on the operand instead. Returning `None` on exhaustion
 /// rather than erroring, for the reason given on [`resolve_wave_alloc`].
 fn bump_raw(inner: &Mutex<Inner>, name: &'static str, len: usize, align: usize) -> Option<u64> {
-    let mut inner = inner.lock().ok()?;
+    let mut guard = inner.lock().ok()?;
+    bump_locked(&mut guard, name, len, align)
+}
+
+/// [`bump_raw`] against a lock the caller already holds.
+///
+/// Split out so a caller that must *decide* under the same guard it carves under
+/// can do both without dropping it in between — see the guest branch of
+/// [`resolve_wave_alloc`], where releasing the lock between reading `live` and
+/// bumping would leave a window for the generation to close underneath it.
+fn bump_locked(inner: &mut Inner, name: &'static str, len: usize, align: usize) -> Option<u64> {
     let start = aligned_start(inner.base, inner.cursor, align);
     let end = start.checked_add(len)?;
     if end > inner.capacity {
@@ -469,6 +521,20 @@ pub struct Generation {
     /// mint a [`WaveTicket`] for the storages allocated inside it.
     domain: u32,
     arena: u32,
+    /// The cursor as this generation opened, so a **nested** one releases back
+    /// to where it began.
+    ///
+    /// Generations are scope guards and therefore strictly LIFO, which is the
+    /// stack discipline a bump wants: the outermost rewinds to zero and every
+    /// one inside it is a mark/release pair. Without this an inner generation
+    /// was a no-op — `live` was still positive when it dropped, so nothing
+    /// moved — and staging a decoder's blocks inside a per-tile generation
+    /// bounded nothing at all while looking like it did.
+    ///
+    /// Releasing is only sound because a stage copies its result out before it
+    /// closes ([`guest_stage`]); anything still living in the released range
+    /// when the mark unwinds would be handed to the next carve.
+    entry_cursor: usize,
 }
 
 impl Generation {
@@ -534,6 +600,37 @@ impl Drop for Generation {
         let (should_reset, stream, reclaim) = {
             let mut inner = self.inner.lock().unwrap();
             inner.live -= 1;
+            // A nested generation releases to its mark and stops here. It does
+            // not touch `dirty` or `epoch`: the outer generation is still open,
+            // its tickets must keep resolving, and the ranges below the mark are
+            // still live. Only the outermost rewinds the arena.
+            //
+            // **Guest arenas only.** Releasing early hands the range back to the
+            // next carve, which is sound exactly where every value that outlives
+            // the scope has been copied out of it first — the contract
+            // [`guest_stage`] keeps, and the reason a guest stage may nest. The
+            // wave path has no such contract: its generations exist to bound a
+            // layer phase, tensors cross between them freely, and reclaiming a
+            // nested one's bytes there hands live attention state to the next
+            // allocation. That shows up as an unspecified launch failure in a
+            // test that has nothing to do with the scope that moved the cursor.
+            //
+            // No fence, unlike the reset below. The reset needs one because the
+            // ranges it frees may be read by a domain that does not share this
+            // stream; a nested release stays inside one generation on one
+            // stream, where the next kernel to write a released range is
+            // ordered behind the kernel that read it. Adding a synchronise here
+            // would put one in the innermost scope of the decoder — per resnet,
+            // per block, per tile.
+            if inner.live > 0 && self.arena == GUEST_ARENA {
+                if inner.cursor > inner.peak {
+                    inner.peak = inner.cursor;
+                }
+                inner.cursor = self.entry_cursor;
+                // No tier reference to give back: a guest arena stands in the
+                // guest's own claimed ground, so this generation never took one.
+                return;
+            }
             (
                 inner.live == 0 && inner.dirty,
                 inner.stream.clone(),
@@ -542,8 +639,14 @@ impl Drop for Generation {
         };
         // The tier's reference count moves on **every** drop, not only the ones
         // that reset a cursor: a clean generation still held the tier open.
+        //
+        // A guest generation is excluded for the same reason the persistence
+        // domain is, by a different route: its arena stands in the guest's own
+        // claimed ground rather than in the tier, so there is no tier reference
+        // for it to have taken and none to give back. Releasing one here would
+        // decrement a count this generation never incremented.
         let release = |g: &Generation| {
-            if g.domain != NOT_A_WAVE {
+            if g.domain != NOT_A_WAVE && g.arena != GUEST_ARENA {
                 release_if_last(g.domain as usize);
             }
         };
@@ -735,6 +838,225 @@ fn align_phase_plan(plan: [usize; 3]) -> [usize; 3] {
 /// nothing, so an op reading persistence-staged memory allocates from the pool —
 /// which is the correct answer, not a fallback.
 pub(crate) const NOT_A_WAVE: u32 = u32::MAX;
+
+/// Arena coordinate for a co-resident guest's activations.
+///
+/// A wave domain's arenas are indexed by [`LayerPhase`] — 0, 1, 2 — so this is
+/// the first coordinate that names no phase, and `WaveDomain::arenas.get(3)`
+/// already answers `None` for it. That is what makes it safe to overload the
+/// field rather than widen the ticket: a guest ticket cannot be mistaken for a
+/// wave one by any code that does not know about guests, and the miss it
+/// produces there is the ordinary "allocate from the pool" answer.
+/// Re-exported rather than defined twice: a ticket naming it is minted at the
+/// guest's *placement* sites, which sit below this crate, so the constant lives
+/// beside [`WaveTicket`] and the registry that answers it lives here.
+pub use candle::wave_provenance::{GUEST_ANY_EPOCH, GUEST_ARENA};
+
+/// The guest arena open on each device, while a drain is running.
+///
+/// Empty in steady state. A drain installs one over its own claimed ground and
+/// removes it before that ground goes back to the KV side — so an entry here is
+/// exactly as long-lived as the guest, and a ticket that outlives it resolves
+/// to nothing rather than to whatever the KV side put there next.
+fn guest_domains() -> &'static Mutex<HashMap<usize, BumpArena>> {
+    static DOMAINS: OnceLock<Mutex<HashMap<usize, BumpArena>>> = OnceLock::new();
+    DOMAINS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether any guest arena is open, readable without taking the registry lock.
+///
+/// [`guest_stage`] wraps model code that is not a guest's — `ResnetBlock2D` is
+/// shared with the U-Net and every stable-diffusion pipeline in the workspace —
+/// so the common case by far is "no arena, run `f`". Reaching that answer
+/// through [`begin_guest`] costs a process-global mutex and an allocated error
+/// string per call, per resnet, per forward, for callers that will never have an
+/// arena at all. This is the cheap negative: `Relaxed` is sufficient because a
+/// drain installs its arena long before any stage runs and removes it long
+/// after, so no stage can race the transition.
+static GUEST_ARENA_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Put a guest arena over `base..base + capacity` for the duration of a drain.
+///
+/// `base` must name ground the caller holds for at least as long as the arena —
+/// in practice a placement out of the guest's own `GuestGround`, which the drain
+/// keeps until it drops the model. Nothing here checks that, for the same reason
+/// nothing else in this module can: the address is untyped span, and the only
+/// party that knows whose it is is the one that claimed it.
+///
+/// Replaces any arena already installed for the device. A drain is serialised
+/// against every other drain by the scheduler thread, so the previous one has
+/// finished by the time this runs; replacing rather than refusing means a drain
+/// that died without closing cannot wedge every later one.
+pub fn open_guest_arena(stream: &Arc<CudaStream>, base: u64, capacity: usize) {
+    candle::cuda_backend::wave_provenance::install_wave_allocator(resolve_wave_alloc);
+    let ordinal = stream.context().ordinal();
+    let arena = BumpArena::over(stream, "guest", base, capacity, Reclaim::Fence);
+    let mut map = guest_domains().lock().unwrap();
+    map.insert(ordinal, arena);
+    GUEST_ARENA_OPEN.store(true, Ordering::Relaxed);
+}
+
+/// Take the guest arena away, so no later ticket can resolve into that ground.
+///
+/// **Called before the guest's ground goes back**, never after: once the regions
+/// return to the KV side they are attention state again, and a stale ticket
+/// carving from them would hand a diffusion model's scratch the same addresses.
+pub fn close_guest_arena(stream: &Arc<CudaStream>) {
+    let ordinal = stream.context().ordinal();
+    let mut map = guest_domains().lock().unwrap();
+    map.remove(&ordinal);
+    // Tracks the *registry*, not this device: another device may still have one
+    // open, and a flag that said otherwise would route its stages to the pool.
+    GUEST_ARENA_OPEN.store(!map.is_empty(), Ordering::Relaxed);
+}
+
+/// Open a generation on the device's guest arena.
+///
+/// One stage of a guest's pipeline per generation: the encode, a denoise step, a
+/// decode tile — and, nested inside those, the transformer block or decoder
+/// resnet that actually bounds the sum. Dropping the outermost fences the stream
+/// and rewinds the cursor, so the next stage reuses the same bytes; dropping a
+/// nested one releases to the cursor it opened at. That recycling is the whole
+/// point, and why a guest needs an arena rather than a bump that only grows.
+///
+/// Every tensor allocated inside the generation dies with it. A value that has
+/// to survive into the next stage must be copied out to the guest's ground
+/// first; see `guest::arena::Stage` for the pairing.
+pub fn begin_guest(stream: &Arc<CudaStream>) -> Result<Generation> {
+    let ordinal = stream.context().ordinal();
+    let map = guest_domains().lock().unwrap();
+    let arena = map.get(&ordinal).ok_or_else(|| {
+        candle::Error::Msg(
+            "guest arena: no arena is open on this device — `open_guest_arena` runs at the start \
+             of a drain and `close_guest_arena` at the end of it"
+                .into(),
+        )
+    })?;
+    let arena = arena.clone();
+    drop(map);
+    arena.generation(ordinal as u32, GUEST_ARENA)
+}
+
+/// Run `f` as one stage of a guest's pipeline, on the guest arena.
+///
+/// `x` is copied into the open generation so what `f` allocates inherits from
+/// it, and `f`'s result is copied back out before the cursor rewinds. When no
+/// arena is open — every caller that is not a guest — this is `f(x)` and nothing
+/// else.
+///
+/// # Why a *block* is the stage, and a forward is not
+///
+/// [`begin_guest`] describes a stage as the encode, a denoise step, or a decode
+/// tile, and for a small draw a step is one. It stops being one as the image
+/// grows: a bump does not free inside a generation, so a generation holds the
+/// **sum** of everything allocated in it, and a 1024×1024 denoise step is
+/// thirty-four blocks and some six hundred allocations. Measured, that sum
+/// saturated a 3,948 MiB arena and then a 7,020 MiB one — 3,937 and 6,993 —
+/// and saturation is not a near miss: the first carve that fails yields an owned
+/// tensor, nothing downstream of it can inherit, and the rest of the forward
+/// reverts to the pool. One overflow undoes the whole arrangement.
+///
+/// A block is the stage that keeps the sum bounded. Its intermediates die with
+/// it, the next block reuses the same bytes, and the arena holds one block
+/// rather than thirty-four.
+///
+/// The cost is one copy in and one copy out per block — the hidden state, which
+/// is the smallest tensor crossing that boundary and the only one that has to.
+///
+/// # Stages nest
+///
+/// "A block" is not one granularity for the whole pipeline. A transformer block
+/// is the right stage for the denoise; a convolutional decoder's blocks are far
+/// larger, and its own resnets are the unit that fits. Both are expressed the
+/// same way, because [`Generation`] is LIFO and a nested one releases to the
+/// cursor it opened at — so an inner stage bounds its sum inside an outer one
+/// rather than being silently absorbed by it. Wrap whatever level actually
+/// bounds the arena and let the nesting sort it out.
+pub fn guest_stage<F>(x: &candle::Tensor, f: F) -> Result<candle::Tensor>
+where
+    F: FnOnce(&candle::Tensor) -> Result<candle::Tensor>,
+{
+    // The cheap negative, before any lock: this wraps model code shared with
+    // callers that are not guests and never will be.
+    if !GUEST_ARENA_OPEN.load(Ordering::Relaxed) {
+        return f(x);
+    }
+    let Ok(cuda) = x.device().as_cuda_device() else {
+        return f(x);
+    };
+    let stream = cuda.cuda_stream();
+    let Ok(generation) = begin_guest(&stream) else {
+        // No arena on *this* device, though one is open elsewhere.
+        return f(x);
+    };
+    let staged = stage_in(x, cuda, &generation)?;
+    let out = f(&staged)?;
+    // Out before the rewind, and this is the copy that makes releasing the
+    // arena sound — nothing the stage allocated may outlive it.
+    //
+    // `empty` rather than `zeros`: `slice_set` below writes every element, so a
+    // memset here would be a second full-width pass over the exact bytes about
+    // to be stamped (principle 6). Neither constructor inherits a ticket, which
+    // is the other half of what this needs — the survivor must be an ordinary
+    // owned allocation, off the arena it is escaping.
+    let survivor = candle::Tensor::empty(out.shape(), out.dtype(), out.device())?;
+    survivor.slice_set(&out, 0, 0)?;
+    drop(out);
+    drop(staged);
+    drop(generation);
+    Ok(survivor)
+}
+
+/// Copy `x` into the open guest generation, so ops reading it carve there.
+///
+/// Inheritance runs along the operand chain — a matmul takes its ticket from the
+/// lhs — so a stage whose input is owned allocates everything from the pool
+/// however well the arena is sized. This is where each stage's chain starts.
+///
+/// **The ticket carries `generation`'s real epoch, not [`GUEST_ANY_EPOCH`].**
+/// The any-epoch licence exists for the *weights*, which are placed once and
+/// read by every stage, and it is the one thing that must not be handed to a
+/// tensor that names a range: a stage's chain has to stop resolving when the
+/// stage's arena rewinds, or a ticket outliving its scope would carve from
+/// ground the arena has already given back.
+fn stage_in(
+    x: &candle::Tensor,
+    cuda: &candle::CudaDevice,
+    generation: &Generation,
+) -> Result<candle::Tensor> {
+    use candle::cuda_backend::wave_provenance::{wave_alloc, LeaseOrigin};
+
+    let ticket = generation.ticket();
+    let bytes = x.elem_count() * x.dtype().size_in_bytes();
+    let Some(ptr) = wave_alloc(ticket, bytes, 256) else {
+        return Ok(x.clone());
+    };
+    let dev = candle::Device::Cuda(cuda.clone());
+    // SAFETY: the range was carved from the generation open above, which the
+    // caller drops only after this tensor and everything derived from it.
+    let dst = unsafe {
+        candle::Tensor::from_leased_cuda_ptr(
+            ptr,
+            x.dtype(),
+            x.dims().to_vec(),
+            &dev,
+            LeaseOrigin::Wave(ticket),
+        )
+    }?;
+    dst.slice_set(x, 0, 0)?;
+    Ok(dst)
+}
+
+/// `(cursor, peak, capacity)` for the guest arena on `ordinal`, or `None` when
+/// no drain is running. The peak is what a guest's activation claim should be
+/// sized from, measured rather than guessed.
+pub fn guest_domain_stats(ordinal: usize) -> Option<(usize, usize, usize)> {
+    guest_domains()
+        .lock()
+        .unwrap()
+        .get(&ordinal)
+        .map(|a| a.stats())
+}
 
 /// Slot for a phase's arena.
 ///
@@ -1449,6 +1771,41 @@ fn stream_of(domain: &WaveDomain) -> Arc<CudaStream> {
 /// take — turning it into a hard failure here would abort a forward that could
 /// have completed on pool memory.
 fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> Option<u64> {
+    // A guest ticket names no phase, so it is answered from the guest registry
+    // rather than the wave domain's three arenas. Checked first because it is
+    // the cheaper lookup and because `arenas.get(3)` would otherwise decide it
+    // by returning `None` — the right answer for the wrong reason, and one that
+    // would silently stop working if a fourth phase were ever added.
+    if ticket.arena == GUEST_ARENA {
+        let map = guest_domains().lock().ok()?;
+        let arena = map.get(&(ticket.domain as usize))?;
+        let inner = Arc::clone(&arena.inner);
+        let name = arena.name;
+        drop(map);
+        {
+            // Decided and carved under one guard. Dropping it between the two
+            // would let the generation close in the window and hand this carve a
+            // range the arena has already rewound past.
+            let mut guard = inner.lock().ok()?;
+            // **A guest's weights carry a seed, not a provenance.** They are
+            // placed once and read by every stage — the encode, each denoise
+            // step, each decode tile — and each stage is its own generation, so
+            // a real epoch would route the first stage and nothing after it.
+            // [`GUEST_ANY_EPOCH`] means "whichever generation is open", and
+            // `live == 0` still refuses when none is: the seed never names a
+            // range, so it cannot alias one.
+            //
+            // Tensors carved *inside* a stage do not use that seed — `stage_in`
+            // stamps the open generation's real epoch, so the chain descending
+            // from a stage stops resolving the moment that stage's arena
+            // rewinds, and only the weights keep the any-epoch licence.
+            let epoch_ok = ticket.epoch == GUEST_ANY_EPOCH || guard.epoch == ticket.epoch;
+            if !epoch_ok || guard.live == 0 {
+                return None;
+            }
+            return bump_locked(&mut guard, name, bytes, align);
+        }
+    }
     let map = wave_domains().lock().ok()?;
     let domain = map.get(&(ticket.domain as usize))?;
     let arena = domain.arenas.get(ticket.arena as usize)?;
@@ -1570,6 +1927,85 @@ mod tests {
         assert!(a.0 + a.1 as u64 <= b.0, "a and b overlap");
         assert!(b.0 + b.1 as u64 <= c.0, "b and c overlap");
         assert_eq!(c.0 % 256, 0, "alignment must be honoured");
+    }
+
+    /// **A nested generation is a mark/release scope; only the outermost
+    /// rewinds.**
+    ///
+    /// This is the property that makes staging composable. Before it, `live`
+    /// was merely a count and an inner generation moved nothing when it
+    /// dropped, so a decoder that staged its resnets inside a per-tile
+    /// generation accumulated every resnet's intermediates anyway — the arena
+    /// filled, the first failed carve produced an owned tensor, and everything
+    /// downstream of it fell to the pool. The assertions below are the whole
+    /// contract: the inner drop returns the cursor to where that generation
+    /// opened, and the outer drop returns it to zero.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn a_nested_generation_releases_to_its_mark() {
+        use crate::kv_cache::{
+            begin_guest, close_guest_arena, guest_domain_stats, open_guest_arena,
+        };
+        use candle::cuda_backend::cudarc::driver::{CudaStream, DevicePtr};
+        use candle::Device;
+        use std::sync::Arc;
+
+        let Ok(device) = Device::new_cuda(0) else {
+            return;
+        };
+        let cuda = device.as_cuda_device().unwrap();
+        let stream = cuda.cuda_stream();
+        let ordinal = stream.context().ordinal();
+
+        // Real ground for the arena to stand on, so a carve inside it addresses
+        // memory this test owns for the duration.
+        let ground = unsafe { stream.alloc::<u8>(1 << 20).unwrap() };
+        let (base, _sync) = ground.device_ptr(&stream);
+
+        // **Closed on the way out however this test leaves.** The registry is
+        // process-global and `ground` dies at the end of this scope, so an
+        // assertion that fires before a trailing `close_guest_arena` would leave
+        // every later test in this binary looking at an arena over freed memory.
+        // That is not hypothetical — it is exactly how a nested-release bug in
+        // the wave path presented, as unrelated tests failing with an
+        // unspecified launch failure.
+        struct CloseOnDrop(Arc<CudaStream>);
+        impl Drop for CloseOnDrop {
+            fn drop(&mut self) {
+                close_guest_arena(&self.0);
+            }
+        }
+        open_guest_arena(&stream, base, 1 << 20);
+        let _close = CloseOnDrop(stream.clone());
+
+        let outer = begin_guest(&stream).unwrap();
+        outer.alloc(4096, 256).unwrap();
+        let mark = guest_domain_stats(ordinal).unwrap().0;
+        assert!(mark >= 4096, "the outer carve did not move the cursor");
+
+        {
+            let inner = begin_guest(&stream).unwrap();
+            inner.alloc(8192, 256).unwrap();
+            let within = guest_domain_stats(ordinal).unwrap().0;
+            assert!(within >= mark + 8192, "the inner carve shared the cursor");
+        }
+        assert_eq!(
+            guest_domain_stats(ordinal).unwrap().0,
+            mark,
+            "a nested generation must release to the cursor it opened at"
+        );
+
+        // The outer scope is still usable after the release, and reuses the
+        // bytes the inner one gave back.
+        outer.alloc(8192, 256).unwrap();
+        assert!(guest_domain_stats(ordinal).unwrap().0 >= mark + 8192);
+
+        drop(outer);
+        assert_eq!(
+            guest_domain_stats(ordinal).unwrap().0,
+            0,
+            "the outermost generation must rewind the arena"
+        );
     }
 
     /// Alignment rounds the cursor up, never down — a range must start at or

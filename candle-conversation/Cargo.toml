@@ -22,6 +22,15 @@ candle-transformers = { workspace = true, features = ["cuda", "ruler-bench"] }
 crossbeam = { workspace = true }
 cudarc = { workspace = true }
 fs2 = { workspace = true }
+# PNG encoding for the image guest's output. The guest hands the caller bytes
+# rather than a tensor: the pixels live in a buffer the drain's give-back
+# invalidates, so they have to be encoded before the ground goes back.
+image = { workspace = true }
+# The matte guest's network is a published ONNX export, not a checkpoint with
+# named tensors — see `src/guest/matte.rs` for why it is evaluated as it
+# shipped rather than rebuilt as candle modules. Its weights still land in
+# ground like every other guest's.
+candle-onnx = { path = "../candle-onnx", version = "0.9.1" }
 memmap2 = { workspace = true }
 rayon = { workspace = true }
 tempfile = { workspace = true }

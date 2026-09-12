@@ -536,6 +536,7 @@ mod tests {
                     int8mode: Some(int8mode),
                     expert_pack_dir: None,
                     mtp_path: Some(mtp_path.clone()),
+                    gate_donor_path: None,
                 },
             )?;
             let cfg = &m.model().cfg;
@@ -593,6 +594,7 @@ mod tests {
                         int8mode: Some(int8mode),
                         expert_pack_dir: None,
                         mtp_path: Some(mtp_path.clone()),
+                        gate_donor_path: None,
                     },
                 )
             },
@@ -650,6 +652,7 @@ mod tests {
                         int8mode: Some(int8mode),
                         expert_pack_dir: None,
                         mtp_path: Some(mtp_path.clone()),
+                        gate_donor_path: None,
                     },
                 )?;
                 assert!(

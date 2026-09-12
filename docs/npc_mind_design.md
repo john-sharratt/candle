@@ -350,6 +350,8 @@ In pseudocode:
 
 The loop is continuous under load: as soon as the last action finishes, if events are waiting, it ticks again, and a busy NPC takes back-to-back ticks each draining a *fat batch* of events — bigger, better-informed thinking steps rather than one-event-at-a-time thrashing. Idle means blocked, and blocked costs nothing: an NPC waiting on an empty inbox burns no decode and is not in the batch, so only NPCs with pending events occupy the GPU. That is what lets the population scale — the GPU works on exactly the minds that have something to process.
 
+> **Amendment.** Blocking is the cheap case, not the only one. An NPC with a high pace floor — one whose work is continuous rather than reactive — never has an empty inbox to block on, so its economy cannot rest on blocking. It rests instead on the present being *deterministic*: the situation an NPC is handed each turn is computed rather than generated, so an unchanged situation renders to identical tokens and there is nothing to prefill. A mind nothing happened to costs nothing whether or not it is blocked. See `npc_engine_design.md` Part V.
+
 A scheduled timer event sits on the same queue so that "nothing arrives" cannot mean "dead forever." It is an enqueued future event, not a spin-check, and its interval is the NPC's idle metabolism: salience sets the heartbeat, so a guard at his post ticks slowly while the same guard who just heard a noise ticks tight until things settle, then relaxes. Alertness for free, with no separate system.
 
 ### Salience-gated ticks and preemption

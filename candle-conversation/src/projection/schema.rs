@@ -590,6 +590,22 @@ pub struct SectionSchema {
     /// the other `depends_on_absent` the same collection — so exactly one shows
     /// (e.g. a tools-aware vs a no-tools grounding paragraph).
     pub depends_on_absent: Option<CollectionId>,
+    /// Emission gate on whether the named collection is **configured** — has ≥ 1
+    /// MEMBER — rather than on what it selected this projection.
+    ///
+    /// [`Self::depends_on`] asks "did provenance pick something *this instant*",
+    /// which is the right question for the structural markers that wrap the
+    /// picks (an empty `<tools></tools>` is pointless) and the WRONG question for
+    /// the prose that introduces the facility. Gated on selection, a tool
+    /// overview vanishes on exactly the turn provenance happens to score
+    /// nothing — and the model, told nothing about tools, answers from memory
+    /// instead of calling one. A collection with zero members is genuinely
+    /// disabled (the tools dial set to `None` filters every member out), and
+    /// that is what this asks.
+    pub depends_on_configured: Option<CollectionId>,
+    /// Inverse of [`Self::depends_on_configured`]: emits only when the named
+    /// collection has **no** members, i.e. the facility is switched off.
+    pub depends_on_unconfigured: Option<CollectionId>,
     /// Marks this section as resolved from a dialect template (a
     /// `kind: template` YAML item that referenced a `DialectTemplate`
     /// catalog entry, e.g. `system_start`).  The scheduler's
@@ -637,6 +653,8 @@ impl CompressionPrompt {
                 priority: 50.0,
                 depends_on: None,
                 depends_on_absent: None,
+                depends_on_configured: None,
+                depends_on_unconfigured: None,
                 is_template: false,
                 template_tokens: None,
             },
@@ -1237,6 +1255,28 @@ pub struct Schema {
     /// The one system prompt every projection emits, framed by the target
     /// layer's [`dials`](LayerSchema::dials).
     pub system_prompt: SystemPromptSchema,
+    /// Turn every repetition penalty off for the duration of a tool call.
+    ///
+    /// # Why this is opt-in
+    ///
+    /// It is right for one kind of caller and badly wrong for the other, and
+    /// which one you are is a property of the schema rather than of the engine.
+    ///
+    /// An assistant's tool arguments are *quotations*: file paths, identifiers,
+    /// numbers, names lifted from the prompt or an earlier span. Penalising a
+    /// token because it appeared before is exactly wrong there — the value is
+    /// only correct if it repeats. That caller wants this on.
+    ///
+    /// A character's tool arguments are the opposite. `say` takes what the
+    /// character means; the argument *is* the prose, and it is the one span in
+    /// the turn where repetition control matters most. With this on, a cast
+    /// decoded its every utterance with presence, frequency, repeat and DRY all
+    /// switched off — and one character said the same sentence, word for word,
+    /// for a hundred turns.
+    ///
+    /// Off by default: the penalties a caller configured are the ones it gets.
+    /// A schema that needs verbatim arguments asks for the exemption by name.
+    pub free_tool_calls_from_penalties: bool,
 }
 
 impl Schema {

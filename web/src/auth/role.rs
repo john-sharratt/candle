@@ -1,12 +1,28 @@
 //! Who may do what.
 //!
-//! Three levels, and the whole estate makes its decisions with them:
+//! Four levels, and the whole estate makes its decisions with them:
 //!
 //! | Role | Who | May |
 //! |---|---|---|
 //! | [`Role::Unauthenticated`] | the gateway named nobody | read what is public |
 //! | [`Role::User`] | signed in | everything above, plus their own characters |
 //! | [`Role::Admin`] | named in the config | everything above, plus edit authored content |
+//! | [`Role::Creator`] | named in the config | everything above, and is known inside the fiction |
+//!
+//! # The Creator is the one level that is also a *character*
+//!
+//! Every other role here answers only "may this request proceed". The Creator
+//! answers that and one more thing: worlds built by this estate are worlds whose
+//! inhabitants were made, and the person who made them is somebody they can be
+//! addressed by. So the role is read in two places that no other role reaches —
+//! the name a person carries on a thread inside the world, and their membership
+//! of the world's open channel.
+//!
+//! It sits above [`Role::Admin`] rather than beside it because everything an
+//! admin may do to authored content, the person who authored it may also do.
+//! Placing it above is what keeps every existing `at_least(Role::Admin)` check
+//! correct without being rewritten — which is the property the ordering exists
+//! for.
 //!
 //! # Why a config file and not a database
 //!
@@ -32,6 +48,8 @@
 //!     - sub: "108000000000000000000"    # durable; survives an email change
 //!     - email: someone@example.com      # readable; inherits the provider's
 //!                                       # reassignment risk
+//!   creators:
+//!     - email: someone@example.com      # outranks `admins`; the same spelling
 //! ```
 //!
 //! An entry that matched "whichever field it looks like" would be a rule nobody
@@ -60,6 +78,14 @@ pub enum Role {
     /// disk: worlds, personalities, and anything else the daemon writes into a
     /// mind.
     Admin,
+    /// Named in the config's `roles.creators`. Everything an admin may do, and
+    /// the one role the fiction itself knows about — see the module header.
+    ///
+    /// **Deliberately the last variant.** `Ord` comes from the declaration
+    /// order, so being last is what makes a creator clear every bar an admin
+    /// clears. A variant inserted before `Admin` instead would silently demote
+    /// the person who owns the estate.
+    Creator,
 }
 
 impl Role {
@@ -69,7 +95,17 @@ impl Role {
             Role::Unauthenticated => "unauthenticated",
             Role::User => "user",
             Role::Admin => "admin",
+            Role::Creator => "creator",
         }
+    }
+
+    /// Whether this caller is known to the worlds themselves.
+    ///
+    /// Read where a person's *name inside the fiction* is decided, rather than
+    /// where access is decided — the one question `at_least` cannot answer,
+    /// because it is not about a bar being cleared. See the module header.
+    pub fn is_creator(self) -> bool {
+        self == Role::Creator
     }
 
     /// Whether this role clears a bar. Reads as the sentence the call site
@@ -157,10 +193,20 @@ impl Principal {
 pub struct Roles {
     #[serde(default)]
     pub admins: Vec<Principal>,
+    /// Named in `roles.creators`. Outranks `admins`, so somebody listed here
+    /// does not also need listing there — and listing them in both is
+    /// redundant rather than wrong.
+    #[serde(default)]
+    pub creators: Vec<Principal>,
 }
 
 impl Roles {
     /// The role of a caller the gateway did or did not name.
+    ///
+    /// **Creators are checked first**, because the two lists may name the same
+    /// person and the higher answer is the true one. Checking admins first
+    /// would let an entry in the lower list mask the higher, which is a silent
+    /// demotion — exactly the failure the ordering was introduced to prevent.
     pub fn of(&self, id: Option<&Identity>) -> Role {
         let Some(id) = id else {
             return Role::Unauthenticated;
@@ -170,6 +216,9 @@ impl Roles {
         if id.sub.is_empty() {
             return Role::Unauthenticated;
         }
+        if self.creators.iter().any(|p| p.matches(id)) {
+            return Role::Creator;
+        }
         if self.admins.iter().any(|p| p.matches(id)) {
             Role::Admin
         } else {
@@ -178,11 +227,18 @@ impl Roles {
     }
 
     /// Whether anybody at all can edit authored content here. Worth logging at
-    /// startup: a deployment with no admins is one where every save will be
+    /// startup: a deployment with nobody named is one where every save will be
     /// refused, and finding that out from a 403 is worse than from a line in
     /// the log.
+    ///
+    /// **Both lists count.** While this read `admins` only, a deployment whose
+    /// sole principal was a creator logged "no admins configured — read-only to
+    /// everyone" and then served writes perfectly well: a warning that is false
+    /// in the reassuring direction is worse than no warning, because the next
+    /// person to read the log goes looking for a permissions fault that is not
+    /// there.
     pub fn is_empty(&self) -> bool {
-        self.admins.is_empty()
+        self.admins.is_empty() && self.creators.is_empty()
     }
 }
 
@@ -207,11 +263,108 @@ mod tests {
 
     #[test]
     fn the_levels_are_ordered_so_a_comparison_is_the_whole_check() {
+        assert!(Role::Creator > Role::Admin);
         assert!(Role::Admin > Role::User);
         assert!(Role::User > Role::Unauthenticated);
         assert!(Role::Admin.at_least(Role::User));
         assert!(!Role::User.at_least(Role::Admin));
         assert!(Role::Unauthenticated.at_least(Role::Unauthenticated));
+    }
+
+    /// **A creator clears every bar an admin clears.**
+    ///
+    /// The whole reason the level was added on top rather than beside: every
+    /// `at_least(Role::Admin)` already written across the estate has to keep
+    /// admitting the person who owns it, without one of them being revisited.
+    #[test]
+    fn a_creator_clears_every_bar_an_admin_does() {
+        for bar in [Role::Unauthenticated, Role::User, Role::Admin] {
+            assert!(
+                Role::Creator.at_least(bar),
+                "a creator was refused a bar an admin clears: {bar}"
+            );
+        }
+        assert!(!Role::Admin.at_least(Role::Creator));
+    }
+
+    #[test]
+    fn a_creator_entry_names_that_person_and_nobody_else() {
+        let r = admins("creators:\n  - email: someone@example.com\n");
+        assert_eq!(r.of(Some(&id("g1", "someone@example.com"))), Role::Creator);
+        assert_eq!(r.of(Some(&id("g1", "other@example.com"))), Role::User);
+        assert_eq!(r.of(None), Role::Unauthenticated);
+    }
+
+    /// **The higher list wins, whichever order the file is written in.**
+    ///
+    /// Naming one person in both is a natural thing to do, and if `admins` were
+    /// consulted first it would answer `Admin` — silently demoting the estate's
+    /// owner while the config plainly says otherwise. That failure is invisible
+    /// from the config and invisible from the log.
+    #[test]
+    fn being_named_in_both_lists_resolves_to_the_higher_one() {
+        let r =
+            admins("admins:\n  - email: me@example.com\ncreators:\n  - email: me@example.com\n");
+        assert_eq!(r.of(Some(&id("g1", "me@example.com"))), Role::Creator);
+    }
+
+    /// A deployment whose only principal is a creator is not read-only, and the
+    /// startup warning must not say it is.
+    #[test]
+    fn a_deployment_with_only_a_creator_is_not_reported_as_having_nobody() {
+        let r = admins("creators:\n  - email: me@example.com\n");
+        assert!(!r.is_empty());
+        assert!(Roles::default().is_empty());
+    }
+
+    /// **Every level above a bar clears it, for every bar.**
+    ///
+    /// The property an access check is allowed to assume, and the one an exact
+    /// match quietly breaks. `matches!(role, Role::Admin)` was correct for as
+    /// long as `Admin` was the top of the ladder, and became a silent demotion
+    /// the moment something went above it: the estate's owner signed in and was
+    /// refused a control an admin had, with no error anywhere. This is what
+    /// makes that a property of the type rather than a thing to remember at
+    /// each call site.
+    #[test]
+    fn a_higher_level_clears_every_bar_a_lower_one_does() {
+        let ladder = [
+            Role::Unauthenticated,
+            Role::User,
+            Role::Admin,
+            Role::Creator,
+        ];
+        for (i, higher) in ladder.iter().enumerate() {
+            for lower in &ladder[..=i] {
+                assert!(
+                    higher.at_least(*lower),
+                    "{higher} does not clear {lower}'s bar"
+                );
+            }
+            for above in &ladder[i + 1..] {
+                assert!(!higher.at_least(*above), "{higher} cleared {above}'s bar");
+            }
+        }
+    }
+
+    /// The wire spelling is what a refusal body and the log line carry, so each
+    /// level needs its own and none may collide.
+    #[test]
+    fn every_level_has_its_own_spelling() {
+        let all = [
+            Role::Unauthenticated,
+            Role::User,
+            Role::Admin,
+            Role::Creator,
+        ];
+        for (i, role) in all.iter().enumerate() {
+            assert!(!role.as_str().is_empty());
+            for other in &all[i + 1..] {
+                assert_ne!(role.as_str(), other.as_str(), "two levels spell the same");
+            }
+        }
+        assert!(Role::Creator.is_creator());
+        assert!(!Role::Admin.is_creator());
     }
 
     #[test]

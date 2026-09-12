@@ -1,0 +1,23 @@
+# Zend — the console for the coding assistant.
+#
+# One indexable address, the front door. Everything behind it is an instrument
+# panel over one developer's own daemon.
+User-agent: *
+Allow: /$
+Allow: /favicon.svg
+
+# The tool pages. They also carry `noindex` in their own head, which is the
+# stronger signal — a page merely disallowed here can still be indexed from a
+# link elsewhere, whereas one a crawler is allowed to fetch and finds `noindex`
+# on is dropped. Both, so neither has to be the only line of defence.
+Disallow: /logs
+Disallow: /perf
+Disallow: /project
+Disallow: /substrate
+
+# The API and the log stream. Every route refuses an unauthenticated caller;
+# there is still no reason to crawl them.
+Disallow: /v1/
+Disallow: /ws/
+
+Sitemap: https://code.tokera.com/sitemap.xml

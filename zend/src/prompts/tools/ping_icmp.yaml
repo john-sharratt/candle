@@ -1,4 +1,29 @@
 name: ping_icmp
+questions:
+- ping 192.168.1.1
+- send a few ICMP echoes to the gateway and report the times
+- what's the round trip to db-primary
+- ping the NAS and tell me the packet loss
+- is that machine responding at all
+- how bad is the latency to the London region
+- are we losing packets to this address
+- does it answer ICMP, or is that blocked
+- the app is timing out and I want to know if the box is even up
+- users say the network feels slow, start with the basics
+- checking the link is alive before I debug the service
+- someone rebooted that server, has it come back
+- ping it
+- is that host up, ping it
+- latency check
+- can you reach it
+- ping that server and tell me if it's up
+- is this host reachable
+- what's the latency to 8.8.8.8
+- can you reach the gateway
+- check whether the box is responding to ICMP
+- how many milliseconds is the round trip to this host
+- is the machine online, ping it
+- measure the packet loss to this address
 category: Network diagnostics
 description: 'Ping a host using ICMP echo and return round-trip statistics. Use for: checking whether a host is reachable, measuring network latency, confirming a server is up, diagnosing connectivity problems. Triggered by "ping", "is X reachable", "can you reach", "check if the server is up", "latency to", "is the host alive", "test connectivity to". Returns resolved IP, packets sent/received, packet loss percentage, and RTT min/avg/max in milliseconds. Use port_scan to check specific service ports; use trace_route for path diagnostics; use dns_lookup for name resolution without connectivity test.'
 parameters:

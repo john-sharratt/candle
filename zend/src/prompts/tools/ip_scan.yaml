@@ -1,4 +1,29 @@
 name: ip_scan
+questions:
+- sweep 10.20.30.0/24 for responding hosts
+- scan the 172.16.0.0/24 range and list what answers
+- probe every address in this CIDR block
+- enumerate live machines across 192.168.50.0/24
+- how many devices are on this network segment
+- which addresses in that range are actually in use
+- is anything unexpected sitting on this subnet
+- what's the next free IP in this range
+- taking an inventory of the lab network
+- someone plugged in a device and I want to find it
+- building a picture of the VLAN before we re-address it
+- suspect a rogue host on this segment
+- scan the subnet
+- sweep that range
+- who's on this network
+- CIDR sweep please
+- sweep 192.168.1.0/24 and tell me what's alive
+- what hosts are up on my local subnet
+- discover the devices on this CIDR range
+- map the machines on the 10.0.0.0/24 network
+- scan the whole subnet for live hosts
+- how many boxes are responding in this address range
+- do a LAN discovery across that CIDR block
+- find every reachable host in 172.16.5.0/24
 category: Network diagnostics
 description: Sweep an entire CIDR subnet for live hosts, probing TCP port 80 on each address in the range. Use for LAN discovery and network mapping; link-local 169.254.x.x ranges are blocked.
 high_risk: true

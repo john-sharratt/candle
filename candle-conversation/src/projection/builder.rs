@@ -619,6 +619,8 @@ impl Builder {
                 priority,
                 depends_on: None,
                 depends_on_absent: None,
+                depends_on_configured: None,
+                depends_on_unconfigured: None,
                 is_template: false,
                 template_tokens: None,
             }));
@@ -745,6 +747,8 @@ impl Builder {
                     priority,
                     depends_on: None,
                     depends_on_absent: None,
+                    depends_on_configured: None,
+                    depends_on_unconfigured: None,
                     is_template: false,
                     template_tokens: None,
                 });
@@ -783,6 +787,8 @@ impl Builder {
                     priority,
                     depends_on: None,
                     depends_on_absent: None,
+                    depends_on_configured: None,
+                    depends_on_unconfigured: None,
                     is_template: false,
                     template_tokens: None,
                 });
@@ -1100,6 +1106,9 @@ impl Builder {
             SectionId::new(section_id.raw() + 1)
         };
         let schema = Schema {
+            // A single-section plain-prompt schema emits no tool calls, so the
+            // exemption has nothing to apply to either way.
+            free_tool_calls_from_penalties: false,
             system_prompt: SystemPromptSchema {
                 items: vec![SystemPromptItem::Section(SectionSchema {
                     id: section_id,
@@ -1108,6 +1117,8 @@ impl Builder {
                     priority: 50.0,
                     depends_on: None,
                     depends_on_absent: None,
+                    depends_on_configured: None,
+                    depends_on_unconfigured: None,
                     is_template: false,
                     template_tokens: None,
                 })],
@@ -1145,6 +1156,8 @@ impl Builder {
                                 priority: 50.0,
                                 depends_on: None,
                                 depends_on_absent: None,
+                                depends_on_configured: None,
+                                depends_on_unconfigured: None,
                                 is_template: false,
                                 template_tokens: None,
                             },

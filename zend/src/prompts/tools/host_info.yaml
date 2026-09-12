@@ -1,4 +1,29 @@
 name: host_info
+questions:
+- forward and reverse DNS for mail.example.net
+- resolve this host then PTR each address back
+- give me the full DNS picture for that hostname
+- run a name-to-IP-to-name round trip on this
+- do the forward and reverse records agree for this host
+- what hostname does that IP claim
+- is the PTR consistent with the A record here
+- which provider does this address appear to belong to
+- our mail is being rejected and I suspect the reverse DNS
+- auditing the DNS records for these servers before an audit
+- want to identify this host without touching it
+- checking whether the PTR was ever set up for this box
+- profile this host
+- rDNS check
+- what hostname and PTR does this host have
+- identify it from DNS only
+- profile this host for me — forward and reverse DNS
+- what does the reverse lookup say for that server's IPs
+- give me a DNS profile of this hostname
+- audit the DNS records for this host, both directions
+- resolve this name and then reverse the addresses back
+- who does this IP claim to be, and does the name match
+- check the forward and reverse DNS agree for this host
+- identify this host from its DNS records without probing it
 category: Network diagnostics
 description: 'Profile a host: resolve its name to IP addresses, then run a reverse-DNS lookup back from those IPs. Use for host identification and DNS-record auditing — no connectivity probe is sent.'
 parameters:

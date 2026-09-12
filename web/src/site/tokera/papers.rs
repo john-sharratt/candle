@@ -18,7 +18,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::Deserialize;
 
-use super::page::{self, Meta, Nav, Width};
+use super::page::{self, Kind, Meta, Nav, Width};
 use super::State;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -190,6 +190,7 @@ pub async fn show(state: Arc<State>, slug: &str) -> Response {
         .cloned()
         .collect::<Vec<_>>()
         .join(" · ");
+    let path = format!("/papers/{slug}");
     let meta = Meta {
         heading: &paper.title,
         subtitle: (!paper.subtitle.is_empty()).then_some(paper.subtitle.as_str()),
@@ -197,6 +198,12 @@ pub async fn show(state: Arc<State>, slug: &str) -> Response {
         description: &paper.summary,
         nav: Nav::Papers,
         width: Width::Split,
+        path: &path,
+        // `ScholarlyArticle`, not `BlogPosting` — see [`page::json_ld`]. It is
+        // the vocabulary Google Scholar reads.
+        kind: Kind::Paper,
+        image: None,
+        published: (!paper.date.is_empty()).then_some(paper.date.as_str()),
     };
 
     Html(page::split(

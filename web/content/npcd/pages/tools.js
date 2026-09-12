@@ -3,28 +3,61 @@
 
 import { API } from '../lib/api.js';
 import { h } from '../lib/dom.js';
-import { toast, modal, only } from '../lib/ui.js';
+import { toast, modal, only, empty } from '../lib/ui.js';
 
-const MODE_SHORT = { physical: 'phys', video_call: 'video', voice_call: 'voice', instant_message: 'im' };
+const MODE_SHORT = { physical: 'phys', instant_message: 'im' };
 
 export async function render() {
-  const r = await API.listTools().catch(() => ({ tools: [], uncalibrated: 0 }));
   const el = h('div', { class: 'page', style: 'max-width:1100px' });
+
+  /* A failure is reported, not defaulted.
+   *
+   * This was `.catch(() => ({ tools: [], uncalibrated: 0 }))`, and zero
+   * uncalibrated tools is exactly the value that renders a green **all
+   * calibrated** chip. So a daemon that could not be reached at all came back
+   * as the reassuring answer, over an empty table. */
+  let r;
+  try {
+    r = await API.listTools();
+  } catch (e) {
+    el.appendChild(h('div', { class: 'hd' }, h('div', {}, h('h1', {}, 'Tools'))));
+    el.appendChild(h('div', { class: 'panel' },
+      empty('⊘', 'The tool catalog could not be read',
+        e.detail || e.message || 'the daemon did not answer')));
+    return el;
+  }
 
   el.appendChild(h('div', { class: 'hd' },
     h('div', {}, h('h1', {}, 'Tools'),
       h('div', { class: 'sub' },
-        'The act vocabulary. Every tool carries intent, not output — the narrator renders the words.')),
+        'The act vocabulary. Every tool carries intent, not output — the narrator renders the words. '
+        + 'What a character is offered is narrowed per turn by where it is standing, so this is the '
+        + 'whole catalog rather than any one character\'s.')),
     h('div', { class: 'row' },
       // Reading the catalog is every signed-in operator's; running a
       // calibration pass is not. It is a daemon-wide side effect that changes
       // how every character on this machine selects a tool — the only write on
       // this page that is not scoped to the caller's own characters, which is
       // what puts it with the admin controls rather than beside them.
-      r.uncalibrated
+      /* `null` means nothing has counted, and there is no tool registry to
+       * count — the engine registers tools with the layers each may write. Only
+       * a real number gets a chip; the empty-state panel below says why the
+       * table is empty. */
+      r.uncalibrated == null
+        ? null
+        : r.uncalibrated
         ? (only('admin', () => h('button', {
           class: 'btn primary',
-          onClick: async () => { await API.calibrateTools(); toast('calibration pass queued', 'ok'); },
+          onClick: async () => {
+            // Awaited and reported. It used to toast success whatever came
+            // back, which is the same failure as the chip above.
+            try {
+              await API.calibrateTools();
+              toast('calibration pass queued', 'ok');
+            } catch (e) {
+              toast(e.detail || e.message || 'could not queue a calibration pass', 'err');
+            }
+          },
         }, `Calibrate ${r.uncalibrated} tool${r.uncalibrated === 1 ? '' : 's'}`))
           || h('span', { class: 'chip warn', title: 'calibration is an admin’s to run' },
             `${r.uncalibrated} uncalibrated`))
@@ -34,6 +67,18 @@ export async function render() {
   for (const t of r.tools) {
     if (!groups.has(t.category)) groups.set(t.category, []);
     groups.get(t.category).push(t);
+  }
+
+  // An empty catalog with a reason. Without this the page is a heading over
+  // nothing, which reads as a daemon that lost its tools rather than one that
+  // has never had any.
+  if (!r.tools.length) {
+    el.appendChild(h('div', { class: 'panel' },
+      empty('◌', 'No tools registered',
+        r.engine_connected === false
+          ? 'Tools are registered by the engine, with the layers each one may write. This daemon '
+            + 'is not running one, so the catalog is empty and there is nothing to calibrate.'
+          : 'This daemon has registered no tools.')));
   }
 
   for (const [cat, ts] of groups) {
@@ -48,6 +93,18 @@ export async function render() {
             title: '/' + t.name,
             body: h('div', {},
               h('p', { style: 'color:var(--ink-soft)' }, t.description),
+              /* Where the act can be done, in full.
+               *
+               * The table's chip summarises — six station names wrap the row
+               * and are unreadable at a glance — but the list is exactly what
+               * somebody asking "why can my character not do this?" needs, and
+               * here there is room for it. */
+              (t.at_named || []).length
+                ? h('div', { style: 'margin:10px 0' },
+                  h('div', { class: 'tiny dim' }, 'Reachable at'),
+                  h('div', { class: 'row wrap', style: 'gap:4px;margin-top:4px' },
+                    t.at_named.map((n) => h('span', { class: 'chip accent' }, n))))
+                : null,
               h('h3', {}, 'Parameters — the schema the model actually sees'),
               h('pre', {
                 class: 'mono',
@@ -55,15 +112,26 @@ export async function render() {
                   'padding:11px;overflow:auto;font-size:.75rem',
               }, JSON.stringify(t.parameters || { type: 'object', properties: {} }, null, 2)),
               h('div', { class: 'tiny dim' },
-                'Derived from the Rust request type by schemars — never hand-written, so the prompt and the parser cannot disagree.')),
+                'Built from the same parameter list the turn grammar compiles from, so the prompt, '
+                + 'the grammar and the parser cannot disagree about what an act takes. '
+                + 'An "x-bound-to" argument has no fixed list: the world enumerates it per turn — '
+                + 'the people actually here, the rooms actually reachable, the things actually carried '
+                + '— and a value outside that set is unrepresentable rather than refused.')),
           }),
         },
           h('td', {}, h('code', { class: 'mono', style: 'color:var(--accent)' }, t.name)),
           h('td', { class: 'tiny', style: 'color:var(--ink-soft)' }, t.description),
           h('td', {}, h('div', { class: 'row wrap', style: 'gap:4px' },
-            (t.modes || []).length === 4
-              ? h('span', { class: 'chip' }, 'all')
-              : (t.modes || []).map((m) => h('span', { class: 'chip accent' }, MODE_SHORT[m] || m)))),
+            [
+              (t.modes || []).length === 4
+                ? h('span', { class: 'chip' }, 'all')
+                : (t.modes || []).map((m) => h('span', { class: 'chip accent' }, MODE_SHORT[m] || m)),
+              /* What the act needs beyond a mode. An act is ABSENT when its
+               * condition does not hold, never refused — so an operator
+               * looking for a tool a character never calls needs to see the
+               * condition, or the absence reads as the model ignoring it. */
+              t.needs ? h('span', { class: 'chip warn', title: 'absent unless this holds' }, t.needs) : null,
+            ])),
           h('td', {}, h('span', { class: 'chip' + (t.source === 'extension' ? ' violet' : '') }, t.source)),
           h('td', {}, t.calibrated
             ? h('span', { class: 'chip ok' }, 'yes')

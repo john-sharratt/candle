@@ -275,6 +275,7 @@ mod tests {
                     int8mode: Some(int8mode),
                     expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
                     mtp_path: None,
+                    gate_donor_path: None,
                 },
             )?;
             println!("✓ Model loaded\n");
@@ -324,6 +325,7 @@ mod tests {
                         int8mode: Some(int8mode),
                         expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
                         mtp_path: None,
+                        gate_donor_path: None,
                     },
                 )
             },
@@ -545,6 +547,7 @@ mod tests {
                         int8mode: Some(int8mode),
                         expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
                         mtp_path: None,
+                        gate_donor_path: None,
                     },
                 )?;
                 // A gate that silently fell back to plain decode would still pass

@@ -1,0 +1,19 @@
+id: appraisal-bench
+kind: fixture
+name: the appraisal bench
+short: >
+  What comes in is judged here for whether it is worth keeping at all, and most
+  of it is not.
+long: >
+  The bench where a thing is weighed for lasting value before anybody spends
+  effort on it. Almost everything a world throws off is not meant to be kept
+  forever — a record that keeps all of it is not an archive, it is a heap, and
+  a heap answers no questions. Appraising is refusing, mostly, and the refusals
+  have to be defensible: whoever comes after will want to know why a thing was
+  let go, and the only honest answer is one written at the time.
+# Letting a thing go is deliberate, so it is reached through a mode that has
+# to be entered rather than offered to anybody standing near the bench.
+modes:
+  - reading
+  - working
+  - offered

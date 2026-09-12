@@ -1,0 +1,16 @@
+id: mending-bench
+kind: fixture
+name: the mending bench
+short: >
+  Where what is decaying is stabilised, without pretending it was never damaged.
+long: >
+  A record does not sit still: entries go stale as the world around them
+  changes, references rot as what they point at is renamed or retired, and a
+  thing written well in its day can become unreadable to anybody who did not
+  live through it. Mending is stabilising what is failing while leaving the
+  evidence that it failed. A repair passed off as an original is worse than the
+  damage, because the next Maker has no way to know what they are looking at.
+modes:
+  - reading
+  - working
+  - offered

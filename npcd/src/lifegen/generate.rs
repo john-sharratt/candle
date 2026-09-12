@@ -1,0 +1,853 @@
+//! Building one shared prefix per phase and running every pending node against
+//! it.
+//!
+//! # The prefix is shared by construction, not by caching
+//!
+//! Each phase builds one prefix from the strata above it and sends it as the
+//! system turn of every node in that phase. Whatever varies per node — the year
+//! a month expands, the year *and* month a day expands, a day's required
+//! consequences — travels in the user turn.
+//!
+//! That split is load-bearing rather than tidy. A per-node detail in the shared
+//! half would be a prompt built for one node and attended by all of them, so
+//! [`prompt`]'s own tests assert that no phase prefix names a specific year,
+//! month or day.
+//!
+//! # Where the text comes from
+//!
+//! [`Narrator`], and this module does not know what is behind it. The ladder ran
+//! on the main acting model until the prose guest could serve it; the only thing
+//! that changed here was which closure `Jobs::start` was handed. Producing prose
+//! is a dependency, not a responsibility.
+//!
+//! # The wave is a latency budget, not a width
+//!
+//! Nodes are submitted from a small pool of threads because each call blocks.
+//! With a guest behind the narrator they do **not** decode in parallel: a
+//! submission joins the guest's backlog, the backlog becomes one drain, and the
+//! drain serves its jobs one at a time with normal inference blocked throughout.
+//!
+//! So [`MAX_IN_FLIGHT`] does not choose how much runs at once. It chooses how
+//! long the engine is unavailable before the card comes back — which is why it
+//! is four rather than the engine's wave width.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use super::document;
+use super::plan::{CastMember, NodeId, Phase, Plan, YearBeat};
+use super::progress::{GenProgress, Stage};
+use super::prompt;
+use super::seed::check;
+
+/// How many nodes are submitted to the guest at once.
+///
+/// # It buys parallelism now, and it did not before
+///
+/// This was four, and four was right for the guest as it stood: a submission
+/// joined a backlog, the backlog became one drain, and the drain served it **one
+/// job at a time**. Widening the wave bought nothing but a longer stretch with
+/// the engine blocked — measured, eight months held the card for 492 seconds in
+/// a single drain and ten jobs in that run died on `CUDA_ERROR_OUT_OF_MEMORY`.
+///
+/// The drain decodes its backlog as a wave now, so the same eight months step
+/// together and read the checkpoint once between them instead of eight times.
+/// The number here is the width of that wave.
+///
+/// **What keeps it safe is no longer this constant.** The old figure was a guess
+/// standing in for a memory limit nobody was enforcing; the guest now sizes its
+/// own wave from what a seat's K/V actually costs against a byte budget, claims
+/// ground for exactly that, and chunks a wider backlog itself. So this can be
+/// the guest's own ceiling and let the guest decide — a wave of short turns runs
+/// wide, a wave of full-context ones narrows on its own, and neither depends on
+/// the ladder having guessed right.
+pub const MAX_IN_FLIGHT: usize = 16;
+
+/// A fork's answer, or why it has none.
+struct Answer {
+    id: NodeId,
+    text: Result<String, String>,
+}
+
+/// Prime a phase's prefix and run every pending node of it.
+///
+/// Returns how many nodes were written. A phase with nothing pending primes
+/// nothing and returns zero — regenerating one month must not pay for a prefix
+/// no fork is going to use.
+/// How one node's prose is produced: a system turn and a user turn in, the
+/// model's answer out.
+///
+/// **The ladder does not know what is behind this, and that is the point.** It
+/// picks the pending nodes, builds each one's prompt from the strata above it,
+/// and applies what comes back; producing the text is somebody else's job. The
+/// ladder ran on the main acting model until the prose guest could serve it, and
+/// the only thing that changed here was which closure `Jobs::start` was handed.
+///
+/// Blocking, because a job owns an OS thread from end to end and there is no
+/// runtime under it — the implementation bridges to the guest queue itself.
+pub type Narrator = Arc<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync>;
+
+pub fn run_phase(
+    narrate: &Narrator,
+    mind: &Path,
+    plan: &Mutex<Plan>,
+    phase: Phase,
+    // The character's own idiom, from their personality — see
+    // `prompt::voice_of`. Passed in rather than read here because the
+    // personality registry lives on the app state and a plan does not carry it:
+    // a life is written *for* a personality and does not contain one.
+    voice: &str,
+    progress: &GenProgress,
+) -> anyhow::Result<usize> {
+    progress.enter(phase);
+
+    // Everything the prompts are built from is read once, here, from the plan
+    // as it stands — **including whatever the operator corrected by hand**. A
+    // prefix inherited from the decode that produced the parent would silently
+    // ignore the edit that is the entire point of the review loop.
+    let (snapshot, primed_at, pending) = {
+        let p = plan.lock().unwrap();
+        (p.clone(), p.prefix_hash(), p.pending(phase))
+    };
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    let prefix = match phase {
+        Phase::Story => {
+            let checked = check(&snapshot.seed).map_err(|e| {
+                anyhow::anyhow!(
+                    "seed: {}",
+                    e.iter().map(|b| b.message()).collect::<Vec<_>>().join("; ")
+                )
+            })?;
+            prompt::story_prefix(&checked, voice)
+        }
+        Phase::Years => prompt::years_prefix(&snapshot, voice),
+        Phase::Months => prompt::months_prefix(&snapshot, voice),
+        Phase::Days => prompt::days_prefix(&snapshot, voice),
+    };
+
+    progress.detail(format!("{} node(s)", pending.len()));
+
+    let turns: Vec<(NodeId, String)> = pending
+        .iter()
+        .map(|id| (*id, turn_for(&snapshot, *id)))
+        .collect();
+    // What each fork was actually asked, kept for the write-back check below. The
+    // prefix hash cannot stand in for this: a month's parent year travels in the
+    // fork's *turn*, not in the shared prefix, and is deliberately left out of the
+    // hash so that correcting one year does not invalidate every other year's
+    // months. That keeps an edit local — and left the edited year's own months
+    // unguarded.
+    let planned: BTreeMap<NodeId, String> = turns.iter().cloned().collect();
+
+    // **What was actually asked, in characters.** A phase that produces nothing looks
+    // identical whether the prompt was wrong, the turn was empty, or the model declined — and
+    // the first two are the common causes. Sizes here separate them at a glance.
+    tracing::debug!(
+        target: "npcd::lifegen",
+        phase = ?phase,
+        prefix_chars = prefix.len(),
+        forks = turns.len(),
+        first_turn_chars = turns.first().map(|(_, t)| t.len()).unwrap_or(0),
+        "phase primed"
+    );
+    progress.fanning_out(turns.len() as u64);
+    let answers = fan_out(narrate, &prefix, turns, progress)?;
+    for a in &answers {
+        match &a.text {
+            Ok(t) => tracing::debug!(
+                target: "npcd::lifegen",
+                node = ?a.id,
+                reply_chars = t.len(),
+                "answered"
+            ),
+            Err(e) => tracing::debug!(target: "npcd::lifegen", node = ?a.id, "refused: {e}"),
+        }
+    }
+
+    // **The prefix a fork was planned against must still be the prefix.** An
+    // operator editing the story while a phase runs would otherwise have every
+    // node of it written against an arc that no longer exists — plausibly, and
+    // with nothing anywhere to say so.
+    let mut p = plan.lock().unwrap();
+    if p.prefix_hash() != primed_at {
+        anyhow::bail!(
+            "the life story changed while the {} phase was running — nothing was written; \
+             run it again against the story as it stands now",
+            phase.unit()
+        );
+    }
+
+    let mut written = 0;
+    for a in answers {
+        let Ok(text) = a.text else {
+            tracing::warn!(
+                "life {}: {:?} not generated — {}",
+                p.seed.who,
+                a.id,
+                a.text.unwrap_err()
+            );
+            continue;
+        };
+        // **The decode as the model produced it, before any parsing.**
+        //
+        // Everything downstream — `strip_reasoning`, `parse_story`, the document write — can
+        // only report what survived it, and every failure in this phase so far has been
+        // diagnosed from the wreckage rather than the event. The distinction this exists to
+        // draw: prose that is wrong from its first token is a prompt or a weights problem,
+        // while prose that starts clean and degrades is a state one, and the parsed output
+        // cannot tell the two apart. At `debug`, so it costs nothing in a normal run.
+        tracing::debug!(
+            target: "npcd::lifegen",
+            who = %p.seed.who,
+            node = ?a.id,
+            chars = text.len(),
+            head = %text.chars().take(400).collect::<String>(),
+            "decode"
+        );
+        // **The parent this node expanded must still be the parent.** The shared
+        // prefix is checked once above; a node's own parent — the year a month
+        // expands, the month a day expands — reaches it through the turn, which
+        // was built from the snapshot taken before the decode. An operator
+        // correcting year 1999 mid-phase marks its months stale, and writing
+        // prose generated against the *old* 1999 over that mark would discard the
+        // correction and clear the flag that recorded it. Checked per node rather
+        // than per phase, so the other eleven years' months still land.
+        let asked_now = turn_for(&p, a.id);
+        if planned.get(&a.id) != Some(&asked_now) {
+            tracing::warn!(
+                "life {}: {:?} not written — what it expands was edited while the {} phase \
+                 ran; it stays pending and regenerates against the correction",
+                p.seed.who,
+                a.id,
+                phase.unit()
+            );
+            continue;
+        }
+        if apply(&mut p, a.id, &text) {
+            written += 1;
+        } else {
+            // **A decode that parses to nothing is a failure, and it used to be a
+            // silent one.** `apply` refuses empty prose, but saying so nowhere meant a
+            // node that produced 311 seconds of tokens and no document was
+            // indistinguishable from one that worked — the job still reported `done`.
+            // The length is here because it separates the two ways to arrive at
+            // nothing: a model that stopped immediately, and one that reasoned to the
+            // token cap without ever closing its `<think>` block.
+            tracing::warn!(
+                "life {}: {:?} produced no document from {} chars of decode",
+                p.seed.who,
+                a.id,
+                text.len()
+            );
+        }
+    }
+
+    // **The outline, a run of years at a time, once the arc it follows exists.**
+    //
+    // Sequential and not a fan-out, which is the whole point: each run is shown
+    // where the life had got to, so a year can follow from the twenty before it
+    // instead of being invented beside them. Forks cannot do that — siblings
+    // never see each other.
+    if phase == Phase::Story && p.story.content.is_generated() {
+        match build_outline(narrate, &mut p, &prefix, progress) {
+            Ok(n) => tracing::info!("life {}: {} year(s) outlined", p.seed.who, n),
+            // A life with an arc and a short outline is worth keeping; the
+            // outline can be run again. Failing the phase here would throw away
+            // the story that just succeeded.
+            Err(e) => tracing::warn!(
+                "life {}: the outline stopped early — {e:#}; the story is written and the \
+                 outline can be extended by running the story phase again",
+                p.seed.who
+            ),
+        }
+    }
+
+    progress.stage(Stage::Writing);
+    // Only a story that was actually generated is written. Without the guard a redo
+    // that cleared the node and then failed to refill it wrote the *empty* node over
+    // the good document already on disk — a failed regeneration destroying the thing
+    // it was regenerating. `routes.rs::commit` has always tested this; this call site
+    // did not.
+    if phase == Phase::Story && p.story.content.is_generated() {
+        document::write_story(mind, &p.seed.who, &p.story.content.text)?;
+    }
+    let report = document::sync(mind, &p)?;
+    if !report.removed.is_empty() {
+        tracing::info!(
+            "life {}: {} document(s) removed as no longer part of the plan",
+            p.seed.who,
+            report.removed.len()
+        );
+    }
+    super::plan::save(mind, &p)?;
+    Ok(written)
+}
+
+/// The instruction one fork gets.
+fn turn_for(plan: &Plan, id: NodeId) -> String {
+    match id {
+        NodeId::Story => match check(&plan.seed) {
+            Ok(c) => prompt::story_turn(&c),
+            // Unreachable in practice: `run_phase` checks the seed before it
+            // primes. Kept total rather than panicking, because a fork that
+            // asks for nothing is recoverable and a poisoned pool is not.
+            Err(_) => String::new(),
+        },
+        NodeId::Year { year } => prompt::year_turn(plan, year),
+        NodeId::Month { year, month } => prompt::month_turn(plan, year, month),
+        NodeId::Day { year, month, day } => prompt::day_turn(plan, year, month, day),
+    }
+}
+
+/// How many years one outline turn asks for.
+///
+/// The ceiling is what a model will actually finish. Asked for a whole life's
+/// worth at once it writes four to eighteen lines and stops, whatever the token
+/// budget; asked for twenty it writes twenty. The floor is cost: every turn
+/// re-primes the shared prefix, so halving this doubles the prefill bill for the
+/// same number of years.
+const OUTLINE_RUN: usize = 20;
+
+/// How many already-written beats a turn is shown.
+///
+/// Enough to carry the thread, bounded because the context is not. A finished
+/// outline for one of these lives is several times the 6,144 tokens the guest
+/// has, so a turn carrying every beat so far would stop fitting about a third of
+/// the way through the life it was writing.
+const OUTLINE_TAIL: usize = 8;
+
+/// Fill in the year outline, a run of years at a time.
+///
+/// Returns how many beats the plan ended up with. Years already outlined are
+/// left alone and not asked for again, so running this a second time extends an
+/// outline that stopped early rather than starting it over — which is what makes
+/// a failure here recoverable instead of destructive.
+fn build_outline(
+    narrate: &Narrator,
+    plan: &mut Plan,
+    prefix: &str,
+    progress: &GenProgress,
+) -> anyhow::Result<usize> {
+    let display = plan.seed.display.clone();
+    let prose = plan.story.content.text.clone();
+
+    let missing: Vec<i32> = plan
+        .years
+        .iter()
+        .map(|y| y.year)
+        .filter(|y| !plan.story.outline.iter().any(|b| b.year == *y))
+        .collect();
+    if missing.is_empty() {
+        return Ok(plan.story.outline.len());
+    }
+
+    progress.stage(Stage::Generating);
+    progress.fanning_out(missing.len().div_ceil(OUTLINE_RUN) as u64);
+
+    for want in missing.chunks(OUTLINE_RUN) {
+        if progress.is_cancelled() {
+            anyhow::bail!("cancelled");
+        }
+        let tail: Vec<YearBeat> = plan
+            .story
+            .outline
+            .iter()
+            .rev()
+            .take(OUTLINE_TAIL)
+            .rev()
+            .cloned()
+            .collect();
+
+        let turn = prompt::outline_turn(&display, &prose, &tail, want);
+        let raw = narrate(prefix, &turn).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // **Only the years that were asked for.** A model handed a run ending in
+        // 2740 will sometimes keep going, and a beat for a year the life does not
+        // have is a beat no document can ever be named for.
+        let mut landed = 0;
+        for b in prompt::parse_outline(&raw) {
+            if !want.contains(&b.year) {
+                continue;
+            }
+            if plan.story.outline.iter().any(|x| x.year == b.year) {
+                continue;
+            }
+            plan.story.outline.push(b);
+            landed += 1;
+        }
+        if landed == 0 {
+            tracing::warn!(
+                "life {}: years {:?} to {:?} produced no outline from {} chars of decode",
+                plan.seed.who,
+                want.first(),
+                want.last(),
+                raw.len()
+            );
+        }
+        plan.story.outline.sort_by_key(|b| b.year);
+        progress.completed_one(format!(
+            "years {} to {}",
+            want.first().copied().unwrap_or_default(),
+            want.last().copied().unwrap_or_default()
+        ));
+    }
+
+    Ok(plan.story.outline.len())
+}
+
+/// Fork the primed parent once per node and decode a wave at a time.
+///
+/// # Why the forking happens here and the decoding does not
+///
+/// A [`Sequence`] is `Send` but not `Sync`, so the primed parent stays on this
+/// thread and each *child* is moved into a worker. That is not a workaround —
+/// it is the shape the cap wants anyway: forks are minted one wave at a time,
+/// so a five-hundred-month phase holds sixty-four slots rather than five
+/// hundred, and the rest wait as instructions in a `Vec` instead of as
+/// conversations holding KV for a turn that has not started.
+///
+/// Cancellation is checked between waves rather than inside a decode. A turn
+/// already in flight is left to finish, because tearing one down leaves a slot
+/// the engine still believes is busy.
+fn fan_out(
+    narrate: &Narrator,
+    prefix: &str,
+    turns: Vec<(NodeId, String)>,
+    progress: &GenProgress,
+) -> anyhow::Result<Vec<Answer>> {
+    let out: Mutex<Vec<Answer>> = Mutex::new(Vec::with_capacity(turns.len()));
+    let flight = AtomicUsize::new(0);
+
+    for wave in turns.chunks(MAX_IN_FLIGHT) {
+        if progress.is_cancelled() {
+            break;
+        }
+        progress.in_flight(wave.len() as u64);
+        flight.store(wave.len(), Ordering::Relaxed);
+
+        // **Submitted together so they drain together.** Each call blocks on
+        // the guest queue, and the queue batches whatever is waiting into one
+        // drain — so a wave of thirty months is one load of the checkpoint and
+        // thirty decodes, not thirty loads. Submitting them one at a time would
+        // pay the load per node, which for a 14 B is seconds each.
+        std::thread::scope(|scope| {
+            for (id, turn) in wave {
+                let (out, flight, progress) = (&out, &flight, &progress);
+                let (id, turn) = (*id, turn.as_str());
+                scope.spawn(move || {
+                    let answer = narrate(prefix, turn);
+                    progress.in_flight(flight.fetch_sub(1, Ordering::Relaxed) as u64 - 1);
+                    progress.completed_one(detail_for(id));
+                    out.lock().unwrap().push(Answer { id, text: answer });
+                });
+            }
+        });
+    }
+
+    let mut answers = out.into_inner().unwrap();
+    // Workers finish out of order; the plan is applied in reading order so a
+    // log of one run reads like the life.
+    answers.sort_by_key(|a| a.id);
+    Ok(answers)
+}
+
+fn detail_for(id: NodeId) -> String {
+    match id {
+        NodeId::Story => "the life story".to_string(),
+        _ => id.date_key().unwrap_or_default(),
+    }
+}
+
+/// Fold one fork's answer into the plan. Returns whether anything landed.
+fn apply(plan: &mut Plan, id: NodeId, raw: &str) -> bool {
+    match id {
+        NodeId::Story => {
+            let out = prompt::parse_story(raw);
+            if out.prose.trim().is_empty() {
+                return false;
+            }
+            // The seed's own people are merged in first and marked, so a
+            // relationship formed against one of them resolves to the NPC it
+            // already names rather than to a slug the story reinvented.
+            let mut cast: Vec<CastMember> = plan
+                .seed
+                .cast
+                .iter()
+                .map(|c| CastMember {
+                    entity_id: c.entity_id.clone(),
+                    display: c.display.clone(),
+                    what: c.what.clone(),
+                    npc_id: c.npc_id,
+                    from_seed: true,
+                })
+                .collect();
+            for c in out.cast {
+                if !cast.iter().any(|x| x.entity_id == c.entity_id) {
+                    cast.push(c);
+                }
+            }
+            plan.story.cast = cast;
+            // Only years the life actually has. A model that outlines 1997 for
+            // a character born in 1998 has written a year that no document can
+            // be named for.
+            let real: Vec<i32> = plan.years.iter().map(|y| y.year).collect();
+            plan.story.outline = out
+                .outline
+                .into_iter()
+                .filter(|b| real.contains(&b.year))
+                .collect();
+            plan.story
+                .content
+                .generated("Life story".to_string(), out.prose);
+            true
+        }
+        NodeId::Year { year } => {
+            let (title, prose) = prompt::parse_titled(raw);
+            if prose.trim().is_empty() {
+                return false;
+            }
+            match plan.content_mut(NodeId::Year { year }) {
+                Some(c) => {
+                    c.generated(title, prose);
+                    true
+                }
+                None => false,
+            }
+        }
+        NodeId::Month { year, month } => {
+            let out = prompt::parse_month(raw, year, month);
+            if out.prose.trim().is_empty() {
+                return false;
+            }
+            // The month names its own defining days, which is the allocation
+            // the day phase then expands. A day the operator has already edited
+            // keeps its title.
+            for (day, title) in out.days {
+                if let Some(d) = plan.ensure_day(year, month, day) {
+                    if !d.content.edited && d.content.title.is_empty() {
+                        d.content.title = title;
+                    }
+                }
+            }
+            match plan.content_mut(NodeId::Month { year, month }) {
+                Some(c) => {
+                    c.generated(out.title, out.prose);
+                    true
+                }
+                None => false,
+            }
+        }
+        NodeId::Day { year, month, day } => {
+            let (title, prose) = prompt::parse_titled(raw);
+            if prose.trim().is_empty() {
+                return false;
+            }
+            match plan.content_mut(NodeId::Day { year, month, day }) {
+                Some(c) => {
+                    // A day's title came from its month's allocation; a decode
+                    // that supplies a better one may improve it, but never
+                    // replaces one a human set.
+                    let keep = c.edited && !c.title.is_empty();
+                    let title = if keep { c.title.clone() } else { title };
+                    c.generated(title, prose);
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lifegen::plan::{Content, YearBeat};
+    use crate::lifegen::seed::{Cadence, Seed, SeedCast};
+
+    fn seed() -> Seed {
+        Seed {
+            who: "cindy-tan".into(),
+            display: "Cindy Tan".into(),
+            born: "1998-09-14".into(),
+            through: "2000-03-02".into(),
+            place: "Nanyang".into(),
+            role: "a clerk".into(),
+            cadence: Cadence::Even,
+            facts: Vec::new(),
+            world: Vec::new(),
+            cast: vec![SeedCast {
+                entity_id: "prof-lim".into(),
+                display: "Professor Lim".into(),
+                what: "taught her".into(),
+                npc_id: Some(7),
+            }],
+            eras: Vec::new(),
+        }
+    }
+
+    fn plan() -> Plan {
+        Plan::new(&check(&seed()).unwrap())
+    }
+
+    #[test]
+    fn a_story_answer_lands_as_prose_cast_and_outline() {
+        let mut p = plan();
+        let raw = "\
+You were born in the rain.
+
+## Cast
+- hess | Hess | the man at the granary
+
+## Years
+- 1998 | Born | You arrive.
+- 1999 | The Quiet Year | Nothing arrives.
+- 2000 | The Fire | It goes.
+";
+        assert!(apply(&mut p, NodeId::Story, raw));
+        assert_eq!(p.story.content.text, "You were born in the rain.");
+        assert!(p.story.content.is_generated());
+        assert_eq!(p.story.outline.len(), 3);
+        assert_eq!(p.story.beat(1999).unwrap().title, "The Quiet Year");
+    }
+
+    /// **The seed's people keep their NPC binding.** A relationship formed
+    /// against one of them must resolve to the character it names, not to a
+    /// slug the story reinvented.
+    #[test]
+    fn the_seeds_cast_survives_the_story_with_its_npc_id() {
+        let mut p = plan();
+        apply(
+            &mut p,
+            NodeId::Story,
+            "Prose.\n\n## Cast\n- prof-lim | Prof Lim | someone else\n- hess | Hess | x\n",
+        );
+        let lim = p
+            .story
+            .cast
+            .iter()
+            .find(|c| c.entity_id == "prof-lim")
+            .unwrap();
+        assert_eq!(lim.npc_id, Some(7), "the binding was lost");
+        assert!(lim.from_seed);
+        assert_eq!(lim.display, "Professor Lim", "the seed's name wins");
+        assert_eq!(p.story.cast.len(), 2);
+        assert!(p.seeded_entities().contains(&"prof-lim".to_string()));
+    }
+
+    /// A year the life does not have cannot be written to a document, so it is
+    /// dropped rather than carried as an outline entry nothing expands.
+    #[test]
+    fn an_outline_year_outside_the_life_is_dropped() {
+        let mut p = plan();
+        apply(
+            &mut p,
+            NodeId::Story,
+            "Prose.\n\n## Years\n- 1997 | Before | x\n- 1998 | Born | y\n- 2050 | After | z\n",
+        );
+        assert_eq!(
+            p.story.outline.iter().map(|b| b.year).collect::<Vec<_>>(),
+            vec![1998]
+        );
+    }
+
+    /// **The month allocates its defining days**, which is the assignment the
+    /// day phase expands.
+    #[test]
+    fn a_month_answer_creates_the_days_it_named() {
+        let mut p = plan();
+        let raw = "# First Term\n\nYou arrived late.\n\n## Days\n- 14 | First Week | x\n- 30 | The Argument | y\n";
+        assert!(apply(
+            &mut p,
+            NodeId::Month {
+                year: 1998,
+                month: 9
+            },
+            raw
+        ));
+        let m = p.month(1998, 9).unwrap();
+        assert_eq!(m.content.title, "First Term");
+        assert_eq!(
+            m.days.iter().map(|d| d.day).collect::<Vec<_>>(),
+            vec![14, 30]
+        );
+        assert_eq!(m.days[0].content.title, "First Week");
+        // The days exist but are not written, so they are what the day phase
+        // will pick up.
+        assert_eq!(p.pending(Phase::Days).len(), 2);
+    }
+
+    /// A human's title outranks a regenerated month's opinion of it.
+    #[test]
+    fn regenerating_a_month_does_not_retitle_a_day_a_human_named() {
+        let mut p = plan();
+        apply(
+            &mut p,
+            NodeId::Month {
+                year: 1998,
+                month: 9,
+            },
+            "# T\n\nP.\n\n## Days\n- 14 | Model Title | x\n",
+        );
+        p.day_mut(1998, 9, 14)
+            .unwrap()
+            .content
+            .edit("My Title".into(), "I wrote this.".into());
+        apply(
+            &mut p,
+            NodeId::Month {
+                year: 1998,
+                month: 9,
+            },
+            "# T2\n\nP2.\n\n## Days\n- 14 | Another Model Title | x\n",
+        );
+        assert_eq!(p.month(1998, 9).unwrap().days[0].content.title, "My Title");
+    }
+
+    #[test]
+    fn an_empty_answer_lands_nothing_rather_than_an_empty_document() {
+        let mut p = plan();
+        assert!(!apply(&mut p, NodeId::Year { year: 1998 }, "   \n\n  "));
+        assert!(!p.year(1998).unwrap().content.is_generated());
+        assert!(!apply(&mut p, NodeId::Story, "## Cast\n- a | A | x\n"));
+    }
+
+    #[test]
+    fn a_year_answer_lands_with_its_title() {
+        let mut p = plan();
+        assert!(apply(
+            &mut p,
+            NodeId::Year { year: 1999 },
+            "# The Quiet Year\n\nYou learned to wait.\n"
+        ));
+        let y = p.year(1999).unwrap();
+        assert_eq!(y.content.title, "The Quiet Year");
+        assert_eq!(y.content.text, "You learned to wait.");
+    }
+
+    /// Applying to a node the plan does not have is a miss, not a panic — a
+    /// model can answer about a month outside the life.
+    #[test]
+    fn an_answer_for_a_node_outside_the_life_is_dropped() {
+        let mut p = plan();
+        assert!(!apply(&mut p, NodeId::Year { year: 2050 }, "# X\n\nY.\n"));
+        assert!(!apply(
+            &mut p,
+            NodeId::Month {
+                year: 1998,
+                month: 1
+            },
+            "# X\n\nY.\n"
+        ));
+    }
+
+    /// A day the operator wrote keeps its prose and its title through a
+    /// regeneration of the day itself only if it was not asked for — the
+    /// pending filter is what protects it, and this asserts the title half.
+    #[test]
+    fn a_day_answer_keeps_a_title_a_human_set() {
+        let mut p = plan();
+        p.ensure_day(1999, 1, 3).unwrap();
+        p.day_mut(1999, 1, 3)
+            .unwrap()
+            .content
+            .edit("My Day".into(), "mine".into());
+        apply(
+            &mut p,
+            NodeId::Day {
+                year: 1999,
+                month: 1,
+                day: 3,
+            },
+            "# Model Day\n\nThe model's prose.\n",
+        );
+        let d = &p.month(1999, 1).unwrap().days[0];
+        assert_eq!(d.content.title, "My Day");
+        assert_eq!(d.content.text, "The model's prose.");
+    }
+
+    /// The turn for each node carries that node's parent text — the per-fork
+    /// half, which is exactly what must not be in the shared prefix.
+    #[test]
+    fn each_nodes_turn_carries_its_own_parent() {
+        let mut p = plan();
+        p.story.content = Content {
+            title: "S".into(),
+            text: "An arc.".into(),
+            edited: false,
+            stale: false,
+        };
+        p.story.outline.push(YearBeat {
+            year: 1999,
+            title: "Quiet".into(),
+            premise: "Nothing.".into(),
+        });
+        p.content_mut(NodeId::Year { year: 1999 })
+            .unwrap()
+            .generated("Quiet".into(), "The year's own text.".into());
+        p.content_mut(NodeId::Month {
+            year: 1999,
+            month: 4,
+        })
+        .unwrap()
+        .generated("April".into(), "The month's own text.".into());
+        p.ensure_day(1999, 4, 2).unwrap();
+
+        assert!(turn_for(&p, NodeId::Year { year: 1999 }).contains("Quiet | Nothing."));
+        assert!(turn_for(
+            &p,
+            NodeId::Month {
+                year: 1999,
+                month: 4
+            }
+        )
+        .contains("The year's own text."));
+        assert!(turn_for(
+            &p,
+            NodeId::Day {
+                year: 1999,
+                month: 4,
+                day: 2
+            }
+        )
+        .contains("The month's own text."));
+    }
+
+    /// The fan-out never spawns more workers than there is work, and never
+    /// fewer than one.
+    #[test]
+    fn the_worker_pool_is_bounded_by_the_work_and_the_wave_width() {
+        for (work, want) in [(0, 1), (1, 1), (2, 2), (500, MAX_IN_FLIGHT)] {
+            assert_eq!(MAX_IN_FLIGHT.min(work).max(1), want);
+        }
+    }
+
+    /// **The wave is a width, and it used to be a latency budget.**
+    ///
+    /// While the drain served its backlog one job at a time, a wider wave bought
+    /// no throughput at all — only a longer stretch with the engine blocked, and
+    /// eight months measured at 492 seconds in one drain. The drain decodes as a
+    /// wave now, so the same eight step together.
+    ///
+    /// The ceiling here is deliberately not the safety mechanism: the guest sizes
+    /// its own wave against what a seat's K/V costs and chunks a wider backlog
+    /// itself, so this only has to be wide enough to give it something to batch.
+    #[test]
+    fn a_wave_is_wide_enough_to_be_worth_batching() {
+        // A `const` block, so a width that stops being worth batching is a
+        // compile error rather than a test run — the value is known at compile
+        // time and there is nothing for a runtime assertion to learn. The
+        // `>= 1` companion this replaces was implied by this bound anyway.
+        const {
+            assert!(
+                MAX_IN_FLIGHT >= 8,
+                "the drain batches its backlog now, and a narrower wave leaves \
+                 most of that width unused"
+            )
+        }
+    }
+}

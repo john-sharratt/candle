@@ -1,4 +1,29 @@
 name: telnet_send
+questions:
+- send "show running-config" to the switch over telnet
+- type enable on the Telnet session and wait for the password prompt
+- run "show ip route" on the telnet-connected router
+- send the VLAN configuration lines to the device over telnet
+- what does the switch print back over telnet
+- did the telnet command land, or are we still at the prompt
+- which expect pattern should I wait for on this device
+- is the Telnet session at an enable prompt yet
+- checking the interface status on the network gear
+- pushing a config change to the switch by hand
+- navigating the appliance's telnet menu to option 3
+- reading the router's ARP table over the terminal
+- send that over telnet
+- run it on the Telnet session
+- type that into the telnet terminal
+- send the command to the switch
+- run "show interfaces" on the telnet session and wait for the prompt
+- send this config command to the switch over telnet
+- type "enable" into the Telnet terminal and read the response
+- issue show running-config on the router via telnet
+- send this command to the network device and wait for the # prompt
+- navigate the menu on the telnet console, pick option 3
+- run a status command on the telnet-connected appliance
+- send this line to the Telnet session and capture the output
 category: Telnet sessions
 description: 'Send text to an open Telnet session and read until an expect regex matches (the device prompt, by default). Use for: running commands on network gear, querying device status, configuring routers/switches, navigating menu-driven legacy interfaces. Triggered by "run X on the switch", "configure the router", "show running-config", "send this to the device". Returns received text up to the matched pattern, a matched flag, and duration. Output capped at 32 KiB. Every send requires confirmation. Use ssh_session_exec instead for SSH-capable hosts — SSH provides exit codes and encryption.'
 high_risk: true

@@ -1,4 +1,29 @@
 name: remote_fs_session_delete
+questions:
+- delete /tmp/build.tar.gz on the SFTP host
+- remove the stale artefact from /srv/releases on the server
+- purge the old upload from the remote filesystem
+- delete the rotated log on the remote machine over SFTP
+- is that remote file safe to delete
+- will removing it on the server break the running service
+- which remote files are left over from the last deploy
+- does the delete apply to the server or my session copy
+- the box is out of disk and the old releases must go
+- cleaning up after a failed remote deploy
+- the temp file we uploaded is no longer needed on the host
+- removing a secret we accidentally pushed to the server
+- delete it on the SFTP host
+- remove that remote file
+- delete over SFTP
+- clean that up on the server
+- delete that file on the remote server over SFTP
+- remove the stale artefact from the remote host
+- clean up the old upload on the SFTP machine
+- delete /tmp/build.tar.gz on the remote filesystem
+- get rid of that file on the remote box
+- remove the obsolete release file over sftp
+- delete the remote log file, not the local one
+- erase that path on the SFTP server
 category: Remote filesystem
 description: Remove a file on a remote host's filesystem over SFTP. For the local session VFS use file_delete instead.
 high_risk: true

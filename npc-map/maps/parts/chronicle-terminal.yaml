@@ -1,0 +1,20 @@
+id: chronicle-terminal
+kind: station
+name: world history terminal
+binds: one era
+short: >
+  An era's pages are rewritten at one, entries added under it and entries
+  retired.
+long: >
+  A terminal onto the world's recorded history. Sitting at one claims a single
+  era — a named span of the record — and holds it until you get up, so nobody
+  else can rewrite it while you are working. The era's own pages are yours to
+  change; every other era is yours to read, and reading them is most of the
+  job, because a date is only right against the dates either side of it. What
+  you cannot do here is settle where two eras meet: a boundary belongs to both
+  of them and neither holder can decide it alone.
+# Reading is always on; a change is branched, offered and merged.
+modes:
+  - reading
+  - working
+  - offered

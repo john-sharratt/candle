@@ -158,9 +158,18 @@ fn branch_checkpoints_to_keep(substrate: &Substrate) -> Vec<(StreamId, RecordLoc
 /// `Chunk` / `Tokens` become `Raw` items carrying their source `(segment,
 /// offset, record_size)` and a header synthesized from the substrate/manifest
 /// index; every resident record (`StreamDecl`, `Commit`, `Label`, `ConvState`,
-/// `ProjectionEvents`, `WideQSig`, `TreeMetadata`, `DebugId`, `Distilled`) is a
-/// `Synth` item carrying its freshly-encoded payload. [`write_compacted_log`]
-/// reads the `Raw` bytes back coalesced and stages them verbatim.
+/// `ProjectionEvents`, `WideQSig`, `TreeMetadata`, `TurnCoupling`, `DebugId`,
+/// `Distilled`) is a `Synth` item carrying its freshly-encoded payload.
+/// [`write_compacted_log`] reads the `Raw` bytes back coalesced and stages them
+/// verbatim.
+///
+/// **Every record class must appear here or be deliberately reclaimed.** There
+/// is no fallback that carries an unhandled type forward and nothing warns when
+/// one is missing — the record simply stops existing at the next compaction.
+/// `Npc` and `TurnCoupling` were each lost exactly that way. The exhaustive
+/// match in [`super::accounting::RecordAccounting::record`] is the checklist:
+/// a header-keyed type needs a `Raw` carry-forward from its location map, and a
+/// payload-keyed one needs a `Synth` re-emit from substrate RAM.
 pub fn collect_live_records(
     manifest: &Manifest,
     substrate: &Substrate,
@@ -580,12 +589,17 @@ pub fn collect_live_records(
             bytes,
         ));
     }
-    // Tool-round-trip couplings. Re-emitted from the substrate's live set, not
-    // carried from disk: the record is payload-keyed, so nothing supersedes an
-    // old copy and `accounting` never credits one as dead. Dropping it deletes
-    // the only statement that a call turn and its response are one exchange —
-    // silently, since a timeline with no couplings is a legitimate state
-    // (nothing ever called a tool there) and reads as intact.
+    // Per-(timeline, turn) tool round-trip couplings.
+    //
+    // Resident and payload-keyed, like `Label` and `DebugId` — nothing
+    // supersedes an old copy and `accounting` never credits one as dead, so the
+    // only way one reaches the compacted log is a re-emit from RAM. Dropping it
+    // deletes the only statement that a call turn and its response are one
+    // exchange: `summary_tree::exchange` groups an exchange as the maximal run
+    // of coupled turns, so every compaction began splitting the two halves of a
+    // round-trip apart. Nothing failed — a timeline with no couplings is a
+    // legitimate state (nothing ever called a tool there) and reads as intact,
+    // which is exactly why this went unnoticed.
     for (timeline_id, from_turn) in substrate.live_couplings() {
         if tombstoned.contains(&timeline_id) {
             continue;

@@ -90,6 +90,15 @@ pub(crate) struct Reservation {
     mapped: usize,
     device: CUdevice,
     context: Arc<CudaContext>,
+    /// How many driver calls this span had to drain queued fills for — see
+    /// [`Self::retry_if_not_ready`].
+    ///
+    /// Counted so the condition stays visible. A retry that logs nothing turns a
+    /// real driver behaviour into folklore, and the number is the difference
+    /// between "the loop occasionally overtakes the driver, as designed" and
+    /// "every granule is now paying a full context sync", which is the
+    /// optimisation silently undone.
+    not_ready_retries: u32,
 }
 
 fn check(res: CUresult, what: &str) -> Result<()> {
@@ -192,6 +201,7 @@ impl Reservation {
             mapped: 0,
             device,
             context: stream.context().clone(),
+            not_ready_retries: 0,
         })
     }
 
@@ -237,6 +247,9 @@ impl Reservation {
         let res = unsafe {
             candle::cuda_backend::cudarc::driver::sys::cuMemCreate(&mut handle, len, &prop, 0)
         };
+        let res = self.retry_if_not_ready("cuMemCreate", idx, res, || unsafe {
+            candle::cuda_backend::cudarc::driver::sys::cuMemCreate(&mut handle, len, &prop, 0)
+        });
         if res == CUresult::CUDA_ERROR_OUT_OF_MEMORY {
             return Ok(false);
         }
@@ -247,6 +260,9 @@ impl Reservation {
         // exactly `len` bytes.
         let mapped =
             unsafe { candle::cuda_backend::cudarc::driver::sys::cuMemMap(addr, len, 0, handle, 0) };
+        let mapped = self.retry_if_not_ready("cuMemMap", idx, mapped, || unsafe {
+            candle::cuda_backend::cudarc::driver::sys::cuMemMap(addr, len, 0, handle, 0)
+        });
         if mapped != CUresult::CUDA_SUCCESS {
             // Release the granule rather than leak it: it is mapped nowhere.
             // SAFETY: `handle` is live and unmapped.
@@ -271,6 +287,11 @@ impl Reservation {
         let access = unsafe {
             candle::cuda_backend::cudarc::driver::sys::cuMemSetAccess(addr, len, &desc, 1)
         };
+        // The call this was first seen on — see `retry_if_not_ready`. It is not
+        // special; it was simply the one the llama3 span reached first.
+        let access = self.retry_if_not_ready("cuMemSetAccess", idx, access, || unsafe {
+            candle::cuda_backend::cudarc::driver::sys::cuMemSetAccess(addr, len, &desc, 1)
+        });
         if access != CUresult::CUDA_SUCCESS {
             self.discard(addr, handle);
             check(access, "cuMemSetAccess")?;
@@ -305,6 +326,62 @@ impl Reservation {
         self.granules[idx] = Some(handle);
         self.mapped += 1;
         Ok(true)
+    }
+
+    /// Run one driver call, and if it refuses with `NOT_READY`, drain what this
+    /// span has queued and try once more.
+    ///
+    /// # Why the whole loop needs this, not one call
+    ///
+    /// `map_granule` queues an asynchronous zero-fill per granule and moves on,
+    /// which is the point — a host wait per granule is what queuing the fill
+    /// exists to remove, and a balloon maps hundreds of them. The consequence is
+    /// that every driver call the loop makes afterwards runs with earlier fills
+    /// still in flight, and the driver may answer `CUDA_ERROR_NOT_READY` rather
+    /// than serialising against them itself.
+    ///
+    /// That is not a failure of the call it is reported on. It surfaced on
+    /// `cuMemSetAccess` — a call with nothing wrong with it, reporting someone
+    /// else's pending work — and failed the whole span reservation:
+    /// `test_parallel_batched_forwarding_llama3` failed five times out of five,
+    /// while `_llama2`, whose span needs fewer granules, passed every time. The
+    /// bigger the span, the more fills in flight, the likelier the loop overtakes
+    /// the driver.
+    ///
+    /// So it is applied to **all three** of `cuMemCreate` / `cuMemMap` /
+    /// `cuMemSetAccess`: the condition belongs to the loop, and patching only the
+    /// call that happened to report it first leaves the same trap for the next
+    /// span shape that reaches a different one.
+    ///
+    /// # What the fence actually proves
+    ///
+    /// [`Self::fence`] is a full context synchronize, so it drains *any*
+    /// outstanding work, not specifically the fill. The fill is the only thing
+    /// this loop queues and so is the obvious culprit — but the repair does not
+    /// depend on that being right, which is deliberate: a retry that waits for
+    /// everything cannot be defeated by the diagnosis being incomplete.
+    ///
+    /// Retries are counted and reported (see [`Self::not_ready_retries`]) rather
+    /// than swallowed. A silent retry turns a real driver condition into folklore;
+    /// if this starts firing on every granule, that is a finding, not a shrug.
+    fn retry_if_not_ready(
+        &mut self,
+        what: &str,
+        idx: usize,
+        first: CUresult,
+        mut call: impl FnMut() -> CUresult,
+    ) -> CUresult {
+        if first != CUresult::CUDA_ERROR_NOT_READY {
+            return first;
+        }
+        self.not_ready_retries += 1;
+        log::debug!(
+            "reservation: {what} refused granule {idx} with NOT_READY — draining \
+             {} queued granule fill(s) and retrying",
+            self.mapped,
+        );
+        self.fence();
+        call()
     }
 
     /// Wait for every write this span has queued, before any of it is unmapped.
@@ -348,11 +425,26 @@ impl Reservation {
         let first = offset / self.granularity;
         let last = (offset + bytes).div_ceil(self.granularity);
         let mut claimed = 0;
+        let retries_before = self.not_ready_retries;
         for idx in first..last.min(self.granules.len()) {
             if !self.map_granule(idx)? {
                 break;
             }
             claimed += self.granularity;
+        }
+        // Reported once per range rather than per retry: the useful figure is the
+        // RATE. A handful across a few hundred granules is the loop occasionally
+        // overtaking the driver, which is the design working. One per granule
+        // means every mapping is paying a full context sync, and the queued fill
+        // has quietly become a synchronous one — the optimisation undone without
+        // anything failing.
+        let retries = self.not_ready_retries - retries_before;
+        if retries > 0 {
+            let granules = claimed / self.granularity;
+            log::debug!(
+                "reservation: {retries} NOT_READY drain(s) over {granules} granule(s) \
+                 ({claimed} B claimed)",
+            );
         }
         Ok(claimed)
     }

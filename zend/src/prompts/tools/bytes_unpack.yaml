@@ -1,4 +1,29 @@
 name: bytes_unpack
+questions:
+- unpack 0x0100ffff2a000000 as <HHI
+- read this 20-byte buffer as a u64 timestamp then a 12-byte name
+- decode the first 8 bytes big-endian, ignore the rest
+- parse this dump with the format >QQd
+- what's the length field in this frame
+- are these values little- or big-endian, try both
+- what does byte offset 4 onwards decode to
+- how many records fit in this buffer at 24 bytes each
+- I captured this packet and need the fields out of it
+- the parser is returning garbage, show me what's really in these bytes
+- a C struct was written to this file and I need to read it back
+- I have a binary log and the record layout, decode one entry
+- unpack it
+- decode these bytes for me
+- reverse what bytes_pack did to this
+- I'm reverse-engineering this format, take a guess at the fields
+- decode this hex buffer as two u32s and a float
+- what fields are in these bytes if the format is >HHI
+- unpack this binary record for me
+- read the little-endian integers out of this blob
+- parse this byte string back into its struct fields
+- what values does this packed buffer hold
+- take these bytes apart using the format <QQd
+- reverse the packing on this binary payload
 category: Byte encoding
 description: Decode a raw byte buffer back into structured values — fixed-width integers, floats, and strings — using a struct-style format string. The inverse of bytes_pack. Always call this tool to decode the bytes; never work them out by hand.
 parameters:

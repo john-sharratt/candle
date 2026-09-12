@@ -39,5 +39,6 @@ pub trait WithForward {
 
 pub mod autoencoder;
 pub mod model;
+pub mod quant_choice;
 pub mod quantized_model;
 pub mod sampling;

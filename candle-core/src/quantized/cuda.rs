@@ -2476,11 +2476,25 @@ fn dequantize_f32_into(
     elem_count: usize,
     dst_ptr: u64,
 ) -> Result<()> {
-    let qtype = if dtype == GgmlDType::MXFP4 {
-        // MXFP4 has no QType slot (kept off the locked QTYPE tables) — standalone kernel.
-        None
-    } else {
-        Some(dtype_to_qtype(dtype)? as i32)
+    /// Which routine turns this source into f32.
+    enum Widen {
+        /// A block format with a `QType` slot — the ordinary dequant kernel.
+        Block(i32),
+        /// MXFP4: no `QType` slot (kept off the locked QTYPE tables), standalone kernel.
+        Mxfp4,
+        /// **A source that is already float.** Not a dequant at all — a widening cast, or
+        /// for F32 a straight copy. It is handled here rather than at the caller so that a
+        /// float tensor takes the same banded route as every quantized one: without it
+        /// `QMatMul::build` had to dequantize the whole tensor, copy it again through
+        /// `force_contiguous`, and quantize it to an intermediate `Q8_0` — four whole-tensor
+        /// buffers to produce a twin that this path produces from a 48 MiB band.
+        Float(GgmlDType),
+    }
+
+    let widen = match dtype {
+        GgmlDType::MXFP4 => Widen::Mxfp4,
+        GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => Widen::Float(dtype),
+        _ => Widen::Block(dtype_to_qtype(dtype)? as i32),
     };
 
     // **Banded, so one launch never runs long enough to trip the GPU watchdog.**
@@ -2503,8 +2517,8 @@ fn dequantize_f32_into(
         let n = band.min(elem_count - off);
         let src = data_ptr + (off / bs * ts) as u64;
         let dst = dst_ptr + (off * std::mem::size_of::<f32>()) as u64;
-        match qtype {
-            None => unsafe {
+        match widen {
+            Widen::Mxfp4 => unsafe {
                 candle_kernels::simple::quantized::run_dequantize_mxfp4(
                     src as *const std::ffi::c_void,
                     dst as *mut std::ffi::c_void,
@@ -2512,7 +2526,7 @@ fn dequantize_f32_into(
                     0,
                 );
             },
-            Some(q) => unsafe {
+            Widen::Block(q) => unsafe {
                 run_dequantize_block(
                     src as *const std::ffi::c_void,
                     dst as *mut std::ffi::c_void,
@@ -2521,6 +2535,35 @@ fn dequantize_f32_into(
                     DequantOutDType::F32 as i32,
                 );
             },
+            // `num_dims = 0` / `info = null`: the band is contiguous by construction, so the
+            // cast needs no layout.
+            Widen::Float(GgmlDType::F16) => unsafe {
+                candle_kernels::simple::cast::run_cast_f16_f32(
+                    src as *const std::ffi::c_void,
+                    dst as *mut f32,
+                    n,
+                    0,
+                    std::ptr::null(),
+                );
+            },
+            Widen::Float(GgmlDType::BF16) => unsafe {
+                candle_kernels::simple::cast::run_cast_bf16_f32(
+                    src as *const std::ffi::c_void,
+                    dst as *mut f32,
+                    n,
+                    0,
+                    std::ptr::null(),
+                );
+            },
+            // Already f32: the "widen" is a copy, and the driver does it without a kernel.
+            // Not folded into the cast dispatcher, which has no identity arm.
+            Widen::Float(_) => {
+                let bytes = n * std::mem::size_of::<f32>();
+                unsafe {
+                    cudarc::driver::result::memcpy_dtod_sync(dst, src, bytes)
+                        .map_err(crate::Error::wrap)?;
+                }
+            }
         }
         off += n;
     }
@@ -4388,6 +4431,188 @@ pub fn gemx_repacking_supported(dtype: GgmlDType) -> bool {
     }
 }
 
+/// Build a KO twin from a source that is **still on the host**, a band at a time.
+///
+/// # Why this exists at all
+///
+/// [`QCudaStorage::repack_ko_into`] bands its f32 intermediate, so the twin costs one band
+/// rather than a whole-tensor buffer. But it reads from a source already resident on the
+/// device, and getting it there is its own whole-tensor allocation — for a `[248320, 4096]`
+/// BF16 `output.weight`, **1,940 MiB** that exists only to be read once, in order, and dropped.
+///
+/// `dense_span::peak_load_pool_bytes` budgets for exactly that (`largest_source + 2 bands`), so
+/// nothing is *wrong* until the largest source is unusually big — and then the margin between
+/// the bound and the pool's real behaviour is a few tens of MiB, which allocator granularity
+/// and stream-ordered frees from the preceding tensors eat. It presented as
+/// `CUDA_ERROR_OUT_OF_MEMORY` on a card with 14 GiB free.
+///
+/// The source is already in a memory-mapped file. Reading it a band at a time makes the load's
+/// device peak `staging band + f32 band + ko band` — about 85 MiB for that head instead of
+/// 2,000 — and independent of how large any single tensor is.
+///
+/// # Contract
+///
+/// `src` is the tensor's raw bytes as GGUF lays them out: whole blocks, row-major, no padding.
+/// `dst`, when given, is at least [`ko_repacked_bytes`] of live device memory that outlives the
+/// returned storage — the same contract `repack_ko_into` takes.
+pub fn repack_ko_from_host(
+    device: &CudaDevice,
+    src: &[u8],
+    shape: &Shape,
+    src_dtype: GgmlDType,
+    ko_dtype: GgmlDType,
+    dst: Option<(u64, LeaseOrigin)>,
+) -> Result<QCudaStorage> {
+    let (nrows, ncols) = shape.dims2()?;
+    if !crate::quantized::ko_quant::ko_tileable(nrows, ncols) {
+        crate::bail!(
+            "repack_ko_from_host: shape [{nrows}, {ncols}] must have nrows % 32 == 0 and \
+             ncols % 128 == 0"
+        );
+    }
+    // MXFP4 → MXFP4_KO is an exact byte permutation done on the host, not a dequant/requant,
+    // so it has no band loop to join. It is also not a shape this path is asked for: the
+    // permutation already reads from host bytes and never materialises the source on device.
+    if ko_dtype == GgmlDType::MXFP4_KO {
+        crate::bail!(
+            "repack_ko_from_host: MXFP4_KO is a host-side permutation — use `repack_ko_into`"
+        );
+    }
+    let qtype = dtype_to_qtype(ko_dtype)? as i32;
+    let bs = src_dtype.block_size();
+    let ts = src_dtype.type_size();
+    if !ncols.is_multiple_of(bs) {
+        crate::bail!(
+            "repack_ko_from_host: {ncols} columns is not a whole number of {src_dtype:?} \
+             blocks ({bs})"
+        );
+    }
+    let need = nrows * ncols / bs * ts;
+    if src.len() < need {
+        crate::bail!(
+            "repack_ko_from_host: source holds {} bytes, need {need} for [{nrows}, {ncols}] \
+             of {src_dtype:?}",
+            src.len()
+        );
+    }
+
+    let bytes = ko_repacked_bytes(shape, ko_dtype)?;
+    let row_groups = nrows / 8;
+    let k_blocks = ncols / 128;
+    let chunk_bytes = crate::quantized::ko_quant::ko_chunk_bytes(ko_dtype);
+    // The same band geometry `repack_ko_into` uses — whole row-groups, sized so the f32
+    // intermediate stays inside `REPACK_BAND_BYTES`, and at least one however wide the tensor.
+    let band_rows = ((REPACK_BAND_BYTES / (ncols * std::mem::size_of::<f32>())) / 8)
+        .max(1)
+        .min(row_groups)
+        * 8;
+
+    // Three bounded buffers: the staged source bytes, their f32 expansion, and the KO chunks
+    // the quantize kernel writes. None scales with the tensor.
+    let mut stage = unsafe { device.alloc::<u8>(band_rows * ncols / bs * ts)? };
+    let mut f32_band = unsafe { device.alloc::<f32>(band_rows * ncols)? };
+    let mut ko_band = unsafe { device.alloc::<u8>(band_rows / 8 * k_blocks * chunk_bytes)? };
+
+    // **Wrapped before the first fallible step**, for the reason `repack_ko_into` gives at
+    // length: `out` may be a lease into the dense block, and a bare `CudaSlice` dropped on an
+    // error path frees memory this code does not own. Every `?` below is inside that window.
+    let (out, backing) = match dst {
+        // SAFETY: the caller's contract — at least `bytes` of live, un-aliased device memory
+        // outliving the storage.
+        Some((ptr, origin)) => (
+            unsafe { device.cuda_stream().upgrade_device_ptr::<u8>(ptr, bytes) },
+            Backing::Lease(origin),
+        ),
+        // SAFETY: filled by the loop below.
+        None => (unsafe { device.alloc::<u8>(bytes)? }, Backing::Owned),
+    };
+    let mut me = QCudaStorage {
+        data: std::mem::ManuallyDrop::new(PaddedCudaSlice {
+            inner: out,
+            len: bytes,
+        }),
+        dtype: ko_dtype,
+        device: device.clone(),
+        backing,
+    };
+    let stream = device.cuda_stream();
+
+    let mut r0 = 0usize;
+    while r0 < nrows {
+        let rows = band_rows.min(nrows - r0);
+        let src_off = r0 * ncols / bs * ts;
+        let src_len = rows * ncols / bs * ts;
+        // Host → device for this band only. Every row is a whole number of blocks, so the
+        // band's bytes are contiguous in the mapping and need no gather.
+        device.memcpy_htod(
+            &src[src_off..src_off + src_len],
+            &mut stage.slice_mut(..src_len),
+        )?;
+        {
+            let (sp, _sg) = stage.device_ptr(&stream);
+            let (fp, _fg) = f32_band.device_ptr_mut(&stream);
+            dequantize_f32_into(sp, src_dtype, rows * ncols, fp)?;
+        }
+        {
+            let (fp, _fg) = f32_band.device_ptr(&stream);
+            let (kp, _kg) = ko_band.device_ptr_mut(&stream);
+            unsafe {
+                run_quantize_ko(
+                    fp as *const f32,
+                    kp as *mut std::ffi::c_void,
+                    rows as i32,
+                    ncols as i32,
+                    qtype,
+                );
+            }
+        }
+        // Scatter the band's chunks to their global positions: one contiguous run per k-block,
+        // because `g` is the inner index of `k_blk · row_groups + g`. Identical to
+        // `repack_ko_into`'s scatter, and it has to be — the two produce the same bytes.
+        let band_groups = rows / 8;
+        let g0 = r0 / 8;
+        let run = band_groups * chunk_bytes;
+        for k in 0..k_blocks {
+            let dst_off = (k * row_groups + g0) * chunk_bytes;
+            let src_off = k * band_groups * chunk_bytes;
+            debug_assert!(
+                dst_off + run <= bytes,
+                "band scatter passes the destination"
+            );
+            let src_view = ko_band.slice(src_off..src_off + run);
+            let mut dst_view = me.data.inner.slice_mut(dst_off..dst_off + run);
+            stream
+                .memcpy_dtod(&src_view, &mut dst_view)
+                .map_err(crate::Error::wrap)?;
+        }
+        r0 += rows;
+    }
+    // The H2D copies are stream-ordered against the kernels that read them, and the band
+    // buffers free on the same stream when they drop, so no synchronise is needed here — the
+    // same reasoning `repack_ko_into` records for its own loop.
+    Ok(me)
+}
+
+/// Whether `repack_ko_into` can build this source's KO twin **directly**, without the caller
+/// first converting it to something else.
+///
+/// This is the predicate `QMatMul::build` routes on, and the one the slot planner predicts it
+/// with — the two must give the same answer or the planner sizes a slot the loader does not
+/// write. [`gemx_repacking_supported`] is a narrower question (does this dtype have a GEMX
+/// repack kernel) and stays that way, because the streaming path asks it about kernels rather
+/// than about routes.
+///
+/// A **float** source qualifies even though it has no GEMX kernel: `dequantize_f32_into` widens
+/// it a band at a time exactly as it dequantizes a block format, so `repack_ko_into` reads it
+/// without help. Before that arm existed the only way to give a float projection a KO twin was
+/// to dequantize the whole tensor, copy it again through `force_contiguous`, and quantize it to
+/// an intermediate `Q8_0` — four whole-tensor buffers, which on a `[248320, 4096]` F16 head is
+/// 10,730 MiB to produce a twin the banded route builds inside 48 MiB. It OOMed a 24 GiB card.
+pub fn repackable_to_ko(dtype: GgmlDType) -> bool {
+    gemx_repacking_supported(dtype)
+        || matches!(dtype, GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16)
+}
+
 /// The f32 band [`QCudaStorage::repack_ko_into`] holds while it repacks.
 ///
 /// **The repack's device scratch, and it does not scale with the tensor.** The repack is
@@ -5537,17 +5762,17 @@ pub fn to_dynamic<'w>(
         CudaStorageSlice::F16(s) => {
             let v = s.slice(o1..o2);
             let (ptr, _g) = v.device_ptr(&stream);
-            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device)?
+            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device, cuda.backing)?
         }
         CudaStorageSlice::BF16(s) => {
             let v = s.slice(o1..o2);
             let (ptr, _g) = v.device_ptr(&stream);
-            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device)?
+            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device, cuda.backing)?
         }
         CudaStorageSlice::F32(s) => {
             let v = s.slice(o1..o2);
             let (ptr, _g) = v.device_ptr(&stream);
-            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device)?
+            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device, cuda.backing)?
         }
         _ => crate::bail!("to_dynamic(int8): activation slice dtype must be F16/BF16/F32"),
     };
@@ -5573,29 +5798,45 @@ pub(crate) fn q8a1024_byte_len(rows: usize, cols: usize) -> usize {
 /// q8a1024 flat-grouped blocks (8 × 128-tiles per 1152-byte super-block; qs
 /// de-interleaved from the per-32 ds — see blocks.cuh). The matmul mode is not chosen here; it is
 /// derived later by the occupancy formula `q8a128_dense_use_mode2` at dispatch.
-pub fn quantize_acts_q8a128(
+pub fn quantize_acts_q8a128<'w>(
     act_ptr: u64,
     dtype: i32,
     rows: usize,
     cols: usize,
     device: &CudaDevice,
-) -> Result<Q8a128Operand<'static>> {
+    // The activation's own backing, so the operand is carved where the
+    // activation lives. Unplumbed, this allocated from the pool unconditionally
+    // — and it is on the int8 matmul's hot path, so *every* projection in a
+    // quantized model did. The forbidden-allocation detector named it directly:
+    // `quantize_acts_q8a128 <- to_dynamic <- forward_via_int8`, at the top of
+    // the report by both call count and bytes.
+    origin: Backing,
+) -> Result<Q8a128Operand<'w>> {
     let bytes = q8a1024_byte_len(rows, cols);
-    let mut out = unsafe { device.alloc::<u8>(bytes)? };
-    {
-        let stream = device.cuda_stream();
-        let (op, _g) = out.device_ptr_mut(&stream);
-        unsafe {
-            run_quantize_q8a128(
-                act_ptr as *const std::ffi::c_void,
-                op as *mut std::ffi::c_void,
-                rows as i32,
-                cols as i32,
-                dtype,
-            );
-        }
+    // The same three-value resolve `rms_norm_q8a128` below uses, which is the
+    // fused form of this and was plumbed while this was not.
+    let (out_ptr_planned, owned, out_backing) = resolve_u8_out(origin, device, bytes)?;
+    // SAFETY: `out_ptr_planned` names `bytes` of either the carved arena range or
+    // the owned fallback, and the kernel writes exactly that; `act_ptr` is the
+    // caller's activation, read as `dtype` for `rows * cols`.
+    unsafe {
+        run_quantize_q8a128(
+            act_ptr as *const std::ffi::c_void,
+            out_ptr_planned as *mut std::ffi::c_void,
+            rows as i32,
+            cols as i32,
+            dtype,
+        );
     }
-    Ok(Q8a128Operand::new(out, rows, cols))
+    q8a128_from_out(
+        owned,
+        out_ptr_planned,
+        out_backing,
+        bytes,
+        rows,
+        cols,
+        device,
+    )
 }
 
 /// Fused RMSNorm → q8a128: normalize each row of `xs` `[.. × K]` by `alpha` `[K]` and emit the

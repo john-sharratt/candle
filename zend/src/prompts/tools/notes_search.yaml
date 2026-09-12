@@ -1,4 +1,29 @@
 name: notes_search
+questions:
+- search notes for "connection pool"
+- find anything tagged incident that mentions timeouts
+- which notes talk about the certificate renewal
+- look for notes containing the word rollback
+- did I ever write anything about this error message
+- do any of my notes cover the migration procedure
+- where did I record that workaround
+- is there a note about who owns this service
+- I can't recall the key, only roughly what it said
+- looking for prior context on this problem
+- I'm sure I've solved this before, find the note
+- searching my own history for this topic
+- search my notes
+- find notes about that
+- grep the notes
+- search my notes for anything on this topic
+- find my notes mentioning postgres
+- search the notes for anything about the migration
+- which note did I write about the SSH key rotation
+- look through my notes for "rate limit"
+- I can't remember the key — find the note about deployment
+- search notes tagged security for the word audit
+- do I have a note that talks about the staging server
+- find notes containing this phrase
 category: Notes
 description: Find stored notes by a content substring or tag match, returning ranked hits with text snippets. Use when the note's exact key is unknown; supply a query, tags, or both.
 parameters:
