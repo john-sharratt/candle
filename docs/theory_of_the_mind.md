@@ -108,6 +108,10 @@ Grouped by function rather than stack position, because several layers cross the
 
 The main conversation — the decoder that actually emits — is not listed. It is the *reader* of the substrate, not a conversation within it. Its job is attention over everything below.
 
+> **"Parallel" here means concurrent on the substrate, not concurrent in decode.** Every layer below is a conversation that persists and is written to; they are parallel in the sense that all of them are standing and available to be attended to at once. They are not parallel in the sense of several decodes running at the same instant inside one head and reconciling afterwards — `npc_mind_design.md` Part VI forbids exactly that, and nothing here asks for it. Each layer owns a question the others do not ask, and runs on its own clock: the action layer at the tick, goals and missions on a slow clock, consolidation on daydream and sleep. At most one is awake in a given mind at a time.
+>
+> The coupling that makes this safe is asymmetric, and §3 is the reason. A faster layer writes *up* into a slower one and does not wait for an answer. A slower layer's output comes back *down* only by winning attention in the gather — never by being concatenated into the reader's context, which is the leak. Where this document says a layer is "attended to", that is load-bearing and means attention weights, not tokens.
+
 | # | Layer | Function | Failure signature |
 |---|---|---|---|
 | **Perceptual ground** | | | |

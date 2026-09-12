@@ -289,7 +289,15 @@ The asymmetry that makes async pay off is the one the inference engine is built 
 
 ### The unit of parallelism is the NPC, not the conversation
 
-An NPC is one mind: one inbox, one serialized cognitive process folding over it. Parallelism is across minds — many NPCs in one GPU batch — and out in the world — events genuinely arriving at once — never inside a single head running several conversation threads that later reconcile.
+An NPC is one mind: one inbox, one serialized cognitive process folding over it. Parallelism is across minds — many NPCs in one GPU batch — and out in the world — events genuinely arriving at once — never inside a single head running several decodes on the same question that later reconcile.
+
+> **What this rule does and does not forbid.** It forbids *concurrent decode* within one head: two threads awake on the same question, racing, and merging their answers afterwards. That is where arbitration logic breeds, and there is none anywhere in this design.
+>
+> It does **not** forbid a mind from holding several conversations. It must hold several, and `theory_of_the_mind.md` is the argument for which ones: goals, missions, self-integration, metacognition and consolidation are separate streams because their failure modes are separate. Part VIII already says so in passing — "strategies are a conversation in the layer beneath action, several active or finished at once" — and this paragraph, read too broadly, contradicted it.
+>
+> The reconciliation is the **clock**. Many conversations per mind, at most one awake at a time, each on its own clock: action at the tick, strategy on the slow clock, consolidation on daydream and sleep. They never reconcile because they never answer the same question — each owns a question the others do not ask.
+>
+> Coupling is asymmetric and that asymmetry is the whole safety argument. **Write up, never await** — a fast layer calls a fire-and-forget mutation tool and returns immediately, so the fast clock never blocks on the slow one. **Read down through the gather, never through tokens** — a slower layer's output reaches the action layer by winning provenance selection, weighted against everything else, never by being pasted into its context as a message. The moment a layer's output arrives as tokens it stops being one voice among many and becomes the context the others are weighed against, which is the leak `theory_of_the_mind.md` §3 is about and the runaway loop of Part X-bis.
 
 A popular NPC fielding three players does not spin up three mind-copies. The three players' events land in her one salience-weighted inbox. When she is scheduled to think, the assembler builds one prompt and she emits one cognitive step that fans out into several actions — reply to A, glance at the fight, ignore C for now. Serial cognition, multi-action output, parallel I/O. The three conversations are reconstructed by observers from her stream of addressed utterances; they are a reading of the stream, not threads in her head.
 

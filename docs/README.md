@@ -96,6 +96,7 @@ web UI.
 | Doc | Covers |
 |---|---|
 | [`npc_mind_design.md`](npc_mind_design.md) | "The Asynchronous Mind" — the NPC cognitive architecture: one mechanism (gather substrate under salience, attend, act, write back) applied uniformly, with a mutable substrate the model influences but never controls and an immutable core it cannot write. |
+| [`reflection_and_dreams.md`](reflection_and_dreams.md) | The second and third conversations a character runs: `reflect` as a one-shot transient conversation over a deep dream gather, and a private per-NPC dream corpus maintained as a quality-diversity search — anti-correlated generation, relevance selection, recency reaping. Implements the reflection half of `theory_of_the_mind.md`'s layers 14/16/17/19. |
 | [`narrative_engine.md`](narrative_engine.md) | Roleplay Engine (RPE) design: translates structured player `Input` events into narrated prose via a conversation-as-KV-cache narrator, with `parse_turn`/`text_to_inputs` as the crate's entry points. |
 
 ## Web tier & deployment
