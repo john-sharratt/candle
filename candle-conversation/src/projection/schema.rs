@@ -1164,14 +1164,18 @@ pub enum SelectionRule {
     /// single active threat).
     Single,
 
-    /// Collection-only: the single member whose `name` equals the runtime
-    /// value of the named selector (resolved from the projection's
-    /// `SelectionState`, e.g. set per turn via `TurnOptions::selection`).
-    /// This is an **explicit, score-independent** pick — it ignores provenance
-    /// relevance and the score threshold entirely, selecting exactly the
-    /// member the caller names (or nothing, if the selector is unset or
-    /// names no member). Used to force one section out of a catalog by name —
-    /// e.g. calibration pinning a single tool from the `tools` collection.
+    /// Collection-only: the members whose `name`s the named selector holds
+    /// (resolved from the projection's `SelectionState`, set per turn via
+    /// `TurnOptions::selection`), emitted in declaration order. This is an
+    /// **explicit, score-independent** pick — it ignores provenance relevance
+    /// and the score threshold entirely, selecting exactly the members the
+    /// caller names (or nothing, if the selector is unset or names none).
+    ///
+    /// One name pins one member — a character's identity out of every
+    /// character's. Several is a caller showing a set only it can decide: a
+    /// character's acts are the ones its body can do here and now, with these
+    /// people and these things in reach, which is a fact about the world rather
+    /// than a score.
     ///
     /// On a turn group (which has no member names) this selects nothing.
     Named { selector: String },

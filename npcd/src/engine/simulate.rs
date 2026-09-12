@@ -246,6 +246,9 @@ fn persona_of<'a>(s: &'a Scenario, world: &'a str, mission: &'a str) -> Persona<
         personality: &s.personality,
         world_id: &s.world_id,
         identity: "",
+        // A scenario states its own frame; it does not carry a personality
+        // record to read an anchor out of.
+        anchor: "",
         manner: "",
         beliefs: &[],
         relationships: &[],

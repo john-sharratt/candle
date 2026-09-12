@@ -387,35 +387,49 @@ mod tests {
         let units = build_units(&m, d.path());
         let anchor = units[0].anchor.as_ref().unwrap();
 
-        // Qwen3.5 / Qwen3.8 — a nested function element with raw values.
-        let fb = ToolCallEnvelope::for_dialect(&Dialect::qwen35());
-        let call = render_list_call(&fb, &units[0]);
-        assert!(
-            call.contains("<function=file_list>") && call.contains("<parameter=prefix>"),
-            "a FunctionBlock checkpoint gets elements: {call}"
+        // What the ingest prefills must equal what the DIALECT's envelope
+        // renders — asserted against the envelope rather than against a literal
+        // shape, because a literal here is the second opinion that caused the
+        // original divergence. `Dialect::qwen35` declares `CallStyle::JsonBlock`
+        // today and declared `FunctionBlock` yesterday; this test is about the
+        // two staying joined, not about which one is current.
+        let env = ToolCallEnvelope::for_dialect(&Dialect::qwen35());
+        assert_eq!(
+            render_list_call(&env, &units[0]),
+            env.render("file_list", &[("prefix", units[0].list_prefix())]),
+            "the listing call must be the dialect envelope's own rendering",
         );
-        assert!(
-            !call.contains("\"name\""),
-            "and no JSON object: {call}"
-        );
-        let read = render_read_call(&fb, anchor);
-        assert!(
-            read.contains("<parameter=start_line>\n1</parameter>"),
-            "raw values, unquoted: {read}"
+        assert_eq!(
+            render_read_call(&env, anchor),
+            env.render(
+                "file_read",
+                &[
+                    ("path", anchor.path.as_str()),
+                    ("start_line", &anchor.start_line.to_string()),
+                    ("end_line", &anchor.end_line.to_string()),
+                ],
+            ),
+            "the read call must be the dialect envelope's own rendering",
         );
 
-        // The two styles must actually differ, or this test proves nothing.
-        let js = ToolCallEnvelope::for_dialect(&Dialect::chat_ml());
-        assert_ne!(
-            render_list_call(&js, &units[0]),
-            call,
-            "the call shape must track the dialect"
+        // And it is the CHECKPOINT's envelope, not a hardcoded family: ask the
+        // dialect for a different style and the rendering follows it.
+        let lines = ToolCallEnvelope::for_dialect(&Dialect::llama3());
+        assert_eq!(
+            render_list_call(&lines, &units[0]),
+            lines.render("file_list", &[("prefix", units[0].list_prefix())]),
         );
     }
 
     /// A path is the one part of a call an author does not control. Spliced in
     /// raw, a quote or backslash would emit a `<tool_call>` the extractor cannot
     /// parse — so the arguments must be JSON-escaped and stay round-trippable.
+    ///
+    /// This is the surviving form of a concern that used to need two tests. While
+    /// `Dialect::qwen35` declared `CallStyle::FunctionBlock`, values rode raw and
+    /// the hazard was a value containing `</parameter>` and closing its own span;
+    /// that dialect now declares `JsonBlock`, so there are no raw values and no
+    /// `</parameter>` anywhere, and escaping is the whole of the question.
     #[test]
     fn a_path_with_json_metacharacters_stays_parseable() {
         let anchor = Anchor {
@@ -436,36 +450,6 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
         assert_eq!(parsed["name"], "file_read");
         assert_eq!(parsed["arguments"]["path"], "a/we\"ird\\dir/mod.rs");
-    }
-
-    /// The same guarantee on a FunctionBlock checkpoint, where values are RAW.
-    ///
-    /// Nothing escapes them and nothing can — that is the style's whole point —
-    /// so the property that matters is different: the value must not contain the
-    /// element's own end marker, or the span would close early and the rest of
-    /// the path would be read as the next element.
-    #[test]
-    fn a_raw_value_does_not_contain_its_own_terminator() {
-        let anchor = Anchor {
-            path: "a/we\"ird\\dir/mod.rs".to_string(),
-            start_line: 1,
-            end_line: 2,
-            total_lines: 3,
-            body: "//! One.\n//! Two.\n".to_string(),
-            language: Language::Rust,
-        };
-        let env = ToolCallEnvelope::for_dialect(&Dialect::qwen35());
-        let call = render_read_call(&env, &anchor);
-        assert!(
-            call.contains("<parameter=path>\na/we\"ird\\dir/mod.rs</parameter>"),
-            "the path rides raw, quotes and backslashes included: {call}"
-        );
-        assert_eq!(
-            call.matches("</parameter>").count(),
-            3,
-            "one terminator per argument and no more — a value carrying the \
-             marker would close its own span early: {call}"
-        );
     }
 
     /// The excerpt response is the shared numbered/fenced format, framed in tags.

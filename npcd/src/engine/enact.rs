@@ -21,11 +21,13 @@
 //! the API, the harness, a checkpoint whose tokenizer left the tree unarmed —
 //! and they are written for a character to read rather than for a log.
 
+use npc_map::world::Where;
 use serde_json::{Map, Value};
 
 use crate::engine::act::Act;
 use crate::engine::body::{destinations, refusal, Outcome};
 use crate::engine::tools::SELF;
+use crate::engine::whereabouts;
 use crate::sim::field::Stance;
 use crate::sim::item::{Item, Kind as ItemKind};
 use crate::world::Hosted;
@@ -517,8 +519,8 @@ fn scan(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         // it offers names — but the API and the harness are not
         // grammar-constrained, and this is the same latitude `operate` gives a
         // mode a device does not admit.
-        let by_key = npc_map::world::Where::parse(at.trim())
-            .filter(|w| hosted.read(|world| world.node(w).is_some()));
+        let by_key =
+            Where::parse(at.trim()).filter(|w| hosted.read(|world| world.node(w).is_some()));
         let Some(place) = destinations(hosted, body)
             .into_iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(at.trim()))
@@ -559,10 +561,40 @@ fn scan(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         if !seen.1.is_empty() {
             parts.push(format!("worth taking: {}", seen.1.join(", ")));
         }
-        return Outcome::Did(match parts.is_empty() {
+        let mut said = match parts.is_empty() {
             true => format!("You look at {at}. Nobody there, and nothing moving."),
             false => format!("You look at {at}. {}.", parts.join("; ")),
+        };
+        // **And who else is on this floor, and where.** A scan of one room
+        // answered the question a searching character was not asking: over a
+        // morning of pulses the cast scanned room after room one at a time and
+        // walked into each just after the person it wanted had left. The room
+        // looked at and the room the character stands in are left out — it has
+        // been told about both already. See [`whereabouts`].
+        //
+        // With nobody else on the floor at all, the place to look is the
+        // handset: `message` and `reach_out` are offered on every turn and a
+        // searching cast never once reached for them. Only said to a character
+        // carrying one — the same gate that puts those acts in its grammar.
+        let (floor, alone_on_floor) = hosted.read(|w| {
+            let mine = w.actor(body).map(|a| a.at.clone());
+            let mut except: Vec<&Where> = vec![&place];
+            except.extend(mine.as_ref());
+            (
+                whereabouts::line(w, body, &except),
+                whereabouts::elsewhere(w, body, &[]).is_empty(),
+            )
         });
+        if let Some(floor) = floor {
+            said.push(' ');
+            said.push_str(&floor);
+        } else if alone_on_floor && hosted.sim(|s| s.has_phone(body)) {
+            said.push_str(
+                " Nobody else is on this floor. If you are looking for somebody, message them — \
+                 `reach_out` to start a conversation, `message` on one you already have.",
+            );
+        }
+        return Outcome::Did(said);
     }
     let (Some(x), Some(y)) = (text(args, "x"), text(args, "y")) else {
         return Outcome::Refused(
@@ -916,6 +948,78 @@ mod tests {
             crate::sim::seed::outfit(s, "c2");
         });
         h
+    }
+
+    /// The tower's one floor, with each `(id, name, node)` standing on it.
+    fn tower_with(bodies: &[(&str, &str, &str)]) -> Hosted {
+        let h = Hosted::load(
+            "battle-cities",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps"),
+        )
+        .expect("the shipped maps must load");
+        h.with(|w| {
+            for (id, name, node) in bodies {
+                w.enter(*id, *name, Where::new("tower-redoubt", *node))
+                    .unwrap();
+            }
+        });
+        h
+    }
+
+    /// **A scan names who else is on the floor, and where.** The room looked at
+    /// was empty; the person the character wanted was two doors down.
+    #[test]
+    fn a_scan_names_who_else_is_on_the_floor() {
+        let h = tower_with(&[
+            ("c1", "Wren Weaver", "muster-hall"),
+            ("c2", "Yaelis Vayne", "barracks"),
+        ]);
+        let out = perform(
+            &h,
+            "c1",
+            &act("scan", json!({"at": "tower-redoubt/gatehouse"})),
+        );
+        let line = out.line().unwrap();
+        assert!(line.contains("Nobody there"), "{line}");
+        assert!(
+            line.contains("Elsewhere on this floor: Yaelis Vayne is in the barracks."),
+            "{line}"
+        );
+        assert!(
+            !line.contains("message them"),
+            "somebody is on the floor: {line}"
+        );
+    }
+
+    /// With nobody else on the floor, the handset is where to look.
+    #[test]
+    fn a_scan_of_an_empty_floor_points_at_the_handset() {
+        let h = tower_with(&[("c1", "Wren Weaver", "muster-hall")]);
+        h.with_sim(|s| crate::sim::seed::issue_handset(s, "c1", "Wren Weaver"));
+        let out = perform(
+            &h,
+            "c1",
+            &act("scan", json!({"at": "tower-redoubt/gatehouse"})),
+        );
+        assert!(
+            out.line()
+                .unwrap()
+                .contains("If you are looking for somebody, message them"),
+            "{out:?}"
+        );
+    }
+
+    /// Without a handset it does not point at something the character cannot
+    /// use — the same gate that keeps the messaging acts out of its grammar.
+    #[test]
+    fn without_a_handset_an_empty_floor_says_nothing_about_messaging() {
+        let h = tower_with(&[("c1", "Wren Weaver", "muster-hall")]);
+        let out = perform(
+            &h,
+            "c1",
+            &act("scan", json!({"at": "tower-redoubt/gatehouse"})),
+        );
+        assert!(!out.line().unwrap().contains("message them"), "{out:?}");
     }
 
     #[test]

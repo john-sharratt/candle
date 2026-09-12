@@ -187,12 +187,13 @@ mod tests {
         assert_eq!(d.assistant_start, Dialect::chat_ml().assistant_start);
     }
 
-    /// It writes calls in its own syntax, which is not JSON. See
+    /// It calls tools in JSON blocks — see `Dialect::qwen35` for why that is
+    /// not the element syntax its own template writes, and
     /// `candle_transformers::models::dialect::CallStyle`.
     #[test]
-    fn it_calls_tools_the_way_its_template_does() {
+    fn it_calls_tools_in_json_blocks() {
         let d = qwen35_9b_q6().dialect;
-        assert_eq!(d.call_style, CallStyle::FunctionBlock);
+        assert_eq!(d.call_style, CallStyle::JsonBlock);
         assert!(d.call_style.multi_call());
         assert!(d.call_style.carries_results());
     }

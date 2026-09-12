@@ -224,6 +224,25 @@ pub struct ThinkSteerEnvelope {
     pub think_close: TokenId,
     /// The model's end-of-sequence id.
     pub eos: TokenId,
+    /// Text injected immediately after the block's closing tag, before control
+    /// returns to the decoder.
+    ///
+    /// **This is what makes the turn's shape deterministic across the join.**
+    /// Empty — the ordinary case — hands control back the moment the block
+    /// closes, and what the model does next is its own business: right for an
+    /// assistant whose reasoning is followed by prose.
+    ///
+    /// An **action loop** wants the opposite. A character that has finished
+    /// thinking must now act, and leaving it free at that join is leaving it
+    /// free to write an essay instead — which is what turns produced: a closed
+    /// block, then prose, then nothing the world could act on. Setting this to
+    /// the tool-call marker emits it as part of the grammar, which fires the act
+    /// stencil and puts the turn straight into a call.
+    ///
+    /// A caller that splices the call grammar onto the block itself (see
+    /// `compile_action_loop`'s prelude) has already closed the join structurally
+    /// and leaves this empty.
+    pub after_close: &'static str,
 }
 
 /// Build the steering tree spec for `mode`.  **Every** mode yields a tree,
@@ -238,7 +257,7 @@ pub struct ThinkSteerEnvelope {
 /// all, so the closing run follows the trigger immediately.
 pub fn compile_think_tree(mode: ThinkMode, env: &ThinkSteerEnvelope) -> TreeSpec {
     match mode {
-        ThinkMode::Off => off(),
+        ThinkMode::Off => off(env),
         ThinkMode::Quick => quick(env),
         ThinkMode::Balanced => balanced(env),
         ThinkMode::Deep => deep(env),
@@ -268,11 +287,25 @@ fn think_span(
 
 /// The injected closing tag the block actually ends on (the model's own
 /// `</think>` is always dropped), spliced to `End`.
-fn close_tag_then_end(spec: &mut TreeSpec) -> SpecId {
+/// `env.after_close` rides in a **separate** static node rather than being
+/// concatenated onto the tag, for the reason [`off`] documents: a static run's
+/// last token is held back and committed, while every earlier token goes
+/// through `push_forwarded` and has its flag dropped. Appending to this run
+/// would bury `</think>` one slot from the end and lose the commit that arms
+/// the index-page cut.
+fn close_tag_then_end(spec: &mut TreeSpec, env: &ThinkSteerEnvelope) -> SpecId {
     let end = spec.push(NodeSpec::End);
+    let after = if env.after_close.is_empty() {
+        end
+    } else {
+        spec.push(NodeSpec::Static {
+            text: env.after_close.to_string(),
+            next: end,
+        })
+    };
     spec.push(NodeSpec::Static {
         text: "</think>".to_string(),
-        next: end,
+        next: after,
     })
 }
 
@@ -307,7 +340,7 @@ const BLOCK_OPEN: &str = "\n";
 /// budget the session programs from [`ThinkMode::eot_budget`]).
 fn single_span_tree(env: &ThinkSteerEnvelope, label: &str, forced_after: u32) -> TreeSpec {
     let mut spec = TreeSpec::new(label);
-    let close = close_tag_then_end(&mut spec);
+    let close = close_tag_then_end(&mut spec, env);
     let span = think_span(&mut spec, env, forced_after, close);
     spec.root = spec.push(NodeSpec::Static {
         text: BLOCK_OPEN.to_string(),
@@ -349,12 +382,24 @@ fn single_span_tree(env: &ThinkSteerEnvelope, label: &str, forced_after: u32) ->
 /// tree closes the block whatever the model intends, and makes that zero true.
 ///
 /// It carries no [`NodeSpec::FreeText`], which is what keeps `span_count` at 0.
-fn off() -> TreeSpec {
+///
+/// [`ThinkSteerEnvelope::after_close`] rides in its own static node after this
+/// run rather than being appended to it — for the reason stated above, which
+/// applies with full force here: this run's last token must remain `</think>`.
+fn off(env: &ThinkSteerEnvelope) -> TreeSpec {
     let mut spec = TreeSpec::new("think_off");
     let end = spec.push(NodeSpec::End);
+    let after = if env.after_close.is_empty() {
+        end
+    } else {
+        spec.push(NodeSpec::Static {
+            text: env.after_close.to_string(),
+            next: end,
+        })
+    };
     spec.root = spec.push(NodeSpec::Static {
         text: "\n\n</think>".to_string(),
-        next: end,
+        next: after,
     });
     spec
 }
@@ -408,6 +453,7 @@ mod tests {
             think_open: THINK_OPEN_ID,
             think_close: THINK_CLOSE_ID,
             eos: vocab().eos(),
+            after_close: "",
         }
     }
 

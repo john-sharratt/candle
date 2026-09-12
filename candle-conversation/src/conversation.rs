@@ -3148,7 +3148,20 @@ impl Sequence {
         options: TurnOptions,
     ) -> crate::Result<TurnResponse> {
         let handle = self.submit_turn_with_options(user_message, options)?;
-        let response = handle.wait()?;
+        // **A turn that fails never reaches `finish_turn`**, which is the only
+        // other thing that clears the in-flight guard — so without this one
+        // failed decode rejected every turn the conversation was ever asked for
+        // afterwards, with `TurnInFlight`, and nothing short of dropping the
+        // sequence brought it back. That is what a character looks like when a
+        // single wave faults under it: alive, scheduled, and never acting again.
+        let response = match handle.wait() {
+            Ok(response) => response,
+            Err(e) => {
+                drop(handle);
+                self.abort_turn();
+                return Err(e);
+            }
+        };
 
         // Record the assistant turn and prefill next user header.
         self.finish_turn(handle, &response)?;

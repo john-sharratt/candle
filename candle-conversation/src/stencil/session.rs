@@ -48,8 +48,9 @@ pub enum Observe {
     /// committed) and the cursor advances so the successor prefills the
     /// continuation in its place (the steering retry).
     TokenClosedDrop,
-    /// A free-text span hit its hard limit and was force-closed (the integration
-    /// injects the canonical close tokens).
+    /// A free-text span hit its hard limit and was force-closed. The tree then
+    /// writes the span's `close_run` — the text its terminator would have
+    /// consumed — before moving on, exactly as for an intercepted EOS.
     SpanForcedClosed,
     /// A free-text span ended via an EOS sample (`eos_ends`).
     SpanEos,
@@ -411,7 +412,27 @@ impl StencilSession {
                     }
                     Feed::Continue => {
                         if emitted >= span.limits.forced_after {
-                            self.cursor = Cursor::At(span.next);
+                            // **Cut short is interrupted too**, and closes the
+                            // same way the EOS path above does: the terminator
+                            // never fired, so the text it would have consumed
+                            // was never written, and the tree writes it.
+                            //
+                            // This went straight to the successor, which for a
+                            // function-block value is the next `<parameter=…>`
+                            // — so a value that ran to the limit left its
+                            // element open, and a reader bounding it by the
+                            // first `</parameter>` took the *next* argument's
+                            // close as its own. A `reflect` whose thoughts ran
+                            // on came back missing `feeling`, a required
+                            // argument the grammar had in fact forced, with the
+                            // feeling itself swallowed into the thoughts.
+                            self.cursor = match span.close_run.is_empty() {
+                                true => Cursor::At(span.next),
+                                false => Cursor::Closing {
+                                    run: span.close_run.clone(),
+                                    then: span.next,
+                                },
+                            };
                             Ok(Observe::SpanForcedClosed)
                         } else {
                             self.cursor = Cursor::InFreeText {

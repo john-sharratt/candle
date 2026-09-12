@@ -4060,10 +4060,13 @@ impl Scheduler {
                     .map_err(ConversationError::Model);
                 if result.is_ok() {
                     // Reset sampling state counters while preserving the shape.
-                    // end_turn() clears per-turn frequency/presence counts; the
-                    // context tokens fed in the next prefill will re-seed DRY.
+                    // A reset slot is reused for new content, so everything the
+                    // previous occupant said goes — its cross-turn history
+                    // included, which `end_turn` would have carried over and
+                    // penalised in the next occupant's first turn. The context
+                    // tokens fed in the next prefill re-seed DRY.
                     if let Some(state) = self.sampling_states.get_mut(&sequence_id) {
-                        state.end_turn();
+                        state.clear();
                     }
                     // A reset slot is reused for NEW content (the titler resets
                     // between title jobs): the previous occupant's belief must
@@ -12786,6 +12789,8 @@ mod tests {
                 selection: ProjectionSelection {
                     system: vec![SystemItem::Collection {
                         name: "tools".into(),
+                        member_glue: String::new(),
+                        member_glue_tokens: 0,
                         sections: vec![SelectedSection {
                             name: "calculator".into(),
                             tokens: 5,

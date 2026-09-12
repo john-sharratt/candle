@@ -38,6 +38,12 @@ pub struct SequenceSamplingState {
     /// Incremented when `end_turn()` is called; cleared when the conversation is reset.
     pub cross_turn_counts: Vec<i32>,
 
+    /// The turns still inside the cross-turn window, oldest first, each as the
+    /// `(token, count)` pairs it added — so a turn can be taken back out of
+    /// [`Self::cross_turn_counts`] when it leaves. Empty when the window is
+    /// unbounded.
+    pub cross_turn_history: Vec<Vec<(u32, i32)>>,
+
     /// Recent token history (for repeat/DRY penalty).
     /// Stored oldest-first; the scheduler copies the tail window to the GPU buffer.
     pub recent_tokens: Vec<i32>,
@@ -103,6 +109,7 @@ impl SequenceSamplingState {
         Self {
             token_counts: vec![0; vocab_size],
             cross_turn_counts: vec![0; vocab_size],
+            cross_turn_history: Vec::new(),
             recent_tokens: Vec::with_capacity(max_recent_len),
             current_len: 0,
             in_segment: false,
@@ -176,6 +183,7 @@ impl SequenceSamplingState {
     pub fn clear(&mut self) {
         self.token_counts.fill(0);
         self.cross_turn_counts.fill(0);
+        self.cross_turn_history.clear();
         self.recent_tokens.clear();
         self.current_len = 0;
         self.in_segment = false;
@@ -197,14 +205,35 @@ impl SequenceSamplingState {
     /// boundaries.  The sliding-window cap (`max_recent_len`) keeps it
     /// bounded.  Repeat penalty also uses `recent_tokens` and benefits
     /// from the cross-turn window.
-    pub fn end_turn(&mut self) {
-        // Accumulate into cross-turn counts
-        for (cross, &cur) in self
-            .cross_turn_counts
-            .iter_mut()
-            .zip(self.token_counts.iter())
-        {
-            *cross = cross.saturating_add(cur);
+    pub fn end_turn(&mut self, cross_turn_window: usize) {
+        // Fold this turn into the cross-turn counts, and — when the window is
+        // finite — take back out the turn that falls off the far end of it.
+        // Each turn is kept as its own `(token, count)` pairs rather than a
+        // dense copy, so the history costs what the turns said, not a
+        // vocabulary per turn.
+        //
+        // A turn that sampled nothing is not recorded: this also runs at a
+        // conversation's first decode, with nothing said yet, and letting that
+        // take a slot would make a window of one forget the only turn it had.
+        let turn: Vec<(u32, i32)> = self
+            .token_counts
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| c > 0)
+            .map(|(t, &c)| (t as u32, c))
+            .collect();
+        for &(t, c) in &turn {
+            let cross = &mut self.cross_turn_counts[t as usize];
+            *cross = cross.saturating_add(c);
+        }
+        if cross_turn_window > 0 && !turn.is_empty() {
+            self.cross_turn_history.push(turn);
+            while self.cross_turn_history.len() > cross_turn_window {
+                for (t, c) in self.cross_turn_history.remove(0) {
+                    let cross = &mut self.cross_turn_counts[t as usize];
+                    *cross = cross.saturating_sub(c).max(0);
+                }
+            }
         }
         // Reset per-turn state (frequency/presence penalties are per-turn)
         self.token_counts.fill(0);
@@ -1715,8 +1744,75 @@ mod tests {
             st.record_token(0, MAX_RECENT);
         }
         assert_eq!(st.degenerate_run, DEGENERATE_TOKEN_RUN);
-        st.end_turn();
+        st.end_turn(0);
         assert_eq!(st.degenerate_run, 0);
+    }
+
+    /// **The cross-turn penalty sees a window of turns, not the whole day.**
+    ///
+    /// It is flat — any count above zero costs the same — so without a bound it
+    /// ends up on a character's entire working vocabulary, and a uniform shift
+    /// tells no act from any other. With a window, a turn that leaves takes its
+    /// tokens with it.
+    #[test]
+    fn the_cross_turn_window_forgets_turns_that_fall_out_of_it() {
+        let mut st = SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT);
+        for tok in [3u32, 4, 5] {
+            st.record_token(tok, MAX_RECENT);
+            st.end_turn(2);
+        }
+        assert_eq!(
+            st.cross_turn_counts[3], 0,
+            "two turns on, the first is forgotten"
+        );
+        assert_eq!(st.cross_turn_counts[4], 1);
+        assert_eq!(st.cross_turn_counts[5], 1);
+    }
+
+    /// A token used again is still penalised until its *last* use leaves.
+    #[test]
+    fn a_token_used_again_stays_counted_until_its_last_use_leaves() {
+        let mut st = SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT);
+        for tok in [3u32, 3, 4] {
+            st.record_token(tok, MAX_RECENT);
+            st.end_turn(2);
+        }
+        assert_eq!(
+            st.cross_turn_counts[3], 1,
+            "its second use is still in the window"
+        );
+        st.record_token(5, MAX_RECENT);
+        st.end_turn(2);
+        assert_eq!(st.cross_turn_counts[3], 0, "and now it is not");
+    }
+
+    /// `0` keeps every turn, which is what every caller that sets no window —
+    /// all of them with the penalty off — has always had.
+    #[test]
+    fn a_zero_window_remembers_every_turn() {
+        let mut st = SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT);
+        for tok in [3u32, 4, 5, 6] {
+            st.record_token(tok, MAX_RECENT);
+            st.end_turn(0);
+        }
+        assert!([3usize, 4, 5, 6]
+            .iter()
+            .all(|&t| st.cross_turn_counts[t] == 1));
+        assert!(
+            st.cross_turn_history.is_empty(),
+            "nothing to forget, nothing kept"
+        );
+    }
+
+    /// `end_turn` also runs at a conversation's first decode with nothing
+    /// sampled yet. That must not use up a slot.
+    #[test]
+    fn a_turn_that_sampled_nothing_takes_no_slot() {
+        let mut st = SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT);
+        st.record_token(3, MAX_RECENT);
+        st.end_turn(1);
+        st.end_turn(1);
+        assert_eq!(st.cross_turn_counts[3], 1);
     }
 
     /// The bar has to be low enough to stop a broken forward promptly, and high
@@ -1960,7 +2056,7 @@ mod tests {
 
         state.close_script_pos = Some(1);
         state.close_would_continue = true;
-        state.end_turn();
+        state.end_turn(0);
         assert!(!state.in_segment, "turn end closes a dangling segment");
         assert_eq!(state.segment_len, 0);
         assert_eq!(state.close_script_pos, None);

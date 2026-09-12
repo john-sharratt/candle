@@ -33,18 +33,18 @@ pub enum LoadStep {
     Model,
     /// Replay the redo log at `.substrate/` into the in-RAM substrate.
     Substrate,
-    /// Prefill the tool catalog's calibration examples so tool selection is
-    /// calibrated rather than cold. See `engine::tools`.
+    /// Install every act into the schema's `tools` collection, one member each,
+    /// so a turn can show the ones it is able to take. See `engine::tools::install`.
     ///
     /// **Before [`LoadStep::Layers`], and the order is load-bearing.** Every
-    /// layer frames on the shared system prompt, and the tool catalog is part of
-    /// that prompt. A turn prefilled while the catalog is still absent captures
-    /// its KV — and the wide-Q signature the gather matches against — under a
-    /// prompt that is not the one any character will ever think under. The
-    /// documents would be *in* the substrate and subtly mismatched to every
-    /// query made of them, which is the worst kind of wrong: nothing fails, and
-    /// retrieval is quietly worse than it should be.
-    Calibrating,
+    /// layer frames on the shared system prompt, and the acts are part of that
+    /// prompt. A turn prefilled while they are still absent captures its KV —
+    /// and the wide-Q signature the gather matches against — under a prompt that
+    /// is not the one any character will ever think under. The documents would
+    /// be *in* the substrate and subtly mismatched to every query made of them,
+    /// which is the worst kind of wrong: nothing fails, and retrieval is quietly
+    /// worse than it should be.
+    Tools,
     /// Diff the mind directory against what the substrate holds and ingest the
     /// difference — the step that puts a world's documents where a character can
     /// reach them.
@@ -55,13 +55,12 @@ pub enum LoadStep {
 
 impl LoadStep {
     /// Canonical order. Each phase depends on the one before it: the substrate
-    /// needs the model's engine, calibration needs the substrate to prefill
-    /// into, the layers need the prompt calibration completes, and the cast
-    /// needs the world it is about to think about.
+    /// needs the model's engine, the layers need the prompt the acts complete,
+    /// and the cast needs the world it is about to think about.
     pub const ALL: &'static [LoadStep] = &[
         LoadStep::Model,
         LoadStep::Substrate,
-        LoadStep::Calibrating,
+        LoadStep::Tools,
         LoadStep::Layers,
         LoadStep::Waking,
     ];
@@ -72,7 +71,7 @@ impl LoadStep {
             LoadStep::Model => "Loading model",
             LoadStep::Substrate => "Replaying substrate",
             LoadStep::Layers => "Ingesting mind layers",
-            LoadStep::Calibrating => "Calibrating tools",
+            LoadStep::Tools => "Installing tools",
             LoadStep::Waking => "Waking the cast",
         }
     }
@@ -85,7 +84,7 @@ impl LoadStep {
             LoadStep::Model => "layers",
             LoadStep::Substrate => "turns",
             LoadStep::Layers => "files",
-            LoadStep::Calibrating => "tools",
+            LoadStep::Tools => "tools",
             LoadStep::Waking => "characters",
         }
     }
@@ -317,27 +316,28 @@ mod tests {
         let s = p.snapshot().expect("loading");
         assert_eq!(
             s.completed,
-            vec![LoadStep::Model, LoadStep::Substrate, LoadStep::Calibrating]
+            vec![LoadStep::Model, LoadStep::Substrate, LoadStep::Tools]
         );
     }
 
-    /// **Calibration precedes the layers, and the order is load-bearing.**
+    /// **The acts are installed before the layers, and the order is
+    /// load-bearing.**
     ///
-    /// Every layer frames on the shared system prompt, and the tool catalog is
-    /// part of it. A document prefilled before the catalog exists captures its
-    /// KV under a prompt no character will ever think under — the turns land,
-    /// nothing errors, and retrieval is quietly worse than it should be for the
-    /// life of that substrate.
+    /// Every layer frames on the shared system prompt, and the acts are part of
+    /// it. A document prefilled before they exist captures its KV under a
+    /// prompt no character will ever think under — the turns land, nothing
+    /// errors, and retrieval is quietly worse than it should be for the life of
+    /// that substrate.
     #[test]
     fn the_prompt_is_complete_before_anything_is_prefilled_against_it() {
         let pos = |want: LoadStep| LoadStep::ALL.iter().position(|s| *s == want).unwrap();
         assert!(
-            pos(LoadStep::Calibrating) < pos(LoadStep::Layers),
+            pos(LoadStep::Tools) < pos(LoadStep::Layers),
             "layers are ingested before the prompt they frame on is finished"
         );
         // And both sit after the substrate they write into, and before the cast
         // that reads them.
-        assert!(pos(LoadStep::Substrate) < pos(LoadStep::Calibrating));
+        assert!(pos(LoadStep::Substrate) < pos(LoadStep::Tools));
         assert!(pos(LoadStep::Layers) < pos(LoadStep::Waking));
     }
 

@@ -1137,6 +1137,9 @@ mod tests {
             think_open: 1,
             think_close: 2,
             eos: 3,
+            // This test asserts the SPLICE closes the join, so the injected
+            // marker must stay out of it.
+            after_close: "",
         };
         let prelude = compile_think_tree(ThinkMode::Balanced, &env);
         let spec =

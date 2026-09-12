@@ -449,7 +449,22 @@ async fn main() -> anyhow::Result<()> {
                     .map(str::to_owned)
             })
             .unwrap_or_default();
-        Some(engine::persona::of(payload, &world))
+        // The personality's anchor, as prose. The projection pins it by slug for
+        // an acting turn; a reflection has no gather, so unless it is carried
+        // here it reaches that conversation by no route at all. See
+        // `OwnedPersona::anchor`.
+        let anchor = persona_state
+            .personalities
+            .blocking_read()
+            .get(&payload.personality_id)
+            .and_then(|r| {
+                r.body
+                    .get("anchor")
+                    .and_then(|a| a.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        Some(engine::persona::of(payload, &world, &anchor))
     }));
 
     // Where bodies are, recorded so a restart can put them back.
@@ -649,7 +664,10 @@ async fn main() -> anyhow::Result<()> {
                         .iter()
                         .filter_map(|c| {
                             let payload = npcs.payload(c.npc_id)?;
-                            let owned = engine::persona::of(payload, "");
+                            // No anchor: it is its own collection member, and
+                            // rendering it into the character block as well
+                            // would pin the same paragraph twice.
+                            let owned = engine::persona::of(payload, "", "");
                             Some((c.npc_id, engine::prompt::character(&owned.as_persona())))
                         })
                         .collect(),

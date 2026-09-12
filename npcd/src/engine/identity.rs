@@ -277,7 +277,7 @@ fn member(collection: &str, id: &str) -> String {
 ///
 /// **Called before anything opens a conversation under this schema.** A member
 /// is sealed as the first conversation materialises it, and the ordering rule
-/// `LoadStep::Calibrating` already states applies here too: a layer document
+/// `LoadStep::Tools` already states applies here too: a layer document
 /// prefilled while the prompt is still incomplete captures its signature under a
 /// prompt no character will ever think under.
 pub fn install(

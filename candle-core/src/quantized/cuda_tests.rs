@@ -4184,7 +4184,6 @@ fn ko_repack_band_is_bounded_regardless_of_tensor_size() {
 // test is its own process, which is the only place that measurement means
 // anything.
 
-
 /// **The host-banded read must match the device one for every source it accepts**, not just
 /// the float ones that motivated it.
 ///

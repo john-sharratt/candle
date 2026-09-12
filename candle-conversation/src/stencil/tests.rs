@@ -435,6 +435,48 @@ fn forced_close_on_runaway_string() {
         .any(|o| matches!(o, Observe::SpanForcedClosed)));
 }
 
+/// **A span cut short at its limit still closes its element.** A consuming
+/// terminator's text is only in the output because the model wrote it, so a
+/// value that runs to `forced_after` has to have it written by the tree before
+/// the successor — otherwise a function-block value is left open and the
+/// reader takes the NEXT parameter's close as its own, losing that parameter.
+#[test]
+fn a_forced_close_writes_the_marker_its_terminator_would_have_consumed() {
+    use super::builder::StencilTreeBuilder;
+    use super::terminator::Terminator;
+    use super::tree::FreeTextLimits;
+
+    let v = TestVocab::new();
+    let limits = FreeTextLimits {
+        ramp_start: None,
+        ramp_len: 0,
+        boost: 0.0,
+        forced_after: 3,
+    };
+    let spec = StencilTreeBuilder::new("t")
+        .root("v")
+        .free_text(
+            "v",
+            Terminator::Until { marker: "</p>" },
+            false,
+            limits,
+            "next",
+        )
+        .static_node("next", "<q>", "done")
+        .end("done")
+        .build()
+        .unwrap();
+    let tree = Arc::new(compile(&spec, &v).unwrap());
+    let policy = Oracle::Policy(Box::new(|_| b'x' as TokenId));
+    let run = simulate(tree, &v, policy, 100).unwrap();
+    assert_eq!(run.forced_closes, 1);
+    assert_eq!(
+        run.text(&v),
+        "xxx</p><q>",
+        "the marker precedes the successor"
+    );
+}
+
 #[test]
 fn eos_ends_a_free_span() {
     use super::builder::StencilTreeBuilder;

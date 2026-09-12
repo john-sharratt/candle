@@ -575,7 +575,7 @@ fn projection_probe_cases(substrate: &Substrate) -> Vec<ProbeCase> {
         for ev in &events {
             // The `tools` section this projection locked — the provenance label.
             let Some(tool) = ev.selection.system.iter().find_map(|item| match item {
-                SystemItem::Collection { name, sections } if name == "tools" => {
+                SystemItem::Collection { name, sections, .. } if name == "tools" => {
                     sections.iter().find(|s| s.selected).map(|s| s.name.clone())
                 }
                 _ => None,

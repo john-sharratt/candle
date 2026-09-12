@@ -384,12 +384,27 @@ impl Dialect {
     /// following user turn, each wrapped in `<tool_response>`. Every one of
     /// those tags is a real token in this vocabulary rather than text that
     /// happens to look like one.
+    ///
+    /// # Decoded in JSON blocks all the same
+    ///
+    /// The engine calls tools on this family with [`CallStyle::JsonBlock`] —
+    /// Qwen3's `<tool_call>{"name": …, "arguments": {…}}</tool_call>` — rather
+    /// than the function element above. The grammar, the parser and every
+    /// prompt's worked example follow this field, so they change together.
+    ///
+    /// **The difference is behavioural, not syntactic.** Both shapes parse and
+    /// both grammars hold. But put in company and asked a direct question, the
+    /// checkpoint answered under the function element with `reflect` — three
+    /// probes out of three, the question quoted back in its own thoughts — and
+    /// under the JSON block with `say`, three out of three, on the same prompt
+    /// and the same scenario. A cast that cannot bring itself to speak is not a
+    /// cast, so the shape that lets it is the one it gets.
     pub fn qwen35() -> Self {
         Self {
             dialect_type: DialectType::Qwen35,
             no_think: "",
             document_end: "<|im_end|>",
-            call_style: CallStyle::FunctionBlock,
+            call_style: CallStyle::JsonBlock,
             ..Self::chat_ml()
         }
     }
@@ -661,7 +676,7 @@ mod tests {
     /// recorded twice, and the copy nothing compiles is the one that goes stale.
     #[test]
     fn each_family_declares_the_call_shape_its_template_uses() {
-        assert_eq!(Dialect::qwen35().call_style, CallStyle::FunctionBlock);
+        assert_eq!(Dialect::qwen35().call_style, CallStyle::JsonBlock);
         for d in [
             Dialect::chat_ml(),
             Dialect::llama2(),

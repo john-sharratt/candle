@@ -3994,7 +3994,7 @@ impl ZendSession {
             .map(|d| (d.name.as_str(), d.description.as_str()))
             .collect();
         for item in &event.selection.system {
-            if let SystemItem::Collection { name, sections } = item {
+            if let SystemItem::Collection { name, sections, .. } = item {
                 for sec in sections {
                     if !sec.selected && sec.score <= 0.0 {
                         continue;

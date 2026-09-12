@@ -54,7 +54,9 @@ use candle_conversation::stencil::{
     compile_action_loop, compile_think_tree, StencilTree, ThinkMode, ThinkSteerEnvelope,
     ToolCallEnvelope,
 };
-use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnOptions};
+use candle_conversation::{
+    ConversationEngine, SamplingConfig, Sequence, SequenceConfig, TurnOptions,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -62,7 +64,9 @@ use crate::engine::act::{self, Parsed};
 use crate::engine::event::Event;
 use crate::engine::identity;
 use crate::engine::prompt::{self, Persona};
+use crate::engine::reflect;
 use crate::engine::retention;
+use crate::engine::schema::ReflectionTurns;
 use crate::engine::sleep::conversation_id;
 use crate::engine::tools::{self, for_mode, Mode};
 use crate::engine::window::{Speaker, Window};
@@ -183,6 +187,13 @@ pub struct Minds {
     /// log with no dead records is a log compaction cannot reclaim. See
     /// [`crate::engine::retention`] for what that cost in practice.
     keep_turns: Option<u64>,
+    /// The two user turns a reflection sends, as the mind authors them.
+    ///
+    /// `None` for a mind that declares no `reflection` block, and reflection is
+    /// then unavailable — there is no built-in wording to fall back to, because a
+    /// second copy of a prompt is a copy that diverges from the one being edited.
+    /// See [`crate::engine::schema::ReflectionTurns`].
+    reflection: Option<ReflectionTurns>,
 }
 
 /// The schema a character's conversation opens against, with its acts and
@@ -195,6 +206,15 @@ pub struct Projected {
     pub group: GroupId,
     /// Which members exist, so a turn pins the right ones.
     pub identities: identity::Installed,
+    /// The fingerprint of everything a conversation under this schema is
+    /// framed by — the authored YAML and every member installed into it. See
+    /// [`crate::engine::schema::frame`] and [`frame_fingerprint`].
+    ///
+    /// Not a fingerprint of [`Self::prompt`]: that is only the text before the
+    /// first collection, and a change to the acts, the frame for acting or who
+    /// anybody is left it untouched, so a conversation written under the old
+    /// prompt went on being rejoined under the new one.
+    pub frame: String,
 }
 
 /// Everything one probe turn revealed.
@@ -297,6 +317,12 @@ fn compile_act_loop(
                 // spans end on either `</think>` or EOS, and an EOS the tree
                 // does not know is one it cannot end a span on.
                 eos: tok.token_to_id(cfg.dialect.assistant_end).unwrap_or(0),
+                // Empty because this prelude is SPLICED onto the call grammar
+                // below (`compile_action_loop(…, Some(&prelude))`), so the join
+                // at `</think>` is already a node edge rather than a moment the
+                // decoder is free in. Injecting the marker here as well would
+                // emit it twice.
+                after_close: "",
             };
             Some(compile_think_tree(thinking.mode(), &steer))
         }
@@ -382,16 +408,14 @@ impl Minds {
                 .apply_think_mode(ThinkMode::Off, e.tokenizer(), max);
         }
         // **A cast is not an assistant, and the architecture default is tuned
-        // for one.** The checkpoint's own numbers are Qwen's general-task
-        // pairing — temperature 0.7 into a `top_p` 0.8 nucleus — which is the
-        // right conservative choice for answering a question and the wrong one
-        // for speaking as somebody. A character handed a situation much like the
-        // last one lands on the same sentence out of a nucleus that narrow, and
-        // did: one said the same thing, word for word, for a hundred turns.
-        //
-        // Qwen's wider published pairing is the one their own creative-writing
-        // runs used. Taken here rather than in the architecture default, so the
-        // same checkpoint serving zend keeps the narrow one — see
+        // for one.** A character handed a situation much like the last one lands
+        // on the same act out of a narrow nucleus, and did: one said the same
+        // thing, word for word, for a hundred turns, and on the card's think-off
+        // row another walked between two rooms twenty times without answering
+        // the question in front of it. So the think-off row is widened to
+        // `1.0 / 0.95`, and the repetition load moves onto DRY and a cross-turn
+        // penalty. Set on the row rather than on the temperature, so the
+        // per-turn switch in [`Self::sampling_for`] still picks it — see
         // [`SamplingConfig::for_character_dialogue`].
         base_config.sampling = base_config.sampling.for_character_dialogue();
         // Compiled at boot for the empty room, which proves the catalog builds
@@ -440,6 +464,7 @@ impl Minds {
             projection: RwLock::new(None),
             live: Mutex::new(HashMap::new()),
             keep_turns: None,
+            reflection: None,
         }
     }
 
@@ -459,6 +484,26 @@ impl Minds {
             ),
         }
         self.keep_turns = keep;
+        self
+    }
+
+    /// Install the reflection turns the mind authors.
+    ///
+    /// `None` leaves reflection unavailable and says so once at load, rather than
+    /// at the first request — a deployment that has lost the block should find out
+    /// from its own startup log and not from a character that will not reflect.
+    pub fn asking(mut self, turns: Option<ReflectionTurns>) -> Self {
+        match &turns {
+            Some(_) => tracing::info!(
+                "reflection armed — two authored turns into a transient conversation that is \
+                 tombstoned when they are answered"
+            ),
+            None => tracing::warn!(
+                "reflection unavailable — the mind declares no usable `reflection` block, so \
+                 nothing will generate a dream brief"
+            ),
+        }
+        self.reflection = turns;
         self
     }
 
@@ -551,8 +596,13 @@ impl Minds {
         };
         drop(guard);
 
+        // The acts this turn can take, and only those — the same set, under the
+        // same mode, the grammar below is compiled from. See `compile_act_loop`.
+        let mut selection = selection;
+        tools::show_within(&mut selection, Mode::Physical, within);
         let options = TurnOptions {
             turn_grammar: self.grammar_for(thinking, within),
+            sampling: Some(self.sampling_for(thinking)),
             selection,
             assistant_prefill: self.opening(thinking),
             ..Default::default()
@@ -614,6 +664,27 @@ impl Minds {
     /// block prefilled closed there is nothing to steer and no chat-template
     /// capability to depend on. A mission that genuinely wants deliberation is
     /// the exception, and it takes the ordinary path.
+    /// The turn's sampling, with this turn's think mode applied.
+    ///
+    /// **Each think mode has its own temperature and nucleus**, and the dial
+    /// picks one per turn: the reasoning row for a mission that raises it, the
+    /// cast's think-off row for [`identity::Deliberation::None`], which is what
+    /// almost every turn runs. For this checkpoint and this cast the two rows
+    /// happen to agree at `1.0 / 0.95` — the card's reasoning row, and the
+    /// think-off row widened to match it by
+    /// [`SamplingConfig::for_character_dialogue`] — so on every turn here the
+    /// dial moves the stencil and the close budget, and the numbers move only
+    /// for a family whose rows differ.
+    ///
+    /// The two paths that decide a turn — the probe and the live act — both
+    /// come through here, which is what keeps them from drifting.
+    fn sampling_for(&self, thinking: identity::Deliberation) -> SamplingConfig {
+        self.base_config
+            .sampling
+            .clone()
+            .with_think_mode(thinking.mode(), self.base_config.max_response_tokens)
+    }
+
     fn opening(&self, thinking: identity::Deliberation) -> Option<String> {
         // Nothing to prefill when no grammar compiled — the turn free-decodes,
         // and seeding a marker no tree is bound to would commit it to a shape
@@ -725,6 +796,56 @@ impl Minds {
         self.live.lock().unwrap().len()
     }
 
+    /// Stop a character and run one reflection — see [`crate::engine::reflect`].
+    ///
+    /// Goes through here rather than being built by the caller because the
+    /// engine handle and the checkpoint's own [`SequenceConfig`] live here, and
+    /// a reflection assembled from a second opinion about either would run the
+    /// model outside the settings it was tuned under.
+    ///
+    /// **Touches none of this character's live state.** It does not open, read
+    /// or disturb the conversation in [`Self::live`]: a reflection is its own
+    /// throwaway timeline, and a character mid-decode is not waited on because
+    /// there is nothing here they share.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reflect(
+        &self,
+        npc_id: u64,
+        persona: &Persona<'_>,
+        mode: Mode,
+        situation: &str,
+        inner_thoughts: &str,
+        feeling: &str,
+        domain: &str,
+        sampled_axes: &[String],
+    ) -> anyhow::Result<reflect::Reflection> {
+        // The mind's schema, so a reflection opens against the same sections a
+        // live conversation does. Without it the two prompts are built by
+        // different code and drift apart section by section — which is exactly
+        // what had happened: the reflection's frame named none of the schema's
+        // sections and carried none of its collections.
+        let projected = self.projection.read().unwrap();
+        let turns = self.reflection.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "this mind declares no `reflection` block, so there are no turns to send — \
+                 author `reflection.question_one`, `.question_two` and `.question_two_retry` \
+                 in projection.yaml"
+            )
+        })?;
+        reflect::Reflect::new(Arc::clone(&self.engine), self.base_config.clone(), turns)
+            .under(projected.as_ref())
+            .run(
+                npc_id,
+                persona,
+                mode,
+                situation,
+                inner_thoughts,
+                feeling,
+                domain,
+                sampled_axes,
+            )
+    }
+
     /// Rejoin this character's conversation, or open it a new one.
     ///
     /// # Rejoin before mint
@@ -773,36 +894,64 @@ impl Minds {
         let id = conversation_id(npc_id, day);
         let mut cfg = self.base_config.clone();
         cfg.context_window_turns = CONTEXT_WINDOW_TURNS;
-        // **The rendered prompt, until the reasoning block closes.**
+        // **The mind's own schema, when there is one.**
         //
-        // Everything for the projection path is built and installed — the acts,
-        // the identities, the world and the building are in the schema's
-        // collections and selected per turn, and `Projected` is handed over at
-        // boot. What is not solved is the decode: under the mind's schema the
-        // checkpoint opens `<think>` and never closes it, so the turn runs to
-        // `max_response_tokens` and is discarded whole as reasoning. Every tick
-        // then produces no acts and logs no error, because a decode that reasons
-        // forever is a successful decode.
+        // This was a rendered copy for a long time, and the comment here said
+        // why: under the schema the checkpoint opened `<think>` and never closed
+        // it, so a turn ran to `max_response_tokens` and was discarded whole as
+        // reasoning — a decode that reasons forever is a successful decode, so
+        // every tick produced no acts and logged no error. Three suppressions
+        // were tried and none held: the `no_think` glue, `thinking_effort: off`,
+        // and the `ThinkMode::Off` close budget in the sampling config.
         //
-        // Suppressing it three ways did not: the `no_think` glue present,
-        // `thinking_effort` off, and the `ThinkMode::Off` close budget
-        // programmed into the sampling config. So the remaining fault is below
-        // the prompt, and a character that cannot act is worse than one whose
-        // prompt is a rendered copy — which is what this is until that is found.
+        // **None of those three is the mechanism that works.** All are requests —
+        // a marker this family does not honour, a selector, and a budget that
+        // caps a runaway rather than preventing one. What holds is a steering
+        // stencil bound to the decoded `<think>` token, which makes the block
+        // unrepresentable rather than discouraged; `compile_act_loop` carries it
+        // and [`Self::grammar_for`] has been putting it on every turn since.
+        // The rendered prompt was working around a fault that had already been
+        // fixed underneath it.
         //
-        // The same envelope `compile_act_loop` compiles, so what the prompt
-        // shows a character is what the grammar will hold it to.
-        let system = prompt::build(
-            persona,
-            mode,
-            &for_mode(mode),
-            &ToolCallEnvelope::for_dialect(&self.base_config.dialect),
-        );
-        let frame = frame_fingerprint(&system);
+        // Falling back to the rendered copy when there is no mind is not a dual
+        // path kept alive for safety — a daemon with no `projection.yaml` has no
+        // schema to open against, and the copy is the only prompt there is.
+        let under = self.projection.read().unwrap();
+        let (system, projected) = match under.as_ref() {
+            Some(p) => (p.prompt.clone(), Some(p)),
+            // The same envelope `compile_act_loop` compiles, so what the prompt
+            // shows a character is what the grammar will hold it to.
+            None => (
+                prompt::build(
+                    persona,
+                    mode,
+                    &for_mode(mode),
+                    &ToolCallEnvelope::for_dialect(&self.base_config.dialect),
+                ),
+                None,
+            ),
+        };
+        let frame = match projected {
+            Some(p) => p.frame.clone(),
+            None => frame_fingerprint(&system),
+        };
 
         let rejoined = resumable(&self.engine, &id, &frame).and_then(|timeline| {
             let engine = self.engine.lock().ok()?;
-            match engine.resume_conversation(timeline, &system, cfg.clone()) {
+            // Resumed against the same schema it was opened under. A conversation
+            // minted on the projection and rejoined on the synthetic one would
+            // carry a different prompt under the same fingerprint, which is the
+            // one thing the fingerprint exists to make impossible.
+            let resumed = match projected {
+                Some(p) => engine.resume_conversation_with_projection(
+                    timeline,
+                    &system,
+                    p.builder.clone(),
+                    cfg.clone(),
+                ),
+                None => engine.resume_conversation(timeline, &system, cfg.clone()),
+            };
+            match resumed {
                 Ok(sequence) => {
                     // Both read the substrate, so both are answered while the
                     // lock the resume needed is still in hand.
@@ -858,7 +1007,19 @@ impl Minds {
             });
         }
 
-        let sequence = self.engine.lock().unwrap().new_conversation(&system, cfg)?;
+        let sequence = {
+            let engine = self.engine.lock().unwrap();
+            match projected {
+                Some(p) => engine.new_conversation_with_projection(
+                    &system,
+                    p.builder.clone(),
+                    p.layer,
+                    p.group,
+                    cfg,
+                )?,
+                None => engine.new_conversation(&system, cfg)?,
+            }
+        };
         let timeline = sequence.timeline_id();
         {
             let engine = self.engine.lock().unwrap();
@@ -989,7 +1150,7 @@ impl Minds {
         // selection — so a daemon running the rendered prompt needs it just as
         // much. It used to be built only on the projected branch, so the path
         // the daemon actually ran never injected the switch at all.
-        let selection = self
+        let mut selection = self
             .projection
             .read()
             .unwrap()
@@ -1010,8 +1171,16 @@ impl Minds {
                     )
             })
             .unwrap_or_else(|| identity::deliberation(identity::Deliberation::default()));
+        // **What it can do, shown beside what it is.** Every act is installed in
+        // the schema's `tools` collection and a turn names the ones it can take
+        // — the same set, under the same mode, `grammar_for` compiles the mask
+        // from — so the list a character reads is never wider or narrower than
+        // what it can decode. A character alone reads no `say`; one standing at
+        // a chronicle terminal reads the terminal's acts until it walks away.
+        tools::show_within(&mut selection, Mode::Physical, within);
         let options = TurnOptions {
             turn_grammar: self.grammar_for(identity::Deliberation::default(), within),
+            sampling: Some(self.sampling_for(identity::Deliberation::default())),
             selection,
             assistant_prefill: self.opening(identity::Deliberation::default()),
             ..Default::default()
@@ -1100,18 +1269,21 @@ impl Minds {
 
 /// A fingerprint of the frame a character thinks under.
 ///
-/// The whole rendered system prompt, which is everything that decides what a
-/// turn in this conversation looks like: who the character is, which acts exist,
-/// what a call to one is spelled as. Change any of them and a history written
-/// before the change is a history the character can no longer produce — see
-/// [`Minds::open_conversation`] for why that is a reason not to rejoin it.
+/// The fingerprint of a conversation's whole frame, which is everything that
+/// decides what a turn in it looks like: who the character is, which acts
+/// exist, what a call to one is spelled as. Change any of them and a history
+/// written before the change is a history the character can no longer produce —
+/// see [`Minds::open_conversation`] for why that is a reason not to rejoin it.
+///
+/// `frame` is the rendered prompt for a daemon with no mind, and
+/// [`crate::engine::schema::frame`] under the projection.
 ///
 /// Content-addressed rather than versioned, so nothing has to remember to bump a
 /// number when it edits a prompt. That is the property zend's ingest cache
 /// relies on for the same job.
-fn frame_fingerprint(system: &str) -> String {
+pub fn frame_fingerprint(frame: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(system.as_bytes());
+    hasher.update(frame.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
