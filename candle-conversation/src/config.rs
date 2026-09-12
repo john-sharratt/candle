@@ -1912,13 +1912,12 @@ pub struct SequenceConfig {
     /// punctuation-driven reprojection (cadence-only).
     pub reproject_trigger_texts: Vec<String>,
 
-    /// When `true`, turns on this conversation skip the per-turn
-    /// projection rebuild once the slot is seeded: the prefill appends
-    /// onto the cumulative slot instead of resetting + re-projecting, and
-    /// continuous mid-decode reprojection is forced off. The turn still
-    /// seals into the substrate. Used by append-only utility ingests
-    /// (`code_reading`, `repo_map`) where re-projecting the whole trunk
-    /// every turn is unnecessary and O(n²). **Default: `false`.**
+    /// When `true`, continuous mid-decode reprojection is off for this
+    /// conversation's turns, and it records no post-seal projection event.
+    /// Each turn is still projected when it is submitted — its slot rebuilt
+    /// from the conversation's selected branch and its own turns. Used by
+    /// append-only utility ingests (`code_reading`, `repo_map`), whose turns
+    /// have nothing to retrieve mid-decode. **Default: `false`.**
     pub disable_reprojection: bool,
 
     /// Per-conversation KV-compression level override for this

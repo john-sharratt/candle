@@ -57,6 +57,7 @@
 use super::adaptive::{AnchorConfig, BudgetAdaptive, LocalityConfig, MemberBudgetAdaptive};
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
 use super::policy::{PolicyConfig, SelectionPolicy};
+use super::project::SelectionState;
 use crate::summary_tree::scope::Scope;
 
 /// Schema for one layer's system-prompt content.
@@ -971,6 +972,54 @@ impl LayerDials {
     /// No overrides — every selector falls back to its section-tree default.
     pub fn is_empty(&self) -> bool {
         self.dials.is_empty()
+    }
+
+    /// `selection` with every dial this layer sets and the selection leaves
+    /// unset filled in: the effective selection a projection targeting this
+    /// layer runs under, and the one its conversations' prompt state is built
+    /// for. A per-turn choice beats the layer's dial.
+    pub fn seed(&self, selection: &SelectionState) -> SelectionState {
+        let mut effective = selection.clone();
+        for (selector, option) in self.iter() {
+            if effective.get(selector).is_none() {
+                effective.select(selector, option);
+            }
+        }
+        effective
+    }
+}
+
+#[cfg(test)]
+mod layer_dials_tests {
+    use super::LayerDials;
+    use crate::projection::SelectionState;
+
+    fn dials() -> LayerDials {
+        LayerDials::from_pairs(vec![
+            ("thinking_effort".to_string(), "off".to_string()),
+            ("tool_call_example".to_string(), "absent".to_string()),
+        ])
+    }
+
+    /// A dial fills each selector the turn leaves unset.
+    #[test]
+    fn a_dial_fills_an_unset_selector() {
+        let effective = dials().seed(&SelectionState::new());
+        assert_eq!(effective.get("thinking_effort"), Some("off"));
+        assert_eq!(effective.get("tool_call_example"), Some("absent"));
+    }
+
+    /// A per-turn choice beats the layer's dial, and a selector the layer does
+    /// not dial is untouched.
+    #[test]
+    fn a_turns_choice_beats_the_dial() {
+        let mut selection = SelectionState::new();
+        selection.select("thinking_effort", "deep");
+        selection.select("persona", "summarize");
+        let effective = dials().seed(&selection);
+        assert_eq!(effective.get("thinking_effort"), Some("deep"));
+        assert_eq!(effective.get("persona"), Some("summarize"));
+        assert_eq!(effective.get("tool_call_example"), Some("absent"));
     }
 }
 

@@ -2286,7 +2286,16 @@ impl Scheduler {
         let _ = self.session.free_sequence(old_view.0);
         let _ = self.model.release_sequence(old_view.0);
 
-        // The parent's prefix, from the substrate, exactly as submit built it.
+        // The parent's prefix, from the substrate, exactly as submit built it —
+        // lifted back into VRAM first, as submit lifted it. The wait that gave
+        // this turn's blocks back is exactly the window in which the turns it
+        // selected get demoted to RAM, and a unit that is not hot cannot be
+        // injected: `apply_projection` refuses it rather than build a context
+        // that silently lacks it.
+        if let Some(conversation) = self.slot_conversations.get(&parent_id).cloned() {
+            let (sections, turns) = projection_assembler::projection_working_set(&work.projection);
+            self.elevate_projection_working_set(&conversation, &sections, &turns, "rematerialise");
+        }
         self.apply_projection(parent_id, BlockCount(0), &work.projection)?;
 
         // A fresh view over every block the rebuilt parent now holds.

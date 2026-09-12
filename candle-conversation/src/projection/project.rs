@@ -1677,13 +1677,7 @@ pub fn run_with_sink<R: ContentResolver>(
     let merged_selection;
     let effective_selection: &SelectionState = match target_dials {
         Some(dials) => {
-            let mut eff = selection.clone();
-            for (sel, opt) in dials.iter() {
-                if eff.get(sel).is_none() {
-                    eff.select(sel.to_string(), opt.to_string());
-                }
-            }
-            merged_selection = eff;
+            merged_selection = dials.seed(selection);
             &merged_selection
         }
         None => selection,

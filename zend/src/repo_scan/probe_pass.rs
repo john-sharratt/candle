@@ -61,7 +61,7 @@
 
 use std::collections::BTreeMap;
 
-use candle_conversation::{Sequence, TurnOptions};
+use candle_conversation::{SelectionState, Sequence, TurnOptions};
 
 use crate::repo_scan::dir_unit::DirUnit;
 use crate::repo_scan::probe::idf::TermIndex;
@@ -83,11 +83,9 @@ use crate::repo_scan::probe::{plan, render, Probe, ProbeSet};
 ///    statically-assembled prompt walks the schema in declaration order and the
 ///    toggle sits inside the section tree, so the marker landed mid-body where
 ///    the soft switch is not read.
-/// 3. `/no_think` prepended to the assembled body, which does put it at position
-///    0. Still not enough: the switch also requires an empty `<think></think>`
-///    prefilled into the assistant turn, applied by the dialect during
-///    projection — which a conversation created with an explicit prompt string
-///    under `disable_reprojection` never runs.
+/// 3. `/no_think` prepended to the conversation's system-prompt text. That text
+///    is only the conversation's recorded prompt; the model reads the
+///    projection of the shared schema, so the switch never reached it.
 /// 4. `/no_think` on the user turn, the form Qwen reads from the latest message.
 ///
 /// Splitting generation to one turn per register did not help either: a
@@ -146,9 +144,8 @@ pub const GENERATE_BRANCH: &[(&str, &str)] = &[
     //
     // This dial is NOT sufficient on its own — it is a sentence in the prompt
     // ("Answer directly, without deliberating first"), and the model overrides it
-    // routinely. The mechanism is `/no_think` prepended to the system prompt
-    // body, which `repo_scan::branch_system_prompt` applies for this branch; the
-    // dial stays because it also selects the matching sampling parameters.
+    // routinely. The mechanism is `/no_think` on the user turn (see [`generate`]);
+    // the dial stays because it also selects the matching sampling parameters.
     //
     // Measured with the dial alone: generations of 6,363 and 6,735 characters,
     // every one of them reasoning about how to answer, none reaching a single
@@ -171,6 +168,22 @@ pub const ANSWER_BRANCH: &[(&str, &str)] = &[
     ("response_length", "terse"),
     ("summarize_examples", "absent"),
 ];
+
+/// A branch as the [`SelectionState`] a turn projects under: every
+/// `(node, option)` pair selected, every other selector left to the target
+/// layer's dials and then the schema default.
+///
+/// This is how a branch reaches the model. The conversation's system-prompt
+/// text is only its recorded prompt; each turn's context is the projection of
+/// the shared schema under the turn's selection, so a turn submitted without
+/// its branch runs on the dialogue assistant's defaults.
+pub fn branch_state(branch: &[(&str, &str)]) -> SelectionState {
+    let mut sel = SelectionState::new();
+    for (node, option) in branch {
+        sel.select(*node, *option);
+    }
+    sel
+}
 
 /// Per-directory probe accounting, folded into the pass report.
 #[derive(Debug, Clone, Default)]
@@ -243,10 +256,8 @@ pub fn generate(
         // Qwen reads `/think` and `/no_think` from the latest user message, and that
         // is the only lever left after three failures: the `thinking_effort` dial is
         // advisory prose, the schema's `no_think` toggle lands mid-prompt where the
-        // switch is not read, and prepending to the system-prompt body still leaves
-        // the mechanism's other half — an empty `<think></think>` prefilled into the
-        // assistant turn — unapplied, because it is the dialect's work at projection
-        // and these conversations never re-project.
+        // switch is not read, and the conversation's system-prompt text is only its
+        // recorded prompt, which the model never reads.
         //
         // Left unsuppressed the reasoning is not merely wasteful, it is unbounded:
         // measured blocks of 5,342 and 15,102 characters, the latter past even a
@@ -255,6 +266,9 @@ pub fn generate(
 
         let options = TurnOptions {
             max_tokens: Some(GENERATION_MAX_TOKENS),
+            // The question writer's branch: the turn's projection is the prompt
+            // this conversation runs on.
+            selection: branch_state(GENERATE_BRANCH),
             ..Default::default()
         };
         let handle = conv
@@ -340,6 +354,9 @@ pub fn seed_context(conv: &mut Sequence, unit: &DirUnit, summary: &str) -> anyho
     if summary.trim().is_empty() {
         return Ok(0);
     }
+    // Every turn of this conversation — this seed and the probe groups after it
+    // — projects under the answering branch.
+    conv.set_selection(branch_state(ANSWER_BRANCH));
     conv.insert_turn_staged(
         &crate::repo_scan::render::render_request(unit),
         summary,
@@ -382,7 +399,8 @@ pub fn ingest(conv: &mut Sequence, probes: &[Probe], dir: &str, pad_token: u32) 
             .iter()
             .map(|p| (p.text.clone(), p.tags(dir)))
             .collect();
-        let submitted = conv.submit_prefilled_turn_group(&cases, Default::default(), pad_token);
+        let submitted =
+            conv.submit_prefilled_turn_group(&cases, branch_state(ANSWER_BRANCH), pad_token);
         let (handle, _indices) = match submitted {
             Ok(pair) => pair,
             Err(e) => {
@@ -582,6 +600,19 @@ mod tests {
     #[test]
     fn the_generation_branch_drops_the_summarize_examples() {
         assert!(GENERATE_BRANCH.contains(&("summarize_examples", "absent")));
+    }
+
+    /// Every pair of a branch lands in the selection its turns submit with. A
+    /// pair left out falls back to the layer dial and then the schema default —
+    /// for `persona`, the dialogue assistant.
+    #[test]
+    fn a_branch_selects_every_one_of_its_options() {
+        for branch in [GENERATE_BRANCH, ANSWER_BRANCH] {
+            let sel = branch_state(branch);
+            for (node, option) in branch {
+                assert_eq!(sel.get(node), Some(*option), "`{node}` not selected");
+            }
+        }
     }
 
     /// The holdout file must land somewhere the walk cannot see. If it were

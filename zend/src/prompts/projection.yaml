@@ -613,6 +613,12 @@ system_prompt:
     # no ordinary request should be drawn toward. The `absent` option exists for
     # a tool-free projection, where demonstrating a call would contradict a
     # prompt that lists no tools.
+    #
+    # The ingest layers (`repo_map`, `code_reading`) set it absent through their
+    # dials. An ingest turn asks for no tool of its own, and the demonstration is
+    # a user turn: a folder conversation whose own request had dropped out of its
+    # context answered this one instead — "The provided text does not contain IP
+    # addresses; `example.com` resolves via DNS" — in folder after folder.
     - kind: section_tree
       nodes:
         - kind: optional
@@ -668,6 +674,8 @@ layers:
       thinking_effort: off
       response_length: terse
       tools: none
+      # An ingest turn asks for no tool of its own; see `tool_call_example`.
+      tool_call_example: absent
     summary:
       turns:
         max_tokens: 384
@@ -837,6 +845,8 @@ layers:
       thinking_effort: off
       response_length: terse
       tools: none
+      # An ingest turn asks for no tool of its own; see `tool_call_example`.
+      tool_call_example: absent
     summary:
       turns:
         max_tokens: 512

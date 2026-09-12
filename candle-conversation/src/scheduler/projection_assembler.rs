@@ -1189,6 +1189,102 @@ fn reserve_glue_island(
     Ok(())
 }
 
+/// The substrate units a segment list injects, in the per-id form
+/// [`Scheduler::elevate_projection_working_set`](super::Scheduler) lifts: every
+/// sealed section, and the `(timeline, index)` of every sealed turn or turn
+/// half, in segment order.
+///
+/// A turn with no timeline is left out — it has no residence to lift, and
+/// [`inject_sealed_turn`] refuses it.
+pub(super) fn projection_working_set(
+    segments: &[ProjectionSegment],
+) -> (Vec<SectionId>, Vec<TurnKey>) {
+    let mut sections = Vec::new();
+    let mut turns = Vec::new();
+    for seg in segments {
+        match seg {
+            ProjectionSegment::Sealed(SealedKind::Section(rs)) => sections.push(rs.id),
+            ProjectionSegment::Sealed(SealedKind::Turn(rt, _))
+            | ProjectionSegment::Sealed(SealedKind::TurnHalf(rt)) => {
+                if let Some(key) = rt.key() {
+                    turns.push(key);
+                }
+            }
+            ProjectionSegment::Generated { .. } | ProjectionSegment::NewUserMessage { .. } => {}
+        }
+    }
+    (sections, turns)
+}
+
+#[cfg(test)]
+mod working_set_tests {
+    use super::projection_working_set;
+    use crate::projection::{
+        GeneratedIdentity, GroupId, LayerId, ProjectionSegment, ResolvedSection, ResolvedTurn,
+        SealedKind, SectionId, TimelineId, TurnId, TurnIndex, TurnKey,
+    };
+    use crate::Role;
+    use std::sync::Arc;
+
+    fn turn(timeline: Option<TimelineId>, index: u32) -> ResolvedTurn {
+        ResolvedTurn {
+            id: TurnId {
+                layer_id: LayerId::for_test(1),
+                group_id: GroupId::for_test(1),
+                index: TurnIndex(index),
+            },
+            timeline,
+        }
+    }
+
+    /// **The rebuild lifts exactly what it is about to inject.** A demoted turn
+    /// is rebuilt from the segment list its submit projected; every sealed unit
+    /// in that list must be named for the lift, or `apply_projection` meets it
+    /// in RAM and refuses the turn.
+    #[test]
+    fn every_sealed_unit_is_named_and_nothing_else() {
+        let tl = TimelineId::for_test(7);
+        let segments = vec![
+            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection {
+                id: SectionId::new(3),
+            })),
+            ProjectionSegment::Generated {
+                tokens: Arc::new(vec![1, 2]),
+                identity: GeneratedIdentity {
+                    name: "system_close".to_string(),
+                    position: 1,
+                },
+            },
+            ProjectionSegment::Sealed(SealedKind::Turn(turn(Some(tl), 0), Role::Assistant)),
+            ProjectionSegment::Sealed(SealedKind::TurnHalf(turn(Some(tl), 1))),
+            ProjectionSegment::NewUserMessage {
+                tokens: Arc::new(vec![9]),
+            },
+        ];
+        let (sections, turns) = projection_working_set(&segments);
+        assert_eq!(sections, vec![SectionId::new(3)]);
+        assert_eq!(
+            turns,
+            vec![
+                TurnKey::new(tl, TurnIndex(0)),
+                TurnKey::new(tl, TurnIndex(1))
+            ]
+        );
+    }
+
+    /// A turn with no timeline has no residence, so it is not asked for.
+    #[test]
+    fn a_turn_without_a_timeline_is_not_named() {
+        let segments = vec![ProjectionSegment::Sealed(SealedKind::Turn(
+            turn(None, 0),
+            Role::Assistant,
+        ))];
+        let (sections, turns) = projection_working_set(&segments);
+        assert!(sections.is_empty());
+        assert!(turns.is_empty());
+    }
+}
+
 // ── Sealed-segment injection ─────────────────────────────────────────────────
 
 fn inject_sealed_section(
@@ -1206,13 +1302,12 @@ fn inject_sealed_section(
         Some(s) => s,
         None => {
             walker.skipped_sections += 1;
-            tracing::warn!(
-                target: "candle_conversation::persistence::tier",
-                section = sid.raw(),
-                slot = parent_id.0,
-                "apply_projection: section not hot — elevate missed it; skipping borrow"
-            );
-            return Ok(());
+            return Err(ConversationError::Channel(format!(
+                "apply_projection: selected section {} is not hot on slot {} — elevate \
+                 missed it, and the prompt would silently lack it",
+                sid.raw(),
+                parent_id.0,
+            )));
         }
     };
     inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
@@ -1302,14 +1397,13 @@ fn inject_sealed_turn(
     // genuinely untracked) turn, surfaced loudly rather than silently dropped.
     let Some(timeline) = timeline else {
         walker.skipped_turns += 1;
-        tracing::warn!(
-            target: "candle_conversation::scheduler::reproject",
-            slot = parent_id.0,
-            group = group.raw(),
-            index = index.0,
-            "apply_projection: turn carries no timeline; dropping selected turn"
-        );
-        return Ok(());
+        return Err(ConversationError::Channel(format!(
+            "apply_projection: selected turn (group {}, index {}) on slot {} carries no \
+             timeline — it cannot be injected",
+            group.raw(),
+            index.0,
+            parent_id.0,
+        )));
     };
 
     // Bind the read to a local so the scrutinee's `RwLockReadGuard` drops BEFORE
@@ -1393,34 +1487,39 @@ fn inject_sealed_turn(
             };
             let tok_count = conv.turn_token_count_of(timeline, index);
             drop(conv);
-            tracing::warn!(
-                target: "candle_conversation::scheduler::reproject",
-                slot = parent_id.0,
-                group = group.raw(),
-                index = index.0,
-                used_timeline = timeline.raw(),
-                slot_timeline = ?ctx.slot_target.map(|t| t.timeline.raw()),
+            // **Refused, not dropped.** A context that silently lacks a turn the
+            // projection selected is the worst outcome available: the decode
+            // answers fluently from what is left. Measured on the repo-map ingest
+            // — a folder summary whose request turn had been demoted to RAM was
+            // rebuilt without it, and the model answered the only question left
+            // in its prompt, the tool-call format demonstration's.
+            return Err(ConversationError::Channel(format!(
+                "apply_projection: selected turn has no hot sealed K/V — slot {} group {} \
+                 index {} timeline {} (slot timeline {:?}, group timelines {}, entry \
+                 exists {}, tiers hot/warm/cold {:?}/{:?}/{:?}, {} tokens)",
+                parent_id.0,
+                group.raw(),
+                index.0,
+                timeline.raw(),
+                ctx.slot_target.map(|t| t.timeline.raw()),
                 group_timeline_count,
                 entry_exists,
-                tier_hot = ?tier_hot,
-                tier_warm = ?tier_warm,
-                tier_cold = ?tier_cold,
+                tier_hot,
+                tier_warm,
+                tier_cold,
                 tok_count,
-                "apply_projection: selected turn has no hot sealed K/V; dropping it"
-            );
-            return Ok(());
+            )));
         }
     };
     if sealed.is_empty() {
         walker.skipped_turns += 1;
-        tracing::warn!(
-            target: "candle_conversation::scheduler::reproject",
-            slot = parent_id.0,
-            group = group.raw(),
-            index = index.0,
-            "apply_projection: selected turn sealed K/V is empty; dropping it"
-        );
-        return Ok(());
+        return Err(ConversationError::Channel(format!(
+            "apply_projection: selected turn (group {}, index {}) on slot {} has empty \
+             sealed K/V — it cannot be injected",
+            group.raw(),
+            index.0,
+            parent_id.0,
+        )));
     }
     inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
     // The rows that go with those chunks. Borrowing the K/V is what makes a

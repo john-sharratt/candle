@@ -220,7 +220,7 @@ time-sharing between them.
 - **Large wave (throughput mode).** Triggered only when the pending-token backlog
   exceeds a threshold (**~2048 tokens**, tunable) — enough that streaming all 128
   experts is worth it. (Lowered from an initial 8192 once the ingest went 24-way
-  parallel with the rolling-window-bounded per-scope KV: a burst of ~24 small
+  parallel with the bounded per-scope KV of §4.7: a burst of ~24 small
   scopes reaches ~2048 readily, so the trigger fires without waiting for an
   8192-token backlog that a bounded-KV parallel ingest rarely accumulates.) Packs
   as many backlogged **prefill + glue** tokens as VRAM
@@ -466,61 +466,39 @@ to `C_max`. It captures most of the expert- and KV-reuse win with trivial
 bookkeeping (O(clusters), no per-add `E(S)` recompute); the full bang-per-buck
 greedy replaces it once the coarse version is validated.
 
-### 4.7 Bounded ingest context — the rolling window (PREREQUISITE)
+### 4.7 Bounded ingest context
 
-Code investigation confirmed a real defect the wave engine must **not** inherit:
-**the `code_read` (and any append-only bulk) ingest prefills each scope against
-the ENTIRE accumulated linear context of that file's conversation — system prompt
-+ every prior scope — with no window, no top-k, no eviction. Context grows
-unboundedly with scope count.**
+An append-only ingest (`code_reading`, `repo_map`) must not prefill each unit
+against an ever-growing linear context. The cost model (§1.2, §4.6) assumes each
+sequence's `kv_swept` is **bounded**, and an unbounded ingest context (a) makes
+every prefill forward's `T_attn` grow without limit, (b) consumes the VRAM
+headroom the large wave needs for its activation buffer (§4.4), and (c) can
+exceed the model's positional limit outright. A large wave batches prefill
+backlog; if each backlogged unit carried an ever-growing context, the wave's KV
+footprint would be unbounded and the §6 throughput math would break.
 
-Mechanism (why it's unbounded today):
+How it is bounded:
 
-- `code_read_config` sets `disable_reprojection = true` (`repo_scan/mod.rs:48`).
-- That makes `skip_projection = disable_reprojection && block_count > 0` true from
-  the first scope (`scheduler/mod.rs:1699`), so `apply_projection` is skipped and
-  the cumulative slot is left intact (`:1975-1987`); the prefill view borrows the
-  **whole parent** — `BlockRange::new(0, parent_block_count)` (`:2009`).
-- The `scopes` group *does* declare `selection: {top_k, k:8}` + `window: 6000`
-  (`projection.yaml:244`), but that only runs under `apply_projection`
-  (retrieval / summary), **never during the append-only ingest**.
-- So `context_depth = sequence_offset(view)` climbs monotonically
-  (`prefill.rs:643`). The ~6200 seen in logs is just a small file's cumulative
-  total (~61 scopes × ~100 tok), **not a bound** — a genuinely large file grows
-  past the model's context window and blows up KV VRAM.
-- Neither provenance/BDP selection **nor** any window is active for these turns —
-  full linear KV, prefill and summary decode alike. (Provenance selection is the
-  *projected* path's machinery; the ingest opts out via `disable_reprojection`.)
-
-Why it's a prerequisite for the wave engine: the cost model (§1.2, §4.6) assumes
-each sequence's `kv_swept` is **bounded** (a relevant subset, not the whole
-growing file). Unbounded ingest context (a) makes every prefill forward's
-`T_attn` grow without limit, (b) consumes the exact VRAM headroom the large wave
-needs for its activation buffer (§4.4), and (c) can exceed the model's positional
-limit outright. A large wave batches prefill backlog; if each backlogged scope
-carries an ever-growing context, the wave's KV footprint is unbounded and the §6
-throughput math breaks.
-
-**Fix — a rolling window of N turns.** At the point where `skip_projection`
-currently borrows the whole parent (`scheduler/mod.rs:1975-2013`), borrow instead
-**only the system-prompt blocks + the last N turns' (scopes') blocks**, so each
-scope prefills against `system_prompt ⊕ last-N-scopes` — bounded, constant-cost.
-
-- `N` is the design knob (≈4–8 scopes of local context is plenty for the model to
-  read a file coherently; whole-file understanding comes from the *summary* layer,
-  not from holding every scope in one context).
-- Alternative/compat: stop disabling reprojection for ingest so the `scopes`
-  top_k=8 selection trims the context to the k most-relevant prior scopes — reuses
-  existing machinery but pays the per-scope selection cost; the rolling window is
-  simpler and deterministic.
-- The dormant `context_window_turns` field (`config.rs:1345`, default 0, inert —
-  superseded by projection) describes exactly this "system prompt + last N turns"
-  rebuild but is not wired into `insert_turn`/prefill; the rolling window can
-  revive it for this path or be a fresh ingest-local mechanism.
-
-With the window, each scope's context is `O(N · scope_size)` — constant — so the
-large wave's KV is predictable. **This lands early in the migration (§7) because
-the whole large-wave throughput argument assumes bounded per-item KV.**
+- **One conversation per unit.** `code_reading` forks each scope onto a fresh
+  timeline (`fork_scope`), so a scope's round-trip sees its own request and none
+  of the file's other scopes; the pairs are spliced onto the file timeline after
+  they seal. `repo_map` opens one conversation per folder — a three-turn chain —
+  and one per folder for its probes.
+- **Every ingest turn is projected.** The slot is rebuilt from the substrate as
+  the conversation's selected branch of the system prompt plus every one of its
+  own turns, unscored (`target_is_ingest_self`), trimmed by the layer's
+  `window`. There is no cumulative-slot shortcut, because the slot does not hold
+  that context: one primed at creation holds the schema's *default* branch rather
+  than the branch the turn selects, and one given back while its turn waited
+  holds nothing. Appending onto whatever the slot held gave one conversation two
+  different contexts — measured on the repo map, a folder summary decoded under
+  the dialogue persona when its slot stayed resident, and without its own request
+  when the slot had been rebuilt.
+- A rebuilt turn lifts its selected units back into VRAM before re-applying
+  them, and `apply_projection` refuses a selected unit that is not hot rather
+  than build a context that silently lacks it.
+- `disable_reprojection` turns off mid-decode reprojection for these turns. It
+  does not skip the per-turn projection.
 
 ---
 
@@ -607,11 +585,9 @@ waves push toward compute-bound throughput; small waves keep latency low.
 
 ## 7. Migration plan (incremental, each step shippable)
 
-0. **Rolling-window ingest context (PREREQUISITE, §4.7).** Bound the code_read /
-   bulk-ingest prefill to `system_prompt ⊕ last-N-scopes` instead of the whole
-   growing parent (`scheduler/mod.rs:1975-2013`). Independent of everything below,
-   fixes a live unbounded-context/VRAM defect, and makes per-item KV constant so
-   the large-wave math holds. Do first.
+0. **Bounded ingest context (PREREQUISITE, §4.7).** Done: one conversation per
+   ingest unit, every ingest turn projected from the substrate and trimmed by the
+   layer window, so per-item KV is constant and the large-wave math holds.
 1. **Backlog instrumentation (no behaviour change).** Add
    `pending_prefill_tokens` accounting and surface it on the wave line + a new
    `WaveStats` field. Validates the signal before anything depends on it.
@@ -670,11 +646,10 @@ throughput/latency probes for steps 5–6.
   latency for its duration — may need to cap large-wave size lower on the 16 GB
   box, or preempt at layer granularity (finish the current layer, yield to a small
   wave, resume) if per-turn latency SLAs are tight.
-- **Unbounded ingest context (see §4.7).** Without the rolling-window prerequisite
-  (migration step 0), code_read prefills the full growing linear context per scope
-  — the large wave then batches ever-larger per-item KV and the throughput math
-  breaks. This is a live defect independent of the wave engine; the wave engine
-  just makes its VRAM cost acute.
+- **Unbounded ingest context (see §4.7).** Bounded by per-unit conversations and
+  the layer window. A path that appended ingest turns onto a cumulative slot
+  would reintroduce it — and, as §4.7 records, give one conversation two
+  different contexts.
 - **Recovery-cooldown measurement.** The "decode has recovered" signal (§4.2)
   needs a stable per-conversation baseline tps captured just before the large wave
   and a recovery band; noisy tps (variable context depth, few decode sequences)
@@ -715,7 +690,7 @@ throughput/latency probes for steps 5–6.
 | Glue assembly / bridge window | `scheduler/projection_assembler.rs` (`GapFillPlan`, `fire_gap_fill_batch`), `paged-glue/api.rs:44-54` |
 | Cross-session concat | `batched_model.rs:288` (`forward_batch`) |
 | Dormant Phase-2 config | `config.rs:1273-1292` |
-| Ingest skips projection (unbounded ctx) | `repo_scan/mod.rs:48` (`disable_reprojection`), `scheduler/mod.rs:1699` (`skip_projection`), whole-parent borrow `:1975-2013`/`:2009` |
-| `scopes` top_k / window (inactive in ingest) | `prompts/projection.yaml:244` (`top_k k:8`), layer window `:176` |
-| Dormant rolling-window field | `config.rs:1345` (`context_window_turns`, default 0), `conversation.rs:2232` (`window_state`) |
+| Ingest turns always projected (§4.7) | `repo_scan/mod.rs` `utility_config` (`disable_reprojection`: no mid-decode reprojection), `scheduler/mod.rs` `SubmitTurn` handler, `projection/project.rs` `target_is_ingest_self` arm |
+| Ingest context bound | per-unit conversations (`fork_scope`, one per folder), the layer `window` in `prompts/projection.yaml` |
+| Dormant rolling-window field | `config.rs` (`context_window_turns`, default 0), `conversation.rs` (`window_state`) |
 | Expert affinity / prefetch (for §4.6) | `expert_lre/transition.rs` (`predict_prefetch`, `observe`) |

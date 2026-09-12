@@ -13,9 +13,10 @@ use crate::persistence::content_hash::{hash_tokens, ContentChain, ContentHash};
 use crate::persistence::record::{BranchCheckpointPayload, SnapshotLayer};
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
-    from_projection_with_origins, Builder, Conversation, Observe, ProjectionEvent, ProjectionMode,
-    ProjectionTarget, SectionId, SectionTree, SelectionState, SystemPromptItem, TimelineId,
-    TurnIndex,
+    from_projection_with_origins, Builder, Conversation, Observe, OptionalState, ProjectionEvent,
+    ProjectionMode, ProjectionTarget, SectionId, SectionTree, SelectionState, SystemPromptItem,
+    TimelineId, TurnIndex, FORCE_TOOL_SELECTOR, FORCE_TOOL_SEPARATOR, NO_THINK_SELECTOR,
+    TOOLS_ENABLED_SELECTOR,
 };
 use crate::provenance::WideQSig;
 use crate::scheduler::exported_state::SharedState;
@@ -294,10 +295,15 @@ pub struct Sequence {
     ///
     /// Half of the branch-swap window; the other half (has anything advanced
     /// that state since?) is derived from the timeline's turn count at the use
-    /// site in [`Sequence::submit_turn_with_options`], because every path that
+    /// site in [`Sequence::rekey_prompt_state`], because every path that
     /// advances the state lands a turn on the timeline and a tracked flag
     /// would have to be cleared by each of them.
     state_is_prompt_only: bool,
+    /// The effective selection — this conversation's selection seeded with
+    /// its target layer's dials — the installed prompt checkpoint was built
+    /// for. [`Sequence::rekey_prompt_state`] rebuilds the checkpoint when a
+    /// first turn's effective selection differs from it.
+    checkpoint_selection: SelectionState,
 }
 
 /// The dialect's framing markers (`<|im_start|>system`, `<|im_end|>`, …) — the
@@ -579,6 +585,61 @@ fn examples_shape(prefilled_pairs: usize) -> &'static str {
     }
 }
 
+/// The section-tree selection an ingest round-trip chain frames its turns with,
+/// on top of `base`.
+///
+/// A round-trip is a SUMMARIZATION task, not the dialogue agent, so the shared
+/// system prompt is driven into its summarizer mode by selection:
+///
+/// - tools ON, force-pinned to the tools the prefill calls: the chain PREFILLS
+///   tool_calls and their tool_responses, so the projection must present a
+///   coherent tool context or the model can't connect the prefill to any
+///   capability and degrades (refusals, off-language, hallucinated tool
+///   chatter). The tool block is enabled and exactly those tools are
+///   force-selected (see [`FORCE_TOOL_SELECTOR`]) — present, coherent, no
+///   belief-driven catalog noise.
+/// - `persona = summarize`: swaps the "You are Zen, pair programming…"
+///   dialogue frame for the terse code-summarizer frame (content-provided,
+///   English, summary-only).
+/// - `response_length = terse`: the default `standard` length section says "a
+///   short paragraph or two", which fights the two-sentence goal.
+/// - `summarize_examples`: worked example turns stuffed between the system
+///   prompt and the chain so the model imitates the exact request→summary
+///   shape. The option names the SHAPE of the chain (`file` for a scope read,
+///   `folder` for a directory round-trip), because an example teaches the
+///   subject as much as the format: shown the file examples, a folder chain
+///   summarises the excerpt it was handed rather than the directory it was
+///   asked about.
+fn ingest_chain_selection(
+    base: &SelectionState,
+    prefilled_pairs: usize,
+    force_tools: &[String],
+) -> SelectionState {
+    let mut sel = base.clone();
+    sel.set_optional(TOOLS_ENABLED_SELECTOR, OptionalState::Present);
+    sel.select(
+        FORCE_TOOL_SELECTOR,
+        force_tools.join(&FORCE_TOOL_SEPARATOR.to_string()),
+    );
+    sel.select("persona", "summarize");
+    sel.select("response_length", "terse");
+    sel.select("summarize_examples", examples_shape(prefilled_pairs));
+    sel
+}
+
+/// The selection the chain's DECODED turn submits with: the chain's whole
+/// framing plus the `/no_think` switch that turn adds.
+///
+/// [`Sequence::submit_turn_with_options`] adopts a turn's selection wholesale,
+/// so a decoded turn whose options carried only its own additions projected
+/// under the default persona, length and examples — the summary, the one turn
+/// the chain exists to produce, was the one turn not framed as a summary.
+fn ingest_decode_selection(chain: &SelectionState) -> SelectionState {
+    let mut sel = chain.clone();
+    sel.set_optional(NO_THINK_SELECTOR, OptionalState::Present);
+    sel
+}
+
 impl Sequence {
     /// Create a new conversation backed by a full projection [`Builder`].
     ///
@@ -649,6 +710,7 @@ impl Sequence {
             primed_prefix: Arc::new(Vec::new()),
             branch_spans: Vec::new(),
             state_is_prompt_only: false,
+            checkpoint_selection: SelectionState::default(),
         };
 
         // Set the in-memory tree's system prompt tokens so the tree's
@@ -987,6 +1049,7 @@ impl Sequence {
         // rebuilds from exactly these inputs.
         conv.primed_prefix = Arc::new(fixed_prefix.clone());
         conv.branch_spans = branch_spans;
+        conv.checkpoint_selection = conv.effective_prompt_selection();
 
         // Pre-warm the slot: inject all system-prompt sections now so the
         // first `submit_turn` sees an already-populated slot and skips
@@ -1087,7 +1150,8 @@ impl Sequence {
                     break;
                 }
                 ids.extend_from_slice(&primed[cursor..start]);
-                let selection = tree.selection(|id| self.selection.get(id));
+                let effective = self.effective_prompt_selection();
+                let selection = tree.selection(|id| effective.get(id));
                 ids.extend(tree.branch_prefix_ids(&selection));
                 cursor = start + len;
             }
@@ -1115,6 +1179,62 @@ impl Sequence {
             tokens.extend_from_slice(&section);
         }
         (chain.prefix(), tokens)
+    }
+
+    /// This conversation's selection seeded with its target layer's dials
+    /// (`LayerDials::seed`) — the selection its projections run under, and so
+    /// the one its prompt state must be built for.
+    fn effective_prompt_selection(&self) -> SelectionState {
+        self.projection
+            .schema()
+            .layers
+            .iter()
+            .find(|l| l.id == self.target.layer)
+            .map_or_else(|| self.selection.clone(), |l| l.dials.seed(&self.selection))
+    }
+
+    /// Swap the installed prompt checkpoint for the branch this conversation's
+    /// FIRST turn selects, when that differs from the one it was built for.
+    ///
+    /// The checkpoint installed at create was built for the selection the
+    /// conversation had then, because create cannot know the first turn's.
+    /// This is the one moment it can be swapped: the state is still exactly
+    /// that checkpoint, and the projection the submit runs will show the newly
+    /// selected sections. State must match what the K/V shows (§4.6); without
+    /// this, every conversation whose first turn carried non-default dials ran
+    /// on the default branch's prompt memory while projecting the dialed
+    /// prompt — E2 of the behavioural catalogue caught it by the checkpoint
+    /// counters sitting still. Every turn-submitting path calls it, because an
+    /// ingest conversation's first turn is a prefilled insert, not a decoded
+    /// submit.
+    ///
+    /// **The window is DERIVED, not tracked.** `state_is_prompt_only` says this
+    /// conversation was born with a checkpoint (a fork's state is real and must
+    /// never be swapped); the empty timeline says nothing has advanced that
+    /// state since. A tracked "still pristine" bool would have to be cleared by
+    /// every path that advances the state, and each of them seals or adopts a
+    /// turn onto this timeline, so the turn count states the same fact without
+    /// anyone having to remember. Without the derived half, a code_read
+    /// conversation that ingested scopes and then took a dialed first turn had
+    /// the bare prompt checkpoint installed over the state that had absorbed
+    /// them: K/V holding the ingest, recurrent layers having forgotten it.
+    fn rekey_prompt_state(&mut self) -> crate::Result<()> {
+        if !self.state_is_prompt_only {
+            return Ok(());
+        }
+        let effective = self.effective_prompt_selection();
+        if effective == self.checkpoint_selection
+            || self.substrate.read().turn_count(self.target.timeline) != 0
+        {
+            return Ok(());
+        }
+        let primed = Arc::clone(&self.primed_prefix);
+        let spans = self.branch_spans.clone();
+        if let Some((prefix, fresh)) = self.build_branch_checkpoint(&primed, &spans)? {
+            self.restore_branch_checkpoint(prefix, fresh)?;
+        }
+        self.checkpoint_selection = effective;
+        Ok(())
     }
 
     /// Compute and persist this conversation's prompt branch checkpoint (§4.6).
@@ -1756,41 +1876,10 @@ impl Sequence {
         // becomes the conversation's current selection and drives every
         // projection — initial prefill and decode reprojection — until the next
         // turn changes it.
-        let selection_changed = self.selection != options.selection;
         self.selection = options.selection.clone();
-
-        // A FIRST turn whose dials select a different prompt branch: the
-        // checkpoint installed at create is the default branch's, because
-        // create cannot know the dials. This is the one moment it can be
-        // swapped — the state is still exactly that checkpoint, and the
-        // projection this submit runs will show the newly selected sections.
-        // State must match what the K/V shows (§4.6); without this, every
-        // conversation whose first turn carried non-default dials ran on the
-        // default branch's prompt memory while projecting the dialed prompt —
-        // E2 of the behavioural catalogue caught it by the checkpoint counters
-        // sitting still.
-        //
-        // **The window is DERIVED, not tracked.** `state_is_prompt_only` says
-        // this conversation was born with a checkpoint (a fork's state is real
-        // and must never be swapped); the empty timeline says nothing has
-        // advanced that state since. A tracked "still pristine" bool has to be
-        // cleared by every path that advances the state, and the paths that
-        // are not this one — `insert_turn_inner`, `submit_prefilled_turn`,
-        // `catch_memory_up_to` — each seal or adopt a turn onto this timeline
-        // BEFORE any later submit runs, so the turn count states the same fact
-        // without anyone having to remember. Without the derived half, a
-        // code_read conversation that ingested scopes and then took a dialed
-        // first turn had the bare prompt checkpoint installed over the state
-        // that had absorbed them: K/V holding the ingest, recurrent layers
-        // having forgotten it — the very defect this block exists to remove.
-        let timeline_is_empty = self.substrate.read().turn_count(self.target.timeline) == 0;
-        if selection_changed && self.state_is_prompt_only && timeline_is_empty {
-            let primed = Arc::clone(&self.primed_prefix);
-            let spans = self.branch_spans.clone();
-            if let Some((prefix, fresh)) = self.build_branch_checkpoint(&primed, &spans)? {
-                self.restore_branch_checkpoint(prefix, fresh)?;
-            }
-        }
+        // A first turn whose selection names a different prompt branch swaps
+        // the checkpoint installed at create — see [`Self::rekey_prompt_state`].
+        self.rekey_prompt_state()?;
         // Whatever branch it started from, this turn's decode advances the
         // state past the prompt — the swap window closes.
         self.state_is_prompt_only = false;
@@ -2030,6 +2119,7 @@ impl Sequence {
             });
         }
         self.selection = selection;
+        self.rekey_prompt_state()?;
 
         // **No suppression block here, unlike `submit_turn_with_options`.** That
         // path prefills the dialect's closed block because the model is about to
@@ -2170,6 +2260,7 @@ impl Sequence {
             });
         }
         self.selection = selection;
+        self.rekey_prompt_state()?;
 
         // Each case's grid is the whole turn a lone prefill would lay down —
         // opener, user body, the user/assistant join, and the closing marker —
@@ -2273,7 +2364,6 @@ impl Sequence {
                 sampling: self.config.sampling.clone(),
                 event_tx,
                 reprojection: None,
-                disable_reprojection: self.config.disable_reprojection,
                 triggers: Arc::new(TriggerRegistry::new()),
                 // Every case's assistant half is supplied in the grid, so there
                 // is nothing to constrain and nothing to exempt.
@@ -2392,8 +2482,8 @@ impl Sequence {
         post_decode_tokens.extend_from_slice(&self.tokenize(self.config.dialect.assistant_end)?);
 
         let disable_reprojection = self.config.disable_reprojection;
-        // Append-only ingests skip the per-turn projection rebuild and also
-        // suppress continuous mid-decode reprojection.
+        // Append-only ingests suppress continuous mid-decode reprojection; their
+        // per-turn projection runs like any other turn's.
         let reprojection = if disable_reprojection {
             None
         } else {
@@ -2421,7 +2511,6 @@ impl Sequence {
                 sampling,
                 event_tx,
                 reprojection,
-                disable_reprojection,
                 triggers,
                 turn_grammar,
                 free_tool_calls_from_penalties,
@@ -2465,6 +2554,18 @@ impl Sequence {
             projection: Arc::clone(&self.projection),
             selection: self.selection.clone(),
         }
+    }
+
+    /// Adopt `selection` as this conversation's section-tree selection for the
+    /// turns it submits from here on.
+    ///
+    /// For a conversation created to play one role — an ingest conversation
+    /// framed to answer or to write questions — and set before its first turn,
+    /// so every projection of it reads that branch of the shared system prompt.
+    /// A turn submitted with its own selection (`TurnOptions::selection`,
+    /// [`Self::submit_prefilled_turn_group`]) replaces this one.
+    pub fn set_selection(&mut self, selection: SelectionState) {
+        self.selection = selection;
     }
 
     /// Insert a preformed turn into the conversation **without model inference**.
@@ -2550,6 +2651,10 @@ impl Sequence {
                 sequence_id: self.id,
             });
         }
+
+        // The conversation's first turn may select a different prompt branch
+        // than the checkpoint was built for — see [`Self::rekey_prompt_state`].
+        self.rekey_prompt_state()?;
 
         // Format the full exchange (user + assistant_start prefix +
         // assistant_text) and tokenize as a single prefill payload.
@@ -2789,41 +2894,9 @@ impl Sequence {
         force_tools: &[String],
         triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<(Vec<u32>, usize)> {
-        // A scope round-trip is a SUMMARIZATION task, not the dialogue agent. Drive
-        // the shared system prompt into its summarizer mode via selection — the
-        // generic, per-mode section-toggling design rather than a bespoke per-layer
-        // prompt string:
-        //   - tools ON, force-pinned to the tools the prefill calls: the chain
-        //     PREFILLS tool_calls and their tool_responses, so the projection must
-        //     present a coherent tool context or the model can't connect the
-        //     prefill to any capability and degrades (refusals, off-language,
-        //     hallucinated tool chatter). Enable the tool block and force-select
-        //     exactly those tools (see `FORCE_TOOL_SELECTOR`) — present, coherent,
-        //     no belief-driven catalog noise.
-        //   - `persona = summarize`: swaps the "You are Zen, pair programming…"
-        //     dialogue frame for the terse code-summarizer frame (content-provided,
-        //     English, summary-only) — the fix for the reasoning/refusal/off-language
-        //     summaries the conversational persona produced.
-        //   - `response_length = terse`: the default `standard` length section says
-        //     "a short paragraph or two", which fights the two-sentence goal.
-        self.selection.set_optional(
-            crate::projection::TOOLS_ENABLED_SELECTOR,
-            crate::projection::OptionalState::Present,
-        );
-        let pinned_tools = force_tools.join(&crate::projection::FORCE_TOOL_SEPARATOR.to_string());
-        self.selection
-            .select(crate::projection::FORCE_TOOL_SELECTOR, pinned_tools.clone());
-        self.selection.select("persona", "summarize");
-        self.selection.select("response_length", "terse");
-        //   - `summarize_examples`: stuff worked example turns between the system
-        //     prompt and this chain's turns so the model imitates the exact
-        //     request→summary shape. The option names the SHAPE of this chain
-        //     (`file` for a scope read, `folder` for a directory round-trip),
-        //     because an example teaches the subject as much as the format: shown
-        //     the file examples, a folder chain summarises the excerpt it was
-        //     handed rather than the directory it was asked about.
-        self.selection
-            .select("summarize_examples", examples_shape(prefilled.len()));
+        // The summarizer framing every turn of the chain projects under — see
+        // [`ingest_chain_selection`].
+        self.selection = ingest_chain_selection(&self.selection, prefilled.len(), force_tools);
         // The prefilled turns — each `[user][assistant]` written verbatim, with
         // staged provenance so a later scan can resolve sig hit → event → turn.
         let mut indices: Vec<u32> = Vec::with_capacity(prefilled.len() + 1);
@@ -2890,26 +2963,16 @@ impl Sequence {
         // window holds the model's own prose rather than a directory listing.
         summary_sampling.repeat_last_n = 64;
         summary_sampling.apply_think_mode(ThinkMode::Off, &self.tokenizer, max_summary_tokens);
-        let mut opts = TurnOptions {
+        // The decode projects under the chain's whole framing plus `/no_think` —
+        // see [`ingest_decode_selection`] for why the turn must carry all of it.
+        let opts = TurnOptions {
             max_tokens: Some(max_summary_tokens),
             sampling: Some(summary_sampling),
             tags,
             triggers,
+            selection: ingest_decode_selection(&self.selection),
             ..Default::default()
         };
-        opts.selection.set_optional(
-            crate::projection::NO_THINK_SELECTOR,
-            crate::projection::OptionalState::Present,
-        );
-        // Same tools-ON pin as the conversation-level selection above: the decode's
-        // own projection must also carry the coherent tool context the prefilled
-        // tool_response turns refer to.
-        opts.selection.set_optional(
-            crate::projection::TOOLS_ENABLED_SELECTOR,
-            crate::projection::OptionalState::Present,
-        );
-        opts.selection
-            .select(crate::projection::FORCE_TOOL_SELECTOR, pinned_tools);
         let handle = self.submit_turn_with_options(decode_user, opts)?;
         // Interruptible wait: a graceful shutdown mid-ingest latches the cancel
         // flag, and this returns `IngestCancelled` instead of waiting out the
@@ -3875,6 +3938,8 @@ impl Sequence {
             // timeline's snapshot, never exactly the prompt checkpoint — so
             // the branch-swap window is closed.
             state_is_prompt_only: false,
+            // Unread while the window is closed.
+            checkpoint_selection: SelectionState::default(),
             // Forks start with a fresh scanner state — scoring will refresh
             // on the next provenance scan.  No need to clone the parent's scores.
         };
@@ -4500,47 +4565,6 @@ impl Drop for Sequence {
     }
 }
 
-/// Pure block-range windowing for a bounded rolling-window ingest (design
-/// `docs/unified_wave_inference_engine.md` §4.7): given the system-prompt end
-/// block `sys_end`, the ascending per-turn start blocks `turn_starts` (one per
-/// sealed turn), the current `total` block count, and `window_turns`, return the
-/// parent block ranges the next prefill should attend — the system prompt plus
-/// the most recent `window_turns` sealed turns.
-///
-/// `window_turns == 0` (unbounded) or fewer sealed turns than the window returns
-/// the whole parent `[(0, total)]` — a no-op, byte-for-byte the unwindowed
-/// behaviour. Split out from [`Conversation::windowed_ingest_ranges`] so it is
-/// unit-testable without a live substrate.
-pub(crate) fn windowed_ingest_ranges_impl(
-    sys_end: usize,
-    turn_starts: &[usize],
-    total: usize,
-    window_turns: usize,
-) -> Vec<(usize, usize)> {
-    let whole = || {
-        if total == 0 {
-            Vec::new()
-        } else {
-            vec![(0, total)]
-        }
-    };
-    if window_turns == 0 || turn_starts.len() <= window_turns {
-        return whole();
-    }
-    let keep_from = turn_starts[turn_starts.len() - window_turns];
-    // If the window already reaches back into (or to) the system prompt, the two
-    // pieces are contiguous — borrow the whole parent.
-    if keep_from <= sys_end {
-        return whole();
-    }
-    let mut ranges = Vec::with_capacity(2);
-    if sys_end > 0 {
-        ranges.push((0, sys_end));
-    }
-    ranges.push((keep_from, total));
-    ranges
-}
-
 /// A lock-free snapshot of the handles the interactive projection probe needs
 /// ([`Sequence::probe_ctx`]), so the probe — a full GPU turn round-trip — runs
 /// WITHOUT holding the `base_conv` mutex, which is the fork source every new
@@ -4659,7 +4683,6 @@ impl ProbeCtx {
                 sampling: SamplingConfig::argmax(),
                 event_tx,
                 reprojection: None,
-                disable_reprojection: false,
                 triggers: Arc::new(TriggerRegistry::new()),
                 // A one-token wide-Q probe constrains nothing.
                 turn_grammar: None,
@@ -4752,30 +4775,74 @@ fn cap_probe_window(probe: Vec<WideQSig>, max_tail: usize) -> Vec<WideQSig> {
 }
 
 #[cfg(test)]
-mod windowed_ingest_tests {
-    use super::windowed_ingest_ranges_impl as w;
+mod ingest_selection_tests {
+    use super::{ingest_chain_selection, ingest_decode_selection};
+    use crate::projection::{
+        OptionalState, SelectionState, FORCE_TOOL_SELECTOR, NO_THINK_SELECTOR,
+        TOOLS_ENABLED_SELECTOR,
+    };
 
+    fn folder_tools() -> Vec<String> {
+        vec!["file_list".to_string(), "file_read".to_string()]
+    }
+
+    /// A folder chain frames its turns as the summariser, with the two tools its
+    /// prefilled calls name pinned into the catalog.
     #[test]
-    fn window_bounds_to_system_prompt_plus_last_n_turns() {
-        // system prompt occupies [0,2); five sealed turns start at 2,5,9,12,16;
-        // current total is 20 blocks.
-        let sys = 2;
-        let starts = [2usize, 5, 9, 12, 16];
-        // Unbounded (0) or window >= turn count → whole parent (no-op).
-        assert_eq!(w(sys, &starts, 20, 0), vec![(0, 20)]);
-        assert_eq!(w(sys, &starts, 20, 5), vec![(0, 20)]);
-        assert_eq!(w(sys, &starts, 20, 9), vec![(0, 20)]);
-        // Keep last 2 turns → system [0,2) + [starts[3]=12, 20).
-        assert_eq!(w(sys, &starts, 20, 2), vec![(0, 2), (12, 20)]);
-        // Keep last 1 → [0,2) + [16, 20).
-        assert_eq!(w(sys, &starts, 20, 1), vec![(0, 2), (16, 20)]);
-        // No system prompt → single tail range.
-        assert_eq!(w(0, &starts, 20, 2), vec![(12, 20)]);
-        // Empty parent → no ranges.
-        assert_eq!(w(0, &[], 0, 3), Vec::<(usize, usize)>::new());
-        // Window reaches into the system-prompt region (keep_from <= sys_end) →
-        // contiguous → whole parent.
-        assert_eq!(w(13, &starts, 20, 2), vec![(0, 20)]);
+    fn a_folder_chain_selects_the_summariser_and_pins_its_tools() {
+        let sel = ingest_chain_selection(&SelectionState::new(), 2, &folder_tools());
+        assert_eq!(sel.get("persona"), Some("summarize"));
+        assert_eq!(sel.get("response_length"), Some("terse"));
+        assert_eq!(sel.get("summarize_examples"), Some("folder"));
+        assert_eq!(
+            sel.optional(TOOLS_ENABLED_SELECTOR),
+            Some(OptionalState::Present)
+        );
+        assert_eq!(sel.get(FORCE_TOOL_SELECTOR), Some("file_list,file_read"));
+    }
+
+    /// A single-pair chain is a code scope and takes the file examples.
+    #[test]
+    fn a_scope_chain_takes_the_file_examples() {
+        let sel = ingest_chain_selection(&SelectionState::new(), 1, &["file_read".to_string()]);
+        assert_eq!(sel.get("summarize_examples"), Some("file"));
+        assert_eq!(sel.get(FORCE_TOOL_SELECTOR), Some("file_read"));
+    }
+
+    /// **The decoded summary is framed as a summary.** Its turn adopts its own
+    /// selection wholesale, and built from the turn's additions alone it lost
+    /// the persona, the length and the examples — the one turn the chain exists
+    /// to produce was the one projected under the dialogue frame.
+    #[test]
+    fn the_decoded_turn_keeps_the_chains_framing_and_suppresses_thinking() {
+        let chain = ingest_chain_selection(&SelectionState::new(), 2, &folder_tools());
+        let decode = ingest_decode_selection(&chain);
+        for selector in [
+            "persona",
+            "response_length",
+            "summarize_examples",
+            FORCE_TOOL_SELECTOR,
+            TOOLS_ENABLED_SELECTOR,
+        ] {
+            assert_eq!(
+                decode.get(selector),
+                chain.get(selector),
+                "`{selector}` was dropped from the decoded turn"
+            );
+        }
+        assert_eq!(
+            decode.optional(NO_THINK_SELECTOR),
+            Some(OptionalState::Present)
+        );
+    }
+
+    /// Selectors set before the chain, which it does not own, survive it.
+    #[test]
+    fn the_chain_keeps_the_selectors_it_does_not_own() {
+        let mut base = SelectionState::new();
+        base.select("thinking_effort", "off");
+        let sel = ingest_chain_selection(&base, 2, &folder_tools());
+        assert_eq!(sel.get("thinking_effort"), Some("off"));
     }
 }
 

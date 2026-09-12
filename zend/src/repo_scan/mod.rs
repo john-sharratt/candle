@@ -414,12 +414,11 @@ fn dir_tags(unit: &DirUnit) -> Vec<String> {
 pub(crate) fn utility_config(mut config: SequenceConfig) -> SequenceConfig {
     config.tree.summarize_every = 0;
     config.tree.segment_summarize_every = 0;
-    // Utility ingests (repo_map, code_reading) are append-only cumulative
-    // trunks — each turn just extends the layer. Skip the per-turn projection
-    // rebuild (reset + re-project the whole trunk, which is O(n²) and serial on
-    // the scheduler thread); turns still seal into the substrate. This lets the
-    // parallel workers' prefills/decodes actually batch instead of serialising
-    // behind reprojection.
+    // Utility ingests (repo_map, code_reading) are append-only: each turn
+    // extends its own conversation, and each turn's projection is that
+    // conversation's selected branch of the system prompt plus every one of its
+    // own turns, unscored (`target_is_ingest_self`). No mid-decode reprojection:
+    // an ingest turn has nothing to retrieve while it decodes.
     config.disable_reprojection = true;
     // Utility ingests quantize at C5, fully adaptive for both K and V (the
     // engine-wide uniform-K pin is off in this config). The code-reading layer
@@ -435,13 +434,11 @@ pub(crate) fn utility_config(mut config: SequenceConfig) -> SequenceConfig {
 /// so a co-located `code_reading` pass doesn't re-walk, plus the [`DirState`]
 /// the refresh path compares against.
 ///
-/// The closing decode is a summary *of the folder* because
-/// [`layer_system_prompt`] frames the conversation with [`SUMMARIZE_BRANCH`] —
-/// the summarizer persona plus the FOLDER-shaped worked examples. Both parts
-/// matter, and neither can be selected at runtime: the prompt is a static string
-/// and `disable_reprojection` (see [`utility_config`]) means the conversation
-/// never re-projects, so the selections
-/// `ingest_roundtrip_chain_indices` sets can never materialise.
+/// The closing decode is a summary *of the folder* because every turn of the
+/// chain projects under [`SUMMARIZE_BRANCH`] — the summarizer persona plus the
+/// FOLDER-shaped worked examples — which `ingest_roundtrip_chain_indices`
+/// selects. Both parts matter: the persona makes it a summary, and the examples
+/// make it a summary of the folder rather than of the excerpt it was handed.
 #[allow(clippy::too_many_arguments)]
 pub fn ingest_repo_map(
     engine: &Mutex<ConversationEngine>,
@@ -611,12 +608,14 @@ struct IngestPlan {
     layer: LayerId,
     group: GroupId,
     proj_builder: projection::Builder,
+    /// Recorded prompt text of the folder conversations — [`SUMMARIZE_BRANCH`]
+    /// rendered. What the model reads is the projection its turns select.
     system_prompt: String,
-    /// System prompt for the throwaway probe-generation conversations — the
-    /// question-writer framing rather than the summariser's.
+    /// Recorded prompt text of the throwaway probe-generation conversations —
+    /// [`probe_pass::GENERATE_BRANCH`] rendered.
     probe_prompt: String,
-    /// System prompt for the per-folder probe-ANSWERING conversations, framed to
-    /// answer with a `<think>` block rather than to summarise without one.
+    /// Recorded prompt text of the per-folder probe conversations —
+    /// [`probe_pass::ANSWER_BRANCH`] rendered.
     answer_prompt: String,
     config: SequenceConfig,
     /// `<think>` bound to [`ThinkMode::Off`]'s tree, for every folder summary
@@ -687,10 +686,12 @@ impl IngestPlan {
             group,
             proj_builder: proj_builder.clone(),
             system_prompt: layer_system_prompt(proj_builder, layer_name, config),
-            // Generation: thinking suppressed — its budget is for questions.
-            // Answering: thinking KEPT, because the `<think>` block is exactly
-            // the reasoning-shaped signature a mid-decode scan matches against.
-            probe_prompt: probe_generation_prompt(proj_builder, config),
+            probe_prompt: branch_system_prompt(
+                proj_builder,
+                config,
+                probe_pass::GENERATE_BRANCH,
+                true,
+            ),
             answer_prompt: branch_system_prompt(
                 proj_builder,
                 config,
@@ -1627,12 +1628,15 @@ fn ingest_probe_chunks(
 
 /// The section-tree branch an ingest conversation frames on: the terse
 /// code-summarization engine, with the worked request→summary examples stuffed
-/// in. Node id → option id; a node not named here keeps its schema default.
+/// in. Node id → option id; a node not named here keeps the layer's dial, then
+/// its schema default.
 ///
-/// This has to be resolved into the STATIC system prompt rather than left to a
-/// runtime `Selection`: an ingest conversation is created with an explicit
-/// prompt string and runs with `disable_reprojection` (see [`utility_config`]),
-/// so it never re-projects and a later selection change can never materialise.
+/// The chain's turns select these options at runtime
+/// (`ingest_roundtrip_chain_indices`), and every turn is projected, so the
+/// selection is what the model reads. [`layer_system_prompt`] renders the same
+/// branch as the conversation's recorded prompt text, and
+/// [`validate_summarize_branch`] fails the ingest when the schema cannot supply
+/// it.
 const SUMMARIZE_BRANCH: &[(&str, &str)] = &[
     // The conversational "You are Zen, pair programming…" frame makes the model
     // reason aloud, refuse, or chat; `summarize` pins content-is-provided,
@@ -1654,8 +1658,9 @@ const SUMMARIZE_BRANCH: &[(&str, &str)] = &[
 ///
 /// Mirrors the dialogue layer's `pre_collection_prelude` (`session.rs`): fixed
 /// sections verbatim, plus each section-tree node's *chosen* option — chosen
-/// here by [`SUMMARIZE_BRANCH`] rather than by the tree's defaults, so the
-/// conversation is framed as the summarizer it is.
+/// here by [`SUMMARIZE_BRANCH`] rather than by the tree's defaults. This is the
+/// conversation's recorded prompt text; the model reads the projection its
+/// turns select, which is the same branch.
 fn layer_system_prompt(
     builder: &projection::Builder,
     layer_name: &str,
@@ -1677,12 +1682,10 @@ fn layer_system_prompt(
 /// writes questions ([`probe_pass::GENERATE_BRANCH`]) and one that answers them
 /// with a `<think>` block ([`probe_pass::ANSWER_BRANCH`]).
 ///
-/// `suppress_thinking` prepends `/no_think` to the assembled body, which is how
-/// the model's soft switch is actually driven (`models::builder`). It is not
-/// reachable through the section tree: the schema's `no_think` toggle carries a
-/// *dialect* marker rather than prompt content, and a conversation created with
-/// an explicit prompt string under `disable_reprojection` never re-projects, so
-/// selecting it resolves cleanly and contributes nothing at all.
+/// `suppress_thinking` prepends `/no_think` to the rendered body. Like the rest
+/// of this text it is the conversation's recorded prompt, not what the model
+/// reads: the soft switch reaches the model on the user turn, where Qwen reads
+/// it (see `probe_pass::generate`).
 fn branch_system_prompt(
     builder: &projection::Builder,
     config: &SequenceConfig,
@@ -1692,45 +1695,6 @@ fn branch_system_prompt(
     config
         .dialect
         .format_system_prompt(&branch_prompt_body(builder, branch, suppress_thinking))
-}
-
-/// The system prompt for the probe-GENERATION conversation: one option's text
-/// and nothing else.
-///
-/// Deliberately **not** the schema walk every other ingest prompt uses. That
-/// walk emits every fixed section in the shared system prompt — the coding
-/// assistant's framing, the grounding rules, the history stance — and the
-/// question-writer persona is one paragraph inside thousands of tokens of it.
-/// The result was a generator that reasoned at length about what was being asked
-/// of it and never got to the questions: measured blocks of 5,342, 15,102 and
-/// 15,140 characters, one of them concluding the task was to "generate 50 short
-/// paragraphs".
-///
-/// The persona text still comes from the schema, so the prompt stays a config
-/// item rather than a string literal in Rust. What is dropped is only the
-/// scaffolding that belongs to a *dialogue* — which this conversation is not.
-fn probe_generation_prompt(builder: &projection::Builder, config: &SequenceConfig) -> String {
-    use projection::SystemPromptItem;
-    let persona = builder
-        .schema()
-        .system_prompt
-        .items
-        .iter()
-        .find_map(|item| match item {
-            SystemPromptItem::SectionTree(tree) => tree
-                .nodes
-                .iter()
-                .find(|n| n.name == "persona")?
-                .options
-                .iter()
-                .find(|o| o.id == "question_writer")
-                .map(|o| o.content.clone()),
-            _ => None,
-        })
-        .unwrap_or_default();
-    config
-        .dialect
-        .format_system_prompt(&format!("/no_think\n{}", persona.trim()))
 }
 
 /// The unwrapped body [`branch_system_prompt`] frames — split out so the
@@ -2254,10 +2218,56 @@ mod tests {
         .expect("projection.yaml must parse")
     }
 
-    /// The system prompt an ingest conversation is actually created with — the
-    /// artifact, not a proxy for it. It must frame the model as the summarizer
-    /// and carry the worked examples, or the folder decode answers a
-    /// summary request conversationally.
+    /// **Ingest layers never carry the tool-call demonstration.** It is a user
+    /// turn asking for `example.com`'s address followed by the call, and a
+    /// folder conversation whose own request had dropped out of its context
+    /// answered that question instead of summarising. An ingest turn asks for no
+    /// tool of its own, so the layers' dials remove it from every branch they
+    /// project.
+    #[test]
+    fn ingest_layers_drop_the_tool_call_demonstration() {
+        let builder = bundled_builder();
+        let schema = builder.schema();
+        let tree = schema
+            .system_prompt
+            .section_trees()
+            .find(|t| t.nodes.iter().any(|n| n.name == "tool_call_example"))
+            .expect("the schema declares the tool-call demonstration");
+        let node = tree
+            .nodes
+            .iter()
+            .find(|n| n.name == "tool_call_example")
+            .expect("its node");
+        let demonstration: Vec<_> = node
+            .options
+            .iter()
+            .filter(|o| o.id == "present")
+            .flat_map(|o| o.variants.iter().map(|v| v.id))
+            .collect();
+        assert!(
+            !demonstration.is_empty(),
+            "the demonstration must have sealed variants for this test to mean anything"
+        );
+        for layer in ["repo_map", "code_reading"] {
+            let dials = &schema
+                .layers
+                .iter()
+                .find(|l| l.name == layer)
+                .expect("ingest layer")
+                .dials;
+            let selection = tree.selection(|id| dials.get(id));
+            let emitted = tree.branch_prefix_ids(&selection);
+            assert!(
+                emitted.iter().all(|id| !demonstration.contains(id)),
+                "`{layer}` still projects the tool-call demonstration",
+            );
+        }
+    }
+
+    /// [`SUMMARIZE_BRANCH`] rendered — the folder conversation's recorded prompt
+    /// text, and the same branch its turns select. It must frame the model as
+    /// the summarizer and carry the worked examples, or the folder decode
+    /// answers a summary request conversationally.
     #[test]
     fn the_ingest_prompt_is_framed_as_the_summarizer() {
         let builder = bundled_builder();

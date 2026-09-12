@@ -275,18 +275,6 @@ pub(crate) enum SchedulerRequest {
         /// for the full contract.  `None` skips re-projection entirely
         /// (used by single-shot paths like RULER eval and summarisation).
         reprojection: Option<ReprojectionPolicy>,
-        /// When `true`, skip the per-turn projection rebuild
-        /// (`apply_projection` reset + re-project) as long as the slot
-        /// already holds content, and append the prefill onto the
-        /// cumulative slot instead.  The `seal_action` is unaffected, so
-        /// the turn still seals into the substrate.  The system prompt is
-        /// seeded by PrimingProjection at conversation creation (so the
-        /// slot is already non-empty and this stays true from turn 1);
-        /// see the handler for the gated-section trade-off.  Used by
-        /// append-only utility ingests (e.g. `code_reading`) where
-        /// re-projecting the whole trunk every turn is both unnecessary
-        /// and O(n²) — see `zend::code_read`.
-        disable_reprojection: bool,
         /// Tool-call stencils that may fire during this turn's decode, keyed by
         /// their trigger token (e.g. `<tool_call>`).  An empty registry means no
         /// constrained decoding — the turn free-decodes.
@@ -2113,15 +2101,6 @@ pub(super) fn sum_pending_prefill_tokens(items: impl IntoIterator<Item = (usize,
         .sum()
 }
 
-/// Rolling-window size (turns) for append-only ingest prefills (the
-/// `disable_reprojection` path — `code_reading` / `repo_map`): each such turn
-/// attends only the system prompt + the last `CODE_READ_WINDOW_TURNS` sealed
-/// turns, bounding otherwise-unbounded ingest context that would exhaust the
-/// window and blow up KV VRAM (design `docs/unified_wave_inference_engine.md`
-/// §4.7 and [`crate::projection::resolver::Conversation::windowed_ingest_ranges`]).
-/// `0` = unbounded (whole-parent borrow).
-const CODE_READ_WINDOW_TURNS: usize = 8;
-
 #[derive(Default)]
 struct WaveChannel {
     fwds: u64,
@@ -3286,14 +3265,6 @@ pub(crate) struct Scheduler {
     /// `HOST_RAM_PROBE_INTERVAL`, never per wave.
     host_ram_probe: Option<(std::time::Instant, u64, u64)>,
 
-    /// Timelines being ingested append-only (`disable_reprojection` submits, e.g.
-    /// `code_reading` / `repo_map`). Their sealed turns are never re-attended
-    /// until query time, so the gentle-early ladder rung
-    /// (`demote_cold_ingest_if_pressured`) demotes their warm-backed hot KV to
-    /// RAM at ~50% capacity — long before the near-cap eviction ladder — keeping
-    /// only a small rolling hot window resident during a bulk repo ingest.
-    ingest_timelines: HashSet<TimelineId>,
-
     /// Set while `drain_submissions` runs: `apply_projection` defers each
     /// no-deferred-user gap-fill (ingest / compression) into `deferred_glue_fires`
     /// instead of firing a single-slot forward, so they batch into ONE forward at
@@ -3665,7 +3636,6 @@ impl Scheduler {
             admit_completions: 0,
             wave_ran_forward: false,
             host_ram_probe: None,
-            ingest_timelines: HashSet::new(),
             batch_drain_gap_fills: false,
             deferred_glue_fires: Vec::new(),
             wave_prefill_residual: None,
@@ -3847,7 +3817,6 @@ impl Scheduler {
                 sampling,
                 event_tx,
                 reprojection,
-                disable_reprojection,
                 triggers,
                 turn_grammar,
                 free_tool_calls_from_penalties,
@@ -3889,33 +3858,16 @@ impl Scheduler {
                         _ => SealAction::None,
                     }
                 };
-                // Append-only ingests (e.g. code_reading) opt out of the
-                // per-turn projection rebuild once their slot is seeded:
-                // skip the reset + re-project and prefill straight onto the
-                // cumulative slot. The seal is unaffected — turns still land
-                // in the substrate.
-                //
-                // The system prompt is laid down at conversation creation by
-                // PrimingProjection (see `Conversation::new_*`), so the slot
-                // already has blocks before turn 1 and `skip_projection` is
-                // true from the first turn — `apply_projection` never runs for
-                // these ingests. That's intentional: priming injects the
-                // `fixed_prefix` (system) sections. The trade-off is that
-                // collection-member / `depends_on`-gated sections (which only
-                // materialize via per-turn `apply_projection`) are NOT added;
-                // utility-layer system prompts (code_reading, repo_map) use
-                // only fixed sections, so this is exact for them.
-                let skip_projection = disable_reprojection
-                    && self.session.sequence_block_count(parent_id.0).unwrap_or(0) > 0;
-                // Mark this as an append-only ingest timeline so the gentle-early
-                // ladder can demote its sealed, warm-backed KV to RAM at ~50%
-                // capacity — it is never re-attended until query time. See
-                // `demote_cold_ingest_if_pressured`.
-                if disable_reprojection {
-                    if let Some(tgt) = slot_target {
-                        self.ingest_timelines.insert(tgt.timeline);
-                    }
-                }
+                // Append-only ingests (code_reading, repo_map) are projected
+                // like every other turn: the slot is rebuilt from the substrate
+                // as the conversation's selected branch of the system prompt plus
+                // every one of its own turns in order (`target_is_ingest_self`
+                // selects them all, unscored). There is no cumulative-slot
+                // shortcut, because the slot does not hold that context: one
+                // primed at creation holds the schema's DEFAULT branch rather
+                // than the branch the turn selects, and one given back while its
+                // turn waited holds nothing — appending onto whatever is there
+                // gives one conversation two different contexts.
                 // Step 1: run projection (if requested) and apply it
                 // — reset `parent_id` to empty and write the
                 // projected sections + projected turns from the
@@ -3939,12 +3891,11 @@ impl Scheduler {
                 let mut staged_composition: Option<crate::projection::ProjectionEvent> = None;
                 // The turn's opening belief — assigned by the projection path
                 // below (carried belief stepped through the submit projection);
-                // default when projection is skipped.
+                // default for a raw prefill with no projection inputs.
                 let mut turn_belief = PriorBelief::default();
-                let (projected_sections, projected_segments) = if let (Some(inputs), Some(target)) = (
-                    projection_inputs.as_ref().filter(|_| !skip_projection),
-                    slot_target,
-                ) {
+                let (projected_sections, projected_segments) = if let (Some(inputs), Some(target)) =
+                    (projection_inputs.as_ref(), slot_target)
+                {
                     let conversation = match self.slot_conversations.get(&parent_id) {
                         Some(c) => c.clone(),
                         None => {
@@ -4185,18 +4136,13 @@ impl Scheduler {
                     );
                 }
 
-                // When reprojection is disabled and the slot is already
-                // seeded, leave the cumulative slot intact — prefill appends
-                // onto it below. `apply_projection(_, BlockCount(0), _)` would
-                // reset it to empty, so it must be skipped here (not just fed
-                // empty segments, which is the RULER/summarisation reset path).
-                if !skip_projection {
-                    if let Err(e) =
-                        self.apply_projection(parent_id, BlockCount(0), &projected_segments)
-                    {
-                        let _ = event_tx.send(TurnEvent::Error(e));
-                        return true;
-                    }
+                // Reset the slot and lay down the projection. Fed no segments —
+                // a raw prefill with no projection inputs (RULER, summarisation)
+                // — this is the reset alone.
+                if let Err(e) = self.apply_projection(parent_id, BlockCount(0), &projected_segments)
+                {
+                    let _ = event_tx.send(TurnEvent::Error(e));
+                    return true;
                 }
 
                 // Step 2: borrowed ranges cover the whole
@@ -4219,34 +4165,7 @@ impl Scheduler {
                     offset_div_ceil = parent_offset_for_log.div_ceil(self.chunk_size),
                     "view borrow plan",
                 );
-                // Rolling window over an append-only ingest (design §4.7): on the
-                // disable-reprojection path (`skip_projection`), borrow just the
-                // system prompt + the last `CODE_READ_WINDOW_TURNS` sealed turns
-                // instead of the whole growing parent — bounding otherwise-
-                // unbounded ingest context. `window == 0` is the whole-parent
-                // borrow.
-                let window = if skip_projection {
-                    CODE_READ_WINDOW_TURNS
-                } else {
-                    0
-                };
-                let effective_ranges: Vec<BlockRange> = if window > 0 {
-                    self.slot_targets
-                        .get(&parent_id)
-                        .map(|t| t.timeline)
-                        .zip(self.slot_conversations.get(&parent_id))
-                        .map(|(tl, c)| c.windowed_ingest_ranges(tl, window, parent_block_count))
-                        .unwrap_or_else(|| {
-                            if parent_block_count == 0 {
-                                Vec::new()
-                            } else {
-                                vec![(0, parent_block_count)]
-                            }
-                        })
-                        .into_iter()
-                        .map(|(s, e)| BlockRange::new(s, e))
-                        .collect()
-                } else if parent_block_count == 0 {
+                let effective_ranges: Vec<BlockRange> = if parent_block_count == 0 {
                     Vec::new()
                 } else {
                     vec![BlockRange::new(0, parent_block_count)]
@@ -4297,14 +4216,9 @@ impl Scheduler {
                     announced: false,
                     // What this slot was materialised from, so the
                     // materialisation can be given back while the turn waits.
-                    // Empty when the projection was skipped — a seeded slot the
-                    // prefill appends onto has no segment list to rebuild from,
-                    // and must not be demoted.
-                    projection: if skip_projection {
-                        Vec::new()
-                    } else {
-                        projected_segments.clone()
-                    },
+                    // Empty for a raw prefill with no projection inputs — it has
+                    // no segment list to rebuild from, and is never demoted.
+                    projection: projected_segments.clone(),
                     demoted: false,
                     held_until_decodes_below: None,
                     sequence_id: view_id,
@@ -4354,7 +4268,7 @@ impl Scheduler {
                 // Drop the conversation handle and projection target
                 // bound to this slot.
                 self.slot_conversations.remove(&sequence_id);
-                let freed_target = self.slot_targets.remove(&sequence_id);
+                self.slot_targets.remove(&sequence_id);
                 self.recurrent_seeds.remove(&sequence_id);
                 self.ephemeral_slots.remove(&sequence_id);
                 self.ephemeral_sigs.remove(&sequence_id);
@@ -4381,7 +4295,6 @@ impl Scheduler {
                 // recycled — a stale prefill entry keyed by the freed id would
                 // collide with the reused slot in the next wave-group assembly.
                 self.purge_freed_slot_scheduling_state(sequence_id);
-                self.prune_ingest_timeline(freed_target);
                 true
             }
 
@@ -6122,7 +6035,7 @@ impl Scheduler {
         let _ = self.session.free_sequence(slot.0);
         let _ = self.model.release_sequence(slot.0);
         self.slot_conversations.remove(&slot);
-        let freed_target = self.slot_targets.remove(&slot);
+        self.slot_targets.remove(&slot);
         self.sampling_states.remove(&slot);
         self.slot_projection_state.remove(&slot);
         self.compression_event_sinks.remove(&slot);
@@ -6132,28 +6045,6 @@ impl Scheduler {
         // Purge any in-flight prefill/decode/cohort state for this slot before
         // its id is recycled (see [`Self::purge_freed_slot_scheduling_state`]).
         self.purge_freed_slot_scheduling_state(slot);
-        self.prune_ingest_timeline(freed_target);
-    }
-
-    /// Drop a freed slot's timeline from [`Self::ingest_timelines`] once no
-    /// other live slot still targets it. Without this, the set grows by one
-    /// entry per ingested file for the daemon's lifetime (a slow leak, and a
-    /// growing scan for [`demote_cold_ingest_if_pressured`]). Called from every
-    /// slot-teardown path; a `None` target (raw/non-projecting slot) is a no-op.
-    fn prune_ingest_timeline(&mut self, freed_target: Option<ProjectionTarget>) {
-        let Some(tgt) = freed_target else {
-            return;
-        };
-        if !self.ingest_timelines.contains(&tgt.timeline) {
-            return;
-        }
-        if !self
-            .slot_targets
-            .values()
-            .any(|t| t.timeline == tgt.timeline)
-        {
-            self.ingest_timelines.remove(&tgt.timeline);
-        }
     }
 
     /// Give back **all** of a slot's ground: its block table and the recurrent
