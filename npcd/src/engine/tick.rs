@@ -185,6 +185,10 @@ pub struct Inbox {
     /// context, identical decode; the character repeated one act until something
     /// outside it changed.
     last_nudge_ms: u64,
+    /// Thinking somewhere else, and not to be given a turn here until it is
+    /// back — see [`Scheduler::hold`]. What arrives meanwhile is queued, not
+    /// dropped, and read on the first turn after [`Scheduler::release`].
+    held: bool,
 }
 
 impl Inbox {
@@ -204,6 +208,7 @@ impl Inbox {
             scheduled: false,
             last_news_ms: 0,
             last_nudge_ms: 0,
+            held: false,
         }
     }
 
@@ -367,7 +372,12 @@ impl Inbox {
         // reads — it would sit in the queue until something louder happened to
         // arrive behind it. The salience below still decides how *urgently*, and
         // whether a standing wait survives it.
-        let wake = true;
+        //
+        // The one exception is a character that is held: it is already
+        // thinking, in another conversation, and a turn here now would answer
+        // the room before the act it is in the middle of has answered it. The
+        // event is queued all the same, and `release` brings it back to read it.
+        let wake = !self.held;
         // **Anything arriving cuts a pause short**, and nearly all of that is
         // free: a pause is only a due time, and `deliver` moves every
         // character's due time to now. That is the whole benefit over the
@@ -648,6 +658,76 @@ impl Scheduler {
         true
     }
 
+    /// Keep a character from taking a turn while it thinks somewhere else.
+    ///
+    /// **For an act whose answer comes from another conversation.** A
+    /// reflection is answered by a conversation of its own that takes seconds,
+    /// and the answer rides at the head of the character's next turn as the
+    /// reflect call's result. A turn taken in between — and every moment
+    /// delivers the room, which would give it one — would have answered the room
+    /// with that call still unanswered, and the late answer would then land
+    /// against whatever it called next.
+    ///
+    /// Only this character stops; the driver and everybody else carry on.
+    /// Whatever arrives meanwhile is queued as usual. Returns whether there was
+    /// a character to hold.
+    pub fn hold(&self, npc_id: u64) -> bool {
+        let mut g = self.inboxes.lock().unwrap();
+        let Some(i) = g.get_mut(&npc_id) else {
+            return false;
+        };
+        i.held = true;
+        true
+    }
+
+    /// Let a held character think again, straight away, on everything that
+    /// arrived while it was held. Idempotent — releasing a character that is
+    /// not held only brings it forward. See [`Self::hold`].
+    pub fn release(&self, npc_id: u64) -> bool {
+        {
+            let mut g = self.inboxes.lock().unwrap();
+            let Some(i) = g.get_mut(&npc_id) else {
+                return false;
+            };
+            i.held = false;
+        }
+        self.think_again(npc_id)
+    }
+
+    /// Complete an act's row with the result that came back after it was
+    /// recorded — in the character's window and in the Pulse ring both, so the
+    /// feed and the transcript say the same thing. See [`Window::amend_npc`].
+    ///
+    /// Returns whether the row was found in the window.
+    pub fn amend_act(&self, npc_id: u64, from: &str, to: String) -> bool {
+        let found = self
+            .inboxes
+            .lock()
+            .unwrap()
+            .get_mut(&npc_id)
+            .is_some_and(|i| i.window.amend_npc(from, to.clone()));
+        let mut recent = self.recent.lock().unwrap();
+        if let Some(act) = recent
+            .iter_mut()
+            .rev()
+            .filter(|r| r.npc_id == npc_id)
+            .flat_map(|r| r.acts.iter_mut())
+            .find(|a| a.as_str() == from)
+        {
+            *act = to;
+        }
+        found
+    }
+
+    /// Whether a character is held. See [`Self::hold`].
+    pub fn is_held(&self, npc_id: u64) -> bool {
+        self.inboxes
+            .lock()
+            .unwrap()
+            .get(&npc_id)
+            .is_some_and(|i| i.held)
+    }
+
     /// Whether this character is due the standing task. See [`Inbox::nudge_due`].
     pub fn nudge_due(&self, npc_id: u64, world_ms: u64, after_ms: u64) -> bool {
         self.inboxes
@@ -761,6 +841,11 @@ impl Scheduler {
             let Some(inbox) = inboxes.get(&npc_id) else {
                 continue;
             };
+            // Held: dropped rather than deferred, because `release` queues it
+            // afresh and a deferred entry would only come back to be dropped.
+            if inbox.held {
+                continue;
+            }
             // **`due_at` is the truth; a heap entry is a hint.**
             //
             // An entry is pushed when a tick ends and cannot be withdrawn, so
@@ -1134,6 +1219,64 @@ mod tests {
         );
         let rec = s.tick(1, 3_000, 0, |_, _| vec![]).expect("ticked");
         assert_eq!(rec.perceived.len(), 1);
+    }
+
+    /// **A character thinking somewhere else is not given a turn here, and
+    /// loses nothing that arrives meanwhile.** What a reflection relies on: its
+    /// answer has to be the next thing the character reads about the act, so
+    /// the room cannot be allowed to give it a turn first — and every moment
+    /// delivers the room. Released, it thinks at once, on all of it.
+    #[test]
+    fn a_held_character_queues_what_arrives_and_thinks_when_released() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.wake(2, 0, 0);
+        assert!(s.hold(1));
+        assert!(s.is_held(1));
+
+        s.deliver(1, 0, Salience::NORMAL, say("somebody comes in"));
+        s.deliver(1, 0, Salience::URGENT, say("an alarm"));
+        s.deliver(2, 0, Salience::NORMAL, say("the same room"));
+        assert_eq!(s.due_now(1_000), vec![2], "only the other one moves");
+        assert_eq!(s.inbox_depth(1), Some(2), "nothing was dropped");
+
+        assert!(s.release(1));
+        assert!(!s.is_held(1));
+        assert_eq!(s.due_now(2_000), vec![1], "back at once");
+        let rec = s.tick(1, 2_000, 0, |_, _| vec![]).expect("ticked");
+        assert_eq!(rec.perceived.len(), 2, "on everything it missed");
+
+        assert!(!s.hold(99), "nobody to hold");
+        assert!(s.release(1), "releasing twice is harmless");
+    }
+
+    /// **An act recorded before its result is completed with it.** A reflect
+    /// goes into the window as the act alone and is answered seconds later by
+    /// its own conversation; the row has to end up reading what came back, not
+    /// stay a call with nothing after it.
+    #[test]
+    fn an_act_recorded_before_its_result_is_completed_with_it() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.deliver(1, 0, Salience::NORMAL, say("a box sags"));
+        assert_eq!(s.due_now(1_000), vec![1]);
+        s.tick(1, 1_000, 0, |_, _| vec!["reflect — it gave up".into()]);
+
+        let done = "reflect — it gave up → I keep counting what gives up".to_string();
+        assert!(s.amend_act(1, "reflect — it gave up", done.clone()));
+        let window: Vec<String> = s
+            .window_of(1, |w| w.turns().map(|t| t.text.clone()).collect())
+            .unwrap();
+        assert!(window.contains(&done), "{window:?}");
+        assert!(
+            !window.iter().any(|t| t == "reflect — it gave up"),
+            "{window:?}"
+        );
+
+        assert!(
+            !s.amend_act(1, "nothing like it", "x".into()),
+            "nothing to amend"
+        );
     }
 
     /// The neighbouring path, which does **not** wedge — and is here to keep it
@@ -1865,7 +2008,7 @@ mod tests {
         );
 
         s.deliver(1, 0, Salience::NORMAL, say("something else"));
-        s.tick(1, 0, 0, |_, _| vec!["say — anything".to_string()])
+        s.tick(1, 0, 0, |_, _| vec!["tell — anything".to_string()])
             .expect("it ticked");
         let age = s.census()[0]
             .acted_ms_ago
@@ -1885,7 +2028,7 @@ mod tests {
         let s = sched();
         s.wake(1, 0, 0);
         s.deliver(1, 0, Salience::NORMAL, say("anything"));
-        s.tick(1, 0, 0, |_, _| vec!["say — something back".to_string()])
+        s.tick(1, 0, 0, |_, _| vec!["tell — something back".to_string()])
             .expect("it ticked");
 
         assert!(

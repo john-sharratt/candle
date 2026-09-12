@@ -54,12 +54,9 @@ export const only = (need, build) => (mayEdit(need) ? build() : null);
 export const roNote = (what, need = 'admin') =>
   `Read-only — changing ${what} is an ${need}’s to do. Edit the file in the mind, or ask one.`;
 
-export const LAYERS = [
-  'perception', 'action', 'agency', 'relationships', 'beliefs',
-  'memory', 'interaction', 'environment', 'world',
-];
-
-export const layerColor = (l) => `var(--l-${l})`;
+/* A layer's swatch. The layers are the mind's own, so one the palette has no
+ * colour for — any a projection adds — takes a neutral rule rather than none. */
+export const layerColor = (l) => `var(--l-${l}, var(--line-3))`;
 
 export const STATE_LABEL = {
   active: 'active', ticking: 'ticking now', idle: 'idle',

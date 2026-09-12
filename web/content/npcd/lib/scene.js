@@ -37,7 +37,7 @@ import { sticky, selectionInside, throttled } from './live.js';
 import * as sessions from './sessions.js';
 
 /* Tools whose observable trace is somebody speaking. */
-const SPOKEN = new Set(['speak', 'say', 'tell', 'ask', 'answer', 'reply', 'send_image']);
+const SPOKEN = new Set(['speak', 'tell', 'whisper', 'shout', 'ask', 'answer', 'reply', 'send_image']);
 
 /* Tools that land in the room without a word: `act` is one body doing something
  * to another — steadying them, taking a weapon off them, putting them down —

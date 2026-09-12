@@ -64,6 +64,8 @@ use candle_conversation::stencil::{
 use candle_conversation::{ConversationEngine, SequenceConfig, TurnOptions};
 use serde::Serialize;
 
+use crate::engine::act::escape_control_in_strings;
+use crate::engine::dreams;
 use crate::engine::identity;
 use crate::engine::mind::Projected;
 use crate::engine::prompt::{self, Persona, Stance};
@@ -128,7 +130,7 @@ const BRIEF_FLOOR_WORDS: usize = 40;
 ///   inside is the answer, so it is taken out rather than thrown away — a
 ///   reflection that reached the character as raw markup would be worse than one
 ///   that lost its wrapper.
-fn plain_prose(raw: &str) -> String {
+pub(crate) fn plain_prose(raw: &str) -> String {
     let mut s = raw.trim();
     if let Some(rest) = s.strip_prefix("</think>") {
         s = rest.trim();
@@ -217,13 +219,16 @@ const REFLECTION: Tool = Tool {
     category: "Attention",
     plane: Plane::World,
     availability: Availability::Always,
-    description: "What you have come to think — one sentence, first person, in your own voice. \
-                  Not a plan and not an explanation of itself.",
+    description: "What you have come to think — one sentence, first person, in your own voice, \
+                  said as how it is for you rather than as a fact. Not a plan and not an \
+                  explanation of itself.",
     params: &[Param {
         name: "said",
         ty: "string",
         required: true,
-        description: "One sentence. What you find yourself inclined toward, and nothing else.",
+        description: "One sentence, framed as what you feel, what it seems like, or what you \
+                      find yourself wanting — \"I feel like…\", \"it seems as if…\", \"I find \
+                      myself…\". Never a statement of what you or anything is.",
     }],
     examples: &[],
 };
@@ -445,9 +450,17 @@ fn element(answer: &str, name: &str) -> Option<String> {
 /// `arguments.name` of the first JSON object in the answer — the JSON-block
 /// shape. Only the first value is read, so anything after the call is ignored
 /// rather than failing the parse.
+///
+/// **Repaired before it is read.** A string span lets a raw newline through,
+/// which is not valid JSON, and a brief is prose that runs to paragraphs — so
+/// unrepaired, `serde` refused the whole call, the answer read as having no
+/// assumption and no brief, and one run lost its dream on every pass. The
+/// repair is the one the acting parser already applies, for the same reason —
+/// see [`escape_control_in_strings`].
 fn json_argument(answer: &str, name: &str) -> Option<String> {
     let start = answer.find('{')?;
-    let call: serde_json::Value = serde_json::Deserializer::from_str(&answer[start..])
+    let repaired = escape_control_in_strings(&answer[start..]);
+    let call: serde_json::Value = serde_json::Deserializer::from_str(&repaired)
         .into_iter::<serde_json::Value>()
         .next()?
         .ok()?;
@@ -484,7 +497,7 @@ fn json_argument(answer: &str, name: &str) -> Option<String> {
 ///
 /// `None` when the checkpoint's tokenizer has no single `<think>` token, in
 /// which case the turn free-decodes exactly as it did before.
-fn think_off(
+pub(crate) fn think_off(
     engine: &Arc<Mutex<ConversationEngine>>,
     cfg: &SequenceConfig,
 ) -> Option<Arc<StencilTree>> {
@@ -618,11 +631,12 @@ pub struct Repair {
 
 /// What is wrong with the line that crosses back to the character.
 ///
-/// The two invariants §6 specifies, and nothing else. Both are about register
-/// rather than content: a line that runs to several sentences is a paragraph of
-/// reasoning, and a line that explains itself has stopped being an inclination
-/// and become an argument. §6: *"A response that starts explaining itself is a
-/// regression, and nothing else would flag it."*
+/// Three invariants, all about register rather than content: a line that runs
+/// to several sentences is a paragraph of reasoning; a line that explains itself
+/// has stopped being an inclination and become an argument (§6: *"A response
+/// that starts explaining itself is a regression, and nothing else would flag
+/// it."*); and a line that states its image as a fact has stopped being a
+/// reflection at all — see [`states_it_as_fact`].
 fn reflection_fault(line: &str) -> Option<String> {
     let t = line.trim();
     if t.is_empty() {
@@ -643,7 +657,70 @@ fn reflection_fault(line: &str) -> Option<String> {
     if let Some(w) = EXPLAINING.iter().find(|w| lower.contains(**w)) {
         return Some(format!("the reflection explains itself (\"{}\")", w.trim()));
     }
+    if states_it_as_fact(t) {
+        // Said back as the refusal, so it is written as something the model
+        // can act on: what was wrong, and the shape of what would be right.
+        return Some(
+            "it says it as a fact rather than as how it is for you — say it as what you feel, \
+             what it seems like, or what you find yourself wanting (\"I feel like…\", \"it seems \
+             as if…\", \"I find myself…\")"
+                .into(),
+        );
+    }
     None
+}
+
+/// Whether a reflection states what came to the character as a fact.
+///
+/// **A reflection reports an inner state; it does not make claims.** What
+/// crosses back lands in the character's own context, where it is read the next
+/// turn as something the character holds. Framed — *"I feel like I am the room
+/// itself"* — it is an image the character had. Unframed — *"I am the room
+/// itself"* — it is a statement about what the character is, and read back as
+/// its own conclusion it becomes one: measured live, a character whose
+/// reflections came back as *"I am the room itself"*, *"I am the vibration in
+/// the pipe"*, *"I am the space between your words"*, one after another.
+///
+/// So the line has to carry an experiential frame — a feeling, a seeming, a
+/// wanting, a comparison held as a comparison. The frames are the ways English
+/// marks a thing as experienced rather than asserted; a line with none of them
+/// is an assertion.
+fn states_it_as_fact(line: &str) -> bool {
+    const FRAMES: &[&str] = &[
+        "i feel",
+        "i'm feeling",
+        "i am feeling",
+        "it feels",
+        "feels like",
+        "feels as",
+        "i find myself",
+        "i sense",
+        "i wonder",
+        "i want",
+        "wanting",
+        "i'd rather",
+        "i would rather",
+        "inclined",
+        "i'm thinking",
+        "i am thinking",
+        "i think",
+        "i can't help",
+        "part of me",
+        "it seems",
+        "seems like",
+        "seems as",
+        "as if",
+        "as though",
+        "i notice",
+        "drawn to",
+        "i suspect",
+        "tempted",
+        "i keep",
+        "i half",
+        "i almost",
+    ];
+    let lower = line.to_lowercase().replace('\u{2019}', "'");
+    !FRAMES.iter().any(|f| lower.contains(f))
 }
 
 /// How many sentences `t` holds.
@@ -956,6 +1033,17 @@ impl<'t> Reflect<'t> {
         feeling: &str,
         domain: &str,
         sampled_axes: &[String],
+        // **Handed the line that crosses back the moment it exists** — after
+        // the first question, before any dream is asked for. What lets the act
+        // answer the character in the time one question takes rather than the
+        // time the whole review does; the dream is written after it, on the
+        // same thread, with nobody waiting on it.
+        //
+        // **And it answers whether to go on.** `false` ends the conversation
+        // at the answer — no brief asked for and no dream: what a reflect gets
+        // while its character already has a dream being written. See
+        // `Runtime::claim_dream`.
+        on_reflection: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<Reflection> {
         let started = std::time::Instant::now();
 
@@ -983,9 +1071,11 @@ impl<'t> Reflect<'t> {
         let (mut sequence, timeline) = {
             let engine = self.engine.lock().unwrap();
             let seq = match self.projected {
+                // Its own dreams, gathered deep — §4: a reflection is the same
+                // retrieval as an acting turn, run further. See `dreams`.
                 Some(p) => engine.new_conversation_with_projection(
                     &system,
-                    p.builder.clone(),
+                    dreams::scoped(&p.builder, npc_id, dreams::IN_REFLECTION),
                     p.layer,
                     p.group,
                     cfg,
@@ -1081,6 +1171,7 @@ impl<'t> Reflect<'t> {
                     npc_id,
                     persona.personality,
                     persona.world_id,
+                    persona.building,
                     identity::Deliberation::default(),
                 )
             })
@@ -1199,9 +1290,15 @@ impl<'t> Reflect<'t> {
         // own words and arrives however it arrives. `you were thinking {x}` ran
         // straight into "That the roster has had a name on it…" and read as a
         // sentence with a capital letter dropped into the middle of it.
+        //
+        // The situation goes in as the world wrote it. It is the world's own
+        // percept — "You are in the muster hall…" and who is there — which is
+        // already a sentence addressed to the reader; wrapping it in "You are
+        // {}." made "You are You are in…".
         let mut opening = String::new();
         if !situation.trim().is_empty() {
-            opening.push_str(&format!("You are {}.\n\n", situation.trim()));
+            opening.push_str(situation.trim());
+            opening.push_str("\n\n");
         }
         if !inner_thoughts.trim().is_empty() {
             opening.push_str(&format!(
@@ -1232,6 +1329,49 @@ impl<'t> Reflect<'t> {
             &mut tokens,
             &mut trail,
         )?;
+        // Its one field, read the way every other answer here is read. The
+        // markup-stripping salvage is for an answer that did not come back as a
+        // call at all — run over a JSON block it would hand the character the
+        // whole call object as its own thought.
+        //
+        // **And handed over now.** It is the only thing the character is
+        // waiting on, and nothing after this point changes it.
+        let crossing_back = field(&first, "said").unwrap_or_else(|| plain_prose(&first));
+        if !on_reflection(&crossing_back) {
+            // Retired exactly as a finished one is — see below.
+            if let Ok(engine) = self.engine.lock() {
+                if let Err(e) = engine.tombstone_timeline(timeline) {
+                    tracing::warn!(
+                        "reflection conversation {timeline} could not be retired: {e:?} — it \
+                         stays selectable and nothing will ever read it"
+                    );
+                }
+            }
+            drop(sequence);
+            return Ok(Reflection {
+                npc_id,
+                situation: situation.trim().to_string(),
+                feeling: feeling.trim().to_string(),
+                domain: domain.to_string(),
+                sampled_axes: sampled_axes.to_vec(),
+                reflection: crossing_back.clone(),
+                assumption: None,
+                brief: None,
+                raw: String::new(),
+                original_raw: String::new(),
+                retried: false,
+                fault: None,
+                retry_raw: None,
+                retry_fault: None,
+                repairs: Vec::new(),
+                reflection_fault: reflection_fault(&crossing_back),
+                transcript: trail,
+                tokens,
+                timeline: timeline.raw(),
+                ms: started.elapsed().as_millis() as u64,
+                system_prompt: read,
+            });
+        }
 
         // **Then it is let go.** The call was the disciplined form; this turn is
         // unstencilled, so what follows is the character thinking in its own
@@ -1385,8 +1525,7 @@ impl<'t> Reflect<'t> {
         //
         // Its length is held by the refusal loop rather than by a token ceiling:
         // one sentence, under [`REFLECTION_MAX_WORDS`], said back in words the
-        // model can act on.
-        let reflection = first;
+        // model can act on. Handed over above, as soon as it was answered.
 
         // Tombstoned as well as transient. Transient keeps it off disk; the
         // tombstone is what keeps it out of every later gather and out of
@@ -1400,12 +1539,6 @@ impl<'t> Reflect<'t> {
             }
         }
         drop(sequence);
-
-        // Its one field, read the way every other answer here is read. The
-        // markup-stripping salvage is for an answer that did not come back as a
-        // call at all — run over a JSON block it would hand the character the
-        // whole call object as its own thought.
-        let crossing_back = field(&reflection, "said").unwrap_or_else(|| plain_prose(&reflection));
 
         Ok(Reflection {
             npc_id,
@@ -1461,6 +1594,25 @@ mod tests {
             );
             assert_eq!(field(answer, "missing"), None, "{answer}");
         }
+    }
+
+    /// **A raw newline inside a JSON value does not cost the answer.** The
+    /// string span lets one through, and a brief is prose that runs to
+    /// paragraphs — unrepaired, the whole call failed to parse and a run lost
+    /// its dream on every pass, reported as having no assumption at all.
+    #[test]
+    fn a_raw_newline_inside_a_json_value_is_read_rather_than_lost() {
+        let answer = "<tool_call>\n{\"name\": \"dream\", \"arguments\": {\"assumption\": \
+                      \"that the floor holds\", \"brief\": \"You walk out.\nThen down.\"}}\n\
+                      </tool_call>";
+        assert_eq!(
+            field(answer, "assumption").as_deref(),
+            Some("that the floor holds")
+        );
+        assert_eq!(
+            field(answer, "brief").as_deref(),
+            Some("You walk out.\nThen down.")
+        );
     }
 
     /// The close is grammar scaffolding, not something the character said.
@@ -1704,9 +1856,37 @@ mod tests {
     #[test]
     fn a_single_terminated_sentence_is_one_sentence() {
         assert_eq!(
-            reflection_fault("I am not going to say anything about it."),
+            reflection_fault("I feel like I am not going to say anything about it."),
             None
         );
+    }
+
+    /// **A reflection says how it is for the character, never what is so.**
+    /// The unframed lines are the live ones: read back as the character's own
+    /// conclusions, each told it what it was.
+    #[test]
+    fn a_reflection_stated_as_fact_is_caught_and_a_framed_one_is_not() {
+        for fact in [
+            "I am the room itself, and the silence is simply my own breath.",
+            "I am the vibration in the pipe, the quiet hum beneath the silence.",
+            "I am here, and that is enough.",
+            "The hum vibrates in my teeth.",
+        ] {
+            let f = reflection_fault(fact);
+            assert!(
+                f.as_deref().is_some_and(|w| w.contains("as a fact")),
+                "{fact} → {f:?}"
+            );
+        }
+        for framed in [
+            "I feel like I am the room itself.",
+            "It seems as if the silence belongs to the room and not to me.",
+            "I find myself wanting to stop holding my breath.",
+            "The hum feels like it is inside my teeth.",
+            "I\u{2019}m thinking of challenging him.",
+        ] {
+            assert_eq!(reflection_fault(framed), None, "{framed}");
+        }
     }
 
     /// **The conclusion the word list cannot see.** Measured live: a brief ended

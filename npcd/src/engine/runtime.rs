@@ -21,7 +21,7 @@
 //! console shows an engine that is present and broken rather than absent. The
 //! loader logs what failed and exits the process.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -39,7 +39,12 @@ use candle_conversation::{
 /// shared because it is a wire constant of the conversation layer that neither
 /// daemon owns — and taking a dependency on the other daemon to reach it would
 /// be far stranger than the fourteen bytes.
-const PROJECTION_MARKER: &str = "<|projection|>";
+pub(crate) const PROJECTION_MARKER: &str = "<|projection|>";
+
+/// How many of a character's existing dream axes a reflection is steered away
+/// from — `docs/reflection_and_dreams.md` §5: shown every axis it had used the
+/// generator recombined them; shown a random eight it found a new one.
+const SAMPLED_AXES: usize = 8;
 
 use crate::engine::act::Act;
 use crate::engine::authoring;
@@ -63,6 +68,7 @@ use crate::npcs::Casting;
 use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
 use npc_map::world::Where;
+use npc_map::{describe, perceive};
 
 /// How often the driver thread looks for characters that are due.
 ///
@@ -118,6 +124,38 @@ pub struct Recorded {
     pub feed: String,
     /// What the character is told came of the act.
     pub answer: String,
+    /// Whether the world took the act — the verdict `answer` is written from.
+    /// What decides whether a `reflect` goes on to a reflection: one the world
+    /// refused was not a character stopping to think.
+    pub landed: bool,
+}
+
+/// What a turn with a reflection in it still owes, held until the reflection's
+/// first question is answered — see [`Runtime::begin_reflection`].
+#[derive(Clone, Debug)]
+pub struct Owed {
+    /// Every answer the turn owes, one per call, in call order. The reflect's
+    /// holds the world's own line until the reflection replaces it.
+    pub answers: Vec<String>,
+    /// Which of `answers` is the reflect's.
+    pub slot: usize,
+    /// The reflect's row as recorded: the act without its result. Completed
+    /// with the result once there is one — see [`Scheduler::amend_act`].
+    pub row: String,
+}
+
+/// One character's dream slot, taken — see [`Runtime::claim_dream`]. Handed
+/// back when dropped, so a dream that errors or panics part-way cannot leave
+/// the character unable to dream again.
+struct DreamSlot<'a> {
+    rt: &'a Runtime,
+    npc_id: u64,
+}
+
+impl Drop for DreamSlot<'_> {
+    fn drop(&mut self) {
+        self.rt.dreaming.lock().unwrap().remove(&self.npc_id);
+    }
 }
 
 /// Everything the prompt needs about one character, owned.
@@ -162,6 +200,8 @@ pub struct OwnedPersona {
     /// the runtime rather than by the persona source: it comes from the map,
     /// which the authored record knows nothing about.
     pub place: String,
+    /// Which part of the world `place` describes — see [`Persona::building`].
+    pub building: String,
     pub mode: Mode,
 }
 
@@ -180,6 +220,7 @@ impl OwnedPersona {
             situation: &self.situation,
             world: &self.world,
             place: &self.place,
+            building: &self.building,
         }
     }
 }
@@ -285,9 +326,20 @@ pub struct Runtime {
     /// stopping the daemon — every question an operator asks of a live world is
     /// asked of one that is moving underneath the answer.
     metronomes: Mutex<BTreeMap<String, Metronome>>,
-    /// Each world's building, rendered once. The same text for every character
-    /// in it, and it never changes.
-    places: Mutex<BTreeMap<String, String>>,
+    /// Each world's buildings, rendered once, keyed by world and then in
+    /// [`npc_map::describe::places`] order. The same text for every character
+    /// standing in one, and it never changes.
+    places: Mutex<BTreeMap<String, Vec<(String, String)>>>,
+    /// The characters with a dream being written — from the moment their
+    /// reflection's first question is answered to the moment the dream is kept.
+    /// §7: *"At most one dream in flight per character."*
+    ///
+    /// **The dream, not the reflection.** A reflect while this is taken still
+    /// gets its own reflection and its own answer; only the brief and the dream
+    /// after it are skipped. This once guarded the whole reflection and refused
+    /// every reflect behind it — a slot held for three to seven minutes against
+    /// a thirty-second cooldown answered six reflects in ten with nothing.
+    dreaming: Mutex<HashSet<u64>>,
     /// Which behaviour-space cell the next unattributed reflection draws from.
     ///
     /// A plain rotating counter, shared across the cast rather than kept per
@@ -417,7 +469,7 @@ const IDLE_AFTER_MS: u64 = 90_000;
 /// about work needs a *piece* of work in it: a page, a date, a disagreement
 /// with a colleague's entry.
 pub const IN_COMPANY: &str = "Nothing has been asked of you, and you are not alone. {who} \
-                              here with you. `say` or `ask` something about the work, now, and \
+                              here with you. `tell` or `ask` something about the work, now, and \
                               name a particular thing — a page you read, a date that will not \
                               reconcile, an entry of theirs you doubt. Ask them something they \
                               have to answer, or answer what they asked you. Address them \
@@ -467,6 +519,7 @@ impl Runtime {
             bodies: Bindings::new(),
             metronomes: Mutex::new(BTreeMap::new()),
             places: Mutex::new(BTreeMap::new()),
+            dreaming: Mutex::new(HashSet::new()),
             reflect_domain: AtomicUsize::new(0),
             feelings: RwLock::new(Vec::new()),
             cooldowns: crate::engine::cooldown::Cooldowns::new(),
@@ -1098,8 +1151,8 @@ impl Runtime {
     ///
     /// An act that landed is recorded as the act: [`Act::summary`], the same
     /// `tool — intent` shape every act outside a world already has. The world's
-    /// own reply to a successful act reads as narration — "You say, to the
-    /// room: …" — and taking that instead made speech the one act that did not
+    /// own reply to a successful act reads as narration — "You shout, for
+    /// anyone within earshot." — and taking that instead made speech the one act that did not
     /// look like an act. That is wrong twice over: in the feed, where it broke
     /// a column of single-word tools, and in the character's own window, where
     /// the model reads its history and is being shown what an act looks like.
@@ -1131,6 +1184,7 @@ impl Runtime {
     /// concern, written when the feed was the only channel there was.
     pub fn record_act(&self, npc_id: u64, act: &Act) -> Recorded {
         let outcome = self.act_on_world(npc_id, act);
+        let landed = outcome.happened();
         // What the character is told, whatever the verdict. `NotOfTheBody` has
         // no line of its own — nothing in a world happened — so it says so
         // rather than echoing the call back.
@@ -1158,7 +1212,11 @@ impl Runtime {
             // Nothing in a world happened, so there is nothing to arrow to.
             Outcome::NotOfTheBody => act.summary(),
         };
-        Recorded { feed, answer }
+        Recorded {
+            feed,
+            answer,
+            landed,
+        }
     }
 
     /// Hold a world still, or let it go again. `false` if no such world.
@@ -1303,34 +1361,92 @@ impl Runtime {
     /// space fills evenly instead of being sampled wherever the model prefers —
     /// see [`reflect::DOMAINS`]. `sampled_axes` is a **sample** of the
     /// character's existing dream corpus and must never be all of it.
+    ///
+    /// The dream is written after this returns, on a thread of its own — the
+    /// caller gets the reflection, and the dream lands in the corpus whenever
+    /// it lands. See [`Self::dream_now`].
     pub fn reflect(
-        &self,
+        self: &Arc<Self>,
         npc_id: u64,
+        situation: Option<&str>,
         inner_thoughts: &str,
         feeling: &str,
         domain: Option<&str>,
         sampled_axes: &[String],
     ) -> anyhow::Result<reflect::Reflection> {
+        let r = self.reflect_with(
+            npc_id,
+            situation,
+            inner_thoughts,
+            feeling,
+            domain,
+            sampled_axes,
+            &mut |_| true,
+        )?;
+        if let (Some(brief), Some(assumption)) = (r.brief.clone(), r.assumption.clone()) {
+            let rt = Arc::clone(self);
+            let spawned = std::thread::Builder::new()
+                .name(format!("dream-{npc_id}"))
+                .spawn(move || rt.dream_if_free(npc_id, &brief, &assumption));
+            if let Err(e) = spawned {
+                tracing::warn!("npc {npc_id}: the dream could not be started — {e}");
+            }
+        }
+        Ok(r)
+    }
+
+    /// One reflection, handing `on_reflection` the line that crosses back the
+    /// moment the first question is answered. See [`reflect::Reflect::run`].
+    // Each is a separate axis of one reflection — whose, where it says it is,
+    // what it is thinking and feeling, which cell, steered from what, and who
+    // hears the answer first — and every caller supplies all of them.
+    #[allow(clippy::too_many_arguments)]
+    fn reflect_with(
+        &self,
+        npc_id: u64,
+        situation: Option<&str>,
+        inner_thoughts: &str,
+        feeling: &str,
+        domain: Option<&str>,
+        sampled_axes: &[String],
+        on_reflection: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<reflect::Reflection> {
         let who = self
             .persona_of(npc_id)
             .ok_or_else(|| anyhow::anyhow!("no such character, or it has no persona"))?;
 
-        // Where the character understands itself to be. Taken from the persona
-        // rather than re-derived from the world: the tick's situation prose is
-        // built from a world *delta* and there is no delta here, and a
-        // reflection that described a room by a different route than the
-        // character's own turns do would be reflecting on somewhere slightly
-        // else.
-        let situation = who.situation.clone();
+        // Failing that, where the character is in the world's own words: the
+        // percept of the room its body stands in and who is there with it. The persona's own
+        // `situation` is empty for every authored character — it is filled per
+        // tick from a world *delta*, and there is no delta here — so a
+        // reflection taken from it opened on nothing, and a character asked to
+        // dream about its day dreamed about an office.
+        //
+        // **The character's own account first.** The act passes it — where the
+        // character says it is and what is going on — and the reflection is
+        // framed on that: `docs/reflection_and_dreams.md` §3. The percept is the
+        // fallback for a caller that gives none, never a replacement for one
+        // that did.
+        let situation = situation
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.situation_of(npc_id))
+            .unwrap_or_else(|| who.situation.clone());
 
         let domain = domain.map(str::to_string).unwrap_or_else(|| {
             let n = self.reflect_domain.fetch_add(1, Ordering::Relaxed);
             reflect::DOMAINS[n % reflect::DOMAINS.len()].to_string()
         });
 
-        let guard = self.minds.read().unwrap();
-        let minds = guard
-            .as_ref()
+        // Cloned out rather than read through the guard: this runs for the
+        // length of several decodes, on a thread that reads `minds` again to
+        // hand the answer back.
+        let minds = self
+            .minds
+            .read()
+            .unwrap()
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("no engine — the daemon is still loading"))?;
         minds.reflect(
             npc_id,
@@ -1341,7 +1457,231 @@ impl Runtime {
             feeling,
             &domain,
             sampled_axes,
+            on_reflection,
         )
+    }
+
+    /// Dream a brief and keep the dream. Logged, never returned: nobody is
+    /// waiting on it, and a dream that did not land costs a dream.
+    fn dream_now(&self, npc_id: u64, brief: &str, assumption: &str) {
+        let started = Instant::now();
+        let Some(minds) = self.minds.read().unwrap().clone() else {
+            return;
+        };
+        let Some(who) = self.persona_of(npc_id) else {
+            return;
+        };
+        match minds.dream(npc_id, &who.as_persona(), brief, assumption) {
+            Ok(kept) => tracing::info!(
+                "npc {npc_id}: dreamt, {} line(s) kept in {:?} — {} dream(s) now; it opens: {}",
+                kept.lines.len(),
+                started.elapsed(),
+                minds.dreams_kept(npc_id),
+                kept.lines.first().map(String::as_str).unwrap_or_default(),
+            ),
+            Err(e) => tracing::warn!("npc {npc_id}: the dream was not kept — {e:#}"),
+        }
+    }
+
+    /// Claim this character's one reflection slot, if a reflection can run.
+    ///
+    /// `false` only when this daemon cannot reflect at all — no mind authoring
+    /// the questions. Never for being soon after another: the character is held
+    /// until its answer lands, so it cannot ask twice at once, and the work that
+    /// is one at a time is the dream — see [`Self::claim_dream`].
+    fn can_reflect(&self) -> bool {
+        self.minds
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|m| m.can_reflect())
+    }
+
+    /// Take this character's one dream slot, if it is free. Held until the
+    /// returned guard drops. See [`Self::dreaming`].
+    fn claim_dream(&self, npc_id: u64) -> Option<DreamSlot<'_>> {
+        // **The lock is released before any guard exists.** A guard dropped
+        // while this lock is held deadlocks, because dropping one takes the
+        // lock to hand the slot back — and `then_some` builds its value
+        // eagerly, so on a taken slot it built a guard and dropped it on the
+        // spot, inside the lock, and the thread waited on itself for ever. It
+        // would also have handed back the slot it had just been refused.
+        let free = self.dreaming.lock().unwrap().insert(npc_id);
+        free.then(|| DreamSlot { rt: self, npc_id })
+    }
+
+    /// Dream a brief if this character is not already dreaming, and say so if
+    /// it is. For the route, whose reflection has already asked for the brief.
+    fn dream_if_free(&self, npc_id: u64, brief: &str, assumption: &str) {
+        match self.claim_dream(npc_id) {
+            Some(_slot) => self.dream_now(npc_id, brief, assumption),
+            None => tracing::info!(
+                "npc {npc_id}: a dream is already being written, so this brief is not dreamt"
+            ),
+        }
+    }
+
+    /// Answer a `reflect` with a reflection, without anybody waiting on it.
+    ///
+    /// **The act's answer is the reflection's first line.** `answers` is every
+    /// answer the turn owes, in call order, with the world's own line for the
+    /// reflect at `slot` — what the character is told if the reflection cannot
+    /// give it anything better. The whole list is held back until the first
+    /// question is answered, so the results still arrive one per call, in the
+    /// order the calls were made, at the head of the character's next turn.
+    ///
+    /// **Asynchronous, and only for this character.** The reflection runs on a
+    /// thread of its own. The tick driver goes straight on to everybody else;
+    /// this character alone is held, so the room cannot give it a turn before
+    /// its reflect has been answered. It is released the moment the answer is
+    /// in — about as long as one question takes — and the rest of the
+    /// reflection and the dream after it carry on behind it, on the same
+    /// thread, with nobody waiting.
+    pub fn begin_reflection(
+        self: &Arc<Self>,
+        npc_id: u64,
+        situation: String,
+        inner_thoughts: String,
+        feeling: String,
+        owed: Owed,
+    ) {
+        self.scheduler.hold(npc_id);
+        let rt = Arc::clone(self);
+        let fallback = owed.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("reflect-{npc_id}"))
+            .spawn(move || {
+                rt.reflect_in_background(npc_id, &situation, &inner_thoughts, &feeling, owed)
+            });
+        if let Err(e) = spawned {
+            tracing::warn!("npc {npc_id}: the reflection could not be started — {e}");
+            // No reflection, so what came back is the world's own line.
+            let came_back = fallback
+                .answers
+                .get(fallback.slot)
+                .cloned()
+                .unwrap_or_default();
+            self.scheduler.amend_act(
+                npc_id,
+                &fallback.row,
+                format!("{} {LANDED} {came_back}", fallback.row),
+            );
+            if let Some(m) = self.minds.read().unwrap().as_ref() {
+                m.deliver_outcomes(npc_id, fallback.answers);
+            }
+            self.scheduler.release(npc_id);
+        }
+    }
+
+    /// The reflection thread's whole life: ask, answer the character, then
+    /// dream. See [`Self::begin_reflection`].
+    fn reflect_in_background(
+        &self,
+        npc_id: u64,
+        situation: &str,
+        inner_thoughts: &str,
+        feeling: &str,
+        owed: Owed,
+    ) {
+        /// Whatever happens below — an error, a panic — the character is let
+        /// go. A character left held is one that never thinks again, with
+        /// nothing anywhere saying why.
+        struct Done<'a> {
+            rt: &'a Runtime,
+            npc_id: u64,
+        }
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                // Only if it is still held. The answer normally let it go
+                // minutes ago, and `release` also brings a character forward —
+                // so an unconditional one here woke it for nothing every time
+                // a dream finished.
+                if self.rt.scheduler.is_held(self.npc_id) {
+                    self.rt.scheduler.release(self.npc_id);
+                }
+            }
+        }
+        let _done = Done { rt: self, npc_id };
+
+        let started = Instant::now();
+        let Some(minds) = self.minds.read().unwrap().clone() else {
+            return;
+        };
+        // The reflect's answer — the reflection's line, or the world's own when
+        // the reflection gave none — goes in its slot, and its row is completed
+        // with the same words: what came back, after the arrow.
+        let deliver = |mut owed: Owed, line: Option<&str>| {
+            let slot = owed.slot;
+            if let (Some(line), Some(answer)) = (line, owed.answers.get_mut(slot)) {
+                *answer = line.to_string();
+            }
+            let came_back = owed.answers.get(slot).cloned().unwrap_or_default();
+            self.scheduler.amend_act(
+                npc_id,
+                &owed.row,
+                format!("{} {LANDED} {came_back}", owed.row),
+            );
+            minds.deliver_outcomes(npc_id, owed.answers);
+            self.scheduler.release(npc_id);
+        };
+        let axes = minds.dreamt_axes(npc_id, SAMPLED_AXES);
+        let mut owed = Some(owed);
+        let mut slot: Option<DreamSlot<'_>> = None;
+        let result = self.reflect_with(
+            npc_id,
+            Some(situation),
+            inner_thoughts,
+            feeling,
+            None,
+            &axes,
+            // Answer the character, then decide whether this reflection goes on
+            // to a dream: only if the character's dream slot is free, and then
+            // it is held through the dream and handed back when this returns.
+            &mut |line| {
+                if let Some(answers) = owed.take() {
+                    deliver(answers, Some(line));
+                    tracing::info!(
+                        "npc {npc_id}: reflect answered in {:?}, before any dream — {line}",
+                        started.elapsed()
+                    );
+                }
+                slot = self.claim_dream(npc_id);
+                slot.is_some()
+            },
+        );
+        // A reflection that failed before it answered still owes the character
+        // its answer, and the answer is that nothing came —
+        // [`body::NO_REFLECTION`], the line already in its slot.
+        if let Some(answers) = owed.take() {
+            deliver(answers, None);
+        }
+        let r = match result {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("npc {npc_id}: reflection failed — {e:#}");
+                return;
+            }
+        };
+        tracing::info!(
+            "npc {npc_id}: reflection done in {:?} ({} axis/axes sampled){}",
+            started.elapsed(),
+            axes.len(),
+            r.fault
+                .as_deref()
+                .map(|f| format!(" — brief fault: {f}"))
+                .unwrap_or_default()
+        );
+        if slot.is_none() {
+            tracing::info!(
+                "npc {npc_id}: a dream is already being written, so this reflection stopped at \
+                 its answer"
+            );
+            return;
+        }
+        match (r.brief.as_deref(), r.assumption.as_deref()) {
+            (Some(brief), Some(assumption)) => self.dream_now(npc_id, brief, assumption),
+            _ => tracing::warn!("npc {npc_id}: the reflection produced no brief, so no dream"),
+        }
     }
 
     fn persona_of(&self, npc_id: u64) -> Option<OwnedPersona> {
@@ -1349,31 +1689,60 @@ impl Runtime {
             let g = self.persona.read().unwrap();
             g.as_ref().and_then(|f| f(npc_id))
         }?;
-        // The building it lives in, which the authored record knows nothing
-        // about — it comes from the map. Rendered once per world and kept,
-        // because it is the same two thousand words for every character in it
-        // and it never changes.
-        if let Some((hosted, _)) = self.body_of(npc_id) {
-            who.place = self.remembered_place(&hosted);
+        // The building it is standing in, which the authored record knows
+        // nothing about — it comes from the map and the body. Only that one: a
+        // world holds more than one building, and a character told about all
+        // of them as "where you work" places itself in whichever it read most
+        // about.
+        if let Some((hosted, body)) = self.body_of(npc_id) {
+            if let Some((key, text)) = self.building_of(&hosted, &body) {
+                who.building = key;
+                who.place = text;
+            }
         }
         Some(who)
     }
 
-    /// The building a world is, as anyone living in it would describe it.
+    /// Every building of a world, as anyone living in it would describe it —
+    /// [`describe::places`], keyed by part.
     ///
     /// Cached per world. Generating it is cheap but not free, and every
     /// character in a building would otherwise re-render the identical text on
     /// every conversation it opens.
-    fn remembered_place(&self, hosted: &Hosted) -> String {
+    fn places_of(&self, hosted: &Hosted) -> Vec<(String, String)> {
         if let Some(known) = self.places.lock().unwrap().get(hosted.id()) {
             return known.clone();
         }
-        let text = hosted.read(|w| npc_map::describe::place(w.map()));
+        let parts = hosted.read(|w| describe::places(w.map()));
         self.places
             .lock()
             .unwrap()
-            .insert(hosted.id().to_string(), text.clone());
-        text
+            .insert(hosted.id().to_string(), parts.clone());
+        parts
+    }
+
+    /// The building a body is standing in: its [`identity::building_key`] and
+    /// what anyone who lives there knows of it. `None` for a body that is not
+    /// in the world, or standing somewhere no part of the map describes.
+    fn building_of(&self, hosted: &Hosted, body: &str) -> Option<(String, String)> {
+        let part = hosted.read(|w| {
+            let area = w.actor(body)?.at.area.clone();
+            describe::enclosing(w.map(), &area).map(str::to_string)
+        })?;
+        let text = self
+            .places_of(hosted)
+            .into_iter()
+            .find(|(id, _)| *id == part)?
+            .1;
+        Some((identity::building_key(hosted.id(), &part), text))
+    }
+
+    /// Where a character is right now, as the world puts it: the room its body
+    /// stands in and who is there. `None` for a character with no body.
+    fn situation_of(&self, npc_id: u64) -> Option<String> {
+        let (hosted, body) = self.body_of(npc_id)?;
+        let seen = hosted.read(|w| perceive::percept(w, &body));
+        (!seen.trim().is_empty()).then_some(seen)
     }
 
     /// What time it is in this character's world.
@@ -1426,6 +1795,10 @@ pub struct LoadPlan {
     pub authored: identity::Authored,
     /// The world clock at startup.
     pub world_ms: u64,
+    /// Retire every character's conversation before the cast wakes, so each
+    /// opens a fresh one — `--forget-conversations`. See
+    /// [`Minds::forget_conversations`].
+    pub forget_conversations: bool,
 }
 
 /// Begin loading, on its own thread. Returns immediately.
@@ -1683,13 +2056,17 @@ fn load(
     // standing in it.
     let identities = match projection.as_mut() {
         Some(p) => {
+            // One member per building of every world, so a character is pinned
+            // to the one it is standing in — see [`Runtime::building_of`].
             let places: BTreeMap<String, String> = rt
                 .hosted
                 .ids()
                 .into_iter()
-                .filter_map(|id| {
-                    let hosted = rt.hosted.get(&id)?;
-                    Some((id, prompt::building(&rt.remembered_place(&hosted))))
+                .filter_map(|id| rt.hosted.get(&id).map(|hosted| (id, hosted)))
+                .flat_map(|(id, hosted)| {
+                    rt.places_of(&hosted).into_iter().map(move |(part, text)| {
+                        (identity::building_key(&id, &part), prompt::building(&text))
+                    })
                 })
                 .collect();
             identity::install(&mut p.builder, &plan.authored, &places)?
@@ -1805,6 +2182,26 @@ fn load(
         None => tracing::info!("mind: none — nothing to ingest"),
     }
 
+    // ── a clean slate, when asked for ──────────────────────────────────────
+    //
+    // Before the cast wakes, because a character opens its conversation on its
+    // first thought: retired here, nothing is left for it to rejoin, and the
+    // open it makes next is a fresh one.
+    if plan.forget_conversations {
+        if let Some(minds) = rt.minds.read().unwrap().as_ref() {
+            let retired: usize = plan
+                .cast
+                .iter()
+                .map(|c| minds.forget_conversations(c.npc_id))
+                .sum();
+            tracing::info!(
+                "conversations: {retired} retired across {} character(s) — every character \
+                 starts a fresh conversation",
+                plan.cast.len()
+            );
+        }
+    }
+
     // ── the cast ───────────────────────────────────────────────────────────
     p.set_step(LoadStep::Waking);
     p.set_progress(0, plan.cast.len() as u64);
@@ -1888,7 +2285,10 @@ fn load(
 ///
 /// Borrows the handle, because `finish_turn` consumes it: the stream has to be
 /// fully drained before the turn can be sealed.
-fn drain(handle: &TurnHandle, addr: &str) -> (Option<TurnResponse>, Vec<ProjectionEvent>) {
+pub(crate) fn drain(
+    handle: &TurnHandle,
+    addr: &str,
+) -> (Option<TurnResponse>, Vec<ProjectionEvent>) {
     let mut events = Vec::new();
     let mut response = None;
     for ev in handle.stream() {
@@ -1917,7 +2317,7 @@ fn drain(handle: &TurnHandle, addr: &str) -> (Option<TurnResponse>, Vec<Projecti
 /// Failure is logged, never propagated — a document whose signature did not
 /// persist is still a document in the substrate, and refusing the whole ingest
 /// over a lost hook would trade something for nothing.
-fn persist_signatures(
+pub(crate) fn persist_signatures(
     conv: &mut Sequence,
     response: &TurnResponse,
     events: &mut Vec<ProjectionEvent>,
@@ -2607,9 +3007,46 @@ pub fn drive(rt: Arc<Runtime>) {
                                 // character learns it went wrong rather than
                                 // believing it worked. `record_act` holds the
                                 // rule.
+                                // **A reflect the world took is answered by a
+                                // reflection** — at most one per turn. Its slot
+                                // keeps `body::NO_REFLECTION` until the
+                                // reflection answers.
+                                let mut reflecting: Option<(Owed, [String; 3])> = None;
                                 for a in &t.parsed.acts {
                                     let r = rt.record_act(id, a);
                                     done.push(r.feed);
+                                    if a.tool == "reflect"
+                                        && r.landed
+                                        && reflecting.is_none()
+                                        && rt.can_reflect()
+                                    {
+                                        let arg = |k: &str| {
+                                            a.args
+                                                .get(k)
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or_default()
+                                                .to_string()
+                                        };
+                                        // Recorded as the act alone — `reflect`
+                                        // and its thought — and completed with
+                                        // what came back once it has.
+                                        let row = a.summary();
+                                        if let Some(last) = done.last_mut() {
+                                            *last = row.clone();
+                                        }
+                                        reflecting = Some((
+                                            Owed {
+                                                answers: Vec::new(),
+                                                slot: answers.len(),
+                                                row,
+                                            },
+                                            [
+                                                arg("situation"),
+                                                arg("inner_thoughts"),
+                                                arg("feeling"),
+                                            ],
+                                        ));
+                                    }
                                     answers.push(r.answer);
                                     // A pause that landed stops the character
                                     // here. Armed after the act rather than
@@ -2636,7 +3073,21 @@ pub fn drive(rt: Arc<Runtime>) {
                                 // a person watching wants to read and what the
                                 // character needs to know are different
                                 // sentences. See `Recorded`.
-                                minds.deliver_outcomes(id, answers);
+                                //
+                                // A turn with a reflection in it hands its answers
+                                // to the reflection instead, which delivers them
+                                // once its first question is answered.
+                                match reflecting {
+                                    Some((owed, [situation, inner, feeling])) => rt
+                                        .begin_reflection(
+                                            id,
+                                            situation,
+                                            inner,
+                                            feeling,
+                                            Owed { answers, ..owed },
+                                        ),
+                                    None => minds.deliver_outcomes(id, answers),
+                                }
                                 done
                             }
                             Err(e) => {
@@ -2932,6 +3383,37 @@ mod tests {
         assert!(rt.embody(2, WORLD, "m1", 0).is_err(), "two minds, one body");
     }
 
+    /// **A character is told about the building it is in, and a reflection
+    /// opens on the room it is in.** Both failed together: every character in
+    /// the world was handed the whole world as "the building you work in" —
+    /// six vault levels and not one room of the Redoubt — and a reflection
+    /// opened on the persona's situation, which is empty for every authored
+    /// character. Asked where it was, a character in the Redoubt named a vault
+    /// room; asked to reflect, it dreamed of an office.
+    #[test]
+    fn a_character_knows_the_building_it_stands_in_and_the_room_it_is_in() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "band-one");
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        hosted.with(|w| {
+            w.enter("m2", "Maker-02", Where::new("tower-redoubt", "muster-hall"))
+                .unwrap()
+        });
+        rt.scheduler.wake(2, 0, 0);
+        rt.embody(2, WORLD, "m2", 0).expect("bound");
+
+        let (vault_key, vault) = rt.building_of(&hosted, "m1").expect("in the vault");
+        let (redoubt_key, redoubt) = rt.building_of(&hosted, "m2").expect("in the tower");
+        assert_eq!(vault_key, identity::building_key(WORLD, "creators-vault"));
+        assert_eq!(redoubt_key, identity::building_key(WORLD, "tower-redoubt"));
+        assert!(redoubt.to_lowercase().contains("muster hall"), "{redoubt}");
+        assert!(!vault.to_lowercase().contains("muster hall"), "{vault}");
+
+        let here = rt.situation_of(2).expect("a body is somewhere");
+        assert!(here.contains("muster hall"), "{here}");
+        assert!(rt.situation_of(99).is_none(), "nobody is nowhere");
+    }
+
     #[test]
     fn embodying_into_a_world_or_a_body_that_is_not_there_is_refused() {
         let rt = vaulted();
@@ -3021,7 +3503,7 @@ mod tests {
             .line()
             .expect("a body act")
             .to_string();
-        assert!(said.contains("to Maker-02"), "{said}");
+        assert!(said.contains("You tell Maker-02"), "{said}");
 
         // Not yet: perception happens on the world's clock, not the speaker's.
         run(&rt, 2);
@@ -3036,15 +3518,15 @@ mod tests {
         assert!(heard.contains("redoubt"), "{heard}");
     }
 
-    /// **A pause is visible, and being spoken to ends it.**
+    /// **Being spoken to ends a pause.**
     ///
     /// The deadlock the typed wait needed three mechanisms to prevent cannot
-    /// form here: Wyneth stops, Perrin sees her stop and has something to react
-    /// to, and Perrin speaking brings her straight back through the ordinary
-    /// sweep. No condition to satisfy, no patience, no rule excluding Perrin
-    /// from waiting back.
+    /// form here: Wyneth stops, and Perrin speaking brings her straight back
+    /// through the ordinary sweep. No condition to satisfy, no patience, no
+    /// rule excluding Perrin from waiting back — and nothing announcing to the
+    /// room that she stopped, which it no longer is.
     #[test]
-    fn a_pause_is_seen_by_the_room_and_ended_by_it() {
+    fn a_pause_is_ended_by_the_room() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         embody(&rt, 2, "m2", "green-room");
@@ -3061,18 +3543,17 @@ mod tests {
             "she did not actually stop"
         );
 
-        // Perrin can see it. That is what gives the room something to break the
-        // silence with, and it is the whole of the anti-deadlock mechanism.
+        // Perrin is told nothing about it.
         let world = rt.hosted.get(WORLD).unwrap();
         environment::advance(&world, &rt.bodies, &rt.scheduler);
         run(&rt, 2);
         let seen = window(&rt, 2).join("\n");
-        assert!(seen.contains("lets the moment pass"), "{seen}");
+        assert!(!seen.contains("lets the moment pass"), "{seen}");
 
         // And Perrin speaking brings her back at once, through nothing but the
         // ordinary delivery path.
         assert!(rt
-            .act_on_world(2, &act("say", json!({"intent": "that I am here"})))
+            .act_on_world(2, &act("shout", json!({"intent": "that I am here"})))
             .happened());
         environment::advance(&world, &rt.bodies, &rt.scheduler);
         assert!(rt.scheduler.due_now(1).contains(&1), "she was not woken");
@@ -3109,7 +3590,8 @@ mod tests {
     #[test]
     fn an_act_that_landed_is_recorded_as_an_act_whatever_the_world_said_back() {
         // Speech is the case that made this visible. The world answers a
-        // successful `say` in narration — "You say, to the room: …" — and
+        // successful `shout` in narration — "You shout, for anyone within
+        // earshot." — and
         // recording *that* put one prose sentence in a column of single-word
         // acts, both in the feed and in the character's own window.
         let rt = vaulted();
@@ -3119,19 +3601,16 @@ mod tests {
 
         let said = rt.record_act(
             1,
-            &act("say", json!({"intent": "the redoubt burned twice"})),
+            &act("shout", json!({"intent": "the redoubt burned twice"})),
         );
         // The feed carries both halves: what was asked, then what came of it.
         assert_eq!(
             said.feed,
-            "say — the redoubt burned twice → You say, to the room: the redoubt burned twice"
+            "shout — the redoubt burned twice → You shout, for anyone within earshot."
         );
         // The character, meanwhile, is told only what the world did with it —
         // it does not need to be told the name of the act it just chose.
-        assert_eq!(
-            said.answer,
-            "You say, to the room: the redoubt burned twice"
-        );
+        assert_eq!(said.answer, "You shout, for anyone within earshot.");
 
         // A body act and a head act now read the same way as each other, which
         // is the point — one shape, whether or not a world was involved.
@@ -3210,6 +3689,48 @@ mod tests {
             r.answer
         );
         assert!(!r.answer.contains("gesture —"), "{}", r.answer);
+    }
+
+    /// **A reflect's row is its thought, then what came back.** Its situation
+    /// and feeling are the reflection's input and are not listed; and what a
+    /// pause says back is only that it happened — never the character's own
+    /// words. When a reflection runs, its answer takes the arrow's side instead.
+    #[test]
+    fn a_reflect_is_recorded_as_its_thought_and_what_came_of_it() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        let r = rt.record_act(
+            1,
+            &act(
+                "reflect",
+                json!({
+                    "situation": "alone in the green room",
+                    "inner_thoughts": "the box has given up a fold",
+                    "feeling": "weary",
+                }),
+            ),
+        );
+        assert_eq!(
+            r.feed,
+            format!(
+                "reflect — the box has given up a fold → {}",
+                body::NO_REFLECTION
+            )
+        );
+        assert_eq!(r.answer, body::NO_REFLECTION);
+    }
+
+    /// **One dream at a time, per character, and the slot always comes
+    /// back.** What a reflect finds taken is the dream, never the reflection:
+    /// it still answers, and only skips the dream.
+    #[test]
+    fn a_character_writes_one_dream_at_a_time() {
+        let rt = rt();
+        let first = rt.claim_dream(1).expect("a free slot");
+        assert!(rt.claim_dream(1).is_none(), "two dreams at once");
+        assert!(rt.claim_dream(2).is_some(), "one slot per character");
+        drop(first);
+        assert!(rt.claim_dream(1).is_some(), "the slot never came back");
     }
 
     #[test]
@@ -3291,13 +3812,13 @@ mod tests {
         embody(&rt, 2, "m2", "green-room");
         run(&rt, 1);
 
-        let spoke = act("say", json!({"intent": "first"}));
+        let spoke = act("shout", json!({"intent": "first"}));
         assert!(
             rt.act_on_world(2, &spoke).happened(),
             "the world took the speech"
         );
         // And what gets recorded for it is the act, in the shape every act has.
-        assert_eq!(spoke.summary(), "say — first");
+        assert_eq!(spoke.summary(), "shout — first");
 
         run(&rt, 2);
         assert!(
@@ -3506,10 +4027,10 @@ mod tests {
         // been looking at" got three characters agreeing about silence for a
         // hundred turns, because none of them had to name a thing.
         // **Naming the act is what makes an instruction land.** "Talk to them"
-        // is a wish; "`say` or `ask`" is the branch the grammar has an arm for,
+        // is a wish; "`tell` or `ask`" is the branch the grammar has an arm for,
         // and the difference showed up as a cast that only ever walked.
         assert!(
-            together.contains("`say`") && together.contains("`ask`"),
+            together.contains("`tell`") && together.contains("`ask`"),
             "the instruction names no act to carry it out: {together}"
         );
         assert!(

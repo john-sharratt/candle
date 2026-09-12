@@ -162,6 +162,11 @@ pub enum ConstructionError {
     #[error("unknown collection {0:?}")]
     UnknownCollection(String),
 
+    /// A post-construction override (`set_group_selection`, `set_group_tags`)
+    /// named a turn group no layer in the schema declares.
+    #[error("unknown group {0:?}")]
+    UnknownGroup(String),
+
     /// Runtime mutator (e.g. [`super::Builder::set_collection_single_section`])
     /// was given a section name the collection does not contain.
     #[error("unknown section {0:?} in collection")]

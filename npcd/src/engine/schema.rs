@@ -39,6 +39,8 @@ use std::path::Path;
 use candle_conversation::models::DialectType;
 use candle_conversation::projection::{Builder, GroupId, LayerId};
 
+use crate::engine::dreams;
+
 /// The mind's projection, and the target a written document lands in.
 pub struct Projection {
     pub builder: Builder,
@@ -84,6 +86,12 @@ pub fn build(mind: Option<&Path>, world_name: &str) -> Option<Projection> {
             return None;
         }
     };
+
+    // Nobody's dreams until a conversation says whose — see [`dreams::close`].
+    // Here, the one place the schema is built, so every conversation opened on
+    // it — an ingest, a life episode, a probe — starts closed.
+    let mut builder = builder;
+    dreams::close(&mut builder);
 
     let (layer, group) = live_target(&builder)?;
     let prelude = prelude(&builder);

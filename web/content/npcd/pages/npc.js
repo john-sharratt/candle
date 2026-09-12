@@ -13,7 +13,7 @@ import {
   // `modal` was missing, and `authorBelief` calls it — so "Author a belief"
   // threw a ReferenceError instead of opening. It went unnoticed because the
   // only other caller on this page reached it through a dynamic import.
-  layerColor, LAYERS, idBadge, confirmDialog, modal,
+  layerColor, idBadge, confirmDialog, modal,
 } from '../lib/ui.js';
 import * as sessions from '../lib/sessions.js';
 import { scene, actParts } from '../lib/scene.js';
@@ -31,6 +31,10 @@ export async function render(params) {
 
   const sub = await API.getSubstrate(id).catch(() => ({ layers: [] }));
   const layerCounts = Object.fromEntries((sub.layers || []).map((l) => [l.layer, l]));
+  /* The mind's own layers, in the order its projection declares them — never a
+   * list this page keeps, so a layer added to `projection.yaml` appears here
+   * without anybody touching the console. See `npcd::engine::layers`. */
+  const declared = (sub.layers || []).map((l) => l.layer);
 
   // ── rail ──────────────────────────────────────────────────────────────────
   const rail = document.getElementById('rail');
@@ -72,8 +76,10 @@ export async function render(params) {
     railItem('presence', 'In the room', npc.live_interactions),
 
     h('div', { class: 'rail-sec' }, 'layers'),
-    LAYERS.map((l) => railItem(l, l[0].toUpperCase() + l.slice(1),
-      layerCounts[l] ? layerCounts[l].turns : null, layerColor(l))),
+    // Counted in conversations — a day, a dream, a file — because that is what
+    // the layer view lists.
+    declared.map((l) => railItem(l, l[0].toUpperCase() + l.slice(1),
+      layerCounts[l].conversations, layerColor(l))),
 
     h('div', { class: 'rail-sec' }, 'instruments'),
     railItem('projection', 'Projection'),
@@ -128,7 +134,7 @@ export async function render(params) {
     environment: environmentTab,
     pulse: pulseTab,
   };
-  const fn = TABS[tab] || (LAYERS.includes(tab) ? () => streamLayer(tab) : overview);
+  const fn = TABS[tab] || (declared.includes(tab) ? () => streamLayer(tab) : overview);
   // Any tab other than Messages stops its poll — otherwise the timer runs
   // against a detached node for as long as the console is open.
   if (tab !== 'messages') clearInterval(messagePoll);
@@ -339,24 +345,45 @@ export async function render(params) {
 
   // ── layer streams ─────────────────────────────────────────────────────────
 
+  /* One layer, as this character can read it: the conversations in it — a day,
+   * a dream, an ingested file — newest first, each with what it was written
+   * with and its turns. Nothing here knows which layer it is showing. */
   async function streamLayer(layer) {
-    const r = await API.getLayer(id, layer).catch(() => ({ items: [] }));
+    const r = await API.getLayer(id, layer).catch(() => ({ conversations: [] }));
     const info = layerCounts[layer] || {};
+    const convs = r.conversations || [];
     mount(bodyHost,
       h('div', { class: 'panel', style: 'margin-bottom:12px' },
         h('div', { class: 'row', style: 'gap:18px;flex-wrap:wrap' },
-          stat('turns', fmtNum(info.turns)), stat('tokens', fmtK(info.tokens)),
-          stat('window', fmtK(info.window)), stat('resident', (info.resident ?? '—') + '%'))),
-      r.items.length
-        ? h('div', {}, r.items.map((t) => h('div', { class: 'panel', style: 'padding:12px 16px' },
-          h('div', { class: 'row', style: 'gap:9px;margin-bottom:4px' },
-            h('span', { class: 'tiny mono dim' }, 'turn ' + t.turn),
-            h('span', { class: 'tiny mono dim' }, worldTime(t.world_ms)),
-            h('span', { style: 'flex:1' }),
-            h('span', { class: 'tiny mono', style: 'color:' + layerColor(layer) }, 'score ' + t.score.toFixed(2)),
-            h('span', { class: 'tiny mono dim' }, t.tokens + ' tok')),
-          h('div', { style: 'font-size:.86rem' }, t.preview))))
-        : empty('◌', 'Nothing in this layer yet'));
+          stat('conversations', fmtNum(info.conversations)), stat('turns', fmtNum(info.turns)),
+          stat('window', fmtK(info.window)))),
+      convs.length
+        ? h('div', {}, convs.map((c) => conversationPanel(layer, c)),
+          r.more ? h('div', { class: 'tiny dim', style: 'margin-top:6px' },
+            `The newest ${convs.length} of ${fmtNum(info.conversations)}.`) : null)
+        : empty('◌', r.engine_connected === false ? 'The engine is not running' : 'Nothing in this layer yet'));
+  }
+
+  /* A user half every turn shares — the label a dream's lines are written
+   * under, say — is said once above them rather than above every line. */
+  function conversationPanel(layer, c) {
+    const turns = c.turns || [];
+    const shared = turns.length > 1 && turns.every((t) => t.user === turns[0].user) ? turns[0].user : null;
+    const meta = Object.entries(c.metadata || {});
+    return h('div', { class: 'panel', style: 'padding:12px 16px' },
+      h('div', { class: 'row', style: 'gap:9px;margin-bottom:6px;flex-wrap:wrap' },
+        h('span', { class: 'mono', style: 'font-weight:700;color:' + layerColor(layer) },
+          c.name || 'conversation ' + c.timeline),
+        h('span', { style: 'flex:1' }),
+        h('span', { class: 'tiny mono dim' }, turns.length + (turns.length === 1 ? ' turn' : ' turns'))),
+      meta.length
+        ? h('div', { class: 'row', style: 'gap:6px;flex-wrap:wrap;margin-bottom:6px' },
+          meta.map(([k, v]) => h('span', { class: 'chip', title: k }, `${k}: ${v}`)))
+        : null,
+      shared ? h('div', { class: 'tiny dim', style: 'margin-bottom:4px' }, shared) : null,
+      turns.map((t) => h('div', { style: 'font-size:.86rem;margin:4px 0' },
+        shared ? null : h('div', { class: 'tiny dim' }, t.user),
+        h('div', {}, t.assistant))));
   }
 
   function stat(label, value) {

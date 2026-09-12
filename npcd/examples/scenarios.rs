@@ -166,7 +166,7 @@ fn cases() -> Vec<Case> {
         // ── 2. does provenance bring the right acts into focus ──────────────
         Case {
             name: "somebody is here",
-            asks: "company surfaces speech — `say` or `tell`, not a journey",
+            asks: "company surfaces speech — `tell` or `ask`, not a journey",
             body: with(with_company, &["Perrin Vastwood"]),
             expect: |o| {
                 acted(o).or_else(|| {
@@ -175,10 +175,11 @@ fn cases() -> Vec<Case> {
                     // world's narration of a successful act — which stopped
                     // being what gets recorded when the act itself became the
                     // record, and left this asserting on prose nothing emits.
-                    let spoke = o
-                        .acts
-                        .iter()
-                        .any(|a| a.starts_with("say") || a.starts_with("tell"));
+                    let spoke = o.acts.iter().any(|a| {
+                        ["tell", "ask", "whisper", "shout"]
+                            .iter()
+                            .any(|t| a.starts_with(t))
+                    });
                     (!spoke).then(|| format!("did not speak — {:?}", o.acts))
                 })
             },

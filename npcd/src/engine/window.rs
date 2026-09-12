@@ -169,6 +169,28 @@ impl Window {
         });
     }
 
+    /// Rewrite the most recent of the character's own turns reading `from`.
+    ///
+    /// For an act whose result arrives after the act is recorded — a reflect,
+    /// answered by a conversation of its own. The row goes in as the act alone
+    /// and is completed here once there is something to complete it with.
+    /// Returns whether there was such a turn: one that has already faded out of
+    /// the window has nothing left to amend.
+    pub fn amend_npc(&mut self, from: &str, to: String) -> bool {
+        match self
+            .turns
+            .iter_mut()
+            .rev()
+            .find(|t| t.speaker == Speaker::Npc && t.text == from)
+        {
+            Some(turn) => {
+                turn.text = to;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn turns(&self) -> impl Iterator<Item = &Turn> {
         self.turns.iter()
     }

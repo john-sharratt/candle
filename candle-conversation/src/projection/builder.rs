@@ -495,6 +495,54 @@ impl Builder {
         }
     }
 
+    /// Override a turn group's selection rule after construction.
+    ///
+    /// The group-level counterpart of [`Self::set_collection_selection`], and
+    /// for the same kind of caller: one schema serving conversations that want
+    /// the same corpus at different depths. A conversation that reflects reaches
+    /// further into it than one that acts, and the difference is `k`, not a
+    /// second schema. A belief-driven group's budget follows its rule (see
+    /// [`GroupSchema::belief_config`]), so this moves both.
+    pub fn set_group_selection(
+        &mut self,
+        name: &str,
+        selection: SelectionRule,
+    ) -> Result<(), ConstructionError> {
+        let group = self.group_named(name)?;
+        group.selection = selection;
+        Ok(())
+    }
+
+    /// Scope a turn group to turns carrying one of `tags`, after construction.
+    ///
+    /// **An empty list is no scope at all** — every turn in the group is a
+    /// candidate, which is what a group has always meant. That is deliberately
+    /// not the collection rule, where an empty filter admits only untagged
+    /// turns: a turn group's candidates are the conversations written to it,
+    /// and untagged is how nearly all of them are written.
+    ///
+    /// A non-empty list is what makes one group private to one owner: the
+    /// group holds every owner's conversations, and each conversation reading
+    /// it names the tag that is its own.
+    pub fn set_group_tags(
+        &mut self,
+        name: &str,
+        tags: Vec<String>,
+    ) -> Result<(), ConstructionError> {
+        let group = self.group_named(name)?;
+        group.policy.tags = tags;
+        Ok(())
+    }
+
+    fn group_named(&mut self, name: &str) -> Result<&mut GroupSchema, ConstructionError> {
+        self.schema
+            .layers
+            .iter_mut()
+            .flat_map(|l| l.groups.iter_mut())
+            .find(|g| g.name == name)
+            .ok_or_else(|| ConstructionError::UnknownGroup(name.to_string()))
+    }
+
     /// Restrict a collection to a single named member and force it
     /// [`SelectionRule::AlwaysVisible`] — projection + reprojection emit exactly
     /// that one section and drop the rest. Used to test whether the model
@@ -1192,6 +1240,8 @@ impl Builder {
                 }],
                 policy: SelectionPolicy::default_policy(),
                 gather_scope: GatherScope::default(),
+                // The only layer, so the bottom of its own stack.
+                rank: 0,
                 // This synthetic fallback layer IS the dialogue layer, so it takes
                 // the interactive decode priority the production dialogue layer does.
                 decode_priority: DecodePriority::High,

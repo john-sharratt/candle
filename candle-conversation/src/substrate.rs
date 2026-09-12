@@ -1006,6 +1006,16 @@ pub trait ContentResolver {
         false
     }
 
+    /// Whether `turn` carries one of `tags` — the scope a tagged turn group
+    /// admits (see [`crate::projection::Builder::set_group_tags`]).
+    ///
+    /// Asked only for a group whose tag list is non-empty. Default `true`:
+    /// a resolver that tracks no tags cannot scope, and a mock that says every
+    /// turn is out of scope would empty every tagged group in every test.
+    fn turn_carries(&self, _turn: TurnKey, _tags: &[String]) -> bool {
+        true
+    }
+
     /// The turn in `group` whose gather-scope decl tags contain `tag`, if any.
     /// Used to resolve a group's declared `default` member (a workspace-root
     /// cluster tagged `"."`, etc.) when normal selection is empty — so the

@@ -137,6 +137,7 @@ pub fn of(n: &NpcPayload, world: &str, anchor: &str) -> OwnedPersona {
         // this character has a body and what building it stands in. An
         // authored record carries no map.
         place: String::new(),
+        building: String::new(),
         mode: Mode::Physical,
     }
 }

@@ -108,6 +108,14 @@ pub enum Availability {
     /// invited to address somebody, because there is nobody to address and the
     /// invitation is what makes it try.
     Nearby,
+    /// Only while at least two other people are in the room.
+    ///
+    /// For an act that keeps something from somebody who is standing there —
+    /// which needs one person to tell and another to keep it from. Offered with
+    /// only one other person present, a whisper keeps nothing from anyone, and
+    /// that is where the cast used it: every remark in a two-person exchange,
+    /// narrated at the other one under its breath.
+    AmongOthers,
     /// Only while standing somewhere that is not home.
     ///
     /// **Being called back to where you already are is not a thing that can
@@ -194,26 +202,39 @@ pub struct Tool {
     pub at: &'static [&'static str],
 }
 
-/// Speech to the room, and speech to a person.
+/// Speech, pitched three ways.
 ///
-/// **Two tools, not one with an optional target.** Saying something aloud to a
-/// room and addressing one person in it are different acts, and as one tool
-/// with an optional `to` a character is invited to name somebody every turn —
-/// which it does, because a model handed a field fills it in. Split, the
-/// difference is also legible in what everybody else perceives, because the
-/// world carries who an utterance was aimed at and renders it three ways.
+/// **Three tools for three reaches, not one with a volume.** Who hears an
+/// utterance is decided by how it was pitched: [`TELL`] is to one person and
+/// overheard by the room, [`WHISPER`] is to one person and heard by nobody
+/// else, and [`SHOUT`] is to nobody in particular and carries to every room that
+/// can see into this one. As one tool with an optional target a character is
+/// invited to name somebody every turn — which it does, because a model handed
+/// a field fills it in — and the world carries both who an utterance was aimed
+/// at and how it was pitched, so the difference is legible to everybody else.
 ///
-/// # Both of them need somebody to hear
+/// # Talking to somebody is `tell`
 ///
-/// This was `Always`, on the reasoning that speaking aloud is possible whether
-/// or not anybody is listening. It is, and it was still wrong: **speech into an
-/// empty room reaches nobody and changes nothing**, which by this catalog's own
-/// standard is an act that does not act.
+/// The cast talked to each other through the room-wide act, aimed at nobody,
+/// with one person standing there to aim at, and every exchange read as two
+/// characters announcing things to the air. So the everyday act is the
+/// addressed one.
 ///
-/// What it did instead was worse than nothing. Three characters stood alone in
-/// three rooms, and every time the building did something — a box sagging, a
-/// smell of hot plastic, a shadow moving under a bench — each of them said it
-/// back out loud, paraphrased, to nobody:
+/// # `whisper` is the exception, and says so
+///
+/// Offered beside `tell` as "for when it is only for them", a whisper was what
+/// the cast reached for by default: in a conversation between two people every
+/// remark is only for the other one. A whisper is for keeping something from
+/// somebody else who is standing there, and both descriptions now say that in
+/// as many words — `tell` is the ordinary voice, `whisper` needs a reason.
+///
+/// # `tell` and `whisper` need somebody to hear
+///
+/// **Speech into an empty room reaches nobody and changes nothing**, which by
+/// this catalog's own standard is an act that does not act — and offered alone
+/// it was worse than nothing. Three characters stood alone in three rooms, and
+/// every time the building did something each of them said it back out loud,
+/// paraphrased, to nobody:
 ///
 /// ```text
 /// perceived: A smell of hot plastic comes and goes with no source anybody could point at.
@@ -221,19 +242,21 @@ pub struct Tool {
 ///                  quickly as it arrived, with no source I can find.
 /// ```
 ///
-/// That is not a character reacting to its world, it is a character narrating
-/// it — and twelve of the last fourteen acts in the feed were exactly this.
-/// Absent when alone, it is not a thing the character can do, which is the same
-/// discipline `tell` and `ask` already follow and the reason they follow it.
-const SAY: Tool = Tool {
-    name: "say",
+/// That is a character narrating its world rather than reacting to it. So both
+/// addressed acts are absent when alone, and their `to` is bound to the people
+/// actually standing here. A shout is the one that is not, because a shout is
+/// how a character alone reaches the rooms around it — and it is its own
+/// deterrent: everybody within earshot hears it.
+const SHOUT: Tool = Tool {
+    name: "shout",
     at: &[],
     category: "Speech",
     plane: Plane::Speech,
-    availability: Availability::Nearby,
-    description: "Say something aloud, to whoever is here. You give what you MEAN — the \
-                  substance and the stance — not the sentence; the narrator renders your intent \
-                  in your own voice. Everyone in the room hears it. Nobody outside it does.",
+    availability: Availability::Always,
+    description: "Call out, for anybody within earshot — everyone in this room and in every room \
+                  that can see into it. Aimed at nobody in particular. You give what you MEAN, \
+                  not the sentence; the narrator renders it in your own voice. Not for \
+                  talking to somebody who is with you — that is `tell`.",
     params: &[
         Param {
             name: "intent",
@@ -253,19 +276,18 @@ const SAY: Tool = Tool {
     ],
     examples: &[
         Example {
-            situation: "You are in the green room with two others. You have just found the \
-                        same era written up twice, differently, and neither version says which \
-                        is right.",
-            call: r#"{"intent":"that the third era is written twice and the two do not agree, and that I would like to know which of them anybody has been working from","manner":"plainly"}"#,
-            because: "To the room, not to a person — it is a question for whoever happens to \
-                      know, and naming one of them would be guessing at who that is.",
+            situation: "You are alone in the green room and have just found the same era \
+                        written up twice, differently. People are working on the run outside.",
+            call: r#"{"intent":"that the third era is written twice and the two do not agree, and that anybody who has been working from it should come and look","manner":"urgently"}"#,
+            because: "It is for whoever can hear, and there is nobody here to tell. A shout \
+                      reaches the rooms around you.",
         },
         Example {
-            situation: "You have just walked into a room where somebody is working and you \
-                        have nothing to ask them.",
-            call: r#"{"intent":"that I am here and not going to interrupt","manner":"brief"}"#,
-            because: "Arriving somewhere silently and standing there is worse than saying so. \
-                      An intent can be small.",
+            situation: "The lift has jammed half-open, and people on the run outside are \
+                        about to walk into it.",
+            call: r#"{"intent":"that the lift is not safe and nobody should get in it","manner":"as a warning"}"#,
+            because: "A warning is for everybody within earshot at once. Naming one person \
+                      would leave the rest to walk into it.",
         },
     ],
 };
@@ -275,14 +297,18 @@ const TELL: Tool = Tool {
     at: &[],
     category: "Speech",
     plane: Plane::Speech,
-    // Offered only while somebody is here to be told. A character alone has
+    // Offered only while somebody is here to be spoken to. A character alone has
     // nobody to name, and being invited to name one is what makes it invent a
     // person who is not there.
     availability: Availability::Nearby,
-    description: "Say something to one person here, by the name you know them by. Everyone in \
-                  the room still hears it — they simply hear that it was for them, not for \
-                  you. Use this when it is meant for one of them; use `say` when it is for \
-                  whoever is listening.",
+    description: "Talk to somebody here. This is your ordinary speaking voice and how you talk \
+                  to a person — replies, news, questions you are not pressing, anything you \
+                  would say to their face. Name who you are talking to, by the name you know \
+                  them by; anybody else in the room overhears, and hears that it was for them. \
+                  You give what you MEAN, not the sentence; the narrator renders it in your own \
+                  voice. Use this unless you have a reason not to: `whisper` only when it must \
+                  be kept from somebody else who is standing here, `shout` only when it is for \
+                  everybody within earshot.",
     params: &[
         Param {
             name: "to",
@@ -319,10 +345,72 @@ const TELL: Tool = Tool {
         Example {
             situation: "Somebody has just come in and said they are not going to interrupt.",
             call: r#"{"to":"Maker-02","intent":"that they are not interrupting and I would rather have the company","manner":"warmly"}"#,
-            because: "A reply is addressed. Saying it to the room would leave the person who \
-                      spoke to you unsure it was meant for them.",
+            because: "A reply is addressed. Shouting it to everybody would leave the person \
+                      who spoke to you unsure it was meant for them.",
+        },
+        Example {
+            situation: "Maker-04 and Maker-02 are both in the green room with you, and you \
+                        want Maker-04 to know the kiln has cooled enough to open.",
+            call: r#"{"to":"Maker-04","intent":"that the kiln has cooled and it can open it whenever it likes","manner":"easily"}"#,
+            because: "Nothing in it needs keeping from Maker-02. Whispering it would make an \
+                      ordinary remark look like a secret, and leave Maker-02 wondering what \
+                      is being kept from it.",
         },
     ],
+};
+
+/// Speech to one person that nobody else makes out.
+///
+/// **The room still sees it happen.** Two heads together is a thing people
+/// notice, and a character that could whisper invisibly could conspire in front
+/// of anybody with nobody the wiser — so everybody else in the room is told
+/// that it happened, and to whom, and not a word of it.
+const WHISPER: Tool = Tool {
+    name: "whisper",
+    at: &[],
+    category: "Speech",
+    plane: Plane::Speech,
+    // One person to whisper to and at least one more to keep it from — with
+    // only the listener here, it is `tell` said quietly.
+    availability: Availability::AmongOthers,
+    description: "Speak to one person here too quietly for anybody else to make out. Only for \
+                  something that must be kept from somebody ELSE who is standing here — a \
+                  secret, a warning about a person in the room, a thing you would not say in \
+                  front of them. It is not how you talk to people; that is `tell`, even when \
+                  what you say is meant for one person. The rest of the room sees you whisper \
+                  and hears none of it, so an ordinary remark whispered reads as something \
+                  being hidden.",
+    params: &[
+        Param {
+            name: "to",
+            ty: "string",
+            required: true,
+            description: "Who you are whispering to, exactly as their name appears where you \
+                          are. They must be here.",
+        },
+        Param {
+            name: "intent",
+            ty: "string",
+            required: true,
+            description: "What you mean to convey. Substance, not wording — never a finished \
+                          line of dialogue.",
+        },
+        Param {
+            name: "manner",
+            ty: "string",
+            required: false,
+            description: "How it is meant to land — urgently, conspiratorially, as a warning. \
+                          Colours the rendering; never becomes words itself.",
+        },
+    ],
+    examples: &[Example {
+        situation: "Maker-04 is beside you in the green room, and so is Maker-02, whose \
+                    version of the third era you think is the wrong one.",
+        call: r#"{"to":"Maker-04","intent":"that I think Maker-02's version of the third era is the wrong one, and I would rather not say so in front of it","manner":"quietly"}"#,
+        because: "It is for one of them and about the other. Said aloud it would be an \
+                  accusation in front of the accused. Had Maker-02 not been there, this would \
+                  be `tell`.",
+    }],
 };
 
 /// A question put to somebody here.
@@ -475,7 +563,7 @@ const FOLLOW: Tool = Tool {
 /// showing was chosen — a distinction the world cannot represent and nobody
 /// watching can tell, since both arrive as *somebody did something*.
 ///
-/// Needs company for the reason `say` does: a signal nobody is there to read is
+/// Needs company for the reason `tell` does: a signal nobody is there to read is
 /// a signal that reaches nobody, and offering it to a character alone is what
 /// makes it perform to an empty room. What is left for a solitary body is
 /// `act`, which is a thing done rather than a thing shown.
@@ -486,7 +574,7 @@ const GESTURE: Tool = Tool {
     plane: Plane::World,
     availability: Availability::Nearby,
     description: "Do something without speaking — a signal, a warning, a refusal, or just what \
-                  shows on you. Everyone here sees it. Like `say`, you give the meaning and not \
+                  shows on you. Everyone here sees it. Like `tell`, you give the meaning and not \
                   the movement.",
     params: &[
         Param {
@@ -626,13 +714,28 @@ const REFLECT: Tool = Tool {
     category: "Attention",
     plane: Plane::World,
     availability: Availability::Always,
-    description: "Take stock of where you are and what has just happened. Say what is going \
-                  through your head, what you are actually feeling, and what you have made of \
-                  it — nobody hears any of it. **This is the act for a moment you cannot do \
+    description: "Take stock of where you are and what has just happened. Say where you are \
+                  and what is going on, what is going through your head, and what you are \
+                  actually feeling — nobody hears any of it. **This is the act for a moment \
+                  you cannot do \
                   anything about**: a room settles, a light goes, somebody laughs two floors \
                   away. You stand still while you think, and anything happening around you \
                   brings you straight back.",
     params: &[
+        // **The handoff to the reflection.** That conversation has no
+        // perception, no window and no world state of its own; it is framed on
+        // the character's own account of its circumstances, and this is that
+        // account — `docs/reflection_and_dreams.md` §3. First, because it is
+        // what the other two are about. And a cheap diagnostic besides: a
+        // character that describes its situation wrongly has a perception fault
+        // nothing else would surface.
+        Param {
+            name: "situation",
+            ty: "string",
+            required: true,
+            description: "Where you are and what is going on around you, as you see it — the \
+                          room, who is in it, what has just happened.",
+        },
         // **Required, and that is the point of it.** Stopping is the one act
         // whose outward half is nothing at all, so without this the record of a
         // character's quietest hours is a column of identical rows and there is
@@ -661,37 +764,28 @@ const REFLECT: Tool = Tool {
             description: "The register you are actually in, named from the list. Not what you \
                           think you ought to feel — what is true while you stand there.",
         },
-        // Distinct from `inner_thoughts` on purpose: thoughts are what is going
-        // through your head *now*, unshaped; a reflection is what you have made
-        // of something over time. Both are worth having and they are not the
-        // same act of mind.
-        Param {
-            name: "my_reflections",
-            ty: "string",
-            required: true,
-            description: "What you have come to think, as against what is passing through your \
-                          head. Something you have worked out, changed your mind about, or \
-                          finally admitted to yourself. If nothing has settled, say that — it is \
-                          an answer, and pretending otherwise is how a character invents \
-                          convictions it does not hold.",
-        },
+        // **No third field for what it has come to think.** There was one,
+        // `my_reflections`, and it asked the character to write inline the one
+        // thing the reflection conversation exists to produce properly — then
+        // read it straight back as the act's outcome, which is what made this the
+        // act whose result was a restatement of itself. What it has come to think
+        // is now what comes back: see `docs/reflection_and_dreams.md` §3 and §6.
     ],
     examples: &[
         Example {
             situation: "You have asked Maker-04 something and it has not answered yet. There is \
                         nothing else you need from this room.",
-            call: r#"{"inner_thoughts":"it heard me and is deciding whether to tell me, and I would rather know why it hesitated than have the answer","feeling":"alert","my_reflections":"nothing has settled yet, and I would rather wait than decide early what the hesitation means"}"#,
+            call: r#"{"situation":"in the command room with Maker-04, waiting on an answer it has not given","inner_thoughts":"it heard me and is deciding whether to tell me, and I would rather know why it hesitated than have the answer","feeling":"alert"}"#,
             because: "The answer is theirs to give and there is nothing to do until it comes. \
                       What you notice while waiting is worth more than filling the silence.",
         },
         Example {
             situation: "You are alone in the reading room, your work is filed, and no order has \
                         come down.",
-            call: r#"{"inner_thoughts":"the filing went too easily, which usually means I have missed something, and I cannot find what","feeling":"uneasy","my_reflections":"I have stopped trusting a quiet afternoon, and I am not sure that is caution rather than superstition"}"#,
+            call: r#"{"situation":"alone in the reading room with my work filed and nothing asked of me","inner_thoughts":"the filing went too easily, which usually means I have missed something, and I cannot find what","feeling":"uneasy"}"#,
             because: "Nothing here needs doing. Standing still is the honest act, and casting \
                       about for one more thing to touch is how a room gets rearranged for no \
-                      reason. The reflection is the half worth keeping — it is a thing about \
-                      itself the character did not know an hour ago.",
+                      reason.",
         },
         // **The case that was being answered wrongly.** The room does something
         // small, and a character with nothing to do about it reached for the
@@ -702,7 +796,7 @@ const REFLECT: Tool = Tool {
         Example {
             situation: "A cardboard box on the floor gives up a fold and sags. Nobody is here \
                         and nothing about it is yours to see to.",
-            call: r#"{"inner_thoughts":"another thing in here has quietly given up while nobody was watching it","feeling":"weary","my_reflections":"this place is not being kept, it is being outlasted, and I have started counting the evidence"}"#,
+            call: r#"{"situation":"on my own in the store, where a box on the floor has just sagged","inner_thoughts":"another thing in here has quietly given up while nobody was watching it","feeling":"weary"}"#,
             because: "There is nothing to *do* to a sagging box. Touching it, or walking off \
                       somewhere, would be a character inventing an action to fill a moment that \
                       called for a thought.",
@@ -749,7 +843,7 @@ pub const SELF: &str = "yourself";
 /// changes the character's own state, or returns something the character did
 /// not have. Names that were a second word for one of these went to the act
 /// that does the work — `express` into [`GESTURE`], `listen` and `inspect` into
-/// [`OBSERVE`], `greet`/`offer`/`refuse`/`threaten` into [`SAY`] and [`TELL`],
+/// [`OBSERVE`], `greet`/`offer`/`refuse`/`threaten` into [`TELL`] and [`SHOUT`],
 /// whose `manner` already carries the stance that distinguished them.
 /// Every act a character can take, from every source.
 ///
@@ -772,7 +866,7 @@ pub static CATALOG: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(||
 const BODY_ACTS: &[Tool] = &[
     // Speech, attention, movement — what a body does with other bodies and
     // with rooms.
-    SAY, TELL, ASK, GESTURE, MOVE_TO, FOLLOW, REFLECT, SEND_IMAGE,
+    TELL, WHISPER, SHOUT, ASK, GESTURE, MOVE_TO, FOLLOW, REFLECT, SEND_IMAGE,
 ];
 
 /// The interaction modes a character can be in. Decides which tools are offered.
@@ -874,7 +968,7 @@ pub fn for_body(mode: Mode, embodied: bool) -> Vec<&'static Tool> {
             Availability::AtPart => false,
             // Depends on who is standing next to you, which the prompt cannot
             // know and the situation can. See `nearby`.
-            Availability::Nearby => false,
+            Availability::Nearby | Availability::AmongOthers => false,
             // Depends on where the body is standing, which changes every time
             // it walks. The prompt is written once, so this is the situation's
             // to offer — the same reason `Nearby` is absent here.
@@ -892,11 +986,20 @@ pub fn for_body(mode: Mode, embodied: bool) -> Vec<&'static Tool> {
 /// Empty when alone, and that emptiness is the point. A character with nobody
 /// to address is never shown a way to address somebody, so it never invents one
 /// to address.
-pub fn nearby(mode: Mode) -> Vec<&'static Tool> {
+///
+/// `company` is how many others are here, because not every one of these arrives
+/// with the first: a whisper needs somebody besides its listener to keep it from
+/// (see [`Availability::AmongOthers`]), and this line naming it to a character
+/// with one person beside it undid the grammar's rule in words.
+pub fn nearby(mode: Mode, company: usize) -> Vec<&'static Tool> {
     let _ = mode;
     CATALOG
         .iter()
-        .filter(|t| t.availability == Availability::Nearby)
+        .filter(|t| match t.availability {
+            Availability::Nearby => company >= 1,
+            Availability::AmongOthers => company >= 2,
+            _ => false,
+        })
         .collect()
 }
 
@@ -954,7 +1057,7 @@ pub fn entry(t: &Tool) -> String {
 ///
 /// Forced to [`SelectionRule::Named`] whatever the schema declared, because the
 /// selector is this module's to name: a collection authored `always_visible`
-/// would offer a character alone in a corridor someone to `tell`.
+/// would offer a character alone in a corridor someone to `tell` something to.
 ///
 /// `installed` is called after each one, with how many are in so far.
 pub fn install<'a>(
@@ -1304,6 +1407,7 @@ pub fn fixed_values(tool: &str, param: &str) -> Option<&'static [&'static str]> 
 /// [`tests::every_live_parameter_names_a_real_one`] closes that.
 const LIVE: &[(&str, &str, Choices)] = &[
     ("tell", "to", Choices::Company),
+    ("whisper", "to", Choices::Company),
     ("ask", "to", Choices::Company),
     ("gesture", "to", Choices::Company),
     // **A picture goes to a conversation, not to the room.** This bound to the
@@ -1589,6 +1693,7 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
             // in [`for_body`], which is what builds its prompt.
             Availability::Embodied => true,
             Availability::Nearby => !within.alone(),
+            Availability::AmongOthers => within.company.len() >= 2,
             // A journey home is only a journey from somewhere else.
             Availability::AwayFromHome => within.away_from_home,
             // The map decides. A station in the room is what puts its acts in
@@ -1837,7 +1942,7 @@ mod tests {
     fn a_required_parameter_is_forced_by_the_compiled_grammar() {
         use candle_conversation::stencil::{compile_tool_call_tree, ToolCallEnvelope};
 
-        // In company, because `tell` needs somebody to tell — alone it is not
+        // In company, because `tell` needs somebody to speak to — alone it is not
         // in the grammar at all, which is the point of
         // [`a_character_alone_cannot_reach_the_acts_that_need_company`].
         let specs = specs_within(Mode::Physical, &Within::among(&["Maker-02"]));
@@ -1849,7 +1954,9 @@ mod tests {
         // `give` is absent from this list on purpose: it binds `what` to the
         // pack, and a character carrying nothing has nothing to hand over.
         // Company is necessary for it and not sufficient.
-        for expected in ["say", "tell", "ask", "gesture", "act", "promise"] {
+        // `whisper` is absent too: with one other person here there is nobody
+        // to keep it from — see `Availability::AmongOthers`.
+        for expected in ["tell", "shout", "ask", "gesture", "act", "promise"] {
             assert!(
                 specs.iter().any(|s| s.name == expected),
                 "`{expected}` was dropped in a room with somebody in it"
@@ -2350,13 +2457,16 @@ mod tests {
             .into_iter()
             .map(|t| t.name)
             .collect();
-        for needs_company in ["ask", "tell", "say", "gesture"] {
+        // A shout is the one speech act offered alone: it is how a character
+        // with nobody here reaches the rooms around it.
+        assert!(alone.contains(&"shout".to_string()), "{alone:?}");
+        for needs_company in ["ask", "tell", "whisper", "gesture"] {
             assert!(
                 !alone.contains(&needs_company.to_string()),
                 "`{needs_company}` reaches nobody and was offered anyway: {alone:?}"
             );
         }
-        // **`say` and `gesture` are in that list**, which they were not. Speech
+        // **`tell` and `gesture` are in that list**, which they were not. Speech
         // into an empty room reaches nobody and changes nothing, and offering
         // it produced a cast that narrated the scenery at itself: three
         // characters alone in three rooms, saying every noise the building made
@@ -2387,6 +2497,39 @@ mod tests {
         assert!(together.contains(&"tell".to_string()), "{together:?}");
     }
 
+    /// **A whisper needs somebody to keep it from.** With one other person in
+    /// the room it is `tell` said quietly, and offered there it was what the
+    /// cast said everything with — so it arrives with the second person and
+    /// leaves with them, while `tell` stays.
+    #[test]
+    fn a_whisper_is_offered_only_with_somebody_else_to_keep_it_from() {
+        let names = |w: &Within| -> Vec<String> {
+            specs_within(Mode::Physical, w)
+                .into_iter()
+                .map(|t| t.name)
+                .collect()
+        };
+        let one = names(&Within::among(&["Perrin Vastwood"]));
+        let two = names(&Within::among(&["Perrin Vastwood", "Wren Weaver"]));
+        assert!(!one.contains(&"whisper".to_string()), "{one:?}");
+        assert!(one.contains(&"tell".to_string()), "{one:?}");
+        assert!(two.contains(&"whisper".to_string()), "{two:?}");
+        assert!(two.contains(&"tell".to_string()), "{two:?}");
+
+        // The situation's "you can also use" line follows the same rule — it
+        // named `whisper` beside one person, and the cast took it at its word.
+        let told = |company: usize| -> Vec<&str> {
+            nearby(Mode::Physical, company)
+                .into_iter()
+                .map(|t| t.name)
+                .collect()
+        };
+        assert!(told(0).is_empty(), "{:?}", told(0));
+        assert!(!told(1).contains(&"whisper"), "{:?}", told(1));
+        assert!(told(1).contains(&"tell"), "{:?}", told(1));
+        assert!(told(2).contains(&"whisper"), "{:?}", told(2));
+    }
+
     /// **An addressee can only be somebody who is here.**
     ///
     /// A free-text `to` let a character write any string, and it wrote a first
@@ -2410,8 +2553,8 @@ mod tests {
         // its lines.
         let about = ask.params.iter().find(|p| p.name == "about").unwrap();
         assert_eq!(about.enum_values, None);
-        let say = specs.iter().find(|t| t.name == "say").unwrap();
-        assert!(say.params.iter().all(|p| p.enum_values.is_none()));
+        let shout = specs.iter().find(|t| t.name == "shout").unwrap();
+        assert!(shout.params.iter().all(|p| p.enum_values.is_none()));
     }
 
     /// **Stopping has nothing to *choose*, anywhere.**
@@ -2469,10 +2612,8 @@ mod tests {
 
         // **Every one of them, always.** A field a model may skip is a field a
         // model does skip, and the quiet turns are exactly the ones with
-        // nothing else in them to read. "Nothing has settled" is an answer, and
-        // the description says so — which is what keeps a required reflection
-        // from becoming an invented conviction.
-        for name in ["inner_thoughts", "feeling", "my_reflections"] {
+        // nothing else in them to read.
+        for name in ["situation", "inner_thoughts", "feeling"] {
             let param = p
                 .params
                 .iter()
@@ -2480,6 +2621,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("a pause does not ask `{name}`"));
             assert!(param.required, "`{name}` is one a character may skip");
         }
+        // And nothing asking it to write its own conclusion: that is what the
+        // reflection conversation answers with.
+        assert_eq!(p.params.len(), 3, "{:?}", p.params);
     }
 
     /// **How it feels is chosen from the moods the mind actually holds.**
@@ -2724,7 +2868,7 @@ mod tests {
         // And only that one. A cooldown that took the rest of the catalog with
         // it would leave a character with nothing to do but stand there.
         assert!(after.contains(&"act".to_string()));
-        assert!(after.contains(&"say".to_string()));
+        assert!(after.contains(&"tell".to_string()));
         assert_eq!(after.len() + 1, before.len(), "{after:?}");
     }
 
@@ -2782,8 +2926,8 @@ mod tests {
         // What it keeps is what it can actually do without a body: attend,
         // reach somewhere it is not, and read.
         //
-        // **`say` is not in this list and is not missing.** Speech needs
-        // somebody to hear it, so like `ask` and `tell` it arrives with the
+        // **`tell` is not in this list and is not missing.** Speech needs
+        // somebody to hear it, so like `ask` and `whisper` it arrives with the
         // situation rather than with the prompt — this is `for_body`, which is
         // the prompt's half and deliberately withholds everything conditional
         // on the room. `command_tower` and `produce` are absent for the same
@@ -2798,7 +2942,7 @@ mod tests {
         // situation once it is somewhere else. It was `Embodied` — true, and
         // not enough: offered at home it reported crossing the building and
         // moved nobody, twenty-four times in sixty acts.
-        for conditional in ["say", "ask", "tell", "gesture", "recall"] {
+        for conditional in ["tell", "ask", "whisper", "gesture", "recall"] {
             assert!(
                 !bodiless.contains(&conditional) && !bodied.contains(&conditional),
                 "{conditional} depends on the situation, so the prompt cannot know it"
@@ -2869,10 +3013,10 @@ mod tests {
     }
 
     /// The catalog is the character's whole vocabulary. If it is thin, the model
-    /// forces everything through `say` and the world never changes.
+    /// forces everything through `tell` and the world never changes.
     ///
     /// `Social` and `Internal` are gone deliberately, and not by thinning:
-    /// `greet`/`offer`/`refuse`/`threaten` were `say` with a stance, which its
+    /// `greet`/`offer`/`refuse`/`threaten` were `tell` with a stance, which its
     /// `manner` already carries, and every `Internal` act wrote nothing
     /// anywhere. What the character can *do* is unchanged; what it can do
     /// pointlessly is not. See [`CATALOG`].
@@ -2966,7 +3110,7 @@ mod tests {
     }
 
     /// **What a turn shows is exactly what its grammar offers**, and it moves
-    /// with the room: alone there is nobody to `say` anything to, so `say` is
+    /// with the room: alone there is nobody to `tell` anything to, so `tell` is
     /// not shown; with company it is. `reflect` needs nothing, so it is always
     /// there.
     #[test]
@@ -2985,8 +3129,8 @@ mod tests {
         }
         let alone = shown(&Within::nowhere());
         let company = shown(&Within::among(&["Maker-02"]));
-        assert!(!alone.contains(&member("say")), "{alone:?}");
-        assert!(company.contains(&member("say")), "{company:?}");
+        assert!(!alone.contains(&member("tell")), "{alone:?}");
+        assert!(company.contains(&member("tell")), "{company:?}");
         assert!(alone.contains(&member("reflect")) && company.contains(&member("reflect")));
     }
 
@@ -3021,8 +3165,8 @@ mod tests {
                 "the glue separates entries, not the entry"
             );
         }
-        let say = entry(by_name("say").unwrap());
-        assert!(say.contains("\n  manner (optional): "), "{say}");
-        assert!(say.contains("\n  intent: "), "{say}");
+        let tell = entry(by_name("tell").unwrap());
+        assert!(tell.contains("\n  manner (optional): "), "{tell}");
+        assert!(tell.contains("\n  intent: "), "{tell}");
     }
 }

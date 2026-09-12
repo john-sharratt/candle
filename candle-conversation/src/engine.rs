@@ -8,7 +8,7 @@ use crate::persistence::record::DistillMode;
 use crate::persistence::thread::PersistenceThread;
 use crate::persistence::SharedSubstrate;
 use crate::projection::{
-    Builder, Conversation, GroupId, LayerId, ProjectionTarget, Reserved, TimelineId,
+    Builder, Conversation, GroupId, LayerId, ProjectionTarget, Reserved, TimelineId, TurnIndex,
 };
 use crate::scheduler::{Scheduler, SchedulerRequest};
 use crate::sequence_handle::SequenceId;
@@ -741,6 +741,31 @@ impl ConversationEngine {
         self.conversation.warm_ingest_normalization(schema);
     }
 
+    /// Warm one belief group's per-timeline hit levels by self-match — for a
+    /// group nothing else teaches, such as a tag-scoped turn group, which
+    /// learns only from probes inside its scope. Returns how many timelines
+    /// were warmed. See
+    /// [`crate::projection::Conversation::warm_group_normalization`].
+    pub fn warm_group_normalization(
+        &self,
+        schema: &crate::projection::Schema,
+        group: GroupId,
+    ) -> usize {
+        self.conversation.warm_group_normalization(schema, group)
+    }
+
+    /// Warm one timeline's hit levels by self-match — a conversation written
+    /// onto a belief group after the group was warmed. See
+    /// [`crate::projection::Conversation::warm_timeline_normalization`].
+    pub fn warm_timeline_normalization(
+        &self,
+        schema: &crate::projection::Schema,
+        timeline: TimelineId,
+    ) -> bool {
+        self.conversation
+            .warm_timeline_normalization(schema, timeline)
+    }
+
     /// Warm the belief-driven section collections' per-member hit levels from
     /// their own tag-scoped corpus. Call after load, once the corpus is stable —
     /// without it a collection's levels are cold on every process start but the
@@ -909,6 +934,46 @@ impl ConversationEngine {
     /// names a turn that exists.
     pub fn timeline_turn_count(&self, timeline: TimelineId) -> u64 {
         self.conversation.read().turn_count(timeline) as u64
+    }
+
+    /// Every live conversation written to `group` — the set selection reads,
+    /// so archived and tombstoned conversations are not in it.
+    pub fn group_conversations(&self, group: GroupId) -> Vec<TimelineId> {
+        self.conversation
+            .read()
+            .active_timelines_for_group(group)
+            .collect()
+    }
+
+    /// Both halves of every turn in `timeline`, in order — `(user, assistant)`,
+    /// verbatim as stored.
+    pub fn conversation_texts(&self, timeline: TimelineId) -> Vec<(String, String)> {
+        let read = self.conversation.read();
+        (0..read.turn_count(timeline))
+            .map(|i| {
+                (
+                    read.user_text_of(timeline, TurnIndex(i)),
+                    read.assistant_text_of(timeline, TurnIndex(i)),
+                )
+            })
+            .collect()
+    }
+
+    /// Whether any turn of `timeline` carries one of `tags` — the test a
+    /// tag-scoped group applies to decide whether a conversation is in scope.
+    pub fn conversation_carries(&self, timeline: TimelineId, tags: &[String]) -> bool {
+        let read = self.conversation.read();
+        (0..read.turn_count(timeline)).any(|i| {
+            read.turn_tags(timeline, TurnIndex(i))
+                .iter()
+                .any(|t| tags.contains(t))
+        })
+    }
+
+    /// The name a conversation was written under (its `conv_id`), if it was
+    /// given one.
+    pub fn conversation_conv_id(&self, timeline: TimelineId) -> Option<String> {
+        self.conversation.conv_id_of(timeline)
     }
 
     /// Mark `timeline` for distillation at `mode` (shed content at compaction) —

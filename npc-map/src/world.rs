@@ -221,11 +221,14 @@ pub enum Happening {
         subject: Option<String>,
     },
     /// Somebody spoke. `to` is who they aimed it at, and is a fact about the
-    /// utterance rather than about who received it — everybody in the room
-    /// hears it either way. `None` is spoken to the room at large.
+    /// utterance rather than about who received it — at an ordinary pitch
+    /// everybody in the room hears it either way. `None` is spoken to the room
+    /// at large. `voice` is how it was pitched, which is what decides who else
+    /// makes it out — see [`Voice`].
     Said {
         to: Option<String>,
         words: String,
+        voice: Voice,
     },
     /// Somebody did something without speaking — a look held, a hand raised, a
     /// chair pushed back.
@@ -288,6 +291,25 @@ impl Happening {
     pub fn is_private(&self) -> bool {
         self.is_outcome() || matches!(self, Happening::SetOut { .. })
     }
+}
+
+/// How an utterance was pitched — the one thing about it that decides who else
+/// can make it out.
+///
+/// Carried on the event rather than inferred from who was listening, because
+/// the world records what happened in full and [`crate::witness`] narrows it on
+/// the way out: a whisper is a thing everybody in the room saw happen and one
+/// person heard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Voice {
+    /// An ordinary voice. Everybody in the room hears it; nobody outside does.
+    Said,
+    /// Raised. The room hears it, and so does every room that can see into it
+    /// — the one kind of speech that carries through a doorway.
+    Shouted,
+    /// Lowered. Only the person it is aimed at makes out the words; everybody
+    /// else in the room sees it happen and hears nothing of it.
+    Whispered,
 }
 
 #[derive(Clone, Debug)]
@@ -942,7 +964,21 @@ impl World {
 
     /// Say something to the room. Nobody outside it hears.
     pub fn say(&mut self, id: &str, words: impl Into<String>) -> Done {
-        self.utter(id, None, words)
+        self.utter(id, None, words, Voice::Said)
+    }
+
+    /// Call out, to anybody within earshot: the room, and every room that can
+    /// see into it. Aimed at nobody — a shout is for whoever hears it.
+    pub fn shout(&mut self, id: &str, words: impl Into<String>) -> Done {
+        self.utter(id, None, words, Voice::Shouted)
+    }
+
+    /// Say something to one person too quietly for anybody else to make out.
+    ///
+    /// The rest of the room still sees it happen — two heads together is a
+    /// thing people notice — and hears none of it. The listener must be here.
+    pub fn whisper(&mut self, id: &str, to: &str, words: impl Into<String>) -> Done {
+        self.utter(id, Some(to), words, Voice::Whispered)
     }
 
     /// Say something to somebody in particular.
@@ -957,7 +993,7 @@ impl World {
     /// The listener must be in the room. Talking *about* somebody who is not
     /// there is [`World::say`] with their name in the words.
     pub fn tell(&mut self, id: &str, to: &str, words: impl Into<String>) -> Done {
-        self.utter(id, Some(to), words)
+        self.utter(id, Some(to), words, Voice::Said)
     }
 
     /// Do something in the room without speaking. Everybody standing there sees
@@ -974,9 +1010,7 @@ impl World {
     /// So `"gestures towards the table"`, not `"towards the table"`. A fragment
     /// reaches the other characters as a sentence with the verb missing —
     /// measured live, nine gestures arrived as *"Yaelis Vayne towards the table,
-    /// indicating the standing orders"* while the pause beside them, which does
-    /// pass a predicate, read correctly as *"Yaelis Vayne stops, and lets the
-    /// moment pass."*
+    /// indicating the standing orders"*.
     ///
     /// Do **not** name the target in `what`: pass it as `to` and the aiming is
     /// added once, as `", at X"`. Both is how one act came to read
@@ -1041,7 +1075,13 @@ impl World {
         Ok((place, to.map(String::from)))
     }
 
-    fn utter(&mut self, id: &str, to: Option<&str>, words: impl Into<String>) -> Done {
+    fn utter(
+        &mut self,
+        id: &str,
+        to: Option<&str>,
+        words: impl Into<String>,
+        voice: Voice,
+    ) -> Done {
         let (place, to) = self.aim(id, to)?;
         self.now += 1;
         self.log.push(Event {
@@ -1051,6 +1091,7 @@ impl World {
             what: Happening::Said {
                 to,
                 words: words.into(),
+                voice,
             },
         });
         Ok(())

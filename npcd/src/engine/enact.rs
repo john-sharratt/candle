@@ -780,7 +780,7 @@ fn record_verdict(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Out
 //
 // Every one of these reaches somebody who is not here, from wherever the
 // character is standing, at a time that is not necessarily now. That is the
-// whole difference from `say` and `tell`, and it is why they are separate acts.
+// whole difference from `tell`, and it is why they are separate acts.
 
 fn message(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let (Some(to), Some(intent)) = (text(args, "to"), text(args, "intent")) else {

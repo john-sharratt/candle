@@ -13,7 +13,9 @@ use std::time::Instant;
 use super::event::{decode_events, ProjectionSelection, SystemItem};
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
-use super::schema::{CorruptTurnPolicy, LayerSchema, Schema, SystemPromptItem, SystemPromptSchema};
+use super::schema::{
+    CorruptTurnPolicy, GroupSchema, LayerSchema, Schema, SystemPromptItem, SystemPromptSchema,
+};
 use crate::error::ConversationError;
 use crate::normalization::{ChildKey, NormalizationCache, Phase, ScopeKey};
 use crate::persistence::content_hash::{
@@ -119,6 +121,43 @@ impl Observe<'_> {
                 scope_tags.is_empty() || scope_tags.iter().any(|s| tags.contains(s))
             }
         }
+    }
+}
+
+/// Whether a group's hit levels can be learned by self-match.
+///
+/// Belief-driven, because only a belief group normalizes at all; and additive,
+/// because a gated-fusion group normalizes traffic-relative (the A.4 floored
+/// path keys on observed-traffic PEAKS, so a rare hit on a quiet file stands
+/// out). Self-match warming would stamp every file's peak at its own self-match
+/// magnitude and erase that contrast — the gate already handles the promiscuous
+/// domination this warm-up was built to fix. Config-keyed, not axis-keyed: any
+/// additive-fusion group warms.
+fn is_warmable(group: &GroupSchema) -> bool {
+    group.is_belief_driven() && group.policy.scan.fusion == FusionMode::Additive
+}
+
+/// `group` of `layer`, if the schema declares it there and it [`is_warmable`].
+fn warmable(
+    schema: &Schema,
+    layer: LayerId,
+    group: GroupId,
+) -> Option<(&LayerSchema, &GroupSchema)> {
+    let layer = schema.layers.iter().find(|l| l.id == layer)?;
+    let group = layer.groups.iter().find(|g| g.id == group)?;
+    is_warmable(group).then_some((layer, group))
+}
+
+/// `layer` with `group` as its only group.
+///
+/// The view a single group's self-match warm scores under.
+/// [`Conversation::score_belief_groups`] scores — and, observing, teaches —
+/// every belief group in the layer it is handed, so a probe of one group's
+/// timeline would otherwise teach its siblings a scope that is not theirs.
+fn alone(layer: &LayerSchema, group: &GroupSchema) -> LayerSchema {
+    LayerSchema {
+        groups: vec![group.clone()],
+        ..layer.clone()
     }
 }
 
@@ -1335,75 +1374,8 @@ impl Conversation {
             if !is_ingest {
                 continue;
             }
-            for group in &layer.groups {
-                if !group.is_belief_driven() {
-                    continue;
-                }
-                // A gated-fusion group normalizes traffic-relative (the A.4
-                // floored path keys on observed-traffic PEAKS, so a rare hit on
-                // a quiet file stands out). Self-match warming would stamp
-                // every file's peak at its own self-match magnitude and erase
-                // that contrast — the gate already handles the promiscuous
-                // domination this warm-up was built to fix. Config-keyed, not
-                // axis-keyed: any additive-fusion group still warms.
-                if group.policy.scan.fusion != FusionMode::Additive {
-                    continue;
-                }
-                let timelines: Vec<TimelineId> = self
-                    .inner
-                    .read()
-                    .unwrap()
-                    .active_timelines_for_group(group.id)
-                    .collect();
-                for tl in timelines {
-                    // This file's / cluster's own turn signatures. Gathered under a
-                    // short-lived read lock so the per-turn `score_belief_groups`
-                    // calls below (which take the lock themselves) never re-enter it.
-                    let sigs: Vec<(u64, Arc<Vec<WideQSig>>)> = {
-                        let sub = self.inner.read().unwrap();
-                        let count = sub.turn_count(tl);
-                        (0..count)
-                            .filter_map(|i| {
-                                let sid = turn_stream_id(tl.raw(), i);
-                                sub.decoded_wide_sig(sid).map(|s| (sid.0, s))
-                            })
-                            .collect()
-                    };
-                    let self_target = ProjectionTarget {
-                        layer: layer.id,
-                        group: group.id,
-                        timeline: tl,
-                    };
-                    // A handful of self-probes is enough: the asymmetric EWMA
-                    // (alpha_up 0.30) is ~94% converged after 8 observes, and each
-                    // call already scores against ALL the file's exchanges, so this
-                    // caps the one-time warm cost without materially moving the level.
-                    for (source, sig) in sigs.iter().take(WARM_INGEST_PROBES_PER_TIMELINE) {
-                        if sig.is_empty() {
-                            continue;
-                        }
-                        let mut throwaway = ProjectionScores::new();
-                        // CPU fallback (`device: None`): the warm-up runs off the
-                        // reproject hot path and only needs the learned hit level,
-                        // which the CPU and GPU scans agree on up to fast-math ULP.
-                        let _ = self.score_belief_groups(
-                            layer,
-                            self_target,
-                            sig.as_slice(),
-                            None,
-                            &mut throwaway,
-                            // Self-match warming of an ingest group: the probe is
-                            // this group's own turn, so it is inside the scope by
-                            // construction.
-                            Observe::Yes {
-                                tags: &group.policy.tags,
-                                source: *source,
-                            },
-                            None,
-                        );
-                    }
-                    warmed_timelines += 1;
-                }
+            for group in layer.groups.iter().filter(|g| is_warmable(g)) {
+                warmed_timelines += self.warm_group(layer, group);
             }
         }
         tracing::info!(
@@ -1411,6 +1383,111 @@ impl Conversation {
             "normalization warm-up: learned per-file hit levels for ingest-layer timelines \
              (0 ⇒ no append-only ingest layer marked — belief levels stay cold)"
         );
+    }
+
+    /// Warm one belief group's per-timeline hit levels by self-match —
+    /// [`Self::warm_ingest_normalization`] for a single group, whatever its
+    /// layer.
+    ///
+    /// For a group nothing else teaches: a tag-scoped turn group learns only
+    /// from probes inside its scope, and ordinary dialogue is untagged, so its
+    /// levels stay at the cold-start prior for the life of the process — where
+    /// `normalize` is a flat `scale/prior` multiple of the raw score rather
+    /// than a normalization. Only `group` is scored and taught (see [`alone`]).
+    /// Returns how many timelines were warmed; `0` when the group is not in
+    /// the schema or not [`is_warmable`].
+    pub fn warm_group_normalization(&self, schema: &Schema, group: GroupId) -> usize {
+        let Some(layer) = schema
+            .layers
+            .iter()
+            .find(|l| l.groups.iter().any(|g| g.id == group))
+        else {
+            return 0;
+        };
+        let Some((layer, group)) = warmable(schema, layer.id, group) else {
+            return 0;
+        };
+        self.warm_group(&alone(layer, group), group)
+    }
+
+    /// Warm one timeline's hit levels by self-match — a conversation written
+    /// onto a belief group after the group was warmed, which would otherwise be
+    /// the one member scored on a different scale from the rest. `false` when
+    /// the timeline is unknown or its group is not [`is_warmable`].
+    pub fn warm_timeline_normalization(&self, schema: &Schema, timeline: TimelineId) -> bool {
+        let Some((layer, group)) = self.timeline_target(timeline) else {
+            return false;
+        };
+        let Some((layer, group)) = warmable(schema, layer, group) else {
+            return false;
+        };
+        self.warm_timeline(&alone(layer, group), group, timeline);
+        true
+    }
+
+    /// Every active timeline of `group`, warmed under `layer`. Returns how many.
+    fn warm_group(&self, layer: &LayerSchema, group: &GroupSchema) -> usize {
+        let timelines: Vec<TimelineId> = self
+            .inner
+            .read()
+            .unwrap()
+            .active_timelines_for_group(group.id)
+            .collect();
+        for &tl in &timelines {
+            self.warm_timeline(layer, group, tl);
+        }
+        timelines.len()
+    }
+
+    /// Self-match one timeline of `group`: a handful of its own turns probe it,
+    /// folding its hit levels under the SAME `scope = turn_group(group,
+    /// timeline)` a live query reads back.
+    fn warm_timeline(&self, layer: &LayerSchema, group: &GroupSchema, tl: TimelineId) {
+        // This file's / cluster's own turn signatures. Gathered under a
+        // short-lived read lock so the per-turn `score_belief_groups` calls
+        // below (which take the lock themselves) never re-enter it.
+        let sigs: Vec<(u64, Arc<Vec<WideQSig>>)> = {
+            let sub = self.inner.read().unwrap();
+            let count = sub.turn_count(tl);
+            (0..count)
+                .filter_map(|i| {
+                    let sid = turn_stream_id(tl.raw(), i);
+                    sub.decoded_wide_sig(sid).map(|s| (sid.0, s))
+                })
+                .collect()
+        };
+        let self_target = ProjectionTarget {
+            layer: layer.id,
+            group: group.id,
+            timeline: tl,
+        };
+        // A handful of self-probes is enough: the asymmetric EWMA (alpha_up
+        // 0.30) is ~94% converged after 8 observes, and each call already scores
+        // against ALL the file's exchanges, so this caps the one-time warm cost
+        // without materially moving the level.
+        for (source, sig) in sigs.iter().take(WARM_INGEST_PROBES_PER_TIMELINE) {
+            if sig.is_empty() {
+                continue;
+            }
+            let mut throwaway = ProjectionScores::new();
+            // CPU fallback (`device: None`): the warm-up runs off the reproject
+            // hot path and only needs the learned hit level, which the CPU and
+            // GPU scans agree on up to fast-math ULP.
+            let _ = self.score_belief_groups(
+                layer,
+                self_target,
+                sig.as_slice(),
+                None,
+                &mut throwaway,
+                // Self-match: the probe is this group's own turn, so it is
+                // inside the scope by construction.
+                Observe::Yes {
+                    tags: &group.policy.tags,
+                    source: *source,
+                },
+                None,
+            );
+        }
     }
 
     /// Score every belief-driven **turn group** in `layer` against its own turns
@@ -1476,11 +1553,27 @@ impl Conversation {
             // A belief group is never the projection target (the target is the
             // Sequence dialogue group, skipped above), but mirror the target mask
             // anyway so the invariant holds if that ever changes.
-            let timelines: Vec<TimelineId> = if self_local || group.id == target.group {
+            let mut timelines: Vec<TimelineId> = if self_local || group.id == target.group {
                 vec![target.timeline]
             } else {
                 sub.active_timelines_for_group(group.id).collect()
             };
+            // A tagged group reads only the conversations carrying its tags — the
+            // same scope projection applies to its candidates, applied here so an
+            // out-of-scope conversation is neither scanned nor allowed to teach
+            // the group's hit levels. See `Builder::set_group_tags`. Never the
+            // target's own group, which is its own timeline already — the same
+            // exemption projection makes.
+            if !group.policy.tags.is_empty() && group.id != target.group {
+                let tags = &group.policy.tags;
+                timelines.retain(|&tl| {
+                    (0..sub.turn_count(tl)).any(|i| {
+                        sub.turn_tags(tl, TurnIndex(i))
+                            .iter()
+                            .any(|t| tags.contains(t))
+                    })
+                });
+            }
             // ── Phase A: assemble every file's exchanges + gallery windows ───────
             // All files in the group are built first so the whole group can be scored
             // in ONE batched GPU launch (per-file z), or file-by-file on the CPU
@@ -3706,6 +3799,13 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         self.read.turn_score_for_timeline(turn.timeline, turn.index)
     }
 
+    fn turn_carries(&self, turn: TurnKey, tags: &[String]) -> bool {
+        self.read
+            .turn_tags(turn.timeline, turn.index)
+            .iter()
+            .any(|t| tags.contains(t))
+    }
+
     fn group_attention_mass(&self, group: GroupId) -> f32 {
         self.read.scores_or_empty().group_mass(group)
     }
@@ -3793,7 +3893,8 @@ impl<'a> ContentResolver for TargetedRead<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collection_warm_plan, selected_in_collection, subwindow_bounds, Conversation, Observe,
+        alone, collection_warm_plan, is_warmable, selected_in_collection, subwindow_bounds,
+        warmable, Conversation, Observe,
     };
 
     fn tags(v: &[&str]) -> Vec<String> {
@@ -3908,8 +4009,121 @@ mod tests {
         assert!(!Observe::No.teaches(&tools));
         assert!(!Observe::No.teaches(&unscoped));
     }
-    use crate::projection::{ProjectionSelection, SelectedSection, SystemItem};
+    use crate::projection::{Builder, ProjectionSelection, SelectedSection, SystemItem};
     use std::collections::HashSet;
+
+    /// A belief layer with two ranked groups beside a dialogue layer — enough
+    /// to ask which group a warm reaches and what it scores under.
+    const WARM_YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "You are a helpful assistant."
+layers:
+  - name: ground
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 40
+    groups:
+      - id: facts
+        selection:
+          kind: top_k
+          k: 3
+      - id: rumours
+        selection:
+          kind: top_k
+          k: 2
+  - name: dialogue
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 100
+      min_percent: 50
+    groups:
+      - id: conversation
+        selection:
+          kind: conversation
+          recent: 4
+          historical_top_k: 8
+"#;
+
+    /// A ranked group is warmed where the schema declares it, and asking for it
+    /// under any other layer finds nothing rather than a group of the same id
+    /// somewhere else.
+    #[test]
+    fn a_ranked_group_is_warmable_in_its_own_layer_and_nowhere_else() {
+        let b = Builder::from_yaml(WARM_YAML).unwrap();
+        let ground = b.id_for_layer("ground").unwrap();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+        let facts = b.id_for_group("facts").unwrap();
+
+        let (layer, group) = warmable(b.schema(), ground, facts).expect("facts is warmable");
+        assert_eq!(layer.name, "ground");
+        assert_eq!(group.name, "facts");
+        assert!(warmable(b.schema(), dialogue, facts).is_none());
+    }
+
+    /// Recency is not a belief, so there is no hit level to learn.
+    #[test]
+    fn a_recency_group_is_not_warmable() {
+        let b = Builder::from_yaml(WARM_YAML).unwrap();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+        let conversation = b.id_for_group("conversation").unwrap();
+        let group = b
+            .schema()
+            .layers
+            .iter()
+            .find(|l| l.id == dialogue)
+            .unwrap()
+            .groups[0]
+            .clone();
+        assert!(!is_warmable(&group));
+        assert!(warmable(b.schema(), dialogue, conversation).is_none());
+    }
+
+    /// **A warm scores one group, not its layer.** `score_belief_groups` scores
+    /// and teaches every belief group it is handed, so the view a single
+    /// group's warm runs under must hold that group alone — and nothing else
+    /// about the layer may change, or the scan would read a different layer.
+    #[test]
+    fn a_single_group_warm_scores_under_a_layer_holding_only_that_group() {
+        let b = Builder::from_yaml(WARM_YAML).unwrap();
+        let ground = b.id_for_layer("ground").unwrap();
+        let rumours = b.id_for_group("rumours").unwrap();
+        let (layer, group) = warmable(b.schema(), ground, rumours).unwrap();
+        assert_eq!(
+            layer.groups.len(),
+            2,
+            "the fixture has a sibling to leave out"
+        );
+
+        let view = alone(layer, group);
+        assert_eq!(view.groups.len(), 1);
+        assert_eq!(view.groups[0].id, rumours);
+        assert_eq!(view.id, layer.id);
+        assert_eq!(view.name, layer.name);
+        assert_eq!(view.window, layer.window);
+        assert_eq!(view.score_threshold, layer.score_threshold);
+    }
 
     /// `(tags, timeline, index)` rows in the shape `collection_warm_plan` reads.
     fn corpus(rows: &[(&[&str], u64, u32)]) -> Vec<(Vec<String>, u64, u32)> {

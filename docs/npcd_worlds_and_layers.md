@@ -102,10 +102,16 @@ design.
 collection. So the craft side works today with no change: declare `tags: []`
 and a collection sees the shared, untagged library.
 
-**Layers do not.** `score_belief_groups` contains no reference to tags at all.
-A layer group's candidates come from `ContentResolver::group_turns(group)`
-(`project.rs:1144`, whose comment notes *"group_turns has already masked the
-candidates"*), and the implementation masks by **timeline**, never by tag.
+**Layers did not, and now can — per conversation.** `score_belief_groups` had
+no reference to tags, and a layer group's candidates come from
+`ContentResolver::group_turns(group)`, which masks by **timeline**, never by
+tag. A turn group can now be scoped to turns carrying one of a set of tags
+(`Builder::set_group_tags`), applied in both the belief scan and projection via
+`ContentResolver::turn_carries`. It is set on a conversation's own copy of the
+builder rather than in the YAML, because the scope is whose data a reader is,
+and an empty list still means the whole group — unlike a collection's empty
+filter. The dream layer is its first user
+(`docs/reflection_and_dreams.md` §4); world scoping below is still open.
 
 That is the gap, and it is on the side that matters most: the `world` layer is
 the canon. Two ways to close it:

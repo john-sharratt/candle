@@ -160,7 +160,8 @@ fn awaiting_line(world: &World, sim: &crate::sim::Sim, body: &str) -> Option<Str
     let mut s = String::from("Waiting on an answer from you:");
     s.push_str(&named.join(""));
     s.push_str(
-        "\n\nSay something to them. A question you leave standing is one they asked into silence.",
+        "\n\nAnswer them: `tell` them if they are here, `message` them if they are not. A \
+         question you leave standing is one they asked into silence.",
     );
     Some(s)
 }
@@ -181,7 +182,7 @@ fn company_line(world: &World, body: &str) -> Option<String> {
     if others.is_empty() {
         return None;
     }
-    let tools: Vec<&str> = tools::nearby(Mode::Physical)
+    let tools: Vec<&str> = tools::nearby(Mode::Physical, others.len())
         .into_iter()
         .map(|t| t.name)
         .collect();

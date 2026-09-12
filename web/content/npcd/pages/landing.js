@@ -180,7 +180,7 @@ const SAMPLE = [
   { act: { tick: 411, tool: 'face', intent: 'check the eastern line' },
     narration: 'He turns east, and the ridge line resolves out of the dusk.' },
   { act: { tick: 412, tool: 'consider', intent: 'weigh the gap in the rotation', observable: false } },
-  { act: { tick: 413, tool: 'say', intent: 'ask who has the second watch' },
+  { act: { tick: 413, tool: 'ask', intent: 'who has the second watch' },
     narration: '"Who has second watch tonight?" — asked lightly, the way a man asks a thing he already suspects.' },
   { act: { tick: 414, tool: 'move_to', intent: 'walk the line rather than send someone' },
     narration: 'He goes himself. The fire is somebody else\'s to keep for an hour.' },

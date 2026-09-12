@@ -52,6 +52,7 @@ pub mod authoring;
 pub mod bench;
 pub mod body;
 pub mod cooldown;
+pub mod dreams;
 pub mod driver;
 pub mod enact;
 pub mod environment;
@@ -59,6 +60,7 @@ pub mod event;
 pub mod identity;
 pub mod ingest;
 pub mod interaction;
+pub mod layers;
 pub mod life;
 pub mod loading;
 pub mod mind;
@@ -99,6 +101,7 @@ use web::auth::Role;
 
 use crate::api::{err, owner_of, Authored};
 use crate::engine::interaction::Interlocutor;
+use crate::engine::mind::Minds;
 use crate::guard::Api;
 use crate::projection;
 
@@ -295,36 +298,55 @@ async fn substrate(
     headers: HeaderMap,
     Path(nid): Path<String>,
 ) -> Response {
-    if let Err(r) = owned(&s, &headers, &nid).await {
-        return *r;
-    }
-    let layers = projection::layers(&s.mind).unwrap_or_default();
+    let npc_id = match owned(&s, &headers, &nid).await {
+        Ok(id) => id,
+        Err(r) => return *r,
+    };
+    // The layers are the mind's: every one `projection.yaml` declares, in its
+    // order, whatever the engine is doing.
+    let declared = projection::layers(&s.mind).unwrap_or_default();
+    let live = match minds_of(&s) {
+        Some(minds) => tokio::task::spawn_blocking(move || minds.layer_counts(npc_id))
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
     Json(json!({
-        "layers": layers.iter().map(|l| json!({
-            "layer": l.get("name").cloned().unwrap_or(Value::Null),
-            "window": l.get("window").cloned().unwrap_or(Value::Null),
-            "turns": 0,
-            "tokens": 0,
-            // How much of this layer is resident in VRAM. A paging figure, and
-            // nothing has paged anything.
-            "resident": Value::Null,
-        })).collect::<Vec<_>>(),
-        "engine_connected": false,
+        "layers": declared.iter().map(|l| {
+            let name = l.get("name").and_then(Value::as_str).unwrap_or_default();
+            let held = live.as_ref().and_then(|c| c.iter().find(|c| c.layer == name));
+            json!({
+                "layer": name,
+                "window": l.get("window").cloned().unwrap_or(Value::Null),
+                // Real zeros without an engine: a character that has never
+                // run holds nothing in any layer.
+                "conversations": held.map_or(0, |c| c.conversations),
+                "turns": held.map_or(0, |c| c.turns),
+            })
+        }).collect::<Vec<_>>(),
+        "engine_connected": live.is_some(),
     }))
     .into_response()
 }
 
-/// One layer's turns. None, and the layer has to be one that exists.
+/// How many conversations a layer view carries: the newest, and a flag that
+/// there are older ones.
+const LAYER_PAGE: usize = 50;
+
+/// One layer's conversations, as this character can read them — see
+/// [`layers::readable`]. The layer has to be one the mind declares.
 async fn layer(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
     Path((nid, name)): Path<(String, String)>,
 ) -> Response {
-    if let Err(r) = owned(&s, &headers, &nid).await {
-        return *r;
-    }
-    let layers = projection::layers(&s.mind).unwrap_or_default();
-    let known = layers
+    let npc_id = match owned(&s, &headers, &nid).await {
+        Ok(id) => id,
+        Err(r) => return *r,
+    };
+    let declared = projection::layers(&s.mind).unwrap_or_default();
+    let known = declared
         .iter()
         .any(|l| l.get("name").and_then(Value::as_str) == Some(name.as_str()));
     if !known {
@@ -336,7 +358,33 @@ async fn layer(
             &format!("`{name}` is not a layer this mind declares"),
         );
     }
-    Json(json!({ "layer": name, "items": [], "engine_connected": false })).into_response()
+    let Some(minds) = minds_of(&s) else {
+        return Json(json!({
+            "layer": name,
+            "conversations": [],
+            "more": false,
+            "engine_connected": false,
+        }))
+        .into_response();
+    };
+    let wanted = name.clone();
+    let page = tokio::task::spawn_blocking(move || minds.layer_page(npc_id, &wanted, LAYER_PAGE))
+        .await
+        .ok()
+        .flatten();
+    Json(json!({
+        "layer": name,
+        "conversations": page.as_ref().map(|p| json!(p.conversations)).unwrap_or(json!([])),
+        "more": page.as_ref().is_some_and(|p| p.more),
+        "engine_connected": page.is_some(),
+    }))
+    .into_response()
+}
+
+/// The live minds, when the engine is up — how a route reads what a
+/// character's conversations actually hold rather than what the mind declares.
+fn minds_of(s: &Authored) -> Option<Arc<Minds>> {
+    s.runtime.as_ref()?.minds.read().unwrap().clone()
 }
 
 /// One turn's stored form. There are no turns, so there is no turn.

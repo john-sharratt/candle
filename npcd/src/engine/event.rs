@@ -182,6 +182,10 @@ pub enum Addressed {
     Room,
     /// Said to you.
     You,
+    /// Said to you, too quietly for anybody else to make out. Still aimed at
+    /// you — it asks for an answer like anything else said to you — but the
+    /// listener is told it was a whisper, because that is half of what it said.
+    Whispered,
     /// Said to somebody else, in front of you.
     Other { who: String },
 }
@@ -365,6 +369,7 @@ impl Event {
                 // discipline is narrate acts, never fabricate.
                 match to {
                     Addressed::You => format!("{speaker} says to you: {t}"),
+                    Addressed::Whispered => format!("{speaker} whispers to you: {t}"),
                     Addressed::Room => format!("{speaker} says: {t}"),
                     Addressed::Other { who } => format!("{speaker} says to {who}: {t}"),
                 }

@@ -9,7 +9,7 @@
 //! and a set of constraints to honour throughout.
 //!
 //! This is not a concession to latency. It is the same split the catalogue
-//! already runs on: `say` carries what a character means and the narrator writes
+//! already runs on: `tell` carries what a character means and the narrator writes
 //! the words. Here `engage` carries what a character intends and the simulator
 //! resolves the shots. In both cases the model supplies substance and something
 //! faster supplies mechanism, and neither can produce what the other did not
@@ -22,7 +22,7 @@
 //! read a sentence, so a string handed to it would be written every turn, read
 //! by nothing, and look exactly like control while being a no-op.
 //!
-//! The tactic that will not enumerate is *spoken* — a `tell` to the squad, which
+//! The tactic that will not enumerate is *spoken* — a `shout` to the squad, which
 //! the narrator renders and the other characters perceive. That lands where
 //! language works.
 

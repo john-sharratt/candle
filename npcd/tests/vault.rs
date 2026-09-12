@@ -697,6 +697,8 @@ fn a_visitor_enters_the_room_and_can_be_addressed() {
     // deliberately not here: it needs something to give as well, so it stays
     // absent for a character carrying nothing — which is the empty-set rule
     // working rather than this failing.
+    // `whisper` is not here either: one visitor is somebody to tell, not
+    // somebody to keep a thing from — see `Availability::AmongOthers`.
     for act in ["tell", "ask", "gesture"] {
         assert!(
             offered.iter().any(|t| t.name == act),

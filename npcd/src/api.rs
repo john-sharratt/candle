@@ -657,6 +657,14 @@ async fn post_reflect(
         .unwrap_or("")
         .trim()
         .to_string();
+    // Where the character says it is — what the act passes. Optional here: a
+    // caller that names none gets the world's own percept of the room.
+    let situation = body
+        .get("situation")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     // Absent means rotate. Naming one is for a caller walking the space
     // deliberately — a test, or a fill of a cell the corpus is thin in.
     let domain = body
@@ -686,7 +694,14 @@ async fn post_reflect(
     // The decodes run on the engine thread. Off the async executor, because a
     // blocking model call on a tokio worker stalls every other route.
     let out = tokio::task::spawn_blocking(move || {
-        rt.reflect(npc_id, &inner, &feeling, domain.as_deref(), &axes)
+        rt.reflect(
+            npc_id,
+            situation.as_deref(),
+            &inner,
+            &feeling,
+            domain.as_deref(),
+            &axes,
+        )
     })
     .await;
 

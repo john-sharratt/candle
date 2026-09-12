@@ -6,7 +6,7 @@
 //! each naming a tool and its arguments:
 //!
 //! ```text
-//! {"tool":"say","intent":"that he will not get the ledger"}
+//! {"tool":"tell","to":"Hess","intent":"that he will not get the ledger"}
 //! {"tool":"read","what":"the muster board"}
 //! ```
 //!
@@ -56,7 +56,7 @@ impl Act {
     /// what intent, in a form a person reading the feed can scan.
     /// # The arguments are named when there is more than one
     ///
-    /// A single value needs no label — `say — the redoubt burned twice` reads
+    /// A single value needs no label — `shout — the redoubt burned twice` reads
     /// as what it is. Several bare values do not: `ask — Yaelis Vayne; where
     /// the data chips are` leaves a reader to infer which half is the person
     /// and which is the question, and for `act — steady them; Soren` or
@@ -74,6 +74,9 @@ impl Act {
         // otherwise render alphabetically and `manner` would precede `intent`.
         if let Some(t) = tools::by_name(self.tool) {
             for p in t.params {
+                if !shown(self.tool, p.name) {
+                    continue;
+                }
                 if let Some(v) = self.args.get(p.name) {
                     parts.push((p.name, render(v)));
                 }
@@ -92,6 +95,29 @@ impl Act {
                     .join("; ")
             ),
         }
+    }
+}
+
+/// The acts whose row names only some of what they were called with.
+///
+/// **`reflect` is its thought.** Its other two arguments are the reflection's
+/// input, not the act: the situation opens the reflection conversation and the
+/// feeling sets its register, and neither is what a reader of the row — or the
+/// character reading its own history — needs to see that it did. Listed in full,
+/// the row was three labelled paragraphs ahead of the arrow; the arrow's side is
+/// what the reflection came back with.
+///
+/// A side table rather than a field on [`tools::Tool`], the way
+/// `body::ANSWERS` is: it is a fact about how an act is recorded, which the
+/// catalog otherwise knows nothing about.
+const SUMMARY_SHOWS: &[(&str, &[&str])] = &[("reflect", &["inner_thoughts"])];
+
+/// Whether `param` belongs in `tool`'s row. Everything does, unless the tool
+/// is in [`SUMMARY_SHOWS`].
+fn shown(tool: &str, param: &str) -> bool {
+    match SUMMARY_SHOWS.iter().find(|(t, _)| *t == tool) {
+        Some((_, only)) => only.contains(&param),
+        None => true,
     }
 }
 
@@ -224,7 +250,7 @@ const CALL_CLOSE: &str = "</tool_call>";
 /// Outside a string a newline is structural — it is what separates one call
 /// from the next — so only the inside is touched. Borrowed and untouched when
 /// there is nothing to escape, which is every ordinary decode.
-fn escape_control_in_strings(s: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn escape_control_in_strings(s: &str) -> std::borrow::Cow<'_, str> {
     if !needs_repair(s) {
         return std::borrow::Cow::Borrowed(s);
     }
@@ -289,7 +315,7 @@ fn needs_repair(s: &str) -> bool {
 /// which the decode used.
 fn flatten(obj: serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
     let mut obj = obj;
-    // `{"name": "say", "arguments": {"intent": "…"}}` — the stencil's shape.
+    // `{"name": "shout", "arguments": {"intent": "…"}}` — the stencil's shape.
     let Some(Value::String(name)) = obj.remove("name") else {
         return obj;
     };
@@ -553,10 +579,10 @@ mod tests {
     #[test]
     fn a_function_block_value_survives_quotes_and_newlines() {
         let p = parse(
-            "<tool_call>\n<function=reflect>\n<parameter=inner_thoughts>\n\
+            "<tool_call>\n<function=reflect>\n<parameter=situation>\nthe command room, \
+             waiting\n</parameter>\n<parameter=inner_thoughts>\n\
              it heard me. It said \"no\" and meant it.\nI am not going to ask twice.\n\
              </parameter>\n<parameter=feeling>\nwary\n</parameter>\n\
-             <parameter=my_reflections>\nnothing has settled\n</parameter>\n\
              </function>\n</tool_call>",
         );
         assert_eq!(p.acts.len(), 1, "{:?}", p.rejected);
@@ -606,21 +632,25 @@ mod tests {
     /// never writes one, and the parameter list is closed by `</function>`.
     ///
     /// Dropping that argument cost the whole act. A live cast produced
-    /// *"Your `reflect` needed `my_reflections` and did not have it"* on turn
-    /// after turn, discarding two arguments the character had written in full
-    /// along with the third.
+    /// *"Your `reflect` needed `my_reflections` and did not have it"* — its
+    /// last parameter then — on turn after turn, discarding the arguments the
+    /// character had written in full along with it.
     #[test]
     fn a_last_argument_closed_by_the_function_tag_is_still_read() {
         let p = parse(
-            "<tool_call>\n<function=reflect>\n<parameter=inner_thoughts>\n\
-             the box has given up a fold\n</parameter>\n<parameter=feeling>\nweary\n</parameter>\n\
-             <parameter=my_reflections>\nnothing here is being kept</function>\n</tool_call>",
+            "<tool_call>\n<function=reflect>\n<parameter=situation>\nalone in the store\n\
+             </parameter>\n<parameter=inner_thoughts>\n\
+             the box has given up a fold\n</parameter>\n<parameter=feeling>\nweary</function>\n\
+             </tool_call>",
         );
         assert_eq!(p.acts.len(), 1, "{:?} / {:?}", p.rejected, p.narration);
         assert_eq!(p.acts[0].tool, "reflect");
-        assert_eq!(p.acts[0].args["feeling"], "weary");
         assert_eq!(
-            p.acts[0].args["my_reflections"], "nothing here is being kept",
+            p.acts[0].args["inner_thoughts"],
+            "the box has given up a fold"
+        );
+        assert_eq!(
+            p.acts[0].args["feeling"], "weary",
             "the argument the function tag closed was dropped"
         );
     }
@@ -630,7 +660,7 @@ mod tests {
     /// world should act on.
     #[test]
     fn an_unterminated_function_block_is_not_guessed_at() {
-        let p = parse("<tool_call>\n<function=say>\n<parameter=intent>\nhalf a thoug");
+        let p = parse("<tool_call>\n<function=tell>\n<parameter=intent>\nhalf a thoug");
         assert!(p.acts.is_empty(), "{:?}", p.acts);
         assert!(p.rejected.is_empty(), "{:?}", p.rejected);
     }
@@ -641,7 +671,7 @@ mod tests {
     fn narration_around_a_function_block_is_kept_apart_from_it() {
         let p = parse(
             "I should say something.\n\
-             <tool_call>\n<function=say>\n<parameter=intent>\nthat I am here\n</parameter>\n\
+             <tool_call>\n<function=shout>\n<parameter=intent>\nthat I am here\n</parameter>\n\
              </function>\n</tool_call>",
         );
         assert_eq!(p.acts.len(), 1, "{:?}", p.rejected);
@@ -661,7 +691,7 @@ mod tests {
         assert_eq!(p.acts[0].tool, "move_to");
 
         let wrapped = parse(
-            "<tool_call>\n{\"name\": \"say\", \"arguments\": {\"intent\": \"that I am here\"}}\n\
+            "<tool_call>\n{\"name\": \"shout\", \"arguments\": {\"intent\": \"that I am here\"}}\n\
              </tool_call>",
         );
         assert_eq!(wrapped.acts.len(), 1, "{:?}", wrapped.rejected);
@@ -709,7 +739,7 @@ mod tests {
             ("\u{1}start of heading", "\u{1}start of heading"),
         ] {
             let p = parse(&format!(
-                "{{\"name\": \"say\", \"arguments\": {{\"intent\": \"{raw}\"}}}}"
+                "{{\"name\": \"shout\", \"arguments\": {{\"intent\": \"{raw}\"}}}}"
             ));
             assert_eq!(p.rejected, Vec::new(), "{raw:?}: {:?}", p.rejected);
             assert_eq!(p.acts.len(), 1, "{raw:?}");
@@ -723,8 +753,8 @@ mod tests {
     #[test]
     fn a_newline_between_calls_is_left_alone() {
         let p = parse(
-            "{\"name\": \"say\", \"arguments\": {\"intent\": \"one\"}}\n\
-             {\"name\": \"say\", \"arguments\": {\"intent\": \"two\"}}",
+            "{\"name\": \"shout\", \"arguments\": {\"intent\": \"one\"}}\n\
+             {\"name\": \"shout\", \"arguments\": {\"intent\": \"two\"}}",
         );
         assert_eq!(p.rejected, Vec::new(), "{:?}", p.rejected);
         assert_eq!(p.acts.len(), 2);
@@ -736,7 +766,7 @@ mod tests {
     #[test]
     fn an_escaped_quote_does_not_end_the_string() {
         let p = parse(
-            "{\"name\": \"say\", \"arguments\": {\"intent\": \"he said \\\"go\\\"\nand went\"}}",
+            "{\"name\": \"shout\", \"arguments\": {\"intent\": \"he said \\\"go\\\"\nand went\"}}",
         );
         assert_eq!(p.rejected, Vec::new(), "{:?}", p.rejected);
         assert_eq!(p.acts[0].args["intent"], "he said \"go\"\nand went");
@@ -745,7 +775,7 @@ mod tests {
     /// The ordinary decode — every one of them — pays a scan and no allocation.
     #[test]
     fn a_clean_decode_is_not_rewritten() {
-        let clean = "{\"name\": \"say\", \"arguments\": {\"intent\": \"nothing to repair\"}}";
+        let clean = "{\"name\": \"shout\", \"arguments\": {\"intent\": \"nothing to repair\"}}";
         assert!(matches!(
             escape_control_in_strings(clean),
             std::borrow::Cow::Borrowed(_)
@@ -803,11 +833,11 @@ mod tests {
     fn the_bare_line_and_the_envelope_both_still_work() {
         let p = parse(
             "{\"tool\":\"read\",\"what\":\"the muster board\"}\n\
-             <tool_call>\n{\"name\": \"say\", \"arguments\": {\"intent\": \"that I heard it\"}}\n</tool_call>",
+             <tool_call>\n{\"name\": \"shout\", \"arguments\": {\"intent\": \"that I heard it\"}}\n</tool_call>",
         );
         assert_eq!(p.rejected, Vec::new(), "{:?}", p.rejected);
         let tools: Vec<&str> = p.acts.iter().map(|a| a.tool).collect();
-        assert_eq!(tools, vec!["read", "say"]);
+        assert_eq!(tools, vec!["read", "shout"]);
     }
 
     /// A required parameter is still required in the envelope — the grammar
@@ -834,9 +864,9 @@ mod tests {
 
     #[test]
     fn a_single_call_parses() {
-        let p = parse(r#"{"tool":"say","intent":"that I will not"}"#);
+        let p = parse(r#"{"tool":"shout","intent":"that I will not"}"#);
         assert_eq!(p.acts.len(), 1);
-        assert_eq!(p.acts[0].tool, "say");
+        assert_eq!(p.acts[0].tool, "shout");
         assert_eq!(p.acts[0].args["intent"], "that I will not");
         assert!(p.rejected.is_empty());
         assert!(p.narration.is_empty());
@@ -846,11 +876,11 @@ mod tests {
     fn several_calls_keep_their_order() {
         let p = parse(
             "{\"tool\":\"read\",\"what\":\"the muster board\"}\n\
-             {\"tool\":\"say\",\"intent\":\"that someone is coming\"}",
+             {\"tool\":\"shout\",\"intent\":\"that someone is coming\"}",
         );
         assert_eq!(
             p.acts.iter().map(|a| a.tool).collect::<Vec<_>>(),
-            vec!["read", "say"]
+            vec!["read", "shout"]
         );
     }
 
@@ -861,11 +891,11 @@ mod tests {
     fn prose_around_calls_is_kept_and_not_acted_on() {
         let p = parse(
             "I have had enough of this.\n\
-             {\"tool\":\"say\",\"intent\":\"that I am not handing over the ledger\",\"manner\":\"final\"}\n\
+             {\"tool\":\"shout\",\"intent\":\"that I am not handing over the ledger\",\"manner\":\"final\"}\n\
              He will not like that.",
         );
         assert_eq!(p.acts.len(), 1);
-        assert_eq!(p.acts[0].tool, "say");
+        assert_eq!(p.acts[0].tool, "shout");
         assert_eq!(
             p.narration,
             "I have had enough of this.\nHe will not like that."
@@ -891,7 +921,7 @@ mod tests {
     /// completely different fixes, so a malformed call is reported.
     #[test]
     fn a_malformed_call_is_rejected_rather_than_dropped() {
-        let p = parse(r#"{"tool":"say","intent":}"#);
+        let p = parse(r#"{"tool":"tell","intent":}"#);
         assert!(p.acts.is_empty());
         assert_eq!(p.rejected.len(), 1);
         assert!(matches!(p.rejected[0], Rejected::NotJson { .. }));
@@ -915,12 +945,12 @@ mod tests {
     /// character did not finish making.
     #[test]
     fn a_missing_required_parameter_is_a_rejection_not_a_best_effort_act() {
-        let p = parse(r#"{"tool":"say","manner":"flatly"}"#);
+        let p = parse(r#"{"tool":"shout","manner":"flatly"}"#);
         assert!(p.acts.is_empty());
         assert_eq!(
             p.rejected[0],
             Rejected::MissingParam {
-                tool: "say",
+                tool: "shout",
                 param: "intent"
             }
         );
@@ -979,7 +1009,7 @@ mod tests {
     /// An optional parameter's absence is fine — that is what optional means.
     #[test]
     fn an_absent_optional_parameter_is_not_a_rejection() {
-        let p = parse(r#"{"tool":"say","intent":"hello"}"#);
+        let p = parse(r#"{"tool":"shout","intent":"hello"}"#);
         assert_eq!(p.acts.len(), 1);
         assert!(p.rejected.is_empty());
     }
@@ -1047,8 +1077,8 @@ mod tests {
     /// reading is noise, and most acts a character takes have exactly one.
     #[test]
     fn a_single_argument_needs_no_label_to_be_understood() {
-        let p = parse(r#"{"tool":"say","intent":"the redoubt burned twice"}"#);
-        assert_eq!(p.acts[0].summary(), "say — the redoubt burned twice");
+        let p = parse(r#"{"tool":"shout","intent":"the redoubt burned twice"}"#);
+        assert_eq!(p.acts[0].summary(), "shout — the redoubt burned twice");
     }
 
     /// Built directly rather than parsed: no act in the catalog takes no

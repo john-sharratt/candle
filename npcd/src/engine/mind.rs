@@ -46,7 +46,7 @@
 //! bounds are deliberate and neither is the other's fallback.
 
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 
 use candle_conversation::projection::{Builder, GroupId, LayerId, TimelineId};
@@ -61,8 +61,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::engine::act::{self, Parsed};
+use crate::engine::dreams;
 use crate::engine::event::Event;
 use crate::engine::identity;
+use crate::engine::layers;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::reflect;
 use crate::engine::retention;
@@ -512,7 +514,80 @@ impl Minds {
              acts and identity selected per turn",
             projected.prompt.len()
         );
+        self.warm_dreams(&projected);
         *self.projection.write().unwrap() = Some(projected);
+    }
+
+    /// Every layer of the mind's projection, with how much of each this
+    /// character can read. `None` before the projection is loaded.
+    pub fn layer_counts(&self, npc_id: u64) -> Option<Vec<layers::LayerCount>> {
+        let (builder, live) = self.as_character(npc_id)?;
+        Some(layers::counts(
+            &self.engine.lock().unwrap(),
+            &builder,
+            live,
+            npc_id,
+        ))
+    }
+
+    /// The newest `limit` conversations of one layer this character can read.
+    /// `None` for a layer the projection does not declare, or before it is
+    /// loaded.
+    pub fn layer_page(&self, npc_id: u64, layer: &str, limit: usize) -> Option<layers::Page> {
+        let (builder, live) = self.as_character(npc_id)?;
+        layers::page(
+            &self.engine.lock().unwrap(),
+            &builder,
+            live,
+            npc_id,
+            layer,
+            limit,
+        )
+    }
+
+    /// The schema this character's conversations open with, and the live group
+    /// they are written to — so what the console reads of a layer is what the
+    /// character's own projection could gather from it.
+    ///
+    /// The projection lock is let go before anything takes the engine's.
+    fn as_character(&self, npc_id: u64) -> Option<(Builder, GroupId)> {
+        let projection = self.projection.read().unwrap();
+        let p = projection.as_ref()?;
+        Some((
+            dreams::scoped(&p.builder, npc_id, dreams::IN_ACTING),
+            p.group,
+        ))
+    }
+
+    /// Put every dream already kept on the normalized score band.
+    ///
+    /// A recalled line is scored against its own **hit level** — the score it
+    /// reaches when it is the answer — so the dream group's gate means what the
+    /// same numbers mean on `repo_map`. The levels are learned from the traffic
+    /// that reads them: every turn a character takes carries its own dreams tag,
+    /// so its seal teaches its own dreams, and a line that matches every turn
+    /// ends up with a high level and is discounted.
+    ///
+    /// **This is the cold start, not the level.** A dream is probed by its own
+    /// lines, and the vote is a sum over a probe's strongest tokens — a line is
+    /// one sentence where a turn probes with its whole tail, so self-match lands
+    /// well below what the room reaches and live traffic lifts it within a few
+    /// turns. It still beats the bare prior, which multiplies the raw vote rather
+    /// than normalizing it: recalled lines scored anywhere from four thousand to
+    /// a million on it.
+    ///
+    /// Dreams kept after this are warmed as they are written — see
+    /// [`dreams::keep`].
+    fn warm_dreams(&self, projected: &Projected) {
+        let Some(group) = projected.builder.id_for_group(dreams::GROUP) else {
+            return;
+        };
+        let warmed = self
+            .engine
+            .lock()
+            .unwrap()
+            .warm_group_normalization(projected.builder.schema(), group);
+        tracing::info!("dreams: {warmed} dream(s) put on the normalized score band");
     }
 
     /// Run one thinking step against a **throwaway** conversation, and report
@@ -559,6 +634,7 @@ impl Minds {
                     0,
                     persona.personality,
                     persona.world_id,
+                    persona.building,
                     thinking,
                 );
                 let seq = self
@@ -771,6 +847,24 @@ impl Minds {
         Arc::clone(&self.engine)
     }
 
+    /// Retire every conversation this character has, so the next one it opens
+    /// starts fresh instead of rejoining where it stopped.
+    ///
+    /// **Before the character has thought this process**, which is the only
+    /// place it is called: the conversation it holds in memory is opened on its
+    /// first turn, so at startup there is none to strand. The same retirement
+    /// [`Self::open_conversation`] runs on everything it did not rejoin — with
+    /// nothing kept — so there is one way a conversation is retired, not two.
+    ///
+    /// Tombstoned, not deleted: the turns become reclaimable and compaction
+    /// takes them. The character's memory, beliefs and relationships are
+    /// untouched; only the conversation it was carrying on is gone.
+    ///
+    /// Returns how many conversations it retired.
+    pub fn forget_conversations(&self, npc_id: u64) -> usize {
+        retire_superseded(&self.engine, npc_id, None)
+    }
+
     /// The model's own dialect and sampling, as captured at load.
     ///
     /// Handed out rather than reassembled by the caller for the reason it is
@@ -813,6 +907,7 @@ impl Minds {
         feeling: &str,
         domain: &str,
         sampled_axes: &[String],
+        on_reflection: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<reflect::Reflection> {
         // The mind's schema, so a reflection opens against the same sections a
         // live conversation does. Without it the two prompts are built by
@@ -838,7 +933,54 @@ impl Minds {
                 feeling,
                 domain,
                 sampled_axes,
+                on_reflection,
             )
+    }
+
+    /// Dream a brief and keep the dream — see [`crate::engine::dreams`].
+    ///
+    /// Two conversations, one after the other, neither of them this
+    /// character's live one: the dream is decoded in a throwaway conversation
+    /// and written, a line to a turn, into one of its own on the dream layer.
+    /// Nothing here touches [`Self::live`], so a character mid-decode is not
+    /// waited on.
+    pub fn dream(
+        &self,
+        npc_id: u64,
+        persona: &Persona<'_>,
+        brief: &str,
+        assumption: &str,
+    ) -> anyhow::Result<dreams::Kept> {
+        let projected = self.projection.read().unwrap();
+        let p = projected
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no schema, so no dream layer to keep a dream in"))?;
+        let story = dreams::dream(&self.engine, &self.base_config, p, npc_id, persona, brief)?;
+        dreams::keep(
+            &self.engine,
+            &self.base_config,
+            p,
+            npc_id,
+            assumption,
+            &story,
+        )
+    }
+
+    /// A sample of the axes this character has dreamt along — see
+    /// [`dreams::sample_axes`].
+    pub fn dreamt_axes(&self, npc_id: u64, n: usize) -> Vec<String> {
+        dreams::sample_axes(&self.engine, npc_id, n)
+    }
+
+    /// How many dreams this character has kept.
+    pub fn dreams_kept(&self, npc_id: u64) -> usize {
+        dreams::count(&self.engine, npc_id)
+    }
+
+    /// Whether this daemon can reflect at all: a mind that authors the
+    /// questions, and a schema to ask them under.
+    pub fn can_reflect(&self) -> bool {
+        self.reflection.is_some() && self.projection.read().unwrap().is_some()
     }
 
     /// Rejoin this character's conversation, or open it a new one.
@@ -941,7 +1083,7 @@ impl Minds {
                 Some(p) => engine.resume_conversation_with_projection(
                     timeline,
                     &system,
-                    p.builder.clone(),
+                    dreams::scoped(&p.builder, npc_id, dreams::IN_ACTING),
                     cfg.clone(),
                 ),
                 None => engine.resume_conversation(timeline, &system, cfg.clone()),
@@ -1005,9 +1147,11 @@ impl Minds {
         let sequence = {
             let engine = self.engine.lock().unwrap();
             match projected {
+                // Its own dreams and nobody else's, a few lines deep — a turn
+                // in the room is reminded of one when something resonates.
                 Some(p) => engine.new_conversation_with_projection(
                     &system,
-                    p.builder.clone(),
+                    dreams::scoped(&p.builder, npc_id, dreams::IN_ACTING),
                     p.layer,
                     p.group,
                     cfg,
@@ -1162,6 +1306,7 @@ impl Minds {
                         npc_id,
                         persona.personality,
                         persona.world_id,
+                        persona.building,
                         identity::Deliberation::default(),
                     )
             })
@@ -1170,7 +1315,7 @@ impl Minds {
         // the schema's `tools` collection and a turn names the ones it can take
         // — the same set, under the same mode, `grammar_for` compiles the mask
         // from — so the list a character reads is never wider or narrower than
-        // what it can decode. A character alone reads no `say`; one standing at
+        // what it can decode. A character alone reads no `tell`; one standing at
         // a chronicle terminal reads the terminal's acts until it walks away.
         tools::show_within(&mut selection, Mode::Physical, within);
         let options = TurnOptions {
@@ -1178,11 +1323,45 @@ impl Minds {
             sampling: Some(self.sampling_for(identity::Deliberation::default())),
             selection,
             assistant_prefill: self.opening(identity::Deliberation::default()),
+            // **Inside its own dreams' scope.** A turn teaches the hit levels of
+            // the scopes its tags name, and the dream group is scoped to this
+            // character's tag — so without it a character's own turns, the only
+            // traffic its dreams are ever read against, would teach them
+            // nothing. See `Minds::warm_dreams`.
+            tags: vec![dreams::tag(npc_id)],
             ..Default::default()
         };
         let (response, timeline, watermark) = {
             let mut live = conversation.lock().unwrap();
             let response = live.sequence.send_turn_with_options(&perception, options)?;
+            // **Whether a dream reached this turn**, said in the log whenever
+            // one did. A dream is only worth having if it comes back, and it
+            // comes back by winning the gather rather than by being pasted in —
+            // so the only way to see it is to ask the projection what it held.
+            if let Some(ev) = live.sequence.projection_event(&response.stats) {
+                let recalled: Vec<(u64, f32)> = ev
+                    .selection
+                    .turns
+                    .iter()
+                    .filter(|t| t.layer == dreams::LAYER && t.selected)
+                    .filter_map(|t| Some((t.timeline?, t.score)))
+                    .collect();
+                if !recalled.is_empty() {
+                    let from: BTreeSet<u64> = recalled.iter().map(|(tl, _)| *tl).collect();
+                    // The scores too: whether a line came back because it
+                    // resonated or only because the group had room is the one
+                    // thing a gate on this layer would be set from.
+                    let scores: Vec<String> =
+                        recalled.iter().map(|(_, s)| format!("{s:.0}")).collect();
+                    tracing::info!(
+                        "npc {npc_id}: this turn was reminded of {} line(s) from {} of its \
+                         dream(s), scored {}",
+                        recalled.len(),
+                        from.len(),
+                        scores.join("/")
+                    );
+                }
+            }
             (response, live.sequence.timeline_id(), live.retired_through)
         };
         // **Retire whatever now sits below the horizon.**
@@ -1367,14 +1546,16 @@ fn resumable(engine: &Arc<Mutex<ConversationEngine>>, id: &str, frame: &str) -> 
 /// Failure is logged, never propagated — a tombstone that did not land leaves
 /// bulk on disk, and refusing to let a character think over its bookkeeping
 /// would be far worse.
+///
+/// Returns how many it retired.
 fn retire_superseded(
     engine: &Arc<Mutex<ConversationEngine>>,
     npc_id: u64,
     keep: Option<TimelineId>,
-) {
+) -> usize {
     let prefix = format!("npc-{npc_id}-day-");
     let Ok(engine) = engine.lock() else {
-        return;
+        return 0;
     };
     let stale: Vec<(TimelineId, String)> = engine
         .conversations_with_conv_id_prefix(&prefix)
@@ -1382,7 +1563,7 @@ fn retire_superseded(
         .filter(|(tl, _)| Some(*tl) != keep)
         .collect();
     if stale.is_empty() {
-        return;
+        return 0;
     }
     let mut retired = 0;
     for (tl, conv) in &stale {
@@ -1401,6 +1582,7 @@ fn retire_superseded(
              reclaimable"
         );
     }
+    retired
 }
 
 /// Tombstone a conversation's timeline.

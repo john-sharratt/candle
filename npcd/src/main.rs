@@ -105,6 +105,20 @@ struct Cli {
     /// console's polls.
     #[arg(long)]
     log_identity: bool,
+
+    /// Retire every character's conversation at startup, so each one opens a
+    /// fresh conversation instead of rejoining where it stopped.
+    ///
+    /// A changed prompt or tool set already does this on its own — a
+    /// conversation written under a different frame is superseded rather than
+    /// rejoined. This is for the change nothing fingerprints: sampling, the
+    /// engine, or simply wanting the cast to start the day clean.
+    ///
+    /// Only the conversations go. They are tombstoned, and compaction reclaims
+    /// them; each character's memory, beliefs, relationships and place in the
+    /// world are untouched.
+    #[arg(long)]
+    forget_conversations: bool,
 }
 
 /// How many routes across both tables sit at exactly this role, for the
@@ -624,6 +638,7 @@ async fn main() -> anyhow::Result<()> {
         runtime.clone(),
         engine::runtime::LoadPlan {
             world_ms: 0,
+            forget_conversations: cli.forget_conversations,
             cast,
             // Personalities, not the cast. A layer directory is named after a
             // personality — `layers/memory/zen/` — and a world's biographies
@@ -747,4 +762,18 @@ fn now_ms_i64() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Off unless asked for.** Retiring every character's conversation is not
+    /// something a restart may do by accident — a cast that forgot where it was
+    /// every time the daemon came back would never hold a conversation at all.
+    #[test]
+    fn conversations_are_forgotten_only_when_asked() {
+        assert!(!Cli::parse_from(["npcd"]).forget_conversations);
+        assert!(Cli::parse_from(["npcd", "--forget-conversations"]).forget_conversations);
+    }
 }
