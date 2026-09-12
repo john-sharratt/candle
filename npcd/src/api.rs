@@ -384,6 +384,11 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         )
         .route("/v1/npc/:nid/agency", Role::User, get(get_agency))
         .route("/v1/npc/:nid/agency/:sid", Role::User, put(put_strategy))
+        // Stops the character, runs the reflection's decodes, throws the
+        // conversation away.
+        // `User` for the same reason the portrait route is: it is *your own*
+        // character, and the handler refuses one that is not.
+        .route("/v1/npc/:nid/reflect", Role::User, post(post_reflect))
         .route(
             "/v1/npc/:nid/modulation",
             Role::User,
@@ -590,6 +595,113 @@ async fn get_npc(
             Json(v).into_response()
         }
         Err(e) => npc_err(e),
+    }
+}
+
+/// `POST /v1/npc/:nid/reflect` — stop a character and have it think once.
+///
+/// Runs two turns in a conversation that is **never persisted and tombstoned on
+/// the way out**: the first asks what comes to the character where it stands,
+/// the second asks it to describe a dream it has not had. The first answer is
+/// what a live tick would hand back to the character; the second is a brief for
+/// a dream that a separate conversation would decode.
+///
+/// **Serial.** It holds the request for every decode the reflection runs — the
+/// two questions, the loosed turn and the repair passes — and it stops every
+/// other character thinking while it runs, the same way the portrait route does.
+/// Reflecting is what a character does when it has already chosen to stand
+/// still, so the wait is not the fast clock blocking on a slow one.
+///
+/// The response is split into parts rather than returned as one blob because
+/// they have genuinely different audiences — see
+/// [`crate::engine::reflect::Reflection`].
+async fn post_reflect(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(nid): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let (_, owner) = match owner_of(&s, &headers).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let Ok(npc_id) = nid.parse::<u64>() else {
+        return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
+    };
+    // Ownership before anything expensive: a reflection costs several decodes
+    // and stops the cast, and neither should be spendable on somebody else's
+    // character.
+    if let Err(e) = s.npcs.read().await.get(npc_id, &owner) {
+        return npc_err(e);
+    }
+
+    // What is going through its head. Required, because it is the half of a
+    // reflection the character supplies and there is no sensible default for
+    // it — a reflection with nothing in it reflects on nothing.
+    let inner = body
+        .get("inner_thoughts")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if inner.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "inner_thoughts_required",
+            "say what is going through its head — a reflection needs something to be about",
+        );
+    }
+    let feeling = body
+        .get("feeling")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // Absent means rotate. Naming one is for a caller walking the space
+    // deliberately — a test, or a fill of a cell the corpus is thin in.
+    let domain = body
+        .get("domain")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // A SAMPLE of the character's existing axes, never all of them. Shown
+    // everything it has dreamt, a generator stops inventing and recombines.
+    let axes: Vec<String> = body
+        .get("sampled_axes")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let Some(rt) = s.runtime.clone() else {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_engine",
+            "this daemon has no engine",
+        );
+    };
+    // The decodes run on the engine thread. Off the async executor, because a
+    // blocking model call on a tokio worker stalls every other route.
+    let out = tokio::task::spawn_blocking(move || {
+        rt.reflect(npc_id, &inner, &feeling, domain.as_deref(), &axes)
+    })
+    .await;
+
+    match out {
+        Ok(Ok(r)) => Json(r).into_response(),
+        Ok(Err(e)) => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "reflect_failed",
+            &format!("{e}"),
+        ),
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reflect_panicked",
+            &format!("{e}"),
+        ),
     }
 }
 
@@ -2963,6 +3075,7 @@ mod tests {
                 ("/v1/npc/:nid/relationships/:eid", "user"),
                 ("/v1/npc/:nid/agency", "user"),
                 ("/v1/npc/:nid/agency/:sid", "user"),
+                ("/v1/npc/:nid/reflect", "user"),
                 ("/v1/npc/:nid/modulation", "user"),
                 // A portrait, and the bytes back. `user` rather than open: an
                 // id is a content hash and unguessable, and unguessable is not

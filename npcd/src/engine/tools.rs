@@ -28,15 +28,23 @@
 //! separate and is not reachable from here. [`tests::no_tool_writes_beliefs`]
 //! holds the line.
 //!
-//! # Examples are not documentation
+//! # What the character reads
 //!
-//! Each tool carries `examples` — short trajectories showing the tool chosen
-//! against a concrete situation. These are prefilled into a calibration layer at
-//! startup (the `Calibrating` load step), which is what makes tool *selection*
-//! work rather than merely tool *invocation*. A tool with no examples is
-//! uncalibrated and selects measurably worse, so an example-less tool is a build
-//! failure here rather than a quiet quality regression.
+//! Every tool is installed at startup as one member of the mind's `tools`
+//! collection — its call, what it is for, and what each parameter takes; see
+//! [`entry`] and [`install`]. Each turn then shows exactly the members its
+//! grammar offers ([`show_within`]), so the list a character reads and the mask
+//! it decodes under are one computation over the same world. A grammar alone
+//! guarantees the shape of a call and says nothing about what an act is *for*,
+//! and a character that has never read a word about `reflect` does not reflect.
+//!
+//! Each tool also carries `examples` — a concrete situation, the call a
+//! well-calibrated character makes in it, and why that call rather than a
+//! neighbouring one. They are what an act is written against, not what the
+//! model reads; a tool with none has not been thought through, so an
+//! example-less tool is a build failure here rather than a quiet regression.
 
+use candle_conversation::projection::{Builder, SelectionRule, SelectionState};
 use candle_conversation::stencil::{Param as StencilParam, ParamType, ToolSpec};
 use serde::Serialize;
 
@@ -90,11 +98,10 @@ pub enum Availability {
     Pictorial,
     /// Only while somebody else is in the room.
     ///
-    /// **Offered with the situation, not with the prompt.** Who is standing
-    /// next to you changes every tick and the system prompt is written once, so
-    /// a tool that depends on company cannot live there — it arrives beside
-    /// *where you are*, computed from the world, for the same reason the percept
-    /// does.
+    /// **Decided per turn, from the world.** Who is standing next to you
+    /// changes every tick, so whether this is offered is computed from the room
+    /// on each turn — in the grammar, in the prompt's act list (see
+    /// [`show_within`]), and in the situation's line naming who is here.
     ///
     /// Absent rather than present-and-refused, which is the same discipline
     /// `MessagingOnly` follows: a character alone in a corridor should never be
@@ -839,10 +846,10 @@ impl Mode {
 
 /// The tools offered in a mode, whatever the character's situation.
 ///
-/// **What goes in the system prompt.** The prompt is written once when a
-/// conversation opens and is the prefix every turn is read inside, so only
-/// tools that are always there belong in it — anything that comes and goes
-/// would be a promise the prompt could not keep.
+/// **What the rendered prompt lists** — the prompt a daemon with no mind uses,
+/// written once when a conversation opens, so only tools that are always there
+/// belong in it. Under the mind's projection every tool is installed and each
+/// turn shows the ones it can take; see [`show_within`].
 pub fn for_mode(mode: Mode) -> Vec<&'static Tool> {
     for_body(mode, true)
 }
@@ -895,6 +902,103 @@ pub fn nearby(mode: Mode) -> Vec<&'static Tool> {
 
 pub fn by_name(name: &str) -> Option<&'static Tool> {
     CATALOG.iter().find(|t| t.name == name)
+}
+
+/// The system-prompt collection every tool is installed into — see [`install`].
+pub const COLLECTION: &str = "tools";
+
+/// A tool's member name in [`COLLECTION`].
+pub fn member(tool: &str) -> String {
+    format!("{COLLECTION}/{tool}")
+}
+
+/// `say(intent, manner?) — Say something aloud…` — a tool as one line: the
+/// call, with optional parameters marked, and what it is for.
+pub fn one_line(t: &Tool) -> String {
+    let params: Vec<String> = t
+        .params
+        .iter()
+        .map(|p| match p.required {
+            true => p.name.to_string(),
+            false => format!("{}?", p.name),
+        })
+        .collect();
+    format!("{}({}) — {}", t.name, params.join(", "), t.description)
+}
+
+/// A tool as the character reads it in the prompt: [`one_line`], then each
+/// parameter and what it takes, one per line.
+///
+/// **The parameters are the half a grammar cannot teach.** The mask forces
+/// `intent` to be present; only its description says that it takes what you
+/// *mean* rather than the sentence, which is the whole of this module's first
+/// rule. No trailing newline — the collection's glue separates entries.
+pub fn entry(t: &Tool) -> String {
+    let mut s = one_line(t);
+    for p in t.params {
+        let optional = if p.required { "" } else { " (optional)" };
+        s.push_str(&format!("\n  {}{optional}: {}", p.name, p.description));
+    }
+    s
+}
+
+/// Install `tools` into the schema's [`COLLECTION`], one member each, and make
+/// it selected by name — so nothing shows until a turn names it.
+///
+/// **Every tool, whatever it needs.** What a body can do changes every tick
+/// with who is here, what it carries and where it stands, and the system prompt
+/// is sealed once; so the prompt holds all of them and each turn chooses. A
+/// collection scored by provenance would show whichever acts looked relevant,
+/// which is not the same set as the acts that are possible — see
+/// [`show_within`] for the one that is.
+///
+/// Forced to [`SelectionRule::Named`] whatever the schema declared, because the
+/// selector is this module's to name: a collection authored `always_visible`
+/// would offer a character alone in a corridor someone to `tell`.
+///
+/// `installed` is called after each one, with how many are in so far.
+pub fn install<'a>(
+    builder: &mut Builder,
+    tools: impl IntoIterator<Item = &'a Tool>,
+    mut installed: impl FnMut(usize, &Tool),
+) -> anyhow::Result<usize> {
+    let Some(cid) = builder.id_for_system_collection(COLLECTION) else {
+        anyhow::bail!(
+            "the schema declares no `{COLLECTION}` collection — a character would be held to acts \
+             it has never read a word about"
+        );
+    };
+    builder
+        .set_collection_selection(
+            COLLECTION,
+            SelectionRule::Named {
+                selector: COLLECTION.to_string(),
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("selecting `{COLLECTION}` by name: {e}"))?;
+    let mut n = 0;
+    for t in tools {
+        builder
+            .add_section_to_collection(cid, member(t.name), entry(t), 100.0)
+            .map_err(|e| anyhow::anyhow!("installing `{}` into `{COLLECTION}`: {e}", t.name))?;
+        n += 1;
+        installed(n, t);
+    }
+    Ok(n)
+}
+
+/// Show exactly these tools on a turn, replacing whatever it showed before.
+/// A name that was never installed shows nothing.
+pub fn show<'a>(selection: &mut SelectionState, tools: impl IntoIterator<Item = &'a str>) {
+    selection.select_all(COLLECTION, tools.into_iter().map(member));
+}
+
+/// Show the tools a character standing *here* can take — exactly the acts
+/// [`specs_within`] builds the turn's grammar from, so the prompt can neither
+/// offer an act the mask refuses nor leave out one it allows.
+pub fn show_within(selection: &mut SelectionState, mode: Mode, within: &Within) {
+    let specs = specs_within(mode, within);
+    show(selection, specs.iter().map(|s| s.name.as_str()));
 }
 
 /// How many acts one turn may contain.
@@ -2807,5 +2911,118 @@ mod tests {
                 t.name
             );
         }
+    }
+
+    /// A schema with an empty `tools` collection, authored the wrong way round
+    /// on purpose — `install` has to make it named. The frame section is there
+    /// because a system prompt of nothing but an empty collection is refused by
+    /// the builder before `install` ever sees it.
+    const PROMPT: &str = "system_prompt:\n  items:\n    - kind: section\n      id: frame\n      \
+                          content: hello\n    - kind: collection\n      name: tools\n      \
+                          selection: { kind: always_visible }\n      sections: []\nlayers: []\n";
+
+    /// **Every act, and both of the reflection's answers, go into one
+    /// collection**, and it ends up selected by name whatever the schema said.
+    /// A name shared between the two lists would fail the install, which is
+    /// why the reflection's calls are checked here too.
+    #[test]
+    fn every_tool_installs_as_a_member_of_the_tools_collection() {
+        use candle_conversation::projection::SystemPromptItem;
+        let mut b = Builder::from_yaml(PROMPT).unwrap();
+        let all: Vec<&Tool> = CATALOG
+            .iter()
+            .chain(crate::engine::reflect::ASKED)
+            .collect();
+        let mut counted = Vec::new();
+        let n = install(&mut b, all.iter().copied(), |i, _| counted.push(i)).unwrap();
+        assert_eq!(n, all.len());
+        assert_eq!(counted, (1..=all.len()).collect::<Vec<_>>());
+        for t in &all {
+            assert!(
+                b.id_for_system_section(&member(t.name)).is_some(),
+                "`{}` was not installed",
+                t.name
+            );
+        }
+        let rule = b.schema().system_prompt.items.iter().find_map(|i| match i {
+            SystemPromptItem::Collection(c) if c.name == COLLECTION => Some(c.selection.clone()),
+            _ => None,
+        });
+        assert!(
+            matches!(rule, Some(SelectionRule::Named { ref selector }) if selector == COLLECTION),
+            "{rule:?}"
+        );
+    }
+
+    /// Without the collection there is nowhere to put them, and a character
+    /// held to acts it has never read about is the failure this exists to end
+    /// — so it is refused rather than skipped.
+    #[test]
+    fn a_schema_without_the_collection_is_refused() {
+        let yaml = "system_prompt:\n  items:\n    - kind: section\n      id: frame\n      \
+                    content: hello\nlayers: []\n";
+        let mut b = Builder::from_yaml(yaml).unwrap();
+        assert!(install(&mut b, CATALOG.iter(), |_, _| {}).is_err());
+    }
+
+    /// **What a turn shows is exactly what its grammar offers**, and it moves
+    /// with the room: alone there is nobody to `say` anything to, so `say` is
+    /// not shown; with company it is. `reflect` needs nothing, so it is always
+    /// there.
+    #[test]
+    fn a_turn_shows_exactly_the_acts_its_grammar_offers() {
+        let shown = |within: &Within| {
+            let mut sel = SelectionState::new();
+            show_within(&mut sel, Mode::Physical, within);
+            sel.members(COLLECTION).to_vec()
+        };
+        for within in [Within::nowhere(), Within::among(&["Maker-02"])] {
+            let offered: Vec<String> = specs_within(Mode::Physical, &within)
+                .iter()
+                .map(|s| member(&s.name))
+                .collect();
+            assert_eq!(shown(&within), offered);
+        }
+        let alone = shown(&Within::nowhere());
+        let company = shown(&Within::among(&["Maker-02"]));
+        assert!(!alone.contains(&member("say")), "{alone:?}");
+        assert!(company.contains(&member("say")), "{company:?}");
+        assert!(alone.contains(&member("reflect")) && company.contains(&member("reflect")));
+    }
+
+    /// Showing is a replacement, not an addition: a reflection turn that shows
+    /// `dream` does not still show the `reflection` it asked for a turn ago.
+    #[test]
+    fn showing_replaces_what_was_shown() {
+        let mut sel = SelectionState::new();
+        show(&mut sel, ["reflection"]);
+        show(&mut sel, ["dream"]);
+        assert_eq!(sel.members(COLLECTION), &[member("dream")]);
+    }
+
+    /// An entry names every parameter with what it takes — the half of a tool
+    /// the grammar cannot teach — and says which are optional.
+    #[test]
+    fn an_entry_names_every_parameter_and_what_it_takes() {
+        for t in CATALOG.iter() {
+            let e = entry(t);
+            assert!(e.starts_with(&one_line(t)), "{e}");
+            for p in t.params {
+                assert!(
+                    e.contains(&format!("{}: {}", p.name, p.description))
+                        || e.contains(&format!("{} (optional): {}", p.name, p.description)),
+                    "`{}` does not describe `{}`",
+                    t.name,
+                    p.name
+                );
+            }
+            assert!(
+                !e.ends_with('\n'),
+                "the glue separates entries, not the entry"
+            );
+        }
+        let say = entry(by_name("say").unwrap());
+        assert!(say.contains("\n  manner (optional): "), "{say}");
+        assert!(say.contains("\n  intent: "), "{say}");
     }
 }

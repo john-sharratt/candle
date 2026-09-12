@@ -37,13 +37,14 @@
 //! because a thing that happened stays happened.
 
 use npc_map::delta::Delta;
-use npc_map::world::World;
+use npc_map::world::{Happening, World};
 
 use crate::engine::event::{EventKind, Salience};
 use crate::engine::perceived::{digest, situation, Perceived};
 use crate::engine::reach;
 use crate::engine::tick::Scheduler;
 use crate::engine::tools::{self, Mode};
+use crate::engine::whereabouts;
 use crate::sim::phone;
 use crate::world::binding::Bindings;
 use crate::world::Hosted;
@@ -82,10 +83,35 @@ pub fn carried(world: &World, sim: &crate::sim::Sim, delta: &Delta) -> Vec<Perce
             text.push_str("\n\n");
             text.push_str(&owed);
         }
+        if let Some(floor) = arrival_line(world, delta) {
+            text.push_str("\n\n");
+            text.push_str(&floor);
+        }
         out.push(situation(text));
     }
     out.extend(digest(world, &delta.events));
     out
+}
+
+/// Who else is on the floor a body has just arrived on, as a line it reads.
+///
+/// **On arrival only.** The situation is re-sent whenever it changes, so a live
+/// roster in it would change every time anybody on the floor moved and push a
+/// fresh situation at every body standing on it. Arriving is the moment a
+/// character decides where to go next, so it is told then, once; the next
+/// situation, sent for some other reason, carries none of it. The room it
+/// arrived in is left out — who is standing there is [`company_line`]'s. See
+/// [`whereabouts`] for why a character is told this at all.
+fn arrival_line(world: &World, delta: &Delta) -> Option<String> {
+    let arrived = delta
+        .events
+        .iter()
+        .any(|w| w.mine() && matches!(w.what, Happening::GotThere { .. }));
+    if !arrived {
+        return None;
+    }
+    let here = world.actor(&delta.who)?.at.clone();
+    whereabouts::line(world, &delta.who, &[&here])
 }
 
 /// Who is waiting on an answer from this character, as a line it reads.

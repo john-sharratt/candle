@@ -33,7 +33,7 @@
 
 use candle_conversation::stencil::{CallStyle, ToolCallEnvelope};
 
-use crate::engine::tools::{Mode, Tool};
+use crate::engine::tools::{one_line, Mode, Tool};
 
 /// What a character needs to know about itself to think as itself.
 ///
@@ -54,6 +54,13 @@ pub struct Persona<'a> {
     pub world_id: &'a str,
     /// The immutable core — who this is. From the personality template.
     pub identity: &'a str,
+    /// The personality's anchor, as prose.
+    ///
+    /// Rendered only by the stances that do not gather — see
+    /// [`build_for`]. An acting turn receives the same text through the
+    /// projection's `ANCHOR` collection, and rendering it here as well would
+    /// print it twice.
+    pub anchor: &'a str,
     /// How they speak and carry themselves.
     pub manner: &'a str,
     /// What they hold true. Read-only to the character, by construction.
@@ -168,6 +175,64 @@ pub fn building(place: &str) -> String {
     )
 }
 
+/// What kind of turn a character is taking, and the one place the prompt forks.
+///
+/// Everything above the fork — who this is, the world, the building, the mood —
+/// is read the same way whatever the character is doing. What differs is here,
+/// and it differs by *contradiction* rather than by degree: [`Stance::Acting`]
+/// forbids inventing a person and [`Stance::Dreaming`] requires it; acting says
+/// a call is the whole reply and dreaming has no call in it. Both can never be
+/// emitted at once, which is why this is an enum rather than a flag that adds a
+/// paragraph.
+///
+/// Mirrors the `stance` selector in the mind's `projection.yaml`. The two must
+/// say the same thing: this is the path that actually decodes (see
+/// [`crate::engine::mind::Minds::open_conversation`]), and a projection whose
+/// branches disagreed with these would describe a different character.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Stance {
+    /// Awake in a room, acting through the grammar. The standing case.
+    #[default]
+    Acting,
+    /// Stopped, thinking, with nothing to call.
+    ///
+    /// **Deliberately silent on invention.** The two turns this serves pull
+    /// opposite ways — the first is about the real situation and must stay
+    /// grounded, the second writes a dream brief and must invent — so the frame
+    /// rules on neither and the turns carry their own.
+    Reflecting,
+    /// Asleep, running one dream. None of the acting instruction survives here.
+    Dreaming,
+}
+
+impl Stance {
+    /// Whether a turn under this stance can call acts.
+    ///
+    /// The one question the rest of the engine asks: a stance with no acts
+    /// needs no catalog, no grammar and no envelope, and handing it any of the
+    /// three is how a reflection ends up emitting `<tool_call>`.
+    pub fn acts(self) -> bool {
+        matches!(self, Stance::Acting)
+    }
+
+    /// This stance's option in the mind's [`STANCE_SELECTOR`].
+    pub fn id(self) -> &'static str {
+        match self {
+            Stance::Acting => "acting",
+            Stance::Reflecting => "reflecting",
+            Stance::Dreaming => "dreaming",
+        }
+    }
+}
+
+/// The selector in the mind's `projection.yaml` that picks a turn's stance.
+///
+/// **Unselected it falls to its default, `acting`** — which is right for an
+/// acting turn and wrong for everything else: a reflection left on it reads
+/// "never invent a room, a person, or an event" in the conversation that is
+/// about to be asked for a dream.
+pub const STANCE_SELECTOR: &str = "stance";
+
 /// Everything every character reads, whoever they are.
 ///
 /// **Identical for every character in the daemon**, which is what makes it the
@@ -176,6 +241,159 @@ pub fn building(place: &str) -> String {
 /// and mixing them in is what made a fifty-Maker vault hold fifty copies of the
 /// same two thousand words.
 pub fn frame(mode: Mode, tools: &[&Tool], env: &ToolCallEnvelope) -> String {
+    frame_for(Stance::Acting, mode, tools, env)
+}
+
+/// [`frame`] under a chosen [`Stance`].
+///
+/// The acting branch is byte-identical to what this file emitted before the
+/// fork, so nothing about a character standing in a room changed.
+pub fn frame_for(stance: Stance, mode: Mode, tools: &[&Tool], env: &ToolCallEnvelope) -> String {
+    match stance {
+        Stance::Acting => frame_acting(mode, tools, env),
+        Stance::Reflecting => frame_reflecting(tools, env),
+        Stance::Dreaming => ASLEEP.to_string(),
+    }
+}
+
+/// How many tools a catalog needs before its category headings earn their lines.
+const GROUPING_FLOOR: usize = 4;
+
+/// One tool per line, grouped by category — the vocabulary block.
+///
+/// Shared by every stance that offers a vocabulary rather than written out
+/// twice. The acting frame and the reflection frame differ in what they are for
+/// and not in how a tool reads, and two copies of this loop would be two places
+/// for a parameter to stop being listed.
+pub fn catalog(tools: &[&Tool]) -> String {
+    let mut s = String::with_capacity(1024);
+    // **Headings only when there is something to navigate.** They exist so a
+    // character can find one act among twenty; below that they are two headings
+    // over two lines, which reads as a taxonomy that means something and means
+    // nothing. The reflection's vocabulary is two entries and was getting
+    // `Attention` and `Dreaming` as section titles for one item each.
+    let grouped = tools.len() > GROUPING_FLOOR;
+    let mut category = "";
+    for t in tools {
+        if grouped && t.category != category {
+            category = t.category;
+            s.push_str("  ");
+            s.push_str(category);
+            s.push('\n');
+        }
+        s.push_str("    ");
+        s.push_str(&one_line(t));
+        s.push('\n');
+    }
+    s
+}
+
+/// The frame for a character that has stopped and is answering calls.
+///
+/// **A reflection is an exchange, not an essay.** Something asks, and the
+/// character answers in the same shape everything else in this engine answers
+/// in — a named call with named arguments, held to a grammar. That is what the
+/// checkpoint is tuned for and what it reliably produces: the format failures
+/// this conversation kept hitting, the labels it dropped and the paragraphs it
+/// cut short, were all the cost of asking for prose in a bespoke layout instead.
+///
+/// The stopped framing still applies to every word of it. Nothing said here is
+/// heard, nothing is an act, and nothing reaches the world — the calls are the
+/// shape of the answer, not a way of doing anything.
+fn frame_reflecting(tools: &[&Tool], env: &ToolCallEnvelope) -> String {
+    let mut s = String::with_capacity(2048);
+    s.push_str(STOPPED);
+    s.push_str("WHAT YOU ARE ASKED\n\n");
+    s.push_str(&catalog(tools));
+    s.push_str(
+        "\nEach one is asked of you in turn. Answer the one you were just asked and nothing \
+         else.\n\n",
+    );
+    s.push_str("HOW TO ANSWER\n\n");
+    s.push_str(&format!(
+        "{}\n\n{}\n\n",
+        match env.style {
+            CallStyle::FunctionBlock =>
+                "One block. Name what you are answering, then give each part its own element. \
+                 Values are plain text — write them as you would say them, with no quoting and \
+                 no escaping, and they may run to several lines.",
+            _ => "One JSON object. Nothing else.",
+        },
+        env.render(
+            "dream",
+            &[
+                ("assumption", "that the ground bears your weight"),
+                (
+                    "brief",
+                    "You are four levels down when the floor stops being there…"
+                ),
+            ],
+        ),
+    ));
+    s
+}
+
+/// The frame for a character that has stopped.
+///
+/// Returned prose lands back in the character's own context and competes in the
+/// next gather, so the register is load-bearing: an inclination is weighed
+/// against everything else, and an imperative is the one shape that gets obeyed
+/// instead. "You are thinking of challenging him" and "Challenge him" carry the
+/// same information and only one of them is safe to hand back.
+const STOPPED: &str = "\
+You are not an assistant and there is nobody to help. You are this person, living through \
+this, with your own reasons.
+
+You have stopped. You are standing still with your own head, and nothing here reaches \
+anybody: nothing you say is heard, nothing you say is an act, and there is nothing to call. \
+No acts, no tools, no reply to anybody.
+
+What comes to you while you are stopped comes the way things come when you are not working \
+at them — sideways, out of proportion, attached to the wrong thing. You are not solving \
+anything and nobody has asked you a question.
+
+Speak as it occurs to you, not as a conclusion. What you arrive at is something you find \
+yourself inclined toward, not something you have decided and certainly not something you \
+are telling yourself to do.
+
+";
+
+/// The frame for a character that is dreaming.
+///
+/// Every rule is one a test produced by failing without it: without the first a
+/// decode wrote *"dreams don't allow understanding while they're happening"*
+/// into the prose, reciting its own instruction; without the third one scar
+/// became handwriting across six levels; without the last it ended on a stack of
+/// similes reaching for significance.
+const ASLEEP: &str = "\
+You are not an assistant and there is nobody to help. You are this person, living through \
+this, with your own reasons.
+
+You are asleep, and this is the dream. You are inside it. There is nothing to call and \
+nothing to do: no acts, no tools, no reply to anybody. Only what happens to you, in the \
+order it happens. Write it in the present tense, as yourself, as it happens.
+
+The word \"dream\" does not appear, and neither does dreaming, meaning, understanding, or \
+what any of this might signify. Nothing here stops to comment on itself. As far as you are \
+concerned this is simply your day.
+
+The strange thing stays exactly as large as it is. It does not spread — not to another \
+room, another document, another object, or another part of you. One thing, that size, no \
+larger. Nothing arrives to explain it and nothing else joins in.
+
+Everything that is not the strange thing behaves completely normally: the light, the doors, \
+the work in your hands, the weight of your own body, and every person in it going about \
+their day exactly as they always do.
+
+Anybody who appears is somebody you already know. You do not meet new people here.
+
+It ends on something happening — an action, an image, a state. Never on a thought, a \
+question, or a realisation, and never on what any of it meant. It may stop before anything \
+is settled, and usually does.
+
+";
+
+fn frame_acting(mode: Mode, tools: &[&Tool], env: &ToolCallEnvelope) -> String {
     let mut s = String::with_capacity(4096);
 
     // ── the standing instruction ───────────────────────────────────────────
@@ -241,33 +459,7 @@ pub fn frame(mode: Mode, tools: &[&Tool], env: &ToolCallEnvelope) -> String {
 
     // ── the vocabulary ─────────────────────────────────────────────────────
     s.push_str("WHAT YOU CAN DO\n\n");
-    let mut category = "";
-    for t in tools {
-        if t.category != category {
-            category = t.category;
-            s.push_str("  ");
-            s.push_str(category);
-            s.push('\n');
-        }
-        s.push_str("    ");
-        s.push_str(t.name);
-        s.push('(');
-        let params: Vec<String> = t
-            .params
-            .iter()
-            .map(|p| {
-                if p.required {
-                    p.name.to_string()
-                } else {
-                    format!("{}?", p.name)
-                }
-            })
-            .collect();
-        s.push_str(&params.join(", "));
-        s.push_str(") — ");
-        s.push_str(t.description);
-        s.push('\n');
-    }
+    s.push_str(&catalog(tools));
     s.push('\n');
 
     // ── the call format ────────────────────────────────────────────────────
@@ -347,7 +539,42 @@ pub fn frame(mode: Mode, tools: &[&Tool], env: &ToolCallEnvelope) -> String {
 /// string per character, which is what made a vault of Makers hold a copy of the
 /// building each.
 pub fn build(p: &Persona<'_>, mode: Mode, tools: &[&Tool], env: &ToolCallEnvelope) -> String {
+    build_for(Stance::Acting, p, mode, tools, env)
+}
+
+/// [`build`] under a chosen [`Stance`].
+///
+/// Everything before the frame is stance-independent on purpose — a character
+/// dreaming is the same character, with the same beliefs and the same building,
+/// and a reflection that read a different identity than the tick before it would
+/// be a different person thinking.
+pub fn build_for(
+    stance: Stance,
+    p: &Persona<'_>,
+    mode: Mode,
+    tools: &[&Tool],
+    env: &ToolCallEnvelope,
+) -> String {
     let mut s = character(p);
+
+    // **The anchor, for the stances that have no gather to deliver it.**
+    //
+    // An acting turn opens against the mind's projection and pins the `ANCHOR`
+    // collection member for its personality, so the anchor reaches it that way
+    // and must not be rendered here as well. A reflection and a dream build
+    // their whole prompt from this function and select nothing, so for them the
+    // frame is the only route there is.
+    //
+    // Placed after `character` and before the world on purpose: it is the lens
+    // the world is read through. A Maker told what it is — that it writes a
+    // world and does not live in one — reads the setting below as its subject.
+    // Told nothing, it reads the same words as its surroundings, which is what
+    // it did.
+    if !stance.acts() && !p.anchor.trim().is_empty() {
+        s.push_str(p.anchor.trim());
+        s.push_str("\n\n");
+    }
+
     if !p.world.trim().is_empty() {
         s.push_str("The world you live in:\n");
         s.push_str(p.world.trim());
@@ -368,7 +595,7 @@ pub fn build(p: &Persona<'_>, mode: Mode, tools: &[&Tool], env: &ToolCallEnvelop
         s.push_str(p.situation.trim());
         s.push_str("\n\n");
     }
-    s.push_str(&frame(mode, tools, env));
+    s.push_str(&frame_for(stance, mode, tools, env));
     s
 }
 
@@ -389,6 +616,7 @@ mod tests {
             personality: "quartermaster",
             world_id: "besieged-city",
             identity: "A quartermaster who has outlived two garrisons.",
+            anchor: "You keep what a siege eats, and you count it twice.",
             manner: "Short sentences. Does not repeat herself.",
             beliefs: &[],
             relationships: &[],
@@ -397,6 +625,70 @@ mod tests {
             world: "A besieged city in its fourth month.",
             place: "",
         }
+    }
+
+    /// **The anchor reaches a reflection through the frame and an acting turn
+    /// through the projection, and it must arrive exactly once either way.**
+    ///
+    /// An acting turn pins the `ANCHOR` collection member by slug, so rendering
+    /// it here as well would put the same paragraph in the prompt twice. A
+    /// reflection selects nothing, so if the frame does not carry it the
+    /// character never reads a word of who it is — which is what was happening,
+    /// and what sent a Maker looking for its own colleagues inside the story it
+    /// writes.
+    #[test]
+    fn the_anchor_is_rendered_for_the_stances_that_do_not_gather() {
+        let p = persona();
+        let anchor = "You keep what a siege eats, and you count it twice.";
+
+        let acting = build_for(
+            Stance::Acting,
+            &p,
+            Mode::Physical,
+            &for_mode(Mode::Physical),
+            &env(),
+        );
+        assert!(
+            !acting.contains(anchor),
+            "an acting turn gathers the anchor; the frame must not print it too"
+        );
+
+        for stance in [Stance::Reflecting, Stance::Dreaming] {
+            let s = build_for(stance, &p, Mode::Physical, &[], &env());
+            assert!(s.contains(anchor), "{stance:?} carries no anchor: {s}");
+            assert_eq!(
+                s.matches(anchor).count(),
+                1,
+                "{stance:?} printed the anchor more than once"
+            );
+        }
+    }
+
+    /// The anchor is the lens the world is read through, so it has to be in
+    /// front of the world rather than after it.
+    #[test]
+    fn the_anchor_comes_before_the_world_it_frames() {
+        let p = persona();
+        let s = build_for(Stance::Reflecting, &p, Mode::Physical, &[], &env());
+        let anchor_at = s.find("You keep what a siege eats").expect("anchor");
+        let world_at = s.find("The world you live in:").expect("world");
+        assert!(
+            anchor_at < world_at,
+            "the world is framed before the lens is"
+        );
+    }
+
+    /// **Each stance names its option in the mind's selector.** A turn selects
+    /// its branch by this string, and one that matched no option would fall
+    /// silently to `acting` — which is what every reflection did, reading
+    /// "never invent a person" while being asked for a dream.
+    #[test]
+    fn each_stance_names_its_option_in_the_minds_selector() {
+        assert_eq!(STANCE_SELECTOR, "stance");
+        assert_eq!(Stance::Acting.id(), "acting");
+        assert_eq!(Stance::Reflecting.id(), "reflecting");
+        assert_eq!(Stance::Dreaming.id(), "dreaming");
+        assert_eq!(Stance::default(), Stance::Acting, "the selector's default");
     }
 
     /// **A character that has not been told the rooms exist cannot name one.**

@@ -104,12 +104,19 @@ fn intent(agency: &[AuthoredStrategy]) -> Option<String> {
 
 /// Build the prompt-facing persona from an authored record.
 ///
-/// `world` is the world's own description, resolved by the caller — this module
-/// does not reach into the registry, so it stays testable without one.
-pub fn of(n: &NpcPayload, world: &str) -> OwnedPersona {
+/// `world` is the world's own description and `anchor` is the personality's,
+/// both resolved by the caller — this module does not reach into the registry,
+/// so it stays testable without one.
+///
+/// Pass an empty `anchor` where the anchor is delivered some other way. The one
+/// caller that does is the render of the `WHO` collection member, because there
+/// the anchor is its own collection and printing it into the character block as
+/// well would put it in the prompt twice.
+pub fn of(n: &NpcPayload, world: &str, anchor: &str) -> OwnedPersona {
     OwnedPersona {
         name: n.name.clone(),
         identity: n.persona_description.trim().to_string(),
+        anchor: anchor.trim().to_string(),
         // The authored record has no separate manner field yet; the personality
         // template supplies it through `persona_description`. Left empty rather
         // than duplicating the description into both slots, which would print
@@ -300,7 +307,7 @@ mod tests {
     /// the restrictive mode is the safe default.
     #[test]
     fn a_ticking_character_is_physically_present_by_default() {
-        let p = of(&payload("Vasska", ""), "A besieged city.");
+        let p = of(&payload("Vasska", ""), "A besieged city.", "");
         assert_eq!(p.mode, Mode::Physical);
         assert_eq!(p.name, "Vasska");
         assert_eq!(p.world, "A besieged city.");
@@ -311,6 +318,7 @@ mod tests {
     fn the_description_does_not_appear_as_both_identity_and_manner() {
         let p = of(
             &payload("V", "A quartermaster who has outlived two garrisons."),
+            "",
             "",
         );
         assert_eq!(

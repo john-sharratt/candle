@@ -67,6 +67,7 @@ pub mod persona;
 pub mod prompt;
 pub mod pulse;
 pub mod reach;
+pub mod reflect;
 pub mod retention;
 pub mod rooms;
 pub mod runtime;
@@ -79,6 +80,7 @@ pub mod stir;
 pub mod tick;
 pub mod tools;
 pub mod watcher;
+pub mod whereabouts;
 pub mod window;
 pub mod work;
 

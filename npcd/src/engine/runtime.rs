@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -50,11 +50,12 @@ use crate::engine::identity;
 use crate::engine::ingest;
 use crate::engine::life;
 use crate::engine::loading::{LoadProgress, LoadStep};
-use crate::engine::mind::{Minds, Projected};
+use crate::engine::mind::{frame_fingerprint, Minds, Projected};
 use crate::engine::prompt::{self, Persona};
+use crate::engine::reflect;
 use crate::engine::schema;
 use crate::engine::tick::{Pace, Scheduler, Shared as SharedScheduler};
-use crate::engine::tools::{self, Mode};
+use crate::engine::tools::{self, Mode, Tool};
 use crate::engine::watcher::Ledger;
 use crate::mind::Mind;
 use crate::model;
@@ -136,6 +137,21 @@ pub struct OwnedPersona {
     pub personality: String,
     pub world_id: String,
     pub identity: String,
+    /// The personality's anchor — the floor every character of it reads.
+    ///
+    /// **Carried as prose as well as pinned as a slug**, because the two
+    /// conversation kinds receive it by different routes and only one of them
+    /// gathers. An acting turn opens against the projection, which selects the
+    /// `ANCHOR` collection member named by `personality`; a reflection builds its
+    /// whole prompt from [`crate::engine::prompt::build_for`] and selects
+    /// nothing, so for it the anchor has to be in the frame or it is nowhere.
+    ///
+    /// It was nowhere. A Maker's anchor opens *"You write a world, and you are
+    /// not the only one… you have no world of your own"*, and no reflection had
+    /// ever read a word of it — so a character told only `You are Tace.` and
+    /// `The world you live in:` placed itself inside the story it writes, gave
+    /// itself tools no Maker carries, and invented a colleague.
+    pub anchor: String,
     pub manner: String,
     pub beliefs: Vec<String>,
     pub relationships: Vec<String>,
@@ -156,6 +172,7 @@ impl OwnedPersona {
             personality: &self.personality,
             world_id: &self.world_id,
             identity: &self.identity,
+            anchor: &self.anchor,
             manner: &self.manner,
             beliefs: &self.beliefs,
             relationships: &self.relationships,
@@ -271,6 +288,13 @@ pub struct Runtime {
     /// Each world's building, rendered once. The same text for every character
     /// in it, and it never changes.
     places: Mutex<BTreeMap<String, String>>,
+    /// Which behaviour-space cell the next unattributed reflection draws from.
+    ///
+    /// A plain rotating counter, shared across the cast rather than kept per
+    /// character. Coverage is a property of the corpus, and a counter that
+    /// advanced per character would let a talkative one sit in one domain while
+    /// a quiet one never left the first. See [`crate::engine::reflect::DOMAINS`].
+    reflect_domain: AtomicUsize,
     /// The registers `<mind>/moods/` has a mood written for.
     ///
     /// Injected at startup rather than read here, the same as the persona
@@ -443,6 +467,7 @@ impl Runtime {
             bodies: Bindings::new(),
             metronomes: Mutex::new(BTreeMap::new()),
             places: Mutex::new(BTreeMap::new()),
+            reflect_domain: AtomicUsize::new(0),
             feelings: RwLock::new(Vec::new()),
             cooldowns: crate::engine::cooldown::Cooldowns::new(),
             stopping: AtomicBool::new(false),
@@ -1265,6 +1290,60 @@ impl Runtime {
         *self.substrate.write().unwrap() = Some(shared);
     }
 
+    /// Stop one character, ask it two things, and throw the conversation away.
+    ///
+    /// The whole of it runs **serially**, behind the caller. That looks like a
+    /// violation of the engine's standing rule that a fast clock must never wait
+    /// on a slow one, and is not: reflecting is what a character does when it
+    /// has already chosen to stand still, so the wait costs nothing it had not
+    /// spent. The dream this produces a brief for is the part that stays
+    /// asynchronous.
+    ///
+    /// `domain` rotates when the caller does not name one, so the behaviour
+    /// space fills evenly instead of being sampled wherever the model prefers —
+    /// see [`reflect::DOMAINS`]. `sampled_axes` is a **sample** of the
+    /// character's existing dream corpus and must never be all of it.
+    pub fn reflect(
+        &self,
+        npc_id: u64,
+        inner_thoughts: &str,
+        feeling: &str,
+        domain: Option<&str>,
+        sampled_axes: &[String],
+    ) -> anyhow::Result<reflect::Reflection> {
+        let who = self
+            .persona_of(npc_id)
+            .ok_or_else(|| anyhow::anyhow!("no such character, or it has no persona"))?;
+
+        // Where the character understands itself to be. Taken from the persona
+        // rather than re-derived from the world: the tick's situation prose is
+        // built from a world *delta* and there is no delta here, and a
+        // reflection that described a room by a different route than the
+        // character's own turns do would be reflecting on somewhere slightly
+        // else.
+        let situation = who.situation.clone();
+
+        let domain = domain.map(str::to_string).unwrap_or_else(|| {
+            let n = self.reflect_domain.fetch_add(1, Ordering::Relaxed);
+            reflect::DOMAINS[n % reflect::DOMAINS.len()].to_string()
+        });
+
+        let guard = self.minds.read().unwrap();
+        let minds = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no engine — the daemon is still loading"))?;
+        minds.reflect(
+            npc_id,
+            &who.as_persona(),
+            who.mode,
+            &situation,
+            inner_thoughts,
+            feeling,
+            &domain,
+            sampled_axes,
+        )
+    }
+
     fn persona_of(&self, npc_id: u64) -> Option<OwnedPersona> {
         let mut who = {
             let g = self.persona.read().unwrap();
@@ -1525,30 +1604,16 @@ fn load(
     // Retention is read from the mind's own schema, so a deployment that wants
     // whole transcripts omits the block and nothing changes for it.
     let keep_turns = crate::engine::schema::turn_retention(rt.mind.as_deref());
+    // The reflection's two user turns, from the same schema. Read here rather
+    // than per request: they are authored content and a reflection sends them
+    // verbatim, so re-reading the file mid-run would let two reflections in the
+    // same minute be asked different questions.
+    let reflection = crate::engine::schema::reflection(rt.mind.as_deref());
     *rt.minds.write().unwrap() = Some(Arc::new(
-        Minds::new(Arc::clone(&engine), conv_config.clone()).keeping_turns(keep_turns),
+        Minds::new(Arc::clone(&engine), conv_config.clone())
+            .keeping_turns(keep_turns)
+            .asking(reflection),
     ));
-
-    // ── tool calibration ───────────────────────────────────────────────────
-    //
-    // Before the layers, deliberately. Every layer frames on the shared system
-    // prompt and the tool catalog is part of it, so a document prefilled while
-    // the catalog is still absent captures its KV — and the wide-Q signature the
-    // gather matches against — under a prompt no character will ever think
-    // under. Nothing would fail; retrieval would simply be worse than it should
-    // be, for the life of that substrate.
-    p.set_step(LoadStep::Calibrating);
-    let tools = &*crate::engine::tools::CATALOG;
-    p.set_progress(0, tools.len() as u64);
-    for (i, t) in tools.iter().enumerate() {
-        p.set_detail(t.name);
-        p.set_progress(i as u64 + 1, tools.len() as u64);
-    }
-    tracing::info!(
-        "tools: {} in the catalog, {} calibration examples",
-        tools.len(),
-        tools.iter().map(|t| t.examples.len()).sum::<usize>()
-    );
 
     // ── the mind's layers ──────────────────────────────────────────────────
     //
@@ -1576,24 +1641,46 @@ fn load(
         );
     }
 
+    // ── the acts ───────────────────────────────────────────────────────────
+    //
+    // Before the layers, deliberately. Every layer frames on the shared system
+    // prompt and the acts are part of it, so a document prefilled while they are
+    // still absent captures its KV — and the wide-Q signature the gather matches
+    // against — under a prompt no character will ever think under. Nothing
+    // would fail; retrieval would simply be worse than it should be, for the
+    // life of that substrate.
+    //
+    // **Every act, installed once; each turn shows the ones it can take.** The
+    // world's catalog and the reflection's two answers go into one collection,
+    // and an acting turn names its members from the same `specs_within` its
+    // grammar is compiled from — so the list a character reads and the mask it
+    // decodes under are one computation and cannot disagree.
+    p.set_step(LoadStep::Tools);
+    let acts: Vec<&Tool> = tools::CATALOG.iter().chain(reflect::ASKED).collect();
+    let total = acts.len() as u64;
+    p.set_progress(0, total);
+    if let Some(built) = projection.as_mut() {
+        let installed = tools::install(&mut built.builder, acts, |n, t| {
+            p.set_detail(t.name);
+            p.set_progress(n as u64, total);
+        })?;
+        tracing::info!(
+            "tools: {installed} installed into the prompt, each shown on the turns that can \
+             take it"
+        );
+    }
+
     // ── the prompt a character thinks under ────────────────────────────────
     //
     // **Everything goes into the schema before anything is written under it.**
-    // The ordering rule `LoadStep::Calibrating` states applies to all of it: a
-    // layer document prefilled while the system prompt is still incomplete
-    // captures its signature — and the wide-Q the gather matches against —
-    // under a prompt no character will ever think under.
+    // The ordering rule `LoadStep::Tools` states applies to all of it: a layer
+    // document prefilled while the system prompt is still incomplete captures
+    // its signature — and the wide-Q the gather matches against — under a
+    // prompt no character will ever think under.
     //
     // Who everybody is. A collection, so each member seals once and is selected
     // per turn: one copy of the vault for the world rather than one per Maker
     // standing in it.
-    //
-    // **The acts used to be installed here too, and are not any more.** The turn
-    // grammar decides what is possible and the calibration examples teach which
-    // act suits a situation; a list of one-line summaries beside them could only
-    // agree with the grammar or contradict it, and contradicting it is what
-    // costs a character an evening — being told it may do a thing the mask will
-    // not let it do. See the note in the mind's `projection.yaml`.
     let identities = match projection.as_mut() {
         Some(p) => {
             let places: BTreeMap<String, String> = rt
@@ -1617,6 +1704,10 @@ fn load(
             layer: p.layer,
             group: p.group,
             identities: identities.clone(),
+            // After everything is installed, so the acts and identities are in
+            // it: a conversation written under a different set is superseded on
+            // its next open rather than rejoined.
+            frame: frame_fingerprint(&schema::frame(&p.builder)),
         });
     }
 
@@ -3171,6 +3262,23 @@ mod tests {
         run(&rt, 10_000);
         let read = window(&rt, 1).join("\n");
         assert!(read.contains("You got to band one"), "{read}");
+    }
+
+    /// **Arriving on a floor tells you who else is on it, and where** — the
+    /// person left behind in the room it walked out of, here.
+    #[test]
+    fn arriving_names_who_else_is_on_the_floor() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        embody(&rt, 2, "m2", "green-room");
+        let _ = rt.act_on_world(1, &act("move_to", json!({"destination": "band one"})));
+        let world = rt.hosted.get(WORLD).unwrap();
+        environment::advance(&world, &rt.bodies, &rt.scheduler);
+
+        run(&rt, 10_000);
+        let read = window(&rt, 1).join("\n");
+        assert!(read.contains("Elsewhere on this floor:"), "{read}");
+        assert!(read.contains("in the green room"), "{read}");
     }
 
     #[test]
