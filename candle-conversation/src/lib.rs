@@ -107,7 +107,7 @@ pub use config::{
     pick_max_hot_turns, DecodeHealthConfig, DryConfig, EngineConfig, SamplingConfig,
     SchedulerConfig, SequenceConfig,
 };
-pub use conversation::{GlueMarkers, Sequence};
+pub use conversation::{GlueMarkers, SectionInserts, Sequence};
 pub use engine::{ConversationEngine, SubstrateReloadStatus, ThinkSteering};
 pub use error::ConversationError;
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};

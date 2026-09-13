@@ -430,7 +430,9 @@ pub(crate) enum SchedulerRequest {
     /// for it.  The scheduler cold-loads the chunks into hot VRAM via
     /// the same pipeline used for turn cold-loads, restores the
     /// section into the substrate (`SectionEntryData` + residence
-    /// with both hot and cold installed), and replies with `Ok(())`.
+    /// with both hot and cold installed), and replies with the chunks
+    /// per KV layer it recovered. The layout is judged against the
+    /// session's backings — the one place that knows the KV layer count.
     ///
     /// On any failure the scheduler falls back to a normal
     /// `IngestSection` would be issued by the caller — this request
@@ -445,13 +447,12 @@ pub(crate) enum SchedulerRequest {
         section_id: SectionId,
         stream_id: StreamId,
         address: ContentAddress,
-        chunks_per_layer: usize,
         /// Pre-tokenised section content — the same byte sequence
         /// the original prefill used.  Reused verbatim so we don't
         /// need to read the `Tokens` record back from disk just to
         /// repopulate `SectionEntryData::tokens`.
         tokens: TokenBuffer,
-        response_tx: Sender<Result<(), ConversationError>>,
+        response_tx: Sender<Result<usize, ConversationError>>,
     },
 
     /// Pre-warm a freshly-allocated slot by injecting the static system-prompt
@@ -4391,7 +4392,6 @@ impl Scheduler {
                 section_id,
                 stream_id,
                 address,
-                chunks_per_layer,
                 tokens,
                 response_tx,
             } => {
@@ -4400,7 +4400,6 @@ impl Scheduler {
                     section_id,
                     stream_id,
                     address,
-                    chunks_per_layer,
                     tokens,
                 );
                 let _ = response_tx.send(result);
@@ -7327,9 +7326,8 @@ impl Scheduler {
         section_id: SectionId,
         stream_id: StreamId,
         _address: ContentAddress,
-        _chunks_per_layer: usize,
         tokens: TokenBuffer,
-    ) -> Result<(), ConversationError> {
+    ) -> Result<usize, ConversationError> {
         // The cold→hot section install goes through the adaptive-format
         // restore machinery (`alloc_sealed_block` + per-band arena writes),
         // which does not alias K≡V. A single-latent backing (DeepSeek's
@@ -7354,10 +7352,16 @@ impl Scheduler {
         //    the redo log.  Installed alone (with hot = None) so the
         //    elevate path can lift the section when a projection
         //    needs it.
-        let cold_refs = conversation
+        let Some(cold_refs) = conversation
             .recover_section_cold_refs(stream_id, n_layers)
             .map_err(ConversationError::Model)?
-            .unwrap_or_default();
+        else {
+            return Err(ConversationError::Channel(format!(
+                "section stream {stream_id:?} holds no chunks for this session's \
+                 {n_layers} KV layers — re-ingest"
+            )));
+        };
+        let chunks_per_layer = cold_refs.first().map_or(0, |s| s.chunks.len());
 
         // 2. Install as a cold-marker.  `sealed_hot = Vec::new()`
         //    leaves `residence.hot = None`; `cold_refs` lands in
@@ -7377,7 +7381,7 @@ impl Scheduler {
             cold_refs,
             tokens_arc,
         );
-        Ok(())
+        Ok(chunks_per_layer)
     }
 
     /// A unit's own tokens begin on `slot`: close its index so the prefix ahead

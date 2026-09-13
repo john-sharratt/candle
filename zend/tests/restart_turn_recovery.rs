@@ -21,9 +21,48 @@ mod common;
 
 use candle::Device;
 use candle_conversation::models::Model;
+use candle_conversation::SectionInserts;
 use common::{say, Workspace};
 
 const MODEL: Model = Model::Qwen35_0_8B_Q8;
+
+/// **A restart restores the prompt; it does not prefill it again.**
+///
+/// Every section the schema declares is sealed under a content address, so a
+/// workspace reopened under the same schema already holds every section's K/V
+/// in its redo log. Prefilling them again is a whole-prompt forward on every
+/// boot — on the daemon, most of the time between "Loading model" and ready.
+///
+/// On this hybrid the sections persist on the six attention layers of
+/// twenty-four, so a restore judged against transformer depth refuses every
+/// one of them and the second boot prefills exactly what the first did.
+#[test]
+fn a_restart_restores_the_prompt_rather_than_prefilling_it() {
+    let device = Device::new_cuda(0).expect("cuda");
+    let ws = Workspace::for_model(MODEL);
+
+    let first = {
+        let (engine, conv) = ws.open(&device);
+        let inserts = conv.section_inserts();
+        engine.shutdown().expect("clean shutdown");
+        inserts
+    };
+    assert!(
+        first.prefilled > 0,
+        "a fresh workspace prefills its prompt: {first:?}"
+    );
+
+    let (_engine, conv) = ws.open(&device);
+    assert_eq!(
+        conv.section_inserts(),
+        SectionInserts {
+            present: first.present,
+            restored: first.prefilled,
+            prefilled: 0,
+        },
+        "the reopened workspace holds every section the first boot sealed ({first:?})"
+    );
+}
 
 #[test]
 fn a_clean_restart_recovers_every_sealed_turn() {

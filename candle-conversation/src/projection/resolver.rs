@@ -3476,23 +3476,6 @@ impl Conversation {
             .unwrap_or(false)
     }
 
-    /// Snapshot a persisted section stream's `chunks_per_layer` for the
-    /// cold-load path — `manifest.chunks.len() / n_layers` — when the
-    /// stream is known and its chunk count divides evenly, otherwise `None`.
-    pub fn section_stream_layout(&self, stream_id: StreamId, n_layers: usize) -> Option<usize> {
-        drop(self.persistence.lock().unwrap());
-        let substrate = self.read();
-        let entry = substrate.stream_of(stream_id)?;
-        if entry.chunks.is_empty() || n_layers == 0 {
-            return None;
-        }
-        let total = entry.chunks.len();
-        if total % n_layers != 0 {
-            return None;
-        }
-        Some(total / n_layers)
-    }
-
     /// Cold-load a persisted section's chunks back into hot VRAM via
     /// the shared `load_stream_into_hot` pipeline.  Returns the
     /// per-layer `SealedSequence` the substrate's residence slab

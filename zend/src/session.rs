@@ -4653,6 +4653,24 @@ impl ZendSession {
                         // load critical path, after `ready`, exactly like a watcher burst.
                         // A no filesystem event fires for down-time edits, so this is what
                         // covers them.
+                        // The tool catalog's levels, BEFORE ready: they are what
+                        // every conversation's tool selection is scored on, they
+                        // are rebuilt empty on each process load, and the dialogue
+                        // replay cannot teach them (its probes are the untagged
+                        // turns; the tool corpus is tagged). Cold, the scores are
+                        // not merely smaller but differently ORDERED, and none
+                        // clears the collection's gate — so a query answered before
+                        // a background warm finished saw no tool definition at all
+                        // and answered from memory.
+                        {
+                            let t_warm = Instant::now();
+                            let conv = { state.engine.lock().unwrap().conversation() };
+                            conv.warm_collection_normalization(state.refresh_builder.schema());
+                            tracing::info!(
+                                elapsed_ms = t_warm.elapsed().as_millis() as u64,
+                                "tool collection levels warmed before ready"
+                            );
+                        }
                         let state_for_reconcile = Arc::clone(&state);
                         let reconcile = std::thread::spawn(move || {
                             match state_for_reconcile.refresh_ingest_layers() {
@@ -4677,14 +4695,6 @@ impl ZendSession {
                             let conv =
                                 { state_for_reconcile.engine.lock().unwrap().conversation() };
                             let schema = state_for_reconcile.refresh_builder.schema().clone();
-                            // The tool catalog's levels first: they are what every
-                            // conversation's tool selection is scored on, they are
-                            // rebuilt empty on each process load, and the dialogue
-                            // replay cannot teach them (its probes are the untagged
-                            // turns; the tool corpus is tagged). Cold, the scores are
-                            // not merely smaller but differently ORDERED, so a tool
-                            // query resolves to the wrong tool.
-                            conv.warm_collection_normalization(&schema);
                             conv.warm_ingest_normalization(&schema);
                         });
                         *session_for_watcher.reconcile_thread.lock().unwrap() = Some(reconcile);

@@ -304,6 +304,24 @@ pub struct Sequence {
     /// for. [`Sequence::rekey_prompt_state`] rebuilds the checkpoint when a
     /// first turn's effective selection differs from it.
     checkpoint_selection: SelectionState,
+    /// Outcomes of this sequence's section inserts — see [`SectionInserts`].
+    section_inserts: SectionInserts,
+}
+
+/// What a sequence's section inserts did, by outcome. Every section its schema
+/// (or a later `insert_section*` call) asks for lands in exactly one field.
+///
+/// A section whose K/V the workspace already holds under the same content
+/// address is restored from the redo log, never prefilled again, so a
+/// workspace reopened under an unchanged schema prefills nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SectionInserts {
+    /// Already in the substrate — inserted earlier in this process.
+    pub present: usize,
+    /// Restored from the redo log as cold markers.
+    pub restored: usize,
+    /// Prefilled and sealed.
+    pub prefilled: usize,
 }
 
 /// The dialect's framing markers (`<|im_start|>system`, `<|im_end|>`, …) — the
@@ -711,6 +729,7 @@ impl Sequence {
             branch_spans: Vec::new(),
             state_is_prompt_only: false,
             checkpoint_selection: SelectionState::default(),
+            section_inserts: SectionInserts::default(),
         };
 
         // Set the in-memory tree's system prompt tokens so the tree's
@@ -991,19 +1010,33 @@ impl Sequence {
                             }
                             continue;
                         }
-                        for option in &node.options {
-                            for v in &option.variants {
+                        // Every variant of this node is sealed against earlier
+                        // nodes only, so the whole node prefills as one batch.
+                        let variants = || {
+                            node.options.iter().flat_map(|option| {
+                                option
+                                    .variants
+                                    .iter()
+                                    .map(move |v| (v, option.content.as_str()))
+                            })
+                        };
+                        let prefixes: Vec<Vec<SectionId>> = variants()
+                            .map(|(v, _)| {
                                 let mut prefix = linear_prefix.clone();
                                 prefix.extend_from_slice(&v.in_tree_prefix);
-                                conv.insert_section_with_prefix(
-                                    v.id,
-                                    option.content.as_str(),
-                                    &prefix,
-                                )?;
-                                done_bytes += option.content.len() as u64;
-                                report(done_bytes);
-                            }
-                        }
+                                prefix
+                            })
+                            .collect();
+                        let batch: Vec<(SectionId, &str, &[SectionId])> = variants()
+                            .zip(&prefixes)
+                            .map(|((v, content), prefix)| (v.id, content, prefix.as_slice()))
+                            .collect();
+                        let done_bytes_ref = &mut done_bytes;
+                        let report_ref = &report;
+                        conv.insert_sections_with_progress(&batch, false, |_sid, content_len| {
+                            *done_bytes_ref += content_len as u64;
+                            report_ref(*done_bytes_ref);
+                        })?;
                     }
                     // Sections declared after the tree (and the priming
                     // projection) attend to the default branch — the fan-out is
@@ -1479,6 +1512,30 @@ impl Sequence {
         sections: &[(SectionId, &str)],
         prefix_section_ids: &[SectionId],
         in_collection: bool,
+        on_section_done: F,
+    ) -> crate::Result<Vec<(SectionId, usize)>>
+    where
+        F: FnMut(SectionId, usize),
+    {
+        let sections: Vec<(SectionId, &str, &[SectionId])> = sections
+            .iter()
+            .map(|&(id, content)| (id, content, prefix_section_ids))
+            .collect();
+        self.insert_sections_with_progress(&sections, in_collection, on_section_done)
+    }
+
+    /// Ingest sections that each carry their OWN prefix, in parallel.
+    ///
+    /// The general form of [`Self::insert_section_collection_with_progress`]:
+    /// every section is restored or prefilled against its own prefix, and
+    /// every prefill is fired before any is awaited, so the scheduler packs
+    /// them into shared forwards. No section here may sit in another's prefix
+    /// — each prefix must already be sealed. A section tree's variants of one
+    /// node are exactly that: each is sealed against earlier nodes only.
+    pub fn insert_sections_with_progress<F>(
+        &mut self,
+        sections: &[(SectionId, &str, &[SectionId])],
+        in_collection: bool,
         mut on_section_done: F,
     ) -> crate::Result<Vec<(SectionId, usize)>>
     where
@@ -1494,32 +1551,12 @@ impl Sequence {
         struct Pending<'a> {
             section_id: SectionId,
             content: &'a str,
+            prefix: &'a [SectionId],
             tokens: TokenBuffer,
             token_count: usize,
             address: ContentAddress,
             debug_name: String,
         }
-        // Rebuild a `ContentChain` snapshot from the supplied prefix
-        // section ids.  Sections in this call all share the same
-        // prefix snapshot (collection-member semantics: members don't
-        // attend to each other, so each member's `prefix_hash` is the
-        // chain state *before* the collection).  The chain reads each
-        // prefix section's tokens from the substrate — they were
-        // tokenised and pinned on a previous `insert_section_*` call.
-        //
-        // **Collection members are excluded from the chain.**  Without
-        // this, every change to a collection member (installing a new
-        // tool, removing one, editing a tool's description) would
-        // produce a fresh `prefix_hash` for every section *after* the
-        // collection, cascading stream-id invalidation through the
-        // whole downstream tail and forcing a re-prefill of sections
-        // whose own content didn't change.  Collection members are
-        // already an approximation in the post-collection prefix
-        // (projection selects a subset at runtime, so the cached K/V
-        // is never a strict function of the specific members that
-        // ingested) — treating them as outside the content chain
-        // matches that approximation and keeps minor catalog changes
-        // local.
         // ── Pass 1: already-present sections, by id alone ──────────────
         // `section_exists` is broader than `section_is_hot`: it returns true for
         // cold-marker sections that were restored on substrate reload but
@@ -1537,7 +1574,8 @@ impl Sequence {
         // ~294 ms per sequence, 206 s of a 341 s phase, all of it on the calling
         // thread with the GPU idle behind it.
         let mut out_skip: Vec<(SectionId, usize)> = Vec::new();
-        let mut candidates: Vec<(SectionId, &str)> = Vec::with_capacity(sections.len());
+        let mut candidates: Vec<(SectionId, &str, &[SectionId])> =
+            Vec::with_capacity(sections.len());
         // ONE read guard for the whole triage, not one per section. The substrate
         // RwLock is writer-priority, so each reader taken while the persistence
         // thread is queued to write blocks until that write lands — and a
@@ -1557,7 +1595,7 @@ impl Sequence {
         let mut skipped: Vec<(SectionId, usize, usize)> = Vec::new();
         {
             let view = self.substrate.read();
-            for &(section_id, content) in sections {
+            for &(section_id, content, prefix) in sections {
                 if content.is_empty() {
                     continue;
                 }
@@ -1566,10 +1604,11 @@ impl Sequence {
                     skipped.push((section_id, block_count, content.len()));
                     continue;
                 }
-                candidates.push((section_id, content));
+                candidates.push((section_id, content, prefix));
             }
         }
         for (section_id, block_count, content_len) in skipped {
+            self.section_inserts.present += 1;
             out_skip.push((section_id, block_count));
             on_section_done(section_id, content_len);
         }
@@ -1580,61 +1619,44 @@ impl Sequence {
             return Ok(out_skip);
         }
 
-        let prefix_hash = {
-            let mut chain = ContentChain::new();
-            let view = self.substrate.read();
-            let schema = self.projection.schema();
-            for &pid in prefix_section_ids {
-                // Skip collection members of the shared prompt — they don't
-                // advance the content chain.
-                if schema.system_prompt.is_collection_member(pid) {
-                    continue;
-                }
-                let pre_tokens = view.section_tokens_of(pid);
-                if pre_tokens.is_empty() {
-                    // A prefix section with no recorded tokens — this
-                    // happens for template-kind items that don't enter
-                    // the substrate.  Skip; they contribute nothing to
-                    // the cumulative content prefix anyway.
-                    continue;
-                }
-                chain.push_section(&pre_tokens);
-            }
-            chain.prefix()
-        };
         // ── Pass 2: triage what's left into two buckets ────────────────
         //   - Persisted in the redo log under its content-addressed
         //     stream id → restore from disk (`RestoreSection`).
         //   - Otherwise → ingest with a fresh prefill (`IngestSection`).
-        let n_layers = self.model_core.num_layers;
         let mut to_ingest: Vec<Pending<'_>> = Vec::with_capacity(candidates.len());
         let mut to_restore: Vec<Pending<'_>> = Vec::with_capacity(candidates.len());
-        for (section_id, content) in candidates {
+        // A collection's members share one prefix; hash it once.
+        let mut prefix_memo: Option<(&[SectionId], ContentHash)> = None;
+        for (section_id, content, prefix) in candidates {
             let tokens = self.tokenize(content)?;
             if tokens.is_empty() {
                 continue;
             }
             let token_count = tokens.len();
+            let prefix_hash = match prefix_memo {
+                Some((memo, hash)) if memo == prefix => hash,
+                _ => {
+                    let hash = self.content_prefix_hash(prefix);
+                    prefix_memo = Some((prefix, hash));
+                    hash
+                }
+            };
             let address = ContentAddress {
                 prefix_hash,
                 section_hash: hash_tokens(&tokens),
             };
             let debug_name = self.section_debug_name(section_id);
-            // Manifest check.  Only meaningful when the model's
-            // layer count is known; without backings (test harnesses
-            // that don't register a session) we can't compute
-            // `chunks_per_layer`, so we fall through to ingest.
+            // Manifest check: durable chunks under this content address.
+            // Whether they fit the session's KV layers is the scheduler's to
+            // judge, because it holds the backings — a model's transformer
+            // depth is not its KV layer count (a hybrid keeps K/V on its
+            // attention layers only). A refusal there falls back to ingest.
             let stream_id = crate::persistence::content_hash::section_stream_id(address);
-            if n_layers > 0
-                && self.substrate.section_stream_is_persisted(stream_id)
-                && self
-                    .substrate
-                    .section_stream_layout(stream_id, n_layers)
-                    .is_some()
-            {
+            if self.substrate.section_stream_is_persisted(stream_id) {
                 to_restore.push(Pending {
                     section_id,
                     content,
+                    prefix,
                     tokens,
                     token_count,
                     address,
@@ -1645,6 +1667,7 @@ impl Sequence {
             to_ingest.push(Pending {
                 section_id,
                 content,
+                prefix,
                 tokens,
                 token_count,
                 address,
@@ -1668,10 +1691,6 @@ impl Sequence {
         let mut restore_out: Vec<(SectionId, usize)> = Vec::with_capacity(to_restore.len());
         for item in to_restore.into_iter() {
             let stream_id = crate::persistence::content_hash::section_stream_id(item.address);
-            let chunks_per_layer = self
-                .substrate
-                .section_stream_layout(stream_id, n_layers)
-                .unwrap_or(0);
             // Capture the content length for the progress callback
             // before `item.tokens` / `item.content` get consumed by
             // the request payload below.
@@ -1684,17 +1703,18 @@ impl Sequence {
                     section_id: item.section_id,
                     stream_id,
                     address: item.address,
-                    chunks_per_layer,
                     tokens: item.tokens.clone(),
                     response_tx: tx,
                 })
                 .map_err(|_| ConversationError::SchedulerGone)?;
             match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
-                Ok(()) => {
+                Ok(chunks_per_layer) => {
                     // Block count for diagnostics — the section is
                     // now a cold-marker; the actual hot grid lands
-                    // when the next projection elevates it.  Use the
-                    // manifest's chunks_per_layer as the count.
+                    // when the next projection elevates it.  The
+                    // scheduler reports the chunks per KV layer it
+                    // recovered.
+                    self.section_inserts.restored += 1;
                     restore_out.push((item.section_id, chunks_per_layer));
                     on_section_done(item_section_id, item_content_len);
                 }
@@ -1744,7 +1764,7 @@ impl Sequence {
                 .send(SchedulerRequest::IngestSection {
                     sequence_id: slot_id,
                     section_id: item.section_id,
-                    prefix_section_ids: prefix_section_ids.to_vec(),
+                    prefix_section_ids: item.prefix.to_vec(),
                     tokens: item.tokens,
                     address: item.address,
                     debug_name: item.debug_name,
@@ -1789,6 +1809,7 @@ impl Sequence {
             };
             let (slot_id, section_id, content_len, _rx) = pending.swap_remove(idx);
             let seal = recv_result?;
+            self.section_inserts.prefilled += 1;
             let block_count = seal.block_to.saturating_sub(seal.block_from);
             let _ = self.scheduler_tx.send(SchedulerRequest::FreeSequence {
                 sequence_id: slot_id,
@@ -1807,6 +1828,45 @@ impl Sequence {
             "section_collection",
         );
         Ok(out)
+    }
+
+    /// Outcomes of every section insert this sequence has run.
+    pub fn section_inserts(&self) -> SectionInserts {
+        self.section_inserts
+    }
+
+    /// The content-chain hash of `prefix_section_ids` — the `prefix_hash`
+    /// half of a section's content address. The chain reads each prefix
+    /// section's tokens from the substrate, where an earlier insert pinned
+    /// them.
+    ///
+    /// **Collection members are excluded from the chain.** Without this, every
+    /// change to a collection member (installing a new tool, removing one,
+    /// editing a tool's description) would produce a fresh `prefix_hash` for
+    /// every section *after* the collection, cascading stream-id invalidation
+    /// through the whole downstream tail and forcing a re-prefill of sections
+    /// whose own content didn't change. Collection members are already an
+    /// approximation in the post-collection prefix (projection selects a subset
+    /// at runtime, so the cached K/V is never a strict function of the specific
+    /// members that ingested) — treating them as outside the content chain
+    /// matches that approximation and keeps minor catalog changes local.
+    fn content_prefix_hash(&self, prefix_section_ids: &[SectionId]) -> ContentHash {
+        let mut chain = ContentChain::new();
+        let view = self.substrate.read();
+        let schema = self.projection.schema();
+        for &pid in prefix_section_ids {
+            if schema.system_prompt.is_collection_member(pid) {
+                continue;
+            }
+            let pre_tokens = view.section_tokens_of(pid);
+            // A prefix item with no recorded tokens is a template that never
+            // enters the substrate; it contributes nothing to the chain.
+            if pre_tokens.is_empty() {
+                continue;
+            }
+            chain.push_section(&pre_tokens);
+        }
+        chain.prefix()
     }
 
     /// Look up a section's symbolic name from the projection schema.
@@ -3940,6 +4000,8 @@ impl Sequence {
             state_is_prompt_only: false,
             // Unread while the window is closed.
             checkpoint_selection: SelectionState::default(),
+            // A fork inserts no sections of its own.
+            section_inserts: SectionInserts::default(),
             // Forks start with a fresh scanner state — scoring will refresh
             // on the next provenance scan.  No need to clone the parent's scores.
         };
