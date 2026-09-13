@@ -1093,8 +1093,8 @@ impl Builder {
     // ── Synthetic construction ────────────────────────────────────────────────
 
     /// Build a minimal single-layer schema around a pre-rendered system-prompt
-    /// string, for legacy callers that provide a plain `&str` rather than a
-    /// YAML schema.
+    /// string, for callers that provide a plain `&str` rather than a YAML
+    /// schema.
     ///
     /// The resulting builder has one `dialogue` layer (32 768-token window),
     /// one `primary_conversation` group with `AlwaysVisible` selection (all
@@ -1102,30 +1102,34 @@ impl Builder {
     /// window config downstream), and the system-prompt text as a single
     /// `frame` section.
     ///
-    /// IDs are fixed at 1 each; there is no name map.
-    ///
-    pub fn for_plain_prompt(system_prompt_text: &str) -> Self {
-        Self::synthetic_single_section(
-            system_prompt_text,
-            LayerId::new(1),
-            GroupId::new(1),
-            SectionId::new(1),
-        )
+    /// The layer and group ids are fixed at 1. The frame is sealed under
+    /// `frame`, which comes from
+    /// [`ConversationEngine::plain_prompt_section`](crate::ConversationEngine::plain_prompt_section)
+    /// for this same text: a section that already exists is reused by id
+    /// without its text being compared, so a fixed id would hand this
+    /// conversation whichever prompt had sealed there first.
+    pub fn for_plain_prompt(system_prompt_text: &str, frame: SectionId) -> Self {
+        Self::synthetic_single_section(system_prompt_text, LayerId::new(1), GroupId::new(1), frame)
     }
 
-    /// Same as [`Self::for_plain_prompt`] but allocates the synthetic
-    /// schema's ids from the [`Reserved`] kind's slot at the top of the
-    /// u32 range. Use this for engine-internal conversations (the
-    /// daemon's titler) that must coexist in the same substrate as a
-    /// YAML schema without colliding.
+    /// Same as [`Self::for_plain_prompt`] but takes the layer and group ids
+    /// from the [`Reserved`] kind's slot at the top of the u32 range. Use this
+    /// for engine-internal conversations (the daemon's titler) that must
+    /// coexist in the same substrate as a YAML schema without their turns
+    /// entering its projection. The frame is `frame`, for the same reason as
+    /// there.
     ///
     /// [`Reserved`]: super::Reserved
-    pub fn for_plain_prompt_reserved(system_prompt_text: &str, kind: Reserved) -> Self {
+    pub fn for_plain_prompt_reserved(
+        system_prompt_text: &str,
+        kind: Reserved,
+        frame: SectionId,
+    ) -> Self {
         Self::synthetic_single_section(
             system_prompt_text,
             LayerId::reserved(kind),
             GroupId::reserved(kind),
-            SectionId::reserved(kind),
+            frame,
         )
     }
 
@@ -1168,15 +1172,11 @@ impl Builder {
         section_id: SectionId,
     ) -> Self {
         // Id for the summary's answer framing section (never emitted; sealed
-        // lazily only if this conversation is summarised). Offset from the frame,
-        // special-cased so a reserved frame (top of the u32 range) keeps the id in
-        // the reserved band. There is no question-half section: a summary's user
-        // half is derived, never decoded, so it has no prompt to frame.
-        let summary_a_id = if section_id.raw() == u32::MAX {
-            SectionId::new(u32::MAX - 1)
-        } else {
-            SectionId::new(section_id.raw() + 1)
-        };
+        // lazily only if this conversation is summarised), the one beside the
+        // frame — every frame partition leaves that id free for it. There is no
+        // question-half section: a summary's user half is derived, never
+        // decoded, so it has no prompt to frame.
+        let summary_a_id = SectionId::new(section_id.raw() + 1);
         let schema = Schema {
             // A single-section plain-prompt schema emits no tool calls, so the
             // exemption has nothing to apply to either way.

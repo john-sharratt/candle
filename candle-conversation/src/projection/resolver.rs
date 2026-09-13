@@ -3022,6 +3022,24 @@ impl Conversation {
         self.write().mark_timeline_transient(timeline);
     }
 
+    /// Mark a throwaway conversation's frame as transient — see
+    /// [`crate::substrate::Substrate::mark_section_transient`]. In-memory only.
+    pub fn mark_section_transient(&self, section: SectionId) {
+        self.write().mark_section_transient(section);
+    }
+
+    /// Whether a section is transient — see
+    /// [`crate::substrate::Substrate::is_section_transient`].
+    pub fn is_section_transient(&self, section: SectionId) -> bool {
+        self.read().is_section_transient(section)
+    }
+
+    /// Remove a transient section — see
+    /// [`crate::substrate::Substrate::retire_section`].
+    pub fn retire_section(&self, section: SectionId) -> bool {
+        self.write().retire_section(section)
+    }
+
     /// Couple `from_turn` to the tool response that follows it — in-RAM (so this
     /// session's summariser groups the exchange immediately) and on disk (a
     /// [`crate::persistence::record::RecordType::TurnCoupling`] record, so the

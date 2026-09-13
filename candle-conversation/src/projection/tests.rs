@@ -582,7 +582,7 @@ fn decode_priority_ratio_is_decode_tokens_per_prefill() {
 fn builder_fallback_dialogue_layer_is_high_priority() {
     // The template-less fallback IS the dialogue layer, so it inherits the
     // interactive priority even without a YAML declaration.
-    let b = Builder::for_plain_prompt("You are a helpful assistant.");
+    let b = Builder::for_plain_prompt("You are a helpful assistant.", SectionId::new(1));
     let dialogue = b.id_for_layer("dialogue").unwrap();
     assert_eq!(
         b.layer(dialogue).unwrap().decode_priority,

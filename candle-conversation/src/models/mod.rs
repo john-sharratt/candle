@@ -182,6 +182,7 @@ impl ModelArch {
 /// | `Qwen3_30B_A3B_Q4` | 30 B (3B active) | Q4_K_M | Qwen3Moe | ChatML | ~17 GB (LRU) |
 /// | `Qwen3_30B_A3B_Q6` | 30 B (3B active) | Q6_K | Qwen3Moe | ChatML | ~25 GB (LRU) |
 /// | `Qwen36_35B_A3B_Q4` | 35 B (3B active) | UD-Q4_K_M | Qwen35Hybrid | ChatML | ~22 GB (tiered) |
+/// | `Qwen36_35B_A3B_AntiLoop_StyleTune` | 35 B (3B active) | Q4_K_M | Qwen35Hybrid | Qwen35 | ~22 GB (tiered) |
 /// | `Custom(_)` | — | — | any | any | — |
 #[derive(Debug, Clone)]
 #[allow(non_camel_case_types)]
@@ -216,6 +217,13 @@ pub enum Model {
     /// `docs/deltanet_state_persistence.md`.
     Qwen36_35B_A3B_Q4,
 
+    /// **The hybrid** — AntiLoop's Qwen3.6-35B-A3B, a fine-tune trained against
+    /// repetition loops, under StyleTune's output head, both at Q4_K_M (~22 GB).
+    /// `npcd`'s model. The same architecture, tokenizer and KV row as
+    /// [`Model::Qwen36_35B_A3B_Q4`], with the stock checkpoint as its
+    /// recurrent-gate donor.
+    Qwen36_35B_A3B_AntiLoop_StyleTune,
+
     /// Qwen3.8-Flash-Next Q4_KO — 250 B total, ~13 B active, 48 layers at 3:1
     /// (36 gated-DeltaNet, 12 attention). Native 262,144-token context.
     ///
@@ -235,9 +243,9 @@ pub enum Model {
     /// expert cache to thrash — so a character costs the same whether it is the
     /// only one awake or one of a hundred.
     ///
-    /// This is `npcd`'s model. A deployment wanting a fine-tune of it in its
-    /// place says so in `models.override.yaml` rather than adding a variant
-    /// here — see [`overrides`].
+    /// A deployment wanting a fine-tune of it in its place says so in
+    /// `models.override.yaml` rather than adding a variant here — see
+    /// [`overrides`].
     Qwen35_9B_Q6,
 
     /// Qwen3.5-0.8B Q8_0 — the lineage's smallest dense member (~0.8 GB), the
@@ -306,6 +314,23 @@ pub struct LoraSpec {
     /// silently changes under a deployment changes what its characters say with
     /// nothing in this codebase changing. `"main"` where a pin is not available.
     pub revision: String,
+}
+
+/// One tensor a preset reads from another published checkpoint instead of its own.
+///
+/// What lets one model be assembled from two conversions of the same base — see
+/// [`ModelSpec::tensor_overrides`]. Coordinates as [`ModelSpec`] names its own checkpoint,
+/// pinned the same way and for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorOverrideSpec {
+    /// The tensor's GGUF name, e.g. `output.weight`.
+    pub tensor: String,
+    /// HuggingFace repository of the checkpoint it is read from.
+    pub repo: String,
+    /// Pinned revision of that repository.
+    pub revision: String,
+    /// GGUF filename within it.
+    pub filename: String,
 }
 
 /// Immutable metadata for a model variant.
@@ -386,6 +411,18 @@ pub struct ModelSpec {
     /// stock conversion has nothing to repair — and for a custom model, which has no base.
     /// Nothing is fetched unless the primary is found to need it.
     pub gate_donor: Option<(String, String, String)>,
+    /// Tensors read from another checkpoint instead of this one.
+    ///
+    /// **Part of the model, not a repair.** Where [`Self::gate_donor`] is held in reserve and
+    /// fetched only when the primary turns out to need it, each of these is fetched on every
+    /// load, because the model this spec names is made of them. The loader requires each to
+    /// match the primary's shape, repacks it from its own quant type, and refuses a load that
+    /// never reads one. Only the qwen35 lineage's loader reads them; the builder refuses a spec
+    /// that names any for another arch.
+    ///
+    /// Dropped by an override that replaces [`Self::model_repo`]: they were chosen against the
+    /// checkpoint that override displaced.
+    pub tensor_overrides: Vec<TensorOverrideSpec>,
     /// HuggingFace repository containing `tokenizer.json`.
     pub tokenizer_repo: String,
     /// Pinned revision of [`Self::tokenizer_repo`], as the gates pin theirs.
@@ -509,6 +546,9 @@ impl Model {
             Model::Qwen3_14B_Q6 => qwen3::qwen3_14b_q6(),
             // Qwen3 MoE
             Model::Qwen36_35B_A3B_Q4 => qwen36_moe::qwen36_35b_a3b_q4(),
+            Model::Qwen36_35B_A3B_AntiLoop_StyleTune => {
+                qwen36_moe::qwen36_35b_a3b_antiloop_styletune()
+            }
             Model::Qwen38_FlashNext_Q4KO => qwen38_flash_next::qwen38_flash_next_q4ko(),
             Model::Qwen35_9B_Q6 => qwen35_dense::qwen35_9b_q6(),
             Model::Qwen35_0_8B_Q8 => qwen35_dense::qwen35_0_8b_q8(),

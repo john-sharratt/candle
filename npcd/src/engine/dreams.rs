@@ -406,6 +406,33 @@ pub fn count(engine: &Arc<Mutex<ConversationEngine>>, npc_id: u64) -> usize {
         .len()
 }
 
+/// Retire every dream this character has kept.
+///
+/// Tombstoned, as a superseded day conversation is: the lines stop being
+/// gathered and compaction reclaims them. The lookup already skips tombstoned
+/// conversations, so a dream retired here is no longer counted, sampled for its
+/// axis, or recalled into a room.
+///
+/// Failure is logged, never propagated — a dream that could not be retired
+/// stays recallable, which is untidy and no reason to stop the cast waking.
+///
+/// Returns how many it retired.
+pub fn forget(engine: &Arc<Mutex<ConversationEngine>>, npc_id: u64) -> usize {
+    let engine = engine.lock().unwrap();
+    let kept = engine.find_conversations_by_metadata(META_OF, &npc_id.to_string());
+    let mut retired = 0;
+    for timeline in kept {
+        match engine.tombstone_timeline(timeline) {
+            Ok(()) => retired += 1,
+            Err(e) => tracing::warn!(
+                "npc {npc_id}: dream conversation {timeline} could not be retired: {e:?} — it \
+                 stays recallable"
+            ),
+        }
+    }
+    retired
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

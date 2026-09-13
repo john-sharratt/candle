@@ -14,12 +14,6 @@
 //! `<data>/guests.yaml`, beside the substrate:
 //!
 //! ```yaml
-//! prose:
-//!   gguf: D:/models/Hermes-3-Llama-3.2-3B-Q6_K.gguf
-//!   tokenizer: D:/models/hermes3/tokenizer.json
-//!   # optional
-//!   max_context: 4096
-//!   system: "You are a narrator. Write vivid, concrete prose."
 //! image:
 //!   transformer: D:/models/z-image/z_image_turbo-Q8_0.gguf
 //!   text_encoder: D:/models/z-image/qwen3_4b_f32-q8_0.gguf
@@ -35,6 +29,10 @@
 //!   family: is_net
 //! ```
 //!
+//! There is no `prose` section: names, descriptions, narration and the image
+//! prompt judge run on the resident model ([`crate::prose`]), so a file that
+//! still carries one is refused at startup rather than silently ignored.
+//!
 //! Every section is optional and any may stand alone. A section whose files
 //! are not on disk is **refused at startup**, loudly, rather than accepted and
 //! discovered at the first drain — by then the engine has already evicted its
@@ -42,10 +40,8 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_conversation::guest::prose_choice::HermesQuant;
 use candle_conversation::guest::{
     Guest, GuestModel, GuestRegistry, ImageGuest, ImageSpec, MatteFamily, MatteGuest, MatteSpec,
-    ProseGuest, ProseSpec,
 };
 use serde::Deserialize;
 
@@ -53,8 +49,6 @@ use serde::Deserialize;
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GuestsFile {
-    #[serde(default)]
-    pub prose: Option<ProseSection>,
     #[serde(default)]
     pub image: Option<ImageSection>,
     #[serde(default)]
@@ -77,30 +71,6 @@ pub struct MatteSection {
     /// matte full of holes, which reads as a broken model.
     #[serde(default)]
     pub family: MatteFamily,
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProseSection {
-    /// The directory holding the Hermes-4-14B rungs a deployment downloaded.
-    ///
-    /// **A directory, not a file, because the rung is the card's decision.**
-    /// The image guest names its checkpoint outright — a deployment picks a
-    /// Z-Image rung once and lives with it — but the prose guest is claimed and
-    /// dropped every drain against ground that a resident model is already
-    /// standing in, so the file that fits is a property of the machine rather
-    /// than of the deployment. `HermesQuant::for_vram` picks it, and this says
-    /// where to look; see [`candle_conversation::guest::prose_choice`] for the
-    /// ladder and the measurements under it.
-    ///
-    /// One machine's directory may hold one rung and another's three. Only the
-    /// rung this card wants has to be present.
-    pub dir: PathBuf,
-    pub tokenizer: PathBuf,
-    #[serde(default)]
-    pub max_context: Option<usize>,
-    #[serde(default)]
-    pub system: Option<String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -163,50 +133,6 @@ pub fn load(data: &Path) -> Result<GuestRegistry, String> {
 /// Turn a parsed file into a registry, checking every path first.
 pub fn build(file: GuestsFile) -> Result<GuestRegistry, String> {
     let mut registry = GuestRegistry::new();
-
-    if let Some(p) = file.prose {
-        // **The card chooses the rung, here, once.** Total VRAM rather than
-        // free: this is which checkpoint the deployment runs, and a free-memory
-        // reading would have the daemon pick a different file depending on what
-        // happened to be resident at startup.
-        let total_vram = candle::quantized::get_total_vram_device0().unwrap_or(0) as u64;
-        let quant = HermesQuant::for_vram(total_vram);
-        let gguf = p.dir.join(quant.filename());
-        require_dir(&p.dir, "prose.dir")?;
-        // Named in the error, because "no such file" against a path the operator
-        // never wrote is a puzzle: they configured a directory and the daemon
-        // chose the filename inside it.
-        if !gguf.is_file() {
-            return Err(format!(
-                "prose.dir has no {}: this card reports {} MiB of VRAM, so the prose guest wants \
-                 the {:?} rung of Hermes-4-14B. Download it from {} into {:?}",
-                quant.filename(),
-                total_vram >> 20,
-                quant,
-                quant.repo(),
-                p.dir,
-            ));
-        }
-        require_file(&p.tokenizer, "prose.tokenizer")?;
-        tracing::info!(
-            target: "npcd::guests",
-            vram_mib = total_vram >> 20,
-            rung = ?quant,
-            file = ?gguf,
-            ground_mib = candle_conversation::guest::prose_choice::ground_bytes_at(quant, 4096) >> 20,
-            "prose guest: Hermes-4-14B rung chosen for this card"
-        );
-        let mut spec = ProseSpec::hermes4_14b(gguf, p.tokenizer);
-        if let Some(c) = p.max_context {
-            spec.max_context = c;
-        }
-        if let Some(s) = p.system {
-            spec.default_system = s;
-        }
-        registry.register(Guest::Prose, move || {
-            Box::new(ProseGuest::new(spec.clone())) as Box<dyn GuestModel>
-        });
-    }
 
     if let Some(i) = file.image {
         require_file(&i.transformer, "image.transformer")?;
@@ -302,40 +228,9 @@ mod tests {
     #[test]
     fn a_checkpoint_that_is_not_there_is_refused_before_the_daemon_serves() {
         let d = tmp("missing-ckpt");
-        std::fs::write(
-            path(&d),
-            "prose:\n  dir: ./nope\n  tokenizer: ./nope.json\n",
-        )
-        .unwrap();
+        std::fs::write(path(&d), "matte:\n  model: ./nope.onnx\n").unwrap();
         let e = load(&d).unwrap_err();
-        assert!(e.contains("prose.dir"), "{e}");
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// **A directory that exists without the rung this card wants is refused,
-    /// and the message names the file.** The operator configured a directory
-    /// and the daemon chose the filename inside it, so "no such file" against a
-    /// path they never wrote is a puzzle unless the error says where the name
-    /// came from.
-    #[test]
-    fn a_directory_without_this_cards_rung_says_which_file_it_wanted() {
-        let d = tmp("wrong-rung");
-        let dir = d.join("hermes4");
-        std::fs::create_dir_all(&dir).unwrap();
-        let tok = d.join("t.json");
-        std::fs::write(&tok, b"{}").unwrap();
-        std::fs::write(
-            path(&d),
-            format!(
-                "prose:\n  dir: {}\n  tokenizer: {}\n",
-                dir.display().to_string().replace('\\', "/"),
-                tok.display().to_string().replace('\\', "/")
-            ),
-        )
-        .unwrap();
-        let e = load(&d).unwrap_err();
-        assert!(e.contains("Hermes-4-14B-Q"), "should name the rung: {e}");
-        assert!(e.contains("bartowski"), "should name where to get it: {e}");
+        assert!(e.contains("matte.model"), "{e}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -344,77 +239,51 @@ mod tests {
     #[test]
     fn a_malformed_file_is_an_error_not_an_empty_registry() {
         let d = tmp("malformed");
-        std::fs::write(path(&d), "prose:\n  dir: [not, a, path]\n").unwrap();
+        std::fs::write(path(&d), "matte:\n  model: [not, a, path]\n").unwrap();
         assert!(load(&d).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// An unknown key is refused rather than ignored — a misspelt `tokeniser`
-    /// would otherwise leave the guest reading a default that does not exist.
+    /// An unknown key is refused rather than ignored — a misspelt `familly`
+    /// would otherwise leave the guest reading a default nobody chose.
     #[test]
     fn an_unknown_key_is_refused() {
         let d = tmp("unknown-key");
-        std::fs::write(
-            path(&d),
-            "prose:\n  dir: a\n  tokeniser: b.json\n  tokenizer: b.json\n",
-        )
-        .unwrap();
+        std::fs::write(path(&d), "matte:\n  model: a.onnx\n  familly: u2_net\n").unwrap();
         assert!(load(&d).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// Both sections are optional and either stands alone.
+    /// **A file that still configures a prose guest is refused, naming it.**
+    /// Prose runs on the resident model now; a section accepted and ignored
+    /// would leave an operator believing a checkpoint is in use that nothing
+    /// loads.
+    #[test]
+    fn a_prose_section_is_refused_by_name() {
+        let d = tmp("prose-section");
+        std::fs::write(path(&d), "prose:\n  dir: a\n  tokenizer: b.json\n").unwrap();
+        let e = load(&d).unwrap_err();
+        assert!(e.contains("prose"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Every section is optional and each stands alone.
     #[test]
     fn each_guest_can_be_configured_without_the_other() {
-        let d = tmp("prose-only");
-        let dir = d.join("hermes4");
-        std::fs::create_dir_all(&dir).unwrap();
-        // Whatever rung this machine's card asks for, so the test passes on all
-        // three of them rather than on whichever one wrote it.
-        let quant =
-            HermesQuant::for_vram(candle::quantized::get_total_vram_device0().unwrap_or(0) as u64);
-        std::fs::write(dir.join(quant.filename()), b"x").unwrap();
-        let tok = d.join("t.json");
-        std::fs::write(&tok, b"{}").unwrap();
+        let d = tmp("matte-only");
+        let model = d.join("m.onnx");
+        std::fs::write(&model, b"x").unwrap();
         std::fs::write(
             path(&d),
             format!(
-                "prose:\n  dir: {}\n  tokenizer: {}\n",
-                dir.display().to_string().replace('\\', "/"),
-                tok.display().to_string().replace('\\', "/")
+                "matte:\n  model: {}\n",
+                model.display().to_string().replace('\\', "/")
             ),
         )
         .unwrap();
         let r = load(&d).unwrap();
-        assert_eq!(r.configured(), vec![Guest::Prose]);
+        assert_eq!(r.configured(), vec![Guest::Matte]);
         let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// The optional overrides reach the spec rather than being parsed and
-    /// dropped — a `max_context` an operator set is the number a job is refused
-    /// against.
-    #[test]
-    fn the_optional_settings_reach_the_spec() {
-        let file = GuestsFile {
-            matte: None,
-            prose: Some(ProseSection {
-                dir: PathBuf::from("a"),
-                tokenizer: PathBuf::from("b"),
-                max_context: Some(8192),
-                system: Some("You are terse.".into()),
-            }),
-            image: None,
-        };
-        // The paths do not exist, so this refuses — which is itself the point of
-        // the check above. What is asserted here is that parsing carried the
-        // settings, which the refusal message cannot show.
-        assert!(build(file).is_err());
-
-        let mut spec = ProseSpec::hermes3_3b("a", "b");
-        spec.max_context = 8192;
-        spec.default_system = "You are terse.".into();
-        assert_eq!(spec.max_context, 8192);
-        assert_eq!(spec.default_system, "You are terse.");
     }
 
     /// A shift that is not a number would reach the scheduler and put every
@@ -433,7 +302,6 @@ mod tests {
             .collect();
         let file = GuestsFile {
             matte: None,
-            prose: None,
             image: Some(ImageSection {
                 transformer: files[0].clone(),
                 transformer_restricted: None,
@@ -457,7 +325,6 @@ mod tests {
         let d = tmp("image-paths");
         let file = GuestsFile {
             matte: None,
-            prose: None,
             image: Some(ImageSection {
                 transformer: d.join("nope.gguf"),
                 transformer_restricted: None,
@@ -490,7 +357,6 @@ mod tests {
             .collect();
         let section = |restricted: Option<PathBuf>| GuestsFile {
             matte: None,
-            prose: None,
             image: Some(ImageSection {
                 transformer: files[0].clone(),
                 transformer_restricted: restricted,

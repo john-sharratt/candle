@@ -3224,6 +3224,22 @@ pub(crate) fn spawn_pipeline_thread(
         .name("expert-pipeline".into())
         .spawn(move || {
             let _dead_on_exit = DeadFlagGuard(dead_flag);
+            // **A CUDA context is current per thread.** This thread does its
+            // own uploads — `compute_experts_grouped` stages routing indices
+            // with `memcpy_stod_from` — and a context bound on the thread that
+            // built the device is not bound here, so every one of them failed
+            // `CUDA_ERROR_INVALID_CONTEXT`. Only a card that streams experts
+            // reaches this path at all; one that holds them resident never
+            // does, which is how it stayed hidden. Bound once, for the thread's
+            // life. Failing to bind leaves nothing this thread can do, so it
+            // exits and the dead flag stops the dispatch relying on it.
+            #[cfg(feature = "cuda")]
+            if let Device::Cuda(cd) = &state.device {
+                if let Err(e) = cd.cuda_stream().context().bind_to_thread() {
+                    tracing::error!("expert-pipeline: could not bind the CUDA context: {e}");
+                    return;
+                }
+            }
             while let Ok(msg) = rx.recv() {
                 match msg {
                     PipelineMessage::Work(req) => {

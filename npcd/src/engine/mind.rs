@@ -745,12 +745,11 @@ impl Minds {
     /// **Each think mode has its own temperature and nucleus**, and the dial
     /// picks one per turn: the reasoning row for a mission that raises it, the
     /// cast's think-off row for [`identity::Deliberation::None`], which is what
-    /// almost every turn runs. For this checkpoint and this cast the two rows
-    /// happen to agree at `1.0 / 0.95` — the card's reasoning row, and the
-    /// think-off row widened to match it by
-    /// [`SamplingConfig::for_character_dialogue`] — so on every turn here the
-    /// dial moves the stencil and the close budget, and the numbers move only
-    /// for a family whose rows differ.
+    /// almost every turn runs. For this checkpoint the two rows differ: the
+    /// preset runs both at `0.7 / 0.95`, and
+    /// [`SamplingConfig::for_character_dialogue`] widens the cast's think-off
+    /// row to `1.0 / 0.95` — so a character decodes hotter on an ordinary turn
+    /// than when a mission has it reason.
     ///
     /// The two paths that decide a turn — the probe and the live act — both
     /// come through here, which is what keeps them from drifting.
@@ -868,6 +867,13 @@ impl Minds {
     /// Returns how many conversations it retired.
     pub fn forget_conversations(&self, npc_id: u64) -> usize {
         retire_superseded(&self.engine, npc_id, None)
+    }
+
+    /// Retire every dream this character has kept — see [`dreams::forget`].
+    ///
+    /// Returns how many it retired.
+    pub fn forget_dreams(&self, npc_id: u64) -> usize {
+        dreams::forget(&self.engine, npc_id)
     }
 
     /// The model's own dialect and sampling, as captured at load.

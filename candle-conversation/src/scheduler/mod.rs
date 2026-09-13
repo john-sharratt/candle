@@ -460,6 +460,20 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<(), ConversationError>>,
     },
 
+    /// Remove transient sections — a throwaway conversation's frame — once
+    /// their last user has finished with them.
+    ///
+    /// On the wave thread because the scheduler holds per-section state of its
+    /// own (the index page, the name, a queued quantize) that has to go with the
+    /// substrate entry, and because between waves nothing is attending it.
+    /// Fire-and-forget: the sender has already let go, and a section that is not
+    /// transient is left alone — see
+    /// [`crate::substrate::Substrate::retire_section`].
+    RetireSections {
+        conversation: Conversation,
+        sections: Vec<SectionId>,
+    },
+
     /// Pre-warm a freshly-allocated slot by injecting the static system-prompt
     /// sections before the user submits the first turn.
     ///
@@ -4194,6 +4208,20 @@ impl Scheduler {
                 true
             }
 
+            SchedulerRequest::RetireSections {
+                conversation,
+                sections,
+            } => {
+                for id in sections {
+                    if conversation.retire_section(id) {
+                        self.section_positional.remove(&id);
+                        self.section_name_cache.remove(&id);
+                        self.pending_section_quantize.retain(|p| p.section_id != id);
+                    }
+                }
+                true
+            }
+
             SchedulerRequest::PrimingProjection {
                 sequence_id,
                 section_ids,
@@ -6452,6 +6480,8 @@ impl Scheduler {
         // glue K/V into whatever this rebuild placed at those indices. Drop the
         // superseded plan and defer only this latest projection, so exactly one
         // (current) plan fires against the slot as this call built it.
+        // Read before any of `self`'s fields are borrowed out of it below.
+        let pass_budget = self.prefill_pass_budget();
         let defer = if self.batch_drain_gap_fills {
             self.deferred_glue_fires
                 .retain(|p| p.parent_id != parent_id);
@@ -6474,7 +6504,7 @@ impl Scheduler {
                 slot_target,
                 parent_id,
                 chunk_size: self.chunk_size,
-                max_prefill_pass_tokens: self.max_prefill_pass_tokens,
+                max_prefill_pass_tokens: pass_budget,
                 tokenizer: &self.tokenizer,
                 slot_tokens: &mut self.slot_tokens,
                 boundary_markers: &self.boundary_markers,
@@ -6510,6 +6540,7 @@ impl Scheduler {
         // eviction can protect it (see `evict_cold_tail`). Same as the single-slot
         // `apply_projection`; the wave path threads build/finish separately, so we
         // stamp it here where the segments are in hand.
+        let pass_budget = self.prefill_pass_budget();
         let state = self.slot_projection_state.entry(parent_id).or_default();
         state.working_set = projection_assembler::working_set_from_segments(segments);
         let mut ctx = projection_assembler::ApplyContext {
@@ -6520,7 +6551,7 @@ impl Scheduler {
             slot_target,
             parent_id,
             chunk_size: self.chunk_size,
-            max_prefill_pass_tokens: self.max_prefill_pass_tokens,
+            max_prefill_pass_tokens: pass_budget,
             tokenizer: &self.tokenizer,
             slot_tokens: &mut self.slot_tokens,
             boundary_markers: &self.boundary_markers,
@@ -6548,6 +6579,7 @@ impl Scheduler {
                 ))
             })?;
         let slot_target = self.slot_targets.get(&parent_id).copied();
+        let pass_budget = self.prefill_pass_budget();
         let state = self.slot_projection_state.entry(parent_id).or_default();
         let mut ctx = projection_assembler::ApplyContext {
             session: &mut self.session,
@@ -6557,7 +6589,7 @@ impl Scheduler {
             slot_target,
             parent_id,
             chunk_size: self.chunk_size,
-            max_prefill_pass_tokens: self.max_prefill_pass_tokens,
+            max_prefill_pass_tokens: pass_budget,
             tokenizer: &self.tokenizer,
             slot_tokens: &mut self.slot_tokens,
             boundary_markers: &self.boundary_markers,
@@ -8322,17 +8354,25 @@ impl Scheduler {
                         in_collection: *in_collection,
                     });
                 }
-                // Declare the section stream in the redo log so the
-                // manifest knows the (address, debug_name) before any
-                // chunks land.  Mirrors record_turn's StreamDecl write.
-                if let Err(e) = conversation.declare_section_stream(*address, debug_name) {
-                    tracing::warn!("declare section stream failed: {e}");
+                // A transient section — a throwaway conversation's frame — is
+                // never read back from disk, so it declares no stream and writes
+                // no tokens; its residence is already `no_cold_persist`, so its
+                // chunks stay off the cold tier too. See
+                // `Substrate::mark_section_transient`.
+                if !conversation.is_section_transient(*section_id) {
+                    // Declare the section stream in the redo log so the
+                    // manifest knows the (address, debug_name) before any
+                    // chunks land.  Mirrors record_turn's StreamDecl write.
+                    if let Err(e) = conversation.declare_section_stream(*address, debug_name) {
+                        tracing::warn!("declare section stream failed: {e}");
+                    }
+                    // Persist the section's token ids (off-thread writer, so the
+                    // seal never blocks on the persistence lock), then fire the
+                    // persistence trigger so the chunks land on disk in the next
+                    // pass.
+                    conversation.enqueue_tokens(stream_id, tokens.to_vec());
+                    self.persist_trigger.fire();
                 }
-                // Persist the section's token ids (off-thread writer, so the seal
-                // never blocks on the persistence lock), then fire the persistence
-                // trigger so the chunks land on disk in the next pass.
-                conversation.enqueue_tokens(stream_id, tokens.to_vec());
-                self.persist_trigger.fire();
             }
             SealAction::None => unreachable!("filtered above"),
             SealAction::TurnGroup(_) => unreachable!(
@@ -8454,14 +8494,26 @@ impl Scheduler {
         Ok(if state.is_empty() { None } else { Some(state) })
     }
 
-    /// Run `tokens` through the model on `seq`, in `max_prefill_pass_tokens`
+    /// Tokens one prefill forward may carry — see [`admission::prefill_pass_budget`].
+    ///
+    /// Read per forward rather than once at construction: the model's cap includes
+    /// what the KV side can still hold, which moves with every claim.
+    fn prefill_pass_budget(&self) -> usize {
+        admission::prefill_pass_budget(
+            self.max_prefill_pass_tokens,
+            self.model
+                .prefill_width_cap(self.session.activation_dtype()),
+        )
+    }
+
+    /// Run `tokens` through the model on `seq`, in [`Self::prefill_pass_budget`]
     /// chunks.
     ///
     /// The chunking is not an optimisation: one forward over a whole prompt is a
     /// transient activation spike large enough to page, which is the same reason
     /// `build_section_batch` bounds its own per-forward budget.
     fn prefill_tokens_on(&mut self, seq: usize, tokens: &[u32]) -> Result<(), ConversationError> {
-        let cap = self.max_prefill_pass_tokens.max(1);
+        let cap = self.prefill_pass_budget();
         let n_layers = self.model.num_layers();
         let mut off = 0usize;
         while off < tokens.len() {

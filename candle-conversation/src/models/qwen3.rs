@@ -29,6 +29,7 @@ pub(super) fn qwen3_8b_q4() -> ModelSpec {
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
         model_rev: String::new(),
         gate_donor: None,
+        tensor_overrides: Vec::new(),
         tokenizer_repo: "Qwen/Qwen3-8B".into(),
         // Unpinned: no revision has been verified against this checkpoint's
         // `tokenizer.ggml.tokens`. The load-time check against that table is
@@ -58,6 +59,7 @@ pub(super) fn qwen3_8b_q6() -> ModelSpec {
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
         model_rev: String::new(),
         gate_donor: None,
+        tensor_overrides: Vec::new(),
         tokenizer_repo: "Qwen/Qwen3-8B".into(),
         // Unpinned: no revision has been verified against this checkpoint's
         // `tokenizer.ggml.tokens`. The load-time check against that table is
@@ -91,6 +93,7 @@ pub(super) fn qwen3_14b_q4() -> ModelSpec {
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
         model_rev: String::new(),
         gate_donor: None,
+        tensor_overrides: Vec::new(),
         tokenizer_repo: "Qwen/Qwen3-14B".into(),
         tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),
@@ -117,6 +120,7 @@ pub(super) fn qwen3_14b_q5() -> ModelSpec {
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
         model_rev: String::new(),
         gate_donor: None,
+        tensor_overrides: Vec::new(),
         tokenizer_repo: "Qwen/Qwen3-14B".into(),
         tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),
@@ -143,6 +147,7 @@ pub(super) fn qwen3_14b_q6() -> ModelSpec {
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
         model_rev: String::new(),
         gate_donor: None,
+        tensor_overrides: Vec::new(),
         tokenizer_repo: "Qwen/Qwen3-14B".into(),
         tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),

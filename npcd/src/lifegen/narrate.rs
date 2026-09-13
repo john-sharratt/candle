@@ -7,12 +7,13 @@
 //! share one copy of the story's K/V and batch into the same waves. That is the
 //! right shape for bulk, and nothing here replaces it.
 //!
-//! This is the other case — **one node, on demand, in a different voice.** An
+//! This is the other case — **one node, on demand, in a narrator's voice.** An
 //! operator reading a month that came out flat wants that month rewritten, now,
 //! and wants it to read like prose rather than like a character deciding what
-//! to do. The acting model is tuned for the second; the prose guest is a
-//! narrator. So a single node goes to the guest, which is exactly the shape a
-//! guest serves well: one prompt, one answer, no fan-out.
+//! to do. So a single node is written through [`crate::prose`]: a throwaway
+//! conversation on the resident model under the narrator's voice, with no
+//! character's identity or acts in front of it — one prompt, one answer, no
+//! fan-out.
 //!
 //! The two write through the same door. A node this produces is recorded with
 //! [`Content::generated`], not `edit` — it is a generation, so a later ladder
@@ -24,16 +25,16 @@ use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use candle_conversation::guest::{GuestError, GuestOutcome, GuestRequest, ProseRequest};
 use serde::Deserialize;
 use serde_json::json;
 
 use super::plan::{NodeId, Plan};
 use crate::api::Authored;
+use crate::prose;
 
 /// The voice, and the shape of the answer.
 ///
-/// Stated per request rather than left to the guest's default because this is a
+/// Stated per request rather than left to the default voice because this is a
 /// *life document*, not free narration: it has to stay inside what the strata
 /// above it already committed to, and a narrator that invents a sibling in
 /// March contradicts every other month of that year — which are written by
@@ -47,7 +48,7 @@ const VOICE: &str = "You are writing one stratum of a character's life history. 
 /// Tokens one node gets.
 ///
 /// A month is a page. Generous enough that a good answer is never cut off, and
-/// bounded because every token is time the whole estate is not thinking.
+/// bounded so one rewrite cannot run on for pages.
 const MAX_TOKENS: u32 = 900;
 
 #[derive(Debug, Default, Deserialize)]
@@ -251,7 +252,7 @@ fn push_ancestor(s: &mut String, plan: &Plan, id: NodeId, heading: &str) {
 
 /// `POST /v1/life/:who/node/:key/narrate`
 ///
-/// Generates one node through the prose guest and writes it into the plan and
+/// Generates one node through [`crate::prose`] and writes it into the plan and
 /// onto disk, answering with the prose so the console can show it without a
 /// second read.
 /// **The body is required, and `{}` is the ordinary one.**
@@ -293,15 +294,15 @@ pub async fn post_narrate(
         );
     }
 
-    // Built before the drain and from a plan this route owns, so nothing else
-    // can move the context underneath the prompt while the guest runs.
+    // Built before the decode and from a plan this route owns, so nothing else
+    // can move the context underneath the prompt while it runs.
     let narration = prompt_for(
         &plan,
         id,
         &body.note,
         &crate::lifegen::routes::voice_for(&s, &who).await,
     );
-    let request = GuestRequest::Prose(ProseRequest {
+    let request = prose::Request {
         // The voice and everything already true go in the system turn; the one
         // thing to write goes in the user turn. See [`Narration`] for what
         // putting both in the user turn produced.
@@ -312,18 +313,11 @@ pub async fn post_narrate(
         seed: body.seed,
         // Narration is prose, not a decision — nothing to constrain it to.
         choices: None,
-    });
+    };
 
-    let (text, tokens, seed) = match crate::guest_routes::run_guest(&s, request).await {
-        Ok(GuestOutcome::Prose { text, tokens, seed }) => (text, tokens, seed),
-        Ok(other) => {
-            return fail(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "wrong_guest",
-                &format!("the prose request came back as {}", other.guest()),
-            )
-        }
-        Err(e) => return guest_refusal(&e),
+    let (text, tokens, seed) = match prose::run(&s, request).await {
+        Ok(a) => (a.text, a.tokens, a.seed),
+        Err(e) => return prose::refusal(&e),
     };
 
     let trimmed = text.trim();
@@ -384,28 +378,6 @@ fn default_title(id: NodeId) -> String {
 
 fn fail(status: StatusCode, error: &str, detail: &str) -> Response {
     (status, Json(json!({ "error": error, "detail": detail }))).into_response()
-}
-
-/// The same status mapping every guest route uses — a caller that learns
-/// "retry" from one and "give up" from another for the same condition cannot
-/// act on either.
-fn guest_refusal(e: &GuestError) -> Response {
-    let (status, code) = match e {
-        GuestError::Refused(_) => (StatusCode::BAD_REQUEST, "bad_request"),
-        GuestError::NoRoom { .. } => (StatusCode::SERVICE_UNAVAILABLE, "no_room"),
-        GuestError::Unavailable(_) => (StatusCode::NOT_IMPLEMENTED, "no_prose_model"),
-        GuestError::Failed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "guest_failed"),
-        GuestError::Abandoned => (StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable"),
-    };
-    (
-        status,
-        Json(json!({
-            "error": code,
-            "detail": e.to_string(),
-            "retry": matches!(e, GuestError::NoRoom { .. } | GuestError::Abandoned),
-        })),
-    )
-        .into_response()
 }
 
 #[cfg(test)]
@@ -607,14 +579,14 @@ mod tests {
     #[test]
     fn the_request_it_builds_is_servable() {
         let n = prompt_for(&plan(), NodeId::Year { year: 1998 }, "", "");
-        let r = GuestRequest::Prose(ProseRequest {
+        let r = prose::Request {
             system: format!("{VOICE}\n\n{}", n.context),
             prompt: n.task,
             max_tokens: MAX_TOKENS,
             temperature: None,
             seed: None,
             choices: None,
-        });
+        };
         assert!(r.check().is_ok(), "{:?}", r.check());
     }
 

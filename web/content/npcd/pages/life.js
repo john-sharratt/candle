@@ -604,35 +604,28 @@ function stratum(host, key, node, heading, hint, open, aside) {
       /* **Narrate — this one stratum, in the narrator's voice.**
        *
        * Beside Regenerate rather than replacing it, because they are different
-       * things. Regenerate queues the ladder on the main engine: it may run
-       * several rungs, it fans out, and it comes back as a job you watch. This
-       * asks the prose guest for exactly this node and returns the prose — one
-       * prompt, one answer, no job to poll.
+       * things. Regenerate queues the ladder: it may run several rungs, it fans
+       * out, and it comes back as a job you watch. This asks for exactly this
+       * node and returns the prose — one prompt, one answer, no job to poll.
        *
-       * It blocks the whole cast for its duration, so the button says so, and
-       * disables itself rather than letting a second press queue a second
-       * stop-the-world job over the same node. */
+       * It disables itself while it runs rather than letting a second press
+       * queue a second rewrite of the same node. */
       h('button', {
         class: 'btn sm',
-        title: 'Rewrite just this stratum with the co-resident narrator. Pauses the cast.',
+        title: 'Rewrite just this stratum in the narrator\'s voice.',
         onClick: async (e) => {
           const b = e.target;
           const run = async () => {
             const was = b.textContent;
             b.disabled = true;
-            b.textContent = '◍ narrating — the cast is paused';
+            b.textContent = '◍ narrating…';
             try {
               const r = await API.narrateLifeNode(S.who, key, { force: node.edited });
               toast(`Narrated — ${r.tokens} tokens`
                 + (r.stale_below ? `, ${r.stale_below} below are now out of date` : ''), 'ok');
               await redraw(host);
             } catch (err) {
-              /* A daemon with no prose guest is a deployment fact, not a
-               * fault — naming it stops somebody debugging a model that was
-               * never configured. */
-              problems(err.error === 'no_prose_model'
-                ? { detail: 'no prose model is configured on this daemon' }
-                : err);
+              problems(err);
             } finally {
               b.disabled = false;
               b.textContent = was;

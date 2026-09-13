@@ -153,9 +153,8 @@ pub fn drain_one<R: EngineRoom>(
     }
     report.freed_mib = freed >> 20;
 
-    // Step 3. Claim only what the guest places itself — a second tenancy, like
-    // the prose guest's chunked K/V, was shed for above and claims its own
-    // regions from what that freed.
+    // Step 3. Claim only what the guest places itself — a second tenancy was
+    // shed for above and claims its own regions from what that freed.
     let device = room.device();
     let ground_want = model.ground_bytes(&requests);
     let ground = match room.claim_ground(ground_want) {
@@ -392,7 +391,7 @@ mod tests {
     use crate::guest::model::testing::FakeGuest;
     use crate::guest::progress::GuestSink;
     use crate::guest::queue::GuestQueue;
-    use crate::guest::work::{GuestOutcome, ImageLora, ImageRequest, ProseRequest};
+    use crate::guest::work::{GuestMatte, GuestOutcome, ImageLora, ImageRequest, MatteRequest};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
 
@@ -488,14 +487,11 @@ mod tests {
         })
     }
 
-    fn prose_job() -> GuestRequest {
-        GuestRequest::Prose(ProseRequest {
-            system: String::new(),
-            prompt: "the yard".into(),
-            max_tokens: 16,
-            temperature: None,
-            seed: None,
-            choices: None,
+    fn matte_job() -> GuestRequest {
+        GuestRequest::Matte(MatteRequest {
+            pixels: vec![0; 4 * 4 * 3],
+            width: 4,
+            height: 4,
         })
     }
 
@@ -549,8 +545,8 @@ mod tests {
             free: 64 << 20,
             ..Default::default()
         };
-        let (mut model, _, _, _) = guest_model(Guest::Prose, 4 << 20);
-        let (_q, jobs, receipt, seen) = queued_watched(prose_job());
+        let (mut model, _, _, _) = guest_model(Guest::Matte, 4 << 20);
+        let (_q, jobs, receipt, seen) = queued_watched(matte_job());
         drain_one(&mut room, &mut model, jobs);
 
         let events = seen.lock().unwrap().clone();
@@ -560,8 +556,8 @@ mod tests {
             "the watcher was not told the guest had started loading"
         );
         assert!(
-            events.iter().any(|e| matches!(e, GuestEvent::Token(_))),
-            "the run produced no fragments for the watcher"
+            events.iter().any(|e| matches!(e, GuestEvent::Step { .. })),
+            "the run reported no progress to the watcher"
         );
         assert!(receipt.wait().is_ok());
     }
@@ -576,8 +572,8 @@ mod tests {
             sheds: vec![],
             ..Default::default()
         };
-        let (mut model, _, _, _) = guest_model(Guest::Prose, 64 << 20);
-        let (_q, jobs, receipt, seen) = queued_watched(prose_job());
+        let (mut model, _, _, _) = guest_model(Guest::Matte, 64 << 20);
+        let (_q, jobs, receipt, seen) = queued_watched(matte_job());
         drain_one(&mut room, &mut model, jobs);
 
         assert!(
@@ -595,8 +591,8 @@ mod tests {
             free: 64 << 20,
             ..Default::default()
         };
-        let (mut model, _, _, _) = guest_model(Guest::Prose, 4 << 20);
-        let (_q, jobs, receipts) = queued(vec![prose_job()]);
+        let (mut model, _, _, _) = guest_model(Guest::Matte, 4 << 20);
+        let (_q, jobs, receipts) = queued(vec![matte_job()]);
         let report = drain_one(&mut room, &mut model, jobs);
         assert_eq!(report.served, 1);
         assert!(receipts.into_iter().next().unwrap().wait().is_ok());
@@ -698,8 +694,8 @@ mod tests {
             free: 64 << 20,
             ..Default::default()
         };
-        let (mut model, loads, runs, unloads) = guest_model(Guest::Prose, 4 << 20);
-        let (_q, jobs, receipts) = queued(vec![prose_job(), prose_job(), prose_job()]);
+        let (mut model, loads, runs, unloads) = guest_model(Guest::Matte, 4 << 20);
+        let (_q, jobs, receipts) = queued(vec![matte_job(), matte_job(), matte_job()]);
         let report = drain_one(&mut room, &mut model, jobs);
 
         assert_eq!(
@@ -711,7 +707,7 @@ mod tests {
         assert_eq!(unloads.load(Ordering::Relaxed), 1);
         assert_eq!((report.served, report.failed), (3, 0));
         for r in receipts {
-            assert!(matches!(r.wait(), Ok(GuestOutcome::Prose { .. })));
+            assert!(matches!(r.wait(), Ok(GuestOutcome::Matte(_))));
         }
     }
 
@@ -724,9 +720,9 @@ mod tests {
             free: 64 << 20,
             ..Default::default()
         };
-        let (mut model, _, runs, _) = guest_model(Guest::Prose, 4 << 20);
+        let (mut model, _, runs, _) = guest_model(Guest::Matte, 4 << 20);
         model.fail_run = true;
-        let (_q, jobs, receipts) = queued(vec![prose_job(), prose_job()]);
+        let (_q, jobs, receipts) = queued(vec![matte_job(), matte_job()]);
         let report = drain_one(&mut room, &mut model, jobs);
 
         assert_eq!(
@@ -856,7 +852,7 @@ mod tests {
         }
         impl GuestModel for Hoarder {
             fn guest(&self) -> Guest {
-                Guest::Prose
+                Guest::Matte
             }
             fn footprint_bytes(&self, _: &[GuestRequest]) -> usize {
                 1 << 20
@@ -875,11 +871,12 @@ mod tests {
                 _r: &GuestRequest,
                 _sink: &GuestSink,
             ) -> Result<GuestOutcome, String> {
-                Ok(GuestOutcome::Prose {
-                    text: String::new(),
-                    tokens: 0,
-                    seed: 0,
-                })
+                Ok(GuestOutcome::Matte(GuestMatte {
+                    width: 1,
+                    height: 1,
+                    png: vec![],
+                    lifted: 0.0,
+                }))
             }
             fn unload(&mut self) {
                 // Deliberately does not release `kept` — this is the bug the
@@ -892,7 +889,7 @@ mod tests {
             ..Default::default()
         };
         let mut model = Hoarder { kept: None };
-        let (_q, jobs, _r) = queued(vec![prose_job()]);
+        let (_q, jobs, _r) = queued(vec![matte_job()]);
         drain_one(&mut room, &mut model, jobs);
         assert!(
             model.kept.is_some(),

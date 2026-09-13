@@ -1,7 +1,7 @@
 //! The line between a game's content and abuse of the generator.
 //!
-//! Every image prompt is read by the prose guest — Hermes 3 — before the image
-//! guest is allowed to draw it. It is asked **four narrow questions in
+//! Every image prompt is read by the resident model, in a conversation of its
+//! own, before the image guest is allowed to draw it. It is asked **four narrow questions in
 //! parallel**, each answered in **one token** under a
 //! [`candle_conversation::stencil`] that masks the sampler to exactly two: `Y`
 //! and `N`. The four answers are combined here, in code.
@@ -34,11 +34,9 @@
 //! `age` keeps its original framing because it has no negation in it: "is every
 //! person an adult" already asks for the permitted state.
 //!
-//! They are asked concurrently and served by **one** model load: guest jobs
-//! drain one guest at a time and a drain serves the whole backlog, so four
-//! questions submitted together cost what one does. Asked in sequence they would
-//! be four evictions of the engine's working set and four loads of a 3 GB
-//! checkpoint.
+//! They are asked concurrently. Each is a throwaway conversation on the resident
+//! model ([`crate::prose`]), so four submitted together ride the same waves and
+//! cost about what one does; nothing else in the world stops for them.
 //!
 //! # Why the answer is stencilled
 //!
@@ -105,19 +103,23 @@
 //! enough the fix is to make it stricter, in one place, in the language the
 //! thing doing the judging actually reads.
 //!
-//! # Why a separate model rather than the engine
+//! # Why the cast's model can be the judge
 //!
-//! The prose guest is a small instruct model with no stake in the answer, and it
-//! is already resident machinery — [`crate::describe`] and [`crate::namegen`]
-//! run it. The engine could do it and is always loaded, but it is the *cast's*
-//! model: it carries a world, a personality and a voice, and asking it to
-//! adjudicate would put the judgement inside the same context that writes the
-//! characters.
+//! The judge used to be a separate small instruct model, for one reason: the
+//! resident model is the *cast's*, and asking a character to adjudicate would put
+//! the judgement inside the context that writes the characters. That reason is
+//! about the context, not the weights. Each question here is its own throwaway
+//! conversation whose whole system prompt is the question — no world, no
+//! personality, no character, no history — so the weights answer with none of
+//! the cast's context in front of them.
 //!
 //! # What it scores, and what that cost to find
 //!
 //! On a 28-prompt corpus — 16 that must be refused, 12 that must be drawn — this
-//! configuration scores **28/28**, reproducibly.
+//! configuration scored **28/28**, reproducibly, **on Hermes 3**, the judge's
+//! model before it moved onto the resident one. The resident model has not yet
+//! been scored against the corpus; until it is, that figure is the previous
+//! judge's, not this one's.
 //!
 //! Twelve measured iterations got there, and the instructive part is that almost
 //! every attempt to make the *wording* better made the result worse. What
@@ -153,10 +155,8 @@
 
 use std::sync::Arc;
 
-use candle_conversation::guest::{GuestOutcome, GuestRequest, GuestSink, ProseRequest};
-
 use crate::api::Authored;
-use crate::guest_routes::run_guest_watched;
+use crate::prose;
 
 /// The two answers the judge may give, as **single tokens**.
 ///
@@ -462,12 +462,11 @@ enum Answer {
 /// Anything other than the verdict stops the draw, including the judge being
 /// unavailable, erroring, or answering with something unexpected. A gate that
 /// opened when its judge was missing would be bypassable by whatever made the
-/// judge missing, and on a daemon that serves guests between waves that is not
-/// hypothetical — a queue, a load failure or a misconfigured `guests.yaml` are
-/// all reachable states.
+/// judge missing, and that is not hypothetical — an engine still loading, or a
+/// decode that failed, are both reachable states.
 ///
-/// The cost is stated plainly rather than hidden: a deployment with no prose
-/// guest configured draws no images, and is told exactly that.
+/// The cost is stated plainly rather than hidden: while the engine is loading
+/// nothing is drawn, and the caller is told exactly that.
 pub async fn check(s: &Arc<Authored>, prompt: &str) -> Result<(), Denial> {
     // Nothing to judge. Refused at the boundary instead of being sent to the
     // model, which would answer something about the empty string.
@@ -475,12 +474,9 @@ pub async fn check(s: &Arc<Authored>, prompt: &str) -> Result<(), Denial> {
         return Err(Denial::Refused);
     }
 
-    // **All three, concurrently, and that is not just for latency.** Guest jobs
-    // are drained one guest at a time and a drain serves the *whole backlog*, so
-    // three questions submitted together are answered by one model load. Asked
-    // in sequence they would be three separate drains — three evictions of the
-    // engine's working set and three loads of a 3 GB checkpoint — for three
-    // answers that do not depend on each other.
+    // **All four, concurrently.** Each is its own conversation, and submitted
+    // together they ride the same waves — one decode step answers all four, for
+    // four answers that do not depend on each other.
     let (age, nudity, sex, people) = tokio::join!(
         ask(s, &QUESTIONS[0], prompt),
         ask(s, &QUESTIONS[1], prompt),
@@ -539,7 +535,7 @@ pub async fn check(s: &Arc<Authored>, prompt: &str) -> Result<(), Denial> {
 
 /// Put one question to the judge. `Ok(true)` is a pass.
 async fn ask(s: &Arc<Authored>, q: &Question, prompt: &str) -> Result<Answer, Denial> {
-    let request = GuestRequest::Prose(ProseRequest {
+    let request = prose::Request {
         system: q.system.to_string(),
         // Delimited and labelled as data. It does not make the prompt inert —
         // see the module note — but it is the difference between a model that
@@ -553,17 +549,10 @@ async fn ask(s: &Arc<Authored>, q: &Question, prompt: &str) -> Result<Answer, De
         // same mechanism the tool catalogue uses to force a call to its exact
         // names. One token each, so the walk has nothing to commit to.
         choices: Some(CHOICES.iter().map(|s| s.to_string()).collect()),
-    });
+    };
 
-    let answer = match run_guest_watched(s, request, GuestSink::none()).await {
-        Ok(GuestOutcome::Prose { text, .. }) => text,
-        Ok(other) => {
-            return Err(Denial::Unavailable(format!(
-                "the {} check came back as {}",
-                q.label,
-                other.guest()
-            )))
-        }
+    let answer = match prose::run(s, request).await {
+        Ok(a) => a.text,
         Err(e) => return Err(Denial::Unavailable(e.to_string())),
     };
 

@@ -537,6 +537,7 @@ mod tests {
                     expert_pack_dir: None,
                     mtp_path: Some(mtp_path.clone()),
                     gate_donor_path: None,
+                    tensor_overrides: Vec::new(),
                 },
             )?;
             let cfg = &m.model().cfg;
@@ -595,6 +596,7 @@ mod tests {
                         expert_pack_dir: None,
                         mtp_path: Some(mtp_path.clone()),
                         gate_donor_path: None,
+                        tensor_overrides: Vec::new(),
                     },
                 )
             },
@@ -653,6 +655,7 @@ mod tests {
                         expert_pack_dir: None,
                         mtp_path: Some(mtp_path.clone()),
                         gate_donor_path: None,
+                        tensor_overrides: Vec::new(),
                     },
                 )?;
                 assert!(

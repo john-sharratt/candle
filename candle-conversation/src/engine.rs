@@ -8,7 +8,8 @@ use crate::persistence::record::DistillMode;
 use crate::persistence::thread::PersistenceThread;
 use crate::persistence::SharedSubstrate;
 use crate::projection::{
-    Builder, Conversation, GroupId, LayerId, ProjectionTarget, Reserved, TimelineId, TurnIndex,
+    Builder, Conversation, GroupId, LayerId, PlainPromptFrames, ProjectionTarget, Reserved,
+    SectionId, TimelineId, TurnIndex,
 };
 use crate::scheduler::{Scheduler, SchedulerRequest};
 use crate::sequence_handle::SequenceId;
@@ -155,6 +156,10 @@ pub struct ConversationEngine {
 
     /// Tokenizer (shared, immutable, safe to clone into conversations).
     tokenizer: Arc<tokenizers::Tokenizer>,
+
+    /// The frame sections handed out to plain-prompt conversations, and the
+    /// claim on each — see [`Self::plain_prompt_section`].
+    plain_frames: Mutex<PlainPromptFrames>,
 
     /// Engine-wide configuration.
     #[allow(dead_code)]
@@ -487,6 +492,7 @@ impl ConversationEngine {
             scheduler_tx: tx,
             scheduler_handle: Mutex::new(Some(handle)),
             tokenizer: Arc::new(tokenizer),
+            plain_frames: Mutex::new(PlainPromptFrames::default()),
             config,
             model_core,
             conversation,
@@ -1107,10 +1113,95 @@ impl ConversationEngine {
         kind: Reserved,
         config: SequenceConfig,
     ) -> crate::Result<Sequence> {
-        let builder = Builder::for_plain_prompt_reserved(system_prompt, kind);
+        let frame = self.plain_prompt_section(system_prompt)?;
+        let builder = Builder::for_plain_prompt_reserved(system_prompt, kind, frame);
         let layer_id = LayerId::reserved(kind);
         let group_id = GroupId::reserved(kind);
         self.new_conversation_with_projection(system_prompt, builder, layer_id, group_id, config)
+    }
+
+    /// The section a plain prompt's frame is sealed under.
+    ///
+    /// Chosen from the prompt's own tokens and checked against what the
+    /// substrate already holds — see [`PlainPromptFrames`] for why a fixed id
+    /// hands a conversation the prompt some other conversation was opened with.
+    /// Give it to [`Builder::for_plain_prompt`] or
+    /// [`Builder::for_plain_prompt_reserved`] with this same text, since that
+    /// text is what the section seals.
+    ///
+    /// The id is claimed as it is returned, so a conversation opening a
+    /// different prompt at the same moment is not handed it before this one
+    /// has sealed. A conversation opened for one job and discarded takes
+    /// [`Self::transient_prompt_section`] instead, which leaves nothing behind.
+    pub fn plain_prompt_section(&self, prompt_text: &str) -> crate::Result<SectionId> {
+        let encoding = self
+            .tokenizer
+            .encode(prompt_text, false)
+            .map_err(|e| ConversationError::Tokenizer(e.to_string()))?;
+        let mut frames = self.plain_frames.lock().unwrap();
+        let view = self.conversation.read();
+        frames
+            .resolve(encoding.get_ids(), |id| {
+                view.section_exists(id).then(|| view.section_tokens_of(id))
+            })
+            .ok_or_else(|| {
+                ConversationError::Other(format!(
+                    "no frame section is free for this prompt within {} probes of its slot",
+                    PlainPromptFrames::MAX_PROBES
+                ))
+            })
+    }
+
+    /// The section a throwaway conversation's frame is sealed under, held until
+    /// [`Self::release_prompt_section`].
+    ///
+    /// [`Self::plain_prompt_section`] for a conversation opened for one job and
+    /// discarded. The frame is **transient**: never written to disk, and retired
+    /// from the substrate when the last conversation holding it releases it, so
+    /// a caller whose every prompt is different leaves nothing behind. Two jobs
+    /// on the same prompt share the section while both hold it.
+    ///
+    /// Every successful call must be matched by one release, made after the
+    /// conversation that used the frame has been dropped.
+    pub fn transient_prompt_section(&self, prompt_text: &str) -> crate::Result<SectionId> {
+        let encoding = self
+            .tokenizer
+            .encode(prompt_text, false)
+            .map_err(|e| ConversationError::Tokenizer(e.to_string()))?;
+        let id = {
+            let mut frames = self.plain_frames.lock().unwrap();
+            let view = self.conversation.read();
+            frames.acquire(encoding.get_ids(), |id| {
+                view.section_exists(id).then(|| view.section_tokens_of(id))
+            })
+        }
+        .ok_or_else(|| {
+            ConversationError::Other(format!(
+                "no transient frame section is free for this prompt within {} probes of its \
+                 slot",
+                PlainPromptFrames::MAX_PROBES
+            ))
+        })?;
+        // Before the conversation that uses it opens: the seal reads this to
+        // skip the disk, and a section that sealed first has already written.
+        self.conversation.mark_section_transient(id);
+        Ok(id)
+    }
+
+    /// Let go of a frame taken with [`Self::transient_prompt_section`].
+    ///
+    /// The last release retires the section, on the wave thread between waves —
+    /// see [`SchedulerRequest::RetireSections`]. Sent after the conversation's
+    /// own slot was freed, on the same queue, so the retirement never runs ahead
+    /// of the slot that was reading the frame.
+    pub fn release_prompt_section(&self, section: SectionId) {
+        let last = self.plain_frames.lock().unwrap().release(section);
+        if last {
+            let _ = self.scheduler_tx.send(SchedulerRequest::RetireSections {
+                conversation: self.conversation.clone(),
+                sections: vec![section],
+            });
+        }
     }
 
     /// Compile a tool catalog into a [`TriggerRegistry`] for constrained
@@ -1269,7 +1360,9 @@ impl ConversationEngine {
                 .unwrap_or(system_prompt);
             s.strip_suffix(config.dialect.system_end).unwrap_or(s)
         };
-        let builder = Builder::for_plain_prompt(inner_prompt);
+        // The frame's id comes from its text — see [`Self::plain_prompt_section`].
+        let frame = self.plain_prompt_section(inner_prompt)?;
+        let builder = Builder::for_plain_prompt(inner_prompt, frame);
         let (layer_id, group_id) = {
             let layer = &builder.schema().layers[0];
             (layer.id, layer.groups[0].id)
@@ -1438,7 +1531,9 @@ impl ConversationEngine {
                 .unwrap_or(system_prompt);
             s.strip_suffix(config.dialect.system_end).unwrap_or(s)
         };
-        let builder = Builder::for_plain_prompt(inner_prompt);
+        // The frame's id comes from its text — see [`Self::plain_prompt_section`].
+        let frame = self.plain_prompt_section(inner_prompt)?;
+        let builder = Builder::for_plain_prompt(inner_prompt, frame);
         self.resume_conversation_with_projection(timeline, system_prompt, builder, config)
     }
 

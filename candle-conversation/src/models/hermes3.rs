@@ -29,6 +29,7 @@ pub(super) fn hermes3_3b_q6() -> ModelSpec {
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
         model_rev: String::new(),
         gate_donor: None,
+        tensor_overrides: Vec::new(),
         tokenizer_repo: "NousResearch/Hermes-3-Llama-3.2-3B".into(),
         // Unpinned: no revision verified against this checkpoint's own token
         // table. The load-time check against it guards the pairing meanwhile.
@@ -61,6 +62,7 @@ pub(super) fn hermes3_70b_q4() -> ModelSpec {
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
         model_rev: String::new(),
         gate_donor: None,
+        tensor_overrides: Vec::new(),
         tokenizer_repo: "NousResearch/Hermes-3-Llama-3.1-70B".into(),
         tokenizer_rev: String::new(),
         default_system_prompt: "You are a helpful assistant.".into(),

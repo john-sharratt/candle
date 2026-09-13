@@ -283,6 +283,13 @@ pub struct Substrate {
     /// qualifies. In-memory only — the flag is re-derived on load, never a
     /// redo-log marker.
     transient_timelines: HashSet<TimelineId>,
+    /// Sections whose KV **no reader will ever need from disk** — the frame of
+    /// a conversation opened for one job and thrown away. Their residences are
+    /// flagged [`SequenceResidence::no_cold_persist`] at install, the
+    /// scheduler's seal writes neither their stream declaration nor their
+    /// tokens, and [`Self::retire_section`] removes them outright. See
+    /// [`Self::mark_section_transient`]. In-memory only.
+    transient_sections: HashSet<SectionId>,
     /// Individual `(timeline, turn_index)` turns flagged dead by a **turn-scoped**
     /// [`RecordType::Tombstone`] (`turn_index = Some`), leaving the rest of their
     /// timeline live. Written by the per-layer `drop_turn` corrupt-turn policy.
@@ -3757,6 +3764,60 @@ impl Substrate {
         self.transient_timelines.contains(&timeline)
     }
 
+    /// Mark `section`'s durable state as **ephemeral** — the frame of a
+    /// conversation opened for one job and thrown away.
+    ///
+    /// The section counterpart of [`Self::mark_timeline_transient`], for the
+    /// same reason: nothing will read it back from disk, so writing it costs a
+    /// redo-log write compaction would only have to take back. Its residence is
+    /// flagged [`SequenceResidence::no_cold_persist`] — now when it is already
+    /// installed, at install otherwise — the scheduler's seal skips its stream
+    /// declaration and token record, and [`Self::retire_section`] removes it
+    /// once its last user is done.
+    ///
+    /// Call it before the section seals: a seal that has already declared the
+    /// stream has written the record this exists to avoid.
+    pub fn mark_section_transient(&mut self, section: SectionId) {
+        self.transient_sections.insert(section);
+        if let Some(entry) = self.sections.get(&section) {
+            self.residence[entry.residence.0].no_cold_persist = true;
+        }
+    }
+
+    /// Whether `section`'s durable state is ephemeral — see
+    /// [`Self::mark_section_transient`].
+    pub fn is_section_transient(&self, section: SectionId) -> bool {
+        self.transient_sections.contains(&section)
+    }
+
+    /// Remove a transient section: its entry, and its hot and warm KV.
+    ///
+    /// **Transient sections only.** A persisted section has a stream on disk
+    /// that the next load registers again, so removing its entry here would
+    /// only make this process disagree with the next one; it is refused.
+    /// Returns whether a section was removed.
+    ///
+    /// The KV chunks are reference-counted, so a slot still holding the
+    /// section's injected copy keeps its own until the slot is freed — dropping
+    /// the substrate's reference releases nothing another holder is using.
+    pub fn retire_section(&mut self, section: SectionId) -> bool {
+        if !self.transient_sections.remove(&section) {
+            return false;
+        }
+        let Some(entry) = self.sections.remove(&section) else {
+            return false;
+        };
+        self.section_token_total = self.section_token_total.saturating_sub(entry.token_count);
+        let r = entry.residence;
+        if self.residence[r.0].hot.take().is_some() {
+            Self::remove_from_lru(&mut self.hot_lru, r);
+        }
+        if self.residence[r.0].warm.take().is_some() {
+            Self::remove_from_lru(&mut self.warm_lru, r);
+        }
+        true
+    }
+
     /// Whether `timeline` has been tombstoned.
     pub fn is_tombstoned(&self, timeline: TimelineId) -> bool {
         self.tombstoned_timelines.contains(&timeline)
@@ -5026,6 +5087,7 @@ impl Substrate {
         self.timelines.clear();
         self.timelines_by_group.clear();
         self.sections.clear();
+        self.transient_sections.clear();
         self.timeline_token_totals.clear();
         self.section_token_total = 0;
         // Drop the whole decoded-signature memo — stream ids may be reused.
@@ -5159,6 +5221,11 @@ impl Substrate {
     ) -> candle::Result<()> {
         let sealed_cpu = migrate_to_cpu(&sealed_gpu)?;
         let residence = self.alloc_residence(stream_id, None);
+        // A throwaway conversation's frame never reaches the cold tier — see
+        // `mark_section_transient`.
+        if self.transient_sections.contains(&section) {
+            self.residence[residence.0].no_cold_persist = true;
+        }
         let entry = SectionEntryData {
             token_count,
             block_range: (0, 0),
@@ -6189,6 +6256,85 @@ mod tests {
         assert_eq!(
             sub.sections.get(&section).unwrap().tokens.as_slice(),
             &[1u32, 2, 3]
+        );
+    }
+
+    /// Install `section` with one hot and one warm layer.
+    fn install_section_hot_and_warm(sub: &mut Substrate, section: SectionId) -> ResidenceIndex {
+        sub.set_section_full(
+            section,
+            StreamId::default(),
+            10,
+            Arc::new(vec![minimal_sealed_layer()]),
+            identity_migrate,
+            Arc::new(vec![1u32]),
+        )
+        .unwrap();
+        let r = sub.section_residence(section).unwrap();
+        sub.install_warm(r, vec![minimal_sealed_layer()]);
+        r
+    }
+
+    /// **A transient section never reaches the disk.** Marked before it
+    /// installs, its residence is `no_cold_persist`, so its warm copy is never
+    /// counted as awaiting a cold write.
+    #[test]
+    fn a_transient_section_is_installed_never_to_cold_persist() {
+        let mut sub = Substrate::new();
+        let (kept, scratch) = (SectionId::new(7), SectionId::new(8));
+        sub.mark_section_transient(scratch);
+        let kept_r = install_section_hot_and_warm(&mut sub, kept);
+        let scratch_r = install_section_hot_and_warm(&mut sub, scratch);
+
+        assert!(!sub.residence[kept_r.0].no_cold_persist);
+        assert!(sub.residence[scratch_r.0].no_cold_persist);
+        assert_eq!(
+            sub.pending_cold_count(),
+            1,
+            "only the kept section awaits a cold write"
+        );
+        assert!(sub.is_section_transient(scratch) && !sub.is_section_transient(kept));
+    }
+
+    /// Marked after it installed, the residence it already has is flagged.
+    #[test]
+    fn marking_an_installed_section_flags_its_residence() {
+        let mut sub = Substrate::new();
+        let s = SectionId::new(9);
+        let r = install_section_hot_and_warm(&mut sub, s);
+        sub.mark_section_transient(s);
+        assert!(sub.residence[r.0].no_cold_persist);
+    }
+
+    /// **Retiring a transient section removes it and frees its KV**; a
+    /// persisted one is refused, because the next load would register it again.
+    #[test]
+    fn only_a_transient_section_is_retired() {
+        let mut sub = Substrate::new();
+        let (kept, scratch) = (SectionId::new(11), SectionId::new(12));
+        sub.mark_section_transient(scratch);
+        install_section_hot_and_warm(&mut sub, kept);
+        let r = install_section_hot_and_warm(&mut sub, scratch);
+        assert_eq!(sub.section_token_total, 20);
+
+        assert!(
+            !sub.retire_section(kept),
+            "a persisted section is not retired"
+        );
+        assert!(sub.section_exists(kept));
+
+        assert!(sub.retire_section(scratch));
+        assert!(!sub.section_exists(scratch));
+        assert!(sub.residence[r.0].hot.is_none() && sub.residence[r.0].warm.is_none());
+        assert!(
+            !sub.warm_lru.contains(&r),
+            "its warm copy left the LRU with it"
+        );
+        assert!(!sub.is_section_transient(scratch));
+        assert_eq!(sub.section_token_total, 10, "its tokens left the total");
+        assert!(
+            !sub.retire_section(scratch),
+            "a second retire finds nothing"
         );
     }
 

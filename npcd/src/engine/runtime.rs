@@ -77,12 +77,20 @@ use npc_map::{describe, perceive};
 /// within this long at worst.
 const DRIVE_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Tokens one prefill forward carries — the model's own per-forward ceiling.
+/// Tokens one prefill forward carries when the model can take them — the
+/// scheduler's per-forward *target*.
 ///
 /// See the note at the load site. In short: the wave's fixed cost is per slab,
 /// not per token, so a budget close to one document's size makes every document
 /// pay a whole sweep. At the ceiling a slab carries four or five documents and
 /// pays it once.
+///
+/// **A target, not a guarantee.** The scheduler bounds every forward by the
+/// model's own width cap as well (`prefill_pass_budget`), and on a routed
+/// checkpoint that cap is the narrower of the two: the expert chain carries eight
+/// rows per token. Read alone, this number sized the world ingest on the routed
+/// Qwen3.6-35B-A3B for a 3.3 GB transient tier a 24 GB card's partition did not
+/// have, and every document in the wave failed.
 const PREFILL_PASS_TOKENS: usize = 8192;
 
 /// Resolves a character's world-clock instant, in milliseconds.
@@ -1662,9 +1670,16 @@ impl Runtime {
                 return;
             }
         };
+        // The turn count and each turn's tokens, because a slow reflection is
+        // either too many tokens or too slow a token, and the two have different
+        // fixes — the elapsed time alone cannot say which.
         tracing::info!(
-            "npc {npc_id}: reflection done in {:?} ({} axis/axes sampled){}",
+            "npc {npc_id}: reflection done in {:?} — {} turn(s), {} token(s) {:?} ({} axis/axes \
+             sampled){}",
             started.elapsed(),
+            r.tokens.len(),
+            r.tokens.iter().sum::<usize>(),
+            r.tokens,
             axes.len(),
             r.fault
                 .as_deref()
@@ -1799,6 +1814,9 @@ pub struct LoadPlan {
     /// opens a fresh one — `--forget-conversations`. See
     /// [`Minds::forget_conversations`].
     pub forget_conversations: bool,
+    /// Retire every dream every character has kept before the cast wakes —
+    /// `--forget-dreams`. See [`Minds::forget_dreams`].
+    pub forget_dreams: bool,
 }
 
 /// Begin loading, on its own thread. Returns immediately.
@@ -2201,6 +2219,20 @@ fn load(
             );
         }
     }
+    if plan.forget_dreams {
+        if let Some(minds) = rt.minds.read().unwrap().as_ref() {
+            let retired: usize = plan
+                .cast
+                .iter()
+                .map(|c| minds.forget_dreams(c.npc_id))
+                .sum();
+            tracing::info!(
+                "dreams: {retired} retired across {} character(s) — every character starts \
+                 with nothing dreamt",
+                plan.cast.len()
+            );
+        }
+    }
 
     // ── the cast ───────────────────────────────────────────────────────────
     p.set_step(LoadStep::Waking);
@@ -2389,13 +2421,20 @@ fn ingest_layer(
     // `Builder::for_plain_prompt` declares one layer holding one section — so a
     // document written under it has nothing to gather from and produces no
     // signature. That is how 1,818 documents came to be written and unreachable.
-    let synthetic = proj.is_none().then(|| {
-        let prompt = source.prompt();
-        let b = Builder::for_plain_prompt(&prompt);
-        let l = &b.schema().layers[0];
-        let (layer, group) = (l.id, l.groups[0].id);
-        (prompt, b, layer, group)
-    });
+    let synthetic = match proj {
+        Some(_) => None,
+        None => {
+            let prompt = source.prompt();
+            // Its frame id comes from its text, so a layer's documents are
+            // written under the layer's own prompt rather than under whichever
+            // plain prompt sealed a shared id first.
+            let frame = engine.lock().unwrap().plain_prompt_section(&prompt)?;
+            let b = Builder::for_plain_prompt(&prompt, frame);
+            let l = &b.schema().layers[0];
+            let (layer, group) = (l.id, l.groups[0].id);
+            Some((prompt, b, layer, group))
+        }
+    };
     let (prompt, builder, layer_id, group_id) = match (proj, &synthetic) {
         (Some(p), _) => (p.prelude.clone(), &p.builder, p.layer, p.group),
         (None, Some((prompt, b, l, g))) => (prompt.clone(), b, *l, *g),

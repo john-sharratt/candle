@@ -123,6 +123,19 @@ struct Cli {
     /// world are untouched.
     #[arg(long)]
     forget_conversations: bool,
+
+    /// Retire every dream every character has kept, at startup.
+    ///
+    /// With `--forget-conversations`, the clean slate for a test run: each
+    /// character wakes into a fresh conversation with nothing dreamt. Messages
+    /// need no flag — the phone and channel threads live in the hosted world and
+    /// are seeded afresh from its map on every load.
+    ///
+    /// Only the dreams go. They are tombstoned, and compaction reclaims them;
+    /// each character's memory, beliefs, relationships and place in the world
+    /// are untouched.
+    #[arg(long)]
+    forget_dreams: bool,
 }
 
 /// How many routes across both tables sit at exactly this role, for the
@@ -654,6 +667,7 @@ async fn main() -> anyhow::Result<()> {
         engine::runtime::LoadPlan {
             world_ms: 0,
             forget_conversations: cli.forget_conversations,
+            forget_dreams: cli.forget_dreams,
             cast,
             // Personalities, not the cast. A layer directory is named after a
             // personality — `layers/memory/zen/` — and a world's biographies
@@ -820,5 +834,18 @@ mod tests {
     fn conversations_are_forgotten_only_when_asked() {
         assert!(!Cli::parse_from(["npcd"]).forget_conversations);
         assert!(Cli::parse_from(["npcd", "--forget-conversations"]).forget_conversations);
+    }
+
+    /// **Dreams are kept unless asked.** They outlive the day a character had
+    /// them, so a restart that dropped them would be a cast that never builds
+    /// up anything to dream from. The flag is its own, so a test run can wipe
+    /// the conversations and the dreams together or either alone.
+    #[test]
+    fn dreams_are_forgotten_only_when_asked() {
+        assert!(!Cli::parse_from(["npcd"]).forget_dreams);
+        let both = Cli::parse_from(["npcd", "--forget-conversations", "--forget-dreams"]);
+        assert!(both.forget_conversations && both.forget_dreams);
+        let dreams_only = Cli::parse_from(["npcd", "--forget-dreams"]);
+        assert!(dreams_only.forget_dreams && !dreams_only.forget_conversations);
     }
 }

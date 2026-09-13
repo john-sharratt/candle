@@ -27,14 +27,13 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use candle_conversation::guest::{
-    resolve_seed, GuestOutcome, GuestRequest, GuestSink, ProseRequest, Seeded,
-};
+use candle_conversation::guest::{resolve_seed, Seeded};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::Authored;
 use crate::describe::INITIALS;
+use crate::prose;
 
 /// The voice, and the shape of the answer.
 ///
@@ -202,9 +201,8 @@ pub fn clean_name(raw: &str) -> String {
 
 /// `POST /v1/generate/name`
 ///
-/// Blocks for the length of a drain, like every guest route — but a name is
-/// twenty tokens, so the drain is dominated by the model load the description
-/// that follows will reuse.
+/// A name is twenty tokens on the resident model, so it lands while the author
+/// is still reading the world they picked.
 pub async fn post_name(State(s): State<Arc<Authored>>, Json(body): Json<NameBody>) -> Response {
     if body.world_id.trim().is_empty() {
         return fail(
@@ -235,7 +233,7 @@ pub async fn post_name(State(s): State<Arc<Authored>>, Json(body): Json<NameBody
 
     let seed = resolve_seed(body.seed);
     let brief = name_brief(&world, personality.as_ref(), seed);
-    let request = GuestRequest::Prose(ProseRequest {
+    let request = prose::Request {
         system: format!("{VOICE}\n\n{}", brief.context),
         prompt: brief.task,
         max_tokens: MAX_TOKENS,
@@ -243,10 +241,10 @@ pub async fn post_name(State(s): State<Arc<Authored>>, Json(body): Json<NameBody
         seed: Some(seed),
         // A name is free prose — the set of good ones is not enumerable.
         choices: None,
-    });
+    };
 
-    match crate::guest_routes::run_guest_watched(&s, request, GuestSink::none()).await {
-        Ok(GuestOutcome::Prose { text, seed, .. }) => {
+    match prose::run(&s, request).await {
+        Ok(prose::Answer { text, seed, .. }) => {
             let name = clean_name(&text);
             if name.is_empty() {
                 return fail(
@@ -263,12 +261,7 @@ pub async fn post_name(State(s): State<Arc<Authored>>, Json(body): Json<NameBody
             }))
             .into_response()
         }
-        Ok(other) => fail(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "wrong_guest",
-            &format!("the prose request came back as {}", other.guest()),
-        ),
-        Err(e) => crate::describe::guest_refusal(&e),
+        Err(e) => prose::refusal(&e),
     }
 }
 

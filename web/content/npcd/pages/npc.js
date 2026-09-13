@@ -1017,9 +1017,7 @@ export async function render(params) {
           'generated from. Written as a present-day person: the personality supplies the anchor, this ' +
           'supplies the human texture.'),
         h('div', { class: 'row', style: 'margin-top:10px;gap:8px' },
-          /* **Real, and streamed into the field.** This was a stub that toasted
-           * "engine required" and called nothing — a button that could only
-           * fail, left behind when the prose guest arrived. It writes the same
+          /* **Real, and streamed into the field.** It writes the same
            * generation the create step does, against the character's own world
            * and personality, and lands in the textarea so the existing Save
            * decides whether it is kept. */
@@ -1048,8 +1046,8 @@ export async function render(params) {
                 toast('description written — Save to keep it', 'ok');
               } catch (err) {
                 descIn.value = before;
-                toast(err.error === 'no_prose_model'
-                  ? 'no prose model is configured on this daemon'
+                toast(err.error === 'engine_unavailable'
+                  ? 'the engine is still loading — try again in a moment'
                   : (err.detail || err.message || 'could not write a description'), 'err');
               } finally {
                 b.disabled = false;

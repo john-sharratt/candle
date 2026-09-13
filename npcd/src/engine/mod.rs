@@ -67,6 +67,7 @@ pub mod mind;
 pub mod perceived;
 pub mod persona;
 pub mod prompt;
+pub mod prose;
 pub mod pulse;
 pub mod reach;
 pub mod reflect;

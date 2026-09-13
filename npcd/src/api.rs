@@ -51,6 +51,7 @@ use crate::mind::{
 };
 use crate::npcs::{self, Filter, NpcError, Npcs};
 use crate::portrait;
+use crate::prose;
 use crate::registry::{self, PutError, Registry};
 use crate::visibility;
 
@@ -277,15 +278,10 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             Role::Admin,
             post(guest_routes::post_image),
         )
-        .route(
-            "/v1/guest/prose",
-            Role::Admin,
-            post(guest_routes::post_prose),
-        )
-        // One stratum of a life, rewritten in the narrator's voice through the
-        // prose guest. The ladder (`/generate`) stays on the main engine, which
-        // is the right shape for a five-hundred-node fan-out; this is the other
-        // case — one node, on demand, in a voice the acting model does not have.
+        .route("/v1/generate/prose", Role::Admin, post(prose::post_prose))
+        // One stratum of a life, rewritten in the narrator's voice. The ladder
+        // (`/generate`) is the right shape for a five-hundred-node fan-out; this
+        // is the other case — one node, on demand.
         .route(
             "/v1/life/:who/node/:key/narrate",
             Role::Admin,
@@ -3041,7 +3037,9 @@ mod tests {
                 // serve wants a hand on it rather than a rate limit.
                 ("/v1/guest", "admin"),
                 ("/v1/guest/image", "admin"),
-                ("/v1/guest/prose", "admin"),
+                // Free prose on the resident model. `admin`: a free-text
+                // generator open to every account is a generator for anything.
+                ("/v1/generate/prose", "admin"),
                 // One stratum of a life, in the narrator's voice. `admin` with
                 // the rest of `/v1/life` — it writes prose into the substrate
                 // that a character will believe it remembers.

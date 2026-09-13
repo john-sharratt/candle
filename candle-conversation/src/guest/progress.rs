@@ -1,10 +1,9 @@
 //! Watching a job while it runs, rather than only when it finishes.
 //!
 //! A guest drain is seconds long — evict, load a model across the PCIe link,
-//! decode, hand the ground back — and for all of that a caller holding only a
-//! [`super::GuestReceipt`] has nothing to show but a spinner. The prose it is
-//! waiting for exists a token at a time well before the job ends, and a reader
-//! reads at about that rate anyway.
+//! run, hand the ground back — and for all of that a caller holding only a
+//! [`super::GuestReceipt`] has nothing to show but a spinner. A draw is counted
+//! steps well before its picture exists, and a caller can draw a bar from them.
 //!
 //! # Why a callback and not a channel
 //!
@@ -31,17 +30,9 @@ pub enum GuestEvent {
     /// are crossing the link. Seconds, and the only part of a drain with
     /// nothing to show — so it is worth naming rather than leaving blank.
     Loading,
-    /// A decoded fragment, in order. Fragments concatenate to the final text
-    /// exactly; nothing is re-sent and nothing is a correction of what came
-    /// before, so a consumer may append and never rewrite.
-    ///
-    /// A fragment is whatever one token detokenised to, which is not a word and
-    /// may not be valid UTF-8 on its own — the guest holds partial sequences
-    /// back until they complete rather than emitting a replacement character.
-    Token(String),
     /// Countable work, for a job whose output does not exist until it ends.
     ///
-    /// Prose can show itself arriving; an image cannot — the picture is mush
+    /// An image cannot show itself arriving — the picture is mush
     /// until the last denoise step and does not exist as pixels until the
     /// decoder runs. `done` of `total` is the only honest thing there is to say
     /// while that happens, and it is enough to draw a bar with.
@@ -66,7 +57,7 @@ pub enum GuestEvent {
 /// Where a job's progress goes while it runs, if anywhere.
 ///
 /// Most jobs have no watcher and carry [`GuestSink::none`], which costs one
-/// `Option` check per token and nothing else.
+/// `Option` check per event and nothing else.
 #[derive(Default)]
 pub struct GuestSink(Option<Box<dyn Fn(GuestEvent) + Send + Sync>>);
 
@@ -82,9 +73,8 @@ impl GuestSink {
 
     /// Whether anything is listening.
     ///
-    /// Worth checking before *building* an event that costs something — a
-    /// detokenised fragment is an allocation, and there is no point making one
-    /// for nobody.
+    /// Worth checking before *building* an event that costs something — there
+    /// is no point making one for nobody.
     pub fn is_watched(&self) -> bool {
         self.0.is_some()
     }
@@ -115,7 +105,6 @@ mod tests {
         let s = GuestSink::none();
         assert!(!s.is_watched());
         s.emit(GuestEvent::Loading);
-        s.emit(GuestEvent::Token("x".into()));
         s.emit(GuestEvent::Step {
             done: 1,
             total: 9,
@@ -169,9 +158,9 @@ mod tests {
         assert_eq!(seen.last().map(|(d, _, w)| (*d, *w)), Some((8, "decoding")));
     }
 
-    /// Events reach the watcher in the order they were emitted — a consumer
-    /// appends fragments and never reorders them, so out-of-order delivery
-    /// would be scrambled prose rather than late prose.
+    /// Events reach the watcher in the order they were emitted — a bar drawn
+    /// from counts that arrive out of order jumps backwards, which reads as the
+    /// job having lost work it already did.
     #[test]
     fn a_watched_sink_receives_in_order() {
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -181,39 +170,21 @@ mod tests {
         };
         assert!(sink.is_watched());
         sink.emit(GuestEvent::Loading);
-        for t in ["Ael", "is", " Mael"] {
-            sink.emit(GuestEvent::Token(t.into()));
+        for done in 1..=3u32 {
+            sink.emit(GuestEvent::Step {
+                done,
+                total: 3,
+                what: "denoising",
+            });
         }
+        let step = |done| GuestEvent::Step {
+            done,
+            total: 3,
+            what: "denoising",
+        };
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![
-                GuestEvent::Loading,
-                GuestEvent::Token("Ael".into()),
-                GuestEvent::Token("is".into()),
-                GuestEvent::Token(" Mael".into()),
-            ]
+            vec![GuestEvent::Loading, step(1), step(2), step(3)]
         );
-    }
-
-    /// **The fragments must concatenate to the whole text.** A consumer builds
-    /// the result by appending, so a guest that emitted a running prefix each
-    /// time would produce "AAeAelAeli…" on the screen and the right answer in
-    /// the final response — a discrepancy nobody would look for.
-    #[test]
-    fn fragments_concatenate_to_the_text() {
-        let built = Arc::new(Mutex::new(String::new()));
-        let sink = {
-            let built = Arc::clone(&built);
-            GuestSink::new(move |e| {
-                if let GuestEvent::Token(t) = e {
-                    built.lock().unwrap().push_str(&t);
-                }
-            })
-        };
-        let whole = "Aelis Maelstrom, of House Cyclone";
-        for chunk in ["Ael", "is", " Maelstrom", ",", " of House", " Cyclone"] {
-            sink.emit(GuestEvent::Token(chunk.into()));
-        }
-        assert_eq!(*built.lock().unwrap(), whole);
     }
 }

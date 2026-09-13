@@ -235,7 +235,7 @@ impl GuestQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guest::work::{GuestImage, ImageLora, ImageRequest, ProseRequest};
+    use crate::guest::work::{GuestImage, ImageLora, ImageRequest, MatteRequest};
 
     fn image() -> GuestRequest {
         GuestRequest::Image(ImageRequest {
@@ -250,14 +250,11 @@ mod tests {
         })
     }
 
-    fn prose() -> GuestRequest {
-        GuestRequest::Prose(ProseRequest {
-            system: String::new(),
-            prompt: "the yard".into(),
-            max_tokens: 32,
-            temperature: None,
-            seed: None,
-            choices: None,
+    fn matte() -> GuestRequest {
+        GuestRequest::Matte(MatteRequest {
+            pixels: vec![0; 4 * 4 * 3],
+            width: 4,
+            height: 4,
         })
     }
 
@@ -295,7 +292,7 @@ mod tests {
     fn a_drain_takes_one_guests_backlog_and_leaves_the_rest() {
         let q = GuestQueue::new();
         q.submit(image()).unwrap();
-        q.submit(prose()).unwrap();
+        q.submit(matte()).unwrap();
         q.submit(image()).unwrap();
         assert_eq!(q.depth(), 3);
 
@@ -307,7 +304,7 @@ mod tests {
             "a guest's own jobs must stay in submission order"
         );
         assert_eq!(q.depth(), 1, "the other guest's job was taken too");
-        assert_eq!(q.next_guest(), Some(Guest::Prose));
+        assert_eq!(q.next_guest(), Some(Guest::Matte));
     }
 
     /// Oldest-first across guests, so a steady stream of one kind cannot leave
@@ -315,11 +312,11 @@ mod tests {
     #[test]
     fn the_longest_waiting_guest_is_loaded_next() {
         let q = GuestQueue::new();
-        q.submit(prose()).unwrap();
+        q.submit(matte()).unwrap();
         q.submit(image()).unwrap();
-        assert_eq!(q.next_guest(), Some(Guest::Prose));
+        assert_eq!(q.next_guest(), Some(Guest::Matte));
 
-        q.take(Guest::Prose);
+        q.take(Guest::Matte);
         assert_eq!(q.next_guest(), Some(Guest::Image));
         q.take(Guest::Image);
         assert_eq!(q.next_guest(), None);
@@ -353,7 +350,7 @@ mod tests {
     fn shutdown_answers_every_waiting_caller() {
         let q = GuestQueue::new();
         let a = q.submit(image()).unwrap();
-        let b = q.submit(prose()).unwrap();
+        let b = q.submit(matte()).unwrap();
         q.close();
 
         assert_eq!(a.wait(), Err(GuestError::Abandoned));
@@ -381,7 +378,7 @@ mod tests {
     fn submission_order_is_a_total_order_across_guests() {
         let q = GuestQueue::new();
         let a = q.submit(image()).unwrap();
-        let b = q.submit(prose()).unwrap();
+        let b = q.submit(matte()).unwrap();
         let c = q.submit(image()).unwrap();
         assert_eq!((a.seq, b.seq, c.seq), (0, 1, 2));
     }

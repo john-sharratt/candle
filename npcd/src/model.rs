@@ -1,40 +1,42 @@
 //! Which model this daemon runs — the single place npcd decides.
 //!
-//! npcd runs **Qwen3.5-9B** at Q6_K: the lineage's dense member, ~7.5 GB, the
-//! same hybrid attention/DeltaNet stack as its routed siblings with the mixture
-//! taken out.
+//! npcd runs **a hybrid of two Qwen3.6-35B-A3B fine-tunes**: AntiLoop's weights —
+//! a tune trained against the repetition loops a cast falls into — under
+//! StyleTune's output head, which is where that tune's prose lives. It is the
+//! routed member of the hybrid lineage, 35 B total with about 3 B active per
+//! token: gated-DeltaNet layers carrying a recurrent state, attention layers
+//! carrying paged K/V, and 256 experts behind the three-tier expert cache. See
+//! `Model::Qwen36_35B_A3B_AntiLoop_StyleTune` for how the two files make one
+//! model.
 //!
-//! # Why dense, when the rest of the fleet runs MoE
+//! # What a routed model costs this daemon
 //!
-//! Because the workload is inverted. A routed model amortises expert weight
-//! loads across a wave of sessions stepping through layers together, which is
-//! excellent when those sessions are doing similar work. A hundred characters in
-//! different places, on different concerns, reaching different experts is
-//! precisely the case where that amortisation is weakest — and it is the whole
-//! of this daemon's workload.
+//! A routed model amortises expert loads across a wave of sessions stepping
+//! through layers together, and a cast on different concerns reaching different
+//! experts is where that amortisation is weakest. Measured on a 24 GB card the
+//! stock 3.6 at Q4 still prefilled faster than the dense 9B and decoded a single
+//! session at about three quarters of its rate, with every gate row valid — and
+//! it is by a distance the stronger model.
 //!
-//! The dense model has no expert cache to thrash and no routing to mispredict,
-//! so a character's cost does not depend on how many other characters are awake.
-//! For an engine whose selling point is a hundred minds at once, that
-//! independence is worth more than the quality a larger routed model would buy.
+//! The price is KV room. The weights take most of a small card, with the expert
+//! cache paging the rest from host RAM, so a 24 GB card holds about a third of
+//! the KV regions the dense 9B at Q6_K leaves — and a resident cast's histories
+//! are what fill them. [`Model::Qwen35_9B_Q6`] stays in the registry for a cast
+//! large enough that the room matters more than the model.
 //!
-//! It also leaves the card. On 24 GB the routed 35B spends most of the span on
-//! weights and their paging; the 9B at Q6_K leaves room for the KV regions a
-//! large resident cast actually needs.
+//! # One quant on every card
 //!
-//! # No VRAM ladder
-//!
-//! There was one, when this daemon selected between two quants of Qwen3-30B-A3B
-//! and loaded neither. One model now, because the engine is real: a ladder whose
-//! rungs have different KV threshold rows would mean the C-ladder calibration
-//! depended on which card you started on, and `QWEN35_9B_KV_FACTORS` is derived
-//! against exactly one checkpoint.
+//! Q4_K_M, whatever the card: the hybrid is assembled from two conversions at
+//! that quant, and one checkpoint everywhere keeps the KV threshold row and the
+//! C-ladder calibration the same on every machine. The int8 path is the
+//! builder's routed-arm choice, `Int8Mode::auto` — Precision on any int8-MMA
+//! card. On a 24 GB 3090 the hybrid passed every row of its forwarding gate
+//! there, and Precision was preferred over the faster Performance twin for its
+//! accuracy.
 
 use candle_conversation::models::Model;
 
 /// The model npcd runs.
-///
-/// The stock instruct checkpoint — the lineage's dense member at Q6_K.
 ///
 /// # A deployment may be running something else
 ///
@@ -42,15 +44,15 @@ use candle_conversation::models::Model;
 /// often a private one: a fine-tune somebody has no right to redistribute is a
 /// legitimate thing to run and a bad thing to commit. So it is named in
 /// `models.override.yaml` at the workspace root, which is gitignored and
-/// replaces this preset's coordinates and its adapters. See
-/// `candle_conversation::models::overrides`.
+/// replaces a preset's coordinates and its adapters under the preset's own name.
+/// See `candle_conversation::models::overrides`.
 ///
 /// This function returns the *variant*; `Model::spec()` applies the override. So
 /// the tests below assert what is true either way — the architecture, the
 /// tokenizer lineage, the context — and never the repository's coordinates,
 /// which an override is entitled to change.
 pub fn model() -> Model {
-    Model::Qwen35_9B_Q6
+    Model::Qwen36_35B_A3B_AntiLoop_StyleTune
 }
 
 /// What the console shows about the selection, before anything is loaded.
@@ -59,9 +61,8 @@ pub struct ModelSpec {
     pub name: &'static str,
     pub quant: &'static str,
     pub params_total: &'static str,
-    /// Equal to `params_total` on a dense model. Kept because the console
-    /// renders both and a mixture-of-experts sibling would differ — the field
-    /// stating "these are the same" is more useful than its absence.
+    /// The parameters a token actually passes through — about 3 B of the 35 B,
+    /// which is what the console's two figures side by side say at a glance.
     pub params_active: &'static str,
     pub repo: &'static str,
     pub filename: &'static str,
@@ -109,8 +110,8 @@ pub fn spec() -> ModelSpec {
     ModelSpec {
         name: Box::leak(name.into_boxed_str()),
         quant: quant_of(filename),
-        params_total: "9B",
-        params_active: "9B",
+        params_total: "35B",
+        params_active: "3B",
         repo: Box::leak(s.model_repo.into_boxed_str()),
         filename,
         bytes: s.model_bytes,
@@ -122,20 +123,32 @@ mod tests {
     use super::*;
     use candle_conversation::models::ModelArch;
 
-    /// **The dense arch, not the routed one.**
+    /// **The routed hybrid arch.**
     ///
-    /// The two loaders each refuse the other's checkpoint — correctly, since a
-    /// dense file loaded through the routed path would stand up an expert cache
-    /// over weights that have none. Declaring `Qwen35Hybrid` here is what made
-    /// npcd spend five minutes loading and then fail with `is a dense
-    /// checkpoint` from a loader it should never have reached.
+    /// The two loaders each refuse the other's checkpoint — a routed file loaded
+    /// through the dense path has no expert cache to stand up, and a dense one
+    /// through the routed path stands one up over weights that have none. The
+    /// arch is what routes the load, so it is asserted rather than assumed.
     #[test]
-    fn npcd_runs_the_dense_member_of_the_lineage() {
+    fn npcd_runs_the_routed_member_of_the_lineage() {
         assert!(
-            matches!(model().spec().arch, ModelArch::Qwen35Dense),
-            "arch {:?} routes to the MoE loader, which refuses a dense checkpoint",
+            matches!(model().spec().arch, ModelArch::Qwen35Hybrid),
+            "arch {:?} routes to a loader that refuses a routed checkpoint",
             model().spec().arch
         );
+    }
+
+    /// **The hybrid, locked on Q4_K_M.** The preset rather than the resolved spec, because an
+    /// override is entitled to change the file — what is asserted is what the repository ships.
+    #[test]
+    fn the_preset_is_the_hybrid_at_q4_k_m() {
+        let s = model().preset_spec();
+        assert_eq!(quant_of(&s.model_filename), "Q4_K_M");
+        assert_eq!(s.tensor_overrides.len(), 1, "one tensor from a second file");
+        let head = &s.tensor_overrides[0];
+        assert_eq!(head.tensor, "output.weight");
+        assert_eq!(quant_of(&head.filename), "Q4_K_M");
+        assert_ne!(head.repo, s.model_repo, "the head is another checkpoint's");
     }
 
     /// **The console's figures come from the resolved spec, override and all.**
@@ -220,13 +233,12 @@ mod tests {
     ///
     /// The override file deliberately cannot reach `arch`, and this is the
     /// consequence worth asserting: whatever checkpoint a deployment substitutes
-    /// still loads through the dense hybrid path. A file that could swap the
-    /// architecture would let a local edit route npcd into the MoE loader — the
-    /// five-minute load ending in `is a dense checkpoint` — with nothing in the
-    /// repository changed to explain it.
+    /// still loads through the routed hybrid path. A file that could swap the
+    /// architecture would let a local edit route npcd into a loader that refuses
+    /// its checkpoint, with nothing in the repository changed to explain it.
     #[test]
-    fn an_override_cannot_move_npcd_off_the_dense_arch() {
-        assert!(matches!(model().spec().arch, ModelArch::Qwen35Dense));
+    fn an_override_cannot_move_npcd_off_the_routed_arch() {
+        assert!(matches!(model().spec().arch, ModelArch::Qwen35Hybrid));
         assert_eq!(model().spec().arch, model().preset_spec().arch);
     }
 
@@ -258,11 +270,12 @@ mod tests {
         }
     }
 
-    /// Dense: the two parameter counts are the same, and saying so is the point.
+    /// Routed: a token passes through a fraction of the weights, and the console
+    /// saying so is the point of carrying both figures.
     #[test]
-    fn a_dense_model_has_no_gap_between_total_and_active() {
+    fn a_routed_model_activates_a_fraction_of_its_parameters() {
         let s = spec();
-        assert_eq!(s.params_total, s.params_active);
+        assert_ne!(s.params_total, s.params_active);
     }
 
     /// The quant label is read out of the filename, longest match first.
@@ -272,8 +285,9 @@ mod tests {
     /// the console would state it with the same confidence.
     #[test]
     fn the_quant_label_is_read_from_the_filename() {
+        assert_eq!(quant_of("Qwen3.6-35B-A3B-AntiLoop.Q4_K_M.gguf"), "Q4_K_M");
+        assert_eq!(quant_of("Qwen3.6-35B-A3B-UD-Q6_K.gguf"), "Q6_K");
         assert_eq!(quant_of("Qwen3.5-9B-Q6_K.gguf"), "Q6_K");
-        assert_eq!(quant_of("model-Q4_K_M.gguf"), "Q4_K_M");
         assert_eq!(quant_of("model-Q4_K_S.gguf"), "Q4_K_S");
         assert_eq!(quant_of("model-Q4_0.gguf"), "Q4_0");
         assert_eq!(quant_of("model-BF16.gguf"), "BF16");

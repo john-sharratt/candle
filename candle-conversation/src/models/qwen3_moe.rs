@@ -35,6 +35,7 @@ pub(super) fn qwen3_30b_a3b_q6() -> ModelSpec {
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
         model_rev: String::new(),
         gate_donor: None,
+        tensor_overrides: Vec::new(),
         tokenizer_repo: "Qwen/Qwen3-30B-A3B".into(),
         // Unpinned: no revision verified against this checkpoint's own token
         // table. The load-time check against it guards the pairing meanwhile.

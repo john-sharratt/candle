@@ -16,7 +16,7 @@
 //! event, and a caller that reconnected mid-drain would learn only that it was
 //! still running.
 //!
-//! Prose answers in one JSON object. **An image answers as an NDJSON stream**,
+//! **An image answers as an NDJSON stream**,
 //! because it has a length worth showing and no partial result to show: the
 //! guest counts its denoise steps and its decode, those counts come across as
 //! `step` lines, and the terminal `done` line carries the whole picture. The
@@ -34,7 +34,7 @@ use axum::Json;
 use base64::Engine as _;
 use candle_conversation::guest::{
     GuestError, GuestEvent, GuestOutcome, GuestRequest, GuestSink, ImageLora, ImageRequest,
-    MatteRequest, ProseRequest, DEFAULT_REFERENCE_HOLD,
+    MatteRequest, DEFAULT_REFERENCE_HOLD,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -131,25 +131,6 @@ fn default_steps() -> u32 {
     24
 }
 
-/// What a caller posts to `/v1/guest/prose`.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProseBody {
-    pub prompt: String,
-    #[serde(default)]
-    pub system: String,
-    #[serde(default = "default_tokens")]
-    pub max_tokens: u32,
-    #[serde(default)]
-    pub temperature: Option<f32>,
-    #[serde(default)]
-    pub seed: Option<u64>,
-}
-
-fn default_tokens() -> u32 {
-    512
-}
-
 /// `GET /v1/guest` — what this deployment offers and how deep the queue is.
 pub async fn get_guests(State(s): State<Arc<Authored>>) -> Response {
     let Some(rt) = s.runtime.as_ref() else {
@@ -216,7 +197,7 @@ pub async fn post_image(
     }
 
     // **Before the stream opens, and before the image guest is queued.** The
-    // prompt is read by the prose guest first; see [`crate::compliance`] for
+    // prompt is read by the resident model first; see [`crate::compliance`] for
     // where the line is and why a failure to check stops the draw. Refused here
     // as a status rather than in band, because nothing has been started yet and
     // a caller branching on 403 should not have to parse a 200. A restricted
@@ -283,9 +264,6 @@ pub async fn post_image(
                 GuestEvent::Step { done, total, what } => {
                     json!({ "event": "step", "done": done, "total": total, "what": what })
                 }
-                // An image guest emits no tokens. Forwarded rather than dropped
-                // so the arm is not a place a future guest's output goes to die.
-                GuestEvent::Token(text) => json!({ "event": "token", "text": text }),
             };
             // A send that fails means the reader hung up. The job runs on: the
             // drain has already evicted the engine's working set for it, and
@@ -323,23 +301,6 @@ pub async fn post_image(
     });
 
     ndjson::stream(rx)
-}
-
-/// `POST /v1/guest/prose`
-pub async fn post_prose(State(s): State<Arc<Authored>>, Json(body): Json<ProseBody>) -> Response {
-    let request = GuestRequest::Prose(ProseRequest {
-        system: body.system,
-        prompt: body.prompt,
-        max_tokens: body.max_tokens,
-        temperature: body.temperature,
-        seed: body.seed,
-        // The public prose route decodes freely. A stencil is a grammar the
-        // caller would have to supply, and `ProseBody` deliberately has no field
-        // for one — an arbitrary grammar from an untrusted caller is a way to
-        // make the guest decode something nobody reviewed.
-        choices: None,
-    });
-    serve(s, request).await
 }
 
 /// Queue a job, wait for it, and hand the caller the outcome.
@@ -492,37 +453,6 @@ pub async fn post_cutout(State(s): State<Arc<Authored>>, Json(body): Json<Cutout
     }
 }
 
-async fn serve(s: Arc<Authored>, request: GuestRequest) -> Response {
-    if s.runtime.as_ref().is_none() {
-        return unavailable();
-    }
-    match run_guest(&s, request).await {
-        Ok(outcome) => rendered(outcome),
-        // `Abandoned` from `run_guest` also covers "the engine is still
-        // loading", which is what a caller sees during startup and wants the
-        // loading message for rather than the shutdown one.
-        Err(GuestError::Abandoned) => unavailable(),
-        Err(e) => refusal(&e),
-    }
-}
-
-fn rendered(outcome: GuestOutcome) -> Response {
-    match outcome {
-        // The seed rides back with the text because a draft an author liked is
-        // a one-off unless the draw can be repeated.
-        GuestOutcome::Prose { text, tokens, seed } => {
-            Json(json!({ "text": text, "tokens": tokens, "seed": seed })).into_response()
-        }
-        // The queue routes by kind, so this is a routing fault rather than
-        // anything the caller did — reported as one instead of being rendered
-        // into a shape the caller did not ask for.
-        other => refusal(&GuestError::Failed(format!(
-            "the prose request came back as {}",
-            other.guest()
-        ))),
-    }
-}
-
 /// Map a guest refusal to a status a caller can act on.
 ///
 /// The three cases want three different responses and a single 500 would hide
@@ -574,17 +504,6 @@ mod tests {
             lora: body.lora,
             reference: None,
             shift: body.shift,
-        });
-        assert!(r.check().is_ok(), "{:?}", r.check());
-
-        let body: ProseBody = serde_json::from_str(r#"{"prompt":"the yard"}"#).unwrap();
-        let r = GuestRequest::Prose(ProseRequest {
-            system: body.system,
-            prompt: body.prompt,
-            max_tokens: body.max_tokens,
-            temperature: body.temperature,
-            seed: body.seed,
-            choices: None,
         });
         assert!(r.check().is_ok(), "{:?}", r.check());
     }
@@ -735,7 +654,6 @@ mod tests {
     #[test]
     fn a_body_with_no_prompt_is_refused_at_the_boundary() {
         assert!(serde_json::from_str::<ImageBody>(r#"{"width":512}"#).is_err());
-        assert!(serde_json::from_str::<ProseBody>(r#"{"max_tokens":16}"#).is_err());
     }
 
     /// **Every guest refusal reaches a streaming caller as a terminal line.**

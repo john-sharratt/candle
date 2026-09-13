@@ -55,8 +55,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum Reserved {
     /// The daemon's titler conversation — generates sidebar labels from
     /// the first user message of each main conversation. Lives on its
-    /// own layer/group/section so its turns never enter a user
-    /// conversation's projection.
+    /// own layer and group so its turns never enter a user
+    /// conversation's projection; its frame is resolved from its prompt
+    /// like any plain prompt's (see [`super::PlainPromptFrames`]).
     Titler,
     /// The cached tool-catalog summary section for "Comprehensive" tools mode —
     /// an overview of the full catalog. Sealed at runtime (its content is
@@ -73,13 +74,18 @@ pub enum Reserved {
     /// load phase) so they seed the wide-Q (`Q·Q`) reference substrate without ever
     /// entering a user conversation's projection.
     Calibration,
+    /// A daemon's prose jobs — names, descriptions, narration and the image
+    /// prompt judge, each decoded in a throwaway conversation. On its own layer
+    /// and group so a job's turns never enter a character's projection; the
+    /// caller closes the group per conversation, so one job never reads another's.
+    Prose,
 }
 
 impl Reserved {
     /// Number of reserved kinds — the width of the band at the very top of the
     /// u32 space that is disjoint from the `1..n` ids YAML allocates. Bump this
     /// when adding a `Reserved` variant.
-    pub const COUNT: u32 = 4;
+    pub const COUNT: u32 = 5;
 
     /// Per-kind offset from the top of the u32 range. Slot 0 = `u32::MAX`,
     /// slot 1 = `u32::MAX - 1`, etc.
@@ -89,6 +95,7 @@ impl Reserved {
             Reserved::ToolSummary => 1,
             Reserved::ToolSummaryRestricted => 2,
             Reserved::Calibration => 3,
+            Reserved::Prose => 4,
         }
     }
 
