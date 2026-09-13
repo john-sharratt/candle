@@ -222,6 +222,13 @@ the line as the corpus it indexes.
 all of them beside the schema when `--mind` names one, and falls back to `--data`
 only for a daemon run without a mind at all.
 
+**`--data` defaults to the `--mind` directory.** A substrate is one mind's corpus
+ingested and answers for no other, so it lives beside the mind that produced it:
+the mind ignores `.substrate/` and `accounts/`, and they sit in its root without
+ever being committed. Passing `--data` still puts them anywhere else. Only a
+daemon run with neither flag falls back to the `npcd` directory in the source
+tree.
+
 **There is no "New World" button.** An empty world is non-functional — no canon
 means the `world` layer projects nothing — so a button that creates a container
 hands back something broken and calls it success. A world is a YAML file and a

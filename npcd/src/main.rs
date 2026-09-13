@@ -26,7 +26,7 @@
 //! `web --authoritative`, which is what it was written for.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -67,7 +67,11 @@ struct Cli {
     /// Where the engine's own state lives — `.substrate/` and `accounts/`, the
     /// things the daemon writes rather than a person. Also the fallback source
     /// for authored content (`worlds/`, `personalities/`) when no `--mind` is
-    /// named. Defaults to the `npcd` directory in the source tree.
+    /// named.
+    ///
+    /// Defaults to the `--mind` directory, so a mind carries its own substrate
+    /// beside it (a mind ignores `.substrate/` and `accounts/`). With no
+    /// `--mind` either, the `npcd` directory in the source tree.
     #[arg(long)]
     data: Option<PathBuf>,
 
@@ -186,8 +190,14 @@ async fn main() -> anyhow::Result<()> {
             schema.label,
             dir.display()
         ),
-        None => tracing::info!(
-            "projection schema: {} — placeholder, no layers and no content libraries",
+        // A warning, not a note: a daemon with no mind starts, serves the console
+        // and looks healthy, while every character in it has no world, no
+        // personality, no layers and no libraries to think with — and its
+        // substrate lands in the source tree rather than beside any mind.
+        None => tracing::warn!(
+            "no --mind given: running on the {} placeholder schema — no layers, no content \
+             libraries, no worlds and no personalities, and the substrate goes to the data \
+             directory's default rather than beside a mind. Pass --mind <dir> to run a real one",
             schema.label
         ),
     }
@@ -216,7 +226,12 @@ async fn main() -> anyhow::Result<()> {
         None => Roots::embedded(&[&SITE, &COMMON]),
     };
 
-    // **The compiled-in default is a path on the machine that built this.**
+    // **Beside the mind, unless told otherwise.** A substrate is built from one
+    // mind's corpus and answers for nothing else, so the mind being run is where
+    // its substrate and accounts belong — see [`data_dir`].
+    //
+    // **With no mind either, the compiled-in default is a path on the machine
+    // that built this.**
     //
     // `CARGO_MANIFEST_DIR` is resolved by the compiler, so the binary carries
     // one developer's absolute source path as its idea of where the substrate
@@ -230,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
     // in when it is not. Either way the choice is logged, because "which
     // substrate is this daemon actually writing to" is the first question asked
     // when a cast comes up empty.
-    let data = match cli.data {
+    let data = match data_dir(cli.data, schema.dir.as_deref()) {
         Some(dir) => dir,
         None => {
             let built_at = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -764,9 +779,39 @@ fn now_ms_i64() -> i64 {
         .unwrap_or(0)
 }
 
+/// Where the substrate and accounts go: `--data` when it is given, and the
+/// mind's own directory when it is not. `None` with neither, which leaves the
+/// caller its compiled-in default.
+///
+/// **The mind, not the source tree.** A substrate is a mind's corpus ingested,
+/// so run against a different mind it answers for the wrong canon — and the
+/// source tree's copy used to be where every mind's substrate landed, whichever
+/// one was named, unless `--data` was remembered on every launch.
+fn data_dir(explicit: Option<PathBuf>, mind: Option<&Path>) -> Option<PathBuf> {
+    explicit.or_else(|| mind.map(Path::to_path_buf))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A named mind keeps its own substrate.** Without `--data`, the data
+    /// directory is the mind's; `--data` still wins when it is given; and with
+    /// neither there is nothing to choose, so the caller's default stands.
+    #[test]
+    fn the_data_directory_defaults_to_the_mind() {
+        let mind = Path::new("D:/prog/mind");
+        assert_eq!(data_dir(None, Some(mind)), Some(mind.to_path_buf()));
+        assert_eq!(
+            data_dir(Some(PathBuf::from("E:/elsewhere")), Some(mind)),
+            Some(PathBuf::from("E:/elsewhere")),
+            "an explicit --data wins"
+        );
+        assert_eq!(data_dir(None, None), None);
+        assert!(Cli::parse_from(["npcd", "--mind", "D:/prog/mind"])
+            .data
+            .is_none());
+    }
 
     /// **Off unless asked for.** Retiring every character's conversation is not
     /// something a restart may do by accident — a cast that forgot where it was
