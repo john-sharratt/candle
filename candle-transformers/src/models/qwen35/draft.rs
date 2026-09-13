@@ -434,10 +434,21 @@ pub fn draft_cohort(
         || -> Result<()> {
             if let Device::Cuda(d) = dev {
                 let plan = WavePlan::new(model.wave_geometry(act_dtype));
-                // One row per sequence and every one of them scored: this steps
-                // `n` drafts forward a token at a time, so it is decode-shaped
+                // One decode row per sequence: this steps `n` drafts forward a
+                // token at a time, so its layer phases are decode-shaped
                 // throughout.
-                let width = WaveWidth::decode(n);
+                //
+                // **And it scores nothing on the span.** Each step's logits come
+                // from `lm_head.forward_live` on the head's output, which carves
+                // from the pool rather than the forward arena — measured: this
+                // forward's plan charged 498,944 B a row of head norm and logits
+                // to the forward phase and the phase carved 0 B. Pricing
+                // `decode(n)` reserved that for every draft, on every step of
+                // every speculative cohort.
+                let width = WaveWidth {
+                    decode_rows: n,
+                    ..WaveWidth::default()
+                };
                 plan_wave_transient(
                     &d.cuda_stream(),
                     [

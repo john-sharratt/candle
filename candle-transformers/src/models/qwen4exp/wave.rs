@@ -32,7 +32,8 @@ use std::sync::{Mutex, RwLock};
 use candle::quantized::cuda::to_dynamic;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
-    ffn_work_dtype, DeltaNetWidths, KvCache, ModelGeometry, WaveWidth, QWEN4EXP_KV_FACTORS,
+    ffn_work_dtype, DeltaNetWidths, KvCache, ModelGeometry, SharedExpertWidths, WaveWidth,
+    QWEN4EXP_KV_FACTORS,
 };
 
 use super::batched_attention::Qwen4ExpAttentionLayer;
@@ -60,8 +61,10 @@ use crate::models::delta_net::{
     RecurrentStateStore, SeqSpan, ZGate,
 };
 use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
+use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::qwen35::attention::RopeTables;
+use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
 use crate::models::qwen35::spec::split_block_rows;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::verify_wave::VerifyPlan;
@@ -1436,6 +1439,13 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
                     value_dim: cfg.delta_net.value_dim(),
                     n_v_heads: cfg.delta_net.n_v_heads,
                 }),
+            // Every MoE layer adds an always-active shared expert to the routed
+            // block, its gate projection stored padded to one KO tile — the
+            // lineage's layout, carried over unchanged.
+            shared_expert: Some(SharedExpertWidths {
+                intermediate: cfg.moe.shared_expert_ffn_size,
+                gate_cols: SHARED_GATE_TILE,
+            }),
             act_dtype,
             accum_dtype: if int8 {
                 DType::F32
@@ -1449,6 +1459,11 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             // wave flattened to `[rows, hidden]` before the sweep.
             gated_qkv: true,
             fused_qkv: false,
+            // No Q/K/V biases in this lineage.
+            qkv_bias: false,
+            // The fused q8 decode combine serves this head dim on an int8
+            // session, through the same predicate the dispatch asks.
+            decode_q8_context: int8 && paged_decode_q8_head_dim(cfg.attn_head_dim),
             head_qk_norm: true,
             head_norm_reshapes: false,
             partial_rotary: cfg.rope_dim < cfg.attn_head_dim,

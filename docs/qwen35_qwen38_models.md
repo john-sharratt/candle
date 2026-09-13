@@ -1505,6 +1505,31 @@ drain point, the real numbers (9B, BF16×1): `prefill:qkv_proj` **8.2 ms**, not
 ~60%**. The F32 round trip in `dn:proj` (45.1 ms) is deliberate (§7.16 below);
 the mixer is the target.
 
+**The shared expert's FFN carves (2026-09-13).** The MoE checkpoints' FFN phase
+was priced as Qwen3-MoE's routed chain alone; the shared expert — an ordinary
+SwiGLU every token also goes through, gated by `sigmoid(w_gate · x)` — was not
+declared. A census of Qwen3.5-35B-A3B at 2,100 rows (BF16, shared intermediate
+512) shows exactly six of its steps on the span, in this order before the router:
+
+| carve | bytes | what |
+|---|---|---|
+| `to_dynamic` | 4,300,800 | fused `[gate \| up]`, 2 × 512 × work dtype |
+| `Silu` | 2,150,400 | `silu(gate)` |
+| `Mul` | 2,150,400 | `silu(gate) ⊙ up` |
+| `to_dynamic` | 134,400 | the gate projection, padded to one 32-column KO tile |
+| `Sigmoid` | 4,200 | one scalar per token |
+| `Add` | 8,601,600 | `routed + gated`, carved beside the routed combine |
+
+The shared **down projection** and `y · gate` do *not* appear: `forward_live_as`'s
+int8 arm quantizes its operand, which breaks provenance, so both come off the
+CUDA pool. They are priced nowhere — charging them would be slack. The six that
+are here are `ModelGeometry::shared_expert` (`SharedExpertWidths { intermediate,
+gate_cols }`), and `priced_intermediate` no longer folds the shared width into
+the routed experts' with a `max`. The plan now prices this generation to the
+byte, 287,024,640 B including the 836 B of alignment the sigmoid and the routing
+tables leave; the F16 session adds the `to_dtype_mut` result cast and prices to
+the byte as well (150,628,864 B at 1,070 rows).
+
 ### 7.16 The fused prefill scan (design)
 
 `dn:mix` is `delta_net_mix_spans` — the recurrent mixer, written entirely as

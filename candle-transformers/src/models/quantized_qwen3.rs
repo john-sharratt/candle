@@ -571,6 +571,8 @@ impl BatchedModelCore for ModelWeights {
             vocab: self.lm_head.weight_dims().first().copied().unwrap_or(0),
             // `self_attn.q_norm` / `k_norm` — Qwen3 carries both.
             head_qk_norm: true,
+            // Qwen3 dropped the Q/K/V biases Qwen2 had.
+            qkv_bias: false,
         }
     }
 

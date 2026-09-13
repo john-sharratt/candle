@@ -446,6 +446,8 @@ impl BatchedModelCore for ModelWeights {
             vocab: self.output.weight_dims().first().copied().unwrap_or(0),
             // Qwen2 predates the per-head Q/K norm; it arrived with Qwen3.
             head_qk_norm: false,
+            // `attention_bq`/`bk`/`bv`, added in `project_qkv`.
+            qkv_bias: true,
         }
     }
 

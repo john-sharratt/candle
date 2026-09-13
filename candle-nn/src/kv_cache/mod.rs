@@ -76,13 +76,13 @@ pub use chunked::span_claims;
 pub use chunked::{BandAddr, BlockBands, BlockTableMutation, WriterIndices};
 pub use chunked::wave_plan::{
     ffn_work_dtype, BufferShape, Chain, DeltaNetWidths, Encoding, LayerPhase, ModelGeometry,
-    WaveBuffer, WavePlan, WaveWidth, BUMP_ALIGNMENT,
+    SharedExpertWidths, WaveBuffer, WavePlan, WaveWidth, BUMP_ALIGNMENT,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
     begin_forward, begin_guest, begin_wave, close_guest_arena, end_wave_transient,
     guest_domain_stats, open_guest_arena, plan_wave_transient, wave_domain_stats, wave_is_live,
-    wave_max_planned, wave_max_slack, wave_reset_observations, wave_worst_slack,
+    wave_max_planned, wave_max_slack, wave_reset_observations, wave_settle, wave_worst_slack,
     BumpRange, ForwardOpen, WaveGeneration, GUEST_ARENA, KV_ARENA_MID_WAVE,
 };
 #[cfg(feature = "cuda")]
@@ -186,6 +186,61 @@ pub fn active_kv_formats(k_format: KvFormat, on_gpu: bool) -> (KvFormat, KvForma
             KvFormat::Float(candle::DType::F16),
             KvFormat::Float(candle::DType::F16),
         ),
+    }
+}
+
+/// Bytes one [`CHUNK_SIZE`]-token K/V block costs across the whole model, in
+/// `k` and `v`.
+///
+/// **The one price both buyers of K/V ground use** — the scheduler's admission
+/// and a driver with no scheduler (`buy_ground_for_sequences`) — so they cannot
+/// disagree about what a block costs. The driver used to derive its own from
+/// the activation width, which is half of R16 on the K side: the Qwen3-MoE Q8_0
+/// gate at twenty contexts claimed ~1.5x what it had bought, and its tier was
+/// refused 33 regions into live arenas.
+///
+/// Takes the formats rather than reading them so the caller must decide which
+/// it means: priced in the sealed formats instead of [`active_kv_formats`], a
+/// live working set is understated 3.7x.
+pub fn per_block_kv_bytes(
+    layers: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    k: KvFormat,
+    v: KvFormat,
+) -> u64 {
+    // `bytes_per_block` is the exact figure for one CHUNK_SIZE-element block —
+    // per-element arithmetic cannot round-trip a quantized format (`Q4_0` is 18
+    // bytes for 32 elements), so this must not be derived from a rate.
+    let per = |f: KvFormat| -> u64 { (kv_heads * head_dim) as u64 * f.bytes_per_block() as u64 };
+    (per(k) + per(v)).saturating_mul(layers as u64)
+}
+
+#[cfg(test)]
+mod per_block_kv_bytes_tests {
+    use super::{active_kv_formats, per_block_kv_bytes, KvFormat, QuantFormat};
+    use candle::DType;
+
+    #[test]
+    fn a_block_costs_both_halves_across_every_layer() {
+        let f16 = KvFormat::Float(DType::F16);
+        // 4 kv heads x 128 dim x 32 tokens x 2 bytes = 32 KiB per half per layer.
+        let one = per_block_kv_bytes(1, 4, 128, f16, f16);
+        assert_eq!(one, 2 * 4 * 128 * 32 * 2);
+        assert_eq!(
+            per_block_kv_bytes(48, 4, 128, f16, f16),
+            one * 48,
+            "every layer holds a block",
+        );
+    }
+
+    /// **A live quantized sequence costs its active formats**: K in R16 — 128
+    /// bytes per 32 elements, twice plain F16 — and V in F16, whatever it seals
+    /// to later.
+    #[test]
+    fn a_live_quantized_block_costs_r16_k_and_f16_v() {
+        let (k, v) = active_kv_formats(KvFormat::Quantized(QuantFormat::Q8_0), true);
+        assert_eq!(per_block_kv_bytes(1, 1, 1, k, v), 128 + 64);
     }
 }
 

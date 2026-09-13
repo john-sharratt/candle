@@ -35,7 +35,7 @@ use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
     ChunkedKvBacking, CompressionPolicy, GpuArenaClassStats, HeadGids, KvCache, KvFormat,
-    ModelGeometry, QuantFormat, WavePlan, WaveWidth, WAVE_SPAN_BYTES,
+    ModelGeometry, QuantFormat, WavePlan, WaveWidth, REGION_BYTES, WAVE_SPAN_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -2529,6 +2529,24 @@ impl BatchedInferenceSession {
     /// Head dimension in this session's backing.
     pub fn head_dim(&self) -> usize {
         self.backings.first().map(|b| b.head_dim()).unwrap_or(0)
+    }
+
+    /// One 32-token K/V block across every KV layer of this session, in the
+    /// formats a **live** sequence occupies (`active_kv_formats`).
+    ///
+    /// **The session's layers, not the model's.** On a hybrid stack only the
+    /// attention layers carry K/V — one in four on the Qwen3.5 lineage, plus
+    /// the draft head's — and this session holds exactly one backing per such
+    /// layer. Pricing a block over the model's transformer depth charged a
+    /// hybrid four times its K/V: harmless while the weight side could concede
+    /// the excess, and a refusal of the whole purchase once it could not —
+    /// Qwen3.8-27B at twenty contexts asked for 742 regions, and the layer zone,
+    /// which concedes all or nothing, gave none. Admission and a scheduler-less
+    /// driver both price from here, so the two cannot disagree about it.
+    pub fn live_kv_block_bytes(&self) -> u64 {
+        use candle_nn::kv_cache::per_block_kv_bytes;
+        let (k, v) = self.active_kv_formats();
+        per_block_kv_bytes(self.num_layers(), self.n_kv_head(), self.head_dim(), k, v)
     }
 
     /// Print a compact per-chunk palette4 format distribution for layer 0 of the given sequence.
@@ -5137,10 +5155,11 @@ pub trait ManagedBatchedModel {
         sequences: usize,
         tokens: usize,
         act_dtype: DType,
+        kv_block_bytes: u64,
     ) -> GroundPurchase {
         use candle_nn::kv_cache::{
-            kv_ground_shortfall, region_stats, transient_headroom_bytes, WavePlan, WaveWidth,
-            REGION_BYTES,
+            kv_ground_shortfall, region_stats, set_least_tier_bytes, transient_headroom_bytes,
+            CHUNK_SIZE,
         };
         // **The model's own device, not device 0.** Every other reader of the
         // pool takes the ordinal from the device it is acting for; hardcoding
@@ -5178,7 +5197,7 @@ pub trait ManagedBatchedModel {
         // sequence's turn priced the 35B's five-context wave at 160 MiB against
         // the 624 MiB it then asked the placement for.
         let plan = WavePlan::new(self.wave_geometry(act_dtype));
-        let prefill_rows = tokens.saturating_mul(sequences).min(MAX_PREFILL_TOKENS);
+        let prefill_rows = widest_prefill_rows(tokens, sequences);
         let tier = plan
             .tier_bytes(WaveWidth::decode(sequences))
             .max(plan.tier_bytes(WaveWidth::prefill(prefill_rows, sequences)));
@@ -5196,14 +5215,13 @@ pub trait ManagedBatchedModel {
         // exactly the same — the purchase succeeded, so nothing reports a
         // refusal.
         //
-        // Priced at the **live** width, which is what a running sequence
-        // actually occupies: K sits in R16 and V uncompressed until the chunk
-        // seals, so the compressed format the config names is what the bytes
-        // become, not what they cost while the wave is writing them.
-        let kv_per_row = 2 * self.n_kv_head() * self.head_dim() * act_dtype.size_in_bytes();
-        let kv = kv_per_row
-            .saturating_mul(self.num_layers())
-            .saturating_mul(tokens)
+        // Priced at `kv_block_bytes` — the session's
+        // `live_kv_block_bytes`, the figure the scheduler's admission prices
+        // with: every KV layer the session holds, in the formats a running
+        // sequence's chunks actually occupy (K in R16 and V uncompressed until
+        // the chunk seals), in whole blocks.
+        let kv = (kv_block_bytes as usize)
+            .saturating_mul(tokens.div_ceil(CHUNK_SIZE))
             .saturating_mul(sequences);
         let claims = store
             .saturating_mul(sequences)
@@ -5215,6 +5233,18 @@ pub trait ManagedBatchedModel {
         } else {
             self.request_kv_ground(short)
         };
+        // **Hold the purchase against the weight side's growth.** Phase 0 of
+        // every forward runs `reclaim_spare_ground`, which offers the weight
+        // side every free KV region less the published hold. The purchase above
+        // is protected for one negotiation only (it reads as pressure), so with
+        // nothing published the next forward's phase 0 took the ground back and
+        // the widest forward of the config found its tier regions short:
+        // Qwen3-MoE at ten contexts bought 49 regions and was refused 29 regions
+        // into live arenas, the 35B hybrids likewise. The scheduler publishes the
+        // tier of each wave it composes (`hold_wave_tier`) and buys the claims at
+        // admission; a driver with no scheduler holds the whole turn it priced —
+        // see [`driver_ground_hold`] — until its next purchase replaces it.
+        set_least_tier_bytes(gpu_id, driver_ground_hold(claims, tier));
         GroundPurchase {
             sequences,
             store_bytes: store,
@@ -5300,6 +5330,35 @@ pub(crate) const MAX_PREFILL_TOKENS: usize = 8192;
 /// per-token rate only.
 pub(crate) fn prefill_slack_cap(width_cap: usize) -> usize {
     width_cap + width_cap / 4
+}
+
+/// Rows of the widest prefill slab `sequences` turns of `tokens_per_sequence`
+/// tokens can produce: all of them together, up to the ceiling the slicer's
+/// final slab may reach ([`prefill_slack_cap`] of [`MAX_PREFILL_TOKENS`]).
+///
+/// Priced at the bare cap, a twenty-context Qwen3-MoE wave came to a 1,904 MiB
+/// tier against the 2,304 MiB its placement then asked for — the final slab had
+/// absorbed its tail, exactly as [`pack_prefill_slabs`] is written to.
+pub(crate) fn widest_prefill_rows(tokens_per_sequence: usize, sequences: usize) -> usize {
+    tokens_per_sequence
+        .saturating_mul(sequences)
+        .min(prefill_slack_cap(MAX_PREFILL_TOKENS))
+}
+
+/// Bytes a driver with no scheduler holds against the weight side's growth
+/// for the whole of the turn it just bought ground for: every region its
+/// claims will take, and the widest forward's tier.
+///
+/// The claims land forward by forward, each forward's arenas created before
+/// its tier is placed, while phase 0 of every forward offers the weight side
+/// whatever the pool's published hold leaves free. Holding the tier alone let
+/// that growth take the ground the later forwards' claims then ate out of the
+/// tier's gap: the 35B hybrids at sixteen contexts were refused 25 regions
+/// into live arenas with the tier held.
+pub(crate) fn driver_ground_hold(claims_regions: usize, tier_bytes: usize) -> usize {
+    claims_regions
+        .saturating_mul(REGION_BYTES)
+        .saturating_add(tier_bytes)
 }
 
 /// Pack pure-prefill sequences into token-bounded slabs, returned as
@@ -5732,5 +5791,35 @@ mod slab_tests {
     fn slack_is_a_quarter_of_the_cap() {
         assert_eq!(prefill_slack_cap(8192), 10240);
         assert_eq!(prefill_slack_cap(100), 125);
+    }
+}
+
+#[cfg(test)]
+mod ground_hold_tests {
+    use super::{driver_ground_hold, widest_prefill_rows, MAX_PREFILL_TOKENS};
+    use candle_nn::kv_cache::REGION_BYTES;
+
+    /// A turn set wider than the cap is priced at the slack ceiling the final
+    /// slab may reach, not at the bare cap.
+    #[test]
+    fn a_wide_turn_set_is_priced_at_the_slack_ceiling() {
+        assert_eq!(
+            widest_prefill_rows(700, 20),
+            MAX_PREFILL_TOKENS + MAX_PREFILL_TOKENS / 4
+        );
+    }
+
+    /// A turn set under the cap is priced at exactly its rows.
+    #[test]
+    fn a_narrow_turn_set_is_priced_at_its_rows() {
+        assert_eq!(widest_prefill_rows(100, 4), 400);
+        assert_eq!(widest_prefill_rows(0, 16), 0);
+    }
+
+    /// The hold is every claimed region plus the tier, by the byte.
+    #[test]
+    fn the_hold_is_the_claims_and_the_tier() {
+        assert_eq!(driver_ground_hold(3, 1000), 3 * REGION_BYTES + 1000);
+        assert_eq!(driver_ground_hold(0, 0), 0);
     }
 }

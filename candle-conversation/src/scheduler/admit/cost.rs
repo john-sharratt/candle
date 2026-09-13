@@ -26,7 +26,7 @@
 //! `active_kv_formats`, and the distinction is the whole reason the function
 //! takes them as an argument rather than reading config.
 
-use candle_nn::kv_cache::{KvFormat, CHUNK_SIZE, REGION_BYTES};
+use candle_nn::kv_cache::{CHUNK_SIZE, REGION_BYTES};
 
 /// What one admission would take, split by tenant so a refusal can say which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -106,24 +106,6 @@ impl Cost {
     }
 }
 
-/// Bytes one 32-token K/V block costs across the whole model, in `k`/`v`.
-///
-/// Takes the formats rather than reading them so the caller must decide which
-/// it means — see the module header on the 3.7x that decision is worth.
-pub(crate) fn per_block_kv_bytes(
-    layers: usize,
-    kv_heads: usize,
-    head_dim: usize,
-    k: KvFormat,
-    v: KvFormat,
-) -> u64 {
-    // `bytes_per_block` is the exact figure for one CHUNK_SIZE-element block —
-    // per-element arithmetic cannot round-trip a quantized format (`Q4_0` is 18
-    // bytes for 32 elements), so this must not be derived from a rate.
-    let per = |f: KvFormat| -> u64 { (kv_heads * head_dim) as u64 * f.bytes_per_block() as u64 };
-    (per(k) + per(v)).saturating_mul(layers as u64)
-}
-
 /// K/V for `tokens` more tokens on a sequence that already holds `held` tokens.
 ///
 /// Blocks are 32 tokens, so a sequence part-way through a block pays nothing
@@ -141,21 +123,10 @@ pub(crate) fn kv_bytes_for_advance(held: usize, tokens: usize, per_block: u64) -
 mod tests {
     use super::*;
     use candle::DType;
+    use candle_nn::kv_cache::{per_block_kv_bytes, KvFormat};
 
     fn f16() -> KvFormat {
         KvFormat::Float(DType::F16)
-    }
-
-    #[test]
-    fn a_block_costs_both_halves_across_every_layer() {
-        // 4 kv heads x 128 dim x 32 tokens x 2 bytes = 32 KiB per half per layer.
-        let one = per_block_kv_bytes(1, 4, 128, f16(), f16());
-        assert_eq!(one, 2 * 4 * 128 * 32 * 2);
-        assert_eq!(
-            per_block_kv_bytes(48, 4, 128, f16(), f16()),
-            one * 48,
-            "every layer holds a block",
-        );
     }
 
     /// **The advance pays for the blocks it opens, not for its tokens.** A

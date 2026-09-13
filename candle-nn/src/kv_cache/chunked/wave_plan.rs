@@ -280,6 +280,26 @@ pub struct DeltaNetWidths {
     pub n_v_heads: usize,
 }
 
+/// A MoE layer's always-active **shared expert**, as
+/// [`ModelGeometry::shared_expert`] carries it.
+///
+/// An ordinary SwiGLU every token goes through, scaled by a per-token
+/// `sigmoid(w_gate · x)` and summed with the routed combine — Qwen3.5/3.6's
+/// MoE. Only part of it lands on the span: the fused gate/up projection, the
+/// SiLU, the product, the gate's tile-wide projection, its sigmoid, and the
+/// final sum. The down projection goes through `forward_live_as`, whose int8 arm
+/// quantizes its operand and so breaks provenance; its result, and the gated
+/// product built on it, come off the CUDA pool and are not priced here.
+/// Measured on Qwen3.5-35B-A3B at 2,100 rows: exactly those six carves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedExpertWidths {
+    /// The shared SwiGLU's intermediate width.
+    pub intermediate: usize,
+    /// Columns the gate projection emits: its one real output, padded to a full
+    /// KO tile so the int8 kernel can run it.
+    pub gate_cols: usize,
+}
+
 /// Which generation a buffer lives in.
 ///
 /// Named `LayerPhase` rather than `WavePhase` because
@@ -343,6 +363,9 @@ pub struct ModelGeometry {
     /// here and not in the FFN phase. Both kinds run an ordinary FFN, so the
     /// FFN phase is uniform and takes no term from this.
     pub delta_net: Option<DeltaNetWidths>,
+    /// The MoE layer's always-active shared expert, where it has one. `None`
+    /// on a MoE without one (Qwen3-MoE) and on a dense stack.
+    pub shared_expert: Option<SharedExpertWidths>,
     /// The compute dtype activations are carried in.
     pub act_dtype: DType,
     /// What the int8 tensor-core kernels emit before the cast back to
@@ -397,6 +420,28 @@ pub struct ModelGeometry {
     /// The Qwen3.5 lineage is the exception and is `false` in both modes — its Q
     /// weight is the interleaved `[q | gate]` and does not pack with K and V.
     pub fused_qkv: bool,
+    /// Whether Q, K and V each get a **bias** added after the projection
+    /// (Qwen2).
+    ///
+    /// The add is an allocation at every width, and it reads the narrowed view
+    /// as it stands — so on a fused projection it *replaces* the split copy
+    /// rather than following it. Qwen2 used to be priced through the split
+    /// copies, whose sizes happen to match; that held until a one-row wave,
+    /// where the narrows are free and the adds are not, and the span ran out
+    /// 1,792 B into the Q bias.
+    pub qkv_bias: bool,
+    /// Whether the paged decode kernel emits its context **as q8a1024 on the
+    /// span** — an int8 session at a head dim the fused q8 combine serves
+    /// (`prefill_utils::paged_decode_q8_head_dim`, the one predicate the
+    /// dispatch itself goes through; it cannot be called from this crate, so
+    /// the model states the answer here).
+    ///
+    /// Elsewhere the decode path takes the FP context and the chain carves one
+    /// `rows × hidden` buffer after the projection rather than a q8 context
+    /// *and* one: measured on Qwen2 (head dim 64) at 60 decode rows, 445,184 B
+    /// against the 506,368 B the plan charged with the context in it — exactly
+    /// the context and its alignment pad.
+    pub decode_q8_context: bool,
     /// Whether the model applies a **per-head RMSNorm to Q and K** at all.
     ///
     /// Qwen3 and later carry one; Llama and Qwen2 do not, and charging them for
@@ -465,9 +510,10 @@ impl ModelGeometry {
     /// place in the forward and a second copy of it would drift.
     ///
     /// The width is the same two bytes either way, so this changes no buffer's
-    /// *size* — what it decides is whether [`WaveBuffer::FfnNormOperand`] is an
-    /// allocation or a no-op. (The cast on the way *back* out is
-    /// `to_dtype_mut`, which is in place and allocates nothing either way.)
+    /// *size* — what it decides is whether two casts are allocations or no-ops:
+    /// [`WaveBuffer::FfnNormOperand`] on the way in, and
+    /// [`WaveBuffer::MoeResultCast`] on the way back out, where `to_dtype_mut`
+    /// returns early only when the dtypes already agree.
     pub fn work_dtype(&self) -> DType {
         ffn_work_dtype(self.act_dtype)
     }
@@ -483,24 +529,6 @@ impl ModelGeometry {
         self.n_experts > 1
     }
 }
-
-/// How many u32 of routing metadata the expert pipeline uploads per assignment.
-///
-/// The one term here that is a **bound rather than a transcript**, and it is
-/// labelled as such because the alternative is worse. The threaded expert
-/// pipeline splits a wave's assignments into expert batches and, per batch,
-/// uploads three assignment-indexed tables, three tile-indexed tables (a tile
-/// covers at least one assignment, so these are bounded by the same count) and
-/// one token-indexed table. Batches partition the assignments, so however many
-/// there are the assignment-indexed uploads sum to the same total — but the
-/// tile and token tables do not decompose that cleanly, and pinning them exactly
-/// would tie this file to the pipeline's batching policy.
-///
-/// The census measured 3.5 u32 per assignment at the widest wave the gate runs.
-/// Eight is that doubled, and it costs 0.19% of the FFN phase — a margin worth
-/// paying on the plan's least structured term, where being short fails a forward
-/// and being generous is invisible.
-const ROUTING_U32_PER_ASSIGNMENT: usize = 8;
 
 /// Every buffer a layer allocates from the transient tier.
 ///
@@ -575,6 +603,13 @@ pub enum WaveBuffer {
     KHeadsPacked,
     /// V, made contiguous out of the fused QKV buffer for the cache write.
     VContiguous,
+    /// `q + bq`, on a stack with Q/K/V biases — see
+    /// [`ModelGeometry::qkv_bias`]. Both chains, every width.
+    QBias,
+    /// `k + bk`, as [`Self::QBias`].
+    KBias,
+    /// `v + bv`, as [`Self::QBias`].
+    VBias,
     /// The attention context in its **dense** form, which prefill and glue write.
     AttnOutput,
     /// The attention context in its **packed** form.
@@ -648,15 +683,57 @@ pub enum WaveBuffer {
     /// dispatch paths, and priced dense for the reason given on
     /// [`Self::AttnNorm`].
     FfnNorm,
+    /// The shared expert's fused `[gate | up]` projection, in `work_dtype`. It
+    /// runs before the router — the routed half consumes the activation, so the
+    /// shared half reads it first — and every shared buffer below is carved in
+    /// that order. See [`SharedExpertWidths`] for which of its steps land here.
+    SharedGateUp,
+    /// `silu(gate)` over the shared expert's gate half.
+    SharedAct,
+    /// `silu(gate) ⊙ up` — what the shared down projection consumes.
+    SharedGated,
+    /// The shared expert's gate projection, a KO tile wide; only column 0 is
+    /// the gate, the rest are the padding rows' zeros.
+    SharedGateLogits,
+    /// `sigmoid` of that column: one scalar per token, and the one shared
+    /// buffer whose length is rarely a multiple of the alignment.
+    SharedGateSigmoid,
     /// The router's per-token logits over every expert. Both paths.
     RouterLogits,
     /// Top-k routing weights, in F32. Both paths.
     RouteWeights,
     /// Top-k expert ids, as u32. Both paths.
     RouteIndices,
-    /// The routing tables the expert pipeline uploads per batch — see
-    /// [`ROUTING_U32_PER_ASSIGNMENT`]. Threaded pipeline only.
-    RoutingTables,
+    /// The threaded pipeline's three assignment-indexed uploads, one `u32` per
+    /// (token, expert) pair each: the gathered token ids, the weight ids in
+    /// token-major order, and the permutation the scatter reads `down_out`
+    /// through. Threaded pipeline only: the GPU-native path bucketizes into the
+    /// dispatch tables' own workspace, off the span.
+    ///
+    /// **Three carves, not one table**, and the plan has to say so: each pays
+    /// its own alignment pad when the assignment count is not a multiple of 64,
+    /// where a single three-wide table would pay it once — 256 B under what the
+    /// 35B carved at 2,100 rows, which is an overrun rather than a rounding.
+    ///
+    /// One upload per layer, because the pipeline computes every routed expert
+    /// in one canonically-ordered call; splitting hits from misses made a
+    /// token's k terms sum in a residency-dependent grouping. Measured at 9,880
+    /// rows × 8 experts: three carves of 316,160 B. The plan used to charge
+    /// eight tables per assignment, on the reasoning that batching made the
+    /// count unknowable — 1.5 MiB a phase of ground conceded to tables that did
+    /// not exist.
+    RoutingTokenIds,
+    /// See [`Self::RoutingTokenIds`].
+    RoutingWeightIds,
+    /// See [`Self::RoutingTokenIds`].
+    RoutingPermutation,
+    /// The per-token prefix offsets into the permutation, `rows + 1` of them.
+    /// Threaded pipeline only.
+    ///
+    /// The one routing table whose length is not a multiple of the alignment,
+    /// so the next carve pays a pad after it — the 156 B the census reports
+    /// lost at 9,880 rows.
+    RoutingTokenStarts,
     /// Tokens gathered into expert-major order for the grouped GEMMs.
     MoeGather,
     /// Gate projection over the gathered tokens.
@@ -665,15 +742,22 @@ pub enum WaveBuffer {
     UpGemm,
     /// Fused SwiGLU output, requantized to feed the down GEMM.
     SwigluAct,
-    /// Down projection, in the accumulate dtype.
+    /// Down projection, in the accumulate dtype — which the scatter reads as it
+    /// is. Both paths: `grouped_qmatmul_dev_q8a128` inherits the gathered
+    /// operand's arena exactly as the pipeline's grouped GEMM does.
     ///
-    /// Threaded pipeline only: the GPU-native path's grouped down GEMM feeds
-    /// `fused_deterministic_scatter` without materialising a span-backed result.
+    /// **There is no cast after it.** The plan used to charge one, `experts ×
+    /// hidden` in the compute dtype, that neither path makes —
+    /// `fused_deterministic_scatter` validates the F32 operand rather than
+    /// converting it. At 9,880 rows that was 323,747,840 B of a 1,816,655,360 B
+    /// FFN plan that the census never saw carved.
     DownGemm,
-    /// Down projection cast to the compute dtype for the scatter. Pipeline only.
-    DownCast,
     /// The MoE combine target the scatter accumulates into. Both paths.
     MoeCombine,
+    /// `routed + gated shared` — the layer's output on a stack with a shared
+    /// expert. It carves beside the routed combine because that is its first
+    /// operand; the gated shared half it adds is on the pool.
+    MoeSharedSum,
 
     // ── The dense FFN ───────────────────────────────────────────────────────
     // Four carves, measured on the 0.8B at 2100 rows: 62,630,400 B. No router,
@@ -723,23 +807,22 @@ pub enum WaveBuffer {
     /// lifetime.
     HeadLogits,
 
-    /// The **threaded expert pipeline's** combine target, the twin of
-    /// [`Self::MoeCombine`].
+    /// The MoE result **narrowed to the residual's dtype**, when the experts ran
+    /// in a different one. Both paths.
     ///
-    /// The two dispatch paths each scatter into their own `rows × hidden`
-    /// buffer, and the plan charges their union for the reason the module
-    /// header gives: a phase is sized for whichever chain runs, and the
-    /// pipeline path's buffers are a superset of the GPU-native path's
-    /// ([`Self::DownGemm`] and [`Self::DownCast`] are the others it adds).
+    /// `ffn_forward` hands the experts `work_dtype` — BF16 for an F16 session,
+    /// the F16-overflow stability cast — and then calls
+    /// `to_dtype_mut(out_dtype)` on the combine. That returns early when the
+    /// dtypes agree and **allocates** a fresh `rows × hidden` buffer when they do
+    /// not: the census shows the `to_dtype_mut` carve on every F16 session and on
+    /// no BF16 one.
     ///
-    /// Named, because it used to be charged as an "FFN result cast to the
-    /// residual's dtype" that does not exist: `ffn_forward`'s
-    /// `out.to_dtype_mut(out_dtype)` is an **in-place** cast — it allocates
-    /// nothing even when the dtypes differ, and returns early when they agree.
-    /// The two happened to be the same number of bytes, so the span was right
-    /// and the reason was wrong, which is the state in which a number survives
-    /// every change that should have corrected it.
-    MoePipelineCombine,
+    /// It used to be charged unconditionally, as a second combine target "for
+    /// the threaded pipeline". Either path has exactly one combine target
+    /// ([`Self::MoeCombine`]); the buffer beside it was always this cast, so a
+    /// BF16 session paid `rows × hidden × 2` for it on every forward — while an
+    /// F16 one was told the cast was free and the charge was for something else.
+    MoeResultCast,
     /// The FFN norm's operand widened to `work_dtype` — the other half of the
     /// same F16 stability cast, on the MoE arm's **float** path.
     ///
@@ -873,22 +956,33 @@ impl WaveBuffer {
             | Self::KNormOut
             | Self::KHeadsPacked
             | Self::VContiguous
+            | Self::QBias
+            | Self::KBias
+            | Self::VBias
             | Self::AttnOutput
             | Self::DecodeContext
             | Self::OProjOutput => LayerPhase::Attention,
             Self::FfnNorm
+            | Self::SharedGateUp
+            | Self::SharedAct
+            | Self::SharedGated
+            | Self::SharedGateLogits
+            | Self::SharedGateSigmoid
             | Self::RouterLogits
             | Self::RouteWeights
             | Self::RouteIndices
-            | Self::RoutingTables
+            | Self::RoutingTokenIds
+            | Self::RoutingWeightIds
+            | Self::RoutingPermutation
+            | Self::RoutingTokenStarts
             | Self::MoeGather
             | Self::GateGemm
             | Self::UpGemm
             | Self::SwigluAct
             | Self::DownGemm
-            | Self::DownCast
             | Self::MoeCombine
-            | Self::MoePipelineCombine
+            | Self::MoeSharedSum
+            | Self::MoeResultCast
             | Self::FfnNormOperand
             | Self::DenseFfnNorm
             | Self::DenseGateUp
@@ -924,6 +1018,12 @@ impl WaveBuffer {
         // sized by. The two groups' own counts are named where they are used.
         let rows = w.rows();
         let er = g.expert_rows(rows);
+        // Zero widths where there is no shared expert, which the guard arm below
+        // prices at nothing before any of these are read.
+        let shared = g.shared_expert.unwrap_or(SharedExpertWidths {
+            intermediate: 0,
+            gate_cols: 0,
+        });
         // A layer norm's output encoding is the session's, not the buffer's —
         // the same fork for the attention norm, the FFN norm and the dense
         // FFN's norm.
@@ -937,6 +1037,28 @@ impl WaveBuffer {
         match self {
             Self::AttnNorm => norm(rows),
             Self::QkvProjection => dense(rows, g.qkv_cols(), g.act_dtype),
+            // A bias add reads the narrowed view directly and writes its own
+            // contiguous result, so where there are biases the adds are the Q,
+            // K and V buffers and no split copy happens at any width.
+            Self::QSplit | Self::KSplit | Self::VContiguous if g.qkv_bias => {
+                dense(0, 0, g.act_dtype)
+            }
+            Self::QBias if g.qkv_bias => dense(rows, g.attn_cols(), g.act_dtype),
+            Self::KBias | Self::VBias if g.qkv_bias => dense(rows, g.kv_cols(), g.act_dtype),
+            Self::QBias | Self::KBias | Self::VBias => dense(0, 0, g.act_dtype),
+            // **A one-row wave copies nothing out of the fused row.** The narrow
+            // is along the last dimension, so it is strided only while some
+            // leading dimension is wider than one. With a single row every
+            // leading dimension is 1, `Shape::is_contiguous` skips unit
+            // dimensions, and `contiguous()` hands the view straight back.
+            // Measured on Qwen3-30B-A3B: a one-row decode priced 40,704 B of
+            // attention and carved 30,464 — these three, exactly.
+            //
+            // Not Q on a gated lineage: its `[q | gate]` is interleaved per
+            // head, so the narrow strides across heads however few rows there
+            // are.
+            Self::QSplit if rows == 1 && !g.gated_qkv => dense(0, 0, g.act_dtype),
+            Self::KSplit | Self::VContiguous if rows == 1 => dense(0, 0, g.act_dtype),
             // Q is narrowed out of a wider buffer whenever there *is* one: a
             // fused projection's `qkv_cols` row, or a gated lineage's
             // interleaved `[q | gate]`. With neither, `wq`'s output is already
@@ -992,7 +1114,10 @@ impl WaveBuffer {
             // each at its own group's width, which is what a single row count
             // could not say.
             Self::AttnOutput => dense(w.prefill_rows, g.attn_cols(), g.act_dtype),
-            Self::DecodeContext => q8(w.decode_rows, g.attn_cols()),
+            // Only where the decode kernel emits it — see
+            // `ModelGeometry::decode_q8_context`.
+            Self::DecodeContext if g.decode_q8_context => q8(w.decode_rows, g.attn_cols()),
+            Self::DecodeContext => dense(0, 0, g.act_dtype),
             Self::OProjOutput => dense(w.decode_rows, g.hidden, g.act_dtype),
             // The DeltaNet chain prices zero on a stack with no DeltaNet
             // layers, which makes `Chain::DeltaNet` sum to zero and drop out of
@@ -1034,20 +1159,39 @@ impl WaveBuffer {
             }
             Self::ReplaySpanPtrs => dense(w.staged_spans, 4, DType::I64),
             Self::ReplaySpanExtents => dense(w.staged_spans, 2, DType::U32),
+            // The shared expert's half of the chain, on a stack whose MoE has
+            // one — and nothing at all otherwise.
+            Self::SharedGateUp
+            | Self::SharedAct
+            | Self::SharedGated
+            | Self::SharedGateLogits
+            | Self::SharedGateSigmoid
+            | Self::MoeSharedSum
+                if !g.is_moe() || g.shared_expert.is_none() =>
+            {
+                dense(0, 0, g.act_dtype)
+            }
+            Self::SharedGateUp => dense(rows, 2 * shared.intermediate, g.work_dtype()),
+            Self::SharedAct | Self::SharedGated => dense(rows, shared.intermediate, g.work_dtype()),
+            Self::SharedGateLogits => dense(rows, shared.gate_cols, g.work_dtype()),
+            Self::SharedGateSigmoid => dense(rows, 1, g.work_dtype()),
+            Self::MoeSharedSum => dense(rows, g.hidden, g.work_dtype()),
             // The two FFN chains are alternatives a layer dispatches between,
             // so each prices zero on the geometry that does not run it and the
             // phase's `max` takes whichever is live.
             Self::FfnNorm
             | Self::MoeCombine
-            | Self::MoePipelineCombine
+            | Self::MoeResultCast
             | Self::FfnNormOperand
             | Self::DownGemm
-            | Self::DownCast
             | Self::MoeGather
             | Self::RouterLogits
             | Self::RouteWeights
             | Self::RouteIndices
-            | Self::RoutingTables
+            | Self::RoutingTokenIds
+            | Self::RoutingWeightIds
+            | Self::RoutingPermutation
+            | Self::RoutingTokenStarts
             | Self::GateGemm
             | Self::UpGemm
             | Self::SwigluAct
@@ -1059,16 +1203,23 @@ impl WaveBuffer {
             Self::RouterLogits => dense(rows, g.n_experts, g.act_dtype),
             Self::RouteWeights => dense(rows, g.experts_per_tok, DType::F32),
             Self::RouteIndices => dense(rows, g.experts_per_tok, DType::U32),
-            Self::RoutingTables => dense(er, ROUTING_U32_PER_ASSIGNMENT, DType::U32),
+            Self::RoutingTokenIds | Self::RoutingWeightIds | Self::RoutingPermutation => {
+                dense(er, 1, DType::U32)
+            }
+            // Prefix offsets: one per token plus the end, so none at all for a
+            // phase no token reaches.
+            Self::RoutingTokenStarts if rows == 0 => dense(0, 0, DType::U32),
+            Self::RoutingTokenStarts => dense(rows + 1, 1, DType::U32),
             Self::MoeGather => q8(er, g.hidden),
             Self::GateGemm => dense(er, g.intermediate, g.accum_dtype),
             Self::UpGemm => dense(er, g.intermediate, g.accum_dtype),
             Self::SwigluAct => q8(er, g.intermediate),
             Self::DownGemm => dense(er, g.hidden, g.accum_dtype),
-            Self::DownCast => dense(er, g.hidden, g.act_dtype),
-            // One combine target per dispatch path, charged as a union — see
-            // the variant's note and the module header.
-            Self::MoeCombine | Self::MoePipelineCombine => dense(rows, g.hidden, g.act_dtype),
+            Self::MoeCombine => dense(rows, g.hidden, g.act_dtype),
+            Self::MoeResultCast if g.work_dtype() != g.act_dtype => {
+                dense(rows, g.hidden, g.act_dtype)
+            }
+            Self::MoeResultCast => dense(0, 0, g.act_dtype),
             // The F16 stability cast's operand, which does not exist without
             // it: the experts run in `work_dtype`, which equals `act_dtype`
             // unless the session is F16. A packed operand skips it outright.
@@ -1506,6 +1657,9 @@ mod tests {
             packed_head: true,
             gated_qkv: false,
             partial_rotary: false,
+            shared_expert: None,
+            qkv_bias: false,
+            decode_q8_context: true,
             // The fused segmented projection and a `[batch, seq, ..]` wave —
             // the twelve carves `MEASURED_ATTN_PREFILL_PER_ROW` itemises.
             fused_qkv: true,
@@ -1545,6 +1699,9 @@ mod tests {
             packed_head: true,
             gated_qkv: true,
             partial_rotary: true,
+            shared_expert: None,
+            qkv_bias: false,
+            decode_q8_context: true,
             // Three separate projections, and a wave already packed `[rows, ..]`
             // — so neither the K/V narrows nor the head-norm reshapes exist.
             fused_qkv: false,
@@ -1578,6 +1735,9 @@ mod tests {
             packed_head: true,
             gated_qkv: false,
             partial_rotary: false,
+            shared_expert: None,
+            qkv_bias: false,
+            decode_q8_context: true,
             fused_qkv: true,
             head_qk_norm: false,
             head_norm_reshapes: true,
@@ -1637,7 +1797,10 @@ mod tests {
                         || (matches!(b, WaveBuffer::QRotaryPermute | WaveBuffer::KRotaryPermute)
                             && !g.partial_rotary)
                         || (matches!(b, WaveBuffer::KSplit | WaveBuffer::VContiguous)
-                            && !g.fused_qkv)
+                            && (!g.fused_qkv || g.qkv_bias))
+                        || (matches!(b, WaveBuffer::QBias | WaveBuffer::KBias | WaveBuffer::VBias)
+                            && !g.qkv_bias)
+                        || (matches!(b, WaveBuffer::DecodeContext) && !g.decode_q8_context)
                         || (matches!(b, WaveBuffer::QSplit) && !g.fused_qkv && !g.gated_qkv)
                         || (matches!(
                             b,
@@ -1650,6 +1813,20 @@ mod tests {
                             && !g.head_qk_norm)
                         || (matches!(b, WaveBuffer::FfnNormOperand)
                             && (g.work_dtype() == g.act_dtype || g.packed_norm))
+                        // The result cast exists only where the experts ran in a
+                        // wider dtype than the residual.
+                        || (matches!(b, WaveBuffer::MoeResultCast)
+                            && g.work_dtype() == g.act_dtype)
+                        // The shared expert's half, on a stack whose MoE has one.
+                        || (matches!(
+                            b,
+                            WaveBuffer::SharedGateUp
+                                | WaveBuffer::SharedAct
+                                | WaveBuffer::SharedGated
+                                | WaveBuffer::SharedGateLogits
+                                | WaveBuffer::SharedGateSigmoid
+                                | WaveBuffer::MoeSharedSum
+                        ) && g.shared_expert.is_none())
                         // The head's two alternatives: a packed session carves
                         // its logits on the span, a float one carries an F32
                         // working copy of the norm instead.
@@ -1963,18 +2140,19 @@ mod tests {
     /// range. That widening is a real `to_dtype` on the float arm and nothing
     /// at all on the packed arm, where q8a128 carries its own scales.
     ///
-    /// The cast on the way *back* out is `to_dtype_mut`, which is in place: it
-    /// returns early when the dtypes agree and casts the buffer where it
-    /// stands when they do not, so it is never an allocation. It was charged as
-    /// one for a long time, at a size that happened to match
-    /// [`WaveBuffer::MoePipelineCombine`] — which is why the FFN span was right
-    /// while its reason was wrong.
+    /// The cast on the way *back* out is `to_dtype_mut`, which returns early
+    /// when the dtypes agree and **allocates** when they do not — the census
+    /// shows its carve on every F16 session and on no BF16 one. So it is
+    /// charged exactly where `work_dtype` differs from `act_dtype`, and nowhere
+    /// else. It was once declared as never allocating, and charged anyway under
+    /// another name at a size that happened to match.
     #[test]
     fn the_f16_stability_cast_is_charged_only_where_it_exists() {
         let rows = WaveWidth::prefill(1000, 1);
         let bf16 = moe();
         assert_eq!(bf16.work_dtype(), bf16.act_dtype);
         assert_eq!(WaveBuffer::FfnNormOperand.bytes(&bf16, rows), 0);
+        assert_eq!(WaveBuffer::MoeResultCast.bytes(&bf16, rows), 0);
 
         let f16 = ModelGeometry {
             act_dtype: DType::F16,
@@ -1983,6 +2161,9 @@ mod tests {
         assert_eq!(f16.work_dtype(), DType::BF16);
         // Still nothing: a packed operand is range-safe and skips the widening.
         assert_eq!(WaveBuffer::FfnNormOperand.bytes(&f16, rows), 0);
+        // But the result comes back in BF16 either way, and narrowing it to the
+        // F16 residual is a real buffer.
+        assert_eq!(WaveBuffer::MoeResultCast.bytes(&f16, rows), 1000 * 2048 * 2);
         let f16_float = ModelGeometry {
             packed_norm: false,
             ..f16
@@ -1990,25 +2171,87 @@ mod tests {
         assert!(WaveBuffer::FfnNormOperand.bytes(&f16_float, rows) > 0);
     }
 
-    /// **Each expert-dispatch path scatters into its own combine target, and
-    /// the phase charges both.**
+    /// **One combine target, whichever path dispatches the experts.**
     ///
-    /// The union rule the module header states for the FFN: the GPU-native path
-    /// scatters straight out of the down GEMM into one `rows × hidden` buffer,
-    /// the threaded pipeline into its own, and the plan has to hold whichever
-    /// runs. Pinned as a pair because the second used to be declared as a cast
-    /// that does not allocate, and a rename that dropped it would have taken
-    /// 4,096 B a row off the 30B's span with every existing test still green.
+    /// Both paths scatter into a single `rows × hidden` buffer. The plan used to
+    /// charge a second one for "the threaded pipeline" — which was really the
+    /// result cast above, so every BF16 session paid for a buffer it never made.
     #[test]
-    fn both_expert_dispatch_paths_get_a_combine_target() {
+    fn a_moe_layer_has_one_combine_target() {
         let rows = WaveWidth::prefill(1000, 1);
-        let g = moe();
-        let one = WaveBuffer::MoeCombine.bytes(&g, rows);
-        assert_eq!(one, 1000 * 2048 * 2);
-        assert_eq!(WaveBuffer::MoePipelineCombine.bytes(&g, rows), one);
-        // Neither exists on a dense stack, which has no expert dispatch at all.
-        for b in [WaveBuffer::MoeCombine, WaveBuffer::MoePipelineCombine] {
+        assert_eq!(WaveBuffer::MoeCombine.bytes(&moe(), rows), 1000 * 2048 * 2);
+        // None on a dense stack, which has no expert dispatch at all.
+        for b in [WaveBuffer::MoeCombine, WaveBuffer::MoeResultCast] {
             assert_eq!(b.bytes(&dense(), rows), 0);
+        }
+    }
+
+    /// **The FFN phase is the census, to the byte**, at two widths and both
+    /// session dtypes — routing tables, the result cast and the alignment pad
+    /// after the token offsets included.
+    ///
+    /// The plan charged 325,288,960 B more than the F16 generation carved: a
+    /// down-projection cast neither dispatch path makes, and routing tables
+    /// bounded at eight per assignment against the three the pipeline uploads.
+    #[test]
+    fn the_ffn_phase_is_the_measured_generation() {
+        let bf16 = WavePlan::new(moe());
+        let width = WaveWidth::prefill(4960, 20);
+        assert_eq!(
+            bf16.phase_bytes(LayerPhase::Ffn, width),
+            MEASURED_FFN_BF16_4960,
+            "{}",
+            bf16.describe(width)
+        );
+        let f16 = WavePlan::new(ModelGeometry {
+            act_dtype: DType::F16,
+            ..moe()
+        });
+        let width = WaveWidth::prefill(9880, 20);
+        assert_eq!(
+            f16.phase_bytes(LayerPhase::Ffn, width),
+            MEASURED_FFN_F16_9880,
+            "{}",
+            f16.describe(width)
+        );
+    }
+
+    /// **A shared expert's carves are priced, and only the ones on the span.**
+    /// Its down projection and the gated product built on it come off the
+    /// pool; charging them would be slack, omitting the six that are here was
+    /// an overrun the down-cast overcharge happened to hide.
+    #[test]
+    fn the_shared_expert_ffn_is_the_measured_generation() {
+        let bf16 = WavePlan::new(moe_35b());
+        let width = WaveWidth::prefill(2100, 4);
+        assert_eq!(
+            bf16.phase_bytes(LayerPhase::Ffn, width),
+            MEASURED_FFN_35B_BF16_2100,
+            "{}",
+            bf16.describe(width)
+        );
+        let f16 = WavePlan::new(ModelGeometry {
+            act_dtype: DType::F16,
+            ..moe_35b()
+        });
+        let width = WaveWidth::prefill(1070, 2);
+        assert_eq!(
+            f16.phase_bytes(LayerPhase::Ffn, width),
+            MEASURED_FFN_35B_F16_1070,
+            "{}",
+            f16.describe(width)
+        );
+        // And none of it on a MoE without a shared expert.
+        for b in [
+            WaveBuffer::SharedGateUp,
+            WaveBuffer::SharedAct,
+            WaveBuffer::SharedGated,
+            WaveBuffer::SharedGateLogits,
+            WaveBuffer::SharedGateSigmoid,
+            WaveBuffer::MoeSharedSum,
+        ] {
+            assert_eq!(b.bytes(&moe(), width), 0, "{b:?}");
+            assert!(b.bytes(&moe_35b(), width) > 0, "{b:?}");
         }
     }
 
@@ -2237,28 +2480,168 @@ mod tests {
     /// ```
     const MEASURED_ATTN_DECODE_PER_ROW: usize = 40704;
 
-    /// The FFN chain on the **threaded expert pipeline**, which is the wider of
-    /// the two dispatch paths — the GPU-native path scatters straight out of the
-    /// down GEMM and never materialises [`WaveBuffer::DownGemm`] or
-    /// [`WaveBuffer::DownCast`] on the span.
+    /// The same decode chain at **one row**, where `QSplit`, `KSplit` and
+    /// `VContiguous` are not carved: the narrows out of a single fused row are
+    /// already contiguous. Read off the per-forward pair on the Qwen3-30B-A3B
+    /// gate — planned 40,704 B, used 30,464 B at `0 prefill + 1 decode rows`.
+    const MEASURED_ATTN_DECODE_ONE_ROW: usize = 30464;
+
+    /// The FFN chain per row on a **BF16** int8 session, excluding the routing
+    /// tables (which do not scale by the row alone):
     ///
-    /// Excludes the routing tables, which are bounded rather than measured
-    /// (see [`ROUTING_U32_PER_ASSIGNMENT`]) — they came to 3.5 u32 per
-    /// assignment against the 8 charged here.
-    const MEASURED_FFN_PIPELINE_PER_ROW: usize = 183616;
+    /// ```text
+    ///  2304  FfnNorm        q8a128 over hidden
+    ///   256  RouterLogits
+    ///    64  RouteWeights + RouteIndices
+    ///  4096  MoeCombine
+    /// 18432  MoeGather      8 × q8a128 over hidden
+    /// 49152  Gate + Up      8 × 768 × F32, twice
+    ///  6912  SwigluAct      8 × q8a128 over 768
+    /// 65536  DownGemm       8 × 2048 × F32
+    /// ```
+    const MEASURED_FFN_PIPELINE_PER_ROW: usize = 146752;
+
+    /// Two whole FFN generations off the census, to the byte — the plan must
+    /// price each exactly, routing tables and alignment pad included.
+    ///
+    /// * BF16, 4,960 rows: 14 carves, no result cast, 124 B lost to alignment.
+    /// * F16, 9,880 rows: 15 carves, the `to_dtype_mut` result cast among them,
+    ///   156 B lost to alignment.
+    const MEASURED_FFN_BF16_4960: usize = 728_386_048;
+    const MEASURED_FFN_F16_9880: usize = 1_491_366_400;
+
+    /// The same generation on Qwen3.5-35B-A3B, whose MoE adds a shared expert:
+    /// six more carves (gate/up, SiLU, product, gate tile, sigmoid, the final
+    /// sum) and the alignment pads the sigmoid and the routing tables leave.
+    ///
+    /// * BF16, 2,100 rows: 20 carves, 836 B lost to alignment.
+    /// * F16, 1,070 rows: 21 carves — the result cast again — 680 B lost.
+    const MEASURED_FFN_35B_BF16_2100: usize = 287_024_640;
+    const MEASURED_FFN_35B_F16_1070: usize = 150_628_864;
+
+    /// Qwen3.5-35B-A3B's FFN shapes. The FFN chain takes nothing from the
+    /// attention side, so only the fields it reads are the checkpoint's.
+    fn moe_35b() -> ModelGeometry {
+        ModelGeometry {
+            intermediate: 512,
+            experts_per_tok: 8,
+            n_experts: 256,
+            shared_expert: Some(SharedExpertWidths {
+                intermediate: 512,
+                gate_cols: 32,
+            }),
+            ..moe()
+        }
+    }
 
     /// The plan must cover every chain that can run in its phase, because a
     /// mixed wave runs more than one of them inside a single generation.
     ///
     /// This is the assertion the whole module exists to make true, and it was
     /// false by 1.8x on attention and by 2x on the accumulate dtype until the
-    /// census measured it. Stated against constants read off a real run rather
-    /// than against the plan's own arithmetic — a test that recomputed the
-    /// declaration would have passed throughout.
+    /// **A one-row wave is priced without the three fused-row copies**, because
+    /// it does not make them — and only a one-row wave: at two rows every
+    /// narrow strides over the row dimension and each copy is real.
+    #[test]
+    fn a_single_row_wave_copies_nothing_out_of_the_fused_row() {
+        let g = moe();
+        let plan = WavePlan::new(g);
+        assert_eq!(
+            plan.phase_bytes(LayerPhase::Attention, WaveWidth::decode(1)),
+            MEASURED_ATTN_DECODE_ONE_ROW,
+            "{}",
+            plan.describe(WaveWidth::decode(1))
+        );
+        for b in [
+            WaveBuffer::QSplit,
+            WaveBuffer::KSplit,
+            WaveBuffer::VContiguous,
+        ] {
+            assert_eq!(b.bytes(&g, WaveWidth::decode(1)), 0, "{b:?} at one row");
+            assert_eq!(b.bytes(&g, WaveWidth::prefill(1, 1)), 0, "{b:?} at one row");
+            assert!(b.bytes(&g, WaveWidth::decode(2)) > 0, "{b:?} at two rows");
+        }
+        // A gated lineage's Q is interleaved per head, so its narrow strides
+        // across heads even at one row.
+        let gated = ModelGeometry {
+            gated_qkv: true,
+            ..g
+        };
+        assert!(WaveBuffer::QSplit.bytes(&gated, WaveWidth::decode(1)) > 0);
+    }
+
+    /// **With Q/K/V biases the adds are the three buffers, at every width.**
+    /// The add reads the narrowed view as it stands, so no split copy happens —
+    /// and unlike the copy, the add is not free at one row. Priced through the
+    /// split copies, Qwen2 matched to the byte until a one-row decode, where it
+    /// ran out of span 1,792 B (one Q row) into the Q bias.
+    #[test]
+    fn a_bias_add_replaces_the_split_copy_at_every_width() {
+        let biased = ModelGeometry {
+            qkv_bias: true,
+            ..moe()
+        };
+        for width in [
+            WaveWidth::decode(1),
+            WaveWidth::prefill(1, 1),
+            WaveWidth::decode(7),
+        ] {
+            let rows = width.rows();
+            assert_eq!(
+                WaveBuffer::QBias.bytes(&biased, width),
+                rows * biased.attn_cols() * 2
+            );
+            for b in [WaveBuffer::KBias, WaveBuffer::VBias] {
+                assert_eq!(b.bytes(&biased, width), rows * biased.kv_cols() * 2);
+            }
+            for b in [
+                WaveBuffer::QSplit,
+                WaveBuffer::KSplit,
+                WaveBuffer::VContiguous,
+            ] {
+                assert_eq!(b.bytes(&biased, width), 0, "{b:?}");
+            }
+        }
+        // Qwen2-0.5B's own decode generation, off the gate: 60 decode rows,
+        // head dim 64 — so the FP context, not the q8 one — and the three bias
+        // adds. The norm, the fused projection, the adds and one `rows ×
+        // hidden` buffer after them, plus the pad the flat-grouped q8 norm
+        // leaves.
+        let qwen2 = ModelGeometry {
+            hidden: 896,
+            vocab: 151_936,
+            intermediate: 4864,
+            n_head: 14,
+            n_kv_head: 2,
+            head_dim: 64,
+            experts_per_tok: 1,
+            n_experts: 1,
+            head_qk_norm: false,
+            packed_head: false,
+            decode_q8_context: false,
+            ..biased
+        };
+        assert_eq!(
+            WavePlan::new(qwen2).phase_bytes(LayerPhase::Attention, WaveWidth::decode(60)),
+            445_184,
+            "{}",
+            WavePlan::new(qwen2).describe(WaveWidth::decode(60))
+        );
+        // Past one row the phase costs what the split copies used to, which is
+        // why the old pricing matched every wide wave.
+        let width = WaveWidth::decode(7);
+        assert_eq!(
+            WavePlan::new(biased).phase_bytes(LayerPhase::Attention, width),
+            WavePlan::new(moe()).phase_bytes(LayerPhase::Attention, width),
+        );
+    }
+
     #[test]
     fn the_plan_covers_every_measured_chain() {
         let plan = WavePlan::new(moe());
-        for rows in [1usize, 20, 124, 744, 3936] {
+        // From two rows: a one-row wave carves a different chain, pinned by
+        // `a_single_row_wave_copies_nothing_out_of_the_fused_row`.
+        for rows in [2usize, 20, 124, 744, 3936] {
             // **Each group against its own width**, which is what the split
             // buys: a wave of `rows` prefill tokens must cover the prefill
             // chain at `rows`, and a wave of `rows` decode tokens the decode
@@ -2442,12 +2825,22 @@ mod tests {
     /// A budget too small to price a single token is a misconfiguration, and
     /// must be reported as zero rather than rounded up to one — admitting a
     /// wave the span cannot hold is the failure the gate exists to prevent.
+    ///
+    /// At exactly one row's price it admits the widest width that price still
+    /// covers — which need not be one. `wave_bytes` is the largest phase, and
+    /// at one prefill row that is the head's single scored row of logits, which
+    /// a second prefill row does not add to: the FFN at two rows still sits
+    /// under it. The staircase has a flat step there, and the bound is only
+    /// right if it walks to the end of it.
     #[test]
     fn a_budget_below_one_row_admits_nothing() {
         let plan = WavePlan::new(moe());
         let one_row = plan.wave_bytes(w(1));
         assert_eq!(plan.max_rows_within(one_row - 1, empty_head()), 0);
-        assert_eq!(plan.max_rows_within(one_row, empty_head()), 1);
+        let widest = plan.max_rows_within(one_row, empty_head());
+        assert!(widest >= 1);
+        assert!(plan.wave_bytes(w(widest)) <= one_row);
+        assert!(plan.wave_bytes(w(widest + 1)) > one_row);
     }
 
     /// Halving the budget must roughly halve the admitted width — the property

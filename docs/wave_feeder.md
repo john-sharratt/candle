@@ -1729,14 +1729,38 @@ what it used sits under it on both sides and never appears. `wave_max_slack`
 pairs each forward's own plan with its own peak, so the test now says *every*
 forward was exact rather than that the widest one was.
 
-**The trap this keeps setting.** Twice now, a charge whose *size* was right and
-whose *reason* was wrong survived every change that should have corrected it:
-the F32 round trip was covering the DeltaNet chain, and `FfnResidualCast` — an
-`to_dtype_mut`, which is in-place and allocates nothing — was covering the
-threaded pipeline's combine target. Both were found by removing the wrong reason
-and watching a *different* assertion fail. When a buffer's justification does not
-survive reading the code, re-derive the number; do not keep it because the total
-looks right.
+**…once the books judge every forward.** The pairing first read the previous
+forward's plan out of `WaveDomain::planned` — the *layout's* record, which
+`end_wave_transient` clears at phase 0 of every forward and `enter_arena_window`
+clears when a sealing pass takes the gap. So the pricing that followed almost
+never found a plan to judge, and the run's last forward was never judged at all.
+The symptom was a contradiction: the MoE gates reported their widest FFN plan
+195–310 MiB over the run's peak while the worst forward on the books was 1.1 MiB
+over. The books are now their own field, `unjudged`, settled exactly once — by
+the next pricing, or by `wave_settle`, which the harness calls before its
+verdict. **A widest-plan slack that no per-forward pair accounts for is a hole in
+the books before it is a pricing error.**
+
+**The trap this keeps setting.** A charge whose *size* is right and whose
+*reason* is wrong survives every change that should have corrected it. The F32
+round trip was covering the DeltaNet chain. And a `rows × hidden` MoE buffer was
+charged for years under two wrong reasons in turn — first as a result cast
+declared *not* to allocate, then as a second "pipeline" combine target — while it
+was in fact that cast: `to_dtype_mut` returns early when the dtypes agree and
+**allocates** when they do not, which the census shows on every F16 session and
+on no BF16 one. It is `MoeResultCast` now, charged exactly where
+`work_dtype != act_dtype`. When a buffer's justification does not survive reading
+the code, re-derive the number from a census; do not keep it because the total
+looks right — and do not trust a reading of the code over a carve.
+
+**Two more fossils hid under the MoE FFN until the books could see them**
+(Qwen3-30B census at 9,880 rows): a down-projection cast charged at
+`experts × hidden × 2` that neither dispatch path makes — the scatter validates
+the F32 `down_out` and never converts it, 323.7 MB of a 1.8 GB plan — and routing
+tables bounded at eight `u32` per assignment against the three separate tables
+and `rows + 1` offsets the pipeline actually uploads, once per layer. The first
+was large enough to hide an *under*-price: the Qwen3.5/3.6 shared expert's six
+span carves were never declared (see `docs/qwen35_qwen38_models.md`).
 
 **And admission was not charging it at all.** Pricing the tier exactly is worth
 nothing if the thing that decides wave width never sees it. Two defects, one

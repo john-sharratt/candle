@@ -1023,12 +1023,17 @@ pub fn account_model_load<M>(device: &Device, load: impl FnOnce() -> Result<M>) 
 #[cfg(feature = "cuda")]
 pub fn assert_tier_exact(device: &Device) -> Result<()> {
     use candle_nn::kv_cache::{
-        wave_domain_stats, wave_max_planned, wave_max_slack, wave_worst_slack, BUMP_ALIGNMENT,
+        wave_domain_stats, wave_max_planned, wave_max_slack, wave_settle, wave_worst_slack,
+        BUMP_ALIGNMENT,
     };
 
     let candle::DeviceLocation::Cuda { gpu_id } = device.location() else {
         return Ok(());
     };
+    // The run's last forward has no later pricing to judge it, and its plan is
+    // already in `max_planned` — so without this the widest-wave verdict can
+    // name a slack no per-forward pair accounts for.
+    wave_settle(gpu_id)?;
     let (Some(stats), Some(reserved)) = (wave_domain_stats(gpu_id), wave_max_planned(gpu_id))
     else {
         // No wave domain: nothing priced a tier on this device.
@@ -1078,19 +1083,6 @@ pub fn assert_tier_exact(device: &Device) -> Result<()> {
             );
         }
     }
-    if slack_total > 0 {
-        candle::bail!(
-            "the tier reserved {} it never used (attention {}, ffn {}, forward {}). \
-             Price every phase from the wave's own width so the reservation IS the \
-             demand — every slack byte is ground the weight side conceded and the \
-             tier never touched. See `docs/wave_feeder.md` §4.11.12.",
-            mib(slack_total),
-            mib(reserved[0].saturating_sub(stats[0].1)),
-            mib(reserved[1].saturating_sub(stats[1].1)),
-            mib(reserved[2].saturating_sub(stats[2].1)),
-        );
-    }
-
     let per_forward = wave_max_slack(gpu_id).unwrap_or([0; 3]);
     println!(
         "worst single forward: attention {}, ffn {}, forward {}",
@@ -1098,36 +1090,55 @@ pub fn assert_tier_exact(device: &Device) -> Result<()> {
         mib(per_forward[1]),
         mib(per_forward[2])
     );
+    // **Name the pair, not just the gap.** The census reports a generation
+    // only when it sets a new mark for its arena, so the forward this is
+    // about is invisible to it. A plan and a usage are each a sum of
+    // declared shapes, and on a known geometry that is enough to say which
+    // chain was charged and which was carved.
+    //
+    // Built before either verdict, because both need it: a phase whose widest
+    // reservation outran its peak use is one forward's plan outrunning its
+    // own carve, and the verdict on the total used to bail before this named
+    // that forward — leaving a 194.8 MiB FFN overprice on the 35B hybrid with
+    // no width to reproduce it at.
+    let detail = match wave_worst_slack(gpu_id) {
+        Some(w) => (0..3)
+            .filter(|&i| !granularity(per_forward[i]))
+            .map(|i| {
+                let (width, planned, used) = w[i];
+                format!(
+                    "\n    {}: planned {} B, used {} B, over by {} B — \
+                     at {} prefill + {} decode rows, {} scored, {} staged over {} spans",
+                    PHASE[i],
+                    planned,
+                    used,
+                    planned.saturating_sub(used),
+                    width.prefill_rows,
+                    width.decode_rows,
+                    width.scored_rows,
+                    width.staged_rows,
+                    width.staged_spans,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        None => String::new(),
+    };
+    if slack_total > 0 {
+        candle::bail!(
+            "the tier reserved {} it never used (attention {}, ffn {}, forward {}). \
+             Price every phase from the wave's own width so the reservation IS the \
+             demand — every slack byte is ground the weight side conceded and the \
+             tier never touched. See `docs/wave_feeder.md` §4.11.12.\n  worst forward:{detail}",
+            mib(slack_total),
+            mib(reserved[0].saturating_sub(stats[0].1)),
+            mib(reserved[1].saturating_sub(stats[1].1)),
+            mib(reserved[2].saturating_sub(stats[2].1)),
+        );
+    }
+
     let worst: usize = per_forward.iter().filter(|&&s| !granularity(s)).sum();
     if worst > 0 {
-        // **Name the pair, not just the gap.** The census reports a generation
-        // only when it sets a new mark for its arena, so the forward this is
-        // about is invisible to it. A plan and a usage are each a sum of
-        // declared shapes, and on a known geometry that is enough to say which
-        // chain was charged and which was carved.
-        let detail = match wave_worst_slack(gpu_id) {
-            Some(w) => (0..3)
-                .filter(|&i| !granularity(per_forward[i]))
-                .map(|i| {
-                    let (width, planned, used) = w[i];
-                    format!(
-                        "\n    {}: planned {} B, used {} B, over by {} B — \
-                         at {} prefill + {} decode rows, {} scored, {} staged over {} spans",
-                        PHASE[i],
-                        planned,
-                        used,
-                        planned.saturating_sub(used),
-                        width.prefill_rows,
-                        width.decode_rows,
-                        width.scored_rows,
-                        width.staged_rows,
-                        width.staged_spans,
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(""),
-            None => String::new(),
-        };
         candle::bail!(
             "some forward reserved {} it never used (attention {}, ffn {}, forward {}) \
              even though the widest one was exact. A wave is priced from its own \
@@ -1478,6 +1489,7 @@ impl TestParams {
             config.num_contexts,
             widest_turn,
             session.activation_dtype(),
+            session.live_kv_block_bytes(),
         );
         println!("  [ground] {bought}");
 

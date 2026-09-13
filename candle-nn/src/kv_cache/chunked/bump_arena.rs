@@ -827,12 +827,27 @@ struct WaveDomain {
     /// the prefill wave on both sides of that comparison and never appears.
     ///
     /// This is the figure that says *every* forward was exact, which is the
-    /// property the tier is supposed to have. Folded in
-    /// [`plan_wave_transient`], where the previous forward's plan is still in
-    /// hand and its usage can be taken off the arenas.
+    /// property the tier is supposed to have. Folded by [`settle_forward`],
+    /// from [`Self::unjudged`] and the arenas' per-forward marks.
     ///
     /// Observational only, like its neighbour.
     max_slack: [usize; 3],
+    /// The most recent forward's plan and width, **until its usage has been
+    /// set against it** — see [`settle_forward`].
+    ///
+    /// Kept apart from [`Self::planned`] because the two have different
+    /// lifetimes. `planned` is the layout's, and it is cleared the moment the
+    /// tier it priced is released between forwards ([`end_wave_transient`] at
+    /// phase 0 of every forward, [`enter_arena_window`] when a sealing pass takes
+    /// the gap). Judging from `planned` therefore judged only the forwards whose
+    /// tier happened to survive to the next pricing: on the 35B hybrid the widest
+    /// FFN plan stood 194.8 MiB over the arena's whole-run peak while the worst
+    /// forward the fold ever saw was 1.1 MiB over, because the forward that
+    /// planned it had its `planned` cleared before anything compared it.
+    ///
+    /// This is the books, not the layout: taken exactly once per forward, by the
+    /// next pricing or by [`wave_settle`] at the end of a run.
+    unjudged: Option<([usize; 3], WaveWidth)>,
     /// The `(planned, used)` pair that produced [`Self::max_slack`], per phase.
     ///
     /// **The slack alone cannot be attributed.** The census reports a
@@ -843,10 +858,8 @@ struct WaveDomain {
     /// known geometry that is enough to say which chain was charged and which
     /// was carved.
     worst_slack: [(usize, usize); 3],
-    /// The width the current forward was priced at, and the widths behind
-    /// [`Self::worst_slack`] — carried so a slack report names the wave that
-    /// produced it rather than only the bytes.
-    planned_width: WaveWidth,
+    /// The widths behind [`Self::worst_slack`] — carried so a slack report names
+    /// the wave that produced it rather than only the bytes.
     worst_width: [WaveWidth; 3],
     /// Where the tier currently sits, while it exists.
     placed_at: Option<u64>,
@@ -1237,8 +1250,8 @@ fn domain_entry<'a>(
             planned: None,
             max_planned: None,
             max_slack: [0; 3],
+            unjudged: None,
             worst_slack: [(0, 0); 3],
-            planned_width: WaveWidth::prefill(0, 0),
             worst_width: [WaveWidth::prefill(0, 0); 3],
             placed_at: None,
             placed_bytes: None,
@@ -1587,6 +1600,36 @@ pub fn end_wave_transient(stream: &Arc<CudaStream>) {
     });
 }
 
+/// Set the last priced forward's plan against what it actually carved, and
+/// reset the arenas' per-forward marks for whatever comes next.
+///
+/// Its plan is in [`WaveDomain::unjudged`] and its usage is still on the arenas,
+/// so this is the one moment the two can be compared *as a pair* rather than as
+/// two process-lifetime maxima — see `max_slack`. Taking `unjudged` is what
+/// makes a forward judged exactly once, whichever of the next pricing or
+/// [`wave_settle`] reaches it first.
+///
+/// Unconditional on the arenas, so the marks are reset even when there is no
+/// plan to judge — the first forward, or carves made by an unplanned guard.
+fn settle_forward(domain: &mut WaveDomain) {
+    let used = [
+        domain.arenas[0].take_forward_peak(),
+        domain.arenas[1].take_forward_peak(),
+        domain.arenas[2].take_forward_peak(),
+    ];
+    let Some((plan, width)) = domain.unjudged.take() else {
+        return;
+    };
+    for i in 0..3 {
+        let slack = plan[i].saturating_sub(used[i]);
+        if slack > domain.max_slack[i] {
+            domain.max_slack[i] = slack;
+            domain.worst_slack[i] = (plan[i], used[i]);
+            domain.worst_width[i] = width;
+        }
+    }
+}
+
 /// Price and reserve this forward's transient tier.
 ///
 /// # Three lock scopes, and the middle one is deliberate
@@ -1629,29 +1672,10 @@ pub fn plan_wave_transient(
         // move it after the read.
         let mut map = await_arena_windows(lock_domains(), &stream);
         let (_, domain) = domain_entry(&mut map, &stream);
-        // **Close the books on the forward that just ended.** Its plan is still
-        // in `planned` and its usage is still on the arenas, so this is the one
-        // moment the two can be compared *as a pair* rather than as two
-        // process-lifetime maxima — see `max_slack`.
-        //
-        // Unconditional on the arenas, so the marks are reset even for the
-        // first forward, which has no previous plan to judge.
-        let used = [
-            domain.arenas[0].take_forward_peak(),
-            domain.arenas[1].take_forward_peak(),
-            domain.arenas[2].take_forward_peak(),
-        ];
-        if let Some(prev) = domain.planned {
-            for i in 0..3 {
-                let slack = prev[i].saturating_sub(used[i]);
-                if slack > domain.max_slack[i] {
-                    domain.max_slack[i] = slack;
-                    domain.worst_slack[i] = (prev[i], used[i]);
-                    domain.worst_width[i] = domain.planned_width;
-                }
-            }
-        }
-        domain.planned_width = width;
+        // **Close the books on the forward that just ended**, then open them on
+        // this one — see `unjudged`.
+        settle_forward(domain);
+        domain.unjudged = Some((per_phase, width));
         domain.planned = Some(per_phase);
         // Element-wise max, kept past the release, so the reservation can be
         // compared against the arenas' process-lifetime peaks — see
@@ -2214,7 +2238,8 @@ pub fn wave_max_planned(ordinal: usize) -> Option<[usize; 3]> {
 /// **The figure that says every forward was exact**, as opposed to
 /// [`wave_max_planned`] against `peak`, which only says the widest one was.
 /// A forward's own slack is folded in when the *next* one prices, so the last
-/// forward of a run is not counted until another follows it.
+/// forward of a run is not counted until another follows it or
+/// [`wave_settle`] closes it.
 pub fn wave_max_slack(ordinal: usize) -> Option<[usize; 3]> {
     lock_domains().get(&ordinal).map(|d| d.max_slack)
 }
@@ -2235,8 +2260,34 @@ pub fn wave_worst_slack(ordinal: usize) -> Option<[(WaveWidth, usize, usize); 3]
     })
 }
 
+/// Judge the last forward on `ordinal`, which no later pricing will.
+///
+/// A forward is judged when the next one prices ([`settle_forward`]), so the
+/// final forward of a run stays unjudged — and its plan is already in
+/// [`wave_max_planned`], so a verdict read without this compares that plan
+/// against a peak its own usage may not have set, and names no forward for it.
+///
+/// **Refuses while a forward is open or a generation is live**: the usage is
+/// still growing then, and a judgement taken mid-forward would record slack the
+/// rest of the forward was about to spend.
+pub fn wave_settle(ordinal: usize) -> Result<()> {
+    let mut map = lock_domains();
+    let Some(domain) = map.get_mut(&ordinal) else {
+        return Ok(());
+    };
+    if domain.forward_open || domain.live_generations > 0 {
+        candle::bail!(
+            "wave_settle on device {ordinal}: a forward is still open ({} live \
+             generation(s)) — its usage is not final",
+            domain.live_generations
+        );
+    }
+    settle_forward(domain);
+    Ok(())
+}
+
 /// Forget every observation on `ordinal`: the planned maxima, the worst
-/// per-forward slack, and the arenas' peaks.
+/// per-forward slack, the plan awaiting judgement, and the arenas' peaks.
 ///
 /// **For a harness that runs more than one model in one process.** The wave
 /// domain is keyed by device ordinal and outlives any single test, so a second
@@ -2251,6 +2302,9 @@ pub fn wave_reset_observations(ordinal: usize) {
     if let Some(d) = lock_domains().get_mut(&ordinal) {
         d.max_planned = None;
         d.max_slack = [0; 3];
+        // An earlier run's last forward, which would otherwise be judged against
+        // this run's first usage.
+        d.unjudged = None;
         d.worst_slack = [(0, 0); 3];
         d.worst_width = [WaveWidth::prefill(0, 0); 3];
         for a in &d.arenas {
@@ -2510,8 +2564,9 @@ mod tests {
 #[cfg(all(test, feature = "cuda"))]
 mod wave_tests {
     use super::{
-        begin_forward, begin_wave, enter_arena_window, plan_wave_transient, wave_domain_stats,
-        LayerPhase,
+        begin_forward, begin_wave, end_wave_transient, enter_arena_window, plan_wave_transient,
+        wave_domain_stats, wave_max_slack, wave_reset_observations, wave_settle, wave_worst_slack,
+        LayerPhase, WaveWidth,
     };
     use candle::{Device, Result};
 
@@ -2710,6 +2765,69 @@ mod wave_tests {
         // And once that forward has run, the tier is ordinary idle ground again.
         drop(begin_wave(&s, LayerPhase::Attention)?);
         drop(enter_arena_window(&s)?);
+        Ok(())
+    }
+
+    /// **Every forward is judged — including one whose tier phase 0 released
+    /// before the next pricing, and the run's last.**
+    ///
+    /// The fold used to read the previous forward's plan from `planned`, which
+    /// `end_wave_transient` clears at phase 0 of every forward. So the pricing
+    /// that followed found nothing to judge, and the 35B hybrid reported its
+    /// widest FFN plan 194.8 MiB over the run's peak while the worst forward the
+    /// fold had seen was 1.1 MiB over.
+    #[test]
+    fn a_forward_is_judged_even_after_phase_zero_releases_its_tier() -> Result<()> {
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let ordinal = s.context().ordinal();
+        wave_reset_observations(ordinal);
+
+        // Priced at 4 MiB of attention, carves 1 MiB.
+        let first = WaveWidth::prefill(1, 1);
+        plan_wave_transient(&s, [4 << 20, 1 << 20, 1 << 20], first)?;
+        {
+            let guard = begin_wave(&s, LayerPhase::Attention)?;
+            let _range = guard.alloc(1 << 20, 256)?;
+        }
+        // Exactly the production order: the next forward's phase 0 hands the
+        // tier back, and the layout's plan with it, before that forward prices.
+        end_wave_transient(&s);
+        let second = WaveWidth::prefill(2, 1);
+        plan_wave_transient(&s, [1 << 20, 8 << 20, 1 << 20], second)?;
+        let slack = wave_max_slack(ordinal).expect("the domain exists");
+        assert_eq!(
+            slack[0],
+            3 << 20,
+            "the first forward's attention slack must be judged though its plan \
+             was cleared from the layout"
+        );
+        let worst = wave_worst_slack(ordinal).expect("the domain exists");
+        assert_eq!((worst[0].1, worst[0].2), (4 << 20, 1 << 20));
+        assert_eq!(worst[0].0.prefill_rows, first.prefill_rows);
+
+        // The second forward is the run's last: nothing prices after it.
+        {
+            let guard = begin_wave(&s, LayerPhase::Ffn)?;
+            let _range = guard.alloc(2 << 20, 256)?;
+        }
+        assert_eq!(
+            wave_max_slack(ordinal).expect("the domain exists")[1],
+            1 << 20,
+            "unsettled, only the first forward's FFN slack is on the books"
+        );
+        wave_settle(ordinal)?;
+        let settled = wave_max_slack(ordinal).expect("the domain exists");
+        assert_eq!(settled[1], 6 << 20, "settling judges the last forward");
+        let worst = wave_worst_slack(ordinal).expect("the domain exists");
+        assert_eq!(worst[1].0.prefill_rows, second.prefill_rows);
+
+        // Judged once: a second settle and a later pricing find nothing to fold.
+        wave_settle(ordinal)?;
+        plan_wave_transient(&s, [1 << 20, 1 << 20, 1 << 20], first)?;
+        assert_eq!(wave_max_slack(ordinal).expect("the domain exists"), settled);
+        end_wave_transient(&s);
+        wave_reset_observations(ordinal);
         Ok(())
     }
 

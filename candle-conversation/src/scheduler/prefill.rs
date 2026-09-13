@@ -1634,14 +1634,7 @@ impl Scheduler {
     /// sequence occupies — see `admit::cost` for the 3.7x that distinction is
     /// worth.
     pub(super) fn per_block_kv_bytes(&self) -> u64 {
-        let (k, v) = self.session.active_kv_formats();
-        admit::cost::per_block_kv_bytes(
-            self.session.num_layers(),
-            self.session.n_kv_head(),
-            self.session.head_dim(),
-            k,
-            v,
-        )
+        self.session.live_kv_block_bytes()
     }
 
     /// Buy from the weight side whatever of `cost` the K/V side does not hold

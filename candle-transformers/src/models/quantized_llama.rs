@@ -617,6 +617,8 @@ impl BatchedModelCore for ModelWeights {
             // Llama's attention has no `attn_q_norm`/`attn_k_norm` weight at
             // all — Q and K go from the projection to the rotary untouched.
             head_qk_norm: false,
+            // Nor any Q/K/V bias.
+            qkv_bias: false,
         }
     }
 

@@ -56,6 +56,7 @@ use super::batched_layer::{
 };
 use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
+use super::prefill_utils::paged_decode_q8_head_dim;
 use super::quantized_matmul::QMatMul;
 use super::rope_tables::CisPrecomputations;
 use super::tensor_cat::TensorCat;
@@ -171,6 +172,10 @@ pub struct WaveShapes {
     /// later do; Llama and Qwen2 have no such weight, and pricing one charged
     /// them for six buffers they never allocate.
     pub head_qk_norm: bool,
+    /// Whether Q, K and V each get a **bias** added after the projection —
+    /// Qwen2's attention does; Llama and Qwen3 have none. See
+    /// [`ModelGeometry::qkv_bias`] for what it changes on the span.
+    pub qkv_bias: bool,
 }
 
 /// The dtype activations are carried in, for a KV cache stored as `cache_dtype`.
@@ -252,6 +257,12 @@ pub trait BatchedModelCore {
             // session.
             fused_qkv: self.layer(0).int8mode().is_int8(),
             head_qk_norm: shapes.head_qk_norm,
+            qkv_bias: shapes.qkv_bias,
+            // `want_q8` in the decode path, asked of the same predicate: an
+            // int8 layer at a head dim the fused q8 combine serves. Qwen2's 64
+            // is not one, and its context was priced on a span it never lands on.
+            decode_q8_context: self.layer(0).int8mode().is_int8()
+                && paged_decode_q8_head_dim(self.head_dim()),
             // The wave is carried as `[batch, seq, heads · dim]`, so where there
             // IS a per-head norm it copies in and transposes back: the census
             // shows `QNormIn`/`QHeadsPacked` and their K twins.
@@ -275,6 +286,9 @@ pub trait BatchedModelCore {
             },
             gated_qkv: false,
             partial_rotary: false,
+            // No stack on this path has one: Qwen3-MoE routes every token
+            // through its top-k experts and nothing else.
+            shared_expert: None,
         }
     }
 

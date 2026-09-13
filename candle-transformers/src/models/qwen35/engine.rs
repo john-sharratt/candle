@@ -16,14 +16,15 @@
 
 use candle::quantized::Int8Mode;
 use candle::{DType, Device};
-use candle_nn::kv_cache::{ffn_work_dtype, DeltaNetWidths, ModelGeometry};
+use candle_nn::kv_cache::{ffn_work_dtype, DeltaNetWidths, ModelGeometry, SharedExpertWidths};
 
 use super::config::{LayerKind, Qwen35Config};
-use super::quantized_weights::QuantModel;
+use super::quantized_weights::{QuantModel, SHARED_GATE_TILE};
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, KvLayers, ProvenanceLayerIndices,
 };
 use crate::models::delta_net::KvLayerMap;
+use crate::models::prefill_utils::paged_decode_q8_head_dim;
 
 /// The per-row intermediate activation the **FFN phase** carries.
 ///
@@ -40,8 +41,10 @@ use crate::models::delta_net::KvLayerMap;
 pub fn priced_intermediate(cfg: &Qwen35Config) -> usize {
     match &cfg.moe {
         // MoE prices the *per-expert* intermediate; `expert_rows` applies the
-        // fan-out separately.
-        Some(moe) => moe.expert_ffn_size.max(moe.shared_expert_ffn_size),
+        // fan-out separately. The shared expert is not folded in here: its
+        // buffers are a chain of their own (`ModelGeometry::shared_expert`),
+        // and a `max` would widen every routed row to cover it.
+        Some(moe) => moe.expert_ffn_size,
         None => cfg.intermediate_size,
     }
 }
@@ -78,6 +81,13 @@ pub fn wave_geometry(cfg: &Qwen35Config, act_dtype: DType, int8mode: Int8Mode) -
                 value_dim: cfg.delta_net.value_dim(),
                 n_v_heads: cfg.delta_net.n_v_heads,
             }),
+        // Every MoE layer in this lineage adds an always-active shared expert
+        // to the routed block, and its gate projection is stored padded to one
+        // KO tile.
+        shared_expert: cfg.moe.as_ref().map(|moe| SharedExpertWidths {
+            intermediate: moe.shared_expert_ffn_size,
+            gate_cols: SHARED_GATE_TILE,
+        }),
         act_dtype,
         packed_norm: int8mode.is_int8(),
         // This lineage's callers read `int8mode` off the head itself
@@ -91,6 +101,11 @@ pub fn wave_geometry(cfg: &Qwen35Config, act_dtype: DType, int8mode: Int8Mode) -
         // `qkv_segmented`. K and V arrive contiguous and neither is copied out
         // of anything.
         fused_qkv: false,
+        // No Q/K/V biases in this lineage.
+        qkv_bias: false,
+        // The fused q8 decode combine serves this lineage's head dim on an
+        // int8 session, through the same predicate the dispatch asks.
+        decode_q8_context: int8mode.is_int8() && paged_decode_q8_head_dim(cfg.attn_head_dim),
         // Per-head RMSNorm on Q and K, as every Qwen3-and-later stack has.
         head_qk_norm: true,
         // The wave is flattened to `[rows, hidden]` before the layer sweep, so

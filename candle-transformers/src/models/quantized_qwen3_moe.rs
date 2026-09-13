@@ -1634,6 +1634,7 @@ impl ModelWeights {
                 vocab,
                 // `self_attn.q_norm` / `k_norm` — Qwen3 carries both.
                 head_qk_norm: true,
+                qkv_bias: false,
             },
             device: device.clone(),
             // Reader path keeps every projection in FP16; int8 dense repack is only wired on the
@@ -2403,6 +2404,7 @@ impl ModelWeights {
                 vocab,
                 // `self_attn.q_norm` / `k_norm` — Qwen3 carries both.
                 head_qk_norm: true,
+                qkv_bias: false,
             },
             device: device.clone(),
             int8mode,
