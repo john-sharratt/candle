@@ -113,7 +113,7 @@ static ONNX: OnceLock<Mutex<HashMap<Stamp, Arc<candle_onnx::onnx::ModelProto>>>>
 /// happened to have inserted at that moment. The claim being checked is about
 /// one path's own entries anyway.
 #[cfg(test)]
-fn cached_headers_for(path: &Path) -> usize {
+pub(crate) fn cached_headers_for(path: &Path) -> usize {
     HEADERS.get().map_or(0, |m| {
         m.lock().unwrap().keys().filter(|k| k.path == path).count()
     })
@@ -124,11 +124,16 @@ fn cached_headers_for(path: &Path) -> usize {
 /// The returned `Arc` is a snapshot: callers derive geometry and sizes from it
 /// rather than holding it, so a later swap of the checkpoint does not leave a
 /// live model describing a file that is no longer there.
+///
+/// Shared with [`ModelBuilder`](crate::models::ModelBuilder), which consults the
+/// same header three times per engine build — metadata, the tokenizer check and
+/// the vocabulary width. Read unbuffered each time, those three parses of a
+/// 248k-token Qwen3.5 table were 6–7 s of an 8.6–14 s model load.
 pub fn gguf_header(path: &Path) -> candle::Result<Arc<gguf_file::Content>> {
     let cache = HEADERS.get_or_init(|| Mutex::new(HashMap::new()));
 
     let stamp = Stamp::of(path)
-        .map_err(|e| candle::Error::Msg(format!("guest checkpoint {path:?}: {e}")))?;
+        .map_err(|e| candle::Error::Msg(format!("GGUF checkpoint {path:?}: {e}")))?;
     if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&stamp).cloned()) {
         return Ok(hit);
     }
@@ -139,7 +144,7 @@ pub fn gguf_header(path: &Path) -> candle::Result<Arc<gguf_file::Content>> {
     // same cold entry both parse and the second insert wins — a wasted parse
     // once per process, against a lock nobody can be stuck behind.
     let file = File::open(path)
-        .map_err(|e| candle::Error::Msg(format!("guest checkpoint {path:?}: {e}")))?;
+        .map_err(|e| candle::Error::Msg(format!("GGUF checkpoint {path:?}: {e}")))?;
     // Buffered, which is the difference between a syscall per field and a
     // syscall per 512 KiB. A Llama-3 GGUF's metadata holds a 128,256-element
     // token array, so the field count is in the hundreds of thousands.

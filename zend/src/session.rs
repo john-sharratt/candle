@@ -3369,6 +3369,12 @@ pub struct ZendSession {
     /// in-progress load has broken its ingest and drained the engine (on the
     /// loader thread, which owns it) before the process exits.
     load_thread: Mutex<Option<JoinHandle<()>>>,
+    /// Handle to the startup reconcile thread: it catches up files that changed
+    /// while the daemon was down, then warms the normalization levels, holding
+    /// the inference state for its whole run. [`Self::shutdown`] cancels and
+    /// joins it before draining the engine, so a stopped session never keeps its
+    /// model resident — or its scan on the device — behind the next one.
+    reconcile_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Snapshot returned by `GET /v1/status`. `loading` is `None` once the
@@ -3479,6 +3485,7 @@ impl ZendSession {
             started_at_ms,
             file_store,
             load_thread: Mutex::new(None),
+            reconcile_thread: Mutex::new(None),
         }
     }
 
@@ -4643,7 +4650,7 @@ impl ZendSession {
                         // A no filesystem event fires for down-time edits, so this is what
                         // covers them.
                         let state_for_reconcile = Arc::clone(&state);
-                        std::thread::spawn(move || {
+                        let reconcile = std::thread::spawn(move || {
                             match state_for_reconcile.refresh_ingest_layers() {
                                 Ok(true) => tracing::info!(
                                     "startup background reconcile: ingest layers updated"
@@ -4676,6 +4683,7 @@ impl ZendSession {
                             conv.warm_collection_normalization(&schema);
                             conv.warm_ingest_normalization(&schema);
                         });
+                        *session_for_watcher.reconcile_thread.lock().unwrap() = Some(reconcile);
                         // The engine is up — only NOW mark ready and unblock
                         // submit-flow waiters. Skipped on the shutdown-during-ingest
                         // path (the `Ok(None)` arm below).
@@ -4730,6 +4738,19 @@ impl ZendSession {
             let _ = tokio::task::spawn_blocking(move || {
                 if h.join().is_err() {
                     tracing::warn!("shutdown: loader thread panicked");
+                }
+            })
+            .await;
+        }
+        //    Then the startup reconcile thread. It holds the inference state for
+        //    its whole run, and its warm-up scan stops between probes on the
+        //    cancel raised in step 1, so the join returns promptly — after which
+        //    nothing outside this call keeps the engine alive past the drain below.
+        let reconcile = self.reconcile_thread.lock().unwrap().take();
+        if let Some(h) = reconcile {
+            let _ = tokio::task::spawn_blocking(move || {
+                if h.join().is_err() {
+                    tracing::warn!("shutdown: reconcile thread panicked");
                 }
             })
             .await;
@@ -4919,7 +4940,7 @@ impl ZendSession {
 /// The [`projection::TimelineId`] a client `conv_id` maps to — a stable hash
 /// of the id. Deterministic across daemon restarts, so a reconnecting client
 /// resolves to the same timeline the substrate reload recovered (§16.12).
-fn timeline_for(conv_id: &str) -> projection::TimelineId {
+pub fn timeline_for(conv_id: &str) -> projection::TimelineId {
     let h = content_hash::hash_bytes(conv_id.as_bytes());
     projection::TimelineId::from_raw(h.lo.max(1)).expect("timeline id is non-zero")
 }

@@ -49,6 +49,10 @@ pub use chunked::fletcher_golden::{fletcher32_golden, fletcher32_golden_on, Gold
 /// simulated workload with no device in reach
 /// (`docs/vram_partition_behavioural_tests.md`).
 pub use chunked::growth_policy::{kv_grow_step, GrowthPolicy, Occupancy, Refusal};
+/// A guest's pipeline stage. Defined in both configurations — `f(x)` when there
+/// is no GPU backend, since no guest arena can exist without one — because the
+/// model code that marks its stages is built in both.
+pub use chunked::guest_stage;
 #[cfg(feature = "cuda")]
 pub use chunked::persistence_domain_stats;
 #[cfg(feature = "cuda")]
@@ -63,8 +67,8 @@ pub use chunked::wave_plan::{
 #[cfg(feature = "cuda")]
 pub use chunked::{
     begin_forward, begin_guest, begin_wave, close_guest_arena, end_wave_transient,
-    guest_domain_stats, guest_stage, open_guest_arena, plan_wave_transient, wave_domain_stats,
-    wave_is_live, BumpRange, ForwardOpen, WaveGeneration, GUEST_ARENA, KV_ARENA_MID_WAVE,
+    guest_domain_stats, open_guest_arena, plan_wave_transient, wave_domain_stats, wave_is_live,
+    BumpRange, ForwardOpen, WaveGeneration, GUEST_ARENA, KV_ARENA_MID_WAVE,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{

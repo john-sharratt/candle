@@ -37,12 +37,12 @@
 //!
 //! Every scenario the 0.8B answers correctly runs in the default suite, on
 //! `Qwen35_0_8B_Q8` — the production model's lineage, dialect and tool-call
-//! style — against the suite's own workspace under `target/tmp`, thinking off.
-//! Each scenario boots its own daemon: ~9–13 s of model load and ~4–10 s of
-//! tool-section prefill before the query, ~20–30 s end to end. The prefill
-//! grows across the boots of one process (4.4 s on the first, 9.9 s on the
-//! second, same sections), which is where the spread comes from. The first run
-//! on a fresh workspace also calibrates the tool catalog once, ~35 s.
+//! style — against the suite's own workspace under `target/tmp`, thinking off,
+//! each on a conversation of its own that is retired afterwards. Each scenario
+//! boots its own daemon: ~3 s of model load (~10 s on the first, which parses
+//! the checkpoint header for the whole process) and ~4.4 s of tool-section
+//! prefill before the query, ~10 s end to end. The first run on a fresh
+//! workspace also calibrates the tool catalog once, ~35 s.
 //!
 //! A scenario the 0.8B answers wrongly runs on the production model against
 //! the live repo workspace, whose substrate carries that model's calibration,
@@ -55,26 +55,28 @@
 #[cfg(feature = "cuda")]
 mod tool_scenarios {
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use futures::StreamExt;
 
+    use candle::vram::host_pinned_bytes;
     use candle_conversation::models::Model;
     use candle_conversation::persistence::SUBSTRATE_DIR;
-    use candle_conversation::SelectionState;
+    use candle_conversation::{SamplingConfig, SelectionState};
     use zend::api::chat::dial_selection;
     use zend::config::{DaemonConfig, ModelChoice};
     use zend::log_broadcast::LogBus;
-    use zend::session::{StreamItem, ZendSession};
+    use zend::session::{timeline_for, StreamItem, ZendSession};
     use zend::types::{ChatMessage, Role};
 
-    /// Per-scenario cap. A scenario on a warm workspace is ~20–30 s; the first
-    /// run on a fresh one also calibrates the whole tool catalog once, which is
-    /// what this leaves room for while still catching a hang.
+    /// Per-scenario cap. A scenario on a warm workspace is ~10 s; the first run
+    /// on a fresh one also calibrates the whole tool catalog once, which is what
+    /// this leaves room for while still catching a hang.
     const TIMEOUT_SECS: u64 = 900;
 
     /// The model every default scenario runs: the production model's lineage,
-    /// dialect and tool-call style at 0.8B, so a scenario costs ~20–30 s rather
+    /// dialect and tool-call style at 0.8B, so a scenario costs ~10 s rather
     /// than the production model's ~76 s and the orchestration exercised is
     /// still the real one.
     const MODEL: Model = Model::Qwen35_0_8B_Q8;
@@ -161,6 +163,18 @@ mod tool_scenarios {
     /// Boot a ZendSession on `rig`, wait for ready, send `prompt`, shut the
     /// session down, and return the concatenated assistant text.
     async fn run_on(rig: Rig, prompt: &str, conv_id: &str) -> String {
+        // A conversation of this run's own. The workspace persists across runs,
+        // so a fixed id would resume every earlier run's conversation — its
+        // history and its recurrent memory — and the scenario would no longer be
+        // the one prompt it names.
+        static RUN: OnceLock<u128> = OnceLock::new();
+        let run = *RUN.get_or_init(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("the clock is past the epoch")
+                .as_nanos()
+        });
+        let conv_id = format!("{conv_id}-{run}");
         let (workspace, model, selection, compact_substrate) = match rig {
             Rig::Small => {
                 let ws = workspace();
@@ -195,11 +209,15 @@ mod tool_scenarios {
             role: Role::User,
             content: prompt.to_string(),
         }];
+        // Argmax, so a scenario is one fixed decode of its prompt. Left to the
+        // daemon, sampling is reseeded from the clock every turn and the same
+        // prompt passes or fails from one run to the next.
         let mut stream = session
-            .submit(
+            .submit_with_sampling(
                 messages,
                 Some(512),
                 conv_id.to_string(),
+                Some(SamplingConfig::argmax()),
                 None,
                 None,
                 false,
@@ -231,10 +249,22 @@ mod tool_scenarios {
         }
         eprintln!("\n\n[FINAL RESPONSE]\n{response}");
         eprintln!("[STATUS MESSAGES] {status_msgs:?}");
+        // Retire this run's conversation, so the workspace does not keep one per
+        // scenario per run; compaction reclaims it.
+        if let Some(Err(e)) = session.tombstone_timeline_raw(timeline_for(&conv_id).raw()) {
+            panic!("tombstoning {conv_id}: {e}");
+        }
         // Release the workspace's substrate for the next scenario.
         session.shutdown().await;
         response
     }
+
+    /// Host-pinned bytes still allocated once the previous scenario's session had
+    /// shut down and been released.
+    static PINNED_AFTER_PREVIOUS: Mutex<Option<u64>> = Mutex::new(None);
+
+    /// How long a finished scenario's runtime may take to wind its tasks down.
+    const RUNTIME_WIND_DOWN: Duration = Duration::from_secs(60);
 
     fn run_with_timeout<F: std::future::Future<Output = String> + Send + 'static>(f: F) -> String {
         let _one_at_a_time = SCENARIO.lock().unwrap_or_else(|e| e.into_inner());
@@ -242,11 +272,37 @@ mod tool_scenarios {
             .enable_all()
             .build()
             .expect("tokio runtime");
-        let result = rt.block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT_SECS), f).await
-        });
-        rt.shutdown_background();
-        result.unwrap_or_else(|_| panic!("test timed out after {TIMEOUT_SECS}s"))
+        let result =
+            rt.block_on(async { tokio::time::timeout(Duration::from_secs(TIMEOUT_SECS), f).await });
+        // Wait for everything the session spawned, so what is still pinned below
+        // is what the session left behind rather than what is still unwinding.
+        rt.shutdown_timeout(RUNTIME_WIND_DOWN);
+        let response = result.unwrap_or_else(|_| panic!("test timed out after {TIMEOUT_SECS}s"));
+        assert_session_released_its_pinned_memory();
+        response
+    }
+
+    /// **A shut-down session releases what it pinned.**
+    ///
+    /// Every scenario boots and shuts down a full session in this one process, so
+    /// each one's residue is measurable against the last. The first reading is
+    /// the baseline — it includes what the process pins once and keeps — and every
+    /// later session must leave exactly that behind. A session still reachable
+    /// after `shutdown` keeps its expert warm tier pinned, and its engine
+    /// competes with the next session for the card.
+    fn assert_session_released_its_pinned_memory() {
+        let now = host_pinned_bytes();
+        let mut previous = PINNED_AFTER_PREVIOUS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(before) = *previous {
+            assert_eq!(
+                now, before,
+                "a shut-down session left pinned host memory behind: {before} bytes after \
+                 the previous scenario, {now} after this one"
+            );
+        }
+        *previous = Some(now);
     }
 
     // ── Scenario 1: simple datetime query ────────────────────────────────────

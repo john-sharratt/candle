@@ -54,6 +54,8 @@ mod gpu_test_lock;
 pub mod growth_policy;
 #[cfg(feature = "cuda")]
 pub mod guard;
+#[cfg(not(feature = "cuda"))]
+mod guest_stage_cpu;
 mod head_gids;
 mod io;
 mod meta_pool;
@@ -143,6 +145,8 @@ pub use bump_arena::{
 };
 #[cfg(feature = "cuda")]
 pub use guard::{expect_kv_range, expect_kv_range_in};
+#[cfg(not(feature = "cuda"))]
+pub use guest_stage_cpu::guest_stage;
 #[cfg(feature = "cuda")]
 pub use region_pool::{
     claim_dense, claim_span_region, dense_bytes, empty_sweep_stats, ensure_reservation,
