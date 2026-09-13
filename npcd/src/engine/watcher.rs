@@ -172,6 +172,17 @@ impl Ledger {
         }
     }
 
+    /// Forget every document, and persist that.
+    ///
+    /// For a substrate whose conversations have all been retired
+    /// (`--wipe-conversations`): the ledger's claim is "this document is a turn
+    /// in there", and after the wipe none is, so every document is owed again
+    /// and the whole mind re-ingests.
+    pub fn forget_all(&self) {
+        self.hashes.lock().unwrap().clear();
+        self.flush();
+    }
+
     /// The verdict [`Self::reconcile`] would give, **without recording it**.
     ///
     /// The ledger's entry is a claim that a document is a turn in the substrate, so writing one
@@ -754,6 +765,30 @@ mod tests {
         assert_eq!(
             second.reconcile(&doc, Some("# Alpha, revised")),
             Reconcile::Changed
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// **After a wipe, every document is owed again** — on disk as well as in
+    /// memory. `--wipe-conversations` retires every turn the ledger vouches for,
+    /// and a ledger that still vouched for them after a restart would skip the
+    /// whole mind and stand up a cast that knows nothing.
+    #[test]
+    fn a_forgotten_ledger_owes_every_document_again() {
+        let data = tmp();
+        let doc = data.join("world.md");
+
+        let first = Ledger::open(&data);
+        first.reconcile(&doc, Some("# Alpha"));
+        first.flush();
+        first.forget_all();
+        assert_eq!(first.inspect(&doc, Some("# Alpha")), Reconcile::Added);
+
+        let second = Ledger::open(&data);
+        assert_eq!(
+            second.inspect(&doc, Some("# Alpha")),
+            Reconcile::Added,
+            "a restart skipped a document the wipe had retired"
         );
         let _ = std::fs::remove_dir_all(&data);
     }

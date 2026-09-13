@@ -2935,6 +2935,12 @@ impl Conversation {
         self.read().conversations_with_conv_id_prefix(prefix)
     }
 
+    /// Every live timeline, named or not — see
+    /// [`crate::substrate::Substrate::live_timeline_ids`].
+    pub fn live_timeline_ids(&self) -> Vec<TimelineId> {
+        self.read().live_timeline_ids()
+    }
+
     /// Set a conversation's `archived` lifecycle flag and persist it
     /// as a `RecordType::ConvState` record. Idempotent: if the
     /// substrate already holds the requested state, the record is

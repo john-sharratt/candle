@@ -3139,6 +3139,19 @@ impl Substrate {
         self.timelines.keys().copied()
     }
 
+    /// Every registered timeline that is not tombstoned, named or not.
+    ///
+    /// [`Self::known_conversations`] lists only timelines that carry a
+    /// `conv_id`; an ingested document is a conversation with none, so a caller
+    /// retiring *everything* needs this set instead.
+    pub fn live_timeline_ids(&self) -> Vec<TimelineId> {
+        self.timelines
+            .keys()
+            .filter(|tl| !self.tombstoned_timelines.contains(tl))
+            .copied()
+            .collect()
+    }
+
     // ── Per-stream runtime state (was Manifest.streams) ─────────────────
 
     /// Read the in-RAM runtime state for `stream_id` — chunk index +
@@ -8147,6 +8160,32 @@ mod tests {
             found,
             vec!["npc-7-day-1".to_string(), "npc-7-day-2".to_string()],
             "the lookup took a neighbour, a stranger, or a retired conversation"
+        );
+    }
+
+    /// **Every live timeline is listed, named or not.** A caller retiring
+    /// everything cannot start from `known_conversations`: an ingested document
+    /// is a conversation that never set a `conv_id`, and a wipe that missed those
+    /// would leave exactly the prefilled K/V it was run to discard.
+    #[test]
+    fn live_timelines_include_the_unnamed_and_exclude_the_retired() {
+        let (layer, group, named, mut sub) = make_timeline();
+        sub.set_conv_id(named, "npc-7-day-1");
+
+        let alloc = TimelineAllocator::new();
+        let unnamed = alloc.next();
+        sub.register_timeline(unnamed, layer, group);
+        let retired = alloc.next();
+        sub.register_timeline(retired, layer, group);
+        sub.tombstone_timeline(retired);
+
+        let mut live = sub.live_timeline_ids();
+        live.sort();
+        let mut want = vec![named, unnamed];
+        want.sort();
+        assert_eq!(
+            live, want,
+            "an unnamed conversation was missed or a retired one was listed"
         );
     }
 

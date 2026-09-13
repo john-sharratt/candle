@@ -1817,6 +1817,10 @@ pub struct LoadPlan {
     /// Retire every dream every character has kept before the cast wakes —
     /// `--forget-dreams`. See [`Minds::forget_dreams`].
     pub forget_dreams: bool,
+    /// Retire every conversation in the substrate and clear the ingest ledger
+    /// before the layers load — `--wipe-conversations`. See
+    /// [`wipe_conversations`].
+    pub wipe_conversations: bool,
 }
 
 /// Begin loading, on its own thread. Returns immediately.
@@ -2104,6 +2108,20 @@ fn load(
             // its next open rather than rejoined.
             frame: frame_fingerprint(&schema::frame(&p.builder)),
         });
+    }
+
+    // ── a wiped substrate, when asked for ──────────────────────────────────
+    //
+    // Before the layers, because the ingest decides what to write from the
+    // ledger: every conversation goes, the ledger is emptied with them, and the
+    // mind and every life are then written afresh on this same start.
+    if plan.wipe_conversations {
+        let retired = wipe_conversations(&engine);
+        rt.ledger.forget_all();
+        tracing::info!(
+            "substrate: {retired} conversation(s) retired and the ingest ledger cleared — the \
+             mind and every life re-ingest now; the cast itself is kept"
+        );
     }
 
     p.set_step(LoadStep::Layers);
@@ -2397,6 +2415,33 @@ pub(crate) fn persist_signatures(
 /// what makes that safe: a submission needs the lock only long enough to push a
 /// job onto a queue, so it is never waiting behind a layer.
 type SharedEngine = Arc<Mutex<ConversationEngine>>;
+
+/// Retire every live conversation in the substrate — `--wipe-conversations`.
+///
+/// Every kind goes: the characters' own conversations, their dreams, every
+/// mind-layer document, every life episode and the beliefs, relationships and
+/// intentions it left. Listed from the substrate's timelines rather than its
+/// named conversations, because an ingested document carries no `conv_id`.
+///
+/// The characters are not conversations — each is an `Npc` record in the same
+/// log — so the cast survives it untouched.
+///
+/// Returns how many it retired.
+fn wipe_conversations(engine: &SharedEngine) -> usize {
+    let engine = engine.lock().unwrap();
+    let mut retired = 0;
+    for timeline in engine.live_conversations() {
+        match engine.tombstone_timeline(timeline) {
+            Ok(()) => retired += 1,
+            Err(e) => {
+                tracing::warn!(
+                    "conversation {timeline} could not be retired: {e:?} — it stays live"
+                )
+            }
+        }
+    }
+    retired
+}
 
 fn ingest_layer(
     engine: &SharedEngine,

@@ -852,6 +852,16 @@ impl ConversationEngine {
         self.conversation.known_conversations()
     }
 
+    /// Every live conversation, whether or not it carries a `conv_id` —
+    /// tombstoned ones excluded.
+    ///
+    /// [`Self::known_conversations`] lists only the named ones, which is what a
+    /// sidebar wants and not what a caller retiring everything wants: an
+    /// ingested document is a conversation with no `conv_id` at all.
+    pub fn live_conversations(&self) -> Vec<TimelineId> {
+        self.conversation.live_timeline_ids()
+    }
+
     /// Live conversations whose `conv_id` starts with `prefix`, as
     /// `(timeline, conv_id)` — tombstoned ones excluded.
     ///

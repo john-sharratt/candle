@@ -136,6 +136,22 @@ struct Cli {
     /// are untouched.
     #[arg(long)]
     forget_dreams: bool,
+
+    /// Retire every conversation in the substrate at startup, and re-ingest the
+    /// mind.
+    ///
+    /// Everything that is a conversation goes: each character's own, their
+    /// dreams, every mind-layer document, every life episode and the beliefs,
+    /// relationships and intentions it left. The ingest ledger is cleared with
+    /// them, so the mind and every life are written afresh on this same start —
+    /// which, on a full mind, is a long one.
+    ///
+    /// The cast is kept. A character is a record of its own in the substrate,
+    /// not a conversation, so who exists, who owns them and where they stand
+    /// are untouched. This is the reset for K/V the engine can no longer vouch
+    /// for, short of deleting the substrate and creating the cast again.
+    #[arg(long)]
+    wipe_conversations: bool,
 }
 
 /// How many routes across both tables sit at exactly this role, for the
@@ -668,6 +684,7 @@ async fn main() -> anyhow::Result<()> {
             world_ms: 0,
             forget_conversations: cli.forget_conversations,
             forget_dreams: cli.forget_dreams,
+            wipe_conversations: cli.wipe_conversations,
             cast,
             // Personalities, not the cast. A layer directory is named after a
             // personality — `layers/memory/zen/` — and a world's biographies
@@ -847,5 +864,16 @@ mod tests {
         assert!(both.forget_conversations && both.forget_dreams);
         let dreams_only = Cli::parse_from(["npcd", "--forget-dreams"]);
         assert!(dreams_only.forget_dreams && !dreams_only.forget_conversations);
+    }
+
+    /// **A wipe is its own flag and never implied.** It re-ingests the whole
+    /// mind, which is a long start, so neither of the narrower flags may turn it
+    /// on.
+    #[test]
+    fn conversations_are_wiped_only_when_asked() {
+        assert!(!Cli::parse_from(["npcd"]).wipe_conversations);
+        let narrow = Cli::parse_from(["npcd", "--forget-conversations", "--forget-dreams"]);
+        assert!(!narrow.wipe_conversations);
+        assert!(Cli::parse_from(["npcd", "--wipe-conversations"]).wipe_conversations);
     }
 }
