@@ -126,7 +126,7 @@ use super::types::{
 };
 use crate::models::profile::{profile_now, ProfileAccumulator};
 #[cfg(feature = "cuda")]
-use crate::models::wave_buffers::wave_zeros_ticketed;
+use crate::models::wave_buffers::{wave_empty_ticketed, wave_zeros_ticketed};
 #[cfg(feature = "cuda")]
 use candle::direct_io::AlignedScratch;
 #[cfg(feature = "cuda")]
@@ -2257,9 +2257,17 @@ impl PipelineState {
         // There is no wave domain without CUDA, so off-CUDA the target is an
         // ordinary owned allocation — the same split the `MoeInput` match below
         // makes, for the same reason.
+        //
+        // The CUDA target is **uninitialised** (hot-path invariant 6): the
+        // deterministic scatter stores every `(token, column)` of it, so a
+        // memset would be a full-width write of exactly the bytes the kernel is
+        // about to stamp. The one path that does not reach the scatter — no
+        // expert routed at all — zeros it explicitly below. The non-CUDA arm
+        // accumulates one expert at a time through `index_add`, so its zero is
+        // read and stays.
         #[cfg(feature = "cuda")]
         let mut ys =
-            wave_zeros_ticketed((num_tokens, hidden), req.out_dtype, &self.device, req.wave)?;
+            wave_empty_ticketed((num_tokens, hidden), req.out_dtype, &self.device, req.wave)?;
         #[cfg(not(feature = "cuda"))]
         let mut ys = Tensor::zeros((num_tokens, hidden), req.out_dtype, &self.device)?;
         // Non-CUDA only ever sees `Float` (int8/q8a128 is cuda-only).
@@ -2287,7 +2295,7 @@ impl PipelineState {
         // experts happened to be resident. Residency varies run to run, float
         // addition is not associative, and the result was an engine that
         // returned different text for the same prompt
-        // (`docs/deepseek_decode_reproducibility.md`). Expert id is a function
+        // (`docs/deepseek/deepseek_decode_reproducibility.md`). Expert id is a function
         // of routing alone, so this order is the same on every run.
         //
         // The cost is the overlap this used to buy: hit experts were computed
@@ -2325,7 +2333,18 @@ impl PipelineState {
                 };
                 experts_vec.push((slot, toks.as_slice(), wids.as_slice()));
             }
-            if !experts_vec.is_empty() {
+            if experts_vec.is_empty() {
+                // Nothing routed, so the scatter never runs and the target it
+                // would have defined is still uninitialised. The layer's routed
+                // output is zero here by definition rather than by omission, and
+                // this is the line that says so.
+                ys = wave_zeros_ticketed(
+                    (num_tokens, hidden),
+                    req.out_dtype,
+                    &self.device,
+                    req.wave,
+                )?;
+            } else {
                 compute_experts_grouped(
                     &req.input,
                     &mut ys,

@@ -146,7 +146,7 @@ pub struct BlockQ2_0 {
 const _: () = assert!(std::mem::size_of::<BlockQ2_0>() == 10);
 
 /// R16: Raw F16 with reserved Q-capture space (candle-specific)
-/// 32Ã—F16 primary values (64 bytes) + 32Ã—u16 reserved Q space (64 bytes) = 128 bytes
+/// 32×F16 primary values (64 bytes) + 32×u16 reserved Q space (64 bytes) = 128 bytes
 /// Dequant reads the 32 F16 values; Q space is reserved for future Q capture.
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
@@ -281,8 +281,8 @@ pub struct BlockQ3_1 {
 }
 const _: () = assert!(std::mem::size_of::<BlockQ3_1>() == 16);
 
-/// P2: 2-bit palette index â€” pure arena routing, not a quant.
-/// Each byte packs 4 head_dim positions Ã— 2-bit indices.
+/// P2: 2-bit palette index — pure arena routing, not a quant.
+/// Each byte packs 4 head_dim positions × 2-bit indices.
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
 pub struct BlockP2 {
@@ -294,8 +294,8 @@ const _: () = assert!(std::mem::size_of::<BlockP2>() == 1);
 /// 0.53 BPE effective with the per-group 4-byte header amortised).
 ///
 /// Per-block layout (manually packed):
-///   `deltas`  â€” bits[3:0]=mag_delta (4-bit), bits[7:4]=out_delta (4-bit)
-///   `pattern` â€” bits[3:0]=sign_pattern (4-bit), bits[7:4]=shape (4-bit)
+///   `deltas`  — bits[3:0]=mag_delta (4-bit), bits[7:4]=out_delta (4-bit)
+///   `pattern` — bits[3:0]=sign_pattern (4-bit), bits[7:4]=shape (4-bit)
 ///
 /// See `candle-kernels/src/quantize/q0_v_tables.cuh` for the constant
 /// lookup tables.
@@ -355,11 +355,11 @@ impl BlockQ0V {
     }
 }
 
-/// Q1_A: 1-bit asymmetric â€” separate INT8 amplitude per sign + 32 sign bits
+/// Q1_A: 1-bit asymmetric — separate INT8 amplitude per sign + 32 sign bits
 /// (6 bytes per 32 elements, 1.50 BPE).
 ///
-///   sign_bit = 1 â†’ x = +scale_pos / 127
-///   sign_bit = 0 â†’ x = -scale_neg / 127
+///   sign_bit = 1 → x = +scale_pos / 127
+///   sign_bit = 0 → x = -scale_neg / 127
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
 pub struct BlockQ1A {
@@ -490,7 +490,7 @@ pub const QK_AWQ: usize = 128;
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C, align(16))]
 pub struct BlockQAWQ {
-    pub(crate) qs: [u32; 16],  // 128 Ã— 4-bit = 64 bytes
+    pub(crate) qs: [u32; 16],  // 128 × 4-bit = 64 bytes
     pub(crate) scale: f16,     // scale for entire block
     pub(crate) zero: f16,      // zero point for entire block
     pub(crate) _pad: [u32; 3], // padding to 80 bytes
@@ -507,7 +507,7 @@ const _: () = assert!(std::mem::size_of::<BlockQAWQ>() == 80);
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C, align(16))]
 pub struct BlockQAWQ_G64 {
-    pub(crate) qs: [u32; 16],    // 128 Ã— 4-bit = 64 bytes
+    pub(crate) qs: [u32; 16],    // 128 × 4-bit = 64 bytes
     pub(crate) scales: [f16; 2], // scale per 64-element group
     pub(crate) zeros: [f16; 2],  // zero per 64-element group
     pub(crate) _pad: u32,        // padding to 80 bytes
@@ -1888,7 +1888,7 @@ impl GgmlType for BlockR16 {
     }
 }
 
-// â”€â”€ FP8 E4M3 helpers for CPU decode/encode â”€â”€
+// ── FP8 E4M3 helpers for CPU decode/encode ──
 fn decode_e4m3(bits: u8) -> f32 {
     let sign = (bits >> 7) & 1;
     let exp = ((bits >> 3) & 0xf) as i32;
@@ -2212,7 +2212,7 @@ impl GgmlType for BlockQ3_1 {
 impl GgmlType for BlockP2 {
     const DTYPE: GgmlDType = GgmlDType::P2;
     const BLCK_SIZE: usize = QK_P2;
-    type VecDotType = BlockQ8_0; // unused â€” P2 is not a quant
+    type VecDotType = BlockQ8_0; // unused — P2 is not a quant
 
     fn to_float(xs: &[Self], ys: &mut [f32]) {
         // P2 is pure index metadata, not quantized values.
@@ -4550,7 +4550,7 @@ impl GgmlType for BlockQ0X {
             let bulk_int = (mean * 127.0).round().clamp(-127.0, 127.0) as i32;
             let bulk_anchor = bulk_int as i8;
 
-            // 2. argmax(|x_i_i8 - bulk|) â†’ outlier_idx; track its residual
+            // 2. argmax(|x_i_i8 - bulk|) → outlier_idx; track its residual
             let mut outlier_idx: usize = 0;
             let mut outlier_residual: i32 = 0;
             let mut best_abs: i32 = -1;
@@ -4879,7 +4879,12 @@ impl GgmlType for BlockQ2_K {
 
             let mut is = 0;
 
-            for (y_block, qs) in y.chunks_exact_mut(128).zip(block.qs.chunks_exact(32)) {
+            for (y_block, qs) in y
+                .as_chunks_mut::<128>()
+                .0
+                .iter_mut()
+                .zip(block.qs.as_chunks::<32>().0)
+            {
                 // Step by 32 over q.
                 let mut shift = 0;
                 let mut y_block_index = 0;
@@ -5052,7 +5057,7 @@ impl GgmlType for BlockQ3_K {
     fn from_float(xs: &[f32], ys: &mut [Self]) {
         for (block, x) in group_for_quantization(xs, ys) {
             let mut scales: [f32; QK_K / 16] = [0.0; QK_K / 16];
-            for (j, x_scale_slice) in x.chunks_exact(16).enumerate() {
+            for (j, x_scale_slice) in x.as_chunks::<16>().0.iter().enumerate() {
                 scales[j] = make_q3_quants(x_scale_slice, 4, true);
             }
 
@@ -5157,11 +5162,19 @@ impl GgmlType for BlockQ3_K {
             // Dequantize both 128 long blocks
             // 32 qs values per 128 long block
             // Each 16 elements get a scale
-            for (y, qs) in y.chunks_exact_mut(128).zip(block.qs.chunks_exact(32)) {
+            for (y, qs) in y
+                .as_chunks_mut::<128>()
+                .0
+                .iter_mut()
+                .zip(block.qs.as_chunks::<32>().0)
+            {
                 let mut shift = 0;
-                for shift_scoped_y in y.chunks_exact_mut(32) {
-                    for (scale_index, scale_scoped_y) in
-                        shift_scoped_y.chunks_exact_mut(16).enumerate()
+                for shift_scoped_y in y.as_chunks_mut::<32>().0.iter_mut() {
+                    for (scale_index, scale_scoped_y) in shift_scoped_y
+                        .as_chunks_mut::<16>()
+                        .0
+                        .iter_mut()
+                        .enumerate()
                     {
                         let dl = d_all * (scales[is] as f32 - 32.0);
                         for (i, inner_y) in scale_scoped_y.iter_mut().enumerate() {
@@ -5292,7 +5305,7 @@ impl GgmlType for BlockQ4_K {
             let mut mins: [f32; QK_K / 32] = [0.0; QK_K / 32];
             let mut scales: [f32; QK_K / 32] = [0.0; QK_K / 32];
 
-            for (j, x_scale_slice) in x.chunks_exact(32).enumerate() {
+            for (j, x_scale_slice) in x.as_chunks::<32>().0.iter().enumerate() {
                 (scales[j], mins[j]) = make_qkx1_quants(15, 5, x_scale_slice);
             }
 
@@ -5489,7 +5502,7 @@ impl GgmlType for BlockQ5_K {
             let mut mins: [f32; QK_K / 32] = [0.0; QK_K / 32];
             let mut scales: [f32; QK_K / 32] = [0.0; QK_K / 32];
 
-            for (j, x_scale_slice) in x.chunks_exact(32).enumerate() {
+            for (j, x_scale_slice) in x.as_chunks::<32>().0.iter().enumerate() {
                 (scales[j], mins[j]) = make_qkx1_quants(31, 5, x_scale_slice);
             }
 
@@ -5878,7 +5891,7 @@ impl GgmlType for BlockQ8_K {
 // AWQ dequant formula: w = scale * (q - zero)
 // where q is 4-bit unsigned [0,15], extracted from packed u32 nibbles.
 //
-// Nibble packing: each u32 contains 8 Ã— 4-bit weights
+// Nibble packing: each u32 contains 8 × 4-bit weights
 //   qs[i] = n0 | (n1 << 4) | (n2 << 8) | ... | (n7 << 28)
 //   Thread t extracts 8 nibbles from qs[t], handling elements t*8..(t+1)*8
 //

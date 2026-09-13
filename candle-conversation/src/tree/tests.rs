@@ -56,7 +56,10 @@ fn turns_since_no_segment() {
 
 #[test]
 fn summarize_fires_at_n_turns() {
-    // summarize_every = 4, day boundary off — stub fires, doesn't mutate nodes.
+    // summarize_every = 4, day boundary off. This asserts the TRIGGER, not the
+    // summarization: `finish_turn` is passed no inference backend, so
+    // `run_summarize` logs and returns without launching a task, and the tree
+    // is left unmutated.
     let mut tree = make_tree_fixed_day(0);
     for i in 0..4u32 {
         tree.finish_turn(
@@ -67,7 +70,7 @@ fn summarize_fires_at_n_turns() {
             None,
         );
     }
-    // Stub doesn't insert segments; nodes stays at 4.
+    // No backend ⇒ no task ⇒ no segment inserted; the count stays at 4.
     assert_eq!(tree.nodes().count(), 4);
 }
 

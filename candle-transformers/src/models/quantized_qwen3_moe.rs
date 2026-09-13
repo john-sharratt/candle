@@ -23,7 +23,8 @@ use super::expert_lre::GpuDispatchTables;
 #[cfg(feature = "cuda")]
 use super::expert_lre::{layer_geometries, minimum_resident_slots, slot_bytes_for};
 use super::expert_lre::{
-    ExpertCache, ExpertSlot, MmapExpertRef, MoeInput, PipelineStats, ProfileSnapshot,
+    sort_assignments_by_expert, ExpertCache, ExpertSlot, MmapExpertRef, MoeInput, PipelineStats,
+    ProfileSnapshot,
 };
 use super::kv_cache_utils::{new_kv_caches, KvCaches};
 use super::profile::{gpu_span, profile_now, ProfileMark};
@@ -32,8 +33,8 @@ use super::quantized_mlp::QuantizedMlp;
 use super::rope_tables::CisPrecomputations;
 use crate::models::batched_layer::WaveRef;
 use crate::models::routing_capture;
+use crate::models::wave_buffers::wave_empty;
 use crate::models::wave_buffers::wave_root;
-use crate::models::wave_buffers::wave_zeros;
 use crate::quantized_nn::RmsNorm;
 use candle::cuda_backend::wave_provenance::WaveTicket;
 #[cfg(feature = "cuda")]
@@ -44,7 +45,7 @@ use candle::quantized::cuda::{
 };
 #[cfg(feature = "cuda")]
 use candle::quantized::get_vram_info;
-use candle::quantized::{gguf_file, Int8Mode, QTensor};
+use candle::quantized::{gguf_file, Int8Mode, QTensor, SumScale};
 use candle::LiveTensor;
 use candle::{DType, Device, Result, Tensor};
 #[cfg(feature = "cuda")]
@@ -542,7 +543,16 @@ impl SparseMoeBlock {
             )?;
         }
         let g_moe = gpu_span("moe:silu", &device);
-        let inter_acts = silu_mul_q8a128(&gate_out, &up_out, &cuda_dev, gate_out.cuda_backing())?;
+        // Raw Σx — a language model's SwiGLU intermediate stays orders of
+        // magnitude below f16's 65504; the down matmul reads this operand's own
+        // `sum_scale`, so the two agree by construction.
+        let inter_acts = silu_mul_q8a128(
+            &gate_out,
+            &up_out,
+            &cuda_dev,
+            gate_out.cuda_backing(),
+            SumScale::Raw,
+        )?;
         g_moe.end();
         let g_moe = gpu_span("moe:down", &device);
         let down_out = grouped_qmatmul_dev_q8a128(
@@ -576,13 +586,14 @@ impl SparseMoeBlock {
         // widens it straight back (hot-path invariant 1).
 
         // 4. Deterministic scatter — identical accumulation order to the host path.
-        // The combine target is the layer's largest transient, and it is
-        // scattered into rather than overwritten, so it has to start zeroed.
-        // `wave_zeros` gives it a range of the wave's half when the layer has a
-        // generation open around `ffn_forward` — which `forward_layer_batched_mixed`
-        // does, spanning this call through the residual add that consumes the
-        // result.
-        let ys = wave_zeros((num_tokens, hidden_dim), out_dtype, &device, wave)?;
+        // The combine target is the layer's largest transient, and the scatter
+        // *defines* every one of its elements (one block per token, the column
+        // loop striding the whole row), so it is allocated uninitialised —
+        // hot-path invariant 6. `wave_empty` gives it a range of the wave's half
+        // when the layer has a generation open around `ffn_forward` — which
+        // `forward_layer_batched_mixed` does, spanning this call through the
+        // residual add that consumes the result.
+        let ys = wave_empty((num_tokens, hidden_dim), out_dtype, &device, wave)?;
         let g_moe = gpu_span("moe:scatter", &device);
         fused_deterministic_scatter(
             &ys,
@@ -787,61 +798,11 @@ impl SparseMoeBlock {
         _routing_start: ProfileMark,
         wave: Option<WaveTicket>,
     ) -> Result<Tensor> {
-        // ── 2. Group assignments by expert via a counting sort ──
-        // Each entry: (expert_id, token_idx, flat_weight_idx). Same-expert tokens
-        // must be contiguous for the grouped-GEMM dispatch. Expert id is a small
-        // bounded integer, so we bucket by it in **O(A + E)** (A = token→expert
-        // assignments, E = experts) — no comparison sort — keeping the cost
-        // linear even for large prefill batches (a sort here is O(A log A) and
-        // scaled badly with the batch size we want for expert-stream amortization).
+        // ── 2. Group assignments by expert — the shared grouped-GEMM dispatch
+        // sort (`expert_lre::sort_assignments_by_expert`: O(A+E) counting sort,
+        // stable in token order, router sentinels skipped). ──
         let t = profile_now();
-        let k_u = k as u32;
-        // Bucket count = the router's expert count. The router kernel writes
-        // `num_experts` itself as a sentinel into any top-k slot that found no
-        // valid expert (a token whose logits were all -inf/NaN), so ids `>=
-        // num_experts` are skipped in both passes — they aren't real experts and
-        // would index past `num_experts` here and the pipeline's expert arrays.
-        let n_experts = num_experts;
-
-        // Pass 1: count assignments per expert (skipping sentinels).
-        let mut counts = vec![0u32; n_experts];
-        for idxs in &idx_cpu {
-            for &eid in idxs {
-                if (eid as usize) < n_experts {
-                    counts[eid as usize] += 1;
-                }
-            }
-        }
-        // Prefix-sum into per-expert bucket starts; collect the ascending active
-        // expert ids in the same pass.
-        let mut cursor = vec![0u32; n_experts];
-        let mut expert_ids: Vec<usize> = Vec::new();
-        let mut running = 0u32;
-        for (e, &c) in counts.iter().enumerate() {
-            cursor[e] = running;
-            running += c;
-            if c > 0 {
-                expert_ids.push(e);
-            }
-        }
-        // Pass 2: scatter each assignment into its expert's bucket (stable in
-        // token order) → assignments grouped by ascending expert id, exactly as
-        // a sort-by-expert would produce. `slot_k` stays the original top-k
-        // position so the flat weight index remains aligned even when a
-        // sentinel slot is skipped.
-        let num_assignments = running as usize;
-        let mut assignments: Vec<(u32, u32, u32)> = vec![(0, 0, 0); num_assignments];
-        for (tok, idxs) in idx_cpu.iter().enumerate() {
-            let tok_u = tok as u32;
-            for (slot_k, &eid) in idxs.iter().enumerate() {
-                if (eid as usize) >= n_experts {
-                    continue;
-                }
-                let pos = cursor[eid as usize] as usize;
-                assignments[pos] = (eid, tok_u, tok_u * k_u + slot_k as u32);
-                cursor[eid as usize] += 1;
-            }
-        }
+        let (expert_ids, assignments) = sort_assignments_by_expert(&idx_cpu, k, num_experts);
         self.cache.record_profile("fwd_cpu_assign", t);
 
         // Store this layer's expert set for the next layer's speculative hint
@@ -905,7 +866,7 @@ enum FeedForward {
 /// A layer's FFN before the expert cache exists.
 ///
 /// The load order is dense-weights-then-span-then-experts (see
-/// `docs/elastic_vram_partition.md` §4): the reservation is sized from a live
+/// `docs/archived/elastic_vram_partition.md` §4): the reservation is sized from a live
 /// measurement taken once every dense tensor is resident, and the expert cache
 /// is filled into the span that measurement produced. A MoE layer's
 /// `SparseMoeBlock` holds an `Arc<ExpertCache>`, so it cannot be built during
@@ -2487,7 +2448,7 @@ mod tests {
 
     /// **Does Qwen3-MoE decode reproduce itself, run to run?**
     ///
-    /// DeepSeek-V4-Flash does not (`docs/deepseek_decode_reproducibility.md`).
+    /// DeepSeek-V4-Flash does not (`docs/deepseek/deepseek_decode_reproducibility.md`).
     /// This test answers the question that result cannot: is the fault in
     /// shared infrastructure, or in DeepSeek-specific code?
     ///
@@ -2890,6 +2851,76 @@ mod tests {
         params.with_int8mode(int8mode).run(configs, load_model)?;
 
         Ok(())
+    }
+
+    /// **Depth on the 30B-A3B**: the batched forward at 32K and 128K of KV.
+    ///
+    /// The lineage's reference MoE and the checkpoint most of the published
+    /// figures were measured on, so its depth curve is the one to compare the
+    /// newer architectures against.
+    #[test]
+    #[ignore = "downloads the 30B-A3B Q4_K_M GGUF (~18 GB) and runs a 128K-token prompt. \
+                Run with: cargo test --release --features cuda -p candle-transformers --lib \
+                quantized_qwen3_moe::tests::long_context_30b_a3b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn long_context_30b_a3b() -> Result<()> {
+        use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
+        use crate::models::batch_test::test_helpers::hf_get;
+        use crate::models::batched_model::BatchedInference;
+
+        let tokenizer_path = hf_get(
+            "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            hf_hub::RepoType::Model,
+            "main",
+            "tokenizer.json",
+        )
+        .map_err(|e| candle::Error::Msg(format!("tokenizer.json: {e}")))?;
+        let tokenizer_json = std::fs::read_to_string(&tokenizer_path)
+            .map_err(|e| candle::Error::Msg(format!("read tokenizer.json: {e}")))?;
+        let model_path = hf_get(
+            "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
+            hf_hub::RepoType::Model,
+            "main",
+            "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
+        )
+        .map_err(|e| candle::Error::Msg(format!("model: {e}")))?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+        long_context_gate(
+            "Qwen3-30B-A3B-Instruct-2507 (MoE, Q4_K_M)",
+            int8mode,
+            &tokenizer_json,
+            Dialect::chat_ml(),
+            // `qwen3moe.context_length` in the GGUF — the 2507 release is native
+            // 262K, unlike the 32K original.
+            262_144,
+            // One shallow rung even though the window is wide: this is the
+            // Qwen3-generation MoE, kept as the architectural comparison for
+            // the Qwen3.5+ MoEs rather than as a depth subject of its own.
+            &[(
+                8_192,
+                &[InferenceMode::BF16, InferenceMode::C5, InferenceMode::C10][..],
+            )],
+            1,
+            64,
+            DepthTask::Coherence,
+            &device,
+            || {
+                let model = ModelWeights::from_gguf_with_options(
+                    &model_path,
+                    &device,
+                    None,
+                    GgufLoadOptions {
+                        int8mode: Some(int8mode),
+                        expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
+                    },
+                )?;
+                let inv_freq = model
+                    .rope_inv_freq()
+                    .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
+                BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+            },
+        )
     }
 
     /// Continuous-fair-wave equivalence gate (`docs/continuous_fair_waves.md`):

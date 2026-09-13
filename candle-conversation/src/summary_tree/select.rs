@@ -1,7 +1,7 @@
 //! Score-density selection — the projection algorithm that fills the
 //! layer's token budget with the highest-scoring subset of the summary
 //! **forest**'s nodes, then eliminates redundant ancestors and fills
-//! coverage gaps until convergence (`docs/immutable_summary_forest.md` —
+//! coverage gaps until convergence (`docs/archived/immutable_summary_forest.md` —
 //! *Window of attention*).
 //!
 //! # The five steps

@@ -287,10 +287,23 @@ impl ToolCallEnvelope {
                     if i > 0 {
                         s.push_str(", ");
                     }
-                    // The value is a JSON string here, so a quote in it would
-                    // end the string early. Examples are authored prose and do
-                    // contain them.
-                    s.push_str(&format!("\"{k}\": {}", Value::String((*v).to_string())));
+                    // **A JSON scalar is written as one; everything else is a
+                    // string.** `build_value` emits a `Number` unquoted and a
+                    // `String` quoted, and this function's whole claim is that
+                    // it cannot drift from the grammar — so quoting every value
+                    // was a drift waiting to be noticed. It went unnoticed
+                    // because the only callers were worked examples whose
+                    // arguments are prose; the ingest chains prefill numeric
+                    // line ranges, and `"start_line": "1"` teaches a shape the
+                    // grammar would never emit.
+                    //
+                    // A quote inside a string value would end it early, so the
+                    // string arm goes through `Value::String`, which escapes.
+                    // The one hazard is a genuinely string-typed argument whose
+                    // text is all digits — it renders unquoted. Nothing here
+                    // has one (paths and prefixes carry `/` or `.`), and the
+                    // typed grammar is what actually constrains the decode.
+                    s.push_str(&format!("\"{k}\": {}", json_scalar(v)));
                 }
             }
         }
@@ -314,6 +327,51 @@ impl ToolCallEnvelope {
             // parser, so the shape on the wire is the same either way.
             CallStyle::JsonBlock | CallStyle::Lines => Self::qwen3(),
         }
+    }
+
+    /// [`Self::for_dialect`] adapted for the **assistant turn**, where one call
+    /// IS the whole reply: the marker the model has already emitted comes off
+    /// the front, and the turn terminator goes on the close so the turn ends
+    /// with the call.
+    ///
+    /// **The close must END on that terminator, with nothing after it.** A
+    /// static run's last token is held back from the forward and rides the next
+    /// decode step, which commits it; a token in any earlier slot goes through
+    /// `push_forwarded`, whose flag is dropped. ChatML's `assistant_end` is
+    /// `"<|im_end|>\n"`, so appending it verbatim buries the EOS one slot from
+    /// the end where nothing sees it — the decode does not stop and the model
+    /// writes its own next turn into this one. Measured from the persisted
+    /// substrate: one assistant turn holding three `<|im_start|>`/`<|im_end|>`
+    /// pairs — the real call, the turn end, then a hallucinated `user` header
+    /// with a second think block and a second call.
+    ///
+    /// Hence `trim_end`, and hence this being a constructor rather than two
+    /// lines at the call site: the rule is a property of the envelope, and
+    /// `the_assistant_close_ends_on_the_turn_terminator` holds it for every
+    /// dialect. `stencil::think` carries the identical rule for the reasoning
+    /// block and learned it the same way.
+    pub fn for_assistant_turn(d: &Dialect) -> Self {
+        let base = Self::for_dialect(d);
+        Self {
+            open: base
+                .open
+                .strip_prefix(&base.marker)
+                .unwrap_or(&base.open)
+                .to_string(),
+            close: format!("{}{}", base.close, d.assistant_end.trim_end()),
+            ..base
+        }
+    }
+}
+
+/// One argument value as JSON: a number or boolean verbatim, anything else as a
+/// quoted, escaped string. Mirrors [`ToolTreeBuilder::build_value`]'s split
+/// between `ParamType::Number`/`Boolean` and `ParamType::String`.
+fn json_scalar(v: &str) -> String {
+    if v == "true" || v == "false" || v.parse::<f64>().is_ok() {
+        v.to_string()
+    } else {
+        Value::String(v.to_string()).to_string()
     }
 }
 
@@ -719,6 +777,100 @@ mod tests {
     use crate::stencil::compile::compile;
     use crate::stencil::vocab::TestVocab;
 
+    /// `render` writes the shape the grammar compiles — including the scalar
+    /// split the grammar makes.
+    ///
+    /// The JSON arm used to quote every value, so a numeric argument rendered
+    /// `"start_line": "1"` while `build_value`'s `Number` arm emits `1`. Only
+    /// prose-valued callers existed, so nothing caught it until an ingest chain
+    /// needed to prefill a line range.
+    #[test]
+    fn render_writes_numbers_bare_and_strings_quoted() {
+        let json = ToolCallEnvelope::qwen3();
+        let out = json.render("file_read", &[("path", "a/mod.rs"), ("start_line", "1")]);
+        assert!(
+            out.contains(r#""path": "a/mod.rs""#),
+            "a string argument stays quoted and escaped: {out}"
+        );
+        assert!(
+            out.contains(r#""start_line": 1"#),
+            "a numeric argument is bare, as `build_value` emits it: {out}"
+        );
+
+        // A function block's values are raw whatever their type, so neither
+        // gains quotes and the scalar question does not arise.
+        let fb = ToolCallEnvelope::qwen35();
+        let out = fb.render("file_read", &[("path", "a/mod.rs"), ("start_line", "1")]);
+        assert!(
+            out.contains("<parameter=path>\na/mod.rs</parameter>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("<parameter=start_line>\n1</parameter>"),
+            "{out}"
+        );
+        assert!(!out.contains('"'), "raw values carry no quotes: {out}");
+    }
+
+    /// A quote inside a string value must not end the string early.
+    #[test]
+    fn render_escapes_a_quote_in_a_string_value() {
+        let json = ToolCallEnvelope::qwen3();
+        let out = json.render("say", &[("intent", r#"that "it" is mine"#)]);
+        assert!(
+            out.contains(r#""intent": "that \"it\" is mine""#),
+            "the quote is escaped rather than terminating: {out}"
+        );
+    }
+
+    /// **The assistant close must END on the turn terminator.** The rule and the
+    /// measured consequence are on
+    /// [`ToolCallEnvelope::for_assistant_turn`]; this is the guard.
+    ///
+    /// It exists because the regression that motivated it replaced a correct
+    /// literal (`"}}\n</tool_call><|im_end|>"`) with `assistant_end` appended
+    /// verbatim — right in intent, since the shape belongs to the dialect and
+    /// not to a literal, but ChatML's `assistant_end` trails a newline. Nothing
+    /// in the area asserted the terminator's POSITION, so every Qwen tool call
+    /// ran past its own turn end until the substrate was read by hand.
+    ///
+    /// Asserted over every dialect, not just the broken one: the three that
+    /// happen not to trail whitespace today are one edit away from doing so.
+    #[test]
+    fn the_assistant_close_ends_on_the_turn_terminator() {
+        for d in [
+            Dialect::chat_ml(),
+            Dialect::qwen35(),
+            Dialect::llama2(),
+            Dialect::llama3(),
+            Dialect::deepseek(),
+        ] {
+            let env = ToolCallEnvelope::for_assistant_turn(&d);
+            let term = d.assistant_end.trim_end();
+            assert!(
+                !term.is_empty(),
+                "{:?}: no assistant terminator to end on",
+                d.dialect_type
+            );
+            assert!(
+                env.close.ends_with(term),
+                "{:?}: close {:?} must end on {:?} — a terminator in any earlier \
+                 slot has its flag dropped and the decode never stops",
+                d.dialect_type,
+                env.close,
+                term
+            );
+            // The marker the model already emitted must not be re-emitted.
+            assert!(
+                !env.open.starts_with(&env.marker),
+                "{:?}: open {:?} still leads with the marker {:?}",
+                d.dialect_type,
+                env.open,
+                env.marker
+            );
+        }
+    }
+
     fn catalog() -> Vec<ToolSpec> {
         parse_tools(
             r#"[
@@ -991,9 +1143,11 @@ mod tests {
             think_open: 1,
             think_close: 2,
             eos: 3,
+            // This test asserts the SPLICE closes the join, so the injected
+            // marker must stay out of it.
             after_close: "",
         };
-        let prelude = compile_think_tree(ThinkMode::Balanced, &env).unwrap();
+        let prelude = compile_think_tree(ThinkMode::Balanced, &env);
         let spec =
             compile_action_loop(&catalog(), &loop_env(), 2, "<|im_end|>", Some(&prelude)).unwrap();
 

@@ -1,5 +1,5 @@
 //! Multi-log inheritance — read-only inherited substrates and the
-//! process-wide shared cache (§13.5 of `docs/kv_tier_migration.md`).
+//! process-wide shared cache (§13.5 of `docs/archived/kv_tier_migration.md`).
 //!
 //! A child substrate is opened over an ordered list of logs: the last is
 //! its own writable active log, the earlier ones are inherited and

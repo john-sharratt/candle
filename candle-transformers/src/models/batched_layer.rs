@@ -26,6 +26,7 @@ use crate::models::prefill_utils::{
     paged_prefill_batched, SharedPm,
 };
 use crate::models::profile::{gpu_span, pipeline_record, profile_now, span};
+use crate::models::qsa_selection::QsaSelection;
 use crate::models::quantized_matmul::QMatMul;
 use crate::utils::repeat_kv;
 
@@ -449,6 +450,10 @@ pub struct WaveAttnGroup<'a, 'c> {
     /// Decode rows sit in the flat buffer as a `[1, rows, hidden]` slice but the
     /// decode kernel wants `[rows, 1, hidden]`; prefill/glue stay `[1, rows, hidden]`.
     pub decode_layout: bool,
+    /// QSA: this group's block-sparse selection for the CURRENT layer, in the
+    /// group's own row order. `None` — every model but Qwen3.8-Flash-Next's
+    /// full-attention layers — is a full causal read.
+    pub qsa: Option<&'c QsaSelection>,
 }
 
 /// Mixed-wave transformer layer — the co-batched form of
@@ -525,6 +530,7 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
                 g.offsets,
                 g.params,
                 layer_idx,
+                g.qsa,
                 attn_wave.as_ref(),
             )?;
             let h = if g.decode_layout {
@@ -605,6 +611,11 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
 /// Compute batched attention for a layer.
 ///
 /// Dispatches to single-token decode or multi-token prefill paths.
+///
+/// `qsa` is this LAYER's block-sparse selection for these rows, which is why
+/// it is an argument rather than a field of the wave-invariant `params`: a
+/// hybrid stack's indexer produces a new one at every full-attention layer.
+#[allow(clippy::too_many_arguments)]
 pub fn forward_attn_batched<'w, L: BatchedAttentionLayer>(
     layer: &L,
     caches: &mut [&mut KvCache],
@@ -612,6 +623,7 @@ pub fn forward_attn_batched<'w, L: BatchedAttentionLayer>(
     offsets: &[usize],
     params: &BatchedAttentionParams<'_>,
     layer_idx: usize,
+    qsa: Option<&QsaSelection>,
     wave: WaveRef<'w>,
 ) -> Result<LiveTensor<'w>> {
     // Route by the batch's DECLARED flavour (its headers), not tensor shape: a
@@ -638,6 +650,7 @@ pub fn forward_attn_batched<'w, L: BatchedAttentionLayer>(
                 } => b.dev_ptr() + layer_idx as u64 * stride,
                 _ => 0,
             },
+            qsa,
             wave,
         )?;
         Ok(ret)
@@ -664,6 +677,7 @@ pub fn forward_attn_batched<'w, L: BatchedAttentionLayer>(
             params.rope_cs,
             params.generation,
             params.shared_prefill_pm,
+            qsa,
             wave,
         )?;
         Ok(ret)
@@ -684,6 +698,7 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
     #[allow(unused_variables)] rope_cs: &Tensor,
     #[allow(unused_variables)] generation: &Generation,
     #[allow(unused_variables)] decode_headers_ptr: u64,
+    #[allow(unused_variables)] qsa: Option<&QsaSelection>,
     wave: WaveRef<'w>,
 ) -> Result<LiveTensor<'w>> {
     validate_batch_sizes(caches.len(), offsets.len(), x.len())?;
@@ -725,7 +740,7 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
         .is_some();
 
     // Apply model-side RoPE only for the non-paged path.
-    // Paged kernel always applies RoPE internally â€” applying it here would double-rotate.
+    // Paged kernel always applies RoPE internally — applying it here would double-rotate.
     let (q, k) = if use_paged {
         // Kernel will rotate; skip model-side rotation.
         (q, k)
@@ -794,9 +809,18 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
             decode_headers_ptr,
             want_q8,
             if want_q8 { gate.as_ref() } else { None },
+            qsa,
         )?
     } else {
-        // Non-chunked fallback: standard per-sequence attention
+        // Non-chunked fallback: standard per-sequence attention. It carries no
+        // selection, so a layer that has one must not be silently answered
+        // densely — that is a wrong number, not a slower one.
+        if qsa.is_some() {
+            candle::bail!(
+                "QSA selection on the non-paged decode fallback: the contiguous-KV path \
+                 reads the whole prefix, so it cannot honour a block-sparse selection"
+            );
+        }
         standard_batched_attention(caches, &q, &k, &v, head_dim, n_head, n_kv_head)?
     };
 
@@ -840,6 +864,7 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     rope_cs: &Tensor,
     generation: &Generation,
     shared_pm: &std::cell::RefCell<Option<SharedPm>>,
+    qsa: Option<&QsaSelection>,
     wave: WaveRef<'w>,
 ) -> Result<LiveTensor<'w>> {
     // The flat-packed activation has leading dim 1 (x.len() == 1), so validate
@@ -925,7 +950,7 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     // The cache is already sized and truncated for this wave: `wave_admit` did
     // both, for every layer, before the forward began. Nothing on this path may
     // claim a chunk — the transient tier is placed against the arena frontier
-    // and a claim here would move it (`docs/elastic_vram_partition.md` §7).
+    // and a claim here would move it (`docs/archived/elastic_vram_partition.md` §7).
     let rope_zeros = Tensor::zeros(n_seqs, DType::U32, q.device())?;
     // Flat attention output: [total_q, n_head, head_dim]. A reprojection-glue
     // forward (HD128, chunked) routes to the paged-glue kernel — it streams the
@@ -962,6 +987,23 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
             );
         }
     }
+    // Only the int8 prefix-attention kernel reads a selection. The glue and
+    // float-fallback routes would answer densely, which is a wrong number
+    // rather than a slow one, so they refuse instead.
+    if qsa.is_some()
+        && (glue_meta.is_some()
+            || !(is_cuda_paged
+                && int8_prefill_head_dim(head_dim)
+                && int8_prefill_act_dtype(q.dtype())))
+    {
+        candle::bail!(
+            "QSA selection on a prefill route that reads the whole prefix (glue \
+             {}, paged {is_cuda_paged}, head_dim {head_dim}, q dtype {:?}) — only the \
+             int8 prefix-attention kernel carries block-sparse masking",
+            glue_meta.is_some(),
+            q.dtype()
+        );
+    }
     let out_packed = match glue_meta {
         Some(g) => paged_glue_attn(
             wave,
@@ -984,7 +1026,7 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
             generation,
             shared_pm,
         )?,
-        // Shapes and dtypes the int8 prefix-attention kernel is not built for:
+        // Shapes and dtypes the int8 prefix-attention kernel is not built for.
         // the float fallback, which keeps the paged cache contract
         // (unrotated K/V in the arena) and pays a per-sequence materialized
         // score matrix instead of a fused kernel.
@@ -1029,6 +1071,7 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
             rope_interleaved,
             generation,
             shared_pm,
+            qsa,
         )?,
     };
 
@@ -1366,6 +1409,8 @@ fn paged_decode_attention<'w>(
     // Output gate folded into the q8 emit (`sigmoid(g) ⊙ ctx` inside the combine kernel).
     // Only meaningful with `emit_q8`; the FP path applies its gate on the FP context instead.
     gate: Option<&LiveTensor<'_>>,
+    // QSA: this group's block-sparse selection, one row per slot.
+    qsa: Option<&QsaSelection>,
 ) -> Result<LiveTensor<'w>> {
     // Host spans, not GPU ones: both regions are pure host work in the common
     // path — validation, then metadata assembly whose only possible launches are
@@ -1435,12 +1480,12 @@ fn paged_decode_attention<'w>(
 
     // Mixed-precision handling:
     // - FP8 arenas: Q must be BF16 (for precision), k_new/v_new must also be BF16.
-    //   The decode kernel reads k_new/v_new as BF16* and arena_store_element converts BF16â†’FP8
+    //   The decode kernel reads k_new/v_new as BF16* and arena_store_element converts BF16→FP8
     //   when writing to the arena. Passing FP8 bytes to a BF16* kernel produces garbage.
     // - Other arenas: Q/k_new/v_new must all match arena dtype
     let (q_kernel, k_kernel, v_kernel) = if arena_dtype == DType::F8E4M3 {
         // FP8 KV cache with BF16 compute: Q and new K/V are all BF16.
-        // The kernel writes BF16â†’FP8 to the arena via arena_store_element (correct conversion).
+        // The kernel writes BF16→FP8 to the arena via arena_store_element (correct conversion).
         if q_3d.dtype() != DType::BF16 {
             candle::bail!(
                 "paged-decode: FP8 arenas require BF16 Q, got {:?}",
@@ -1497,6 +1542,7 @@ fn paged_decode_attention<'w>(
                 rope_cs,
                 rope_interleaved,
                 gate_kernel.as_ref(),
+                qsa,
             )?
         } else {
             paged_decode_attn(
@@ -1512,6 +1558,7 @@ fn paged_decode_attention<'w>(
                 &v_kernel,
                 rope_cs,
                 rope_interleaved,
+                qsa,
             )?
         };
         g_kernel.end();

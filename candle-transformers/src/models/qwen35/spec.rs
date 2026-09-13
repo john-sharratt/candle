@@ -53,8 +53,6 @@ use crate::models::wave_buffers::wave_empty;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{begin_wave, LayerPhase, WaveGeneration};
 
-use super::quantized_weights::QuantModel;
-
 /// The COHORT's stashed speculative blocks: every verifying sequence's rows in
 /// one set of shared buffers, so the replay that consumes them advances every
 /// sequence's state in one batched launch per layer.
@@ -280,8 +278,31 @@ fn stage_on_wave<'w>(
     Ok(ops.all_rows())
 }
 
+/// Per recurrent layer, in sweep order: the four small constants the mixer
+/// needs, and the transformer-layer index they belong to.
+///
+/// The caller resolves these, because *where* they come from is the one
+/// model-specific thing in a replay. A streamed checkpoint reads them from the
+/// layer's residue rather than the layer — the replay runs at accept time, well
+/// after the sweep that captured the stash, so the image may long since have
+/// been evicted and `ensure`ing it would pull ~240 MB over PCIe to read four
+/// constants that never left VRAM. A resident stack hands over the layer's own.
+pub struct ReplayLayer<'a> {
+    pub layer_index: usize,
+    pub consts: DeltaNetConstants<'a>,
+}
+
+/// Advance each rewinding sequence's recurrent state to its accepted prefix,
+/// from the state the block was entered with.
+///
+/// Model-agnostic: everything specific to a checkpoint is resolved by the
+/// caller into `layers` — see [`ReplayLayer`]. Both the hybrid and `qwen4exp`
+/// run this, because the recurrence they rewind is the same one.
 pub fn replay_accepted_prefixes(
-    model: &QuantModel,
+    layers: &[ReplayLayer<'_>],
+    dims: &DeltaNetDims,
+    eps: f64,
+    device: &Device,
     stash: &VerifyStash,
     jobs: &mut [(StashSpan, usize, &mut RecurrentStateStore)],
 ) -> Result<()> {
@@ -310,6 +331,14 @@ pub fn replay_accepted_prefixes(
         return Ok(());
     }
     let layer_indices: Vec<usize> = short[0].2.recurrent_layer_indices().collect();
+    if layers.len() != layer_indices.len() {
+        candle::bail!(
+            "verify replay: {} layers supplied against {} recurrent layers — the caller's \
+             sweep order and the store's disagree",
+            layers.len(),
+            layer_indices.len()
+        );
+    }
     if stash.layers.len() != layer_indices.len() {
         candle::bail!(
             "qwen35 verify replay: {} stashed layers against {} recurrent layers — the \
@@ -331,8 +360,6 @@ pub fn replay_accepted_prefixes(
             stash.filled.len(),
         );
     }
-    let dims: &DeltaNetDims = &model.cfg.delta_net;
-    let eps = model.cfg.rms_norm_eps;
 
     // **A generation for the replay, because the stash has no provenance to
     // lend.**
@@ -367,19 +394,17 @@ pub fn replay_accepted_prefixes(
     // the staging **and** the mixer's own intermediates before the next layer
     // asks, which is the same lifetime a forward gives its phases.
     for (ord, &li) in layer_indices.iter().enumerate() {
-        // The **residue**, not the layer. The replay runs at accept time, well
-        // after the sweep that captured the stash, so on a streamed checkpoint
-        // this layer may long since have been evicted — and `ensure`ing it would
-        // pull ~240 MB over PCIe to read four small constants that never left
-        // VRAM. The residue holds exactly those four.
-        let residue = model.layers.residue(li)?;
-        let w = residue.delta_net().map_err(|_| {
-            candle::Error::Msg(format!(
-                "qwen35 verify replay: layer {li} carries recurrent state but is not DeltaNet"
-            ))
-        })?;
+        let entry = &layers[ord];
+        if entry.layer_index != li {
+            candle::bail!(
+                "verify replay: layer {} supplied where the store's ordinal {ord} is layer \
+                 {li} — a replay against the wrong layer's constants advances the state \
+                 silently and wrongly",
+                entry.layer_index
+            );
+        }
         #[cfg(feature = "cuda")]
-        let wave: Option<WaveGeneration> = match &model.device {
+        let wave: Option<WaveGeneration> = match device {
             Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?),
             _ => None,
         };
@@ -389,13 +414,8 @@ pub fn replay_accepted_prefixes(
         // from it has a leased root. Four copies per layer of buffers the
         // capture already copied once — against the pool traffic above, and
         // against a `contiguous()` the `rows()` path would have paid anyway.
-        let p = stage_on_wave(&stash.layers[ord], &model.device, wave.as_ref())?;
-        let c = DeltaNetConstants {
-            dt_bias: &w.dt_bias,
-            a: &w.a,
-            conv: &w.conv,
-            norm: &w.norm,
-        };
+        let p = stage_on_wave(&stash.layers[ord], device, wave.as_ref())?;
+        let c = &entry.consts;
         // One span per rewinding sequence, over its own rows of the shared
         // buffers. For each: READ the half the block was entered from, WRITE
         // the live one — the shorter advance replaces the block-length advance
@@ -416,7 +436,7 @@ pub fn replay_accepted_prefixes(
         // The gated activations are the layer's output, which the accepted
         // tokens' logits were already produced from. Only the states are
         // wanted, and every sequence's advances in ONE launch pair.
-        delta_net_advance_spans(&p, &c, dims, &mut seqs, eps)?;
+        delta_net_advance_spans(&p, c, dims, &mut seqs, eps)?;
     }
     Ok(())
 }

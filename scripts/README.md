@@ -60,6 +60,6 @@ WORKSPACE_DIR=/data/zen_cruise scripts/nightly_infinite_conversation.sh cruise
 ## Related docs
 
 `docs/archived/infinite_conversations.md` (design this harness measures
-against — archived; see `docs/immutable_summary_forest.md` for the current
+against — archived; see `docs/archived/immutable_summary_forest.md` for the current
 summary-tree design), `zend/tests/infinite_conversation_deep.rs`,
 `zend/tests/infinite_conversation_smoke.rs`.

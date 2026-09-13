@@ -1464,12 +1464,17 @@ extern "C" {
 
     /// Quantize act[rows][cols] (dtype 0=F16,1=BF16,2=F32) → block_q8a128
     /// [rows][cols/128] (the contiguous q8 activation block, 144 B each).
+    ///
+    /// `sum_norm` is `SumScale::as_code()`: 0 stores the raw per-128 Σx, 1
+    /// stores Σx/amax. The matmul must be launched with the same choice, which
+    /// is why it rides on `Q8a128Operand` rather than being decided per call.
     pub fn run_quantize_q8a128(
         act: *const c_void,
         out: *mut c_void,
         rows: c_int,
         cols: c_int,
         dtype: c_int,
+        sum_norm: c_int,
     );
 
     /// Dequantize block_q8a128[rows][cols/128] → out[rows][cols]

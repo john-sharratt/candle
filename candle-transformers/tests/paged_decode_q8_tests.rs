@@ -147,6 +147,7 @@ fn build_history_slot(
             false,
             &generation,
             &std::cell::RefCell::new(None),
+            None,
         )?;
     }
     cache.set_current_seq_len(HISTORY_TOKENS)?;
@@ -281,6 +282,7 @@ fn decode_one_slot(
             v_new,
             rope_cs,
             false,
+            None,
         )?,
         DecodeEmit::Q8 { gate } => paged_decode_attn_q8(
             None,
@@ -296,6 +298,7 @@ fn decode_one_slot(
             rope_cs,
             false,
             gate,
+            None,
         )?,
     };
     drop(headers_gpu);

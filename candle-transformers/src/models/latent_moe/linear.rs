@@ -3,7 +3,7 @@
 //! carry the PyTorch `[out, in]` convention (`y = x·Wᵀ`); the quantized path defers to
 //! `QMatMul::forward`.
 
-use candle::quantized::{Int8Mode, QMatMul};
+use candle::quantized::{Int8Mode, QMatMul, SumScale};
 use candle::{DType, Device, Module, Result, Tensor};
 
 /// Quantize `x` to a **single shared** q8a128 activation operand and run every weight in
@@ -35,7 +35,8 @@ pub fn shared_int8_forward(x: &Tensor, weights: &[&QLinear]) -> Result<Option<Ve
     // per-slice contiguous copies that requires offset the one-launch saving — flat decode,
     // slightly slower prefill. `qkv_segmented` only wins when the concat is consumed as-is.)
     let xc = x.to_dtype(DType::F32)?.contiguous()?;
-    let op = cuda::to_dynamic(&xc, Int8Mode::Performance, &dev)?;
+    // Raw Σx — a language model's block sums stay far below f16's ceiling.
+    let op = cuda::to_dynamic(&xc, Int8Mode::Performance, &dev, SumScale::Raw)?;
     let mut out = Vec::with_capacity(weights.len());
     for w in weights {
         let q = w
@@ -162,6 +163,10 @@ impl QLinear {
                     &x.to_dtype(DType::F32)?.contiguous()?,
                     Int8Mode::Performance,
                     in_dtype,
+                    // Raw Σx: this is a language model's residual stream, whose
+                    // per-128 block sums stay orders of magnitude below f16's
+                    // 65504 — see `SumScale`.
+                    SumScale::Raw,
                 )
             }
         }

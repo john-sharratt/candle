@@ -1,4 +1,4 @@
-//! Off-thread substrate writer (`docs/kv_tier_migration.md`).
+//! Off-thread substrate writer (`docs/archived/kv_tier_migration.md`).
 //!
 //! Every redo-log append that would otherwise block a caller on the persistence
 //! lock (which a segment compaction can hold across its whole relocation I/O) is
@@ -68,6 +68,13 @@ pub(crate) enum WriteJob {
         stream_id: StreamId,
         payload: Vec<u8>,
     },
+    /// A turn's QSA index page (`TurnIndexPage` record). Mirrored in RAM by the
+    /// enqueuer — this turn's own projections read it immediately — so this
+    /// appends only the durable copy the next process start depends on.
+    TurnIndexPage {
+        stream_id: StreamId,
+        payload: Vec<u8>,
+    },
     /// Phase 2: a warm→cold KV migration. The GPU gather already produced `grid`;
     /// the writer appends its chunks, folds their locations into the substrate
     /// index, marks the stream durable-through, then `install_cold`s (drops hot)
@@ -125,6 +132,7 @@ impl WriteJob {
             WriteJob::StreamDecl { payload, .. } => payload.len() as u64,
             WriteJob::Tokens { token_ids, .. } => (token_ids.len() * 4) as u64,
             WriteJob::WideQSigs { payload, .. } => payload.len() as u64,
+            WriteJob::TurnIndexPage { payload, .. } => payload.len() as u64,
             WriteJob::ProjectionEvents { payload, .. } => payload.len() as u64,
             WriteJob::ConvMeta { payload, .. } => payload.len() as u64,
             WriteJob::Snapshot { payload, .. } => payload.len() as u64,
@@ -342,6 +350,17 @@ fn process_one(
                     target: "candle_conversation::persistence::writer",
                     stream_id = stream_id.0,
                     "wide-Q sigs append failed: {e}"
+                );
+            }
+        }
+        WriteJob::TurnIndexPage { stream_id, payload } => {
+            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = p.append_turn_index_page(stream_id, &payload) {
+                tracing::error!(
+                    target: "candle_conversation::persistence::writer",
+                    stream_id = stream_id.0,
+                    "turn index page append failed: {e} — this turn will be borrowable \
+                     but unindexable after a restart"
                 );
             }
         }

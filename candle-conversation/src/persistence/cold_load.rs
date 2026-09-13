@@ -7,7 +7,7 @@
 //! controller DMAs straight through the GPU's PCIe BAR into a
 //! `cuFileBufRegister`'d region of the VRAM staging scratch, with no
 //! host bounce buffer and no copy-stream HtoD. See
-//! [`docs/kv_tier_migration.md`](../../../docs/kv_tier_migration.md) §4.
+//! [`docs/archived/kv_tier_migration.md`](../../../docs/archived/kv_tier_migration.md) §4.
 //!
 //! GPUDirect Storage (GDS) is a **Linux-only NVIDIA technology** — it
 //! depends on the `nvidia-fs` kernel module that NVIDIA does not ship for

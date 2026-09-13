@@ -137,6 +137,14 @@ system_prompt:
     #   no_think         ← thinking on/off (present/absent)
     - kind: section_tree
       nodes:
+        # `no_think` — the USER-TURN half of `Dialect::thinking_suppression`.
+        # Renders the family's soft switch (`/no_think` on ChatML/Qwen3) and
+        # NOTHING on a family that has none (Qwen3.5/3.8, where `no_think` is
+        # deliberately empty). A zero-token segment here is therefore correct,
+        # not a bug: that family is suppressed by the other half of the pair, an
+        # already-closed `<think></think>` block prefilled after the assistant
+        # header by `submit_turn_with_options`. Exactly one of the two is ever
+        # live. See `Dialect::no_think_block`.
         - kind: optional
           id: no_think
           dialect: no_think_prefix
@@ -183,6 +191,46 @@ system_prompt:
             When the conversation holds the specifics — the actual files, code, and
             decisions — reason from those, not from how things usually look.
 
+        # Thinking depth, in the checkpoint's OWN reasoning-effort vocabulary.
+        # Qwen3.8's chat template carries three trained levels — `low`,
+        # `medium`, `xhigh` — and each is a SYSTEM-PROMPT instruction placed
+        # ahead of the turn, never text written into the `<think>` block. These
+        # options reuse those strings verbatim, so the dial pulls the lever the
+        # checkpoint was tuned for instead of a paraphrase of it.
+        #
+        # `balanced` is the template's `medium`, which emits NOTHING: an option
+        # with no content seals no variant and contributes no segment at all
+        # (`project.rs` — "Empty options emit nothing"), so the default path
+        # carries no reasoning instruction, exactly as the vendor template
+        # renders it. The dial still reports `balanced` in the resolved
+        # selections, so the GUI and the section-tree dims are unaffected.
+        #
+        # `off` is the one rung with no vendor counterpart: the template emits no
+        # instruction for it, suppressing thinking structurally instead —
+        # `enable_thinking: false` renders `<think>\n\n</think>` straight after
+        # the assistant header.
+        #
+        # **That structural half is now what does the work.** The engine prefills
+        # the closed block for a family whose `/no_think` soft switch is empty
+        # (`Dialect::thinking_suppression`, read in `submit_turn_with_options`),
+        # so the dial is a guarantee rather than a request. This prose is the
+        # belt to that braces — it costs nothing and states the intent in the
+        # model's own vocabulary — but it is no longer load-bearing.
+        #
+        # It was, once, and the failure is worth remembering: production read
+        # only the user-turn half of the suppression pair, which is empty here,
+        # so the `no_think` node emitted a ZERO-TOKEN segment and this prose was
+        # the entire mechanism. The model ignored it on 22 of 22 repo_map
+        # summaries, opened a block anyway, and — with `</think>` banned outside
+        # a segment — could not close the one it spelled out in plain text. It
+        # ran to the response cap and the raw monologue was stored as the
+        # summary. 5 of 22 usable before the fix; 355 of 355 directories clean
+        # after it, with zero think-block opens.
+        #
+        # `deep` and `exhaustive` share the `xhigh` anchor because the model has
+        # three trained levels and this dial exposes five; they separate on the
+        # extra directive here plus their per-block token budgets
+        # (`ThinkMode::eot_budget`, 2048 vs 4096).
         - kind: selector
           id: thinking_effort
           default: balanced
@@ -192,16 +240,16 @@ system_prompt:
                 Answer directly, without deliberating first.
             - id: quick
               content: |+
-                Think briefly — a sentence or three to pin down the one thing that decides the answer, then stop thinking.
+                Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.
+            # `medium`: the vendor emits no instruction here, and neither do we.
             - id: balanced
-              content: |+
-                Think to the depth the question warrants, usually a short paragraph: the specific facts and trade-offs that determine the answer, without re-deriving what you are already certain of.
             - id: deep
               content: |+
-                Think carefully: take the problem from more than one angle, weigh the trade-offs, and check your conclusion against the specifics before committing.
+                Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
             - id: exhaustive
               content: |+
-                Think exhaustively: enumerate the relevant cases, weigh each alternative and its trade-offs, and stress-test your conclusion against edge cases. Leave nothing decision-relevant unthought.
+                Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
+                Where the task has distinct cases or failure modes, enumerate them and check your conclusion against each before committing.
 
         - kind: selector
           id: response_length
@@ -630,19 +678,25 @@ layers:
     groups:
       - id: structure
         # Cap the reconstructed repo map at the three most-relevant folders.
-        # `default` is the floor: if the threshold filters every folder out, the
-        # workspace-root folder is re-injected so repo_map never vanishes from the
-        # projection.
+        # There is no floor: if the threshold filters every folder out, the group
+        # contributes nothing and repo_map drops out of the projection for that
+        # turn. That is the correct answer to "no folder is relevant" — a question
+        # the repo map cannot help with should not pay for it. Injection is by
+        # score here, on the same terms as the tool catalog.
         # k: 3 — the workspace-root folder reliably wins one slot on belief (its
         # listing names every crate, so it matches most repo questions), so 2
         # leaves only a single content slot that a specific dir (candle-core/src)
         # narrowly loses to generic prose folders (docs/). 3 = root + 2 content;
         # the queried dir ranks top-3 across every probed query. See §83.
+        #
+        # `k` counts EXCHANGES, not turns: a folder's chain is
+        # `request → <tool_call>` / `<tool_response> → <tool_call>` /
+        # `<tool_response> → summary`, coupled into one run, and a seat buys the
+        # whole run. So 3 is three folders, as the note above assumes.
         selection: { kind: top_k, k: 3 }
         # Cuts the zero floor so the pre-belief path (fork/startup, no probe:
-        # every folder scores exactly 0) selects nothing and the `default`
-        # below re-injects the workspace root alone. Without this the group
-        # inherited the layer's 0.0 placeholder, zero-score folders stayed
+        # every folder scores exactly 0) selects nothing at all. Without this the
+        # group inherited the layer's 0.0 placeholder, zero-score folders stayed
         # eligible, and TopK's tie-break (ascending key = ingestion order)
         # seeded the SAME arbitrary leaf folders into every conversation's
         # view — which the model, reading dialogue-shaped ingest turns under
@@ -651,7 +705,6 @@ layers:
         # `zend/scripts/` and "a project with 11 members" unprompted. The live
         # belief loop is untouched (its own min/evict of 250 governs there).
         score_threshold: 1.0
-        default: { tag: "." }
         # Concept B: strong structural attention buys extra cluster slots.
         budget_adaptive: { per_extra: 800, absolute_max: 5 }
         policy:
@@ -1203,6 +1256,25 @@ layers:
     # Rust type via `schemars` — the registry IS the source of truth.
     # No dials: the dialogue layer uses the section-tree defaults; the live
     # request (effort/verbosity/think/tools) sets them per turn.
+    #
+    # ── The `summary:` block below is DORMANT ────────────────────────────
+    #
+    # The AVL summariser is disconnected (`Engine::new`): it is never spawned
+    # and no timeline enqueues, so nothing compresses a conversation into
+    # summary nodes and these prompts are never sent. They are kept because the
+    # machinery is kept — `summary_tree` still compiles and is tested, and
+    # re-enabling is a matter of deciding which timelines opt in.
+    #
+    # Why it was switched off, so the prompts are not "fixed" and switched back
+    # on without the underlying problem being solved: compression was producing
+    # bad memory rather than a saving. Measured on a 16-turn conversation, 5 of
+    # 9 summary nodes were unfaithful — two echoed the user's question back, one
+    # echoed the compressor's own instruction verbatim, and the merge node that
+    # stands for the WHOLE conversation read "I am an AI assistant." These nodes
+    # are written in the first person, as if they were the reply, and a later
+    # projection reads them as history: a wrong one is a FALSE MEMORY the model
+    # cannot tell from something it actually said, not a missing summary.
+    # Retrieval quality is being pursued through provenance selection instead.
     summary:
       turns:
         max_tokens: 192
@@ -1228,8 +1300,13 @@ layers:
       summaries:
         max_tokens: 192
         assistant:
+          # This prompt used to open with a literal `/no_think`. Do not put it
+          # back: it is prompt TEXT, not the dialect's switch, and on a family
+          # whose `no_think` is empty (Qwen3.5/3.8) the model reads it as a stray
+          # instruction rather than a suppression marker. Suppression on this
+          # path comes from the closed block the probe prefills after
+          # `assistant_start` (`BoundaryMarkers::no_think_block`).
           system_prompt: |
-            /no_think
             The answer sections below are already compressed — several separate
             summaries. Merge them into one faithful, shorter section in the
             original first/second-person voice, keeping the facts, numbers, and

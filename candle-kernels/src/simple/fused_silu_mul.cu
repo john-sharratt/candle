@@ -236,7 +236,15 @@ template <> __device__ __forceinline__ float smq8_round<__nv_bfloat16>(float v) 
 template <typename T>
 __device__ void silu_mul_q8a128_impl(
     const T* __restrict__ gate, const T* __restrict__ up,
-    block_q8a128* __restrict__ out, int rows, int cols)
+    block_q8a128* __restrict__ out, int rows, int cols,
+    // `SumScale::as_code()`: 0 stores the raw Σx, 1 stores Σx/amax. A RUNTIME
+    // argument, so this adds no kernel variant.
+    //
+    // **This is the producer the normalised convention exists for.** The SwiGLU
+    // intermediate is where Σx runs away — Z-Image's reaches ≈2×10⁵ against
+    // f16's 65504 ceiling — so a model that needs `ByAmax` needs it here above
+    // all, and one that does not must still get its raw bytes unchanged.
+    int sum_norm)
 {
     const int total_tiles = (int)(((int64_t)rows * cols) / 128);
     const int total_warps = (gridDim.x * blockDim.x) >> 5;
@@ -271,15 +279,16 @@ __device__ void silu_mul_q8a128_impl(
             // a SwiGLU intermediate is the widest activation in a model, and it
             // is where the raw f16 sum overflows first.
             ds[0] = make_half2(__float2half_rn(amax / 127.f),
-                               __float2half_rn(s * id * (1.f / 127.f)));
+                               __float2half_rn(sum_norm ? (s * id * (1.f / 127.f)) : s));
         }
     }
 }
 
 #define SILU_MUL_Q8A128_OP(TYPENAME, FN_NAME) \
   extern "C" __global__ void FN_NAME( \
-      const TYPENAME* gate, const TYPENAME* up, void* out, int rows, int cols) { \
-    silu_mul_q8a128_impl<TYPENAME>(gate, up, reinterpret_cast<block_q8a128*>(out), rows, cols); \
+      const TYPENAME* gate, const TYPENAME* up, void* out, int rows, int cols, \
+      int sum_norm) { \
+    silu_mul_q8a128_impl<TYPENAME>(gate, up, reinterpret_cast<block_q8a128*>(out), rows, cols, sum_norm); \
   }
 
 SILU_MUL_Q8A128_OP(float, silu_mul_q8a128_f32)

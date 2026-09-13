@@ -23,6 +23,7 @@ pub(super) fn hermes3_3b_q6() -> ModelSpec {
         chat_format,
         model_repo: "bartowski/Hermes-3-Llama-3.2-3B-GGUF".into(),
         model_filename: "Hermes-3-Llama-3.2-3B-Q6_K.gguf".into(),
+        prepared_from_source: false,
         model_bytes: 2_643_850_336,
         // Unpinned: no verified commit has been recorded for this conversion. See
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
@@ -54,6 +55,7 @@ pub(super) fn hermes3_70b_q4() -> ModelSpec {
         chat_format,
         model_repo: "bartowski/Hermes-3-Llama-3.1-70B-GGUF".into(),
         model_filename: "Hermes-3-Llama-3.1-70B-Q4_K_M.gguf".into(),
+        prepared_from_source: false,
         model_bytes: 42_520_393_792,
         // Unpinned: no verified commit has been recorded for this conversion. See
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.

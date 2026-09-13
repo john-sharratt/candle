@@ -91,6 +91,21 @@ pub struct PipelineStats {
     /// fleet at whatever happens to be standing free. Refreshed by the pipeline
     /// thread each classify, like `resident_vram_bytes`.
     pub zone_cedeable_bytes: usize,
+    /// **Gauge**: whether the MoE dispatches on the device.
+    ///
+    /// `true` when the expert grid is fully VRAM-resident and
+    /// `GpuDispatchTables` captured it, so routing never leaves the card;
+    /// `false` when the cache streams, where each layer reads its routing back
+    /// to the host to schedule that layer's pinned→VRAM uploads by expert id
+    /// (the sanctioned exception (a) of hot-path invariant 3).
+    ///
+    /// Reported because the difference is a multiple on decode latency and
+    /// nothing else says which path a run took: the decline is a `tracing::warn`
+    /// and the gate harnesses install no subscriber, so it has been shouting
+    /// into a void. A run whose hit rate is below 100% is on the host path by
+    /// construction, and now the table says so instead of leaving it to be
+    /// inferred from the miss column.
+    pub device_dispatch: bool,
 }
 
 impl PipelineStats {
@@ -120,6 +135,7 @@ impl PipelineStats {
                 s.warm_slots,
                 s.total_experts,
                 s.prefetch_depth,
+                s.device_dispatch,
             );
             *s = Self::default();
             (
@@ -128,6 +144,7 @@ impl PipelineStats {
                 s.warm_slots,
                 s.total_experts,
                 s.prefetch_depth,
+                s.device_dispatch,
             ) = gauges;
         }
     }

@@ -125,10 +125,6 @@ pub struct ModelBuilder {
     /// handle to one `.substrate/` silently drops records; see
     /// [`SharedSubstrate`].
     substrate: Option<SharedSubstrate>,
-    /// When `true`, the engine does not spawn the async summariser thread and
-    /// new conversations are not registered for summarisation (the AVL summary
-    /// forest is left un-extended). Off by default.
-    disable_summariser: bool,
     /// Per-layer corrupt-turn policy (from the projection schema), forwarded to
     /// [`EngineConfig::layer_corrupt_turn`] so the startup reload drops the whole
     /// conversation (ingest layers) or just the turn (dialogue) per layer. Empty
@@ -176,7 +172,6 @@ impl ModelBuilder {
             max_hot_turns: 0,
             workspace_path: None,
             substrate: None,
-            disable_summariser: false,
             layer_corrupt_turn: HashMap::new(),
             expert_pack_dir: None,
             prefill_pass_tokens: None,
@@ -284,14 +279,6 @@ impl ModelBuilder {
         policies: HashMap<LayerId, CorruptTurnPolicy>,
     ) -> ModelBuilder {
         self.layer_corrupt_turn = policies;
-        self
-    }
-
-    /// Disable the background summariser thread (and the per-conversation
-    /// summarisation registration). Use to bring the engine up without the
-    /// AVL summary forest running — e.g. for bulk corpus prefill.
-    pub fn disable_summariser(mut self, disable: bool) -> Self {
-        self.disable_summariser = disable;
         self
     }
 
@@ -410,6 +397,9 @@ impl ModelBuilder {
             dialect: dialect_type.dialect(),
             model_repo: String::new(),
             model_filename: gguf_filename,
+            // A custom model already IS a local file — the caller handed one
+            // over. There is no prepare step to report and no repo to skip.
+            prepared_from_source: false,
             model_bytes,
             // Built from a local file, which has no repository to pin a revision in.
             model_rev: String::new(),
@@ -758,7 +748,6 @@ impl ModelBuilder {
         );
 
         let mut ret = EngineConfig::new(eos_tokens.into());
-        ret.disable_summariser = self.disable_summariser;
         ret.layer_corrupt_turn = self.layer_corrupt_turn.clone();
         if let Some(n) = self.prefill_pass_tokens {
             ret.scheduler.large_prefill_max_tokens = n;
@@ -906,6 +895,23 @@ impl ModelBuilder {
                     .map_err(ConversationError::Model)?;
                 Ok(Box::new(
                     BatchedEngine::new(engine).map_err(ConversationError::Model)?,
+                ))
+            }
+            ModelArch::Qwen4Exp => {
+                use candle::quantized::Int8Mode;
+                use candle_transformers::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
+                // Per-layer progress not yet wired for this arch.
+                let _ = progress;
+                // KV is allocated per ATTENTION layer (12 of 48) and the window
+                // budget is config-derived, exactly as the hybrid's is.
+                let _ = max_seq;
+                // `model_path` is the merged KO artifact, not the vendor's
+                // split: the engine takes one mmap and one `Content`, and the
+                // expert pack is sized from a live span measurement at load.
+                let gpu = Qwen4ExpGpu::load(model_path, device, Int8Mode::auto(device))
+                    .map_err(ConversationError::Model)?;
+                Ok(Box::new(
+                    Qwen4ExpBatched::new(gpu).map_err(ConversationError::Model)?,
                 ))
             }
             ModelArch::Qwen35Hybrid => {

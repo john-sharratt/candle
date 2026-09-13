@@ -106,6 +106,17 @@ impl HeadGids {
         &self.0
     }
 
+    /// Whether both handles name the same allocation — the same gids, not
+    /// merely equal ones.
+    ///
+    /// A holder that pins a chunk's gids to keep its arena alive asks this to
+    /// find out whether a chunk it already pinned has been re-gid'd, which is
+    /// a pointer compare rather than a walk of the slots.
+    #[inline]
+    pub fn is_same_alloc(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// Return the K GID for head `h`, palette `p`.
     ///
     /// Indexed as `self.0[h * GIDS_PER_HEAD + p * 2]`.

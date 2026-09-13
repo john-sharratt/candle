@@ -16,7 +16,7 @@
 //!
 //! A page slot is written with a single sub-range H2D copy to its device
 //! address; the scan kernel receives those addresses directly (the paged-KV
-//! `k_ptr` precedent — see `docs/paged_gallery_arena.md` §3.2). That contract is
+//! `k_ptr` precedent — see `docs/archived/paged_gallery_arena.md` §3.2). That contract is
 //! unchanged: `page_addr` always returned a raw address, so only where the bytes
 //! come from has moved.
 

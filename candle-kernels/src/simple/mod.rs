@@ -68,7 +68,19 @@ pub mod fletcher32;
 // one launch replaces the ~120 tiny host-orchestrated ops per sub-block per layer
 pub mod bdp;
 pub mod hyper_mhc;
+/// PLE gathered-row dequant (the qwen4exp n-gram transfer's receive half).
+pub mod ple_gather_dequant;
+// QSA block selection: indexer scores → the per-query packed entry list the
+// paged attention kernels read.
+pub mod qsa_index_append;
+pub mod qsa_page_place;
+pub mod qsa_score_paged;
+pub mod qsa_topk;
+// The Gated Residual's fused pre-mix / combine (Qwen3.8-Flash-Next).
+pub mod gr_hyper;
 pub mod sinkhorn;
+/// W4A16 → Q4_KO expert repack (the qwen4exp import path).
+pub mod w4a16_repack;
 
 // Fused compressed-corpus hot-cache gather: assembles a decode wave's selected
 // gallery rows into one contiguous block, replacing per-region index_select+cat

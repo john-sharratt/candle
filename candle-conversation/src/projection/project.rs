@@ -104,9 +104,90 @@ use super::schema::{
     GroupSchema, LayerSchema, Schema, ScoreFormula, SectionCollection, SectionSchema,
     SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection,
 };
-use super::selection::{apply_selection, resolve_default_turn, trim_to_budget_low_score_first};
+use super::selection::{apply_selection, trim_to_budget_low_score_first};
 use crate::substrate::ContentResolver;
 use crate::summary_tree::{NodeId, SelectionDiagnostics, SelectionOrigin};
+
+/// Collapse `keys` into exchange candidates: one `(representative, score)` per
+/// exchange, in first-appearance order, recording each representative's full
+/// member list in `members`.
+///
+/// The representative is the exchange's first turn, so the candidate order the
+/// rules see is still insertion order. The score is the best over the members:
+/// the belief scan already stamps every member of a run with the shared
+/// exchange score, and taking the best is what makes "a hit on any member pulls
+/// in the whole run" true for every other scoring path too.
+fn exchange_candidates(
+    resolver: &dyn ContentResolver,
+    keys: &[TurnKey],
+    members: &mut HashMap<TurnKey, Vec<TurnKey>>,
+) -> Vec<(TurnKey, f32)> {
+    resolver
+        .group_exchanges(keys)
+        .into_iter()
+        .filter_map(|m| {
+            let rep = *m.first()?;
+            let score = m
+                .iter()
+                .map(|k| resolver.turn_score(*k))
+                .fold(f32::MIN, f32::max);
+            members.insert(rep, m);
+            Some((rep, score))
+        })
+        .collect()
+}
+
+/// Take `key`'s exchange as one candidate, recording its membership, and return
+/// the representative that stands for the whole run at every later step.
+///
+/// For the two places that name a turn directly rather than ranking candidates
+/// — a group's `default:` fallback and the timeline anchor — so neither can
+/// seat half a round-trip.
+fn close_under_exchange(
+    resolver: &dyn ContentResolver,
+    members: &mut HashMap<TurnKey, Vec<TurnKey>>,
+    key: TurnKey,
+) -> TurnKey {
+    let Some(m) = resolver.group_exchanges(&[key]).into_iter().next() else {
+        return key;
+    };
+    let Some(&rep) = m.first() else {
+        return key;
+    };
+    members.insert(rep, m);
+    rep
+}
+
+/// Emit a selected candidate: the exchange's turns in ascending order, right
+/// where the representative sat. Selection ranks representatives; this is the
+/// one place they expand back into the turns the projection carries.
+fn push_exchange(
+    out: &mut Vec<(GroupId, TurnKey)>,
+    group: GroupId,
+    members: &HashMap<TurnKey, Vec<TurnKey>>,
+    key: TurnKey,
+) {
+    match members.get(&key) {
+        Some(m) => out.extend(m.iter().map(|k| (group, *k))),
+        None => out.push((group, key)),
+    }
+}
+
+/// Tokens one exchange candidate costs — the sum over its members, so every
+/// budget decision is priced against what the projection actually emits.
+///
+/// A key with no recorded membership (an anchor head, a `default:` fallback)
+/// prices as itself; the caller closes those under exchange before emitting.
+fn exchange_token_count(
+    resolver: &dyn ContentResolver,
+    members: &HashMap<TurnKey, Vec<TurnKey>>,
+    key: TurnKey,
+) -> usize {
+    match members.get(&key) {
+        Some(m) => m.iter().map(|k| resolver.turn_token_count(*k)).sum(),
+        None => resolver.turn_token_count(key),
+    }
+}
 
 /// Fixed scoring formula used for all turn scoring and section selection.
 /// Calibrated against real Qwen3-30B-A3B Q-vector data; span α=2.0 with
@@ -1132,6 +1213,11 @@ pub fn run_with_sink<R: ContentResolver>(
         schema: &'a GroupSchema,
         layer_idx: usize,
         selected: Vec<(TurnKey, f32)>, // ((timeline, index), score), insertion order
+        /// Exchange membership for every candidate: representative → the run's
+        /// turns in ascending order. `selected` holds representatives, so this is
+        /// what prices a candidate for the budget and what expands it at emit —
+        /// a tool round-trip is selected, trimmed and emitted whole.
+        members: HashMap<TurnKey, Vec<TurnKey>>,
         group_score: f32,
         /// The §8 score-density selector produced `selected` (already
         /// budget-fit and in chronological order — summaries ABOVE the turns
@@ -1153,6 +1239,22 @@ pub fn run_with_sink<R: ContentResolver>(
 
     for (li, layer) in visible_layers.iter().enumerate() {
         let layer_is_target = layer.id == target.layer;
+        // OUT OF SERVICE for the whole process (`--disable-layer`, applied via
+        // `Builder::set_layer_gathered`): the layer contributes nothing to the
+        // assembly. Its belief groups are already excluded at scoring time, but a
+        // `Sequence` (recency) group is not belief-driven and is never scored, so
+        // without this it would still emit its window — the exclusion has to be
+        // restated where the assembly walks layers, or "excluded from provenance"
+        // would hold for retrieved turns and quietly fail for recency ones.
+        //
+        // The target layer is exempt, for the same reason the diagnostic toggle
+        // below exempts it: skipping it leaves the projection with nothing to
+        // emit. Disabling the layer you are projecting FOR is not a meaningful
+        // request, and answering it with an empty context would be worse than
+        // ignoring it.
+        if !layer_is_target && !layer.gathered {
+            continue;
+        }
         // Runtime diagnostic kill switch: a non-target layer toggled off
         // contributes nothing to the assembly (its groups are never scored or
         // selected). The target layer is never skipped — that would leave the
@@ -1189,18 +1291,33 @@ pub fn run_with_sink<R: ContentResolver>(
             // away — and the first one it takes is the turn being written, which
             // carries no tags until it seals. A prefill whose own turn is
             // scoped out of its own projection never finishes.
+            //
+            // Scoped BEFORE the exchange closure below, so the closure only ever
+            // runs over turns this reader may see. An exchange lives on one
+            // timeline, and a timeline in a tagged group is one owner's, so
+            // closing a scoped turn's exchange cannot pull in another owner's.
             let scoped = !group.policy.tags.is_empty() && group.id != target.group;
-            let all_turns: Vec<(TurnKey, f32)> = resolver
+            let in_scope: Vec<TurnKey> = resolver
                 .group_turns(group.id)
                 .into_iter()
                 .filter(|key| !scoped || resolver.turn_carries(*key, &group.policy.tags))
-                .map(|key| {
-                    let score = resolver.turn_score(key);
-                    (key, score)
-                })
                 .collect();
 
-            let tc = |key: TurnKey| resolver.turn_token_count(key);
+            // A candidate is an EXCHANGE, not a turn. A tool round-trip is
+            // recorded as coupled turns (`Sequence::couple_turn`) and is one
+            // indivisible projection unit: the rules below rank whole runs and
+            // the budget trims whole runs, so a `<tool_call>` is never seated
+            // without the `<tool_response>` that answers it. An uncoupled turn
+            // is its own singleton exchange, so a group with no round-trips
+            // behaves exactly as before.
+            //
+            // The exchange is also the unit provenance voted on — the belief
+            // scan aggregates a whole run into one case and stamps every member
+            // with the shared score — so ranking exchanges here ranks exactly
+            // what the scan decided, instead of re-splitting it into halves.
+            let mut members: HashMap<TurnKey, Vec<TurnKey>> = HashMap::new();
+            let all_turns: Vec<(TurnKey, f32)> =
+                exchange_candidates(resolver, &in_scope, &mut members);
 
             // Score-density override: when this is the *target* group
             // and a summary tree exists for the target timeline, swap
@@ -1232,9 +1349,30 @@ pub fn run_with_sink<R: ContentResolver>(
                     }
                     diag.pending_count = resolver.pending_summary_len(target.timeline);
                     sink(diag);
-                    picks
+                    // §8 picks nodes, and a node can be one half of a tool
+                    // round-trip on the live timeline. Close the picks under
+                    // exchange so the emitted set is whole runs — the same unit
+                    // every other path here selects. The scores stay §8's own:
+                    // `exchange_candidates` takes the best over the members, and
+                    // an unpicked member scores 0, so a closed exchange carries
+                    // exactly the score of the pick that earned it.
+                    let picked: Vec<TurnKey> = picks
+                        .iter()
+                        .map(|(idx, _origin, _score)| TurnKey::new(target.timeline, *idx))
+                        .collect();
+                    let pick_score: HashMap<TurnKey, f32> = picks
                         .iter()
                         .map(|(idx, _origin, score)| (TurnKey::new(target.timeline, *idx), *score))
+                        .collect();
+                    exchange_candidates(resolver, &picked, &mut members)
+                        .into_iter()
+                        .map(|(rep, _)| {
+                            let score = members[&rep]
+                                .iter()
+                                .filter_map(|k| pick_score.get(k).copied())
+                                .fold(f32::MIN, f32::max);
+                            (rep, score)
+                        })
                         .collect()
                 } else {
                     Vec::new()
@@ -1242,6 +1380,11 @@ pub fn run_with_sink<R: ContentResolver>(
             } else {
                 Vec::new()
             };
+
+            // `members` is complete from here (every candidate exchange, plus any
+            // the score-density path closed), so the budget can price a candidate
+            // by what emitting it actually costs.
+            let tc = |key: TurnKey| exchange_token_count(resolver, &members, key);
 
             // Fall through to the rule-based unbounded selection path
             // when score-density wasn't applicable.
@@ -1374,22 +1517,23 @@ pub fn run_with_sink<R: ContentResolver>(
                 }
             }
 
-            // Default fallback: if belief/scores/rule selected nothing, bring in
-            // the group's declared default turn (by tag) so the group — and its
-            // layer — never drops out of the projection at the empty-group
-            // retain below. The sentinel score clears both the layer and group
-            // score gates; it fires only when empty, so it never double-selects
-            // or fights the belief challenger.
-            if selected.is_empty() {
-                if let Some(key) = resolve_default_turn(group.default.as_ref(), group.id, resolver)
-                {
-                    let sentinel = layer
-                        .score_threshold
-                        .max(group.score_threshold.unwrap_or(0.0));
-                    selected.push((key, sentinel));
-                    selection_origins.insert(key, SelectionOrigin::Fallback);
-                }
-            }
+            // An empty selection stays empty. A group whose members all scored
+            // below the threshold has nothing relevant to contribute, and Step 7
+            // drops it — taking its layer with it if no sibling group survived.
+            // That is the intended outcome, not a hole to be plugged.
+            //
+            // This used to inject the group's declared `default` turn with a
+            // SENTINEL score synthesised to clear the very gates the turn had
+            // just failed. It defeated the threshold by construction: repo_map
+            // sets `score_threshold: 1.0` precisely so a cold probe (every folder
+            // scoring exactly 0) selects nothing, and the fallback then put the
+            // workspace-root exchange back regardless — ~4,000 tokens of folder
+            // listing and summary in front of a model that had asked for none of
+            // it. Measured on a live greeting: several exchanges injected, every
+            // one either `reason: fallback` or scoring 0.0.
+            //
+            // Selection is by score, on the same terms as the tool catalog: pass
+            // the threshold or stay out.
 
             // Concept D — timeline anchor: whenever ANY exchange of a timeline
             // is selected in an anchored group, the timeline's anchor member
@@ -1406,7 +1550,14 @@ pub fn run_with_sink<R: ContentResolver>(
                     *best = best.max(*score);
                 }
                 for (timeline, best) in per_timeline {
-                    let head = TurnKey::new(timeline, TurnIndex(0));
+                    // Turn 0 opens its timeline's first exchange, so it is that
+                    // exchange's representative; closing here records the
+                    // membership for a timeline whose head was never a candidate.
+                    let head = close_under_exchange(
+                        resolver,
+                        &mut members,
+                        TurnKey::new(timeline, TurnIndex(0)),
+                    );
                     if selected.iter().any(|(k, _)| *k == head) {
                         continue;
                     }
@@ -1432,14 +1583,41 @@ pub fn run_with_sink<R: ContentResolver>(
             if !score_density_used {
                 if let SelectionRule::Sequence { recent, .. } = &group.selection {
                     // `Sequence` is the live-conversation rule, so the group holds
-                    // one timeline and candidate order is index order.
-                    let split = (all_turns.len() as u32).saturating_sub(*recent as u32);
+                    // one timeline and candidate order is exchange order. Read the
+                    // split off each pick's POSITION in `all_turns` rather than its
+                    // turn index: the candidates are exchanges, so position and
+                    // index only coincide when nothing on the timeline is coupled.
+                    let split = all_turns.len().saturating_sub(*recent);
+                    let position: HashMap<TurnKey, usize> = all_turns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (key, _))| (*key, i))
+                        .collect();
                     for (key, _) in &selected {
-                        let origin = if key.index.0 >= split {
+                        let origin = if position.get(key).is_some_and(|p| *p >= split) {
                             SelectionOrigin::Recent
                         } else {
                             SelectionOrigin::Historical
                         };
+                        selection_origins.insert(*key, origin);
+                    }
+                }
+            }
+
+            // Every non-representative member of a selected exchange rides in on
+            // its representative's decision, so it carries the same score and the
+            // same origin. Stamping them is what makes the selection record
+            // explain every turn the projection emits — a `<tool_response>` that
+            // appears "unselected" in the panel reads as a leak. Representatives
+            // are the only keys the next reprojection seeds from
+            // (`Carried::turn_group` looks up `all_turns`), so this cannot
+            // perturb the belief carry.
+            for (rep, score) in &selected {
+                let Some(m) = members.get(rep) else { continue };
+                let origin = selection_origins.get(rep).copied();
+                for key in m.iter().skip(1) {
+                    selection_scores.set_turn(*key, *score, true);
+                    if let Some(origin) = origin {
                         selection_origins.insert(*key, origin);
                     }
                 }
@@ -1456,6 +1634,7 @@ pub fn run_with_sink<R: ContentResolver>(
                 schema: group,
                 layer_idx: li,
                 selected,
+                members,
                 group_score: 0.0,
                 score_density: score_density_used,
             });
@@ -1574,10 +1753,12 @@ pub fn run_with_sink<R: ContentResolver>(
     let natural_tokens: HashMap<GroupId, usize> = group_states
         .iter()
         .map(|gs| {
+            // Priced per EXCHANGE — what emitting the candidate actually costs —
+            // so the flexbox natural cap matches the tokens the group emits.
             let tokens: usize = gs
                 .selected
                 .iter()
-                .map(|(key, _)| resolver.turn_token_count(*key))
+                .map(|(key, _)| exchange_token_count(resolver, &gs.members, *key))
                 .sum();
             (gs.schema.id, tokens)
         })
@@ -1662,14 +1843,14 @@ pub fn run_with_sink<R: ContentResolver>(
                 // and could silently drop picks via `historical_top_k`. Emit
                 // the picks verbatim, in their existing order.
                 for (key, _) in &gs.selected {
-                    final_selected.push((gs.schema.id, *key));
+                    push_exchange(&mut final_selected, gs.schema.id, &gs.members, *key);
                 }
                 continue;
             }
             let group_budget = group_budgets[gi];
-            let tc = |key: TurnKey| resolver.turn_token_count(key);
+            let tc = |key: TurnKey| exchange_token_count(resolver, &gs.members, key);
 
-            let mut selected_indices = if gs.schema.is_belief_driven() {
+            let selected_indices = if gs.schema.is_belief_driven() {
                 // Belief already decided the surviving set (RelLeak + the rule's
                 // budget); the bounded pass must ONLY trim to the token budget,
                 // not re-apply the rule's `score_threshold` to the post-leak
@@ -1691,19 +1872,14 @@ pub fn run_with_sink<R: ContentResolver>(
                 )
             };
 
-            // Budget-trim floor: the token trim must never drop a group to
-            // nothing. If it did, re-inject the group's declared default turn so
-            // the group stays present regardless of budget pressure.
-            if selected_indices.is_empty() {
-                if let Some(idx) =
-                    resolve_default_turn(gs.schema.default.as_ref(), gs.schema.id, resolver)
-                {
-                    selected_indices.push(idx);
-                }
-            }
+            // A group the budget trimmed to nothing stays trimmed. Re-injecting
+            // a declared default here restored a member the budget had just
+            // rejected, which is the same defeat of the gate as the empty-
+            // selection fallback above — the group is present not because
+            // anything qualified but because something had to be.
 
             for idx in selected_indices {
-                final_selected.push((gs.schema.id, idx));
+                push_exchange(&mut final_selected, gs.schema.id, &gs.members, idx);
             }
         }
     }

@@ -38,7 +38,6 @@
 
 use std::sync::RwLock;
 
-use candle::quantized::pinned_staging::Generation;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
@@ -48,18 +47,21 @@ use candle_nn::kv_cache::{
 };
 use candle_nn::Module;
 
+#[cfg(feature = "cuda")]
+use super::batched_inference::build_glue_meta;
+use super::batched_inference::BatchedInferenceSession;
 use super::batched_layer::{
-    forward_layer_batched_mixed, BatchedAttentionLayer, BatchedAttentionParams, DecodeHeaders,
-    WaveAttnGroup,
+    forward_layer_batched_mixed, BatchedAttentionLayer, BatchedAttentionParams, BatchedPrefillMeta,
+    DecodeHeaders, WaveAttnGroup,
 };
 use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
-use super::kv_cache_utils::SequenceContext;
 use super::prefill_utils::SharedPm;
 use super::quantized_matmul::QMatMul;
 use super::rope_tables::CisPrecomputations;
 use super::tensor_cat::TensorCat;
 use super::wave_admit::admit_wave_kv;
+use super::wave_driver::{assemble_wave_contexts, WaveGroups};
 #[cfg(feature = "cuda")]
 use crate::models::wave_buffers::wave_root;
 use crate::quantized_nn::RmsNorm;
@@ -571,40 +573,62 @@ impl<M: BatchedModelCore> BatchedInference<M> {
     /// linear, and the FFN/MoE is token-flat, this is bit-identical to running the
     /// three types as separate forwards through a shared MoE.
     ///
-    /// `contexts` are ordered `[decode… | prefill… | glue…]`; `n_decode` /
-    /// `n_prefill` give the group boundaries (glue is the remainder). The three
-    /// `*_headers` are the per-group attention metadata (Decode / Prefill /
-    /// Prefill+glue). When the range reaches the head, returns logits for the
-    /// **decode + prefill** rows only (glue rows scatter K/V, they carry no logits).
-    #[allow(clippy::too_many_arguments)]
+    /// The uniform transformer's [`crate::models::wave_driver::WaveSweep`] body:
+    /// `wave` carries the internal-order `[decode… | prefill… | glue…]` groups,
+    /// and this sweep builds its own attention metadata (headers describe live
+    /// arena state, so they belong to the sweep's phase order — see the wave
+    /// driver's module docs) before borrowing its contexts from the session.
+    /// When the range reaches the head, returns logits for the **decode +
+    /// prefill** rows only (glue rows scatter K/V, they carry no logits).
     pub fn forward_wave_contexts(
         &self,
-        contexts: &mut [SequenceContext],
-        n_decode: usize,
-        n_prefill: usize,
-        decode_headers: DecodeHeaders,
-        prefill_headers: DecodeHeaders,
-        glue_headers: DecodeHeaders,
-        generation: &Generation,
-        layer_start: usize,
-        layer_end: usize,
-        x_in: Option<TensorCat>,
+        session: &mut BatchedInferenceSession,
+        wave: WaveGroups<'_>,
     ) -> Result<(WavePhase, Option<WaveGuard>)> {
-        if contexts.is_empty() {
+        let WaveGroups {
+            n_decode,
+            n_prefill,
+            seq_ids,
+            inputs,
+            pending_glue,
+            generation,
+            layer_start,
+            layer_end,
+            x_in,
+            act_dtype: _,
+            adapter,
+        } = wave;
+        if seq_ids.is_empty() {
             candle::bail!("forward_wave: empty batch");
+        }
+        // Refused rather than ignored. Dropping the name here would serve the
+        // BASE model under an adapter's name, which reads as a bad fine-tune
+        // rather than as an unsupported architecture.
+        if let Some(name) = adapter {
+            candle::bail!(
+                "forward_wave: this architecture has no LoRA support, so adapter \
+                 `{name}` cannot be applied"
+            );
         }
         let num_layers = self.model.num_layers();
         if layer_start > layer_end || layer_end > num_layers {
             candle::bail!("forward_wave: bad layer range [{layer_start}, {layer_end})");
         }
-        let n_glue = contexts
+        let n_glue = seq_ids
             .len()
             .checked_sub(n_decode + n_prefill)
             .ok_or_else(|| candle::Error::Msg("forward_wave: group bounds exceed batch".into()))?;
 
-        // Per-group offsets + query lengths, in [decode | prefill | glue] order.
-        let offsets: Vec<usize> = contexts.iter().map(|c| c.offset).collect();
-        let q_lens: Vec<usize> = contexts.iter().map(|c| c.input_len).collect();
+        // Per-group offsets + query lengths, in [decode | prefill | glue] order
+        // — read from the session BEFORE the contexts borrow it mutably.
+        let offsets: Vec<usize> = seq_ids
+            .iter()
+            .map(|&s| session.sequence_offset(s).unwrap_or(0))
+            .collect();
+        let q_lens: Vec<usize> = inputs
+            .iter()
+            .map(|t| t.dims().get(1).copied().unwrap_or(1))
+            .collect();
         let (dec_off, rest_off) = offsets.split_at(n_decode);
         let (pre_off, glue_off) = rest_off.split_at(n_prefill);
         let (dec_q, rest_q) = q_lens.split_at(n_decode);
@@ -612,6 +636,43 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // Flat token-row counts per group (decode is one row per sequence).
         let pre_rows: usize = pre_q.iter().sum();
         let glue_rows: usize = glue_q.iter().sum();
+
+        // Attention metadata, from the session's shared borrow. Decode gets its
+        // packed SlotHeader buffer; prefill/glue get ragged cu_seqlens; glue
+        // additionally translates the staged per-token scatter descriptors.
+        // The uniform stack's arena state does not move before the layer loop
+        // reads it, so building here — before phase 0 — matches the order the
+        // wave driver used when it built these.
+        #[cfg(feature = "cuda")]
+        let decode_headers = if n_decode > 0 {
+            let (buf, stride) = session.build_decode_metadata(&seq_ids[..n_decode], generation)?;
+            DecodeHeaders::Decode { buf, stride }
+        } else {
+            DecodeHeaders::Decode {
+                buf: None,
+                stride: 0,
+            }
+        };
+        #[cfg(not(feature = "cuda"))]
+        let decode_headers = DecodeHeaders::Decode {
+            buf: None,
+            stride: 0,
+        };
+        let dev = self.model.device();
+        let prefill_headers =
+            DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(pre_off, pre_q, dev)?);
+        #[allow(unused_mut)]
+        let mut glue_meta = BatchedPrefillMeta::new_ragged(glue_off, glue_q, dev)?;
+        #[cfg(feature = "cuda")]
+        if let Some(pending) = pending_glue {
+            glue_meta.glue = build_glue_meta(pending, glue_q, dev)?;
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = pending_glue;
+        let glue_headers = DecodeHeaders::Prefill(glue_meta);
+
+        let mut contexts = assemble_wave_contexts(session, seq_ids, inputs)?;
+        let contexts = contexts.as_mut_slice();
 
         let cache_dtype = contexts
             .first()
@@ -689,7 +750,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // **Phase 1: admit.** Claim every KV slot this wave will write, for
         // every layer in the range, before a single byte of it computes — so the
         // arena frontier is final when the transient tier is reserved against it
-        // (`docs/elastic_vram_partition.md` §7, `wave_admit`). Decode's claims
+        // (`docs/archived/elastic_vram_partition.md` §7, `wave_admit`). Decode's claims
         // were made by the caller when it built the position map; this covers
         // the multi-token rows.
         admit_wave_kv(contexts, n_decode, n_prefill, layer_start, layer_end)?;
@@ -912,6 +973,9 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                     params: &dec_params,
                     rows: n_decode,
                     decode_layout: true,
+                    // No QSA: this lineage's attention reads the whole causal
+                    // prefix (the selection is Qwen3.8-Flash-Next's own).
+                    qsa: None,
                 });
             }
             if n_prefill > 0 {
@@ -921,6 +985,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                     params: &pre_params,
                     rows: pre_rows,
                     decode_layout: false,
+                    qsa: None,
                 });
             }
             if n_glue > 0 {
@@ -930,6 +995,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                     params: &glue_params,
                     rows: glue_rows,
                     decode_layout: false,
+                    qsa: None,
                 });
             }
             forward_layer_batched_mixed(

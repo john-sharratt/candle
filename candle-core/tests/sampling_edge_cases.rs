@@ -31,7 +31,7 @@ fn temperature_does_not_change_argmax() {
         ..Default::default()
     };
 
-    // Run multiple times with different RNG offsets â€” should always pick peak
+    // Run multiple times with different RNG offsets — should always pick peak
     for offset in 0..20u64 {
         let mut pp = p.clone();
         pp.rng_offsets = vec![offset];
@@ -171,7 +171,7 @@ fn topk_topp_combined() {
     logits[40] = 7.0;
     logits[50] = 6.0;
 
-    // top_k=5, top_p=0.95 â€” should select from {10, 20, 30, 40, 50}
+    // top_k=5, top_p=0.95 — should select from {10, 20, 30, 40, 50}
     let p = SamplingParams {
         logits_f32: logits,
         batch_size: 1,
@@ -198,7 +198,7 @@ fn topk_topp_combined() {
 #[test]
 fn single_vocab_token() {
     let stream = test_stream();
-    // vocab_size = 1 â†’ only token 0 is possible
+    // vocab_size = 1 → only token 0 is possible
     let p = SamplingParams {
         logits_f32: vec![42.0f32],
         batch_size: 1,
@@ -474,7 +474,7 @@ fn f32_neg_inf_logit_is_never_picked() {
 
 #[test]
 fn f32_all_neg_inf_except_one() {
-    // Only one finite logit â€” it must win.
+    // Only one finite logit — it must win.
     let stream = test_stream();
     let vocab = 128;
     let mut logits = vec![f32::NEG_INFINITY; vocab];
@@ -493,7 +493,7 @@ fn f32_all_neg_inf_except_one() {
 
 #[test]
 fn f32_mixed_inf_and_finite() {
-    // Multiple +Inf logits â€” tie-break: first one wins.
+    // Multiple +Inf logits — tie-break: first one wins.
     let stream = test_stream();
     let vocab = 64;
     let mut logits = vec![0.0f32; vocab];
@@ -509,7 +509,7 @@ fn f32_mixed_inf_and_finite() {
         ..Default::default()
     };
     let gpu = run_gpu(&stream, &p);
-    // Both 10 and 20 are +Inf â€” GPU parallel reduction may pick either
+    // Both 10 and 20 are +Inf — GPU parallel reduction may pick either
     assert!(
         gpu[0] == 10 || gpu[0] == 20,
         "should pick one of the +Inf tokens, got {}",
@@ -580,7 +580,7 @@ fn f32_subnormal_logits() {
 
 #[test]
 fn f32_alternating_extreme_logits() {
-    // Alternating +Inf / -Inf / normal values â€” stress test for reduction.
+    // Alternating +Inf / -Inf / normal values — stress test for reduction.
     let stream = test_stream();
     let vocab = 256;
     let mut logits = Vec::with_capacity(vocab);

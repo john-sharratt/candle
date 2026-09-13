@@ -1828,7 +1828,7 @@ __device__ void grouped_matmul_impl(
 // power-of-two scale immediately — the fold drains one reusable accumulator per
 // sub, so it holds no extra registers, and the per-32 scales apply exactly (no
 // re-quantization of an E8M0 format onto an affine grid). See
-// docs/q8_matmul_pipeline.md.
+// docs/archived/q8_matmul_pipeline.md.
 // =============================================================================
 
 // Activation tile load: global → shared via cp.async (.ca, L1-resident — the tile is re-read
@@ -1930,9 +1930,16 @@ __device__ void grouped_matmul_impl_int8(
     int b_start, int b_cnt, int row_tile_idx,
     int8_t smem_A_i8[][N_SUB * 16][KI8_STRIDE],
     half2 smem_A_ds[][N_SUB * 16],
-    uint8_t* smem_W_flat)
+    uint8_t* smem_W_flat,
+    // `SumScale::as_code()` for the activation operand: 0 raw, 1 Σx/amax.
+    int sum_norm)
 {
     using block_c_t = block_compact_t<block_q_t>;
+    // The operand's sum convention, as the two coefficients that rebuild Σx.
+    // Uniform across the grid and resolved once here, so the k-loop below is
+    // branchless and identical in shape for both conventions.
+    const float sum_a = sum_norm ? 127.f : 0.f;
+    const float sum_b = sum_norm ? 0.f : 1.f;
     const int tid = threadIdx.y * WARP_SIZE_TC + threadIdx.x;
     const int warp_id = tid / WARP_SIZE_TC;
     const int lane = tid % WARP_SIZE_TC;
@@ -2034,13 +2041,16 @@ __device__ void grouped_matmul_impl_int8(
         for (int t = 0; t < N_SUB; ++t) {
             const float2 a0 = __half22float2(smem_A_ds[ab][t * 16 + groupID]);      // token-half A
             const float2 a1 = __half22float2(smem_A_ds[ab][t * 16 + groupID + 8]);  // token-half B
-            // Rebuild Σx from the stored Σx/amax: the block holds the sum
-            // normalised (blocks.cuh), because a raw f16 Σx overflows on any
-            // activation whose 128-block sums pass 65504 — Z-Image's SwiGLU
-            // intermediate reaches 2×10⁵ and turned the whole matmul into NaN.
-            // `a.x` is amax/127, so `a.y · a.x · 127` is Σx exactly.
-            const float a0_sum = a0.y * a0.x * 127.f;
-            const float a1_sum = a1.y * a1.x * 127.f;
+            // Rebuild Σx from the stored field, whichever convention wrote it
+            // (blocks.cuh). `sum_a`/`sum_b` are hoisted from the operand's
+            // `SumScale` before the k-loop, so this is one FMA + one multiply
+            // either way — no branch in the inner loop, and no second kernel:
+            //   raw    (0, 1): fmaf(a.x, 0, 1) = 1     → a.y, the stored Σx, EXACTLY
+            //   by-amax(127,0): fmaf(a.x, 127, 0)      → a.y · amax = Σx
+            // The raw arm is bit-identical to reading `a.y` directly, because
+            // multiplying by an exact 1.0f is exact in IEEE.
+            const float a0_sum = a0.y * fmaf(a0.x, sum_a, sum_b);
+            const float a1_sum = a1.y * fmaf(a1.x, sum_a, sum_b);
             if constexpr (is_mxfp4_persub<block_c_t>::value) {
                 // PER-SUB fold: each 32-K sub's exact int32 sum scaled by its own
                 // E8M0 `2^(e_sub-128)` (the activation scale is per-128, so it is
@@ -2112,7 +2122,10 @@ static __device__ void quantized_matmul_dense_entry_int8(
     const block_compact_t<block_q_t>* __restrict__ weights,
     const block_q8a128* __restrict__ act,
     output_t* __restrict__ dst,
-    int ncols_x, int nrows_x, int total_batch, int y_stride, int dst_stride)
+    int ncols_x, int nrows_x, int total_batch, int y_stride, int dst_stride,
+    // The activation operand's `SumScale::as_code()`, passed straight through to
+    // the impl, which turns it into two hoisted coefficients.
+    int sum_norm)
 {
     constexpr int BATCH = N_SUB * 16;   // tokens per block (mode-1: 16, mode-2: 16·N_SUB)
     const int b_start = blockIdx.x * BATCH;
@@ -2128,7 +2141,7 @@ static __device__ void quantized_matmul_dense_entry_int8(
     if constexpr (is_scale_separate<block_compact_t<block_q_t>>::value) {
         grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB>(
             weights, act, dst, ncols_x, nrows_x, y_stride, dst_stride,
-            b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat);
+            b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
     }
 }
 
@@ -2155,7 +2168,12 @@ static __device__ void quantized_matmul_grouped_entry(
     const int* __restrict__ tile_b_cnt,        // [total_tiles] tokens in tile (1..16·N_SUB)
     const act_t* __restrict__ vy,
     output_t* __restrict__ dst,
-    int ncols_x, int nrows_x, int y_stride, int dst_stride, int row_fast)
+    int ncols_x, int nrows_x, int y_stride, int dst_stride, int row_fast,
+    // The activation operand's `SumScale::as_code()`. Defaulted because this
+    // entry also serves FLOAT activations, which carry no q8a128 header at all —
+    // the `if constexpr` below discards it for them, so the FP instantiations
+    // and their launchers do not name a value that has no meaning for them.
+    int sum_norm = 0)
 {
     using block_c_t = block_compact_t<block_q_t>;
 
@@ -2189,7 +2207,7 @@ static __device__ void quantized_matmul_grouped_entry(
         if constexpr (is_scale_separate<block_c_t>::value) {
             grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB>(
                 weights, vy, dst, ncols_x, nrows_x, y_stride, dst_stride,
-                b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat);
+                b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
         }
     } else {
         using compute_t = std::conditional_t<

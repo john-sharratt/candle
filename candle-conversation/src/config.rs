@@ -1012,8 +1012,11 @@ impl SamplingConfig {
     /// per-span EOT close ramp + graceful/force cutoffs from `mode.eot_budget()`.
     ///
     /// `max_response_tokens` guards the short-output case. `Off`/`Quick`'s EOT
-    /// budget (~220/300) is a *dialogue backstop* — it assumes the model self-closes
-    /// an empty block from the `/no_think` glue and only caps a runaway. A short
+    /// budget (~220/300) is a *dialogue backstop* — it caps a runaway, and assumes
+    /// something upstream has already stopped a block from opening at all
+    /// (structurally, via the closed block `Dialect::thinking_suppression`
+    /// prefills; the `/no_think` glue it used to lean on is empty on families
+    /// that suppress that way). A short
     /// summary (`max_response_tokens` ≈ 100) can never reach a 300-token backstop,
     /// so when the block budget can't fit the response the steering collapses to a
     /// forced **empty** close — the budget goes to the answer, not runaway (often
@@ -1710,12 +1713,6 @@ pub struct EngineConfig {
     /// builders override via `ret.dialect = ...`.
     pub dialect: Dialect,
 
-    /// When `true`, the engine does not spawn the async summariser thread and
-    /// new conversations are not registered for summarisation. The AVL summary
-    /// forest is left un-extended (provenance scans still work on raw turns).
-    /// Off by default; set via `ModelBuilder::disable_summariser`.
-    pub disable_summariser: bool,
-
     /// Per-layer [`CorruptTurnPolicy`] (keyed by `LayerId`), applied when a turn
     /// is unrecoverable during the startup substrate reload. Set on the substrate
     /// in `ConversationEngine::new` *before* the reload thread is spawned, so the
@@ -1750,7 +1747,6 @@ impl EngineConfig {
             model_spec: None,
             tokenizer: None,
             dialect: Dialect::chat_ml(),
-            disable_summariser: false,
             layer_corrupt_turn: HashMap::new(),
         }
     }
@@ -2304,6 +2300,86 @@ mod sampling_config_tests {
             assert_eq!(dry.base, 1.75);
             assert_eq!(dry.allowed_length, 2);
             assert_eq!(dry.range, 512);
+        }
+    }
+
+    /// **Every ramp must actually ramp.**
+    ///
+    /// `eos_ramp_len` and `segment_close_ramp_len` are named "len" but hold the
+    /// ramp's ABSOLUTE END, which is why every call site has a comment saying so.
+    /// The kernel computes `span = max(end - start, 1)`, so an end below the start
+    /// collapses the span to 1: the boost jumps from nothing to its full multiplier
+    /// in a single token instead of easing in over the intended window. It is a
+    /// cliff wearing a ramp's name, and it reads as a plausible pair of numbers.
+    ///
+    /// That shipped — the qwen3 non-thinking preset carried `(start 400, end 100)`
+    /// under a comment reading "starts at 400 tokens, full by 500", so the whole
+    /// family got an instant full-strength EOS boost at token 401.
+    #[test]
+    fn every_ramp_ends_after_it_starts() {
+        let named = SamplingConfig::preset_names().iter().map(|n| {
+            (
+                n.to_string(),
+                SamplingConfig::preset(n).expect("named preset"),
+            )
+        });
+        let arches = ["qwen3", "qwen3moe", "qwen2moe", "qwen2", "llama", "unknown"];
+        let thinking = arches.iter().map(|a| {
+            (
+                format!("for_gguf_architecture({a})"),
+                SamplingConfig::for_gguf_architecture(a),
+            )
+        });
+        // `None` for families with no non-thinking variant — dropped rather than
+        // stood in for, so the sweep only ever checks configs that really exist.
+        let non_thinking = arches.iter().filter_map(|a| {
+            SamplingConfig::non_thinking_for_gguf_architecture(a)
+                .map(|c| (format!("non_thinking_for_gguf_architecture({a})"), c))
+        });
+        let by_arch = thinking.chain(non_thinking);
+
+        for (name, cfg) in named.chain(by_arch) {
+            // A ramp is only live when its end is positive (the kernel's
+            // `use_ramp` gate); a zeroed ramp is "disabled", not malformed.
+            if cfg.eos_ramp_len > 0 {
+                assert!(
+                    cfg.eos_ramp_len > cfg.eos_ramp_start,
+                    "{name}: EOS ramp ends at {} but starts at {} — the span \
+                     collapses to 1 token and the boost becomes a cliff",
+                    cfg.eos_ramp_len,
+                    cfg.eos_ramp_start,
+                );
+            }
+            if cfg.segment_close_ramp_len > 0 {
+                assert!(
+                    cfg.segment_close_ramp_len > cfg.segment_close_ramp_start,
+                    "{name}: segment-close ramp ends at {} but starts at {}",
+                    cfg.segment_close_ramp_len,
+                    cfg.segment_close_ramp_start,
+                );
+            }
+        }
+    }
+
+    /// The qwen3 non-thinking preset's ramp matches the window its own comment
+    /// documents — the pair that was wrong, pinned so a future edit to one
+    /// without the other fails here.
+    #[test]
+    fn qwen3_non_thinking_eos_ramp_spans_four_hundred_to_five_hundred() {
+        for arch in ["qwen3", "qwen3moe", "qwen2moe"] {
+            let cfg = SamplingConfig::non_thinking_for_gguf_architecture(arch)
+                .unwrap_or_else(|| panic!("{arch} has a non-thinking preset"));
+            assert_eq!(cfg.eos_ramp_start, 400, "{arch} ramp start");
+            assert_eq!(cfg.eos_ramp_len, 500, "{arch} ramp end");
+            // The ramp must also finish before the graceful failsafe, or the
+            // failsafe fires while the boost is still easing in and the ramp
+            // never reaches full strength.
+            assert!(
+                cfg.graceful_eos_after >= cfg.eos_ramp_len,
+                "{arch}: graceful EOS at {} precedes the ramp's end at {}",
+                cfg.graceful_eos_after,
+                cfg.eos_ramp_len,
+            );
         }
     }
 }

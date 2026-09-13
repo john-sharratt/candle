@@ -282,7 +282,7 @@ fn f16_with_temperature_and_topk() {
         rng_offsets: vec![0],
         ..Default::default()
     };
-    // With such a dominant logit (prob â‰ˆ 1.0), every seed must pick token 10.
+    // With such a dominant logit (prob ≈ 1.0), every seed must pick token 10.
     // This also tests that collect_above_threshold correctly prioritises the
     // high-probability token over zero-probability tokens at the threshold.
     for offset in 0..10u64 {
@@ -337,7 +337,7 @@ fn f16_overflow_to_inf() {
     let stream = test_stream();
     let vocab = 64;
     let mut logits = vec![0.0f32; vocab];
-    logits[5] = 70000.0; // overflows f16 â†’ Inf
+    logits[5] = 70000.0; // overflows f16 → Inf
     logits[10] = 65504.0; // f16 max, finite
 
     let (typed, quantised) = f32_to_f16(&logits);
@@ -412,7 +412,7 @@ fn f16_precision_loss_changes_winner() {
 
 #[test]
 fn f16_small_values_near_min_normal() {
-    // f16 smallest normal â‰ˆ 6.1e-5. Subnormals go down to ~5.96e-8.
+    // f16 smallest normal ≈ 6.1e-5. Subnormals go down to ~5.96e-8.
     // Test logits near these boundaries.
     let stream = test_stream();
     let vocab = 64;
@@ -820,7 +820,7 @@ fn bf16_with_temperature_and_topk() {
         rng_offsets: vec![0],
         ..Default::default()
     };
-    // With such a dominant logit (prob â‰ˆ 1.0), every seed must pick token 10.
+    // With such a dominant logit (prob ≈ 1.0), every seed must pick token 10.
     // This also tests that collect_above_threshold correctly prioritises the
     // high-probability token over zero-probability tokens at the threshold.
     for offset in 0..10u64 {
@@ -930,7 +930,7 @@ fn fp8_max_representable_value() {
 
 #[test]
 fn fp8_coarse_precision_quantisation() {
-    // fp8 e4m3 has only 3 mantissa bits â†’ precision of 1 part in 8 at each exponent.
+    // fp8 e4m3 has only 3 mantissa bits → precision of 1 part in 8 at each exponent.
     // At magnitude 64, representable values are 60, 62, 64, 68, 72, ...
     // Test that two logits that round to the same fp8 value produce consistent results.
     let stream = test_stream();
@@ -972,7 +972,7 @@ fn fp8_coarse_precision_quantisation() {
 
 #[test]
 fn fp8_small_positive_values() {
-    // fp8 e4m3 smallest subnormal â‰ˆ 2^-9 = 0.001953125
+    // fp8 e4m3 smallest subnormal ≈ 2^-9 = 0.001953125
     let stream = test_stream();
     let vocab = 32;
     let mut logits = vec![-10.0f32; vocab]; // all negative
@@ -1087,7 +1087,7 @@ fn fp8_negative_logits() {
 }
 
 // ============================================================================
-// Tests: Precision Edge Cases (F32 â€” testing kernel robustness)
+// Tests: Precision Edge Cases (F32 — testing kernel robustness)
 // ============================================================================
 
 #[test]

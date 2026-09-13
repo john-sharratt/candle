@@ -1,5 +1,5 @@
 //! Grouping `Normal` turns into **exchanges** — the unit of summarisation and
-//! selection (`docs/immutable_summary_forest.md`, *Exchanges*).
+//! selection (`docs/archived/immutable_summary_forest.md`, *Exchanges*).
 //!
 //! A tool round-trip spans more than one turn. The model answers with `<think>`
 //! plus a `<tool_call>`; the tool's output arrives as the *next* turn's user half

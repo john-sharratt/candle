@@ -1,5 +1,5 @@
 //! VRAM↔RAM transfer orchestration (§3, §4, §16.6 of
-//! `docs/kv_tier_migration.md`).
+//! `docs/archived/kv_tier_migration.md`).
 //!
 //! `transfer.rs` drives `candle-nn`'s `kv_migrate` scatter/gather kernel:
 //!

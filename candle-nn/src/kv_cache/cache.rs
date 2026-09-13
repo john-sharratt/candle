@@ -3,10 +3,16 @@
 //! This module provides `Cache` for single-tensor caches and `KvCache` for
 //! paired key-value caches, supporting both contiguous and chunked backing.
 
-use super::chunked::{ChunkedKvBacking, CompressionPolicy, CHUNK_SIZE, GID_STRIDE};
+use super::chunked::{ChunkedKvBacking, CompressionPolicy, HeadGids, CHUNK_SIZE, GID_STRIDE};
 use ahash::HashMap;
 use candle::quantized::GgmlDType;
 use candle::{DType, Result, Tensor};
+use std::sync::Arc;
+
+/// What a slot-state sync hands back per slot: the serialised slice array's
+/// `(slices_ptr, n_slices, write_slice)`, the pins keeping the chunks it
+/// references alive, and whether any slot was re-serialised.
+pub type SlotStateSync = (Vec<(u64, u32, u32)>, Vec<Arc<Vec<HeadGids>>>, bool);
 
 /// Internal chunked cache wrapper for a single sequence slot.
 #[derive(Debug, Clone)]
@@ -987,6 +993,59 @@ impl KvCache {
             .collect();
         backing.validate_decode_batch_state(&entries)?;
         Ok(())
+    }
+
+    /// Bring every selected slot's persistent slot-state buffer up to date and
+    /// return each slot's `(slices_ptr, n_slices, write_slice)` — the three
+    /// fields a `SlotHeader` carries besides its position map.
+    ///
+    /// This is the SAME buffer the decode metadata builder reads, and the same
+    /// serialized `TokenSlice` array both attention kernels walk. A chunk's
+    /// slice entry changes only when the slot's chunk table changes, and every
+    /// mutator of that table clears the buffer (`push_chunk`, `replace_chunks`,
+    /// … — see `SequenceState::sync_decode_gpu_chunks`), so a slot whose table
+    /// stood still since the last sync hands back its live pointer with no
+    /// re-serialisation at all. That is what makes a per-layer header build
+    /// O(1) instead of O(chunks): at depth the prefix is thousands of chunks
+    /// that are byte-identical from one forward to the next.
+    ///
+    /// `offsets` are the slots' pre-write token counts, in `caches` order, and
+    /// `arena_info` the caller's already-resolved arena table — resolving it
+    /// walks every arena for a device pointer, so a caller that holds one hands
+    /// it over rather than paying for a second.
+    ///
+    /// Also returns each slot's serialisation pins — hold them until the launch
+    /// against these slices has retired — and, as the third value, whether at
+    /// least one slot had to be re-serialised, which is the caller's cue to
+    /// re-run any check that only needs to hold over a table that changed.
+    pub fn sync_chunked_slot_states(
+        caches: &[&mut KvCache],
+        offsets: &[usize],
+        arena_info: &[super::ResolvedArenaInfo],
+    ) -> Result<SlotStateSync> {
+        if caches.len() != offsets.len() {
+            candle::bail!(
+                "offset count mismatch: got {} offsets for {} caches",
+                offsets.len(),
+                caches.len()
+            )
+        }
+        let Some(first) = caches.first() else {
+            return Ok((Vec::new(), Vec::new(), false));
+        };
+        let backing = match &first.k.storage {
+            CacheStorage::Chunked(c) => c.backing.clone(),
+            CacheStorage::Contiguous { .. } => candle::bail!("expected chunked backing"),
+        };
+        let mut entries: Vec<(usize, usize)> = Vec::with_capacity(caches.len());
+        for (i, (cache, &offset)) in caches.iter().zip(offsets.iter()).enumerate() {
+            let batch_idx = cache.k.chunked_batch_idx().ok_or_else(|| {
+                candle::Error::Msg(format!("slot {i} has no chunked batch index"))
+            })?;
+            entries.push((batch_idx, offset));
+        }
+        let (slots, pins, stats) = backing.sync_decode_gpu_chunks(&entries, arena_info)?;
+        Ok((slots, pins, stats.rebuilds > 0))
     }
 
     /// Prime the persistent decode slot-state buffers after prefill.

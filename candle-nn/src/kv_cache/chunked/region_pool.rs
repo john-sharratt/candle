@@ -2,7 +2,7 @@
 //!
 //! One VA span per device, claimed once and never given back, covering
 //! **everything the engine owns except the dense weights**
-//! (`docs/elastic_vram_partition.md` §2):
+//! (`docs/archived/elastic_vram_partition.md` §2):
 //!
 //! ```text
 //!            while a forward runs:                between forwards:
@@ -1613,7 +1613,7 @@ fn try_claim(pool: &mut RegionPool, stream: &std::sync::Arc<CudaStream>) -> Resu
 ///
 /// # Anchored at the arena frontier `A`
 ///
-/// `docs/elastic_vram_partition.md` §7 phase 2. This leaves the whole remainder
+/// `docs/archived/elastic_vram_partition.md` §7 phase 2. This leaves the whole remainder
 /// in one contiguous run adjacent to the weight side, so the boundary can be
 /// moved to `A + T` in the same operation rather than through a control loop
 /// hunting for bytes stranded mid-span:
@@ -2028,6 +2028,68 @@ pub fn ensure_reservation(device: &candle::Device, load_headroom: usize) -> Resu
 pub fn freeze_dense(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {
     with_pool(stream, |pool| {
         pool.dense_frozen = true;
+        // **Retract a previous model's weight zone.**
+        //
+        // `POOLS` is process-global and never torn down, so `weight_floor`
+        // outlives the model that installed it. The load path assumes otherwise
+        // — see `reclaim_load_headroom`, which states as its precondition that
+        // at close_load "no weight floor has been installed" — and that holds
+        // only for the FIRST load in a process. A second load of a model with no
+        // weight side of its own installs nothing, so it silently inherits the
+        // previous one's floor and runs with whatever KV area that left.
+        //
+        // Measured: in one test binary, DeepSeek-V4-Flash (284B, MXFP4 experts)
+        // installs a floor leaving the weight side ~47 GiB; the dense Llama-2
+        // that loads next then gets **81 KV regions of a 3,974-region span** and
+        // dies in `place_transient` at 8 contexts — "this wave is too wide for a
+        // partition that has nothing left to trade", against 47 GiB of weight
+        // ground holding 0.1 MiB. Alone, the same model passes. The same shape
+        // reaches production wherever one process loads a second checkpoint.
+        //
+        // Here is the one safe moment: the load phase has just closed, so
+        // nothing has claimed a region and no zone is built yet — `build_experts`
+        // and `build_layers` both run after this. A model that wants a weight
+        // side installs it immediately below; one that does not now starts from
+        // the documented default of the whole span.
+        //
+        // **Guarded on `live`, not on `next`.** `next` is the lowest index never
+        // handed out — a monotonic bump that never returns to 0 once any region
+        // has been claimed — so it is non-zero on *every* load after the first,
+        // which is exactly when this retraction is needed. Guarding on it refuses
+        // the case it exists for. (That is not a hypothetical either: the first
+        // version of this guard did precisely that, and the suite failed
+        // identically with the fix in place.)
+        //
+        // `live` is the real occupancy, and it is the only thing that could make
+        // this unsafe. Note the direction as well: retracting toward `span_end`
+        // GROWS the KV side and can never cut a live KV region — the hazard the
+        // partition rules warn about is the floor moving *down* onto them.
+        if pool.weight_floor != pool.span_end() {
+            if pool.live == 0 {
+                let span_end = pool.span_end();
+                match pool.set_weight_floor(span_end) {
+                    Ok(regions) => tracing::info!(
+                        target: "candle_nn::kv_cache::region_pool",
+                        regions,
+                        "close_load: retracted a previous model's weight zone; the span is the \
+                         KV side's until a zone is installed for this load"
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: "candle_nn::kv_cache::region_pool",
+                        "close_load: could not retract the previous weight zone ({e}); this \
+                         load runs against the KV area that zone left"
+                    ),
+                }
+            } else {
+                tracing::warn!(
+                    target: "candle_nn::kv_cache::region_pool",
+                    live = pool.live,
+                    "close_load: a weight zone from an earlier load is installed and KV regions \
+                     are still live, so it cannot be retracted safely; this load runs against \
+                     the KV area that zone left"
+                );
+            }
+        }
         Ok(pool.dense_bytes)
     })
 }

@@ -54,5 +54,8 @@ extern "C" {
         out: *mut c_void,
         rows: i32,
         cols: i32,
+        // The Σx convention these q8a128 blocks are written in
+        // (`SumScale::as_code()`): 0 raw, 1 Σx/amax.
+        sum_norm: i32,
     );
 }

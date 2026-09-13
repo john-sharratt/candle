@@ -13,13 +13,15 @@ extern "C" void run_paged_prefill_int8_fp16(
     const void*, const void*, const void*, const uint8_t*,
     const uint32_t*, const uint32_t*, const uint32_t*, void*,
     int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
-    float, const uint32_t*, const float*, int32_t, cudaStream_t);
+    float, const uint32_t*, const float*, int32_t, cudaStream_t,
+    const uint32_t*, const uint32_t*, const uint2*, const uint2*, int32_t, int32_t);
 
 extern "C" void run_paged_prefill_int8_bf16(
     const void*, const void*, const void*, const uint8_t*,
     const uint32_t*, const uint32_t*, const uint32_t*, void*,
     int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
-    float, const uint32_t*, const float*, int32_t, cudaStream_t);
+    float, const uint32_t*, const float*, int32_t, cudaStream_t,
+    const uint32_t*, const uint32_t*, const uint2*, const uint2*, int32_t, int32_t);
 
 extern "C" void run_paged_prefill_int8(
     const void* q_ptr,
@@ -41,7 +43,13 @@ extern "C" void run_paged_prefill_int8(
     const uint32_t* rope_offsets,
     const float* rope_cs,
     int32_t rope_interleaved,
-    void* stream_ptr
+    void* stream_ptr,
+    const uint32_t* sel_entries,
+    const uint32_t* sel_cnt,
+    const uint2* sel_pages,
+    const uint2* sel_page_win,
+    int32_t sel_stride,
+    int32_t sel_ratio
 ) {
     cudaStream_t stream = (cudaStream_t)stream_ptr;
     switch (q_dtype) {
@@ -50,14 +58,16 @@ extern "C" void run_paged_prefill_int8(
                 q_ptr, k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
                 o_ptr, total_q, batch_size, n_head, n_kv_head, head_dim,
                 max_q_len, softmax_scale, rope_offsets, rope_cs,
-                rope_interleaved, stream);
+                rope_interleaved, stream, sel_entries, sel_cnt, sel_pages, sel_page_win,
+                sel_stride, sel_ratio);
             break;
         case ArenaFormat::BF16:
             run_paged_prefill_int8_bf16(
                 q_ptr, k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
                 o_ptr, total_q, batch_size, n_head, n_kv_head, head_dim,
                 max_q_len, softmax_scale, rope_offsets, rope_cs,
-                rope_interleaved, stream);
+                rope_interleaved, stream, sel_entries, sel_cnt, sel_pages, sel_page_win,
+                sel_stride, sel_ratio);
             break;
         default:
             fprintf(stderr, "run_paged_prefill_int8: unsupported q_dtype %d\n", q_dtype);

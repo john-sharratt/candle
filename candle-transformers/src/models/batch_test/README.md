@@ -26,7 +26,7 @@ quantization formats, and a pure-Rust RULER task generator.
 | `story.md` | The user-turn story text ("The Backyard Astronaut") used by `TestParams::new` as the default `prompt_user` — the body the model must rewrite per session. |
 | `system.md` | The default `prompt_system`: instructs the model to deterministically replace every occurrence of "Marcus" (and case variants) with a per-session name, changing nothing else — this is the `StoryRewrite` `TestMode`. |
 | `names.md` | 99 newline-separated first names, one assigned per test session, used both to build each session's rewrite target and to check that adjacent sessions produce genuinely distinct output (catches KV cross-contamination). |
-| `fixtures/routing_trace_qwen3_30b.bin.gz` | Captured Qwen3-30B-A3B MoE expert-routing trace (`candle-transformers/src/models/routing_capture.rs::FIXTURE_PATH`), written by a focused capture test and read by the offline Markov-expert-prediction evaluator — see `docs/markov_expert_prediction_eval.md`. |
+| `fixtures/routing_trace_qwen3_30b.bin.gz` | Captured Qwen3-30B-A3B MoE expert-routing trace (`candle-transformers/src/models/routing_capture.rs::FIXTURE_PATH`), written by a focused capture test and read by the offline Markov-expert-prediction evaluator — see `docs/archived/markov_expert_prediction_eval.md`. |
 
 ## Key types & entry points
 
@@ -58,6 +58,6 @@ The captured `perf-investigation/baseline_run*.txt` and
 
 ## Related docs
 
-`docs/markov_expert_prediction_eval.md` (the routing-trace fixture's
+`docs/archived/markov_expert_prediction_eval.md` (the routing-trace fixture's
 consumer), `docs/perplexity_results.md` (a different, standalone quality
 harness — not this module).

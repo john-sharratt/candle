@@ -8,8 +8,8 @@
 // Gather: out[i, j] = xs[token_ids[i], j]
 //   Replaces: Tensor::new(token_ids) + xs.index_select
 //
-// Weighted scatter-add:
-//   ys[token_ids[i], j] += weights_flat[weight_ids[i]] * src[i, j]
+// Weighted scatter:
+//   ys[token_ids[i], j] = Σ_i weights_flat[weight_ids[i]] * src[i, j]
 //   Replaces: Tensor::new(weight_ids) + index_select + reshape + to_dtype
 //             + broadcast_mul + index_add  (6 ops → 1 kernel)
 //
@@ -118,7 +118,23 @@ extern "C" __global__ void moe_gather_u8(
 // token_starts[t+1] = end index (exclusive) for token t
 // This is a prefix sum of per-token expert counts (variable k supported).
 //
-// ACCUMULATES into ys (+=). Initialize ys to zero before the first call.
+// **The kernel DEFINES `ys`; it does not accumulate into it.** The grid is
+// (num_tokens, ceil(hidden/BLOCK)) and the column loop strides the whole row, so
+// every (token, column) of the target is stored exactly once — which means the
+// target must be allocated UNINITIALISED (hot-path invariant 6), never zeroed.
+//
+// It used to seed the reduction from `ys` itself, so every caller paid a memset
+// over the combine target and this kernel paid a full read of it, per MoE layer
+// per forward, to add a value that was always zero. That was load-bearing only
+// for a two-call shape (hits, then misses) that no longer exists: the callers
+// merged into one canonically-ordered pass because residency-dependent grouping
+// made decode non-deterministic, and the seed outlived the reason for it.
+//
+// A token with no contributions (start == end) stores 0, which is what the
+// zeroed buffer held — so the degenerate row is defined here rather than by the
+// absent memset. The one case that is NOT covered is a caller skipping the
+// launch entirely when nothing is routed; such a caller must zero its own
+// target, and both do.
 
 // **`down_out` is ALWAYS F32, whatever `ys` is.** The grouped int8 GEMM that
 // produces it emits F32, and this kernel already accumulates in float — so it
@@ -130,10 +146,6 @@ extern "C" __global__ void moe_gather_u8(
 //
 // It also loses nothing numerically: the accumulation was always float, and the
 // narrowing now happens after the sum rather than before it.
-
-__device__ __forceinline__ float scatter_load(float x)          { return x; }
-__device__ __forceinline__ float scatter_load(__half x)         { return __half2float(x); }
-__device__ __forceinline__ float scatter_load(__nv_bfloat16 x)  { return __bfloat162float(x); }
 
 __device__ __forceinline__ void scatter_store(float* p, float v)         { *p = v; }
 __device__ __forceinline__ void scatter_store(__half* p, float v)        { *p = __float2half(v); }
@@ -157,7 +169,7 @@ __device__ __forceinline__ void deterministic_scatter_impl(
     for (int col = (int)(blockIdx.y * blockDim.x + threadIdx.x);
          col < hidden;
          col += (int)(blockDim.x * gridDim.y)) {
-        float sum = scatter_load(dst[col]);
+        float sum = 0.f;
         for (int idx = start; idx < end; idx++) {
             float w = weights_flat[reordered_weight_ids[idx]];
             sum += w * down_out[(size_t)perm[idx] * hidden + col];
@@ -230,7 +242,11 @@ extern "C" __global__ void deterministic_scatter_f32(
 // top-k **indices** (u32) and **weights** (f32) in descending-logit order, matching the sort path
 // (`sort_last_dim(descending)` → `narrow(0, k)`); ties resolve to the lowest expert index.
 #define MOE_ROUTE_MAX_K 16
-#define MOE_ROUTE_MAX_SLOTS 8   // experts per lane ⇒ supports up to 32·8 = 256 experts
+// Experts-per-lane is a TEMPLATE parameter (`SLOTS`), not this constant: 8
+// slots serve up to 32·8 = 256 experts (the qwen3/3.5 lineage and DeepSeek),
+// 16 serve 512 (qwen4exp). Per instantiation, so the narrow variant's
+// register pressure is untouched by the wide one's existence.
+#define MOE_ROUTE_MAX_SLOTS 8
 
 template<typename T>
 __device__ __forceinline__ float moe_route_to_f32(T x);
@@ -238,7 +254,7 @@ template<> __device__ __forceinline__ float moe_route_to_f32<float>(float x) { r
 template<> __device__ __forceinline__ float moe_route_to_f32<__half>(__half x) { return __half2float(x); }
 template<> __device__ __forceinline__ float moe_route_to_f32<__nv_bfloat16>(__nv_bfloat16 x) { return __bfloat162float(x); }
 
-template<typename T>
+template<typename T, int SLOTS>
 __device__ void moe_route_impl(
     const T*       __restrict__ logits,      // [num_tokens, n_experts]
     uint32_t*      __restrict__ out_idx,     // [num_tokens, k]
@@ -252,9 +268,9 @@ __device__ void moe_route_impl(
     const T* row = logits + (size_t)token * (size_t)n_experts;
 
     // Coalesced single read of this lane's experts into registers (−inf pads the tail).
-    float v[MOE_ROUTE_MAX_SLOTS];
+    float v[SLOTS];
     #pragma unroll
-    for (int j = 0; j < MOE_ROUTE_MAX_SLOTS; ++j) {
+    for (int j = 0; j < SLOTS; ++j) {
         int e = lane + 32 * j;
         v[j] = (e < n_experts) ? moe_route_to_f32<T>(row[e]) : -INFINITY;
     }
@@ -262,7 +278,7 @@ __device__ void moe_route_impl(
     // Global max (warp reduction over the per-lane local max).
     float gmax = -INFINITY;
     #pragma unroll
-    for (int j = 0; j < MOE_ROUTE_MAX_SLOTS; ++j) gmax = fmaxf(gmax, v[j]);
+    for (int j = 0; j < SLOTS; ++j) gmax = fmaxf(gmax, v[j]);
     for (int off = 16; off > 0; off >>= 1) gmax = fmaxf(gmax, __shfl_xor_sync(FULL, gmax, off));
 
     // Full Σ exp(l − gmax) — only needed for the un-renormalized softmax weights.
@@ -270,7 +286,7 @@ __device__ void moe_route_impl(
     if (!norm_topk) {
         float ls = 0.f;
         #pragma unroll
-        for (int j = 0; j < MOE_ROUTE_MAX_SLOTS; ++j) {
+        for (int j = 0; j < SLOTS; ++j) {
             if (v[j] > -INFINITY) ls += __expf(v[j] - gmax);
         }
         for (int off = 16; off > 0; off >>= 1) ls += __shfl_xor_sync(FULL, ls, off);
@@ -286,7 +302,7 @@ __device__ void moe_route_impl(
         float bv = -INFINITY;
         int   bi = n_experts;          // sentinel > any valid index
         #pragma unroll
-        for (int j = 0; j < MOE_ROUTE_MAX_SLOTS; ++j) {
+        for (int j = 0; j < SLOTS; ++j) {
             int e = lane + 32 * j;
             if (e < n_experts && v[j] > bv) { bv = v[j]; bi = e; }
         }
@@ -298,7 +314,17 @@ __device__ void moe_route_impl(
         float ev = __expf(bv - gmax);
         z_top += ev;                   // identical on every lane (all share bv)
         if (lane == 0) { sel_w[p] = ev; sel_i[p] = bi; }
-        if (lane == (bi & 31)) v[bi >> 5] = -INFINITY;  // owner masks the winner
+        // Owner masks the winner — but only when a winner was found. `bi` seeds
+        // at the `n_experts` sentinel, and when no lane holds a finite candidate
+        // it survives to here, where `v[bi >> 5]` is `v[n_experts >> 5]`. At
+        // `n_experts == 32 * SLOTS` — 512 on the x512 instantiation, 256 on the
+        // narrow one — that is exactly `v[SLOTS]`, one past the end of the
+        // per-lane array. The store lands on whatever the compiler placed after
+        // it, silently, on the degenerate-routing path the output clamp below is
+        // already written to survive. Below that width the index is in bounds but
+        // still masks a slot no round asked for, so the guard is on the sentinel
+        // rather than on the width.
+        if (bi < n_experts && lane == (bi & 31)) v[bi >> 5] = -INFINITY;
     }
 
     if (lane == 0) {
@@ -328,19 +354,41 @@ extern "C" __global__ void moe_route_f32(
     const float* logits, uint32_t* out_idx, float* out_weights,
     int num_tokens, int n_experts, int k, int norm_topk
 ) {
-    moe_route_impl<float>(logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+    moe_route_impl<float, 8>(logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
 }
 
 extern "C" __global__ void moe_route_f16(
     const __half* logits, uint32_t* out_idx, float* out_weights,
     int num_tokens, int n_experts, int k, int norm_topk
 ) {
-    moe_route_impl<__half>(logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+    moe_route_impl<__half, 8>(logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
 }
 
 extern "C" __global__ void moe_route_bf16(
     const __nv_bfloat16* logits, uint32_t* out_idx, float* out_weights,
     int num_tokens, int n_experts, int k, int norm_topk
 ) {
-    moe_route_impl<__nv_bfloat16>(logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+    moe_route_impl<__nv_bfloat16, 8>(logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+}
+
+// The 512-expert instantiations (16 slots per lane) — qwen4exp's router.
+extern "C" __global__ void moe_route_f32_x512(
+    const float* logits, uint32_t* out_idx, float* out_weights,
+    int num_tokens, int n_experts, int k, int norm_topk
+) {
+    moe_route_impl<float, 16>(logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+}
+
+extern "C" __global__ void moe_route_f16_x512(
+    const __half* logits, uint32_t* out_idx, float* out_weights,
+    int num_tokens, int n_experts, int k, int norm_topk
+) {
+    moe_route_impl<__half, 16>(logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+}
+
+extern "C" __global__ void moe_route_bf16_x512(
+    const __nv_bfloat16* logits, uint32_t* out_idx, float* out_weights,
+    int num_tokens, int n_experts, int k, int norm_topk
+) {
+    moe_route_impl<__nv_bfloat16, 16>(logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
 }

@@ -1,7 +1,7 @@
 # Engine Generalization & Optimization Plan
 
 Status: **DRAFT for review** · Owner: overnight autonomous run · Supersedes nothing (adds to
-`docs/deepseek_batched_paged_attention_plan.md`, which remains the canonical attention design).
+`docs/deepseek/deepseek_batched_paged_attention_plan.md`, which remains the canonical attention design).
 
 This plan takes the working DeepSeek-V4-Flash paged latent-attention engine (crash/OOM/garbage on
 long prefill now fixed — see `[[wave-prefill-snapshot-dangling]]`) and drives it to a **generic,
@@ -36,7 +36,7 @@ green before the next phase starts.
 
 ## Baselines, references & grounding (read before starting)
 
-- **Read the canonical design doc first:** `docs/deepseek_batched_paged_attention_plan.md`. It is
+- **Read the canonical design doc first:** `docs/deepseek/deepseek_batched_paged_attention_plan.md`. It is
   authoritative for the attention design (compressor monoid, two-stage BDP→Indexer corpus select,
   single-latent K≡V, glue, the C/E/G/K sections referenced throughout this plan). Ground every
   kernel change in it; if the doc is itself wrong, fix the doc in the same change.
@@ -470,7 +470,7 @@ the residual bottleneck, `prefill_attn` still 208 s @ n=8). Decode-target work u
 arithmetic was per-key FP64 RoPE reduction (`rope_angle`, 1/64-rate on sm_120) × the 4× head-tile
 recompute. Shipped the **factored RoPE cos/sin table** (`rope_lookup`: position split at bit 10 +
 angle-addition; ≈768 KB per frequency set, built once at load, bit-exact vs the mirror —
-`docs/deepseek_batched_paged_attention_plan.md` §G/§L) — per-(key,pair) trig is now 2 cache-hot
+`docs/deepseek/deepseek_batched_paged_attention_plan.md` §G/§L) — per-(key,pair) trig is now 2 cache-hot
 float2 loads + 6 f32 ops. Alongside it, the split-KV partial pool was replaced by a **caller-owned
 fixed workspace** (`LatentWorkspace`, ~64 MiB built once per model, Arc-shared across layers,
 host-immutable; prefill launches chunk their queries to the fixed capacity — bit-identical per row).

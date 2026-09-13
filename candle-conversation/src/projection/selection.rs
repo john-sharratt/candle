@@ -50,22 +50,8 @@
 //!   emission:  insertion order
 //! ```
 
-use super::ids::{GroupId, TurnKey};
-use super::schema::{SelectionDefault, SelectionRule};
-use crate::substrate::ContentResolver;
-
-/// Resolve a group's declared `default` fallback turn — the member brought in
-/// when normal selection is empty, keyed by a gather-scope tag (e.g. `"."` for
-/// the repo_map workspace-root cluster). `None` when the group has no default
-/// or the tag resolves to no turn. Off the hot path — only consulted on an
-/// empty selection.
-pub fn resolve_default_turn(
-    default: Option<&SelectionDefault>,
-    group: GroupId,
-    resolver: &dyn ContentResolver,
-) -> Option<TurnKey> {
-    resolver.turn_with_tag(group, &default?.tag)
-}
+use super::ids::TurnKey;
+use super::schema::SelectionRule;
 
 /// Apply a selection rule to a group's turns.
 ///

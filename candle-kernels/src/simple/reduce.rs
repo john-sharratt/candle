@@ -218,6 +218,9 @@ extern "C" {
         n_rows: i32,
         n_cols: i32,
         eps: f32,
+        // The Σx convention these q8a128 blocks are written in
+        // (`SumScale::as_code()`): 0 raw, 1 Σx/amax.
+        sum_norm: i32,
     );
 
     // =========================================================================

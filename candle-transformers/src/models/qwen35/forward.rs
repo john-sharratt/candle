@@ -49,6 +49,7 @@ use super::wave::delta_net_mix_wave;
 use crate::models::delta_net::seq_spans;
 use crate::models::delta_net::LayerKind;
 use crate::models::delta_net::{RecurrentStateStore, StashSlot};
+use crate::models::profile::pipeline_record_duration;
 use crate::models::verify_wave::VerifyPlan;
 use candle_nn::kv_cache::ModelGeometry;
 
@@ -56,16 +57,16 @@ use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, ModelCoreProperties, WaveResult,
 };
 use crate::models::batched_layer::{
-    forward_layer_batched_mixed, BatchedAttentionParams, WaveAttnGroup,
+    forward_layer_batched_mixed, BatchedAttentionParams, BatchedPrefillMeta, DecodeHeaders,
+    WaveAttnGroup,
 };
 use crate::models::batched_model::{WaveGuard, WavePhase};
 use crate::models::expert_lre::{PipelineStats, ProfileSnapshot};
-use crate::models::kv_cache_utils::SequenceContext;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_admit::admit_wave_kv;
 use crate::models::wave_buffers::wave_root;
-use crate::models::wave_driver::{drive_wave, WaveGroups, WaveSweep};
+use crate::models::wave_driver::{assemble_wave_contexts, drive_wave, WaveGroups, WaveSweep};
 
 /// The hybrid as the scheduler drives it.
 ///
@@ -497,10 +498,17 @@ impl ManagedBatchedModel for HybridBatched {
                     }
                 }
             }
-            match stash.as_ref() {
+            // The KV truncate above walks every layer's chunk list; the replay
+            // below advances the recurrence over the kept tokens alone. They
+            // scale with different things — the cache's depth against the draft
+            // budget — so they are timed apart.
+            let t_replay = std::time::Instant::now();
+            let r = match stash.as_ref() {
                 Some(st) => self.replay_recurrent(st, &jobs),
                 None => Ok(()),
-            }
+            };
+            pipeline_record_duration("rewind:replay", t_replay.elapsed(), 1);
+            r
         })();
         if let Some(st) = stash {
             self.put_verify_stash(st)?;
@@ -720,10 +728,10 @@ impl WaveSweep for HybridBatched {
     /// failure than the one that caused it.
     fn sweep(
         &self,
-        contexts: &mut [SequenceContext],
-        groups: WaveGroups<'_>,
+        session: &mut BatchedInferenceSession,
+        wave: WaveGroups<'_>,
     ) -> Result<(WavePhase, Option<WaveGuard>)> {
-        let seqs = groups.seq_ids.to_vec();
+        let seqs = wave.seq_ids.to_vec();
 
         // Hand back the previous wave's transient tier, and let the elastic
         // boundary grow in the one gap it is legal in — every guard from that
@@ -748,10 +756,13 @@ impl WaveSweep for HybridBatched {
             self.reclaim_spare_ground();
         }
 
-        // Offsets in context order, which is the order `seq_ids` is in — a
-        // sequence standing at zero gets its recurrent state reset, not just
-        // created (see `ensure_recurrent`).
-        let offsets: Vec<usize> = contexts.iter().map(|c| c.offset).collect();
+        // Offsets in `seq_ids` order, read from the session — a sequence
+        // standing at zero gets its recurrent state reset, not just created
+        // (see `ensure_recurrent`).
+        let offsets: Vec<usize> = seqs
+            .iter()
+            .map(|&s| session.sequence_offset(s).unwrap_or(0))
+            .collect();
         self.ensure_recurrent(&seqs, &offsets)?;
         self.begin_recurrent_wave(&seqs)?;
         let mut stores = match self.take_recurrent(&seqs) {
@@ -766,7 +777,7 @@ impl WaveSweep for HybridBatched {
 
         let swept = {
             let mut refs: Vec<&mut RecurrentStateStore> = stores.iter_mut().collect();
-            sweep_layers(self, contexts, groups, &mut refs)
+            sweep_layers(self, session, wave, &mut refs)
         };
 
         self.put_recurrent(&seqs, stores)?;
@@ -781,28 +792,24 @@ impl WaveSweep for HybridBatched {
 /// The layer sweep proper.
 fn sweep_layers(
     model: &HybridBatched,
-    contexts: &mut [SequenceContext],
-    groups: WaveGroups<'_>,
+    session: &mut BatchedInferenceSession,
+    wave: WaveGroups<'_>,
     stores: &mut [&mut RecurrentStateStore],
 ) -> Result<(WavePhase, Option<WaveGuard>)> {
     let WaveGroups {
         n_decode,
         n_prefill,
         seq_ids,
-        decode_headers,
-        prefill_headers,
-        glue_headers,
+        inputs,
+        pending_glue,
         generation,
         layer_start,
         layer_end,
         x_in,
         act_dtype,
         adapter,
-    } = groups;
-    // Refused below, before it can be read — named here so the destructuring
-    // stays exhaustive and a new group cannot be added without this seeing it.
-    drop(glue_headers);
-    if contexts.is_empty() {
+    } = wave;
+    if seq_ids.is_empty() {
         candle::bail!("qwen35 wave: empty batch");
     }
     let q = model.model();
@@ -815,14 +822,15 @@ fn sweep_layers(
             "qwen35 wave: bad layer range [{layer_start}, {layer_end}) over {num_layers} layers"
         );
     }
-    let n_glue = contexts
+    let n_glue = seq_ids
         .len()
         .checked_sub(n_decode + n_prefill)
         .ok_or_else(|| candle::Error::Msg("qwen35 wave: group bounds exceed batch".into()))?;
     // The gap-fill kernel is `head_dim 128` only and the float prefill fallback
     // carries no glue masking, so a glue row would be attended as an ordinary
-    // prefill token — a wrong answer, not a slow one.
-    if n_glue > 0 {
+    // prefill token — a wrong answer, not a slow one. `pending_glue` can only
+    // arrive with glue rows, so the one check covers both.
+    if n_glue > 0 || pending_glue.is_some() {
         candle::bail!(
             "qwen35 wave: {n_glue} glue rows — reprojection glue is not implemented at \
              head_dim {}; this stack must recompute rather than gap-fill",
@@ -830,12 +838,52 @@ fn sweep_layers(
         );
     }
 
-    let offsets: Vec<usize> = contexts.iter().map(|c| c.offset).collect();
-    let q_lens: Vec<usize> = contexts.iter().map(|c| c.input_len).collect();
+    // Offsets + query lengths from the session, BEFORE the contexts borrow it.
+    let offsets: Vec<usize> = seq_ids
+        .iter()
+        .map(|&s| session.sequence_offset(s).unwrap_or(0))
+        .collect();
+    let q_lens: Vec<usize> = inputs
+        .iter()
+        .map(|t| t.dims().get(1).copied().unwrap_or(1))
+        .collect();
     let (dec_off, pre_off) = offsets.split_at(n_decode);
     let (dec_q, pre_q) = q_lens.split_at(n_decode);
     let pre_rows: usize = pre_q.iter().sum();
     let total_rows = n_decode + pre_rows;
+
+    // Attention metadata, from the session's shared borrow — the hybrid's arena
+    // state does not move before the layer loop reads it, so building here
+    // matches the order the wave driver used when it built these.
+    //
+    // Spanned because it is the widest-scaling piece of the sweep's setup: one
+    // slot header per decode sequence, so it is ~1 ms at a handful of slots and
+    // ~20 ms at 128.
+    let g_meta = crate::models::profile::gpu_span("fwd:meta", model.device());
+    #[cfg(feature = "cuda")]
+    let decode_headers = if n_decode > 0 {
+        let (buf, stride) = session.build_decode_metadata(&seq_ids[..n_decode], generation)?;
+        DecodeHeaders::Decode { buf, stride }
+    } else {
+        DecodeHeaders::Decode {
+            buf: None,
+            stride: 0,
+        }
+    };
+    #[cfg(not(feature = "cuda"))]
+    let decode_headers = DecodeHeaders::Decode {
+        buf: None,
+        stride: 0,
+    };
+    let prefill_headers = DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(
+        pre_off,
+        pre_q,
+        model.device(),
+    )?);
+    g_meta.end();
+
+    let mut contexts = assemble_wave_contexts(session, seq_ids, inputs)?;
+    let contexts = contexts.as_mut_slice();
 
     // The wave's declared width — carried, not re-derived. See
     // `WaveGroups::act_dtype`. The embedding emits this and every kernel after
@@ -889,6 +937,7 @@ fn sweep_layers(
 
     // Combined residual: embed every row flat `[1, total, hidden]`, or resume a
     // paused wave from its persisted stream.
+    let g_embed = crate::models::profile::gpu_span("fwd:embed", dev);
     let mut x = match x_in {
         Some(resume) => resume,
         None => {
@@ -897,6 +946,7 @@ fn sweep_layers(
             TensorCat::from_cat_tensor(embed_rows(q, &packed.to_tensor(), embed_dtype)?, 0)?
         }
     };
+    g_embed.end();
 
     // The interleaved `(cos, sin)` table the paged kernels index by position.
     // Partial rotary, so it is the model's own table — `compute_rope_cs` would
@@ -991,8 +1041,13 @@ fn sweep_layers(
     // 68 KB + 40 KB per forward is not worth that. Left as a driver allocation
     // until the head guard's lifetime is pinned down; `wave_from_vec` takes the
     // generation, so the fix is passing one rather than rewriting this.
+    // Spanned for the same reason as `fwd:meta`: one table entry per DeltaNet
+    // layer per decode sequence, so it is the other setup cost that grows with
+    // the cohort rather than with the model.
+    let g_dntab = crate::models::profile::gpu_span("fwd:dntab", dev);
     #[cfg(feature = "cuda")]
     let dn_table = crate::models::delta_net::cuda::build_wave_table(&spans, stores, None)?;
+    g_dntab.end();
 
     // Spans a speculative verify will have to rewind stash each DeltaNet
     // layer's recurrence operands as the sweep passes through it — every
@@ -1061,6 +1116,14 @@ fn sweep_layers(
         // The wave arrives at `li`: join its transfer if one is in flight, and
         // hold the handle for as long as its compute is being issued. On a
         // resident store this is an `Arc` bump.
+        // Stream-elapsed for the WHOLE layer, so it can be compared against the
+        // sum of the `dn:*` / `decode:*` sub-spans inside it. Those cover the
+        // projections, the mixer and the attention kernel but nothing between
+        // them, and at width the forward's stream time is ~5.6× their sum — this
+        // span says whether the difference sits inside layers (unspanned norms,
+        // residuals, quantize/convert kernels) or between them (a starved stream
+        // waiting on host-side per-layer work).
+        let g_layer = crate::models::profile::gpu_span("fwd:layer", dev);
         let layer = q.layers.ensure(li)?;
         // This layer's adapter pairs, or all-`None` when the wave is unadapted
         // or the adapter does not reach this layer. Seven hash lookups per
@@ -1089,6 +1152,9 @@ fn sweep_layers(
                         params: &dec_params,
                         rows: n_decode,
                         decode_layout: true,
+                        // Dense attention: the block-sparse selection belongs
+                        // to Qwen3.8-Flash-Next's indexer, not this lineage.
+                        qsa: None,
                     });
                 }
                 if n_prefill > 0 {
@@ -1098,6 +1164,7 @@ fn sweep_layers(
                         params: &pre_params,
                         rows: pre_rows,
                         decode_layout: false,
+                        qsa: None,
                     });
                 }
                 let layer = Qwen35AttentionLayer {
@@ -1244,6 +1311,7 @@ fn sweep_layers(
         // but the prefetch may evict the slot `layer` borrows — so releasing it
         // first would end the borrow the assert path is still inside.
         q.layers.prefetch()?;
+        g_layer.end();
     }
 
     // File the stash back, whether this sweep was whole or one window of a
@@ -1333,6 +1401,7 @@ fn sweep_layers(
     if idx.is_empty() {
         return Ok((WavePhase::Residual(x), None));
     }
+    let g_head = crate::models::profile::gpu_span("fwd:head", dev);
     let pre_norm = {
         let n_sel = idx.len();
         let sel = Tensor::from_vec(idx, n_sel, x_flat.device())?;
@@ -1366,6 +1435,7 @@ fn sweep_layers(
             q.lm_head.forward(&q.final_norm.forward(&pre_norm)?)?
         }
     };
+    g_head.end();
 
     Ok((
         WavePhase::Logits(TensorCat::from_cat_tensor(logits, 0)?),

@@ -8,8 +8,15 @@
 // (grouped GEMM), and the token-major segment tables (deterministic scatter) —
 // entirely on the device.
 //
-// The kernel is a SINGLE thread block of BUCKETIZE_THREADS (256) threads. Every
-// output is bit-deterministic:
+// The kernel is a SINGLE thread block of BUCKETIZE_THREADS (256) threads, and
+// serves up to MAX_EXPERTS (512) experts — MORE experts than it has threads, so
+// every per-expert phase is a grid-stride loop rather than one-thread-per-expert.
+// That distinction is the whole of what raising the bound cost: at 256 the two
+// forms coincide, and at 512 the one-thread-per-expert form would have left the
+// upper half of the experts with no offsets, no scatter bases and no tiles —
+// silently, because their assignments would simply land at stale positions.
+//
+// Every output is bit-deterministic:
 //   * phase 1 — a grid-stride per-expert histogram: each assignment is read
 //     ONCE and bumped into its expert's shared bin with an atomicAdd (an id
 //     ≥ n_experts is the router's "no expert" sentinel and is skipped). The
@@ -46,11 +53,16 @@
 
 #include <stdint.h>
 
-// 256 threads: phase 2/4 are one-thread-per-expert (up to 256 routed experts;
-// Qwen3-MoE has 128), phase 1/4b/5 are grid-stride, and phase 3 is one-thread-
-// per-chunk. All scale with the block width.
+// 256 threads; every per-expert phase strides over `n_experts`, so the expert
+// count is independent of the block width. Phase 3 is one-thread-per-chunk.
+//
+// MAX_EXPERTS 512 is Qwen3.8-Flash-Next's width (Qwen3-MoE has 128, Qwen3.5 has
+// 256). The static shared-memory cost is `sh_cc` (32 KB, fixed) plus three
+// int32 arrays over the expert axis — 512·4·3 ≈ 6 KB — plus ~1 KB of scan and
+// header, ≈ 39 KB against the 48 KiB static cap. Raising the bound again means
+// dynamic shared memory, not a constant change.
 #define BUCKETIZE_THREADS 256
-#define MAX_EXPERTS 256
+#define MAX_EXPERTS 512
 #define MAX_TOPK 32
 #define INVALID_ROW 0xFFFFFFFFu
 // Phase-3 chunk-table budget (ints). NCHUNK = SH_CC_INTS / n_experts chunks.
@@ -106,9 +118,8 @@ extern "C" __global__ void moe_bucketize_kernel(
         }
     }
     __syncthreads();
-    const int my_count = (tid < n_experts) ? sh_counts[tid] : 0;
 
-    // ── Phase 2: offsets + tile prefix + header (thread 0, ≤128 iterations) ──
+    // ── Phase 2: offsets + tile prefix + header (thread 0) ──
     if (tid == 0) {
         int32_t off = 0;
         int32_t tiles = 0;
@@ -168,11 +179,12 @@ extern "C" __global__ void moe_bucketize_kernel(
     }
     __syncthreads();
     // Per-expert exclusive prefix across chunks: sh_cc[c][e] becomes chunk c's
-    // write base for expert e. Thread e owns expert e, sweeps the NCHUNK counts.
-    if (tid < n_experts) {
-        int32_t run = sh_offsets[tid];
+    // write base for expert e. A thread owns an expert and sweeps the NCHUNK
+    // counts; with more experts than threads it takes several, striding.
+    for (int e = tid; e < n_experts; e += BUCKETIZE_THREADS) {
+        int32_t run = sh_offsets[e];
         for (int c = 0; c < NCHUNK; c++) {
-            const int idx = c * n_experts + tid;
+            const int idx = c * n_experts + e;
             const int32_t v = sh_cc[idx];
             sh_cc[idx] = run;
             run += v;
@@ -197,14 +209,18 @@ extern "C" __global__ void moe_bucketize_kernel(
     __syncthreads();
 
     // ── Phase 4: tile tables + padding ──
-    if (tid < n_experts && my_count > 0) {
-        const int32_t base = sh_tile_pref[tid];
-        const int32_t start = sh_offsets[tid];
-        const int32_t n_my_tiles = (my_count + tile_w - 1) / tile_w;
+    for (int e = tid; e < n_experts; e += BUCKETIZE_THREADS) {
+        const int32_t count = sh_counts[e];
+        if (count <= 0) {
+            continue;
+        }
+        const int32_t base = sh_tile_pref[e];
+        const int32_t start = sh_offsets[e];
+        const int32_t n_my_tiles = (count + tile_w - 1) / tile_w;
         for (int t = 0; t < n_my_tiles; t++) {
-            tile_expert[base + t] = tid;
+            tile_expert[base + t] = e;
             tile_b_start[base + t] = start + t * tile_w;
-            const int32_t rem = my_count - t * tile_w;
+            const int32_t rem = count - t * tile_w;
             tile_b_cnt[base + t] = rem < tile_w ? rem : tile_w;
         }
     }

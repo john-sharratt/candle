@@ -1,5 +1,5 @@
 //! KV tier-migration primitive — the Rust side of the `kv_pack` /
-//! `kv_unpack` scatter/gather kernel (`docs/kv_tier_migration.md` §9).
+//! `kv_unpack` scatter/gather kernel (`docs/archived/kv_tier_migration.md` §9).
 //!
 //! A migration plan is a flat list of `(src, dst, byte_len)` records, each
 //! carrying device addresses the caller has already resolved. [`kv_migrate`]
@@ -286,7 +286,7 @@ pub fn kv_migrate_on(
     Ok(())
 }
 
-/// Host-side migration plan-builder (`docs/kv_tier_migration.md` §8).
+/// Host-side migration plan-builder (`docs/archived/kv_tier_migration.md` §8).
 #[cfg(feature = "cuda")]
 impl super::ChunkedKvBacking {
     /// Resolve every unique physical sub-chunk of a sealed sequence to its

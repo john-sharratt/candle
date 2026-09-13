@@ -123,6 +123,15 @@
   .zmd .zdots i { width: 7px; height: 7px; border-radius: 50%; background: #5a5652; display: inline-block; animation: zdot 1.3s ease-in-out infinite; }
   .zmd .zdots i:nth-child(2) { animation-delay: .22s; } .zmd .zdots i:nth-child(3) { animation-delay: .44s; }
   .zmd .zstatus { font-size: .82rem; color: #5a5652; font-style: italic; margin-left: .75rem; }
+  /* A failed turn. Deliberately not styled as a token of the answer: it reads
+     as a notice about the turn, so a partial answer above it stays legible as
+     the model's words rather than blending into the failure. */
+  .zmd .zerr {
+    margin-top: .6rem; padding: .55rem .7rem; border-radius: 6px;
+    border: 1px solid #d8a7a0; border-left: 3px solid #b4483a;
+    background: #fbf1ef; color: #7d2f24; font-size: .88rem; line-height: 1.45;
+  }
+  .zmd .zerr b { color: #9a3729; }
   /* Selectable regions: chat content + file viewer opt back into text
      selection (the global mousedown-preventDefault suppresses it on chrome). */
   .z-selectable, .z-selectable * { -webkit-user-select: text; user-select: text; }
@@ -638,6 +647,13 @@ import { estateSwitcher } from './common/lib/estate.js';
     return html;
   }
   function nodeHtml(msg, open, toolOutputs) {
+    // A turn that failed says so, in the bubble, whether or not it produced any
+    // text first. Without this a failed turn renders as an empty assistant
+    // message — indistinguishable from the model having nothing to say.
+    if (msg.error) {
+      const body = msg.content ? renderContent(msg.content, false, open, toolOutputs || msg.toolOutputs, null) : '';
+      return body + '<div class="zerr" role="alert"><b>Generation failed.</b> ' + esc(msg.error) + '</div>';
+    }
     if (msg.streaming && !msg.content) {
       // Bouncing dots while waiting; the italic word only appears if the daemon
       // emits a status event (e.g. "retrieving context").
@@ -890,6 +906,10 @@ import { estateSwitcher } from './common/lib/estate.js';
   }
   function startStream(convId, userText) {
     if (stream) stream.cancel();
+    // Set by `onError`, read by `onDone`: a failed turn has nothing persisted to
+    // hydrate from, and hydrating would replace the error bubble with an empty
+    // conversation — putting us back to a blank failure.
+    let failed = false;
     const conv = S.conversations.find((c) => c.id === convId);
     const opts = { think: S.effortLevel !== 0, effort: S.effortLevel, verbosity: S.verbosityLevel, tools: ['none', 'restricted', 'comprehensive'][S.toolsLevel] };
     stream = API.streamChatCompletion(conv, userText, opts, {
@@ -908,10 +928,19 @@ import { estateSwitcher } from './common/lib/estate.js';
         }
       }),
       onLog: () => addLog(API.nextLogLine()),
+      // The stream failed rather than finished. Record it on the message so the
+      // bubble renders the reason, and log it — a silent failure here was the
+      // whole reason a wedged turn looked like an empty answer.
+      onError: (msg) => {
+        failed = true;
+        patchStream(convId, (m) => { m.error = msg; m.status = ''; });
+        addLog(API.mkLog('ERROR', 'zend::http', 'POST /v1/chat/completions conv_id=' + convId + ' stream=failed: ' + msg));
+      },
       onDone: () => {
         patchStream(convId, (m) => { m.streaming = false; });
         S.conversations = S.conversations.map((c) => c.id === convId ? Object.assign({}, c, { streaming: false }) : c);
         render();
+        if (failed) return;
         // Reconcile the live single-bubble stream to the persisted per-turn
         // structure (real turns + full projection timeline). The daemon commits
         // every turn's events before sending Done, so the fetch sees them.
@@ -2411,11 +2440,27 @@ import { estateSwitcher } from './common/lib/estate.js';
     // thinking with no K/V: the spine-materialized prefix/suffix, a dropped
     // reasoning block) dimmed + italic so "recorded but not in this turn's K/V"
     // is visible at a glance.
-    const segMarker = (m) => ({
-      system_start: G && G.system_start, user_start: G && G.user_start,
-      assistant_start: G && G.assistant_start, im_end: G && (G.user_end || G.assistant_end),
-      no_think: G && G.no_think,
-    }[m] || ('<' + m + '>'));
+    // A marker the DIALECT leaves empty is not an unknown marker. `no_think` is
+    // empty on every Qwen3.5/3.8 checkpoint — that family suppresses thinking
+    // with the already-closed `<think></think>` block (`no_think_block`), and
+    // `Glue`'s contract is that exactly one of the two is non-empty — so `||`
+    // fell through to the placeholder and drew a `<no_think>` row for a marker
+    // that is not in the prompt at all. The turn's sealed tokens go straight
+    // from `<|im_start|>user\n` into the body; nothing was being injected, but
+    // the panel said otherwise about the one thing it exists to show verbatim.
+    //
+    // So: present-but-empty resolves to '' (the caller drops the row), and the
+    // `<name>` placeholder is kept for a marker name we genuinely do not know,
+    // which is a real signal worth seeing.
+    const segMarker = (m) => {
+      const t = {
+        system_start: (G && G.system_start) || '', user_start: (G && G.user_start) || '',
+        assistant_start: (G && G.assistant_start) || '',
+        im_end: (G && (G.user_end || G.assistant_end)) || '',
+        no_think: (G && G.no_think) || '',
+      };
+      return m in t ? t[m] : '<' + m + '>';
+    };
     // The turn's segment vector, rendered the SAME way the system prompt is:
     // boundary glue as flat `⟐` rows (so it reads identically to the system
     // framing) interleaved with the content blocks — user (purple), thinking
@@ -2428,7 +2473,11 @@ import { estateSwitcher } from './common/lib/estate.js';
       segs.forEach((s) => {
         const ethereal = s.kv == null;
         if (s.kind === 'glue') {
-          const r = glueRow(segMarker(s.marker));
+          const marker = segMarker(s.marker);
+          // Empty on this dialect ⇒ the assembler emitted nothing, so neither
+          // does the panel. See `segMarker`.
+          if (!marker) return;
+          const r = glueRow(marker);
           // Ethereal glue (the turn's opener/closer, materialized by the spine)
           // stays legible — italic marks it as "not in this turn's own grid"
           // without washing the text out.

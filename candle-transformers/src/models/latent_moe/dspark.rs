@@ -18,7 +18,7 @@
 //! This module lands the parts that are self-contained and exactly testable: the config,
 //! the weight loader, and the pure Markov-bias / confidence math (paper Eqs. 5 and 7).
 //! The backbone forward with target-KV injection and the draft/verify loop are the
-//! GPU-coupled integration built on top — see `docs/deepseek_v4_speculative_decode.md`.
+//! GPU-coupled integration built on top — see `docs/deepseek/deepseek_v4_speculative_decode.md`.
 
 use candle::{DType, Result, Tensor};
 use candle_nn::ops::softmax_last_dim;

@@ -28,6 +28,7 @@ pub mod refresh_ctx;
 pub mod repo_scan;
 pub mod response_section;
 pub mod session;
+pub mod think_gate;
 pub mod tool_def;
 pub mod tool_summary;
 pub mod tools;

@@ -22,15 +22,23 @@
 // with lane_mask (lanes < me) and summing across all jj.
 // Part (b) is a lane-local palette comparison, no warp ops needed.
 //
-// Cost: 8 ballots, VEC*N_PALETTE=16 popcs, ~10 regs.  Zero divergence.
-// operator[](j) is a single register read.
+// Cost: 8 ballots, VEC*N_PALETTE=16 popcs.  Zero divergence.
 //
-// For HD=128 VEC=4: max idx = 3*32+31 = 127, fits in uint8_t.
+// The VEC offsets are held PACKED, four bytes to a 32-bit word, so an iterator
+// costs ceil(VEC/4) registers rather than VEC: a `uint8_t scatter[VEC]` is
+// promoted to one 32-bit register per element by the compiler, and at VEC=8
+// (HD=256) a K and a V iterator together were 16 registers of live state
+// across the whole token walk — a quarter of a 64-register budget. operator[]
+// with a constant `j` (the callers are fully unrolled) is one byte extract.
+//
+// Every offset is < HEAD_DIM ≤ 256, so a byte holds it.
 // ============================================================================
 template <int VEC, int HEAD_DIM>
 struct PalIter {
     static constexpr int SUB = HEAD_DIM / N_PALETTE;
-    uint8_t scatter[VEC];
+    static_assert(HEAD_DIM <= 256, "PalIter packs offsets as bytes");
+    static constexpr int WORDS = (VEC + 3) / 4;
+    uint32_t packed[WORDS];
 
     __device__ __forceinline__ void init(const uint8_t* pal_map, int lane) {
         // pal_map stores 2-bit palette IDs packed 4 per byte, in ascending dim
@@ -72,6 +80,8 @@ struct PalIter {
         // lane-local self-contribution (# of earlier own slots with
         // same palette), then combine with cross[p].
         #pragma unroll
+        for (int w = 0; w < WORDS; w++) packed[w] = 0u;
+        #pragma unroll
         for (int j = 0; j < VEC; j++) {
             int p = pal_of(start_dim + j);
             int local = 0;
@@ -79,11 +89,12 @@ struct PalIter {
             for (int jj = 0; jj < j; jj++) {
                 local += (pal_of(start_dim + jj) == p) ? 1 : 0;
             }
-            scatter[j] = (uint8_t)(p * SUB + cross[p] + local);
+            const uint32_t off = (uint32_t)(p * SUB + cross[p] + local) & 0xFFu;
+            packed[j >> 2] |= off << ((j & 3) * 8);
         }
     }
 
     __device__ __forceinline__ int operator[](int j) const {
-        return scatter[j];
+        return (int)((packed[j >> 2] >> ((j & 3) * 8)) & 0xFFu);
     }
 };

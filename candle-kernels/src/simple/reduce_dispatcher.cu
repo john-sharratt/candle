@@ -158,9 +158,10 @@ extern "C" __global__ void rmsnorm_bf16(const void*, void*, const void*, int, in
 extern "C" __global__ void rmsnorm_f8_e4m3(const void*, void*, const void*, int, int, float);
 
 // Fused RMSNorm → q8a128 (producer epilogue). `out` is the flat-grouped q8a1024 buffer.
-extern "C" __global__ void rmsnorm_q8a128_f32(const void*, void*, const void*, int, int, float);
-extern "C" __global__ void rmsnorm_q8a128_f16(const void*, void*, const void*, int, int, float);
-extern "C" __global__ void rmsnorm_q8a128_bf16(const void*, void*, const void*, int, int, float);
+// Trailing `int` is `sum_norm` — the q8a128 Σx convention (`SumScale::as_code()`).
+extern "C" __global__ void rmsnorm_q8a128_f32(const void*, void*, const void*, int, int, float, int);
+extern "C" __global__ void rmsnorm_q8a128_f16(const void*, void*, const void*, int, int, float, int);
+extern "C" __global__ void rmsnorm_q8a128_bf16(const void*, void*, const void*, int, int, float, int);
 
 // =============================================================================
 // LAYERNORM kernels
@@ -334,7 +335,8 @@ extern "C" void run_rmsnorm_q8a128_op(
     const void* alpha,
     int n_rows,
     int n_cols,
-    float eps
+    float eps,
+    int sum_norm   // q8a128 Σx convention (`SumScale::as_code()`)
 ) {
     int cap = n_cols < 1024 ? n_cols : 1024;
     int block_size = 32;
@@ -345,13 +347,13 @@ extern "C" void run_rmsnorm_q8a128_op(
 
     switch (dtype) {
         case 0: // F32
-            rmsnorm_q8a128_f32<<<grid, block, shared_mem_size>>>((const float*)src, out, (const float*)alpha, n_cols, block_size, eps);
+            rmsnorm_q8a128_f32<<<grid, block, shared_mem_size>>>((const float*)src, out, (const float*)alpha, n_cols, block_size, eps, sum_norm);
             break;
         case 2: // F16
-            rmsnorm_q8a128_f16<<<grid, block, shared_mem_size>>>((const __half*)src, out, (const __half*)alpha, n_cols, block_size, eps);
+            rmsnorm_q8a128_f16<<<grid, block, shared_mem_size>>>((const __half*)src, out, (const __half*)alpha, n_cols, block_size, eps, sum_norm);
             break;
         case 3: // BF16
-            rmsnorm_q8a128_bf16<<<grid, block, shared_mem_size>>>((const __nv_bfloat16*)src, out, (const __nv_bfloat16*)alpha, n_cols, block_size, eps);
+            rmsnorm_q8a128_bf16<<<grid, block, shared_mem_size>>>((const __nv_bfloat16*)src, out, (const __nv_bfloat16*)alpha, n_cols, block_size, eps, sum_norm);
             break;
     }
 }

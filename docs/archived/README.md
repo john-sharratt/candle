@@ -56,7 +56,7 @@ code no longer has.
 |---|---|
 | `coding_assistant_conversation.md` | A flattened ChatML trunk simulating the Zen Code phased-ingestion pipeline as one linear conversation, for trunk-conversation experimentation. |
 | `cognitive_architecture.md` | "The Three-Part Mind" — an NPC cognitive architecture split into Sleep, Daydreaming, and Reasoning processes over a static Beliefs substrate; precursor to `docs/npc_mind_design.md`. |
-| `infinite_conversations.md` | v1 design for unbounded conversation history via a self-balancing AVL summary tree with a `dirty`-bit regeneration sweep. §7's tree structure is superseded by `docs/immutable_summary_forest.md`. |
+| `infinite_conversations.md` | v1 design for unbounded conversation history via a self-balancing AVL summary tree with a `dirty`-bit regeneration sweep. §7's tree structure is superseded by `docs/archived/immutable_summary_forest.md`. |
 | `summarization_design.md` | Early wiring plan for the `ConversationTree` summarization trigger, before the inference path for `run_summarize()` was implemented. |
 | `time_division_memory_tree.md` | v2 fixed-budget summary tree for unbounded NPC life recall, with per-level compression ratios (structural routing → era → period → leaf detail). |
 | `tree_gen_design.md` | Design for `tree_gen`, the guide-pipeline life-timeline generator that plans scaffolding before narrating to the character; see the shipped example at `candle-conversation/examples/tree_gen.rs`. |

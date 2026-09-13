@@ -1,5 +1,5 @@
 //! Deterministic construction of `mode: structural` summary nodes
-//! (`docs/immutable_summary_forest.md`, the structural pipeline).
+//! (`docs/archived/immutable_summary_forest.md`, the structural pipeline).
 //!
 //! For directory-tree content (the `repo_map` layer), the structure is fully
 //! determined by the input — the model is never needed, at any tree level.

@@ -20,12 +20,13 @@ use candle::{LiveTensor, Result, Tensor};
 // of their own.
 use crate::models::profile::gpu_span;
 use crate::models::quantized_matmul::QMatMul;
+use crate::models::stacked_proj::project_grouped;
 
 use super::mix::{
     delta_net_mix_spans, DeltaNetConstants, DeltaNetLayerTable, DeltaNetProjections, DeltaNetSeq,
     DeltaNetState,
 };
-use super::types::DeltaNetDims;
+use super::types::{DeltaNetDims, ZGate};
 
 /// A DeltaNet layer's production weights.
 ///
@@ -34,14 +35,21 @@ use super::types::DeltaNetDims;
 /// because the recurrence accumulates and must not drift (the checkpoints
 /// themselves declare `mamba_ssm_dtype: float32`).
 pub struct QuantDeltaNetWeights {
-    /// `[conv_dim, hidden]` fused `[Q|K|V]`.
-    pub wqkv: QMatMul,
-    /// `[value_dim, hidden]` output gate.
-    pub wz: QMatMul,
-    /// `[n_v_heads, hidden]`.
-    pub w_beta: QMatMul,
-    /// `[n_v_heads, hidden]`.
-    pub w_alpha: QMatMul,
+    /// The input projections — `[Q|K|V]`, `z`, `β`, `α` in that order —
+    /// covering `conv_dim + value_dim + 2·n_v_heads` rows between them.
+    ///
+    /// All four contract the same activation over `hidden`, so a loader that can
+    /// row-concatenate their weights hands over **one** and the layer issues one
+    /// GEMM where it issued four.
+    ///
+    /// A list rather than one weight because stacking is a byte append over the
+    /// GGUF block layout and so must precede the KO repack, which a loader
+    /// applying a *per-tensor* narrowing schedule cannot do for tensors it
+    /// narrows differently. qwen4exp stacks all four; qwen35's streaming loader
+    /// keeps them apart because its schedule narrows `attn_qkv` alone and a
+    /// stacked weight takes one target. `stacked_proj::project_grouped` walks
+    /// the same code for either and the unstacked case pays nothing.
+    pub proj: Vec<QMatMul>,
     /// `[hidden, value_dim]`.
     pub w_out: QMatMul,
     /// F32 constants — see the struct note on why these are not quantized.
@@ -62,6 +70,7 @@ pub fn quantized_delta_net_layer_forward<'w>(
     dims: &DeltaNetDims,
     state: &mut DeltaNetState,
     rms_eps: f64,
+    zgate: ZGate,
 ) -> Result<LiveTensor<'w>> {
     let t = x.dim(0)?;
     // One carried state, as in the float single-span path: `s` is read and
@@ -75,7 +84,8 @@ pub fn quantized_delta_net_layer_forward<'w>(
         out,
         stash: None,
     }];
-    let mixed = quantized_delta_net_layer_forward_spans(x, w, dims, &mut one, rms_eps, None)?;
+    let mixed =
+        quantized_delta_net_layer_forward_spans(x, w, dims, &mut one, rms_eps, None, zgate)?;
     let [seq] = one;
     seq.state.absorb_solo(&seq.out)?;
     Ok(mixed)
@@ -113,6 +123,7 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
     seqs: &mut [DeltaNetSeq<'_>],
     rms_eps: f64,
     table: Option<&DeltaNetLayerTable>,
+    zgate: ZGate,
 ) -> Result<LiveTensor<'w>> {
     let act = x.dtype();
     // `forward_live`, not `Module::forward`: the input is the layer's own
@@ -126,11 +137,24 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
     // per projection (four launches per DeltaNet layer, the single largest
     // source of `cast_f16_f32` in a prefill sweep) to recover a number the F32
     // accumulator had already computed and thrown away on the store.
+    //
+    // One GEMM launch per stacked group, then ONE ragged scatter for the split —
+    // a single arena bump for every part, no per-part copy, no memset.
+    let hv = dims.n_v_heads;
+    let widths = [dims.conv_dim(), dims.value_dim(), hv, hv];
+    let mut take = project_grouped(
+        x,
+        &w.proj,
+        &widths,
+        candle::DType::F32,
+        "delta-net input projections",
+    )?
+    .into_iter();
     let p = DeltaNetProjections {
-        qkv: w.wqkv.forward_live_as(x, candle::DType::F32)?,
-        z: w.wz.forward_live_as(x, candle::DType::F32)?,
-        beta_lin: w.w_beta.forward_live_as(x, candle::DType::F32)?,
-        alpha_lin: w.w_alpha.forward_live_as(x, candle::DType::F32)?,
+        qkv: take.next().expect("four parts requested"),
+        z: take.next().expect("four parts requested"),
+        beta_lin: take.next().expect("four parts requested"),
+        alpha_lin: take.next().expect("four parts requested"),
     };
     g_proj.end();
     // A span that will have to rewind keeps this layer's operands, copied out
@@ -148,7 +172,7 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
         norm: &w.norm,
     };
     let g_mix = gpu_span("dn:mix", x.device());
-    let gated = delta_net_mix_spans(&p, &c, dims, seqs, rms_eps, table)?;
+    let gated = delta_net_mix_spans(&p, &c, dims, seqs, rms_eps, table, zgate)?;
     g_mix.end();
 
     let g_out = gpu_span("dn:out_proj", x.device());
@@ -243,10 +267,12 @@ mod tests {
 
         // Same numbers on both sides; only the projection kernel differs.
         let reference = DeltaNetWeights {
-            wqkv: qw.wqkv.dequantize()?,
-            wz: qw.wz.dequantize()?,
-            w_beta: qw.w_beta.dequantize()?,
-            w_alpha: qw.w_alpha.dequantize()?,
+            // The group in canonical order — this lineage's loader does not
+            // stack, so the four entries are the four projections.
+            wqkv: qw.proj[0].dequantize()?,
+            wz: qw.proj[1].dequantize()?,
+            w_beta: qw.proj[2].dequantize()?,
+            w_alpha: qw.proj[3].dequantize()?,
             w_out: qw.w_out.dequantize()?,
             dt_bias: qw.dt_bias.clone(),
             a: qw.a.clone(),
@@ -261,9 +287,9 @@ mod tests {
         let eps = model.cfg.rms_norm_eps;
 
         let mut s_prod = DeltaNetState::zeros(&dims, &device)?;
-        let got = quantized_delta_net_layer_forward(&x, qw, &dims, &mut s_prod, eps)?;
+        let got = quantized_delta_net_layer_forward(&x, qw, &dims, &mut s_prod, eps, ZGate::Silu)?;
         let mut s_ref = DeltaNetState::zeros(&dims, &device)?;
-        let want = delta_net_layer_forward(&x, &reference, &dims, &mut s_ref, eps)?;
+        let want = delta_net_layer_forward(&x, &reference, &dims, &mut s_ref, eps, ZGate::Silu)?;
 
         let rel = |a: &Tensor, b: &Tensor| -> Result<f32> {
             let diff = a.sub(b)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;

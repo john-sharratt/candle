@@ -21,7 +21,7 @@ use candle::{Result, Tensor};
 use super::attention::{attention_layer_forward, AttentionState, AttentionWeights, RopeTables};
 use super::config::{LayerKind, Qwen35Config};
 use super::moe::{FfnWeights, MoeWeights};
-use crate::models::delta_net::{delta_net_layer_forward, DeltaNetState, DeltaNetWeights};
+use crate::models::delta_net::{delta_net_layer_forward, DeltaNetState, DeltaNetWeights, ZGate};
 
 /// The token-mixing half of a layer.
 #[derive(Debug, Clone)]
@@ -144,7 +144,7 @@ impl Qwen35Model {
                     // Written into, so there is nothing to take out and put
                     // back — the swap-with-zeros this replaced existed only to
                     // move a value the layer never needed to own.
-                    delta_net_layer_forward(&h, w, &self.cfg.delta_net, s, eps)?
+                    delta_net_layer_forward(&h, w, &self.cfg.delta_net, s, eps, ZGate::Silu)?
                 }
                 (LayerMix::Attention(w), LayerState::Attention(s)) => {
                     let taken = std::mem::replace(s, AttentionState::empty());

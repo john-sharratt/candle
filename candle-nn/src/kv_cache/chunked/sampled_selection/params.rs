@@ -11,6 +11,42 @@ pub const DEFAULT_REPORT_ARENA_CHUNKS: usize = 8192;
 /// Smaller arena span used by the calibration sweep over the sampled subset.
 pub const DEFAULT_CALIBRATION_ARENA_CHUNKS: usize = 2048;
 
+/// **Q0_V is load-bearing at C6, C8, C9 and C10. Do not remove it — that was
+/// tried, and it costs output validation on three models.**
+///
+/// It is by far the most expensive format here to decode, which is what invites
+/// the removal. The whole 32-element block is a two-byte header naming a curve,
+/// a scale and a centroid in `__constant__` tables, and constant memory
+/// broadcasts only when a warp reads ONE address; every lane in the decode
+/// kernel is on a different dim, so a different block, so a different curve row,
+/// and each of the three lookups per element serialises across the warp.
+/// Measured on the decode A/B harness at head_dim 256, 8 slots, 2048 tokens
+/// (`decode_ab bench --formats c10`): **332.9 µs against 45.3 µs for BF16 —
+/// 7.35×**, where every other candidate at this level sits between 1.26× and
+/// 1.71×.
+///
+/// **That cost is real and it is still not a reason to drop the format.**
+/// Removing it from these four levels leaves the compression ratio identical —
+/// 7.10× on Qwen3.5-35B, unchanged — because those blocks fall back to Q0_X,
+/// which is also two bytes. What changes is the reconstruction: Q0_X carries no
+/// curve, so a block Q0_V fitted well can fit it badly. Measured on the
+/// batched-forward gates, same build, this list the only difference:
+///
+/// | | Q0_V removed | Q0_V present |
+/// |---|---|---|
+/// | Qwen3.5-35B-A3B, C10 x32 / x64 | 31/32, 63/64 sessions | **pass** |
+/// | Qwen3.8-Flash-Next, C10 x8 | 7/8 sessions | **pass** |
+/// | Qwen3.6-35B-A3B, C10 x64 | 60/64 sessions | 61/64, its own standing level |
+///
+/// Reproducible — the failures were identical across two runs each way.
+///
+/// One trap worth naming, since it is what made the removal look safe. A
+/// uniform-format bench cannot say whether a format matters to an *adaptive*
+/// cache, and `decode_ab`'s fixture is **synthetic** K/V whose statistics need
+/// not match a model's. On that fixture an adaptive C10 cache measured 73.6 µs
+/// with Q0_V against 73.2 µs without — no difference, which reads as "the
+/// selector never picks it". On real KV it plainly does. Any future case for
+/// changing this list has to come from the model gates, not the harness.
 #[rustfmt::skip]
 pub const PRODUCTION_K_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
     [
@@ -476,20 +512,35 @@ pub const QWEN35_0_8B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFact
 /// compression. A hi-tight/low-loose redistribution at the same geometric
 /// means measured strictly worse than the symmetric split.
 ///
-/// **Re-derived 2026-08-28, k 1.1 → 1.09**, after the dense weights moved into
-/// the device reservation. That change shifts wave widths and therefore
-/// accumulation order, which is exactly the drift the rows below warn about:
-/// C10×10 had gone red at k 1.1 with nothing else altered.
+/// **Re-derived 2026-09-10, k 1.09 → 1.07 and v 1.9 → 1.85**, after the wave
+/// admission and driver rework. Same cause as the re-derivation before it: wave
+/// widths move, accumulation order moves with them, and the top rung — which
+/// this row deliberately parks one notch under its break — goes red. C10×10 had
+/// fallen to 9/10 sessions with nothing else altered. Both axes were stepped
+/// together and the first step passed, so the new edges are **not** bracketed;
+/// the pair below is a passing point, not a measured boundary.
 ///
-/// Each axis was walked separately and both edges are now bracketed, so a
-/// future retune starts from measurements rather than a sweep:
+/// Cost of the step: C10×10 6.30× → 6.19×, about 1.7% of ratio.
 ///
-/// * **K edge 1.09 ✓ / 1.1 ✗** at v 1.9. The margin is one hundredth — this row
-///   sits as close to the break as the lineage target asks for, and is
-///   correspondingly fragile.
-/// * **V edge 1.9 ✓ / 2.0 ✗** at k 1.075. V is no longer the inert axis the
-///   earlier note claimed: it breaks the top rung one notch above its current
-///   value, so probe both axes here rather than K alone.
+/// The 2026-08-28 measurements, for whoever brackets this next — they were taken
+/// on the previous wave geometry, so treat them as the shape of the surface
+/// rather than as live numbers:
+///
+/// * **K edge 1.09 ✓ / 1.1 ✗** at v 1.9 — a margin of one hundredth.
+/// * **V edge 1.9 ✓ / 2.0 ✗** at k 1.075. V is not the inert axis an earlier
+///   note claimed: it broke the top rung one notch above its value, so probe
+///   both axes here rather than K alone.
+///
+/// **This row will drift again.** Twice now it has gone red on a change that
+/// touched neither quantization nor this model — only the width of a wave. A
+/// row tuned to sit one notch under the break cannot survive that, by
+/// construction; if the re-derivations become tiresome, the fix is to buy
+/// standing margin rather than to keep re-finding the edge.
+///
+/// Merge, 2026-09-12: this branch had 1.07/1.85; main re-derived to 0.95/1.65
+/// after restoring Q4_0/Q4_1 to the C10 candidates. Main's is the LOWER pair and
+/// is kept — a tighter error bound costs ratio, never quality — and its evidence
+/// below is the fuller of the two.
 ///
 /// C10×10 at 6.30×, identical across two confirmation runs.
 /// **Re-derived 2026-09-01, k 1.09 → 0.95 and v 1.9 → 1.65, after restoring
@@ -533,10 +584,30 @@ pub const QWEN35_0_8B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFact
 /// did not pass, so the comparison is against a gate that was red, not against
 /// working compression.
 pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 0.95,
-    k_low: 0.95,
-    v_hi: 1.65,
-    v_low: 1.65,
+    // Merge, 2026-09-12: the table above is main's, measured on main. This
+    // branch's row was 1.07/1.85, and the merge first took main's 0.95/1.65 on
+    // the reasoning that the lower pair is the tighter error bound and so the
+    // safe one. **Measured here, that is backwards:**
+    //
+    // | k    | v    | C10 ×10 | ratio |
+    // |------|------|---------|-------|
+    // | 0.95 | 1.65 | 9/10 ✗  | 5.48× |
+    // | 1.07 | 1.85 | 10/10 ✓ | 5.87× |
+    //
+    // Both runs deterministic, the 0.95 row twice. So this branch's pair passes
+    // AND compresses better, and the "lower cannot cost quality" reasoning is
+    // false — the ladder is not monotone in these factors, exactly as main's own
+    // MoE row records ((1.1, 2.35) passes while (1.15, 2.35) and (1.1, 2.43)
+    // both fail).
+    //
+    // Main's table is not wrong; it is a measurement of main. A calibration row
+    // belongs to the code it was derived against, and picking between two
+    // branches' rows by their VALUES rather than by re-measuring is how a merge
+    // ships a combination neither side ever ran.
+    k_hi: 1.07,
+    k_low: 1.07,
+    v_hi: 1.85,
+    v_low: 1.85,
 };
 
 /// Qwen3.5-35B-A3B (routed hybrid).
@@ -602,11 +673,20 @@ pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactor
 /// the other — so re-verify this row after a ladder change, exactly as after an
 /// admission or width change.
 ///
-/// **Re-derived 2026-08-28, K 1.2 → 1.1 and V 2.5 → 2.35**, after the dense
-/// weights moved into the device reservation — the width/accumulation drift
-/// this row has now been caught by three times. C10×64 had gone red.
+/// **Re-derived 2026-09-10, K 1.1 → 1.08 and V 2.35 → 2.30**, after the wave
+/// admission and driver rework — the width/accumulation drift this row has now
+/// been caught by four times. C10×64 had gone red at 63/64 sessions. Both axes
+/// were stepped together and the first step passed, so these are a passing
+/// point, not bracketed edges. Cost: C10 7.10× → 6.98×, about 1.7% of ratio,
+/// now 7.02/6.97/6.98/6.98× (×8/16/32/64).
 ///
-/// Both axes walked separately, both edges bracketed:
+/// **Four re-derivations, none of them provoked by a quantization or model
+/// change.** Every one followed a change to wave width. A row parked one notch
+/// under its break cannot survive that; buying standing margin would end the
+/// cycle more cheaply than continuing to re-find the edge.
+///
+/// The 2026-08-28 measurements, taken on the previous wave geometry — the shape
+/// of the surface rather than live numbers:
 ///
 /// * **K edge 1.1 ✓ / 1.15 ✗** at v 2.35.
 /// * **V edge 2.35 ✓ / 2.43 ✗** at k 1.1.
@@ -635,10 +715,36 @@ pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactor
 /// on the passing side — 0.08 on K and 0.13 on V — rather than creeping toward
 /// the break for the last 0.05× (see the 9B row for what edge-sitting costs).
 pub const QWEN35_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 1.17,
-    k_low: 1.17,
-    v_hi: 2.47,
-    v_low: 2.47,
+    // **Re-derived 2026-09-12 for the origin/main merge, k 1.08 → 1.00 and
+    // v 2.30 → 2.10.** This is the re-verification the caution above asks for
+    // after an admission change, and the merge is the largest one this row has
+    // seen: main restored Q4_0/Q4_1 to the shared C10 candidates.
+    //
+    // | k    | v    | C10 ×64 | ratio |
+    // |------|------|---------|-------|
+    // | 1.08 | 2.30 | 63/64 ✗ | 6.63× |  (this branch's pre-merge row)
+    // | 1.17 | 2.47 | 62/64 ✗ | 7.05× |  (main's, re-derived post-Q4)
+    // | 1.08 | 2.10 | 63/64 ✗ | 6.36× |  V alone — inert, as the note below says
+    // | 1.00 | 2.10 | 64/64 ✓ | 6.21× |
+    //
+    // Note the second row: main's pair reproduces main's reported 7.05× exactly,
+    // so the candidate list and the selection ARE behaving as main's do — the
+    // factors simply do not transfer, because the two branches' numerics differ.
+    // The third row is this model's documented V-limitation asserting itself the
+    // other way: only the JOINT move cleared ×64, exactly as the bracket above
+    // records. ×8/×16/×32 were green throughout, so a narrower rung would have
+    // called this fixed three probes early.
+    //
+    // **A lower factor is NOT automatically safe**, which is what this comment
+    // claimed when the merge first resolved it. The 9B row falsified that in the
+    // same session: main's *lower* 0.95/1.65 failed 9/10 where this branch's
+    // higher 1.07/1.85 passed 10/10 at a better ratio. The ladder is not
+    // monotone in these factors and "lower is the tighter bound, so it cannot
+    // cost quality" is not a substitute for running the gate.
+    k_hi: 1.00,
+    k_low: 1.00,
+    v_hi: 2.10,
+    v_low: 2.10,
 };
 
 /// Qwen3.6-35B-A3B (routed hybrid point release).
@@ -674,29 +780,54 @@ pub const QWEN35_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFacto
 /// The "probe K first on this model" advice above still holds, and this time it
 /// was enough on its own — unlike the 3.5, which needed both axes together.
 ///
-/// C10 at 6.67/6.65/6.65/6.65× (×8/16/32/64), identical across two
-/// confirmation runs.
-/// **Re-derived 2026-09-01, k 1.15 → 1.32 and v 2.0 → 2.29**, after the shared
-/// C10 candidate lists regained Q4_0/Q4_1 (see the 9B row). C10 had fallen
-/// 6.65× → 6.32× at the old factors; it now runs **7.05×**, comfortably above the
-/// original, because the richer candidate set is worth more here than the looser
-/// factors gave up.
+/// **Re-derived 2026-09-03, K 1.15 → 1.05.** C10 had gone red at ×32 *and* ×64
+/// (31/32 and 61/64 sessions) while ×8 and ×16 stayed green — the row had drifted
+/// since 2026-08-28, which is exactly the re-verification the caution above asks
+/// for. Nothing in the compression path had changed; the drift is the wave-width
+/// and admission movement that caution names.
 ///
-/// | k | v | C10 | result |
-/// |---|---|---|---|
-/// | 1.15 | 2.00 | 6.32× | passes (post-Q4, pre-retune) |
-/// | 1.30 | 2.25 | 6.95× | passes |
-/// | **1.32** | **2.29** | **7.05×** | **passes** |
-/// | 1.42 | 2.45 | 7.51× | fails, session 0 |
+/// K probed alone again, and again it was enough — but it took two notches, not
+/// one, and the two rungs cleared at different points:
 ///
-/// Edge bracketed at 1.42/2.45, so the margin is 0.10 on K and 0.16 on V —
-/// wider than the 35B's and far wider than the one-hundredth that broke the 9B
-/// row twice.
+/// * **K 1.15** — ×32 ✗ (31/32), ×64 ✗ (61/64).
+/// * **K 1.10** — ×32 ✓, ×64 ✗ (63/64). The wide rung is the last to go.
+/// * **K 1.05** — ×8/16/32/64 all ✓, twice.
+///
+/// V held at 2.0 throughout and was not swept: the 2026-08-28 bracket put its
+/// edge at 2.0 ✓ / 2.1 ✗, so it had no room to give and a sweep would only have
+/// cost ratio, per this row's standing advice.
+///
+/// Worth noting for the next re-derivation: **×32 recovering does not mean the
+/// row is clear.** At K 1.10 three of four rungs passed and only ×64 was left,
+/// one session short — a stopping point that looks like success from every rung
+/// but the widest.
+///
+/// C10 at 6.50/6.47/6.46/6.47× (×8/16/32/64), identical across two confirmation
+/// runs — 6.65× → 6.47× at ×64, the ratio this costs.
 pub const QWEN36_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 1.32,
-    k_low: 1.32,
-    v_hi: 2.29,
-    v_low: 2.29,
+    // **Re-derived 2026-09-12 for the origin/main merge, k 1.05 → 1.00**, V held
+    // at 2.0. Main's row (1.32/2.29) was not taken: factors do not transfer
+    // between branches whose numerics differ — see the measured table in
+    // `QWEN35_MOE_KV_FACTORS` above, where main's pair reproduced main's ratio
+    // exactly and still failed here.
+    //
+    // | k    | v   | C10 ×64 | ratio |
+    // |------|-----|---------|-------|
+    // | 1.05 | 2.0 | 63/64 ✗ | 6.47× |  (green on four runs BEFORE the merge)
+    // | 1.00 | 2.0 | 64/64 ✓ | 6.04× |
+    //
+    // One K notch, and K alone, exactly as this row's standing advice says to
+    // probe it — the note from the 09-01 derivation ("3.6 is K-limited… the next
+    // derivation probes K first there") paid for itself immediately. ×8/×16/×32
+    // were green at both factors; only ×64 moved.
+    //
+    // That the pre-merge pair was four-runs-green and is now one session short
+    // is this row drifting on an admission change, which is precisely the
+    // failure mode its caution predicts — not a defect elsewhere.
+    k_hi: 1.00,
+    k_low: 1.00,
+    v_hi: 2.0,
+    v_low: 2.0,
 };
 
 /// Qwen3.8-27B (dense flagship hybrid).
@@ -791,4 +922,95 @@ pub const QWEN38_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
     k_low: 0.8,
     v_hi: 2.05,
     v_low: 2.05,
+};
+
+/// Qwen3.8-Flash-Next (`qwen4exp`) — the 512-expert sparse-attention hybrid.
+///
+/// **Derived 2026-08-31** on
+/// `quantized_qwen38_moe::tests::test_parallel_batched_forwarding`, whose
+/// ladder gained C0–C10 rungs for this row. Two properties of this model
+/// shape the derivation and are worth stating before the numbers:
+///
+/// * **Only 12 of 48 layers hold K/V at all.** The other 36 mix through a
+///   recurrence, so a compression level here touches a quarter of the stack —
+///   the per-layer error a level admits is diluted across three layers that
+///   cannot propagate it, which is not true of any dense row above.
+/// * **QSA caps the read at 2051 cells.** Past that depth a query reads a
+///   *selected* subset, so a block's quantization error reaches the output
+///   only when the indexer selects that block. Compression error and selection
+///   interact, and this row is derived at gate depth (~713 tokens), where
+///   selection is the identity and every cell is read. **A row derived below
+///   the budget is a bound, not a measurement, for behaviour above it** — the
+///   deep-context rung is recorded as outstanding rather than assumed.
+///
+/// Walked from the lineage's neighbour (the 3.6 row, k 1.15 / v 2.0), which
+/// passed the whole ladder on the first run at 5.54× — so the row was loose
+/// and the derivation is a search *outward* for the edge, not inward from a
+/// failure. Six runs of the C-ladder gate:
+///
+/// | k | v | C10×2 | C10×8 | ratio |
+/// |---|---|-------|-------|-------|
+/// | 1.15 | 2.0 | pass | pass | 5.54× |
+/// | 1.5  | 3.0 | pass | pass | 6.95× |
+/// | 1.65 | 3.0 | pass | pass | **7.15×** |
+/// | 1.8  | 3.0 | pass | pass | 7.36× |
+/// | 1.65 | 3.3 | **fail** | **fail** | 7.56× |
+/// | 1.8  | 3.6 | **fail** | **fail** | 8.13× |
+/// | 2.2  | 4.5 | **fail** | **fail** | 10.14× |
+///
+/// * **V edge 3.0 ✓ / 3.3 ✗** at k 1.65 — V is the binding axis here.
+/// * **K 1.8 ✓** at v 3.0. K's own edge above 1.8 is not bracketed: the next
+///   probe that failed (1.8 / 3.6) moved V as well, so what is known is that
+///   1.8 passes and that V is what gives way first.
+///
+/// # Why the row sits one notch under the C10 edge rather than further back
+///
+/// **C10 is the calibration probe; C5 is the operating point.** zend runs
+/// `compression_level(5)` (`session.rs`, `repo_scan`), so the margin that has
+/// to be comfortable is C5's, and C10 is run only because a row tuned at the
+/// level production uses cannot tell you how much edge is left. Held to the
+/// tighter of the two readings, this row would be paying real ratio at C5 to
+/// buy headroom at a level nothing runs.
+///
+/// The evidence that C5 is nowhere near an edge here: **C8 still passed at
+/// 6.87× under thresholds loose enough to break C10 entirely** (k 2.2 /
+/// v 4.5). Everything at or below C8 has a wide margin at this row; only the
+/// top rung is close to anything.
+///
+/// Confirmed across two ladders at k 1.8 / v 3.0: the first ran
+/// C0/C4/C8/C10×2/C10×8, the second swapped the middle rung to **C5 — the
+/// level zend runs**. C0, C8 and both C10 widths each passed twice.
+///
+/// # The row this model did NOT need, and why it is worth recording
+///
+/// When the Gated Residual fused, C10×2 went red and this row was retightened
+/// to k 1.65 / v 2.8 — costing ratio at **C5, the level production runs**, to
+/// fix a marginal session at C10, a rung that exists only as a probe. That was
+/// the wrong currency, and the wrong diagnosis.
+///
+/// The cause was not reassociation. The first fused kernel rolled its own
+/// `1/(1 + __expf(-x))` where the eager path calls `fast_exp::sigmoid` — a
+/// cubic polynomial with ~0.009% error. The kernel was therefore ~400× MORE
+/// accurate than the reference it replaced, a ~9e-5 relative change on every
+/// gate value, which is orders of magnitude above any last-ulp effect. Fixing
+/// the kernel to use the shared primitive put the arithmetic back and this row
+/// held at k 1.8 / v 3.0 unchanged.
+///
+/// **The rule this leaves behind:** when a KV rung moves after a kernel
+/// change, establish whether the arithmetic actually changed before spending
+/// compression on it — and a fusion that improves precision is an arithmetic
+/// change, not a neutral one. A calibration derived against a reference is
+/// only valid for code that computes what the reference computes.
+///
+/// Both C10 widths fail *together* at every failing point measured, so this
+/// model gives no warning rung between pass and fail: a red C10 here is the
+/// first signal, not the second.
+///
+/// Ratio lands in line with the lineage (3.5 at 7.13×, 3.6 at 6.8×) despite
+/// only a quarter of the stack holding K/V at all.
+pub const QWEN4EXP_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
+    k_hi: 1.8,
+    k_low: 1.8,
+    v_hi: 3.0,
+    v_low: 3.0,
 };

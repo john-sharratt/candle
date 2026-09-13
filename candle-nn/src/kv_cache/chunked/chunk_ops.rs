@@ -2504,7 +2504,7 @@ mod tests {
     }
 
     /// Turn-seal window-ring snapshot → restore (Artifact A of
-    /// docs/deepseek_turn_seal_persistence.md): after the sliding-window ring
+    /// docs/deepseek/deepseek_turn_seal_persistence.md): after the sliding-window ring
     /// evicts its front chunk, the resident window + `base_pos` — captured via
     /// the snapshot primitives (`window_base_pos` / `resident_len` /
     /// `read_contiguous`) — restore bit-exactly into a fresh backing

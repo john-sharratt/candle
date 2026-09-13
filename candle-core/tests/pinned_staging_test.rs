@@ -17,6 +17,26 @@ mod tests {
         CudaDevice::new(0).expect("CUDA device 0 required for pinned_staging tests")
     }
 
+    /// Wait for the arena reset that dropping the last generation only *starts*.
+    ///
+    /// The drop path deliberately does not drain the stream — doing that from a
+    /// destructor, on whatever thread happened to drop the last guard, stalled
+    /// the whole GPU pipeline once per generation. It records a fence and
+    /// returns, leaving the arena standing; the reset lands later, when
+    /// `try_reclaim` finds that fence fired at the next `begin_generation`.
+    ///
+    /// So on a CUDA stager `arena_used()` is still non-zero immediately after
+    /// `drop(gen)`, and a test that wants to observe the settled arena has to
+    /// say so. `flush` is that wait: it synchronises the stream and resets under
+    /// the same lock, subsuming the pending fence.
+    ///
+    /// [`generation_drop_defers_the_reset_behind_a_fence`] covers the deferral
+    /// itself; every other test here is about arena accounting and wants the
+    /// settled state, not the timing.
+    fn settle(stager: &PinnedStager) {
+        stager.flush().expect("flush");
+    }
+
     // -----------------------------------------------------------------------
     // Basic construction
     // -----------------------------------------------------------------------
@@ -289,15 +309,8 @@ mod tests {
         let _gpu = stager.submit(buf).unwrap();
         let used_before = stager.arena_used();
         assert!(used_before > 0);
-        // flush() with generation alive should still sync but arena dirty
-        // flag is managed; arena won't be reset because generation is alive
-        // Actually, flush calls sync_and_reset_all which does reset...
-        // Let's check what actually happens
-        // The current flush() does NOT check live_generations — it unconditionally resets.
-        // That's a potential bug: flush() should respect generations like alloc() does.
-        // For now, test the Generation drop behavior instead.
         drop(gen);
-        // After last generation drops, arena should be reset
+        settle(&stager);
         assert_eq!(stager.arena_used(), 0);
     }
 
@@ -310,8 +323,46 @@ mod tests {
         let _gpu = stager.submit(buf).unwrap();
         assert!(stager.arena_used() > 0);
         drop(gen);
+        settle(&stager);
         assert_eq!(stager.arena_used(), 0);
         assert_eq!(stager.arena_count(), 1);
+    }
+
+    /// The reset is deferred, and this is the test that says so.
+    ///
+    /// Dropping the last generation records a fence and returns; the arena is
+    /// still standing on the far side of the drop. What clears it is the next
+    /// generation's `try_reclaim`, once that fence has fired — which is why the
+    /// sync below sits between the two.
+    #[test]
+    fn generation_drop_defers_the_reset_behind_a_fence() {
+        use candle_core::cuda_backend::cudarc::driver::CudaStream;
+        use std::sync::Arc;
+
+        let dev = cuda_dev();
+        let stager = PinnedStager::new(&dev);
+        let gen = stager.begin_generation();
+        let buf = stager.alloc(4096).unwrap();
+        let _gpu = stager.submit(buf).unwrap();
+        let used = stager.arena_used();
+        assert!(used > 0);
+
+        drop(gen);
+        assert_eq!(
+            stager.arena_used(),
+            used,
+            "dropping the last generation records a fence and returns — it must \
+             NOT drain the stream, so the arena still stands here"
+        );
+
+        let stream: Arc<CudaStream> = dev.cuda_stream();
+        stream.synchronize().expect("synchronize");
+        let _next = stager.begin_generation();
+        assert_eq!(
+            stager.arena_used(),
+            0,
+            "the fence has fired, so the next generation reclaims the arena"
+        );
     }
 
     #[test]
@@ -336,6 +387,7 @@ mod tests {
         // Submit it to clear outstanding
         let _gpu = stager.submit(buf).unwrap();
         drop(gen);
+        settle(&stager);
         assert_eq!(stager.arena_used(), 0);
     }
 
@@ -366,8 +418,9 @@ mod tests {
         );
         assert_eq!(stager.arena_count(), 1);
 
-        // Drop outer generation — now arena resets
+        // Drop outer generation — now the arena resets, once the fence settles
         drop(gen1);
+        settle(&stager);
         assert_eq!(stager.arena_used(), 0);
     }
 
@@ -381,6 +434,7 @@ mod tests {
             let buf = stager.alloc(4096).unwrap();
             let _gpu = stager.submit(buf).unwrap();
             drop(gen);
+            settle(&stager);
             assert_eq!(
                 stager.arena_used(),
                 0,
@@ -402,6 +456,7 @@ mod tests {
                 let _gpu = stager.submit(buf).unwrap();
             }
             drop(gen);
+            settle(&stager);
             assert_eq!(stager.arena_used(), 0);
             assert_eq!(stager.arena_count(), 1);
         }
@@ -437,7 +492,8 @@ mod tests {
         );
 
         drop(gen);
-        // After generation drop, overflow arenas freed
+        settle(&stager);
+        // Once the fence settles, the overflow arenas are freed
         assert_eq!(stager.arena_count(), 1);
         assert_eq!(stager.arena_used(), 0);
     }
@@ -474,6 +530,7 @@ mod tests {
         );
 
         drop(gen);
+        settle(&stager);
         assert_eq!(stager.arena_count(), 1);
     }
 
@@ -523,6 +580,7 @@ mod tests {
             assert!(stager.arena_count() >= 2);
             drop(gen);
         }
+        settle(&stager);
         assert_eq!(stager.arena_count(), 1);
         assert_eq!(stager.arena_used(), 0);
 
@@ -535,6 +593,7 @@ mod tests {
             }
             drop(gen);
         }
+        settle(&stager);
         assert_eq!(stager.arena_count(), 1);
         assert_eq!(stager.arena_used(), 0);
     }
@@ -563,6 +622,7 @@ mod tests {
         assert!(stager.pending_bytes() > 0); // owned in pending queue
 
         drop(gen);
+        settle(&stager);
         assert_eq!(stager.arena_used(), 0);
         assert_eq!(stager.pending_bytes(), 0);
     }
@@ -687,6 +747,7 @@ mod tests {
             let _gpu = stager.submit(buf).unwrap();
             drop(gen);
         }
+        settle(&stager);
         assert_eq!(stager.arena_used(), 0);
         assert_eq!(stager.arena_count(), 1);
         assert_eq!(stager.pending_bytes(), 0);
@@ -759,6 +820,7 @@ mod tests {
         assert!(stager.pending_bytes() > 0);
 
         drop(gen);
+        settle(&stager);
         assert_eq!(stager.arena_count(), 1);
         assert_eq!(stager.arena_used(), 0);
         assert_eq!(stager.pending_bytes(), 0);
@@ -822,6 +884,7 @@ mod tests {
         assert!(count >= 20, "expected many overflow arenas, got {}", count);
 
         drop(gen);
+        settle(&stager);
         assert_eq!(stager.arena_count(), 1);
         assert_eq!(stager.arena_used(), 0);
     }
@@ -854,6 +917,7 @@ mod tests {
         );
 
         drop(gen);
+        settle(&stager);
         assert_eq!(stager.arena_used(), 0);
     }
 
@@ -882,6 +946,7 @@ mod tests {
         assert!(stager.pending_bytes() > 0);
 
         drop(gen);
+        settle(&stager);
 
         assert_eq!(stager.arena_count(), 1);
         assert_eq!(stager.arena_used(), 0);
@@ -910,11 +975,14 @@ mod tests {
         let _gpu2 = s2.submit(buf).unwrap();
 
         drop(gen1);
-        // s1 reset, s2 still active
+        settle(&s1);
+        // s1 reset, s2 still active — settling one stager must not touch the
+        // other, which is the whole point of the test.
         assert_eq!(s1.arena_used(), 0);
         assert!(s2.arena_used() > 0);
 
         drop(gen2);
+        settle(&s2);
         assert_eq!(s2.arena_used(), 0);
     }
 }

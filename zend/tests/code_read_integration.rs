@@ -97,12 +97,12 @@ fn code_read_call_turn_is_summarize_request_then_tool_call() {
     let progress = LoadProgress::new();
     ingest_code_reading_into_sink(&mut sink, &root, &map, &progress).unwrap();
 
-    // The FIRST turn (the call): user is the two-sentence summarise request; the
+    // The FIRST turn (the call): user is the summarise request; the
     // assistant is JUST the `<tool_call>` — no baked boundary markers, no
     // tool_response (that's the next, coupled turn). The seams are regenerated.
     let (call_user, call_assistant, _) = &sink.turns[0];
     assert!(call_user.starts_with("Summarize `src/lib.rs` (lines "));
-    assert!(call_user.contains("in no more than two sentences"));
+    assert!(call_user.contains("complete sentences, ending with a full stop"));
     assert!(call_assistant.starts_with("<tool_call>"));
     assert!(call_assistant.trim_end().ends_with("</tool_call>"));
     assert!(call_assistant.contains("\"name\":\"file_read\""));

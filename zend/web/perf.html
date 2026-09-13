@@ -16,10 +16,25 @@
      a standalone page that could not reach the app's tokens. Both are gone:
      it uses `common/base.css` like every other page, so the theme is the
      theme. */
+  /* **This page has to make its own scroller.** `base.css` sets
+     `html, body { height: 100%; overflow: hidden }` because the app shell
+     scrolls in `.outlet`, not on the document — and this page has no shell, it
+     puts `<main class="page">` straight in `<body>`. Without a scroll container
+     of its own, everything below the fold was simply clipped: the phase
+     timeline and the eight panels under it were rendered and unreachable.
+     Same shape as `logs.html` — body is the flex column, the wrapper scrolls,
+     and `.page` keeps its centred max-width inside it so the scrollbar sits at
+     the viewport edge rather than at the content's. */
+  body { margin: 0; height: 100vh; display: flex; flex-direction: column; }
+  .scroller { flex: 1; min-height: 0; overflow-y: auto; }
   .kpis {
     display: grid; gap: 12px; margin-bottom: 16px;
     grid-template-columns: repeat(auto-fit, minmax(196px, 1fr));
   }
+  /* Its own grid, so it needs the same release from the flow-stacking margin
+     that `base.css` gives `.grid` — otherwise every KPI after the first sat
+     10px below its neighbours. */
+  .kpis > .panel + .panel { margin-top: 0; }
   .kpi { position: relative; overflow: hidden; padding-left: 16px; }
   .kpi .rail { position: absolute; left: 0; top: 0; bottom: 0; width: 3px; }
   .kpi .val { font-size: 1.5rem; font-weight: 700; letter-spacing: -.02em; line-height: 1.2; }
@@ -50,7 +65,9 @@
   <div class="row" id="chrome"></div>
 </header>
 
-<main class="page wide" id="page"></main>
+<div class="scroller">
+  <main class="page wide" id="page"></main>
+</div>
 
 <script type="module">
 /* Zend's wave and pressure telemetry, rebuilt on the shared framework.
@@ -77,6 +94,11 @@ const POLL_MS = 4000;
 const MiB = 1024;
 const gib = (mib) => (mib || 0) / MiB;
 const last = (a) => a[a.length - 1] || {};
+/* Wave throughput. `ws` is the wave's wall-clock in ms (as is every duration
+ * the telemetry endpoint sends), so the /1000 is what makes this per-second.
+ * Shared by the chart and the KPI card so the headline can't disagree with
+ * the line above it. */
+const tokPerSec = (w) => (w.ws > 0 ? w.tok / (w.ws / 1000) : 0);
 
 /* One hue per scheduler phase, so the flip between small-batch decode and
  * large-batch prefill reads at a glance rather than by hunting a legend. */
@@ -183,25 +205,41 @@ add(makeStackChart(cPhase, () => {
   for (const p of PTS) {
     if (p.age > 130) continue;
     const key = Math.round(p.age);
-    if (!wins.has(key)) wins.set(key, { age: key, ph: {} });
+    // Tokens are bucketed alongside the duration, not dropped: the bar's
+    // HEIGHT is time, but the question asked of a bar is almost always "was
+    // that time productive", and that needs both. Summing them here is what
+    // lets the tooltip quote a rate per phase.
+    if (!wins.has(key)) wins.set(key, { age: key, ph: {}, tk: {} });
     wins.get(key).ph[p.kind] = (wins.get(key).ph[p.kind] || 0) + p.dur;
+    wins.get(key).tk[p.kind] = (wins.get(key).tk[p.kind] || 0) + (p.tok || 0);
   }
   const bars = [...wins.values()].sort((a, b) => b.age - a.age)
-    .map((w) => ({ age: w.age, parts: w.ph }));
+    .map((w) => ({ age: w.age, parts: w.ph, toks: w.tk }));
   return {
     bars, keys: PHASES,
     color: (k) => PH[k],
     yFmt: (v) => (v >= 1000 ? (v / 1000).toFixed(1) + 's' : v.toFixed(0) + 'ms'),
     xLabel: (b) => (b.age === 0 ? 'now' : '-' + b.age.toFixed(0) + 's'),
-    tip: (b) => PHASES.filter((k) => b.parts[k])
-      .map((k) => ({ t: `${k} ${b.parts[k].toFixed(0)}ms`, c: PH[k] })),
+    // Time and rate together. A phase that moved no tokens — idle, sync,
+    // blocked — has no rate to quote and says so by omission rather than by
+    // printing a zero, which would read as "ran and produced nothing" when the
+    // truth is "was never going to produce anything".
+    tip: (b) => PHASES.filter((k) => b.parts[k]).map((k) => {
+      const ms = b.parts[k], tk = (b.toks && b.toks[k]) || 0;
+      const rate = ms > 0 ? tk / (ms / 1000) : 0;
+      return {
+        t: tk > 0 ? `${k} ${ms.toFixed(0)}ms · ${fmtNum(Math.round(rate))} tok/s`
+                  : `${k} ${ms.toFixed(0)}ms`,
+        c: PH[k],
+      };
+    }),
     emptyText: 'no phase samples yet',
   };
 }));
 
 add(makeChart(cTok, () => ({
   xs: T(),
-  series: [series(W.map((w) => (w.ws > 0 ? w.tok / (w.ws / 1000) : 0)), 'var(--ok)', 'tok/s')],
+  series: [series(W.map(tokPerSec), 'var(--ok)', 'tok/s')],
   yFmt: fmtNum,
 })));
 
@@ -318,8 +356,8 @@ function paintKPIs() {
   const w = last(W);
   if (!W.length) return;
   const usedG = gib(w.res), totG = gib(w.tot) || 1, frac = usedG / totG;
-  const tps = w.ws > 0 ? w.tok / (w.ws / 1000) : 0;
-  const peakTps = Math.max(1, ...W.filter((x) => x.ws > 0).map((x) => x.tok / (x.ws / 1000)));
+  const tps = tokPerSec(w);
+  const peakTps = Math.max(1, ...W.map(tokPerSec));
 
   const cards = [
     kpi('KV reserved', usedG.toFixed(1), 'GiB', `of ${totG.toFixed(0)} GiB card`,

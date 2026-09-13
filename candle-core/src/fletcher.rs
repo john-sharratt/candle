@@ -36,8 +36,7 @@ pub fn fletcher32(data: &[u8]) -> u32 {
     let modulus = MOD as u64;
     let mut sum1: u64 = 0;
     let mut sum2: u64 = 0;
-    let words = data.chunks_exact(2);
-    let remainder = words.remainder();
+    let (words, remainder) = data.as_chunks::<2>();
     let mut n = 0usize;
     for w in words {
         let word = (w[0] as u64) | ((w[1] as u64) << 8);
@@ -72,13 +71,13 @@ mod tests {
         const MOD: u32 = 65535;
         let mut sum1: u32 = 0;
         let mut sum2: u32 = 0;
-        let mut words = data.chunks_exact(2);
-        for w in &mut words {
+        let (words, remainder) = data.as_chunks::<2>();
+        for w in words {
             let word = (w[0] as u32) | ((w[1] as u32) << 8);
             sum1 = (sum1 + word) % MOD;
             sum2 = (sum2 + sum1) % MOD;
         }
-        if let [tail] = words.remainder() {
+        if let [tail] = remainder {
             let word = *tail as u32;
             sum1 = (sum1 + word) % MOD;
             sum2 = (sum2 + sum1) % MOD;

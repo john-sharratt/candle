@@ -8,6 +8,7 @@
 //! coalesces adjacent indices into runs and, because of the two sections, issues
 //! two `stream.memcpy_htod` per run (the headers range + the records range).
 
+use super::head_gids::HeadGids;
 use super::slot_state_arena::{self, SlotStateSlot};
 use super::types::ChunkWindow;
 use crate::kv_cache::arena_table::ResolvedArenaInfo;
@@ -47,6 +48,21 @@ pub(crate) struct GpuChunks {
     /// host buffer is grow-only and the device slot is a class width, so
     /// neither length divides down to the entry count any more.
     n_chunks: usize,
+    /// The chunks this serialisation REFERENCES, held alive by their gids.
+    ///
+    /// A serialised slot-state is a page table: its records name arena base
+    /// pointers, so the arenas behind them must outlive every launch that reads
+    /// it. Nothing about the host chunk table guarantees that — the persistence
+    /// thread's quantize-swap rewrites a slot's sealed chunks mid-wave, and once
+    /// the last gid for a float source arena drops, the arena is released and
+    /// re-tenanted under an in-flight kernel. So the serialisation carries its
+    /// own pins, taken in the same pass that wrote the bytes.
+    ///
+    /// Shared, so a launch holds the set it actually read with ONE refcount
+    /// bump rather than a clone per chunk: `clear` installs a fresh vector and
+    /// a launch still holding the old one keeps exactly the arenas its headers
+    /// point at, for as long as it needs them.
+    pins: Arc<Vec<HeadGids>>,
     /// The event the most recent `memcpy_htod_async` out of [`Self::buf`] was
     /// recorded on — the handle for retiring a copy that may still be in flight.
     ///
@@ -118,8 +134,15 @@ impl GpuChunks {
             chunk_byte_size: 0,
             gen_records: None,
             n_chunks: 0,
+            pins: Arc::new(Vec::new()),
             upload_done: None,
         }
+    }
+
+    /// The chunks this serialisation references, for a consumer to hold across
+    /// its launch. One refcount bump — see [`Self::pins`].
+    pub(crate) fn pins(&self) -> Arc<Vec<HeadGids>> {
+        Arc::clone(&self.pins)
     }
 
     /// Retire any `memcpy_htod_async` still reading [`Self::buf`] or still
@@ -535,6 +558,27 @@ impl GpuChunksGuard<'_> {
             rope_base,
             kvheads_ptr,
         );
+        // Keep the pin describing what the bytes now reference. The gids are the
+        // same object on every writer-length patch — the overwhelmingly common
+        // call — so the compare short-circuits and the shared vector is left
+        // alone; only a genuine re-gid pays `make_mut`'s copy, and only while a
+        // launch is still holding the old set.
+        //
+        // The pins are written by the same pass that writes the bytes, so one
+        // per live entry is an invariant, not an expectation. Say so here rather
+        // than index into a short vector: an entry with no pin is a serialised
+        // record whose arena nothing is holding, which surfaces as a freed arena
+        // under a running kernel.
+        if self.inner.pins.len() != current_n {
+            candle::bail!(
+                "update_chunk: {} pins for {current_n} serialised chunks — the \
+                 slot-state buffer and its chunk references diverged",
+                self.inner.pins.len()
+            );
+        }
+        if !self.inner.pins[chunk_idx].is_same_alloc(&chunk.gids) {
+            Arc::make_mut(&mut self.inner.pins)[chunk_idx] = chunk.gids.clone();
+        }
         self.dirty_chunks.push(chunk_idx);
         Ok(())
     }
@@ -565,6 +609,10 @@ impl GpuChunksGuard<'_> {
         }
         self.dirty_chunks.clear();
         let n = chunks.len();
+        // Pin what this pass is about to reference. A fresh vector, never a
+        // mutation of the old one: a launch reading the previous serialisation
+        // still holds that one and must keep ITS arenas, not these.
+        self.inner.pins = Arc::new(chunks.iter().map(|c| c.gids.clone()).collect());
         // All chunks in a backing share one band count; derive it from the first.
         let n_palette = chunk_n_palette(&chunks[0], n_kv_head);
         let chunk_byte_size = token_slice_serialized_size(n_kv_head, head_dim, n_palette);
@@ -647,6 +695,10 @@ impl GpuChunksGuard<'_> {
         // the next snapshot re-copies from the rebuilt buffer.
         self.inner.gen_records = None;
         self.inner.n_chunks = 0;
+        // Release this serialisation's claim on its chunks. A launch still
+        // reading the bytes holds its own reference to the same vector, so the
+        // arenas it addresses stay alive until it drops.
+        self.inner.pins = Arc::new(Vec::new());
     }
 }
 
@@ -669,6 +721,7 @@ impl Drop for GpuChunksGuard<'_> {
             chunk_byte_size,
             gen_records: _,
             n_chunks,
+            pins: _,
             // Set below, once the copies this scope enqueues are in flight.
             upload_done: _,
         } = &mut *self.inner;
@@ -812,6 +865,8 @@ impl Clone for GpuChunks {
             chunk_byte_size: 0,
             gen_records: None,
             n_chunks: 0,
+            // Nothing is serialised here yet, so nothing is referenced.
+            pins: Arc::new(Vec::new()),
             // Nothing was copied into this one; it owns no buffer and no slot.
             upload_done: None,
         }

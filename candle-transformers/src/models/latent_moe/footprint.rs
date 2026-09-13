@@ -1,6 +1,6 @@
 //! KV-footprint accounting: what DeepSeek's bounded-window + compressed-corpus
 //! attention holds resident vs what a traditional dense-attention FP16 model
-//! would hold at the same depth (`docs/deepseek_batched_paged_attention_plan.md`
+//! would hold at the same depth (`docs/deepseek/deepseek_batched_paged_attention_plan.md`
 //! Part IV §H).
 //!
 //! The reported compression is a **system-level** ratio — bounded attention ×

@@ -12,11 +12,12 @@
 //! ingest + VRAM budget-band admission), `run.rs` (top-level wave loop + wave
 //! relief), `sample.rs` (batched sampler), `projection_assembler.rs`
 //! (rebuilds a slot's prefix K/V from the substrate every projection, per
-//! `docs/conversation_builder.md`), `phase_ring.rs` (telemetry ring for
+//! `docs/archived/conversation_builder.md`), `phase_ring.rs` (telemetry ring for
 //! `/v1/phases`), `profile.rs` (feature-gated zero-cost span timer), and
 //! `kv_zero_check.rs` (feature `kv-zero-check`, audits live K/V slots).
 mod admission;
 mod decode;
+pub mod exported_state;
 mod guest_room;
 #[cfg(feature = "kv-zero-check")]
 pub(crate) mod kv_zero_check;
@@ -36,6 +37,7 @@ use crate::conversation::slice_per_layer_sealed;
 use crate::decode_health::DecodeHealthState;
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnResponse};
+use crate::index_pages;
 use crate::persistence::cold_load::{
     preallocate_pinned_scratch, ColdLoadStager, PINNED_PREALLOC_BYTES,
 };
@@ -82,6 +84,8 @@ use candle_transformers::models::batched_inference::{
     BatchedInferenceSession, ManagedBatchedModel, ProvSignPacked,
 };
 use candle_transformers::models::delta_net::ExportedLayerState;
+
+use self::exported_state::{ExportedState, SharedState};
 use crossbeam::channel::{Receiver, Sender};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -386,8 +390,7 @@ pub(crate) enum SchedulerRequest {
     /// Replies `Ok(false)` when the model carries no recurrent state.
     InstallRecurrentState {
         sequence_ids: Vec<SequenceId>,
-        schedule_hash: u64,
-        layers: Arc<[ExportedLayerState]>,
+        state: SharedState,
         response_tx: Sender<Result<bool, ConversationError>>,
     },
 
@@ -423,7 +426,7 @@ pub(crate) enum SchedulerRequest {
         /// The branch's complete ordered token stream — every sealed section of
         /// the system prompt under one selector assignment, concatenated.
         tokens: TokenBuffer,
-        response_tx: Sender<Result<Option<(u64, Vec<ExportedLayerState>)>, ConversationError>>,
+        response_tx: Sender<Result<Option<ExportedState>, ConversationError>>,
     },
 
     /// Recover a previously-persisted section directly from the redo
@@ -1132,6 +1135,17 @@ struct ReprojectInFlight {
     view_id: SequenceId,
     parent_id: SequenceId,
     tail_per_layer: Vec<candle_nn::kv_cache::SealedSequence>,
+    /// The index rows describing `tail_per_layer`, taken in `prepare` before the
+    /// re-projection resets the parent's per-position state, and re-attached in
+    /// `complete` where that K/V is injected back. Travels with the K/V it
+    /// describes for the same reason a sealed section's page does: the rows come
+    /// from hidden states, so nothing downstream can recompute them.
+    ///
+    /// `(token width, bytes)` per page, as the seal produced them. The widths
+    /// are unused on this path — the pages go straight back in order — but they
+    /// travel rather than being discarded, so this list and a stored one are the
+    /// same shape.
+    tail_index_page: Vec<(usize, Vec<u8>)>,
     decode_state: DecodeState,
     sampling_state: Option<SequenceSamplingState>,
     sections_len: usize,
@@ -1174,6 +1188,76 @@ struct DecodeState {
     /// The `(layer, group, timeline)` to write to is looked up from
     /// [`Scheduler::slot_targets`] at seal time, not carried here.
     seal_action: SealAction,
+    /// Index into [`Self::generated_tokens`] of this turn's `</think>`, when one
+    /// has been decoded.
+    ///
+    /// **The turn's reasoning span, recorded as it happens.** The span the seal
+    /// needs is `[assistant_content_start, here + 1)` — the assistant body up to
+    /// and including the close marker — so one position settles it, and any
+    /// preamble the model emits before `<think>` is inside the reasoning region
+    /// where it belongs rather than needing a second marker to bound it.
+    ///
+    /// Only the FIRST close is recorded. A `</think>` in the answer body (the
+    /// sampler bans one outside a think block, but a think-steer tree can drop
+    /// the model's own and play its own close) must not move a boundary that is
+    /// already fixed.
+    think_close_at: Option<u32>,
+    /// How many of [`Self::generated_tokens`] have actually been **forwarded**.
+    ///
+    /// **The invariant this replaces was implicit, and one path broke it.** The
+    /// scheduler took each decode step's input from `generated_tokens.last()`,
+    /// on the understanding that the last entry is always the one token
+    /// committed-but-not-yet-forwarded. A suppressed `</think>` breaks it: the
+    /// token is sampled and *dropped* rather than committed, so `last()` still
+    /// names the token this step already forwarded — and
+    /// `inject_stencil_prefills`, re-driven by the same drop, forwards it a
+    /// second time.
+    ///
+    /// The K/V absorbs that silently, because it is position-addressed: the
+    /// sequence offset never advanced, so the re-forward overwrites the same
+    /// slot and the length does not change. The index does not — `append_wave`
+    /// appends a row unconditionally. Measured on a think-steered turn: 47
+    /// tokens forwarded, 59 tokens' worth of index rows, `turn_token_count` and
+    /// the token grid agreeing at the lower number, and the surplus surfacing
+    /// many layers later as a turn whose pages do not cover it.
+    ///
+    /// Counting forwards explicitly makes the question answerable instead of
+    /// assumed: what is pending is `generated_tokens[forwarded_generated..]`,
+    /// which is empty exactly when there is nothing to forward.
+    ///
+    /// **It answers "is anything waiting", and nothing else.** It is maintained
+    /// by the paths that forward, so a path that forwards without touching it
+    /// reads low — which is survivable for the pending question (the caller
+    /// takes the last entry, still the right token) and is NOT survivable for
+    /// sizing the sealed grid. Sealing from it produced a grid of 287 against a
+    /// K/V of 289 on a measured turn, breaking the 1:1 contract `token_ids`
+    /// exists to keep; the grid's authority is the K/V, and the seal drops
+    /// exactly the trailing unforwarded token instead.
+    forwarded_generated: usize,
+    /// A page cut this turn has earned but not yet taken.
+    ///
+    /// **A cut may not land between a speculative wave's snapshot and its
+    /// rewind.** `IndexCache::snapshot` captures the live tail only — not the
+    /// pages — so a cut in that window moves the tail's rows into a page, and
+    /// the rewind then restores the tail from the snapshot while the page still
+    /// holds the same rows. They are counted twice, and the index ends exactly
+    /// one drafted block past the K/V for the rest of the sequence. Measured at
+    /// a constant +5 against a 5-token block, on a full accept as much as a
+    /// partial one.
+    ///
+    /// The rollback runs *after* the commit loop for its own reasons (a stash
+    /// span is good for one step), so the commit cannot move; the cut does. It
+    /// is recorded here and taken by [`Scheduler::flush_page_cut`] once the
+    /// rewind has settled — which is also the only point at which the tail is
+    /// the accepted prefix rather than the drafted block.
+    pending_page_cut: bool,
+    /// The break token the pending cut is following — the predecessor whose
+    /// identity armed it, or `None` for the turn's first token.
+    ///
+    /// Diagnostic only. "A page closed here" is not enough to debug a
+    /// misaligned reasoning span: the question is always *which* break the cut
+    /// was answering, and by flush time the run has moved on.
+    pending_page_cut_after: Option<u32>,
     /// Whether this sequence has finished (EOS or max_tokens).
     finished: bool,
     /// Decode start time (for stats).
@@ -1293,6 +1377,193 @@ struct DecodeState {
     pending_mask: Option<StepMask>,
 }
 
+impl DecodeState {
+    /// Append one token to the turn's generated run, recording the reasoning
+    /// boundary as it goes past.
+    ///
+    /// **Every token enters `generated_tokens` through here**, because they
+    /// arrive by three different routes and the boundary has to be seen on all
+    /// of them: the sampler's own commit, an assistant prefill prefix, and a
+    /// stencil's static run — which is where a think-steered `</think>` actually
+    /// lands, the tree having suppressed the model's own. Recording at the
+    /// sampler alone would leave every steered turn with no span at all.
+    ///
+    /// `think_close` is [`Scheduler::think_close`], passed rather than read
+    /// because the caller already holds a mutable borrow of this state.
+    ///
+    /// **Private, because the answer to "does this open a page?" is only usable
+    /// together with the model.** The two ways to call it say when the token is
+    /// forwarded relative to the call, which is the whole of what decides
+    /// whether a cut is possible: [`commit_generated`] for a token about to be
+    /// forwarded, [`Self::push_forwarded`] for one already carried.
+    fn push_generated(&mut self, token: u32, think_close: Option<u32>, breaks: &[u32]) -> bool {
+        let closes_page = self.opens_index_page(breaks);
+        // Before the push: the index of the token being appended. Only the
+        // first close counts — see `think_close_at`. This still tracks
+        // `</think>` alone, because it locates the reasoning SPAN for the
+        // layout, which is a different question from where a page ends.
+        if self.think_close_at.is_none() && Some(token) == think_close {
+            self.think_close_at = Some(self.generated_tokens.len() as u32);
+        }
+        self.generated_tokens.push(token);
+        closes_page
+    }
+
+    /// Record a token whose forward has **already happened**.
+    ///
+    /// A cut is not merely unnecessary here, it would be wrong: the token's
+    /// index row is appended by the forward that carried it, so closing now
+    /// would leave that row on the page the new region was supposed to start
+    /// after. The static-run path forwards its whole run and then records it,
+    /// and [`Scheduler::run_prefill`] has already split that forward at the
+    /// reasoning boundary — the only moment the cut could land.
+    fn push_forwarded(&mut self, token: u32, think_close: Option<u32>, breaks: &[u32]) {
+        let _ = self.push_generated(token, think_close, breaks);
+        // Already carried, so it is forwarded the moment it is recorded.
+        self.forwarded_generated = self.generated_tokens.len();
+    }
+
+    /// Record a token that is committed but **not yet forwarded** — it rides the
+    /// next decode step, which cuts at its own commit.
+    ///
+    /// The third of the three states a recorded token can be in, and the one
+    /// that was previously assumed rather than tracked: exactly the trailing
+    /// entry, always. A suppressed token leaves none in this state, which is why
+    /// the assumption had to become a count.
+    fn push_pending(&mut self, token: u32, think_close: Option<u32>, breaks: &[u32]) {
+        let _ = self.push_generated(token, think_close, breaks);
+    }
+
+    /// Record a token the caller is about to forward, and note the page cut if
+    /// it opens a new region.
+    ///
+    /// **The cut is recorded, not taken.** It must not land between a
+    /// speculative wave's snapshot and its rewind — see
+    /// [`Self::pending_page_cut`] — so the caller takes it with
+    /// [`Scheduler::flush_page_cut`] once the K/V is final. The third of the
+    /// three ways a token enters the run, and the only one that can earn a cut:
+    /// the other two are already forwarded ([`Self::push_forwarded`]) or
+    /// deliberately waiting ([`Self::push_pending`]).
+    fn push_committed(&mut self, token: u32, think_close: Option<u32>, breaks: &[u32]) {
+        let prev = self.generated_tokens.last().copied();
+        if self.push_generated(token, think_close, breaks) {
+            self.pending_page_cut = true;
+            self.pending_page_cut_after = prev;
+        }
+    }
+
+    /// The committed tokens still waiting to be forwarded.
+    ///
+    /// Normally the single token the last commit produced; empty after a
+    /// suppressed token, because nothing was committed and the previous entry
+    /// went out with the step that sampled it.
+    fn pending_forward(&self) -> &[u32] {
+        &self.generated_tokens[self.forwarded_generated.min(self.generated_tokens.len())..]
+    }
+
+    /// Record that everything committed so far has now been forwarded.
+    fn mark_forwarded(&mut self) {
+        self.forwarded_generated = self.generated_tokens.len();
+    }
+
+    /// Whether the token about to be pushed begins a new region of the turn's
+    /// index, so the pages either side of it can be handed over — or dropped —
+    /// independently.
+    ///
+    /// **The timing is off by one from where this is asked**, and that is the
+    /// whole of the subtlety. A token committed at step *t* is *forwarded* at
+    /// step *t+1*, and a token's index row is appended by the forward that
+    /// carries it. The cut is deferred within step *t* — past the speculative
+    /// rewind, see [`Self::pending_page_cut`] — but still lands before step
+    /// *t+1*'s append, so `token` ends up at the head of the new page.
+    ///
+    /// Two regions open, and neither test mentions `<think>`: the reasoning
+    /// region starts where the assistant body does, not at the open marker, so
+    /// any preamble the model emits before it is inside the reasoning where it
+    /// belongs.
+    ///
+    /// | This token | Opens |
+    /// |---|---|
+    /// | the turn's first | the reasoning page, at the prefill/decode boundary |
+    /// | the one after any break token | the next region's page |
+    ///
+    /// Keyed off the **previous token's identity**, read straight from the run.
+    /// The earlier form asked whether `think_close_at + 1` had been reached,
+    /// which made the cut depend on the span having been located — so a turn
+    /// whose `</think>` was prefilled or played by a steering tree, rather than
+    /// sampled, recorded no boundary and cut nothing.
+    fn opens_index_page(&self, breaks: &[u32]) -> bool {
+        match self.generated_tokens.last() {
+            None => true,
+            Some(prev) => breaks.contains(prev),
+        }
+    }
+}
+
+/// Close `slot`'s index at a unit boundary — the shared body of
+/// [`Scheduler::begin_unit`], reachable from the projection assembler, which
+/// holds the model but not the scheduler.
+///
+/// `held` is the slot's token length, for the log only: it says whether the
+/// closed width accounts for everything standing on the slot or only part of it.
+pub(super) fn close_unit_boundary(
+    model: &(dyn ManagedBatchedModel + Send),
+    slot: SequenceId,
+    unit: &'static str,
+    held: usize,
+) {
+    match model.close_positional_page(slot.0) {
+        Ok(0) => {}
+        Ok(closed) => tracing::info!(
+            target: "candle_conversation::scheduler::unit_boundary",
+            seq_id = slot.0,
+            unit,
+            closed,
+            held,
+            "index: closed the prefix into a page at this unit's boundary"
+        ),
+        Err(e) => tracing::warn!(
+            seq_id = slot.0,
+            unit,
+            "closing the index page at a unit boundary failed ({e}); this unit's rows will \
+             be sealed together with the prefix ahead of it"
+        ),
+    }
+}
+
+/// Take a page cut [`commit_generated`] recorded, if any.
+///
+/// Call once the sequence's K/V is final for the step: after a speculative
+/// rollback, or immediately when none is possible. Closing earlier double-counts
+/// the flushed rows, because the rewind's snapshot does not cover pages.
+fn flush_page_cut(
+    model: &(dyn ManagedBatchedModel + Send),
+    slot: SequenceId,
+    state: &mut DecodeState,
+) {
+    if !std::mem::take(&mut state.pending_page_cut) {
+        return;
+    }
+    let after = state.pending_page_cut_after.take();
+    match model.close_positional_page(slot.0) {
+        Ok(closed) => tracing::info!(
+            target: "candle_conversation::scheduler::unit_boundary",
+            seq_id = slot.0,
+            closed,
+            generated = state.generated_tokens.len(),
+            after = ?after,
+            think_close_at = ?state.think_close_at,
+            "index: closed a page at a reasoning boundary"
+        ),
+        Err(e) => tracing::warn!(
+            seq_id = slot.0,
+            "closing the index page at a reasoning boundary failed ({e}); this turn's \
+             reasoning will not occupy whole pages and cannot be windowed out of a later \
+             projection"
+        ),
+    }
+}
+
 /// Per-turn view bookkeeping carried in the scheduler's `turn_views` map.
 ///
 /// Distinct from a single view's `(parent, original_borrowed)` because
@@ -1381,46 +1652,6 @@ struct PendingCompressionSeal {
     response_tx: Sender<Result<TurnIndex, ProbeError>>,
 }
 
-/// A finished dialogue turn whose reasoning-free tokens have been enqueued for
-/// re-prefill on the shared wave, awaiting its seal. Keyed by `pending_id` in
-/// [`Scheduler::pending_turn_seals`]. When the prefill completes,
-/// `complete_turn_reprefill` snapshots the clean K/V, seals the turn (via the
-/// normal `SealAction::Turn` write), and fires the deferred `Done` — the seal
-/// therefore lands one wave after decode, but the client's streamed tokens are
-/// unaffected and `Done` still carries the seal result.
-struct PendingTurnSeal {
-    /// Parent slot the clean turn is re-prefilled onto (the view was already
-    /// finalized in `cleanup_finished`, so this is the plain parent sequence).
-    parent_id: SequenceId,
-    /// First block of the turn's own region on `parent_id` — the clean re-prefill
-    /// appends here, and the seal captures `[seal_block_from, block_count)`.
-    seal_block_from: usize,
-    /// The turn's segment layout: the `<think>…</think>` block is an ETHEREAL
-    /// `Thinking` segment (its text is kept for display, its K/V dropped).
-    layout: TurnLayout,
-    /// Clean replay tokens (reasoning stripped) — pinned as the turn's `token_ids`
-    /// so they match the reasoning-free sealed K/V.
-    token_ids: Vec<u32>,
-    /// Gather-scope tags carried from the decode's `DecodeState`, re-stamped onto
-    /// the sealed turn. (Wide-Q provenance sigs are NOT carried — the seal
-    /// re-gathers them from the reasoning-free re-prefilled grid via
-    /// `gather_wide_sigs`, so they match the sealed K/V.)
-    tags: Vec<String>,
-    /// The caller's event channel — the deferred `Done` fires here once sealed.
-    event_tx: Sender<TurnEvent>,
-    /// `Done` payload, captured at decode-end: the FULL decoded reply (reasoning
-    /// included, exactly as streamed) and the decode stats. Only the SEALED K/V
-    /// is reasoning-free; the client's view is unchanged.
-    done_text: String,
-    done_token_ids: TokenBuffer,
-    stats: TurnStats,
-    /// The re-prefill `PrefillWork`'s private event sink. The prefill machinery
-    /// sends progress/errors on the paired `Sender`; keeping the receiver alive
-    /// here stops those sends from failing before the wave completes. Dropped
-    /// when the pending seal is drained.
-    _sink_rx: Receiver<TurnEvent>,
-}
-
 /// Minimum NEW prefill tokens per evidence tick. A tick certifies "the current
 /// admission budget survives this pressure", which a handful of tiny interactive
 /// turns cannot — one chunk-sized batch per tick is the floor. Small forwards
@@ -1491,16 +1722,6 @@ pub(crate) enum SealAction {
     /// is written, so out-of-order seals would record the group's turns in a
     /// sequence that does not match their K/V.
     TurnGroup(Arc<Vec<CarvedTurn>>),
-    /// The clean re-prefill of a finished dialogue turn, keyed by `pending_id`
-    /// in [`Scheduler::pending_turn_seals`]. The decode's K/V carried the
-    /// `<think>…</think>` reasoning; this unit re-prefills the turn with the
-    /// reasoning stripped so the SEALED K/V never lets a future projection attend
-    /// its own thoughts. Rides the shared prefill wave (batched with the live
-    /// turn + summaries); once it finishes,
-    /// `promote_finished_prefills_to_decodes` snapshots the clean K/V, seals the
-    /// turn (reasoning kept as ethereal text), and fires the deferred `Done`.
-    /// `max_decode_tokens` is 0 — prefill + seal, no decode.
-    TurnReprefill { pending_id: u64 },
 }
 
 /// Content the substrate pins on a `SealAction::Turn` write — the
@@ -2211,8 +2432,8 @@ impl WaveStats {
     /// their own segment on top:
     /// - `reproj_ms` runs inside the decode quantum → carved out of decode into
     ///   Projection.
-    /// - `seal_ms` runs inside prefill (`complete_turn_reprefill`) and decode
-    ///   (`perform_seal_and_write`) → carved out of those into Sealing.
+    /// - `seal_ms` runs inside prefill and decode (`perform_seal_and_write`)
+    ///   → carved out of those into Sealing.
     /// - `evict_ms` runs partly in the flush block (reclaim/demote → the blocked
     ///   remainder) and partly inside the quanta (relief) → carved out, blocked
     ///   first, into Eviction.
@@ -2255,10 +2476,10 @@ impl WaveStats {
         // seal runs inside it and sealing must be able to take from it.
         let mut housekeeping_dur = carve_ms(self.housekeeping_us / 1000, &mut [&mut blocked_dur]);
 
-        // Sealing runs in three places: the turn-reprefill seal inside
-        // HOUSEKEEPING (`complete_turn_reprefill` → `perform_seal_and_write`,
-        // reached from `promote_finished_prefills_to_decodes`), and the immediate
-        // seals inside prefill and decode. Housekeeping first — that is where the
+        // Sealing runs in two places: the compression-turn seal inside
+        // HOUSEKEEPING (`complete_compression_turn` → `perform_seal_and_write`,
+        // reached from `promote_finished_prefills_to_decodes`), and the turn seals
+        // inside prefill and decode. Housekeeping first — that is where the
         // per-turn K/V snapshot actually runs, and carving only from prefill/decode
         // left it stranded in the housekeeping band no matter how well it was timed.
         let seal_ms = (self.seal_snapshot_us + self.seal_sig_us + self.seal_flush_us) / 1000;
@@ -2392,8 +2613,7 @@ impl WaveStats {
         // saturated to 0 — destroying exactly the attribution the split exists
         // for.
         let (promote, admit, demote, gpu) = run::take_housekeeping_split();
-        let (finalise, reprefill, compression) = run::take_promote_split();
-        let (rp_write, rp_trunc) = run::take_reprefill_split();
+        let (finalise, compression) = run::take_promote_split();
         if housekeeping_dur > 0 {
             push(&mut phases, PhaseKind::Housekeeping, housekeeping_dur, 0, 0);
             // Decompose the band for the log: the dashboard draws one
@@ -2416,11 +2636,7 @@ impl WaveStats {
                     .saturating_sub(promote + admit + demote + gpu),
                 // Promote dominates the band, so it carries its own split.
                 promote_finalise_ms = finalise,
-                promote_reprefill_ms = reprefill,
                 promote_compression_ms = compression,
-                // …and the reprefill seal carries its own, since it is ~99% of promote.
-                reprefill_write_ms = rp_write,
-                reprefill_truncate_ms = rp_trunc,
                 "housekeeping split"
             );
         }
@@ -2432,6 +2648,36 @@ impl WaveStats {
         }
         phase_ring::push_window(window_ms, phases);
     }
+}
+
+/// A turn's per-token signature run with `span` removed.
+///
+/// The run is 1:1 with the turn's real-token grid, so `span` is a grid range.
+/// Removing it leaves the run 1:1 with the **windowed** turn — which is what a
+/// projection of that turn actually injects — and shifts every index after the
+/// hole.
+///
+/// **That shift is safe here and would not be everywhere**, so it is worth
+/// saying why. Exactly one consumer indexes this run positionally:
+/// `Substrate::user_sig_span`, which reads the layout's `User` segments. On a
+/// dialogue turn the user body lies wholly before the assistant body, hence
+/// wholly before the reasoning, so the hole is past everything it addresses. The
+/// one shape with a `User` segment *after* the assistant body is a code_read
+/// tool exchange, and that returns from `build_turn_layout` before the thinking
+/// split — it has no `Thinking` segment, so `span` is `None` and this is never
+/// called for it. The other consumer, the belief gallery, scores each signature
+/// independently and reads no index at all.
+///
+/// A free function so the range arithmetic is testable without a scheduler.
+fn sigs_without_span(sigs: Vec<WideQSig>, span: std::ops::Range<usize>) -> Vec<WideQSig> {
+    let end = span.end.min(sigs.len());
+    if span.start >= end {
+        return sigs;
+    }
+    sigs.into_iter()
+        .enumerate()
+        .filter_map(|(i, s)| (!(span.start..end).contains(&i)).then_some(s))
+        .collect()
 }
 
 /// Carve a sub-slice of `amt` ms out of `buckets` in priority order, draining each
@@ -2481,13 +2727,45 @@ pub(crate) struct Scheduler {
     session: BatchedInferenceSession,
     /// Shared tokenizer for streaming decode.
     tokenizer: tokenizers::Tokenizer,
+    /// The `</think>` token id, when the tokenizer has a single token for it.
+    ///
+    /// **The reasoning span's end, measured rather than re-derived.** A turn's
+    /// `<think>…</think>` block is located by watching this id go past during
+    /// decode ([`DecodeState::think_close_at`]), not by decoding the assistant
+    /// text and re-tokenising the block — a round trip whose result is only
+    /// approximately the span it describes.
+    ///
+    /// `None` when the tokenizer spells the marker as several tokens. That is a
+    /// genuine absence: the block cannot be located this way, so the turn seals
+    /// with no reasoning span and is projected whole. Resolved by NAME, matching
+    /// `Engine::compile_think_steering`, which gates the same way.
+    think_close: Option<u32>,
+    /// Tokens that end an index page wherever they appear — `<think>`,
+    /// `</think>`, and the turn closer.
+    ///
+    /// **A property of the token stream, not of the decode state.** The boundary
+    /// that this replaced was derived from [`DecodeState::think_close_at`], so it
+    /// could only be found for a marker the sampler *decoded* — and a turn's
+    /// `<think>…</think>` is usually **prefilled**, arriving before any
+    /// `DecodeState` exists. `reasoning_split` therefore looked the state up,
+    /// found nothing, and split nothing: measured at **0 splits and 6 late cuts
+    /// across 822 turns**, which is why almost no turn's reasoning occupied
+    /// pages of its own.
+    ///
+    /// Reading the ids straight off the stream removes the dependency: a marker
+    /// breaks a page whether it was decoded, prefilled, or played by a steering
+    /// tree. Three entries, so a linear scan beats a hash.
+    ///
+    /// The cut falls **after** the token, so a marker stays in the page it
+    /// closes rather than heading the next one.
+    page_break_tokens: Vec<u32>,
     /// EOS token ID (stops generation).
     eos_tokens: TokenBuffer,
     /// Device the model lives on.
     device: Device,
     /// Resident VRAM gallery arena for the paged belief scan (one per device,
     /// shared across conversations). `None` on non-CUDA devices — the reproject
-    /// then falls back to the CPU per-file scan. See `docs/paged_gallery_arena.md`.
+    /// then falls back to the CPU per-file scan. See `docs/archived/paged_gallery_arena.md`.
     gallery_arena: Option<Arc<GalleryArena>>,
     /// Active decode state per sequence ID.
     active_decodes: HashMap<SequenceId, DecodeState>,
@@ -2508,6 +2786,30 @@ pub(crate) struct Scheduler {
     /// each entry's offset reaches its token count, then finalised by
     /// [`Self::finalize_done_section_ingests`].
     pub(super) active_section_ingests: Vec<ActiveSectionIngest>,
+    /// Each sealed section's per-position model state, keyed as its K/V is.
+    ///
+    /// The index page a section's own prefill produced, kept so the next
+    /// section that borrows this one's chunks can be handed the rows that go
+    /// with them — see `ManagedBatchedModel::push_positional_state`. Empty for
+    /// every model that carries no such state.
+    ///
+    /// Process-local, and that is a real limit rather than a choice: a section
+    /// recovered cold from the substrate on a later run has its K/V and not its
+    /// page, so the first ingest to borrow it warns and selects against a
+    /// prefix it never indexed. Persisting it belongs beside the section's own
+    /// records, keyed by the same stream id.
+    pub(super) section_positional: HashMap<SectionId, Arc<Vec<u8>>>,
+    /// Each sealed turn's per-position model state, keyed as its K/V is.
+    ///
+    /// The conversation counterpart of [`Self::section_positional`], and the
+    /// one that carries the actual dialogue: a projection rebuilds a slot by
+    /// Arc-injecting the turns it selected, and those turns' index rows cannot
+    /// be borrowed with their chunks.
+    ///
+    /// Process-local, with the same limit stated there — a turn cold-loaded on
+    /// a later run has its K/V and not its page, and the injection says so
+    /// rather than selecting silently against a prefix it never indexed.
+    pub(super) turn_positional: HashMap<TurnKey, Arc<Vec<u8>>>,
     /// Batched sampler for token generation.
     sampler: BatchedSampler,
     /// When `true`, special tokens are included in streamed text.
@@ -2627,7 +2929,7 @@ pub(crate) struct Scheduler {
     /// Trigger handle for the async summariser thread.  Fired after
     /// every turn-seal (`docs/archived/infinite_conversations.md` §4 step ③)
     /// so the freshly-pending Normal turn is absorbed into the immutable
-    /// summary forest (`docs/immutable_summary_forest.md`) on the next
+    /// summary forest (`docs/archived/immutable_summary_forest.md`) on the next
     /// pass instead of waiting up to 250 ms
     /// for the periodic tick.  Backpressure-clearing is purely a
     /// latency optimisation — the tick alone is correct.
@@ -2682,6 +2984,15 @@ pub(crate) struct Scheduler {
     /// silently wrong on anything else. Holding the value here is what makes
     /// them one thing.
     prov_fold: crate::provenance::FoldParams,
+    /// KV layers whose Q carries provenance — the model's
+    /// `provenance_capture_layers`, cached beside the fold that was derived
+    /// from it.
+    ///
+    /// Cached together on purpose: the fold's geometry is `layers × kv_heads`,
+    /// so a gather taken over a different count than the fold was built for
+    /// yields different bits, not merely slower ones. One field each, read from
+    /// one place, is what keeps them from drifting.
+    prov_capture_layers: usize,
 
     /// Periodic forward-pass batch-size telemetry (diagnostic; one line / 2 s).
     wave_stats: WaveStats,
@@ -2699,14 +3010,6 @@ pub(crate) struct Scheduler {
 
     /// Monotonic id source for `compression_jobs`.
     next_compression_job_id: u64,
-
-    /// Finished dialogue turns whose reasoning-free tokens are re-prefilling on
-    /// the shared wave, keyed by `pending_id`. Drained when the prefill completes
-    /// — see [`PendingTurnSeal`] and `complete_turn_reprefill`.
-    pending_turn_seals: HashMap<u64, PendingTurnSeal>,
-
-    /// Monotonic id source for `pending_turn_seals`.
-    next_turn_seal_id: u64,
 
     /// AIMD congestion budget over prefill admission, in **bytes** of VRAM the
     /// inference working set may occupy — the single throttle every pressure
@@ -2873,7 +3176,7 @@ impl Scheduler {
         // records, and the substrate read paths check a record's stamp against
         // it and refuse a mismatch rather than scoring incomparable bits into a
         // confident number.
-        let prov_fold = {
+        let (prov_fold, prov_capture_layers) = {
             let props = model.model_core_properties();
             let f = crate::provenance::FoldParams::derive(
                 props.n_kv_heads,
@@ -2881,7 +3184,7 @@ impl Scheduler {
                 props.head_dim,
             );
             crate::provenance::set_active_fold(f);
-            f
+            (f, props.provenance_capture_layers)
         };
 
         // Force this thread to bind to the device's CUDA context
@@ -2907,6 +3210,36 @@ impl Scheduler {
         // galleries before it ever evicted model KV. The rungs are gone;
         // `relieve_vram_pressure` calls `evict_lru` directly and does it before
         // touching KV, which is the same priority expressed as call order.
+        // **What this checkpoint actually brings to a decode.** Every one of
+        // these is a capability the engine silently degrades around rather than
+        // failing on: a model with no drafter reports `draft_budget == 0`, every
+        // sequence takes a one-token row, and the speculative path becomes an
+        // expensive no-op that logs nothing. That is a ~5x throughput difference
+        // — measured 4.85 accepted/step in the batched-forward harness against
+        // one token per forward in the daemon — and until now the only way to
+        // tell the two apart was arithmetic on wave timings.
+        //
+        // Logged once, at load, so "what is running" is a fact in the log rather
+        // than an inference from throughput.
+        // The widths are the ladder's answer AT LOAD. A model may also clamp the
+        // budget per wave against free VRAM (`affordable_draft_budget`), and that
+        // clamp is inert here — nothing is resident yet — so a wide wave can run
+        // shallower than the wide figure suggests. `w1` is the one to read for
+        // "does this checkpoint speculate at all": 0 there means no drafter.
+        tracing::info!(
+            target: "candle_conversation::engine_caps",
+            draft_budget_w1 = model.draft_budget(1),
+            draft_budget_w8 = model.draft_budget(8),
+            draft_ladder_w64_unclamped = model.draft_budget(64),
+            speculative_rewind = model.can_rewind_speculative_block(),
+            recurrent_state = model.carries_recurrent_state(),
+            positional_state = model.carries_positional_state(),
+            recurrent_memories = model.recurrent_memory_count(),
+            layers = model.num_layers(),
+            vocab_size,
+            "decode capabilities at load (draft_budget 0 ⇒ NO speculation: one token per forward)"
+        );
+
         let gallery_arena = GalleryArena::new(&device, 24, 3).map(Arc::new).ok();
         let sampler = BatchedSampler::new(
             device.clone(),
@@ -2917,12 +3250,55 @@ impl Scheduler {
         );
 
         let chunk_size = CHUNK_SIZE;
+        // Before the tokenizer moves into `Self`. A multi-token spelling yields
+        // `None` and the reasoning span is simply never located — see the field.
+        // **Tokens that end an index page, whether decoded or prefilled.**
+        //
+        // Resolved by name, because the ids are not in any config — the turn
+        // closer in particular is a dialect marker the checkpoint never
+        // declares (`<|im_end|>` is 248046 here and appears nowhere in the
+        // metadata). A spelling this tokenizer does not have as a single token
+        // simply contributes no boundary.
+        //
+        // Three is the whole list, and a `Vec` rather than a set because a
+        // linear scan over three `u32`s beats hashing one.
+        //
+        // `</think>` is taken from this same lookup rather than resolved again:
+        // it is one fact — which id closes the reasoning — read for two
+        // purposes, and resolving it twice is two places for it to disagree.
+        let [think_open, think_close, turn_close] =
+            ["<think>", "</think>", "<|im_end|>"].map(|name| {
+                let id = tokenizer.token_to_id(name);
+                if id.is_none() {
+                    tracing::warn!(
+                        "tokenizer has no single `{name}` token — it will not break an index \
+                         page, so a region it bounds cannot be windowed out of a projection"
+                    );
+                }
+                id
+            });
+        if think_close.is_none() {
+            tracing::warn!(
+                "tokenizer has no single `</think>` token — sealed turns will carry no \
+                 reasoning span, so a projected turn is injected whole"
+            );
+        }
+        let page_break_tokens: Vec<u32> = [think_open, think_close, turn_close]
+            .into_iter()
+            .flatten()
+            .collect();
+        tracing::info!(
+            ?page_break_tokens,
+            "index page breaks resolved by name (<think>, </think>, turn closer)"
+        );
         Self {
             rx,
             model,
             session,
             gallery_arena,
             tokenizer,
+            think_close,
+            page_break_tokens,
             eos_tokens,
             device,
             active_decodes: HashMap::new(),
@@ -2930,6 +3306,8 @@ impl Scheduler {
             prefill_queue: VecDeque::new(),
             active_prefills: Vec::new(),
             active_section_ingests: Vec::new(),
+            section_positional: HashMap::new(),
+            turn_positional: HashMap::new(),
             sampler,
             show_special_tokens,
             health_config,
@@ -2955,12 +3333,11 @@ impl Scheduler {
             ),
             boundary_markers,
             prov_fold,
+            prov_capture_layers,
             wave_stats: WaveStats::new(),
             compression_jobs: HashMap::new(),
             pending_compression_seals: HashMap::new(),
             next_compression_job_id: 0,
-            pending_turn_seals: HashMap::new(),
-            next_turn_seal_id: 0,
             admit_budget: Self::MAX_PREFILL_WIDTH as u64 * admission::admit_quantum(),
             host_ram_probe: None,
             admit_grow_streak: 0,
@@ -3985,8 +4362,7 @@ impl Scheduler {
 
             SchedulerRequest::InstallRecurrentState {
                 sequence_ids,
-                schedule_hash,
-                layers,
+                state,
                 response_tx,
             } => {
                 // Every slot gets the same state, so the scatter is per-slot but
@@ -4002,15 +4378,35 @@ impl Scheduler {
                 let mut installed = false;
                 let mut first_err = None;
                 for sequence_id in sequence_ids {
-                    match self
-                        .model
-                        .restore_recurrent(sequence_id.0, schedule_hash, &layers)
-                        .map_err(ConversationError::Model)
-                    {
-                        Ok(did) => installed |= did,
-                        Err(e) => {
-                            if first_err.is_none() {
-                                first_err = Some(e);
+                    if !state.layers.is_empty() {
+                        match self
+                            .model
+                            .restore_recurrent(sequence_id.0, state.schedule_hash, &state.layers)
+                            .map_err(ConversationError::Model)
+                        {
+                            Ok(did) => installed |= did,
+                            Err(e) => {
+                                if first_err.is_none() {
+                                    first_err = Some(e);
+                                }
+                            }
+                        }
+                    }
+                    // The aux blob is installed even when the layers were
+                    // refused: the two classes validate independently, and a
+                    // schedule-hash mismatch on the delta-rule rows says nothing
+                    // about whether this model can read these bytes.
+                    if !state.aux.is_empty() {
+                        match self
+                            .model
+                            .restore_aux_state(sequence_id.0, &state.aux)
+                            .map_err(ConversationError::Model)
+                        {
+                            Ok(did) => installed |= did,
+                            Err(e) => {
+                                if first_err.is_none() {
+                                    first_err = Some(e);
+                                }
                             }
                         }
                     }
@@ -4683,7 +5079,18 @@ impl Scheduler {
         let turn_start = Instant::now();
         // Prefill `assistant_start` to get the first-token logits and frame the
         // model to *answer* rather than continue the prompt.
-        let asst_start = self.boundary_markers.assistant_start.as_ref().clone();
+        //
+        // The already-closed reasoning block follows it, which is how a dialect
+        // with no `/no_think` soft switch suppresses thinking (see
+        // `BoundaryMarkers::no_think_block`); empty on families that use the
+        // switch, which the instruction above already carries. Without it this
+        // probe suppressed nothing on Qwen3.5/3.8 AND had no backstop —
+        // `SamplingConfig::compression()` leaves the segment ids unresolved, so
+        // neither the forced close nor the EOT ramp can fire — and the
+        // compressor reasoned until it hit the response cap, storing the trace
+        // as the summary.
+        let mut asst_start = self.boundary_markers.assistant_start.as_ref().clone();
+        asst_start.extend_from_slice(&self.boundary_markers.no_think_block);
         let prefill_logits = self
             .run_prefill(slot, &asst_start)
             .map_err(|e| format!("SubmitSummaryProbe: prefill assistant_start: {e}"))?;
@@ -4734,42 +5141,52 @@ impl Scheduler {
             hs.skip_entropy_checks = config.temperature <= 0.01;
             hs
         };
-        self.active_decodes.insert(
-            slot,
-            DecodeState {
-                event_tx,
-                generated_tokens: TokenBuffer::from(vec![first]),
-                max_tokens,
-                sampling_config: config,
-                seal_action: SealAction::CompressionPass { job_id },
-                // A compression pass emits no tool calls.
-                free_tool_calls_from_penalties: false,
-                prefill_assistant_text: String::new(),
-                finished: false,
-                decode_start: Instant::now(),
-                decode_busy_us: 0,
-                prefill_ms,
-                prefill_token_count,
-                turn_start,
-                health,
-                reprojection: None,
-                non_punct_since_reproject: 0,
-                last_projection_end: 0,
-                post_decode_tokens: TokenBuffer::default(),
-                belief: PriorBelief::default(),
-                prefill_tokens: TokenBuffer::default(),
-                user_text: String::new(),
-                tags: Vec::new(),
-                user_content_start: 0,
-                user_content_end: 0,
-                assistant_content_start: 0,
-                no_think: false,
-                in_tool_call: false,
-                triggers: Arc::new(TriggerRegistry::new()),
-                stencil: None,
-                pending_mask: None,
-            },
-        );
+        // The turn's first token goes in through `push_generated` like every
+        // other, so the reasoning boundary is seen even when the prefill's own
+        // logits produced it.
+        let mut state = DecodeState {
+            event_tx,
+            generated_tokens: TokenBuffer::default(),
+            think_close_at: None,
+            forwarded_generated: 0,
+            pending_page_cut: false,
+            pending_page_cut_after: None,
+            max_tokens,
+            sampling_config: config,
+            seal_action: SealAction::CompressionPass { job_id },
+            // A compression pass emits no tool calls.
+            free_tool_calls_from_penalties: false,
+            prefill_assistant_text: String::new(),
+            finished: false,
+            decode_start: Instant::now(),
+            decode_busy_us: 0,
+            prefill_ms,
+            prefill_token_count,
+            turn_start,
+            health,
+            reprojection: None,
+            non_punct_since_reproject: 0,
+            last_projection_end: 0,
+            post_decode_tokens: TokenBuffer::default(),
+            belief: PriorBelief::default(),
+            prefill_tokens: TokenBuffer::default(),
+            user_text: String::new(),
+            tags: Vec::new(),
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
+            no_think: false,
+            in_tool_call: false,
+            triggers: Arc::new(TriggerRegistry::new()),
+            stencil: None,
+            pending_mask: None,
+        };
+        // The turn's first token always opens a page — the prefill/decode
+        // boundary — so the reasoning starts one.
+        state.push_committed(first, self.think_close, &self.page_break_tokens);
+        // No speculative rewind in flight on the summarise path either.
+        flush_page_cut(self.model.as_ref(), slot, &mut state);
+        self.active_decodes.insert(slot, state);
         Ok(())
     }
 
@@ -4875,27 +5292,6 @@ impl Scheduler {
             return tokens.to_vec();
         }
         let stripped = crate::think_strip::strip_think_blocks(&text);
-        self.tokenizer
-            .encode(stripped.as_str(), false)
-            .map(|e| e.get_ids().to_vec())
-            .unwrap_or_else(|_| tokens.to_vec())
-    }
-
-    /// As [`Self::strip_think_from_tokens`], but PRESERVES the surviving answer's
-    /// formatting (newlines, indentation, code blocks) — only the
-    /// `<think>…</think>` block and the whitespace immediately around it are
-    /// removed. Used for a dialogue turn's clean re-prefill, where collapsing the
-    /// answer's whitespace (as the summary path does) would mangle its layout in
-    /// the re-injected K/V.
-    fn strip_think_from_tokens_keep_layout(&self, tokens: &[u32]) -> Vec<u32> {
-        let Ok(text) = self.tokenizer.decode(tokens, true) else {
-            return tokens.to_vec();
-        };
-        let lower = text.to_ascii_lowercase();
-        if !lower.contains("<think>") && !lower.contains("</think>") {
-            return tokens.to_vec();
-        }
-        let stripped = crate::think_strip::strip_think_blocks_keep_layout(&text);
         self.tokenizer
             .encode(stripped.as_str(), false)
             .map(|e| e.get_ids().to_vec())
@@ -5072,18 +5468,26 @@ impl Scheduler {
 
     /// Build a turn's [`TurnLayout`] at seal time from the submit-time content
     /// boundaries and the per-half display text. The dialect marker lengths come
-    /// from the scheduler's `boundary_markers`; when the assistant body carries a
-    /// `<think>…</think>` block it is split into a real `Thinking` segment whose
-    /// token length is measured by re-tokenising the block (the answer span
-    /// absorbs any tokeniser round-trip remainder, so the layout still tiles).
-    #[allow(clippy::too_many_arguments)]
+    /// from the scheduler's `boundary_markers`.
     ///
-    /// `ethereal_thinking` chooses how the `<think>…</think>` block is
-    /// represented: `false` keeps its K/V (the grid still contains the reasoning
-    /// tokens — a REAL `Thinking` span); `true` drops its K/V (the grid was
-    /// re-prefilled reasoning-free, so the block is an ETHEREAL `Thinking`
-    /// segment whose prose is kept for display but never materializes into the
-    /// slot). The clean-reprefill seal passes `true`.
+    /// `think_close_at` is the turn's reasoning boundary as
+    /// [`DecodeState::think_close_at`] recorded it — the index into the
+    /// generated run of the `</think>` that closed the block. The reasoning
+    /// span is then `[assistant_content_start, first generated + that + 1)`:
+    /// the assistant body up to and including the marker.
+    ///
+    /// **Measured, not re-derived.** This used to locate the block by searching
+    /// the decoded text for `<think>` and re-tokenising it to get a length, so
+    /// the span was only approximately the tokens it described — its own comment
+    /// conceded that the answer span absorbed the round-trip remainder. That was
+    /// harmless while the span was dropped wholesale; it stops being harmless
+    /// the moment anything windows on it. The text search survives for the
+    /// segment's display prose only, which is what it was always right for.
+    ///
+    /// **Every turn seals its reasoning as a REAL span.** Nothing is destroyed
+    /// at write time to implement a read-time rule: the sealed grid is a
+    /// faithful record of what was decoded, and the projection decides what a
+    /// later turn may attend (`docs/thinking_span_projection.md`).
     #[allow(clippy::too_many_arguments)]
     fn build_turn_layout(
         &self,
@@ -5094,7 +5498,7 @@ impl Scheduler {
         user_text: String,
         assistant_text: String,
         no_think: bool,
-        ethereal_thinking: bool,
+        think_close_at: Option<u32>,
     ) -> TurnLayout {
         // A `/no_think` decode (dialogue turns under ThinkMode::Off, and every
         // code_read scope summary) collapses its reasoning to a bare
@@ -5144,24 +5548,36 @@ impl Scheduler {
         {
             return layout.with_assistant_split(subs);
         }
-        // Split the `<think>…</think>` reasoning out of the assistant body. Its
-        // token length is measured by re-tokenising the block; `ethereal_thinking`
-        // decides whether that length is a real K/V span or dropped.
-        if let (Some(o), Some(c)) = (
+        // Split the `<think>…</think>` reasoning out of the assistant body.
+        //
+        // The span comes from the boundary decode recorded, not from the text:
+        // the generated run starts at `assistant_content_start`, so its index
+        // `i` is grid position `assistant_content_start + i` and a block closing
+        // at `i` is `i + 1` tokens of assistant body. Any preamble the model
+        // emitted before `<think>` is inside that region, which is where it
+        // belongs — it is reasoning too.
+        //
+        // No recorded boundary means no block was decoded (a prefilled
+        // assistant half, or a tokenizer with no single `</think>` token), and
+        // the turn seals without a `Thinking` segment.
+        let Some(close_at) = think_close_at else {
+            return layout;
+        };
+        // `with_thinking_split` clamps to the assistant span, which is the
+        // right bound: it already excludes the reserved trailing marker.
+        let think_len = close_at.saturating_add(1);
+        // Display prose only. An empty result is correct rather than a failure
+        // — a suppressed turn's collapsed block is stripped from the display
+        // text upstream (`strip_empty_think_blocks`) while its tokens still
+        // occupy the K/V the span describes.
+        let block = match (
             assistant_text.find("<think>"),
             assistant_text.find("</think>"),
         ) {
-            if c >= o {
-                let block = assistant_text[o..c + "</think>".len()].to_string();
-                let think_len = self
-                    .tokenizer
-                    .encode(block.as_str(), false)
-                    .map(|t| t.get_ids().len() as u32)
-                    .unwrap_or(0);
-                return layout.with_thinking_split(block, think_len, ethereal_thinking);
-            }
-        }
-        layout
+            (Some(o), Some(c)) if c >= o => assistant_text[o..c + "</think>".len()].to_string(),
+            _ => String::new(),
+        };
+        layout.with_thinking_split(block, think_len, false)
     }
 
     /// If `asst_text` is a code_read tool exchange — `<tool_call>`, the
@@ -5244,203 +5660,6 @@ impl Scheduler {
                 kv: KvSpan::new(a4, total.saturating_sub(a4)),
             },
         ])
-    }
-
-    /// Defer a finished dialogue turn's seal: re-prefill it with the
-    /// `<think>…</think>` reasoning stripped so the SEALED K/V is reasoning-free
-    /// (a future projection of the turn can no longer attend its own thoughts),
-    /// then seal + fire the deferred `Done` once the re-prefill wave completes.
-    /// The reasoning TEXT is kept as an ethereal `Thinking` segment, so
-    /// display / history / summaries are unchanged. The caller has already
-    /// truncated the slot to `seal_block_from` (its go/no-go); this only builds
-    /// the clean grid, stashes the [`PendingTurnSeal`], and enqueues the unit.
-    fn enqueue_clean_turn_reprefill(
-        &mut self,
-        parent_id: SequenceId,
-        seal_block_from: usize,
-        state: DecodeState,
-        text: String,
-        stats: TurnStats,
-    ) {
-        // Forwarded generated: drop the last, un-forwarded sampled token (its K/V
-        // never landed in the slot), matching the immediate-seal path.
-        let forwarded_generated: &[u32] = state
-            .generated_tokens
-            .split_last()
-            .map(|(_, rest)| rest)
-            .unwrap_or(&[]);
-        // Reasoning-free answer: strip `<think>…</think>` (+ the whitespace around
-        // it) while keeping the answer's own formatting. A turn with no think
-        // block re-prefills byte-identical (a clean no-op).
-        let clean_answer = self.strip_think_from_tokens_keep_layout(forwarded_generated);
-        // Clean grid: [user_msg][user_end][assistant_start] (already
-        // `/no_think`-free — that glue lives in the prefix, before
-        // `seal_block_from`) + the reasoning-free answer + the closing tail.
-        let mut clean_tokens: Vec<u32> = Vec::with_capacity(
-            state.prefill_tokens.len() + clean_answer.len() + state.post_decode_tokens.len(),
-        );
-        clean_tokens.extend_from_slice(&state.prefill_tokens);
-        clean_tokens.extend_from_slice(&clean_answer);
-        clean_tokens.extend_from_slice(&state.post_decode_tokens);
-        let total = clean_tokens.len() as u32;
-
-        // Display text (verbatim, reasoning included). Already the whole
-        // assistant half — what was written, then what was decoded — so there is
-        // nothing to choose between; see the sibling seal in `drain_finished`.
-        let assistant_text = text.clone();
-        // The `<think>` block becomes an ETHEREAL `Thinking` segment over the
-        // reasoning-free grid — text kept, K/V dropped.
-        let layout = self.build_turn_layout(
-            state.user_content_start,
-            state.user_content_end,
-            state.assistant_content_start,
-            total,
-            state.user_text.clone(),
-            assistant_text,
-            state.no_think,
-            true,
-        );
-
-        let pending_id = self.next_turn_seal_id;
-        self.next_turn_seal_id += 1;
-        tracing::trace!(
-            target: "candle_conversation::scheduler::turn_seal",
-            "clean reprefill enqueued: slot {}, {} clean tokens, post-truncate offset {:?}, \
-             blocks {:?}, writer_start {:?}",
-            parent_id,
-            clean_tokens.len(),
-            self.session.sequence_offset(parent_id.0),
-            self.session.sequence_block_count(parent_id.0),
-            self.session.writer_start_idx(parent_id.0),
-        );
-
-        // Private sink for the re-prefill unit's `PrefillWork`; the real caller
-        // channel (`state.event_tx`) fires `Done` from `complete_turn_reprefill`.
-        let (sink_tx, sink_rx) = crossbeam::channel::unbounded();
-
-        self.pending_turn_seals.insert(
-            pending_id,
-            PendingTurnSeal {
-                parent_id,
-                seal_block_from,
-                layout,
-                token_ids: clean_tokens.clone(),
-                tags: state.tags,
-                event_tx: state.event_tx,
-                done_text: text,
-                done_token_ids: state.generated_tokens,
-                stats,
-                _sink_rx: sink_rx,
-            },
-        );
-
-        // Enqueue the clean grid as a `max_decode=0` prefill unit — it rides the
-        // SAME wave as the next turn's prefill and any summaries, so the
-        // re-prefill batches for maximum parallelism. `complete_turn_reprefill`
-        // seals + fires the deferred `Done`.
-        self.prefill_queue.push_back(PrefillWork {
-            sequence_id: parent_id,
-            tokens: TokenBuffer::from(clean_tokens),
-            prefill_text: String::new(),
-            user_text: String::new(),
-            user_content_start: 0,
-            user_content_end: 0,
-            assistant_content_start: 0,
-            no_think: false,
-            tags: Vec::new(),
-            prefill_assistant_text: String::new(),
-            event_tx: sink_tx,
-            max_decode_tokens: 0,
-            sampling: SamplingConfig::compression(),
-            submitted_at: Instant::now(),
-            reprojection: None,
-            belief: PriorBelief::default(),
-            seal_action: SealAction::TurnReprefill { pending_id },
-            post_decode_tokens: TokenBuffer::default(),
-            projection_offsets: Vec::new(),
-            staged_composition: None,
-            triggers: Arc::new(TriggerRegistry::new()),
-            turn_grammar: None,
-            free_tool_calls_from_penalties: false,
-        });
-    }
-
-    /// Seal a finished dialogue turn once its reasoning-free re-prefill completes
-    /// on the wave: snapshot the clean K/V (via the normal `SealAction::Turn`
-    /// write), drop the slot's chunks, and fire the deferred `Done` (the client's
-    /// full reply + the seal result). Mirrors `complete_compression_turn`.
-    fn complete_turn_reprefill(&mut self, pending_id: u64) {
-        let Some(pending) = self.pending_turn_seals.remove(&pending_id) else {
-            return;
-        };
-        let PendingTurnSeal {
-            parent_id,
-            seal_block_from,
-            layout,
-            token_ids,
-            tags,
-            event_tx,
-            done_text,
-            done_token_ids,
-            stats,
-            _sink_rx,
-        } = pending;
-
-        tracing::trace!(
-            target: "candle_conversation::scheduler::turn_seal",
-            "reprefill complete: slot {}, offset {:?}, blocks {:?}, writer_start {:?}",
-            parent_id,
-            self.session.sequence_offset(parent_id.0),
-            self.session.sequence_block_count(parent_id.0),
-            self.session.writer_start_idx(parent_id.0),
-        );
-        let turn_content = TurnContent {
-            role: Role::Assistant,
-            tags,
-            layout,
-            token_ids: TokenBuffer::from(token_ids),
-        };
-        let t_write = Instant::now();
-        let seal_result = self
-            .perform_seal_and_write(
-                parent_id,
-                seal_block_from,
-                // The clean re-prefill truncated the slot to `seal_block_from`
-                // and appended this turn, so the turn IS the slot's tail.
-                SealEnd::SlotEnd,
-                &SealAction::Turn,
-                Some(turn_content),
-            )
-            .unwrap_or_else(|e| {
-                tracing::warn!("clean turn seal failed for slot {}: {}", parent_id, e);
-                None
-            });
-
-        let write_us = t_write.elapsed().as_micros() as u64;
-
-        // Drop the slot's chunks now the residence owns them (the next projection
-        // rebuilds from the substrate) — same housekeeping as the immediate seal.
-        let t_trunc = Instant::now();
-        if let Err(e) = self.session.truncate_sequence_to_blocks(parent_id.0, 0) {
-            tracing::warn!(
-                "post-seal slot truncate failed for slot {}: {}",
-                parent_id,
-                e
-            );
-        }
-        // Splits the reprefill seal, which the sub-step timers pinned as ~99% of
-        // the housekeeping band, into its two candidate costs — the substrate
-        // write and the slot truncate. The snapshot and sig-gather inside
-        // `perform_seal_and_write` are already timed into the Sealing band and
-        // measure small, so whichever of these two dominates is the hot spot.
-        run::note_reprefill_split(write_us, t_trunc.elapsed().as_micros() as u64);
-
-        let _ = event_tx.send(TurnEvent::Done(TurnResponse {
-            text: done_text,
-            token_ids: done_token_ids,
-            stats,
-            seal: seal_result,
-        }));
     }
 
     /// Seal a re-prefilled compressed turn once the shared wave finishes its
@@ -6089,6 +6308,55 @@ impl Scheduler {
                 );
             }
         }
+
+        // The model's own state, restored from the same record. Independent of
+        // the layer restore above: a model may carry one, the other, or both,
+        // and the delta-rule import failing on geometry says nothing about
+        // whether this blob is installable.
+        self.restore_aux_from_payload(slot_id, timeline, payload.turn_index, &payload.aux);
+    }
+
+    /// Install a snapshot's model-opaque blob, reporting what happened.
+    ///
+    /// Shared by the two paths that install a persisted state — a timeline
+    /// resume and a branch checkpoint — because the interesting part is the
+    /// reporting, and a path that quietly skipped the blob would produce
+    /// exactly the fluent-and-forgotten resume the recurrent path is loud
+    /// about.
+    fn restore_aux_from_payload(
+        &self,
+        slot_id: SequenceId,
+        timeline: TimelineId,
+        turn_index: u32,
+        aux: &[u8],
+    ) {
+        if aux.is_empty() {
+            return;
+        }
+        match self.model.restore_aux_state(slot_id.0, aux) {
+            Ok(true) => {
+                tracing::debug!(
+                    "restored {} bytes of auxiliary state for timeline {timeline} at \
+                     turn {turn_index}",
+                    aux.len(),
+                );
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    "AUXILIARY RESUME SKIPPED (model reads no auxiliary state) for \
+                     timeline {timeline}: {} bytes were persisted, so this conversation \
+                     was sealed by a different model",
+                    aux.len(),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "AUXILIARY RESUME REFUSED for timeline {timeline} at turn \
+                     {turn_index}: {e} — the conversation continues without that \
+                     state.",
+                );
+            }
+        }
     }
 
     /// Handle the case where generation finishes on the first token (EOS or max=0).
@@ -6210,6 +6478,8 @@ impl Scheduler {
                 tokenizer: &self.tokenizer,
                 slot_tokens: &mut self.slot_tokens,
                 boundary_markers: &self.boundary_markers,
+                section_positional: &self.section_positional,
+                turn_positional: &self.turn_positional,
             },
             segments,
             defer,
@@ -6254,6 +6524,8 @@ impl Scheduler {
             tokenizer: &self.tokenizer,
             slot_tokens: &mut self.slot_tokens,
             boundary_markers: &self.boundary_markers,
+            section_positional: &self.section_positional,
+            turn_positional: &self.turn_positional,
         };
         projection_assembler::apply_segments_build(state, &mut ctx, segments)
     }
@@ -6289,6 +6561,8 @@ impl Scheduler {
             tokenizer: &self.tokenizer,
             slot_tokens: &mut self.slot_tokens,
             boundary_markers: &self.boundary_markers,
+            section_positional: &self.section_positional,
+            turn_positional: &self.turn_positional,
         };
         // The wave path fires the batched gap-fill BEFORE this finish, so the
         // fresh islands' K/V is in the gaps and capturable.
@@ -6548,74 +6822,15 @@ impl Scheduler {
                     }
                 }
 
-                // Clean-reprefill defer (dialogue turns only). The decode's K/V
-                // carries the `<think>…</think>` reasoning; sealing it as-is would
-                // let a future projection of this turn attend its own thoughts. So
-                // re-prefill the turn reasoning-free and seal THAT instead. The
-                // truncate that resets the slot to the turn boundary is the
-                // go/no-go: on success the seal + `Done` defer to the re-prefill
-                // wave (batched with the next wave's normal prefills); on the rare
-                // truncate failure we fall through to the immediate,
-                // reasoning-bearing seal so the turn is never lost.
-                if matches!(state.seal_action, SealAction::Turn)
-                    && self
-                        .session
-                        .truncate_sequence_to_blocks(seal_slot.0, seal_block_from)
-                        .and_then(|_| {
-                            // The kept blocks are the immutable prefix; the
-                            // clean re-prefill must append AT `seal_block_from`
-                            // (the seal anchor), never extend a kept
-                            // partial/empty tail block below it.
-                            self.session.seal_writer_boundary(seal_slot.0)
-                        })
-                        .is_ok()
-                {
-                    // **DISCARD.** The decoded blocks — thinking tokens and all
-                    // — were just truncated away, and the turn is about to be
-                    // re-prefilled clean onto the parent. The recurrent state
-                    // follows the K/V, so the view's advanced state is dropped
-                    // with the blocks it advanced over, leaving the parent at
-                    // the turn boundary. The clean re-prefill then advances it
-                    // over `[user][clean response]` exactly once.
-                    //
-                    // Moving here instead is the `<think>` skew — a state that
-                    // has seen the reasoning as well as the answer while the
-                    // K/V holds only the answer — on every thinking turn, and
-                    // it compounds. It is also invisible: the model stays
-                    // fluent and simply remembers a little more than it said.
-                    if let Some((view_id, _parent_id)) = pending_view_state.take() {
-                        if let Err(e) = self.model.release_sequence(view_id.0) {
-                            tracing::warn!(
-                                "failed to release recurrent state for discarded view {}: {}",
-                                view_id,
-                                e,
-                            );
-                        }
-                    }
-                    let stats = TurnStats {
-                        prefill_ms: state.prefill_ms,
-                        decode_ms,
-                        total_ms,
-                        tokens_generated,
-                        tokens_per_second,
-                        prefill_token_count: state.prefill_token_count,
-                        sequence: sequence_stats,
-                    };
-                    self.enqueue_clean_turn_reprefill(
-                        seal_slot,
-                        seal_block_from,
-                        state,
-                        text,
-                        stats,
-                    );
-                    continue;
-                }
-
-                // **MOVE.** Everything past the clean-reprefill branch keeps the
-                // view's decoded blocks on the parent, so the state it advanced
-                // over them moves with them. Reached both when the seal is not a
-                // turn and when the clean re-prefill could not be set up — in
-                // the latter case the blocks stayed, so the state must too.
+                // **The view's decoded blocks stay on the parent, so the state
+                // it advanced over them moves with them.**
+                //
+                // There is one disposition now, for every turn. A turn seals
+                // with everything it decoded — reasoning included — and the
+                // projection decides what a later turn may attend
+                // (`docs/thinking_span_projection.md`). Nothing truncates the
+                // decoded blocks away any more, so nothing may release the state
+                // that advanced over them.
                 if let Some((view_id, parent_id)) = pending_view_state.take() {
                     if let Err(e) = self.model.move_recurrent(view_id.0, parent_id.0) {
                         tracing::warn!(
@@ -6692,6 +6907,16 @@ impl Scheduler {
                             // another forward could write its K/V into
                             // the slot.  Drop it so token_ids aligns
                             // 1:1 with the K/V chunk grid.
+                            //
+                            // **Deliberately NOT `forwarded_generated`.** That
+                            // counter answers "is anything waiting to go out",
+                            // which is all the injection path needs, and it is
+                            // maintained by the paths that forward — so a path
+                            // that forwards without touching it reads low.
+                            // Sealing from it made `token_ids` 2 tokens shorter
+                            // than the chunk grid on a measured turn (287 against
+                            // 289), breaking the 1:1 contract this slice exists
+                            // to keep. The grid's authority is the K/V.
                             let forwarded_generated: &[u32] = state
                                 .generated_tokens
                                 .split_last()
@@ -6715,9 +6940,6 @@ impl Scheduler {
                             // of any turn that had both.
                             let assistant_text = text.clone();
                             let total = full_tokens.len() as u32;
-                            // Immediate (non-deferred) seal: no re-prefill ran, so
-                            // the grid still contains the reasoning tokens — the
-                            // `<think>` block is a REAL span (`ethereal = false`).
                             let layout = self.build_turn_layout(
                                 state.user_content_start,
                                 state.user_content_end,
@@ -6726,7 +6948,7 @@ impl Scheduler {
                                 state.user_text.clone(),
                                 assistant_text,
                                 state.no_think,
-                                false,
+                                state.think_close_at,
                             );
                             Some(TurnContent {
                                 role: Role::Assistant,
@@ -6855,6 +7077,53 @@ impl Scheduler {
         Ok(())
     }
 
+    /// A unit's own tokens begin on `slot`: close its index so the prefix ahead
+    /// of them becomes a page of its own.
+    ///
+    /// **Call this at the instant the unit's K/V anchor is captured, and
+    /// nowhere else.** The anchor and this cut are one fact — "this unit's own
+    /// tokens start here" — recorded for two stores that the seal reads back
+    /// together: `[anchor, block_count)` of the K/V, and the matching token
+    /// count from the index. Nothing in either store makes them agree. The
+    /// prefix ahead of a unit is *forwarded* on this slot, so its rows land in
+    /// the same live index tail the unit is about to extend, and the seal then
+    /// asks for "the last N tokens" of a run that begins before the unit does.
+    ///
+    /// **Where a turn's own tokens begin depends on how its user half got
+    /// there, so the boundary is taken at both places it can be.** A projection
+    /// that carries the in-flight user message *prefills it onto the parent*
+    /// (`deferred_user`) before the view is carved, so the turn's content starts
+    /// there; a slot that skips projection (the `code_read` ingest) forwards
+    /// nothing before the carve, so its turn starts on the view. The call is
+    /// idempotent — an already-empty tail closes `0` — so both fire and whichever
+    /// one is the real boundary is the one that closes anything.
+    ///
+    /// Sites: [`projection_assembler::apply_segments_finish`] (before the
+    /// deferred user prefill), [`Self::create_view`] (before the carve, so
+    /// `fork_recurrent` copies a cache already closed), [`Self::reproject_view`]
+    /// (the same turn's anchor moving to the rebuilt prefix's end), and
+    /// [`Self::prepare_section_ingest`] (a section). The anchor itself is not
+    /// passed in because they do not share a coordinate system — a windowed
+    /// borrow counts view blocks, an ingest counts the slot's own — while the
+    /// cut is the same operation on the same slot in all of them.
+    ///
+    /// Recording them apart is what let them drift, and getting the *set* wrong
+    /// is what survived the first consolidation: with only the carve, a turn
+    /// whose user half was prefilled during projection had that half closed into
+    /// the prefix's page, leaving a 7-token assistant header as the whole of its
+    /// "prefill" page. Measured on turn after turn — `turn_token_count=324`,
+    /// `reasoning=(296, 3)`, sealed `widths=[7, 28]` — the 289-token user
+    /// message sealed as part of the prefix, every time.
+    ///
+    /// The closed width is logged rather than discarded. A cut placed after the
+    /// tokens it was meant to separate closes `0` and is otherwise
+    /// indistinguishable from one that was simply not needed, so the number is
+    /// the only evidence the boundary landed where it was aimed.
+    fn begin_unit(&mut self, slot: SequenceId, unit: &'static str) {
+        let held = self.session.sequence_offset(slot.0).unwrap_or(0);
+        close_unit_boundary(self.model.as_ref(), slot, unit, held);
+    }
+
     /// CPU-only setup for a section ingest: truncate slot, inject prefix,
     /// capture `seal_block_from`, push writer chunk, pin tokens on substrate.
     /// Returns `seal_block_from` (the chunk index lower bound for the seal).
@@ -6870,6 +7139,12 @@ impl Scheduler {
         // 1. Defensive truncate.
         self.session
             .truncate_sequence_to_blocks(sequence_id.0, 0)
+            .map_err(ConversationError::Model)?;
+        // The slot's per-position state goes with its K/V. A reused slot starts
+        // at position 0, and pages describing the previous occupant's positions
+        // would put this section's first token at that prefix's end.
+        self.model
+            .reset_positional_state(sequence_id.0)
             .map_err(ConversationError::Model)?;
 
         // 2. Inject substrate-pinned prefix sections (zero-copy Arc clone).
@@ -6936,6 +7211,27 @@ impl Scheduler {
                             per_layer_chunks[layer_idx].extend(layer_seq.chunks.iter().cloned());
                             per_layer_token_count[layer_idx] += layer_seq.token_count;
                         }
+                        // The one thing borrowing the chunks does not bring
+                        // along. Pushed in prefix order, so the pages sit at
+                        // the positions their K/V does; a section without one
+                        // leaves this ingest's queries asking for blocks the
+                        // model does not hold, and the select refuses.
+                        if let Some(blob) = self.section_positional.get(&prefix_id) {
+                            if let Err(e) = self.model.push_positional_state(sequence_id.0, blob) {
+                                tracing::warn!(
+                                    "prepare_section_ingest: prefix section {:?} index page \
+                                     refused: {e}",
+                                    prefix_id
+                                );
+                            }
+                        } else if self.model.carries_positional_state() {
+                            tracing::warn!(
+                                "prepare_section_ingest: prefix section {:?} has no index \
+                                 page — this ingest will select against a prefix it never \
+                                 indexed",
+                                prefix_id
+                            );
+                        }
                     }
                 }
                 let total_tokens = per_layer_token_count.first().copied().unwrap_or(0);
@@ -6958,11 +7254,14 @@ impl Scheduler {
             }
         }
 
-        // 3. Capture seal lower bound before pushing the fresh writer chunk.
+        // 3. Capture the seal's lower bound — and, in the same step, the index
+        //    boundary that has to name the same position — before pushing the
+        //    fresh writer chunk.
         let seal_block_from = self
             .session
             .sequence_block_count(sequence_id.0)
             .unwrap_or(0);
+        self.begin_unit(sequence_id, "section");
 
         // 4. Push fresh writer chunk so section N doesn't alias the prefix's
         //    partial Arc-shared tail.  Not needed for empty prefix (slot is
@@ -7026,6 +7325,9 @@ impl Scheduler {
                 "section seal: pre-seal slot stats"
             );
         }
+        // Read before the move — the warn below needs the width, and the seal
+        // takes ownership of the buffer.
+        let n_tokens = tokens.len();
         let seal = self.perform_seal_and_write(
             sequence_id,
             seal_block_from,
@@ -7046,6 +7348,40 @@ impl Scheduler {
                 "ingest_section: seal returned None (slot had no content?)".into(),
             )
         })?;
+
+        // The page that goes with the chunks just sealed. Taken here, at the
+        // seal, because this is where the section's own forward has finished
+        // and before the slot is reused — and closed on a block boundary, so
+        // the piece covers its own tokens and no others.
+        match self.model.seal_positional_state(sequence_id.0) {
+            Ok(Some(blob)) => {
+                self.section_positional.insert(section_id, Arc::new(blob));
+            }
+            // **`None` is not "nothing to do" — it is a section with no index.**
+            // It used to be swallowed, and that silence is what let an entire
+            // system prompt reach the model unindexed: every section returned
+            // `None`, the assembler had no blob to push, and the shortfall
+            // surfaced only when the prefix grew past the QSA identity
+            // threshold and a select refused — thousands of tokens and one
+            // conversation later, naming the slot rather than the seal.
+            Ok(None) => tracing::warn!(
+                section = section_id.raw(),
+                seq = sequence_id.0,
+                n_tokens,
+                "section sealed with NO index page — the model holds no per-position \
+                 state for this slot, so anything borrowing its tokens selects against \
+                 a prefix it never indexed",
+            ),
+            Err(e) => {
+                // Not fatal to the seal — the K/V is committed — but the next
+                // ingest to borrow this section will have to say so.
+                tracing::warn!(
+                    "section {:?}: index page not sealed ({e}); an ingest borrowing it will \
+                     select against a prefix it never indexed",
+                    section_id
+                );
+            }
+        }
 
         Ok(seal)
     }
@@ -7490,6 +7826,23 @@ impl Scheduler {
             .map(|s| s.iter().map(|c| c.token_count as usize).sum())
             .unwrap_or(0);
 
+        // The turn's reasoning span, read before `turn_content` moves into the
+        // write below. `None` for every seal that is not a dialogue turn, and
+        // for a turn that decoded no reasoning.
+        let reasoning_span = turn_content.as_ref().and_then(|c| {
+            c.layout.segments.iter().find_map(|s| match s {
+                TurnSegment::Thinking { kv, .. } => *kv,
+                _ => None,
+            })
+        });
+        // The turn's own token count, from the buffer whose contract is that it
+        // "must match the K/V chunk grid 1-1". It is the tie-breaker when the
+        // chunk sum and the index walk disagree: equal to the chunk sum means
+        // the K/V grid is intact and the index gained rows; equal to the index
+        // means the grid lost some and this invariant is already broken here,
+        // upstream of anything the index did.
+        let turn_grid_tokens = turn_content.as_ref().map(|c| c.token_ids.len());
+
         // Capture the whole turn's wide per-token `sign(Q)` from R16 NOW — before
         // `record_turn` (below) detaches the sealed KV. All heads / all layers,
         // un-folded. Complete while the turn's KV is R16 (`kv_lossless`); a block
@@ -7498,6 +7851,16 @@ impl Scheduler {
         // it for the GUI's sealing phase, timing the dominant sig-gather cost.
         let t_sig = Instant::now();
         let wide_sigs = self.gather_wide_sigs(seal_slot, (block_from, block_to));
+        // **The signatures describe what is RETRIEVABLE, and the reasoning is
+        // not.** A turn's reasoning is attendable from exactly one subsequent
+        // projection, by position, and never by recall — every later projection
+        // windows it out of the K/V. Leaving its tokens in the signature run lets
+        // the belief scan score a turn on content the projection then removes,
+        // which is a retrieval that returns nothing usable.
+        let wide_sigs = match reasoning_span {
+            Some(span) => sigs_without_span(wide_sigs, span.range()),
+            None => wide_sigs,
+        };
         self.wave_stats
             .add_seal(snapshot_us, t_sig.elapsed().as_micros() as u64, 0);
 
@@ -7635,6 +7998,123 @@ impl Scheduler {
                         encode_wide_sigs_with(&wide_sigs, self.prov_fold),
                     );
                 }
+                // The QSA index rows describing the K/V just sealed. Taken here,
+                // in the one place every turn is written, so a turn cannot be
+                // sealed down a path that forgets them. It lived on a completion
+                // path only one kind of turn reached, and every turn that took
+                // any other route sealed with K/V and no rows at all.
+                //
+                // **Sealed by WIDTH, not from a position.** A turn's rows are
+                // not all in the live tail: a mid-decode reprojection re-injects
+                // its user half from cache and pushes it as a page, so the turn
+                // spans a page boundary. `seal_positional_tail_span` walks back
+                // over whole pages until the width is covered; sealing the tail
+                // alone drops the user's own message, after which the model
+                // decodes a question it cannot attend to and answers a different
+                // one it invented.
+                //
+                // Each page keeps its own ragged width, so they travel as an
+                // ordered list ([`index_pages`]) and are pushed back in that
+                // order. Resident AND durable: the map answers this process's
+                // projections, the record is what makes the turn borrowable
+                // after a restart.
+                match self
+                    .model
+                    .seal_positional_tail_span(seal_slot.0, turn_token_count)
+                {
+                    Ok(pages) if !pages.is_empty() => {
+                        // **The pages must cover the turn EXACTLY.**
+                        //
+                        // `seal_positional_tail_span` walks back over WHOLE
+                        // pages until the width is covered, so if the turn's own
+                        // rows begin partway into a page the walk takes that
+                        // page entire and the set covers more than the turn.
+                        // Storing it makes the turn's index claim rows for
+                        // tokens before it, and every projection that borrows
+                        // the turn then carries an index wider than the K/V —
+                        // measured as a constant "index N tokens past" on every
+                        // ingest slot.
+                        //
+                        // Reported with both numbers because the overshoot is
+                        // exactly one page's width, and naming that width is
+                        // what identifies the piece the turn's rows share a page
+                        // with.
+                        let covered: usize = pages.iter().map(|(w, _)| *w).sum();
+                        if covered != turn_token_count {
+                            // **Both sides of the disagreement, so the next
+                            // reader does not have to guess which one is
+                            // wrong.** `turn_token_count` is the K/V's answer
+                            // (summed chunk widths over `[block_from,
+                            // block_to)`); the walk's `covered` is the index's.
+                            // `reasoning_span` is here because the observed
+                            // shortfall is a constant 7 tokens sitting in a page
+                            // of its own between the turn's prefill and its
+                            // answer — exactly where the reasoning cut falls —
+                            // and its width is what says whether that page is
+                            // the reasoning or something the index gained
+                            // without K/V.
+                            tracing::warn!(
+                                turn = idx.0,
+                                turn_token_count,
+                                covered,
+                                block_from,
+                                block_to,
+                                chunk_widths = ?snapshot
+                                    .chunks
+                                    .get(block_from..block_to)
+                                    .map(|s| s.iter().map(|c| c.token_count).collect::<Vec<_>>())
+                                    .unwrap_or_default(),
+                                reasoning = ?reasoning_span.map(|s| (s.offset, s.len)),
+                                turn_grid_tokens = ?turn_grid_tokens,
+                                n_pages = pages.len(),
+                                widths = ?pages.iter().map(|(w, _)| *w).collect::<Vec<_>>(),
+                                "turn index pages cover {} token(s) {} the turn itself — the \
+                                 walk-back crossed a page the turn does not start on",
+                                covered.abs_diff(turn_token_count),
+                                if covered > turn_token_count { "more than" } else { "less than" }
+                            );
+                        }
+                        // **Do not persist an index the seal already knows is
+                        // wrong.** A payload whose pages do not sum to the turn's
+                        // own K/V width cannot describe it, so every later
+                        // projection that selects the turn refuses to window it —
+                        // and because the payload goes into the redo log, that
+                        // refusal outlives the process with no repair path. Storing
+                        // nothing leaves the turn in the same state as a model that
+                        // seals no pages at all, which `turn_sealed_without_thinking`
+                        // handles by injecting it whole. The warning above already
+                        // names both numbers.
+                        if covered == turn_token_count {
+                            let payload = index_pages::encode(&pages);
+                            conversation.enqueue_index_page(
+                                turn_stream_id(target.timeline.raw(), idx.0),
+                                payload.clone(),
+                            );
+                            self.turn_positional.insert(
+                                TurnKey {
+                                    timeline: target.timeline,
+                                    index: idx,
+                                },
+                                Arc::new(payload),
+                            );
+                        }
+                    }
+                    Ok(_) => {
+                        if self.model.carries_positional_state() {
+                            tracing::warn!(
+                                turn = idx.0,
+                                turn_token_count,
+                                "turn sealed with no index pages — a projection borrowing its \
+                                 K/V will select against a prefix it never indexed"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        turn = idx.0,
+                        "turn index pages not sealed ({e}); a projection borrowing this turn \
+                         will select against a prefix it never indexed"
+                    ),
+                }
                 // Persist the sequence's recurrent state, if it carries any.
                 //
                 // **Before the `Tokens` enqueue, deliberately.** The snapshot
@@ -7661,6 +8141,30 @@ impl Scheduler {
                 // 19-token question costs exactly what a full trajectory does.
                 let ephemeral = conversation.read().is_timeline_transient(target.timeline);
                 let t_export = Instant::now();
+                // The model's other recurrence, in its own encoding. Exported at
+                // the same instant as `layers` — one seal, one state — so the
+                // two can never describe different token counts. A model with
+                // none returns `None` and the blob is empty.
+                //
+                // Skipped for an ephemeral timeline alongside `layers`, and for
+                // the same reason: the payload is dropped on arrival, so the
+                // export is pure cost.
+                let aux = if ephemeral {
+                    Vec::new()
+                } else {
+                    match self.model.export_aux_state(seal_slot.0) {
+                        Ok(blob) => blob.unwrap_or_default(),
+                        Err(e) => {
+                            tracing::warn!(
+                                "auxiliary state export failed for turn {} (the turn is \
+                                 sealed; resuming it will rebuild that state by prefill): {}",
+                                idx.0,
+                                e,
+                            );
+                            Vec::new()
+                        }
+                    }
+                };
                 match if ephemeral {
                     Ok(None)
                 } else {
@@ -7672,6 +8176,7 @@ impl Scheduler {
                             turn_index: idx.0,
                             schedule_hash,
                             layers: layers.into_iter().map(SnapshotLayer::from).collect(),
+                            aux,
                         };
                         let bytes = payload.encode();
                         // Timed around export + encode, which is the whole of
@@ -7683,6 +8188,37 @@ impl Scheduler {
                         SNAPSHOT_BYTES.fetch_add(bytes.len() as u64, Relaxed);
                         SNAPSHOT_COUNT.fetch_add(1, Relaxed);
                         conversation.enqueue_recurrent_snapshot(target.timeline, bytes);
+                    }
+                    // **`None` from a model that declares recurrent state is a
+                    // contradiction, not a fast path.**
+                    //
+                    // The two readings of `None` are "this architecture has no
+                    // such state" and "this architecture has state it cannot
+                    // export", and they are indistinguishable here while having
+                    // opposite consequences: the first costs nothing, the second
+                    // silently produces a conversation that resumes with no
+                    // memory of its history and reads perfectly fluently. That
+                    // is the exact defect this whole path exists to remove, so
+                    // the model's own `carries_recurrent_state` is used to tell
+                    // them apart.
+                    //
+                    // A model reaching this arm has declared state and returned
+                    // none for a sequence that has just decoded a turn — the
+                    // only innocent case, a slot that never ran a wave, cannot
+                    // be sealing. It is a wiring gap in that architecture, and
+                    // it is worth a warning on every seal rather than a silence
+                    // that is only discovered by noticing the model has
+                    // forgotten.
+                    Ok(None) if self.model.carries_recurrent_state() => {
+                        tracing::warn!(
+                            "turn {} sealed with NO recurrent snapshot, but this model \
+                             declares it carries recurrent state — `export_recurrent` \
+                             returned None. The turn's K/V and text are committed, but \
+                             resuming this conversation will start from the \
+                             sequence-start state: it will read fluently and have \
+                             forgotten. This is a missing model hook, not a data loss.",
+                            idx.0,
+                        );
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -7715,7 +8251,7 @@ impl Scheduler {
                 // Wake the summariser thread
                 // (`docs/archived/infinite_conversations.md` §4 step ③) so the
                 // freshly-pending Normal turn gets absorbed into the immutable
-                // summary forest (`docs/immutable_summary_forest.md`) on its
+                // summary forest (`docs/archived/immutable_summary_forest.md`) on its
                 // next pass instead of waiting up to 250 ms for the periodic tick.
                 self.summariser_trigger.fire();
                 // Trim the slot's live-prefill capture cache down to
@@ -7813,11 +8349,6 @@ impl Scheduler {
                     "compression turns seal in promote_finished_prefills_to_decodes, not here"
                 )
             }
-            SealAction::TurnReprefill { .. } => {
-                unreachable!(
-                    "clean turn re-prefill seals via SealAction::Turn in complete_turn_reprefill"
-                )
-            }
         }
 
         Ok(Some(SealResult {
@@ -7881,7 +8412,7 @@ impl Scheduler {
     fn handle_branch_checkpoint_pass(
         &mut self,
         tokens: &[u32],
-    ) -> Result<Option<(u64, Vec<ExportedLayerState>)>, ConversationError> {
+    ) -> Result<Option<ExportedState>, ConversationError> {
         if !self.model.carries_recurrent_state() {
             return Ok(None);
         }
@@ -7892,14 +8423,35 @@ impl Scheduler {
             .session
             .create_sequence()
             .map_err(ConversationError::Model)?;
-        let result = self.prefill_tokens_on(seq, tokens).and_then(|()| {
-            self.model
-                .export_recurrent(seq)
-                .map_err(ConversationError::Model)
-        });
+        let result = self
+            .prefill_tokens_on(seq, tokens)
+            .and_then(|()| self.export_state_of(seq));
         let _ = self.model.release_sequence(seq);
         let _ = self.session.free_sequence(seq);
         result
+    }
+
+    /// Both classes of a sequence's recurrent state, from one export.
+    ///
+    /// `None` only when the model produced neither — a model may carry either
+    /// alone, so the layers being absent is not on its own an answer.
+    fn export_state_of(&self, seq: usize) -> Result<Option<ExportedState>, ConversationError> {
+        let recurrent = self
+            .model
+            .export_recurrent(seq)
+            .map_err(ConversationError::Model)?;
+        let aux = self
+            .model
+            .export_aux_state(seq)
+            .map_err(ConversationError::Model)?
+            .unwrap_or_default();
+        let (schedule_hash, layers) = recurrent.unwrap_or_default();
+        let state = ExportedState {
+            schedule_hash,
+            layers,
+            aux,
+        };
+        Ok(if state.is_empty() { None } else { Some(state) })
     }
 
     /// Run `tokens` through the model on `seq`, in `max_prefill_pass_tokens`
@@ -7997,6 +8549,22 @@ impl Scheduler {
             .session
             .create_sequence()
             .map_err(ConversationError::Model)?;
+        // **Seed before injecting, then clear the per-position state the seed
+        // brought.**
+        //
+        // The fork is here for the recurrent memory — the GDN/PLE state this
+        // replay exists to rebuild — but it copies the whole carried state,
+        // per-position index included, and that part describes the LIVE
+        // sequence's layout rather than the one assembled below. Running it
+        // after the injections also overwrote them. Scratch's index has to
+        // describe scratch: cleared here, then rebuilt piece by piece as each
+        // turn is injected, exactly as a projection assembles a slot.
+        self.model
+            .fork_recurrent(sequence_id.0, scratch)
+            .map_err(ConversationError::Model)?;
+        self.model
+            .reset_positional_state(scratch)
+            .map_err(ConversationError::Model)?;
         let mut injected = 0usize;
         if let (Some(conversation), Some(target)) = (
             self.slot_conversations.get(&sequence_id).cloned(),
@@ -8020,7 +8588,42 @@ impl Scheduler {
                 let sealed = conversation.read().turn_sealed_of(target.timeline, idx);
                 if let Some(sealed) = sealed {
                     match self.session.inject_sealed_at_tail(scratch, &sealed) {
-                        Ok(_) => injected += 1,
+                        Ok(_) => {
+                            injected += 1;
+                            // The rows for the K/V just injected. Borrowing the
+                            // turn's keys does not bring its index across —
+                            // resident copy first, then the turn's stored page,
+                            // the same order a projection uses.
+                            let key = TurnKey::new(target.timeline, idx);
+                            let page =
+                                self.turn_positional
+                                    .get(&key)
+                                    .map(|b| b.to_vec())
+                                    .or_else(|| {
+                                        conversation
+                                            .read()
+                                            .index_page_blob(target.timeline, idx)
+                                            .map(|b| b.to_vec())
+                                    });
+                            match page {
+                                Some(blob) => {
+                                    if let Err(e) = self.model.push_positional_state(scratch, &blob)
+                                    {
+                                        tracing::warn!(
+                                            "memory catch-up: turn {idx} index page refused \
+                                             ({e})"
+                                        );
+                                    }
+                                }
+                                None if self.model.carries_positional_state() => {
+                                    tracing::warn!(
+                                        "memory catch-up: turn {idx} has no index page — the \
+                                         replay selects against a prefix it never indexed"
+                                    );
+                                }
+                                None => {}
+                            }
+                        }
                         Err(e) => tracing::warn!(
                             "memory catch-up: could not inject turn {idx} as context ({e}) — \
                              the adopted span replays with less context than a real append"
@@ -8033,16 +8636,11 @@ impl Scheduler {
             "memory catch-up: replaying {} adopted tokens over {injected} injected turns",
             tokens.len(),
         );
-        let result = self
-            .model
-            .fork_recurrent(sequence_id.0, scratch)
-            .map_err(ConversationError::Model)
-            .and_then(|()| self.prefill_tokens_on(scratch, tokens))
-            .and_then(|()| {
-                self.model
-                    .move_recurrent(scratch, sequence_id.0)
-                    .map_err(ConversationError::Model)
-            });
+        let result = self.prefill_tokens_on(scratch, tokens).and_then(|()| {
+            self.model
+                .move_recurrent(scratch, sequence_id.0)
+                .map_err(ConversationError::Model)
+        });
         let _ = self.model.release_sequence(scratch);
         let _ = self.session.free_sequence(scratch);
         result.map(|()| true)
@@ -8081,7 +8679,20 @@ impl Scheduler {
     /// backing is gone (compressed) contribute nothing — capture a turn while its KV is
     /// still R16 (e.g. `kv_lossless`, or at seal before the bg-quantizer runs).
     fn gather_wide_sigs(&self, seq_id: SequenceId, range: (usize, usize)) -> Vec<WideQSig> {
-        let n_layers = self.session.num_layers();
+        // **The STREAM layers, not every KV layer.** A signature is a statement
+        // about the conversation's own history, and a draft head's K/V is not
+        // that — it is the speculative continuation the head proposed. Folding
+        // it in would describe two histories as one, and on the GPU path it did
+        // worse than that: the capture is all-or-nothing across layers, so the
+        // head's disagreeing block set made every turn's signature come back
+        // empty.
+        //
+        // Both paths take the same bound, because they must produce the same
+        // bits — the fold's geometry is `layers × kv_heads`, so a CPU fallback
+        // counting one more layer than the kernel would not be a slower answer
+        // but a different one. And both take the number the FOLD was derived
+        // from, which is the only way that guarantee holds.
+        let n_layers = self.prov_capture_layers.min(self.session.num_layers());
         let n_kv_head = self.session.n_kv_head();
         let head_dim = self.session.head_dim();
         if n_layers == 0 || n_kv_head == 0 || head_dim == 0 || range.1 <= range.0 {
@@ -8102,7 +8713,7 @@ impl Scheduler {
             let t_res = Instant::now();
             let resolved = self
                 .session
-                .resolve_provenance_q_ptrs(seq_id.0, Some(range))
+                .resolve_provenance_q_ptrs(seq_id.0, Some(range), n_layers)
                 .ok()
                 .flatten();
             PROV_RESOLVE_US.fetch_add(t_res.elapsed().as_micros() as u64, Relaxed);
@@ -8225,6 +8836,18 @@ impl Scheduler {
             visible_block_ranges.iter().map(|r| r.to_raw()).collect()
         };
 
+        // The turn's own tokens start where the parent's prefix ends, so the
+        // index is closed there — on the PARENT, and before the carve.
+        //
+        // Both halves of that are load-bearing. `fork_recurrent` below copies
+        // the parent's index cache wholesale, live tail included, so a tail left
+        // open here arrives in the view as rows the turn's own tokens then
+        // extend. And closing it on the parent is what makes the cut idempotent:
+        // the parent keeps the page, so a slot that accumulates across turns
+        // (the `skip_projection` ingest path, whose parent is never rebuilt)
+        // does not re-close a growing prefix once per turn.
+        self.begin_unit(parent_id, "turn");
+
         let vs = self
             .session
             .create_view_sequence(parent_id.0, &raw_ranges)
@@ -8245,6 +8868,33 @@ impl Scheduler {
             .fork_recurrent(parent_id.0, view_id.0)
             .map_err(ConversationError::Model)?;
         FORK_RECURRENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The view borrows the parent's K/V blocks but copies its per-position
+        // state, so the two have to agree at the moment of the carve. A view
+        // that starts short stays short for its whole life and says nothing
+        // until a selection past the identity threshold refuses — so the
+        // mismatch is named here, where the parent that caused it is still in
+        // hand.
+        if let Some(cov) = self.model.positional_coverage(view_id.0) {
+            let parent_tokens = self.session.sequence_offset(parent_id.0).unwrap_or(0);
+            if cov < parent_tokens {
+                // **The PARENT's coverage too, because it decides where to look.**
+                // A child short of a parent that is itself complete is a fork
+                // that dropped rows; a child short of a parent that was already
+                // short is the parent's prefix having arrived unindexed, and the
+                // fork is faithfully copying nothing. Without both numbers the
+                // warning names the carve for a loss that happened before it.
+                let parent_cov = self.model.positional_coverage(parent_id.0);
+                tracing::warn!(
+                    parent = parent_id.0,
+                    view = view_id.0,
+                    parent_tokens,
+                    parent_coverage = ?parent_cov,
+                    view_coverage = cov,
+                    "create_view: carved a view over {} token(s) its index does not cover",
+                    parent_tokens - cov
+                );
+            }
+        }
 
         // Seed sampling state for the view (clone parent's state so
         // the DRY window survives the carve).
@@ -9075,6 +9725,32 @@ impl Scheduler {
         // reprojected turn would read fluently and have forgotten its own
         // first half.
         //
+        // **The index rows for `tail_per_layer`, taken from the VIEW, before
+        // anything moves.**
+        //
+        // The K/V for the turn so far survives this swap as `tail_per_layer` and
+        // is injected back onto the rebuilt parent. Its index rows do not travel
+        // with it: the move below puts them on the parent, and the re-projection
+        // immediately resets the parent's per-position state and replays the
+        // prefix from pages. So the turn's K/V comes back and the rows
+        // describing it do not, leaving the slot short by exactly this turn's
+        // width — silent while the conversation sits under the QSA identity
+        // threshold, and a refused select the moment it passes it.
+        //
+        // **Sealed by WIDTH, not from a position, and read from the view.** The
+        // turn's rows are not all in its live tail: a previous reprojection
+        // re-injects the turn's user half from cache and pushes it as a page, so
+        // the turn spans a page boundary. `seal_positional_tail_span` walks back
+        // over whole pages until the width is covered and flushes the partial
+        // block, which is the only formulation that takes the whole turn.
+        // Sealing the live tail alone drops the user's own message — measured at
+        // 14 tokens, after which the model decoded a question it could not
+        // attend to and answered a different one it invented.
+        let turn_tokens = tail_per_layer.first().map(|s| s.token_count).unwrap_or(0);
+        let tail_index_page = self
+            .model
+            .seal_positional_tail_span(view_id.0, turn_tokens)
+            .map_err(ConversationError::Model)?;
         // Ordering: move before the free, or there is nothing left to read.
         // The move already removes the view's entry, so the release below is
         // just the general per-sequence cleanup.
@@ -9136,6 +9812,7 @@ impl Scheduler {
             view_id,
             parent_id,
             tail_per_layer,
+            tail_index_page,
             decode_state,
             sampling_state,
             sections_len: projected_sections.len(),
@@ -9168,6 +9845,7 @@ impl Scheduler {
             view_id,
             parent_id,
             tail_per_layer,
+            tail_index_page,
             mut decode_state,
             sampling_state,
             sections_len,
@@ -9217,7 +9895,14 @@ impl Scheduler {
 
         let t_finish = Instant::now();
         self.apply_projection_finish(parent_id, plan)?;
+        // The rebuilt prefix ends here, so the turn's anchor moves here — and
+        // the index closes with it. The rebuild re-supplies the turn's user half
+        // by *prefilling* it (`deferred_user`), which leaves rows in the live
+        // tail; without this cut the tail pages pushed below land on a
+        // non-empty tail and are refused outright, and the slot then holds the
+        // turn's K/V with nothing indexing it.
         let new_prefix_block_count = self.session.sequence_block_count(parent_id.0).unwrap_or(0);
+        self.begin_unit(parent_id, "reprojected turn");
         // apply_ms = this slot's segment build + finish, NOT the shared gap-fill
         // wave (reported separately as glue_ms), so it no longer absorbs the
         // cross-slot wave wait.
@@ -9237,6 +9922,60 @@ impl Scheduler {
             self.session
                 .inject_sealed_at_tail(parent_id.0, &tail_per_layer)
                 .map_err(ConversationError::Model)?;
+            // The rows that describe those tokens, back at the position the
+            // tokens landed. The rebuilt prefix ended flush with its last
+            // injected piece and forwarded nothing, so these rows sit on an
+            // empty live tail and go in as a page — the same shape every other
+            // borrowed piece uses.
+            if !tail_index_page.is_empty() {
+                // In order: each piece the turn spanned keeps its own width.
+                for (_tokens, page) in tail_index_page.iter() {
+                    if let Err(e) = self.model.push_positional_state(parent_id.0, page) {
+                        tracing::warn!(
+                            slot = parent_id.0,
+                            tail_token_count,
+                            "reproject: the turn's index page was refused ({e}); this slot \
+                             holds the turn's K/V with nothing indexing it"
+                        );
+                        break;
+                    }
+                }
+            } else if self.model.carries_positional_state() {
+                tracing::warn!(
+                    slot = parent_id.0,
+                    tail_token_count,
+                    "reproject: the turn's K/V came back with no index page"
+                );
+            }
+            // The turn's K/V is back; its rows have to be too. A gap here is the
+            // width of whatever part of the turn the pages did not cover, and it
+            // is the last point at which that is attributable to this rebuild —
+            // downstream it surfaces only as a refused select on some later turn.
+            if let Some(cov) = self.model.positional_coverage(parent_id.0) {
+                let held = self.session.sequence_offset(parent_id.0).unwrap_or(0);
+                // Both directions. Short drops rows the turn needs; long means
+                // a piece was restored twice — the rebuild re-supplies the
+                // turn's user half from cache and the span seal carries it too
+                // — and the surplus rows claim positions this slot does not
+                // hold, which selects against them without erroring.
+                //
+                // Reported, not refused, for the reason `apply_segments_finish`
+                // records at the same check: a live run showed this path already
+                // diverged before the thinking-span work, so refusing here kills
+                // conversations over a fault that is not theirs.
+                if cov != held {
+                    tracing::warn!(
+                        slot = parent_id.0,
+                        held,
+                        coverage = cov,
+                        tail_token_count,
+                        pages_pushed = tail_index_page.len(),
+                        "reproject: the rebuilt slot's index is {} token(s) {} its K/V",
+                        cov.abs_diff(held),
+                        if cov < held { "short of" } else { "past" }
+                    );
+                }
+            }
             // Mirror the tail's tokens back into the slot_tokens log
             // (we recorded them at original prefill / decode time
             // under the now-freed view id, but the parent's log was
@@ -9351,6 +10090,55 @@ mod tests {
     use candle::{DType, Tensor};
     use candle_transformers::models::speculative_choice::GreedyChooser;
     use std::sync::Mutex;
+
+    /// A signature run with the reasoning span cut out of it.
+    ///
+    /// The run is 1:1 with the turn's grid, so the assertion is identity-based:
+    /// each sig is tagged with its own grid index, and the survivors must be
+    /// exactly the non-reasoning indices, in order. A length check alone would
+    /// pass on a filter that removed the wrong tokens.
+    #[test]
+    fn sigs_without_span_drops_exactly_the_reasoning_tokens() {
+        let run = |n: usize| -> Vec<WideQSig> {
+            (0..n)
+                .map(|i| WideQSig {
+                    n_heads: 1,
+                    words: vec![i as u64],
+                })
+                .collect()
+        };
+        let ids = |v: &[WideQSig]| -> Vec<u64> { v.iter().map(|s| s.words[0]).collect() };
+
+        // Reasoning at grid [3, 6) of a 10-token turn.
+        assert_eq!(
+            ids(&sigs_without_span(run(10), 3..6)),
+            vec![0, 1, 2, 6, 7, 8, 9]
+        );
+        // Abutting the start, and running to the end.
+        assert_eq!(ids(&sigs_without_span(run(5), 0..2)), vec![2, 3, 4]);
+        assert_eq!(ids(&sigs_without_span(run(5), 2..5)), vec![0, 1]);
+        // An empty span is a no-op, not an off-by-one.
+        assert_eq!(ids(&sigs_without_span(run(4), 2..2)), vec![0, 1, 2, 3]);
+    }
+
+    /// A span past the end of the run leaves it untouched.
+    ///
+    /// Not hypothetical: the last generated token is never forwarded, so a turn
+    /// whose final token is `</think>` has a layout span one wider than the
+    /// signature run the seal gathered. Clamping rather than truncating is what
+    /// keeps that from silently eating the answer.
+    #[test]
+    fn sigs_without_span_clamps_a_span_past_the_run() {
+        let run: Vec<WideQSig> = (0..3)
+            .map(|i| WideQSig {
+                n_heads: 1,
+                words: vec![i as u64],
+            })
+            .collect();
+        assert_eq!(sigs_without_span(run.clone(), 5..9).len(), 3);
+        // Overlapping the end: only the in-range part goes.
+        assert_eq!(sigs_without_span(run, 2..9).len(), 2);
+    }
 
     /// **Grid coordinates are not slot coordinates.** A stuffed grid is
     /// prefilled *after* the projection lays the system prompt into the slot, so
@@ -9634,7 +10422,7 @@ mod tests {
     }
 
     use candle_transformers::models::batched_inference::{
-        BatchedConfig, BatchedInferenceSession, ManagedBatchedModel,
+        BatchedConfig, BatchedInferenceSession, KvLayers, ManagedBatchedModel,
     };
     use std::str::FromStr;
 
@@ -9745,6 +10533,74 @@ mod tests {
     /// slightly different, perfectly fluent prose.
     type ToyState = [[f32; 4]; 2];
 
+    /// Ratio of the toy index: tokens per whole row, so a turn boundary that is
+    /// not a multiple of it leaves a ragged open block — the case that makes the
+    /// index worth persisting separately rather than deriving on restore.
+    const TOY_INDEX_RATIO: u32 = 4;
+
+    /// The toy model's auxiliary recurrence — a running token count.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct ToyIndex {
+        tokens: u32,
+    }
+
+    impl ToyIndex {
+        /// Magic + version, so a blob from another model is refused rather than
+        /// read as a plausible count. Mirrors the real aux container.
+        const MAGIC: &'static [u8; 4] = b"TIDX";
+
+        fn rows(&self) -> u32 {
+            self.tokens / TOY_INDEX_RATIO
+        }
+
+        /// Tokens in the trailing partial row — 0 when the count lands on a
+        /// boundary.
+        fn open(&self) -> u32 {
+            self.tokens % TOY_INDEX_RATIO
+        }
+
+        fn encode(&self) -> Vec<u8> {
+            let mut out = Self::MAGIC.to_vec();
+            out.extend_from_slice(&self.tokens.to_le_bytes());
+            out
+        }
+
+        fn decode(blob: &[u8]) -> candle::Result<Self> {
+            if blob.len() != 8 || &blob[..4] != Self::MAGIC {
+                candle::bail!("not a toy index blob ({} bytes)", blob.len());
+            }
+            let mut w = [0u8; 4];
+            w.copy_from_slice(&blob[4..8]);
+            Ok(Self {
+                tokens: u32::from_le_bytes(w),
+            })
+        }
+    }
+
+    /// The toy model's **per-position** state, standing in for the QSA index's
+    /// page list — a third thing again, and modelled separately for the reason
+    /// it exists separately in the real stack.
+    ///
+    /// `ToyState` is a recurrence (rebuildable by replaying tokens in order) and
+    /// `ToyIndex` is an aux blob that travels whole. This is neither: it is a
+    /// *list* whose boundaries are decided by the scheduler, at the instant a
+    /// unit's K/V anchor is taken. Everything a test can get wrong about that
+    /// timing is visible here as a wrong page width.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct ToyPages {
+        /// Widths of the pages closed so far, oldest first.
+        closed: Vec<u32>,
+        /// Tokens forwarded since the last close — the live tail, which a unit
+        /// beginning on this slot must not be allowed to extend.
+        tail: u32,
+    }
+
+    impl ToyPages {
+        fn indexed(&self) -> u32 {
+            self.closed.iter().sum::<u32>() + self.tail
+        }
+    }
+
     const ZERO_STATE: ToyState = [[0.0; 4]; 2];
 
     /// The toy recurrence: `s ← 2s + t·k`, per element, with `k` the element's
@@ -9777,6 +10633,14 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecurrentProbe {
         states: Arc<Mutex<HashMap<usize, ToyState>>>,
+        /// The model's *other* recurrence, standing in for Flash-Next's QSA
+        /// index: a token count, from which whole rows and a ragged open block
+        /// are derived. It travels as opaque bytes and is shaped like nothing in
+        /// `ToyState`, which is the entire reason the aux blob exists.
+        index: Arc<Mutex<HashMap<usize, ToyIndex>>>,
+        /// The per-position pages, advanced by the same forward as the other
+        /// two and cut by [`Scheduler::begin_unit`].
+        pages: Arc<Mutex<HashMap<usize, ToyPages>>>,
         /// Sequences whose state arrived by fork or restore, and must therefore
         /// survive exactly one `offset == 0` reset. The store-level `seeded`
         /// flag of §10 decision 2, modelled per sequence.
@@ -9786,6 +10650,25 @@ mod tests {
     impl RecurrentProbe {
         fn get(&self, seq: usize) -> Option<ToyState> {
             self.states.lock().unwrap().get(&seq).copied()
+        }
+
+        fn get_index(&self, seq: usize) -> Option<ToyIndex> {
+            self.index.lock().unwrap().get(&seq).copied()
+        }
+
+        fn advance_index(&self, seq: usize, tokens: usize) {
+            let mut idx = self.index.lock().unwrap();
+            idx.entry(seq).or_default().tokens += tokens as u32;
+            self.pages.lock().unwrap().entry(seq).or_default().tail += tokens as u32;
+        }
+
+        fn get_pages(&self, seq: usize) -> ToyPages {
+            self.pages
+                .lock()
+                .unwrap()
+                .get(&seq)
+                .cloned()
+                .unwrap_or_default()
         }
 
         fn len(&self) -> usize {
@@ -9891,6 +10774,11 @@ mod tests {
                     if let Some(state) = self.probe.states.lock().unwrap().get_mut(&seq) {
                         toy_advance(state, tokens);
                     }
+                    // The second recurrence advances on the same forward as the
+                    // first. That is not decoration: it is what makes a seal
+                    // that exports one and not the other observable, because
+                    // the two then describe different token counts.
+                    self.probe.advance_index(seq, tokens);
                 }
             }
             self.inner.forward_wave(
@@ -9913,6 +10801,8 @@ mod tests {
 
         fn release_sequence(&self, seq: usize) -> candle::Result<()> {
             self.probe.states.lock().unwrap().remove(&seq);
+            self.probe.index.lock().unwrap().remove(&seq);
+            self.probe.pages.lock().unwrap().remove(&seq);
             self.probe.seeded.lock().unwrap().remove(&seq);
             Ok(())
         }
@@ -9937,6 +10827,49 @@ mod tests {
                 self.probe.set(child, state);
                 self.probe.seeded.lock().unwrap().insert(child);
             }
+            // Both classes fork, or the child decodes with one half of its
+            // memory at the parent's depth and the other at zero.
+            if let Some(idx) = self.probe.get_index(parent) {
+                self.probe.index.lock().unwrap().insert(child, idx);
+            }
+            // **Wholesale, live tail included** — exactly what the real
+            // `fork_recurrent` does with the QSA index cache, and the reason the
+            // parent's boundary has to be closed BEFORE the carve rather than on
+            // the view afterwards.
+            let mut pages = self.probe.pages.lock().unwrap();
+            if let Some(p) = pages.get(&parent).cloned() {
+                pages.insert(child, p);
+            }
+            Ok(())
+        }
+
+        /// The double keeps per-position state, so the paths guarded on this
+        /// answer are actually entered by a CPU test.
+        fn carries_positional_state(&self) -> bool {
+            true
+        }
+
+        /// Close the live tail into a page, returning the width it covered.
+        ///
+        /// `0` for an already-empty tail, which is the legitimate no-op every
+        /// caller relies on — and is indistinguishable from a cut that landed
+        /// after the tokens it was meant to separate.
+        fn close_positional_page(&self, seq: usize) -> candle::Result<usize> {
+            let mut pages = self.probe.pages.lock().unwrap();
+            let entry = pages.entry(seq).or_default();
+            let width = std::mem::take(&mut entry.tail);
+            if width > 0 {
+                entry.closed.push(width);
+            }
+            Ok(width as usize)
+        }
+
+        fn positional_coverage(&self, seq: usize) -> Option<usize> {
+            Some(self.probe.get_pages(seq).indexed() as usize)
+        }
+
+        fn reset_positional_state(&self, seq: usize) -> candle::Result<()> {
+            self.probe.pages.lock().unwrap().remove(&seq);
             Ok(())
         }
 
@@ -9997,8 +10930,8 @@ mod tests {
                         l.state.len()
                     );
                 }
-                for (slot, chunk) in row.iter_mut().zip(l.state.chunks_exact(4)) {
-                    *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                for (slot, chunk) in row.iter_mut().zip(l.state.as_chunks::<4>().0) {
+                    *slot = f32::from_le_bytes(*chunk);
                 }
             }
             self.probe.set(seq, state);
@@ -10014,7 +10947,31 @@ mod tests {
             if let Some(state) = taken {
                 self.probe.set(parent, state);
             }
+            let taken_idx = self.probe.index.lock().unwrap().remove(&child);
+            if let Some(idx) = taken_idx {
+                self.probe.index.lock().unwrap().insert(parent, idx);
+            }
+            let taken_pages = self.probe.pages.lock().unwrap().remove(&child);
+            if let Some(p) = taken_pages {
+                self.probe.pages.lock().unwrap().insert(parent, p);
+            }
             Ok(())
+        }
+
+        /// The toy index in its own encoding — bytes only this model reads.
+        fn export_aux_state(&self, seq: usize) -> candle::Result<Option<Vec<u8>>> {
+            Ok(self.probe.get_index(seq).map(|i| i.encode()))
+        }
+
+        /// Installs the index and seeds the slot for the same reason
+        /// `restore_recurrent` does: a restored sequence's first wave stands at
+        /// offset 0, and an unseeded slot would have the state it was just given
+        /// reset out from under it.
+        fn restore_aux_state(&self, seq: usize, blob: &[u8]) -> candle::Result<bool> {
+            let idx = ToyIndex::decode(blob)?;
+            self.probe.index.lock().unwrap().insert(seq, idx);
+            self.probe.seeded.lock().unwrap().insert(seq);
+            Ok(true)
         }
     }
 
@@ -10023,7 +10980,7 @@ mod tests {
     /// Minimal CPU-backed session: 1 layer, 1 KV head, head_dim=16.
     fn make_test_session() -> BatchedInferenceSession {
         BatchedInferenceSession::new(
-            1,  // num_layers
+            KvLayers::stream_only(1),
             1,  // n_kv_head
             16, // head_dim
             &candle::Device::Cpu,
@@ -10129,13 +11086,13 @@ mod tests {
     #[test]
     fn the_branch_checkpoint_pass_returns_state_the_tokens_produced() {
         let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
-        let (hash, layers) = sched
+        let state = sched
             .handle_branch_checkpoint_pass(&[1, 2, 3, 4])
             .expect("pass ran")
             .expect("a model that carries state returns some");
-        assert_eq!(hash, DummyRecurrentModel::SCHEDULE_HASH);
-        assert_eq!(layers.len(), 2, "one row per toy layer");
-        let advanced = layers.iter().any(|l| l.state.iter().any(|&b| b != 0));
+        assert_eq!(state.schedule_hash, DummyRecurrentModel::SCHEDULE_HASH);
+        assert_eq!(state.layers.len(), 2, "one row per toy layer");
+        let advanced = state.layers.iter().any(|l| l.state.iter().any(|&b| b != 0));
         assert!(
             advanced,
             "the exported state is all zeros — the tokens never reached the model, \
@@ -10191,19 +11148,21 @@ mod tests {
     /// not tolerance — these are copies, so any difference is a layout bug.
     #[test]
     fn a_branch_checkpoint_round_trips_through_its_record_and_installs() {
+        use crate::persistence::content_hash::ContentHash;
         use crate::persistence::record::{BranchCheckpointPayload, SnapshotLayer};
 
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
-        let (hash, layers) = sched
+        let state = sched
             .handle_branch_checkpoint_pass(&[5, 6, 7, 8])
             .expect("pass ran")
             .expect("state");
-        let computed = layers.clone();
+        let computed = state.layers.clone();
 
         let payload = BranchCheckpointPayload {
-            prefix_hash: crate::persistence::content_hash::ContentHash { lo: 9, hi: 11 },
-            schedule_hash: hash,
-            layers: layers.into_iter().map(SnapshotLayer::from).collect(),
+            prefix_hash: ContentHash { lo: 9, hi: 11 },
+            schedule_hash: state.schedule_hash,
+            layers: state.layers.into_iter().map(SnapshotLayer::from).collect(),
+            aux: state.aux,
         };
         let back = BranchCheckpointPayload::decode(&payload.encode()).expect("decode");
         assert_eq!(back, payload, "the record did not survive its own encoding");
@@ -10250,14 +11209,14 @@ mod tests {
     #[test]
     fn a_branch_checkpoint_under_a_foreign_schedule_is_refused() {
         let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
-        let (_, layers) = sched
+        let state = sched
             .handle_branch_checkpoint_pass(&[3, 1, 4])
             .expect("pass ran")
             .expect("state");
         let slot = sched.session.create_sequence().expect("slot");
         let err = sched
             .model
-            .restore_recurrent(slot, 0xBAD, &layers)
+            .restore_recurrent(slot, 0xBAD, &state.layers)
             .expect_err("a foreign schedule hash must not install");
         assert!(err.to_string().contains("schedule hash"), "{err}");
     }
@@ -10269,7 +11228,7 @@ mod tests {
     #[test]
     fn install_recurrent_state_request_installs_onto_the_named_slot() {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
-        let (hash, layers) = sched
+        let state = sched
             .handle_branch_checkpoint_pass(&[2, 4, 6])
             .expect("pass ran")
             .expect("state");
@@ -10278,8 +11237,7 @@ mod tests {
         let (tx, rx) = crossbeam::channel::bounded(1);
         sched.handle_request(SchedulerRequest::InstallRecurrentState {
             sequence_ids: vec![slot],
-            schedule_hash: hash,
-            layers: layers.into(),
+            state: SharedState::from(&state),
             response_tx: tx,
         });
         assert!(
@@ -10287,6 +11245,208 @@ mod tests {
             "the install reported that no state was carried"
         );
         assert!(probe.get(slot.0).is_some(), "the slot has no state");
+    }
+
+    // —— Store and resume: both classes of state ————————————————————————————
+    //
+    // Everything below is about the SECOND class — the model's own encoding,
+    // carried as opaque bytes beside the delta-rule layers. The layers have
+    // their own coverage above; these exist because the two classes travel the
+    // same paths and only one of them was ever asserted, which is exactly the
+    // shape of a state that goes missing without a failing test.
+
+    /// **The pass exports BOTH classes, and they agree about the tokens.**
+    ///
+    /// The failure this rules out is a pass that returns the layers a prefill
+    /// produced beside an aux blob it did not — which reads as a complete
+    /// checkpoint and installs a sequence whose two halves of memory stand at
+    /// different depths.
+    #[test]
+    fn the_branch_checkpoint_pass_exports_both_classes_of_state() {
+        let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
+        let tokens = [1u32, 2, 3, 4, 5, 6, 7];
+        let state = sched
+            .handle_branch_checkpoint_pass(&tokens)
+            .expect("pass ran")
+            .expect("state");
+        assert!(!state.layers.is_empty(), "no delta-rule layers");
+        let idx = ToyIndex::decode(&state.aux).expect("the aux blob is this model's");
+        assert_eq!(
+            idx.tokens,
+            tokens.len() as u32,
+            "the index stands at a different depth than the prefill that made it"
+        );
+        assert_eq!(idx.rows(), 1, "7 tokens at ratio 4 is one whole row");
+        assert_eq!(
+            idx.open(),
+            3,
+            "…and a ragged open block of 3 — the case a boundary-aligned \
+             fixture would never exercise"
+        );
+    }
+
+    /// **A ragged boundary survives the record verbatim.**
+    ///
+    /// A turn ends where the text ends, not on a block boundary, so the open
+    /// block is the normal case rather than an edge one. Every remainder is
+    /// checked because a reconstruction that rounded to whole rows would still
+    /// pass at remainder 0.
+    #[test]
+    fn every_ragged_boundary_round_trips_through_the_snapshot_record() {
+        use crate::persistence::record::{SnapshotLayer, SnapshotPayload};
+
+        for extra in 0..TOY_INDEX_RATIO {
+            let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
+            let n = (2 * TOY_INDEX_RATIO + extra) as usize;
+            let tokens: Vec<u32> = (0..n as u32).collect();
+            let state = sched
+                .handle_branch_checkpoint_pass(&tokens)
+                .expect("pass ran")
+                .expect("state");
+
+            let payload = SnapshotPayload {
+                timeline_id: 3,
+                turn_index: 0,
+                schedule_hash: state.schedule_hash,
+                layers: state.layers.into_iter().map(SnapshotLayer::from).collect(),
+                aux: state.aux.clone(),
+            };
+            let back = SnapshotPayload::decode(&payload.encode()).expect("decode");
+            assert_eq!(back.aux, state.aux, "the record altered the blob");
+
+            let idx = ToyIndex::decode(&back.aux).expect("decode index");
+            assert_eq!(idx.tokens, n as u32);
+            assert_eq!(idx.rows(), 2 + extra / TOY_INDEX_RATIO);
+            assert_eq!(idx.open(), extra, "the partial row's width was lost");
+        }
+    }
+
+    /// **Install puts the aux blob on the slot, and the value is the one that
+    /// was exported.**
+    ///
+    /// Through `handle_request`, so the wiring is covered rather than the
+    /// handler body alone.
+    #[test]
+    fn install_recurrent_state_request_installs_the_aux_blob_too() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let state = sched
+            .handle_branch_checkpoint_pass(&[2, 4, 6, 8, 10])
+            .expect("pass ran")
+            .expect("state");
+        let slot = SequenceId(sched.session.create_sequence().expect("slot"));
+
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        sched.handle_request(SchedulerRequest::InstallRecurrentState {
+            sequence_ids: vec![slot],
+            state: SharedState::from(&state),
+            response_tx: tx,
+        });
+        assert!(rx.recv().expect("reply").expect("install"));
+        assert_eq!(
+            probe.get_index(slot.0).expect("the slot has no index"),
+            ToyIndex { tokens: 5 },
+            "the slot's index is not the one the checkpoint carried"
+        );
+    }
+
+    /// **A restored slot is seeded, so its first wave does not reset the index
+    /// it was just given.**
+    ///
+    /// The same trap the delta-rule restore has: a restored sequence stands at
+    /// offset 0, and `ensure` resets an occupied slot at offset 0 unless it was
+    /// seeded. An aux restore that installed the bytes without seeding would put
+    /// the index back to zero on the next forward — and nothing downstream would
+    /// report it.
+    #[test]
+    fn an_aux_restore_survives_the_first_waves_offset_zero_reset() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let slot = sched.session.create_sequence().expect("slot");
+        sched
+            .model
+            .restore_aux_state(slot, &ToyIndex { tokens: 9 }.encode())
+            .expect("restore");
+
+        // The reset rule is `ensure`'s, and `ensure` is what a wave runs first.
+        probe.ensure(slot, 0);
+        assert_eq!(
+            probe.get_index(slot).expect("index gone entirely"),
+            ToyIndex { tokens: 9 },
+            "the restored index did not survive the offset-0 wave — the slot \
+             was not seeded, and the conversation resumes having forgotten"
+        );
+    }
+
+    /// **A blob from another model is refused, not read as a plausible state.**
+    ///
+    /// The aux blob is opaque to everything between the model and the record,
+    /// so the model is the only place this can be caught. Reading a foreign
+    /// blob as a state is worse than failing to read it: the conversation then
+    /// resumes at a depth nothing computed.
+    #[test]
+    fn a_foreign_aux_blob_is_refused() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let slot = sched.session.create_sequence().expect("slot");
+        for bad in [
+            b"XIDX\x01\x00\x00\x00".to_vec(), // right shape, wrong magic
+            b"TIDX\x01\x00\x00".to_vec(),     // right magic, truncated
+            Vec::new(),
+        ] {
+            assert!(
+                sched.model.restore_aux_state(slot, &bad).is_err(),
+                "a {}-byte foreign blob installed as a state",
+                bad.len()
+            );
+        }
+        assert!(
+            probe.get_index(slot).is_none(),
+            "a refused restore still left something on the slot"
+        );
+    }
+
+    /// **A fork copies both classes.**
+    ///
+    /// A view carve that copied the layers alone would give the child a
+    /// delta-rule state at the parent's depth and an index at zero.
+    #[test]
+    fn a_fork_carries_both_classes_of_state() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let parent = sched.session.create_sequence().expect("parent");
+        let child = sched.session.create_sequence().expect("child");
+        sched
+            .model
+            .restore_aux_state(parent, &ToyIndex { tokens: 13 }.encode())
+            .expect("seed the parent");
+        probe.set(parent, [[1.0; 4]; 2]);
+
+        sched.model.fork_recurrent(parent, child).expect("fork");
+        assert_eq!(probe.get(child), Some([[1.0; 4]; 2]), "layers not forked");
+        assert_eq!(
+            probe.get_index(child),
+            Some(ToyIndex { tokens: 13 }),
+            "the child's index is at a different depth than its layers"
+        );
+    }
+
+    /// **Releasing a slot releases both classes.**
+    ///
+    /// The branch checkpoint pass allocates a throwaway slot per call. A class
+    /// of state the release does not drop leaks once per new branch, for the
+    /// life of the daemon — and the existing leak test only counts the layers.
+    #[test]
+    fn releasing_a_slot_drops_both_classes_of_state() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let before = probe.index.lock().unwrap().len();
+        for _ in 0..4 {
+            sched
+                .handle_branch_checkpoint_pass(&[7, 7, 7])
+                .expect("pass ran");
+        }
+        assert_eq!(
+            probe.index.lock().unwrap().len(),
+            before,
+            "four passes leaked {} index entries",
+            probe.index.lock().unwrap().len() - before
+        );
     }
 
     /// **One request installs the same branch state onto EVERY named slot.**
@@ -10297,7 +11457,7 @@ mod tests {
     #[test]
     fn install_recurrent_state_request_installs_onto_every_named_slot() {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
-        let (hash, layers) = sched
+        let state = sched
             .handle_branch_checkpoint_pass(&[2, 4, 6])
             .expect("pass ran")
             .expect("state");
@@ -10308,8 +11468,7 @@ mod tests {
         let (tx, rx) = crossbeam::channel::bounded(1);
         sched.handle_request(SchedulerRequest::InstallRecurrentState {
             sequence_ids: slots.clone(),
-            schedule_hash: hash,
-            layers: layers.into(),
+            state: SharedState::from(&state),
             response_tx: tx,
         });
         assert!(
@@ -10877,6 +12036,475 @@ mod tests {
             probe.is_seeded(view_id.0),
             "the forked view must be seeded, or its first wave at offset 0 \
              resets the state the fork just copied"
+        );
+    }
+
+    // —— unit-boundary tests ————————————————————————————————————————————————
+    //
+    // The K/V anchor and the index boundary are one fact, and these pin the one
+    // place that records it. Every one of them would have failed against the
+    // three earlier placements — a cut in `apply_segments_finish` (a path the
+    // ingest turn never takes), a cut in `prepare_section_ingest` alone (ditto),
+    // and a cut at prefill admission (right in effect, but on the view *after*
+    // the fork, so the parent's tail stayed open and grew across turns).
+
+    /// Forward `tokens` on `slot` and advance it, the way a prefill unit does.
+    fn forward_on(scheduler: &mut Scheduler, slot: usize, tokens: &[u32]) {
+        let input = candle::Tensor::new(tokens, &scheduler.device)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        scheduler
+            .session
+            .ensure_capacity(&[slot], tokens.len())
+            .unwrap();
+        let nl = scheduler.model.num_layers().max(1);
+        scheduler
+            .model
+            .forward_wave(
+                &mut scheduler.session,
+                &[],
+                &[],
+                &[slot],
+                &[input],
+                &[],
+                &[],
+                0,
+                nl,
+                None,
+            )
+            .unwrap();
+        scheduler
+            .session
+            .advance_sequence(slot, tokens.len())
+            .unwrap();
+    }
+
+    /// **The cut lands on the parent, and it lands before the fork.**
+    ///
+    /// `fork_recurrent` copies the index wholesale, live tail included. A
+    /// boundary taken after the carve leaves the parent's tail open — so it
+    /// survives into the view as rows the turn's own tokens then extend, and the
+    /// parent re-accumulates the same prefix for the next turn to close again.
+    #[test]
+    fn create_view_closes_the_parents_index_before_forking_it() {
+        let (mut scheduler, _tx, probe) = make_test_scheduler_recurrent();
+        let parent = scheduler.session.create_sequence().unwrap();
+
+        // A projected prefix, forwarded on the parent — the case that fails
+        // silently, because borrowed prefix arrives as pages already.
+        forward_on(&mut scheduler, parent, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            probe.get_pages(parent),
+            ToyPages {
+                closed: Vec::new(),
+                tail: 8
+            },
+            "a forwarded prefix leaves its rows in the live tail"
+        );
+
+        let (view_id, _) = scheduler
+            .create_view(SequenceId(parent), &[BlockRange::new(0, 1)])
+            .expect("view creation");
+
+        assert_eq!(
+            probe.get_pages(parent),
+            ToyPages {
+                closed: vec![8],
+                tail: 0
+            },
+            "the parent's prefix must be a page of its own once the turn begins"
+        );
+        assert_eq!(
+            probe.get_pages(view_id.0),
+            ToyPages {
+                closed: vec![8],
+                tail: 0
+            },
+            "the fork must copy an already-closed cache, or the turn extends the prefix's tail"
+        );
+    }
+
+    /// The property the boundary exists for: a turn's own width is recoverable
+    /// from the index, separately from the prefix ahead of it.
+    ///
+    /// Without the cut this is one undifferentiated run of 13, and the seal —
+    /// which asks for "the last N tokens" — takes 5 tokens' worth of rows from a
+    /// page spanning 13. That is the measured 376-vs-53 failure in miniature.
+    #[test]
+    fn a_turns_own_tokens_never_share_a_page_with_the_prefix_ahead_of_them() {
+        let (mut scheduler, _tx, probe) = make_test_scheduler_recurrent();
+        let parent = scheduler.session.create_sequence().unwrap();
+        forward_on(&mut scheduler, parent, &[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let (view_id, _) = scheduler
+            .create_view(SequenceId(parent), &[BlockRange::new(0, 1)])
+            .expect("view creation");
+        forward_on(&mut scheduler, view_id.0, &[9, 10, 11, 12, 13]);
+
+        let pages = probe.get_pages(view_id.0);
+        assert_eq!(
+            pages,
+            ToyPages {
+                closed: vec![8],
+                tail: 5
+            },
+            "the turn's 5 tokens must stand apart from the 8-token prefix"
+        );
+        assert_eq!(pages.indexed(), 13, "and nothing may be lost by the split");
+    }
+
+    /// A slot that accumulates across turns must not re-close the same prefix
+    /// once per turn.
+    ///
+    /// This is why the cut is on the parent rather than the view. Closing on the
+    /// view leaves the parent's tail open, so the *next* carve closes the whole
+    /// accumulated prefix again — a page list that grows quadratically with turn
+    /// count, and page boundaries that move under a turn already sealed against
+    /// them.
+    #[test]
+    fn a_second_turn_does_not_re_close_the_first_turns_prefix() {
+        let (mut scheduler, _tx, probe) = make_test_scheduler_recurrent();
+        let parent = scheduler.session.create_sequence().unwrap();
+        forward_on(&mut scheduler, parent, &[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let (first, _) = scheduler
+            .create_view(SequenceId(parent), &[BlockRange::new(0, 1)])
+            .expect("first view");
+        forward_on(&mut scheduler, first.0, &[9, 10, 11, 12]);
+        // The view finalizes: its pages move to the parent, as `move_recurrent`
+        // does at the end of every turn.
+        scheduler.model.move_recurrent(first.0, parent).unwrap();
+
+        let (second, _) = scheduler
+            .create_view(SequenceId(parent), &[BlockRange::new(0, 1)])
+            .expect("second view");
+
+        assert_eq!(
+            probe.get_pages(second.0),
+            ToyPages {
+                closed: vec![8, 4],
+                tail: 0
+            },
+            "each turn contributes exactly one page; the prefix is not re-closed"
+        );
+    }
+
+    /// An empty tail closes nothing, so the cut is free on the path that was
+    /// already correct — and a slot may pass the boundary twice without the
+    /// second pass inventing a zero-width page.
+    #[test]
+    fn a_unit_boundary_on_an_empty_tail_adds_no_page() {
+        let (mut scheduler, _tx, probe) = make_test_scheduler_recurrent();
+        let parent = scheduler.session.create_sequence().unwrap();
+        forward_on(&mut scheduler, parent, &[1, 2, 3, 4]);
+
+        scheduler.begin_unit(SequenceId(parent), "test");
+        scheduler.begin_unit(SequenceId(parent), "test");
+        scheduler.begin_unit(SequenceId(parent), "test");
+
+        assert_eq!(
+            probe.get_pages(parent),
+            ToyPages {
+                closed: vec![4],
+                tail: 0
+            },
+            "closing an empty tail must be a no-op, not a zero-width page"
+        );
+    }
+
+    // —— reasoning-boundary tests ————————————————————————————————————————————
+
+    /// A `DecodeState` carrying nothing but the two fields the reasoning
+    /// boundary is decided from.
+    fn boundary_state() -> (DecodeState, crossbeam::channel::Receiver<TurnEvent>) {
+        let (tx, rx) = crossbeam::channel::unbounded();
+        let state = DecodeState {
+            event_tx: tx,
+            generated_tokens: TokenBuffer::default(),
+            think_close_at: None,
+            forwarded_generated: 0,
+            pending_page_cut: false,
+            pending_page_cut_after: None,
+            max_tokens: 64,
+            sampling_config: SamplingConfig::default(),
+            seal_action: SealAction::None,
+            free_tool_calls_from_penalties: false,
+            prefill_assistant_text: String::new(),
+            finished: false,
+            decode_start: Instant::now(),
+            decode_busy_us: 0,
+            prefill_ms: 0.0,
+            prefill_token_count: 0,
+            turn_start: Instant::now(),
+            health: crate::decode_health::DecodeHealthState::new(8, 8),
+            reprojection: None,
+            non_punct_since_reproject: 0,
+            last_projection_end: 0,
+            post_decode_tokens: TokenBuffer::default(),
+            belief: PriorBelief::default(),
+            prefill_tokens: TokenBuffer::default(),
+            user_text: String::new(),
+            tags: Vec::new(),
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
+            no_think: false,
+            in_tool_call: false,
+            triggers: Arc::new(TriggerRegistry::new()),
+            stencil: None,
+            pending_mask: None,
+        };
+        (state, rx)
+    }
+
+    /// The turn's own tokens, walked through the one funnel: exactly two cuts,
+    /// at the turn's first token and at the token after `</think>`.
+    ///
+    /// **Every break token ends a page; the marker stays in the page it ends.**
+    ///
+    /// The span and the page boundary are now separate questions.
+    /// `think_close_at` still records only the FIRST `</think>`, because it
+    /// locates the reasoning span the layout carries — while a page ends at
+    /// *any* break token, including a second `</think>` a steering tree replays
+    /// in the answer body. An extra boundary there costs nothing: the projection
+    /// drops pages by position and width, so a finer split is still exact.
+    #[test]
+    fn every_break_token_ends_a_page_and_stays_inside_it() {
+        const OPEN: u32 = 76;
+        const CLOSE: u32 = 77;
+        const BREAKS: &[u32] = &[OPEN, CLOSE];
+        let probe = RecurrentProbe::default();
+        let model = DummyRecurrentModel {
+            inner: DummyModel::new(),
+            probe: probe.clone(),
+        };
+        let (mut state, _rx) = boundary_state();
+        let slot = SequenceId(0);
+
+        // One token per step, each forwarded after it is committed — the decode
+        // loop's shape. The tail advances on the forward, so a page's width is
+        // the tokens between two cuts.
+        // Commit, then flush, then forward — the decode loop's real order. The
+        // cut is deferred so it cannot land inside a speculative rewind's
+        // window; here nothing speculates, so the flush follows immediately.
+        for &t in &[10u32, 11, CLOSE, 12, 13, CLOSE, 14] {
+            state.push_committed(t, Some(CLOSE), BREAKS);
+            flush_page_cut(&model, slot, &mut state);
+            probe.advance_index(slot.0, 1);
+        }
+
+        assert_eq!(
+            state.think_close_at,
+            Some(2),
+            "the SPAN is still fixed by the first close only"
+        );
+        assert_eq!(
+            probe.get_pages(slot.0),
+            ToyPages {
+                // `[10, 11, CLOSE]` then `[12, 13, CLOSE]`, each closed by the
+                // token that follows its marker; `14` is still open.
+                closed: vec![3, 3],
+                tail: 1
+            },
+            "a page ends after each close marker, with the marker inside it"
+        );
+    }
+
+    /// **A suppressed token leaves nothing pending, so nothing is re-sent.**
+    ///
+    /// The decode loop takes each step's input from the trailing generated
+    /// token, on the understanding that exactly one is always
+    /// committed-but-unforwarded. A dropped token commits nothing, so that
+    /// understanding fails and the previous token — already forwarded — is
+    /// carried a second time. The K/V hides it (the offset never advanced, so
+    /// the re-forward overwrites), while the index appends a row and the turn
+    /// then seals with more rows than tokens.
+    ///
+    /// The count makes the question answerable: after a commit one token is
+    /// pending; after that token is forwarded, none is; and a drop adds nothing,
+    /// so none is pending then either.
+    #[test]
+    fn a_suppressed_token_leaves_nothing_pending_to_re_forward() {
+        // No model here: this is pure `DecodeState` bookkeeping — which of the
+        // recorded tokens have gone out — and involves neither the index nor a
+        // page cut.
+        const BREAKS: &[u32] = &[77];
+        let (mut state, _rx) = boundary_state();
+
+        state.push_committed(10, None, BREAKS);
+        assert_eq!(
+            state.pending_forward(),
+            &[10],
+            "a freshly committed token is waiting to be forwarded"
+        );
+
+        // The decode step carries it.
+        state.mark_forwarded();
+        assert!(
+            state.pending_forward().is_empty(),
+            "and stops being pending once it has gone out"
+        );
+
+        // Now the sampler produces a token that steering suppresses: it is
+        // never committed, so `generated_tokens` does not grow.
+        assert_eq!(
+            state.generated_tokens.len(),
+            1,
+            "a dropped token commits nothing"
+        );
+        assert!(
+            state.pending_forward().is_empty(),
+            "so there is still nothing pending — the previous token must NOT be \
+             carried again, which is exactly what the old `last()` rule did"
+        );
+
+        // The steering's own run then arrives; its last token rides the next step.
+        state.push_forwarded(11, None, BREAKS);
+        state.push_pending(12, None, BREAKS);
+        assert_eq!(
+            state.pending_forward(),
+            &[12],
+            "only the token that rides the next decode is pending"
+        );
+        assert_eq!(
+            state.forwarded_generated, 2,
+            "and the seal takes exactly the two that were actually forwarded"
+        );
+    }
+
+    /// **A commit records the cut; it does not take it.**
+    ///
+    /// The separation is the whole fix for a speculative wave.
+    /// `IndexCache::snapshot` covers the live tail and NOT the pages, so a cut
+    /// taken between the snapshot and the rewind moves the tail's rows into a
+    /// page and the rewind then restores the same rows into the tail — counting
+    /// them twice, and leaving the index exactly one drafted block past the K/V
+    /// for the rest of the sequence. Measured at a constant +5 against a 5-token
+    /// block, on a full accept as much as a partial one.
+    ///
+    /// So `commit_generated` may only mark, and the cut lands when the caller
+    /// says the K/V is final.
+    #[test]
+    fn a_commit_marks_the_cut_and_the_flush_takes_it() {
+        const BREAKS: &[u32] = &[77];
+        let probe = RecurrentProbe::default();
+        let model = DummyRecurrentModel {
+            inner: DummyModel::new(),
+            probe: probe.clone(),
+        };
+        let (mut state, _rx) = boundary_state();
+        let slot = SequenceId(0);
+        probe.advance_index(slot.0, 9);
+
+        state.push_committed(10, None, BREAKS);
+        assert!(state.pending_page_cut, "the turn's first token earns a cut");
+        assert_eq!(
+            probe.get_pages(slot.0),
+            ToyPages {
+                closed: Vec::new(),
+                tail: 9
+            },
+            "but the commit must NOT have taken it — a rewind may still be in flight"
+        );
+
+        flush_page_cut(&model, slot, &mut state);
+        assert!(!state.pending_page_cut, "and the flush consumes it");
+        assert_eq!(
+            probe.get_pages(slot.0),
+            ToyPages {
+                closed: vec![9],
+                tail: 0
+            },
+            "the page lands once the K/V is final"
+        );
+
+        // Idempotent: a second flush with nothing pending must not invent a page.
+        flush_page_cut(&model, slot, &mut state);
+        assert_eq!(
+            probe.get_pages(slot.0),
+            ToyPages {
+                closed: vec![9],
+                tail: 0
+            },
+            "a flush with nothing pending is a no-op"
+        );
+    }
+
+    /// The list is read off the stream, so a marker the sampler never produced
+    /// still ends a page — which is the case the previous design could not see.
+    ///
+    /// `think_close` is `None` here: no span is located at all, and the page
+    /// boundaries are unaffected. That pairing is the whole point — a turn whose
+    /// `<think>…</think>` was prefilled recorded no `think_close_at`, and under
+    /// the old rule therefore cut nothing.
+    #[test]
+    fn a_page_ends_at_a_break_token_even_with_no_span_recorded() {
+        const OPEN: u32 = 76;
+        const TURN_END: u32 = 99;
+        const BREAKS: &[u32] = &[OPEN, 77, TURN_END];
+        let probe = RecurrentProbe::default();
+        let model = DummyRecurrentModel {
+            inner: DummyModel::new(),
+            probe: probe.clone(),
+        };
+        let (mut state, _rx) = boundary_state();
+        let slot = SequenceId(0);
+
+        for &t in &[OPEN, 10, 11, TURN_END, 12] {
+            state.push_committed(t, None, BREAKS);
+            flush_page_cut(&model, slot, &mut state);
+            probe.advance_index(slot.0, 1);
+        }
+
+        assert_eq!(state.think_close_at, None, "no span was located");
+        assert_eq!(
+            probe.get_pages(slot.0),
+            ToyPages {
+                // `[OPEN]`, then `[10, 11, TURN_END]`, then `12` still open.
+                closed: vec![1, 3],
+                tail: 1
+            },
+            "both markers ended a page despite no span being recorded"
+        );
+    }
+
+    /// A token that has already been forwarded records its boundary but must not
+    /// cut: its row is in the page the cut would have started after.
+    #[test]
+    fn an_already_forwarded_token_records_its_boundary_without_cutting() {
+        const CLOSE: u32 = 77;
+        let probe = RecurrentProbe::default();
+        let model = DummyRecurrentModel {
+            inner: DummyModel::new(),
+            probe: probe.clone(),
+        };
+        let (mut state, _rx) = boundary_state();
+
+        // A static run: forwarded as one span, then recorded token by token.
+        probe.advance_index(0, 3);
+        for &t in &[10u32, CLOSE, 11] {
+            state.push_forwarded(t, Some(CLOSE), &[CLOSE]);
+        }
+
+        assert_eq!(
+            state.think_close_at,
+            Some(1),
+            "the boundary is still recorded — a steered close is the only one \
+             many turns ever emit"
+        );
+        assert_eq!(
+            probe.get_pages(0),
+            ToyPages {
+                closed: Vec::new(),
+                tail: 3
+            },
+            "but no cut, because the rows are already pooled"
+        );
+        // And the model was never asked, which is the point of the second name.
+        assert!(
+            model.close_positional_page(0).unwrap() == 3,
+            "the tail is still open and closable by whoever owns the boundary"
         );
     }
 

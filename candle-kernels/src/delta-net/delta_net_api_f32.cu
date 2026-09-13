@@ -143,7 +143,8 @@ extern "C" void run_delta_net_norm_gate_f32(
         int rows,
         int d,
         float eps,
+        int sigmoid_gate,
         void* stream) {
     delta_net::launch_norm_gate_f32(o, z, gain, out, rows, d, eps,
-                                    (cudaStream_t)stream);
+                                    sigmoid_gate, (cudaStream_t)stream);
 }

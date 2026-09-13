@@ -1,7 +1,7 @@
 //! Substrate persistence layer — the three-tier KV-cache storage path.
 //!
 //! This is the generalized, mandatory persistence layer specified by
-//! `docs/kv_tier_migration.md`: an append-only NVMe redo log of
+//! `docs/archived/kv_tier_migration.md`: an append-only NVMe redo log of
 //! content-addressed streams that forms a complete, self-contained
 //! substrate image. It is not optional — a substrate is always backed by
 //! its log.
@@ -17,6 +17,7 @@
 //! - [`header_index`] — the batched record-digest chain (§5.6).
 //! - [`recovery`] — chain-first recovery with a forward-walk fallback.
 //! - [`accounting`] — O(1) live/dead byte accounting for compaction.
+//! - [`survival`] — how each record type outlives a rewrite (exhaustive).
 //! - [`inherit`] — multi-log inheritance and the shared cache.
 //!
 //! [`SubstratePersistence`] is the public API tying them together.
@@ -40,6 +41,7 @@ pub mod resume;
 pub mod segment;
 pub mod segmented_log;
 pub mod streams;
+pub mod survival;
 pub mod thread;
 pub mod transfer;
 pub mod walker;
@@ -67,6 +69,7 @@ use record::{
 use segment::SegmentId;
 use segmented_log::SegmentedLog;
 use streams::{ContentAddress, StreamDecl, StreamId, StreamKind, StreamRef};
+use survival::RecordCensus;
 use walker::WalkEntry;
 
 /// Errors raised by the persistence layer.
@@ -289,6 +292,14 @@ pub struct SubstratePersistence {
     /// says which record that is. Without it, `collect_live_records` would omit
     /// every NPC and the first compaction would delete the entire cast.
     npc_locs: HashMap<u64, RecordLoc>,
+
+    /// Per-type record counts as the store stood when it opened — the baseline
+    /// a rewrite's carry-forward tally is reported against, so a class that
+    /// stops being carried is named at the moment it happens rather than
+    /// inferred later from a missing feature. Set once at open and never
+    /// updated: it is a *baseline*, and re-basing it after a rewrite would erase
+    /// the very comparison it exists for.
+    open_census: RecordCensus,
 }
 
 /// Whether a record type is a per-stream metadata record whose current-copy
@@ -305,6 +316,7 @@ fn is_tracked_metadata(rt: RecordType) -> bool {
         RecordType::StreamDecl
             | RecordType::ProjectionEvents
             | RecordType::WideQSig
+            | RecordType::TurnIndexPage
             | RecordType::Commit
     )
 }
@@ -376,6 +388,27 @@ fn record_snapshot_loc(map: &mut HashMap<u64, RecordLoc>, entry: &walker::WalkEn
                 if p.turn_index.is_none() {
                     map.remove(&snapshot_stream_id(p.timeline_id).0);
                 }
+            }
+        }
+        // A `Distilled` marker retires the tail for the same reason a tombstone
+        // does: the recurrent state IS content, derived from a token stream that
+        // distillation has shed, and useless without the K/V it was computed
+        // against. A distilled conversation is never resumed — that is what
+        // distillation means — so the state describes a resume that cannot
+        // happen.
+        //
+        // Dropping it HERE, at the map, rather than at each rewrite is what
+        // makes the two rewrite paths agree without either having to remember.
+        // They did not: `collect_live_records` gated on the distilled set while
+        // incremental maintenance relocated the same tails forward on every
+        // pass, forever, on the reasoning that "the substrate map only ever
+        // holds live conversations' tails" — true of tombstone, which removes
+        // the entry, and false of distill, which did not. Measured on a
+        // production store: 766 distilled timelines carrying ~116 MiB of state
+        // each, ~89 GB of a 120 GB log, none of it resumable.
+        RecordType::Distilled => {
+            if let Ok(p) = record::DistillPayload::decode(&entry.record.payload) {
+                map.remove(&snapshot_stream_id(p.timeline_id).0);
             }
         }
         _ => {}
@@ -516,6 +549,9 @@ impl SubstratePersistence {
         let mut metadata_locs: HashMap<(RecordType, u64), RecordLoc> = HashMap::new();
         let mut snapshot_locs: HashMap<u64, RecordLoc> = HashMap::new();
         let mut npc_locs: HashMap<u64, RecordLoc> = HashMap::new();
+        // What the store actually holds, by type. One array increment per record
+        // in a walk that already visits every record — see `RecordCensus`.
+        let mut census = RecordCensus::new();
         let segmented_log::OpenedSegments {
             mut segments,
             manifest,
@@ -524,11 +560,21 @@ impl SubstratePersistence {
             recovered_records,
         } = SegmentedLog::open_with_sink(dir, |entry| {
             accounting.record(&entry.record.header, entry.size);
+            census.record(entry.record.header.record_type);
             record_metadata_loc(&mut metadata_locs, entry);
             record_snapshot_loc(&mut snapshot_locs, entry);
             record_npc_loc(&mut npc_locs, entry);
             sink(entry);
         })?;
+        // The census at open is the "before" of every before/after: compare two
+        // restarts and a class that a rewrite dropped in between reads as a
+        // count that went to zero.
+        tracing::info!(
+            target: "candle_conversation::persistence::census",
+            total = census.total(),
+            "substrate census at open: {}",
+            census.summary()
+        );
 
         let model_spec = manifest
             .model_spec
@@ -570,6 +616,7 @@ impl SubstratePersistence {
             metadata_locs,
             snapshot_locs,
             npc_locs,
+            open_census: census,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
         // that predates the index chain entirely): flush it now so the
@@ -687,6 +734,7 @@ impl SubstratePersistence {
         self.accounting.record(&header, size);
         self.track_metadata_loc(&header, segment, offset, size);
         self.track_snapshot_loc(&header, segment, offset, size);
+        self.retire_snapshot_on_distill(&header, payload);
         self.track_npc_loc(&header, segment, offset, size);
         // Header + location only. This used to build a `WalkEntry`, whose
         // `Record` owns its payload — so every appended record cloned its whole
@@ -849,6 +897,32 @@ impl SubstratePersistence {
         }
     }
 
+    /// Retire a timeline's recurrent-state tail when its `Distilled` marker is
+    /// appended — the runtime twin of the `Distilled` arm in
+    /// [`record_snapshot_loc`], and the exact counterpart of the removal
+    /// [`Self::write_tombstone`] performs.
+    ///
+    /// Distillation sheds a timeline's content and keeps its provenance
+    /// signatures. The recurrent state is content: it is derived from the token
+    /// stream and is meaningless without the K/V it was computed against, so a
+    /// distilled conversation's snapshot describes a resume that can never
+    /// happen. Retiring the tail here means it stops being live at the *source*,
+    /// which is what lets both rewrite paths do the right thing without either
+    /// having to consult the distilled set.
+    ///
+    /// Keyed off the payload, not the header: a `Distilled` record carries its
+    /// `timeline_id` in the payload and leaves `stream_id` zero, so unlike
+    /// `Snapshot` / `Npc` the identity cannot be read from the header alone.
+    fn retire_snapshot_on_distill(&mut self, h: &RecordHeader, payload: &[u8]) {
+        if h.record_type != RecordType::Distilled {
+            return;
+        }
+        if let Ok(p) = record::DistillPayload::decode(payload) {
+            self.snapshot_locs
+                .remove(&snapshot_stream_id(p.timeline_id).0);
+        }
+    }
+
     /// The runtime-append twin of [`record_npc_loc`].
     fn track_npc_loc(&mut self, h: &RecordHeader, segment: SegmentId, offset: u64, size: u64) {
         if h.record_type == RecordType::Npc {
@@ -941,6 +1015,16 @@ impl SubstratePersistence {
     /// Append a turn's `WideQSig` record (opaque wide-Q window payload), keyed by stream id.
     pub fn append_wide_q_sigs(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<()> {
         self.append_record(RecordType::WideQSig, 0, stream_id.0, 0, 0, 0, payload)?;
+        Ok(())
+    }
+
+    /// Append a turn's QSA index page (opaque payload), keyed by stream id.
+    ///
+    /// The counterpart of [`Self::append_wide_q_sigs`]: both carry a blob that
+    /// belongs to a turn and that no amount of re-reading the turn's K/V can
+    /// reconstruct, because it was computed from hidden states.
+    pub fn append_turn_index_page(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<()> {
+        self.append_record(RecordType::TurnIndexPage, 0, stream_id.0, 0, 0, 0, payload)?;
         Ok(())
     }
 
@@ -1664,6 +1748,42 @@ impl SubstratePersistence {
         // Planning only — no disk reads; each read-back record carries its
         // source location, read back coalesced + staged verbatim in step 3.
         let live = compaction::collect_live_records(&self.manifest, substrate, &self.npc_locs);
+        // What this compaction is carrying forward, by type, against what the
+        // store held when it opened. A class present at open and absent here is
+        // being deleted — the failure this whole module exists to make visible,
+        // and one that raises nothing on its own. One pass over a Vec already in
+        // RAM, once per compaction.
+        {
+            let mut carried = RecordCensus::new();
+            for item in &live {
+                carried.record(item.header().record_type);
+            }
+            let lost = carried.types_lost_against(&self.open_census);
+            if lost.is_empty() {
+                tracing::info!(
+                    target: "candle_conversation::persistence::census",
+                    total = carried.total(),
+                    "compaction carrying forward: {}",
+                    carried.summary()
+                );
+            } else {
+                // `warn`, and naming the classes: every type the store held has
+                // a carrier in `survival.rs`, so a type going to zero here is
+                // either a genuine emptying (a tombstoned timeline's last turn)
+                // or a rewrite that forgot one. Both are worth a line that says
+                // which.
+                tracing::warn!(
+                    target: "candle_conversation::persistence::census",
+                    total = carried.total(),
+                    dropped = ?lost,
+                    "compaction is carrying NO records of {} type(s) the store held at open \
+                     — verify each is a legitimate emptying and not a missing carrier \
+                     (persistence/survival.rs): {}",
+                    lost.len(),
+                    carried.summary()
+                );
+            }
+        }
         report(2);
 
         // 3. Write the live set into a compacted scratch file (a fresh index

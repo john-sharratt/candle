@@ -39,13 +39,17 @@
 //! - ✅ `beliefs` field — static propositions injected into all system prompts
 //! - ✅ `plan` field — Reason-produced intention injected into Reality prompts
 //! - ✅ Temporal marker injection `[T-{day}.{seq}]` with per-tree opt-in
-//! - ✅ Summarization trigger after N turns or on day boundary (stub — logs only)
+//! - ✅ Summarization trigger after N turns or on day boundary
 //! - ✅ `ConversationTreeFork` / `TreePatch` for background work (infrastructure ready)
 //! - ✅ N-ary field layout (`children`, `decode_context`) baked in from day 1
 //! - ✅ HOT/WARM/COLD tier enum defined; all nodes currently stay HOT
+//! - ✅ Summarization inference — `run_summarize()` launches a real
+//!   `SummarizationTask` against the scheduler; `Sequence` drains the queue
+//!   after each turn and applies the resulting [`TreePatch`] (the `patch`
+//!   module documents the path it takes)
+//! - ✅ Recursive segment-of-segments summarization, triggered after each patch
 //! - ❌ Tree rebalancing and segment node creation (TODO)
 //! - ❌ Tier promotion/demotion and VRAM eviction (TODO)
-//! - ❌ Actual summarization inference (TODO: replace `run_summarize()` stub)
 //! - ❌ Sleep pipeline — batch prospective simulation (TODO)
 //! - ❌ Daydream pipeline — resonance probe + latency gate (TODO)
 //! - ❌ Reason pipeline — self-dialogue + Plan update (TODO)

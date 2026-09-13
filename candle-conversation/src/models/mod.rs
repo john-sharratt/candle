@@ -53,6 +53,7 @@ mod qwen2;
 mod qwen3;
 mod qwen35_dense;
 mod qwen36_moe;
+mod qwen38_flash_next;
 mod qwen3_moe;
 
 pub use builder::ModelBuilder;
@@ -88,6 +89,22 @@ pub enum ModelArch {
     /// K/V, which is why it declares
     /// `ManagedBatchedModel::carries_recurrent_state`.
     Qwen35Hybrid,
+    /// `qwen4exp::Qwen4ExpBatched` — Qwen3.8-Flash-Next: a 3:1 gated-DeltaNet ⁄
+    /// sparse-attention hybrid over a 4-stream gated residual, 512 experts on
+    /// every layer, an n-gram hash embedding injected at layer 1, and QSA block
+    /// selection on the 12 full-attention layers.
+    ///
+    /// Carries **four** per-sequence states, the most of any arch here: the
+    /// DeltaNet recurrence, the PLE convolution tail, the QSA index cache, and
+    /// the paged K/V. The first three all live outside the K/V, so this
+    /// declares `carries_recurrent_state` for the same reason
+    /// [`Self::Qwen35Hybrid`] does.
+    ///
+    /// Loaded from a **locally prepared** merged GGUF whose experts are
+    /// `Q4_KO` (a bit-exact import of the vendor's W4A16 release, not a
+    /// requant — `qwen4exp/convert.rs`), the same posture as
+    /// [`Self::DeepSeekV4`]'s offline KO artifact.
+    Qwen4Exp,
     /// `qwen35::HybridBatched` over a **dense** checkpoint of the same lineage —
     /// the same DeltaNet/attention stack with the mixture taken out.
     ///
@@ -133,9 +150,11 @@ impl ModelArch {
     /// invalidate that calibration without re-deriving it.
     pub fn native_activation_dtype(self) -> Option<DType> {
         match self {
-            // Both members of the lineage, routed and dense: the activation
-            // width is the stack's, and the mixture does not change it.
-            Self::Qwen35Hybrid | Self::Qwen35Dense => Some(DType::BF16),
+            // Every member of the lineage — routed, dense, and Flash-Next. The
+            // activation width is the stack's: the mixture does not change it,
+            // and Qwen3.8-Flash-Next declares `"dtype": "bfloat16"` like the
+            // rest, with a gate ladder that runs BF16.
+            Self::Qwen35Hybrid | Self::Qwen35Dense | Self::Qwen4Exp => Some(DType::BF16),
             Self::Qwen3 | Self::Qwen3Moe | Self::Qwen2 | Self::Llama | Self::DeepSeekV4 => None,
         }
     }
@@ -196,6 +215,17 @@ pub enum Model {
     /// history cannot be reconstructed from sealed chunks alone — see
     /// `docs/deltanet_state_persistence.md`.
     Qwen36_35B_A3B_Q4,
+
+    /// Qwen3.8-Flash-Next Q4_KO — 250 B total, ~13 B active, 48 layers at 3:1
+    /// (36 gated-DeltaNet, 12 attention). Native 262,144-token context.
+    ///
+    /// Carries two classes of state no other preset does — a PLE window and a
+    /// QSA index — neither of which is a delta-rule matrix, so both ride the
+    /// turn record's model-opaque blob (`docs/qwen38_index_persistence.md`).
+    ///
+    /// **Its engine GGUF is prepared locally, not downloaded** — see
+    /// [`qwen38_flash_next`] and [`ModelSpec::prepared_from_source`].
+    Qwen38_FlashNext_Q4KO,
 
     /// Qwen3.5-9B Q6_K — the lineage's **dense** member (~7.5 GB), same hybrid
     /// attention/DeltaNet stack with the mixture taken out.
@@ -296,9 +326,26 @@ pub struct ModelSpec {
     /// Dialect used to construct chat messages
     pub dialect: Dialect,
     /// HuggingFace repository containing the GGUF file.
+    ///
+    /// When [`Self::prepared_from_source`] is set this names the repo the
+    /// artifact is *built from*, not one that publishes it.
     pub model_repo: String,
     /// GGUF filename within the repository.
     pub model_filename: String,
+    /// Set when [`Self::model_filename`] names an artifact this codebase
+    /// **prepares** from [`Self::model_repo`]'s published files, rather than one
+    /// published under that name.
+    ///
+    /// Flash-Next is the case that needs it: its engine GGUF is a local build —
+    /// the pinned Q8_0 split, plus the W4A16 release's expert tensors imported
+    /// to Q4_KO, plus the MTP head folded in as the block past the trunk, merged
+    /// into one file. Nothing on the hub is that file.
+    ///
+    /// Resolution therefore skips the network for these: a 404 on a name that
+    /// was never published is a confusing way to say "you have not run the
+    /// prepare step", and retrying it on every start is worse. The resolver
+    /// looks in the local cache and, failing that, says what to run.
+    pub prepared_from_source: bool,
     /// Pinned revision of [`Self::model_repo`], as [`Self::tokenizer_rev`] pins the tokenizer's.
     ///
     /// **The weights are the one coordinate it was still possible to leave unpinned.** A repo
@@ -426,6 +473,7 @@ impl Model {
             Model::Qwen3_14B_Q6 => qwen3::qwen3_14b_q6(),
             // Qwen3 MoE
             Model::Qwen36_35B_A3B_Q4 => qwen36_moe::qwen36_35b_a3b_q4(),
+            Model::Qwen38_FlashNext_Q4KO => qwen38_flash_next::qwen38_flash_next_q4ko(),
             Model::Qwen35_9B_Q6 => qwen35_dense::qwen35_9b_q6(),
             Model::Qwen3_30B_A3B_Q4 => qwen3_moe::qwen3_30b_a3b_q4(),
             Model::Qwen3_30B_A3B_Q6 => qwen3_moe::qwen3_30b_a3b_q6(),
@@ -508,6 +556,7 @@ impl std::fmt::Display for ModelArch {
             ModelArch::Qwen2 => write!(f, "Qwen2"),
             ModelArch::Llama => write!(f, "Llama"),
             ModelArch::DeepSeekV4 => write!(f, "DeepSeekV4"),
+            ModelArch::Qwen4Exp => write!(f, "Qwen4Exp"),
             ModelArch::Qwen35Hybrid => write!(f, "Qwen35Hybrid"),
             ModelArch::Qwen35Dense => write!(f, "Qwen35Dense"),
         }

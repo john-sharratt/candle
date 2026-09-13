@@ -23,6 +23,7 @@ pub(super) fn qwen3_8b_q4() -> ModelSpec {
         chat_format,
         model_repo: "unsloth/Qwen3-8B-GGUF".into(),
         model_filename: "Qwen3-8B-Q4_K_M.gguf".into(),
+        prepared_from_source: false,
         model_bytes: 5_027_784_512,
         // Unpinned: no verified commit has been recorded for this conversion. See
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
@@ -51,6 +52,7 @@ pub(super) fn qwen3_8b_q6() -> ModelSpec {
         chat_format,
         model_repo: "unsloth/Qwen3-8B-GGUF".into(),
         model_filename: "Qwen3-8B-Q6_K.gguf".into(),
+        prepared_from_source: false,
         model_bytes: 6_725_900_096,
         // Unpinned: no verified commit has been recorded for this conversion. See
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
@@ -83,6 +85,7 @@ pub(super) fn qwen3_14b_q4() -> ModelSpec {
         chat_format,
         model_repo: "unsloth/Qwen3-14B-GGUF".into(),
         model_filename: "Qwen3-14B-Q4_K_M.gguf".into(),
+        prepared_from_source: false,
         model_bytes: 9_001_753_984,
         // Unpinned: no verified commit has been recorded for this conversion. See
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
@@ -108,6 +111,7 @@ pub(super) fn qwen3_14b_q5() -> ModelSpec {
         chat_format,
         model_repo: "unsloth/Qwen3-14B-GGUF".into(),
         model_filename: "Qwen3-14B-Q5_K_M.gguf".into(),
+        prepared_from_source: false,
         model_bytes: 10_514_570_624,
         // Unpinned: no verified commit has been recorded for this conversion. See
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
@@ -133,6 +137,7 @@ pub(super) fn qwen3_14b_q6() -> ModelSpec {
         chat_format,
         model_repo: "unsloth/Qwen3-14B-GGUF".into(),
         model_filename: "Qwen3-14B-Q6_K.gguf".into(),
+        prepared_from_source: false,
         model_bytes: 12_121_938_304,
         // Unpinned: no verified commit has been recorded for this conversion. See
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.

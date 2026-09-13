@@ -2,7 +2,7 @@
 //! [`TargetedRead`] — the target-aware [`ContentResolver`] wrapper.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -145,7 +145,10 @@ fn warmable(
 ) -> Option<(&LayerSchema, &GroupSchema)> {
     let layer = schema.layers.iter().find(|l| l.id == layer)?;
     let group = layer.groups.iter().find(|g| g.id == group)?;
-    is_warmable(group).then_some((layer, group))
+    // A layer out of retrieval teaches no hit levels: they would be
+    // denominators for candidates it can never return. See
+    // `LayerSchema::gathered`, which `warm_ingest_normalization` honours too.
+    (layer.gathered && is_warmable(group)).then_some((layer, group))
 }
 
 /// `layer` with `group` as its only group.
@@ -256,7 +259,7 @@ pub struct Conversation {
     inner: Arc<RwLock<Substrate>>,
     allocator: Arc<TimelineAllocator>,
     /// The mandatory persistence layer — every turn is recorded into its
-    /// redo log (`docs/kv_tier_migration.md` §13.6).
+    /// redo log (`docs/archived/kv_tier_migration.md` §13.6).
     persistence: Arc<Mutex<SubstratePersistence>>,
     /// Runtime, in-memory score normalization (per-scope hit levels). NOT
     /// persisted — rebuilt from the substrate's existing turns on first use, then
@@ -973,12 +976,18 @@ impl Conversation {
                     .collect()
             };
             let raw_pairs = pairs(&fresh);
+            // Each scan's own probe length: a raw score is a SUM over probe
+            // tokens, and the tail and question windows differ by an order of
+            // magnitude, so the band has to be told which probe produced which
+            // scores. See `NormConfig::probe_t_ref`.
+            let t_tail = probe.len();
+            let t_q = probe_q.map_or(1, |q| q.len());
             let (normed, normed_q) = {
                 let mut cache = self.normalization.lock().unwrap();
-                let normed = cache.normalize(&scope, &raw_pairs);
+                let normed = cache.normalize(&scope, &raw_pairs, t_tail);
                 let normed_q = fresh_q
                     .as_deref()
-                    .map(|fq| cache.normalize(&scope, &pairs(fq)));
+                    .map(|fq| cache.normalize(&scope, &pairs(fq), t_q));
                 // Segmentation: this collection learns only from a probe inside
                 // its own gather scope. `tags: [tool]` means tool traffic teaches
                 // the tool band and dialogue traffic does not — the band stays a
@@ -986,7 +995,7 @@ impl Conversation {
                 // achieve that.
                 if let (true, Some(source)) = (observe.teaches(&coll.policy.tags), observe.source())
                 {
-                    cache.observe(&scope, source, &raw_pairs);
+                    cache.observe(&scope, source, &raw_pairs, t_tail);
                 }
                 (normed, normed_q)
             };
@@ -1370,6 +1379,15 @@ impl Conversation {
     pub fn warm_ingest_normalization(&self, schema: &Schema) {
         let mut warmed_timelines = 0usize;
         for layer in &schema.layers {
+            // Out of retrieval ⇒ nothing to warm. A hit level is a denominator
+            // for candidates this layer might return, and a non-gathered layer
+            // returns none, so warming it would spend the probe budget learning
+            // levels that can never be read. (`score_belief_groups` declines the
+            // same layer, so `warm_normalization_from_substrate` needs no guard
+            // of its own — it warms THROUGH that call.)
+            if !layer.gathered {
+                continue;
+            }
             let is_ingest = self.inner.read().unwrap().is_append_only_layer(layer.id);
             if !is_ingest {
                 continue;
@@ -1515,6 +1533,14 @@ impl Conversation {
         use crate::persistence::content_hash::turn_stream_id;
         let mut per_group: Vec<(GroupId, Vec<(TurnKey, f32)>)> = Vec::new();
         if probe.is_empty() {
+            return per_group;
+        }
+        // Taken out of retrieval for this boot (`zend --disable-layer`). Its
+        // turns are still in the substrate with their signatures intact — this
+        // declines to score them, so they cannot be selected, which is the whole
+        // of what the flag promises. Re-enabling restores them immediately; the
+        // flag is a read-time filter, not a deletion.
+        if !layer.gathered {
             return per_group;
         }
         // The substrate read guard is scoped to Phase A, never held across Phase
@@ -1915,15 +1941,20 @@ impl Conversation {
                 // the levels between this turn's normalize and observe. Learning only
                 // fires on the once-per-turn seal scan, not on every reprojection,
                 // and folds the TAIL scan's raw scores (the stored whole-turn probe).
+                // As on the collection path above: the tail and question scans
+                // are sums over probes of very different lengths, so each is
+                // normalized against the reference on its own length.
+                let t_tail = probe.len();
+                let t_q = probe_q.map_or(1, |q| q.len());
                 let (normed, normed_q) = {
                     let mut cache = self.normalization.lock().unwrap();
-                    let normed = cache.normalize_with_floors(&scope, &raw_pairs, &floors);
+                    let normed = cache.normalize_with_floors(&scope, &raw_pairs, &floors, t_tail);
                     let normed_q = fresh_q_per_file.as_ref().map(|per_file| {
                         let fq = &per_file[fi];
                         let q_pairs: Vec<(ChildKey, f32)> = (0..f.n_slots)
                             .map(|slot| (child_of(slot), fq.get(slot).copied().unwrap_or(0.0)))
                             .collect();
-                        cache.normalize_with_floors(&scope, &q_pairs, &floors)
+                        cache.normalize_with_floors(&scope, &q_pairs, &floors, t_q)
                     });
                     // A turn group's retrieval target IS the turn, so its gather
                     // scope is the group's own; `tags` on the group route the
@@ -1931,7 +1962,7 @@ impl Conversation {
                     if let (true, Some(source)) =
                         (observe.teaches(&group.policy.tags), observe.source())
                     {
-                        cache.observe(&scope, source, &raw_pairs);
+                        cache.observe(&scope, source, &raw_pairs, t_tail);
                     }
                     (normed, normed_q)
                 };
@@ -2548,7 +2579,7 @@ impl Conversation {
         }
         // Arm low-priority reconciliation per timeline. The summary forest is
         // immutable and its canonical ternary shape is a pure function of the
-        // leaves (`docs/immutable_summary_forest.md`), so the reload doesn't
+        // leaves (`docs/archived/immutable_summary_forest.md`), so the reload doesn't
         // re-summarise anything — it just asks the summariser to rebuild any
         // internal node that's missing (a crash between sealing leaves and their
         // parent) or non-canonical (binary nodes from the superseded AVL, which
@@ -3252,6 +3283,21 @@ impl Conversation {
             .map_err(|e| candle::Error::Msg(format!("persist wide-Q sigs: {e}")))
     }
 
+    /// Persist a turn's QSA index page to the redo log (`TurnIndexPage`,
+    /// last-writer-wins per stream) and mirror it into the in-RAM substrate.
+    ///
+    /// The page has to outlive the process for the same reason the turn's K/V
+    /// does: a later projection borrows both. Kept in RAM alone it is gone at
+    /// restart, and every cold-loaded turn then hands a slot keys it cannot
+    /// index.
+    pub fn persist_index_page(&self, stream_id: StreamId, payload: &[u8]) -> candle::Result<()> {
+        self.write()
+            .set_index_page_blob(stream_id, payload.to_vec());
+        let mut p = self.persistence.lock().unwrap();
+        p.append_turn_index_page(stream_id, payload)
+            .map_err(|e| candle::Error::Msg(format!("persist index page: {e}")))
+    }
+
     /// Enqueue a turn/section `Tokens` record onto the off-thread writer — the
     /// durable copy for reload. The in-memory token buffer is already set at
     /// record time, so this NEVER blocks the seal on the persistence lock (which a
@@ -3279,6 +3325,14 @@ impl Conversation {
             .set_wide_q_sigs_blob(stream_id, payload.clone());
         self.writer
             .enqueue(WriteJob::WideQSigs { stream_id, payload });
+    }
+
+    /// Enqueue a turn's QSA index page, mirroring it in RAM first so this
+    /// session's own projections can borrow the turn immediately.
+    pub fn enqueue_index_page(&self, stream_id: StreamId, payload: Vec<u8>) {
+        self.write().set_index_page_blob(stream_id, payload.clone());
+        self.writer
+            .enqueue(WriteJob::TurnIndexPage { stream_id, payload });
     }
 
     /// Enqueue a conversation's recurrent-state snapshot (the encoded
@@ -3582,7 +3636,7 @@ impl Conversation {
 
     /// Run one **background maintenance** op on the segmented redo log — drop a
     /// fully-dead segment, compact a mostly-dead one, or combine two small
-    /// adjacent ones (`docs/segmented_substrate_log.md` §6). At most one op per
+    /// adjacent ones (`docs/archived/segmented_substrate_log.md` §6). At most one op per
     /// call; the persistence thread polls this every pass. The common no-op
     /// path is a cheap per-segment liveness scan. Holds the persistence lock
     /// and the substrate write lock for the op's duration — cold-loads and
@@ -3758,6 +3812,45 @@ impl<'a> TargetedRead<'a> {
     pub fn new(read: SubstrateRead<'a>, target: ProjectionTarget) -> Self {
         Self { read, target }
     }
+
+    /// Partition one timeline's turns into exchanges — the same partition the
+    /// belief scan scores over, derived the same way.
+    ///
+    /// Couplings address the `Normal` subsequence: summary-forest nodes hold
+    /// turn indices too, so a raw `i → i+1` walk would fuse a coupled call with
+    /// a summary that happens to sit between it and its response. `over_normals`
+    /// projects the couplings onto that subsequence, and the ranges map back
+    /// through it.
+    ///
+    /// Returns `(exchanges, slot_of)` where `slot_of[idx]` names the exchange a
+    /// turn belongs to; a summary node appears in neither.
+    fn exchange_partition(
+        &self,
+        timeline: TimelineId,
+    ) -> (Vec<Vec<TurnIndex>>, HashMap<TurnIndex, usize>) {
+        let total = Substrate::turn_count(&self.read, timeline);
+        let normals: Vec<TurnIndex> = (0..total)
+            .map(TurnIndex)
+            .filter(|idx| {
+                !self
+                    .read
+                    .tree_meta_of(timeline, *idx)
+                    .is_some_and(|m| m.kind.is_summary())
+            })
+            .collect();
+        let couplings = over_normals(&self.read.couplings_of(timeline), &normals);
+        let parts: Vec<Vec<TurnIndex>> = exchanges(&couplings, normals.len())
+            .into_iter()
+            .map(|r| r.map(|pos| normals[pos]).collect())
+            .collect();
+        let mut slot_of = HashMap::new();
+        for (slot, part) in parts.iter().enumerate() {
+            for idx in part {
+                slot_of.insert(*idx, slot);
+            }
+        }
+        (parts, slot_of)
+    }
 }
 
 impl<'a> std::ops::Deref for TargetedRead<'a> {
@@ -3789,6 +3882,37 @@ impl<'a> ContentResolver for TargetedRead<'a> {
             .active_timelines_for_group(group)
             .flat_map(turns_of)
             .collect()
+    }
+
+    /// Exchange closure over the substrate's `TurnCoupling` records — the same
+    /// partition the belief scan scores over, so a rule ranks exactly the unit
+    /// provenance voted on.
+    fn group_exchanges(&self, keys: &[TurnKey]) -> Vec<Vec<TurnKey>> {
+        let mut partitions: HashMap<TimelineId, (Vec<Vec<TurnIndex>>, HashMap<TurnIndex, usize>)> =
+            HashMap::new();
+        let mut seen: HashSet<(TimelineId, usize)> = HashSet::new();
+        let mut out: Vec<Vec<TurnKey>> = Vec::new();
+        for key in keys {
+            let (parts, slot_of) = partitions
+                .entry(key.timeline)
+                .or_insert_with(|| self.exchange_partition(key.timeline));
+            // A summary-forest node joins no exchange (couplings are written
+            // over Normal turns only), so it stands as its own unit.
+            let Some(&slot) = slot_of.get(&key.index) else {
+                out.push(vec![*key]);
+                continue;
+            };
+            if !seen.insert((key.timeline, slot)) {
+                continue;
+            }
+            out.push(
+                parts[slot]
+                    .iter()
+                    .map(|idx| TurnKey::new(key.timeline, *idx))
+                    .collect(),
+            );
+        }
+        out
     }
 
     fn turn_token_count(&self, turn: TurnKey) -> usize {
@@ -3827,19 +3951,6 @@ impl<'a> ContentResolver for TargetedRead<'a> {
 
     fn target_is_ingest_self(&self) -> bool {
         self.read.is_append_only_layer(self.target.layer)
-    }
-
-    fn turn_with_tag(&self, group: GroupId, tag: &str) -> Option<TurnKey> {
-        // Call the Substrate inherent method (timeline-keyed) via deref — not the
-        // trait method (group-keyed) on `SubstrateRead`.
-        let find = |tl: TimelineId| {
-            Substrate::turn_with_tag(&self.read, tl, tag).map(|idx| TurnKey::new(tl, idx))
-        };
-        // Self-local on an append-only ingest target — see `group_turns`.
-        if group == self.target.group || self.read.is_append_only_layer(self.target.layer) {
-            return find(self.target.timeline);
-        }
-        self.read.active_timelines_for_group(group).find_map(find)
     }
 
     fn turn_kind(&self, turn: TurnKey) -> TurnKind {
@@ -4098,6 +4209,18 @@ layers:
             .clone();
         assert!(!is_warmable(&group));
         assert!(warmable(b.schema(), dialogue, conversation).is_none());
+    }
+
+    /// **A layer out of retrieval is not warmed**, whichever warm-up asks —
+    /// the single-group and single-timeline ones as well as the ingest one.
+    #[test]
+    fn a_group_in_a_layer_out_of_retrieval_is_not_warmable() {
+        let mut b = Builder::from_yaml(WARM_YAML).unwrap();
+        let ground = b.id_for_layer("ground").unwrap();
+        let facts = b.id_for_group("facts").unwrap();
+        assert!(warmable(b.schema(), ground, facts).is_some());
+        assert!(b.set_layer_gathered("ground", false));
+        assert!(warmable(b.schema(), ground, facts).is_none());
     }
 
     /// **A warm scores one group, not its layer.** `score_belief_groups` scores

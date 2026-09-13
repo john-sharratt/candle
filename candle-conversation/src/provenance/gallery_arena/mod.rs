@@ -7,7 +7,7 @@
 //! slabs ([`storage`]); a re-seal or eviction returns the pages to the pool. The
 //! scan kernel reads a *paged gallery* — an array of page device addresses plus a
 //! per-token page map — modelled on the paged-KV pointer interface. See
-//! `docs/paged_gallery_arena.md`.
+//! `docs/archived/paged_gallery_arena.md`.
 //!
 //! The arena is a **device-level** resource (one per GPU, scheduler-owned): its
 //! residency map is keyed by the global [`StreamId`] of a turn, so every

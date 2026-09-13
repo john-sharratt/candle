@@ -588,6 +588,67 @@ pub enum Int8Mode {
     Precision,
 }
 
+/// How a q8a128 block stores the per-128 `Σx` in its `ds[0].y` header field.
+///
+/// **A property of the bytes, not of the kernel.** It is chosen by whichever
+/// producer wrote the block and carried on `cuda::Q8a128Operand`, so the matmul
+/// never has to guess which convention it is reading. Both halves cost the same:
+/// the producer stores one value either way, and the matmul rebuilds `Σx` with
+/// one `fmaf` whose two coefficients are hoisted from this choice — so it is a
+/// runtime argument, never a template parameter, and adds no kernel variants.
+///
+/// [`SumScale::Raw`] is the default and is what every language model here uses;
+/// its bytes and its arithmetic are bit-identical to the unparameterised path
+/// that preceded this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SumScale {
+    /// `ds[0].y = Σx` — the raw per-128 sum.
+    #[default]
+    Raw,
+    /// `ds[0].y = Σx / amax`.
+    ///
+    /// **For activations whose block sums overflow f16.** Both header fields are
+    /// f16 and `|Σx|` can reach `128 · amax`, so any activation whose per-128
+    /// sums pass 65504 stores `+inf` and every dot product touching that block
+    /// becomes NaN. An LLM's stay under 10³ and never come near it; Z-Image's
+    /// SwiGLU intermediate reaches ≈2×10⁵, which produced a black image with no
+    /// other symptom.
+    ///
+    /// Normalising bounds the field at `|Σx/amax| ≤ 128` whatever the
+    /// activation's magnitude, and costs no precision — f16's relative precision
+    /// is scale-free, so the normalised value carries the same ~2⁻¹¹ the raw one
+    /// did, and rather more at the bottom, where a small raw `Σx` went
+    /// subnormal. `amax == 0` stores 0, which reconstructs to 0.
+    ///
+    /// It is opt-in rather than universal because it changes the stored bytes:
+    /// a model whose thresholds were derived against raw sums would have them
+    /// invalidated by a silent format change.
+    ByAmax,
+}
+
+impl SumScale {
+    /// The two coefficients that rebuild `Σx` from the stored field, as
+    /// `sum = ds.y · fmaf(ds.x, a, b)`.
+    ///
+    /// `ds.x` is `amax/127`, so `(127, 0)` gives `ds.y · amax` = `Σx` for
+    /// [`Self::ByAmax`], and `(0, 1)` gives `ds.y · 1` — exactly the raw field,
+    /// with no rounding introduced — for [`Self::Raw`].
+    pub fn reconstruct_coeffs(self) -> (f32, f32) {
+        match self {
+            Self::Raw => (0.0, 1.0),
+            Self::ByAmax => (127.0, 0.0),
+        }
+    }
+
+    /// The flag as the kernels take it: `0` raw, `1` normalised.
+    pub fn as_code(self) -> i32 {
+        match self {
+            Self::Raw => 0,
+            Self::ByAmax => 1,
+        }
+    }
+}
+
 impl Int8Mode {
     /// True when the int8 tensor-core path is active (any mode other than [`Int8Mode::Off`]).
     pub fn is_int8(self) -> bool {
@@ -1063,8 +1124,9 @@ impl GgmlDType {
     ///
     /// ⚠ MUST be the exact inverse of `from_gguf_file_code` above — the output
     /// is the integer written to disk in GGUF tensor metadata, NOT the
-    /// `#[repr(u32)]` discriminant of this enum.
-    pub(crate) fn to_gguf_file_code(self) -> u32 {
+    /// `#[repr(u32)]` discriminant of this enum. `pub` for the same streaming
+    /// GGUF composers as [`gguf_file::Value::write`].
+    pub fn to_gguf_file_code(self) -> u32 {
         match self {
             Self::F32 => 0,
             Self::F16 => 1,
@@ -2394,6 +2456,29 @@ impl<'w> LiveQTensor<'w> {
         let device = qtensors[0].device();
         let (mut total_n, k) = qtensors[0].shape.dims2()?;
 
+        // **The one failure this function cannot survive quietly.** Everything
+        // below is a byte append, which is the stacked weight exactly when a
+        // row is a contiguous run of blocks — true of every GGUF block format,
+        // where `k` is a multiple of the block size so no block spans two rows.
+        //
+        // It is false of the KO twins. Those are lane-major GPU chunks whose
+        // bytes are already permuted into the layout the int8 tensor-core
+        // matmul reads (`QCudaStorage::repack_ko`), so rows are interleaved
+        // across lanes and appending two of them yields a weight of exactly the
+        // right byte count holding nonsense — which surfaces as bad numbers many
+        // layers downstream, never as a fault here. Refused by name rather than
+        // guessed at, because the caller's fix is to move the stack earlier
+        // (onto the GGUF layout, before `QMatMul::from_qtensor_with_mode`
+        // repacks) rather than to give up on it.
+        if dtype.is_ko() {
+            crate::bail!(
+                "concat_rows_cuda: {dtype:?} is a KO twin — its bytes are lane-major, already \
+                 repacked for the int8 matmul, so its rows are interleaved and a byte append \
+                 would build a correctly-sized weight holding nonsense. Stack on the GGUF block \
+                 layout instead, BEFORE the repack"
+            )
+        }
+
         for (i, t) in qtensors.iter().enumerate() {
             if t.rank() != 2 {
                 crate::bail!(
@@ -2828,6 +2913,7 @@ impl QMatMul {
         _xs: &LiveTensor<'w>,
         _mode: Int8Mode,
         _out_dtype: crate::DType,
+        _sum_scale: SumScale,
     ) -> Result<LiveTensor<'w>> {
         crate::bail!("forward_via_int8 requires the cuda feature")
     }
@@ -2838,6 +2924,10 @@ impl QMatMul {
         xs: &LiveTensor<'w>,
         mode: Int8Mode,
         out_dtype: crate::DType,
+        // This quantizes the activation itself, so the Σx convention is its
+        // choice to make and not one it can read off an operand. Named rather
+        // than defaulted: a wrong value here is a wrong number, not an error.
+        sum_scale: SumScale,
     ) -> Result<LiveTensor<'w>> {
         let device = match self {
             Self::QTensor(t) => match &t.storage {
@@ -2846,7 +2936,7 @@ impl QMatMul {
             },
             _ => crate::bail!("forward_via_int8 requires a KO QTensor weight"),
         };
-        let acts = cuda::to_dynamic(xs, mode, &device)?;
+        let acts = cuda::to_dynamic(xs, mode, &device, sum_scale)?;
         self.forward_dynamic(acts.as_dynamic(), out_dtype)
     }
 }

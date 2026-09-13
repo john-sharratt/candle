@@ -506,6 +506,136 @@ fn quantize_q8_ko(w: &[f32], nrows: usize, ncols: usize) -> Vec<u8> {
     ob
 }
 
+/// Pack **precomputed** Q4 codes and per-group affine params into the lane-major
+/// `Q4_KO` chunk layout — [`quantize_ko`] without its min-max observer.
+///
+/// The importer's entry point: a source that is *already* 4-bit affine per-128
+/// (compressed-tensors W4A16 g128, AWQ/GPTQ) carries its own codes and scales,
+/// and re-deriving them through the observer re-rounds whenever a group's
+/// extremes don't span the grid. Packing the source's own `(code, scale, min)`
+/// keeps the import **bit-exact**: `dequant_ko` reproduces `scale·q + min` with
+/// the source's values.
+///
+/// `codes` are row-major `[nrows × ncols]`, each in `0..=15`. `dm` is row-major
+/// `[nrows × ncols/128]` of `(scale, min)` per 128-column group. Scales and mins
+/// are stored as f16 — the caller asserts f16-representability where exactness
+/// is claimed (bf16-sourced scales in the f16 normal range are exact).
+pub fn pack_q4_ko(codes: &[u8], dm: &[(f32, f32)], nrows: usize, ncols: usize) -> Vec<u8> {
+    assert_eq!(nrows % 8, 0, "pack_q4_ko: nrows must be a multiple of 8");
+    assert_eq!(
+        ncols % 128,
+        0,
+        "pack_q4_ko: ncols must be a multiple of 128"
+    );
+    assert_eq!(codes.len(), nrows * ncols, "pack_q4_ko: codes length");
+    let k_blocks = ncols / 128;
+    assert_eq!(dm.len(), nrows * k_blocks, "pack_q4_ko: dm length");
+    let p = KoPlanes::of(GgmlDType::Q4_KO);
+    let chunk_bytes = p.chunk_bytes;
+    let row_groups = nrows / 8;
+    let mut ob = vec![0u8; k_blocks * row_groups * chunk_bytes];
+    let mut cbuf = [0u8; 1024];
+    for k_blk in 0..k_blocks {
+        for g in 0..row_groups {
+            let cbase = (k_blk * row_groups + g) * chunk_bytes;
+            // Gather the chunk's 8 × 128 codes contiguously, then place them
+            // by the precomputed chunk permutation — a table walk instead of
+            // per-element index arithmetic. The importer runs this 73k+ times
+            // per checkpoint, which is what bought the table.
+            for r in 0..8 {
+                let row = g * 8 + r;
+                let cb = row * ncols + k_blk * 128;
+                cbuf[r * 128..(r + 1) * 128].copy_from_slice(&codes[cb..cb + 128]);
+            }
+            let out = &mut ob[cbase..cbase + 512];
+            for (o, &(lo, hi)) in out.iter_mut().zip(Q4_KO_CHUNK_PERM.iter()) {
+                *o = (cbuf[lo as usize] & 0xF) | ((cbuf[hi as usize] & 0xF) << 4);
+            }
+            for r in 0..8 {
+                let row = g * 8 + r;
+                let (scale, mn) = dm[row * k_blocks + k_blk];
+                let d = cbase + p.dm_base + r * 4;
+                ob[d..d + 2].copy_from_slice(&f16::from_f32(scale).to_le_bytes());
+                ob[d + 2..d + 4].copy_from_slice(&f16::from_f32(mn).to_le_bytes());
+            }
+        }
+    }
+    ob
+}
+
+/// The Q4_KO chunk permutation: byte `j` of a chunk's 512-byte `ql` plane
+/// holds `(lo, hi)` — the chunk-local element indices (row-major `r·128 + k`)
+/// whose codes land in its low and high nibble.
+///
+/// Derived once from the same arithmetic `quantize_ko`'s loop performs
+/// (`lane = j/16`, `sub = (j%16)/4`, `r = lane/4`, `i = (lane%4)·4 + j%4`).
+/// The byte-identity test against `quantize_ko` is what keeps the table
+/// honest rather than merely self-consistent.
+static Q4_KO_CHUNK_PERM: [(u16, u16); 512] = build_q4_ko_chunk_perm();
+
+const fn build_q4_ko_chunk_perm() -> [(u16, u16); 512] {
+    let mut t = [(0u16, 0u16); 512];
+    let mut j = 0usize;
+    while j < 512 {
+        let lane = j / 16;
+        let sub = (j % 16) / 4;
+        let r = lane / 4;
+        let i = (lane % 4) * 4 + j % 4;
+        let lo = r * 128 + sub * 32 + i;
+        t[j] = (lo as u16, (lo + 16) as u16);
+        j += 1;
+    }
+    t
+}
+
+/// Inverse of [`pack_q4_ko`]: recover the codes and per-group `(scale, min)`
+/// pairs (as the f16 values stored) from a lane-major Q4_KO chunk tensor.
+///
+/// The importer's fast verification path: comparing recovered codes and dm
+/// against the source is byte-equivalent to comparing full dequantizations,
+/// because `dequant_ko` is exactly the affine `scale·code + min` over these
+/// bytes — pinned by the `pack_q4_ko` unit tests against the *untouched*
+/// `dequant_ko`. That independence matters: this function shares
+/// [`Q4_KO_CHUNK_PERM`] with the packer, so a wrong table would round-trip
+/// cleanly here — and be caught there.
+pub fn unpack_q4_ko(chunk: &[u8], nrows: usize, ncols: usize) -> (Vec<u8>, Vec<(f32, f32)>) {
+    assert_eq!(nrows % 8, 0, "unpack_q4_ko: nrows must be a multiple of 8");
+    assert_eq!(
+        ncols % 128,
+        0,
+        "unpack_q4_ko: ncols must be a multiple of 128"
+    );
+    let p = KoPlanes::of(GgmlDType::Q4_KO);
+    let chunk_bytes = p.chunk_bytes;
+    let k_blocks = ncols / 128;
+    let row_groups = nrows / 8;
+    assert_eq!(chunk.len(), k_blocks * row_groups * chunk_bytes);
+    let mut codes = vec![0u8; nrows * ncols];
+    let mut dm = vec![(0f32, 0f32); nrows * k_blocks];
+    let mut cbuf = [0u8; 1024];
+    for k_blk in 0..k_blocks {
+        for g in 0..row_groups {
+            let cbase = (k_blk * row_groups + g) * chunk_bytes;
+            for (j, &(lo, hi)) in Q4_KO_CHUNK_PERM.iter().enumerate() {
+                let b = chunk[cbase + j];
+                cbuf[lo as usize] = b & 0xF;
+                cbuf[hi as usize] = b >> 4;
+            }
+            for r in 0..8 {
+                let row = g * 8 + r;
+                let cb = row * ncols + k_blk * 128;
+                codes[cb..cb + 128].copy_from_slice(&cbuf[r * 128..(r + 1) * 128]);
+                let d = cbase + p.dm_base + r * 4;
+                dm[row * k_blocks + k_blk] = (
+                    f16::from_le_bytes([chunk[d], chunk[d + 1]]).to_f32(),
+                    f16::from_le_bytes([chunk[d + 2], chunk[d + 3]]).to_f32(),
+                );
+            }
+        }
+    }
+    (codes, dm)
+}
+
 /// Inverse of [`quantize_ko`] — reconstruct F32 `[nrows × ncols]` from the lane-major KO
 /// chunk tensor (the per-128 dequant `W = scale·q + min`). Used to validate the quantizer.
 pub fn dequant_ko(chunk: &[u8], nrows: usize, ncols: usize, dtype: GgmlDType) -> Vec<f32> {
@@ -1162,5 +1292,88 @@ mod tests {
         assert_eq!(de[1], 2.0);
         assert_eq!(de[4], 0.0);
         assert_eq!(de[7], 3.0);
+    }
+
+    /// `pack_q4_ko` with supplied codes must byte-match `quantize_ko` whenever
+    /// the observer would derive the same grid — i.e. on data whose every
+    /// 128-group spans code 0 and code 15 exactly.
+    #[test]
+    fn pack_q4_ko_matches_quantize_ko_on_grid_spanning_data() {
+        let (nrows, ncols) = (8usize, 256usize);
+        let k_blocks = ncols / 128;
+        let mut codes = vec![0u8; nrows * ncols];
+        let mut lcg = 12345u64;
+        for c in codes.iter_mut() {
+            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *c = ((lcg >> 33) % 16) as u8;
+        }
+        // Force each group to span the grid so the observer lands on it too.
+        for row in 0..nrows {
+            for kb in 0..k_blocks {
+                codes[row * ncols + kb * 128] = 0;
+                codes[row * ncols + kb * 128 + 1] = 15;
+            }
+        }
+        let scale = 0.03125f32; // exact in f16
+        let mn = -8.0 * scale;
+        let dm = vec![(scale, mn); nrows * k_blocks];
+        let w: Vec<f32> = codes.iter().map(|&c| scale * c as f32 + mn).collect();
+
+        let packed = pack_q4_ko(&codes, &dm, nrows, ncols);
+        let observed = quantize_ko(&w, nrows, ncols, GgmlDType::Q4_KO);
+        assert_eq!(
+            packed, observed,
+            "packed bytes diverge from the observer path"
+        );
+    }
+
+    /// The importer's exactness contract: dequant(pack(codes, s, −8s)) must
+    /// reproduce `s·(code−8)` bit-for-bit — including groups whose codes do
+    /// NOT span the grid, which is precisely where the observer re-rounds and
+    /// this packer must not.
+    #[test]
+    fn pack_q4_ko_is_bit_exact_on_non_spanning_groups() {
+        let (nrows, ncols) = (8usize, 128usize);
+        // A narrow code range: the observer would re-derive scale=(mx−mn)/15
+        // and re-round; the packer must keep the source grid untouched.
+        let codes: Vec<u8> = (0..nrows * ncols).map(|i| 5 + (i % 4) as u8).collect();
+        let scale = 0.0078125f32; // 2^-7, exact in f16
+        let mn = -8.0 * scale;
+        let dm = vec![(scale, mn); nrows];
+        let packed = pack_q4_ko(&codes, &dm, nrows, ncols);
+        let de = dequant_ko(&packed, nrows, ncols, GgmlDType::Q4_KO);
+        for (i, (&code, &got)) in codes.iter().zip(de.iter()).enumerate() {
+            let want = scale * code as f32 + mn; // == s·(q−8) exactly
+            assert!(
+                got == want,
+                "elem {i}: {got} != {want} (code {code}) — the import re-rounded"
+            );
+        }
+    }
+
+    /// `unpack_q4_ko` recovers exactly what `pack_q4_ko` was given — the fast
+    /// verify's contract. The dequant tests above are what anchor the shared
+    /// permutation table to the real layout; this pins the inverse to it.
+    #[test]
+    fn unpack_q4_ko_recovers_codes_and_dm() {
+        let (nrows, ncols) = (16usize, 256usize);
+        let k_blocks = ncols / 128;
+        let mut lcg = 7u64;
+        let codes: Vec<u8> = (0..nrows * ncols)
+            .map(|_| {
+                lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((lcg >> 33) % 16) as u8
+            })
+            .collect();
+        let dm: Vec<(f32, f32)> = (0..nrows * k_blocks)
+            .map(|i| {
+                let s = 2f32.powi((i % 6) as i32 - 8);
+                (s, -8.0 * s)
+            })
+            .collect();
+        let packed = pack_q4_ko(&codes, &dm, nrows, ncols);
+        let (codes2, dm2) = unpack_q4_ko(&packed, nrows, ncols);
+        assert_eq!(codes, codes2, "codes did not round-trip");
+        assert_eq!(dm, dm2, "dm pairs did not round-trip");
     }
 }

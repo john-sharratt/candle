@@ -1,4 +1,4 @@
-//! The append-only redo-log file (§5.1 of `docs/kv_tier_migration.md`).
+//! The append-only redo-log file (§5.1 of `docs/archived/kv_tier_migration.md`).
 //!
 //! A single pre-grown file: a 4 KB superblock followed by 4 KB-aligned
 //! records. Writes are buffered into a group-commit staging buffer and

@@ -158,6 +158,16 @@ impl Generation {
         stager.submit(buf)
     }
 
+    /// Return a handle to a device-resident copy of the staging buffer.
+    ///
+    /// Delegates to the underlying [`PinnedStager::submit_resident`].
+    pub fn submit_resident(&self, buf: PinnedBuf) -> crate::Result<GpuBuf> {
+        let stager = PinnedStager {
+            inner: Arc::clone(&self.inner),
+        };
+        stager.submit_resident(buf)
+    }
+
     /// The stager epoch this generation was opened at. A device pointer this
     /// generation returned stays valid only while the generation is alive; once
     /// it (and every sibling) drops, the arena resets and the next generation
@@ -826,20 +836,8 @@ impl PinnedStager {
                 })
             }
             PinnedBuf::Owned { .. } => {
-                let stream = inner.explicit_stream.clone().unwrap_or_else(|| {
-                    inner
-                        .dev
-                        .as_ref()
-                        .expect("cuda stager missing device")
-                        .cuda_stream()
-                });
+                let (dev_ptr, gpu) = Self::copy_to_device(&inner, &buf)?;
                 let len = buf.len();
-                let mut gpu = unsafe { stream.alloc::<u8>(len).w()? };
-                stream.memcpy_htod(buf.as_slice(), &mut gpu).w()?;
-                let dev_ptr = {
-                    let (ptr, _guard) = gpu.device_ptr(&stream);
-                    ptr
-                };
                 inner.pending_owned_bytes += len;
                 inner.pending_owned.push(buf);
                 Ok(GpuBuf {
@@ -854,6 +852,68 @@ impl PinnedStager {
                 _owned: None,
             }),
         }
+    }
+
+    /// Return a handle to a **device-resident** copy of the staging buffer.
+    ///
+    /// One stream-ordered pinned → device copy into a fresh device
+    /// allocation the returned [`GpuBuf`] owns. This is the right submit
+    /// for data every block of a kernel reads on its critical path — a
+    /// slot header, a per-row table — where the zero-copy mapping's PCIe
+    /// round trip per read is the cost, not the bytes. The bump arena
+    /// bookkeeping is the same as [`Self::submit`]: the pinned source stays
+    /// untouched until the generation's fence fires, so the copy needs no
+    /// wait of its own.
+    pub fn submit_resident(&self, buf: PinnedBuf) -> Result<GpuBuf> {
+        let mut inner = self.inner.lock().unwrap();
+
+        if inner.dev.is_none() || matches!(buf, PinnedBuf::Host { .. }) {
+            return Ok(GpuBuf {
+                dev_ptr: 0,
+                len: buf.len(),
+                _owned: None,
+            });
+        }
+
+        let (dev_ptr, gpu) = Self::copy_to_device(&inner, &buf)?;
+        let len = buf.len();
+        match &buf {
+            PinnedBuf::Bump { .. } => {
+                inner.arena_dirty = true;
+                debug_assert!(inner.bump_outstanding > 0);
+                inner.bump_outstanding -= 1;
+            }
+            PinnedBuf::Owned { .. } => {
+                inner.pending_owned_bytes += len;
+                inner.pending_owned.push(buf);
+            }
+            PinnedBuf::Host { .. } => unreachable!("handled above"),
+        }
+        Ok(GpuBuf {
+            dev_ptr,
+            len,
+            _owned: Some(gpu),
+        })
+    }
+
+    /// Allocate `buf.len()` device bytes on the stager's stream and enqueue
+    /// the pinned → device copy. The copy is asynchronous (pinned source),
+    /// stream-ordered ahead of every launch that follows.
+    fn copy_to_device(inner: &PinnedStagerInner, buf: &PinnedBuf) -> Result<(u64, CudaSlice<u8>)> {
+        let stream = inner.explicit_stream.clone().unwrap_or_else(|| {
+            inner
+                .dev
+                .as_ref()
+                .expect("cuda stager missing device")
+                .cuda_stream()
+        });
+        let mut gpu = unsafe { stream.alloc::<u8>(buf.len()).w()? };
+        stream.memcpy_htod(buf.as_slice(), &mut gpu).w()?;
+        let dev_ptr = {
+            let (ptr, _guard) = gpu.device_ptr(&stream);
+            ptr
+        };
+        Ok((dev_ptr, gpu))
     }
 
     /// Synchronise the stream and free all pending resources.

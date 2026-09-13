@@ -86,15 +86,21 @@ fn read_float_band(
         .ok()?;
     let out = match dtype {
         DType::F16 => bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect(),
         DType::BF16 => bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect(),
         DType::F32 => bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         DType::F8E4M3 => bytes
@@ -952,12 +958,12 @@ impl ChunkedKvBacking {
         Some(chunks)
     }
 
-    /// Patch each sequence's cached decode slot-state WRITER slice after a
-    /// mid-decode prefill wrote tokens into the writer chunk in place — see
-    /// [`super::types::SequenceState::refresh_decode_writer_slice`]. O(1) per
-    /// sequence per layer; sequences with no cached buffer (never decoded, or
-    /// cleared by a chunk-boundary append) rebuild fully on the next decode
-    /// sync instead.
+    /// Patch each sequence's cached decode slot-state slices from the writer
+    /// boundary to the writer after a prefill wrote tokens into them — see
+    /// [`super::types::SequenceState::refresh_decode_writer_slice`]. O(chunks
+    /// the prefill wrote) per sequence per layer; sequences with no cached
+    /// buffer (never decoded, or cleared by a chunk-boundary append) rebuild
+    /// fully on the next decode sync instead.
     /// Free token capacity of `batch_idx`'s current decode WRITE chunk — how
     /// many appended tokens it can still hold before the next append crosses
     /// into a fresh chunk. The caller that extends a slot by `n` tokens uses
@@ -1124,7 +1130,11 @@ impl ChunkedKvBacking {
         &self,
         batch_entries: &[(usize, usize)],
         arena_info: &[crate::kv_cache::arena_table::ResolvedArenaInfo],
-    ) -> candle::Result<(Vec<(u64, u32, u32)>, DecodeGpuChunkSyncStats)> {
+    ) -> candle::Result<(
+        Vec<(u64, u32, u32)>,
+        Vec<Arc<Vec<HeadGids>>>,
+        DecodeGpuChunkSyncStats,
+    )> {
         let n_kv_head = self.inner.n_kv_head;
         let head_dim = self.inner.head_dim;
 
@@ -1134,13 +1144,23 @@ impl ChunkedKvBacking {
             .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
 
         let mut results = Vec::with_capacity(batch_entries.len());
+        // Each slot's serialisation pins, taken under the lock this call
+        // already holds — the chunks its slice array references, for a caller
+        // to hold until its launch has retired (see `GpuChunks::pins`). A
+        // second pass under a second lock cost more than the pinning it
+        // replaced, on a lock the persistence thread contends.
+        let mut pins = Vec::with_capacity(batch_entries.len());
         let mut stats = DecodeGpuChunkSyncStats::default();
         for &(seq_idx, seq_offset) in batch_entries {
             let t_sync = std::time::Instant::now();
             let (result, sync_kind) = if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
                 seq.validate_decode_state(seq_idx, seq_offset)?;
-                seq.sync_decode_gpu_chunks(n_kv_head, head_dim, seq_offset, arena_info)?
+                let synced =
+                    seq.sync_decode_gpu_chunks(n_kv_head, head_dim, seq_offset, arena_info)?;
+                pins.push(seq.gpu_chunk_pins());
+                synced
             } else {
+                pins.push(Arc::new(Vec::new()));
                 ((0, 0, 0), super::types::DecodeGpuChunksSyncKind::Empty)
             };
             let elapsed = t_sync.elapsed();
@@ -1159,7 +1179,7 @@ impl ChunkedKvBacking {
             }
             results.push(result);
         }
-        Ok((results, stats))
+        Ok((results, pins, stats))
     }
 
     /// Like [`Self::sync_decode_gpu_chunks`], but each returned `slices_ptr` is
@@ -1796,7 +1816,11 @@ impl ChunkedKvBacking {
                         .bands()
                         .map(|(g, tag)| (g.arena_idx(), g.chunk_idx(), tag))
                         .collect();
-                    flat.chunks_exact(2).map(|kv| (kv[0], kv[1])).collect()
+                    flat.as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|kv| (kv[0], kv[1]))
+                        .collect()
                 })
                 .collect()
         };
@@ -1891,7 +1915,11 @@ impl ChunkedKvBacking {
                         .collect();
                     (
                         lo + i,
-                        flat.chunks_exact(2).map(|kv| (kv[0], kv[1])).collect(),
+                        flat.as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|kv| (kv[0], kv[1]))
+                            .collect(),
                     )
                 })
                 .collect()
@@ -2034,7 +2062,9 @@ impl ChunkedKvBacking {
                         .collect();
                     (
                         lo + i,
-                        flat.chunks_exact(2)
+                        flat.as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|kv| (kv[0], kv[1]))
                             .collect::<Vec<_>>(),
                     )

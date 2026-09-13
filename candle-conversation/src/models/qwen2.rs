@@ -23,6 +23,7 @@ pub(super) fn qwen2_0_5b() -> ModelSpec {
         chat_format,
         model_repo: "Qwen/Qwen2-0.5B-Instruct-GGUF".into(),
         model_filename: "qwen2-0_5b-instruct-q4_0.gguf".into(),
+        prepared_from_source: false,
         model_bytes: 352_969_408,
         // Unpinned: no verified commit has been recorded for this conversion. See
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.

@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use candle_conversation::memory_report::MemoryReport;
 use candle_conversation::projection::{self, GroupId, LayerId, TimelineId};
+use candle_conversation::stencil::{ThinkMode, ToolCallEnvelope, TriggerRegistry};
 use candle_conversation::{ConversationEngine, SequenceConfig};
 use zend_tools::ToolContext;
 
@@ -514,6 +515,9 @@ pub fn ingest_repo_map(
     let plan = IngestPlan::new(engine, &proj_builder, &config, layer_name, group_name)?;
     // Retire conversations for directories that no longer exist, then snapshot
     // the surviving hashes once for O(1) per-unit resume-cache probes.
+    // Crashed partials are NOT swept here. The sweep has to run whether or not
+    // this pass does, so it belongs to the caller — see
+    // [`retire_crashed_partials`].
     let present: HashSet<&str> = units.iter().map(|u| u.dir.as_str()).collect();
     reconcile_deleted(engine, &present);
     let report = run_dir_pool(engine, &plan, workspace, &units, progress);
@@ -587,6 +591,17 @@ struct IngestPlan {
     proj_builder: projection::Builder,
     system_prompt: String,
     config: SequenceConfig,
+    /// `<think>` bound to [`ThinkMode::Off`]'s tree, for every folder summary
+    /// decode in the pass.
+    ///
+    /// Compiled ONCE here rather than per directory: the compile builds an
+    /// `HfVocab`, which clones the tokenizer — a 12 MB copy per folder for a
+    /// tree that is identical every time.
+    triggers: Arc<TriggerRegistry>,
+    /// The call syntax this checkpoint speaks, for the chain's PREFILLED
+    /// `<tool_call>`s. Asked of the dialect so the prefills cannot teach a
+    /// shape the chat stencil would refuse — see [`render::render_list_call`].
+    envelope: ToolCallEnvelope,
 }
 
 impl IngestPlan {
@@ -607,13 +622,26 @@ impl IngestPlan {
         // summaries score self-local during ingest, so a summary is grounded in its
         // own folder rather than derailed by cross-directory retrieval.
         validate_summarize_branch(proj_builder)?;
+        let triggers = {
+            let en = engine.lock().unwrap();
+            en.compile_think_steering()?
+                .map(|ts| ts.registry_for(&TriggerRegistry::new(), ThinkMode::Off))
+                // No single `<think>`/`</think>` token in this vocabulary, so
+                // there is no block to steer and nothing to bind the trigger to;
+                // `compile_think_steering` has already warned. The sampler-side
+                // `apply_think_mode` still runs.
+                .unwrap_or_else(|| Arc::new(TriggerRegistry::new()))
+        };
         engine.lock().unwrap().mark_layer_append_only(layer);
+        let envelope = ToolCallEnvelope::for_dialect(&config.dialect);
         Ok(Self {
             layer,
             group,
             proj_builder: proj_builder.clone(),
             system_prompt: layer_system_prompt(proj_builder, layer_name, config),
             config: utility_config(config.clone()),
+            triggers,
+            envelope,
         })
     }
 }
@@ -636,6 +664,89 @@ fn reconcile_deleted(engine: &Mutex<ConversationEngine>, present: &HashSet<&str>
             }
         }
     }
+}
+
+/// Retire every crashed-partial `repo_map` conversation, up front.
+///
+/// A partial carries [`DIR_KEY`] but no [`HASH_KEY`] — the directory tag is
+/// written at conversation creation and the content hash only after the unit's
+/// ingest succeeds, so the pair says "this attempt started and never finished".
+///
+/// **Why eagerly, when [`process_one_dir`] already retires one.** That retirement
+/// is per-directory and lazy: it runs only when *that* directory comes back
+/// through the pool on a resume-cache miss. Across ordinary runs the two are
+/// equivalent, because a partial has no hash, so it always misses the cache and
+/// always gets re-ingested. They stop being equivalent the moment the pass does
+/// not run — `--skip-layer repo_map`, an aborted pass, a failure cap — and then
+/// the debris simply stays live.
+///
+/// Live is the problem. A partial is a half-built chain: a request and a
+/// `file_list` round-trip with the summary decode missing, and because it was
+/// never coupled (the ingest writes its `TurnCoupling`s only after the whole
+/// chain returns) nothing marks its halves as belonging together either. It
+/// still carries `WideQSig`s, so it still competes in the provenance gather —
+/// and a file listing is about the most promiscuous thing that can: dozens of
+/// paths, matching almost any probe. Measured on one substrate after a hard kill
+/// mid-ingest: 35 such chains, and the dialogue's projection selecting their
+/// scaffolding turns — a `<tool_response>` listing paired with a `file_read`
+/// call, from two unrelated folders, with the summary nowhere and the last call
+/// answered by nothing.
+///
+/// Called ONCE per boot from the session's ingest pre-loop, for every layer the
+/// operator did not `--disable-layer` — so a `--skip-layer repo_map` boot, which
+/// runs no pass at all, still leaves with its debris retired. That is why the
+/// call does not live in [`ingest_repo_map`]: a sweep that only runs when the
+/// pass runs cannot clean up the one case that produces debris and then declines
+/// to re-ingest it.
+///
+/// Never called from [`refresh_repo_map`]. A refresh can overlap a pool that is
+/// mid-flight, and an in-flight unit is indistinguishable from a crashed one by
+/// metadata alone — both carry `dir` with no hash — so sweeping there would
+/// tombstone the conversation a worker is still building. The pre-loop runs
+/// before any pool starts, so nothing is in flight.
+pub(crate) fn retire_crashed_partials(engine: &Mutex<ConversationEngine>) {
+    let e = engine.lock().unwrap();
+    let mut retired = 0usize;
+    for (tl, dir) in e.conversations_with_metadata_key(DIR_KEY) {
+        if e.conversation_metadata(tl)
+            .is_some_and(|m| ingest_committed(&m))
+        {
+            continue;
+        }
+        match e.tombstone_timeline(tl) {
+            Ok(()) => retired += 1,
+            Err(err) => tracing::warn!(
+                target: "zend::repo_scan",
+                dir = %dir,
+                "tombstone of crashed-partial conversation failed: {err:#}",
+            ),
+        }
+    }
+    if retired > 0 {
+        tracing::info!(
+            target: "zend::repo_scan",
+            retired,
+            "retired crashed-partial repo_map conversations (no content hash) \
+             so their half-built chains leave the provenance gather",
+        );
+    }
+}
+
+/// Whether a `repo_map` conversation's ingest ever committed.
+///
+/// The two keys are a completion protocol, not two independent tags: [`DIR_KEY`]
+/// is written at conversation creation and [`HASH_KEY`] only after the unit's
+/// ingest succeeds, so their combination is the only durable record of whether
+/// an attempt finished. `dir` alone therefore means "started, never committed" —
+/// a crashed partial — and that is what both the eager sweep
+/// ([`retire_crashed_partials`]) and the per-directory deferred tombstone in
+/// [`process_one_dir`] key on.
+///
+/// Named and separate so the rule is stated once and testable without an
+/// engine; the sweep that applies it needs a loaded model and so is covered by
+/// the engine-backed suite rather than here.
+fn ingest_committed(meta: &BTreeMap<String, String>) -> bool {
+    meta.contains_key(HASH_KEY)
 }
 
 /// Metadata key holding a unit's directory — the invalidation-scan key. Distinct
@@ -859,7 +970,7 @@ fn process_one_dir(
     // running the tools, so a directory the tools can't read is caught here and
     // costs no conversation. Prefilling an error body would be worse than
     // skipping — it teaches the model a tool interaction that failed.
-    let (prefilled, decode_user) = render::render_chain(ctx, unit);
+    let (prefilled, decode_user) = render::render_chain(ctx, unit, &plan.envelope);
     if let Some(detail) = render::chain_error(&prefilled, &decode_user) {
         let n = failures.record(&unit.dir, format!("file_list failed: {detail}"));
         tracing::warn!(
@@ -948,7 +1059,7 @@ fn process_one_dir(
     // throwaway intermediate decode to set the wrong style.
     let force_tools: Vec<String> = render::CHAIN_TOOLS.iter().map(|t| t.to_string()).collect();
     let emit = {
-        let mut sink = SequenceTurnSink::new(&mut conv);
+        let mut sink = SequenceTurnSink::new(&mut conv, Arc::clone(&plan.triggers));
         sink.ingest_chain(
             &prefilled,
             &decode_user,
@@ -1238,6 +1349,44 @@ fn validate_summarize_branch(builder: &projection::Builder) -> anyhow::Result<()
 mod tests {
     use super::*;
     use crate::repo_scan::types::Language;
+
+    /// The completion protocol the crashed-partial sweep rests on: the directory
+    /// tag is written at creation, the content hash only on success, so `dir`
+    /// without a hash is the signature of an attempt that never finished.
+    ///
+    /// Pinned because the sweep tombstones on it. Keying on the wrong half would
+    /// retire every GOOD generation on the next pass — the folder summaries are
+    /// exactly the conversations that DO carry a hash — and the blast radius is
+    /// the whole layer, silently, one boot later.
+    #[test]
+    fn a_conversation_is_committed_only_once_it_carries_a_content_hash() {
+        let mut meta = BTreeMap::new();
+        assert!(
+            !ingest_committed(&meta),
+            "no metadata at all is not committed"
+        );
+
+        meta.insert(DIR_KEY.to_string(), "candle-nn/src/".to_string());
+        assert!(
+            !ingest_committed(&meta),
+            "the directory tag alone is a crashed partial — it is written at \
+             conversation creation, before any work"
+        );
+
+        meta.insert(HASH_KEY.to_string(), "abc123".to_string());
+        assert!(
+            ingest_committed(&meta),
+            "the content hash is the commit, and is written only on success"
+        );
+
+        // The hash is what counts, not the tag: a generation that somehow lost
+        // its directory tag has still committed its content and must not be
+        // swept. (`retire_crashed_partials` only visits `DIR_KEY` holders, so
+        // this is belt-and-braces on the predicate itself.)
+        let mut hash_only = BTreeMap::new();
+        hash_only.insert(HASH_KEY.to_string(), "abc123".to_string());
+        assert!(ingest_committed(&hash_only));
+    }
 
     fn unit(dir: &str) -> DirUnit {
         DirUnit {

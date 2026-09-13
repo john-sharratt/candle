@@ -511,7 +511,9 @@ pub(crate) fn think_off(
         eos: tok.token_to_id(cfg.dialect.assistant_end).unwrap_or(0),
         after_close: "",
     };
-    let spec = compile_think_tree(ThinkMode::Off, &steer)?;
+    // Every dial yields a tree, `Off` included — suppression is structural, so
+    // there is no `None` to propagate here.
+    let spec = compile_think_tree(ThinkMode::Off, &steer);
     match e.compile_stencil(&spec) {
         Ok(t) => Some(Arc::new(t)),
         Err(e) => {

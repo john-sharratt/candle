@@ -100,6 +100,7 @@ fn cuda_mm_gemx_large_n_batch1_no_row_aliasing() -> Result<()> {
                     xs_repacked.data.len,
                     0,
                     OutDType::F16 as i32,
+                    SumScale::Raw.as_code(),
                 )
             };
             assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -615,6 +616,7 @@ fn cuda_mm_q4_k_repacked() -> Result<()> {
                 xs_repacked.data.len,
                 0, // force_mode2 (tiling only; result-invariant)
                 OutDType::F16 as i32,
+                SumScale::Raw.as_code(),
             )
         };
         assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -717,6 +719,7 @@ fn cuda_mm_q4_k_repacked_model_size() -> Result<()> {
                 xs_repacked.data.len,
                 0, // force_mode2 (tiling only; result-invariant)
                 OutDType::F16 as i32,
+                SumScale::Raw.as_code(),
             )
         };
         assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -874,6 +877,7 @@ fn cuda_mm_q6_k_repacked() -> Result<()> {
                 xs_repacked.data.len,
                 0, // force_mode2 (tiling only; result-invariant)
                 OutDType::F16 as i32,
+                SumScale::Raw.as_code(),
             )
         };
         assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -1121,6 +1125,7 @@ fn cuda_mm_q4_k_gguf_vs_dequant() -> Result<()> {
                     repacked.data.len,
                     0, // force_mode2 (tiling only; result-invariant)
                     OutDType::BF16 as i32,
+                    SumScale::Raw.as_code(),
                 )
             };
             assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -1294,6 +1299,7 @@ fn cuda_mm_q4_k_fused_qkv() -> Result<()> {
                 repacked.data.len,
                 0, // force_mode2 (tiling only; result-invariant)
                 OutDType::BF16 as i32,
+                SumScale::Raw.as_code(),
             )
         };
         assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -1451,7 +1457,7 @@ fn quantize_dequantize_roundtrip_all_dtypes() -> Result<()> {
 
     // All supported quantization types with their expected max RMSE
     // Tolerances based on theoretical quantization error for uniform random [-8, 8]
-    // RMSE â‰ˆ step_size / sqrt(12) where step_size = range / (2^bits - 1)
+    // RMSE ≈ step_size / sqrt(12) where step_size = range / (2^bits - 1)
     // Added margin for rounding differences between GPU and CPU
     let test_configs: Vec<(GgmlDType, f32, &str)> = vec![
         (GgmlDType::Q4_0, 0.35, "Q4_0"), // 4-bit: theoretical ~0.31
@@ -1584,25 +1590,17 @@ fn quantize_dequantize_roundtrip_all_dtypes() -> Result<()> {
     }
 
     // Print summary table
-    println!(
-        "â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”"
-    );
-    println!(
-        "â”‚ DType   â”‚ Valid â”‚ RMSE     â”‚ MeanDiff â”‚ MaxDiff  â”‚ Quant GB/s  â”‚ Dequant GB/sâ”‚"
-    );
-    println!(
-        "â”œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¤"
-    );
+    println!("┌─────────┬───────┬──────────┬──────────┬──────────┬─────────────┬─────────────┐");
+    println!("│ DType   │ Valid │ RMSE     │ MeanDiff │ MaxDiff  │ Quant GB/s  │ Dequant GB/s│");
+    println!("├─────────┼───────┼──────────┼──────────┼──────────┼─────────────┼─────────────┤");
     for r in &results {
-        let valid_str = if r.valid { "âœ“" } else { "âœ—" };
+        let valid_str = if r.valid { "✓" } else { "✗" };
         println!(
-            "â”‚ {:7} â”‚   {}   â”‚ {:8.5} â”‚ {:8.5} â”‚ {:8.4} â”‚ {:10.2}  â”‚ {:10.2}  â”‚",
+            "│ {:7} │   {}   │ {:8.5} │ {:8.5} │ {:8.4} │ {:10.2}  │ {:10.2}  │",
             r.name, valid_str, r.rmse, r.mean_diff, r.max_diff, r.quant_gbps, r.dequant_gbps
         );
     }
-    println!(
-        "â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜"
-    );
+    println!("└─────────┴───────┴──────────┴──────────┴──────────┴─────────────┴─────────────┘");
 
     // Assert all passed
     let all_valid = results.iter().all(|r| r.valid);
@@ -1615,12 +1613,12 @@ fn quantize_dequantize_roundtrip_all_dtypes() -> Result<()> {
 /// by verifying it produces identical bytes when requantizing dequantized values.
 ///
 /// Test flow:
-/// 1. CPU: Generate random f32 data, quantize with CPU (known-good) â†’ cpu_quant_bytes
-/// 2. CPU: Dequantize CPU result â†’ baseline_f32 (this is what the quantized block represents)
+/// 1. CPU: Generate random f32 data, quantize with CPU (known-good) → cpu_quant_bytes
+/// 2. CPU: Dequantize CPU result → baseline_f32 (this is what the quantized block represents)
 /// 3. Upload baseline_f32 to GPU
-/// 4. GPU: Quantize baseline_f32 â†’ gpu_quant_bytes
+/// 4. GPU: Quantize baseline_f32 → gpu_quant_bytes
 /// 5. Compare: gpu_quant_bytes == cpu_quant_bytes (should match exactly!)
-/// 6. GPU: Dequantize gpu_quant_bytes â†’ roundtrip_f32
+/// 6. GPU: Dequantize gpu_quant_bytes → roundtrip_f32
 /// 7. Compare: roundtrip_f32 vs baseline_f32 (RMSE should be ~0)
 ///
 /// This isolates the GPU quantize kernel and verifies byte-level correctness.
@@ -2090,8 +2088,8 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
                 cpu_dmin.to_f32(),
                 gpu_d.to_f32(),
                 gpu_dmin.to_f32(),
-                if d_match { "âœ“" } else { "âœ—" },
-                if dmin_match { "âœ“" } else { "âœ—" }
+                if d_match { "✓" } else { "✗" },
+                if dmin_match { "✓" } else { "✗" }
             );
 
             // Show scales comparison for this block
@@ -2176,8 +2174,8 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
                 cpu_dmin.to_f32(),
                 gpu_d.to_f32(),
                 gpu_dmin.to_f32(),
-                if d_match { "âœ“" } else { "âœ—" },
-                if dmin_match { "âœ“" } else { "âœ—" }
+                if d_match { "✓" } else { "✗" },
+                if dmin_match { "✓" } else { "✗" }
             );
         }
         println!();
@@ -2280,7 +2278,7 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
 
             // Report
             let byte_match_pct = 100.0 * (quant_size - byte_mismatches) as f64 / quant_size as f64;
-            let status = if byte_mismatches == 0 && rmse < 1e-5 { "âœ“" } else { "âœ—" };
+            let status = if byte_mismatches == 0 && rmse < 1e-5 { "✓" } else { "✗" };
 
             println!("{} {:5}: Bytes: {:6.2}% match ({:6} / {:6} mismatches), RMSE: {:.2e}, MaxDiff: {:.2e}",
                 status, $name, byte_match_pct, byte_mismatches, quant_size, rmse, max_diff);
@@ -2300,7 +2298,7 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
 
     // Test each dtype
     println!(
-        "Testing Q4_0 ({} blocks Ã— {} elements = {} elements)...",
+        "Testing Q4_0 ({} blocks × {} elements = {} elements)...",
         num_blocks,
         BlockQ4_0::BLCK_SIZE,
         num_blocks * BlockQ4_0::BLCK_SIZE
@@ -2308,7 +2306,7 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
     let (q4_0_exact, q4_0_rmse) = test_dtype!(BlockQ4_0, GgmlDType::Q4_0, "Q4_0");
 
     println!(
-        "\nTesting Q8_0 ({} blocks Ã— {} elements = {} elements)...",
+        "\nTesting Q8_0 ({} blocks × {} elements = {} elements)...",
         num_blocks,
         BlockQ8_0::BLCK_SIZE,
         num_blocks * BlockQ8_0::BLCK_SIZE
@@ -2316,7 +2314,7 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
     let (q8_0_exact, q8_0_rmse) = test_dtype!(BlockQ8_0, GgmlDType::Q8_0, "Q8_0");
 
     println!(
-        "\nTesting Q2K ({} blocks Ã— {} elements = {} elements)...",
+        "\nTesting Q2K ({} blocks × {} elements = {} elements)...",
         num_blocks,
         BlockQ2_K::BLCK_SIZE,
         num_blocks * BlockQ2_K::BLCK_SIZE
@@ -2324,7 +2322,7 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
     let (q2k_exact, q2k_rmse) = test_dtype!(BlockQ2_K, GgmlDType::Q2_K, "Q2K");
 
     println!(
-        "\nTesting Q4K ({} blocks Ã— {} elements = {} elements)...",
+        "\nTesting Q4K ({} blocks × {} elements = {} elements)...",
         num_blocks,
         BlockQ4_K::BLCK_SIZE,
         num_blocks * BlockQ4_K::BLCK_SIZE
@@ -2477,23 +2475,19 @@ fn quantize_direct_comparison() -> Result<()> {
 
     // Print fancy table
     println!();
-    println!("â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”");
-    println!("â”‚ DType  â”‚ Status â”‚ Byte Match â”‚ Mismatches â”‚   RMSE   â”‚ MaxDiff  â”‚");
-    println!("â”œâ”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¤");
+    println!("┌────────┬────────┬────────────┬────────────┬──────────┬──────────┐");
+    println!("│ DType  │ Status │ Byte Match │ Mismatches │   RMSE   │ MaxDiff  │");
+    println!("├────────┼────────┼────────────┼────────────┼──────────┼──────────┤");
 
     for r in &results {
-        let status = if r.passed {
-            "   âœ“    "
-        } else {
-            "   âœ—    "
-        };
+        let status = if r.passed { "   ✓    " } else { "   ✗    " };
         println!(
-            "â”‚ {:>6} â”‚{}â”‚ {:>9.2}% â”‚ {:>10} â”‚ {:>8.2e} â”‚ {:>8.2e} â”‚",
+            "│ {:>6} │{}│ {:>9.2}% │ {:>10} │ {:>8.2e} │ {:>8.2e} │",
             r.name, status, r.byte_match_pct, r.mismatches, r.rmse, r.max_diff
         );
     }
 
-    println!("â””â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜");
+    println!("└────────┴────────┴────────────┴────────────┴──────────┴──────────┘");
     println!(
         "\nThresholds: byte_match >= {:.0}%, RMSE <= {:.1}",
         MIN_BYTE_MATCH_PCT, MAX_RMSE
@@ -2569,7 +2563,7 @@ fn grouped_matmul_matches_direct() -> Result<()> {
         expert_offsets.push(expert_offsets.last().unwrap() + b as i32);
     }
 
-    // â”€â”€ Reference: per-expert matmul_gemx â”€â”€
+    // ── Reference: per-expert matmul_gemx ──
     let mut ref_results: Vec<Vec<bf16>> = Vec::new();
     for e in 0..num_experts {
         let start = expert_offsets[e] as usize;
@@ -2589,7 +2583,7 @@ fn grouped_matmul_matches_direct() -> Result<()> {
         ref_results.push(ref_result);
     }
 
-    // â”€â”€ Test: grouped_matmul_gemx â”€â”€
+    // ── Test: grouped_matmul_gemx ──
     let grouped_result = grouped_matmul_gemx(
         &weight_ptrs,
         GgmlDType::Q4_K,
@@ -2735,8 +2729,23 @@ fn round_ties_even_i32(x: f32) -> i32 {
 /// Quantize f32 [rows, cols] → q8a1024 blocks and assert EVERY byte of the output
 /// (each tile's `ds[4]` f16 scale+sum and all 128 qs) against a CPU reference, for a
 /// deterministic input. This pins the exact flat-grouped byte layout + values.
+///
+/// **Run for BOTH sum conventions**, because the opt-in is a change to the stored
+/// bytes and nothing else would catch it going the wrong way: the qs run and the
+/// scale field are identical either way, so a producer that ignored the flag
+/// would differ from the oracle in exactly two bytes per 128-tile — and those two
+/// bytes are the ones a matmul silently reinterprets. [`SumScale::Raw`] must also
+/// reproduce the pre-flag bytes exactly, which is what makes the default safe for
+/// every model whose thresholds were derived before this existed.
 #[test]
 fn q8a128_quantize_raw_bytes() -> Result<()> {
+    for sum_scale in [SumScale::Raw, SumScale::ByAmax] {
+        q8a128_quantize_raw_bytes_for(sum_scale)?;
+    }
+    Ok(())
+}
+
+fn q8a128_quantize_raw_bytes_for(sum_scale: SumScale) -> Result<()> {
     use half::f16;
     let dev = CudaDevice::new(0)?;
     let rows = 3usize;
@@ -2749,8 +2758,20 @@ fn q8a128_quantize_raw_bytes() -> Result<()> {
     let f32_dev = dev.memcpy_stod(&act)?;
     let stream = dev.cuda_stream();
     let (ptr, _g) = f32_dev.device_ptr(&stream);
-    let blocks = quantize_acts_q8a128(ptr, 2 /* F32 */, rows, cols, &dev, Backing::Owned)?
-        .into_owned_data()?;
+    let op = quantize_acts_q8a128(
+        ptr,
+        2, /* F32 */
+        rows,
+        cols,
+        &dev,
+        Backing::Owned,
+        sum_scale,
+    )?;
+    assert_eq!(
+        op.sum_scale, sum_scale,
+        "the operand must report the convention its bytes were written in"
+    );
+    let blocks = op.into_owned_data()?;
     dev.synchronize()?;
     let raw: Vec<u8> = dev.memcpy_dtov(&blocks.slice(..))?;
 
@@ -2776,13 +2797,16 @@ fn q8a128_quantize_raw_bytes() -> Result<()> {
             let amax = vals.iter().fold(0f32, |m, &x| m.max(x.abs()));
             let sum: f32 = vals.iter().sum();
             let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
-            // The single {scale, sum} lives at ds[0] of the tile's meta slot. The
-            // sum field is Σx **normalised by amax** — the matmul rebuilds Σx as
-            // `ds.y · ds.x · 127`, and storing it raw overflows f16 on any
-            // activation whose block sums pass 65504 (blocks.cuh).
+            // The single {scale, sum} lives at ds[0] of the tile's meta slot.
+            // `Raw` stores Σx as it is; `ByAmax` stores Σx/amax, which the matmul
+            // rebuilds as `ds.y · ds.x · 127` — needed because a raw Σx overflows
+            // f16 on any activation whose block sums pass 65504 (blocks.cuh).
             let ds_b = ds_off(flat);
             let exp_scale = f16::from_f32(amax / 127.0);
-            let exp_sum = f16::from_f32(sum * id / 127.0);
+            let exp_sum = match sum_scale {
+                SumScale::Raw => f16::from_f32(sum),
+                SumScale::ByAmax => f16::from_f32(sum * id / 127.0),
+            };
             let got_scale = f16::from_le_bytes([raw[ds_b], raw[ds_b + 1]]);
             let got_sum = f16::from_le_bytes([raw[ds_b + 2], raw[ds_b + 3]]);
             assert_eq!(
@@ -2790,7 +2814,11 @@ fn q8a128_quantize_raw_bytes() -> Result<()> {
                 exp_scale.to_bits(),
                 "blk({r},{t}) scale"
             );
-            assert_eq!(got_sum.to_bits(), exp_sum.to_bits(), "blk({r},{t}) sum");
+            assert_eq!(
+                got_sum.to_bits(),
+                exp_sum.to_bits(),
+                "blk({r},{t}) sum under {sum_scale:?}"
+            );
             // qs: the tile's 128 int8, all quantized with the per-128 id.
             let qs_b = qs_off(flat);
             for (i, &v) in vals.iter().enumerate() {
@@ -2801,7 +2829,9 @@ fn q8a128_quantize_raw_bytes() -> Result<()> {
             checked += 1;
         }
     }
-    println!("q8a128 raw-byte quantize: {checked} per-128 tiles verified byte-exact");
+    println!(
+        "q8a128 raw-byte quantize ({sum_scale:?}): {checked} per-128 tiles verified byte-exact"
+    );
     Ok(())
 }
 
@@ -2823,8 +2853,8 @@ fn q8a128_dequant_exact() -> Result<()> {
     let f32_dev = dev.memcpy_stod(&act)?;
     let stream = dev.cuda_stream();
     let (ptr, _g) = f32_dev.device_ptr(&stream);
-    let blocks =
-        quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
+    let blocks = quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+        .into_owned_data()?;
     let deq = dequantize_q8a128(&blocks, rows, cols, &dev)?;
     dev.synchronize()?;
 
@@ -2889,8 +2919,8 @@ fn q8a128_edge_cases() -> Result<()> {
     let f32_dev = dev.memcpy_stod(&act)?;
     let stream = dev.cuda_stream();
     let (ptr, _g) = f32_dev.device_ptr(&stream);
-    let blocks =
-        quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
+    let blocks = quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+        .into_owned_data()?;
     dev.synchronize()?;
     let raw: Vec<u8> = dev.memcpy_dtov(&blocks.slice(..))?;
 
@@ -2907,7 +2937,7 @@ fn q8a128_edge_cases() -> Result<()> {
     }
 
     // Tile 1 — amax is the spike, so scale = 100/127 and Σx = 100 + 32×2 + Σ(i−16)
-    // = 148, stored normalised as 148/100.
+    // = 148, stored raw because that is the mode this producer was asked for.
     assert_eq!(
         scale_at(1040).to_bits(),
         f16::from_f32(100.0 / 127.0).to_bits(),
@@ -2915,8 +2945,43 @@ fn q8a128_edge_cases() -> Result<()> {
     );
     assert_eq!(
         sum_at(1040).to_bits(),
+        f16::from_f32(148.0).to_bits(),
+        "mixed tile sum, raw",
+    );
+
+    // The same tile under [`SumScale::ByAmax`] — the opt-in that divides the sum
+    // by the tile's amax so it cannot leave f16's range (see
+    // `int8_matmul_survives_block_sums_past_f16_range`). Asserted here beside the
+    // raw form because the two modes differ in exactly this one field: the scale
+    // and every quant are untouched, which is what makes the opt-in free.
+    let normed = quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned, SumScale::ByAmax)?
+        .into_owned_data()?;
+    dev.synchronize()?;
+    let n_raw: Vec<u8> = dev.memcpy_dtov(&normed.slice(..))?;
+    assert_eq!(
+        f16::from_le_bytes([n_raw[1042], n_raw[1043]]).to_bits(),
         f16::from_f32(148.0 / 100.0).to_bits(),
         "mixed tile sum, normalised by amax",
+    );
+    assert_eq!(
+        f16::from_le_bytes([n_raw[1040], n_raw[1041]]).to_bits(),
+        f16::from_f32(100.0 / 127.0).to_bits(),
+        "the scale is the same in both modes",
+    );
+    assert_eq!(
+        &n_raw[128..256],
+        &raw[128..256],
+        "and so are the quants — only `ds[0].y` moves"
+    );
+    assert_eq!(
+        f16::from_le_bytes([n_raw[1024], n_raw[1025]]).to_bits(),
+        0,
+        "zero tile scale, normalised mode"
+    );
+    assert_eq!(
+        f16::from_le_bytes([n_raw[1026], n_raw[1027]]).to_bits(),
+        0,
+        "zero tile sum stays 0 rather than dividing 0 by amax 0"
     );
 
     // The spike saturates to 127; everything else is scaled by the SAME id, so
@@ -2955,11 +3020,16 @@ fn q8a128_edge_cases() -> Result<()> {
 /// 10⁴–10⁵ and its block sums reach 2×10⁵. The first symptom was a black image
 /// eight steps later, with every weight, shape and dtype checking out.
 ///
-/// The fix normalises the field (Σx/amax, bounded by 128 whatever the magnitude
-/// — see `blocks.cuh`); this pins the property rather than the encoding, so it
-/// holds however the sum is later stored. The activation here is deliberately
-/// biased far from zero: a zero-mean one cancels to a small sum however large
-/// its elements are, and would pass even with the bug.
+/// [`SumScale::ByAmax`] normalises the field (Σx/amax, bounded by 128 whatever
+/// the magnitude — see `blocks.cuh`); this pins the property rather than the
+/// encoding, so it holds however the sum is later stored. The activation here is
+/// deliberately biased far from zero: a zero-mean one cancels to a small sum
+/// however large its elements are, and would pass even with the bug.
+///
+/// The mode is what is under test, so it is named explicitly. [`SumScale::Raw`]
+/// — what the LLM paths ask for, where block sums stay under ~10³ — genuinely
+/// does overflow on this fixture; that is the whole reason the other mode
+/// exists, not a defect in this one.
 #[test]
 fn int8_matmul_survives_block_sums_past_f16_range() -> Result<()> {
     use crate::quantized::{QMatMul, QTensor};
@@ -3003,7 +3073,12 @@ fn int8_matmul_survives_block_sums_past_f16_range() -> Result<()> {
     );
 
     let got = mm
-        .forward_via_int8(&xs, Int8Mode::Precision, crate::DType::F32)?
+        .forward_via_int8(
+            &xs,
+            Int8Mode::Precision,
+            crate::DType::F32,
+            SumScale::ByAmax,
+        )?
         .to_vec2::<f32>()?;
     // The FP reference: the same weights dequantised, same activations, f32.
     let want = xs
@@ -3046,8 +3121,8 @@ fn q8a128_unified_dispatch_matches_typed() -> Result<()> {
     let (ptr, _g) = f32_dev.device_ptr(&stream);
 
     // Typed path (dtype 2 = F32) vs unified run_quantize_block(qtype=36).
-    let typed =
-        quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
+    let typed = quantize_acts_q8a128(ptr, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+        .into_owned_data()?;
     let nblocks = n / 128;
     let mut unified = unsafe { dev.alloc::<u8>(nblocks.div_ceil(8) * 1152)? };
     {
@@ -3166,6 +3241,7 @@ fn q8a128_throughput_bench() -> Result<()> {
                     rows_i,
                     cols_i,
                     dtype,
+                    SumScale::Raw.as_code(),
                 );
             }
         }
@@ -3179,6 +3255,7 @@ fn q8a128_throughput_bench() -> Result<()> {
                     rows_i,
                     cols_i,
                     dtype,
+                    SumScale::Raw.as_code(),
                 );
             }
         }
@@ -3376,10 +3453,10 @@ fn q8a128_f16_bf16_paths_match_f32() -> Result<()> {
         let fdev = dev.memcpy_stod(&as_f32)?;
         let (tp, _a) = tdev.device_ptr(&stream);
         let (fp, _b) = fdev.device_ptr(&stream);
-        let blk_t =
-            quantize_acts_q8a128(tp, 0, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
-        let blk_f =
-            quantize_acts_q8a128(fp, 2, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
+        let blk_t = quantize_acts_q8a128(tp, 0, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+            .into_owned_data()?;
+        let blk_f = quantize_acts_q8a128(fp, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+            .into_owned_data()?;
         dev.synchronize()?;
         let bt: Vec<u8> = dev.memcpy_dtov(&blk_t.slice(..))?;
         let bf: Vec<u8> = dev.memcpy_dtov(&blk_f.slice(..))?;
@@ -3424,10 +3501,10 @@ fn q8a128_f16_bf16_paths_match_f32() -> Result<()> {
         let fdev = dev.memcpy_stod(&as_f32)?;
         let (tp, _a) = tdev.device_ptr(&stream);
         let (fp, _b) = fdev.device_ptr(&stream);
-        let blk_t =
-            quantize_acts_q8a128(tp, 1, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
-        let blk_f =
-            quantize_acts_q8a128(fp, 2, rows, cols, &dev, Backing::Owned)?.into_owned_data()?;
+        let blk_t = quantize_acts_q8a128(tp, 1, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+            .into_owned_data()?;
+        let blk_f = quantize_acts_q8a128(fp, 2, rows, cols, &dev, Backing::Owned, SumScale::Raw)?
+            .into_owned_data()?;
         dev.synchronize()?;
         let bt: Vec<u8> = dev.memcpy_dtov(&blk_t.slice(..))?;
         let bf: Vec<u8> = dev.memcpy_dtov(&blk_f.slice(..))?;
@@ -3711,6 +3788,7 @@ fn quantize_acts_q8a128_test(
         ncols,
         dev,
         Backing::Owned,
+        SumScale::Raw,
     )?;
     dev.synchronize()?;
     Ok(out)
@@ -4050,6 +4128,54 @@ fn a_failed_repack_does_not_free_its_leased_destination() -> Result<()> {
          is inside the device reservation, and the pool has just handed it to someone else"
     );
     Ok(())
+}
+
+/// **The band is bounded whatever the tensor — asserted without a device.**
+///
+/// The history this protects: `repack_ko` is dequantize-then-requantize composed through an
+/// f32 buffer, and that buffer used to be the whole tensor — 4,850 MiB for the 27B's
+/// `[248320, 5120]` head. Not merely large but *permanent*: `dense_span` sized the span's
+/// `cuMemAddressReserve` smaller by exactly that figure, and a reservation cannot grow, so a
+/// buffer alive for one tensor during load cost a third of the card until the process exited.
+/// Repacking a row band at a time caps the intermediate at `REPACK_BAND_BYTES` whatever the
+/// tensor's size.
+///
+/// `candle-core/tests/vram_bounds.rs` measures that end to end, through free VRAM. This one
+/// computes the same number the allocation uses, so it needs no device and no quiet card —
+/// it runs anywhere, every time, which is what makes it the primary guard rather than the
+/// backstop.
+///
+/// The regression it would catch is the one that motivated the banding: a
+/// whole-tensor f32, which at 8192×8192 is 256 MiB and grows with the model.
+#[test]
+fn ko_repack_band_is_bounded_regardless_of_tensor_size() {
+    use crate::quantized::cuda::{repack_band_bytes, REPACK_BAND_BYTES};
+    // Square, tall-thin and short-wide, across three orders of magnitude.
+    for (nrows, ncols) in [
+        (8192usize, 8192usize),
+        (65536, 8192),
+        (1024, 1024),
+        (8, 32768),
+        (131072, 256),
+    ] {
+        let band = repack_band_bytes(nrows, ncols);
+        let whole = nrows * ncols * std::mem::size_of::<f32>();
+        assert!(
+            band <= REPACK_BAND_BYTES.max(ncols * 8 * std::mem::size_of::<f32>()),
+            "{nrows}x{ncols}: band {band} B exceeds the {REPACK_BAND_BYTES} B bound \
+             (one row-group is the floor, for a tensor too wide to fit even that)"
+        );
+        assert!(
+            band <= whole,
+            "{nrows}x{ncols}: a band may never exceed the whole tensor it is banding"
+        );
+    }
+    // And it does NOT grow with row count: the whole point of banding.
+    assert_eq!(
+        repack_band_bytes(8192, 8192),
+        repack_band_bytes(65536, 8192),
+        "the band must not scale with rows — that is what makes it a band"
+    );
 }
 
 // The three repack-band tests that used to sit here now live in
@@ -4596,6 +4722,7 @@ fn moe_layer_gemm_bench() -> Result<()> {
                                 Backing::Owned,
                                 n_sub,
                                 row_fast,
+                                SumScale::Raw,
                             )
                         })?;
                         Ok(())
@@ -4683,6 +4810,7 @@ fn grouped_int8_wide_tiles_match_mode2() -> Result<()> {
                 Backing::Owned,
                 n_sub,
                 row_fast,
+                SumScale::Raw,
             )
         })?;
         read_f32_tensor(&dev, &out)
@@ -4832,7 +4960,7 @@ fn qmatmul_int8mode_flag_end_to_end() -> Result<()> {
             _ => unreachable!(),
         };
         // Activation side: the same knob picks q8a128 (int8) or float.
-        let acts = to_dynamic(&act_t, mode, &dev)?;
+        let acts = to_dynamic(&act_t, mode, &dev, SumScale::Raw)?;
         let out = dense_qmatmul(
             acts.as_dynamic(),
             wptr,
@@ -4883,7 +5011,7 @@ fn ko_offline_load_forward_matches_gpu_repack() -> Result<()> {
     let q8 = QMatMul::from_qtensor(QTensor::quantize(&w_t, GgmlDType::Q8_0)?)?;
     let opt_a = q8.repack_for_optimization(Int8Mode::Performance)?;
     let y_a: Vec<f32> = opt_a
-        .forward_via_int8(&act_t, Int8Mode::Performance, act_t.dtype())?
+        .forward_via_int8(&act_t, Int8Mode::Performance, act_t.dtype(), SumScale::Raw)?
         .flatten_all()?
         .to_vec1::<f32>()?;
 
@@ -4895,7 +5023,7 @@ fn ko_offline_load_forward_matches_gpu_repack() -> Result<()> {
     let qt_b = QTensor::new(storage_b, vec![nrows, ncols])?;
     let mm_b = QMatMul::from_qtensor(qt_b)?;
     let y_b: Vec<f32> = mm_b
-        .forward_via_int8(&act_t, Int8Mode::Performance, act_t.dtype())?
+        .forward_via_int8(&act_t, Int8Mode::Performance, act_t.dtype(), SumScale::Raw)?
         .flatten_all()?
         .to_vec1::<f32>()?;
 
@@ -5045,7 +5173,7 @@ fn qmatmul_int8mode_baseline_bit_check() -> Result<()> {
             QStorage::Cuda(cs) => (cs.data_ptr(), cs.storage_size_in_bytes()),
             _ => unreachable!(),
         };
-        let acts = to_dynamic(&act_t, mode, &dev)?;
+        let acts = to_dynamic(&act_t, mode, &dev, SumScale::Raw)?;
         let out = dense_qmatmul(
             acts.as_dynamic(),
             wptr,
@@ -5124,7 +5252,7 @@ fn dense_qmatmul_int8_preserves_3d_shape() -> Result<()> {
         .map(|_| rng.random_range(-1.0f32..1.0))
         .collect();
     let act_t = crate::Tensor::from_vec(act, (b, m, ncols), &device)?;
-    let acts = to_dynamic(&act_t, Int8Mode::Performance, &dev)?;
+    let acts = to_dynamic(&act_t, Int8Mode::Performance, &dev, SumScale::Raw)?;
     let out = dense_qmatmul(
         acts.as_dynamic(),
         wptr,
@@ -5193,7 +5321,7 @@ fn rms_norm_q8a128_matches_reference() -> Result<()> {
             .broadcast_div(&rms)?
             .broadcast_mul(&alpha.to_dtype(crate::DType::F32)?)?
             .to_dtype(dtype)?;
-        let oracle_op = match to_dynamic(&normed, Int8Mode::Performance, &dev)? {
+        let oracle_op = match to_dynamic(&normed, Int8Mode::Performance, &dev, SumScale::Raw)? {
             DynamicActs::Int8(op) => op,
             DynamicActs::Float(_) => unreachable!("Performance mode yields Int8"),
         };
@@ -5201,7 +5329,10 @@ fn rms_norm_q8a128_matches_reference() -> Result<()> {
         let oracle = dev.memcpy_dtov(&oracle_deq.slice(..))?;
 
         // Fused: single kernel.
-        let fused_op = rms_norm_q8a128(&xs, &alpha, eps, &dev, Backing::Owned)?;
+        // Raw, matching the `to_dynamic` oracle this is compared against — the
+        // two must agree on the convention or the comparison measures that
+        // rather than the fusion.
+        let fused_op = rms_norm_q8a128(&xs, &alpha, eps, &dev, Backing::Owned, SumScale::Raw)?;
         let fused_deq = dequantize_q8a128(fused_op.data_slice()?, rows, cols, &dev)?;
         let fused = dev.memcpy_dtov(&fused_deq.slice(..))?;
 
@@ -5241,7 +5372,7 @@ fn silu_mul_q8a128_matches_reference() -> Result<()> {
         let u = up.to_dtype(crate::DType::F32)?;
         let sig = (g.neg()?.exp()? + 1.0)?.recip()?;
         let outf = (&g * &sig)?.mul(&u)?.to_dtype(dtype)?;
-        let oracle_op = match to_dynamic(&outf, Int8Mode::Performance, &dev)? {
+        let oracle_op = match to_dynamic(&outf, Int8Mode::Performance, &dev, SumScale::Raw)? {
             DynamicActs::Int8(op) => op,
             DynamicActs::Float(_) => unreachable!("Performance mode yields Int8"),
         };
@@ -5249,7 +5380,8 @@ fn silu_mul_q8a128_matches_reference() -> Result<()> {
         let oracle = dev.memcpy_dtov(&oracle_deq.slice(..))?;
 
         // Fused: single kernel.
-        let fused_op = silu_mul_q8a128(&gate, &up, &dev, Backing::Owned)?;
+        // Raw, matching the `to_dynamic` oracle — see the sibling rms_norm test.
+        let fused_op = silu_mul_q8a128(&gate, &up, &dev, Backing::Owned, SumScale::Raw)?;
         let fused_deq = dequantize_q8a128(fused_op.data_slice()?, rows, cols, &dev)?;
         let fused = dev.memcpy_dtov(&fused_deq.slice(..))?;
 
@@ -5464,7 +5596,12 @@ fn q4_ko_matches_q4_k_int8() -> Result<()> {
         "compact Q4_K weight must be a whole number of 80-byte blocks"
     );
     let mut ko_bytes = k_bytes.clone();
-    for (kb, ob) in k_bytes.chunks_exact(80).zip(ko_bytes.chunks_exact_mut(80)) {
+    for (kb, ob) in k_bytes
+        .as_chunks::<80>()
+        .0
+        .iter()
+        .zip(ko_bytes.as_chunks_mut::<80>().0.iter_mut())
+    {
         // Each sub's 4 qs ints interleaved [I0,I2,I1,I3] (swap I1/I2). K qs bases per
         // sub are {0,24,40,64}; scales group at the tail (64-79).
         for (s, &kb0) in [0usize, 24, 40, 64].iter().enumerate() {
@@ -8317,6 +8454,7 @@ fn expert_grouped_launch_cost() -> Result<()> {
                 0, // weight_bytes=0 → L2-cached assumption (matches grouped_matmul_gemx)
                 0, // force_mode2 (tiling only; result-invariant)
                 OutDType::BF16 as i32,
+                SumScale::Raw.as_code(),
             );
         };
 
@@ -8440,6 +8578,7 @@ fn expert_grouped_single_launch_cost() -> Result<()> {
                     YType::BF16 as i32,
                     2, // FP grouped kernels ignore the int8 tile mode
                     1, // row-fast grid order
+                    SumScale::Raw.as_code(),
                 );
             }
             Ok(())
@@ -8488,9 +8627,12 @@ fn cuda_moe_route_matches_reference() -> Result<()> {
         dt: crate::DType,
         norm: bool,
     ) -> Result<()> {
-        // (e*131 + t*17) mod 251 is injective over e<251, so every row has distinct experts.
-        // Scale by 0.5 (a power of two) to keep the values exactly representable in bf16/f16.
-        let logit = |t: usize, e: usize| -> f32 { (((e * 131 + t * 17) % 251) as f32) * 0.5 };
+        // A tie-free injective hash per row: mod 251 covers e<251, mod 521 (prime
+        // > 512) covers the wide-slot instantiation. Scale by 0.5 (a power of
+        // two); the 521-modulus values reach 260 and are exact only in f32, so
+        // the 512-expert rung runs F32-only below.
+        let m = if n_experts > 251 { 521 } else { 251 };
+        let logit = move |t: usize, e: usize| -> f32 { (((e * 131 + t * 17) % m) as f32) * 0.5 };
         let data: Vec<f32> = (0..num_tokens * n_experts)
             .map(|i| logit(i / n_experts, i % n_experts))
             .collect();
@@ -8537,6 +8679,14 @@ fn cuda_moe_route_matches_reference() -> Result<()> {
             check(&device, 5, 128, 2, dt, norm)?; // small k
             check(&device, 3, 64, 4, dt, norm)?; // non-128 expert count
         }
+    }
+    // The 16-slot instantiation (n_experts > 256): qwen4exp's 512 × top-10,
+    // plus the boundary just past the narrow kernel. F32-only — see the logit
+    // representability note above.
+    for &norm in &[true, false] {
+        check(&device, 1, 512, 10, crate::DType::F32, norm)?;
+        check(&device, 7, 512, 10, crate::DType::F32, norm)?;
+        check(&device, 3, 257, 4, crate::DType::F32, norm)?;
     }
     Ok(())
 }
@@ -9377,6 +9527,14 @@ fn bench_moe_bucketize() -> Result<()> {
         (4096, 8, 128, "prefill-4096"),
         (8192, 8, 128, "prefill-8192"),
         (4096, 8, 256, "prefill-4096-e256"),
+        // Qwen3.8-Flash-Next: 512 experts, top-10. §0.4 rule 2 — the width the
+        // bound was raised for AND the width it was raised from, so a
+        // regression for the existing callers cannot hide.
+        (16, 10, 512, "decode-16-e512"),
+        (713, 10, 512, "prefill-713-e512"),
+        (2048, 10, 512, "prefill-2048-e512"),
+        (4096, 10, 512, "prefill-4096-e512"),
+        (4096, 10, 256, "prefill-4096-e256-k10"),
     ];
 
     println!("\n=== moe_bucketize micro-bench (tile_w={tile_w}, iters={iters}) ===");
@@ -9600,6 +9758,39 @@ fn cuda_moe_bucketize_matches_cpu_reference() -> Result<()> {
     // k = 1 and tile_w = 16 shape edges.
     assert_bucketize_case(&device, vec![2, 0, 2, 1, 2], 5, 1, 4, 16, "k1-tile16")?;
 
+    // 512 experts — MORE experts than the kernel has threads, so every
+    // per-expert phase must stride rather than assume one thread per expert.
+    // The upper half is what a one-thread-per-expert form would have silently
+    // dropped, so these cases put weight there: an expert at the very top, and
+    // the sentinel at exactly `n_experts`.
+    assert_bucketize_case(
+        &device,
+        vec![511, 256, 0, 511, 300, 511, 1, 480, 511, 257],
+        1,
+        10,
+        512,
+        32,
+        "e512-top-half",
+    )?;
+    assert_bucketize_case(
+        &device,
+        vec![511u32; 64 * 10],
+        64,
+        10,
+        512,
+        32,
+        "e512-one-expert",
+    )?;
+    assert_bucketize_case(
+        &device,
+        vec![512, 300, 512, 511, 0, 999, 512, 256, 7, 512],
+        1,
+        10,
+        512,
+        32,
+        "e512-sentinels",
+    )?;
+
     // Seeded fuzz across prefill-like shapes, with a sprinkle of sentinels.
     let mut rng = StdRng::seed_from_u64(0xb0cc_e71e);
     for &(n_tokens, k, n_experts, tile_w) in &[
@@ -9611,6 +9802,13 @@ fn cuda_moe_bucketize_matches_cpu_reference() -> Result<()> {
         (7, 3, 16, 32),
         (129, 8, 128, 16),
         (17, 8, 128, 1),
+        // Qwen3.8-Flash-Next's own width and top-k, across decode and prefill
+        // shapes; 257 sits one past the old bound.
+        (16, 10, 512, 32),
+        (713, 10, 512, 32),
+        (2048, 10, 512, 32),
+        (64, 10, 257, 32),
+        (33, 10, 512, 16),
     ] {
         let ids: Vec<u32> = (0..n_tokens * k)
             .map(|_| {
@@ -9806,7 +10004,7 @@ fn mxfp4_int8_matmul_matches_float_baseline() -> Result<()> {
             QStorage::Cuda(cs) => (cs.data_ptr(), cs.storage_size_in_bytes()),
             _ => unreachable!(),
         };
-        let acts = to_dynamic(&act_t, mode, &dev)?;
+        let acts = to_dynamic(&act_t, mode, &dev, SumScale::Raw)?;
         let out = dense_qmatmul(
             acts.as_dynamic(),
             wptr,
@@ -9848,5 +10046,105 @@ fn mxfp4_int8_matmul_matches_float_baseline() -> Result<()> {
         rel_per32 < 0.03,
         "exact per-32 int8 rel_l2 {rel_per32:.5} unexpectedly high"
     );
+    Ok(())
+}
+
+/// The deterministic MoE scatter **defines** its target; it does not accumulate
+/// into it.
+///
+/// This is the contract that lets every caller allocate the combine target with
+/// `Tensor::empty` (hot-path invariant 6) instead of paying a memset over the
+/// layer's largest transient — and, on the kernel side, lets it skip a full read
+/// of that target to add a value that is always zero.
+///
+/// **The target is filled with poison, not zeros.** That is the whole test. A
+/// kernel that seeds its reduction from `ys` — which this one did, back when the
+/// callers ran it twice per layer for hits and then misses — passes any test
+/// that pre-zeroes the target, and silently adds garbage to every expert output
+/// the day a caller stops zeroing. Poison makes the two behaviours differ by the
+/// poison value, and the assertion below is exact: the scatter's arithmetic is
+/// one `w · v` product per contribution, and the expected value is computed the
+/// same way in the same order, so there is nothing here to tolerance.
+#[test]
+fn cuda_deterministic_scatter_defines_its_target_rather_than_accumulating() -> Result<()> {
+    use crate::cuda_backend::Backing;
+    use crate::quantized::cuda::fused_deterministic_scatter;
+    use crate::{DType, Device, Tensor};
+
+    let dev = CudaDevice::new(0)?;
+    let device = Device::Cuda(dev.clone());
+
+    // Three tokens with deliberately UNEQUAL contribution counts (2, 3, 0), so
+    // the test covers the variable-k prefix-sum path and, in token 2, the row
+    // that no contribution writes — the case where "defines its target" and
+    // "accumulates into a zeroed target" agree only if the kernel stores an
+    // explicit zero rather than leaving the row alone.
+    const HIDDEN: usize = 5;
+    const NUM_TOKENS: usize = 3;
+    let token_starts: Vec<i32> = vec![0, 2, 5, 5];
+    // token-major row order; each entry names a row of `down_out` and a weight.
+    let perm: Vec<u32> = vec![0, 1, 2, 3, 4];
+    let rw_ids: Vec<u32> = vec![0, 1, 2, 3, 4];
+    let weights: Vec<f32> = vec![0.5, 0.25, 2.0, -1.0, 0.125];
+
+    let down_rows = perm.len();
+    let down: Vec<f32> = (0..down_rows * HIDDEN).map(|i| (i as f32) + 1.0).collect();
+
+    // What the kernel must produce, from the same products in the same order.
+    let mut want = [0f32; NUM_TOKENS * HIDDEN];
+    for t in 0..NUM_TOKENS {
+        for col in 0..HIDDEN {
+            let mut sum = 0f32;
+            for idx in token_starts[t] as usize..token_starts[t + 1] as usize {
+                sum += weights[rw_ids[idx] as usize] * down[perm[idx] as usize * HIDDEN + col];
+            }
+            want[t * HIDDEN + col] = sum;
+        }
+    }
+
+    let down_out = Tensor::from_vec(down, (down_rows, HIDDEN), &device)?;
+    let weights_flat = Tensor::from_vec(weights.clone(), (weights.len(),), &device)?;
+    let perm_dev = dev.memcpy_stod_from(&perm, Backing::Owned)?;
+    let rw_dev = dev.memcpy_stod_from(&rw_ids, Backing::Owned)?;
+    let ts_dev = dev.memcpy_stod_from(&token_starts, Backing::Owned)?;
+
+    // Poison. Any nonzero pattern works; this one is large enough that a stale
+    // read could not be mistaken for rounding and negative on alternating
+    // elements so a sign error shows too.
+    let poison: Vec<f32> = (0..NUM_TOKENS * HIDDEN)
+        .map(|i| if i % 2 == 0 { 1.0e6 } else { -7.5e5 })
+        .collect();
+
+    for dtype in [DType::F32, DType::BF16] {
+        let ys =
+            Tensor::from_vec(poison.clone(), (NUM_TOKENS, HIDDEN), &device)?.to_dtype(dtype)?;
+        fused_deterministic_scatter(
+            &ys,
+            &down_out,
+            &perm_dev,
+            &weights_flat,
+            &rw_dev,
+            &ts_dev,
+            NUM_TOKENS,
+            &dev,
+        )?;
+        let got = ys.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            // BF16 storage rounds the store; F32 must be exact.
+            let ok = if dtype == DType::F32 {
+                g == w
+            } else {
+                (g - w).abs() <= 1e-2 * w.abs().max(1.0)
+            };
+            assert!(
+                ok,
+                "{dtype:?} element {i} (token {}, col {}): got {g}, want {w} — a nonzero gap of \
+                 roughly the poison value means the kernel seeded its reduction from `ys`, and \
+                 every caller allocating the target with `Tensor::empty` is now returning garbage",
+                i / HIDDEN,
+                i % HIDDEN,
+            );
+        }
+    }
     Ok(())
 }

@@ -14,12 +14,13 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 
 use candle_conversation::projection::{self, TimelineId};
+use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
 
 use crate::loading::LoadProgress;
@@ -247,7 +248,9 @@ pub fn ingest_raw(
             .map_err(|e| anyhow::anyhow!("{layer_name} conv create: {e}"))?
     };
 
-    let mut sink = SequenceTurnSink::new(&mut sequence);
+    // Empty: a raw layer only ever PREFILLS its records — it decodes nothing, so
+    // there is no think block to steer.
+    let mut sink = SequenceTurnSink::new(&mut sequence, Arc::new(TriggerRegistry::new()));
     let state = ingest_raw_into_sink(&mut sink, root, progress)?;
     Ok((sequence, state))
 }
@@ -304,7 +307,7 @@ pub fn refresh_raw(
     };
 
     {
-        let mut sink = SequenceTurnSink::new(&mut new_sequence);
+        let mut sink = SequenceTurnSink::new(&mut new_sequence, Arc::new(TriggerRegistry::new()));
         let total = files.len();
         for (i, (rel, content)) in files.iter().enumerate() {
             let turns = records_to_turns(parse_chatml_records(content));

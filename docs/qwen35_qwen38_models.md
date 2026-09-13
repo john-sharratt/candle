@@ -561,8 +561,8 @@ pattern); `Conversation::enqueue_snapshot` (`resolver.rs:2675` pattern);
 seal-site producer (`scheduler/mod.rs:6390-6408`); persistence-thread gather
 (`thread.rs:1085-1121`); reload resolve (`resolver.rs:1990-2007`); device
 restore (`transfer.rs:138` pattern); tombstone gates; inspector histogram +
-skip lists + `snapshots` view; doc updates (`docs/segmented_substrate_log.md`,
-`docs/kv_tier_migration.md`).
+skip lists + `snapshots` view; doc updates (`docs/archived/segmented_substrate_log.md`,
+`docs/archived/kv_tier_migration.md`).
 
 ---
 
@@ -1766,10 +1766,15 @@ element in a register:
   chain (sigmoid materialised in O, O-precision elementwise multiply), so
   fused-vs-unfused differ only in launch count, not numerics.
 - **The combine is now guaranteed to run whenever q8 is requested.** The
-  emit lives only in the combine kernel and `out` is null on the q8 path, so
-  a launch shape that used to direct-write (no stripe, one split) would have
-  dereferenced null. `q8_out != nullptr` now forces the partials + combine
-  route in the launcher.
+  emit (`int8_decode_emit_row`, its own header) lives only in the combine
+  kernel and `out` is null on the q8 path, so a launch shape that used to
+  direct-write (no stripe, one split) would have dereferenced null.
+  `q8_out != nullptr` now forces the partials + combine route in the
+  launcher. (Folding the merge into the head_dim-256 tile kernel — a
+  pairwise tree over the splits, the last-arriving block of each pair
+  merging — was measured against this: its serial tail of device fences and
+  global atomics cost a constant 36 µs per step, seven times the launch it
+  saved, so the combine kernel stays.)
 
 `want_q8` widens to `head_dim ∈ {128, 256}` and the gated-refusal guard is
 gone — a gated layer passes its gate down `paged_decode_attention →

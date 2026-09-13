@@ -2,24 +2,29 @@
 //! background fork and applied to the main tree via
 //! [`ConversationTree::apply_patch`](super::conversation_tree::ConversationTree::apply_patch).
 //!
-//! # Fork / patch pattern
+//! # How a patch reaches the tree
 //!
-//! When the engine needs background work (e.g. async summarization), it calls
-//! [`ConversationTree::fork`] to get a `Send`-able
-//! [`ConversationTreeFork`](super::conversation_tree::ConversationTreeFork)
-//! plus a one-shot [`Receiver<TreePatch>`](crossbeam::channel::Receiver).
-//! The fork is sent to a background thread; when it finishes it calls
-//! `ConversationTreeFork::finish(patch)` to send the result back.
+//! Summarization is the only producer today. `ConversationTree::run_summarize`
+//! launches a `SummarizationTask` — a `CognitiveTask` whose inference runs on
+//! the scheduler — and pushes the handle onto the tree's `pending_tasks`.
+//! `Sequence::finish_turn` drains that queue via `drain_pending_tasks()` and
+//! spin-polls each handle; on `TaskPoll::Ready(patch)` it calls
+//! [`ConversationTree::apply_patch`](super::conversation_tree::ConversationTree::apply_patch)
+//! and then re-checks whether a recursive segment-of-segments summarization
+//! should fire.
 //!
-//! On the main thread, the engine stores the receiver as
-//! `pending_fork_rx: Option<Receiver<TreePatch>>`. At the start of each new
-//! turn submission a `drain_pending_patch()` helper calls `try_recv()` on the
-//! channel — non-blocking, so the turn proceeds immediately if no patch is
-//! ready. This guarantees patch application happens on the main thread in a
-//! quiescent moment, with no locking or blocking.
+//! So patch application still happens on the main thread at a turn boundary,
+//! which is the property the design wanted — but by polling a task handle, not
+//! by receiving on a channel. The spin-poll is deliberately crude (see
+//! `Conversation::run_task_blocking_inner`): summarization is infrequent enough
+//! that blocking a turn boundary on it is acceptable for now.
 //!
-//! TODO: wire `drain_pending_patch()` into the turn-loop once `run_summarize()`
-//! spawns a real background thread.
+//! [`ConversationTree::fork`](super::conversation_tree::ConversationTree::fork)
+//! and [`ConversationTreeFork`](super::conversation_tree::ConversationTreeFork)
+//! offer the alternative — a `Send`-able snapshot plus a one-shot
+//! [`Receiver<TreePatch>`](crossbeam::channel::Receiver) for genuinely
+//! off-thread work. Nothing calls them yet; they are the seam for moving
+//! summarization off the turn boundary.
 
 use super::node::ConversationNode;
 
@@ -31,9 +36,8 @@ use super::node::ConversationNode;
 /// main tree via
 /// [`ConversationTree::apply_patch`](super::conversation_tree::ConversationTree::apply_patch).
 ///
-/// The `run_summarize()` stub currently never sends a real patch (it logs and
-/// returns immediately). The `TreePatch` and channel infrastructure are
-/// present so the real async worker can slot in without struct changes.
+/// Produced by a completed `SummarizationTask` and applied at the next turn
+/// boundary — see the module docs for the path it takes.
 #[derive(Debug)]
 pub struct TreePatch {
     /// Nodes appended by the fork (e.g. new segment nodes from summarization).

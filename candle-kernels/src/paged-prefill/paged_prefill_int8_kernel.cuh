@@ -17,20 +17,26 @@
  *    (2 row-tiles, each served by a QUARTET), BLOCK_M_TOK = M_ROWS / hpg
  *    tokens.
  *
- *  - SLICE-ALIGNED TILES: a KV tile is one TokenSlice run (≤ 32 tokens,
- *    never straddling a chunk). One palette table per tile; the straddle
- *    twin-table scheme of the FP16 kernel is structurally unnecessary.
+ *  - PACKED TILES OVER A BLOCK WALK: a KV tile is 32 SELECTED positions in
+ *    ascending order, not 32 consecutive ones. The block's query rows
+ *    between them select a bounded set of `ratio`-position selection
+ *    blocks whatever the depth (`qsa_walk.cuh` merges the rows' entry
+ *    lists); each tile packs the next 32/ratio of them, so the tile count
+ *    is bounded by the rows' combined budget rather than the prefix
+ *    length. A launch without a selection walks 32-position blocks — the
+ *    dense causal read, in the same loop. Per-row masking inside a tile is
+ *    a bit test: the walk reports which cells of each block each row
+ *    selects, and the compute phase ANDs that with the causal horizon.
  *
- *  - RAW-FIRST STAGING: each palette's 32-token quant-block span is
- *    bulk-copied to smem with 16-byte cp.async (perfectly coalesced),
- *    and every per-element decode — K dequant→RoPE→requant, V int8
- *    read-through or FP requant — extracts from that smem copy in
- *    natural dim order via the rank tables. There is no FP16 exchange
- *    slab: the rank→natural permutation happens in the table-indexed
- *    reads themselves. Dtype palettes (unsealed float prefixes) stage
- *    their raw element spans the same way, K and V phased sequentially
- *    through one scratch region. Non-hop palettes (R16, F32, unaligned
- *    spans) decode element-wise straight from global — rare.
+ *  - PER-WARP COLUMN STAGING: warp w owns tile columns 4w..4w+3 and
+ *    decodes each straight from its source — a fresh token's packed
+ *    input rows, or a sealed token's arena quant blocks / dtype spans
+ *    through that token's slice metadata (per-warp palette bases and
+ *    rank bytes, rebound only when the column's slice changes). Columns
+ *    of one tile may come from different chunks, so the tile carries no
+ *    single palette table; every decode is element-wise through the
+ *    arena accessors, and K is RoPEd + requantised per (token, window)
+ *    while V is stashed as FP16 for a per-dim requant after the barrier.
  *
  *  - FRESH TOKENS FROM THE INPUTS: the q_len new tokens are staged straight
  *    from the packed q/k/v tensors (never read back from the arena); the
@@ -40,17 +46,15 @@
  *    Q:  int8 per (M-row, 32-dim window)   — natural dim order
  *    K:  int8 per (token, 32-dim window)   — natural dim order, post-RoPE
  *    P:  int8 per row, fixed scale 1/127   (P ∈ (0, 1] after online softmax)
- *    V:  int8 per (natural dim, tile)      — arena block scale (read-through)
- *                                            or requant max-abs (fallback)
+ *    V:  int8 per (natural dim, tile)      — requant max-abs over the tile's
+ *                                            32 packed columns
  *  QK epilogue: acc_f32 += i32(window) · qs[row][w] · ks[tok][w]
  *  PV epilogue: o_f32   += i32 · (1/127) · vs[dim]
  *  The O accumulator and V^T slab are NATURAL-dim indexed — palette rank
  *  space is per-slice and cannot host a cross-tile accumulator.
  *
- * Scope: HEAD_DIM % 64 == 0 in [64, 256] (in-thread RoPE pairing). Read-through V
- * engages whenever every V palette's format is an int8 passthrough family
- * (per-element extraction has no lane-width constraint); asymmetric or
- * dtype V palettes take the FP-fallback path.
+ * Scope: HEAD_DIM % 64 == 0 in [64, 256] (in-thread RoPE pairing); the
+ * selection ratio must divide the 32-column tile (4, 8, 16, 32).
  * ============================================================================
  */
 
@@ -63,12 +67,18 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "../arena_table.cuh"
 #include "../paged-decode/slot_types.cuh"
 #include "../convert/convert_all.cuh"
 #include "../mma/mma_wrappers.cuh"
+#include "../convert/int8_elem.cuh"
 #include "pal_rank.cuh"
 #include "kv_store.cuh"
+// QSA block-sparse selection — one row per PACKED QUERY (`q_start + token`).
+// Null for every model that reads the whole causal prefix.
+#include "../qsa_select.cuh"
+#include "qsa_walk.cuh"
 
 namespace prefill_int8 {
 
@@ -76,9 +86,24 @@ using fused_attn::load_a_frag_m16k32_ldmatrix;
 using fused_attn::load_b_frag_n8k32_ldmatrix;
 using fused_attn::mma_int8_m16n8k32;
 
+// Per-element staging/decoding helpers shared with the INT8 tile decode kernel.
+using int8_elem::i8_rope_cs;
+using int8_elem::i8_apply_rope;
+using int8_elem::qt_to_f32;
+using int8_elem::qt_from_f32;
+using int8_elem::i8_quant;
+using int8_elem::i8_arena_elem;
+
 constexpr int I8_WARPS = 8;
 constexpr int I8_THREADS = I8_WARPS * 32;
-constexpr int I8_TILE_TOK = 32;              // one chunk-slice per tile
+constexpr int I8_TILE_TOK = 32;              // packed columns per tile
+constexpr int I8_COLS_PER_WARP = I8_TILE_TOK / I8_WARPS; // columns a warp stages
+
+// The selection ratio a launch may carry: a tile packs whole selection
+// blocks, so the ratio must divide the tile. The launcher refuses the rest.
+__host__ __device__ constexpr bool i8_ratio_supported(int ratio) {
+    return ratio == 4 || ratio == 8 || ratio == 16 || ratio == 32;
+}
 
 // Head-dim-split warp grouping: warp = (row-tile, dim-part). A GROUP of
 // `i8_dim_split` warps serves one m16 row-tile — all of them duplicate the
@@ -124,191 +149,6 @@ __host__ __device__ constexpr int i8_smem_budget(int head_dim) {
     return head_dim >= 256 ? 47 * 1024 : 25600;
 }
 
-/// cos/sin lookup, same FREQUENCY-indexed table as the decode kernels:
-/// rope_cs[pos*HD + 2i] = cos_i, [.. + 2i + 1] = sin_i for frequency i in
-/// [0, HD/2). The table is pairing-agnostic — the half-split pairing
-/// (d, d + HD/2) reads frequency d, the interleaved pairing (2i, 2i + 1)
-/// reads frequency d >> 1.
-template <int HEAD_DIM>
-__device__ __forceinline__ void i8_rope_cs(
-    int pos, int d_idx, const float* __restrict__ rope_cs, float& c, float& s)
-{
-    const float* e = rope_cs + (int64_t)pos * HEAD_DIM + d_idx * 2;
-    c = __ldg(e);
-    s = __ldg(e + 1);
-}
-
-/// Apply RoPE in place over a register window `x[N_WIN]` where lane `l` holds
-/// dims {l + 32w : w in 0..N_WIN} of one head row.
-///
-/// Half-split (`rope_interleaved == 0`, Qwen/GPT-NeoX): pair (d, d + HD/2)
-/// lives IN-THREAD as windows (w, w + N_WIN/2) — pure register math.
-/// Interleaved (`== 1`, LLaMA/GPT-J): pair (2i, 2i + 1) spans lanes
-/// (even, odd) of the SAME window (32 | 32w keeps dim parity = lane parity),
-/// so one `lane ^ 1` shuffle per window fetches the partner — the same
-/// exchange the decode kernels' `apply_rope_interleaved_f32` uses.
-///
-/// Callers must be warp-uniform (every lane executes the shuffle): all three
-/// call sites guard on warp-uniform row/token conditions.
-template <int HEAD_DIM, int N_WIN>
-__device__ __forceinline__ void i8_apply_rope(
-    float (&x)[N_WIN], int pos, int lane, int rope_interleaved,
-    const float* __restrict__ rope_cs)
-{
-    if (rope_interleaved) {
-        const float sign = (lane & 1) ? 1.f : -1.f;
-        #pragma unroll
-        for (int w = 0; w < N_WIN; ++w) {
-            int d = lane + 32 * w;
-            float c, s;
-            i8_rope_cs<HEAD_DIM>(pos, d >> 1, rope_cs, c, s);
-            float partner = __shfl_sync(0xffffffffu, x[w], lane ^ 1);
-            x[w] = x[w] * c + sign * partner * s;
-        }
-    } else {
-        #pragma unroll
-        for (int w = 0; w < N_WIN / 2; ++w) {
-            float c, s;
-            i8_rope_cs<HEAD_DIM>(pos, lane + 32 * w, rope_cs, c, s);
-            float lo = x[w], hi = x[w + N_WIN / 2];
-            x[w] = lo * c - hi * s;
-            x[w + N_WIN / 2] = lo * s + hi * c;
-        }
-    }
-}
-
-template <typename QT>
-__device__ __forceinline__ float qt_to_f32(QT v);
-template <>
-__device__ __forceinline__ float qt_to_f32<__half>(__half v) { return __half2float(v); }
-template <>
-__device__ __forceinline__ float qt_to_f32<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
-
-template <typename QT>
-__device__ __forceinline__ QT qt_from_f32(float v);
-template <>
-__device__ __forceinline__ __half qt_from_f32<__half>(float v) { return __float2half(v); }
-template <>
-__device__ __forceinline__ __nv_bfloat16 qt_from_f32<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
-
-/// cp.async fences for the raw-block staging fill. Groups are per-thread:
-/// every thread commits and drains its own copies before the block-wide
-/// staging barrier makes them visible (a bare __syncthreads does NOT
-/// fence cp.async).
-__device__ __forceinline__ void i8_cp_commit() {
-    asm volatile("cp.async.commit_group;" ::);
-}
-
-__device__ __forceinline__ void i8_cp_wait0() {
-    asm volatile("cp.async.wait_group 0;" ::);
-}
-
-/// 16-byte global→shared bulk copy (both pointers 16-byte aligned).
-__device__ __forceinline__ void i8_cp_async16(void* dst, const void* src) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
-                 :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst))),
-                    "l"(src));
-}
-
-/// Quantize a value against a precomputed window scale (0 ⇒ all-zero window).
-__device__ __forceinline__ int8_t i8_quant(float v, float inv_scale) {
-    float q = rintf(v * inv_scale);
-    q = fminf(127.f, fmaxf(-127.f, q));
-    return (int8_t)q;
-}
-
-/// Runtime-format single-element FP decode from a token-oriented quant
-/// block (`blk` points at ONE dim's block; `e` is the token within it).
-/// Same numerics as load_head_quant_token_oriented: value / scale.
-__device__ __forceinline__ float i8_dequant_elem(
-    int fmt, const char* blk, int e, float scale)
-{
-    switch (fmt) {
-#define I8_DQ(F, B) \
-    case ArenaFormat::F: \
-        return BlockConverter<B, float>::load_element((const B*)blk, e, scale)
-        I8_DQ(R16, block_r16);
-        I8_DQ(Q4_0, block_q4_0);
-        I8_DQ(Q4_1, block_q4_1);
-        I8_DQ(Q5_0, block_q5_0);
-        I8_DQ(Q5_1, block_q5_1);
-        I8_DQ(Q8_0, block_q8_0);
-        I8_DQ(Q8_1, block_q8_1);
-        I8_DQ(Q4_KS, block_q4_ks);
-        I8_DQ(Q8_KS, block_q8_ks);
-        I8_DQ(Q3_0, block_q3_0);
-        I8_DQ(Q3_1, block_q3_1);
-        I8_DQ(Q2_0, block_q2_0);
-        I8_DQ(Q2_1, block_q2_1);
-        I8_DQ(Q2_A, block_q2_a);
-        I8_DQ(Q2_S, block_q2_s);
-        I8_DQ(Q1_S, block_q1_s);
-        I8_DQ(Q0, block_q0);
-        I8_DQ(Q0_V, block_q0_v);
-        I8_DQ(Q1_A, block_q1_a);
-        I8_DQ(Q0_X, block_q0_x);
-        I8_DQ(Q0_M2, block_q0_m2);
-        I8_DQ(Q0_M4, block_q0_m4);
-#undef I8_DQ
-        // A non-arena format reached block extraction — fail loud (the
-        // same __trap idiom as the accessor's block addressing).
-        default: __trap(); return 0.f;
-    }
-}
-
-/// Runtime-format single-element int8 read-through (V). Same families and
-/// numerics as load_head_int8_readthrough's dispatcher.
-__device__ __forceinline__ Int8Sample i8_rt_elem(int fmt, const char* blk, int e)
-{
-    switch (fmt) {
-#define I8_RT(F, B) \
-    case ArenaFormat::F: return BlockInt8<B>::load((const B*)blk, e)
-        I8_RT(Q8_0, block_q8_0);
-        I8_RT(Q4_0, block_q4_0);
-        I8_RT(Q5_0, block_q5_0);
-        I8_RT(Q2_0, block_q2_0);
-        I8_RT(Q3_0, block_q3_0);
-        I8_RT(Q4_KS, block_q4_ks);
-        I8_RT(Q8_KS, block_q8_ks);
-        I8_RT(Q8_1, block_q8_1);
-        I8_RT(Q2_S, block_q2_s);
-        I8_RT(Q1_S, block_q1_s);
-        I8_RT(Q1_A, block_q1_a);
-        I8_RT(Q0, block_q0);
-        I8_RT(Q0_M2, block_q0_m2);
-        I8_RT(Q0_M4, block_q0_m4);
-        I8_RT(Q0_X, block_q0_x);
-#undef I8_RT
-        default: __trap(); return Int8Sample{0, 0.f};
-    }
-}
-
-/// One arena element as FP32, from either a quant-block span (bb > 0:
-/// `base` is the palette's raw smem copy or its global span) or a
-/// channel-oriented dtype palette (bb == 0: element addressing).
-/// Matches load_head_scaled's semantics: decoded value / scale (the
-/// dtype identity fast path skips the divide only when scale == 1.0f,
-/// where /1.0f is exact anyway).
-__device__ __forceinline__ float i8_arena_elem(
-    int fmt, int bb, const char* base, int rank, int within, float scale, int sub)
-{
-    if (bb > 0)
-        return i8_dequant_elem(fmt, base + (int64_t)rank * bb, within, scale);
-    const int es = ArenaFormat::float_elem_size(fmt);
-    const char* pe = base + ((int64_t)within * sub + rank) * es;
-    float v;
-    if (fmt == ArenaFormat::F16) {
-        v = __half2float(*(const __half*)pe);
-    } else if (fmt == ArenaFormat::BF16) {
-        v = __bfloat162float(*(const __nv_bfloat16*)pe);
-    } else if (fmt == ArenaFormat::F32) {
-        v = *(const float*)pe;
-    } else { // F8E4M3
-        v = to_float<__nv_fp8_e4m3>(*(const __nv_fp8_e4m3*)pe);
-    }
-    return v / scale;
-}
-
 // ============================================================================
 // The kernel
 // ============================================================================
@@ -346,18 +186,20 @@ paged_prefill_int8_kernel(
     // [total_q·n_head rows][num_splits][HEAD_DIM + 2] and the combine kernel
     // merges them (base-e log-sum-exp).
     int num_splits,
-    float* __restrict__ partials
+    float* __restrict__ partials,
+    QsaSel sel
 ) {
     static_assert(HEAD_DIM % 64 == 0 && HEAD_DIM >= 64 && HEAD_DIM <= 256,
                   "int8 prefill: HEAD_DIM must be a multiple of 64 in [64, 256]");
     constexpr int N_WIN = HEAD_DIM / 32;       // QK k-step windows (also dims/lane)
     constexpr int PV_SLICES = HEAD_DIM / 8;    // PV n-slices (output dims per mma)
     constexpr int SUB = HEAD_DIM / N_PALETTE;  // palette band width
-    // The rank tables pack (palette, rank) into one byte as p<<6 | rank,
-    // and the raw-span fill copies in 16-byte units.
-    static_assert(N_PALETTE == 4, "rank-table byte packs the palette into 2 bits");
-    static_assert(SUB >= 16 && SUB <= 64,
-                  "rank needs 6 bits; raw spans copy in 16-byte units");
+    // A lane's rank bytes pack (palette, rank) as p<<6 | rank.
+    static_assert(N_PALETTE == 4, "rank byte packs the palette into 2 bits");
+    static_assert(SUB <= 64, "rank needs 6 bits");
+    // Palette maps are compared one 32-bit word per lane.
+    constexpr int MAP_WORDS = HEAD_DIM / 16;
+    static_assert(MAP_WORDS <= 32, "a palette map must fit one word per lane");
 
     constexpr int DIM_SPLIT = i8_dim_split(HEAD_DIM);
     constexpr int I8_ROW_TILES = i8_row_tiles(HEAD_DIM);
@@ -405,10 +247,9 @@ paged_prefill_int8_kernel(
     //     registers + scales). After the drain barrier the whole region is
     //     dead and the tile overlay reuses its bytes.
     //   TILE overlay (per tile): the staging→compute handoff slabs
-    //     (s_k8/s_v8t + scales), the raw∪p8∪fresh scratch, and the palette
-    //     tables. These cannot union among themselves — the slabs span the
-    //     staging barrier and the tables persist across tiles — but all of
-    //     them may alias the dead prologue.
+    //     (s_k8/s_v8t + scales) and the fresh∪p8 scratch. The slabs span
+    //     the staging barrier so they cannot union among themselves, but
+    //     all of them may alias the dead prologue.
     //
     // +16-byte row pads on the MMA slabs (the q8-matmul KI8_STRIDE
     // convention): a multiple of 16 keeps every row address ldmatrix-legal,
@@ -419,24 +260,10 @@ paged_prefill_int8_kernel(
     constexpr int Q8_LD = HEAD_DIM + 16;
     constexpr int V8T_LD = I8_TILE_TOK + 16;
     constexpr int P8_BYTES = I8_WARPS * 16 * V8T_LD;
-    // Raw staging spans: one 32-token block run per palette per side,
-    // sized for the largest arena block (Q8_1/Q8_KS = 36 B/dim). SUB ≥ 16
-    // keeps every slot a multiple of 16 bytes (cp.async-aligned).
-    constexpr int RAW_SLOT = SUB * 36;
-    constexpr int RAW_BYTES = N_PALETTE * RAW_SLOT;
-    // Dtype-tile slot: a float palette span is 32 tokens × SUB dims × 2 B
-    // (F16/BF16; F8 is half that, F32 does not fit and stays non-hop).
-    // Both sides cannot fit simultaneously, so dtype tiles stage K and V
-    // SEQUENTIALLY through one N_PALETTE × RAW_SLOT_D region (see the
-    // staging phase below).
-    constexpr int RAW_SLOT_D = I8_TILE_TOK * SUB * 2;
+    // FP16 V stash: the tile's 32 columns in natural dim order, read back
+    // per dim by the requant pass.
     constexpr int FRESH_BYTES = I8_TILE_TOK * HEAD_DIM * 2;
-    constexpr int SCRATCH_BYTES =
-        (2 * RAW_BYTES > P8_BYTES)
-            ? ((2 * RAW_BYTES > FRESH_BYTES) ? 2 * RAW_BYTES : FRESH_BYTES)
-            : ((P8_BYTES > FRESH_BYTES) ? P8_BYTES : FRESH_BYTES);
-    static_assert(N_PALETTE * RAW_SLOT_D <= SCRATCH_BYTES,
-                  "one side's dtype spans must fit the scratch region");
+    constexpr int SCRATCH_BYTES = (P8_BYTES > FRESH_BYTES) ? P8_BYTES : FRESH_BYTES;
 
     constexpr int ALIGN16 = 15;
     // Tile overlay offsets (all 16-aligned).
@@ -445,32 +272,47 @@ paged_prefill_int8_kernel(
     constexpr int OFF_V8T = (OFF_KS + I8_TILE_TOK * N_WIN * 2 + ALIGN16) & ~ALIGN16;
     constexpr int OFF_VS = (OFF_V8T + HEAD_DIM * V8T_LD + ALIGN16) & ~ALIGN16;
     constexpr int OFF_SCR = (OFF_VS + HEAD_DIM * 2 + ALIGN16) & ~ALIGN16;
-    constexpr int OFF_TBLK = (OFF_SCR + SCRATCH_BYTES + ALIGN16) & ~ALIGN16;
-    constexpr int OFF_TBLV = OFF_TBLK + HEAD_DIM;
-    constexpr int TILE_BYTES = OFF_TBLV + HEAD_DIM;
+    constexpr int TILE_BYTES = OFF_SCR + SCRATCH_BYTES;
     // Prologue overlay (s_q8 only — the Q scales are RESIDENT, below).
     constexpr int PRO_BYTES = I8_M_ROWS * Q8_LD;
     constexpr int ARENA_BYTES = (TILE_BYTES > PRO_BYTES) ? TILE_BYTES : PRO_BYTES;
-    static_assert(ARENA_BYTES + 128 <= i8_smem_budget(HEAD_DIM),
-                  "arena must fit the target-residency smem budget");
+    // The resident statics beside the arena: Q scales, per-warp palette
+    // metadata, per-warp rank tables and the map words they were ranked
+    // under, per-warp column origins.
+    constexpr int RESIDENT_BYTES = I8_M_ROWS * N_WIN * 2
+                                 + I8_WARPS * 2 * N_PALETTE * (8 + 4 + 4 + 4)
+                                 + I8_WARPS * 2 * HEAD_DIM
+                                 + I8_WARPS * 2 * MAP_WORDS * 4
+                                 + I8_WARPS * 4;
+    static_assert(ARENA_BYTES + RESIDENT_BYTES <= i8_smem_budget(HEAD_DIM),
+                  "arena + residents must fit the target-residency smem budget");
 
     __shared__ __align__(16) uint8_t s_arena[ARENA_BYTES];
-    __shared__ uint8_t s_pal_cache[HEAD_DIM / 2];
-    __shared__ int s_tbl_valid;
     // Q scales stay RESIDENT in smem (512 B of the 4-block headroom): the
     // QK fixup reads them as broadcasts, and NOT draining them to
     // registers hands ptxas 4 regs/thread of slack at the 64-reg cap —
     // measured spill traffic was ~25% of global sector volume.
     __shared__ __half s_q_scale[I8_M_ROWS][N_WIN];
-    // Per-palette extraction metadata for the current tile (resident —
-    // 160 B): decode base (raw smem copy, or global for non-hop
-    // palettes), palette scale, format, and quant block bytes (0 ⇒ dtype
-    // element addressing). Index [0] = K, [1] = V. Block-uniform values;
-    // reads are smem broadcasts.
-    __shared__ const char* s_ext_base[2][N_PALETTE];
-    __shared__ float s_ext_scl[2][N_PALETTE];
-    __shared__ int s_ext_fmt[2][N_PALETTE];
-    __shared__ int s_ext_bb[2][N_PALETTE];
+    // Per-WARP palette extraction metadata for the slice the warp's
+    // current column lives in: global decode base, palette scale, format,
+    // and quant block bytes (0 ⇒ dtype element addressing). Index [0] = K,
+    // [1] = V. Warp-uniform values; reads are smem broadcasts. A warp
+    // rebinds them only when its column moves to another slice.
+    __shared__ const char* s_wext_base[I8_WARPS][2][N_PALETTE];
+    __shared__ float s_wext_scl[I8_WARPS][2][N_PALETTE];
+    __shared__ int s_wext_fmt[I8_WARPS][2][N_PALETTE];
+    __shared__ int s_wext_bb[I8_WARPS][2][N_PALETTE];
+    // Per-warp rank tables — byte (palette << 6 | rank) per natural dim,
+    // [0] = K, [1] = V — and the palette-map words they were computed
+    // under (rebuilt only when a newly bound slice's maps differ). Lane
+    // reads of dims {lane + 32w} touch 32 consecutive bytes: conflict-free.
+    __shared__ uint8_t s_wrank[I8_WARPS][2][HEAD_DIM];
+    __shared__ uint32_t s_wmap[I8_WARPS][2][MAP_WORDS];
+    // Logical kv position of each warp's first column (column 4w + c sits
+    // at s_qpos[w] + c); a warp with no block in the tile publishes a
+    // position past every horizon so its columns mask out.
+    __shared__ int s_qpos[I8_WARPS];
+    constexpr int DEAD_QPOS = 0x7fff0000;
 
     // Prologue view (dead after the Q drain barrier).
     auto s_q8 = reinterpret_cast<int8_t(*)[Q8_LD]>(s_arena);
@@ -479,15 +321,10 @@ paged_prefill_int8_kernel(
     auto s_k_scale = reinterpret_cast<__half(*)[N_WIN]>(s_arena + OFF_KS);
     auto s_v8t = reinterpret_cast<int8_t(*)[V8T_LD]>(s_arena + OFF_V8T);
     auto s_v_scale = reinterpret_cast<__half*>(s_arena + OFF_VS);
-    uint8_t* s_tbl_k = s_arena + OFF_TBLK;
-    uint8_t* s_tbl_v = s_arena + OFF_TBLV;
 
     // Scratch tenant views (inside the tile overlay). Temporally disjoint:
-    //   s_raw_k/v — bulk-copied raw quant-block spans, SEALED staging only.
-    //   s_fresh   — FP16 V stash for the per-dim requant, FRESH staging only.
-    //   s_p8      — per-warp quantized P tiles, COMPUTE phase only.
-    char* s_raw_k = (char*)(s_arena + OFF_SCR);
-    char* s_raw_v = s_raw_k + RAW_BYTES;
+    //   s_fresh — FP16 V stash for the per-dim requant, STAGING only.
+    //   s_p8    — per-warp quantized P tiles, COMPUTE phase only.
     auto s_fresh = reinterpret_cast<__half(*)[HEAD_DIM]>(s_arena + OFF_SCR);
     auto s_p8 = reinterpret_cast<int8_t(*)[16][V8T_LD]>(s_arena + OFF_SCR);
 
@@ -573,7 +410,6 @@ paged_prefill_int8_kernel(
             }
         }
     }
-    if (tid == 0) s_tbl_valid = 0;
     __syncthreads();
 
     // ------------------------------------------------------------------
@@ -605,339 +441,199 @@ paged_prefill_int8_kernel(
     float m_run[2] = { -INFINITY, -INFINITY };
     float l_run[2] = { 0.f, 0.f };
 
-    // ==================================================================
-    // Tile loop: sealed slices (logical [0, prefix_len)), then fresh
-    // 32-token tiles (logical [prefix_len, kv_len), staged from inputs).
-    // ==================================================================
-    int cur = 0;
-    int tile_ord = 0; // tile ordinal (sealed and fresh), for split-KV round-robin
-    while (cur < kv_len) {
-        const bool fresh = (cur >= prefix_len);
-        int tile_len;
-        int in_blk0 = 0;
-        const uint8_t* sl_head = nullptr;
+    // ------------------------------------------------------------------
+    // Block walk. The block's query tokens between them select a bounded
+    // set of `QB`-position selection blocks whatever the depth; each tile
+    // packs the next NB = 32 / QB of them in ascending order, so the tile
+    // loop's trip count is bounded by the rows' combined budget. A launch
+    // without a selection walks 32-position blocks, one per tile — the
+    // dense causal read. The walk is warp-private register state; every
+    // warp derives the same block sequence, so the tile's composition
+    // stays block-uniform without a handoff (see qsa_walk.cuh).
+    //
+    // Warp w stages columns 4w..4w+3: the cells `my_to..my_to+3` of the
+    // tile's block `my_blk` (one warp per block at QB 4, all eight on the
+    // single block at QB 32).
+    // ------------------------------------------------------------------
+    static_assert(I8_M_ROWS <= QSA_WALK_MAX_ROWS,
+                  "the walk binds one query row per lane slot");
+    QsaWalk walk;
+    if (qsa_active(sel)) {
+        walk.init(sel, q_start + t0, min(block_m_tok, q_len - t0), lane);
+    } else {
+        walk.init_dense(min(block_m_tok, q_len - t0), I8_TILE_TOK, lane);
+    }
+    const int QB = walk.ratio;
+    const int NB = I8_TILE_TOK / QB;
+    const int my_blk = (warp * I8_COLS_PER_WARP) / QB;
+    const int my_to = warp * I8_COLS_PER_WARP - my_blk * QB;
 
-        if (!fresh) {
-            int sl_idx;
-            resolve_pos(slot_hdr, cur, sl_idx, in_blk0);
-            const uint8_t* sl = get_slice<HEAD_DIM>(slot_hdr.slices_ptr, sl_idx, n_kv_head);
-            sl_head = get_head<HEAD_DIM>(sl, kv_head_idx);
-            int sl_off = (int)slice_offset(sl);
-            int sl_len = (int)slice_len(sl);
-            int remaining = sl_off + sl_len - in_blk0;
-            tile_len = min(min(remaining, prefix_len - cur), I8_TILE_TOK);
-            if (tile_len <= 0) { cur += 1; continue; } // defensive: skip hole
-        } else {
-            tile_len = min(kv_len - cur, I8_TILE_TOK);
+    // Per-warp slice binding for sealed columns: the slice whose palette
+    // metadata sits in s_wext[warp] and whose rank tables sit in
+    // s_wrank[warp] (-1 until the first sealed column; the rank tables
+    // are rebuilt on the first bind and thereafter only on a map change).
+    int bound_slice = -1;
+    auto bind_slice = [&](int sl_idx) {
+        const uint8_t* sl = get_slice<HEAD_DIM>(slot_hdr.slices_ptr, sl_idx, n_kv_head);
+        const uint8_t* head = get_head<HEAD_DIM>(sl, kv_head_idx);
+        if (lane < 2 * N_PALETTE) {
+            const int side = lane / N_PALETTE;
+            const int p = lane - side * N_PALETTE;
+            const int fmt = side ? kvhead_v_fmt<HEAD_DIM>(head, p)
+                                 : kvhead_k_fmt<HEAD_DIM>(head, p);
+            const int es = ArenaFormat::float_elem_size(fmt);
+            s_wext_base[warp][side][p] = (const char*)(uintptr_t)(
+                side ? kvhead_v_ptr<HEAD_DIM>(head, p) : kvhead_k_ptr<HEAD_DIM>(head, p));
+            s_wext_fmt[warp][side][p] = fmt;
+            s_wext_bb[warp][side][p] = (es == 0) ? ArenaAccessor::get_quant_block_bytes(fmt) : 0;
+            s_wext_scl[warp][side][p] = side ? kvhead_v_scale<HEAD_DIM>(head, p)
+                                             : kvhead_k_scale<HEAD_DIM>(head, p);
         }
-        // Round-robin tiles across shards — fresh tiles included (pinning
-        // them to one shard measured as a ~9% SM-imbalance). The skip is
-        // block-uniform (every thread computes identical cursor state),
-        // so the staging barriers below stay convergent.
-        bool mine = (tile_ord % num_splits) == split_idx;
+        // Consecutive slices usually share routing: re-rank only when the
+        // maps differ from the ones the rank bytes were computed under.
+        const uint8_t* k_pal = kvhead_k_pal_map<HEAD_DIM>(head);
+        const uint8_t* v_pal = kvhead_v_pal_map<HEAD_DIM>(head);
+        const uint32_t kw = (lane < MAP_WORDS) ? ((const uint32_t*)k_pal)[lane] : 0u;
+        const uint32_t vw = (lane < MAP_WORDS) ? ((const uint32_t*)v_pal)[lane] : 0u;
+        bool same = (bound_slice >= 0);
+        if (lane < MAP_WORDS)
+            same = same && (kw == s_wmap[warp][0][lane]) && (vw == s_wmap[warp][1][lane]);
+        same = __all_sync(0xffffffffu, same);
+        if (!same) {
+            if (lane < MAP_WORDS) {
+                s_wmap[warp][0][lane] = kw;
+                s_wmap[warp][1][lane] = vw;
+            }
+            #pragma unroll
+            for (int w = 0; w < N_WIN; ++w) {
+                int p, rank;
+                const int d = lane + 32 * w;
+                prefill_pal_rank(k_pal, d, &p, &rank);
+                s_wrank[warp][0][d] = (uint8_t)((p << 6) | rank);
+                prefill_pal_rank(v_pal, d, &p, &rank);
+                s_wrank[warp][1][d] = (uint8_t)((p << 6) | rank);
+            }
+        }
+        bound_slice = sl_idx;
+        __syncwarp();
+    };
+
+    // ==================================================================
+    // Tile loop: each tile is the next NB selected blocks, packed.
+    // ==================================================================
+    int bound = 0;    // next block start the walk may return
+    int tile_ord = 0; // visited-tile ordinal, for split-KV round-robin
+    for (;;) {
+        // ---- WALK (every warp, identical): the tile's blocks ----
+        // rm[h]: lane's row h's selected-cell bits over the tile's 32
+        // columns (block b's cells at bits b·QB ..). my_q: the start of
+        // this warp's block, or END when the tile ends before it.
+        uint32_t rm[QSA_WALK_ROWS_PER_LANE] = { 0u, 0u };
+        int my_q = QSA_WALK_END;
+        int n_blk = 0;
+        for (int b = 0; b < NB; ++b) {
+            uint32_t mk[QSA_WALK_ROWS_PER_LANE];
+            const int q = walk.next(bound, mk);
+            if (q >= kv_len) break;
+            rm[0] |= mk[0] << (b * QB);
+            rm[1] |= mk[1] << (b * QB);
+            if (b == my_blk) my_q = q;
+            n_blk = b + 1;
+            bound = q + QB;
+        }
+        if (n_blk == 0) break;
+        // Round-robin tiles across shards. The skip is block-uniform
+        // (every thread computes identical walk state), so the staging
+        // barriers below stay convergent.
+        const bool mine = (tile_ord % num_splits) == split_idx;
         tile_ord += 1;
-        if (!mine) {
-            cur += tile_len;
-            continue;
-        }
+        if (!mine) continue;
 
         // -------------------- STAGE (all warps) --------------------
-        if (!fresh) {
-            constexpr int TOK_PER_WARP = I8_TILE_TOK / I8_WARPS; // 4
-            const uint8_t* k_pal = kvhead_k_pal_map<HEAD_DIM>(sl_head);
-            const uint8_t* v_pal = kvhead_v_pal_map<HEAD_DIM>(sl_head);
-
-            // Raw-span fill: bulk-copy each palette's 32-token span into
-            // smem with 16-byte cp.async. This is the coalescing fix for
-            // the profiler's dominant finding — per-element extraction
-            // straight from global wasted ~79% of its sectors; the bulk
-            // copy is fully coalesced and the decodes below hit smem.
-            //
-            // Quant palettes copy their block run (≤ 36 B/dim). Dtype
-            // palettes (F16/BF16/F8 — unsealed float prefixes, glue) copy
-            // the raw element span; both sides' dtype spans cannot fit the
-            // scratch simultaneously, so a tile containing ANY dtype
-            // palette stages K and V SEQUENTIALLY through one
-            // RAW_SLOT_D-strided region (two extra barriers). All-quant
-            // tiles — the sealed production path — keep the simultaneous
-            // K+V fill. Non-hop palettes (R16, F32, unaligned spans) keep
-            // their global base and decode element-wise.
-            auto issue_side = [&](int side, int slot_bytes, char* region) {
-                #pragma unroll 1
-                for (int p = 0; p < N_PALETTE; ++p) {
-                    const char* gb = (const char*)(uintptr_t)(
-                        side ? kvhead_v_ptr<HEAD_DIM>(sl_head, p)
-                             : kvhead_k_ptr<HEAD_DIM>(sl_head, p));
-                    const int fmt = side ? kvhead_v_fmt<HEAD_DIM>(sl_head, p)
-                                         : kvhead_k_fmt<HEAD_DIM>(sl_head, p);
-                    const int es = ArenaFormat::float_elem_size(fmt);
-                    int bb = 0;
-                    int span = 0;
-                    if (es == 0) {
-                        bb = ArenaAccessor::get_quant_block_bytes(fmt);
-                        if (bb * SUB <= slot_bytes) span = SUB * bb;
-                    } else if (I8_TILE_TOK * SUB * es <= slot_bytes) {
-                        span = I8_TILE_TOK * SUB * es;
-                    }
-                    const char* eb = gb;
-                    if (span > 0 && (((uintptr_t)gb & 15) == 0)) {
-                        char* rb = region + p * slot_bytes;
-                        // span is a multiple of 16 (SUB ≥ 16, even sizes).
-                        for (int u = tid * 16; u < span; u += I8_THREADS * 16)
-                            i8_cp_async16(rb + u, gb + u);
-                        eb = rb;
-                    }
-                    if (tid == 0) {
-                        s_ext_base[side][p] = eb;
-                        s_ext_fmt[side][p] = fmt;
-                        s_ext_bb[side][p] = (es == 0) ? bb : 0;
-                        s_ext_scl[side][p] = side
-                            ? kvhead_v_scale<HEAD_DIM>(sl_head, p)
-                            : kvhead_k_scale<HEAD_DIM>(sl_head, p);
-                    }
-                }
-            };
-            bool tile_has_dtype = false;
-            #pragma unroll 1
-            for (int sp = 0; sp < 2 * N_PALETTE; ++sp) {
-                const int p = sp & (N_PALETTE - 1);
-                const int fmt = (sp >= N_PALETTE)
-                    ? kvhead_v_fmt<HEAD_DIM>(sl_head, p)
-                    : kvhead_k_fmt<HEAD_DIM>(sl_head, p);
-                const int es = ArenaFormat::float_elem_size(fmt);
-                tile_has_dtype |= (es == 1 || es == 2);
-            }
-            if (tile_has_dtype) {
-                // Phase K only; V fills after the K extract reuses the region.
-                issue_side(0, RAW_SLOT_D, s_raw_k);
-            } else {
-                issue_side(0, RAW_SLOT, s_raw_k);
-                issue_side(1, RAW_SLOT, s_raw_v);
-            }
-            i8_cp_commit();
-            i8_cp_wait0();
-
-            // Palette tables for this slice (one per tile — slice-aligned
-            // tiles cannot straddle maps). Consecutive slices usually share
-            // routing, so the rebuild + its barrier are skipped when the
-            // incoming maps match the cached ones. The comparison inputs are
-            // identical for every thread, so the branch (and its barrier)
-            // stay block-uniform.
-            bool tbl_hit = (s_tbl_valid != 0) &&
-                           pal_map_equal<HEAD_DIM>(k_pal, s_pal_cache) &&
-                           pal_map_equal<HEAD_DIM>(v_pal, s_pal_cache + HEAD_DIM / 4);
-            // Every thread must finish READING the cache before the rebuild
-            // below WRITES it — a fast thread's cache update racing a slow
-            // thread's comparison makes `tbl_hit` diverge, and a divergent
-            // conditional barrier is arrival-counted: threads pair up across
-            // DIFFERENT __syncthreads and silently release
-            // (racecheck-confirmed; presented as a rare A/B flake). This
-            // barrier also publishes the raw-span fill + s_ext metadata
-            // (every thread drained its own cp.async groups above).
-            __syncthreads();
-            if (!tbl_hit) {
-                for (int d = tid; d < HEAD_DIM; d += I8_THREADS) {
-                    int p, rank;
-                    prefill_pal_rank(k_pal, d, &p, &rank);
-                    s_tbl_k[d] = (uint8_t)((p << 6) | rank);
-                    prefill_pal_rank(v_pal, d, &p, &rank);
-                    s_tbl_v[d] = (uint8_t)((p << 6) | rank);
-                }
-                for (int b = tid; b < HEAD_DIM / 4; b += I8_THREADS) {
-                    s_pal_cache[b] = k_pal[b];
-                    s_pal_cache[HEAD_DIM / 4 + b] = v_pal[b];
-                }
-                if (tid == 0) s_tbl_valid = 1;
-                __syncthreads();
-            }
-
-            // K: each warp decodes its own tokens' dims straight from the
-            // staged raw spans (or global for non-hop palettes), RoPEs,
-            // and requants. No FP16 exchange hop — the rank→natural
-            // permutation is in the table-indexed reads themselves, so K
-            // staging is a single warp-private pass.
-            for (int jj = 0; jj < TOK_PER_WARP; ++jj) {
-                int j = warp * TOK_PER_WARP + jj;
-                float x[N_WIN];
-                if (j < tile_len) {
-                    int within = in_blk0 + j;
-                    #pragma unroll
-                    for (int w = 0; w < N_WIN; ++w) {
-                        int d = lane + 32 * w;
-                        uint8_t t = s_tbl_k[d];
-                        int p = (t >> 6) & (N_PALETTE - 1);
-                        x[w] = i8_arena_elem(s_ext_fmt[0][p], s_ext_bb[0][p],
-                                             s_ext_base[0][p], t & 63, within,
-                                             s_ext_scl[0][p], SUB);
-                    }
-                    int pos = cur + j + (int)rope_base;
-                    i8_apply_rope<HEAD_DIM, N_WIN>(x, pos, lane, rope_interleaved, rope_cs);
-                } else {
-                    #pragma unroll
-                    for (int w = 0; w < N_WIN; ++w) x[w] = 0.f;
-                }
+        // Warp w decodes its four columns into s_k8 / s_k_scale and stashes
+        // V (natural dims, FP16) in s_fresh; the per-dim V requant below
+        // runs over the whole tile once every column is in. Sealed columns
+        // come from the arena through the warp's slice binding, fresh ones
+        // from the packed inputs; a column past the tile's blocks (or past
+        // kv_len inside a partial last block) is zero and masked with
+        // P == 0 in the compute phase.
+        #pragma unroll 1
+        for (int tt = 0; tt < I8_COLS_PER_WARP; ++tt) {
+            const int j = warp * I8_COLS_PER_WARP + tt;
+            const int pos = (my_q == QSA_WALK_END) ? kv_len : my_q + my_to + tt;
+            // K stays in registers for RoPE (pairs (w, w + N_WIN/2) are
+            // in-thread); V goes straight to the stash, one dim at a time.
+            float x[N_WIN];
+            if (pos >= kv_len) {
                 #pragma unroll
                 for (int w = 0; w < N_WIN; ++w) {
-                    float a = fabsf(x[w]);
-                    #pragma unroll
-                    for (int off = 16; off > 0; off >>= 1)
-                        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-                    float scale = a / 127.f;
-                    float inv = (scale > 0.f) ? 1.f / scale : 0.f;
-                    s_k8[j][lane + 32 * w] = i8_quant(x[w], inv);
-                    if (lane == 0) s_k_scale[j][w] = __float2half(scale);
+                    x[w] = 0.f;
+                    s_fresh[j][lane + 32 * w] = __float2half(0.f);
+                }
+            } else if (pos >= prefix_len) {
+                const int tok = pos - prefix_len; // fresh token index
+                const QT* kr = k_packed + ((int64_t)(q_start + tok) * n_kv_head + kv_head_idx) * HEAD_DIM;
+                const QT* vr = v_packed + ((int64_t)(q_start + tok) * n_kv_head + kv_head_idx) * HEAD_DIM;
+                #pragma unroll
+                for (int w = 0; w < N_WIN; ++w) {
+                    x[w] = qt_to_f32<QT>(kr[lane + 32 * w]);
+                    s_fresh[j][lane + 32 * w] = __float2half(qt_to_f32<QT>(vr[lane + 32 * w]));
+                }
+            } else {
+                int sl_idx, in_blk;
+                resolve_pos(slot_hdr, pos, sl_idx, in_blk);
+                if (sl_idx != bound_slice) bind_slice(sl_idx); // warp-uniform
+                #pragma unroll
+                for (int w = 0; w < N_WIN; ++w) {
+                    const int d = lane + 32 * w;
+                    const int tk = s_wrank[warp][0][d];
+                    const int pk = (tk >> 6) & (N_PALETTE - 1);
+                    x[w] = i8_arena_elem(s_wext_fmt[warp][0][pk], s_wext_bb[warp][0][pk],
+                                         s_wext_base[warp][0][pk], tk & 63, in_blk,
+                                         s_wext_scl[warp][0][pk], SUB);
+                    const int tv = s_wrank[warp][1][d];
+                    const int pv = (tv >> 6) & (N_PALETTE - 1);
+                    const float v = i8_arena_elem(s_wext_fmt[warp][1][pv], s_wext_bb[warp][1][pv],
+                                                  s_wext_base[warp][1][pv], tv & 63, in_blk,
+                                                  s_wext_scl[warp][1][pv], SUB);
+                    s_fresh[j][lane + 32 * w] = __float2half(v);
                 }
             }
-
-            if (tile_has_dtype) {
-                // Dtype tiles: every warp is done reading the K spans (each
-                // warp's K extract completed above in program order, and the
-                // barrier makes that global), so the region can host the V
-                // spans. The second barrier publishes them + s_ext[1].
-                __syncthreads();
-                issue_side(1, RAW_SLOT_D, s_raw_k);
-                i8_cp_commit();
-                i8_cp_wait0();
-                __syncthreads();
-            }
-
-            // V: read-through when every palette's format is an int8
-            // passthrough family — arena bytes go straight to the V^T slab
-            // in natural dim order, scale = block scale / palette scale.
-            // Per-element extraction has no lane-width constraint, so this
-            // engages at every head dim. Dead columns (j ≥ tile_len) stay
-            // untouched: the compute phase masks them with P == 0.
-            bool v_rt = true;
+            if (pos < kv_len)
+                i8_apply_rope<HEAD_DIM, N_WIN>(x, pos + (int)rope_base, lane, rope_interleaved, rope_cs);
             #pragma unroll
-            for (int p = 0; p < N_PALETTE; ++p)
-                v_rt = v_rt && (s_ext_bb[1][p] > 0) &&
-                       ArenaAccessor::is_int8_readthrough_format(s_ext_fmt[1][p]);
-            if (v_rt) {
-                // The warp's 4 tokens pack into ONE aligned 4-byte store
-                // per dim (V8T_LD's byte columns are 4-way bank-conflicted
-                // by construction — ldmatrix needs 16 | LD, conflict-free
-                // byte columns need LD/4 coprime to 32 — so the lever is
-                // 4× fewer stores). Dead trailing tokens pack as zero;
-                // wholly-dead warps write nothing (masked by P == 0).
-                const int j0 = warp * TOK_PER_WARP;
-                if (j0 < tile_len) {
-                    #pragma unroll
-                    for (int w = 0; w < N_WIN; ++w) {
-                        int d = lane + 32 * w;
-                        uint8_t t = s_tbl_v[d];
-                        int p = (t >> 6) & (N_PALETTE - 1);
-                        const char* blk =
-                            s_ext_base[1][p] + (int64_t)(t & 63) * s_ext_bb[1][p];
-                        int fmt = s_ext_fmt[1][p];
-                        uint32_t pack = 0;
-                        float sblk = 0.f;
-                        #pragma unroll
-                        for (int jj = 0; jj < TOK_PER_WARP; ++jj) {
-                            if (j0 + jj < tile_len) {
-                                Int8Sample smp = i8_rt_elem(fmt, blk, in_blk0 + j0 + jj);
-                                pack |= (uint32_t)(uint8_t)smp.v << (8 * jj);
-                                if (jj == 0) sblk = smp.s;
-                            }
-                        }
-                        float inv = 1.f / s_ext_scl[1][p];
-                        *(uint32_t*)&s_v8t[d][j0] = pack;
-                        // Same-value cross-warp race: smp.s is per (dim,
-                        // block) and the tile is one block, so every warp's
-                        // write of s_v_scale[d] carries the identical value.
-                        s_v_scale[d] = __float2half(sblk * inv);
-                    }
-                }
-            } else {
-                // FP fallback (asymmetric / curve / dtype V palettes): per
-                // natural dim, two passes over the tile's tokens decoded
-                // straight from the raw spans — max-abs, then requant. Two
-                // passes instead of a 32-float register array, which is
-                // guaranteed spill at the 64-reg 4-blocks/SM cap. No
-                // barrier: the decode source is the (already published)
-                // raw spans, not a cross-warp exchange slab.
-                for (int rr = tid; rr < HEAD_DIM; rr += I8_THREADS) {
-                    uint8_t t = s_tbl_v[rr];
-                    int p = (t >> 6) & (N_PALETTE - 1), r = t & 63;
-                    int fmt = s_ext_fmt[1][p], bb = s_ext_bb[1][p];
-                    const char* pb = s_ext_base[1][p];
-                    float scl = s_ext_scl[1][p];
-                    float a = 0.f;
-                    for (int j = 0; j < I8_TILE_TOK; ++j) {
-                        float v = (j < tile_len)
-                            ? i8_arena_elem(fmt, bb, pb, r, in_blk0 + j, scl, SUB)
-                            : 0.f;
-                        a = fmaxf(a, fabsf(v));
-                    }
-                    float scale = a / 127.f;
-                    float inv = (scale > 0.f) ? 1.f / scale : 0.f;
-                    for (int j4 = 0; j4 < I8_TILE_TOK; j4 += 4) {
-                        uint32_t pack = 0;
-                        #pragma unroll
-                        for (int jj = 0; jj < 4; ++jj) {
-                            int j = j4 + jj;
-                            float v = (j < tile_len)
-                                ? i8_arena_elem(fmt, bb, pb, r, in_blk0 + j, scl, SUB)
-                                : 0.f;
-                            pack |= (uint32_t)(uint8_t)i8_quant(v, inv) << (8 * jj);
-                        }
-                        *(uint32_t*)&s_v8t[rr][j4] = pack;
-                    }
-                    s_v_scale[rr] = __float2half(scale);
-                }
-            }
-        } else {
-            // Fresh tile: K/V straight from the packed inputs, natural order.
-            for (int j = warp; j < I8_TILE_TOK; j += I8_WARPS) {
-                int tok = (cur - prefix_len) + j; // fresh token index
-                float x[N_WIN];
-                float v[N_WIN];
-                if (j < tile_len) {
-                    const QT* kr = k_packed + ((int64_t)(q_start + tok) * n_kv_head + kv_head_idx) * HEAD_DIM;
-                    const QT* vr = v_packed + ((int64_t)(q_start + tok) * n_kv_head + kv_head_idx) * HEAD_DIM;
-                    #pragma unroll
-                    for (int w = 0; w < N_WIN; ++w) {
-                        x[w] = qt_to_f32<QT>(kr[lane + 32 * w]);
-                        v[w] = qt_to_f32<QT>(vr[lane + 32 * w]);
-                    }
-                    int pos = cur + j + (int)rope_base;
-                    i8_apply_rope<HEAD_DIM, N_WIN>(x, pos, lane, rope_interleaved, rope_cs);
-                } else {
-                    #pragma unroll
-                    for (int w = 0; w < N_WIN; ++w) { x[w] = 0.f; v[w] = 0.f; }
-                }
+            for (int w = 0; w < N_WIN; ++w) {
+                float a = fabsf(x[w]);
                 #pragma unroll
-                for (int w = 0; w < N_WIN; ++w) {
-                    float a = fabsf(x[w]);
-                    #pragma unroll
-                    for (int off = 16; off > 0; off >>= 1)
-                        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-                    float scale = a / 127.f;
-                    float inv = (scale > 0.f) ? 1.f / scale : 0.f;
-                    s_k8[j][lane + 32 * w] = i8_quant(x[w], inv);
-                    if (lane == 0) s_k_scale[j][w] = __float2half(scale);
-                    // stash V into the FP scratch for the per-dim pass below
-                    s_fresh[j][lane + 32 * w] = __float2half(v[w]);
-                }
-            }
-            __syncthreads();
-            for (int rr = tid; rr < HEAD_DIM; rr += I8_THREADS) {
-                float a = 0.f;
-                #pragma unroll
-                for (int j = 0; j < I8_TILE_TOK; ++j)
-                    a = fmaxf(a, fabsf(__half2float(s_fresh[j][rr])));
+                for (int off = 16; off > 0; off >>= 1)
+                    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
                 float scale = a / 127.f;
                 float inv = (scale > 0.f) ? 1.f / scale : 0.f;
-                for (int j4 = 0; j4 < I8_TILE_TOK; j4 += 4) {
-                    uint32_t pack = 0;
-                    #pragma unroll
-                    for (int jj = 0; jj < 4; ++jj)
-                        pack |= (uint32_t)(uint8_t)i8_quant(
-                                    __half2float(s_fresh[j4 + jj][rr]), inv)
-                                << (8 * jj);
-                    *(uint32_t*)&s_v8t[rr][j4] = pack;
-                }
-                s_v_scale[rr] = __float2half(scale);
+                s_k8[j][lane + 32 * w] = i8_quant(x[w], inv);
+                if (lane == 0) s_k_scale[j][w] = __float2half(scale);
             }
+        }
+        if (lane == 0) s_qpos[warp] = (my_q == QSA_WALK_END) ? DEAD_QPOS : my_q + my_to;
+        __syncthreads();
+        // V: per natural dim, max-abs over the tile's 32 columns, then
+        // requant into the V^T slab (four columns per aligned store).
+        for (int rr = tid; rr < HEAD_DIM; rr += I8_THREADS) {
+            float a = 0.f;
+            #pragma unroll
+            for (int j = 0; j < I8_TILE_TOK; ++j)
+                a = fmaxf(a, fabsf(__half2float(s_fresh[j][rr])));
+            float scale = a / 127.f;
+            float inv = (scale > 0.f) ? 1.f / scale : 0.f;
+            for (int j4 = 0; j4 < I8_TILE_TOK; j4 += 4) {
+                uint32_t pack = 0;
+                #pragma unroll
+                for (int jj = 0; jj < 4; ++jj)
+                    pack |= (uint32_t)(uint8_t)i8_quant(
+                                __half2float(s_fresh[j4 + jj][rr]), inv)
+                            << (8 * jj);
+                *(uint32_t*)&s_v8t[rr][j4] = pack;
+            }
+            s_v_scale[rr] = __float2half(scale);
         }
         __syncthreads();
 
@@ -1001,14 +697,24 @@ paged_prefill_int8_kernel(
             }
         }
 
-        // Mask + scale. Column j's logical kv position is cur + j. The
+        // Mask + scale. Column j's logical kv position is the staging
+        // warp's block start plus its cell (s_qpos[j / 4] + j % 4; a dead
+        // warp's DEAD_QPOS fails the horizon). The row's selected cells are
+        // the walk's bit mask, fetched from the lane that owns the row
+        // (row r of the block's run lives on lane r & 31, half r >> 5) —
+        // every column a row attends is a bit test, no per-key search. The
         // causal horizons are per-tile transients (dead after this loop).
         int horizon[2];
+        uint32_t rmask[2];
         #pragma unroll
         for (int i = 0; i < 2; ++i) {
             int h = prefix_len + row_tok(i) + 1;
             if (h > kv_len) h = kv_len;
             horizon[i] = row_live(i) ? h : 0;
+            const int r = row_tok(i) - t0;
+            const uint32_t m0 = __shfl_sync(0xffffffffu, rm[0], r & 31);
+            const uint32_t m1 = __shfl_sync(0xffffffffu, rm[1], r & 31);
+            rmask[i] = row_live(i) ? ((r >= 32) ? m1 : m0) : 0u;
         }
         #pragma unroll
         for (int s = 0; s < 4; ++s) {
@@ -1017,7 +723,8 @@ paged_prefill_int8_kernel(
             for (int i = 0; i < 4; ++i) {
                 int j = ja + (i & 1);
                 int row = i >> 1;
-                bool ok = (j < tile_len) && (cur + j < horizon[row]);
+                const int pos = s_qpos[j / I8_COLS_PER_WARP] + (j % I8_COLS_PER_WARP);
+                const bool ok = (pos < horizon[row]) && ((rmask[row] >> j) & 1u);
                 sc[s][i] = ok ? sc[s][i] * softmax_scale : -INFINITY;
             }
         }
@@ -1100,7 +807,6 @@ paged_prefill_int8_kernel(
             }
         }
 
-        cur += tile_len;
         __syncthreads(); // staging buffers are reused next iteration
     }
 
@@ -1213,8 +919,17 @@ inline void launch_paged_prefill_int8(
     const uint32_t* rope_offsets,
     const float* rope_cs,
     int32_t rope_interleaved,
-    cudaStream_t stream
+    cudaStream_t stream,
+    QsaSel sel = {nullptr, nullptr, nullptr, nullptr, 0, 1}
 ) {
+    // The tile packs 32 / ratio selection blocks, so the ratio must divide
+    // the tile. A selection built at any other ratio is a host bug, not a
+    // runtime condition — refuse loudly rather than attend the wrong keys.
+    if (sel.entries != nullptr && !i8_ratio_supported(sel.ratio)) {
+        fprintf(stderr, "PAGED PREFILL INT8: unsupported QSA ratio %d (need 4, 8, 16 or 32)\n",
+                sel.ratio);
+        abort();
+    }
     int hpg = (n_kv_head > 0) ? n_head / n_kv_head : 1;
     if (hpg <= 0) hpg = 1;
     int block_m_tok = i8_m_rows(HEAD_DIM) / hpg;
@@ -1289,7 +1004,7 @@ inline void launch_paged_prefill_int8(
         headers_ptr, cu_seqlens_q, q_lens, kv_lens,
         (QT*)o_ptr, (int)batch_size, (int)n_head, (int)n_kv_head,
         softmax_scale, rope_offsets, rope_cs, (int)rope_interleaved,
-        num_splits, partials);
+        num_splits, partials, sel);
 
     if (num_splits > 1) {
         int64_t total_rows = (int64_t)total_q * n_head;

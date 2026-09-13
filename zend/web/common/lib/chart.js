@@ -13,6 +13,28 @@
  *   4. Time runs backwards: the right edge is "now", labels are ages.
  */
 
+/* Pin the canvas's CSS box so the backing store can never drive its layout.
+ *
+ * **Discipline 2, applied to width as well — which it was not, and that is the
+ * whole of the broken-layout bug.** `draw` writes `cv.width = cssW * dpr` to
+ * size the backing store, and `width`/`height` on a canvas are *presentational
+ * attributes*: with no CSS width, the element renders at whatever the attribute
+ * says. So each draw measured `clientWidth`, multiplied by the device ratio,
+ * and wrote that back as the element's own width — on a 2× display the canvas
+ * doubled on every poll, walking out of its panel and dragging the grid with
+ * it. Height escaped only because `cv.style.height` was already set here.
+ *
+ * `100%` makes CSS authoritative in both axes: the attribute stays a pure
+ * backing-store size, `clientWidth` reports the panel's width however the grid
+ * reflows, and `ResizeObserver` redraws at the new size. `display:block` drops
+ * the inline baseline gap that otherwise leaves a few stray pixels under every
+ * chart. */
+function sizeToBox(cv, logicalH) {
+  cv.style.display = 'block';
+  cv.style.width = '100%';
+  cv.style.height = logicalH + 'px';
+}
+
 const cssvar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const fmtN = (n, d = 0) => (isFinite(n) ? n : 0).toLocaleString(undefined,
   { maximumFractionDigits: d, minimumFractionDigits: d });
@@ -79,7 +101,7 @@ export function makeChart(cv, optsFn) {
   if (!cv) return null;
   const logical = cv.dataset.h ? +cv.dataset.h : (+cv.getAttribute('height') || 200);
   cv.dataset.h = logical;                 // never re-read the mutated attribute
-  cv.style.height = logical + 'px';
+  sizeToBox(cv, logical);
 
   const spec = { cv, optsFn, opts: optsFn(), h: logical, _mx: null, _raf: 0 };
   spec.draw = () => draw(spec);
@@ -189,7 +211,7 @@ function draw(spec) {
     g.stroke(); g.setLineDash([]);
   });
 
-  if (spec._mx != null && spec._mx >= padL && spec._mx <= padL + plotW && opts.tip) {
+  if (spec._mx != null && spec._mx >= padL && spec._mx <= padL + plotW) {
     let idx = 0, best = 1e9;
     for (let i = 0; i < xs.length; i++) {
       const d = Math.abs(X(xs[i]) - spec._mx);
@@ -199,7 +221,19 @@ function draw(spec) {
     g.strokeStyle = cssvar('--line-2'); g.lineWidth = 1;
     g.beginPath(); g.moveTo(hx, padT); g.lineTo(hx, padT + plotH); g.stroke();
 
-    const rows = opts.tip(idx) || [];
+    /* **A chart with named, formatted series already knows its own readout.**
+       This used to require every caller to hand-write `tip`, so a page that
+       declared nine charts and a tip for one got a hover readout on one — the
+       other eight drew a bare crosshair and no numbers, which reads as broken
+       rather than as unconfigured. The default reports each series' label and
+       its value at the hovered index, through that series' own axis formatter,
+       and `tip` still overrides wherever a caller wants to say something the
+       series cannot (the phase timeline's per-phase rates, for one). */
+    const rows = opts.tip ? (opts.tip(idx) || []) : opts.series.map((s) => {
+      const f = s.axis === 'r' ? (opts.y2Fmt || opts.fmt || fmtN) : (opts.yFmt || opts.fmt || fmtN);
+      const v = s.data[idx];
+      return { t: `${s.label ? s.label + ' ' : ''}${f(isFinite(v) ? v : 0)}`, c: s.color };
+    });
     g.font = '10.5px ' + cssvar('--mono');
     const tw = Math.max(...rows.map((r) => g.measureText(r.t).width)) + 20;
     const th = rows.length * 15 + 8;
@@ -227,7 +261,7 @@ export function makeStackChart(cv, optsFn) {
   if (!cv) return null;
   const logical = cv.dataset.h ? +cv.dataset.h : (+cv.getAttribute('height') || 200);
   cv.dataset.h = logical;
-  cv.style.height = logical + 'px';
+  sizeToBox(cv, logical);
 
   const spec = { cv, optsFn, opts: optsFn(), h: logical, _mx: null, _raf: 0 };
   spec.draw = () => drawStack(spec);

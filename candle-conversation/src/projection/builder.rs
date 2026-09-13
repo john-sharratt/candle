@@ -434,6 +434,30 @@ impl Builder {
 
     // ── Name-based lookups (YAML string → id) ─────────────────────────────────
 
+    /// Take a layer OUT of the provenance gather, by schema name. Returns
+    /// whether the layer was found.
+    ///
+    /// The runtime half of [`LayerSchema::gathered`] — the only writer. An
+    /// operator's `--disable-layer` decision belongs to one boot, so it is
+    /// applied to the built schema rather than declared in YAML, and it must be
+    /// applied BEFORE the first projection: the flag is read on every belief
+    /// scan and by both normalization warm-ups, so a layer cleared afterwards
+    /// would already have taught hit levels and returned candidates.
+    ///
+    /// Distinct from suppressing a layer's ingest. A layer can be populated and
+    /// not gathered (pointless), or gathered and not populated (`--skip-layer`,
+    /// the useful case: the substrate already holds its turns and they should
+    /// keep answering queries while nothing new is read from disk).
+    pub fn set_layer_gathered(&mut self, name: &str, gathered: bool) -> bool {
+        match self.schema.layers.iter_mut().find(|l| l.name == name) {
+            Some(l) => {
+                l.gathered = gathered;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Resolve a layer's YAML `name:` string to its id.
     /// Returns `None` for unknown names or when constructed via
     /// [`Builder::from_schema`] (which has no name maps).
@@ -1233,13 +1257,13 @@ impl Builder {
                         max_percent: None,
                         adaptive: None,
                     },
-                    default: None,
                     budget_adaptive: None,
                     locality: None,
                     anchor: None,
                 }],
                 policy: SelectionPolicy::default_policy(),
                 gather_scope: GatherScope::default(),
+                gathered: true,
                 // The only layer, so the bottom of its own stack.
                 rank: 0,
                 // This synthetic fallback layer IS the dialogue layer, so it takes

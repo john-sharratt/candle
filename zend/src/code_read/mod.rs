@@ -5,8 +5,11 @@
 //! scope-aware parts; each part contributes a prefilled `read_file`
 //! request, a prefilled `<tool_call>` echo, and a prefilled
 //! `<tool_response>` carrying the source with line numbers.  The
-//! whole-file summary is not decoded inline — it is the root of the
-//! async summary tree the summariser rolls up over these scope turns.
+//! whole-file summary is not decoded inline — it was to be the root of the
+//! async summary tree rolled up over these scope turns. **No such root exists
+//! today**: the summariser is disconnected (`ConversationEngine::new`), so a
+//! file is represented by its per-scope turns and nothing above them. Retrieval
+//! ranks those turns by provenance rather than reading a rolled-up digest.
 //!
 //! Refresh is per-file: content hashes ([`CodeReadState`]) decide
 //! which files changed; deleted files' conversations are tombstoned,
@@ -44,6 +47,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use candle_conversation::projection::{Builder, GroupId, LayerId, SystemPromptItem, TimelineId};
+use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::{ConversationEngine, SequenceConfig};
 use sha2::{Digest, Sha256};
 
@@ -517,6 +521,61 @@ fn reconcile_deleted(engine: &Mutex<ConversationEngine>, present_paths: &HashSet
     }
 }
 
+/// Retire every crashed-partial `code_read` conversation, up front.
+///
+/// The `code_read` twin of `repo_scan::retire_crashed_partials`, and the same
+/// completion protocol: `path` is written at conversation creation and
+/// `content_sha256` only once the file's ingest succeeds, so `path` without a
+/// hash means "started, never committed". [`process_one_file`] already retires
+/// one such partial per path, but only when that path comes back through the
+/// pool — so with `--skip-layer code_reading`, an aborted pass, or the failure
+/// cap tripped, the debris stays live and keeps competing in the provenance
+/// gather with scope turns whose summaries were never decoded.
+///
+/// **Uploads are exempt, for the reason [`reconcile_deleted`] exempts them.**
+/// They live under the endpoint-managed `uploads/` dir that `walk_workspace`
+/// skips, so they never come back through the pool to be re-ingested — and
+/// tombstoning one here would delete freshly-uploaded content with nothing to
+/// rebuild it from. `reconcile_deleted` guards against exactly this and the
+/// guard has to travel with the second sweep.
+///
+/// Called ONCE per boot from the session's ingest pre-loop, for every layer not
+/// named by `--disable-layer` — including a `--skip-layer` layer, which runs no
+/// pass and so would otherwise never sweep. Never called from
+/// [`refresh_code_reading`]: a refresh can overlap a live pool, and an in-flight
+/// file is indistinguishable from a crashed one by metadata alone.
+pub(crate) fn retire_crashed_partials(engine: &Mutex<ConversationEngine>) {
+    let e = engine.lock().unwrap();
+    let mut retired = 0usize;
+    for (tl, path) in e.conversations_with_metadata_key("path") {
+        if is_upload_path(&path) {
+            continue;
+        }
+        let committed = e
+            .conversation_metadata(tl)
+            .is_some_and(|m| m.contains_key("content_sha256"));
+        if committed {
+            continue;
+        }
+        match e.tombstone_timeline(tl) {
+            Ok(()) => retired += 1,
+            Err(err) => tracing::warn!(
+                target: "zend::code_read::ingest",
+                path = %path,
+                "tombstone of crashed-partial conversation failed: {err:#}",
+            ),
+        }
+    }
+    if retired > 0 {
+        tracing::info!(
+            target: "zend::code_read::ingest",
+            retired,
+            "retired crashed-partial code_read conversations (no content hash) \
+             so their half-built scope chains leave the provenance gather",
+        );
+    }
+}
+
 /// Top-level `code_reading` ingestion — **one conversation per file**.
 ///
 /// Each file becomes its own `(code_reading, scopes)` conversation: one
@@ -574,6 +633,8 @@ pub fn ingest_code_reading(
         .iter()
         .map(|(f, _, _, _)| f.path.as_str())
         .collect();
+    // Crashed partials are NOT swept here; the sweep is the caller's, for the
+    // reason given on [`retire_crashed_partials`].
     reconcile_deleted(engine, &present_paths);
     let present_hashes = engine
         .lock()
@@ -639,6 +700,15 @@ fn run_file_pool(
     // stops a flood, as reported state rather than a fatal error. See
     // `crate::ingest_report`.
     let failures = Failures::new();
+    // `<think>` bound to `ThinkMode::Off`'s tree, for every scope summary decode
+    // in the pass. Compiled once, for the reason given on `IngestPlan::triggers`
+    // in `repo_scan`: the compile clones the tokenizer.
+    let triggers = {
+        let en = engine.lock().unwrap();
+        en.compile_think_steering()?
+            .map(|ts| ts.registry_for(&TriggerRegistry::new(), ThinkMode::Off))
+            .unwrap_or_else(|| Arc::new(TriggerRegistry::new()))
+    };
 
     std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(n_workers);
@@ -671,6 +741,7 @@ fn run_file_pool(
                     &done,
                     &failures,
                     progress,
+                    &triggers,
                 ) {
                     // An error escaping `process_one_file` is an unexpected one
                     // (its own failure mode records and returns Ok). Record it
@@ -729,8 +800,9 @@ fn run_file_pool(
 /// otherwise prefill each carved part (read_file tool-call + response),
 /// tag the conversation with its content hash + metadata, then drop it
 /// (freeing the GPU slot; the sealed turns + tags persist in the
-/// substrate). The file summary is not decoded here — it is the async
-/// summary tree's root, rolled up later by the background summariser.
+/// substrate). The file summary is not decoded here — it was to be the async
+/// summary tree's root, rolled up later by the background summariser, which is
+/// currently disconnected. The scope turns stand on their own.
 #[allow(clippy::too_many_arguments)]
 fn process_one_file(
     engine: &Mutex<ConversationEngine>,
@@ -748,6 +820,7 @@ fn process_one_file(
     done: &Arc<AtomicUsize>,
     failures: &Failures,
     progress: &Arc<LoadProgress>,
+    triggers: &Arc<TriggerRegistry>,
 ) -> anyhow::Result<()> {
     // Resume cache: this content hash was already in the (live, non-
     // tombstoned) substrate at ingest start — skip the prefill+decode.
@@ -856,7 +929,7 @@ fn process_one_file(
         })
     };
     let emit_result = {
-        let mut sink = SequenceTurnSink::new(&mut conv);
+        let mut sink = SequenceTurnSink::new(&mut conv, Arc::clone(triggers));
         emit_file_turns(
             &mut sink,
             &file.path,

@@ -45,7 +45,7 @@ use std::sync::{Mutex, OnceLock};
 
 use candle::{DType, Device, DeviceLocation, LiveTensor, Result, Tensor};
 
-use super::types::DeltaNetDims;
+use super::types::{DeltaNetDims, ZGate};
 
 /// The carried per-sequence state of one DeltaNet layer.
 ///
@@ -1309,6 +1309,7 @@ pub fn delta_net_mix<'w>(
     dims: &DeltaNetDims,
     state: &mut DeltaNetState,
     rms_eps: f64,
+    zgate: ZGate,
 ) -> Result<LiveTensor<'w>> {
     let (t, _) = p.qkv.dims2()?;
     // One carried state, so the write half shares `s` and scratches the conv
@@ -1321,7 +1322,7 @@ pub fn delta_net_mix<'w>(
         out,
         stash: None,
     }];
-    let mixed = delta_net_mix_spans(p, c, dims, &mut one, rms_eps, None)?;
+    let mixed = delta_net_mix_spans(p, c, dims, &mut one, rms_eps, None, zgate)?;
     let [seq] = one;
     seq.state.absorb_solo(&seq.out)?;
     Ok(mixed)
@@ -1356,6 +1357,7 @@ pub fn delta_net_mix_spans<'w>(
     seqs: &mut [DeltaNetSeq<'_>],
     rms_eps: f64,
     table: Option<&DeltaNetLayerTable>,
+    zgate: ZGate,
 ) -> Result<LiveTensor<'w>> {
     let (t, _) = p.qkv.dims2()?;
     let (h_k, h_v, d) = (dims.n_k_heads, dims.n_v_heads, dims.head_dim);
@@ -1462,7 +1464,10 @@ pub fn delta_net_mix_spans<'w>(
         if let Some(sp) = spans.as_ref() {
             super::cuda::delta_net_prefill_scan(&fused, sp)?;
         }
-        return super::cuda::delta_net_norm_gate(&o, &p.z, c.norm, d, rms_eps as f32);
+        // The z-gate is a kernel template instantiation: SiLU for the Qwen3.5
+        // lineage, sigmoid for qwen4exp (§12.6 — the one numerical difference
+        // between the two generations' GDN).
+        return super::cuda::delta_net_norm_gate(&o, &p.z, c.norm, d, rms_eps as f32, zgate);
     }
 
     // Causal conv, then SiLU.
@@ -1578,7 +1583,11 @@ pub fn delta_net_mix_spans<'w>(
 
     // Gated per-head norm, then flatten for the output projection.
     let z_heads = p.z.reshape((t, h_v, d))?;
-    let gated = rms_norm_per_head(&o, w.norm, rms_eps)?.mul(&silu(&z_heads)?)?;
+    let z_gate = match zgate {
+        ZGate::Silu => silu(&z_heads)?,
+        ZGate::Sigmoid => candle_nn::ops::sigmoid(&z_heads)?,
+    };
+    let gated = rms_norm_per_head(&o, w.norm, rms_eps)?.mul(&z_gate)?;
     gated.reshape((t, dims.value_dim()))
 }
 
@@ -1704,7 +1713,9 @@ pub fn delta_net_advance_spans(
             },
             stash: None,
         }];
-        let _ = delta_net_mix_spans(&view, c, dims, &mut one, rms_eps, None)?;
+        // The activations — and with them the z-gate — are discarded; only the
+        // advanced state is wanted, so the gate kind cannot matter here.
+        let _ = delta_net_mix_spans(&view, c, dims, &mut one, rms_eps, None, ZGate::Silu)?;
     }
     Ok(())
 }
@@ -1721,6 +1732,7 @@ pub fn delta_net_layer_forward(
     dims: &DeltaNetDims,
     state: &mut DeltaNetState,
     rms_eps: f64,
+    zgate: ZGate,
 ) -> Result<Tensor> {
     let p = DeltaNetProjections {
         qkv: x.matmul(&w.wqkv.t()?)?,
@@ -1734,7 +1746,7 @@ pub fn delta_net_layer_forward(
         conv: &w.conv,
         norm: &w.norm,
     };
-    let gated = delta_net_mix(&p, &c, dims, state, rms_eps)?;
+    let gated = delta_net_mix(&p, &c, dims, state, rms_eps, zgate)?;
     gated.matmul(&w.w_out.t()?)
 }
 
@@ -2105,7 +2117,7 @@ mod tests {
                 alpha_lin: rows(&p.alpha_lin),
             };
             let mut st = DeltaNetState::zeros(&dims, &dev).unwrap();
-            wants.push(delta_net_mix(&ps, &c, &dims, &mut st, eps).unwrap());
+            wants.push(delta_net_mix(&ps, &c, &dims, &mut st, eps, ZGate::Silu).unwrap());
             solo_states.push(st);
         }
         let want = Tensor::cat(&wants, 0).unwrap();
@@ -2131,7 +2143,8 @@ mod tests {
                     stash: None,
                 },
             ];
-            let mixed = delta_net_mix_spans(&p, &c, &dims, &mut seqs, eps, None).unwrap();
+            let mixed =
+                delta_net_mix_spans(&p, &c, &dims, &mut seqs, eps, None, ZGate::Silu).unwrap();
             for s in seqs.iter_mut() {
                 s.state.absorb_solo(&s.out).unwrap();
             }
@@ -2223,7 +2236,7 @@ mod tests {
             // with the same capture it would have made.
             let slot = seqs[0].stash.as_ref().unwrap();
             slot.ops.capture(&p, 0, slot.row, block).unwrap();
-            delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None).unwrap();
+            delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu).unwrap();
         }
 
         // The replay: `kept` rows, from the entering state, into a fresh half.
@@ -2238,7 +2251,7 @@ mod tests {
                 out: replayed.write_half(),
                 stash: None,
             }];
-            delta_net_mix_spans(&pr, &c, &dims, &mut seqs, 1e-6, None).unwrap();
+            delta_net_mix_spans(&pr, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu).unwrap();
         }
 
         // The oracle: the same `kept` rows, nothing else, same entering state.
@@ -2263,7 +2276,7 @@ mod tests {
                 out: want.write_half(),
                 stash: None,
             }];
-            delta_net_mix_spans(&po, &c, &dims, &mut seqs, 1e-6, None).unwrap();
+            delta_net_mix_spans(&po, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu).unwrap();
         }
 
         assert_close(&replayed.s, &want.s, 1e-6, "replayed state");
@@ -2409,7 +2422,8 @@ mod tests {
                 out: want.write_half(),
                 stash: None,
             }];
-            let _ = delta_net_mix_spans(&view, &c, &dims, &mut one, 1e-6, None).unwrap();
+            let _ =
+                delta_net_mix_spans(&view, &c, &dims, &mut one, 1e-6, None, ZGate::Silu).unwrap();
 
             let got_s = batched_outs[i].write_half().s;
             let got_t = batched_outs[i].write_half().conv_tail;
@@ -2478,7 +2492,7 @@ mod tests {
                     stash: None,
                 },
             ];
-            delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None).map(|_| ())
+            delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu).map(|_| ())
         };
 
         // A gap: rows 5..6 belong to nobody.
@@ -2597,18 +2611,32 @@ mod tests {
         let x = lcg_tensor(&[t, hidden], 21, &dev);
 
         let mut s_full = DeltaNetState::zeros(&dims, &dev).unwrap();
-        let y_full = delta_net_layer_forward(&x, &w, &dims, &mut s_full, 1e-6).unwrap();
+        let y_full =
+            delta_net_layer_forward(&x, &w, &dims, &mut s_full, 1e-6, ZGate::Silu).unwrap();
 
         // The same tokens in two calls, through one state buffer — which is
         // the property sealing and resume rest on, and now also the property
         // that the buffer is advanced rather than replaced.
         let a = 4usize;
         let mut s_seg = DeltaNetState::zeros(&dims, &dev).unwrap();
-        let y1 = delta_net_layer_forward(&x.narrow(0, 0, a).unwrap(), &w, &dims, &mut s_seg, 1e-6)
-            .unwrap();
-        let y2 =
-            delta_net_layer_forward(&x.narrow(0, a, t - a).unwrap(), &w, &dims, &mut s_seg, 1e-6)
-                .unwrap();
+        let y1 = delta_net_layer_forward(
+            &x.narrow(0, 0, a).unwrap(),
+            &w,
+            &dims,
+            &mut s_seg,
+            1e-6,
+            ZGate::Silu,
+        )
+        .unwrap();
+        let y2 = delta_net_layer_forward(
+            &x.narrow(0, a, t - a).unwrap(),
+            &w,
+            &dims,
+            &mut s_seg,
+            1e-6,
+            ZGate::Silu,
+        )
+        .unwrap();
         let y_seg = Tensor::cat(&[y1, y2], 0).unwrap();
         assert_close(&y_full, &y_seg, 1e-5, "layer segmented outputs");
         assert_close(&s_full.s, &s_seg.s, 1e-5, "layer segmented state");
@@ -2658,7 +2686,7 @@ mod tests {
         let eps = 1e-6f64;
 
         let mut s = DeltaNetState::zeros(&dims, &dev).unwrap();
-        let got = delta_net_layer_forward(&x, &w, &dims, &mut s, eps).unwrap();
+        let got = delta_net_layer_forward(&x, &w, &dims, &mut s, eps, ZGate::Silu).unwrap();
 
         // The conv tail is zero at sequence start, so only the newest kernel
         // tap contributes and the conv reduces to a per-channel scale.

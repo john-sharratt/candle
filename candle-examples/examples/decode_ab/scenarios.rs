@@ -24,7 +24,19 @@ pub struct Scenario {
     /// Compute dtype of Q / k_new / v_new / output. The kernel typed-dispatch
     /// keys on this (F16 vs BF16/F8E4M3).
     pub compute: DType,
+    /// How the context is laid out in chunks. Empty: one packed prefill —
+    /// every chunk full but the last. Otherwise the segment lengths, summing
+    /// to `ctx_len`: each segment is prefilled on its own, sealed, and injected
+    /// after the previous one, so every segment after the first starts in a
+    /// fresh chunk and a segment that is not a multiple of 32 leaves a hole
+    /// behind it — the layout a projected turn has at every section boundary.
+    /// The FP32 golden is a function of the tokens alone, so a holed layout is
+    /// held to the same reference as the packed one.
+    pub segments: &'static [usize],
 }
+
+/// The packed layout — `segments` of every scenario that does not name one.
+pub const PACKED: &[usize] = &[];
 
 impl Scenario {
     /// Tokens visible to attention after the decode token is scattered.
@@ -38,28 +50,19 @@ impl Scenario {
     }
 }
 
-/// The default scenario matrix: every scenario except those currently known to
-/// crash a kernel and poison the CUDA context (see [`all_scenarios`]). This is
-/// what runs when no `--scenarios` filter is given, so the default sweep
-/// completes cleanly end to end.
+/// The default scenario matrix — [`all_scenarios`] plus the wide-head
+/// Flash-Next shapes at their shallow depths. This is what runs when no
+/// `--scenarios` filter is given.
 pub fn default_scenarios() -> Vec<Scenario> {
-    all_scenarios()
-        .into_iter()
-        .filter(|s| !CONTEXT_FATAL_KNOWN.contains(&s.name))
-        .collect()
+    let mut s = all_scenarios();
+    s.extend(flash_next_scenarios());
+    s.extend(flash_next_holed_scenarios());
+    s
 }
 
-/// Scenarios currently known to illegal-address a kernel (poisoning the CUDA
-/// context for the rest of the process) and therefore excluded from the
-/// default sweep. `mha_hd256_ctx128`: V2 paged-decode illegal-addresses at
-/// head_dim=256 even with a plain F16 arena — the kernel compiles an hd256
-/// launcher but it faults (suspected shared-memory overrun). Still runnable via
-/// `--scenarios mha_hd256_ctx128` for investigation.
-pub const CONTEXT_FATAL_KNOWN: &[&str] = &["mha_hd256_ctx128"];
-
-/// The full scenario universe, including ones flagged `context_fatal_known`.
-/// `--scenarios <name>` resolves against this list so a known-bad scenario can
-/// still be run in isolation for investigation.
+/// The core scenario universe: the hd64/96/128 shapes across MHA / GQA / MQA,
+/// partial tails, both RoPE layouts and both compute dtypes, plus one hd256
+/// MHA row (hpg = 1 on the wide-head tile kernel).
 pub fn all_scenarios() -> Vec<Scenario> {
     let f16 = DType::F16;
     vec![
@@ -73,6 +76,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 1,
             rope_interleaved: true,
             compute: f16,
+            segments: PACKED,
         },
         // ── MHA, single partial chunk ───────────────────────────────────
         Scenario {
@@ -84,6 +88,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 1,
             rope_interleaved: true,
             compute: f16,
+            segments: PACKED,
         },
         // ── GQA 4:1, multi-chunk with partial tail ──────────────────────
         Scenario {
@@ -95,6 +100,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 1,
             rope_interleaved: true,
             compute: f16,
+            segments: PACKED,
         },
         // ── MQA, deep context ───────────────────────────────────────────
         Scenario {
@@ -106,6 +112,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 1,
             rope_interleaved: true,
             compute: f16,
+            segments: PACKED,
         },
         // ── GQA 3:1 (Llama-3.2-3B-ish), batched slots ──────────────────
         Scenario {
@@ -117,6 +124,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 8,
             rope_interleaved: true,
             compute: f16,
+            segments: PACKED,
         },
         // ── Non-interleaved RoPE (Qwen-style) ───────────────────────────
         Scenario {
@@ -128,6 +136,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 1,
             rope_interleaved: false,
             compute: f16,
+            segments: PACKED,
         },
         // ── head_dim = 256 ─────────────────────────────────────────────
         Scenario {
@@ -139,6 +148,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 1,
             rope_interleaved: true,
             compute: f16,
+            segments: PACKED,
         },
         // ── BF16 compute path ──────────────────────────────────────────
         Scenario {
@@ -150,6 +160,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 1,
             rope_interleaved: true,
             compute: DType::BF16,
+            segments: PACKED,
         },
         // ── Deep context, large batch (throughput-leaning) ─────────────
         Scenario {
@@ -161,7 +172,97 @@ pub fn all_scenarios() -> Vec<Scenario> {
             num_slots: 16,
             rope_interleaved: true,
             compute: f16,
+            segments: PACKED,
         },
+    ]
+}
+
+/// Qwen3.8-Flash-Next's full-attention shape (24 query heads over 2 KV heads,
+/// head_dim 256, half-split RoPE, BF16 compute — `docs/qwen38_flash_next.md`
+/// §head geometry) — the wide-head INT8 tile kernel's production shape. The
+/// group's 12 heads are the MMA's M rows, so batch 1 already fills 12 of the
+/// 16-row tile; depth is the axis that matters.
+fn flash_next(name: &'static str, ctx: usize, slots: usize) -> Scenario {
+    Scenario {
+        name,
+        n_q_head: 24,
+        n_kv_head: 2,
+        head_dim: 256,
+        ctx_len: ctx,
+        num_slots: slots,
+        rope_interleaved: false,
+        compute: DType::BF16,
+        segments: PACKED,
+    }
+}
+
+/// Flash-Next over a HOLED layout: the same shape, the context laid out as
+/// `segments`, each sealed and injected after the last. See
+/// [`Scenario::segments`].
+fn flash_next_holed(name: &'static str, segments: &'static [usize], slots: usize) -> Scenario {
+    Scenario {
+        segments,
+        ..flash_next(name, segments.iter().sum(), slots)
+    }
+}
+
+/// Flash-Next decode over the layouts a projected turn actually has: sections
+/// sealed mid-chunk, so every boundary leaves a hole — some on the 4-token
+/// quad grid (one pass per window) and some off it (a window taken in passes).
+/// The 1225-token case is the daemon's own system prompt: 38 full chunks and a
+/// 9-token tail, then the user turn in a fresh chunk. These run in the golden
+/// gate against the same FP32 reference as the packed layouts, and in the
+/// bench beside them so a hole's cost is a number.
+pub fn flash_next_holed_scenarios() -> Vec<Scenario> {
+    vec![
+        // One misaligned hole: a window taken in two passes.
+        flash_next_holed("fnh_b1_9_then_500", &[9, 500], 1),
+        // The daemon's split: 1225-token prefix, 14-token user turn.
+        flash_next_holed("fnh_b1_daemon_1225_14", &[1225, 14], 1),
+        // Sections of the sizes a projected prompt carries, holes on and off
+        // the grid.
+        flash_next_holed("fnh_b1_sections", &[480, 9, 320, 7, 96, 25, 1100], 1),
+        // Tiny sections: several holes inside single windows.
+        flash_next_holed("fnh_b1_tiny_sections", &[5, 17, 3, 11, 32, 25, 6, 200], 1),
+        // Batched: eight slots of the daemon's split.
+        flash_next_holed("fnh_b8_daemon_1225_14", &[1225, 14], 8),
+        // Deep, with a hole every ~500 tokens.
+        flash_next_holed(
+            "fnh_b1_8k_holed",
+            &[
+                489, 501, 511, 497, 503, 509, 499, 505, 495, 507, 493, 511, 489, 501, 511, 497, 8,
+            ],
+            1,
+        ),
+    ]
+}
+
+/// Flash-Next at shallow depth: the partial-tail layouts (ctx % 32 ≠ 0), a
+/// single slice, and the split fan-out over a handful of slices — the regime
+/// where a null-partial storm or a per-block prologue dominates. Part of the
+/// default `compare` sweep.
+pub fn flash_next_scenarios() -> Vec<Scenario> {
+    vec![
+        flash_next("fn_b1_ctx31", 31, 1),
+        flash_next("fn_b1_ctx128", 128, 1),
+        flash_next("fn_b1_ctx200", 200, 1),
+        flash_next("fn_b1_ctx512", 512, 1),
+        flash_next("fn_b1_ctx2048", 2048, 1),
+        flash_next("fn_b8_ctx512", 512, 8),
+        flash_next("fn_b8_ctx2048", 2048, 8),
+    ]
+}
+
+/// Flash-Next at depth: single-session 8K → 128K, the regime the tile kernel
+/// must hold FLAT in (per-token cost is one slice stage; the kernel is
+/// bandwidth-bound on the arena bytes it reads). The 128K fixture stages a
+/// ~2 GB host Q for its prefill, so this group is `bench`/`--scenarios` only.
+pub fn flash_next_deep_scenarios() -> Vec<Scenario> {
+    vec![
+        flash_next("fn_b1_ctx8k", 8192, 1),
+        flash_next("fn_b1_ctx32k", 32768, 1),
+        flash_next("fn_b1_ctx128k", 131072, 1),
+        flash_next("fn_b8_ctx8k", 8192, 8),
     ]
 }
 
@@ -179,6 +280,7 @@ pub fn perf_scenarios() -> Vec<Scenario> {
         num_slots: 8,
         rope_interleaved: true,
         compute: DType::F16,
+        segments: PACKED,
     };
     vec![
         mk("perf_b8_ctx128", 128),
@@ -207,6 +309,7 @@ pub fn single_decode_scenarios() -> Vec<Scenario> {
         num_slots: 1,
         rope_interleaved: true,
         compute: DType::F16,
+        segments: PACKED,
     };
     vec![
         mk("single_ctx4k", 4096),
@@ -234,6 +337,7 @@ pub fn suite_scenarios() -> Vec<Scenario> {
         num_slots: slots,
         rope_interleaved: true,
         compute: DType::F16,
+        segments: PACKED,
     };
     vec![
         // single batch (most grid-starved)
@@ -265,6 +369,7 @@ pub fn suite_deep_scenarios() -> Vec<Scenario> {
         num_slots: slots,
         rope_interleaved: true,
         compute: DType::F16,
+        segments: PACKED,
     };
     vec![
         // deep single-session
@@ -279,6 +384,9 @@ pub fn suite_deep_scenarios() -> Vec<Scenario> {
 /// Filter scenarios by a comma-separated list of names (`--scenarios a,b`).
 pub fn select_scenarios(filter: &str) -> Result<Vec<Scenario>, String> {
     let mut universe = all_scenarios();
+    universe.extend(flash_next_scenarios());
+    universe.extend(flash_next_deep_scenarios());
+    universe.extend(flash_next_holed_scenarios());
     universe.extend(perf_scenarios());
     universe.extend(single_decode_scenarios());
     universe.extend(suite_scenarios());

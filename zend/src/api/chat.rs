@@ -137,12 +137,13 @@ fn dial_selection(
     const EFFORT: [&str; 5] = ["off", "quick", "balanced", "deep", "exhaustive"];
     const LENGTH: [&str; 5] = ["terse", "concise", "standard", "detailed", "comprehensive"];
     let mut sel = SelectionState::new();
-    // A thinking-off turn — effort 0, or the `think` toggle explicitly off — is
-    // suppressed via the `/no_think` glue.  The steering MUST match: force
-    // `thinking_effort = off` so it resolves to `ThinkMode::Off` (no opener, no
-    // injected close).  Otherwise a non-zero effort dial drives a steered `<think>`
-    // block while `/no_think` simultaneously tells the model to suppress it, and the
-    // block gets closed twice (a steered injected `</think>` plus the model's own).
+    // A thinking-off turn — effort 0, or the `think` toggle explicitly off —
+    // must carry BOTH halves of the same decision. The steering has to match the
+    // `no_think` node: force `thinking_effort = off` so it resolves to
+    // `ThinkMode::Off`, whose tree closes the block immediately. Otherwise a
+    // non-zero effort dial drives a steered `<think>` block while the prompt
+    // simultaneously tells the model to suppress it, and the two disagree about
+    // whether the turn reasons at all.
     let off = think == Some(false) || effort == Some(0);
     if off {
         // Only meaningful when the turn actually carries a dial; a bare
@@ -228,48 +229,95 @@ async fn stream_sse(
     let saw_token = Arc::new(AtomicBool::new(false));
     let saw_token_c = Arc::clone(&saw_token);
 
-    let content_events = token_stream.map(move |result| -> anyhow::Result<Event> {
-        match result {
-            Err(e) => Err(e),
+    // **Hold a leading empty think block off the wire.**
+    //
+    // The engine strips empty `<think></think>` from the text it STORES, but the
+    // stream is a separate assembly of raw token events and nothing filtered it,
+    // so a collapsed block went out verbatim and rendered as leaked markup. That
+    // is now the common case rather than a curiosity: the `off` effort dial
+    // closes the block on the token after `<think>`, so every such turn emits
+    // one, and thinking-span projection leaves older turns with no visible
+    // reasoning so the model collapses its own.
+    //
+    // `gate_leading_think` decides from the text so far, and the hold is bounded
+    // by CONTENT rather than by the closing marker — the first non-blank token
+    // inside the block opens the gate for good. A genuine reasoning turn is
+    // therefore never withheld waiting for its own `</think>`; at most a few
+    // whitespace tokens are ever buffered.
+    let mut held = String::new();
+    let mut gate_open = false;
+    let content_events = token_stream.filter_map(move |result| {
+        let out: Option<anyhow::Result<Event>> = match result {
+            Err(e) => Some(Err(e)),
 
             Ok(StreamItem::Status(msg)) => {
                 let data = serde_json::json!({ "text": msg }).to_string();
-                Ok(Event::default().event("status").data(data))
+                Some(Ok(Event::default().event("status").data(data)))
             }
 
-            Ok(StreamItem::Projection(event)) => {
-                let data = serde_json::to_string(&event).map_err(|e| anyhow::anyhow!(e))?;
-                Ok(Event::default().event("projection").data(data))
-            }
+            Ok(StreamItem::Projection(event)) => Some(
+                serde_json::to_string(&event)
+                    .map_err(|e| anyhow::anyhow!(e))
+                    .map(|data| Event::default().event("projection").data(data)),
+            ),
 
-            Ok(StreamItem::Tool(status)) => {
-                let data = serde_json::to_string(&status).map_err(|e| anyhow::anyhow!(e))?;
-                Ok(Event::default().event("tool").data(data))
-            }
+            Ok(StreamItem::Tool(status)) => Some(
+                serde_json::to_string(&status)
+                    .map_err(|e| anyhow::anyhow!(e))
+                    .map(|data| Event::default().event("tool").data(data)),
+            ),
 
             Ok(StreamItem::Token(text)) => {
-                let is_first = !saw_token_c.swap(true, Ordering::Relaxed);
-                if is_first {
-                    tracing::debug!("streaming first token");
-                }
-                let chunk = ChatCompletionChunk {
-                    id: id_c.clone(),
-                    object: "chat.completion.chunk",
-                    created,
-                    model: model_c.clone(),
-                    choices: vec![ChunkChoice {
-                        index: 0,
-                        delta: Delta {
-                            role: if is_first { Some("assistant") } else { None },
-                            content: Some(text),
-                        },
-                        finish_reason: None,
-                    }],
+                // Once open, the gate never closes again for this turn — a
+                // `<think>` later in the answer body is ordinary content.
+                let emit = if gate_open {
+                    Some(text)
+                } else {
+                    held.push_str(&text);
+                    match crate::think_gate::gate_leading_think(&held) {
+                        crate::think_gate::ThinkGate::Hold => None,
+                        crate::think_gate::ThinkGate::Open(at) => {
+                            gate_open = true;
+                            // Everything from the resolve point, which is the
+                            // whole buffer when no block was skipped.
+                            Some(held[at..].to_string())
+                        }
+                    }
                 };
-                let data = serde_json::to_string(&chunk).map_err(|e| anyhow::anyhow!(e))?;
-                Ok(Event::default().data(data))
+                // Held, or nothing left after the skip. An empty delta would
+                // spend the `role` marker on a chunk carrying no text.
+                match emit {
+                    None => None,
+                    Some(t) if t.is_empty() => None,
+                    Some(t) => {
+                        let is_first = !saw_token_c.swap(true, Ordering::Relaxed);
+                        if is_first {
+                            tracing::debug!("streaming first token");
+                        }
+                        let chunk = ChatCompletionChunk {
+                            id: id_c.clone(),
+                            object: "chat.completion.chunk",
+                            created,
+                            model: model_c.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: Delta {
+                                    role: if is_first { Some("assistant") } else { None },
+                                    content: Some(t),
+                                },
+                                finish_reason: None,
+                            }],
+                        };
+                        Some(
+                            serde_json::to_string(&chunk)
+                                .map_err(|e| anyhow::anyhow!(e))
+                                .map(|data| Event::default().data(data)),
+                        )
+                    }
+                }
             }
-        }
+        };
+        std::future::ready(out)
     });
 
     let stop_chunk = ChatCompletionChunk {

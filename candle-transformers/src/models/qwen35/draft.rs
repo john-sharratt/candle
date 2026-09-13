@@ -44,7 +44,10 @@
 //! next wave — so a rejected proposal leaves no trace and an accepted one is
 //! not carried over from the draft.
 
-use candle::{DType, Device, Result, Tensor, D};
+use candle::quantized::pinned_staging::{Generation, GpuBuf};
+use candle::{DType, Device, Result, Tensor};
+
+use crate::models::draft_walk::{draft_reserve, draft_rope_depth, draft_walk};
 use candle_nn::kv_cache::{begin_wave, KvCache, LayerPhase};
 
 use std::cell::RefCell;
@@ -231,6 +234,8 @@ pub fn head_wave_pass(
             params: w.dec_params,
             rows: w.n_decode,
             decode_layout: true,
+            // The drafter's attention is dense — no indexer on this lineage.
+            qsa: None,
         });
     }
     if w.pre_rows > 0 {
@@ -240,6 +245,7 @@ pub fn head_wave_pass(
             params: w.pre_params,
             rows: w.pre_rows,
             decode_layout: false,
+            qsa: None,
         });
     }
     let mut row0 = 0usize;
@@ -259,6 +265,7 @@ pub fn head_wave_pass(
             g.offsets,
             g.params,
             w.kv_layer,
+            g.qsa,
             wave.as_ref(),
         )?;
         row0 += g.rows;
@@ -322,67 +329,16 @@ pub fn draft_cohort(
 
     let dev = &q.device;
     let act_dtype = session.activation_dtype();
-    // The head ropes on ABSOLUTE sequence positions, like every trunk layer:
-    // its history is the sequence's, one row per token, so a drafted position
-    // is `offset + step` and the verify wave that replaces it ropes the same
-    // token at the same place.
-    let base: Vec<usize> = seqs
-        .iter()
-        .map(|&s| session.sequence_offset(s).unwrap_or(0))
-        .collect();
+    // Allocate every drafted position's write chunk before the walk begins —
+    // `draft_walk`'s module docs carry why that is load-bearing rather than
+    // tidy, and the walk does it itself. It is forced here because `max_blocks`
+    // below must be read after it.
+    draft_reserve(session, seqs, kv_layer, max_len)?;
 
-    // **Allocate every drafted position's write chunk BEFORE the loop.**
-    //
-    // The loop below builds its slot headers with an empty `snapshot_seqs`, so
-    // each row carries the zero-copy LIVE pointer into its `GpuChunks` buffer.
-    // That is only sound under the precondition
-    // `build_decode_metadata_at` states for it — "a plain decode row, whose
-    // write chunk is pre-ensured so it never reallocs" — and a draft walk is
-    // not a plain decode row: it advances `max_len` positions, so a step that
-    // crosses a `CHUNK_SIZE` boundary would allocate a block mid-walk and
-    // REBUILD the very buffer the previous step's header still points at.
-    //
-    // Nothing would catch it. This loop deliberately never synchronises, so the
-    // earlier step's `paged_decode` kernel is still in flight reading that
-    // buffer when the rebuild frees it, and the freed block returns to a CUDA
-    // pool being churned tens of thousands of times per wave — so the address is
-    // reissued almost immediately and the kernel reads whatever now owns it.
-    // That is a device-side out-of-range access, not an error return: it
-    // poisons the context, and every later CUDA call in the process fails with
-    // it. It is also invisible to `CUDA_LAUNCH_BLOCKING=1` and to
-    // compute-sanitizer, because both serialise each step to completion before
-    // the next one builds metadata, which is exactly what removes the overlap.
-    //
-    // Ensuring the whole `[base, base + max_len)` range up front does not add an
-    // allocation — the same blocks are allocated either way — it only moves them
-    // to a point where no kernel is reading. This mirrors what the prefill path
-    // does for the same reason.
-    //
-    // It must also run BEFORE `max_blocks` is read below: `ensure_for_offset`
-    // can grow the backing's `max_blocks`, and the rope table is sized from it.
-    if let Some(backing) = session.backing(kv_layer) {
-        for (i, &s) in seqs.iter().enumerate() {
-            backing.ensure_for_offset(s, base[i], max_len)?;
-        }
-    }
-
-    // The rope table spans the arena's whole addressable context, so it is
-    // read from the head's own layer rather than assumed. Refused rather than
-    // defaulted: a zero-block table is not a small table, it is one the paged
-    // kernel indexes straight past — silent wrong RoPE on every drafted
-    // position, and lossless speculation means it could only ever surface as
-    // acceptance quietly collapsing.
-    let max_blocks = session
-        .sequence_caches(seqs[0])
-        .and_then(|c| c.caches.get(kv_layer))
-        .map(|k| k.k_cache().chunked_max_blocks())
-        .ok_or_else(|| {
-            candle::Error::Msg(format!(
-                "qwen35 mtp draft: sequence {} has no live KV layer {kv_layer} to size the \
-                 rope table from — it was released after the cohort was formed",
-                seqs[0]
-            ))
-        })?;
+    // The rope table spans the arena's whole addressable context, so it is read
+    // from the head's own layer rather than assumed — and only after the
+    // reserve above, which can grow it.
+    let max_blocks = draft_rope_depth(session, seqs, kv_layer)?;
     let rope_cs = model.rope_cs(max_blocks)?;
     let inv_freq = model.inv_freq_device().clone();
     let theta = q.cfg.rope_theta;
@@ -410,114 +366,56 @@ pub fn draft_cohort(
         expect_dtype(s, act_dtype, "mtp draft seed")?;
     }
     let seed_refs: Vec<&Tensor> = seeds.iter().collect();
-    let mut h = Tensor::cat(&seed_refs, 0)?;
-    let mut ids = Tensor::from_vec(committed.to_vec(), n, dev)?;
-    let mut steps: Vec<Tensor> = Vec::with_capacity(max_len);
+    let seed_block = Tensor::cat(&seed_refs, 0)?;
     let q_lens = vec![1usize; n];
-    let generation = session.begin_stager_generation();
 
-    // Every drafted position is rolled back before this returns, whatever
-    // happens in between — a proposal that failed mid-flight must not leave the
-    // head's layer longer than the trunk's, which is a length skew the next
-    // wave would have to heal.
-    let drafted = (|| -> Result<()> {
-        for step in 0..max_len {
-            let at: Vec<usize> = base.iter().map(|&b| b + step).collect();
-            let overrides: Vec<(usize, usize)> =
-                seqs.iter().copied().zip(at.iter().copied()).collect();
-            let (_pm, headers, stride) = session.build_decode_metadata_at(
-                kv_layer..kv_layer + 1,
-                seqs,
-                &generation,
-                &overrides,
-                &[],
-                &[],
-            )?;
-            // The decode path does NOT build metadata per call — it dereferences
-            // whatever pointer the headers resolve to, and `None` resolves to
-            // literal 0. That is an illegal address on device, not an error
-            // return, so it is worth one branch here.
-            let headers = headers.ok_or_else(|| {
-                candle::Error::Msg(format!(
-                    "qwen35 mtp draft: no slot headers for {n} sequences at step {step} — \
-                     the decode kernel would dereference a null table"
-                ))
-            })?;
-            let pos: Vec<u32> = at.iter().map(|&p| p as u32).collect();
-            let (cos, sin) = model.rotary().rope_cos_sin(&pos, theta, rope_dtype, dev)?;
-            let pm: RefCell<Option<SharedPm>> = RefCell::new(None);
-            let params = BatchedAttentionParams::new(
-                &cos,
-                &sin,
-                false,
-                &inv_freq,
-                &rope_cs,
-                DecodeHeaders::Decode {
-                    buf: Some(headers),
-                    stride,
-                },
-                &q_lens,
-                &generation,
-                &pm,
-            );
-            let embed = ctx.embed_ids(&ids)?;
-            let h_next = {
-                let mut data = session.caches_for_sequences_mut(seqs);
-                if data.len() != n {
-                    candle::bail!(
-                        "qwen35 mtp draft: {} of {n} sequences still have live slots",
-                        data.len()
-                    )
-                }
-                let mut caches: Vec<&mut KvCache> = data
-                    .iter_mut()
-                    .map(|(_, _, c)| &mut c.caches[kv_layer])
-                    .collect();
-                let out = head.step(&embed, &h, &mut caches, &at, &params, &ctx)?;
-                // The decode kernel commits its write on the device; the host
-                // block table is advanced here, the way the wave driver
-                // advances every layer of a decode row. The next step's
-                // metadata is built against this length.
-                for (c, &p) in caches.iter_mut().zip(&at) {
-                    c.set_current_seq_len(p + 1)?;
-                }
-                out
-            };
-            let logits = ctx.lm_head.forward_live(&h_next)?;
-            // `argmax_keepdim`, not `argmax`: the latter drops the axis, and a
-            // one-row cohort would come back rank-0 rather than `[1, 1]`.
-            //
-            // The reduction already emits U32 on both backends, and the next
-            // step's embedding gather requires it — so it is checked rather than
-            // cast. A cast would be a full pass over the ids on any backend that
-            // ever stopped emitting U32, silently, once per drafted token.
-            let next = logits.argmax_keepdim(D::Minus1)?;
-            expect_dtype(&next, DType::U32, "mtp draft argmax")?;
-            ids = next.flatten_all()?;
-            steps.push(ids.clone());
-            h = h_next;
-        }
-        Ok(())
-    })();
-
-    let mut rolled_back = Ok(());
-    for (i, &seq) in seqs.iter().enumerate() {
-        if let Some(caches) = session.sequence_caches_mut(seq) {
-            if let Some(c) = caches.caches.get_mut(kv_layer) {
-                let r = c.truncate_to_offset(base[i]);
-                if rolled_back.is_ok() {
-                    rolled_back = r;
-                }
-            }
-        }
-    }
-    drafted?;
-    rolled_back?;
-
-    // The one readback: `[n, max_len]`, so the whole cohort's whole block
-    // crosses the bus in a single transfer.
-    let refs: Vec<&Tensor> = steps.iter().collect();
-    Tensor::stack(&refs, 1)?.to_vec2::<u32>()
+    // One position of the walk. Everything around it — the pre-ensure, the
+    // per-step metadata, the cache advance, the rollback, the single readback —
+    // is [`draft_walk`], which is the same for every drafter. What is the
+    // model's own is the rope tables and the head's block, and that is all this
+    // closure holds.
+    let mut step = |ids: &Tensor,
+                    h: &Tensor,
+                    caches: &mut [&mut KvCache],
+                    at: &[usize],
+                    headers: (&GpuBuf, u64),
+                    generation: &Generation|
+     -> Result<(Tensor, Tensor)> {
+        let pos: Vec<u32> = at.iter().map(|&p| p as u32).collect();
+        let (cos, sin) = model.rotary().rope_cos_sin(&pos, theta, rope_dtype, dev)?;
+        let pm: RefCell<Option<SharedPm>> = RefCell::new(None);
+        let params = BatchedAttentionParams::new(
+            &cos,
+            &sin,
+            false,
+            &inv_freq,
+            &rope_cs,
+            DecodeHeaders::Decode {
+                buf: Some(headers.0.clone()),
+                stride: headers.1,
+            },
+            &q_lens,
+            generation,
+            &pm,
+        );
+        let embed = ctx.embed_ids(ids)?;
+        let h_next = head.step(&embed, h, caches, at, &params, &ctx)?;
+        let logits = ctx.lm_head.forward_live(&h_next)?;
+        Ok((h_next, logits))
+    };
+    draft_walk(
+        session,
+        seqs,
+        kv_layer,
+        committed,
+        &seed_block,
+        max_len,
+        // Nothing to open: this head's block runs through
+        // `forward_layer_batched_mixed`, which lays its spans out in whatever
+        // tier is already placed rather than wanting one of its own.
+        || Ok(()),
+        &mut step,
+    )
 }
 
 #[cfg(test)]

@@ -170,15 +170,17 @@ __device__ __forceinline__ void write_regs_to_r16(
     }
 }
 
+// Commit the step's new token for one slot: bump the write slice's length so
+// the token the decode kernel scattered becomes visible to the next step. Runs
+// after every reader of the write slice has finished — the decode kernel reads
+// the pre-bump length, and the bump is issued by a later launch on the stream
+// (the split combine, or `commit_decode_write_len_kernel` where there is none).
 template <int HEAD_DIM>
-__global__ void commit_decode_write_len_kernel(
+__device__ __forceinline__ void commit_decode_write_len(
     const uint8_t* headers_ptr,
-    int num_active_slots,
+    int slot_idx,
     int n_kv_head
 ) {
-    int slot_idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (slot_idx >= num_active_slots) return;
-
     const SlotHeader& slot = get_slot_header(headers_ptr, slot_idx);
     if (slot.n_slices == 0 || slot.write_slice >= slot.n_slices) return;
 
@@ -195,6 +197,17 @@ __global__ void commit_decode_write_len_kernel(
     if ((int)ws_offset + (int)ws_len < CHUNK_SIZE) {
         slice_increment_len(write_slice_ptr);
     }
+}
+
+template <int HEAD_DIM>
+__global__ void commit_decode_write_len_kernel(
+    const uint8_t* headers_ptr,
+    int num_active_slots,
+    int n_kv_head
+) {
+    int slot_idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (slot_idx >= num_active_slots) return;
+    commit_decode_write_len<HEAD_DIM>(headers_ptr, slot_idx, n_kv_head);
 }
 
 // ============================================================================

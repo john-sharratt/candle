@@ -824,20 +824,23 @@ impl SequenceState {
         self.gpu_chunks.as_mut().clear();
     }
 
-    /// Re-serialise just the WRITER chunk's slice in the cached decode GPU
-    /// buffer after a mid-decode prefill wrote tokens into that chunk in
-    /// place (a stencil static run, a think-steer continuation).
+    /// Re-serialise the WRITER REGION's slices — every chunk from the writer
+    /// boundary to the current writer — in the cached decode GPU buffer after
+    /// a prefill wrote tokens without the decode kernel's self-increment (a
+    /// prompt, a stencil static run, a think-steer continuation).
     ///
-    /// The prefill write path keeps host state authoritative: `set_len` tops
-    /// the writer chunk's usage up to the sequence length, and a
-    /// chunk-boundary append clears the whole buffer at the mutation site
-    /// (`push_chunk`). A live buffer here therefore differs from host state
-    /// only in this one slice, and patching it under the guard (async H→D on
-    /// drop) is the O(1) alternative to dropping and re-uploading the entire
-    /// per-layer table — which at depth costs megabytes of pinned realloc and
-    /// a stream sync per layer. A missing buffer is left for the next decode
-    /// sync's full rebuild; a shape mismatch (defensive) falls back to full
-    /// invalidation.
+    /// The prefill write path keeps host state authoritative: `set_len`
+    /// tops up usages from the writer boundary through consecutive chunks to
+    /// the sequence length. The buffer, built before the prefill from the
+    /// same chunks (their chunks are allocated up front, so no append clears
+    /// it during the prefill), still carries their pre-prefill lengths, so
+    /// every chunk in that region is patched under the guard (async H→D on
+    /// drop) — the chunks below the boundary are shared and unwritten. This
+    /// is O(chunks the prefill wrote) against dropping and re-uploading the
+    /// entire per-layer table, which at depth costs megabytes of pinned
+    /// realloc and a stream sync per layer. A missing buffer is left for the
+    /// next decode sync's full rebuild; a shape mismatch (defensive) falls
+    /// back to full invalidation.
     pub(crate) fn refresh_decode_writer_slice(
         &mut self,
         n_kv_head: usize,
@@ -857,7 +860,18 @@ impl SequenceState {
             self.invalidate_gpu_chunks();
             return Ok(());
         }
-        self.update_gpu_chunk(wi, n_kv_head, head_dim, arena_info)
+        // Every chunk a prefill can have written, not only the writer:
+        // `set_len` fills consecutive chunks from the writer boundary, so
+        // the chunks it filled on the way to the writer carry the buffer's
+        // pre-prefill lengths exactly as the writer does — a 200-token
+        // prompt leaves six sealed chunks at length 0, and the decode
+        // attends the last eight tokens alone. Chunks below the boundary
+        // are shared with the substrate and never written.
+        let start = self.writer_start_idx().min(wi);
+        for blk in start..=wi {
+            self.update_gpu_chunk(blk, n_kv_head, head_dim, arena_info)?;
+        }
+        Ok(())
     }
 
     /// Re-serialise the GPU buffer slot at `blk` from the current host state
@@ -1013,20 +1027,12 @@ impl SequenceState {
         self.gpu_chunks.as_mut().clear();
     }
 
-    /// Rebuild the GPU slot-state buffer for decode using the true sequence length.
-    ///
-    /// Serialises all chunks into the pinned host buffer with per-chunk
-    /// `rope_base` values derived from cumulative usage, then uploads to the
-    /// device buffer asynchronously.
-    ///
-    /// Returns `(raw_device_ptr, n_chunks, write_chunk_idx)` where:
-    /// - `raw_device_ptr` is the GPU base pointer for the decode kernel,
-    /// - `n_chunks` is the number of serialised chunk entries,
-    /// - `write_chunk_idx` is the index of the last (writable) chunk.
-    ///
-    /// `seq_offset` is the current sequence length used to derive the true
-    /// token count for the write chunk (overrides the potentially-stale
-    /// `chunk.usage` field).
+    /// The chunks the serialised slot-state references, for a consumer to hold
+    /// across its launch (see `GpuChunks::pins`).
+    pub(crate) fn gpu_chunk_pins(&self) -> Arc<Vec<HeadGids>> {
+        self.gpu_chunks.pins()
+    }
+
     /// Index of the chunk the decode kernel writes into: the first non-full
     /// chunk at or after `writer_start_idx`. Chunks after it are trailing
     /// empties — e.g. a freshly-appended empty writer sitting past a partial
@@ -1107,6 +1113,20 @@ impl SequenceState {
         out
     }
 
+    /// Rebuild the GPU slot-state buffer for decode using the true sequence length.
+    ///
+    /// Serialises all chunks into the pinned host buffer with per-chunk
+    /// `rope_base` values derived from cumulative usage, then uploads to the
+    /// device buffer asynchronously.
+    ///
+    /// Returns `(raw_device_ptr, n_chunks, write_chunk_idx)` where:
+    /// - `raw_device_ptr` is the GPU base pointer for the decode kernel,
+    /// - `n_chunks` is the number of serialised chunk entries,
+    /// - `write_chunk_idx` is the index of the last (writable) chunk.
+    ///
+    /// `seq_offset` is the current sequence length used to derive the true
+    /// token count for the write chunk (overrides the potentially-stale
+    /// `chunk.usage` field).
     pub(crate) fn rebuild_decode_gpu_chunks(
         &mut self,
         n_kv_head: usize,

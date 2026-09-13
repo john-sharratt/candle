@@ -400,7 +400,7 @@ impl Compressor {
 /// Per channel `c ∈ [0, head_dim)`:
 /// `m_c = max_t s_t[c]`, `l_c = Σ_t e^{s_t[c]−m_c}`, `acc_c = Σ_t e^{s_t[c]−m_c}·kv_t[c]`.
 #[derive(Clone)]
-#[allow(dead_code)] // LSE-merge persistence monoid (docs/deepseek_batched_paged_attention_plan.md); wired in a later phase
+#[allow(dead_code)] // LSE-merge persistence monoid (docs/deepseek/deepseek_batched_paged_attention_plan.md); wired in a later phase
 pub struct GroupPartial {
     m: Tensor,   // [d] running per-channel max score
     l: Tensor,   // [d] running per-channel Σ exp
@@ -1215,7 +1215,7 @@ impl IncrementalCompressor {
     /// **previous complete group's first-half rows** (the retained `prev_*`
     /// halves) — the closed partial is a softmax-weighted latent exactly like a
     /// full group, so the attention kernel merges it with no special case
-    /// (docs/deepseek_turn_seal_persistence.md Artifact B). `close` is terminal:
+    /// (docs/deepseek/deepseek_turn_seal_persistence.md Artifact B). `close` is terminal:
     /// it clears the buffer and advances `group_idx`; the compressor must not be
     /// pushed again after it.
     pub fn close(&mut self) -> Result<Option<(Tensor, u32)>> {
@@ -1775,7 +1775,7 @@ mod tests {
 
     /// The streaming (decode) compressor emits, group-by-group, entries numerically equal to
     /// the prefill `forward` over the full prefix — the mandatory prefill/decode equivalence
-    /// (docs/deepseek_v4_flash.md §2.2). Exercises both the overlapping (`ratio == 4`) and
+    /// (docs/deepseek/deepseek_v4_flash.md §2.2). Exercises both the overlapping (`ratio == 4`) and
     /// non-overlapping compressors, across several complete groups plus trailing tokens.
     fn incremental_matches_prefill_case(ratio: usize, d: usize, rd: usize, s: usize) -> Result<()> {
         let dev = Device::Cpu;

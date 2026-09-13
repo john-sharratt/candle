@@ -16,11 +16,12 @@ use crate::stencil::{
     compile, compile_think_tree, compile_tool_call_tree, HfVocab, StencilTree, ThinkMode,
     ThinkSteerEnvelope, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
 };
+// `ChannelProbeRunner` is deliberately not imported: the summariser is
+// disconnected, so nothing constructs a runner. `Substrate` comes from our side.
 use crate::substrate::ConvCompression;
-use crate::summary_tree::{ChannelProbeRunner, SelectionDiagnostics, SummariserThread};
+use crate::summary_tree::{SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
 
-use candle::Device;
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
 use crossbeam::channel;
@@ -28,10 +29,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-/// The compiled thinking-block steering trees, one per non-`Off` effort dial,
-/// built once at engine init (parallel to the tool-call registry).  Each turn
-/// derives its trigger registry by replacing the `<think>` trigger with the
-/// dial's tree — atomic and idempotent via [`TriggerRegistry::with_trigger`].
+/// The compiled thinking-block steering trees, one per effort dial, built once
+/// at engine init (parallel to the tool-call registry).  Each turn derives its
+/// trigger registry by replacing the `<think>` trigger with the dial's tree —
+/// atomic and idempotent via [`TriggerRegistry::with_trigger`].
 pub struct ThinkSteering {
     /// `<think>` id — the trigger the dial's tree is bound to.
     think_open: TokenId,
@@ -59,6 +60,11 @@ impl ThinkSteering {
     /// Binding `off` instead makes suppression a property of the grammar rather
     /// than of the family's chat template, so it holds for every checkpoint and
     /// a caller does not have to know which mechanism its model happens to use.
+    ///
+    /// **A registry has to actually be bound for any of that to hold.** A caller
+    /// that passes `TurnOptions::default()` gets an empty one and no steering at
+    /// all — which is how the ingest summariser came to reason unchecked despite
+    /// its dial reading `Off`. See `Sequence::no_think_triggers`.
     pub fn registry_for(&self, base: &TriggerRegistry, mode: ThinkMode) -> Arc<TriggerRegistry> {
         let tree = match mode {
             ThinkMode::Off => &self.off,
@@ -68,23 +74,6 @@ impl ThinkSteering {
             ThinkMode::Exhaustive => &self.exhaustive,
         };
         Arc::new(base.with_trigger(self.think_open, Arc::clone(tree)))
-    }
-}
-
-/// How many summary probes the summariser submits per batch, chosen by total
-/// VRAM at engine init. Their decodes batch in the scheduler's wave loop, so a
-/// bigger card can keep more summaries in flight: 16 above 32 GB, 4 at or below
-/// (and on CPU, where there's no device VRAM to read).
-fn summary_probe_concurrency(device: &Device) -> usize {
-    const VRAM_32_GIB: usize = 32 * 1024 * 1024 * 1024;
-    let total_vram = match device {
-        Device::Cuda(d) => d.mem_get_info().map(|(_free, total)| total).unwrap_or(0),
-        _ => 0,
-    };
-    if total_vram > VRAM_32_GIB {
-        16
-    } else {
-        4
     }
 }
 
@@ -184,8 +173,11 @@ pub struct ConversationEngine {
     /// no `Option`/`Mutex` shuffle at this layer.
     persist_thread: PersistenceThread,
 
-    /// Async summariser thread — drains the per-turn pending queue,
-    /// runs §6 probes, builds the per-timeline AVL summary tree.
+    /// Async summariser thread — **always the disabled handle.** It would drain
+    /// the per-turn pending queue, run §6 probes and build the per-timeline AVL
+    /// summary tree; none of that happens, because the summariser is
+    /// disconnected (see [`Self::new`]) and no timeline enqueues. Kept as a field
+    /// so the lifecycle calls below stay honest no-ops rather than disappearing.
     /// Mirrors [`PersistenceThread`]'s lifecycle (trigger / tick /
     /// shutdown).  Spawned alongside the scheduler at engine startup;
     /// [`Self::shutdown`] joins it after the persistence thread has
@@ -410,29 +402,32 @@ impl ConversationEngine {
         );
         let persist_trigger = persist_thread.trigger_handle();
 
-        // Spawn the async summariser thread (`docs/immutable_summary_forest.md`
-        // — *Two queues*).  Drains the per-timeline pending queue every
-        // 250 ms (or on trigger), runs probes
-        // (`docs/archived/infinite_conversations.md` §6) via the
-        // scheduler-backed [`ChannelProbeRunner`], extends the
-        // per-timeline summary tree, and persists the resulting
-        // [`TreeMetadata`] records to the redo log.  Spawned after the
-        // persistence thread so its writes flow through the same
-        // workspace handle.
-        let summariser_runner = Arc::new(ChannelProbeRunner::new(tx.clone()));
-        let summary_concurrency = summary_probe_concurrency(session.device());
-        tracing::info!(
-            summary_concurrency,
-            "summariser probe-batch concurrency set from total VRAM"
-        );
-        let summariser_thread = if config.disable_summariser {
-            tracing::info!("disable_summariser: summariser thread not spawned");
-            SummariserThread::disabled()
-        } else {
-            SummariserThread::spawn(conversation.clone(), summariser_runner, summary_concurrency)
-        };
-        // Hand the trigger to the scheduler so every assistant-turn
-        // seal wakes the summariser immediately — design §4 step ③.
+        // **The AVL summariser is disconnected.** It is never spawned, and no
+        // timeline enqueues turns for it (`Timeline::summarize` is false for
+        // every timeline) — so nothing in this engine compresses a conversation
+        // or a layer into summary nodes.
+        //
+        // The decision, deliberately: compression was a persistent source of bad
+        // memory rather than a saving. Measured on a 16-turn conversation, 5 of 9
+        // summary nodes were unfaithful — two echoed the user's question back,
+        // one echoed the compressor's own instruction, and the merge node that
+        // stands for the WHOLE conversation read "I am an AI assistant." Those
+        // nodes are written in the first person, as if they were the reply, and
+        // are what a later projection reads as history: a wrong one is not a
+        // missing summary but a false memory the model cannot distinguish from
+        // something it actually said. Retrieval quality is being pursued through
+        // provenance selection instead, which ranks real turns rather than
+        // manufacturing new text.
+        //
+        // `summary_tree` stays compiled and tested so the machinery — the AVL
+        // shape, the probe protocol, the seal path — is here to build on when
+        // that work resumes. Nothing calls into it.
+        let summariser_thread = SummariserThread::disabled();
+        // The scheduler still holds a trigger and still fires it on every
+        // assistant-turn seal (design §4 step ③). Against the disabled handle
+        // the send has no receiver and fails silently, which is why the seal
+        // path needs no knowledge of whether a summariser exists — and why
+        // re-enabling is a change in `Engine::new` alone.
         let summariser_trigger = summariser_thread.trigger_handle();
 
         // Spawn the scheduler thread.
@@ -643,13 +638,18 @@ impl ConversationEngine {
     }
 
     /// Backpressure metric — turns awaiting summariser absorption for
-    /// `timeline`.  Zero in steady state.
+    /// `timeline`. **Always zero**: the summariser is disconnected, so nothing
+    /// enqueues (see [`Self::new`]). It was zero in steady state before, too, so
+    /// this reads the same either way.
     pub fn pending_summary_len(&self, timeline: TimelineId) -> usize {
         self.conversation.pending_summary_len(timeline)
     }
 
-    /// Wake the summariser thread now instead of waiting for its next
-    /// tick — used to kick off summarisation of freshly-ingested turns promptly.
+    /// Wake the summariser thread now instead of waiting for its next tick.
+    ///
+    /// **A no-op while the summariser is disconnected** — the disabled handle has
+    /// no receiver, so the send fails silently. Callers (the ingest pipeline
+    /// kicks it after a scope lands) need no knowledge of that.
     pub fn trigger_summariser(&self) {
         self.summariser_thread.trigger();
     }
@@ -706,11 +706,18 @@ impl ConversationEngine {
             .set_timeline_compression(timeline, compression);
     }
 
-    /// Enable or disable AVL summarisation for `timeline`. Conversations default
-    /// to `true`; scratch/scaffolding timelines (e.g. the tool-summary
-    /// categorize/assign passes) set `false` before their first turn seals so
-    /// the wave-driven summariser never spends a compression decode on work that
-    /// is about to be tombstoned. See [`crate::summary_tree`].
+    /// Enable or disable AVL summarisation for `timeline`.
+    ///
+    /// **Every timeline now defaults to `false`** — the summariser is
+    /// disconnected (see [`Self::new`]), so setting `true` here would queue turns
+    /// onto `pending_summary_queue` that nothing drains. Nothing in the engine or
+    /// `zend` calls it with `true`; the remaining production callers pass `false`
+    /// on ingest timelines, which is redundant against the default but states the
+    /// intent at the site.
+    ///
+    /// It exists as the single re-enabling point: deciding *which* timelines opt
+    /// in is this call plus spawning the thread in [`Self::new`]. See
+    /// [`crate::summary_tree`].
     pub fn set_timeline_summarize(&self, timeline: TimelineId, summarize: bool) {
         self.conversation
             .set_timeline_summarize(timeline, summarize);
@@ -1161,19 +1168,11 @@ impl ConversationEngine {
         // writes a nested function element, ChatML writes a JSON object — and a
         // literal in this function is a second opinion about that, free to
         // disagree with the checkpoint actually loaded.
-        let d = &self.config.dialect;
-        let base = ToolCallEnvelope::for_dialect(d);
-        let envelope = ToolCallEnvelope {
-            // Minus the marker the model has already emitted, plus the turn
-            // terminator on the close.
-            open: base
-                .open
-                .strip_prefix(&base.marker)
-                .unwrap_or(&base.open)
-                .to_string(),
-            close: format!("{}{}", base.close, d.assistant_end),
-            ..base
-        };
+        // The marker off the front and the turn terminator on the close, with
+        // the close ending exactly ON that terminator — see
+        // [`ToolCallEnvelope::for_assistant_turn`] for why the trailing newline
+        // in `assistant_end` cannot be allowed to ride along.
+        let envelope = ToolCallEnvelope::for_assistant_turn(&self.config.dialect);
         let spec = compile_tool_call_tree(tools, &envelope).map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
         })?;
@@ -1191,21 +1190,26 @@ impl ConversationEngine {
         Ok(Arc::new(registry))
     }
 
-    /// Compile the thinking-block steering trees (one per effort dial) once, for
-    /// reuse across turns via [`ThinkSteering::registry_for`].  Like the tool
+    /// Compile the thinking-block steering trees (one per effort dial, `Off`
+    /// included) once, for reuse across turns via
+    /// [`ThinkSteering::registry_for`].  Like the tool
     /// stencil, this is inactive — `Ok(None)` — when the tokenizer lacks a
     /// single `<think>`/`</think>` token, so the model free-decodes its reasoning.
     ///
-    /// `after_close` is emitted by the grammar immediately after the block's
-    /// closing tag — see [`ThinkSteerEnvelope::after_close`]. `""` hands control
-    /// back to the decoder, which is what an assistant wants. An action loop
-    /// passes the tool-call marker, so a character that has finished thinking is
-    /// put straight into a call rather than left free to write prose at the one
-    /// join the grammar does not otherwise cover.
-    pub fn compile_think_steering(
-        &self,
-        after_close: &'static str,
-    ) -> crate::Result<Option<Arc<ThinkSteering>>> {
+    /// **The tree hands control back to the decoder at `</think>`, and cannot do
+    /// otherwise.** Emitting anything after the closing tag — a tool-call marker,
+    /// to put a character that has finished thinking straight into a call — reads
+    /// as a natural extension and breaks the index page cut. A static run's last
+    /// token is deliberately held back from the forward and rides the next decode
+    /// step, which commits it through `push_committed` and arms the cut; a marker
+    /// in any earlier slot goes through `push_forwarded`, whose cut flag is
+    /// dropped, and `run_prefill`'s `reasoning_split` declines to split when the
+    /// break token is last in the pass. The block still records its
+    /// `think_close_at`, so the turn seals with a reasoning span that is not a
+    /// union of whole pages and every LATER turn fails
+    /// `Substrate::turn_sealed_without_thinking`. See the `Off` arm in
+    /// `stencil::think` for the measured case.
+    pub fn compile_think_steering(&self) -> crate::Result<Option<Arc<ThinkSteering>>> {
         let (Some(think_open), Some(think_close)) = (
             self.tokenizer.token_to_id("<think>"),
             self.tokenizer.token_to_id("</think>"),
@@ -1221,7 +1225,9 @@ impl ConversationEngine {
             think_open,
             think_close,
             eos,
-            after_close,
+            // The assistant's reasoning is followed by prose, so control returns
+            // to the decoder the moment the block closes.
+            after_close: "",
         };
         let vocab = HfVocab::new(
             (*self.tokenizer).clone(),
@@ -1229,7 +1235,7 @@ impl ConversationEngine {
             self.config.vocab_size as u64,
         );
         let compile_mode = |mode: ThinkMode| -> crate::Result<Arc<StencilTree>> {
-            let spec = compile_think_tree(mode, &env).expect("every dial yields a steering spec");
+            let spec = compile_think_tree(mode, &env);
             let tree = compile(&spec, &vocab).map_err(|e| {
                 ConversationError::from(candle::Error::Msg(format!("think stencil: {e}")))
             })?;
@@ -1477,13 +1483,10 @@ impl ConversationEngine {
         self.conversation
             .set_timeline_compression(timeline, compression);
         // Every layer summarises into its AVL summary tree; provenance scans then
-        // expand the compressed nodes on retrieval. This is independent of
-        // `disable_reprojection` — that flag only gates the per-turn reprojection
-        // for append-only utility layers. The AVL summariser runs on its own
-        // thread (wave-driven compression) and never blocks ingest, so even
-        // high-turn-count utility layers can summarise.
-        self.conversation
-            .set_timeline_summarize(timeline, !self.config.disable_summariser);
+        // No summarisation is registered for the timeline: the AVL summariser is
+        // disconnected (see the `SummariserThread::disabled()` note in `new`), so
+        // a timeline keeps its turns whole and retrieval ranks them by provenance
+        // rather than reading a compressed stand-in.
         let target = ProjectionTarget {
             layer,
             group,
@@ -1667,8 +1670,6 @@ impl ConversationEngine {
                     // failed send leaves only the bare timeline mint, no metadata.
                     self.conversation
                         .set_timeline_compression(timeline, compression);
-                    self.conversation
-                        .set_timeline_summarize(timeline, !self.config.disable_summariser);
                     fired.push(Ok(Fired { target, rx }));
                 }
                 Err(_) => fired.push(Err(ConversationError::SchedulerGone)),

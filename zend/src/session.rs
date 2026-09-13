@@ -20,6 +20,7 @@ use candle_conversation::projection::{
     self, Builder, GroupSchema, Reserved, SectionId, SelectionRule, SystemItem, SystemPromptItem,
     SystemPromptSchema, TimelineId, TurnIndex,
 };
+use candle_conversation::provenance::ToolBelief;
 use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
@@ -132,8 +133,8 @@ struct ConvState {
 }
 
 /// Map a turn's `thinking_effort` dial to the steering [`ThinkMode`].  Mirrors
-/// `dial_selection` in `api/chat.rs`: effort 0 → `off` (the `/no_think` glue
-/// yields the empty block, so no tree steers it); an unset dial defaults to the
+/// `dial_selection` in `api/chat.rs`: effort 0 → `off`, whose tree closes the
+/// block on the token after `<think>`; an unset dial defaults to the
 /// projection's `balanced` (free flow).
 fn think_mode_from_selection(selection: &candle_conversation::SelectionState) -> ThinkMode {
     match selection.get("thinking_effort") {
@@ -206,9 +207,16 @@ struct InferenceState {
     /// stops draining; the request path stops enqueuing new title jobs.
     shutting_down: AtomicBool,
     /// Live per-layer ingest state, keyed by projection layer name. One entry
-    /// per schema ingest layer that was actually populated at boot (disabled
-    /// layers are absent). The watcher-driven refresh and the upload path both
-    /// iterate this registry; a projection with no ingest layers leaves it empty.
+    /// per schema ingest layer that was actually populated at boot — a layer
+    /// named by `--disable-layer` OR `--skip-layer` ran no ingest pass and is
+    /// therefore ABSENT, which is also what suppresses its watcher-driven
+    /// refresh: the refresh dispatch reads each layer's prior state from here and
+    /// skips any layer that has none, so "not loaded" implies "not refreshed"
+    /// without either flag being consulted a second time. The upload path also
+    /// iterates this registry, but it SEEDS a missing entry rather than skipping
+    /// it (an upload is a deliberate write, not a disk re-read), so that path
+    /// checks `disabled_layers` itself. A projection with no ingest layers leaves
+    /// this empty.
     ingest_convs: Mutex<HashMap<String, IngestConv>>,
     /// The schema's ingest layers in declaration order (identity + strategy +
     /// display label), resolved once at load. Drives the refresh dispatch —
@@ -283,7 +291,7 @@ const TITLER_MAX_TOKENS: usize = 24;
 const CALIBRATION_MAX_TOKENS: usize = 2048;
 
 /// Closer phrase the sampler plays (followed by `</think>`) when the think
-/// block's HARD per-span cap fires mid-sentence — the em-dash lead-in reads as
+/// block's HARD token cap fires mid-sentence — the em-dash lead-in reads as
 /// a deliberate self-interruption after any dangling fragment, and the
 /// commitment ("know what to do") primes the answer that follows. Tokenized
 /// once at startup into `InferenceState::think_closer_phrase`.
@@ -569,8 +577,8 @@ impl InferenceState {
         tokenizer_path: PathBuf,
         workspace: PathBuf,
         disabled_layers: HashSet<String>,
+        skipped_layers: HashSet<String>,
         ingest_dirs: HashMap<String, String>,
-        disable_summariser: bool,
         compact_substrate: bool,
         progress: Arc<LoadProgress>,
         status_tx: tokio::sync::watch::Sender<String>,
@@ -724,6 +732,33 @@ impl InferenceState {
         }
         let default_identity = identity.default_identity.clone();
 
+        // `--disable-layer` takes its layer OUT OF THE PROVENANCE GATHER, and the
+        // flag has to be set HERE — while there is still exactly one builder.
+        // Every schema that resolves a projection later is a copy of this one:
+        // `base_conv` is built from `proj_builder` itself, and the clone below
+        // feeds the ingest passes, the per-mode turn builders
+        // (`ModeBuilders::build`) and the watcher's `refresh_builder`. Setting
+        // `gathered` after the clone would leave the base conversation — the very
+        // schema the live dialogue projects against — still gathering the layer,
+        // which is the half that mattered.
+        //
+        // `gathered` is runtime-only and deliberately not a YAML field: the
+        // schema declares what a layer IS, and whether this boot lets it compete
+        // is an operator decision for this process only. Nothing is deleted, so
+        // dropping the flag restores the layer's turns to the gather intact.
+        //
+        // A name that is a section collection rather than a layer (`response`,
+        // `mood`) matches nothing here; its suppression is the `section_sinks`
+        // loop above, so a `false` return is expected, not an error.
+        for name in &disabled_layers {
+            if proj_builder.set_layer_gathered(name, false) {
+                tracing::info!(
+                    layer = %name,
+                    "--disable-layer: layer excluded from the provenance gather",
+                );
+            }
+        }
+
         // The dialogue layer's `system_prompt.items` start with a static
         // prelude (mode/frame/grounding/tools_intro) →
         // then the `tools` collection (90+ tool sections, top_k=3) →
@@ -751,9 +786,6 @@ impl InferenceState {
             // driven by the section-tree `no_think` selector (the composer
             // effort dial), not this static flag.
             .thinking(true)
-            // `--disable-summariser`: bring the engine up without the AVL
-            // summary-forest thread (e.g. for bulk corpus prefill).
-            .disable_summariser(disable_summariser)
             // Per-layer corrupt-turn policy (from the projection schema): the
             // startup reload drops the whole conversation for ingest layers and
             // only the corrupt turn for dialogue.
@@ -768,8 +800,6 @@ impl InferenceState {
         if let Some(dir) = expert_pack_dir {
             builder = builder.expert_pack_dir(dir);
         }
-        let conv_config = builder.conversation_config();
-
         // Per-layer progress callback — the library reports
         // `(layers_loaded, total_layers)` after each transformer block
         // is mounted. We translate that into the LoadProgress fraction
@@ -793,6 +823,29 @@ impl InferenceState {
             "load timing: model weights loaded (engine built; substrate reload now running in background)",
         );
 
+        // AFTER the engine build, never before. The builder resolves the
+        // `<think>`/`</think>` ids into its sampling config while loading the
+        // tokenizer, so a config taken earlier is a snapshot with both ids still
+        // at their `-1` placeholder — and every tier of the think-block close
+        // budget is gated on them. Unresolved, `update_segment_state` returns at
+        // its first guard, `in_segment` never opens, `segment_len` never counts,
+        // and the graceful ramp, the force cutoff and the closer script are all
+        // silently unreachable: think blocks then run to the stencil's runaway
+        // span cap and get amputated mid-word instead of closing on a clause.
+        let conv_config = builder.conversation_config();
+        if conv_config.sampling.segment_close_token_id < 0
+            || conv_config.sampling.segment_open_token_id < 0
+        {
+            // Loud, because the failure mode is invisible: generation still
+            // works, it just ignores every thinking budget.
+            anyhow::bail!(
+                "thinking token ids unresolved in the dialogue sampling config \
+                 (open={}, close={}) — the think-block close budget would be inert",
+                conv_config.sampling.segment_open_token_id,
+                conv_config.sampling.segment_close_token_id,
+            );
+        }
+
         // Compile the whole tool catalog into one constrained-decoding stencil,
         // keyed by the `<tool_call>` trigger.  Passed on every user turn so any
         // tool call the model starts is forced to the catalog's exact shape.
@@ -815,7 +868,7 @@ impl InferenceState {
         // The thinking-block steering trees (one per non-off effort dial),
         // compiled once and reused across turns alongside the tool-call base.
         let think_steering = engine
-            .compile_think_steering("")
+            .compile_think_steering()
             .map_err(|e| anyhow::anyhow!("think steering compile: {e}"))?;
         tracing::info!(
             elapsed_ms = t_compile.elapsed().as_millis() as u64,
@@ -854,7 +907,7 @@ impl InferenceState {
 
         // Reclaim is normally fully background: the segmented log's
         // persistence-thread maintenance pass drops / compacts / combines
-        // segments incrementally (`docs/segmented_substrate_log.md` §6), so a
+        // segments incrementally (`docs/archived/segmented_substrate_log.md` §6), so a
         // startup pays no whole-store rewrite. `--compact-substrate` forces the
         // eager path instead — a whole-store rewrite here, after the reload (so
         // the live set is known) and before serving. It always runs when the
@@ -1657,12 +1710,62 @@ impl InferenceState {
         // most promiscuous file tops every query at an un-normalized score (the
         // observed 0% retrieval after a re-ingest). Marking here, once, from the
         // warm's own builder keeps the append-only set consistent on every load path.
+        //
+        // **This is where the two flags part company**, and the split is the whole
+        // point of having two:
+        //
+        // - `--skip-layer` means "the corpus is built, stop re-reading the disk".
+        //   The layer is otherwise FULLY LIVE, so it is marked append-only here
+        //   (hence warmed, hence normalized, hence gathered at sane scores) and its
+        //   crashed partials are retired. Only the read is skipped, below.
+        // - `--disable-layer` means "this layer is out of service". No mark, so no
+        //   normalization warm; `gathered = false` (set before the builder was
+        //   cloned, far above), so no gather; and no sweep, because sweeping
+        //   tombstones turns, which is a MUTATION — the one thing an out-of-service
+        //   layer must not suffer. Its substrate is left exactly as it stands, so
+        //   dropping the flag restores the layer whole.
+        //
+        // The append-only mark must be taken from THIS builder
+        // (`proj_builder_refresh`) — the same one whose layer ids
+        // `warm_ingest_normalization` checks — and up front, before any ingest. The
+        // per-layer marks inside the loop below run on only the branch actually
+        // taken and, on the ingest branch, via the ingest builder's id; a boot that
+        // RE-INGESTS then marks via an id the warm-up doesn't read, the warm sees 0
+        // append-only layers, every content scope stays COLD, and the most
+        // promiscuous file tops every query at an un-normalized score (the observed
+        // 0% retrieval after a re-ingest). Marking here, once, from the warm's own
+        // builder keeps the append-only set consistent on every load path.
+        //
+        // That consistency is what the mark buys, and it is expensive to lose: it
+        // is what `warm_ingest_normalization` recognises a layer by, and without it
+        // the gather divides raw scores in the millions by the `hit_prior` of 400 —
+        // a ~13,000x under-correction that put a repo_map file listing, the most
+        // promiscuous member in the corpus, at the top of an unrelated dialogue's
+        // context at a score of 13,315,007 against the live conversation's 0. A
+        // layer the operator declined to RE-READ still has a substrate full of
+        // turns that answer queries, and those turns need their levels — which is
+        // exactly why `--skip-layer` keeps the mark and `--disable-layer`, which
+        // also leaves nothing in the gather to score, does not.
         for il in &ingest_layers {
             if disabled_layers.contains(&il.name) {
                 continue;
             }
             if let Some(layer_id) = proj_builder_refresh.id_for_layer(&il.name) {
                 engine.lock().unwrap().mark_layer_append_only(layer_id);
+            }
+            // Retire crashed partials before any pool starts — a half-built chain
+            // still carries its `WideQSig`s, so until it is tombstoned it competes
+            // in the gather with a promiscuous file listing and no summary. Nothing
+            // is in flight at this point, which is why the sweep lives here and not
+            // inside the ingest passes (those run only when the read runs, which is
+            // precisely not the `--skip-layer` case that needs it).
+            match il.mode {
+                IngestMode::Folders => crate::repo_scan::retire_crashed_partials(&engine),
+                IngestMode::Files => crate::code_read::retire_crashed_partials(&engine),
+                // Raw ingest has no half-built state to retire: a record's turns
+                // are prefilled and its content hash written in the same commit,
+                // so a conversation is either absent or complete.
+                IngestMode::Raw => {}
             }
         }
         progress.set_step(LoadStep::Ingesting);
@@ -1675,8 +1778,15 @@ impl InferenceState {
             if candle_conversation::ingest_cancelled() {
                 break;
             }
+            // Both flags stop the read; they differ in everything else, and the
+            // divergence is handled in the pre-loop above (append-only mark,
+            // gather membership, crashed-partial sweep). Here they agree.
             if disabled_layers.contains(&il.name) {
-                tracing::info!(layer = %il.name, "--disable-layer: startup ingest suppressed");
+                tracing::info!(layer = %il.name, "--disable-layer: layer inert, startup ingest suppressed");
+                continue;
+            }
+            if skipped_layers.contains(&il.name) {
+                tracing::info!(layer = %il.name, "--skip-layer: layer live, startup ingest skipped");
                 continue;
             }
             // The layer's display label rides the step's `detail` sub-status.
@@ -2694,37 +2804,40 @@ fn run_inference_stream(
                 .unwrap_or(sampling.seed);
         }
         // Per-dial thinking budget: the EOT close ramp's graceful/force thresholds
-        // scale with the effort level (exhaustive thinks longest).  `segment_len`
-        // restarts each steered span, so these are per-span — higher dials get more
-        // room per span and, via more spans, far more total.
+        // scale with the effort level (exhaustive thinks longest).  The steering
+        // tree gives every dial ONE span, so `segment_len` runs the length of the
+        // think block and this budget IS the dial — it is the only thing that
+        // separates deep from balanced.
         let (graceful_eot, force_eot) = think_mode.eot_budget();
         sampling.graceful_segment_close_after = graceful_eot;
         sampling.force_segment_close_after = force_eot;
-        // The per-span close boost ramps `</think>`+EOS over this dial's
-        // [graceful, force] thinking-token window (resets each span), so it builds
-        // pressure into the same point the force override hard-closes — and scales
-        // with the dial instead of a fixed global ramp that misses the short dials.
+        // The close boost ramps `</think>`+EOS over this dial's [graceful, force]
+        // thinking-token window, so it builds pressure into the same point the
+        // force override hard-closes — and scales with the dial instead of a fixed
+        // global ramp that misses the short dials.
         sampling.segment_close_ramp_start = graceful_eot;
         sampling.segment_close_ramp_len = force_eot;
         // The EOS (turn-ender) budget is the whole-turn backstop on total length,
-        // derived from BOTH dials: the think budget (spans × per-span cap) fixes
-        // where the answer starts, so the ramp begins as the think block ends and is
-        // dormant during reasoning (the per-span EOT/EOS boost handles that); the
-        // `response_length` dial sets the answer room above it.  So it can't truncate
-        // the thinking budget, and it scales with both knobs.  (Keeps the preset's
-        // eos_boost magnitude/mult; the boost ramps to the graceful threshold.)
+        // derived from BOTH dials: the think budget fixes where the answer starts,
+        // so the ramp begins as the think block ends and is dormant during
+        // reasoning (the EOT/EOS boost handles that); the `response_length` dial
+        // sets the answer room above it.  So it can't truncate the thinking
+        // budget, and it scales with both knobs.  (Keeps the preset's eos_boost
+        // magnitude/mult; the boost ramps to the graceful threshold.)
         let response_tokens = response_budget_from_selection(&selection);
         let (eos_ramp_start, graceful_eos, forced_eos) = think_mode.eos_budget(response_tokens);
         sampling.eos_ramp_start = eos_ramp_start;
         sampling.eos_ramp_len = graceful_eos;
         sampling.graceful_eos_after = graceful_eos;
         sampling.forced_eos_after = forced_eos;
-        // Hard-cap closer: when the per-span force budget amputates the think
-        // block mid-sentence, the sampler plays this phrase and then closes
-        // the block itself, so the reasoning ends as intentional prose with an
-        // explicit commitment. All dials; the sampler skips it in continuation
-        // spans (deep/exhaustive "But wait" retirement) where more reasoning
-        // follows, and at completed sentences, which need no rescue.
+        // Hard-cap closer: when the force budget amputates the think block
+        // mid-sentence, the sampler plays this phrase and then closes the block
+        // itself, so the reasoning ends as intentional prose with an explicit
+        // commitment instead of a dangling fragment. This is the one place the
+        // stencil puts words inside a think block, and it is a rescue rather
+        // than a steer: it fires only at the hard cap, only mid-sentence (a
+        // completed sentence needs none), and only as the block ENDS — so there
+        // is no reasoning left for the model to misread it into.
         sampling.segment_close_script = state.think_closer_phrase.clone();
 
         // The tool loop runs until the model stops emitting tool calls (i.e.
@@ -2780,6 +2893,23 @@ fn run_inference_stream(
             // <tool_call> tags at the flush, so the GUI renders a card instead of
             // showing the bare JSON the model emits when it drops the wrapper.
             let mut hold_from: Option<usize> = None;
+            // **A collapsed `<think></think>` must not reach the client.**
+            //
+            // The engine strips empty think blocks from the text it STORES
+            // (`strip_empty_think_blocks`, in `build_turn_layout`), but the
+            // stream is assembled from the raw token events and nothing filtered
+            // it — so an empty block went out verbatim and rendered as leaked
+            // markup. It became the common case with thinking-span projection:
+            // older turns have their reasoning windowed out of the K/V, so the
+            // model reads a history with no visible reasoning and answers with a
+            // collapsed block of its own.
+            //
+            // Classifying a block needs its `</think>`, which is why this holds
+            // rather than filters — but only while the block is still
+            // WHITESPACE-ONLY. Real reasoning trips `resolved` on its first
+            // non-blank token and streams from then on, so a thinking turn is
+            // never held back waiting for its own close.
+            let mut think_resolved = false;
             let mut done_resp = None;
             let mut turn_error: Option<anyhow::Error> = None;
             let mut client_gone = false;
@@ -2801,6 +2931,44 @@ fn run_inference_stream(
                                 let rest = text[answer..].trim_start();
                                 if rest.starts_with('{') {
                                     hold_from = Some(text.len() - rest.len());
+                                }
+                            }
+                            // Resolve a leading think block before anything of it
+                            // is emitted. Three outcomes, checked in order: the
+                            // block closed while empty (skip it entirely), it has
+                            // real content (release and never look again), or it
+                            // is still opening (hold — at most a few whitespace
+                            // tokens).
+                            if !think_resolved {
+                                const OPEN: &str = "<think>";
+                                const CLOSE: &str = "</think>";
+                                match text.find(OPEN) {
+                                    None => think_resolved = !text.trim().is_empty(),
+                                    Some(open) => {
+                                        let inner_at = open + OPEN.len();
+                                        match text[inner_at..].find(CLOSE) {
+                                            Some(rel) => {
+                                                let inner = &text[inner_at..inner_at + rel];
+                                                if inner.trim().is_empty() {
+                                                    // Skip the block and the blank
+                                                    // run after it, so the answer
+                                                    // does not open on a gap.
+                                                    let after = inner_at + rel + CLOSE.len();
+                                                    let tail = text[after..].trim_start();
+                                                    emitted_len = text.len() - tail.len();
+                                                }
+                                                think_resolved = true;
+                                            }
+                                            // Open but unclosed: real reasoning the
+                                            // moment it is not just whitespace.
+                                            None => {
+                                                think_resolved = !text[inner_at..].trim().is_empty()
+                                            }
+                                        }
+                                    }
+                                }
+                                if !think_resolved {
+                                    continue;
                                 }
                             }
                             let emit_to = hold_from.unwrap_or(text.len());
@@ -3851,7 +4019,14 @@ impl ZendSession {
             }
         }
 
+        // Rank on the RAW belief, then bound what is rendered. Order first is
+        // load-bearing: a lock-on rides far above the 0-1000 normalized band, so
+        // clamping before the sort ties the leaders and the readout's ordering —
+        // the thing the margin is actually read for — becomes arbitrary.
         tiles.sort_by(|a, b| b.score.total_cmp(&a.score));
+        for tile in &mut tiles {
+            tile.score = ToolBelief::for_display(tile.score);
+        }
 
         // Diagnostic: if `scored` is 0 while `query_tokens` > 0, the probe Q was
         // captured but didn't discriminate against the gallery (cold/partial-warm
@@ -3999,20 +4174,22 @@ impl ZendSession {
         Some(result)
     }
 
-    /// Enable or disable AVL summarisation for `conv_id`'s timeline. Only takes
-    /// effect once the timeline exists (i.e. after its first turn has been
-    /// submitted). Returns `None` if the model isn't loaded. Exercised only by the
-    /// CUDA-gated `duplication_replay` integration test (via the `zend` lib), to
-    /// isolate whether the async summariser's concurrent activity influences a
-    /// conversation's decode — so the `zend` *binary* never calls it and its copy
-    /// of this module reads as dead; the lib copy the test links is public API.
-    #[allow(dead_code)]
-    pub fn set_conversation_summarize(&self, conv_id: &str, summarize: bool) -> Option<()> {
+    /// Tombstone a timeline by its RAW id — the derived-layer counterpart to
+    /// [`Self::tombstone_conversation`], which can only address timelines whose
+    /// id is `hash(conv_id)`.
+    ///
+    /// Backs `DELETE /v1/substrate/timeline/{tl}`. Nothing is removed from the
+    /// dialogue conversation map, because a derived-layer timeline was never in
+    /// it: these are `repo_map` / `code_reading` ingests, addressed only by the
+    /// id the substrate views print.
+    ///
+    /// `None` when the model is not loaded or `raw` is not a valid timeline id
+    /// (zero) — the same shape the sibling routes return.
+    pub fn tombstone_timeline_raw(&self, raw: u64) -> Option<candle_conversation::Result<()>> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let timeline = timeline_for(conv_id);
-        let engine = state.engine.lock().unwrap();
-        engine.set_timeline_summarize(timeline, summarize);
-        Some(())
+        let timeline = projection::TimelineId::from_raw(raw)?;
+        let result = state.engine.lock().unwrap().tombstone_timeline(timeline);
+        Some(result)
     }
 
     /// Decoded turn history for a single recovered conversation — backs
@@ -4288,8 +4465,8 @@ impl ZendSession {
         let load_progress = Arc::clone(&self.load_progress);
         let workspace = self.config.workspace.clone();
         let disabled_layers = self.config.disabled_layers.clone();
+        let skipped_layers = self.config.skipped_layers.clone();
         let ingest_dirs = self.config.ingest_dirs.clone();
-        let disable_summariser = self.config.disable_summariser;
         let compact_substrate = self.config.compact_substrate;
         // Re-arm the process-scoped ingest-cancel latch for this load: it's shared
         // across the process (and the test binary), so clear any cancel left by a
@@ -4372,8 +4549,8 @@ impl ZendSession {
                     tok_path,
                     workspace,
                     disabled_layers,
+                    skipped_layers,
                     ingest_dirs,
-                    disable_summariser,
                     compact_substrate,
                     load_progress_for_blocking,
                     status_tx.clone(),
@@ -5308,10 +5485,15 @@ mod projection_schema_tests {
             SelectionRule::TopK { k } => assert_eq!(*k, 3, "repo map capped at 3 folders"),
             other => panic!("structure should be top_k(3), got {other:?}"),
         }
+        // No floor: repo_map contributes only what clears the threshold. The
+        // group carried `default: { tag: "." }`, which re-injected the
+        // workspace-root folder whenever the threshold filtered everything out —
+        // so a cold probe (every folder scoring exactly 0 against the 1.0 gate)
+        // still paid ~4,000 tokens for a folder listing nobody asked for.
         assert_eq!(
-            group.default.as_ref().map(|d| d.tag.as_str()),
-            Some("."),
-            "repo_map default floor is the workspace-root folder",
+            group.score_threshold,
+            Some(1.0),
+            "repo_map gates on score alone, so the threshold must be explicit",
         );
     }
 }

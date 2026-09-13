@@ -26,7 +26,8 @@
 
 use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
-use crate::models::kv_cache_utils::{new_kv_caches, KvCaches, SequenceContext};
+use crate::models::delta_net::ExportedLayerState;
+use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
 use candle::quantized::pinned_staging::Generation;
 #[cfg(feature = "cuda")]
 use candle::quantized::pinned_staging::GpuBuf;
@@ -45,7 +46,7 @@ use super::batched_layer::GlueMeta;
 use super::batched_model::{BatchedInference, BatchedModelCore, WaveGuard, WavePhase};
 use super::wave_driver::{drive_wave, WaveGroups, WaveSweep};
 #[cfg(feature = "cuda")]
-use crate::models::profile::pipeline_record_duration;
+use crate::models::profile::{gpu_span, pipeline_record_duration};
 use crate::models::speculative_choice::{AcceptWalk, TokenChooser};
 use crate::models::verify_wave::{issue_verify_wave, VerifyPlan, WaveCoBatch};
 
@@ -437,7 +438,15 @@ impl BatchedConfig {
     /// Build a [`CompressionPolicy`] from this config's level (if set).
     /// Returns `None` for uniform/non-compression modes.
     pub fn compression_policy(&self) -> Option<CompressionPolicy> {
-        self.compression_level.map(|level| {
+        self.compression_level
+            .and_then(|level| self.compression_policy_at(level))
+    }
+
+    /// The same policy at an explicit level, for a caller that seals one layer
+    /// differently from the rest. `None` when the session is uncompressed —
+    /// a level cannot conjure compression the mode does not have.
+    pub fn compression_policy_at(&self, level: u8) -> Option<CompressionPolicy> {
+        self.compression_level.map(|_| level).map(|level| {
             CompressionPolicy::new_with_error_threshold_factors(
                 level,
                 self.k_hi_error_threshold_factor,
@@ -530,6 +539,56 @@ pub(crate) fn build_glue_meta(
     }))
 }
 
+/// How a model's KV layers divide into the ones a wave steps together and the
+/// ones stepped by a pass of their own.
+///
+/// A **stream** layer advances on every wave: the trunk sweep writes it, so all
+/// stream layers hold the same token prefix at a wave boundary, and every
+/// stream-wide aggregate — the token prefix `sequence_backing_tokens` reports,
+/// the block structure `build_decode_metadata` reconciles a group to — is taken
+/// over exactly this set.
+///
+/// A **draft** layer is one a NextN/MTP head owns but the wave does not step:
+/// it is allocated, so the head has somewhere to write, and excluded from every
+/// stream-wide aggregate, so a layer holding nothing cannot speak for the ones
+/// that do.
+///
+/// A head is only meant to sit here while it is being brought up. The finished
+/// arrangement is the one `qwen35::draft` documents and `qwen35::engine::kv_layers`
+/// declares: the head's pass runs over the same rows at the same positions in
+/// the same wave, so its layer stands at the same length as its siblings and is
+/// a **stream** layer like any other — covered by the wave's own metadata, and
+/// invisible to fork, view, prefix injection, turn sealing and truncation
+/// precisely because it is not a special case. A model moves from `draft` to
+/// `stream_only` when its head starts stepping in lockstep, and `draft` should
+/// be 0 everywhere once it does.
+///
+/// Folding a draft layer into a stream aggregate is silent and destructive. A
+/// minimum over token prefixes reads 0 for a layer nothing has written, and the
+/// wave-entry reconciler treats that as "offset ran ahead of the backing" and
+/// clamps the sequence to 0 — every wave, with only a `tracing::warn!` to show
+/// for it. The trunk then re-attends from position 0 and the model answers
+/// fluently and wrongly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvLayers {
+    /// Layers the wave steps together.
+    pub stream: usize,
+    /// Layers past the stream, each stepped by a draft head's own pass.
+    pub draft: usize,
+}
+
+impl KvLayers {
+    /// A model whose every KV layer advances on every wave.
+    pub fn stream_only(stream: usize) -> Self {
+        Self { stream, draft: 0 }
+    }
+
+    /// Backings the session allocates.
+    pub fn total(&self) -> usize {
+        self.stream + self.draft
+    }
+}
+
 /// Batched inference session that manages KV cache state for multiple sequences.
 ///
 /// This is the main interface for batched inference. It:
@@ -547,6 +606,13 @@ pub struct BatchedInferenceSession {
     config: BatchedConfig,
     /// Number of layers in the model.
     num_layers: usize,
+    /// Leading layers a wave steps together — see [`KvLayers`]. Every
+    /// stream-wide aggregate is taken over `0..stream_layers`, never over all
+    /// `num_layers`, so a draft head's layer cannot poison one.
+    stream_layers: usize,
+    /// Per layer, a ceiling on the compression level its seals use. `None`
+    /// takes the session's. See [`Self::cap_layer_seal_level`].
+    layer_seal_cap: Vec<Option<u8>>,
     /// Device the session is on.
     device: Device,
     /// Pending reprojection-glue descriptors, set by the wave immediately before
@@ -594,12 +660,13 @@ pub struct ProvSignPacked {
 impl BatchedInferenceSession {
     /// Create a new batched inference session.
     pub fn new(
-        num_layers: usize,
+        layers: KvLayers,
         n_kv_head: usize,
         head_dim: usize,
         device: &Device,
         config: BatchedConfig,
     ) -> Result<Self> {
+        let num_layers = layers.total();
         // Create one backing and share it across all layers.
         // All layers have the same (n_kv_head, head_dim, format) so they
         // share arenas, the GID pool, and the arena table. Each layer gets
@@ -626,9 +693,47 @@ impl BatchedInferenceSession {
             sequences: Vec::new(),
             config,
             num_layers,
+            stream_layers: layers.stream,
+            layer_seal_cap: vec![None; num_layers],
             device: device.clone(),
             pending_glue: None,
         })
+    }
+
+    /// Hold one layer's seals at or below `max_level`, whatever the rest of the
+    /// ladder runs at.
+    ///
+    /// **For a layer whose error budget is not the stack's.** A trunk spreads
+    /// every read over many KV layers, so a level's quantisation error is
+    /// partly averaged over the depth; a one-block draft head has a single
+    /// layer and absorbs none of it.
+    ///
+    /// A **ceiling**, not a setting: the cap only ever lowers, so a session
+    /// already running below it is untouched and the caller does not have to
+    /// know what the session was configured with. Capping to a level *deeper*
+    /// than the session's would be compressing one layer harder than the stack,
+    /// which is never what this is for.
+    ///
+    /// A *level*, not a format, so the layer takes the same code path and the
+    /// same candidate machinery as every other — only less aggressively. The
+    /// alternative of excluding the layer from the seal entirely walks into a
+    /// known corruption: the round-trip truncates every layer to zero blocks
+    /// and re-injects, and "re-injecting Arc-shared chunks under a lone
+    /// sequence corrupted the decode read".
+    ///
+    /// **Note this is the seal path, which is where compression actually
+    /// happens.** A per-`KvCache` policy does not reach it — the seal reads the
+    /// session's — so setting one of those is a silent no-op that looks exactly
+    /// like a null result, and cost this codebase a wrongly-refuted hypothesis.
+    pub fn cap_layer_seal_level(&mut self, layer: usize, max_level: u8) -> Result<()> {
+        let slot = self.layer_seal_cap.get_mut(layer).ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "cap_layer_seal_level: layer {layer} is past the session's {} KV layers",
+                self.num_layers
+            ))
+        })?;
+        *slot = Some(max_level);
+        Ok(())
     }
 
     /// Create a session that shares the KV arena pool with an existing session.
@@ -653,6 +758,11 @@ impl BatchedInferenceSession {
             sequences: Vec::new(),
             config,
             num_layers,
+            // Every backing handed in is a stream layer: a sibling session
+            // exists to borrow chunks through the shared arena pool, and no
+            // draft head runs against it.
+            stream_layers: num_layers,
+            layer_seal_cap: vec![None; num_layers],
             device: device.clone(),
             pending_glue: None,
         }
@@ -879,15 +989,28 @@ impl BatchedInferenceSession {
     ///
     /// Rebuilds slice and header data directly from backing arenas on every call.
     /// Pass `seq_indices` in the same order used for the forward pass batch.
-    /// Returns per-layer slice tensors (must stay alive until after the kernel) and
-    /// per-layer header GpuBufs. Both vecs are empty when `seq_indices` is empty.
+    /// Returns the device-resident `SlotHeader` buffer holding every layer's
+    /// headers (must stay alive until after the kernels) and the per-layer byte
+    /// stride; the buffer is `None` when `seq_indices` is empty.
     #[cfg(feature = "cuda")]
     pub fn build_decode_metadata(
         &self,
         seq_indices: &[usize],
         generation: &Generation,
-    ) -> Result<(Option<GpuBuf>, Option<GpuBuf>, u64)> {
-        self.build_decode_metadata_at(0..self.num_layers, seq_indices, generation, &[], &[], &[])
+    ) -> Result<(Option<GpuBuf>, u64)> {
+        // The STREAM's layers, not every backing: the group a wave steps is
+        // reconciled to a common block structure, and a draft head's layer —
+        // which this sweep never writes — would drag that repair across the
+        // whole group on every decode step, moving the trunk's own write slices
+        // under it. The head's pass builds metadata for its layer alone.
+        self.build_decode_metadata_at(
+            0..self.stream_layers,
+            seq_indices,
+            generation,
+            &[],
+            &[],
+            &[],
+        )
     }
 
     /// [`Self::build_decode_metadata`] with explicit per-sequence offset
@@ -915,11 +1038,12 @@ impl BatchedInferenceSession {
     /// `&[]` makes every row live.
     ///
     /// `layers` names the contiguous group of KV layers to describe. The whole
-    /// stack (`0..num_layers`) is the ordinary answer, and the shared position
-    /// map is what makes it one build rather than N — every layer of the group
-    /// must therefore agree on block structure, which
-    /// [`ChunkedKvBacking::ensure_for_batch_entries_all`] establishes over the
-    /// group before the map is read from its first backing.
+    /// stack (`0..num_layers`) is the ordinary answer, and the group's one
+    /// write-capacity reconciliation is what makes it one build rather than
+    /// N — every layer of the group must therefore agree on block structure,
+    /// which [`ChunkedKvBacking::ensure_for_batch_entries_all`] establishes
+    /// over the group before each layer's headers are checked against the
+    /// first's.
     ///
     /// A NARROWER group exists for exactly one reason: a layer that legitimately
     /// stands at a different length from the rest. The MTP draft head is one —
@@ -939,10 +1063,10 @@ impl BatchedInferenceSession {
         offset_overrides: &[(usize, usize)],
         non_writer: &[usize],
         snapshot_seqs: &[usize],
-    ) -> Result<(Option<GpuBuf>, Option<GpuBuf>, u64)> {
+    ) -> Result<(Option<GpuBuf>, u64)> {
         let n_active = seq_indices.len();
         if n_active == 0 {
-            return Ok((None, None, 0));
+            return Ok((None, 0));
         }
         if layers.start >= layers.end || layers.end > self.num_layers {
             candle::bail!(
@@ -981,23 +1105,19 @@ impl BatchedInferenceSession {
             })
             .collect();
 
-        // Build per-sequence position_map covering [0, state.offset + 1).
-        // Each entry is u32: (slice_idx << 16) | in_blk.  The map is
-        // invariant across the GROUP (slice metadata is uniform within it),
-        // built once, and every layer's SlotHeader points into the
-        // per-sequence region.
-        // Entry at index state.offset is the write slot for the new token.
-        let mut pm_flat: Vec<u32> = Vec::new();
-        let mut pm_seq_byte_offsets: Vec<usize> = Vec::with_capacity(n_active);
-        // `(slice count, write slice)` the map was built against, per sequence.
-        // Both are read from the group's FIRST layer while the map is one buffer
-        // every layer's slot header points at, so every layer's own answer is
-        // checked against them below rather than assumed equal.
-        let mut pm_slot_shape: Vec<(u32, u32)> = Vec::with_capacity(n_active);
+        // `(slice count, write slice)` per sequence, read from the group's
+        // FIRST layer. The decode kernels address the write chunk through
+        // each layer's own header, so every layer's answer is checked
+        // against the first's below rather than assumed equal: a layer whose
+        // block table disagrees would scatter the token into one chunk and
+        // attend to another. (The decode headers carry no position map —
+        // no decode kernel reads one; the prefill and glue uploads in
+        // `prefill_utils` build theirs per forward.)
+        let mut slot_shape: Vec<(u32, u32)> = Vec::with_capacity(n_active);
         // Ensure backings are sized for the upcoming decode write so the slot's
         // chunks reflect the post-write layout when we read them, and reconcile
-        // any block-structure skew between layers — the map built below is one
-        // buffer describing all of them.
+        // any block-structure skew between layers — the shape read below from
+        // the first layer must describe all of them.
         //
         // Every layer of the GROUP at once, and once per decode step rather than
         // once per layer: only the layers that need an allocation take the write
@@ -1014,28 +1134,17 @@ impl BatchedInferenceSession {
             .collect();
         ChunkedKvBacking::ensure_for_batch_entries_all(group, &writer_offsets, 1)?;
         for &(seq_idx, seq_offset) in &seq_offsets {
-            let entry_start = pm_flat.len();
-            pm_seq_byte_offsets.push(entry_start * 4);
             let chunks = group[0].live_chunks_as_sealed(seq_idx).unwrap_or_default();
-            for (sidx, c) in chunks.iter().enumerate() {
-                let base = (sidx as u32) << 16;
-                pm_flat.extend(
-                    (c.offset as u32..c.offset as u32 + c.token_count as u32)
-                        .map(|in_blk| base | in_blk),
-                );
-            }
+            let cum_tokens: usize = chunks.iter().map(|c| c.token_count as usize).sum();
             debug_assert_eq!(
-                pm_flat.len() - entry_start,
-                seq_offset,
-                "decode position_map: cum_tokens {} != state.offset {seq_offset} for seq {seq_idx}",
-                pm_flat.len() - entry_start,
+                cum_tokens, seq_offset,
+                "decode metadata: cum_tokens {cum_tokens} != state.offset {seq_offset} for seq {seq_idx}",
             );
-            // Write-slot entry: the new token lands in the WRITE chunk — the
-            // first non-full chunk from `writer_start_idx`, NOT `chunks.last()`
-            // (which may be a trailing empty sitting past the writer). This MUST
-            // match the `write_slice` rule in `sync_decode_gpu_chunks`, or the
-            // kernel scatters the token into one chunk while attention is told
-            // (via the position_map) to read it from another.
+            // The new token lands in the WRITE chunk — the first non-full
+            // chunk from `writer_start_idx`, NOT `chunks.last()` (which may be
+            // a trailing empty sitting past the writer). This MUST match the
+            // `write_slice` rule in `sync_decode_gpu_chunks`, which is what
+            // every layer is checked against below.
             let wstart = group[0].writer_start_idx_for_seq(seq_idx).unwrap_or(0);
             let n_ch = chunks.len();
             let wi = if n_ch == 0 {
@@ -1046,27 +1155,8 @@ impl BatchedInferenceSession {
                     .find(|&i| (chunks[i].offset as usize + chunks[i].token_count as usize) < 32)
                     .unwrap_or(n_ch - 1)
             };
-            let wi_within = chunks
-                .get(wi)
-                .map_or(0, |c| c.offset as u32 + c.token_count as u32);
-            pm_flat.push(((wi as u32) << 16) | wi_within);
-            pm_slot_shape.push((n_ch as u32, wi as u32));
+            slot_shape.push((n_ch as u32, wi as u32));
         }
-
-        // Upload position_map via the pinned stager — zero-copy PCIe read,
-        // same path as all_headers below.  Pad to at least one entry so the
-        // device pointer is always valid.
-        if pm_flat.is_empty() {
-            pm_flat.push(0);
-        }
-        let pm_byte_len = pm_flat.len() * std::mem::size_of::<u32>();
-        let mut pm_pinned = generation.alloc(pm_byte_len)?;
-        // SAFETY: u32 has no padding and is trivially copyable; the lengths match.
-        let pm_bytes =
-            unsafe { std::slice::from_raw_parts(pm_flat.as_ptr() as *const u8, pm_byte_len) };
-        pm_pinned.copy_from_slice(pm_bytes);
-        let pm_gpu_buf = generation.submit(pm_pinned)?;
-        let pm_base_ptr = pm_gpu_buf.dev_ptr();
 
         let mut slot_rebuild_time = std::time::Duration::ZERO;
         let mut slot_reuse_time = std::time::Duration::ZERO;
@@ -1103,32 +1193,32 @@ impl BatchedInferenceSession {
             saw_slot_reuse |= sync_stats.reuses > 0;
             saw_slot_rebuild |= sync_stats.rebuilds > 0;
 
-            // Append this layer's headers (24 bytes × n_active).
+            // Append this layer's headers (24 bytes × n_active; the position
+            // map field is 0 — see `slot_shape` above).
             for (i, &(ptr, n_slices, write_slice)) in seq_ptrs.iter().enumerate() {
                 // The kernel SCATTERS the new token through this layer's own
-                // `write_slice` and READS it back through the shared map's write
-                // slot. A layer whose block table disagrees with the one the map
-                // was built from writes the token into one chunk and attends to
-                // another — silently, with no fault and no wrong-looking number
-                // anywhere. `ensure_for_batch_entries_all` reconciles the layers
-                // before this point; this is where that is worth confirming,
-                // because both values are already in hand.
-                let (exp_slices, exp_write) = pm_slot_shape[i];
+                // `write_slice`. A layer whose block table disagrees with the
+                // group's writes the token into one chunk while the group's
+                // shared selection attends to another — silently, with no
+                // fault and no wrong-looking number anywhere.
+                // `ensure_for_batch_entries_all` reconciles the layers before
+                // this point; this is where that is worth confirming, because
+                // both values are already in hand.
+                let (exp_slices, exp_write) = slot_shape[i];
                 if (n_slices, write_slice) != (exp_slices, exp_write) {
                     candle::bail!(
                         "decode metadata: layer {layer_idx} describes sequence {} as \
-                         {n_slices} slices writing slice {write_slice}, but the position map \
-                         every layer of {layers:?} shares was built from layer {} as \
-                         {exp_slices} slices writing slice {exp_write}",
+                         {n_slices} slices writing slice {write_slice}, but layer {} of \
+                         the group {layers:?} describes it as {exp_slices} slices writing \
+                         slice {exp_write}",
                         seq_offsets[i].0,
                         layers.start
                     )
                 }
-                let pm_ptr = pm_base_ptr + pm_seq_byte_offsets[i] as u64;
                 all_headers.extend_from_slice(&n_slices.to_le_bytes());
                 all_headers.extend_from_slice(&write_slice.to_le_bytes());
                 all_headers.extend_from_slice(&ptr.to_le_bytes());
-                all_headers.extend_from_slice(&pm_ptr.to_le_bytes());
+                all_headers.extend_from_slice(&0u64.to_le_bytes());
             }
         }
 
@@ -1143,12 +1233,17 @@ impl BatchedInferenceSession {
             u64::from(saw_slot_rebuild),
         );
 
-        // Upload the group's headers in a single pinned → GPU copy.
+        // The group's headers go to DEVICE memory in one pinned → GPU copy.
+        // Every block of every attention launch opens on its slot header and
+        // hangs its whole slice chain off it, so the header is the one
+        // latency-critical read of the kernel: over the zero-copy mapping
+        // that is a PCIe round trip per warp (measured ~11% of the sparse
+        // decode kernel), resident it is an L2 hit.
         let total = group.len() * header_stride;
         let mut pinned = generation.alloc(total)?;
         pinned.copy_from_slice(&all_headers);
-        let gpu_buf = generation.submit(pinned)?;
-        Ok((Some(pm_gpu_buf), Some(gpu_buf), header_stride as u64))
+        let gpu_buf = generation.submit_resident(pinned)?;
+        Ok((Some(gpu_buf), header_stride as u64))
     }
 
     /// Free a sequence, returning its resources to the pool.
@@ -1459,7 +1554,10 @@ impl BatchedInferenceSession {
         start_new_chunk: bool,
     ) -> Result<()> {
         use candle::quantized::pinned_staging::PinnedBuf;
-        use candle_nn::kv_cache::{quantize_sealed_in_place, SealedSequence};
+        use candle_nn::kv_cache::{
+            convert_deferred_descs, quantize_layers_deferred, ChunkedKvBacking, CompressionPolicy,
+            SealedSequence,
+        };
 
         // Quantization policy, or `None` for uncompressed (F16/BF16). When it's
         // `None` we still SEAL + collapse the layout below (record_turn +
@@ -1506,32 +1604,118 @@ impl BatchedInferenceSession {
         let policy = if quantizable { policy } else { None };
 
         let mut scratch: Option<PinnedBuf> = None;
-        for &seq_idx in seq_indices {
-            // Snapshot + quantize each layer. Holding the outputs across the
-            // truncate below keeps their (refcounted) arena slots alive.
-            let mut quantized_per_layer: Vec<SealedSequence> =
-                Vec::with_capacity(self.backings.len());
-            for backing in &self.backings {
-                let live = backing.record_turn(seq_idx)?;
-                if live.chunks.is_empty() || policy.is_none() {
-                    quantized_per_layer.push(live);
-                    continue;
+
+        // ── ONE format selection across the whole cohort ────────────────────
+        //
+        // **The selection kernel's grid is `chunks × kv_heads`, so the batch axis
+        // is what fills it.** Selecting per (sequence, layer) — which this did —
+        // launches `sequences × layers` times with a 2–44 block grid each: an
+        // nsys trace of the ×128 batched-forward rung put
+        // `select_kv_format_palette4_paged` at **77.8% of all GPU time** (43.2 s
+        // over 4,644 launches, 9.3 ms each) with the two dominant shapes
+        // `grid=42` and `grid=2` — 38% and 1.8% of one wave on a 110-SM card.
+        // That is hot-path invariant 5 ("one launch over all slots, not a
+        // per-seq loop") violated on the axis that grows with width, which is
+        // why aggregate decode fell instead of holding from ×64 to ×128.
+        //
+        // `quantize_layers_deferred` already batches the selection across layers
+        // and takes a *list* of sequences per layer, so the cohort just becomes
+        // that list — the persistence thread's hot→warm drain has used it this
+        // way all along (`persistence::thread`, "ONE cross-layer selection").
+        //
+        // Grouped by resolved policy, because a capped layer (the MTP draft head
+        // seals at C3) genuinely selects against different thresholds and must
+        // not be folded in with the session's. In practice that is one group, or
+        // two when a cap is active.
+        let mut live_per_layer: Vec<Vec<SealedSequence>> = Vec::with_capacity(self.backings.len());
+        for (layer_idx, backing) in self.backings.iter().enumerate() {
+            let _ = layer_idx;
+            let mut per_seq = Vec::with_capacity(seq_indices.len());
+            for &seq_idx in seq_indices {
+                per_seq.push(backing.record_turn(seq_idx)?);
+            }
+            live_per_layer.push(per_seq);
+        }
+
+        // `quantized_per_seq[seq][layer]`, seeded with the live snapshots so a
+        // layer the quantizer skips (no chunks, or no policy at all) passes
+        // through unchanged exactly as the per-sequence path did.
+        let mut quantized_per_seq: Vec<Vec<SealedSequence>> = (0..seq_indices.len())
+            .map(|s| {
+                live_per_layer
+                    .iter()
+                    .map(|per_seq| per_seq[s].clone())
+                    .collect()
+            })
+            .collect();
+
+        if let Some(session_policy) = policy.as_ref() {
+            // Resolve each layer's policy once, then bucket layers by it.
+            let layer_policies: Vec<CompressionPolicy> = (0..self.backings.len())
+                .map(|layer_idx| {
+                    self.layer_seal_cap[layer_idx]
+                        .filter(|&cap| self.config.compression_level.is_some_and(|l| cap < l))
+                        .and_then(|cap| self.config.compression_policy_at(cap))
+                        .unwrap_or(*session_policy)
+                })
+                .collect();
+            let mut groups: Vec<(CompressionPolicy, Vec<usize>)> = Vec::new();
+            for (layer_idx, lp) in layer_policies.iter().enumerate() {
+                match groups
+                    .iter_mut()
+                    .find(|(p, _)| p.compression_level == lp.compression_level)
+                {
+                    Some((_, layers)) => layers.push(layer_idx),
+                    None => groups.push((*lp, vec![layer_idx])),
                 }
-                let out = quantize_sealed_in_place(
-                    backing,
-                    &[&live],
-                    policy.as_ref().unwrap(),
+            }
+
+            let mut descs: Vec<candle::quantized::cuda::PalHeadDesc> = Vec::new();
+            let (mut select_ms, mut alloc_ms) = (0u64, 0u64);
+            for (group_policy, layers) in &groups {
+                let backing_refs: Vec<&ChunkedKvBacking> =
+                    layers.iter().map(|&l| &self.backings[l]).collect();
+                let per_layer_seqs: Vec<Vec<&SealedSequence>> = layers
+                    .iter()
+                    .map(|&l| live_per_layer[l].iter().collect())
+                    .collect();
+                let out = quantize_layers_deferred(
+                    &backing_refs,
+                    &per_layer_seqs,
+                    group_policy,
                     &self.device,
                     &copy_stream,
                     &mut scratch,
+                    &mut descs,
+                    &mut select_ms,
+                    &mut alloc_ms,
                 )?;
-                let q = out.into_iter().next().ok_or_else(|| {
-                    candle::Error::Msg(
-                        "quantize_and_seal_sequences: quantizer returned no sequence".into(),
-                    )
-                })?;
-                quantized_per_layer.push(q);
+                // `out[i]` is group-layer `layers[i]`'s sequences, in
+                // `seq_indices` order — scatter back to (seq, layer).
+                for (gi, &layer_idx) in layers.iter().enumerate() {
+                    let layer_out = out.get(gi).ok_or_else(|| {
+                        candle::Error::Msg(
+                            "quantize_and_seal_sequences: quantizer returned no layer".into(),
+                        )
+                    })?;
+                    for (s, q) in layer_out.iter().enumerate() {
+                        quantized_per_seq[s][layer_idx] = q.clone();
+                    }
+                }
             }
+            // The selection deferred every convert; run them all as one batch per
+            // backing before anything reads the quantized bytes or drops the
+            // float sources below.
+            if !descs.is_empty() {
+                let n_kv_head = self.backings[0].n_kv_head();
+                for backing in &self.backings {
+                    convert_deferred_descs(backing, &descs, n_kv_head, &self.device)?;
+                }
+            }
+        }
+
+        for (s, &seq_idx) in seq_indices.iter().enumerate() {
+            let quantized_per_layer = std::mem::take(&mut quantized_per_seq[s]);
             // Convert kernels must finish before we drop the source float chunks
             // (truncate) and before decode reads the quantized bytes. No convert
             // kernel runs when quantization was skipped, so only sync then.
@@ -2003,6 +2187,17 @@ impl BatchedInferenceSession {
         self.num_layers
     }
 
+    /// Leading KV layers a wave steps together — every layer except a draft
+    /// head's.
+    ///
+    /// The bound for any aggregate taken *across* layers. A speculative head's
+    /// K/V is its own history rather than the conversation's, so including it
+    /// makes such an aggregate describe two different things at once — see the
+    /// `stream_layers` field.
+    pub fn stream_layers(&self) -> usize {
+        self.stream_layers
+    }
+
     /// Get the KV backing for a specific layer.
     pub fn backing(&self, layer: usize) -> Option<&ChunkedKvBacking> {
         self.backings.get(layer)
@@ -2107,9 +2302,10 @@ impl BatchedInferenceSession {
         &self,
         seq_idx: usize,
         block_range: Option<(usize, usize)>,
+        n_layers: usize,
     ) -> candle::Result<Option<ProvSignPacked>> {
         let Some((all_ptrs, block_indices)) =
-            self.resolve_provenance_q_ptrs(seq_idx, block_range)?
+            self.resolve_provenance_q_ptrs(seq_idx, block_range, n_layers)?
         else {
             return Ok(None);
         };
@@ -2197,13 +2393,30 @@ impl BatchedInferenceSession {
         &self,
         seq_idx: usize,
         block_range: Option<(usize, usize)>,
+        n_layers: usize,
     ) -> candle::Result<Option<(Vec<i64>, Vec<usize>)>> {
         if self.backings.is_empty() || self.n_kv_head() == 0 || self.prov_sub_head_dim() == 0 {
             return Ok(None);
         }
+        // **The provenance-bearing layers, which are not always all of them.**
+        //
+        // `n_layers` comes from the model's `provenance_capture_layers`, and it
+        // has to be the same number the fold was derived from: the fold's
+        // geometry is `layers × kv_heads`, so a gather over one more layer than
+        // the fold expects does not produce a slower answer, it produces a
+        // different one.
+        //
+        // It also has to exclude a speculative head's layer. The gather is
+        // all-or-nothing — every layer must agree on the same block set, and
+        // any disagreement returns `None` — and a draft head's K/V is its own
+        // history, at its own seal level, so its blocks never match the trunk's.
+        // Including it returned `None` on every turn: the turn sealed, the K/V
+        // was written, and only the signature was silently absent, leaving
+        // retrieval on recency with nothing saying so.
         let mut all_ptrs: Vec<i64> = Vec::new();
         let mut block_indices: Option<Vec<usize>> = None;
-        for backing in &self.backings {
+        let take = n_layers.min(self.backings.len());
+        for backing in &self.backings[..take] {
             let (ptrs, blocks) = backing.provenance_q_ptrs(seq_idx, block_range)?;
             if ptrs.is_empty() {
                 return Ok(None);
@@ -2599,8 +2812,14 @@ impl BatchedInferenceSession {
         // it is valid on every layer, and as the wave completes and the layers
         // converge the minimum rises to the true length. For a uniform (settled)
         // slot every layer is equal, so this is identical to reading layer 0.
+        // The STREAM's layers only. A draft head's layer is stepped by the
+        // head's own pass, so it holds nothing at all until the head runs and
+        // trails by a token mid-wave once it does — either way its prefix is not
+        // evidence about the stream's, and a minimum that included it would
+        // report 0 and drive the wave-entry reconciler to clamp the sequence
+        // back to the start of its history. See [`KvLayers`].
         let mut min_cum: Option<usize> = None;
-        for cache in &caches.caches {
+        for cache in caches.caches.iter().take(self.stream_layers) {
             let mut cum: usize = 0;
             cache.k_cache().chunked_visit_live_chunks(|it| {
                 for c in it {
@@ -2782,6 +3001,7 @@ impl BatchedInferenceSession {
                     .map_err(|e| candle::Error::Msg(format!("snapshot_sequence_per_layer: {e}")))?,
             );
         }
+        assert_sealed_layers_aligned(&out, idx, "snapshot_sequence_per_layer")?;
         Ok(out)
     }
 
@@ -2805,6 +3025,9 @@ impl BatchedInferenceSession {
                     .map_err(|e| candle::Error::Msg(format!("snapshot_sequence_blocks: {e}")))?,
             );
         }
+        // The alignment this method's contract *assumes* of its caller, checked
+        // rather than trusted — see `assert_sealed_layers_aligned`.
+        assert_sealed_layers_aligned(&out, idx, "snapshot_sequence_blocks")?;
         Ok(out)
     }
 
@@ -3274,7 +3497,7 @@ pub trait ManagedBatchedModel {
     /// Widest prefill this model will run in one forward, in tokens.
     ///
     /// The smallest of three unrelated ceilings
-    /// (`docs/elastic_vram_partition.md` §7: `R = min(8192, transient-fits,
+    /// (`docs/archived/elastic_vram_partition.md` §7: `R = min(8192, transient-fits,
     /// KV-fits)`):
     ///
     /// * `MAX_PREFILL_TOKENS` — where GPU compute saturates. Above it a wider
@@ -3388,6 +3611,17 @@ pub trait ManagedBatchedModel {
     /// and sets threshold factors to `1.0`.  The blanket impl for `BatchedInference<M>`
     /// overrides this to read per-model threshold factors from the inner `BatchedModelCore`.
     fn model_core_properties(&self) -> ModelCoreProperties {
+        self.default_core_properties()
+    }
+
+    /// The uniform-transformer answer, so an override can adjust ONE field
+    /// instead of restating all eleven.
+    ///
+    /// A model that differs in one respect — a hybrid whose provenance lives in
+    /// its attention layers only, say — should not have to copy the threshold
+    /// factors and layer indices to say so, because a copy is a second place
+    /// for them to drift.
+    fn default_core_properties(&self) -> ModelCoreProperties {
         let n = self.num_layers();
         let provenance_layer_indices = if n == 0 {
             ProvenanceLayerIndices {
@@ -3728,10 +3962,7 @@ pub trait ManagedBatchedModel {
     /// Refuses mid-wave — a snapshot must capture a sealed boundary, never a
     /// wave in flight. The seal runs outside the wave, so this is an assertion
     /// on that ordering rather than a case to handle.
-    fn export_recurrent(
-        &self,
-        _seq: usize,
-    ) -> Result<Option<(u64, Vec<crate::models::delta_net::ExportedLayerState>)>> {
+    fn export_recurrent(&self, _seq: usize) -> Result<Option<(u64, Vec<ExportedLayerState>)>> {
         Ok(None)
     }
 
@@ -3746,9 +3977,189 @@ pub trait ManagedBatchedModel {
         &self,
         _seq: usize,
         _schedule_hash: u64,
-        _layers: &[crate::models::delta_net::ExportedLayerState],
+        _layers: &[ExportedLayerState],
     ) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Carried per-sequence state that is **not** a DeltaNet layer stack, as an
+    /// opaque byte string the persistence layer stores verbatim.
+    ///
+    /// [`Self::export_recurrent`]'s rows are shaped for one thing — a per-layer
+    /// `(S, conv_tail)` pair — because that is what the hybrid lineage carries.
+    /// An architecture with a differently-shaped state has two bad options and
+    /// one good one: widen `ExportedLayerState` with fields most models leave
+    /// empty, invent a second record type the scheduler has to learn, or hand
+    /// the scheduler bytes it never interprets. This is the third.
+    ///
+    /// The model owns the encoding **and its versioning**. Nothing above this
+    /// line may parse the blob, so a model may change its layout freely as long
+    /// as [`Self::restore_aux_state`] still reads what it once wrote — the same
+    /// contract the record format keeps for its own wire versions.
+    ///
+    /// `None` for a model with no such state, which is every model but
+    /// Qwen3.8-Flash-Next today (its PLE convolution window and hash history).
+    /// Called at the same seal point as `export_recurrent`, so a model that
+    /// returns rows there and `None` here is saying its state is entirely
+    /// DeltaNet-shaped.
+    fn export_aux_state(&self, _seq: usize) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Install what [`Self::export_aux_state`] wrote. Returns `true` when the
+    /// blob was consumed.
+    ///
+    /// **Errors on a blob it cannot parse** rather than starting from zeros.
+    /// The whole point of persisting this is that it cannot be recomputed from
+    /// the K/V; silently discarding it produces a sequence that reads fluently
+    /// against a history it never processed, which is the failure this path
+    /// exists to make impossible.
+    fn restore_aux_state(&self, _seq: usize, _blob: &[u8]) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Whether this model keeps state indexed by token position that borrowing
+    /// K/V does not bring along.
+    ///
+    /// Distinct from [`Self::carries_recurrent_state`]: a recurrence is one
+    /// value carried forward and is rebuilt by replaying tokens in order, while
+    /// this is per-position and has to travel with the positions it describes.
+    /// Answering `true` is what makes a missing page worth a warning rather
+    /// than silence.
+    fn carries_positional_state(&self) -> bool {
+        false
+    }
+
+    /// Discard per-position derived state for `seq` — paired with truncating
+    /// the sequence's K/V to nothing.
+    ///
+    /// A slot being reused starts at position 0, and state describing the
+    /// previous occupant's positions would put the next sequence's first token
+    /// at the old prefix's end. No-op for a model with no such state.
+    fn reset_positional_state(&self, _seq: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// The per-position state produced for whatever `seq` has forwarded since
+    /// its last reset — a sealed section's page.
+    ///
+    /// **Sealed on a block boundary**, so the piece is self-contained: a
+    /// section's tokens do not end on one, and rows left carried would belong
+    /// to a block the *next* section completes. Returns `None` for a model with
+    /// nothing of the kind.
+    fn seal_positional_state(&self, _seq: usize) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// [`Self::seal_positional_state`] for a piece that is not the whole of
+    /// what `seq` has forwarded — a conversation turn, whose slot carries the
+    /// projection's injected prefix ahead of it and keeps decoding after.
+    ///
+    /// `start_pos` is the first token of the piece. Taken without disturbing the
+    /// live state, because the sequence this is read from is still in use.
+    fn seal_positional_range(&self, _seq: usize, _start_pos: usize) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// How many of `seq`'s tokens the model's per-position state actually
+    /// covers, if it keeps any.
+    ///
+    /// The number that has to track the slot's K/V length. Exposed so the paths
+    /// that move K/V around — carve a view, fork, rebuild a prefix — can say
+    /// what they left behind, instead of the mismatch surfacing many layers
+    /// later as a refused selection.
+    fn positional_coverage(&self, _seq: usize) -> Option<usize> {
+        None
+    }
+
+    /// Seal the per-position state for the last `tokens` tokens of `seq`,
+    /// wherever it is held, as blobs to be re-installed in the order returned.
+    ///
+    /// Unlike [`Self::seal_positional_range`] this spans state that has already
+    /// been folded into an injected piece, which is where part of a turn ends
+    /// up once a reprojection has re-injected its opening half.
+    /// Each blob is paired with the tokens it covers, so a caller can place a
+    /// page in the span without parsing bytes it cannot read.
+    fn seal_positional_tail_span(
+        &self,
+        _seq: usize,
+        _tokens: usize,
+    ) -> Result<Vec<(usize, Vec<u8>)>> {
+        Ok(Vec::new())
+    }
+
+    /// Close `seq`'s per-position state on a page boundary, so what it forwards
+    /// next begins a piece the seal can hand over — or drop — on its own.
+    ///
+    /// Called at the edges of a turn's `<think>…</think>` span during decode,
+    /// which is the only moment the cut can be made: the rows for a span are
+    /// pooled by the forward that carries it, and a block pooled across the
+    /// boundary cannot be un-pooled afterwards.
+    ///
+    /// Returns the tokens the closed page covers, `0` when there was nothing to
+    /// close — which is both the no-state case and the already-empty tail. A
+    /// caller that needs to know the boundary actually landed must check it:
+    /// a cut placed after the tokens it was meant to separate closes `0` and
+    /// looks identical to one that was simply not needed.
+    ///
+    /// A no-op for a model that keeps no per-position state, so the caller can
+    /// close unconditionally.
+    fn close_positional_page(&self, _seq: usize) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Install a sealed piece ahead of whatever `seq` forwards next — the
+    /// counterpart of Arc-injecting that piece's K/V.
+    ///
+    /// **This is the one thing injection cannot copy.** K/V can be borrowed
+    /// because it already exists; a recurrence cannot, which is what the branch
+    /// checkpoint pass is for. Per-position state is a third case: it is not a
+    /// recurrence, so no whole-prefix pass rebuilds it, and it is not K/V, so
+    /// borrowing the chunks does not bring it along. Without it a query lands
+    /// at a position whose blocks the model does not hold, and the select
+    /// refuses rather than scoring against a prefix it never indexed.
+    ///
+    /// Returns `false` when the model carries none, so the caller can offer it
+    /// unconditionally.
+    fn push_positional_state(&self, _seq: usize, _blob: &[u8]) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Account for `tokens` of injected K/V that carry **no** per-position state.
+    ///
+    /// Advances where the next piece will be placed, and nothing else: the span
+    /// is simply not indexed, which is the truth about it. Queries landing in it
+    /// find no candidates, and every piece after it sits exactly where its K/V
+    /// does.
+    ///
+    /// This used to have to do more. Positions were implied by the widths that
+    /// came before, so a piece injected without its rows slid every later
+    /// piece's start earlier by its own width and queries past it resolved
+    /// through the wrong block — a wrong answer, not a missing one. A zero-row
+    /// page had to stand in to keep the sum honest. Positions are recorded now
+    /// (`IndexPage::roped_base` and the placement it is put at), so there is no
+    /// sum left to keep honest.
+    ///
+    /// Call it wherever [`Self::push_positional_state`] would have been called
+    /// but the piece has nothing to push. A no-op for a model that keeps no
+    /// per-position state, so the caller declares it unconditionally.
+    fn push_positional_gap(&self, _seq: usize, _tokens: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Rebuild any per-sequence index derived from the K/V, after the K/V has
+    /// been restored but before the sequence decodes.
+    ///
+    /// The counterpart to the aux blob: state that IS derivable from the K/V,
+    /// and large enough that deriving it beats storing it. Qwen3.8-Flash-Next's
+    /// QSA index is ~16 MiB per attention layer at 128K tokens — two orders of
+    /// magnitude past its recurrent snapshot — so it is rebuilt here from the
+    /// keys the restore just brought back.
+    ///
+    /// A no-op for every model whose sequence state is fully described by its
+    /// K/V plus its recurrent snapshot.
+    fn reindex_restored_sequence(&self, _seq: usize, _tokens: usize) -> Result<()> {
+        Ok(())
     }
 
     /// `child`'s state becomes `parent`'s — the linear join.
@@ -4035,6 +4446,11 @@ pub trait ManagedBatchedModel {
         chooser: &mut dyn TokenChooser,
         emits: &mut [Box<dyn FnMut(u32) -> bool + '_>],
     ) -> Result<Vec<Option<u32>>> {
+        // Everything before the forward: drafting, the plain/spec partition and
+        // the per-sequence block clones. Spanned so the step's CPU time is
+        // covered end to end — `spec:setup` + `spec:verify` + `spec:gather` +
+        // `spec:accept` should now sum to the step.
+        let t_setup = std::time::Instant::now();
         if seqs.len() != committed.len() || seqs.len() != emits.len() {
             candle::bail!(
                 "speculative_decode_step_batch: {} seqs, {} committed, {} emits",
@@ -4063,7 +4479,19 @@ pub trait ManagedBatchedModel {
         // `docs/deltanet_state_persistence.md` §5.4). Which offsets are
         // rewindable is a property of the stashed block, so `truncate_sequences`
         // is what refuses one it has no rewind point for.
-        if !self.can_rewind_speculative_block() {
+        //
+        // And only a step that would actually DRAFT needs the rewind: at a zero
+        // draft budget every sequence takes a plain decode wave below and
+        // nothing is ever put back, so a recurrent model with no drafter (a
+        // bring-up, a checkpoint whose conversion carries no MTP head) runs
+        // through this driver legally.
+        //
+        // The test is `max_draft`, the width this step will actually hand
+        // `speculative_draft` below — NOT `draft_budget`, which is the model's
+        // own advice and defaults to 0. Testing the advice lets a caller pass a
+        // real width to a model that never overrode it and draft without a
+        // rewind point, which is precisely the case the bail exists to refuse.
+        if !self.can_rewind_speculative_block() && max_draft > 0 {
             candle::bail!(
                 "speculative decode is unavailable on this model: accepting k of n \
                  drafted tokens requires rewinding the sequence, and this model \
@@ -4118,6 +4546,19 @@ pub trait ManagedBatchedModel {
         // drafted block verifies as virtual rows, in the same wave when the
         // model overrides `verify_blocks` (one launch floor per step, not
         // two).
+        pipeline_record_duration("spec:setup", t_setup.elapsed(), 1);
+        // GPU-side elapsed for the whole forward, beside the CPU-side
+        // `spec:verify` that launches it. Two stream-ordered events, so this is
+        // execution plus any starvation gap *inside* the forward.
+        //
+        // **Read it against `wv:sweep`**, which is the layer sweep plus the
+        // head. The difference is everything this step does around the model,
+        // and it is not small by construction: at 128 slots it once held 881 ms
+        // of a 1,152 ms forward, all of it `vw:own` copying the scored rows off
+        // the wave arena a row at a time. Whenever the accept walk waits far
+        // longer than the `decode:*` / `dn:*` spans account for, this pair says
+        // whether the missing time is inside the model or around it.
+        let g_fwd = gpu_span("verify:fwd", session.device());
         let t_verify = std::time::Instant::now();
         let plain_pairs: Vec<(usize, u32)> =
             plain.iter().map(|&i| (seqs[i], committed[i])).collect();
@@ -4132,6 +4573,14 @@ pub trait ManagedBatchedModel {
             max_draft,
         )?;
         pipeline_record_duration("spec:verify", t_verify.elapsed(), 1);
+        g_fwd.end();
+        // The row gather between the forward and the accept walk: one `squeeze`
+        // per scored row, a `Tensor::stack` over all of them, and the `row_of`
+        // bookkeeping. Spanned because it is the only part of the step that was
+        // neither `spec:verify` nor `spec:walk`, and at width it is the whole of
+        // the gap between them — `stack` costs one launch per row (hot-path
+        // invariant 2) and the tensor it builds is `[rows, vocab]`.
+        let t_gather = std::time::Instant::now();
         let mut plain_logits: Vec<Option<Tensor>> = vec![None; seqs.len()];
         for &i in plain.iter().rev() {
             plain_logits[i] = plain_rows.pop();
@@ -4186,6 +4635,7 @@ pub trait ManagedBatchedModel {
         // under the draft prefix that reaches it, so a chooser carrying
         // repetition penalties or a grammar stencil advances its per-sequence
         // state along exactly the path this loop commits.
+        pipeline_record_duration("spec:gather", t_gather.elapsed(), 1);
         let t_accept = std::time::Instant::now();
         let mut walk = AcceptWalk::new(&blocks);
         while !walk.finished() {
@@ -4204,6 +4654,11 @@ pub trait ManagedBatchedModel {
             walk.commit(&tokens, |i, token| (emits[i])(token))?;
         }
         let (next, kept) = walk.finish();
+        // The walk is bounded by the draft budget and the rollback is not, so
+        // they are timed apart: one is `max_draft + 1` chooser dispatches over a
+        // narrowing cohort, the other visits every layer's chunk list. A single
+        // span over both reads as "accept got slower with depth" and hides which.
+        pipeline_record_duration("spec:walk", t_accept.elapsed(), 1);
         let targets: Vec<(usize, usize)> = seqs
             .iter()
             .enumerate()
@@ -4212,7 +4667,9 @@ pub trait ManagedBatchedModel {
         // ONE rollback call for the step: every sequence's target at once, so a
         // model whose rollback does real work (the recurrent replay) batches it
         // across the cohort instead of paying it per sequence.
+        let t_rollback = std::time::Instant::now();
         self.truncate_sequences(session, &targets)?;
+        pipeline_record_duration("spec:rollback", t_rollback.elapsed(), 1);
         pipeline_record_duration("spec:accept", t_accept.elapsed(), 1);
         Ok(next)
     }
@@ -4226,7 +4683,9 @@ pub trait ManagedBatchedModel {
         config.v_hi_error_threshold_factor *= props.v_hi_error_threshold_factor;
         config.v_low_error_threshold_factor *= props.v_low_error_threshold_factor;
         let session = BatchedInferenceSession::new(
-            props.num_layers,
+            // The default stack has no draft head; a model that carries one
+            // overrides this and declares its head's layer.
+            KvLayers::stream_only(props.num_layers),
             props.n_kv_heads,
             props.head_dim,
             self.device(),
@@ -4278,6 +4737,19 @@ pub trait ManagedBatchedModel {
 
     /// Snapshot expert pipeline telemetry counters (if the model has an expert cache).
     fn expert_stats(&self) -> Option<PipelineStats> {
+        None
+    }
+
+    /// Snapshot the row-cache counters of a disk-resident embedding tier, if
+    /// this model has one.
+    ///
+    /// `(hits, misses, evictions)`. Only Qwen3.8-Flash-Next's PLE table is
+    /// served this way today: 51 B parameters that never enter VRAM, fronted by
+    /// a bounded RAM cache whose hit rate is an empirical property of the
+    /// traffic rather than of the table. The counters existed from the start
+    /// and nothing read them — which is why the tier's sizing has been a design
+    /// estimate rather than a measurement.
+    fn row_cache_stats(&self) -> Option<(u64, u64, u64)> {
         None
     }
 
@@ -4509,6 +4981,11 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         self.model().expert_stats()
     }
 
+    // `row_cache_stats` keeps the trait's `None`: no model reached through
+    // `BatchedInference<M>` serves an embedding tier from disk. The one that
+    // does (Qwen3.8-Flash-Next's PLE table) implements `ManagedBatchedModel`
+    // directly.
+
     fn layer_stream_stats(&self) -> Option<[usize; 7]> {
         self.model().layer_stream_stats()
     }
@@ -4538,6 +5015,88 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
     }
 }
 
+/// Refuse a per-layer snapshot whose layers describe different token windows.
+///
+/// **This is the boundary between a recoverable skew and a permanent one.** A
+/// wave that dies mid-sweep leaves the early layers ahead of the rest, and the
+/// engine has repairs for that: `rollback_wave_kv` at the failure,
+/// `heal_tail_divergence` at the next forward entry. Every one of them works on
+/// a *live slot*. Once the skew is sealed it stops being slot state and becomes
+/// substrate state — written per layer, with no cross-layer record — and from
+/// then on every projection that borrows the turn injects the skew into a fresh
+/// slot, on every layer independently. That is why the same divergence appears
+/// at the same chunk index in unrelated sequences: they borrowed the same turn.
+///
+/// It is also past the reach of the repairs. `heal_tail_divergence` covers a
+/// spread of at most one chunk at the tail and clamps at the sealed boundary
+/// besides, so a skew in sealed history reports as unhealable — the forward
+/// fails, the sequence is dropped, and the conversation dies mid-turn with no
+/// way back short of deleting the turn.
+///
+/// Checking here costs one walk of a list the seal has just built, once per
+/// turn, off the hot path. Refusing the seal leaves the live slot intact and
+/// repairable; letting it through does not.
+///
+/// Compares `(offset, token_count)` per chunk — the window geometry, which is
+/// what has to agree. Everything else in a `SealedChunk` (gids, palettes,
+/// scales, formats) is legitimately per-layer.
+fn assert_sealed_layers_aligned(
+    per_layer: &[candle_nn::kv_cache::SealedSequence],
+    idx: usize,
+    site: &str,
+) -> Result<()> {
+    /// One chunk's window geometry: `(offset within the physical chunk, valid
+    /// tokens from it)`. The part of a `SealedChunk` that must agree across
+    /// layers.
+    type Window = (u16, u16);
+
+    let windows = |s: &candle_nn::kv_cache::SealedSequence| -> Vec<Window> {
+        s.chunks.iter().map(|c| (c.offset, c.token_count)).collect()
+    };
+    let Some(first) = per_layer.first().map(windows) else {
+        return Ok(());
+    };
+    let Some(bad) = per_layer.iter().position(|s| windows(s) != first) else {
+        return Ok(());
+    };
+    // Name the chunk and group the layers by what they hold there — a
+    // contiguous prefix means a per-layer loop stopped early, a lone layer
+    // means something special-cases that index, a scatter means an operation
+    // applied per layer under its own predicate. The same legend
+    // `ChunkedKvBacking::first_window_divergence` reports with, because this is
+    // the same fault caught one stage earlier.
+    let other = windows(&per_layer[bad]);
+    let at = (0..first.len().min(other.len()))
+        .find(|&i| first[i] != other[i])
+        .unwrap_or_else(|| first.len().min(other.len()));
+    let mut groups: Vec<(Option<Window>, Vec<usize>)> = Vec::new();
+    for (li, s) in per_layer.iter().enumerate() {
+        let v = windows(s).get(at).copied();
+        match groups.iter_mut().find(|(k, _)| *k == v) {
+            Some((_, ls)) => ls.push(li),
+            None => groups.push((v, vec![li])),
+        }
+    }
+    let split = groups
+        .iter()
+        .map(|(v, ls)| {
+            let held = match v {
+                Some((off, n)) => format!("(offset {off}, {n} tokens)"),
+                None => "no such chunk".to_string(),
+            };
+            format!("{held} on {} layer(s) {:?}", ls.len(), ls)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    candle::bail!(
+        "{site}: refusing to seal sequence {idx} — the layers describe different token \
+         windows, so sealing would persist the skew into the substrate where no repair \
+         can reach it. First difference at chunk {at}: {split}. The live slot is still \
+         intact and repairable; a wave that died mid-sweep is the usual producer, and \
+         its rollback is what should have undone this."
+    )
+}
+
 /// A uniform transformer's half of a wave: the same layer body at every index.
 ///
 /// Everything around it — group assembly, the 1-token reroute, the token
@@ -4558,21 +5117,102 @@ impl<M: BatchedModelCore> WaveSweep for BatchedInference<M> {
 
     fn sweep(
         &self,
-        contexts: &mut [SequenceContext],
-        groups: WaveGroups<'_>,
+        session: &mut BatchedInferenceSession,
+        wave: WaveGroups<'_>,
     ) -> Result<(WavePhase, Option<WaveGuard>)> {
-        self.forward_wave_contexts(
-            contexts,
-            groups.n_decode,
-            groups.n_prefill,
-            groups.decode_headers,
-            groups.prefill_headers,
-            groups.glue_headers,
-            groups.generation,
-            groups.layer_start,
-            groups.layer_end,
-            groups.x_in,
-        )
+        self.forward_wave_contexts(session, wave)
+    }
+}
+
+#[cfg(test)]
+mod seal_alignment_tests {
+    use super::assert_sealed_layers_aligned;
+    use candle_nn::kv_cache::{ArenaLocation, HeadGids, SealedChunk, SealedSequence};
+    use std::sync::Arc;
+
+    /// One sealed chunk with the given window geometry; every other field is
+    /// legitimately per-layer and plays no part in the check.
+    fn chunk(offset: u16, token_count: u16) -> SealedChunk {
+        SealedChunk {
+            gids: HeadGids::from_vec(Vec::new()),
+            offset,
+            token_count,
+            k_pal: Arc::new(Vec::new()),
+            v_pal: Arc::new(Vec::new()),
+            k_scale: Arc::new(Vec::new()),
+            v_scale: Arc::new(Vec::new()),
+            k_fmt: Arc::new(Vec::new()),
+            v_fmt: Arc::new(Vec::new()),
+            byte_size: 0,
+            meta: None,
+        }
+    }
+
+    fn layer(windows: &[(u16, u16)]) -> SealedSequence {
+        SealedSequence {
+            chunks: windows.iter().map(|&(o, n)| chunk(o, n)).collect(),
+            token_count: windows.iter().map(|&(_, n)| n as usize).sum(),
+            chunk_size: 32,
+            location: ArenaLocation::Cpu,
+        }
+    }
+
+    /// Layers that agree seal normally — the overwhelmingly common case, and
+    /// the one this must not start refusing.
+    #[test]
+    fn aligned_layers_seal() {
+        let uniform = layer(&[(0, 32), (0, 32), (0, 17)]);
+        let per_layer: Vec<SealedSequence> = (0..13).map(|_| uniform.clone()).collect();
+        assert!(assert_sealed_layers_aligned(&per_layer, 4, "test").is_ok());
+    }
+
+    /// The production signature: a wave died mid-sweep, so a contiguous prefix
+    /// of layers holds a full chunk the rest never got. Sealing this is what
+    /// makes it permanent, so the seal must refuse.
+    #[test]
+    fn a_mid_sweep_skew_is_refused_and_named() {
+        let ahead = layer(&[(0, 32), (0, 32), (0, 32)]);
+        let behind = layer(&[(0, 32), (0, 32), (0, 0)]);
+        let per_layer: Vec<SealedSequence> = (0..13)
+            .map(|li| {
+                if li < 3 {
+                    ahead.clone()
+                } else {
+                    behind.clone()
+                }
+            })
+            .collect();
+
+        let err = assert_sealed_layers_aligned(&per_layer, 18, "test")
+            .expect_err("a per-layer skew must not seal");
+        let msg = err.to_string();
+        // The chunk index and BOTH sides, so the report places the fault
+        // instead of merely asserting one exists.
+        assert!(msg.contains("chunk 2"), "{msg}");
+        assert!(msg.contains("32 tokens"), "{msg}");
+        assert!(msg.contains("0 tokens"), "{msg}");
+        // The layer split is the diagnosis — a contiguous prefix means a
+        // per-layer loop stopped early.
+        assert!(msg.contains("[0, 1, 2]"), "{msg}");
+    }
+
+    /// A layer that is missing the chunk entirely (a shorter list, not just a
+    /// different window) is caught too, and says so rather than panicking on
+    /// the index.
+    #[test]
+    fn a_short_layer_is_refused() {
+        let full = layer(&[(0, 32), (0, 32)]);
+        let short = layer(&[(0, 32)]);
+        let per_layer = vec![full.clone(), full, short];
+        let err = assert_sealed_layers_aligned(&per_layer, 1, "test")
+            .expect_err("a short layer must not seal");
+        assert!(err.to_string().contains("no such chunk"), "{err}");
+    }
+
+    /// No layers at all is not a skew — an empty snapshot seals trivially.
+    #[test]
+    fn an_empty_snapshot_is_fine() {
+        assert!(assert_sealed_layers_aligned(&[], 0, "test").is_ok());
     }
 }
 

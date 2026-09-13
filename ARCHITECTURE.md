@@ -239,7 +239,7 @@ across the warp.
 - **Hot** — live `ChunkedKvBacking` arenas in VRAM.
 - **Warm** — pageable CPU arenas driven by `candle-conversation/src/persistence/`
   (not the pinned `warm_pool.rs` originally designed in
-  `docs/kv_tier_migration.md` — see the divergence note in `CLAUDE.md`). An
+  `docs/archived/kv_tier_migration.md` — see the divergence note in `CLAUDE.md`). An
   evicted `SealedSequence` becomes `ArenaLocation::Cpu` with its GIDs
   re-pointed via `HeadGids::map_unique`; the original GPU GIDs drop,
   reclaiming VRAM through the allocator's RAII.
@@ -260,7 +260,7 @@ where alignment allows) and orchestrated host-side by
 `MigrationRecord`). The scheduler tick is one plan, one launch per direction
 — independent of how many sequences are involved — on a **dedicated copy
 CUDA stream** that overlaps with ongoing decode. Full design:
-[`docs/kv_tier_migration.md`](docs/kv_tier_migration.md).
+[`docs/archived/kv_tier_migration.md`](docs/archived/kv_tier_migration.md).
 
 ---
 
@@ -297,7 +297,7 @@ receives **pre-resolved absolute device pointers** plus a `pos_map`
 warm/cold tiers already exist independently (the substrate's `wide_q_sigs`
 blob + its `decoded_wide_sig` `Arc` memo, and the redo log); the arena owns
 only hot-tier VRAM residency and rebuilds an evicted turn from the `Arc` on
-demand. Design: [`docs/paged_gallery_arena.md`](docs/paged_gallery_arena.md).
+demand. Design: [`docs/archived/paged_gallery_arena.md`](docs/archived/paged_gallery_arena.md).
 
 ### 5.3 The scan kernels (`candle-kernels/src/provenance/`)
 
@@ -331,7 +331,7 @@ exactly 8 same-level children. Nodes are immutable once created (no
 AVL-style rotation, no `dirty` bit); the BDP scan drills from a coarse
 "peak" node down into its immutable children to recover detail — the same
 provenance-selected attention, rooted at multiple resolutions instead of one
-global root. Design: [`docs/immutable_summary_forest.md`](docs/immutable_summary_forest.md).
+global root. Design: [`docs/archived/immutable_summary_forest.md`](docs/archived/immutable_summary_forest.md).
 
 ---
 
@@ -349,7 +349,7 @@ a four-part policy (`mod.rs` doc comment) tuned to avoid eviction cascades.
 **Markov expert prediction** (`expert_lre/transition.rs`) — an online,
 self-learning transition matrix predicts a layer's expert routing from the
 prior layer's observed routing (no offline calibration), 69% hit rate on
-Qwen3-30B-A3B (`docs/markov_expert_prediction_eval.md`). The production
+Qwen3-30B-A3B (`docs/archived/markov_expert_prediction_eval.md`). The production
 "Markov Wave" design runs two modes: a Bayesian prior + live per-session
 predictor below the PCIe-saturation batch (≈256), and deterministic
 prefetch-all-missing streaming above it, where prediction adds nothing once
@@ -437,7 +437,7 @@ Selection rules are a closed set — `always_visible`, `top_k(k)`, `single`,
 `conversation { recent, historical_top_k }` — evaluated by score, but turns
 always **emit in insertion order** (score decides who's in-window; sequence
 order decides how it reads). Design:
-[`docs/conversation_builder.md`](docs/conversation_builder.md).
+[`docs/archived/conversation_builder.md`](docs/archived/conversation_builder.md).
 
 ### 8.2 Timelines, turns, sections, collections
 
@@ -457,7 +457,7 @@ YAML itself.
 `candle-conversation/src/persistence/` is a generalized (not
 conversation-specific) module: an append-only, content-addressed redo log at
 `.substrate/substrate.log`, split into ~4 GiB segment files (`segment.rs`,
-`segmented_log.rs` — [`docs/segmented_substrate_log.md`](docs/segmented_substrate_log.md))
+`segmented_log.rs` — [`docs/archived/segmented_substrate_log.md`](docs/archived/segmented_substrate_log.md))
 once large. **There is no in-memory-only mode** — `Substrate` cannot be
 constructed without a backing log; every turn append and section ingest goes
 through this layer, no `Option<Persistence>` seam. One concern per file:
@@ -470,7 +470,7 @@ skip-load header walk (`walker.rs`), the in-RAM last-writer-wins index
 `kv_pack`/`kv_unpack` (`transfer.rs`), the background thread (`thread.rs`),
 warm→hot promotion (`elevate.rs`), and the NVMe→VRAM bridge
 (`cold_load.rs`). Full design:
-[`docs/kv_tier_migration.md`](docs/kv_tier_migration.md) §13.
+[`docs/archived/kv_tier_migration.md`](docs/archived/kv_tier_migration.md) §13.
 
 ---
 

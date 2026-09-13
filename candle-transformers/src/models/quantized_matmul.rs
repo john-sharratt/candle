@@ -1,6 +1,6 @@
 #[cfg(feature = "cuda")]
 use candle::quantized::ko_quant::ko_tileable;
-use candle::quantized::{GgmlDType, Int8Mode, QTensor};
+use candle::quantized::{GgmlDType, Int8Mode, QTensor, SumScale};
 use candle::{DType, Module, Result, Tensor};
 
 use crate::models::profile::{pipeline_record, profile_now};
@@ -103,6 +103,16 @@ pub struct QMatMul {
     /// Numeric mode of this weight: `Off` → standard path; an int8 mode → the weight is
     /// the KO twin and forward runs the q8a128 int8 tensor-core matmul.
     int8mode: Int8Mode,
+    /// How this layer's ACTIVATION stores its per-128 `Σx` when `forward` quantizes
+    /// one — see [`SumScale`].
+    ///
+    /// On the weight because that is where the model can say it once, at load, for
+    /// every matmul in a stack: `forward_live_as` quantizes the activation itself,
+    /// so unlike [`Self::forward_dynamic`] there is no operand to read the
+    /// convention off. [`SumScale::Raw`] is the default and is what every language
+    /// model here uses; a model whose activations can overflow f16 on a block sum
+    /// sets [`SumScale::ByAmax`] via [`Self::with_sum_scale`].
+    sum_scale: SumScale,
 }
 
 impl QMatMul {
@@ -207,6 +217,7 @@ impl QMatMul {
                     inner: candle::quantized::QMatMul::from_arc(ws)?,
                     span,
                     int8mode: mode,
+                    sum_scale: SumScale::Raw,
                 });
             }
             // **A shape that will not tile is a per-tensor fact, knowable up front — not a load
@@ -276,6 +287,7 @@ impl QMatMul {
                     inner,
                     span,
                     int8mode: mode,
+                    sum_scale: SumScale::Raw,
                 });
             }
             tracing::debug!(
@@ -288,6 +300,7 @@ impl QMatMul {
                 inner,
                 span,
                 int8mode: Int8Mode::Off,
+                sum_scale: SumScale::Raw,
             });
         }
 
@@ -297,7 +310,19 @@ impl QMatMul {
             inner,
             span,
             int8mode: Int8Mode::Off,
+            sum_scale: SumScale::Raw,
         })
+    }
+
+    /// Declare how this layer's activation stores its per-128 `Σx`.
+    ///
+    /// Set by the model at load, once, for every matmul that shares the
+    /// property — see [`SumScale`]. The default is [`SumScale::Raw`], which is
+    /// bit-identical to the unparameterised path, so a model that says nothing
+    /// is unaffected.
+    pub fn with_sum_scale(mut self, sum_scale: SumScale) -> Self {
+        self.sum_scale = sum_scale;
+        self
     }
 
     /// Wrap a QTensor that **views** memory someone else owns, reporting the
@@ -328,6 +353,7 @@ impl QMatMul {
             inner: candle::quantized::QMatMul::from_qtensor(view)?,
             span: tracing::span!(tracing::Level::TRACE, "qmatmul"),
             int8mode,
+            sum_scale: SumScale::Raw,
         })
     }
 
@@ -354,6 +380,7 @@ impl QMatMul {
             inner,
             span,
             int8mode: Int8Mode::Precision,
+            sum_scale: SumScale::Raw,
         })
     }
 
@@ -467,9 +494,9 @@ impl QMatMul {
         // The weight twin was baked in at load by `from_*_with_mode`.
         #[cfg(feature = "cuda")]
         if self.int8mode.is_int8() {
-            let out2 = self
-                .inner
-                .forward_via_int8(&xs2, self.int8mode, out_dtype)?;
+            let out2 =
+                self.inner
+                    .forward_via_int8(&xs2, self.int8mode, out_dtype, self.sum_scale)?;
             pipeline_record("qmatmul_q8", t_mm);
             return if let Some((b, s)) = reshape_back {
                 let n = out2.dim(1)?;

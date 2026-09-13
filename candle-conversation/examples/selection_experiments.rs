@@ -1434,19 +1434,21 @@ fn r5(f: &Fixture) {
                         &scope,
                         i as u64,
                         &[(ChildKey::named(slots[i].label.clone()), raw[i])],
+                        probe.len(),
                     );
                 }
             } else {
                 let mut dialogue: Vec<(u64, u64)> = f.events.keys().copied().collect();
                 dialogue.sort_unstable();
                 for (tl, idx) in dialogue {
-                    let raw = scan(&f.probe(tl, idx), grouped_sum);
+                    let probe = f.probe(tl, idx);
+                    let raw = scan(&probe, grouped_sum);
                     let pairs: Vec<(ChildKey, f32)> = slots
                         .iter()
                         .zip(&raw)
                         .map(|(s, &v)| (ChildKey::named(s.label.clone()), v))
                         .collect();
-                    cache.observe(&scope, (tl << 32) ^ idx, &pairs);
+                    cache.observe(&scope, (tl << 32) ^ idx, &pairs, probe.len());
                 }
             }
             for replace_floors in [true, false] {
@@ -1454,23 +1456,27 @@ fn r5(f: &Fixture) {
                     .iter()
                     .map(|&t| 2.0 * (256.0 / t.max(1) as f32).clamp(1.0, 16.0))
                     .collect();
-                let normalize = |raw: Vec<f32>| -> Vec<f32> {
+                let normalize = |raw: Vec<f32>, probe_tokens: usize| -> Vec<f32> {
                     let pairs: Vec<(ChildKey, f32)> = slots
                         .iter()
                         .zip(&raw)
                         .map(|(s, &v)| (ChildKey::named(s.label.clone()), v))
                         .collect();
                     let out = if replace_floors {
-                        cache.normalize_with_floors(&scope, &pairs, &floors)
+                        cache.normalize_with_floors(&scope, &pairs, &floors, probe_tokens)
                     } else {
-                        cache.normalize(&scope, &pairs)
+                        cache.normalize(&scope, &pairs, probe_tokens)
                     };
                     out.into_iter().map(|(_, v)| v).collect()
                 };
+                // Head and tail are probes of different lengths, so each carries
+                // its own — see the normalizer's `probe_t_ref`.
                 let pipeline = |tl: u64, idx: u64| -> Vec<f32> {
                     let all = f.sig(tl, idx);
-                    let q = normalize(scan(&all[..64.min(all.len())], grouped_sum));
-                    let t = normalize(scan(&f.probe(tl, idx), grouped_sum));
+                    let q_window = &all[..64.min(all.len())];
+                    let q = normalize(scan(q_window, grouped_sum), q_window.len());
+                    let probe = f.probe(tl, idx);
+                    let t = normalize(scan(&probe, grouped_sum), probe.len());
                     q.iter().zip(&t).map(|(a, b)| a.max(*b)).collect()
                 };
                 let tour = pipeline(TOUR_TL, T_TOUR);

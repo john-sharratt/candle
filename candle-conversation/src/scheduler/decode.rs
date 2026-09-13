@@ -141,50 +141,81 @@ impl Scheduler {
                     break;
                 };
 
-                // Prefill `[Y] ++ run[..last]`; `run.last()` rides the decode.
-                let Some(y) = self
+                // Prefill `[pending] ++ run[..last]`; `run.last()` rides the decode.
+                //
+                // **`pending` is what has not been forwarded, not simply the last
+                // entry.** Both are usually the same single token — but the path
+                // that re-drives this loop is a *drop*, and a dropped token is
+                // never committed, so `generated_tokens.last()` then names the
+                // token the sampling step already forwarded. Sending it again
+                // costs nothing in K/V (the offset did not advance, so the write
+                // lands on the same slot) and one phantom row in the index, which
+                // surfaces as a turn whose pages over-cover it.
+                // At most ONE token can be pending — the decode commits one per
+                // step and forwards it on the next — so this asks whether there
+                // is one, not how many. Taking the whole pending slice would
+                // inherit any drift in the count; taking its last entry is the
+                // old `generated_tokens.last()` exactly, minus the case that was
+                // wrong: after a drop nothing is pending, and nothing is sent.
+                // Asserted rather than assumed, because taking `.last()` of a
+                // longer pending run would silently drop the earlier entries:
+                // they stay in `generated_tokens` and so in the sealed grid,
+                // while their K/V was never written. That is the same shape of
+                // implicit invariant the page cut broke.
+                if let Some(n) = self
                     .active_decodes
                     .get(&id)
-                    .and_then(|s| s.generated_tokens.last().copied())
-                else {
-                    tracing::warn!(
-                        seq_id = id.0,
-                        "stencil run with no pending token — dropping"
-                    );
-                    if let Some(s) = self.active_decodes.get_mut(&id) {
-                        if let Some(d) = &s.stencil {
-                            Self::log_stencil_finish(id.0, d, "no pending token");
-                        }
-                        s.stencil = None;
+                    .map(|s| s.pending_forward().len())
+                {
+                    if n > 1 {
+                        tracing::warn!(
+                            seq_id = id.0,
+                            pending = n,
+                            "more than one token is waiting to be forwarded; only the last \
+                             will be carried, so the earlier ones would seal into the grid \
+                             with no K/V behind them"
+                        );
                     }
-                    break;
-                };
+                }
+                let pending: Option<u32> = self
+                    .active_decodes
+                    .get(&id)
+                    .and_then(|s| s.pending_forward().last().copied());
                 // A close run ends with the assistant EOS (`}}\n</tool_call>` +
                 // `<|im_end|>`): a tool call is the whole assistant turn, so the
                 // EOS terminates it.  Detect it here so the turn is sealed instead
                 // of the model free-decoding a hallucinated answer past the call.
                 let ends_turn = run.last().is_some_and(|&t| self.eos_tokens.contains(&t));
 
-                let mut input = Vec::with_capacity(run.len());
-                input.push(y);
+                let mut input = Vec::with_capacity(1 + run.len());
+                input.extend(pending);
                 // `run.last()` is never forwarded here: for a normal run it rides
                 // the decode in `batch_decode_step`; for an EOS-terminated run it
                 // is the turn terminator, whose KV is never written (exactly as a
                 // model-sampled EOS).  Either way it is excluded from the prefill.
                 input.extend_from_slice(&run[..run.len() - 1]);
 
-                if let Err(e) = self.run_prefill(id, &input) {
-                    tracing::warn!(
-                        seq_id = id.0,
-                        "stencil prefill forward failed: {e} — dropping"
-                    );
-                    if let Some(s) = self.active_decodes.get_mut(&id) {
-                        if let Some(d) = &s.stencil {
-                            Self::log_stencil_finish(id.0, d, "prefill failed");
+                // Empty only when nothing is pending and the run is one token —
+                // that token rides the decode, so there is no forward to make.
+                // The recording below is unchanged either way.
+                if !input.is_empty() {
+                    if let Err(e) = self.run_prefill(id, &input) {
+                        tracing::warn!(
+                            seq_id = id.0,
+                            "stencil prefill forward failed: {e} — dropping"
+                        );
+                        if let Some(s) = self.active_decodes.get_mut(&id) {
+                            if let Some(d) = &s.stencil {
+                                Self::log_stencil_finish(id.0, d, "prefill failed");
+                            }
+                            s.stencil = None;
                         }
-                        s.stencil = None;
+                        break;
                     }
-                    break;
+                    // Everything pending went out with that pass.
+                    if let Some(s) = self.active_decodes.get_mut(&id) {
+                        s.mark_forwarded();
+                    }
                 }
 
                 // Append the run to the emitted output and stream it; `run.last()`
@@ -193,10 +224,28 @@ impl Scheduler {
                 // part of the sealed turn) but never streamed — matching the
                 // normal decode path, which buffers EOS but does not emit it.
                 let mut carries_eot = false;
+                let think_close = self.think_close;
+                let breaks = &self.page_break_tokens;
                 if let Some(s) = self.active_decodes.get_mut(&id) {
                     let last = run.len() - 1;
                     for (k, &t) in run.iter().enumerate() {
-                        s.generated_tokens.push(t);
+                        // The page cut for this run was already made by
+                        // `run_prefill`, which splits the forward at the
+                        // boundary — the only place it can be made, since these
+                        // tokens are forwarded above and their rows are pooled
+                        // by that pass. A marker in the run's LAST slot is not
+                        // forwarded here at all; the decode step that carries it
+                        // cuts at its own commit.
+                        // The run's LAST token was deliberately excluded from
+                        // `input` above — it rides the next decode step — so it
+                        // is pending, not forwarded. Recording it as forwarded
+                        // is what would make the next injection skip a token
+                        // that still needs carrying.
+                        if k == last {
+                            s.push_pending(t, think_close, breaks);
+                        } else {
+                            s.push_forwarded(t, think_close, breaks);
+                        }
                         if !(ends_turn && k == last) {
                             let _ = s.event_tx.send(TurnEvent::Token(t));
                         }
@@ -379,6 +428,17 @@ impl Scheduler {
             .iter()
             .map(|&id| *self.active_decodes[&id].generated_tokens.last().unwrap())
             .collect();
+        // That token is now on its way out, so it stops being pending. Recorded
+        // here rather than after the forward because the input is fixed at this
+        // point and a failed wave re-forwards the same token — which is the
+        // benign direction (a re-forward of a token still marked sent writes the
+        // same slot again), where leaving it pending would have the NEXT
+        // injection carry it a second time.
+        for &id in seq_ids.iter() {
+            if let Some(s) = self.active_decodes.get_mut(&id) {
+                s.mark_forwarded();
+            }
+        }
         // Extract raw usize IDs for the forward_batched call into candle-transformers.
         let seq_ids_raw: Vec<usize> = seq_ids.iter().map(|id| id.0).collect();
 
@@ -635,9 +695,8 @@ impl Scheduler {
                 // THIS step (only consulted inside a segment): the hard-cap
                 // closer script may play only in a TERMINAL free-text span (or
                 // an unsteered block, where there is no stencil). Everywhere
-                // else — a continuation span whose close is dropped and
-                // re-steered into "But wait, " reasoning, a tool-call value,
-                // a static prefill — a forced close stays bare.
+                // else — a span that retires into further decoding, a tool-call
+                // value, a static prefill — a forced close stays bare.
                 if state.in_segment {
                     state.close_would_continue = self
                         .active_decodes
@@ -827,6 +886,24 @@ impl Scheduler {
                             // discard the tail; the grammar decodes properly
                             // from the next wave.
                             && (p == 0 || s.stencil.is_none())
+                            // **A page cut armed inside this block ends it too,
+                            // for the same reason.** The cut is taken once per
+                            // step, after the rollback, against whatever the K/V
+                            // then holds — so every token committed after the
+                            // arming one lands inside the page the cut was
+                            // closing. One token a step that is exactly right;
+                            // inside a drafted block it makes the page overshoot
+                            // by the rest of the block.
+                            //
+                            // Measured: a turn whose reasoning span was
+                            // `[26..67)` sealed page boundaries
+                            // `[0, 26, 27, 68, …]` — the `</think>` cut armed at
+                            // one block position and the next position carried
+                            // grid 67 into the reasoning's page.
+                            // `turn_sealed_without_thinking` then refused the
+                            // whole turn, because a span that is not a union of
+                            // whole pages cannot be windowed.
+                            && !s.pending_page_cut
                     })
                 })
                 .collect();
@@ -866,6 +943,22 @@ impl Scheduler {
             self.fail_all_decodes(&seq_ids, &format!("speculative rollback failed: {e}"));
             return;
         }
+        // **Now the cuts.** The rollback has settled, so the live tail is the
+        // accepted prefix rather than the drafted block — which is both the only
+        // point a cut describes the right tokens, and the only point at which it
+        // cannot be double-counted by a rewind whose snapshot does not cover
+        // pages. See `DecodeState::pending_page_cut`.
+        for &id in seq_ids.iter() {
+            if let Some(state) = self.active_decodes.get_mut(&id) {
+                super::flush_page_cut(self.model.as_ref(), id, state);
+            }
+        }
+        // The index-vs-K/V check that caught this lives at wave entry
+        // (`qwen4exp index disagrees with this sequence's K/V`), which sees the
+        // same divergence one step later and costs nothing per decode step. A
+        // second check here would take a lock and walk every KV layer on the hot
+        // path to report what that one already reports.
+        //
         // Mirror what the KV really holds into the slot's diagnostic log: the
         // block prefix that survived the rollback.
         for (i, &id) in seq_ids.iter().enumerate() {
@@ -1068,10 +1161,38 @@ impl Scheduler {
                 continue; // nothing valid to commit (degenerate) — leave as-is
             };
             if !prefix.is_empty() && self.run_prefill(seq_id, prefix).is_ok() {
+                let think_close = self.think_close;
+                let breaks = &self.page_break_tokens;
+                // `run_prefill` cuts this span at any break token it CONTAINS —
+                // but `reasoning_split` deliberately declines to split when the
+                // break token is the pass's LAST, on the understanding that the
+                // caller commits it and cuts at its own commit. That holds for
+                // the stencil run above, whose final token rides the next decode
+                // step; here every token is already forwarded, so a healed prefix
+                // ending on a marker would leave that boundary uncut and the
+                // turn's reasoning would not occupy whole pages.
+                let ends_on_break = prefix.last().is_some_and(|t| breaks.contains(t));
                 if let Some(state) = self.active_decodes.get_mut(&seq_id) {
                     for &t in prefix {
-                        state.generated_tokens.push(t);
+                        state.push_forwarded(t, think_close, breaks);
                         let _ = state.event_tx.send(TurnEvent::Token(t));
+                    }
+                }
+                if ends_on_break {
+                    match self.model.close_positional_page(seq_id.0) {
+                        Ok(closed) => tracing::info!(
+                            target: "candle_conversation::scheduler::unit_boundary",
+                            seq_id = seq_id.0,
+                            site = "heal-trailing-break-token",
+                            closed,
+                            "index: closed a page after a healed prefix ending on a break token"
+                        ),
+                        Err(e) => tracing::warn!(
+                            seq_id = seq_id.0,
+                            "closing the index page after a healed break token failed ({e}); the \
+                             region it bounds will not occupy whole pages and cannot be windowed \
+                             out of a later projection"
+                        ),
                     }
                 }
             }
@@ -1404,7 +1525,13 @@ impl Scheduler {
                     continue;
                 }
 
-                state.generated_tokens.push(next_token);
+                // Commit, and close the index page when this token opens a new
+                // region of the turn. Closing HERE rather than at the forward is
+                // the same instant as far as the cache is concerned — nothing
+                // else appends for this sequence between a commit and the step
+                // that forwards the committed token — and it is the one place
+                // that knows the token's role.
+                state.push_committed(next_token, self.think_close, &self.page_break_tokens);
 
                 // Check termination.
                 let is_eos = self.eos_tokens.contains(&next_token);
@@ -1712,8 +1839,10 @@ fn describe_recurrent_state(model: &(dyn ManagedBatchedModel + Send), seq: Seque
 
     let non_finite = |bytes: &[u8]| -> usize {
         bytes
-            .chunks_exact(std::mem::size_of::<f32>())
-            .filter(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite())
+            .as_chunks::<{ std::mem::size_of::<f32>() }>()
+            .0
+            .iter()
+            .filter(|c| !f32::from_le_bytes(**c).is_finite())
             .count()
     };
     let mut bad_layers = 0usize;

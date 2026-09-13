@@ -553,6 +553,54 @@ mod tests {
         params.run(configs, load)
     }
 
+    /// **Depth on the 27B**: the batched forward at 32K and 128K of KV. The
+    /// densest checkpoint in the lineage, so the rung where the weights and the
+    /// cache compete hardest for the same card.
+    #[test]
+    #[ignore = "reads the pinned Qwen3.8-27B GGUF (16.5 GB) and runs a 128K-token prompt. \
+                Run with: cargo test --release --features cuda -p candle-transformers --lib \
+                quantized_qwen38::tests::long_context_27b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn long_context_27b() -> Result<()> {
+        use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
+
+        let device = Device::new_cuda(0)?;
+        let model_path = pinned(&device)?;
+        let mtp_path = pinned_mtp_head()?;
+        let int8mode = Int8Mode::Performance;
+        long_context_gate(
+            "Qwen3.8-27B (hybrid dense)",
+            int8mode,
+            &tokenizer_json()?,
+            Dialect::qwen35(),
+            // `qwen38.context_length` in the GGUF.
+            262_144,
+            &[
+                (
+                    32_768,
+                    &[InferenceMode::BF16, InferenceMode::C5, InferenceMode::C10][..],
+                ),
+                (131_072, &[InferenceMode::BF16, InferenceMode::C10][..]),
+            ],
+            1,
+            64,
+            DepthTask::Coherence,
+            &device,
+            || {
+                from_gguf_path(
+                    &model_path,
+                    &device,
+                    Qwen35LoadOptions {
+                        int8mode: Some(int8mode),
+                        expert_pack_dir: None,
+                        mtp_path: Some(mtp_path.clone()),
+                        gate_donor_path: None,
+                    },
+                )
+            },
+        )
+    }
+
     /// Speculative decode on the 27B — the lineage gate at the flagship
     /// geometry. See [`crate::models::quantized_qwen35::tests::speculative_gate`].
     ///
@@ -579,31 +627,42 @@ mod tests {
                 -- --ignored --nocapture --test-threads=1"]
     fn speculative_decode_27b() -> Result<()> {
         use crate::models::quantized_qwen35::tests::speculative_gate;
+        use crate::models::qwen35::mtp::MTP_MAX_DRAFT;
 
         // Device first — the checkpoint choice is a VRAM measurement.
         let probe = Device::new_cuda(0)?;
         let model_path = pinned(&probe)?;
         let mtp_path = pinned_mtp_head()?;
         let int8mode = Int8Mode::Performance;
-        speculative_gate("Qwen3.8-27B", int8mode, &[1, 4], move || {
-            let device = Device::new_cuda(0)?;
-            let m = from_gguf_path(
-                &model_path,
-                &device,
-                Qwen35LoadOptions {
-                    int8mode: Some(int8mode),
-                    expert_pack_dir: None,
-                    mtp_path: Some(mtp_path.clone()),
-                    gate_donor_path: None,
-                },
-            )?;
-            assert!(
-                m.has_drafter(),
-                "the pinned 27B declares an MTP head but none loaded — the pin has \
+        let tok = tokenizer_json()?;
+        let device = Device::new_cuda(0)?;
+        speculative_gate(
+            "Qwen3.8-27B",
+            int8mode,
+            &[1, 4],
+            &tok,
+            MTP_MAX_DRAFT,
+            &device,
+            move || {
+                let device = Device::new_cuda(0)?;
+                let m = from_gguf_path(
+                    &model_path,
+                    &device,
+                    Qwen35LoadOptions {
+                        int8mode: Some(int8mode),
+                        expert_pack_dir: None,
+                        mtp_path: Some(mtp_path.clone()),
+                        gate_donor_path: None,
+                    },
+                )?;
+                assert!(
+                    m.has_drafter(),
+                    "the pinned 27B declares an MTP head but none loaded — the pin has \
                  moved to a conversion that drops the NextN tensors"
-            );
-            println!("✓ Model loaded\n");
-            Ok(m)
-        })
+                );
+                println!("✓ Model loaded\n");
+                Ok(m)
+            },
+        )
     }
 }

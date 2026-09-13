@@ -768,7 +768,11 @@ impl ChunkedKvBacking {
                 .bands()
                 .map(|(g, tag)| (g.arena_idx(), g.chunk_idx(), tag))
                 .collect();
-            flat.chunks_exact(2).map(|kv| (kv[0], kv[1])).collect()
+            flat.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|kv| (kv[0], kv[1]))
+                .collect()
         };
 
         // Read each band under the storage lock, in `[t][pd]` (token-major)

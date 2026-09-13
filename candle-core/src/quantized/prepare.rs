@@ -84,7 +84,7 @@ fn dequant_source(src: &[u8], n: usize, src_dtype: GgmlDType) -> Result<Vec<f32>
         GgmlDType::Q8_0 => {
             // BlockQ8_0 = 2 B f16 scale + 32 × i8 → 34 B / 32 elems; value = d · q.
             let mut out = vec![0f32; n];
-            for (bi, blk) in src.chunks_exact(34).enumerate() {
+            for (bi, blk) in src.as_chunks::<34>().0.iter().enumerate() {
                 let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
                 for j in 0..32 {
                     out[bi * 32 + j] = blk[2 + j] as i8 as f32 * d;
@@ -94,14 +94,14 @@ fn dequant_source(src: &[u8], n: usize, src_dtype: GgmlDType) -> Result<Vec<f32>
         }
         GgmlDType::BF16 => {
             let mut out = vec![0f32; n];
-            for (i, ch) in src.chunks_exact(2).take(n).enumerate() {
+            for (i, ch) in src.as_chunks::<2>().0.iter().take(n).enumerate() {
                 out[i] = half::bf16::from_le_bytes([ch[0], ch[1]]).to_f32();
             }
             Ok(out)
         }
         GgmlDType::F16 => {
             let mut out = vec![0f32; n];
-            for (i, ch) in src.chunks_exact(2).take(n).enumerate() {
+            for (i, ch) in src.as_chunks::<2>().0.iter().take(n).enumerate() {
                 out[i] = half::f16::from_le_bytes([ch[0], ch[1]]).to_f32();
             }
             Ok(out)

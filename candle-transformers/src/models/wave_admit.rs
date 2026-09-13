@@ -7,7 +7,7 @@
 //! and its position is decided once per forward. For that position to be the
 //! *tight* one — hard against the arena frontier, leaving the whole remainder in
 //! one run adjacent to the weight side — the frontier has to be final when the
-//! tier is placed (`docs/elastic_vram_partition.md` §7). A layer that claims a
+//! tier is placed (`docs/archived/elastic_vram_partition.md` §7). A layer that claims a
 //! new arena halfway through the sweep moves the frontier under a tier that is
 //! already sitting on it.
 //!
@@ -169,16 +169,37 @@ pub(crate) fn admit_wave_kv(
 /// Covers every row including decode — admit skips decode because decode's
 /// claims were made by the caller, but the *advance* happens for decode rows
 /// too, so the rollback cannot.
+/// **Every layer is attempted, even after one fails.** Returning at the first
+/// error — which this did — leaves the rollback itself holding the shape it
+/// exists to erase: layers `0..k` truncated against `k..n` still advanced, from
+/// the one code path that runs *because* something already went wrong. The
+/// failure is still reported (the first error, after the sweep), so a caller
+/// that treats rollback failure as fatal still does; what changes is that the
+/// slot is no longer left mid-repair on the way out.
 pub(crate) fn rollback_wave_kv(
     contexts: &mut [SequenceContext],
     layer_start: usize,
     layer_end: usize,
 ) -> Result<()> {
+    let mut first_err: Option<candle::Error> = None;
     for c in contexts.iter_mut() {
         let offset = c.offset;
         for layer_idx in layer_start..layer_end {
-            c.kv_caches.caches[layer_idx].truncate_to_offset(offset)?;
+            if let Err(e) = c.kv_caches.caches[layer_idx].truncate_to_offset(offset) {
+                tracing::warn!(
+                    layer = layer_idx,
+                    offset,
+                    "wave rollback: layer truncate failed; continuing so the remaining \
+                     layers are not left advanced against the truncated ones: {e}"
+                );
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
         }
     }
-    Ok(())
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }

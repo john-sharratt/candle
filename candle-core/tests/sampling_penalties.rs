@@ -81,7 +81,7 @@ fn frequency_penalty_scales_with_count() {
     logits[5] = 10.0;
     logits[6] = 9.5;
 
-    // Token 5 appeared 3 times Ã¢â€ â€™ penalty = 10.0 - 3 * 2.0 = 4.0, token 6 unaffected
+    // Token 5 appeared 3 times → penalty = 10.0 - 3 * 2.0 = 4.0, token 6 unaffected
     let mut token_counts = vec![0i32; vocab];
     token_counts[5] = 3;
 
@@ -106,7 +106,7 @@ fn presence_penalty_binary_effect() {
     logits[5] = 10.0;
     logits[6] = 9.0;
 
-    // Token 5 has count > 0, presence penalty = 2.0 Ã¢â€ â€™ effective = 10.0 - 2.0 = 8.0 < 9.0
+    // Token 5 has count > 0, presence penalty = 2.0 → effective = 10.0 - 2.0 = 8.0 < 9.0
     let mut token_counts = vec![0i32; vocab];
     token_counts[5] = 1;
 
@@ -336,7 +336,7 @@ fn combined_penalties_interact() {
 
     // repeat_penalty=1.5: 20.0/1.5 = 13.33
     // frequency_penalty=1.0: 13.33 - 5*1.0 = 8.33
-    // presence_penalty=1.0: 8.33 - 1.0 = 7.33  < 9.0 Ã¢â€ â€™ token 11 wins
+    // presence_penalty=1.0: 8.33 - 1.0 = 7.33  < 9.0 → token 11 wins
     let p = SamplingParams {
         logits_f32: logits,
         batch_size: 1,
@@ -369,7 +369,7 @@ fn repeat_penalty_multiple_recent() {
     logits[30] = 8.0;
     logits[40] = 7.0;
 
-    // Penalize tokens 10, 20, 30 Ã¢â€ â€™ token 40 should win
+    // Penalize tokens 10, 20, 30 → token 40 should win
     let recent = vec![10i32, 20, 30, 0, 0]; // 3 actual tokens
     let p = SamplingParams {
         logits_f32: logits,
@@ -444,9 +444,9 @@ fn repeat_penalty_batched_different_histories() {
     }
 
     // Different recent histories:
-    // Seq 0: no recent token 10 Ã¢â€ â€™ picks token 10
-    // Seq 1: token 10 is recent Ã¢â€ â€™ penalized Ã¢â€ â€™ picks token 20
-    // Seq 2: token 20 is recent Ã¢â€ â€™ penalized Ã¢â€ â€™ picks token 10
+    // Seq 0: no recent token 10 → picks token 10
+    // Seq 1: token 10 is recent → penalized → picks token 20
+    // Seq 2: token 20 is recent → penalized → picks token 10
     let mut recent_tokens = vec![0i32; batch * max_recent];
     let mut recent_lens = vec![0i32; batch];
 
@@ -489,7 +489,7 @@ fn frequency_penalty_batched() {
     let mut logits = Vec::new();
     let mut token_counts = Vec::new();
 
-    // Seq 0: token 5 has logit=10, count=1 Ã¢â€ â€™ 10 - 1*2 = 8 > 7 Ã¢â€ â€™ still wins
+    // Seq 0: token 5 has logit=10, count=1 → 10 - 1*2 = 8 > 7 → still wins
     {
         let mut l = vec![0.0f32; vocab];
         l[5] = 10.0;
@@ -501,7 +501,7 @@ fn frequency_penalty_batched() {
         token_counts.extend(tc);
     }
 
-    // Seq 1: token 5 has logit=10, count=5 Ã¢â€ â€™ 10 - 5*2 = 0 < 7 Ã¢â€ â€™ token 6 wins
+    // Seq 1: token 5 has logit=10, count=5 → 10 - 5*2 = 0 < 7 → token 6 wins
     {
         let mut l = vec![0.0f32; vocab];
         l[5] = 10.0;
@@ -536,9 +536,9 @@ fn simple_presence_penalty_argmax() {
     let vocab = 16;
 
     // Create simple logits: all -100 except:
-    // Token 0: logit=10.0, count=5 Ã¢â€ â€™ after penalty: 10.0 - 1.5 = 8.5
-    // Token 1: logit=9.0, count=0 Ã¢â€ â€™ unpenalized: = 9.0
-    // Token 2: logit=8.0, count=0 Ã¢â€ â€™ unpenalized: = 8.0
+    // Token 0: logit=10.0, count=5 → after penalty: 10.0 - 1.5 = 8.5
+    // Token 1: logit=9.0, count=0 → unpenalized: = 9.0
+    // Token 2: logit=8.0, count=0 → unpenalized: = 8.0
     let mut logits = vec![-100.0f32; vocab];
     logits[0] = 10.0;
     logits[1] = 9.0;
@@ -550,9 +550,9 @@ fn simple_presence_penalty_argmax() {
     token_counts[2] = 0; // Not penalized
 
     eprintln!("\n=== SIMPLE PRESENCE PENALTY TEST (ARGMAX) ===");
-    eprintln!("Token 0: logit=10.0, count=5 Ã¢â€ â€™ after penalty: 8.5");
-    eprintln!("Token 1: logit=9.0, count=0 Ã¢â€ â€™ unpenalized: 9.0");
-    eprintln!("Token 2: logit=8.0, count=0 Ã¢â€ â€™ unpenalized: 8.0");
+    eprintln!("Token 0: logit=10.0, count=5 → after penalty: 8.5");
+    eprintln!("Token 1: logit=9.0, count=0 → unpenalized: 9.0");
+    eprintln!("Token 2: logit=8.0, count=0 → unpenalized: 8.0");
     eprintln!("With temperature=0 (argmax), should pick token 1\n");
 
     let p = SamplingParams {
@@ -599,7 +599,7 @@ fn presence_penalty_with_multinomial() {
     let vocab = 16;
 
     // Create simple logits: all -100 except:
-    // Token 0: logit=10.0, count=5 Ã¢â€ â€™ after penalty: 10.0 - 1.5 = 8.5
+    // Token 0: logit=10.0, count=5 → after penalty: 10.0 - 1.5 = 8.5
     // Token 1: logit=9.0, count=0
     // Token 2: logit=8.0, count=0
     let mut logits = vec![-100.0f32; vocab];
@@ -611,7 +611,7 @@ fn presence_penalty_with_multinomial() {
     token_counts[0] = 5; // Penalized
 
     eprintln!("\n=== PRESENCE PENALTY WITH MULTINOMIAL ===");
-    eprintln!("Token 0: logit=10.0, count=5 Ã¢â€ â€™ after penalty: 8.5");
+    eprintln!("Token 0: logit=10.0, count=5 → after penalty: 8.5");
     eprintln!("Token 1: logit=9.0, count=0");
     eprintln!("Token 2: logit=8.0, count=0");
     eprintln!("With temperature=0.7 (multinomial), should strongly prefer token 1\n");
@@ -629,7 +629,7 @@ fn presence_penalty_with_multinomial() {
     };
 
     // top_k=0 means full vocab; only tokens 0,1,2 have non-(-100) logits.
-    // After penalty: token 0 Ã¢â€ â€™ 8.5, token 1 Ã¢â€ â€™ 9.0, token 2 Ã¢â€ â€™ 8.0. All three are valid.
+    // After penalty: token 0 → 8.5, token 1 → 9.0, token 2 → 8.0. All three are valid.
     assert_valid_token(
         &stream,
         &p,
@@ -646,7 +646,7 @@ fn simple_presence_penalty_large_vocab() {
     let vocab = 256;
 
     // Create simple logits: all -100 except:
-    // Token 0: logit=10.0, count=5 Ã¢â€ â€™ after penalty: 8.5
+    // Token 0: logit=10.0, count=5 → after penalty: 8.5
     // Token 1: logit=9.0, count=0
     let mut logits = vec![-100.0f32; vocab];
     logits[0] = 10.0;
@@ -656,7 +656,7 @@ fn simple_presence_penalty_large_vocab() {
     token_counts[0] = 5;
 
     eprintln!("\n=== PRESENCE PENALTY WITH LARGE VOCAB (256) ===");
-    eprintln!("Token 0: logit=10.0, count=5 Ã¢â€ â€™ after penalty: 8.5");
+    eprintln!("Token 0: logit=10.0, count=5 → after penalty: 8.5");
     eprintln!("Token 1: logit=9.0, count=0");
     eprintln!("With temperature=0 (argmax) and vocab=256, should pick token 1\n");
 
@@ -713,7 +713,7 @@ fn simple_presence_penalty_with_top_k() {
     token_counts[0] = 5;
 
     eprintln!("\n=== PRESENCE PENALTY WITH TOP_K ===");
-    eprintln!("Token 0: logit=10.0, count=5 Ã¢â€ â€™ after penalty: 8.5");
+    eprintln!("Token 0: logit=10.0, count=5 → after penalty: 8.5");
     eprintln!("Token 1: logit=9.0, count=0");
     eprintln!("With temperature=0.7, top_k=2\n");
 
@@ -729,7 +729,7 @@ fn simple_presence_penalty_with_top_k() {
         ..Default::default()
     };
 
-    // top_k=2 Ã¢â€ â€™ only the two highest penalized logits: token 1 (9.0) and token 0 (8.5).
+    // top_k=2 → only the two highest penalized logits: token 1 (9.0) and token 0 (8.5).
     assert_valid_token(
         &stream,
         &p,
@@ -755,7 +755,7 @@ fn simple_presence_penalty_with_radix_top_k() {
     token_counts[0] = 5; // Penalized: 10.0 - 1.5 = 8.5
 
     eprintln!("\n=== PRESENCE PENALTY WITH RADIX TOP_K=1 ===");
-    eprintln!("Token 0: logit=10.0, count=5 Ã¢â€ â€™ after penalty: 8.5");
+    eprintln!("Token 0: logit=10.0, count=5 → after penalty: 8.5");
     eprintln!("Token 1: logit=9.0, count=0");
     eprintln!("With temperature=0.7, top_k=1 (radix path)\n");
 
@@ -838,8 +838,8 @@ fn simple_penalty_large_vocab_top_k_2() {
     let mut token_counts = vec![0i32; vocab];
     token_counts[0] = 5;
 
-    // Token 0: raw=10.0, count=5 Ã¢â€ â€™ penalized=8.5
-    // Token 1: raw=9.0,  count=0 Ã¢â€ â€™ penalized=9.0
+    // Token 0: raw=10.0, count=5 → penalized=8.5
+    // Token 1: raw=9.0,  count=0 → penalized=9.0
     // With top_k=2 and presence_penalty=1.5, only tokens 0 and 1 should be sampled.
     // CPU returns deterministic argmax (token 1), GPU uses stochastic sampling.
     // The correct test is to verify GPU only samples from {0, 1}.
@@ -884,7 +884,7 @@ fn simple_penalty_large_vocab_radix() {
     token_counts[0] = 5;
 
     eprintln!("\n=== SIMPLE PENALTY + LARGE VOCAB + RADIX ===");
-    eprintln!("Token 0: logit=10.0, count=5 Ã¢â€ â€™ penalty: 8.5");
+    eprintln!("Token 0: logit=10.0, count=5 → penalty: 8.5");
     eprintln!("Token 1: logit=9.0, count=0");
     eprintln!("vocab=256, temperature=0.7, top_k=1, top_p=1.0\n");
 
@@ -920,7 +920,7 @@ fn repeat_last_n_token_outside_window_not_penalized() {
     let vocab = 32;
 
     // Newest-first buffer: [_, B, _, _, _, _, A, _]
-    // Window = 4 Ã¢â€ â€™ kernel reads indices 0..3: [_, B, _, _] Ã¢â€ â€™ B is penalized, A is not.
+    // Window = 4 → kernel reads indices 0..3: [_, B, _, _] → B is penalized, A is not.
     let token_a: i32 = 5;
     let token_b: i32 = 10;
 
@@ -933,12 +933,12 @@ fn repeat_last_n_token_outside_window_not_penalized() {
     logits[token_a as usize] = 5.0;
     logits[token_b as usize] = 5.0;
 
-    // Pass recent_lens = 4 (window size) Ã¢â‚¬â€ kernel reads indices [0..3].
+    // Pass recent_lens = 4 (window size) — kernel reads indices [0..3].
     let p = SamplingParams {
         logits_f32: logits,
         batch_size: 1,
         vocab_size: vocab as i32,
-        temperature: 0.0, // argmax Ã¢â‚¬â€ deterministic
+        temperature: 0.0, // argmax — deterministic
         repeat_penalty: 1.5,
         recent_tokens: history,
         recent_lens: vec![4],
@@ -946,7 +946,7 @@ fn repeat_last_n_token_outside_window_not_penalized() {
         ..Default::default()
     };
 
-    // token_b in window Ã¢â€ â€™ 5.0 / 1.5 Ã¢â€°Ë† 3.33;  token_a not in window Ã¢â€ â€™ 5.0.
+    // token_b in window → 5.0 / 1.5 ≈ 3.33;  token_a not in window → 5.0.
     // token_a wins.
     let result = run_gpu(&stream, &p);
     assert_eq!(
@@ -963,8 +963,8 @@ fn repeat_last_n_token_inside_window_is_penalized() {
     let stream = test_stream();
     let vocab = 32;
 
-    let token_penalized: i32 = 7; // inside window Ã¢â‚¬â€œ will be penalized
-    let token_fresh: i32 = 15; // never seen Ã¢â‚¬â€œ will not be penalized
+    let token_penalized: i32 = 7; // inside window – will be penalized
+    let token_fresh: i32 = 15; // never seen – will not be penalized
 
     let max_recent = 8usize;
     // Newest-first: token_penalized is at index 2 (inside window=4).
@@ -980,7 +980,7 @@ fn repeat_last_n_token_inside_window_is_penalized() {
         batch_size: 1,
         vocab_size: vocab as i32,
         temperature: 0.0,
-        repeat_penalty: 2.0, // 5.5 / 2.0 = 2.75 < 5.0 Ã¢â€ â€™ fresh wins
+        repeat_penalty: 2.0, // 5.5 / 2.0 = 2.75 < 5.0 → fresh wins
         recent_tokens: history,
         recent_lens: vec![4],
         max_recent_len: max_recent as i32,
@@ -1008,13 +1008,13 @@ fn repeat_last_n_zero_window_no_penalty() {
     let mut logits = vec![-10.0f32; vocab];
     logits[token_target as usize] = 5.0;
 
-    // recent_lens = 0 Ã¢â€ â€™ kernel reads nothing Ã¢â€ â€™ no penalty
+    // recent_lens = 0 → kernel reads nothing → no penalty
     let p = SamplingParams {
         logits_f32: logits,
         batch_size: 1,
         vocab_size: vocab as i32,
         temperature: 0.0,
-        repeat_penalty: 10.0, // huge Ã¢â‚¬â€ would destroy token if applied
+        repeat_penalty: 10.0, // huge — would destroy token if applied
         recent_tokens: history,
         recent_lens: vec![0],
         max_recent_len: max_recent as i32,
@@ -1035,8 +1035,8 @@ fn repeat_last_n_zero_window_no_penalty() {
 // Cross-turn penalty applies a separate (usually lighter) penalty to tokens
 // that appeared in PREVIOUS turns, as distinct from the current turn.  This
 // requires the kernel to distinguish between two categories of seen tokens:
-//   Ã¢â‚¬Â¢ current-turn tokens   Ã¢â€ â€™ use normal presence/frequency penalty
-//   Ã¢â‚¬Â¢ prior-turn tokens     Ã¢â€ â€™ use cross_turn_penalty (flat additive, like presence)
+//   • current-turn tokens   → use normal presence/frequency penalty
+//   • prior-turn tokens     → use cross_turn_penalty (flat additive, like presence)
 //
 // Parameters:
 //   - `cross_turn_penalty: f32` scalar parameter
@@ -1064,18 +1064,18 @@ fn cross_turn_penalty_applies_to_prior_turn_tokens() {
     logits[token_current] = 5.0;
     logits[token_fresh] = 5.0;
 
-    // Current-turn counts Ã¢â‚¬â€ only token_current has been seen this turn
+    // Current-turn counts — only token_current has been seen this turn
     let mut token_counts = vec![0i32; vocab];
     token_counts[token_current] = 1;
 
-    // Prior-turn counts Ã¢â‚¬â€ only token_prior was seen last turn
+    // Prior-turn counts — only token_prior was seen last turn
     let mut cross_turn_counts = vec![0i32; vocab];
     cross_turn_counts[token_prior] = 1;
 
     // With presence_penalty=1.5 and cross_turn_penalty=0.3:
-    //   token_current  Ã¢â€ â€™ 5.0 - 1.5 = 3.5
-    //   token_prior    Ã¢â€ â€™ 5.0 - 0.3 = 4.7
-    //   token_fresh    Ã¢â€ â€™ 5.0
+    //   token_current  → 5.0 - 1.5 = 3.5
+    //   token_prior    → 5.0 - 0.3 = 4.7
+    //   token_fresh    → 5.0
     // Expected winner: token_fresh
     let p = SamplingParams {
         logits_f32: logits,
@@ -1115,8 +1115,8 @@ fn cross_turn_penalty_lighter_than_presence_penalty() {
     token_counts[token_current] = 1;
 
     // With presence=1.5 and cross_turn=0.3:
-    //   token_prior  (cross_turn) Ã¢â€ â€™ 5.0 - 0.3 = 4.7
-    //   token_current (presence)  Ã¢â€ â€™ 5.0 - 1.5 = 3.5
+    //   token_prior  (cross_turn) → 5.0 - 0.3 = 4.7
+    //   token_current (presence)  → 5.0 - 1.5 = 3.5
     // Prior-turn token wins over current-turn token.
     let mut cross_turn_counts = vec![0i32; vocab];
     cross_turn_counts[token_prior] = 1;

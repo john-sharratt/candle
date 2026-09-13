@@ -17,13 +17,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use candle::quantized::cuda::{to_dynamic, DynamicActs};
-use candle::quantized::{get_vram_info, gguf_file, Int8Mode, MmapRegistration};
+use candle::quantized::{get_vram_info, gguf_file, Int8Mode, MmapRegistration, SumScale};
 use candle::{DType, Device, Result, Tensor, D};
 use memmap2::MmapOptions;
 
 use crate::models::expert_lre::{
-    layer_geometries, minimum_resident_slots, slot_bytes_for, ExpertCache, ExpertCacheSetup,
-    MmapExpertRef, MoeInput,
+    layer_geometries, minimum_resident_slots, slot_bytes_for, sort_assignments_by_expert,
+    ExpertCache, ExpertCacheSetup, MmapExpertRef, MoeInput,
 };
 use crate::models::profile::span;
 use candle_nn::kv_cache::WeightZone;
@@ -187,7 +187,7 @@ impl Engine {
         // through one authority. The reservation (`region_pool`) sizes itself
         // from `governor.usable()` at first touch — which happens BELOW, after
         // every dense tensor is resident, so the span takes exactly what is
-        // genuinely left (`docs/elastic_vram_partition.md` §4).
+        // genuinely left (`docs/archived/elastic_vram_partition.md` §4).
         let total_experts = moe_layers.len() * n_expert;
         let gb = |b: usize| b as f64 / (1usize << 30) as f64;
         #[cfg(feature = "cuda")]
@@ -374,7 +374,7 @@ impl Engine {
         // is genuinely left and the reservation (created lazily by the first
         // `span_end` call) takes it. The weight zone opens at the span's right
         // edge; its capacity in slots IS the resident-expert count — no byte
-        // budget, no headroom constant (`docs/elastic_vram_partition.md` §4,
+        // budget, no headroom constant (`docs/archived/elastic_vram_partition.md` §4,
         // `docs/expert_cache_design.md`).
         #[cfg(feature = "cuda")]
         let zone = if let Device::Cuda(cuda_dev) = device {
@@ -519,7 +519,8 @@ impl Engine {
             Device::Cuda(d) => d.clone(),
             _ => candle::bail!("Engine::moe_forward requires a CUDA device"),
         };
-        let q8 = match to_dynamic(&normed, Int8Mode::Performance, &cuda_dev)? {
+        // Raw Σx — a language model's block sums stay far below f16's ceiling.
+        let q8 = match to_dynamic(&normed, Int8Mode::Performance, &cuda_dev, SumScale::Raw)? {
             DynamicActs::Int8(op) => op,
             DynamicActs::Float(_) => {
                 candle::bail!("q8a128 activation quantize returned a non-int8 operand")
@@ -550,36 +551,7 @@ impl Engine {
         s_rb.end();
         let weights_flat = weights.flatten_all()?; // [nt*k]
         let (k, ne) = (self.cfg.n_activated_experts, self.cfg.n_routed_experts);
-        let mut counts = vec![0u32; ne];
-        for row in &idx_cpu {
-            for &eid in row {
-                if (eid as usize) < ne {
-                    counts[eid as usize] += 1;
-                }
-            }
-        }
-        let mut cursor = vec![0u32; ne];
-        let mut expert_ids: Vec<usize> = Vec::new();
-        let mut running = 0u32;
-        for (e, &c) in counts.iter().enumerate() {
-            cursor[e] = running;
-            running += c;
-            if c > 0 {
-                expert_ids.push(e);
-            }
-        }
-        let mut assignments: Vec<(u32, u32, u32)> = vec![(0, 0, 0); running as usize];
-        for (tok, row) in idx_cpu.iter().enumerate() {
-            for (slot_k, &eid) in row.iter().enumerate() {
-                if (eid as usize) >= ne {
-                    continue;
-                }
-                let pos = cursor[eid as usize] as usize;
-                assignments[pos] = (eid, tok as u32, tok as u32 * k as u32 + slot_k as u32);
-                cursor[eid as usize] += 1;
-            }
-        }
-
+        let (expert_ids, assignments) = sort_assignments_by_expert(&idx_cpu, k, ne);
         s_sort.end();
         let s_submit = span("moe:submit");
         let routed = self.experts.submit_moe_work(
@@ -798,7 +770,7 @@ impl KernelSession<'_> {
             b.set_len(self.seq, resident);
         }
         let generation = self.kv.begin_stager_generation();
-        let (_pm, headers, stride) = self.kv.build_decode_metadata(&[self.seq], &generation)?;
+        let (headers, stride) = self.kv.build_decode_metadata(&[self.seq], &generation)?;
         let headers = headers.ok_or_else(|| candle::Error::msg("no decode metadata"))?;
         let base = headers.dev_ptr();
 

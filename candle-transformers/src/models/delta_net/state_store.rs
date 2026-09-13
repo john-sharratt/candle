@@ -830,12 +830,16 @@ impl RecurrentStateStore {
         for (slot, l) in self.slots.iter_mut().zip(layers) {
             let state_f: Vec<f32> = l
                 .state
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect();
             let tail_f: Vec<f32> = l
                 .conv_tail
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect();
             // Written into the slot's buffers rather than replacing them: the

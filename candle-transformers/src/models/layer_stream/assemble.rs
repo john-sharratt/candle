@@ -58,11 +58,17 @@ pub fn assemble_layer(
         MixKind::DeltaNet => {
             let dn = residue.delta_net()?;
             QuantLayerMix::DeltaNet(crate::models::delta_net::QuantDeltaNetWeights {
-                wqkv: take!(LayerTensor::Wqkv),
-                wz: take!(LayerTensor::Wz),
+                // `[qkv, z, β, α]` — the order `project_grouped` splits on.
+                // Unstacked: two come from the slot and two stay resident, and
+                // this lineage's narrowing schedule would not let them share a
+                // format anyway.
+                proj: vec![
+                    take!(LayerTensor::Wqkv),
+                    take!(LayerTensor::Wz),
+                    dn.w_beta.clone(),
+                    dn.w_alpha.clone(),
+                ],
                 w_out: take!(LayerTensor::WOut),
-                w_beta: dn.w_beta.clone(),
-                w_alpha: dn.w_alpha.clone(),
                 dt_bias: dn.dt_bias.clone(),
                 a: dn.a.clone(),
                 conv: dn.conv.clone(),
@@ -71,10 +77,26 @@ pub fn assemble_layer(
         }
         MixKind::Attention => {
             let at = residue.attention()?;
+            let qkv = vec![
+                take!(LayerTensor::Wq),
+                take!(LayerTensor::Wk),
+                take!(LayerTensor::Wv),
+            ];
+            // Read off the weights: unstacked, each still knows its own height,
+            // so there is nothing for the residue to carry.
+            let rows =
+                |w: &crate::models::quantized_matmul::QMatMul, what: &str| -> Result<usize> {
+                    match w.weight_dims().as_slice() {
+                        [rows, _] => Ok(*rows),
+                        other => candle::bail!("{what} is rank {}, expected 2", other.len()),
+                    }
+                };
+            let q_rows = rows(&qkv[0], "attn_q")?;
+            let kv_rows = rows(&qkv[1], "attn_k")?;
             QuantLayerMix::Attention(QuantAttentionWeights {
-                wq: take!(LayerTensor::Wq),
-                wk: take!(LayerTensor::Wk),
-                wv: take!(LayerTensor::Wv),
+                wqkv: qkv,
+                q_rows,
+                kv_rows,
                 wo: take!(LayerTensor::Wo),
                 q_norm: at.q_norm.clone(),
                 k_norm: at.k_norm.clone(),

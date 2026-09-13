@@ -50,6 +50,10 @@ pub mod decode_utils;
 pub mod deepseek2;
 pub mod delta_net;
 pub mod draft_ladder;
+/// The cohort draft walk drives a `BatchedInferenceSession`, so it shares
+/// `batched_inference`'s gate.
+#[cfg(feature = "cuda")]
+pub mod draft_walk;
 // The DeepSeek-V4 arch descriptor names `latent_moe`'s geometry and weights, so
 // it shares that engine's gating.
 #[cfg(feature = "cuda")]
@@ -133,6 +137,12 @@ pub mod prefill_capture;
 #[cfg(feature = "cuda")]
 pub mod prefill_utils;
 pub mod profile;
+// The carrier for a block-sparse attention selection (QSA). Model-independent
+// on purpose: the semantics live with the architecture that has them
+// (`qwen4exp::qsa_select`), the tensors the kernels read live here.
+pub mod qsa_selection;
+/// Choosing an expert weight format from the card the model lands on.
+pub mod quant_ladder;
 pub mod quantized_blip;
 pub mod quantized_blip_text;
 pub mod quantized_gemma3;
@@ -165,6 +175,8 @@ pub mod quantized_qwen36_moe;
 #[cfg(feature = "cuda")]
 pub mod quantized_qwen38;
 #[cfg(feature = "cuda")]
+pub mod quantized_qwen38_moe;
+#[cfg(feature = "cuda")]
 pub mod quantized_qwen3_moe;
 pub mod quantized_recurrent_gemma;
 pub mod quantized_rwkv_v5;
@@ -179,7 +191,12 @@ pub mod qwen3;
 // unconditional — its reference recurrence runs anywhere.
 #[cfg(feature = "cuda")]
 pub mod qwen35;
+// The qwen4exp generation (Qwen3.8-Flash-Next). Its oracle runs on the CPU
+// but leans on `qwen35`'s reference pieces and `latent_moe`'s split reader,
+// both behind the same gate.
 pub mod qwen3_moe;
+#[cfg(feature = "cuda")]
+pub mod qwen4exp;
 pub mod rope_tables;
 pub mod rotary_layout;
 pub mod routing_capture;
@@ -201,6 +218,10 @@ pub mod snac;
 pub mod speculative_choice;
 pub mod stable_diffusion;
 pub mod stable_lm;
+/// Running a group of input projections that share one operand, splitting the
+/// result with one ragged scatter rather than a copy per part.
+#[cfg(feature = "cuda")]
+pub mod stacked_proj;
 pub mod starcoder2;
 pub mod stella_en_v5;
 pub mod t5;

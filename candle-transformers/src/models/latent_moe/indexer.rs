@@ -192,7 +192,7 @@ impl Indexer {
     /// The Indexer's roped per-head query for the token at `pos`, flattened to a
     /// single band `[n_heads * head_dim]` in `(head, dim)` order — the exact
     /// input to `WideQSig::from_band` (Artifact D of
-    /// docs/deepseek_turn_seal_persistence.md). The provenance wide-Q for a
+    /// docs/deepseek/deepseek_turn_seal_persistence.md). The provenance wide-Q for a
     /// DeepSeek turn is `sign` of this band per Indexer head: the model's
     /// LEARNED significance space, read straight from the Indexer, rather than
     /// the R16 cross-layer sign-fold every other model uses. The head ordering

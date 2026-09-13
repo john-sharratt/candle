@@ -216,7 +216,11 @@ pub fn all_formats() -> Vec<ArenaFmt> {
     // Real palette4 quantization (hd128 only). Unity (override → uniform int8
     // arena, the skip-dequant target) vs adaptive (non-unity palette). Q8_0/
     // Q4_0/Q2_0 cover 8/4/2-bit native-INT8 arenas for the memory-bound bench.
-    for level in [0u8, 1, 3, 5, 7] {
+    // Level 10 carries an adaptive row and no uniform ones: it is the level
+    // whose candidate list is long enough for the *mix* to be the thing under
+    // measurement, and a uniform row cannot show what dropping one format from
+    // a candidate set does to a cache that selects per block.
+    for level in [0u8, 1, 3, 5, 7, 10] {
         v.push(ArenaFmt::RealQuant {
             level,
             override_fmt: Some(QuantFormat::Q8_0),
@@ -248,6 +252,39 @@ pub fn all_formats() -> Vec<ArenaFmt> {
         QuantFormat::Q0_M2,
         QuantFormat::Q0_M4,
         QuantFormat::Q0_X,
+        // The rest of the C10 candidate set. Q0_V and Q2_A were the two
+        // production C10 formats with no real-quant row here at all, and Q3_1
+        // is C10's other 3-bit arm — so the level that decides the deep-context
+        // decode rate was the least covered of any on this axis.
+        QuantFormat::Q0_V,
+        QuantFormat::Q2_A,
+        QuantFormat::Q3_1,
+    ] {
+        v.push(ArenaFmt::RealQuant {
+            level: 0,
+            override_fmt: Some(qf),
+        });
+    }
+    v
+}
+
+/// The C10 candidate set, as `CompressionPolicy` selects it — the formats a
+/// maximum-compression cache is actually read through.
+///
+/// C10 is where the decode cost concentrates: its formats are the sub-3-bit
+/// tier, and a per-format regression there moves the deep-context decode rate
+/// while every shallower level stays flat. Kept as its own axis so a codec
+/// change can be measured against the level that exercises it.
+///
+/// Mirrors `PRODUCTION_{K,V}_CANDIDATE_FORMATS[10]`, Q0_V included — the format
+/// still exists and is still readable, so the bench keeps measuring it even
+/// though the selector no longer chooses it. That is the point: the row is what
+/// would have to improve before it could return to the ladder.
+pub fn c10_formats() -> Vec<ArenaFmt> {
+    use QuantFormat::*;
+    let mut v = vec![ArenaFmt::Float(DType::BF16)];
+    for qf in [
+        Q0, Q0_V, Q0_X, Q0_M2, Q1_A, Q1_S, Q0_M4, Q2_A, Q2_S, Q3_0, Q3_1,
     ] {
         v.push(ArenaFmt::RealQuant {
             level: 0,
@@ -268,6 +305,13 @@ pub fn select_formats(filter: &str) -> Result<Vec<ArenaFmt>, String> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
+        // A named group expands to a whole axis, so the compression level whose
+        // codecs are under change can be named directly rather than spelled out
+        // as eleven labels that drift from the policy's own list.
+        if want == "c10" {
+            out.extend(c10_formats());
+            continue;
+        }
         match universe.iter().find(|f| f.label() == want) {
             Some(f) => out.push(*f),
             None => unknown.push(want.to_string()),

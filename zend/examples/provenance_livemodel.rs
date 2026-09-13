@@ -57,13 +57,16 @@ fn main() -> anyhow::Result<()> {
         .collect();
     let observe_trail = std::env::var("OBSERVE_TRAIL").ok().as_deref() == Some("1");
     let d = NormConfig::default();
+    // Only the env-overridable knobs are named; everything else — `scale`, and
+    // the band's reference probe length — comes from the default, so a new
+    // normalizer constant does not break this harness.
     let cfg = NormConfig {
         alpha_up: env_f32("ALPHA_UP", d.alpha_up),
         alpha_dn: env_f32("ALPHA_DN", d.alpha_dn),
         hit_prior: env_f32("HIT_PRIOR", d.hit_prior),
         floor_min: env_f32("FLOOR_MIN", d.floor_min),
         floor_pctl: env_f32("FLOOR_PCTL", d.floor_pctl),
-        scale: d.scale,
+        ..NormConfig::default()
     };
 
     let mut substrate = Substrate::new();
@@ -155,7 +158,10 @@ fn main() -> anyhow::Result<()> {
         let raw = score(&probe);
         let pairs: Vec<(ChildKey, f32)> =
             (0..n).map(|ci| (child_keys[ci].clone(), raw[ci])).collect();
-        cache.observe(&scope, *sid, &pairs);
+        // The probe's own length: a raw score is a sum over probe tokens, and
+        // OBSERVE_TRAIL switches this between a trailing window and the whole
+        // turn — so the level must be learned as a rate, not as a total.
+        cache.observe(&scope, *sid, &pairs, probe.len());
     }
 
     println!(
@@ -170,11 +176,15 @@ fn main() -> anyhow::Result<()> {
         if !focus_probes.contains(sid) {
             continue;
         }
-        // NORMALIZE with the live trailing-window probe.
-        let raw = score(&trailing(sig));
+        // NORMALIZE with the live trailing-window probe. Its length is what this
+        // harness is FOR — a trailing window read against levels warmed from
+        // whole turns is precisely the read/write length mismatch the band
+        // corrects for.
+        let live_probe = trailing(sig);
+        let raw = score(&live_probe);
         let pairs: Vec<(ChildKey, f32)> =
             (0..n).map(|ci| (child_keys[ci].clone(), raw[ci])).collect();
-        let normed = cache.normalize(&scope, &pairs);
+        let normed = cache.normalize(&scope, &pairs, live_probe.len());
         let mut ranked: Vec<(usize, f32)> = normed.iter().map(|(_, v)| *v).enumerate().collect();
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
         let cc_rank = ranked

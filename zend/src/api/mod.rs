@@ -98,7 +98,10 @@ pub fn router(session: Arc<ZendSession>) -> Router {
             "/v1/substrate/layer/:name/toggle",
             post(substrate::toggle_layer),
         )
-        .route("/v1/substrate/timeline/:tl", get(substrate::timeline))
+        .route(
+            "/v1/substrate/timeline/:tl",
+            get(substrate::timeline).delete(substrate::delete_timeline),
+        )
         .route("/v1/substrate/project", post(substrate::project))
         .route("/v1/debug/maintenance", post(status::force_maintenance))
         .route("/v1/conversations", get(conversations::list))

@@ -72,7 +72,7 @@ if pool.dense_frozen {
 ```
 
 After the freeze the dense block is a fixed prefix of the span. The elastic
-boundary — the whole point of `docs/elastic_vram_partition.md` — moves the
+boundary — the whole point of `docs/archived/elastic_vram_partition.md` — moves the
 weight/KV line by evicting and relocating **expert slots**. A dense model has
 no slots, so the boundary has nothing to trade and the partition is inert. KV
 pressure on a dense model can only be answered by refusing work.

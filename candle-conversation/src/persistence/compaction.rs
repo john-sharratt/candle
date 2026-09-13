@@ -1,5 +1,5 @@
 //! Store compaction — reclaim dead weight by rewriting only the **live**
-//! records into a fresh segment (`docs/segmented_substrate_log.md`).
+//! records into a fresh segment (`docs/archived/segmented_substrate_log.md`).
 //!
 //! An append-only store only grows: every superseded partial-tail snapshot,
 //! every stale `ModelSpec` / `Template`, every chunk of a deleted stream is
@@ -463,6 +463,25 @@ pub fn collect_live_records(
                 ));
             }
         }
+        // The turn's QSA index page, re-emitted with its K/V for the same
+        // reason: a compaction that carries a turn's chunks forward but drops
+        // its page leaves a turn that can be borrowed and cannot be indexed.
+        // Unlike the signature this is not sig-gated — it belongs to the K/V,
+        // and a `TextOnly` turn that keeps its chunks keeps its page.
+        if let Some(payload) = &entry.index_page {
+            out.push(CompactItem::synth(
+                RecordHeader {
+                    record_type: RecordType::TurnIndexPage,
+                    format: 0,
+                    payload_len: payload.len() as u64,
+                    crc: 0,
+                    stream_id: stream_id.0,
+                    chunk_index: 0,
+                    token_count: 0,
+                },
+                payload.clone(),
+            ));
+        }
         if let Some(through) = entry.committed_through {
             out.push(CompactItem::synth(
                 RecordHeader {
@@ -572,13 +591,15 @@ pub fn collect_live_records(
     }
     // Per-(timeline, turn) tool round-trip couplings.
     //
-    // Resident and payload-keyed, like `Label` and `DebugId` — the accounting
-    // never supersedes one, so the only way it reaches the compacted log is a
-    // re-emit from RAM. Without this every compaction unjoined each tool call
-    // from its response, and `summary_tree::exchange` — which groups an
-    // exchange as the maximal run of coupled turns — began splitting the two
-    // halves of one round-trip into separate exchanges. Nothing failed; the
-    // summaries just quietly got worse.
+    // Resident and payload-keyed, like `Label` and `DebugId` — nothing
+    // supersedes an old copy and `accounting` never credits one as dead, so the
+    // only way one reaches the compacted log is a re-emit from RAM. Dropping it
+    // deletes the only statement that a call turn and its response are one
+    // exchange: `summary_tree::exchange` groups an exchange as the maximal run
+    // of coupled turns, so every compaction began splitting the two halves of a
+    // round-trip apart. Nothing failed — a timeline with no couplings is a
+    // legitimate state (nothing ever called a tool there) and reads as intact,
+    // which is exactly why this went unnoticed.
     for (timeline_id, from_turn) in substrate.live_couplings() {
         if tombstoned.contains(&timeline_id) {
             continue;
@@ -1533,6 +1554,10 @@ mod tests {
                 conv_tail_cols: 2,
                 conv_tail: vec![fill; 16],
             }],
+            // Filled, not empty: a relocation that carried the layers and
+            // dropped the model's own state would still pass every assertion
+            // that only inspects the layers.
+            aux: vec![fill; 24],
         }
         .encode()
     }
@@ -1652,6 +1677,80 @@ mod tests {
             !has_type(&live, RecordType::Snapshot),
             "a tombstoned timeline's recurrent snapshot survived compaction"
         );
+    }
+
+    /// **A distilled timeline's recurrent tail is retired at the INDEX**, so
+    /// every rewrite path sheds it without having to consult the distilled set.
+    ///
+    /// The gate used to live only in `collect_live_records`. Incremental
+    /// maintenance relocated the same tails forward on every pass, on the stated
+    /// reasoning that "the substrate map only ever holds live conversations'
+    /// tails" — true of a tombstone, which removes the entry, and false of a
+    /// distill, which did not. Measured on a production store: 766 distilled
+    /// timelines × ~116 MiB, about 89 GB of a 120 GB log, none of it resumable.
+    ///
+    /// Asserting on the index (`recurrent_snapshot_entries`) rather than on one
+    /// path's output is the point — that is the property both paths read.
+    #[test]
+    fn a_distilled_timelines_recurrent_snapshot_is_retired_from_the_index() {
+        use crate::persistence::content_hash::snapshot_stream_id;
+        use crate::persistence::record::{DistillMode, DistillPayload};
+
+        let tl = 155u64;
+        let snap = snapshot_payload(tl, 3, 0xAB);
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&record(
+            RecordType::Snapshot,
+            snapshot_stream_id(tl).0,
+            0,
+            &snap,
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::Distilled,
+            0,
+            0,
+            &DistillPayload {
+                timeline_id: tl,
+                mode: DistillMode::ProvenanceOnly,
+            }
+            .encode(),
+        ));
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+
+        // The index itself — what maintenance's relocation worklist walks.
+        assert_eq!(
+            substrate.recurrent_snapshot_entries().count(),
+            0,
+            "a distilled timeline's tail is still live in the substrate index, so \
+             incremental maintenance will relocate it forward forever",
+        );
+        // And therefore also absent from the full-compaction live set.
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        assert!(
+            !has_type(&live, RecordType::Snapshot),
+            "a distilled timeline's recurrent snapshot survived compaction",
+        );
+    }
+
+    /// A LIVE timeline keeps its tail — the retirement must key on the marker,
+    /// not fire for every snapshot that shares the walk.
+    #[test]
+    fn an_undistilled_timelines_recurrent_snapshot_is_kept() {
+        use crate::persistence::content_hash::snapshot_stream_id;
+
+        let tl = 156u64;
+        let snap = snapshot_payload(tl, 3, 0xAB);
+        let blob = record(RecordType::Snapshot, snapshot_stream_id(tl).0, 0, &snap);
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        assert_eq!(substrate.recurrent_snapshot_entries().count(), 1);
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        assert!(has_type(&live, RecordType::Snapshot));
     }
 
     /// **Branch checkpoints are capped; conversation snapshots are not.**
@@ -1978,6 +2077,352 @@ mod tests {
                 |it| it.header().record_type == RecordType::Npc && it.header().stream_id == 900
             ),
             "a tombstoned character is still a record",
+        );
+    }
+
+    /// A tool round-trip's coupling survives compaction.
+    ///
+    /// This is the gate whose absence let every coupling in the store be
+    /// deleted. `TurnCoupling` is payload-keyed, so `accounting` never credits a
+    /// copy as dead and no location map relocates it: re-emitting from the
+    /// substrate's live set is the *only* thing carrying it. And the loss is
+    /// invisible — a timeline with no couplings is a legitimate state (nothing
+    /// there ever called a tool), so the store reads as intact while every
+    /// exchange has quietly come apart into independent turns.
+    #[test]
+    fn collect_carries_turn_couplings_forward() {
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
+        let tl = 77u64;
+        let decl = |turn_index: u32, seq: u32| {
+            StreamDecl::Turn(TurnDecl {
+                timeline_id: tl,
+                turn_index,
+                turn_id_day: 0,
+                turn_id_seq: seq,
+                role: 2,
+                block_start: 0,
+                block_end: 2,
+                layer_id: 1,
+                group_id: 1,
+                anchored_prefix: Vec::new(),
+                view: Vec::new(),
+                segments: Vec::new(),
+                tags: Vec::new(),
+            })
+        };
+        // A three-turn repo_map chain (list → read → summarise): the first two
+        // couple, joining all three into one exchange.
+        let mut blob = Vec::new();
+        for (i, sid) in [(0u32, 600u64), (1, 601), (2, 602)] {
+            blob.extend_from_slice(&record(
+                RecordType::StreamDecl,
+                sid,
+                0,
+                &decl(i, sid as u32).encode(),
+            ));
+        }
+        for from_turn in [0u32, 1] {
+            blob.extend_from_slice(&record(
+                RecordType::TurnCoupling,
+                0,
+                0,
+                &TurnCouplingPayload {
+                    timeline_id: tl,
+                    from_turn,
+                }
+                .encode(),
+            ));
+        }
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        // Precondition: the walk really installed them, so a failure below is
+        // compaction dropping them rather than replay never loading them.
+        assert_eq!(
+            substrate.live_couplings(),
+            vec![(tl, 0), (tl, 1)],
+            "replay must install both couplings",
+        );
+
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        for from_turn in [0u32, 1] {
+            assert!(
+                has_synth(
+                    &live,
+                    RecordType::TurnCoupling,
+                    &TurnCouplingPayload {
+                        timeline_id: tl,
+                        from_turn,
+                    }
+                    .encode(),
+                ),
+                "coupling {from_turn} must survive compaction — without it the \
+                 call turn and its response become independent exchanges",
+            );
+        }
+    }
+
+    /// A tombstoned timeline's couplings go with it. They describe turns that no
+    /// longer exist, so carrying them would make the marker set immortal.
+    #[test]
+    fn collect_drops_couplings_of_a_tombstoned_timeline() {
+        let tl = 88u64;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&record(
+            RecordType::TurnCoupling,
+            0,
+            0,
+            &TurnCouplingPayload {
+                timeline_id: tl,
+                from_turn: 0,
+            }
+            .encode(),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::Tombstone,
+            0,
+            0,
+            &TombstonePayload {
+                timeline_id: tl,
+                turn_index: None,
+                reason: None,
+            }
+            .encode(),
+        ));
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        assert!(!has_type(&live, RecordType::TurnCoupling));
+    }
+
+    /// **The guard that makes [`survival`] load-bearing.**
+    ///
+    /// Builds a store holding one record of every written type, compacts it, and
+    /// requires that each type whose contract is `Relocated` or `Resident` comes
+    /// out the other side. A type added to `RecordType` and to `survival` but not
+    /// to `collect_live_records` fails here rather than deleting user data in
+    /// production — which is exactly how `TurnCoupling`, `Npc`, and turn-scoped
+    /// `Tombstone`s were lost: each compiled clean, passed every test, and the
+    /// accounting classified it as neither live nor dead so nothing counted the
+    /// loss either.
+    ///
+    /// [`survival`]: crate::persistence::survival::survival
+    #[test]
+    fn every_record_type_survives_compaction() {
+        use crate::persistence::content_hash::snapshot_stream_id;
+        use crate::persistence::record::{DistillMode, DistillPayload, TreeMetadataPayload};
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
+        use crate::persistence::survival::{survival, Survival, WRITTEN_RECORD_TYPES};
+        use std::collections::BTreeMap;
+
+        let live_tl = 1001u64;
+        let distilled_tl = 1002u64;
+        let custom: BTreeMap<String, String> = BTreeMap::new();
+        let decl = |timeline_id: u64, turn_index: u32| {
+            StreamDecl::Turn(TurnDecl {
+                timeline_id,
+                turn_index,
+                turn_id_day: 0,
+                turn_id_seq: turn_index + 1,
+                role: 2,
+                block_start: 0,
+                block_end: 2,
+                layer_id: 1,
+                group_id: 1,
+                anchored_prefix: Vec::new(),
+                view: Vec::new(),
+                segments: Vec::new(),
+                tags: Vec::new(),
+            })
+        };
+        let live_sid = 7001u64;
+        let distilled_sid = 7002u64;
+
+        let mut blob = Vec::new();
+        // Singletons.
+        blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"model"));
+        blob.extend_from_slice(&record(RecordType::Template, 0, 0, b"template"));
+        blob.extend_from_slice(&record(RecordType::Tokenizer, 0, 0, b"tokenizer"));
+        // A live turn, with every per-stream record it can carry.
+        blob.extend_from_slice(&record(
+            RecordType::StreamDecl,
+            live_sid,
+            0,
+            &decl(live_tl, 0).encode(),
+        ));
+        blob.extend_from_slice(&record(RecordType::Chunk, live_sid, 0, b"kv"));
+        blob.extend_from_slice(&record(RecordType::Tokens, live_sid, 0, b"tokens"));
+        blob.extend_from_slice(&record(RecordType::Commit, live_sid, 0, b""));
+        blob.extend_from_slice(&record(
+            RecordType::ProjectionEvents,
+            live_sid,
+            0,
+            b"events",
+        ));
+        blob.extend_from_slice(&record(RecordType::TurnIndexPage, live_sid, 0, b"page"));
+        blob.extend_from_slice(&record(
+            RecordType::WideQSig,
+            live_sid,
+            0,
+            &crate::provenance::encode_wide_sigs(&[crate::provenance::WideQSig::from_band(
+                &vec![1.0f32; 4 * 128],
+                128,
+            )]),
+        ));
+        // Per-timeline metadata. `ConvState` is emitted only for an archived
+        // timeline, so archive this one.
+        blob.extend_from_slice(&record(
+            RecordType::Label,
+            0,
+            0,
+            &super::super::manifest::encode_label_payload(live_tl, "conv", "Live", &custom),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::ConvState,
+            0,
+            0,
+            &encode_conv_state_payload(live_tl, ConvState { archived: true }),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::TreeMetadata,
+            0,
+            0,
+            &TreeMetadataPayload {
+                timeline_id: live_tl,
+                turn_index: 0,
+                kind: 0,
+                tree_height: 0,
+                children: Vec::new(),
+            }
+            .encode(),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::DebugId,
+            0,
+            0,
+            &DebugIdPayload {
+                timeline_id: live_tl,
+                debug_id: "resume-key".to_string(),
+            }
+            .encode(),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::TurnCoupling,
+            0,
+            0,
+            &TurnCouplingPayload {
+                timeline_id: live_tl,
+                from_turn: 0,
+            }
+            .encode(),
+        ));
+        // A turn-scoped tombstone — on a turn of the LIVE timeline, so it is a
+        // dead turn inside a living conversation rather than a dead timeline.
+        blob.extend_from_slice(&record(
+            RecordType::Tombstone,
+            0,
+            0,
+            &TombstonePayload {
+                timeline_id: live_tl,
+                turn_index: Some(1),
+                reason: None,
+            }
+            .encode(),
+        ));
+        // Recurrent state: a conversation snapshot and a prompt-branch checkpoint.
+        blob.extend_from_slice(&record(
+            RecordType::Snapshot,
+            snapshot_stream_id(live_tl).0,
+            0,
+            b"snapshot",
+        ));
+        blob.extend_from_slice(&record(RecordType::BranchCheckpoint, 9_001, 0, b"branch"));
+        // A separate distilled timeline, so its marker is emitted without
+        // shedding the live turn's content.
+        blob.extend_from_slice(&record(
+            RecordType::StreamDecl,
+            distilled_sid,
+            0,
+            &decl(distilled_tl, 0).encode(),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::Distilled,
+            0,
+            0,
+            &DistillPayload {
+                timeline_id: distilled_tl,
+                mode: DistillMode::ProvenanceOnly,
+            }
+            .encode(),
+        ));
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        // Characters are tracked persistence-side, not in the substrate.
+        let mut npc_locs: HashMap<u64, RecordLoc> = HashMap::new();
+        npc_locs.insert(8812, loc_at(4_096, 256));
+
+        let live = collect_live_records(&manifest, &substrate, &npc_locs);
+
+        for &rt in WRITTEN_RECORD_TYPES {
+            match survival(rt) {
+                Survival::Relocated | Survival::Resident => assert!(
+                    has_type(&live, rt),
+                    "{rt:?} declares survival::{:?} but compaction emitted no such \
+                     record — it would be deleted from the store on the first pass",
+                    survival(rt),
+                ),
+                // Derived: every copy is dropped and the writer rebuilds the
+                // chain in the new file, so its absence here is correct.
+                Survival::Regenerated => assert!(
+                    !has_type(&live, rt),
+                    "{rt:?} is regenerated by the writer; carrying a stale copy \
+                     forward would corrupt the new chain",
+                ),
+                Survival::NeverWritten => unreachable!("{rt:?} is in WRITTEN_RECORD_TYPES"),
+            }
+        }
+    }
+
+    /// Turn-scoped tombstones survive. The reload's placeholder logic keys off
+    /// the marker to restore the dead turn as an empty hole; without it the turn
+    /// reads as content-declaring with no content.
+    #[test]
+    fn collect_carries_turn_scoped_tombstones_forward() {
+        let tl = 99u64;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&record(
+            RecordType::Tombstone,
+            0,
+            0,
+            &TombstonePayload {
+                timeline_id: tl,
+                turn_index: Some(3),
+                reason: None,
+            }
+            .encode(),
+        ));
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        assert!(
+            has_synth(
+                &live,
+                RecordType::Tombstone,
+                &TombstonePayload {
+                    timeline_id: tl,
+                    turn_index: Some(3),
+                    reason: None,
+                }
+                .encode(),
+            ),
+            "a turn-scoped tombstone must survive, or the dead turn returns",
         );
     }
 }

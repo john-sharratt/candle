@@ -168,7 +168,7 @@ impl KernelLayerSeqState {
     /// partial compressor groups into corpus entries and append them to the
     /// gallery. After this the live window tail is fully represented in the
     /// compressed corpus, so the turn is persistable and resumable from the
-    /// corpus alone (docs/deepseek_turn_seal_persistence.md §2). The attention
+    /// corpus alone (docs/deepseek/deepseek_turn_seal_persistence.md §2). The attention
     /// and indexer compressors share group boundaries, so they close in lockstep
     /// (`comp` yields the attended entry, `icomp` the scoring key; HCA layers
     /// have no indexer and store a 1-wide placeholder key). A no-op on SWA

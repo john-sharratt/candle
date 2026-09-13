@@ -18,6 +18,7 @@ use crate::projection::{
     TurnIndex,
 };
 use crate::provenance::WideQSig;
+use crate::scheduler::exported_state::SharedState;
 use crate::scheduler::projection_assembler::materialize_conversation;
 use crate::scheduler::{
     note_branch_checkpoint_computed, note_branch_checkpoint_installed, CarvedTurn,
@@ -33,6 +34,7 @@ use crate::turn_layout::TurnLayout;
 use crate::TurnEvent;
 use candle_nn::kv_cache::{SealedChunk, SealedSequence};
 use candle_transformers::models::batched_inference::ModelCoreProperties;
+use candle_transformers::models::dialect::Dialect;
 
 /// Slice a per-layer sealing down to the chunk range `[from..to)`.
 ///
@@ -70,7 +72,15 @@ pub(crate) fn slice_per_layer_sealed(
 ///
 /// A turn is sealed once as a single contiguous unit, with the chat
 /// template's role markers baked into the K/V grid:
-/// `[user_start][no_think][user_msg][user_end][assistant_start][response]`.
+/// `[user_start][no_think][user_msg][user_end][assistant_start][closed_think][prefill][response]`
+///
+/// `no_think` and `closed_think` are the two halves of
+/// `Dialect::thinking_suppression` and are mutually exclusive — a family uses
+/// the user-turn switch or the prefilled closed block, never both, and both are
+/// absent on a thinking turn. `prefill` is a caller-supplied assistant seed
+/// (e.g. `<tool_call>`), usually absent. `assistant_content_start` sits after
+/// `closed_think` and before `prefill`: the block is scaffolding stripped from
+/// the stored text, the seed is content that stays in it.
 /// The compressor injects *content-only* halves of a turn — the user
 /// message body or the assistant response body — without those markers,
 /// so each half is derived here by windowing the sealed grid to the
@@ -304,9 +314,49 @@ pub struct GlueMarkers {
     pub assistant_end: String,
     /// The `/no_think` soft-switch, emitted as live glue right after `user_start`
     /// on a suppressed (effort-off) turn — see the scheduler's `no_think_current`
-    /// segment. Empty for non-thinking dialects. The panel renders it so its view
-    /// matches the actual prefill.
+    /// segment. `Dialect::thinking_suppression`'s first half; empty on a family
+    /// that suppresses with [`Self::no_think_block`] instead.
     pub no_think: String,
+    /// The already-closed reasoning block prefilled straight after
+    /// `assistant_start` on a suppressed turn — `thinking_suppression`'s second
+    /// half, and the mechanism for a family with no soft switch (Qwen3.5/3.8).
+    ///
+    /// Carried here for the same reason [`Self::no_think`] is: the panel renders
+    /// the framing verbatim, and this is framing. It is prefilled into the grid,
+    /// not decoded by the model, so a panel that omitted it showed less than the
+    /// turn actually contains.
+    ///
+    /// **Exactly one of the two is ever non-empty** — see
+    /// [`GlueMarkers::from_dialect`], which is the only constructor and takes
+    /// both from the one function that owns the split.
+    pub no_think_block: String,
+}
+
+impl GlueMarkers {
+    /// Read every marker off `dialect`, taking the two suppression halves from
+    /// [`Dialect::thinking_suppression`] rather than from the fields directly.
+    ///
+    /// Going through that function is what keeps the panel honest: it owns the
+    /// "exactly one mechanism is live" rule, so a family that suppresses with the
+    /// prefilled block cannot be rendered as if it used a `/no_think` switch it
+    /// does not have, and neither half can be forgotten the way the block half
+    /// once was.
+    pub fn from_dialect(dialect: &Dialect) -> Self {
+        // `true` asks for the suppressed shape — this is a description of the
+        // framing a suppressed turn *would* carry, not a claim that the current
+        // turn is suppressed. The panel labels it; the dial decides it.
+        let (switch, block) = dialect.thinking_suppression(true);
+        Self {
+            system_start: dialect.system_start.to_string(),
+            system_end: dialect.system_end.to_string(),
+            user_start: dialect.user_start.to_string(),
+            user_end: dialect.user_end.to_string(),
+            assistant_start: dialect.assistant_start.to_string(),
+            assistant_end: dialect.assistant_end.to_string(),
+            no_think: switch.to_string(),
+            no_think_block: block.to_string(),
+        }
+    }
 }
 
 /// A freshly built conversation's prompt-branch state, still to be installed
@@ -447,8 +497,11 @@ pub(crate) fn install_branch_states(
         scheduler_tx
             .send(SchedulerRequest::InstallRecurrentState {
                 sequence_ids,
-                schedule_hash: payload.schedule_hash,
-                layers,
+                state: SharedState {
+                    schedule_hash: payload.schedule_hash,
+                    layers,
+                    aux: payload.aux.clone().into(),
+                },
                 response_tx: tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
@@ -498,8 +551,10 @@ fn first_non_finite_layer(layers: &[ExportedLayerState]) -> Option<(u32, &'stati
             return true;
         }
         bytes
-            .chunks_exact(std::mem::size_of::<f32>())
-            .any(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite())
+            .as_chunks::<{ std::mem::size_of::<f32>() }>()
+            .0
+            .iter()
+            .any(|c| !f32::from_le_bytes(*c).is_finite())
     }
     layers.iter().find_map(|l| {
         if bad(&l.state) {
@@ -1123,11 +1178,12 @@ impl Sequence {
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
         match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
-            Ok(Some((schedule_hash, layers))) => {
+            Ok(Some(state)) => {
                 let payload = BranchCheckpointPayload {
                     prefix_hash: prefix,
-                    schedule_hash,
-                    layers: layers.into_iter().map(SnapshotLayer::from).collect(),
+                    schedule_hash: state.schedule_hash,
+                    layers: state.layers.into_iter().map(SnapshotLayer::from).collect(),
+                    aux: state.aux,
                 };
                 self.substrate
                     .enqueue_branch_checkpoint(prefix, payload.encode());
@@ -1765,9 +1821,10 @@ impl Sequence {
         // baked immediately after `user_start` by `turn_head_tokens`. Baking it
         // into the turn that carries it is what keeps the dial per-turn: a past
         // suppressed turn cannot put a stale switch on a later thinking-on turn
-        // when each turn's grid holds its own.  The assistant header itself is
-        // never modified: a suppressed turn decodes its own empty
-        // `<think></think>`, a thinking turn opens its own `<think>`.
+        // when each turn's grid holds its own.  That covers the families whose
+        // switch lives in the user turn; one whose `no_think` is empty suppresses
+        // in the assistant header instead, via the closed block appended below.
+        // A thinking turn opens its own `<think>` either way.
         let assistant_start_marker = self.config.dialect.assistant_start;
         // Optional assistant prefill: text seeded as the start of the response so
         // the decode is forced to continue from it (e.g. `<tool_call>` commits to
@@ -1776,6 +1833,28 @@ impl Sequence {
         // decodes the continuation. Empty when unset — the path is then identical
         // to an ordinary turn.
         let assistant_prefill = options.assistant_prefill.as_deref().unwrap_or("");
+        // Whether the composer's thinking dial suppressed this turn.  Decided here
+        // rather than at the seal below because it also selects the dialect's
+        // suppression mechanism, and that mechanism is part of the prefill grid.
+        let no_think = matches!(
+            options
+                .selection
+                .optional(crate::projection::NO_THINK_SELECTOR),
+            Some(crate::projection::OptionalState::Present)
+        );
+        // **How THIS dialect suppresses thinking.** `Dialect::thinking_suppression`
+        // owns the split: a family with a `/no_think` soft switch carries it in the
+        // user opener (`turn_head_text`), and one WITHOUT — Qwen3.5 / Qwen3.8, whose
+        // `no_think` is deliberately empty — suppresses by opening the assistant turn
+        // with the reasoning block already closed, exactly as its own template renders
+        // `enable_thinking=false`.
+        //
+        // Production used to read only the user-turn half, so on this family the
+        // `no_think` node emitted a zero-token segment and "thinking off" was a line
+        // of prose in the system prompt rather than a structural guarantee. Measured
+        // on the repo_map ingest: 22 of 22 summaries opened a block regardless, and
+        // 12 of them stored the model's raw monologue as the summary.
+        let closed_think = self.config.dialect.thinking_suppression(no_think).1;
         let assistant_head = format!(
             "{}{}{}",
             user_message, self.config.dialect.user_end, assistant_start_marker,
@@ -1845,14 +1924,34 @@ impl Sequence {
         // `[0, len(user_msg))`.
         let user_content_start = 0;
         let user_content_end = self.tokenize(user_message)?.len();
-        // Assistant content begins at the `assistant_start` boundary — before any
-        // prefilled prefix — so the prefix's K/V seals as part of the assistant
-        // turn. With no prefill this is exactly `prefill_tokens.len()` (the head
-        // IS the whole prefill), preserving the ordinary-turn layout byte-for-byte.
+        // Assistant content begins after the assistant header AND after any
+        // suppression block, but BEFORE a caller's own prefill — so that prefill's
+        // K/V seals as part of the assistant turn while the block's does not.
+        //
+        // **The suppression block is scaffolding, not assistant content.** It is
+        // prefilled, never decoded, and `strip_empty_think_blocks` removes it from
+        // the stored text — so a span that began before it would describe ~4 more
+        // tokens than the text it is paired with, and every consumer that maps
+        // text offsets onto that span (`tool_exchange_segments` carving a code_read
+        // sub-segment, the thinking split) would read shifted K/V.
+        //
+        // A caller's own prefill is the opposite case: a `<tool_call>` seed IS
+        // content, appears in the stored text, and stays inside the span. Hence the
+        // boundary sits between the two — after the block, before the seed. With
+        // neither present this is `prefill_tokens.len()`, the ordinary turn's
+        // "content starts where decoding starts".
+        //
+        // With no caller prefill this is `prefill_tokens.len()` — the block, when
+        // there is one, is the whole tail of the grid, so content begins exactly
+        // where decoding does. Taking that route matters: `assistant_head` embeds
+        // the user message, so the `else` arm re-tokenises the entire message, and
+        // routing every turn through it would pay that on each submit (a
+        // `<tool_response>` carrying a file excerpt on the ingest path).
         let assistant_content_start = if assistant_prefill.is_empty() {
             prefill_tokens.len()
         } else {
-            self.tokenize(&assistant_head)?.len()
+            self.tokenize(&format!("{assistant_head}{closed_think}"))?
+                .len()
         };
         // Clamp to the prefill length and force monotonic so a tokenizer that
         // merges across a join can never invert the windows at seal time.
@@ -1863,15 +1962,6 @@ impl Sequence {
         let assistant_content_start = (assistant_content_start
             .min(total)
             .max(user_content_end as usize)) as u32;
-        // Record whether the composer's `/no_think` dial is active for this
-        // turn, so the projection re-injects the soft-switch into this turn's
-        // user opener when it is later re-rendered as history.
-        let no_think = matches!(
-            options
-                .selection
-                .optional(crate::projection::NO_THINK_SELECTOR),
-            Some(crate::projection::OptionalState::Present)
-        );
         let handle = self.submit_prefill_unit(
             self.id,
             Some(self.projection_inputs()),
@@ -1940,8 +2030,13 @@ impl Sequence {
         }
         self.selection = selection;
 
-        // Thinking turn: no forced `no_think_block` — the trajectory carries its
-        // own `<think>` in the body, matching the decode grid exactly.
+        // **No suppression block here, unlike `submit_turn_with_options`.** That
+        // path prefills the dialect's closed block because the model is about to
+        // decode and must be steered; this one is handed the whole assistant
+        // trajectory verbatim, so the grid must reproduce what was decoded and
+        // nothing else. The trajectory carries its own `<think>` in the body when
+        // it had one, and injecting scaffolding in front of it would make the
+        // replayed grid differ from the decode it is calibrating against.
         let assistant_start_marker = self.config.dialect.assistant_start;
         let assistant_head = format!(
             "{}{}{}",
@@ -2602,6 +2697,7 @@ impl Sequence {
         response_user: &str,
         tags: Vec<String>,
         max_summary_tokens: usize,
+        triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<usize> {
         let (call_idx, _resp_idx, tokens) = self.ingest_scope_roundtrip_indices(
             call_user,
@@ -2609,6 +2705,7 @@ impl Sequence {
             response_user,
             tags,
             max_summary_tokens,
+            triggers,
         )?;
         // Serial path: couple the pair here (the parallel splice couples on the
         // file timeline instead, after adopting both turns — see `adopt_turn`).
@@ -2628,6 +2725,7 @@ impl Sequence {
         response_user: &str,
         tags: Vec<String>,
         max_summary_tokens: usize,
+        triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<(u32, u32, usize)> {
         let (idxs, tokens) = self.ingest_roundtrip_chain_indices(
             &[(call_user.to_string(), call_assistant.to_string())],
@@ -2635,6 +2733,7 @@ impl Sequence {
             tags,
             max_summary_tokens,
             &["file_read".to_string()],
+            triggers,
         )?;
         match idxs.as_slice() {
             [call, resp] => Ok((*call, *resp, tokens)),
@@ -2654,6 +2753,7 @@ impl Sequence {
         tags: Vec<String>,
         max_summary_tokens: usize,
         force_tools: &[String],
+        triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<usize> {
         let (indices, tokens) = self.ingest_roundtrip_chain_indices(
             prefilled,
@@ -2661,6 +2761,7 @@ impl Sequence {
             tags,
             max_summary_tokens,
             force_tools,
+            triggers,
         )?;
         // Couple every turn except the last: each prefilled turn belongs with the
         // one that answers it, so the summariser sees the whole exchange rather
@@ -2685,6 +2786,10 @@ impl Sequence {
     ///
     /// `force_tools` names every tool a prefilled call refers to, pinned into the
     /// catalog so each call is backed by a present definition.
+    ///
+    /// `triggers` steers the summary decode. It carries the `<think>` trigger
+    /// bound to [`ThinkMode::Off`]'s tree — see the suppression note on the
+    /// decode below for why an empty registry is not enough here.
     pub fn ingest_roundtrip_chain_indices(
         &mut self,
         prefilled: &[(String, String)],
@@ -2692,6 +2797,7 @@ impl Sequence {
         tags: Vec<String>,
         max_summary_tokens: usize,
         force_tools: &[String],
+        triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<(Vec<u32>, usize)> {
         // A scope round-trip is a SUMMARIZATION task, not the dialogue agent. Drive
         // the shared system prompt into its summarizer mode via selection — the
@@ -2752,16 +2858,53 @@ impl Sequence {
         // `DecodeState::prefill_tokens` doc), so under sampling the model often opens
         // `<think>` and burns the whole `max_summary_tokens` budget on runaway —
         // frequently off-language (Chinese/Japanese) — reasoning, leaving a truncated
-        // "thought" as the stored summary. Route the summary through the SAME
-        // canonical think-close steering the dialogue path uses (`apply_think_mode`),
-        // as `ThinkMode::Off`: with the short summary budget it collapses to a forced
-        // empty block, so the budget goes to the summary, not the reasoning.
+        // "thought" as the stored summary.
+        //
+        // **Three layers, and only the last one is structural.** The caller frames
+        // the conversation as a summarizer (`thinking_effort = off` resolved into
+        // the static system prompt) and `NO_THINK_SELECTOR` adds the `/no_think`
+        // glue below — both of which the model may simply ignore, because both are
+        // text. `apply_think_mode` then programs the sampler's segment-close
+        // budget, which for `Off` at a short summary budget collapses to a forced
+        // empty block. That is enforcement, but it is *sampler* enforcement: it
+        // fires only once the model has already opened the block, and it depends on
+        // per-row close state holding across a wide ingest wave.
+        //
+        // `triggers` is the layer that cannot be ignored. It binds the `<think>`
+        // trigger to `ThinkMode::Off`'s tree, whose entire body is the static run
+        // `"\n\n</think>"` — it offers no free-decode span at all (asserted by
+        // `stencil::think::off_has_no_free_span`), so the block closes on the token
+        // after it opens and the whole budget goes to the summary. This is what
+        // `compile_think_tree` means by "suppression is structural here, not
+        // advisory", and leaving it out is what let a quarter of a `repo_map` pass
+        // seal with a runaway thought and no summary.
         let mut summary_sampling = SamplingConfig::compression();
+        // **Window the repetition penalty to the summary itself.**
+        //
+        // `compression()` leaves `repeat_last_n` at 0, which means "full history"
+        // — and an ingest chain's history is the prefilled tool responses: a JSON
+        // file listing, every entry of which carries a path like
+        // `"candle-examples/examples/clip/README.md"`. At 1.3× multiplicative,
+        // every `.` in every filename pushes the model off the `.` token, so the
+        // summary ends on a complete clause with no full stop. Measured over one
+        // pass: 31 of 61 folder summaries had no terminal period, and a summary
+        // carrying its own earlier `.` was ~1.7× more likely to lack the final one
+        // — the same effect, visible even against the much larger contribution
+        // from the listing.
+        //
+        // A window keeps what the penalty is FOR and drops what it was never
+        // meant to see: the degenerate loops it exists to break
+        // (`"valid, valid, firm, firm, …"` — see `compression`) are local to the
+        // generation, and 64 tokens is wider than any of them while being narrower
+        // than the summary, so by the time the closing period is sampled the
+        // window holds the model's own prose rather than a directory listing.
+        summary_sampling.repeat_last_n = 64;
         summary_sampling.apply_think_mode(ThinkMode::Off, &self.tokenizer, max_summary_tokens);
         let mut opts = TurnOptions {
             max_tokens: Some(max_summary_tokens),
             sampling: Some(summary_sampling),
             tags,
+            triggers,
             ..Default::default()
         };
         opts.selection.set_optional(
@@ -3388,16 +3531,7 @@ impl Sequence {
     /// Surfaced verbatim so the projection panel can show the glue between
     /// sections/turns without re-tokenising or re-projecting.
     pub fn glue_markers(&self) -> GlueMarkers {
-        let d = &self.config.dialect;
-        GlueMarkers {
-            system_start: d.system_start.to_string(),
-            system_end: d.system_end.to_string(),
-            user_start: d.user_start.to_string(),
-            user_end: d.user_end.to_string(),
-            assistant_start: d.assistant_start.to_string(),
-            assistant_end: d.assistant_end.to_string(),
-            no_think: d.no_think.to_string(),
-        }
+        GlueMarkers::from_dialect(&self.config.dialect)
     }
 
     /// The YAML name of this conversation's target layer (e.g. `dialogue`) — the
@@ -3506,7 +3640,7 @@ impl Sequence {
     }
 
     /// Fork onto a **specific** timeline rather than a freshly minted one —
-    /// the daemon resume path (§16.12 of `docs/kv_tier_migration.md`).
+    /// the daemon resume path (§16.12 of `docs/archived/kv_tier_migration.md`).
     ///
     /// `timeline` is registered against the parent's `(layer, group)`
     /// (idempotent). If the workspace substrate already holds turns under
@@ -4790,6 +4924,152 @@ mod window_sealed_tokens_tests {
         assert_eq!(win[0].chunks[1].token_count, 10);
     }
 
+    /// **The reasoning hole, as the projection cuts it.** A turn is windowed to
+    /// `[0, span.offset) ++ [span.end(), total)` and the two halves are
+    /// concatenated per layer — so a span that begins and ends INSIDE one
+    /// physical chunk emits that chunk twice, as two disjoint windows sharing
+    /// one refcounted gid.
+    ///
+    /// The gid identity is the assertion that matters: it is what makes the
+    /// hole free. Copying the chunk would pass every token-count check here and
+    /// silently double a turn's arena footprint on every projection.
+    #[test]
+    fn windowing_out_a_span_inside_one_chunk_emits_that_chunk_twice() {
+        // Three chunks [32, 32, 20] = 84. Reasoning at [40, 50) sits wholly
+        // inside chunk-1 (which spans [32, 64)).
+        let sealed = one_layer(&[32, 32, 20]);
+        let mid_gid = sealed[0].chunks[1].gids.as_slice()[0].raw();
+        let head = window_sealed_tokens(&sealed, 0, 40);
+        let tail = window_sealed_tokens(&sealed, 50, 84);
+
+        // Head: chunk-0 whole, chunk-1 cut at local 8.
+        assert_eq!(head[0].token_count, 40);
+        assert_eq!(head[0].chunks.len(), 2);
+        assert_eq!(head[0].chunks[1].offset, 0);
+        assert_eq!(head[0].chunks[1].token_count, 8);
+        // Tail: chunk-1 from local 18, then chunk-2 whole.
+        assert_eq!(tail[0].token_count, 34);
+        assert_eq!(tail[0].chunks.len(), 2);
+        assert_eq!(tail[0].chunks[0].offset, 18);
+        assert_eq!(tail[0].chunks[0].token_count, 14);
+        assert_eq!(tail[0].chunks[1].token_count, 20);
+
+        // The same physical chunk, twice, with disjoint windows — shared, not
+        // copied.
+        assert_eq!(head[0].chunks[1].gids.as_slice()[0].raw(), mid_gid);
+        assert_eq!(tail[0].chunks[0].gids.as_slice()[0].raw(), mid_gid);
+
+        // The concatenation the projection injects covers the turn minus the
+        // reasoning, exactly.
+        let width = head[0].token_count + tail[0].token_count;
+        assert_eq!(width, 84 - 10);
+    }
+
+    /// A span abutting the end of the turn leaves an empty tail, and a span
+    /// abutting the start an empty head — both must contribute zero chunks
+    /// rather than a zero-length window, which would put a chunk with no valid
+    /// tokens into the slot's block list.
+    #[test]
+    fn a_span_at_either_edge_leaves_no_empty_chunk() {
+        let sealed = one_layer(&[32, 32]);
+        // Reasoning runs to the end.
+        let tail = window_sealed_tokens(&sealed, 64, 64);
+        assert_eq!(tail[0].token_count, 0);
+        assert!(tail[0].chunks.is_empty());
+        // Reasoning starts at the very beginning.
+        let head = window_sealed_tokens(&sealed, 0, 0);
+        assert_eq!(head[0].token_count, 0);
+        assert!(head[0].chunks.is_empty());
+    }
+
+    /// **The two halves must describe the same tokens, checked against each
+    /// other rather than each against an expectation.**
+    ///
+    /// A windowed turn injects K/V from [`window_sealed_tokens`] and rows from
+    /// [`index_pages::without_span`]. Nothing downstream compares them — a
+    /// mismatch is silent below the QSA identity threshold and a refused select
+    /// above it — so the comparison belongs here, over the real functions on
+    /// both sides.
+    ///
+    /// This is the composition that failed on the daemon: the K/V half was right
+    /// and the page half spanned an extra 323 tokens, and no unit test looked at
+    /// the two together.
+    #[test]
+    fn a_windowed_turns_kv_and_its_retained_pages_span_the_same_tokens() {
+        use crate::index_pages;
+
+        // A turn of 84 tokens across chunks [32, 32, 20], sealed as three pages
+        // — the shape the cuts produce: [prefill][reasoning][answer].
+        let sealed = one_layer(&[32, 32, 20]);
+        let total = 84usize;
+        let cases: [(usize, usize, &[usize]); 3] = [
+            // (span start, span end, page widths)
+            (40, 50, &[40, 10, 34]), // reasoning in the middle
+            (0, 12, &[12, 72]),      // reasoning abutting the start
+            (60, 84, &[60, 24]),     // reasoning running to the end
+        ];
+
+        for (start, end, widths) in cases {
+            let pages: Vec<(usize, Vec<u8>)> = widths.iter().map(|w| (*w, vec![0u8; 4])).collect();
+            let blob = index_pages::encode(&pages);
+
+            // The K/V half: everything either side of the span.
+            let head = window_sealed_tokens(&sealed, 0, start);
+            let tail = window_sealed_tokens(&sealed, end, total);
+            let kv_tokens = head[0].token_count + tail[0].token_count;
+
+            // The index half, from the same span.
+            let kept = index_pages::without_span(&blob, start..end)
+                .unwrap_or_else(|| panic!("pages must align for span {start}..{end}"));
+            let page_tokens: usize = index_pages::decode(&kept)
+                .expect("kept pages decode")
+                .iter()
+                .map(|(w, _)| *w)
+                .sum();
+
+            assert_eq!(
+                kv_tokens, page_tokens,
+                "span {start}..{end}: the windowed K/V spans {kv_tokens} token(s) but its \
+                 retained pages span {page_tokens}"
+            );
+            assert_eq!(
+                kv_tokens,
+                total - (end - start),
+                "and both equal the turn minus its span"
+            );
+        }
+    }
+
+    /// When the pages do NOT line up with the span, both halves must stay whole
+    /// together — the refusal in `without_span` is what the caller keys off, and
+    /// a turn injected whole is consistent where a half-windowed one is not.
+    #[test]
+    fn a_misaligned_span_leaves_both_halves_whole() {
+        use crate::index_pages;
+
+        let sealed = one_layer(&[32, 32, 20]);
+        let total = 84usize;
+        // Pages [40, 44]: the span 40..50 ends inside the second page.
+        let pages: Vec<(usize, Vec<u8>)> =
+            [40usize, 44].iter().map(|w| (*w, vec![0u8; 4])).collect();
+        let blob = index_pages::encode(&pages);
+
+        assert!(
+            index_pages::without_span(&blob, 40..50).is_none(),
+            "a span ending inside a page must be refused, not guessed at"
+        );
+
+        // The caller's response is to inject the turn whole: full K/V, full pages.
+        let whole = window_sealed_tokens(&sealed, 0, total);
+        let page_tokens: usize = index_pages::decode(&blob)
+            .unwrap()
+            .iter()
+            .map(|(w, _)| *w)
+            .sum();
+        assert_eq!(whole[0].token_count, total);
+        assert_eq!(page_tokens, total, "whole means whole on both sides");
+    }
+
     #[test]
     fn chunk_aligned_window_does_not_window_chunks() {
         // Aligned window [32, 64): keeps only the second of three chunks.
@@ -4863,5 +5143,80 @@ mod window_sealed_tokens_tests {
     fn cap_probe_window_tolerates_a_zero_cap() {
         let probe = vec![WideQSig::default(); 1000];
         assert_eq!(cap_probe_window(probe, 0).len(), 65);
+    }
+}
+
+#[cfg(test)]
+mod glue_marker_tests {
+    use super::GlueMarkers;
+    use candle_transformers::models::dialect::Dialect;
+
+    /// **The panel must show whichever half of suppression the family uses.**
+    ///
+    /// Qwen3.5/3.8 has no `/no_think` soft switch — it suppresses by opening the
+    /// assistant turn with the block already closed, prefilled into the grid. The
+    /// block half was once omitted here on the reasoning that a suppressed turn
+    /// "decodes its own empty block into the body", which stopped being true when
+    /// suppression became structural: the panel then rendered strictly less than
+    /// the turn contained, on exactly the family that depends on it.
+    #[test]
+    fn a_block_suppressing_dialect_carries_its_block() {
+        let g = GlueMarkers::from_dialect(&Dialect::qwen35());
+        assert_eq!(g.no_think_block, "<think>\n\n</think>\n\n");
+        assert!(
+            g.no_think.is_empty(),
+            "qwen35 has no soft switch, so the switch half must be empty"
+        );
+    }
+
+    /// The mirror: a family WITH the soft switch carries that and no block, so
+    /// the panel never shows a prefilled block the grid does not contain.
+    #[test]
+    fn a_switch_suppressing_dialect_carries_its_switch() {
+        let g = GlueMarkers::from_dialect(&Dialect::chat_ml());
+        assert_eq!(g.no_think, "/no_think\n");
+        assert!(
+            g.no_think_block.is_empty(),
+            "ChatML suppresses with the switch, so the block half must be empty"
+        );
+    }
+
+    /// **Exactly one half is live, for every dialect the engine can run.**
+    ///
+    /// This is the invariant `Dialect::thinking_suppression` exists to enforce,
+    /// and reading it through that function rather than off the fields is what
+    /// keeps it true here. A dialect with neither (Llama-family, no reasoning
+    /// markers at all) is a legitimate third case: nothing to suppress.
+    #[test]
+    fn never_both_halves_at_once() {
+        for d in [
+            Dialect::chat_ml(),
+            Dialect::qwen35(),
+            Dialect::llama2(),
+            Dialect::llama3(),
+        ] {
+            let g = GlueMarkers::from_dialect(&d);
+            assert!(
+                g.no_think.is_empty() || g.no_think_block.is_empty(),
+                "{:?}: both suppression halves are non-empty — the dialect must \
+                 pick one mechanism",
+                d.dialect_type()
+            );
+        }
+    }
+
+    /// The role markers still come straight off the dialect — the refactor to a
+    /// single constructor must not have quietly changed what the panel frames
+    /// turns with.
+    #[test]
+    fn role_markers_are_passed_through_verbatim() {
+        let d = Dialect::qwen35();
+        let g = GlueMarkers::from_dialect(&d);
+        assert_eq!(g.system_start, d.system_start);
+        assert_eq!(g.system_end, d.system_end);
+        assert_eq!(g.user_start, d.user_start);
+        assert_eq!(g.user_end, d.user_end);
+        assert_eq!(g.assistant_start, d.assistant_start);
+        assert_eq!(g.assistant_end, d.assistant_end);
     }
 }

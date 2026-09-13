@@ -482,6 +482,8 @@ fn indexer_score_reduce(scores: &Tensor, w: &Tensor, counts: Option<&Tensor>) ->
                     ws[0] as i64,
                     ws[1] as i64,
                     cnt_s,
+                    // Packed: this caller's rows all have the same width.
+                    m as i64,
                     stream.cu_stream() as *mut core::ffi::c_void,
                 );
             }
@@ -853,7 +855,7 @@ impl FloatGallery {
             // kernel can address, so the row gather itself must run on the host —
             // the one place invariant 4's "no host compute" does not reach,
             // because there is no kernel that could do it. (What would change
-            // that is the pinned warm pool of docs/kv_tier_migration.md: page-
+            // that is the pinned warm pool of docs/archived/kv_tier_migration.md: page-
             // locked and device-mapped, the hot path's fused gather would read
             // this tier in place. It is a bounded POOL by design — page-locking
             // every spilled arena wholesale would make an unbounded amount of
@@ -1210,7 +1212,7 @@ impl FloatGallery {
 }
 
 /// A turn's compressed corpus in **native durable form** (Artifact C of
-/// docs/deepseek_turn_seal_persistence.md): the two-region attended cache
+/// docs/deepseek/deepseek_turn_seal_persistence.md): the two-region attended cache
 /// (`nope_i8`/`nope_scale`/`rope_bf`) and the Indexer scoring `keys`, all
 /// host-resident and self-describing. This is what the seal persists (no
 /// re-quant — these already are the QAT storage precision) and what resume
@@ -1292,16 +1294,22 @@ impl CorpusSnapshot {
         };
         let nope_i8 = take(&mut off, len * NOPE_DIM)?.to_vec();
         let nope_scale: Vec<f32> = take(&mut off, len * NOPE_BANDS * 4)?
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         let rope_bf: Vec<u16> = take(&mut off, len * ROPE_DIM * 2)?
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         let keys: Vec<f32> = take(&mut off, len * ih * 4)?
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         Some(Self {
             index_head_dim: ih,

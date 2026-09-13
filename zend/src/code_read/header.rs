@@ -8,7 +8,8 @@
 //!
 //! ````text
 //! Segment 1 (user — the request):
-//!   Summarize `src/auth/handler.rs` (lines 47-93) in no more than two sentences.
+//!   Summarize `src/auth/handler.rs` (lines 47-93) in one or two complete
+//!   sentences, ending with a full stop.
 //!
 //! Segment 2 (assistant — tool call):
 //!   <tool_call>{"name":"file_read","arguments":{"path":"src/auth/handler.rs",
@@ -61,14 +62,22 @@ use crate::repo_scan::Language;
 /// so this turn reconstructs as a real request→answer exchange (not a
 /// context-stuffed reference blob) and the decoded summary anchors the scope for
 /// provenance retrieval.
+/// The ask matches `repo_scan::render`'s, for the reason recorded there: a
+/// ceiling on sentence COUNT gets satisfied by one unterminated clause, so the
+/// request names *complete* sentences and a full stop instead. Safe to reword —
+/// [`summary_tree::scope`]'s `parse_excerpt_ref` splits on `lines ` and keeps
+/// only the leading span digits, so trailing prose never reaches the parse.
 pub fn render_part_user_prompt(path: &str, scope: &Scope) -> String {
     format!(
-        "Summarize `{path}` (lines {start}-{end}) in no more than two sentences.",
+        "Summarize `{path}` (lines {start}-{end}) {SCOPE_ASK}",
         path = path,
         start = scope.start_line,
         end = scope.end_line,
     )
 }
+
+/// What [`render_part_user_prompt`] asks for, after the scope is named.
+const SCOPE_ASK: &str = "in one or two complete sentences, ending with a full stop.";
 
 /// Assistant-side `<tool_call>` echo — the assistant segment of a part
 /// turn. The caller splices a role boundary
@@ -133,11 +142,15 @@ mod tests {
     // ── per-file layout: render_part_user_prompt ─────────────────────────────
 
     #[test]
-    fn part_user_prompt_is_a_two_sentence_summary_request() {
+    fn part_user_prompt_asks_for_complete_sentences() {
         let p = render_part_user_prompt("src/lib.rs", &scope(10, 20));
         assert_eq!(
             p,
-            "Summarize `src/lib.rs` (lines 10-20) in no more than two sentences."
+            format!("Summarize `src/lib.rs` (lines 10-20) {SCOPE_ASK}")
+        );
+        assert!(
+            SCOPE_ASK.contains("full stop") && !SCOPE_ASK.contains("no more than"),
+            "the ask names completeness, not a sentence ceiling: {SCOPE_ASK}"
         );
     }
 

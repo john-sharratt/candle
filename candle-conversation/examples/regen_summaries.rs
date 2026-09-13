@@ -5,7 +5,7 @@
 //! It boots a real `ConversationEngine` (model on CUDA) with the production
 //! zend projection template, ingests a fixed set of dialogue turns into the
 //! chosen layer, lets the async summariser absorb them into the immutable
-//! ternary forest (`docs/immutable_summary_forest.md`) using *the current*
+//! ternary forest (`docs/archived/immutable_summary_forest.md`) using *the current*
 //! per-layer `summary` prompts, then walks the forest and prints, for each
 //! node:
 //!   - SoT leaf: the source turn (user + assistant) and the regenerated

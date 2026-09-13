@@ -16,6 +16,7 @@ use super::ids::{GroupId, Reserved, SectionId, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
 use super::schema::{Content, CorruptTurnPolicy, DecodePriority, GatherScope, SelectionRule};
 use crate::substrate::ContentResolver;
+use crate::summary_tree::exchange::{exchanges, over_normals};
 use crate::summary_tree::{SelectionOrigin, TurnKind};
 
 // —— Mock resolver —————————————————————————————————————————————————————————————
@@ -48,9 +49,10 @@ struct MockResolver {
     /// reported by `node_covers`. Empty/absent ⇒ a raw leaf that covers
     /// nothing. Drives the rule-based descendant-dedup tests.
     covers: HashMap<u32, Vec<u32>>,
-    /// (group_raw, tag) → turn_raw, backing `turn_with_tag` so tests can assert
-    /// the default-fallback path resolves a declared default to a real turn.
-    tag_turns: HashMap<(u32, String), u32>,
+    /// group_raw → the turn indices that RUN ON into the next turn, standing in
+    /// for the substrate's `TurnCoupling` records. A tool round-trip's call half
+    /// is coupled to the response that answers it, so the two are one exchange.
+    couplings: HashMap<u32, HashSet<u32>>,
     /// Stands in for "the projection target is an append-only ingest layer".
     ingest_self: bool,
     /// (group_raw, turn_raw) → the gather-scope tags the turn was written with,
@@ -102,10 +104,10 @@ impl MockResolver {
         self
     }
 
-    /// Bind `tag` to `idx` in `group` so `turn_with_tag` resolves it — the
-    /// substrate-side counterpart is a `TurnDecl.tags` scan.
-    fn with_tag(mut self, group: GroupId, tag: &str, idx: TurnIndex) -> Self {
-        self.tag_turns.insert((group.raw(), tag.to_string()), idx.0);
+    /// Couple turn `idx` to the turn after it: the two (and anything the second
+    /// is itself coupled to) form one exchange, selected and trimmed whole.
+    fn with_coupling(mut self, group: GroupId, idx: TurnIndex) -> Self {
+        self.couplings.entry(group.raw()).or_default().insert(idx.0);
         self
     }
 
@@ -177,6 +179,41 @@ impl ContentResolver for MockResolver {
             .collect()
     }
 
+    /// Exchange closure over the fixture's couplings, derived exactly as the
+    /// substrate resolver does it: couplings address the `Normal` subsequence,
+    /// so summary nodes are skipped before the ranges are walked.
+    fn group_exchanges(&self, keys: &[TurnKey]) -> Vec<Vec<TurnKey>> {
+        let mut out: Vec<Vec<TurnKey>> = Vec::new();
+        let mut seen: HashSet<(u64, usize)> = HashSet::new();
+        for key in keys {
+            let group = Self::group_of(*key);
+            let normals: Vec<TurnIndex> = (0..self.turn_counts.get(&group).copied().unwrap_or(0))
+                .filter(|i| !self.summary_idx.contains(i))
+                .map(TurnIndex)
+                .collect();
+            let raw = self.couplings.get(&group).cloned().unwrap_or_default();
+            let couplings = over_normals(&raw.into_iter().collect(), &normals);
+            let parts = exchanges(&couplings, normals.len());
+            let Some(slot) = parts
+                .iter()
+                .position(|r| r.clone().any(|p| normals[p] == key.index))
+            else {
+                out.push(vec![*key]);
+                continue;
+            };
+            if !seen.insert((key.timeline.raw(), slot)) {
+                continue;
+            }
+            out.push(
+                parts[slot]
+                    .clone()
+                    .map(|p| TurnKey::new(key.timeline, normals[p]))
+                    .collect(),
+            );
+        }
+        out
+    }
+
     fn turn_token_count(&self, turn: TurnKey) -> usize {
         *self
             .tokens
@@ -231,12 +268,6 @@ impl ContentResolver for MockResolver {
         self.turn_tags
             .get(&(Self::group_of(turn), turn.index.0))
             .is_some_and(|have| have.iter().any(|t| tags.contains(t)))
-    }
-
-    fn turn_with_tag(&self, group: GroupId, tag: &str) -> Option<TurnKey> {
-        self.tag_turns
-            .get(&(group.raw(), tag.to_string()))
-            .map(|&raw| TurnKey::new(Self::timeline_of(group), TurnIndex(raw)))
     }
 }
 
@@ -360,27 +391,6 @@ fn yaml_parses_and_assigns_ids() {
 }
 
 #[test]
-fn group_default_parses_present_and_absent() {
-    // Present: the `structure` group carries a resolved SelectionDefault.
-    let b = Builder::from_yaml(DEFAULT_FALLBACK_YAML).unwrap();
-    let structure = b.id_for_group("structure").unwrap();
-    let def = b.group(structure).unwrap().default.as_ref();
-    assert_eq!(def.map(|d| d.tag.as_str()), Some("root"));
-
-    // Absent: no `default:` key ⇒ None (every existing fixture stays this way).
-    let b2 = Builder::from_yaml(NO_DEFAULT_YAML).unwrap();
-    let s2 = b2.id_for_group("structure").unwrap();
-    assert!(b2.group(s2).unwrap().default.is_none());
-
-    // Whitespace-only tag is dropped to None by `parse_default`.
-    let blank =
-        DEFAULT_FALLBACK_YAML.replace(r#"default: { tag: "root" }"#, r#"default: { tag: "  " }"#);
-    let b3 = Builder::from_yaml(&blank).unwrap();
-    let s3 = b3.id_for_group("structure").unwrap();
-    assert!(b3.group(s3).unwrap().default.is_none());
-}
-
-#[test]
 fn policy_inherits_default_then_layer_overrides() {
     let yaml = SIMPLE_YAML
         .replace(
@@ -453,6 +463,41 @@ fn gather_scope_defaults_to_shared_and_parses_conversation() {
 fn unknown_layer_name_returns_none() {
     let b = Builder::from_yaml(SIMPLE_YAML).unwrap();
     assert!(b.id_for_layer("nonexistent").is_none());
+}
+
+/// `gathered` is RUNTIME state, never a YAML field: every declared layer starts
+/// gathered and only `set_layer_gathered` clears it.
+///
+/// The return value is how a caller learns the name was a layer at all.
+/// `--disable-layer` also names section *collections* (`response`, `mood`),
+/// which are suppressed on a different path entirely, so "not found" is an
+/// ordinary outcome there and must never be read as "cleared". And the flag
+/// restores: it is one boot's decision, not a deletion.
+#[test]
+fn every_declared_layer_is_gathered_until_the_mutator_clears_it() {
+    let mut b = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    let ground = b.id_for_layer("ground").unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    assert!(
+        b.layer(ground).unwrap().gathered,
+        "a declared layer gathers by default"
+    );
+    assert!(b.layer(dialogue).unwrap().gathered);
+
+    assert!(b.set_layer_gathered("ground", false), "known layer found");
+    assert!(!b.layer(ground).unwrap().gathered);
+    assert!(
+        b.layer(dialogue).unwrap().gathered,
+        "clearing one layer must not touch another",
+    );
+
+    // A name that is not a layer changes nothing, and says so.
+    assert!(!b.set_layer_gathered("response", false));
+    assert!(!b.layer(ground).unwrap().gathered);
+    assert!(b.layer(dialogue).unwrap().gathered);
+
+    assert!(b.set_layer_gathered("ground", true));
+    assert!(b.layer(ground).unwrap().gathered);
 }
 
 #[test]
@@ -716,6 +761,85 @@ fn lower_layers_visible_for_dialogue_target() {
     assert!(groups.contains(&facts), "ground/facts should be visible");
     assert!(groups.contains(&conv), "target conv should be visible");
     let _ = ground;
+}
+
+/// **`--disable-layer` takes a layer out of the ASSEMBLY, not just out of
+/// scoring.**
+///
+/// The scoring-time guards keep a disabled layer's turns from competing in the
+/// belief gather, but a `Sequence` (recency) group is never scored at all — it
+/// emits its window by position. So the exclusion is restated where the
+/// assembly walks layers, and this is the test that holds it there: with
+/// `ground` disabled its turns must not reach the projection, in exactly the
+/// configuration `lower_layers_visible_for_dialogue_target` asserts the opposite
+/// of. Without the assembly-side check that test and this one can both pass
+/// while a recency group quietly keeps emitting.
+#[test]
+fn a_disabled_layer_contributes_nothing_to_the_projection() {
+    let mut b = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    let facts = b.id_for_group("facts").unwrap();
+    let conv = b.id_for_group("conversation").unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+
+    assert!(
+        b.set_layer_gathered("ground", false),
+        "the schema declares a `ground` layer, so the mutator must find it",
+    );
+
+    let mut resolver = MockResolver::new();
+    resolver.append(facts);
+    resolver.append(facts);
+    resolver.append(conv);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: conv,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+
+    let groups: Vec<GroupId> = groups_in_order(proj.sealed_turns());
+    assert!(
+        !groups.contains(&facts),
+        "a disabled layer's group reached the projection: {groups:?}",
+    );
+    assert!(
+        groups.contains(&conv),
+        "disabling one layer must not disturb the target layer",
+    );
+}
+
+/// The target layer is exempt from its own disablement. Disabling the layer you
+/// are projecting FOR is not a meaningful request, and answering it with an
+/// empty context is a worse outcome than ignoring the flag — the same exemption,
+/// for the same reason, that the diagnostic `layer_toggle` kill switch carries.
+#[test]
+fn the_target_layer_is_still_projected_when_disabled() {
+    let mut b = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    let conv = b.id_for_group("conversation").unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    assert!(b.set_layer_gathered("dialogue", false));
+
+    let mut resolver = MockResolver::new();
+    resolver.append(conv);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: conv,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+
+    let groups: Vec<GroupId> = groups_in_order(proj.sealed_turns());
+    assert!(
+        groups.contains(&conv),
+        "the target layer must project even when disabled — an empty context is \
+         a worse answer than ignoring the flag",
+    );
 }
 
 #[test]
@@ -1192,6 +1316,154 @@ layers:
     assert!(b
         .set_group_selection("nowhere", SelectionRule::TopK { k: 1 })
         .is_err());
+}
+
+/// The YAML for the exchange tests: one `top_k` group over a folder-chain
+/// shaped timeline. `k` and the layer `window` are substituted per test.
+fn exchange_yaml(k: usize, window: usize) -> String {
+    format!(
+        r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
+layers:
+  - name: layer
+    window: {window}
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    groups:
+      - id: grp
+        selection: {{ kind: top_k, k: {k} }}
+"#
+    )
+}
+
+/// A `repo_map` folder chain: `request → <tool_call>` (0), `<tool_response> →
+/// <tool_call>` (1), `<tool_response> → summary` (2), coupled 0→1→2, plus one
+/// uncoupled decoy turn.
+///
+/// One seat must buy the WHOLE chain. Seating turn 0 alone is what put a
+/// dangling `<tool_call>` in front of the model — it read the projection as
+/// dialogue and imitated the call, answering a question by emitting
+/// `<tool_call>{"name":"file_list",…}` for a folder nobody had asked about.
+#[test]
+fn one_top_k_seat_buys_the_whole_tool_round_trip_not_just_the_call() {
+    let b = Builder::from_yaml(&exchange_yaml(1, 9000)).unwrap();
+    let layer = b.id_for_layer("layer").unwrap();
+    let grp = b.id_for_group("grp").unwrap();
+
+    let mut resolver = MockResolver::new();
+    let call = resolver.append(grp);
+    let mid = resolver.append(grp);
+    let answer = resolver.append(grp);
+    let decoy = resolver.append(grp);
+    let resolver = resolver
+        .with_coupling(grp, call)
+        .with_coupling(grp, mid)
+        .with_score(grp, call, 0.9)
+        .with_score(grp, mid, 0.9)
+        .with_score(grp, answer, 0.9)
+        .with_score(grp, decoy, 0.5);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+    let emitted: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
+    assert_eq!(emitted, vec![0, 1, 2], "one seat = one whole exchange");
+}
+
+/// The hit can land on any member. A scan that matches the ANSWER must still
+/// bring the call that provoked it — the whole run travels together, in order.
+#[test]
+fn a_hit_on_the_answer_half_brings_the_call_that_provoked_it() {
+    let b = Builder::from_yaml(&exchange_yaml(1, 9000)).unwrap();
+    let layer = b.id_for_layer("layer").unwrap();
+    let grp = b.id_for_group("grp").unwrap();
+
+    let mut resolver = MockResolver::new();
+    let call = resolver.append(grp);
+    let mid = resolver.append(grp);
+    let answer = resolver.append(grp);
+    let decoy = resolver.append(grp);
+    let resolver = resolver
+        .with_coupling(grp, call)
+        .with_coupling(grp, mid)
+        // Only the closing summary scores; the generic call framing does not.
+        .with_score(grp, call, 0.0)
+        .with_score(grp, mid, 0.0)
+        .with_score(grp, answer, 0.9)
+        .with_score(grp, decoy, 0.5);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+    let emitted: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
+    assert_eq!(emitted, vec![0, 1, 2]);
+}
+
+/// The budget prices and trims whole runs. A chain that does not fit is dropped
+/// entirely — never shaved down to its cheap half, which is exactly what a
+/// per-turn shave keeps: the `<tool_call>` turn is ~50 tokens while the
+/// `<tool_response>` halves carry the file listing and the excerpt, so the
+/// dangling call is the *last* thing a token trim would drop.
+#[test]
+fn a_budget_too_small_for_a_round_trip_drops_it_whole() {
+    // The chain costs 40+400+400; the higher-scored decoy costs 40. Only one of
+    // them fits, and the chain is the one that has to go.
+    let b = Builder::from_yaml(&exchange_yaml(2, 200)).unwrap();
+    let layer = b.id_for_layer("layer").unwrap();
+    let grp = b.id_for_group("grp").unwrap();
+
+    let mut resolver = MockResolver::new();
+    let call = resolver.append(grp);
+    let mid = resolver.append(grp);
+    let answer = resolver.append(grp);
+    let decoy = resolver.append(grp);
+    let resolver = resolver
+        .with_coupling(grp, call)
+        .with_coupling(grp, mid)
+        .with_tokens(grp, call, 40)
+        .with_tokens(grp, mid, 400)
+        .with_tokens(grp, answer, 400)
+        .with_tokens(grp, decoy, 40)
+        .with_score(grp, call, 0.5)
+        .with_score(grp, mid, 0.5)
+        .with_score(grp, answer, 0.5)
+        .with_score(grp, decoy, 0.9);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+    let emitted: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
+    assert_eq!(
+        emitted,
+        vec![3],
+        "the chain's cheap call half must not survive on its own",
+    );
 }
 
 #[test]
@@ -2643,9 +2915,9 @@ layers:
             .with_default_tokens(100)
             .with_tokens(sparse_grp, TurnIndex(0), 10);
 
-    // sparse: 1 turn Ã— 10 tokens = 10 (far less than its ~4750 share).
+    // sparse: 1 turn × 10 tokens = 10 (far less than its ~4750 share).
     resolver.append(sparse_grp);
-    // dense: 20 turns Ã— 100 tokens = 2000.
+    // dense: 20 turns × 100 tokens = 2000.
     for _ in 0..20 {
         resolver.append(dense_grp);
     }
@@ -2807,7 +3079,7 @@ layers:
     let layer = b.id_for_layer("layer").unwrap();
     let grp = b.id_for_group("grp").unwrap();
 
-    // 100 turns Ã— 100 tokens each = 10000, far exceeds 4500 budget.
+    // 100 turns × 100 tokens each = 10000, far exceeds 4500 budget.
     let mut resolver = MockResolver::new().with_default_tokens(100);
     for _ in 0..100 {
         resolver.append(grp);
@@ -3443,6 +3715,88 @@ fn substitution_baked_into_immutable_schema() {
     let content_second = b.section(frame).unwrap().content.clone();
     assert_eq!(content_first, content_second);
     assert_eq!(content_first, "Hello A, welcome to B.");
+}
+
+/// **The thinking dial speaks the checkpoint's own reasoning-effort vocabulary,
+/// and `balanced` is silent.**
+///
+/// Qwen3.8's chat template carries three trained effort levels — `low`,
+/// `medium`, `xhigh` — each a system-prompt instruction placed ahead of the
+/// turn (never text written into the `<think>` block). The dial reuses those
+/// strings verbatim so it pulls the lever the checkpoint was tuned for.
+///
+/// `balanced` is the template's `medium`, which injects nothing at all. It must
+/// therefore carry no content and seal NO variant: an empty section in the
+/// prompt is a different thing from no section, and only the latter reproduces
+/// the vendor template on the default path.
+///
+/// `off` is asserted non-empty on purpose, though it is no longer what keeps
+/// the block shut — the `Off` steering tree closes it structurally, on the
+/// token after `<think>`. What this directive still does is tell the model to
+/// answer without deliberating, so it does not open with the throat-clearing it
+/// would otherwise put in a block it is about to be denied.
+#[test]
+fn zend_thinking_effort_uses_the_checkpoints_own_vocabulary() {
+    use candle_transformers::models::dialect::Dialect;
+    let yaml = include_str!("../../../zend/src/prompts/projection.yaml");
+    let dlct = Dialect::chat_ml();
+    let b = Builder::from_yaml_with_vars_and_dialect(yaml, &[("workspace", "candle")], Some(&dlct))
+        .expect("zend projection.yaml must parse");
+
+    let node = b
+        .schema()
+        .system_prompt
+        .section_trees()
+        .flat_map(|t| t.nodes.iter())
+        .find(|n| n.name == "thinking_effort")
+        .expect("the dialogue schema declares a thinking_effort selector");
+
+    let opt = |id: &str| {
+        node.options
+            .iter()
+            .find(|o| o.id == id)
+            .unwrap_or_else(|| panic!("thinking_effort has no {id:?} option"))
+    };
+
+    // `balanced` == the vendor's `medium`: no content, hence no sealed variant,
+    // hence no emitted segment on the default path.
+    assert_eq!(opt("balanced").content, "", "balanced must emit nothing");
+    assert!(
+        opt("balanced").variants.is_empty(),
+        "an option with no content seals no variant"
+    );
+
+    // The rungs that do speak carry the template's own strings.
+    assert!(
+        opt("quick")
+            .content
+            .starts_with("Reasoning effort is set to low."),
+        "quick must use the template's `low` string, got {:?}",
+        opt("quick").content
+    );
+    for id in ["deep", "exhaustive"] {
+        assert!(
+            opt(id)
+                .content
+                .starts_with("Reasoning effort is set to xhigh."),
+            "{id} must use the template's `xhigh` string, got {:?}",
+            opt(id).content
+        );
+    }
+    // Exhaustive EXTENDS xhigh rather than replacing it — the model has three
+    // trained levels and this dial has five rungs, so the top two share an
+    // anchor and separate on this extra directive plus their token budgets.
+    assert!(
+        opt("exhaustive").content.len() > opt("deep").content.len(),
+        "exhaustive must add a directive on top of the xhigh anchor"
+    );
+
+    // `off`'s prose is the only thing suppressing the block on this family.
+    assert!(
+        !opt("off").content.is_empty(),
+        "off's prose is load-bearing — emptying it silently disables the dial"
+    );
+    assert!(!opt("off").variants.is_empty(), "off must seal a variant");
 }
 
 /// Sanity check: the live zend projection schema parses + validates.
@@ -5038,37 +5392,10 @@ fn add_section_invalid_priority_fails() {
 /// rule path; with a `default` declared and its tag bound to a turn, that turn
 /// is injected so the group survives instead of vanishing at the empty-group
 /// retain.
-const DEFAULT_FALLBACK_YAML: &str = r#"
-system_prompt:
-  sections:
-    - id: frame
-      content: "frame"
-layers:
-  - name: ground
-    window: 8000
-    summary:
-      turns:
-        max_tokens: 256
-        user:
-          system_prompt: compress
-          user_prompt: compress
-        assistant:
-          system_prompt: compress
-          user_prompt: compress
-    score_formula: max
-    budget:
-      priority: 40
-    groups:
-      - id: structure
-        selection: { kind: top_k, k: 2 }
-        score_threshold: 0.5
-        default: { tag: "root" }
-"#;
-
-/// Identical to the fixture above but with no `default:` declared, proving the
-/// injection is what keeps the group alive — absent it, an all-below-threshold
-/// group emits nothing.
-const NO_DEFAULT_YAML: &str = r#"
+/// One `top_k(2)` turn group behind a `score_threshold` of 0.5 — the shape the
+/// threshold tests need. A turn group declares no fallback member: passing the
+/// threshold is the only way in.
+const TURN_GROUP_TOPK_YAML: &str = r#"
 system_prompt:
   sections:
     - id: frame
@@ -5094,42 +5421,24 @@ layers:
         score_threshold: 0.5
 "#;
 
+/// **A turn group that qualifies nothing contributes nothing.**
+///
+/// The threshold is the whole gate. This used to inject the group's declared
+/// `default` member with a score synthesised from the layer/group thresholds —
+/// a sentinel built to clear the very bar the member had just failed — so a
+/// group could never be empty and a cold probe always paid for its content.
+/// Live, that put ~4,000 tokens of repo_map (a folder listing, its tool
+/// response, and its summary) in front of a bare "Hi, how are you?".
 #[test]
-fn default_injected_when_selection_empty() {
-    let b = Builder::from_yaml(DEFAULT_FALLBACK_YAML).unwrap();
+fn a_group_whose_turns_all_miss_the_threshold_emits_nothing() {
+    let b = Builder::from_yaml(TURN_GROUP_TOPK_YAML).unwrap();
     let ground = b.id_for_layer("ground").unwrap();
     let structure = b.id_for_group("structure").unwrap();
 
     // Three turns, all scoring 0.1 — below the group's 0.5 threshold, so the
-    // top_k rule selects nothing. Bind the default tag to turn 0.
+    // top_k rule selects nothing.
     let mut resolver = MockResolver::new().with_default_score(0.1);
     resolver.append(structure);
-    resolver.append(structure);
-    resolver.append(structure);
-    resolver = resolver.with_tag(structure, "root", TurnIndex(0));
-
-    let proj = b.project(
-        ProjectionTarget {
-            layer: ground,
-            group: structure,
-            timeline: TimelineId::for_test(1),
-        },
-        &resolver,
-    );
-
-    let turns: Vec<&super::project::ResolvedTurn> = proj.sealed_turns().collect();
-    assert_eq!(turns.len(), 1, "only the default turn should survive");
-    assert_eq!(turns[0].group(), structure);
-    assert_eq!(turns[0].index(), TurnIndex(0), "default resolves to turn 0");
-}
-
-#[test]
-fn no_default_leaves_group_empty() {
-    let b = Builder::from_yaml(NO_DEFAULT_YAML).unwrap();
-    let ground = b.id_for_layer("ground").unwrap();
-    let structure = b.id_for_group("structure").unwrap();
-
-    let mut resolver = MockResolver::new().with_default_score(0.1);
     resolver.append(structure);
     resolver.append(structure);
 
@@ -5145,27 +5454,32 @@ fn no_default_leaves_group_empty() {
     assert_eq!(
         group_turn_count(proj.sealed_turns(), structure),
         0,
-        "no default ⇒ all-below-threshold group emits nothing",
+        "an all-below-threshold group must emit nothing, not a floor member",
+    );
+    // And the layer goes with it: Step 7 drops the empty group, then the layer
+    // that has lost every group. Nothing of `ground` survives.
+    assert_eq!(
+        proj.sealed_turns().count(),
+        0,
+        "the layer must drop out once its only group is empty",
     );
 }
 
 #[test]
-fn default_ignored_when_selection_non_empty() {
-    let b = Builder::from_yaml(DEFAULT_FALLBACK_YAML).unwrap();
+fn turns_clearing_the_threshold_are_the_only_ones_selected() {
+    let b = Builder::from_yaml(TURN_GROUP_TOPK_YAML).unwrap();
     let ground = b.id_for_layer("ground").unwrap();
     let structure = b.id_for_group("structure").unwrap();
 
-    // Turns 1 and 2 clear the 0.5 threshold; the top_k rule fills two slots, so
-    // the default must NOT fire (turn 0, the default, scores below threshold and
-    // stays out).
+    // Turns 1 and 2 clear the 0.5 threshold and fill the two top_k slots; turn 0
+    // is below it and stays out.
     let mut resolver = MockResolver::new().with_default_score(0.1);
-    let t0 = resolver.append(structure);
+    let _t0 = resolver.append(structure);
     let t1 = resolver.append(structure);
     let t2 = resolver.append(structure);
     resolver = resolver
         .with_score(structure, t1, 0.9)
-        .with_score(structure, t2, 0.8)
-        .with_tag(structure, "root", t0);
+        .with_score(structure, t2, 0.8);
 
     let proj = b.project(
         ProjectionTarget {
@@ -5185,7 +5499,7 @@ fn default_ignored_when_selection_non_empty() {
     assert_eq!(
         idxs,
         vec![t1, t2],
-        "real picks fill the budget; the default turn stays out",
+        "only the turns clearing the threshold are selected",
     );
 }
 
@@ -5307,7 +5621,7 @@ fn collection_default_injected_when_selection_empty() {
 #[test]
 fn belief_config_takes_budget_and_gates_from_the_rule() {
     // structure = top_k(2), score_threshold 0.5.
-    let b = Builder::from_yaml(DEFAULT_FALLBACK_YAML).unwrap();
+    let b = Builder::from_yaml(TURN_GROUP_TOPK_YAML).unwrap();
     let structure = b.id_for_group("structure").unwrap();
     let group = b.group(structure).unwrap();
     assert!(group.is_belief_driven());
@@ -5323,7 +5637,7 @@ fn belief_config_takes_budget_and_gates_from_the_rule() {
 
 #[test]
 fn belief_driven_group_selects_top_k_by_score() {
-    let b = Builder::from_yaml(DEFAULT_FALLBACK_YAML).unwrap();
+    let b = Builder::from_yaml(TURN_GROUP_TOPK_YAML).unwrap();
     let ground = b.id_for_layer("ground").unwrap();
     let structure = b.id_for_group("structure").unwrap();
 

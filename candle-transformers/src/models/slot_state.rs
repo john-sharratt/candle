@@ -4,7 +4,7 @@ use candle::{Result, Tensor};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{span_layout, SpanLayout};
 use candle_nn::kv_cache::{
-    HeadGids, LiveChunkRef, MetaGid, ResolvedArenaInfo, SealedChunk, N_PALETTE,
+    HeadGids, LiveChunkRef, MetaGid, ResolvedArenaInfo, SealedChunk, CHUNK_SIZE, N_PALETTE,
 };
 
 // ---------------------------------------------------------------------------
@@ -589,6 +589,145 @@ pub fn pack_position_entry(slice_idx: u32, in_blk: u32) -> u32 {
     (slice_idx << 16) | (in_blk & 0xFFFF)
 }
 
+/// One slot's chunk list reduced to the token layout: `(offset, len)` per
+/// chunk, in slice order.
+///
+/// Everything positional the kernel needs — which slice a `k_pos` resolves
+/// to, where the writer scatters, how the write region maps — is a function
+/// of this and nothing else. The arena pointers, palettes and scales that
+/// make up the rest of a slice differ per layer; the token layout does not,
+/// which is what lets one forward build the position map once and hand it to
+/// every layer (see `SharedPm`).
+pub struct SlotTokenLayout {
+    /// `(offset, len)` per chunk, in slice order.
+    pub chunks: Vec<(u16, u16)>,
+    /// Which slice the kernel scatters into.
+    pub write_slice: u32,
+}
+
+impl SlotTokenLayout {
+    /// The writer is the *first chunk at or after the writer boundary that
+    /// still has capacity*. The boundary is set by the host:
+    /// `inject_sealed_at_tail` advances it past Arc-shared substrate chunks;
+    /// `create_view_sequence` sets it to the CoW chunk (the only writer-owned
+    /// partial); `push_empty_writer_chunk` leaves it alone (the pushed empty is
+    /// already past it).
+    ///
+    /// Within the writer region, prefer the first non-full chunk — this extends
+    /// partial tails (CoW, decode-extending) and starts fresh empties from
+    /// `in_blk = 0`.
+    pub fn new(chunks: Vec<(u16, u16)>, writer_start_idx: usize, chunk_size: usize) -> Self {
+        let write_slice = if writer_start_idx >= chunks.len() {
+            // The writer region has no chunks (freshly injected prefix whose
+            // sealed partial tail is a gap). There is NO valid write target:
+            // point write_slice at the end so an actual write attempt fails
+            // loudly in `extend_for_write_region` instead of silently landing
+            // in an Arc-shared sealed chunk. Writers (prefill with new tokens)
+            // allocate writer chunks first via `ensure_for_batch_entries`,
+            // which brings the boundary back inside the slice list.
+            chunks.len() as u32
+        } else {
+            let mut wi = writer_start_idx;
+            for (i, &(offset, len)) in chunks.iter().enumerate().skip(writer_start_idx) {
+                wi = i;
+                if (offset as usize + len as usize) < chunk_size {
+                    break;
+                }
+            }
+            wi as u32
+        };
+        Self {
+            chunks,
+            write_slice,
+        }
+    }
+
+    /// The slot's logical token count — the sum of its chunks' lengths.
+    pub fn total_tokens(&self) -> usize {
+        self.chunks.iter().map(|&(_, len)| len as usize).sum()
+    }
+
+    /// Append the per-cum-token-position lookup to `pm`: for each slice in
+    /// order, positions `[cum, cum + len)` map to `(slice_idx, offset + i)`.
+    /// Empty slices contribute nothing — no cum_token position lives in them
+    /// yet. Appends rather than returns so a batch's slots pack into one
+    /// buffer without a Vec per slot.
+    pub fn push_position_map(&self, pm: &mut Vec<u32>) {
+        pm.reserve(self.total_tokens());
+        for (idx, &(offset, len)) in self.chunks.iter().enumerate() {
+            for i in 0..len as u32 {
+                pm.push(pack_position_entry(idx as u32, offset as u32 + i));
+            }
+        }
+    }
+
+    /// [`Self::push_position_map`] into a fresh buffer.
+    pub fn position_map(&self) -> Vec<u32> {
+        let mut pm = Vec::new();
+        self.push_position_map(&mut pm);
+        pm
+    }
+
+    /// Append `seq_len` write-region entries to `pm`, covering positions
+    /// `[total_tokens, total_tokens + seq_len)`. Each new position maps into
+    /// the slot's write area starting at the write_slice's current
+    /// `(offset + len)` cursor and advancing chunk-by-chunk through subsequent
+    /// slices.
+    ///
+    /// Caller must have pre-allocated enough slices past `write_slice` (via
+    /// `ensure_for_offsets` / `push_empty_writer_chunk`) to cover `seq_len`
+    /// chunk overflows. Asserts on out-of-range — the read scan in the kernel
+    /// relies on the map covering every position it touches.
+    pub fn extend_for_write_region(&self, pm: &mut Vec<u32>, seq_len: usize, chunk_size: usize) {
+        if seq_len == 0 {
+            return;
+        }
+        let mut cur_slice = self.write_slice as usize;
+        assert!(
+            cur_slice < self.chunks.len(),
+            "extend_for_write_region: no writer chunk (write_slice={} of {} \
+             slices, seq_len={seq_len}) — the write region was not allocated \
+             before prefill (ensure_for_batch_entries)",
+            self.write_slice,
+            self.chunks.len(),
+        );
+        let mut cur_in_blk = {
+            let (offset, len) = self.chunks[cur_slice];
+            offset as u32 + len as u32
+        };
+        for _ in 0..seq_len {
+            // Advance through chunk boundaries (in_blk overflowed past
+            // CHUNK_SIZE) until we find a slice with capacity. Each subsequent
+            // slice starts at its own `offset` field — for freshly-pushed empty
+            // chunks this is 0.
+            while cur_in_blk as usize >= chunk_size {
+                cur_slice += 1;
+                if cur_slice >= self.chunks.len() {
+                    // Dump the full slot layout so the desync is diagnosable in
+                    // release (the bare index panic hides which chunk overflowed).
+                    let layout: String = self
+                        .chunks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(off, len))| format!("[{i}] off={off} len={len}"))
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    panic!(
+                        "extend_for_write_region overflow: ran out of slices at \
+                         cur_slice={cur_slice} (n_slices={}, write_slice={}, seq_len={seq_len}, \
+                         chunk_size={chunk_size}). Slot layout: {layout}",
+                        self.chunks.len(),
+                        self.write_slice,
+                    );
+                }
+                cur_in_blk = self.chunks[cur_slice].0 as u32;
+            }
+            pm.push(pack_position_entry(cur_slice as u32, cur_in_blk));
+            cur_in_blk += 1;
+        }
+    }
+}
+
 impl SlotStateHost {
     /// The KV span every serialized pointer is checked against, fetched ONCE
     /// for a whole serialization pass.
@@ -649,62 +788,17 @@ impl SlotStateHost {
         writer_start_idx: usize,
         build_position_map: bool,
     ) -> Self {
-        // Under cum_token addressing the writer is the *first chunk
-        // at or after the writer boundary that still has capacity*.
-        // The boundary is set by the host: `inject_sealed_at_tail`
-        // advances it past Arc-shared substrate chunks;
-        // `create_view_sequence` sets it to the CoW chunk (the only
-        // writer-owned partial); `push_empty_writer_chunk` leaves it
-        // alone (the pushed empty is already past it).
-        //
-        // Within the writer region, prefer the first non-full chunk —
-        // this extends partial tails (CoW, decode-extending) and
-        // starts fresh empties from in_blk=0.
-        let write_slice = if writer_start_idx >= slices.len() {
-            // The writer region has no chunks (freshly injected prefix whose
-            // sealed partial tail is a gap). There is NO valid write target:
-            // point write_slice at the end so an actual write attempt fails
-            // loudly in `extend_for_write_region` instead of silently landing
-            // in an Arc-shared sealed chunk. Writers (prefill with new
-            // tokens) allocate writer chunks first via
-            // `ensure_for_batch_entries`, which brings the boundary back
-            // inside the slice list.
-            slices.len() as u32
-        } else {
-            let start = writer_start_idx;
-            let mut wi = start;
-            for (i, s) in slices.iter().enumerate().skip(start) {
-                wi = i;
-                if (s.offset as usize + s.len as usize) < 32 {
-                    break;
-                }
-            }
-            wi as u32
-        };
-
-        // Build the per-cum-token-position lookup table.  For each slice
-        // in order, fill positions `[cum, cum + slice.len)` with
-        // `(slice_idx, slice.offset + i)`.  Empty slices contribute zero
-        // entries — they're invisible to the prefix read scan because no
-        // cum_token positions live in them yet.  The total length equals
-        // the slot's logical token count (= sum of slice.len).
-        // Layer-invariant: the position_map depends only on the chunk token
-        // layout (slice offsets/lengths), which is identical across every layer
-        // of a forward (a sequence's chunks are sealed at the same boundaries in
-        // all layers; only the K/V values + arena pointers differ). The prefill
-        // caller therefore builds it on the first layer and reuses it for the
-        // rest — layers after the first pass `build_position_map = false` to skip
-        // this entirely (the dominant per-layer host cost).
+        // Writer selection and the position map are functions of the token
+        // layout alone — `SlotTokenLayout` holds both rules, and the prefill
+        // header build reaches them without materialising slices at all.
+        let layout = SlotTokenLayout::new(
+            slices.iter().map(|s| (s.offset, s.len)).collect(),
+            writer_start_idx,
+            CHUNK_SIZE,
+        );
+        let write_slice = layout.write_slice;
         let position_map: Vec<u32> = if build_position_map {
-            let total_tokens: usize = slices.iter().map(|s| s.len as usize).sum();
-            let mut pm = Vec::with_capacity(total_tokens);
-            for (idx, slice) in slices.iter().enumerate() {
-                let slice_off = slice.offset as u32;
-                for i in 0..(slice.len as u32) {
-                    pm.push(pack_position_entry(idx as u32, slice_off + i));
-                }
-            }
-            pm
+            layout.position_map()
         } else {
             Vec::new()
         };
@@ -757,52 +851,10 @@ impl SlotStateHost {
     /// scan in the kernel relies on the map covering every position it
     /// touches.
     pub fn extend_for_write_region(&mut self, seq_len: usize, chunk_size: usize) {
-        if seq_len == 0 {
-            return;
-        }
-        let mut cur_slice = self.write_slice as usize;
-        assert!(
-            cur_slice < self.slices.len(),
-            "extend_for_write_region: no writer chunk (write_slice={} of {} \
-             slices, seq_len={seq_len}) — the write region was not allocated \
-             before prefill (ensure_for_batch_entries)",
-            self.write_slice,
-            self.slices.len(),
-        );
-        let mut cur_in_blk = {
-            let ws = &self.slices[cur_slice];
-            ws.offset as u32 + ws.len as u32
+        let layout = SlotTokenLayout {
+            chunks: self.slices.iter().map(|s| (s.offset, s.len)).collect(),
+            write_slice: self.write_slice,
         };
-        for _ in 0..seq_len {
-            // Advance through chunk boundaries (in_blk overflowed past
-            // CHUNK_SIZE) until we find a slice with capacity.  Each
-            // subsequent slice starts at its own `offset` field — for
-            // freshly-pushed empty chunks this is 0.
-            while cur_in_blk as usize >= chunk_size {
-                cur_slice += 1;
-                if cur_slice >= self.slices.len() {
-                    // Dump the full slot layout so the desync is diagnosable in
-                    // release (the bare index panic hides which chunk overflowed).
-                    let layout: String = self
-                        .slices
-                        .iter()
-                        .enumerate()
-                        .map(|(i, s)| format!("[{i}] off={} len={}", s.offset, s.len))
-                        .collect::<Vec<_>>()
-                        .join("  ");
-                    panic!(
-                        "extend_for_write_region overflow: ran out of slices at \
-                         cur_slice={cur_slice} (n_slices={}, write_slice={}, seq_len={seq_len}, \
-                         chunk_size={chunk_size}). Slot layout: {layout}",
-                        self.slices.len(),
-                        self.write_slice,
-                    );
-                }
-                cur_in_blk = self.slices[cur_slice].offset as u32;
-            }
-            self.position_map
-                .push(pack_position_entry(cur_slice as u32, cur_in_blk));
-            cur_in_blk += 1;
-        }
+        layout.extend_for_write_region(&mut self.position_map, seq_len, chunk_size);
     }
 }

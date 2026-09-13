@@ -34,17 +34,21 @@ pub async fn ensure_model(
     tokio::fs::create_dir_all(&dir).await?;
 
     let spec = model().spec();
-    let model_path = resolve_file(
-        &spec.model_repo,
-        // The checkpoint carries no pinned revision on the spec; its published
-        // length is what distinguishes it here.
-        "",
-        &spec.model_filename,
-        Some(spec.model_bytes),
-        &dir,
-        status,
-    )
-    .await?;
+    let model_path = if spec.prepared_from_source {
+        resolve_prepared(&spec.model_repo, &spec.model_filename, &dir, status)?
+    } else {
+        resolve_file(
+            &spec.model_repo,
+            // The checkpoint carries no pinned revision on the spec; its
+            // published length is what distinguishes it here.
+            "",
+            &spec.model_filename,
+            Some(spec.model_bytes),
+            &dir,
+            status,
+        )
+        .await?
+    };
     let tok_path = resolve_file(
         &spec.tokenizer_repo,
         &spec.tokenizer_rev,
@@ -59,6 +63,50 @@ pub async fn ensure_model(
 }
 
 // ── Resolution ────────────────────────────────────────────────────────────────
+
+/// Locate an engine artifact this codebase **prepares** rather than downloads.
+///
+/// Same cache layout as everything else — `<cache>/<repo-with-dashes>/<file>` —
+/// so a prepared artifact sits beside the published ones and one convention
+/// covers both. What differs is the miss: there is no URL to fall back to,
+/// because the name was never published, so the miss is reported as the missing
+/// build step it actually is.
+///
+/// Also accepts the file in the hub cache, for the case where a prepare wrote
+/// beside the source shards it read.
+fn resolve_prepared(
+    repo: &str,
+    filename: &str,
+    our_dir: &Path,
+    status: &tokio::sync::watch::Sender<String>,
+) -> anyhow::Result<PathBuf> {
+    let our_path = our_dir.join(repo.replace('/', "--")).join(filename);
+    for candidate in [Some(our_path.clone()), hf_hub_path(repo, "", filename)]
+        .into_iter()
+        .flatten()
+    {
+        if candidate.exists() {
+            let gb = candidate.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1e9;
+            tracing::info!("prepared artifact: {} ({:.2} GB)", candidate.display(), gb);
+            status
+                .send(format!("Found {} ({:.1} GB)", filename, gb))
+                .ok();
+            return Ok(candidate);
+        }
+    }
+    // No fetch, and no partial-file placeholder left behind. Naming the step is
+    // the whole point: a 404 on `{filename}` would be a confusing way to say
+    // "the merge has not been run on this machine".
+    anyhow::bail!(
+        "engine artifact {filename} is not on this machine.\n\
+         It is BUILT, not downloaded — nothing publishes it under that name. Produce it with \
+         the `prepare_engine_gguf` gate in `candle-transformers/src/models/quantized_qwen38_moe.rs` \
+         (it fetches the pinned {repo} Q8_0 split and the W4A16 expert release, imports the \
+         experts to Q4_KO, folds in the MTP head and merges), then place or symlink the result \
+         at {}.",
+        our_path.display(),
+    )
+}
 
 /// Resolve a model file: our cache → HF hub cache → download.
 async fn resolve_file(

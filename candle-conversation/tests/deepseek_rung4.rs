@@ -69,6 +69,8 @@ fn deepseek_spec(model_path: &std::path::Path) -> ModelSpec {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        // The path is handed over directly, so nothing resolves it.
+        prepared_from_source: false,
         model_bytes,
         // Local file only, so there is no revision to pin and no repo an
         // override could displace — the two fields a downloaded checkpoint uses

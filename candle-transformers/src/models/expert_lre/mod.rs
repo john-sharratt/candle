@@ -169,6 +169,7 @@
 //! | `gpu_dispatch` | Device-resident expert pointer tables for the grouped GEMM (cuda) |
 //! | [`handle`]     | `ExpertCache` public API and `PipelineMode` |
 
+mod assignment_sort;
 mod cache;
 pub(crate) mod compute;
 #[cfg(test)]
@@ -204,6 +205,7 @@ mod zone_geometry;
 
 // Re-exports — the public API of this module.
 pub use crate::models::profile::ProfileSnapshot;
+pub use assignment_sort::{sort_assignments_by_expert, ExpertAssignment};
 #[cfg(feature = "cuda")]
 pub use cache::minimum_resident_slots;
 /// Shared with the layer cache, which pins the same count for the same reason:

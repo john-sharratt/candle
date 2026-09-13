@@ -1,7 +1,7 @@
 //! The segmented redo log — the on-disk file set under `.substrate/`.
 //!
 //! The redo log is a set of ~4 GB **segment** files, not one monolithic
-//! file (`docs/segmented_substrate_log.md`). Every segment is a `seg-<id>.log`
+//! file (`docs/archived/segmented_substrate_log.md`). Every segment is a `seg-<id>.log`
 //! file; the **active** append target is simply the **highest-id** one, and the
 //! rest are immutable **sealed** segments. A record's in-RAM location is
 //! `(SegmentId, offset)`, so a read routes to the file that physically holds it.

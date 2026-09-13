@@ -3,6 +3,9 @@
 //! Provides the same public surface as `gpu_chunks.rs` but all operations
 //! are no-ops.  Selected at compile time when the `cuda` feature is absent.
 
+use std::sync::Arc;
+
+use super::head_gids::HeadGids;
 use super::types::ChunkWindow;
 use crate::kv_cache::arena_table::ResolvedArenaInfo;
 
@@ -54,6 +57,13 @@ impl GpuChunks {
 
     pub(crate) fn n_chunks(&self) -> usize {
         0
+    }
+
+    /// Empty, because the stub serialises nothing and so references no chunks.
+    /// A consumer holding this across a launch is holding nothing, which is
+    /// correct: without the feature there is no launch to outlive.
+    pub(crate) fn pins(&self) -> Arc<Vec<HeadGids>> {
+        Arc::new(Vec::new())
     }
 
     /// No-op stand-in for the CUDA snapshot copy (the pinned stager itself is

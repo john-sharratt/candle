@@ -319,9 +319,14 @@ fn compile_act_loop(
                 // spans end on either `</think>` or EOS, and an EOS the tree
                 // does not know is one it cannot end a span on.
                 eos: tok.token_to_id(cfg.dialect.assistant_end).unwrap_or(0),
+                // Empty because this prelude is SPLICED onto the call grammar
+                // below (`compile_action_loop(…, Some(&prelude))`), so the join
+                // at `</think>` is already a node edge rather than a moment the
+                // decoder is free in. Injecting the marker here as well would
+                // emit it twice.
                 after_close: "",
             };
-            compile_think_tree(thinking.mode(), &steer)
+            Some(compile_think_tree(thinking.mode(), &steer))
         }
     };
     let spec = compile_action_loop(

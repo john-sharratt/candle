@@ -11,7 +11,8 @@
 //!   assistant  ← DECODED: what the folder contains
 //!
 //! Round-trip 2 — what is it for?
-//!   user       Summarize the `zend/src/code_read/` folder in no more than two sentences.
+//!   user       Summarize the `zend/src/code_read/` folder in one or two complete
+//!              sentences, ending with a full stop. …
 //!   assistant  <tool_call>{"name":"file_read","arguments":{"path":"zend/src/code_read/mod.rs",
 //!                          "start_line":1,"end_line":24}}</tool_call>
 //!   user       <tool_response>
@@ -41,6 +42,7 @@
 //! hand-written copy would keep in step, like `serde_json` emitting object keys
 //! in sorted order.
 
+use candle_conversation::stencil::ToolCallEnvelope;
 use serde_json::json;
 use zend_tools::tools::file::render::numbered_excerpt;
 use zend_tools::ToolContext;
@@ -59,16 +61,37 @@ pub const CHAIN_TOOLS: &[&str] = &["file_list", "file_read"];
 /// A directory holding a manifest carries its hint in parentheses (`(crate:
 /// candle-nn)`) — the one thing about a folder that the listing states only
 /// obliquely, as a filename.
+///
+/// **"One or two complete sentences", not "no more than two sentences".** The
+/// old phrasing described a ceiling and got measured against: of 61 summaries
+/// from one pass, 55 were a single sentence and 31 ended with no full stop at
+/// all, on a complete clause — the request said how many sentences were allowed
+/// and nothing about finishing one. Naming *complete* sentences asks for the
+/// property that was actually missing, and costs nothing when the model was
+/// going to write one sentence anyway.
+///
+/// **And it must not refuse.** The listing is sometimes the only evidence (a
+/// directory with no anchor file is a single round-trip — see the module docs),
+/// and asked to summarize from filenames alone the model has answered "there
+/// isn't enough information available here yet to summarize them accurately",
+/// which seals as that folder's `repo_map` entry. Saying that names and paths
+/// are a legitimate basis removes the excuse; `summarize_examples` already
+/// teaches the shape.
 pub fn render_request(unit: &DirUnit) -> String {
     let folder = folder_phrase(unit);
+    let tail = SUMMARY_ASK;
     match unit.module_hint() {
-        Some(hint) => format!(
-            "Summarize {folder} ({hint}) in no more than two sentences.",
-            hint = hint.render(),
-        ),
-        None => format!("Summarize {folder} in no more than two sentences."),
+        Some(hint) => format!("Summarize {folder} ({hint}) {tail}", hint = hint.render()),
+        None => format!("Summarize {folder} {tail}"),
     }
 }
+
+/// What [`render_request`] asks for, after the folder is named. A constant so
+/// the tests below assert the real string rather than a copy of it — a prompt
+/// this load-bearing should not be able to drift from its own assertions.
+const SUMMARY_ASK: &str = "in one or two complete sentences, ending with a full stop. \
+     Summarize from whatever the conversation has already shown you — file names and \
+     paths alone are enough; never reply that there is not enough information.";
 
 /// How a request names the folder. A real directory is named by its path in
 /// backticks; the workspace root is named in words. `.` is the tag and cache key,
@@ -82,35 +105,33 @@ fn folder_phrase(unit: &DirUnit) -> String {
     }
 }
 
-/// Assistant-side `<tool_call>` listing the folder.
-pub fn render_list_call(unit: &DirUnit) -> String {
-    format!(
-        "<tool_call>{{\"name\":\"file_list\",\"arguments\":{{\"prefix\":{prefix}}}}}</tool_call>",
-        prefix = quoted(unit.list_prefix()),
-    )
-}
-
-/// Assistant-side `<tool_call>` reading the anchor excerpt.
-pub fn render_read_call(anchor: &Anchor) -> String {
-    format!(
-        "<tool_call>{{\"name\":\"file_read\",\"arguments\":{{\"path\":{path},\
-         \"start_line\":{start},\"end_line\":{end}}}}}</tool_call>",
-        path = quoted(&anchor.path),
-        start = anchor.start_line,
-        end = anchor.end_line,
-    )
-}
-
-/// `s` as a JSON string literal, quotes and escapes included.
+/// Assistant-side `<tool_call>` listing the folder, in the checkpoint's own
+/// call syntax.
 ///
-/// The calls are assembled as text rather than through `serde_json::to_string`
-/// on a map so the keys keep authoring order (`name` before `arguments`, as the
-/// worked examples and every live tool call are written) — `serde_json`'s map is
-/// sorted. That leaves escaping to do by hand, and a path is the one part an
-/// author does not control: a `"` or `\` spliced in raw would emit a tool call
-/// the extractor cannot parse.
-fn quoted(s: &str) -> String {
-    serde_json::Value::String(s.to_string()).to_string()
+/// **Rendered from the dialect's envelope, not written out here.** These calls
+/// are PREFILLED — the model reads them as its own prior output, so their shape
+/// is what it learns to produce. Written as Qwen3 JSON they taught
+/// `{"name":…,"arguments":…}` to a Qwen3.5/3.8 checkpoint whose grammar emits a
+/// `<function=…>` element, so the ingest and the chat stencil disagreed about
+/// the syntax of the same tool on the same weights — thousands of turns of it
+/// in one pass. [`ToolCallEnvelope::for_dialect`] exists to be the single
+/// answer to that question; see its note on a literal being "a second opinion
+/// about the checkpoint actually loaded".
+pub fn render_list_call(env: &ToolCallEnvelope, unit: &DirUnit) -> String {
+    env.render("file_list", &[("prefix", unit.list_prefix())])
+}
+
+/// Assistant-side `<tool_call>` reading the anchor excerpt, in the checkpoint's
+/// own call syntax. See [`render_list_call`].
+pub fn render_read_call(env: &ToolCallEnvelope, anchor: &Anchor) -> String {
+    env.render(
+        "file_read",
+        &[
+            ("path", anchor.path.as_str()),
+            ("start_line", &anchor.start_line.to_string()),
+            ("end_line", &anchor.end_line.to_string()),
+        ],
+    )
 }
 
 /// User-side `<tool_response>` for the listing — produced by running the real
@@ -167,18 +188,22 @@ fn error_detail(turn: &str) -> Option<String> {
 ///
 /// Two pairs when the folder has an anchor (list, then read), one when it does
 /// not — the listing is then the only evidence and the summary follows it.
-pub fn render_chain(ctx: &ToolContext, unit: &DirUnit) -> (Vec<(String, String)>, String) {
+pub fn render_chain(
+    ctx: &ToolContext,
+    unit: &DirUnit,
+    env: &ToolCallEnvelope,
+) -> (Vec<(String, String)>, String) {
     let listing = render_list_response(ctx, unit);
     match &unit.anchor {
         Some(anchor) => (
             vec![
-                (render_request(unit), render_list_call(unit)),
-                (listing, render_read_call(anchor)),
+                (render_request(unit), render_list_call(env, unit)),
+                (listing, render_read_call(env, anchor)),
             ],
             render_read_response(anchor),
         ),
         None => (
-            vec![(render_request(unit), render_list_call(unit))],
+            vec![(render_request(unit), render_list_call(env, unit))],
             listing,
         ),
     }
@@ -204,7 +229,15 @@ mod tests {
     use super::*;
     use crate::repo_scan::dir_unit::build_units;
     use crate::repo_scan::types::{FileEntry, Language, ModuleHint, RepoMap};
+    use candle_conversation::models::Dialect;
     use std::path::Path;
+
+    /// The envelope the chain tests render through. ChatML, so the assertions
+    /// that predate the dialect wiring keep asserting the shape they always did;
+    /// `tool_calls_follow_the_dialects_call_style` covers the other style.
+    fn env() -> ToolCallEnvelope {
+        ToolCallEnvelope::for_dialect(&Dialect::chat_ml())
+    }
 
     fn workspace(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -234,13 +267,36 @@ mod tests {
     }
 
     #[test]
-    fn request_names_the_folder_and_asks_for_two_sentences() {
+    fn request_names_the_folder_and_asks_for_complete_sentences() {
         let d = workspace(&[("a/x.rs", "fn x() {}\n")]);
         let m = map_of(d.path(), &[("a/x.rs", Language::Rust)]);
         let units = build_units(&m, d.path());
         assert_eq!(
             render_request(&units[0]),
-            "Summarize the `a/` folder in no more than two sentences.",
+            format!("Summarize the `a/` folder {SUMMARY_ASK}"),
+        );
+    }
+
+    /// The two properties the ask exists to obtain, named so a reworded prompt
+    /// that drops either one fails here rather than in a substrate audit weeks
+    /// later: **complete** sentences with a terminal stop (31 of 61 summaries in
+    /// one pass ended with no full stop), and no refusal when the file listing is
+    /// the only evidence (which sealed "there isn't enough information available
+    /// here yet" as a folder's summary).
+    #[test]
+    fn the_ask_demands_a_full_stop_and_forbids_a_refusal() {
+        assert!(
+            SUMMARY_ASK.contains("complete sentences") && SUMMARY_ASK.contains("full stop"),
+            "the ask must require a terminated sentence: {SUMMARY_ASK}"
+        );
+        assert!(
+            SUMMARY_ASK.contains("never reply that there is not enough information"),
+            "the ask must forbid a refusal: {SUMMARY_ASK}"
+        );
+        assert!(
+            !SUMMARY_ASK.contains("no more than"),
+            "a ceiling on sentence COUNT is what produced 55 one-sentence answers \
+             out of 61; the ask names completeness instead"
         );
     }
 
@@ -261,7 +317,7 @@ mod tests {
         let request = render_request(&units[0]);
         assert_eq!(
             request,
-            "Summarize the root folder of this project in no more than two sentences.",
+            format!("Summarize the root folder of this project {SUMMARY_ASK}"),
         );
         assert!(!request.contains('`'), "no backticked path for the root");
     }
@@ -278,33 +334,102 @@ mod tests {
         let units = build_units(&m, d.path());
         assert_eq!(
             render_request(&units[0]),
-            "Summarize the `a/` folder (crate: demo) in no more than two sentences.",
+            format!("Summarize the `a/` folder (crate: demo) {SUMMARY_ASK}"),
         );
     }
 
+    /// A JSON-dialect checkpoint gets the Hermes object — **in the layout the
+    /// grammar compiles**, which is not quite the layout this was hardcoded to.
+    ///
+    /// The old literal was one unspaced line (`{"name":"file_list",…}`); the
+    /// envelope the stencil builds from opens `<tool_call>\n{"name": "` and
+    /// closes `}}\n</tool_call>`. So the prefill diverged from the model's own
+    /// output even on Qwen3 — mildly, in whitespace, rather than in syntax, but
+    /// in the same direction and for the same reason. Asserted in full here so
+    /// the prefill and the grammar stay one shape.
     #[test]
-    fn tool_calls_are_single_line_hermes_json() {
+    fn tool_calls_are_hermes_json_on_a_json_dialect() {
+        let env = ToolCallEnvelope::for_dialect(&Dialect::chat_ml());
         let d = workspace(&[("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
         let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
         let units = build_units(&m, d.path());
-        let call = render_list_call(&units[0]);
+        let call = render_list_call(&env, &units[0]);
         assert_eq!(
             call,
-            "<tool_call>{\"name\":\"file_list\",\"arguments\":{\"prefix\":\"a/\"}}</tool_call>",
+            "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"prefix\": \"a/\"}}\n</tool_call>",
         );
-        assert!(!call.contains('\n'), "one line, for clean extraction");
 
-        let read = render_read_call(units[0].anchor.as_ref().unwrap());
+        let read = render_read_call(&env, units[0].anchor.as_ref().unwrap());
         assert_eq!(
             read,
-            "<tool_call>{\"name\":\"file_read\",\"arguments\":{\"path\":\"a/mod.rs\",\
-             \"start_line\":1,\"end_line\":2}}</tool_call>",
+            "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"a/mod.rs\", \
+             \"start_line\": 1, \"end_line\": 2}}\n</tool_call>",
+        );
+        assert!(
+            read.contains("\"start_line\": 1"),
+            "a line number is a JSON number, as the grammar emits it: {read}"
+        );
+    }
+
+    /// **The prefills speak the checkpoint's syntax, not a literal's.**
+    ///
+    /// These calls are prefilled as the model's own prior output, so their shape
+    /// is what it learns to emit. Hardcoded as Qwen3 JSON they taught
+    /// `{"name":…}` to a Qwen3.5/3.8 checkpoint whose grammar emits a
+    /// `<function=…>` element — the ingest and the chat stencil disagreeing
+    /// about the same tool on the same weights, for a whole workspace pass.
+    /// Nothing asserted the connection, which is why it survived the merge that
+    /// introduced `FunctionBlock`.
+    #[test]
+    fn tool_calls_follow_the_dialects_call_style() {
+        let d = workspace(&[("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
+        let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
+        let units = build_units(&m, d.path());
+        let anchor = units[0].anchor.as_ref().unwrap();
+
+        // What the ingest prefills must equal what the DIALECT's envelope
+        // renders — asserted against the envelope rather than against a literal
+        // shape, because a literal here is the second opinion that caused the
+        // original divergence. `Dialect::qwen35` declares `CallStyle::JsonBlock`
+        // today and declared `FunctionBlock` yesterday; this test is about the
+        // two staying joined, not about which one is current.
+        let env = ToolCallEnvelope::for_dialect(&Dialect::qwen35());
+        assert_eq!(
+            render_list_call(&env, &units[0]),
+            env.render("file_list", &[("prefix", units[0].list_prefix())]),
+            "the listing call must be the dialect envelope's own rendering",
+        );
+        assert_eq!(
+            render_read_call(&env, anchor),
+            env.render(
+                "file_read",
+                &[
+                    ("path", anchor.path.as_str()),
+                    ("start_line", &anchor.start_line.to_string()),
+                    ("end_line", &anchor.end_line.to_string()),
+                ],
+            ),
+            "the read call must be the dialect envelope's own rendering",
+        );
+
+        // And it is the CHECKPOINT's envelope, not a hardcoded family: ask the
+        // dialect for a different style and the rendering follows it.
+        let lines = ToolCallEnvelope::for_dialect(&Dialect::llama3());
+        assert_eq!(
+            render_list_call(&lines, &units[0]),
+            lines.render("file_list", &[("prefix", units[0].list_prefix())]),
         );
     }
 
     /// A path is the one part of a call an author does not control. Spliced in
     /// raw, a quote or backslash would emit a `<tool_call>` the extractor cannot
     /// parse — so the arguments must be JSON-escaped and stay round-trippable.
+    ///
+    /// This is the surviving form of a concern that used to need two tests. While
+    /// `Dialect::qwen35` declared `CallStyle::FunctionBlock`, values rode raw and
+    /// the hazard was a value containing `</parameter>` and closing its own span;
+    /// that dialect now declares `JsonBlock`, so there are no raw values and no
+    /// `</parameter>` anywhere, and escaping is the whole of the question.
     #[test]
     fn a_path_with_json_metacharacters_stays_parseable() {
         let anchor = Anchor {
@@ -315,10 +440,12 @@ mod tests {
             body: "//! One.\n//! Two.\n".to_string(),
             language: Language::Rust,
         };
-        let call = render_read_call(&anchor);
+        let env = ToolCallEnvelope::for_dialect(&Dialect::chat_ml());
+        let call = render_read_call(&env, &anchor);
         let body = call
             .strip_prefix("<tool_call>")
-            .and_then(|s| s.strip_suffix("</tool_call>"))
+            .and_then(|s| s.trim_end().strip_suffix("</tool_call>"))
+            .map(str::trim_end)
             .expect("tag wrapper");
         let parsed: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
         assert_eq!(parsed["name"], "file_read");
@@ -373,15 +500,15 @@ fn x() {}
         let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
         let units = build_units(&m, d.path());
         let ctx = ToolContext::with_workspace(d.path());
-        let (prefilled, decode_user) = render_chain(&ctx, &units[0]);
+        let (prefilled, decode_user) = render_chain(&ctx, &units[0], &env());
         assert_eq!(prefilled.len(), 2, "request+list, listing+read");
         assert!(prefilled[0].0.starts_with("Summarize the `a/` folder"));
-        assert!(prefilled[0].1.contains("\"name\":\"file_list\""));
+        assert!(prefilled[0].1.contains("\"name\": \"file_list\""));
         assert!(
             prefilled[1].0.starts_with("<tool_response>{"),
             "the listing"
         );
-        assert!(prefilled[1].1.contains("\"name\":\"file_read\""));
+        assert!(prefilled[1].1.contains("\"name\": \"file_read\""));
         assert!(
             decode_user.contains("```rust"),
             "the decode follows the excerpt"
@@ -399,9 +526,9 @@ fn x() {}
         let m = map_of(d.path(), &[("a/x.rs", Language::Rust)]);
         let units = build_units(&m, d.path());
         let ctx = ToolContext::with_workspace(d.path());
-        let (prefilled, decode_user) = render_chain(&ctx, &units[0]);
+        let (prefilled, decode_user) = render_chain(&ctx, &units[0], &env());
         assert_eq!(prefilled.len(), 1);
-        assert!(prefilled[0].1.contains("\"name\":\"file_list\""));
+        assert!(prefilled[0].1.contains("\"name\": \"file_list\""));
         assert!(decode_user.starts_with("<tool_response>{"));
     }
 
@@ -418,7 +545,7 @@ fn x() {}
         let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
         let units = build_units(&m, d.path());
         let ctx = ToolContext::with_workspace(d.path());
-        let (prefilled, decode_user) = render_chain(&ctx, &units[0]);
+        let (prefilled, decode_user) = render_chain(&ctx, &units[0], &env());
         assert_eq!(chain_error(&prefilled, &decode_user), None);
     }
 
@@ -456,6 +583,9 @@ fn x() {}
         let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
         let units = build_units(&m, d.path());
         let ctx = ToolContext::with_workspace(d.path());
-        assert_eq!(render_chain(&ctx, &units[0]), render_chain(&ctx, &units[0]));
+        assert_eq!(
+            render_chain(&ctx, &units[0], &env()),
+            render_chain(&ctx, &units[0], &env())
+        );
     }
 }

@@ -48,6 +48,67 @@ fn card() -> Result<(Device, CudaDevice)> {
     Ok((device, dev))
 }
 
+/// Compare two KO twins byte for byte, and say something useful when they differ.
+///
+/// `assert_eq!` on the vectors themselves would print both operands in full — a 34 MiB twin is
+/// tens of millions of numbers, and reading them answers nothing. What identifies the fault is
+/// *which chunk* diverged: the row-group and k-block it fell in, whether the divergence starts
+/// at a band boundary, and which plane it sits in. A divergence confined to `dm` is the
+/// (scale, min) pair, i.e. float rounding in the observer; one in `ql` is the codes, i.e. a
+/// layout or permutation fault. They have nothing to do with each other, and the byte offset
+/// within the chunk is the only thing that separates them.
+fn assert_ko_bytes_match(
+    got: &[u8],
+    want: &[u8],
+    nrows: usize,
+    ncols: usize,
+    ko: GgmlDType,
+    what: &str,
+) {
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "{what}: twin byte length changed: {} vs {}",
+        got.len(),
+        want.len()
+    );
+    let Some(i) = (0..got.len()).find(|&i| got[i] != want[i]) else {
+        return;
+    };
+    let chunk_bytes = ko_quant::ko_chunk_bytes(ko);
+    let row_groups = nrows / 8;
+    let k_blocks = ncols / 128;
+    let chunk = i / chunk_bytes;
+    let (k_blk, g) = (chunk / row_groups, chunk % row_groups);
+    let bad: Vec<usize> = (0..got.len()).filter(|&i| got[i] != want[i]).collect();
+    let bad_chunks: std::collections::BTreeSet<usize> =
+        bad.iter().map(|&i| i / chunk_bytes).collect();
+    let bad_groups: std::collections::BTreeSet<usize> =
+        bad_chunks.iter().map(|c| c % row_groups).collect();
+    let in_dm = bad.iter().filter(|&&i| i % chunk_bytes >= 512).count();
+    let max_delta = bad
+        .iter()
+        .map(|&i| got[i].abs_diff(want[i]))
+        .max()
+        .unwrap_or(0);
+    panic!(
+        "{what}: {} of {} bytes differ, in {} of {} chunks; {in_dm} of them in the dm \
+         (scale,min) plane and {} in ql (codes). Largest byte delta {max_delta}.\n\
+         first at byte {i} (chunk {chunk} = k_blk {k_blk}, row-group {g}, offset {} in \
+         chunk): got {} want {}\nrow-groups touched: {:?}{}",
+        bad.len(),
+        got.len(),
+        bad_chunks.len(),
+        k_blocks * row_groups,
+        bad.len() - in_dm,
+        i % chunk_bytes,
+        got[i],
+        want[i],
+        bad_groups.iter().take(16).collect::<Vec<_>>(),
+        if bad_groups.len() > 16 { " …" } else { "" },
+    );
+}
+
 /// **The repack's scratch is a band, not the tensor — and this is what says so.**
 ///
 /// `repack_ko` is dequantize-then-requantize composed through an f32 buffer, and that buffer
@@ -126,16 +187,13 @@ fn ko_repack_scratch_is_a_bounded_band() -> Result<()> {
         .memcpy_dtov(deq.as_cuda_slice::<f32>()?)
         .map_err(Error::wrap)?;
     let want = ko_quant::quantize_ko(&src_f32, nrows, ncols, GgmlDType::Q4_KO);
-    assert_eq!(
-        got.len(),
-        want.len(),
-        "twin byte length changed: {} vs {}",
-        got.len(),
-        want.len()
-    );
-    assert_eq!(
-        got, want,
-        "the host-mapped intermediate changed the repack's output bytes"
+    assert_ko_bytes_match(
+        &got,
+        &want,
+        nrows,
+        ncols,
+        GgmlDType::Q4_KO,
+        "the host-mapped intermediate changed the repack's output bytes",
     );
     Ok(())
 }
@@ -249,10 +307,13 @@ fn a_float_source_repacks_through_the_same_bounded_band() -> Result<()> {
         .memcpy_dtov(deq.as_cuda_slice::<f32>()?)
         .map_err(Error::wrap)?;
     let want = ko_quant::quantize_ko(&src_f32, nrows, ncols, GgmlDType::Q8_KO);
-    assert_eq!(got.len(), want.len(), "twin byte length changed");
-    assert_eq!(
-        got, want,
-        "the widening cast changed the repack's output bytes"
+    assert_ko_bytes_match(
+        &got,
+        &want,
+        nrows,
+        ncols,
+        GgmlDType::Q8_KO,
+        "the widening cast changed the repack's output bytes",
     );
     Ok(())
 }
@@ -339,10 +400,13 @@ fn a_host_banded_repack_matches_the_device_one_without_materialising_the_source(
     // And byte-identical to the device-sourced repack. Staging rows through a small buffer
     // must not move a single output bit.
     let got: Vec<u8> = twin.data()?;
-    assert_eq!(got.len(), want.len(), "twin byte length differs");
-    assert_eq!(
-        got, want,
-        "the host-banded read changed the repack's output bytes"
+    assert_ko_bytes_match(
+        &got,
+        &want,
+        nrows,
+        ncols,
+        GgmlDType::Q8_KO,
+        "the host-banded read changed the repack's output bytes",
     );
     Ok(())
 }

@@ -111,6 +111,25 @@ __device__ __forceinline__ void load_a_frag_m16k32(
     a[3] = *reinterpret_cast<const uint32_t*>(smem_a + (int64_t)(row_base + 8) * lda_bytes + col_base + 16);
 }
 
+// ldmatrix x4 / x2 of 8×8 b16 tiles from a lane-supplied shared address: lane
+// t provides the 16-byte row (t & 7) of tile (t >> 3) (x2 reads lanes 0-15).
+// The caller lays the rows out — padded or XOR-swizzled — so that the eight
+// rows of one tile land in distinct bank quads.
+__device__ __forceinline__ void ldmatrix_x4_b16(uint32_t (&a)[4], uint32_t smem_addr) {
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+        : "r"(smem_addr)
+    );
+}
+__device__ __forceinline__ void ldmatrix_x2_b16(uint32_t (&b)[2], uint32_t smem_addr) {
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+        : "=r"(b[0]), "=r"(b[1])
+        : "r"(smem_addr)
+    );
+}
+
 // ldmatrix variant of the 16x32 INT8 A load (sm_75+). The m16n8k32 s8 A operand is
 // 16 rows × 32 int8 = 16 × 16 b16 = exactly ldmatrix.x4's four 8×8 b16 tiles:
 //   tile0 = rows 0-7  / K 0-15  -> a[0]   tile2 = rows 0-7  / K 16-31 -> a[2]
@@ -129,13 +148,8 @@ __device__ __forceinline__ void load_a_frag_m16k32_ldmatrix(
     const int row_in_tile = lane & 7;            // 0..7
     const int m_offset = (tile_idx & 1) * 8;     // rows 0-7 or 8-15
     const int k_offset = (tile_idx >> 1) * 16;   // int8 K 0-15 or 16-31
-    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(
-        smem_a + (int64_t)(m_offset + row_in_tile) * lda_bytes + k_offset));
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
-        : "r"(addr)
-    );
+    ldmatrix_x4_b16(a, static_cast<uint32_t>(__cvta_generic_to_shared(
+        smem_a + (int64_t)(m_offset + row_in_tile) * lda_bytes + k_offset)));
 }
 
 // ldmatrix variant of the 8x32 INT8 B load (sm_75+). The B operand is 8 rows x
@@ -155,13 +169,8 @@ __device__ __forceinline__ void load_b_frag_n8k32_ldmatrix(
 ) {
     const int tile_idx    = (lane >> 3) & 1;
     const int row_in_tile = lane & 7;
-    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(
-        smem_b + (int64_t)row_in_tile * ldb_bytes + tile_idx * 16));
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
-        : "=r"(b[0]), "=r"(b[1])
-        : "r"(addr)
-    );
+    ldmatrix_x2_b16(b, static_cast<uint32_t>(__cvta_generic_to_shared(
+        smem_b + (int64_t)row_in_tile * ldb_bytes + tile_idx * 16)));
 }
 
 // Load an 8x32 INT8 B fragment. Per PTX ISA m16n8k32 the B operand uses the

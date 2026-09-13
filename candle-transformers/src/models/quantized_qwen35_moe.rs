@@ -284,6 +284,54 @@ mod tests {
         params.run(configs, load)
     }
 
+    /// **Depth on the 35B-A3B**: the batched forward at 32K and 128K of KV,
+    /// with the streaming expert cache in the picture — the depth rows and the
+    /// expert pipeline compete for the same card, which is the interaction a
+    /// short ladder never exercises.
+    #[test]
+    #[ignore = "reads the pinned Qwen3.5-35B GGUF from the HF cache (22 GB) and runs a \
+                128K-token prompt. Run with: cargo test --release --features cuda \
+                -p candle-transformers --lib quantized_qwen35_moe::tests::long_context_35b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn long_context_35b() -> Result<()> {
+        use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
+
+        let model_path = pinned()?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::Performance;
+        long_context_gate(
+            "Qwen3.5-35B-A3B (hybrid MoE)",
+            int8mode,
+            &tokenizer_json()?,
+            Dialect::qwen35(),
+            // `qwen35moe.context_length` in the GGUF.
+            262_144,
+            &[
+                (
+                    32_768,
+                    &[InferenceMode::BF16, InferenceMode::C5, InferenceMode::C10][..],
+                ),
+                (131_072, &[InferenceMode::BF16, InferenceMode::C10][..]),
+            ],
+            1,
+            64,
+            DepthTask::Coherence,
+            &device,
+            || {
+                from_gguf_path(
+                    &model_path,
+                    &device,
+                    Qwen35LoadOptions {
+                        int8mode: Some(int8mode),
+                        expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
+                        mtp_path: None,
+                        gate_donor_path: None,
+                    },
+                )
+            },
+        )
+    }
+
     /// The shared expert against the F32 reference, on the real 35B.
     ///
     /// This is the only part of Qwen3.5's MoE that Qwen3-MoE does not already
@@ -477,31 +525,42 @@ mod tests {
                 -- --ignored --nocapture --test-threads=1"]
     fn speculative_decode_35b() -> Result<()> {
         use crate::models::quantized_qwen35::tests::speculative_gate;
+        use crate::models::qwen35::mtp::MTP_MAX_DRAFT;
 
         let model_path = pinned()?;
         let int8mode = Int8Mode::Performance;
-        speculative_gate("Qwen3.5-35B-A3B", int8mode, &[1, 4], move || {
-            let device = Device::new_cuda(0)?;
-            let m = from_gguf_path(
-                &model_path,
-                &device,
-                Qwen35LoadOptions {
-                    int8mode: Some(int8mode),
-                    expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
-                    mtp_path: None,
-                    gate_donor_path: None,
-                },
-            )?;
-            // A gate that silently fell back to plain decode would still pass
-            // — speculation is lossless, so the only symptom is the speedup
-            // going away. Assert the drafter is really there.
-            assert!(
-                m.has_drafter(),
-                "the pinned 35B has no MTP head — the pin has moved off the \
+        let tok = tokenizer_json()?;
+        let device = Device::new_cuda(0)?;
+        speculative_gate(
+            "Qwen3.5-35B-A3B",
+            int8mode,
+            &[1, 4],
+            &tok,
+            MTP_MAX_DRAFT,
+            &device,
+            move || {
+                let device = Device::new_cuda(0)?;
+                let m = from_gguf_path(
+                    &model_path,
+                    &device,
+                    Qwen35LoadOptions {
+                        int8mode: Some(int8mode),
+                        expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
+                        mtp_path: None,
+                        gate_donor_path: None,
+                    },
+                )?;
+                // A gate that silently fell back to plain decode would still pass
+                // — speculation is lossless, so the only symptom is the speedup
+                // going away. Assert the drafter is really there.
+                assert!(
+                    m.has_drafter(),
+                    "the pinned 35B has no MTP head — the pin has moved off the \
                  -MTP-GGUF repo, or its conversion dropped the NextN tensors"
-            );
-            println!("✓ Model loaded\n");
-            Ok(m)
-        })
+                );
+                println!("✓ Model loaded\n");
+                Ok(m)
+            },
+        )
     }
 }

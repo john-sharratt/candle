@@ -53,6 +53,17 @@ impl Linear {
     pub fn from_weights(weight: QMatMul, bias: Option<Tensor>) -> Self {
         Self { weight, bias }
     }
+
+    /// Declare how this layer's activation stores its per-128 `Σx`, forwarding
+    /// to the inner weight — see [`candle::quantized::SumScale`].
+    ///
+    /// A model whose activations can overflow f16 on a block sum applies this to
+    /// every projection it builds; the default is the raw convention, so a model
+    /// that says nothing is unaffected.
+    pub fn with_sum_scale(mut self, sum_scale: candle::quantized::SumScale) -> Self {
+        self.weight = self.weight.with_sum_scale(sum_scale);
+        self
+    }
 }
 
 impl Module for Linear {
@@ -152,6 +163,14 @@ pub struct RmsNorm {
     weight: Arc<RwLock<Tensor>>,
     eps: f64,
     span: tracing::Span,
+    /// How the fused int8 path stores the per-128 `Σx` of the operand it emits —
+    /// see [`candle::quantized::SumScale`].
+    ///
+    /// On the norm rather than at the call site because this IS a producer: the
+    /// fused kernel writes the header, and whoever consumes the operand reads it
+    /// back through `Q8a128Operand::sum_scale`. [`SumScale::Raw`] is the default
+    /// and every language model's choice.
+    sum_scale: candle::quantized::SumScale,
 }
 
 /// Materialise `src` in `dtype`, taking the fused path when there is one.
@@ -197,7 +216,15 @@ impl RmsNorm {
             weight: Arc::new(RwLock::new(weight)),
             eps,
             span: tracing::span!(tracing::Level::TRACE, "rms-norm"),
+            sum_scale: candle::quantized::SumScale::default(),
         })
+    }
+
+    /// Declare the Σx convention this norm's fused int8 emit writes — see
+    /// [`candle::quantized::SumScale`]. The default is the raw form.
+    pub fn with_sum_scale(mut self, sum_scale: candle::quantized::SumScale) -> Self {
+        self.sum_scale = sum_scale;
+        self
     }
 
     /// Re-materialise the weight in the dtype activations will arrive in, if it
@@ -327,7 +354,14 @@ impl RmsNorm {
             candle::Device::Cuda(d) => d.clone(),
             _ => candle::bail!("RmsNorm::forward_dynamic(int8) requires a CUDA tensor"),
         };
-        let op = candle::quantized::cuda::rms_norm_q8a128(x, &weight, self.eps as f32, &dev, root)?;
+        let op = candle::quantized::cuda::rms_norm_q8a128(
+            x,
+            &weight,
+            self.eps as f32,
+            &dev,
+            root,
+            self.sum_scale,
+        )?;
         Ok(DynamicActs::Int8(op))
     }
 }

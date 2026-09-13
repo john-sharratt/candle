@@ -64,6 +64,13 @@ mod control {
 
     /// Isolated workspace (one-time substrate copy). `(workspace, needs_priming)`.
     /// `REPRIME=1` wipes it for a clean fresh baseline.
+    ///
+    /// **Copies the segment SET, not a single file.** The persistence layer
+    /// writes `.substrate/seg-*.log` plus one `seg-*.active`; `substrate.log` is
+    /// the legacy monolithic name, and opening a substrate that still has one
+    /// *renames* it to `seg-0000000001.log`. So a fixture that copied
+    /// `substrate.log` could only ever work against a substrate no current build
+    /// had opened, and silently produced an empty workspace otherwise.
     fn workspace() -> (PathBuf, bool) {
         let root = candle_root();
         let dst_root = root.join("target").join("reproject_control_ws");
@@ -71,10 +78,9 @@ mod control {
             let _ = std::fs::remove_dir_all(&dst_root);
         }
         let dst_sub = dst_root.join(".substrate");
-        let dst_log = dst_sub.join("substrate.log");
         let sentinel = dst_root.join(".control_primed");
 
-        if dst_log.exists() {
+        if segment_bytes(&dst_sub) > 0 {
             let primed = sentinel.exists();
             eprintln!(
                 "reusing substrate copy at {} (primed={primed})",
@@ -82,19 +88,57 @@ mod control {
             );
             return (dst_root, !primed);
         }
-        std::fs::create_dir_all(&dst_sub).unwrap();
         let src_sub = root.join(".substrate");
-        let src_log = src_sub.join("substrate.log");
+        let src_bytes = segment_bytes(&src_sub);
+        assert!(
+            src_bytes > 0,
+            "no source substrate at {} — this test reprojects a REAL conversation \
+             corpus and has nothing to reproject. It is not self-contained: build \
+             one by running the daemon in the repo root until it has sealed some \
+             turns, then re-run.",
+            src_sub.display(),
+        );
+        std::fs::create_dir_all(&dst_sub).unwrap();
         eprintln!(
             "one-time copy substrate {} ({} MB) -> {}",
-            src_log.display(),
-            std::fs::metadata(&src_log)
-                .map(|m| m.len() / 1_000_000)
-                .unwrap_or(0),
-            dst_log.display()
+            src_sub.display(),
+            src_bytes / 1_000_000,
+            dst_sub.display()
         );
-        std::fs::copy(&src_log, &dst_log).expect("copy substrate.log");
+        copy_segments(&src_sub, &dst_sub);
         (dst_root, true)
+    }
+
+    /// Bytes of segment files in a `.substrate` directory, 0 when there are none.
+    fn segment_bytes(sub: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(sub) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("seg-"))
+            })
+            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .sum()
+    }
+
+    /// Copy every segment file across. The sidecars (index, manifest) are
+    /// rebuilt by the recovery walk, so the log itself is the whole fixture.
+    fn copy_segments(src: &Path, dst: &Path) {
+        for entry in std::fs::read_dir(src)
+            .expect("read source substrate")
+            .flatten()
+        {
+            let name = entry.file_name();
+            let Some(n) = name.to_str() else { continue };
+            if !n.starts_with("seg-") {
+                continue;
+            }
+            std::fs::copy(entry.path(), dst.join(n)).unwrap_or_else(|e| panic!("copy {n}: {e}"));
+        }
     }
 
     #[test]

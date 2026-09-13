@@ -321,6 +321,8 @@ impl MtpHead {
             params,
             rows,
             decode_layout: true,
+            // The MTP head attends densely, like the trunk layer it mirrors.
+            qsa: None,
         }];
         // Runs BOTH halves — attention + residual, then ln2 + FFN + residual —
         // which is exactly the head's block, because the head's block is a

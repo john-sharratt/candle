@@ -20,7 +20,7 @@ use candle_nn::kv_cache::ModelGeometry;
 use super::config::Qwen35Config;
 use super::quantized_weights::QuantModel;
 use crate::models::batched_inference::{
-    BatchedConfig, BatchedInferenceSession, ProvenanceLayerIndices,
+    BatchedConfig, BatchedInferenceSession, KvLayers, ProvenanceLayerIndices,
 };
 use crate::models::delta_net::KvLayerMap;
 
@@ -139,8 +139,27 @@ pub fn provenance_layer_indices(
 /// wave and read only when drafting. See [`super::mtp`] for why the head is a
 /// layer of the model rather than a sidecar with a private cache.
 pub fn session_kv_layers(cfg: &Qwen35Config) -> candle::Result<usize> {
-    let kv_layers = KvLayerMap::new(&cfg.layer_kinds).num_kv_layers();
-    if kv_layers == 0 {
+    Ok(kv_layers(cfg)?.total())
+}
+
+/// Every KV layer this session allocates, the head's included, all of it
+/// **stream**.
+///
+/// The head's layer is not a [`KvLayers::draft`] layer even though a head
+/// writes it, and that is the deliberate design [`super::draft`] argues for:
+/// `head_wave_pass` runs over the same rows at the same positions in the same
+/// wave, so the layer always stands at the same length as its siblings. It is
+/// covered by the wave's own metadata — [`super::draft::HeadWave::kv_layer`]
+/// indexes straight into those slot headers — and every session-wide operation
+/// that assumes "a sequence's layers describe one stream at one length" (fork,
+/// view, prefix injection, turn sealing, truncation) keeps working without
+/// being told the head exists.
+///
+/// `draft` is for a head that has been loaded but does not yet step its layer,
+/// which is a state this model is not in.
+pub fn kv_layers(cfg: &Qwen35Config) -> candle::Result<KvLayers> {
+    let trunk = KvLayerMap::new(&cfg.layer_kinds).num_kv_layers();
+    if trunk == 0 {
         candle::bail!(
             "a stack with no attention layers has no KV to page — the recurrent \
              state store carries all of its history"
@@ -148,7 +167,7 @@ pub fn session_kv_layers(cfg: &Qwen35Config) -> candle::Result<usize> {
     }
     // The loader refuses anything but 0 or 1, so this is a count of heads, not
     // a schedule over them.
-    Ok(kv_layers + cfg.num_mtp_layers)
+    Ok(KvLayers::stream_only(trunk + cfg.num_mtp_layers))
 }
 
 /// The KV layer the MTP draft head writes, or `None` on a checkpoint without
@@ -184,7 +203,7 @@ pub fn create_session(
     config: BatchedConfig,
 ) -> candle::Result<BatchedInferenceSession> {
     BatchedInferenceSession::new(
-        session_kv_layers(cfg)?,
+        kv_layers(cfg)?,
         cfg.num_kv_heads,
         cfg.attn_head_dim,
         device,

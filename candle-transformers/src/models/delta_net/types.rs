@@ -56,3 +56,16 @@ impl DeltaNetDims {
         (self.conv_kernel - 1) * self.conv_dim()
     }
 }
+
+/// The activation of the mixer's output z-gate: `norm(o) ⊙ zgate(z)`.
+///
+/// The Qwen3.5/3.6/3.8-27B lineage gates with SiLU; Qwen3.8-Flash-Next
+/// (`qwen4exp`) gates with a plain sigmoid — llama.cpp's `qwen4exp.cpp` calls
+/// it "the one numerical difference from Qwen3.5's GDN". Everything else about
+/// the mixer is shared, so the gate is a parameter of the shared mixer rather
+/// than a fork of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZGate {
+    Silu,
+    Sigmoid,
+}

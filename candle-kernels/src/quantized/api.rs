@@ -188,6 +188,9 @@ extern "C" {
         weight_bytes: usize,
         force_mode2: i32,
         out_dtype: i32,
+        // The activation operand's `SumScale::as_code()` — 0 raw Σx, 1 Σx/amax.
+        // Read by the int8 dense path only; the FP kernels carry no q8a128 header.
+        sum_norm: i32,
     ) -> i32;
 
     /// Segmented qkv int8 dense matmul: one launch over a shared q8a128 activation × up to 3 KO
@@ -211,6 +214,8 @@ extern "C" {
         dst_stride: i32,
         mode2: i32,
         out_dtype: i32,
+        // The activation operand's `SumScale::as_code()` — 0 raw Σx, 1 Σx/amax.
+        sum_norm: i32,
     ) -> i32;
 
     /// Single-launch grouped matmul over all MoE expert tiles.
@@ -246,6 +251,10 @@ extern "C" {
         // KO rows only (the caller gates on `is_ko`). FP paths ignore it.
         n_sub: i32,
         row_fast: i32,
+        // The activation operand's `SumScale::as_code()` — 0 raw Σx, 1 Σx/amax.
+        // Read on `ytype == 3` (q8a128) only; the FP grouped kernels do not take
+        // it, and the launcher builds a shorter argument list for them.
+        sum_norm: i32,
     );
 
     /// Repack quantized weights to GEMX format (K/128 with embedded scales).

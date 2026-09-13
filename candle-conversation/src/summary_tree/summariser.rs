@@ -1,4 +1,4 @@
-//! The async summariser thread (`docs/immutable_summary_forest.md`).
+//! The async summariser thread (`docs/archived/immutable_summary_forest.md`).
 //!
 //! Spawned alongside the persistence thread at engine start.  Mirrors its
 //! trigger/tick/shutdown idiom.  Builds the per-timeline **append-only
@@ -135,8 +135,10 @@ impl SummariserThread {
 
     /// A disabled handle: spawns no thread. `trigger`/`trigger_handle().fire()`
     /// and `shutdown` are no-ops (the receivers are dropped, so sends fail
-    /// silently and there is no thread to join). Used when the engine is
-    /// configured with `disable_summariser`.
+    /// silently and there is no thread to join).
+    ///
+    /// **This is the only handle the engine builds** — the summariser is
+    /// disconnected (see `Engine::new`), so nothing spawns the real thread.
     pub fn disabled() -> Self {
         let (trigger_tx, _) = channel::bounded::<()>(1);
         let (shutdown_tx, _) = channel::bounded::<()>(1);
@@ -336,7 +338,7 @@ pub fn run_pass(
 ///    `SummaryOfSummaries` over them via additional probes.
 /// 4. Persist every change as `TreeMetadata` redo-log records.  Nodes are
 ///    immutable once written — no root pointer, no rotations, no dirty bit
-///    (`docs/immutable_summary_forest.md`).
+///    (`docs/archived/immutable_summary_forest.md`).
 /// `raw_tail` is how many of the timeline's newest Normal turns stay verbatim
 /// — production passes [`RAW_TAIL_TURNS`]; tests that exercise settledness and
 /// batching pass `0` so their small fixtures stay legible.
@@ -607,7 +609,7 @@ fn build_sos(
 
 /// Build at most one missing internal node toward the canonical ternary shape,
 /// clearing the reconcile hint once the forest is whole. One node per pass keeps
-/// reconciliation low-priority. See `docs/immutable_summary_forest.md`.
+/// reconciliation low-priority. See `docs/archived/immutable_summary_forest.md`.
 fn reconcile_pass(
     conversation: &Conversation,
     runner: &dyn ProbeRunner,
@@ -670,8 +672,33 @@ pub struct ChannelProbeRunner {
 }
 
 impl ChannelProbeRunner {
+    // Retained, uncalled: the engine no longer spawns the summariser, so nothing
+    // constructs a runner. This is the wiring point when that work resumes —
+    // deleting it would mean rediscovering how a probe reaches the scheduler.
+    #[allow(dead_code)]
     pub(crate) fn new(request_tx: Sender<SchedulerRequest>) -> Self {
         Self { request_tx }
+    }
+}
+
+/// How many summary probes the summariser submits per batch, chosen by total
+/// VRAM. Their decodes batch in the scheduler's wave loop, so a bigger card can
+/// keep more summaries in flight: 16 above 32 GB, 4 at or below (and on CPU,
+/// where there's no device VRAM to read).
+///
+/// Lives beside [`SummariserThread::spawn`], the only caller it ever had, now
+/// that the engine no longer spawns the summariser — the sizing belongs with the
+/// thread it sizes rather than stranded in engine startup.
+pub fn summary_probe_concurrency(device: &candle::Device) -> usize {
+    const VRAM_32_GIB: usize = 32 * 1024 * 1024 * 1024;
+    let total_vram = match device {
+        candle::Device::Cuda(d) => d.mem_get_info().map(|(_free, total)| total).unwrap_or(0),
+        _ => 0,
+    };
+    if total_vram > VRAM_32_GIB {
+        16
+    } else {
+        4
     }
 }
 
@@ -810,6 +837,10 @@ mod tests {
         conversation
             .write()
             .register_timeline(timeline, layer, group);
+        // The summariser is disconnected in production, so no timeline enqueues
+        // by default. These tests cover the machinery itself, which is retained
+        // — they turn the gate on for their own timeline.
+        conversation.write().set_timeline_summarize(timeline, true);
         (conversation, timeline)
     }
 
@@ -906,11 +937,37 @@ mod tests {
 
     /// A timeline with `summarize = false` — the gate set for utility/reference
     /// layers (repo_map, code_reading) — must not enqueue its sealed turns onto
-    /// the pending-summary queue, so the summariser never touches them. A
-    /// timeline left at the default (`true`) does enqueue.
+    /// the pending-summary queue, so the summariser never touches them.
+    ///
+    /// **The default is now OFF for every timeline**: the summariser is
+    /// disconnected (see `Engine::new`), so a freshly registered timeline
+    /// enqueues nothing until something explicitly opts it in. That is the
+    /// property this asserts first — production must never accumulate a queue
+    /// nothing drains — with the gate then turned on to show the mechanism is
+    /// intact and still refuses when set false.
     #[test]
     fn summarize_gate_off_skips_pending_enqueue() {
         let tmp = ephemeral_workspace();
+
+        // A bare registered timeline: no opt-in, nothing enqueued. (Note
+        // `fresh_conversation` opts in for the machinery tests, so this builds
+        // its own timeline to observe the true production default.)
+        let conv0 = Conversation::ephemeral();
+        let alloc = crate::projection::TimelineAllocator::new();
+        let bare = alloc.next();
+        conv0.write().register_timeline(
+            bare,
+            crate::projection::LayerId::for_test(1),
+            crate::projection::GroupId::for_test(1),
+        );
+        let _b0 = conv0.write().append_with_blocks(bare, 10, 0, 1);
+        assert_eq!(
+            conv0.pending_summary_len(bare),
+            0,
+            "the summariser is disconnected: a timeline must not enqueue by default"
+        );
+
+        // Explicitly off stays off.
         let (conv, timeline) = fresh_conversation(tmp.path());
         conv.write().set_timeline_summarize(timeline, false);
         let _n0 = conv.write().append_with_blocks(timeline, 10, 0, 1);
@@ -920,12 +977,13 @@ mod tests {
             "summarize=false must not enqueue pending summaries"
         );
 
+        // Explicitly on enqueues — the mechanism is retained, not removed.
         let (conv2, timeline2) = fresh_conversation(tmp.path());
         let _m0 = conv2.write().append_with_blocks(timeline2, 10, 0, 1);
         assert_eq!(
             conv2.pending_summary_len(timeline2),
             1,
-            "default summarize=true must enqueue"
+            "summarize=true must still enqueue"
         );
     }
 

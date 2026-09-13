@@ -17,6 +17,7 @@ use super::types::MoeInput;
 use crate::models::profile::{profile_now, ProfileAccumulator};
 use candle::cuda_backend::wave_provenance::{LeaseOrigin, WaveTicket};
 use candle::cuda_backend::Backing;
+use candle::quantized::SumScale;
 use candle::{Result, Tensor};
 #[cfg(not(feature = "cuda"))]
 use candle_nn::Module;
@@ -86,6 +87,48 @@ pub(crate) fn extract_weight_info(
     }
 }
 
+/// Define `ys` as all-zero when no expert compute will run.
+///
+/// The scatter is a **define**, not an accumulate: it stores every
+/// `(token, column)` it is responsible for, which is why callers hand
+/// [`compute_experts_grouped`] an uninitialised target and why hot-path
+/// invariant 6 is satisfied on the normal path. On a path where the scatter does
+/// not launch, that same reasoning is what makes the target dangerous — nothing
+/// writes it, and its contents are whatever the arena last held.
+///
+/// Zeroing in place rather than rebinding `*ys` keeps the caller's allocation:
+/// on the wave path the target is ticketed arena memory, and swapping in a
+/// freshly-allocated tensor would hand back a buffer the wave allocator did not
+/// issue and cannot account for.
+#[cfg(feature = "cuda")]
+fn define_empty_output(ys: &mut Tensor) -> Result<()> {
+    use candle::cuda_backend::cudarc::driver::result::memset_d8_async;
+    use candle::Storage;
+
+    let bytes = ys.elem_count() * ys.dtype().size_in_bytes();
+    if bytes == 0 {
+        return Ok(());
+    }
+    let candle::Device::Cuda(cuda) = ys.device().clone() else {
+        candle::bail!("grouped expert compute requires CUDA device");
+    };
+    let (storage, layout) = ys.storage_and_layout();
+    if !layout.is_contiguous() {
+        candle::bail!("the grouped expert output is contiguous by construction");
+    }
+    let Storage::Cuda(c) = &*storage else {
+        candle::bail!("grouped expert compute: expected CUDA storage for the output");
+    };
+    let stream = cuda.cuda_stream();
+    let base =
+        c.slice.device_ptr(&stream) + (layout.start_offset() * ys.dtype().size_in_bytes()) as u64;
+    // SAFETY: `base` names `bytes` of this tensor's own contiguous storage, and
+    // the fill is stream-ordered ahead of every reader of `ys`.
+    unsafe { memset_d8_async(base, 0, bytes, stream.cu_stream()) }
+        .map_err(|e| candle::Error::Msg(format!("zeroing an unrouted expert output: {e}")))?;
+    Ok(())
+}
+
 /// Grouped expert SwiGLU: processes all experts in 3 grouped matmul launches.
 ///
 /// Instead of looping over experts and launching separate kernels for each,
@@ -99,7 +142,14 @@ pub(crate) fn extract_weight_info(
 ///
 /// # Arguments
 /// * `xs` — input activations `[num_tokens, hidden_dim]`
-/// * `ys` — output tensor to accumulate into (modified in-place)
+/// * `ys` — output tensor, **fully defined by this call** (modified in-place).
+///   Allocate it uninitialised: the deterministic scatter stores every
+///   `(token, column)`, so zeroing it first writes the exact bytes the kernel
+///   overwrites. When no scatter runs — an empty expert list, or a non-empty one
+///   whose experts carry no tokens — [`define_empty_output`] zeroes the target
+///   instead, so the guarantee holds on every return path and a caller never has
+///   to work out which one it took. A caller that *skips* this function
+///   entirely still owes its own target a zero.
 /// * `experts` — slice of `(slot, token_ids, weight_ids)` for each expert
 /// * `weights_flat` — GPU-resident routing weights `[num_tokens * k]`
 ///
@@ -120,7 +170,7 @@ pub fn compute_experts_grouped(
     wave: Option<WaveTicket>,
 ) -> Result<()> {
     if experts.is_empty() {
-        return Ok(());
+        return define_empty_output(ys);
     }
 
     // Device from the output tensor — a q8a128 `input` carries no device.
@@ -152,7 +202,12 @@ pub fn compute_experts_grouped(
 
     let total_batch = all_token_ids.len();
     if total_batch == 0 {
-        return Ok(());
+        // Experts were routed but none carries a token, so the scatter below
+        // never runs and would leave `ys` holding whatever the allocator
+        // returned. This is NOT the caller's `experts.is_empty()` case — the
+        // list is non-empty here, so a caller checking that guard has already
+        // decided to call and is entitled to a defined output.
+        return define_empty_output(ys);
     }
 
     // **Both id tables are device indices, so they are checked here — before the
@@ -170,7 +225,7 @@ pub fn compute_experts_grouped(
     // synchronises.
     //
     // Refusing here costs one pass over a few thousand `u32`s against a kernel
-    // launch that cannot be undone (`docs/elastic_vram_partition.md`
+    // launch that cannot be undone (`docs/archived/elastic_vram_partition.md`
     // principle 7). The ids come from routing, and this engine has already had
     // one degenerate-routing fault — `moe_route` leaking a `bi = n_experts`
     // sentinel on `-inf`/NaN logits — whose clamp fixed the symptom while the
@@ -428,7 +483,16 @@ pub fn compute_experts_grouped(
             // B4: fused SwiGLU → q8a128 (silu(gate)·up quantized in one kernel), feeds the down GEMM.
             let t = profile_now();
             let inter_acts =
-                silu_mul_q8a128(&gate_out, &up_out, cuda_dev, gate_out.cuda_backing())?;
+                // Raw Σx — a language model's SwiGLU intermediate stays orders
+                // of magnitude below f16's 65504; the consumer below reads this
+                // operand's own `sum_scale`, so the two agree by construction.
+                silu_mul_q8a128(
+                    &gate_out,
+                    &up_out,
+                    cuda_dev,
+                    gate_out.cuda_backing(),
+                    SumScale::Raw,
+                )?;
             profile.record("gemm_silu_mul", t);
             let t = profile_now();
             let down_out = grouped_qmatmul(
@@ -447,6 +511,77 @@ pub fn compute_experts_grouped(
             // pass per expert group per layer to hand the kernel a type it does
             // not want. `fused_deterministic_scatter` validates rather than
             // converts, and says so by name.
+            down_out
+        }
+        // A Float input against a KO pack: the KO twins are int8-MMA formats
+        // with no float GEMM loader, so the rows are gathered as float and the
+        // stacked block quantized ONCE into the q8a128 operand the int8
+        // grouped path consumes. This is gather-then-quantize — one extra
+        // launch per layer against the byte-gather above, which is reserved
+        // for hidden widths that tile the q8a1024 row layout (2560 does not).
+        MoeInput::Float(xs) if gate_dtype.is_ko() => {
+            use candle::quantized::cuda::{
+                grouped_qmatmul, silu_mul_q8a128, to_dynamic, DynamicActs, DynamicTensor,
+            };
+            use candle::quantized::Int8Mode;
+            let t = profile_now();
+            let stacked_xs =
+                candle::quantized::cuda::fused_moe_gather(xs, &tok_ids_dev, total_batch, cuda_dev)?;
+            // Raw Σx — a language model's block sums stay far below f16's ceiling.
+            let stacked_q8 =
+                match to_dynamic(&stacked_xs, Int8Mode::Precision, cuda_dev, SumScale::Raw)? {
+                    DynamicActs::Int8(op) => op,
+                    DynamicActs::Float(_) => {
+                        candle::bail!("q8a128 activation quantize returned a non-int8 operand")
+                    }
+                };
+            profile.record("gemm_gather", t);
+            let t = profile_now();
+            let gate_out = grouped_qmatmul(
+                DynamicTensor::Int8(&stacked_q8),
+                &gate_ptrs,
+                gate_dtype,
+                gate_nrows,
+                &expert_offsets,
+                cuda_dev,
+                stacked_q8.backing(),
+            )?;
+            profile.record("gemm_gate", t);
+            let t = profile_now();
+            let up_out = grouped_qmatmul(
+                DynamicTensor::Int8(&stacked_q8),
+                &up_ptrs,
+                gate_dtype, // up shares gate's KO dtype
+                gate_nrows,
+                &expert_offsets,
+                cuda_dev,
+                stacked_q8.backing(),
+            )?;
+            profile.record("gemm_up", t);
+            let t = profile_now();
+            let inter_acts =
+                // Raw Σx — a language model's SwiGLU intermediate stays orders
+                // of magnitude below f16's 65504; the consumer below reads this
+                // operand's own `sum_scale`, so the two agree by construction.
+                silu_mul_q8a128(
+                    &gate_out,
+                    &up_out,
+                    cuda_dev,
+                    gate_out.cuda_backing(),
+                    SumScale::Raw,
+                )?;
+            profile.record("gemm_silu_mul", t);
+            let t = profile_now();
+            let down_out = grouped_qmatmul(
+                DynamicTensor::Int8(&inter_acts),
+                &down_ptrs,
+                down_dtype,
+                down_nrows,
+                &expert_offsets,
+                cuda_dev,
+                inter_acts.backing(),
+            )?;
+            profile.record("gemm_down", t);
             down_out
         }
         MoeInput::Float(xs) => {
