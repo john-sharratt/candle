@@ -687,10 +687,11 @@ async fn post_reflect(
             "this daemon has no engine",
         );
     };
-    // The decodes run on the engine thread. Off the async executor, because a
-    // blocking model call on a tokio worker stalls every other route.
-    let out = tokio::task::spawn_blocking(move || {
-        rt.reflect(
+    // Awaited directly: the decodes yield on their turn channels, so the
+    // route parks a future rather than a worker — and a client that
+    // disconnects drops it, which stops the decode it was waiting on.
+    let out = rt
+        .reflect(
             npc_id,
             situation.as_deref(),
             &inner,
@@ -698,19 +699,13 @@ async fn post_reflect(
             domain.as_deref(),
             &axes,
         )
-    })
-    .await;
+        .await;
 
     match out {
-        Ok(Ok(r)) => Json(r).into_response(),
-        Ok(Err(e)) => err(
+        Ok(r) => Json(r).into_response(),
+        Err(e) => err(
             StatusCode::SERVICE_UNAVAILABLE,
             "reflect_failed",
-            &format!("{e}"),
-        ),
-        Err(e) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "reflect_panicked",
             &format!("{e}"),
         ),
     }
@@ -756,6 +751,9 @@ async fn create_npc(
                 if let Some(id) = v.get("npc_id").and_then(npc_id_of) {
                     let world_ms = s.world_ms(id).await;
                     rt.scheduler.wake(id, 0, world_ms);
+                    // And its task with it — waking puts the inbox in the
+                    // scheduler; the task is what waits on it and thinks.
+                    rt.spawn_character(id);
                     tracing::info!("npc {id}: created and woken");
 
                     // And given a body, if its world has anywhere to stand. A
@@ -1266,6 +1264,10 @@ async fn delete_npc(
             // the persona source returns `None`, so it thinks about nothing for
             // ever, and its conversation is never retired.
             if let Some(rt) = s.runtime.as_ref() {
+                // The task first: aborting it drops whatever turn it was
+                // awaiting, which stops that decode, and `retire` wakes a task
+                // that was parked so it finds its inbox gone and exits.
+                rt.stop_character(npc_id);
                 rt.scheduler.retire(npc_id);
                 // And what its body was waiting on, or a world running for a
                 // week keeps a row per act for every character it ever had.
@@ -1281,8 +1283,9 @@ async fn delete_npc(
                 if let Some((hosted, body)) = rt.body_of(npc_id) {
                     hosted.with_sim(|s| s.ledger.forget_questions(&body));
                 }
-                if let Some(minds) = rt.minds.read().unwrap().as_ref() {
-                    minds.retire_npc(npc_id);
+                let minds = rt.minds.read().unwrap().clone();
+                if let Some(minds) = minds {
+                    minds.retire_npc(npc_id).await;
                 }
             }
             StatusCode::NO_CONTENT.into_response()

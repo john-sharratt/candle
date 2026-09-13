@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crossbeam::channel::{bounded, Receiver, Sender};
+use flume::{bounded, Receiver, Sender};
 
 use super::progress::{GuestEvent, GuestSink};
 use super::work::{Guest, GuestError, GuestOutcome, GuestRequest};
@@ -53,11 +53,14 @@ impl Pending {
     /// once-ness moved to [`super::drain`], which tracks what it has answered
     /// and reports a job the guest never answered for.
     ///
-    /// A second send is harmless in itself — the receiver reads the first and
-    /// the channel drops the rest — so this is a weaker guarantee, not an unsafe
-    /// one.
+    /// `try_send`, never `send`: the reply channel is `bounded(1)`, so a
+    /// blocking send of a second answer to a caller that has not yet read the
+    /// first would park the thread making it — and this is called from the
+    /// scheduler's drain, where a parked thread is the whole engine stopped.
+    /// A second answer is dropped instead, which makes the weaker once-ness
+    /// guarantee above safe rather than merely likely.
     pub fn answer(&self, outcome: Result<GuestOutcome, GuestError>) {
-        let _ = self.reply.send(outcome);
+        let _ = self.reply.try_send(outcome);
     }
 
     /// Tell a watching caller what is happening. Nothing when none is.
@@ -92,6 +95,15 @@ impl GuestReceipt {
     /// layer, where cancelling is free.
     pub fn wait(self) -> Result<GuestOutcome, GuestError> {
         self.rx.recv().unwrap_or(Err(GuestError::Abandoned))
+    }
+
+    /// Await the job without holding a thread — [`Self::wait`]'s async
+    /// counterpart, with the same deliberately unbounded wait.
+    pub async fn wait_async(self) -> Result<GuestOutcome, GuestError> {
+        self.rx
+            .recv_async()
+            .await
+            .unwrap_or(Err(GuestError::Abandoned))
     }
 
     /// The answer if it is ready, without blocking.
@@ -236,6 +248,7 @@ impl GuestQueue {
 mod tests {
     use super::*;
     use crate::guest::work::{GuestImage, ImageLora, ImageRequest, MatteRequest};
+    use futures::executor::block_on;
 
     fn image() -> GuestRequest {
         GuestRequest::Image(ImageRequest {
@@ -265,6 +278,26 @@ mod tests {
             png: vec![1, 2, 3],
             seed: 7,
         })
+    }
+
+    /// `wait_async` is `wait` without the parked thread: the same answer
+    /// arrives on the same one-shot, and a queue that closes under a waiting
+    /// caller still answers `Abandoned` rather than hanging.
+    #[test]
+    fn a_receipt_can_be_awaited_instead_of_waited_on() {
+        let q = GuestQueue::new();
+        let r = q.submit(image()).unwrap();
+        q.take(Guest::Image)
+            .into_iter()
+            .next()
+            .unwrap()
+            .answer(Ok(an_image()));
+        let outcome = block_on(r.wait_async()).unwrap();
+        assert_eq!(outcome.guest(), Guest::Image);
+
+        let r = q.submit(image()).unwrap();
+        q.close();
+        assert_eq!(block_on(r.wait_async()), Err(GuestError::Abandoned));
     }
 
     #[test]

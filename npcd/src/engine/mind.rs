@@ -32,10 +32,13 @@
 //! # Locking
 //!
 //! The map of live conversations and a live conversation are two locks, taken in
-//! that order and never together for long. A decode is seconds; the map is what
-//! [`Minds::resident`] and every Pulse header read. Holding the map across the
-//! decode — which it used to — stalled the whole daemon behind whichever
-//! character happened to be thinking, on tokio worker threads.
+//! that order and never together for long. The map is a `std` mutex, locked for
+//! a lookup and released — it is what [`Minds::resident`] and every Pulse header
+//! read, and nothing awaits under it. Each conversation is a `tokio` mutex whose
+//! guard is *built* to live across an await: a decode is seconds, and the
+//! character's own task holds its conversation for exactly that span while every
+//! other character's decode proceeds beside it. One turn at a time per character
+//! is the guard's job; one character at a time was the old driver's, and is gone.
 //!
 //! # Why the sequence is windowed as well
 //!
@@ -45,9 +48,10 @@
 //! decides what is relevant, and only a bounded tail is carried verbatim. Both
 //! bounds are deliberate and neither is the other's fallback.
 
-use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
+
+use tokio::sync::Mutex as ConversationLock;
 
 use candle_conversation::projection::{Builder, GroupId, LayerId, TimelineId};
 use candle_conversation::stencil::{
@@ -70,6 +74,7 @@ use crate::engine::reflect;
 use crate::engine::retention;
 use crate::engine::schema::ReflectionTurns;
 use crate::engine::sleep::conversation_id;
+use crate::engine::throwaway::Throwaway;
 use crate::engine::tools::{self, for_mode, Mode};
 use crate::engine::window::{Speaker, Window};
 
@@ -177,10 +182,14 @@ pub struct Minds {
     /// substrate step — before the projection is parsed — so a slow start still
     /// answers its routes. `None` for a daemon with no mind: its characters
     /// think under the rendered prompt.
-    projection: RwLock<Option<Projected>>,
-    /// Each conversation behind its own lock, so a decode holds only the
+    ///
+    /// Behind an `Arc` so a reader clones the handle out and lets the lock go
+    /// before any await — a `RwLock` guard held across a decode would pin the
+    /// whole cast's schema reads behind one turn.
+    projection: RwLock<Option<Arc<Projected>>>,
+    /// Each conversation behind its own async lock, so a decode holds only the
     /// character that is thinking — see the module's *Locking* note.
-    live: Mutex<HashMap<u64, Arc<Mutex<Live>>>>,
+    live: Mutex<HashMap<u64, Arc<ConversationLock<Live>>>>,
     /// How many turns stay verbatim in the redo log, or `None` to keep them all.
     ///
     /// **Off unless the projection asks for it**, because most conversations are
@@ -520,7 +529,13 @@ impl Minds {
             projected.prompt.len()
         );
         self.warm_dreams(&projected);
-        *self.projection.write().unwrap() = Some(projected);
+        *self.projection.write().unwrap() = Some(Arc::new(projected));
+    }
+
+    /// The installed schema, cloned out so no lock outlives this call — the
+    /// shape every await-crossing reader of the projection uses.
+    fn projected(&self) -> Option<Arc<Projected>> {
+        self.projection.read().unwrap().as_ref().map(Arc::clone)
     }
 
     /// Every layer of the mind's projection, with how much of each this
@@ -614,7 +629,7 @@ impl Minds {
     /// `projected` chooses which assembly is under test: the mind's schema, or
     /// the rendered prompt. Both are real paths a character can run under and
     /// the point of the probe is to compare them.
-    pub fn probe(
+    pub async fn probe(
         &self,
         persona: &Persona<'_>,
         mode: Mode,
@@ -627,10 +642,9 @@ impl Minds {
         let mut cfg = self.base_config.clone();
         cfg.context_window_turns = CONTEXT_WINDOW_TURNS;
 
-        let guard = self.projection.read().unwrap();
-        let under = guard.as_ref().filter(|_| projected);
+        let under = self.projected().filter(|_| projected);
         let ran_projected = under.is_some();
-        let (mut sequence, prompt, selection) = match under {
+        let (mut sequence, prompt, selection) = match under.as_deref() {
             Some(p) => {
                 let sel = p.identities.selection_for(
                     // No npc id — a probe is nobody, so it reads the generic
@@ -670,7 +684,12 @@ impl Minds {
                 (seq, system, identity::deliberation(thinking))
             }
         };
-        drop(guard);
+
+        // Retired rather than left standing, however this request ends — a
+        // probe that accumulated a timeline per run would fill the log with
+        // conversations nobody can attribute, and a console that stops
+        // polling drops this future mid-decode, where only a drop guard runs.
+        let _retired = Throwaway::new(&self.engine, sequence.timeline_id(), "probe");
 
         // The acts this turn can take, and only those — the same set, under the
         // same mode, the grammar below is compiled from. See `compile_act_loop`.
@@ -683,13 +702,10 @@ impl Minds {
             assistant_prefill: self.opening(thinking),
             ..Default::default()
         };
-        let response = sequence.send_turn_with_options(perception, options)?;
+        let response = sequence
+            .send_turn_with_options_async(perception, options)
+            .await?;
         let raw = response.text.clone();
-        // Retired rather than left standing: a probe that accumulated a timeline
-        // per run would fill the log with conversations nobody can attribute.
-        if let Ok(e) = self.engine.lock() {
-            let _ = e.tombstone_timeline(sequence.timeline_id());
-        }
 
         Ok(Probe {
             parsed: act::parse(&raw),
@@ -908,7 +924,7 @@ impl Minds {
     /// throwaway timeline, and a character mid-decode is not waited on because
     /// there is nothing here they share.
     #[allow(clippy::too_many_arguments)]
-    pub fn reflect(
+    pub async fn reflect(
         &self,
         npc_id: u64,
         persona: &Persona<'_>,
@@ -918,14 +934,14 @@ impl Minds {
         feeling: &str,
         domain: &str,
         sampled_axes: &[String],
-        on_reflection: &mut dyn FnMut(&str) -> bool,
+        on_reflection: &mut (dyn FnMut(&str) -> bool + Send),
     ) -> anyhow::Result<reflect::Reflection> {
         // The mind's schema, so a reflection opens against the same sections a
         // live conversation does. Without it the two prompts are built by
         // different code and drift apart section by section — which is exactly
         // what had happened: the reflection's frame named none of the schema's
         // sections and carried none of its collections.
-        let projected = self.projection.read().unwrap();
+        let projected = self.projected();
         let turns = self.reflection.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "this mind declares no `reflection` block, so there are no turns to send — \
@@ -934,7 +950,7 @@ impl Minds {
             )
         })?;
         reflect::Reflect::new(Arc::clone(&self.engine), self.base_config.clone(), turns)
-            .under(projected.as_ref())
+            .under(projected.as_deref())
             .run(
                 npc_id,
                 persona,
@@ -946,6 +962,7 @@ impl Minds {
                 sampled_axes,
                 on_reflection,
             )
+            .await
     }
 
     /// Dream a brief and keep the dream — see [`crate::engine::dreams`].
@@ -955,26 +972,27 @@ impl Minds {
     /// and written, a line to a turn, into one of its own on the dream layer.
     /// Nothing here touches [`Self::live`], so a character mid-decode is not
     /// waited on.
-    pub fn dream(
+    pub async fn dream(
         &self,
         npc_id: u64,
         persona: &Persona<'_>,
         brief: &str,
         assumption: &str,
     ) -> anyhow::Result<dreams::Kept> {
-        let projected = self.projection.read().unwrap();
-        let p = projected
-            .as_ref()
+        let p = self
+            .projected()
             .ok_or_else(|| anyhow::anyhow!("no schema, so no dream layer to keep a dream in"))?;
-        let story = dreams::dream(&self.engine, &self.base_config, p, npc_id, persona, brief)?;
+        let story =
+            dreams::dream(&self.engine, &self.base_config, &p, npc_id, persona, brief).await?;
         dreams::keep(
             &self.engine,
             &self.base_config,
-            p,
+            &p,
             npc_id,
             assumption,
             &story,
         )
+        .await
     }
 
     /// A sample of the axes this character has dreamt along — see
@@ -1229,7 +1247,7 @@ impl Minds {
     // bundle rather than the axes and hide that every caller must supply all of
     // them — which is the property that matters.
     #[allow(clippy::too_many_arguments)]
-    pub fn think(
+    pub async fn think(
         &self,
         npc_id: u64,
         persona: &Persona<'_>,
@@ -1241,34 +1259,48 @@ impl Minds {
     ) -> anyhow::Result<Thought> {
         let mut thought = Thought::default();
 
-        // The map is held only long enough to find or open this character's
-        // conversation; the decode below runs under the conversation's own lock.
-        let conversation = {
-            let mut live = self.live.lock().unwrap();
-
-            // The day boundary. Checked here rather than on a timer because a
-            // timer fires on host-elapsed time and would be wrong the moment the
-            // narrative clock is paused, jumped or re-paced — all of which the
-            // console can do at any moment.
-            if let Some(existing) = live.get(&npc_id) {
-                let from = existing.lock().unwrap().day;
-                if from != day {
-                    // Tombstone, not delete. The turns stay in the redo log; what
-                    // changes is that they stop being selected by default.
-                    if let Some(l) = live.remove(&npc_id) {
-                        retire(&self.engine, &l.lock().unwrap());
+        // Find or open this character's conversation. The map is a `std` lock
+        // held only for a lookup; the open — scheduler round trips — happens
+        // between locks. That gap admits no race: only this character's own
+        // task ever opens or replaces its conversation, so the entry cannot
+        // change hands while the map is unlocked.
+        let existing = self.live.lock().unwrap().get(&npc_id).map(Arc::clone);
+        let conversation = match existing {
+            Some(current) => {
+                // The day boundary. Checked here rather than on a timer because
+                // a timer fires on host-elapsed time and would be wrong the
+                // moment the narrative clock is paused, jumped or re-paced —
+                // all of which the console can do at any moment.
+                let from = current.lock().await.day;
+                if from == day {
+                    current
+                } else {
+                    // Tombstone, not delete. The turns stay in the redo log;
+                    // what changes is that they stop being selected by default.
+                    let gone = self.live.lock().unwrap().remove(&npc_id);
+                    if let Some(l) = gone {
+                        retire(&self.engine, &*l.lock().await);
                     }
                     thought.rolled_over = Some((from, day));
+                    let opened = Arc::new(ConversationLock::new(
+                        self.open_conversation(npc_id, day, persona, mode)?,
+                    ));
+                    self.live
+                        .lock()
+                        .unwrap()
+                        .insert(npc_id, Arc::clone(&opened));
+                    opened
                 }
             }
-
-            // Opened through the vacant entry rather than `contains_key` + `insert`,
-            // so the map is probed once and the borrow below cannot miss.
-            match live.entry(npc_id) {
-                Entry::Occupied(e) => Arc::clone(e.get()),
-                Entry::Vacant(slot) => Arc::clone(slot.insert(Arc::new(Mutex::new(
+            None => {
+                let opened = Arc::new(ConversationLock::new(
                     self.open_conversation(npc_id, day, persona, mode)?,
-                )))),
+                ));
+                self.live
+                    .lock()
+                    .unwrap()
+                    .insert(npc_id, Arc::clone(&opened));
+                opened
             }
         };
 
@@ -1280,7 +1312,7 @@ impl Minds {
         // again. A fat batch is one better-informed thinking step rather than
         // several thrashing ones — the mind design is explicit that this is
         // what a busy character should get.
-        let answers = std::mem::take(&mut conversation.lock().unwrap().pending);
+        let answers = std::mem::take(&mut conversation.lock().await.pending);
         let perception = compose(&answers, events, window);
         // **The act stencil is armed here, not hoped for.** `act::parse` reads
         // the decode, and what it reads is a grammar's output rather than a
@@ -1343,8 +1375,14 @@ impl Minds {
             ..Default::default()
         };
         let (response, timeline, watermark) = {
-            let mut live = conversation.lock().unwrap();
-            let response = live.sequence.send_turn_with_options(&perception, options)?;
+            // The async guard is DESIGNED to live across this await (module
+            // *Locking* note): it is what makes one turn at a time per
+            // character true while the rest of the cast decodes concurrently.
+            let mut live = conversation.lock().await;
+            let response = live
+                .sequence
+                .send_turn_with_options_async(&perception, options)
+                .await?;
             // **Whether a dream reached this turn**, said in the log whenever
             // one did. A dream is only worth having if it comes back, and it
             // comes back by winning the gather rather than by being pasted in —
@@ -1388,7 +1426,10 @@ impl Minds {
         // engine lock to write, and holding both would put every other
         // character's decode behind this one's bookkeeping.
         if let Some(keep) = self.keep_turns {
-            if let Ok(engine) = self.engine.lock() {
+            // The engine guard lives inside this block and is gone before the
+            // await below — a `!Send` guard held across an await would pin the
+            // whole character task to one thread.
+            let settled = self.engine.lock().ok().map(|engine| {
                 // **The substrate's count, not the sequence's.**
                 //
                 // `Sequence::turn_count` counts a user and an assistant message
@@ -1400,10 +1441,10 @@ impl Minds {
                 // last real turn, retiring the whole conversation. `keep_turns:
                 // 64` came to mean keep nothing.
                 let depth = engine.timeline_turn_count(timeline);
-                let (through, retired) =
-                    retention::retire_expired(&engine, timeline, depth, keep, watermark);
-                drop(engine);
-                conversation.lock().unwrap().retired_through = through;
+                retention::retire_expired(&engine, timeline, depth, keep, watermark)
+            });
+            if let Some((through, retired)) = settled {
+                conversation.lock().await.retired_through = through;
                 thought.retired = retired;
             }
         }
@@ -1422,15 +1463,15 @@ impl Minds {
     /// outcomes exist. A character with no live conversation is a no-op rather
     /// than an error: it has no turn for them to ride on, so there is nothing
     /// to hold them against.
-    pub fn deliver_outcomes(&self, npc_id: u64, outcomes: Vec<String>) {
+    pub async fn deliver_outcomes(&self, npc_id: u64, outcomes: Vec<String>) {
         if outcomes.is_empty() {
             return;
         }
         // Cloned out of the map before locking the conversation, so a character
-        // mid-decode is waited on without the map held behind it.
+        // mid-decode is awaited without the map held behind it.
         let live = self.live.lock().unwrap().get(&npc_id).map(Arc::clone);
         if let Some(l) = live {
-            l.lock().unwrap().pending.extend(outcomes);
+            l.lock().await.pending.extend(outcomes);
         }
     }
 
@@ -1441,13 +1482,13 @@ impl Minds {
     /// — the cast is meant to still be there when it starts again. Retiring here
     /// would make [`Minds::open_conversation`]'s rejoin unreachable, since the
     /// lookup it runs on excludes tombstoned timelines by design.
-    pub fn retire_npc(&self, npc_id: u64) {
+    pub async fn retire_npc(&self, npc_id: u64) {
         // Taken out of the map first, then locked: a character mid-decode is
-        // waited on rather than tombstoned underneath, and the map is free for
+        // awaited rather than tombstoned underneath, and the map is free for
         // everyone else while we wait.
         let gone = self.live.lock().unwrap().remove(&npc_id);
         if let Some(l) = gone {
-            retire(&self.engine, &l.lock().unwrap());
+            retire(&self.engine, &*l.lock().await);
         }
     }
 }

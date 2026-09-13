@@ -566,29 +566,30 @@ pub async fn post_generate(
     // throwaway conversation on the resident model — the same path `/narrate`
     // takes for a single node — so the whole life is written in one voice.
     //
-    // Built here because this is where both halves are in scope: the state the
-    // engine hangs off, and a runtime handle to submit from. A job owns a plain
-    // OS thread with no runtime under it, so the handle is captured now and the
-    // thread blocks on it — `Handle::block_on` off-runtime is exactly this case.
+    // A future per node, because a rung's fan-out awaits a whole wave of them
+    // concurrently: the engine co-batches whatever is submitted together, so a
+    // wave of thirty months is one load of the checkpoint and thirty decodes.
     let state = Arc::clone(&s);
-    let handle = tokio::runtime::Handle::current();
-    let narrate: Narrator = Arc::new(move |system: &str, user: &str| {
-        let request = prose::Request {
-            system: system.to_string(),
-            prompt: user.to_string(),
-            max_tokens: LADDER_MAX_TOKENS,
-            temperature: Some(LADDER_TEMPERATURE),
-            seed: None,
-            // Prose, not a decision — nothing to constrain it to.
-            choices: None,
-        };
-        handle
-            .block_on(prose::run(&state, request))
-            .map(|a| a.text)
-            .map_err(|e| e.to_string())
+    let narrate: Narrator = Arc::new(move |system: String, user: String| {
+        let state = Arc::clone(&state);
+        Box::pin(async move {
+            let request = prose::Request {
+                system,
+                prompt: user,
+                max_tokens: LADDER_MAX_TOKENS,
+                temperature: Some(LADDER_TEMPERATURE),
+                seed: None,
+                // Prose, not a decision — nothing to constrain it to.
+                choices: None,
+            };
+            prose::run(&state, request)
+                .await
+                .map(|a| a.text)
+                .map_err(|e| e.to_string())
+        })
     });
 
-    // Read once, here, where the registry is: the ladder runs on its own thread
+    // Read once, here, where the registry is: the ladder runs as its own task
     // and a personality is an authored document an operator can edit mid-run,
     // so the voice a phase writes against is the one it started with.
     let voice = voice_for(&s, &who).await;

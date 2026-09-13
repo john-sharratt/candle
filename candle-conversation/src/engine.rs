@@ -25,7 +25,7 @@ use crate::token_buffer::TokenBuffer;
 
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
-use crossbeam::channel;
+use flume::{Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -146,7 +146,7 @@ enum Resumed {
 /// ```
 pub struct ConversationEngine {
     /// Channel to submit work to the scheduler thread.
-    scheduler_tx: channel::Sender<SchedulerRequest>,
+    scheduler_tx: Sender<SchedulerRequest>,
 
     /// Handle to the scheduler thread (joined on drop or on explicit shutdown).
     /// Wrapped in `Mutex<Option>` so `shutdown()` can be called via `&self`,
@@ -289,7 +289,7 @@ impl ConversationEngine {
 
         // Create the scheduler channel (unbounded — backpressure is per-conversation
         // via the turn_in_flight guard, not at the channel level).
-        let (tx, rx) = channel::unbounded();
+        let (tx, rx) = flume::unbounded();
 
         // Workspace-shared `Conversation`: holds per-turn metadata
         // (the substrate handle).  Every `Sequence` we hand out gets a
@@ -592,7 +592,7 @@ impl ConversationEngine {
     /// conversation on that id inherits a stranger's memory, fluently.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn live_memory_count(&self) -> usize {
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         if self
             .scheduler_tx
             .send(crate::scheduler::SchedulerRequest::CountRecurrentMemories { response_tx: tx })
@@ -1046,7 +1046,7 @@ impl ConversationEngine {
         if timelines.is_empty() {
             return Ok(0);
         }
-        let (response_tx, response_rx) = channel::bounded(1);
+        let (response_tx, response_rx) = flume::bounded(1);
         self.scheduler_tx
             .send(SchedulerRequest::DemoteTimelinesHot {
                 conversation: self.conversation.clone(),
@@ -1598,7 +1598,7 @@ impl ConversationEngine {
             timeline,
         };
 
-        let (response_tx, response_rx) = channel::bounded(1);
+        let (response_tx, response_rx) = flume::bounded(1);
         let request = match resumed {
             // A fresh conversation: any state comes from the timeline's own
             // snapshot, which `create_sequence` reads.
@@ -1733,7 +1733,7 @@ impl ConversationEngine {
         // together and one drain cycle allocates every slot.
         struct Fired {
             target: ProjectionTarget,
-            rx: channel::Receiver<crate::Result<SequenceId>>,
+            rx: Receiver<crate::Result<SequenceId>>,
         }
         // Split the call's wall time three ways, because the three parts have
         // very different characters and a caller that batches creations needs to
@@ -1757,7 +1757,7 @@ impl ConversationEngine {
                 group,
                 timeline,
             };
-            let (response_tx, rx) = channel::bounded(1);
+            let (response_tx, rx) = flume::bounded(1);
             match self.scheduler_tx.send(SchedulerRequest::NewSequence {
                 conversation: self.conversation.clone(),
                 target: Some(target),
@@ -1871,7 +1871,7 @@ impl ConversationEngine {
         max_decode_tokens: usize,
     ) -> crate::Result<String> {
         // 1. Allocate a sequence.
-        let (resp_tx, resp_rx) = channel::bounded(1);
+        let (resp_tx, resp_rx) = flume::bounded(1);
         self.scheduler_tx
             .send(SchedulerRequest::NewSequence {
                 conversation: self.conversation.clone(),
@@ -1891,7 +1891,7 @@ impl ConversationEngine {
         //    on Done — for a fresh parent with no blocks the view
         //    borrows nothing and decoded blocks transfer back on
         //    finalize.
-        let (event_tx, event_rx) = channel::unbounded();
+        let (event_tx, event_rx) = flume::unbounded();
         self.scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
                 // One turn, and it is the slot's tail.

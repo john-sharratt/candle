@@ -357,12 +357,9 @@ pub async fn run_guest_watched(
         engine.submit_guest_watched(request, sink)?
     };
 
-    // Off the async pool: a drain is seconds to a minute of another thread's
-    // work, and blocking a tokio worker on it would take one of the runtime's
-    // few threads out of service for the duration.
-    tokio::task::spawn_blocking(move || receipt.wait())
-        .await
-        .unwrap_or_else(|e| Err(GuestError::Failed(format!("the guest wait failed: {e}"))))
+    // Awaited directly: the receipt's reply is a channel, so a drain that
+    // takes a minute parks a future rather than a worker.
+    receipt.wait_async().await
 }
 
 /// The guests this daemon has configured, for a status view.

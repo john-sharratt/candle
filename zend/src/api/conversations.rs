@@ -161,6 +161,7 @@ pub async fn get(
     let glue = session.glue_markers().map(Glue::from);
     let section_content = session
         .section_content(&id)
+        .await
         .unwrap_or_default()
         .into_iter()
         .map(|(name, content)| SectionContent { name, content })

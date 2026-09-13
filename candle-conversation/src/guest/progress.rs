@@ -8,9 +8,9 @@
 //! # Why a callback and not a channel
 //!
 //! The obvious shape is a `Sender` on the job. It would decide, here, which
-//! channel every consumer uses: a `crossbeam` sender cannot be awaited by an
-//! HTTP handler without a thread to bridge it, and a `tokio` one would put an
-//! async runtime into the engine crate for the sake of a progress line.
+//! channel every consumer uses — its buffering, its backpressure policy, its
+//! event framing — and progress consumers do not share one answer to any of
+//! those.
 //!
 //! A callback decides nothing. The scheduler thread calls it inline; whoever
 //! submitted the job wrote it, and knows whether that means a channel, a log

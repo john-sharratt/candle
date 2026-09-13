@@ -36,19 +36,19 @@ use candle_conversation::{
 };
 
 use crate::engine::reflect::{plain_prose, think_off};
+use crate::engine::throwaway::Throwaway;
 use crate::prose::{Answer, Request, DEFAULT_SYSTEM};
 
 /// Decode `request` with `seed`, handing each new fragment of text to
 /// `on_fragment` as it lands.
 ///
-/// Blocks for the length of the decode; [`crate::prose::run_streamed`] runs it
-/// off the async pool.
-pub fn decode(
+/// Awaits the decode; the routes in [`crate::prose`] call it directly.
+pub async fn decode(
     engine: &Arc<Mutex<ConversationEngine>>,
     base: &SequenceConfig,
     request: &Request,
     seed: u64,
-    on_fragment: &mut dyn FnMut(&str),
+    on_fragment: &mut (dyn FnMut(&str) + Send),
 ) -> anyhow::Result<Answer> {
     let mut cfg = base.clone();
     // One turn with nothing before it: there is no history to carry.
@@ -86,6 +86,10 @@ pub fn decode(
         e.mark_timeline_transient(tl);
         (seq, tl, e.token_decoder())
     };
+    // Retired whatever happens — a job that failed half-way leaves nothing
+    // worth keeping, and a caller that drops this future mid-decode leaves
+    // only a drop guard to run the tombstone.
+    let _retired = Throwaway::new(engine, timeline, "prose");
 
     let mut sampling = base
         .sampling
@@ -110,15 +114,8 @@ pub fn decode(
         options,
         &decoder,
         on_fragment,
-    );
-
-    // Retired whatever happened: a job that failed half-way leaves nothing worth
-    // keeping either.
-    if let Ok(e) = engine.lock() {
-        if let Err(err) = e.tombstone_timeline(timeline) {
-            tracing::warn!("prose conversation {timeline} could not be retired: {err:?}");
-        }
-    }
+    )
+    .await;
     drop(sequence);
 
     let r = decoded?;
@@ -155,31 +152,36 @@ impl Drop for HeldFrame {
 }
 
 /// Submit the turn, stream its fragments, and seal it.
-fn run_turn(
+async fn run_turn(
     sequence: &mut Sequence,
     prompt: &str,
     options: TurnOptions,
     decoder: &TokenDecoder,
-    on_fragment: &mut dyn FnMut(&str),
+    on_fragment: &mut (dyn FnMut(&str) + Send),
 ) -> anyhow::Result<TurnResponse> {
+    use tokio_stream::StreamExt;
+
     let handle = sequence.submit_turn_with_options(prompt, options)?;
     let mut ids: Vec<u32> = Vec::new();
     let mut preview = Preview::default();
     let mut response = None;
-    for event in handle.stream() {
-        match event {
-            TurnEvent::Token(id) => {
-                ids.push(id);
-                if let Some(delta) = preview.advance(visible(&decoder.decode(&ids))) {
-                    on_fragment(&delta);
+    {
+        let mut events = std::pin::pin!(handle.stream_async());
+        while let Some(event) = events.next().await {
+            match event {
+                TurnEvent::Token(id) => {
+                    ids.push(id);
+                    if let Some(delta) = preview.advance(visible(&decoder.decode(&ids))) {
+                        on_fragment(&delta);
+                    }
                 }
+                TurnEvent::Done(r) => {
+                    response = Some(r);
+                    break;
+                }
+                TurnEvent::Error(e) => anyhow::bail!("the prose turn failed: {e}"),
+                _ => {}
             }
-            TurnEvent::Done(r) => {
-                response = Some(r);
-                break;
-            }
-            TurnEvent::Error(e) => anyhow::bail!("the prose turn failed: {e}"),
-            _ => {}
         }
     }
     let Some(r) = response else {

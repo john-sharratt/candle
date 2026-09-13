@@ -27,6 +27,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use futures::executor::block_on;
+use tokio::sync::oneshot;
+
 use candle_conversation::persistence::SharedSubstrate;
 use candle_conversation::projection::{Builder, ProjectionEvent, SelectionState};
 use candle_conversation::{
@@ -69,13 +72,6 @@ use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
 use npc_map::world::Where;
 use npc_map::{describe, perceive};
-
-/// How often the driver thread looks for characters that are due.
-///
-/// Not the tick rate — that is per character and salience-driven. This is only
-/// how finely the scheduler's clock is quantised, so a preempt is acted on
-/// within this long at worst.
-const DRIVE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Tokens one prefill forward carries when the model can take them — the
 /// scheduler's per-forward *target*.
@@ -139,7 +135,7 @@ pub struct Recorded {
 }
 
 /// What a turn with a reflection in it still owes, held until the reflection's
-/// first question is answered — see [`Runtime::begin_reflection`].
+/// first question is answered — see [`Runtime::spawn_reflection`].
 #[derive(Clone, Debug)]
 pub struct Owed {
     /// Every answer the turn owes, one per call, in call order. The reflect's
@@ -368,10 +364,58 @@ pub struct Runtime {
     /// acting: a character that moved between bodies mid-fight would otherwise
     /// get a free swing.
     pub cooldowns: crate::engine::cooldown::Cooldowns,
-    /// Set on shutdown so the driver thread stops rather than being killed
-    /// mid-tick with a half-written turn.
+    /// Set on shutdown so every character task stops at its next wait rather
+    /// than being killed mid-tick with a half-written turn.
     stopping: AtomicBool,
+    /// The runtime character tasks, metronomes and reflections run on.
+    ///
+    /// Captured at construction when one is ambient — the daemon constructs
+    /// its `Runtime` inside `#[tokio::main]` — and genuinely absent in the
+    /// unit tests that exercise scheduling data without spawning anything.
+    spawner: Option<tokio::runtime::Handle>,
+    /// One running task per character, keyed by id — the supervisor's roster.
+    ///
+    /// A task is spawned when the character wakes into the scheduler and
+    /// cancelled when it is deleted; a task that panics is restarted by its
+    /// own supervisor wrapper with exponential backoff. See
+    /// [`Runtime::spawn_character`].
+    tasks: Mutex<BTreeMap<u64, CharacterTask>>,
     started: Instant,
+}
+
+/// One supervised character: the supervisor wrapper's handle, and the abort
+/// handle of whichever attempt is currently running the loop.
+///
+/// Both are needed to cancel, because aborting only the wrapper DETACHES the
+/// attempt — a dropped [`tokio::task::JoinHandle`] lets its task run on — and
+/// a detached loop keeps its decode's slot and races the character's
+/// re-creation. That was a live bug: deletion looked instant while the old
+/// loop thought on.
+struct CharacterTask {
+    supervisor: tokio::task::JoinHandle<()>,
+    attempt: Arc<Mutex<AttemptSlot>>,
+}
+
+/// The supervisor's current attempt, or the tombstone that tells a supervisor
+/// racing [`CharacterTask::stop`] to put its fresh attempt down: the stop may
+/// land between the attempt's spawn and its registration here, and without
+/// the tombstone that attempt would be the same detached zombie.
+enum AttemptSlot {
+    Live(Option<tokio::task::AbortHandle>),
+    Stopped,
+}
+
+impl CharacterTask {
+    /// Cancel the supervisor and whatever attempt it is running, and tombstone
+    /// the slot so an attempt registered after this abort is cancelled too.
+    fn stop(&self) {
+        self.supervisor.abort();
+        let mut slot = self.attempt.lock().unwrap();
+        if let AttemptSlot::Live(Some(handle)) = std::mem::replace(&mut *slot, AttemptSlot::Stopped)
+        {
+            handle.abort();
+        }
+    }
 }
 
 /// Where a world's rooms live, under the authored corpus.
@@ -532,6 +576,8 @@ impl Runtime {
             feelings: RwLock::new(Vec::new()),
             cooldowns: crate::engine::cooldown::Cooldowns::new(),
             stopping: AtomicBool::new(false),
+            spawner: tokio::runtime::Handle::try_current().ok(),
+            tasks: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
         })
     }
@@ -566,11 +612,14 @@ impl Runtime {
     /// the runtime — and the daemon would never drop, which reads as a clean
     /// shutdown that never finishes.
     pub fn host(self: &Arc<Self>, id: &str, dir: &Path) -> anyhow::Result<Arc<Hosted>> {
+        let Some(spawner) = self.spawner.clone() else {
+            anyhow::bail!("no async runtime to beat `{id}`'s metronome on");
+        };
         let world = self.hosted.load(id, dir)?;
         let back = Arc::downgrade(self);
         let name = id.to_string();
         let moving = world.clone();
-        let beat = Metronome::start(driver::EVERY, move || {
+        let beat = Metronome::start(&spawner, driver::EVERY, move || {
             let Some(rt) = back.upgrade() else {
                 return;
             };
@@ -1373,7 +1422,7 @@ impl Runtime {
     /// The dream is written after this returns, on a thread of its own — the
     /// caller gets the reflection, and the dream lands in the corpus whenever
     /// it lands. See [`Self::dream_now`].
-    pub fn reflect(
+    pub async fn reflect(
         self: &Arc<Self>,
         npc_id: u64,
         situation: Option<&str>,
@@ -1382,22 +1431,27 @@ impl Runtime {
         domain: Option<&str>,
         sampled_axes: &[String],
     ) -> anyhow::Result<reflect::Reflection> {
-        let r = self.reflect_with(
-            npc_id,
-            situation,
-            inner_thoughts,
-            feeling,
-            domain,
-            sampled_axes,
-            &mut |_| true,
-        )?;
+        let r = self
+            .reflect_with(
+                npc_id,
+                situation,
+                inner_thoughts,
+                feeling,
+                domain,
+                sampled_axes,
+                &mut |_| true,
+            )
+            .await?;
         if let (Some(brief), Some(assumption)) = (r.brief.clone(), r.assumption.clone()) {
             let rt = Arc::clone(self);
-            let spawned = std::thread::Builder::new()
-                .name(format!("dream-{npc_id}"))
-                .spawn(move || rt.dream_if_free(npc_id, &brief, &assumption));
-            if let Err(e) = spawned {
-                tracing::warn!("npc {npc_id}: the dream could not be started — {e}");
+            match &self.spawner {
+                Some(handle) => {
+                    handle
+                        .spawn(async move { rt.dream_if_free(npc_id, &brief, &assumption).await });
+                }
+                None => tracing::warn!(
+                    "npc {npc_id}: the dream could not be started — no async runtime"
+                ),
             }
         }
         Ok(r)
@@ -1409,7 +1463,7 @@ impl Runtime {
     // what it is thinking and feeling, which cell, steered from what, and who
     // hears the answer first — and every caller supplies all of them.
     #[allow(clippy::too_many_arguments)]
-    fn reflect_with(
+    async fn reflect_with(
         &self,
         npc_id: u64,
         situation: Option<&str>,
@@ -1417,10 +1471,11 @@ impl Runtime {
         feeling: &str,
         domain: Option<&str>,
         sampled_axes: &[String],
-        on_reflection: &mut dyn FnMut(&str) -> bool,
+        on_reflection: &mut (dyn FnMut(&str) -> bool + Send),
     ) -> anyhow::Result<reflect::Reflection> {
         let who = self
-            .persona_of(npc_id)
+            .persona_of_async(npc_id)
+            .await
             .ok_or_else(|| anyhow::anyhow!("no such character, or it has no persona"))?;
 
         // Failing that, where the character is in the world's own words: the
@@ -1456,30 +1511,35 @@ impl Runtime {
             .unwrap()
             .clone()
             .ok_or_else(|| anyhow::anyhow!("no engine — the daemon is still loading"))?;
-        minds.reflect(
-            npc_id,
-            &who.as_persona(),
-            who.mode,
-            &situation,
-            inner_thoughts,
-            feeling,
-            &domain,
-            sampled_axes,
-            on_reflection,
-        )
+        minds
+            .reflect(
+                npc_id,
+                &who.as_persona(),
+                who.mode,
+                &situation,
+                inner_thoughts,
+                feeling,
+                &domain,
+                sampled_axes,
+                on_reflection,
+            )
+            .await
     }
 
     /// Dream a brief and keep the dream. Logged, never returned: nobody is
     /// waiting on it, and a dream that did not land costs a dream.
-    fn dream_now(&self, npc_id: u64, brief: &str, assumption: &str) {
+    async fn dream_now(&self, npc_id: u64, brief: &str, assumption: &str) {
         let started = Instant::now();
         let Some(minds) = self.minds.read().unwrap().clone() else {
             return;
         };
-        let Some(who) = self.persona_of(npc_id) else {
+        let Some(who) = self.persona_of_async(npc_id).await else {
             return;
         };
-        match minds.dream(npc_id, &who.as_persona(), brief, assumption) {
+        match minds
+            .dream(npc_id, &who.as_persona(), brief, assumption)
+            .await
+        {
             Ok(kept) => tracing::info!(
                 "npc {npc_id}: dreamt, {} line(s) kept in {:?} — {} dream(s) now; it opens: {}",
                 kept.lines.len(),
@@ -1520,149 +1580,105 @@ impl Runtime {
 
     /// Dream a brief if this character is not already dreaming, and say so if
     /// it is. For the route, whose reflection has already asked for the brief.
-    fn dream_if_free(&self, npc_id: u64, brief: &str, assumption: &str) {
+    async fn dream_if_free(&self, npc_id: u64, brief: &str, assumption: &str) {
         match self.claim_dream(npc_id) {
-            Some(_slot) => self.dream_now(npc_id, brief, assumption),
+            Some(_slot) => self.dream_now(npc_id, brief, assumption).await,
             None => tracing::info!(
                 "npc {npc_id}: a dream is already being written, so this brief is not dreamt"
             ),
         }
     }
 
-    /// Answer a `reflect` with a reflection, without anybody waiting on it.
+    /// Answer a `reflect` with a reflection, as a task of its own.
     ///
-    /// **The act's answer is the reflection's first line.** `answers` is every
-    /// answer the turn owes, in call order, with the world's own line for the
-    /// reflect at `slot` — what the character is told if the reflection cannot
-    /// give it anything better. The whole list is held back until the first
-    /// question is answered, so the results still arrive one per call, in the
-    /// order the calls were made, at the head of the character's next turn.
+    /// Returns the channel the reflection's first line arrives on. The
+    /// character's own task **awaits it** before taking another turn — that
+    /// await is the hold, expressed as code order: the room cannot give the
+    /// character a turn while its task is not looping, and everything that
+    /// arrives meanwhile queues in its inbox. A channel that closes without a
+    /// line — the task could not start, or the reflection died before
+    /// answering — means the world's own line (already in the owed slot)
+    /// stands; see [`Self::settle_reflection`].
     ///
-    /// **Asynchronous, and only for this character.** The reflection runs on a
-    /// thread of its own. The tick driver goes straight on to everybody else;
-    /// this character alone is held, so the room cannot give it a turn before
-    /// its reflect has been answered. It is released the moment the answer is
-    /// in — about as long as one question takes — and the rest of the
-    /// reflection and the dream after it carry on behind it, on the same
-    /// thread, with nobody waiting.
-    pub fn begin_reflection(
+    /// The reflection task carries on behind the answer with nobody waiting:
+    /// the loosed turn, the brief, and — if this character's dream slot is
+    /// free — the dream.
+    pub fn spawn_reflection(
         self: &Arc<Self>,
         npc_id: u64,
         situation: String,
         inner_thoughts: String,
         feeling: String,
-        owed: Owed,
-    ) {
-        self.scheduler.hold(npc_id);
-        let rt = Arc::clone(self);
-        let fallback = owed.clone();
-        let spawned = std::thread::Builder::new()
-            .name(format!("reflect-{npc_id}"))
-            .spawn(move || {
-                rt.reflect_in_background(npc_id, &situation, &inner_thoughts, &feeling, owed)
-            });
-        if let Err(e) = spawned {
-            tracing::warn!("npc {npc_id}: the reflection could not be started — {e}");
-            // No reflection, so what came back is the world's own line.
-            let came_back = fallback
-                .answers
-                .get(fallback.slot)
-                .cloned()
-                .unwrap_or_default();
-            self.scheduler.amend_act(
-                npc_id,
-                &fallback.row,
-                format!("{} {LANDED} {came_back}", fallback.row),
-            );
-            if let Some(m) = self.minds.read().unwrap().as_ref() {
-                m.deliver_outcomes(npc_id, fallback.answers);
+    ) -> oneshot::Receiver<String> {
+        let (answer_tx, answer_rx) = oneshot::channel();
+        match &self.spawner {
+            Some(handle) => {
+                let rt = Arc::clone(self);
+                handle.spawn(async move {
+                    rt.reflection_task(npc_id, situation, inner_thoughts, feeling, answer_tx)
+                        .await;
+                });
             }
-            self.scheduler.release(npc_id);
+            None => {
+                tracing::warn!(
+                    "npc {npc_id}: the reflection could not be started — no async runtime"
+                );
+                // `answer_tx` drops here; the closed channel is the caller's
+                // signal to fall back to the world's own line.
+            }
         }
+        answer_rx
     }
 
-    /// The reflection thread's whole life: ask, answer the character, then
-    /// dream. See [`Self::begin_reflection`].
-    fn reflect_in_background(
-        &self,
+    /// The reflection task's whole life: ask, send the answer, then dream.
+    /// See [`Self::spawn_reflection`].
+    async fn reflection_task(
+        self: Arc<Self>,
         npc_id: u64,
-        situation: &str,
-        inner_thoughts: &str,
-        feeling: &str,
-        owed: Owed,
+        situation: String,
+        inner_thoughts: String,
+        feeling: String,
+        answer_tx: oneshot::Sender<String>,
     ) {
-        /// Whatever happens below — an error, a panic — the character is let
-        /// go. A character left held is one that never thinks again, with
-        /// nothing anywhere saying why.
-        struct Done<'a> {
-            rt: &'a Runtime,
-            npc_id: u64,
-        }
-        impl Drop for Done<'_> {
-            fn drop(&mut self) {
-                // Only if it is still held. The answer normally let it go
-                // minutes ago, and `release` also brings a character forward —
-                // so an unconditional one here woke it for nothing every time
-                // a dream finished.
-                if self.rt.scheduler.is_held(self.npc_id) {
-                    self.rt.scheduler.release(self.npc_id);
-                }
-            }
-        }
-        let _done = Done { rt: self, npc_id };
-
         let started = Instant::now();
-        let Some(minds) = self.minds.read().unwrap().clone() else {
-            return;
+        let axes = {
+            let Some(minds) = self.minds.read().unwrap().clone() else {
+                // `answer_tx` drops: the character falls back to the world's line.
+                return;
+            };
+            minds.dreamt_axes(npc_id, SAMPLED_AXES)
         };
-        // The reflect's answer — the reflection's line, or the world's own when
-        // the reflection gave none — goes in its slot, and its row is completed
-        // with the same words: what came back, after the arrow.
-        let deliver = |mut owed: Owed, line: Option<&str>| {
-            let slot = owed.slot;
-            if let (Some(line), Some(answer)) = (line, owed.answers.get_mut(slot)) {
-                *answer = line.to_string();
-            }
-            let came_back = owed.answers.get(slot).cloned().unwrap_or_default();
-            self.scheduler.amend_act(
-                npc_id,
-                &owed.row,
-                format!("{} {LANDED} {came_back}", owed.row),
-            );
-            minds.deliver_outcomes(npc_id, owed.answers);
-            self.scheduler.release(npc_id);
-        };
-        let axes = minds.dreamt_axes(npc_id, SAMPLED_AXES);
-        let mut owed = Some(owed);
+        let mut answer_tx = Some(answer_tx);
         let mut slot: Option<DreamSlot<'_>> = None;
-        let result = self.reflect_with(
-            npc_id,
-            Some(situation),
-            inner_thoughts,
-            feeling,
-            None,
-            &axes,
-            // Answer the character, then decide whether this reflection goes on
-            // to a dream: only if the character's dream slot is free, and then
-            // it is held through the dream and handed back when this returns.
-            &mut |line| {
-                if let Some(answers) = owed.take() {
-                    deliver(answers, Some(line));
-                    tracing::info!(
-                        "npc {npc_id}: reflect answered in {:?}, before any dream — {line}",
-                        started.elapsed()
-                    );
-                }
-                slot = self.claim_dream(npc_id);
-                slot.is_some()
-            },
-        );
-        // A reflection that failed before it answered still owes the character
-        // its answer, and the answer is that nothing came —
-        // [`body::NO_REFLECTION`], the line already in its slot.
-        if let Some(answers) = owed.take() {
-            deliver(answers, None);
-        }
+        let result = self
+            .reflect_with(
+                npc_id,
+                Some(&situation),
+                &inner_thoughts,
+                &feeling,
+                None,
+                &axes,
+                // Send the character its answer, then decide whether this
+                // reflection goes on to a dream: only if the character's dream
+                // slot is free, and then it is held through the dream and
+                // handed back when this task ends.
+                &mut |line| {
+                    if let Some(tx) = answer_tx.take() {
+                        let _ = tx.send(line.to_string());
+                        tracing::info!(
+                            "npc {npc_id}: reflect answered in {:?}, before any dream — {line}",
+                            started.elapsed()
+                        );
+                    }
+                    slot = self.claim_dream(npc_id);
+                    slot.is_some()
+                },
+            )
+            .await;
+        // A reflection that failed before it answered drops the channel here,
+        // and the closed channel is the character's signal that nothing came —
+        // [`body::NO_REFLECTION`], the line already in its slot, stands.
+        drop(answer_tx.take());
         let r = match result {
             Ok(r) => r,
             Err(e) => {
@@ -1694,28 +1710,70 @@ impl Runtime {
             return;
         }
         match (r.brief.as_deref(), r.assumption.as_deref()) {
-            (Some(brief), Some(assumption)) => self.dream_now(npc_id, brief, assumption),
+            (Some(brief), Some(assumption)) => self.dream_now(npc_id, brief, assumption).await,
             _ => tracing::warn!("npc {npc_id}: the reflection produced no brief, so no dream"),
         }
     }
 
+    /// Land a reflection's answer on the character: complete the act's row and
+    /// hand back every answer the turn owed, the reflect's line among them.
+    ///
+    /// `line` is `None` when the reflection's channel closed without one — it
+    /// never started, or died before answering — and the world's own line,
+    /// already in the owed slot, is what the character reads.
+    async fn settle_reflection(&self, npc_id: u64, mut owed: Owed, line: Option<String>) {
+        if let (Some(line), Some(answer)) = (line.as_ref(), owed.answers.get_mut(owed.slot)) {
+            *answer = line.clone();
+        }
+        let came_back = owed.answers.get(owed.slot).cloned().unwrap_or_default();
+        self.scheduler.amend_act(
+            npc_id,
+            &owed.row,
+            format!("{} {LANDED} {came_back}", owed.row),
+        );
+        let minds = self.minds.read().unwrap().clone();
+        if let Some(minds) = minds {
+            minds.deliver_outcomes(npc_id, owed.answers).await;
+        }
+    }
+
     fn persona_of(&self, npc_id: u64) -> Option<OwnedPersona> {
-        let mut who = {
+        let who = {
             let g = self.persona.read().unwrap();
             g.as_ref().and_then(|f| f(npc_id))
         }?;
-        // The building it is standing in, which the authored record knows
-        // nothing about — it comes from the map and the body. Only that one: a
-        // world holds more than one building, and a character told about all
-        // of them as "where you work" places itself in whichever it read most
-        // about.
+        Some(self.place_persona(npc_id, who))
+    }
+
+    /// [`Self::persona_of`] for an async caller. The persona resolver reads the
+    /// app state's `tokio::sync::RwLock`s, so — like [`Self::world_ms_async`] —
+    /// a character or reflection task runs it on the blocking pool rather than
+    /// panicking on `blocking_read`. Placing the body afterwards reads only the
+    /// runtime's own (non-async) world state, so it stays on the task.
+    async fn persona_of_async(&self, npc_id: u64) -> Option<OwnedPersona> {
+        let src = self.persona.read().unwrap().clone()?;
+        let who = tokio::task::spawn_blocking(move || src(npc_id))
+            .await
+            .ok()
+            .flatten()?;
+        Some(self.place_persona(npc_id, who))
+    }
+
+    /// Put the resolved persona in the building its body stands in — which the
+    /// authored record knows nothing about, because it comes from the map and
+    /// the body. Only that one building: a world holds more than one, and a
+    /// character told about all of them as "where you work" places itself in
+    /// whichever it read most about. Reads the runtime's own world state, not
+    /// the app-state locks the resolver did, so both `persona_of` paths share
+    /// it.
+    fn place_persona(&self, npc_id: u64, mut who: OwnedPersona) -> OwnedPersona {
         if let Some((hosted, body)) = self.body_of(npc_id) {
             if let Some((key, text)) = self.building_of(&hosted, &body) {
                 who.building = key;
                 who.place = text;
             }
         }
-        Some(who)
+        who
     }
 
     /// Every building of a world, as anyone living in it would describe it —
@@ -1769,6 +1827,21 @@ impl Runtime {
         g.as_ref().map_or(0, |f| f(npc_id))
     }
 
+    /// [`Self::world_ms`] for an async caller. The clock resolver reads the
+    /// `tokio::sync::RwLock`s on the app state (it is shared with the blocking
+    /// loader thread that set it), and `blocking_read` panics on an async
+    /// worker — so a character task runs it on the blocking pool instead. The
+    /// resolver is a cheap map lookup; the hop is a boundary, not a cost.
+    pub async fn world_ms_async(&self, npc_id: u64) -> u64 {
+        let clock = self.clock.read().unwrap().clone();
+        match clock {
+            Some(f) => tokio::task::spawn_blocking(move || f(npc_id))
+                .await
+                .unwrap_or(0),
+            None => 0,
+        }
+    }
+
     /// Whether the engine is loaded and the cast is thinking.
     pub fn is_ready(&self) -> bool {
         self.progress.is_ready()
@@ -1778,7 +1851,10 @@ impl Runtime {
         self.started.elapsed()
     }
 
-    /// Ask the driver thread to stop at its next quiet moment.
+    /// Latch the shutdown flag: the metronome callbacks stop moving worlds,
+    /// and a supervisor whose attempt dies during shutdown stops restarting.
+    /// Cancelling and awaiting the character tasks themselves is
+    /// [`Runtime::stop_characters`]'s job, ordered after this.
     pub fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
     }
@@ -2125,6 +2201,12 @@ fn load(
     }
 
     p.set_step(LoadStep::Layers);
+    // The writers below await their prefill drains, and this is a plain
+    // loader thread — so it drives them itself. `futures::executor::block_on`
+    // rather than the ambient runtime's `block_on`, because these futures wake
+    // on the engine's own channels and need no timer or I/O driver, and a
+    // current-thread executor here cannot collide with the ambient runtime
+    // this thread has entered.
     match &rt.mind {
         Some(dir) => {
             let units = crate::projection::ingest_units(&rt.mind_handle);
@@ -2138,7 +2220,7 @@ fn load(
                 ingest::announce(p, source, 0, total);
 
                 if total > 0 {
-                    let failed = ingest_layer(
+                    let failed = block_on(ingest_layer(
                         &engine,
                         &conv_config,
                         projection.as_ref(),
@@ -2146,7 +2228,7 @@ fn load(
                         &turns,
                         &rt.ledger,
                         p,
-                    )?;
+                    ))?;
                     report.written -= failed;
                     report.failed += failed;
                 }
@@ -2188,7 +2270,7 @@ fn load(
                 p.set_unit("episodes");
                 p.set_detail(format!("life · {who}"));
                 p.set_progress(0, episodes.len() as u64);
-                match run_life(
+                match block_on(run_life(
                     &engine,
                     &conv_config,
                     projection.as_ref(),
@@ -2196,7 +2278,7 @@ fn load(
                     &episodes,
                     &rt.ledger,
                     p,
-                ) {
+                )) {
                     Ok(lived) => tracing::info!(
                         "life {who}: {} episode(s), {} belief(s), {} relationship(s), \
                          {} intention(s){}",
@@ -2321,7 +2403,7 @@ fn load(
     p.mark_ready();
     tracing::info!("engine ready in {:?}", rt.uptime());
 
-    drive(Arc::clone(rt));
+    supervise(rt);
     Ok(())
 }
 
@@ -2335,13 +2417,16 @@ fn load(
 ///
 /// Borrows the handle, because `finish_turn` consumes it: the stream has to be
 /// fully drained before the turn can be sealed.
-pub(crate) fn drain(
+pub(crate) async fn drain(
     handle: &TurnHandle,
     addr: &str,
 ) -> (Option<TurnResponse>, Vec<ProjectionEvent>) {
+    use tokio_stream::StreamExt;
+
     let mut events = Vec::new();
     let mut response = None;
-    for ev in handle.stream() {
+    let mut stream = std::pin::pin!(handle.stream_async());
+    while let Some(ev) = stream.next().await {
         match ev {
             TurnEvent::Projection(e) => events.push(e),
             TurnEvent::Done(r) => {
@@ -2443,7 +2528,7 @@ fn wipe_conversations(engine: &SharedEngine) -> usize {
     retired
 }
 
-fn ingest_layer(
+async fn ingest_layer(
     engine: &SharedEngine,
     base_config: &SequenceConfig,
     proj: Option<&schema::Projection>,
@@ -2560,7 +2645,7 @@ fn ingest_layer(
             // selected out of the layers already in the substrate. Dropping them
             // — which is what `_ => {}` did — leaves the document written and
             // unlinked, so a later scan has nothing to pull on.
-            let (response, mut events) = drain(&handle, addr);
+            let (response, mut events) = drain(&handle, addr).await;
             match response {
                 Some(r) => match conv.finish_turn(handle, &r) {
                     Ok(_) => {
@@ -2688,7 +2773,7 @@ pub struct Lived {
 /// write a conviction whose origin did not yet exist — which is exactly the
 /// orphaned-belief shape this whole design exists to end.
 #[allow(clippy::too_many_arguments)]
-fn run_life(
+async fn run_life(
     engine: &SharedEngine,
     base_config: &SequenceConfig,
     proj: Option<&schema::Projection>,
@@ -2757,7 +2842,7 @@ fn run_life(
         // which is why the world is ingested before any life runs — and
         // persisting it writes the link from this moment to the world content it
         // happened against.
-        let (response, mut events) = drain(&handle, &address);
+        let (response, mut events) = drain(&handle, &address).await;
         // A silent `continue` here left the episode un-lived *and* un-retryable: the hash was
         // already banked above, so the next boot skipped it. Now the hash is written at the
         // seal, so this path simply leaves it unrecorded — but it still has to say so and
@@ -2797,7 +2882,7 @@ fn run_life(
         // Now the consequences, on their own records, after the episode they
         // came from is durable.
         for call in &parsed.calls {
-            match write_consequence(engine, &cfg, proj, who, ep, call) {
+            match write_consequence(engine, &cfg, proj, who, ep, call).await {
                 Ok(()) => match call.tool {
                     "form_belief" => lived.beliefs += 1,
                     "form_relationship" | "revise_relationship" => lived.relationships += 1,
@@ -2835,7 +2920,7 @@ fn run_life(
 /// gather as any other layer content, editable from the console, and — because
 /// it names the episode that produced it — arguable. A belief you can trace to a
 /// day is one you can disagree with; a belief simply asserted is not.
-fn write_consequence(
+async fn write_consequence(
     engine: &SharedEngine,
     cfg: &SequenceConfig,
     proj: Option<&schema::Projection>,
@@ -2888,7 +2973,7 @@ fn write_consequence(
             format!("from:{}", ep.date),
         ],
     )?;
-    let (response, mut events) = drain(&handle, &address);
+    let (response, mut events) = drain(&handle, &address).await;
     let r = response.ok_or_else(|| anyhow::anyhow!("no response"))?;
     let timeline = conv.timeline_id();
     conv.finish_turn(handle, &r)?;
@@ -2935,257 +3020,426 @@ fn render_consequence(call: &authoring::Call) -> String {
     }
 }
 
-/// The driver: the thread that keeps every character thinking.
+/// Spawn every woken character's task — the supervisor's initial roster.
 ///
-/// One thread for the whole cast, not one per character. A thread per character
-/// would be a thousand stacks to hold a thousand idle minds, and the scheduler's
-/// whole design is that idle costs nothing — a per-character thread would put
-/// the cost back in a different currency.
-pub fn drive(rt: Arc<Runtime>) {
-    std::thread::Builder::new()
-        .name("npcd-tick".into())
-        .spawn(move || {
-            let start = Instant::now();
-            tracing::info!("tick driver running");
-            while !rt.stopping() {
-                let now_ms = start.elapsed().as_millis() as u64;
+/// One task per character, not one thread: a task parked in its wait costs a
+/// few hundred bytes of state, so a thousand idle minds stay as cheap as the
+/// scheduler's design promises.
+///
+/// Called once, at the end of the load, after the cast has been woken into the
+/// scheduler; a character created later is spawned by the create path, and a
+/// deleted one is stopped by the delete path.
+pub fn supervise(rt: &Arc<Runtime>) {
+    let ids = rt.scheduler.population_ids();
+    let n = ids.len();
+    for id in ids {
+        rt.spawn_character(id);
+    }
+    tracing::info!("cast supervisor running — {n} character task(s) spawned");
+}
 
-                for id in rt.scheduler.due_now(now_ms) {
-                    // Per character, not once per pass: two characters in
-                    // different worlds are at different instants, and one of
-                    // those worlds may be paused.
-                    let world_ms = rt.world_ms(id);
-                    // The day boundary is checked before the tick, so a
-                    // character that has crossed midnight wakes into its new
-                    // conversation rather than acting once more in yesterday's.
-                    if let Some((from, to)) = rt.scheduler.roll_day(id, world_ms) {
-                        tracing::info!("npc {id}: day {from} → {to}, conversation rolled over");
-                        rt.scheduler.deliver(
-                            id,
-                            world_ms,
-                            crate::engine::event::Salience::NORMAL,
-                            crate::engine::event::EventKind::Wake { day: to },
-                        );
-                    }
-                    // What this character is set on, restated every turn.
-                    // Delivered rather than synthesised inside the tick: the
-                    // scheduler knows a character has an empty inbox and
-                    // nothing at all about what it is for.
-                    //
-                    // **Only when there is nothing else to answer.** This gate
-                    // has now been wrong in both directions, and the two
-                    // mistakes are instructive.
-                    //
-                    // It was first gated on an *empty inbox*, which never
-                    // happened: a character with a body is handed the situation
-                    // it is standing in every moment, so the depth is never
-                    // zero, so the standing task written for exactly the case of
-                    // having company was the one that never arrived. Two Makers
-                    // met, had nothing telling them to stay, and walked out of
-                    // the room in opposite directions.
-                    //
-                    // Removing the gate fixed that and introduced the opposite
-                    // fault. The task supersedes in its own band, so restating
-                    // it never accumulates — but it does keep moving to the most
-                    // recent position in the window, which is where attention
-                    // weights hardest. A character mid-conversation was being
-                    // told, more recently than anything its companion had
-                    // actually said, that nothing had been asked of it.
-                    //
-                    // The question was never "is the inbox empty", it is "is
-                    // anything *happening*" — and the situation is a fact about
-                    // the room rather than an event. `has_news` was that
-                    // question asked about this instant, which is the third way
-                    // of getting it wrong: a conversation is mostly the gaps
-                    // between its utterances, and in every one of those gaps
-                    // there is momentarily no news queued.
-                    //
-                    // So the task landed *inside* conversations, and because it
-                    // supersedes in its own band it sat in the most recent
-                    // position in the window every time. Two characters
-                    // alternated for a hundred turns — heard the other speak,
-                    // were told nothing had been asked of them, heard the other
-                    // speak — each being told, more recently than anything its
-                    // companion had said, that nothing was going on.
-                    //
-                    // A stretch of quiet is what the task was always described
-                    // as waiting for. See [`IDLE_AFTER_MS`].
-                    // Two clocks, both `IDLE_AFTER_MS`: quiet since anything
-                    // happened, and quiet since the task itself was last
-                    // restated. Without the second the gate latches open — the
-                    // task is not news, so nothing it does moves the first
-                    // clock — and a character nobody is talking to is handed it
-                    // again on every tick.
-                    if rt.scheduler.nudge_due(id, world_ms, IDLE_AFTER_MS) {
-                        if let Some(text) = rt.nudge_for(id) {
-                            rt.scheduler.deliver(
-                                id,
-                                world_ms,
-                                crate::engine::event::Salience::IDLE,
-                                crate::engine::event::EventKind::Nudge { text },
-                            );
+/// The supervisor's restart pacing: how long a died character task waits
+/// before its retry. Doubles from a floor to a ceiling, and a task that ran a
+/// healthy stretch before dying starts from the floor again. The backoff
+/// exists for the systemic case: an engine that is down fails every character
+/// at once, and a hundred tasks retrying hot would be a stampede on a
+/// scheduler that is trying to come back.
+struct Backoff {
+    next: Duration,
+}
+
+impl Backoff {
+    const FLOOR: Duration = Duration::from_secs(1);
+    const CEIL: Duration = Duration::from_secs(60);
+    /// A task that has run this long without panicking is healthy, and its
+    /// next failure starts the backoff from the floor again.
+    const HEALTHY_AFTER: Duration = Duration::from_secs(300);
+
+    fn new() -> Self {
+        Self { next: Self::FLOOR }
+    }
+
+    /// The wait before this retry, given how long the attempt that just died
+    /// had been running.
+    fn after(&mut self, ran_for: Duration) -> Duration {
+        if ran_for >= Self::HEALTHY_AFTER {
+            self.next = Self::FLOOR;
+        }
+        let wait = self.next;
+        self.next = (self.next * 2).min(Self::CEIL);
+        wait
+    }
+}
+
+impl Runtime {
+    /// Put one character's loop on the runtime, supervised: a panic restarts
+    /// it with exponential backoff, a clean exit (retired, or the daemon
+    /// stopping) ends it. Idempotent — a character whose task is already
+    /// running keeps it.
+    pub fn spawn_character(self: &Arc<Self>, npc_id: u64) {
+        let Some(handle) = self.spawner.clone() else {
+            // The unit tests exercise scheduling data without a runtime; the
+            // daemon always has one.
+            return;
+        };
+        let mut tasks = self.tasks.lock().unwrap();
+        if tasks
+            .get(&npc_id)
+            .is_some_and(|t| !t.supervisor.is_finished())
+        {
+            return;
+        }
+        let rt = Arc::clone(self);
+        let supervisor = handle.clone();
+        let attempt_slot = Arc::new(Mutex::new(AttemptSlot::Live(None)));
+        let slot = Arc::clone(&attempt_slot);
+        let task = handle.spawn(async move {
+            let mut backoff = Backoff::new();
+            loop {
+                let ran = Instant::now();
+                // The loop's own panics are contained by the spawned attempt,
+                // so one bad turn cannot take the supervisor down with it.
+                let attempt = supervisor.spawn(character_loop(Arc::clone(&rt), npc_id));
+                {
+                    // Registered before this task's next await, so a stop that
+                    // aborts the supervisor either finds the handle here or
+                    // has already tombstoned the slot — in which case this
+                    // attempt is the one it could not see, and dies here.
+                    let mut slot = slot.lock().unwrap();
+                    match &mut *slot {
+                        AttemptSlot::Stopped => {
+                            attempt.abort();
+                            return;
                         }
+                        AttemptSlot::Live(handle) => *handle = Some(attempt.abort_handle()),
                     }
-
-                    let minds = rt.minds.read().unwrap().clone();
-                    let persona = rt.persona_of(id);
-                    let day = crate::engine::sleep::day_of(world_ms);
-                    // What the grammar is built from this turn: the acts that
-                    // are reachable from where this character stands, and the
-                    // names it may address. Read here, once, before the decode —
-                    // the world moves under a decode that takes seconds, and a
-                    // grammar built halfway through it would be masked to a room
-                    // that no longer matches the situation the character read.
-                    let within = rt.within(id);
-
-                    rt.scheduler.tick(id, now_ms, world_ms, |events, window| {
-                        let (Some(minds), Some(p)) = (minds.as_ref(), persona.as_ref()) else {
-                            // No engine yet, or a character the authored state
-                            // no longer knows. Perception still lands in the
-                            // window — that half needs nothing — and no acts is
-                            // the honest answer rather than an invented one.
-                            return Vec::new();
-                        };
-                        match minds.think(id, &p.as_persona(), p.mode, day, events, window, &within)
-                        {
-                            Ok(t) => {
-                                // Reported, never swallowed: a character failing
-                                // to act and one choosing not to look identical
-                                // from outside and need completely different
-                                // fixes.
-                                //
-                                // And told to the character, not only to the
-                                // log. A rejection it cannot see is a character
-                                // acting into silence — it has no reason to do
-                                // anything differently, so it makes the same
-                                // malformed call every turn for as long as it
-                                // runs.
-                                // Two lists, because the feed and the character
-                                // read different sentences — see `Recorded`.
-                                // A rejection is the one case where they agree:
-                                // the world's words are all there is.
-                                let mut done: Vec<String> = Vec::new();
-                                let mut answers: Vec<String> = Vec::new();
-                                for r in &t.parsed.rejected {
-                                    tracing::warn!("npc {id}: act rejected — {r:?}");
-                                    done.push(r.line());
-                                    answers.push(r.line());
-                                }
-                                if t.parsed.is_empty() && t.parsed.rejected.is_empty() {
-                                    // Chose to do nothing, and said so cleanly.
-                                    // Distinct from a decode that failed, which
-                                    // logged above.
-                                    tracing::debug!("npc {id}: no act this tick");
-                                }
-                                if !t.parsed.narration.is_empty() {
-                                    tracing::debug!(
-                                        "npc {id}: narration (not an act) — {}",
-                                        t.parsed.narration
-                                    );
-                                }
-                                // Acts that belong to a body go to the world
-                                // they stand in, and the world's verdict — not
-                                // the character's intent — decides how each one
-                                // is recorded. A refusal is an ordinary
-                                // outcome, perceived like any other, so the
-                                // character learns it went wrong rather than
-                                // believing it worked. `record_act` holds the
-                                // rule.
-                                // **A reflect the world took is answered by a
-                                // reflection** — at most one per turn. Its slot
-                                // keeps `body::NO_REFLECTION` until the
-                                // reflection answers.
-                                let mut reflecting: Option<(Owed, [String; 3])> = None;
-                                for a in &t.parsed.acts {
-                                    let r = rt.record_act(id, a);
-                                    done.push(r.feed);
-                                    if a.tool == "reflect"
-                                        && r.landed
-                                        && reflecting.is_none()
-                                        && rt.can_reflect()
-                                    {
-                                        let arg = |k: &str| {
-                                            a.args
-                                                .get(k)
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or_default()
-                                                .to_string()
-                                        };
-                                        // Recorded as the act alone — `reflect`
-                                        // and its thought — and completed with
-                                        // what came back once it has.
-                                        let row = a.summary();
-                                        if let Some(last) = done.last_mut() {
-                                            *last = row.clone();
-                                        }
-                                        reflecting = Some((
-                                            Owed {
-                                                answers: Vec::new(),
-                                                slot: answers.len(),
-                                                row,
-                                            },
-                                            [
-                                                arg("situation"),
-                                                arg("inner_thoughts"),
-                                                arg("feeling"),
-                                            ],
-                                        ));
-                                    }
-                                    answers.push(r.answer);
-                                    // A pause that landed stops the character
-                                    // here. Armed after the act rather than
-                                    // inside it because going quiet is
-                                    // scheduling and being seen to stop is the
-                                    // world's — two halves of one act, and only
-                                    // this half knows the clock.
-                                    rt.arm_pause(id, a, now_ms);
-                                    // And an act that answered brings it
-                                    // straight back, so it has a turn in which
-                                    // to use what it was told.
-                                    rt.arm_followup(id, a);
-                                }
-                                // **And the character is told what came of it.**
-                                //
-                                // One answer per call it made, riding at the
-                                // head of its next turn as `<tool_response>` —
-                                // the half of the protocol that was missing.
-                                // Without it a character acts and reads the
-                                // weather back, which is how every one of them
-                                // came to do nothing but reflect.
-                                //
-                                // The world's verdict, not the feed line: what
-                                // a person watching wants to read and what the
-                                // character needs to know are different
-                                // sentences. See `Recorded`.
-                                //
-                                // A turn with a reflection in it hands its answers
-                                // to the reflection instead, which delivers them
-                                // once its first question is answered.
-                                match reflecting {
-                                    Some((owed, [situation, inner, feeling])) => rt
-                                        .begin_reflection(
-                                            id,
-                                            situation,
-                                            inner,
-                                            feeling,
-                                            Owed { answers, ..owed },
-                                        ),
-                                    None => minds.deliver_outcomes(id, answers),
-                                }
-                                done
-                            }
-                            Err(e) => {
-                                tracing::warn!("npc {id}: decode failed — {e:#}");
-                                Vec::new()
-                            }
-                        }
-                    });
                 }
-                std::thread::sleep(DRIVE_INTERVAL);
+                match attempt.await {
+                    Ok(()) => return,
+                    Err(e) if e.is_cancelled() => return,
+                    Err(e) => {
+                        if rt.stopping() {
+                            return;
+                        }
+                        let wait = backoff.after(ran.elapsed());
+                        tracing::error!(
+                            "npc {npc_id}: character task died ({e}) — restarting in {wait:?}"
+                        );
+                        tokio::time::sleep(wait).await;
+                    }
+                }
             }
-            tracing::info!("tick driver stopped");
-        })
-        .expect("spawn the tick driver");
+        });
+        tasks.insert(
+            npc_id,
+            CharacterTask {
+                supervisor: task,
+                attempt: attempt_slot,
+            },
+        );
+    }
+
+    /// Stop a character's task — the deletion path. Cancels the supervisor AND
+    /// its current attempt (see [`CharacterTask`]); the abort lands at the
+    /// attempt's next await, and a decode it was waiting on is dropped with
+    /// it, which stops that decode ([`candle_conversation::TurnHandle`]'s
+    /// contract).
+    pub fn stop_character(&self, npc_id: u64) {
+        if let Some(task) = self.tasks.lock().unwrap().remove(&npc_id) {
+            task.stop();
+        }
+    }
+
+    /// Shutdown's ordered half: cancel every character task — parked or
+    /// mid-await — and await the supervisors out, so every dropped turn future
+    /// has released its slot before whatever runs after this touches the
+    /// engine. [`Runtime::stop`] should be called first so the metronome
+    /// callbacks and restart guards read the latch.
+    pub async fn stop_characters(&self) {
+        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+        for task in tasks.values() {
+            task.stop();
+        }
+        for (_, task) in tasks {
+            let _ = task.supervisor.await;
+        }
+    }
+}
+
+/// One character's whole life as a task: wait until due, perceive, think, act,
+/// and — when a turn reflects — await the reflection's answer before taking
+/// another turn. Returns when the character is retired or the daemon stops.
+async fn character_loop(rt: Arc<Runtime>, id: u64) {
+    loop {
+        if rt.stopping() {
+            return;
+        }
+        if !rt.scheduler.wait_due(id).await {
+            // Retired: no inbox left to be due.
+            return;
+        }
+        if rt.stopping() {
+            return;
+        }
+        let now_ms = rt.scheduler.now_ms();
+        {
+            // Per character, not once per pass: two characters in
+            // different worlds are at different instants, and one of
+            // those worlds may be paused. Async: the clock resolver reads
+            // the app-state locks, and this runs on a tokio worker.
+            let world_ms = rt.world_ms_async(id).await;
+            // The day boundary is checked before the tick, so a
+            // character that has crossed midnight wakes into its new
+            // conversation rather than acting once more in yesterday's.
+            if let Some((from, to)) = rt.scheduler.roll_day(id, world_ms) {
+                tracing::info!("npc {id}: day {from} → {to}, conversation rolled over");
+                rt.scheduler.deliver(
+                    id,
+                    world_ms,
+                    crate::engine::event::Salience::NORMAL,
+                    crate::engine::event::EventKind::Wake { day: to },
+                );
+            }
+            // What this character is set on, restated every turn.
+            // Delivered rather than synthesised inside the tick: the
+            // scheduler knows a character has an empty inbox and
+            // nothing at all about what it is for.
+            //
+            // **Only when there is nothing else to answer.** This gate
+            // has now been wrong in both directions, and the two
+            // mistakes are instructive.
+            //
+            // It was first gated on an *empty inbox*, which never
+            // happened: a character with a body is handed the situation
+            // it is standing in every moment, so the depth is never
+            // zero, so the standing task written for exactly the case of
+            // having company was the one that never arrived. Two Makers
+            // met, had nothing telling them to stay, and walked out of
+            // the room in opposite directions.
+            //
+            // Removing the gate fixed that and introduced the opposite
+            // fault. The task supersedes in its own band, so restating
+            // it never accumulates — but it does keep moving to the most
+            // recent position in the window, which is where attention
+            // weights hardest. A character mid-conversation was being
+            // told, more recently than anything its companion had
+            // actually said, that nothing had been asked of it.
+            //
+            // The question was never "is the inbox empty", it is "is
+            // anything *happening*" — and the situation is a fact about
+            // the room rather than an event. `has_news` was that
+            // question asked about this instant, which is the third way
+            // of getting it wrong: a conversation is mostly the gaps
+            // between its utterances, and in every one of those gaps
+            // there is momentarily no news queued.
+            //
+            // So the task landed *inside* conversations, and because it
+            // supersedes in its own band it sat in the most recent
+            // position in the window every time. Two characters
+            // alternated for a hundred turns — heard the other speak,
+            // were told nothing had been asked of them, heard the other
+            // speak — each being told, more recently than anything its
+            // companion had said, that nothing was going on.
+            //
+            // A stretch of quiet is what the task was always described
+            // as waiting for. See [`IDLE_AFTER_MS`].
+            // Two clocks, both `IDLE_AFTER_MS`: quiet since anything
+            // happened, and quiet since the task itself was last
+            // restated. Without the second the gate latches open — the
+            // task is not news, so nothing it does moves the first
+            // clock — and a character nobody is talking to is handed it
+            // again on every tick.
+            if rt.scheduler.nudge_due(id, world_ms, IDLE_AFTER_MS) {
+                if let Some(text) = rt.nudge_for(id) {
+                    rt.scheduler.deliver(
+                        id,
+                        world_ms,
+                        crate::engine::event::Salience::IDLE,
+                        crate::engine::event::EventKind::Nudge { text },
+                    );
+                }
+            }
+
+            let minds = rt.minds.read().unwrap().clone();
+            let persona = rt.persona_of_async(id).await;
+            let day = crate::engine::sleep::day_of(world_ms);
+            // What the grammar is built from this turn: the acts that
+            // are reachable from where this character stands, and the
+            // names it may address. Read here, once, before the decode —
+            // the world moves under a decode that takes seconds, and a
+            // grammar built halfway through it would be masked to a room
+            // that no longer matches the situation the character read.
+            let within = rt.within(id);
+
+            // The tick's three phases, with the decode awaited between
+            // the first two and the last — [`Scheduler::begin_tick`] /
+            // [`Scheduler::end_tick`] are `tick` split at exactly that
+            // seam, so this loop and the scheduler tests run one path.
+            let Some(start) = rt.scheduler.begin_tick(id) else {
+                continue;
+            };
+
+            let mut awaiting_reflection: Option<(oneshot::Receiver<String>, Owed)> =
+                None;
+            let done = match (minds.as_ref(), persona.as_ref()) {
+                (Some(minds), Some(p)) => {
+                    match minds
+                        .think(
+                            id,
+                            &p.as_persona(),
+                            p.mode,
+                            day,
+                            &start.events,
+                            &start.window,
+                            &within,
+                        )
+                        .await
+                    {
+                        Ok(t) => {
+                            // Reported, never swallowed: a character failing
+                            // to act and one choosing not to look identical
+                            // from outside and need completely different
+                            // fixes.
+                            //
+                            // And told to the character, not only to the
+                            // log. A rejection it cannot see is a character
+                            // acting into silence — it has no reason to do
+                            // anything differently, so it makes the same
+                            // malformed call every turn for as long as it
+                            // runs.
+                            // Two lists, because the feed and the character
+                            // read different sentences — see `Recorded`.
+                            // A rejection is the one case where they agree:
+                            // the world's words are all there is.
+                            let mut done: Vec<String> = Vec::new();
+                            let mut answers: Vec<String> = Vec::new();
+                            for r in &t.parsed.rejected {
+                                tracing::warn!("npc {id}: act rejected — {r:?}");
+                                done.push(r.line());
+                                answers.push(r.line());
+                            }
+                            if t.parsed.is_empty() && t.parsed.rejected.is_empty() {
+                                // Chose to do nothing, and said so cleanly.
+                                // Distinct from a decode that failed, which
+                                // logged above.
+                                tracing::debug!("npc {id}: no act this tick");
+                            }
+                            if !t.parsed.narration.is_empty() {
+                                tracing::debug!(
+                                    "npc {id}: narration (not an act) — {}",
+                                    t.parsed.narration
+                                );
+                            }
+                            // Acts that belong to a body go to the world
+                            // they stand in, and the world's verdict — not
+                            // the character's intent — decides how each one
+                            // is recorded. A refusal is an ordinary
+                            // outcome, perceived like any other, so the
+                            // character learns it went wrong rather than
+                            // believing it worked. `record_act` holds the
+                            // rule.
+                            // **A reflect the world took is answered by a
+                            // reflection** — at most one per turn. Its slot
+                            // keeps `body::NO_REFLECTION` until the
+                            // reflection answers.
+                            let mut reflecting: Option<(Owed, [String; 3])> = None;
+                            for a in &t.parsed.acts {
+                                let r = rt.record_act(id, a);
+                                done.push(r.feed);
+                                if a.tool == "reflect"
+                                    && r.landed
+                                    && reflecting.is_none()
+                                    && rt.can_reflect()
+                                {
+                                    let arg = |k: &str| {
+                                        a.args
+                                            .get(k)
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or_default()
+                                            .to_string()
+                                    };
+                                    // Recorded as the act alone — `reflect`
+                                    // and its thought — and completed with
+                                    // what came back once it has.
+                                    let row = a.summary();
+                                    if let Some(last) = done.last_mut() {
+                                        *last = row.clone();
+                                    }
+                                    reflecting = Some((
+                                        Owed {
+                                            answers: Vec::new(),
+                                            slot: answers.len(),
+                                            row,
+                                        },
+                                        [arg("situation"), arg("inner_thoughts"), arg("feeling")],
+                                    ));
+                                }
+                                answers.push(r.answer);
+                                // A pause that landed stops the character
+                                // here. Armed after the act rather than
+                                // inside it because going quiet is
+                                // scheduling and being seen to stop is the
+                                // world's — two halves of one act, and only
+                                // this half knows the clock.
+                                rt.arm_pause(id, a, now_ms);
+                                // And an act that answered brings it
+                                // straight back, so it has a turn in which
+                                // to use what it was told.
+                                rt.arm_followup(id, a);
+                            }
+                            // **And the character is told what came of it.**
+                            //
+                            // One answer per call it made, riding at the
+                            // head of its next turn as `<tool_response>` —
+                            // the half of the protocol that was missing.
+                            // Without it a character acts and reads the
+                            // weather back, which is how every one of them
+                            // came to do nothing but reflect.
+                            //
+                            // The world's verdict, not the feed line: what
+                            // a person watching wants to read and what the
+                            // character needs to know are different
+                            // sentences. See `Recorded`.
+                            //
+                            // A turn with a reflection in it hands its
+                            // answers to the reflection instead, delivered
+                            // when its first question is answered — the
+                            // await below this tick.
+                            match reflecting {
+                                Some((owed, [situation, inner, feeling])) => {
+                                    let rx = rt.spawn_reflection(id, situation, inner, feeling);
+                                    awaiting_reflection = Some((rx, Owed { answers, ..owed }));
+                                }
+                                None => minds.deliver_outcomes(id, answers).await,
+                            }
+                            done
+                        }
+                        Err(e) => {
+                            tracing::warn!("npc {id}: decode failed — {e:#}");
+                            Vec::new()
+                        }
+                    }
+                }
+                // No engine yet, or a character the authored state no
+                // longer knows. Perception still lands in the window —
+                // that half needs nothing — and no acts is the honest
+                // answer rather than an invented one.
+                _ => Vec::new(),
+            };
+            rt.scheduler.end_tick(id, now_ms, world_ms, start, done);
+
+            // The turn reflected: its answer has to be the next thing
+            // this character reads about the act, so the loop does not
+            // come back round — and the room cannot give it a turn —
+            // until the answer (or the reflection's failure) is in.
+            // Everything arriving meanwhile queues in the inbox and is
+            // read on the first turn after.
+            if let Some((rx, owed)) = awaiting_reflection {
+                let line = rx.await.ok();
+                rt.settle_reflection(id, owed, line).await;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3197,6 +3451,75 @@ mod tests {
         // A temp path: the tests exercise scheduling, not persistence, and an
         // in-repo one would leave a ledger file behind.
         Runtime::new(Mind::new(None), &std::env::temp_dir())
+    }
+
+    // ── the cast, supervised ────────────────────────────────────────────────
+
+    /// The restart pacing: doubling to a ceiling, and a healthy stretch
+    /// starting it over — the backoff observed to grow and then reset.
+    #[test]
+    fn a_restart_backoff_doubles_to_its_ceiling_and_a_healthy_run_resets_it() {
+        let mut backoff = Backoff::new();
+        let crashed_fast = Duration::from_secs(1);
+        assert_eq!(backoff.after(crashed_fast), Duration::from_secs(1));
+        assert_eq!(backoff.after(crashed_fast), Duration::from_secs(2));
+        assert_eq!(backoff.after(crashed_fast), Duration::from_secs(4));
+        for _ in 0..10 {
+            backoff.after(crashed_fast);
+        }
+        assert_eq!(
+            backoff.after(crashed_fast),
+            Duration::from_secs(60),
+            "the ceiling did not hold"
+        );
+        assert_eq!(
+            backoff.after(Backoff::HEALTHY_AFTER),
+            Duration::from_secs(1),
+            "a healthy stretch did not start the backoff over"
+        );
+    }
+
+    async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// **Deleting a character cancels its loop, not just its supervisor.**
+    ///
+    /// The supervisor runs each attempt as its own spawned task, and aborting
+    /// only the wrapper DETACHES that attempt: the parked loop lives on —
+    /// holding its runtime and, mid-decode, its scheduler slot — while the
+    /// deletion looks done, and the character's re-creation then runs beside
+    /// the zombie. Both futures hold an `Arc<Runtime>` clone, so the count
+    /// returning to its baseline is the proof both actually died. A
+    /// multi-thread runtime, because the parked task has to genuinely run to
+    /// be genuinely cancelled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_a_character_cancels_its_parked_loop() {
+        let rt = rt();
+        // An inbox with nothing due parks the loop in `wait_due` indefinitely
+        // — the exact await the cancellation has to land on.
+        rt.scheduler.wake(1, 0, 0);
+        let baseline = Arc::strong_count(&rt);
+        rt.spawn_character(1);
+        wait_for(
+            || Arc::strong_count(&rt) >= baseline + 2,
+            "the supervisor and its attempt to hold the runtime",
+        )
+        .await;
+        rt.stop_character(1);
+        wait_for(
+            || Arc::strong_count(&rt) == baseline,
+            "the supervisor AND its attempt to be dropped",
+        )
+        .await;
+        assert!(
+            rt.tasks.lock().unwrap().is_empty(),
+            "the roster kept a stopped character"
+        );
     }
 
     /// **Everything this daemon writes goes under `--data`.**
@@ -3258,12 +3581,46 @@ mod tests {
         assert_eq!(rt.world_ms(7), 7_000);
     }
 
-    /// The driver quantises the scheduler's clock; it is not the tick rate. If
-    /// this ever grows past the alert heartbeat, a preempted character would
-    /// wait longer for the driver than for its own metabolism.
-    #[test]
-    fn the_drive_interval_is_finer_than_the_fastest_heartbeat() {
-        assert!(DRIVE_INTERVAL < crate::engine::tick::ALERT_HEARTBEAT);
+    /// **A resolver that reads a `tokio::sync` lock must be safe to ask from a
+    /// character task.**
+    ///
+    /// The clock and persona resolvers close over the daemon's app state, whose
+    /// locks are `tokio::sync::RwLock` — and `blocking_read` on one panics
+    /// inside an async execution context. The character loop runs on a tokio
+    /// worker, so calling the sync `world_ms`/`persona_of` there panicked the
+    /// task on its very first tick; the supervisor then restarted it into the
+    /// same panic forever, and the whole cast sat at zero ticks while its
+    /// inboxes filled. The model-free tests never caught it because no test
+    /// stands a character loop up against a real resolver. This does: a clock
+    /// that reads a `tokio` lock, asked through the async variant from a
+    /// multi-thread runtime, must return the value rather than panic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_async_resolver_read_does_not_panic_on_a_tokio_lock() {
+        let rt = rt();
+        // The shape of the real clock resolver: a `tokio::sync::RwLock` the
+        // closure reads with `blocking_read`, exactly as the daemon's does.
+        let state = Arc::new(tokio::sync::RwLock::new(1_000u64));
+        let clock_state = Arc::clone(&state);
+        rt.set_clock(Arc::new(move |npc_id| {
+            *clock_state.blocking_read() * npc_id
+        }));
+
+        // The async variant the character loop uses: it must reach the value.
+        assert_eq!(rt.world_ms_async(3).await, 3_000);
+
+        // And it must keep working under a concurrent writer holding the lock
+        // across an await — the async caller waits on the blocking pool rather
+        // than deadlocking the worker.
+        {
+            let mut w = state.write().await;
+            let got = tokio::spawn({
+                let rt = Arc::clone(&rt);
+                async move { rt.world_ms_async(5).await }
+            });
+            *w = 2_000;
+            drop(w);
+            assert_eq!(got.await.unwrap(), 10_000);
+        }
     }
 
     // ── the world, hosted ───────────────────────────────────────────────────
@@ -3279,6 +3636,11 @@ mod tests {
     /// Paused on purpose: these assert what hosting, binding and acting *do*,
     /// and a world moving underneath them would make every one of them a race.
     /// The metronome's own behaviour is [`crate::engine::driver`]'s to prove.
+    ///
+    /// Every test that hosts runs as `#[tokio::test]` because hosting needs a
+    /// handle to spawn the metronome on — but on the current-thread flavour a
+    /// body that never awaits never yields, so no spawned task runs and the
+    /// tests keep driving every tick by hand, deterministically.
     fn vaulted() -> Arc<Runtime> {
         let rt = rt();
         rt.host(WORLD, Path::new(ROOMS)).expect("the vault loads");
@@ -3323,8 +3685,8 @@ mod tests {
     /// wait for an answer — did nothing at all. Sending writes a thread; the
     /// world's next moment is what carries it to the inbox; and until it is in
     /// the inbox the character has not been told anything.
-    #[test]
-    fn a_message_reaches_the_characters_inbox_on_the_next_moment() {
+    #[tokio::test]
+    async fn a_message_reaches_the_characters_inbox_on_the_next_moment() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         let hosted = rt.hosted.get(WORLD).expect("hosted");
@@ -3353,8 +3715,8 @@ mod tests {
     /// And it is handed over **once**. The sweep runs twice a second; a cursor
     /// that did not move would read the same message to the character for ever,
     /// which is the failure the phone's own cursor exists to prevent.
-    #[test]
-    fn a_message_is_handed_to_the_mind_exactly_once() {
+    #[tokio::test]
+    async fn a_message_is_handed_to_the_mind_exactly_once() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         let hosted = rt.hosted.get(WORLD).expect("hosted");
@@ -3372,8 +3734,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_hosted_world_is_reachable_and_moving() {
+    #[tokio::test]
+    async fn a_hosted_world_is_reachable_and_moving() {
         let rt = rt();
         assert!(rt.hosted.get(WORLD).is_none(), "hosted before it was asked");
 
@@ -3400,8 +3762,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_world_can_be_held_still_and_let_go() {
+    #[tokio::test]
+    async fn a_world_can_be_held_still_and_let_go() {
         let rt = vaulted();
         assert!(rt.moments()[0].2, "not paused");
         assert!(rt.hold_world(WORLD, false));
@@ -3412,8 +3774,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn embodying_a_character_grounds_it_and_quickens_it() {
+    #[tokio::test]
+    async fn embodying_a_character_grounds_it_and_quickens_it() {
         // Both, at once. A character that can act before it has been told where
         // it is would act blind; one left at an ambient pace would think about
         // its work every two minutes.
@@ -3426,8 +3788,8 @@ mod tests {
         assert!(read.iter().any(|t| t.contains("band one")), "{read:?}");
     }
 
-    #[test]
-    fn what_is_within_reach_arrives_with_where_the_body_is() {
+    #[tokio::test]
+    async fn what_is_within_reach_arrives_with_where_the_body_is() {
         // The two are one fact — both are functions of where it stands — so
         // they arrive together and go stale together.
         let rt = vaulted();
@@ -3442,8 +3804,8 @@ mod tests {
         assert!(here.contains("terminal"), "{here}");
     }
 
-    #[test]
-    fn a_corridor_says_nothing_about_what_is_within_reach() {
+    #[tokio::test]
+    async fn a_corridor_says_nothing_about_what_is_within_reach() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "ring-north");
         run(&rt, 1);
@@ -3455,8 +3817,8 @@ mod tests {
         assert!(!here.contains("Within reach"), "{here}");
     }
 
-    #[test]
-    fn embodying_the_same_character_twice_elsewhere_is_refused() {
+    #[tokio::test]
+    async fn embodying_the_same_character_twice_elsewhere_is_refused() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "band-one");
         rt.hosted
@@ -3474,8 +3836,8 @@ mod tests {
     /// opened on the persona's situation, which is empty for every authored
     /// character. Asked where it was, a character in the Redoubt named a vault
     /// room; asked to reflect, it dreamed of an office.
-    #[test]
-    fn a_character_knows_the_building_it_stands_in_and_the_room_it_is_in() {
+    #[tokio::test]
+    async fn a_character_knows_the_building_it_stands_in_and_the_room_it_is_in() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "band-one");
         let hosted = rt.hosted.get(WORLD).unwrap();
@@ -3498,8 +3860,8 @@ mod tests {
         assert!(rt.situation_of(99).is_none(), "nobody is nowhere");
     }
 
-    #[test]
-    fn embodying_into_a_world_or_a_body_that_is_not_there_is_refused() {
+    #[tokio::test]
+    async fn embodying_into_a_world_or_a_body_that_is_not_there_is_refused() {
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
         let no_world = rt.embody(1, "elsewhere", "m1", 0).unwrap_err().to_string();
@@ -3510,8 +3872,8 @@ mod tests {
         assert!(!rt.bodies.is_bound(1));
     }
 
-    #[test]
-    fn disembodying_lets_a_character_settle_back_to_reacting() {
+    #[tokio::test]
+    async fn disembodying_lets_a_character_settle_back_to_reacting() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "band-one");
         assert!(rt.disembody(1, 0));
@@ -3520,8 +3882,8 @@ mod tests {
         assert!(!rt.disembody(1, 0), "disembodied twice");
     }
 
-    #[test]
-    fn unhosting_a_world_stops_it_and_frees_the_characters_in_it() {
+    #[tokio::test]
+    async fn unhosting_a_world_stops_it_and_frees_the_characters_in_it() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "band-one");
         embody(&rt, 2, "m2", "band-one");
@@ -3546,8 +3908,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_act_that_happens_inside_a_head_never_reaches_the_world() {
+    #[tokio::test]
+    async fn an_act_that_happens_inside_a_head_never_reaches_the_world() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "band-one");
         assert_eq!(
@@ -3556,8 +3918,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_character_with_no_body_cannot_act_on_a_world() {
+    #[tokio::test]
+    async fn a_character_with_no_body_cannot_act_on_a_world() {
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
         assert_eq!(
@@ -3566,8 +3928,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn speaking_reaches_the_other_character_in_the_room() {
+    #[tokio::test]
+    async fn speaking_reaches_the_other_character_in_the_room() {
         // The whole chain, in one daemon: an act from one mind lands in the
         // world, is perceived by the body beside it, and is read by that
         // body's mind.
@@ -3609,8 +3971,8 @@ mod tests {
     /// through the ordinary sweep. No condition to satisfy, no patience, no
     /// rule excluding Perrin from waiting back — and nothing announcing to the
     /// room that she stopped, which it no longer is.
-    #[test]
-    fn a_pause_is_ended_by_the_room() {
+    #[tokio::test]
+    async fn a_pause_is_ended_by_the_room() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         embody(&rt, 2, "m2", "green-room");
@@ -3653,8 +4015,8 @@ mod tests {
     /// Driven by `move_to`, which is one of the two acts that occupy a body.
     /// It was `reflect`, from when reflection was the only thing that stalled;
     /// a thought does not take time, so it no longer does.
-    #[test]
-    fn a_pause_nobody_interrupts_ends_on_its_own() {
+    #[tokio::test]
+    async fn a_pause_nobody_interrupts_ends_on_its_own() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         run(&rt, 1);
@@ -3671,8 +4033,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_act_that_landed_is_recorded_as_an_act_whatever_the_world_said_back() {
+    #[tokio::test]
+    async fn an_act_that_landed_is_recorded_as_an_act_whatever_the_world_said_back() {
         // Speech is the case that made this visible. The world answers a
         // successful `shout` in narration — "You shout, for anyone within
         // earshot." — and
@@ -3717,8 +4079,8 @@ mod tests {
     /// But the words alone read as a sentence dropped into a column of acts —
     /// "Wailen Wylde is already on it." beside "invite — …", with nothing
     /// saying they were the same kind of event or that one had failed.
-    #[test]
-    fn a_refusal_is_recorded_in_the_world_s_words_because_the_prose_is_the_point() {
+    #[tokio::test]
+    async fn a_refusal_is_recorded_in_the_world_s_words_because_the_prose_is_the_point() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
 
@@ -3755,8 +4117,8 @@ mod tests {
     /// outcome, which is what it read live: "gesture — for Wailen to see that
     /// the room is ours for now", every turn, never once told whether anybody
     /// saw it.
-    #[test]
-    fn the_answer_is_the_worlds_verdict_and_the_feed_line_is_the_act() {
+    #[tokio::test]
+    async fn the_answer_is_the_worlds_verdict_and_the_feed_line_is_the_act() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         embody(&rt, 2, "m2", "green-room");
@@ -3779,8 +4141,8 @@ mod tests {
     /// and feeling are the reflection's input and are not listed; and what a
     /// pause says back is only that it happened — never the character's own
     /// words. When a reflection runs, its answer takes the arrow's side instead.
-    #[test]
-    fn a_reflect_is_recorded_as_its_thought_and_what_came_of_it() {
+    #[tokio::test]
+    async fn a_reflect_is_recorded_as_its_thought_and_what_came_of_it() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         let r = rt.record_act(
@@ -3817,8 +4179,8 @@ mod tests {
         assert!(rt.claim_dream(1).is_some(), "the slot never came back");
     }
 
-    #[test]
-    fn an_act_the_world_refuses_reads_as_refused_rather_than_as_done() {
+    #[tokio::test]
+    async fn an_act_the_world_refuses_reads_as_refused_rather_than_as_done() {
         // The distinction the whole path exists to preserve: a character that
         // cannot tell a refused act from a successful one spends the rest of
         // the day reasoning from a move it never made.
@@ -3841,8 +4203,8 @@ mod tests {
             .read(|w| w.actor("m1").unwrap().walk.is_none()));
     }
 
-    #[test]
-    fn moving_is_a_journey_the_world_advances_rather_than_the_act() {
+    #[tokio::test]
+    async fn moving_is_a_journey_the_world_advances_rather_than_the_act() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         let out = rt
@@ -3871,8 +4233,8 @@ mod tests {
 
     /// **Arriving on a floor tells you who else is on it, and where** — the
     /// person left behind in the room it walked out of, here.
-    #[test]
-    fn arriving_names_who_else_is_on_the_floor() {
+    #[tokio::test]
+    async fn arriving_names_who_else_is_on_the_floor() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         embody(&rt, 2, "m2", "green-room");
@@ -3886,8 +4248,8 @@ mod tests {
         assert!(read.contains("in the green room"), "{read}");
     }
 
-    #[test]
-    fn what_a_character_did_comes_back_in_its_own_turn() {
+    #[tokio::test]
+    async fn what_a_character_did_comes_back_in_its_own_turn() {
         // The actor is not left waiting for the world to tell it what it just
         // did — the act goes into its own window in the same turn. What it does
         // wait for is *everyone else* perceiving it.
@@ -3914,8 +4276,8 @@ mod tests {
     /// Every path into a character's window goes through a world moment. An
     /// act that pushed perception itself would be a second one, unbatched and
     /// off the sweep — and it would be invisible, because it would work.
-    #[test]
-    fn nothing_perceives_anything_outside_a_world_moment() {
+    #[tokio::test]
+    async fn nothing_perceives_anything_outside_a_world_moment() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         embody(&rt, 2, "m2", "green-room");
@@ -3944,8 +4306,8 @@ mod tests {
 
     // ── a new character, put into its world ─────────────────────────────────
 
-    #[test]
-    fn a_new_character_arrives_at_the_way_in_and_starts_thinking() {
+    #[tokio::test]
+    async fn a_new_character_arrives_at_the_way_in_and_starts_thinking() {
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
 
@@ -3963,8 +4325,8 @@ mod tests {
         assert_eq!(rt.scheduler.pace_of(1), Some(Pace::WORKING));
     }
 
-    #[test]
-    fn a_character_whose_world_has_no_map_is_left_without_a_body() {
+    #[tokio::test]
+    async fn a_character_whose_world_has_no_map_is_left_without_a_body() {
         // Most worlds have none. Lore and no body is a character, not a
         // failure, and the caller has to be able to tell that from an error.
         let rt = vaulted();
@@ -3975,8 +4337,8 @@ mod tests {
         assert!(rt.body_of(1).is_none());
     }
 
-    #[test]
-    fn putting_a_character_back_in_the_body_it_had_changes_nothing() {
+    #[tokio::test]
+    async fn putting_a_character_back_in_the_body_it_had_changes_nothing() {
         // The restart path and the create path are the same call, so it has to
         // be safe to make twice — once when the character was created, once
         // every boot after.
@@ -4011,8 +4373,8 @@ mod tests {
     /// The world's own state — who is standing where — is held in RAM and goes
     /// with the process, so the character record's remembered room is the only
     /// thing that survives to rebuild it from.
-    #[test]
-    fn a_body_returns_to_the_room_it_was_remembered_in() {
+    #[tokio::test]
+    async fn a_body_returns_to_the_room_it_was_remembered_in() {
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
         let green = "vault-casting/green-room";
@@ -4031,8 +4393,8 @@ mod tests {
     /// A remembered room the map no longer has is not an error — maps are
     /// authored and rooms get renamed. The character arrives at the door, which
     /// is what somebody whose room was demolished should do.
-    #[test]
-    fn a_body_whose_remembered_room_is_gone_arrives_at_the_door() {
+    #[tokio::test]
+    async fn a_body_whose_remembered_room_is_gone_arrives_at_the_door() {
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
 
@@ -4065,8 +4427,8 @@ mod tests {
 
     // ── the standing instruction ────────────────────────────────────────────
 
-    #[test]
-    fn a_character_with_nothing_asked_of_it_is_pointed_at_the_work() {
+    #[tokio::test]
+    async fn a_character_with_nothing_asked_of_it_is_pointed_at_the_work() {
         // Having nothing to do is itself a standing instruction. An NPC that
         // stands still because nothing was assigned reads as scenery.
         //
@@ -4098,8 +4460,8 @@ mod tests {
     /// quiet turn, two characters explored a seventy-eight room building and
     /// never held a conversation: each moved every four seconds, so sharing a
     /// room lasted one tick and neither had a reason to stay for the second.
-    #[test]
-    fn a_character_that_is_not_alone_is_told_to_stay_and_talk() {
+    #[tokio::test]
+    async fn a_character_that_is_not_alone_is_told_to_stay_and_talk() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         assert_eq!(rt.nudge_for(1).as_deref(), Some(NO_MISSION));
@@ -4166,8 +4528,8 @@ mod tests {
     ///
     /// So the question is whether anything *happened*, which is what
     /// [`crate::engine::tick::Inbox::has_news`] answers.
-    #[test]
-    fn the_standing_task_waits_for_a_turn_with_nothing_in_it() {
+    #[tokio::test]
+    async fn the_standing_task_waits_for_a_turn_with_nothing_in_it() {
         use crate::engine::event::{EventKind, Salience};
 
         let rt = vaulted();
@@ -4239,8 +4601,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn somebody_in_the_next_room_is_not_company() {
+    #[tokio::test]
+    async fn somebody_in_the_next_room_is_not_company() {
         // Company is who is *here*. Being able to see somebody through a
         // doorway is a reason to go to them, not a conversation.
         let rt = vaulted();
@@ -4249,8 +4611,8 @@ mod tests {
         assert_eq!(rt.nudge_for(1).as_deref(), Some(NO_MISSION));
     }
 
-    #[test]
-    fn a_character_with_no_body_is_not_told_to_explore_anything() {
+    #[tokio::test]
+    async fn a_character_with_no_body_is_not_told_to_explore_anything() {
         // It has nowhere to go and nobody to talk to; instructing it otherwise
         // is instructing it to do something it cannot.
         let rt = vaulted();
@@ -4314,8 +4676,8 @@ mod tests {
     /// can stand in must be findable by that same name. Anything else needs a
     /// second table to reconcile the two, and a second table is a thing that can
     /// disagree.
-    #[test]
-    fn a_characters_world_id_finds_the_places_it_can_stand_in() {
+    #[tokio::test]
+    async fn a_characters_world_id_finds_the_places_it_can_stand_in() {
         let rt = vaulted();
         // What a character carries is a string from its own document.
         let world_id: String = WORLD.to_string();
@@ -4331,8 +4693,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn two_worlds_are_two_places_and_a_body_in_one_is_not_in_the_other() {
+    #[tokio::test]
+    async fn two_worlds_are_two_places_and_a_body_in_one_is_not_in_the_other() {
         let rt = rt();
         rt.host("creators-vault", Path::new(ROOMS)).unwrap();
         rt.host("second-world", Path::new(ROOMS)).unwrap();
@@ -4358,8 +4720,8 @@ mod tests {
             .expect("a different world");
     }
 
-    #[test]
-    fn unhosting_one_world_leaves_the_others_running() {
+    #[tokio::test]
+    async fn unhosting_one_world_leaves_the_others_running() {
         let rt = rt();
         rt.host("creators-vault", Path::new(ROOMS)).unwrap();
         rt.host("second-world", Path::new(ROOMS)).unwrap();
@@ -4388,8 +4750,8 @@ mod tests {
         assert_eq!(rt.moments().len(), 1);
     }
 
-    #[test]
-    fn only_authored_worlds_with_rooms_are_hosted() {
+    #[tokio::test]
+    async fn only_authored_worlds_with_rooms_are_hosted() {
         // Driven by the registry rather than by what is on disk: a map
         // directory nothing authored must not be hosted under an id no
         // character can name, and an authored world with no map is a world

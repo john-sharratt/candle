@@ -61,7 +61,7 @@ use candle_conversation::stencil::{
     compile_think_tree, compile_tool_call_tree, Param as CallParam, ParamType, StencilTree,
     ThinkMode, ThinkSteerEnvelope, ToolCallEnvelope, ToolSpec,
 };
-use candle_conversation::{ConversationEngine, SequenceConfig, TurnOptions};
+use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnOptions};
 use serde::Serialize;
 
 use crate::engine::act::escape_control_in_strings;
@@ -70,6 +70,7 @@ use crate::engine::identity;
 use crate::engine::mind::Projected;
 use crate::engine::prompt::{self, Persona, Stance};
 use crate::engine::schema::{ReflectionTurns, AXES_SLOT, DOMAIN_SLOT};
+use crate::engine::throwaway::Throwaway;
 use crate::engine::tools::{self, Availability, Mode, Param, Plane, Tool};
 
 /// How many turns of its own the reflection carries.
@@ -1025,7 +1026,7 @@ impl<'t> Reflect<'t> {
     /// the list. The failure is anchoring, not exhaustion, and it gets worse as
     /// the corpus grows, so this is not an optimisation.
     #[allow(clippy::too_many_arguments)]
-    pub fn run(
+    pub async fn run(
         &self,
         npc_id: u64,
         persona: &Persona<'_>,
@@ -1045,7 +1046,7 @@ impl<'t> Reflect<'t> {
         // at the answer — no brief asked for and no dream: what a reflect gets
         // while its character already has a dream being written. See
         // `Runtime::claim_dream`.
-        on_reflection: &mut dyn FnMut(&str) -> bool,
+        on_reflection: &mut (dyn FnMut(&str) -> bool + Send),
     ) -> anyhow::Result<Reflection> {
         let started = std::time::Instant::now();
 
@@ -1090,6 +1091,12 @@ impl<'t> Reflect<'t> {
             engine.mark_timeline_transient(tl);
             (seq, tl)
         };
+        // Tombstoned as well as transient, however this run ends. Transient
+        // keeps it off disk; the tombstone is what keeps it out of every later
+        // gather and out of `find_conversations_by_metadata`, so nothing can
+        // resume or surface it. A drop guard rather than a tail call, because
+        // a caller that drops this future mid-decode runs nothing else.
+        let _retired = Throwaway::new(&self.engine, timeline, "reflection");
 
         // **What the model actually read, not what was handed in.**
         //
@@ -1216,29 +1223,34 @@ impl<'t> Reflect<'t> {
         // verdict goes back inside the wrapper the model reads verdicts in, and
         // it says in words what was wrong. Capped, because an uncapped argument
         // inside a blocking act can spend a character's afternoon on one dream.
-        let ask_until_valid = |sequence: &mut candle_conversation::Sequence,
-                               ask: String,
-                               opts: TurnOptions,
-                               field_name: &'static str,
-                               min: usize,
-                               max: usize,
-                               what: &'static str,
-                               // The brief this turn is revising, when it is a
-                               // revision. `None` for the one that writes it.
-                               revising: Option<&str>,
-                               // A check on the whole call beyond the field's
-                               // length and drift. The reflection has one: its
-                               // two invariants used to be computed at the end
-                               // and *reported*, which is a fault nobody acts on
-                               // — measured, a two-sentence line came back, was
-                               // flagged, and went to the character anyway. The
-                               // dream's is for the field that is *not* being
-                               // measured, which is why it sees the whole call.
-                               also: Option<fn(&str) -> Option<String>>,
-                               tokens: &mut Vec<usize>,
-                               trail: &mut Vec<String>|
-         -> anyhow::Result<String> {
-            let mut turn = sequence.send_turn_with_options(&ask, opts.clone())?;
+        #[allow(clippy::too_many_arguments)]
+        async fn ask_until_valid(
+            sequence: &mut Sequence,
+            exchange: &Exchange<'_>,
+            ask: String,
+            opts: TurnOptions,
+            field_name: &'static str,
+            min: usize,
+            max: usize,
+            what: &'static str,
+            // The brief this turn is revising, when it is a
+            // revision. `None` for the one that writes it.
+            revising: Option<&str>,
+            // A check on the whole call beyond the field's
+            // length and drift. The reflection has one: its
+            // two invariants used to be computed at the end
+            // and *reported*, which is a fault nobody acts on
+            // — measured, a two-sentence line came back, was
+            // flagged, and went to the character anyway. The
+            // dream's is for the field that is *not* being
+            // measured, which is why it sees the whole call.
+            also: Option<fn(&str) -> Option<String>>,
+            tokens: &mut Vec<usize>,
+            trail: &mut Vec<String>,
+        ) -> anyhow::Result<String> {
+            let mut turn = sequence
+                .send_turn_with_options_async(&ask, opts.clone())
+                .await?;
             for _ in 0..MAX_REFUSALS {
                 tokens.push(turn.stats.tokens_generated);
                 trail.push(turn.text.trim().to_string());
@@ -1266,12 +1278,14 @@ impl<'t> Reflect<'t> {
                 let Some(why) = why else {
                     return Ok(turn.text);
                 };
-                turn = sequence.send_turn_with_options(&exchange.respond(&why), opts.clone())?;
+                turn = sequence
+                    .send_turn_with_options_async(&exchange.respond(&why), opts.clone())
+                    .await?;
             }
             tokens.push(turn.stats.tokens_generated);
             trail.push(turn.text.trim().to_string());
             Ok(turn.text)
-        };
+        }
 
         let mut tokens: Vec<usize> = Vec::new();
         let mut trail: Vec<String> = Vec::new();
@@ -1320,6 +1334,7 @@ impl<'t> Reflect<'t> {
         };
         let first = ask_until_valid(
             &mut sequence,
+            &exchange,
             opening,
             thought_opts,
             "said",
@@ -1330,7 +1345,8 @@ impl<'t> Reflect<'t> {
             Some(reflection_call_fault),
             &mut tokens,
             &mut trail,
-        )?;
+        )
+        .await?;
         // Its one field, read the way every other answer here is read. The
         // markup-stripping salvage is for an answer that did not come back as a
         // call at all — run over a JSON block it would hand the character the
@@ -1340,15 +1356,7 @@ impl<'t> Reflect<'t> {
         // waiting on, and nothing after this point changes it.
         let crossing_back = field(&first, "said").unwrap_or_else(|| plain_prose(&first));
         if !on_reflection(&crossing_back) {
-            // Retired exactly as a finished one is — see below.
-            if let Ok(engine) = self.engine.lock() {
-                if let Err(e) = engine.tombstone_timeline(timeline) {
-                    tracing::warn!(
-                        "reflection conversation {timeline} could not be retired: {e:?} — it \
-                         stays selectable and nothing will ever read it"
-                    );
-                }
-            }
+            // Retired exactly as a finished one is — the guard above.
             drop(sequence);
             return Ok(Reflection {
                 npc_id,
@@ -1381,14 +1389,16 @@ impl<'t> Reflect<'t> {
         // that is the one sentence above — but it is what the dream is written
         // out of, and a dream seeded from a sentence is thinner than one seeded
         // from a thought.
-        let loosed = sequence.send_turn_with_options(
-            &exchange.respond("ok"),
-            TurnOptions {
-                sampling: Some(sampling.clone()),
-                selection: selection.clone(),
-                ..Default::default()
-            },
-        )?;
+        let loosed = sequence
+            .send_turn_with_options_async(
+                &exchange.respond("ok"),
+                TurnOptions {
+                    sampling: Some(sampling.clone()),
+                    selection: selection.clone(),
+                    ..Default::default()
+                },
+            )
+            .await?;
         tokens.push(loosed.stats.tokens_generated);
         trail.push(loosed.text.trim().to_string());
 
@@ -1404,6 +1414,7 @@ impl<'t> Reflect<'t> {
 
         let second_raw = ask_until_valid(
             &mut sequence,
+            &exchange,
             instruction,
             writing(),
             "brief",
@@ -1414,7 +1425,8 @@ impl<'t> Reflect<'t> {
             Some(dream_call_fault),
             &mut tokens,
             &mut trail,
-        )?;
+        )
+        .await?;
         let original_raw = second_raw.trim().to_string();
         let mut raw = second_raw;
         let mut parsed = Brief::from_call(&raw);
@@ -1422,7 +1434,9 @@ impl<'t> Reflect<'t> {
         let mut retry_raw = None;
         let mut retry_fault = None;
         if fault.is_some() {
-            let third = sequence.send_turn_with_options(&self.turns.retry, writing())?;
+            let third = sequence
+                .send_turn_with_options_async(&self.turns.retry, writing())
+                .await?;
             // Kept like every other decode, so `transcript` and `tokens` stay one
             // entry per turn. It used to be counted and not kept: a retry that was
             // taken then appeared nowhere in the response, and every transcript
@@ -1489,17 +1503,19 @@ impl<'t> Reflect<'t> {
             );
             let answer = ask_until_valid(
                 &mut sequence,
+                &exchange,
                 ask,
                 writing(),
                 "brief",
                 BRIEF_MIN_WORDS,
                 BRIEF_MAX_WORDS,
                 "dream",
-                Some(&standing),
+                Some(standing.as_str()),
                 Some(dream_call_fault),
                 &mut tokens,
                 &mut trail,
-            )?;
+            )
+            .await?;
             let candidate = Brief::from_call(&answer);
             let cfault = candidate.fault(sampled_axes);
             let took = cfault.is_none() && candidate.brief.is_some();
@@ -1529,17 +1545,6 @@ impl<'t> Reflect<'t> {
         // one sentence, under [`REFLECTION_MAX_WORDS`], said back in words the
         // model can act on. Handed over above, as soon as it was answered.
 
-        // Tombstoned as well as transient. Transient keeps it off disk; the
-        // tombstone is what keeps it out of every later gather and out of
-        // `find_conversations_by_metadata`, so nothing can resume or surface it.
-        if let Ok(engine) = self.engine.lock() {
-            if let Err(e) = engine.tombstone_timeline(timeline) {
-                tracing::warn!(
-                    "reflection conversation {timeline} could not be retired: {e:?} — it stays \
-                     selectable and nothing will ever read it"
-                );
-            }
-        }
         drop(sequence);
 
         Ok(Reflection {

@@ -28,14 +28,22 @@
 //! metabolism — a guard at his post ticks slowly, the same guard who just heard
 //! something ticks tight until it settles. Nothing is ever dropped for being
 //! low-salience; it simply waits.
+//!
+//! # Each character waits on its own inbox
+//!
+//! There is no shared due-queue and nothing polls. Every character is an async
+//! task that sleeps on [`Scheduler::wait_due`] — a wait on its own inbox's
+//! waker, bounded by its own deadline — so an idle cast costs a parked future
+//! apiece and a delivery wakes exactly the character it names, at the moment it
+//! lands rather than at the next poll.
 
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use tokio::sync::Notify;
 
 use crate::engine::event::{Event, EventKind, Salience};
 use crate::engine::sleep::{DayAction, DayTracker};
@@ -54,7 +62,7 @@ pub const ALERT_HEARTBEAT: Duration = Duration::from_secs(4);
 /// **The ordinary state of a quiet character**, and the whole of what "no idle
 /// events" means: nothing is due, so nothing thinks, until the world puts
 /// something in its inbox. Spelled as a deadline past any clock rather than as
-/// an `Option`, so the one comparison in [`Scheduler::due_now`] answers both
+/// an `Option`, so the one comparison in [`Scheduler::wait_due`] answers both
 /// "is it time" and "is it scheduled".
 const NEVER: u64 = u64::MAX;
 
@@ -185,10 +193,11 @@ pub struct Inbox {
     /// context, identical decode; the character repeated one act until something
     /// outside it changed.
     last_nudge_ms: u64,
-    /// Thinking somewhere else, and not to be given a turn here until it is
-    /// back — see [`Scheduler::hold`]. What arrives meanwhile is queued, not
-    /// dropped, and read on the first turn after [`Scheduler::release`].
-    held: bool,
+    /// What the character's own task sleeps on — see [`Scheduler::wait_due`].
+    /// A delivery, a cut-short pause, and a retirement each notify it; the
+    /// permit is stored if the task is mid-think, so a wake sent while the
+    /// character is busy is read the moment it returns to its wait.
+    waker: Arc<Notify>,
 }
 
 impl Inbox {
@@ -208,7 +217,7 @@ impl Inbox {
             scheduled: false,
             last_news_ms: 0,
             last_nudge_ms: 0,
-            held: false,
+            waker: Arc::new(Notify::new()),
         }
     }
 
@@ -349,10 +358,14 @@ impl Inbox {
     /// Accept an event. Never refuses: the mind design is explicit that a filter
     /// dropping evidence before it lands makes a delusion permanent.
     ///
-    /// Returns whether this arrival means the character thinks **now** — either
-    /// because it preempts whatever was planned, or because it roused one that
-    /// was waiting.
-    pub fn push(&mut self, event: Event) -> bool {
+    /// **Every arrival is a wake.** Nothing polls, so an event that does not
+    /// rouse the character's task is an event nobody ever reads — it would sit
+    /// in the queue until something louder happened to arrive behind it. The
+    /// salience still decides how *urgently* the character reads it
+    /// (`readiness` keeps the Pulse feed's "why did it wake" column); a
+    /// character mid-think elsewhere simply finds the wake stored on its waker
+    /// when it comes back.
+    pub fn push(&mut self, event: Event) {
         self.events_seen += 1;
         // Stamped on arrival rather than on drain: the clock the standing task
         // is gated on is "when did something last happen to this character",
@@ -367,22 +380,11 @@ impl Inbox {
             self.last_nudge_ms = self.last_nudge_ms.max(event.at_ms);
         }
         let preempts = event.preempts();
-        // **Anything at all is enough to think about.** Nothing polls any more,
-        // so an event that does not schedule a thought is an event nobody ever
-        // reads — it would sit in the queue until something louder happened to
-        // arrive behind it. The salience below still decides how *urgently*, and
-        // whether a standing wait survives it.
-        //
-        // The one exception is a character that is held: it is already
-        // thinking, in another conversation, and a turn here now would answer
-        // the room before the act it is in the middle of has answered it. The
-        // event is queued all the same, and `release` brings it back to read it.
-        let wake = !self.held;
         // **Anything arriving cuts a pause short**, and nearly all of that is
-        // free: a pause is only a due time, and `deliver` moves every
-        // character's due time to now. That is the whole benefit over the
-        // subscription it replaced — being messaged mid-pause is read at once
-        // rather than two minutes later.
+        // free: a pause is only a due time, and `deliver` moves the character's
+        // due time to now. That is the whole benefit over the subscription it
+        // replaced — being messaged mid-pause is read at once rather than two
+        // minutes later.
         //
         // The one line it does cost is this. `scheduled` tells the end of a tick
         // to leave the deadline alone, and a pause that has been cut short no
@@ -399,11 +401,6 @@ impl Inbox {
             self.heartbeat = ALERT_HEARTBEAT;
         }
         self.queue.push_back(event);
-        // Always. `readiness` still tells a preempt from a pending arrival, so
-        // the Pulse feed keeps its "why did it wake" column — what has gone is
-        // the idea that some arrivals are not worth waking for, which only made
-        // sense while something else was polling.
-        wake
     }
 
     /// Take everything waiting. A busy character drains a fat batch — one
@@ -427,30 +424,18 @@ impl Inbox {
     }
 }
 
-/// A scheduled wake, ordered so the earliest is popped first.
-///
-/// `BinaryHeap` is a max-heap, so the comparison is reversed — the classic place
-/// to get this backwards and end up with a scheduler that runs the furthest-out
-/// character first and looks like a hang.
-#[derive(Debug, PartialEq, Eq)]
-struct Due {
-    at: u64,
-    npc_id: u64,
-}
-
-impl Ord for Due {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .at
-            .cmp(&self.at)
-            .then_with(|| other.npc_id.cmp(&self.npc_id))
-    }
-}
-
-impl PartialOrd for Due {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
+/// A tick's first two phases, handed across the decode to [`Scheduler::end_tick`]:
+/// what was drained, why the character woke, and the window snapshot the decode
+/// reads. Anything delivered while the decode runs lands in the real window and
+/// is seen by the next tick — the same guarantee as an event that arrived a
+/// moment after the drain.
+pub struct TickStart {
+    pub events: Vec<Event>,
+    /// The events as prose — exactly what goes to the model, and what the
+    /// record reports.
+    pub perceived: Vec<String>,
+    pub cause: Readiness,
+    pub window: Window,
 }
 
 /// What one tick did — the Pulse view's row.
@@ -500,10 +485,9 @@ pub struct TickRecord {
     pub ms_ago: u64,
 }
 
-/// The scheduler: every character's loop, and the order they run in.
+/// The scheduler: every character's loop state, and the wakes that run them.
 pub struct Scheduler {
     inboxes: Mutex<HashMap<u64, Inbox>>,
-    due: Mutex<BinaryHeap<Due>>,
     /// Monotonic event sequence, shared by every character so the Pulse view can
     /// order arrivals across the whole cast.
     seq: AtomicU64,
@@ -533,7 +517,6 @@ impl Scheduler {
     pub fn new(recent_cap: usize) -> Self {
         Self {
             inboxes: Mutex::new(HashMap::new()),
-            due: Mutex::new(BinaryHeap::new()),
             seq: AtomicU64::new(0),
             ticks: AtomicU64::new(0),
             recent: Mutex::new(VecDeque::new()),
@@ -628,70 +611,34 @@ impl Scheduler {
     ///
     /// Returns whether there was a character to stop.
     pub fn pause_for(&self, npc_id: u64, now_ms: u64, for_ms: u64) -> bool {
-        let at = {
+        let waker = {
             let mut g = self.inboxes.lock().unwrap();
             let Some(i) = g.get_mut(&npc_id) else {
                 return false;
             };
             i.pause_for(now_ms, for_ms);
-            i.due_at
+            Arc::clone(&i.waker)
         };
-        // Queued explicitly, for the reason every scheduling change here is: the
-        // entry this character was carrying was consumed by the tick that
-        // decided to pause, so moving `due_at` alone would leave it due and
-        // unqueued — awake with nothing to notice it.
-        self.due.lock().unwrap().push(Due { at, npc_id });
+        // Woken so the character's task re-reads its deadline: a pause set from
+        // outside the task's own tick would otherwise not shorten a longer
+        // sleep already in flight.
+        waker.notify_one();
         true
     }
 
     /// Bring a character straight back, because its last act answered with
     /// something. See [`Inbox::think_again`].
     pub fn think_again(&self, npc_id: u64) -> bool {
-        {
+        let waker = {
             let mut g = self.inboxes.lock().unwrap();
             let Some(i) = g.get_mut(&npc_id) else {
                 return false;
             };
             i.think_again();
-        }
-        self.due.lock().unwrap().push(Due { at: 0, npc_id });
-        true
-    }
-
-    /// Keep a character from taking a turn while it thinks somewhere else.
-    ///
-    /// **For an act whose answer comes from another conversation.** A
-    /// reflection is answered by a conversation of its own that takes seconds,
-    /// and the answer rides at the head of the character's next turn as the
-    /// reflect call's result. A turn taken in between — and every moment
-    /// delivers the room, which would give it one — would have answered the room
-    /// with that call still unanswered, and the late answer would then land
-    /// against whatever it called next.
-    ///
-    /// Only this character stops; the driver and everybody else carry on.
-    /// Whatever arrives meanwhile is queued as usual. Returns whether there was
-    /// a character to hold.
-    pub fn hold(&self, npc_id: u64) -> bool {
-        let mut g = self.inboxes.lock().unwrap();
-        let Some(i) = g.get_mut(&npc_id) else {
-            return false;
+            Arc::clone(&i.waker)
         };
-        i.held = true;
+        waker.notify_one();
         true
-    }
-
-    /// Let a held character think again, straight away, on everything that
-    /// arrived while it was held. Idempotent — releasing a character that is
-    /// not held only brings it forward. See [`Self::hold`].
-    pub fn release(&self, npc_id: u64) -> bool {
-        {
-            let mut g = self.inboxes.lock().unwrap();
-            let Some(i) = g.get_mut(&npc_id) else {
-                return false;
-            };
-            i.held = false;
-        }
-        self.think_again(npc_id)
     }
 
     /// Complete an act's row with the result that came back after it was
@@ -719,15 +666,6 @@ impl Scheduler {
         found
     }
 
-    /// Whether a character is held. See [`Self::hold`].
-    pub fn is_held(&self, npc_id: u64) -> bool {
-        self.inboxes
-            .lock()
-            .unwrap()
-            .get(&npc_id)
-            .is_some_and(|i| i.held)
-    }
-
     /// Whether this character is due the standing task. See [`Inbox::nudge_due`].
     pub fn nudge_due(&self, npc_id: u64, world_ms: u64, after_ms: u64) -> bool {
         self.inboxes
@@ -738,58 +676,39 @@ impl Scheduler {
     }
 
     /// Remove a character — deleted, or no longer in the cast after a reload.
+    ///
+    /// The character's own task is woken so it finds the inbox gone and exits;
+    /// see [`Self::wait_due`].
     pub fn retire(&self, npc_id: u64) {
-        self.inboxes.lock().unwrap().remove(&npc_id);
-        // The heap entry is left to expire: popping it is O(n) and the tick loop
-        // already skips ids with no inbox. A stale entry costs one comparison.
+        let gone = self.inboxes.lock().unwrap().remove(&npc_id);
+        if let Some(inbox) = gone {
+            inbox.waker.notify_one();
+        }
     }
 
     pub fn population(&self) -> usize {
         self.inboxes.lock().unwrap().len()
     }
 
-    /// Entries standing in the due heap.
-    ///
-    /// Not the population: a retired character's entry is left to expire, and a
-    /// character is entered once per wake it is owed. The number the duplicate
-    /// -wake test reads, since the scheduler behaves identically either way and
-    /// only the heap shows the difference.
-    #[cfg(test)]
-    fn due_len(&self) -> usize {
-        self.due.lock().unwrap().len()
-    }
-
     /// Deliver an event to a character. `false` if there is no such character.
     pub fn deliver(&self, npc_id: u64, world_ms: u64, salience: Salience, kind: EventKind) -> bool {
         let seq = self.seq.fetch_add(1, AtomicOrdering::Relaxed);
         let event = Event::new(seq, world_ms, salience, kind);
-        let mut inboxes = self.inboxes.lock().unwrap();
-        let Some(inbox) = inboxes.get_mut(&npc_id) else {
-            return false;
-        };
-        // Preempted whatever it was doing, or roused out of a wait — either way
-        // it thinks on the next pass rather than on its own schedule.
-        let wake_now = inbox.push(event);
-        if wake_now {
-            // Due immediately — but only *entered* as due once. `due_at == 0`
-            // already means an at-zero entry is standing in the heap and has not
-            // been served, so a second one would be a duplicate wake for a
-            // character that is already at the front of the queue. A burst of
-            // twenty preempting arrivals between two passes pushed twenty
-            // entries, all naming the same character, all popped by the same
-            // pass — work proportional to the burst to schedule one tick that
-            // drains the whole burst anyway.
-            //
-            // An arrival *during* a decode still gets its entry: the tick set
-            // `due_at` to its next heartbeat before decoding, so this reads
-            // non-zero and the character is re-woken the moment it finishes.
-            let already_queued = inbox.due_at == 0;
+        let waker = {
+            let mut inboxes = self.inboxes.lock().unwrap();
+            let Some(inbox) = inboxes.get_mut(&npc_id) else {
+                return false;
+            };
+            inbox.push(event);
+            // Due immediately: preempted whatever it planned, or roused out of
+            // a wait. The waker coalesces — a burst of twenty arrivals stores
+            // one permit, and the one wake drains the whole burst. An arrival
+            // *during* a decode stores its permit too, so the character is
+            // re-woken the moment its task returns to its wait.
             inbox.due_at = 0;
-            drop(inboxes);
-            if !already_queued {
-                self.due.lock().unwrap().push(Due { at: 0, npc_id });
-            }
-        }
+            Arc::clone(&inbox.waker)
+        };
+        waker.notify_one();
         true
     }
 
@@ -823,52 +742,76 @@ impl Scheduler {
         inboxes.get(&npc_id).map(|i| f(&i.window))
     }
 
-    /// The characters due to think at or before `now_ms`, soonest first.
+    /// The scheduler's own monotonic clock, in milliseconds — the `now_ms`
+    /// every character task ticks against, so a tick's `at_ms` and its age in
+    /// the Pulse ring are measured on one clock.
+    pub fn now_ms(&self) -> u64 {
+        self.born.elapsed().as_millis() as u64
+    }
+
+    /// Sleep until this character is due to think — its own task's wait.
     ///
-    /// Pops from the heap rather than sweeping the population, so an idle cast
-    /// costs nothing per pass.
-    pub fn due_now(&self, now_ms: u64) -> Vec<u64> {
-        let mut ready = Vec::new();
-        let mut deferred: Vec<Due> = Vec::new();
-        let mut due = self.due.lock().unwrap();
-        let inboxes = self.inboxes.lock().unwrap();
-        while let Some(top) = due.peek() {
-            if top.at > now_ms {
-                break;
-            }
-            let Due { npc_id, .. } = due.pop().expect("peeked");
-            // Retired, or a stale duplicate from a preempt. Either way, drop it.
-            let Some(inbox) = inboxes.get(&npc_id) else {
-                continue;
+    /// **`due_at` is the truth; the waker is the doorbell.** The wait re-reads
+    /// the deadline after every wake, so anything that moves it — a delivery
+    /// pulling it to now, a pause pushing it out, a tick parking it at `NEVER`
+    /// — takes effect at once rather than at the end of a stale sleep. A wake
+    /// sent while the task is mid-think is a stored permit, read the moment the
+    /// task comes back here.
+    ///
+    /// Returns `false` when the character has been retired: there is no inbox
+    /// left to be due, and the task exits.
+    pub async fn wait_due(&self, npc_id: u64) -> bool {
+        loop {
+            let (due_at, waker) = {
+                let inboxes = self.inboxes.lock().unwrap();
+                let Some(inbox) = inboxes.get(&npc_id) else {
+                    return false;
+                };
+                (inbox.due_at, Arc::clone(&inbox.waker))
             };
-            // Held: dropped rather than deferred, because `release` queues it
-            // afresh and a deferred entry would only come back to be dropped.
-            if inbox.held {
-                continue;
+            let now = self.now_ms();
+            if due_at <= now {
+                return true;
             }
-            // **`due_at` is the truth; a heap entry is a hint.**
-            //
-            // An entry is pushed when a tick ends and cannot be withdrawn, so
-            // anything that moves a character's next thought *later* — a wait
-            // beginning after the entry was queued — leaves a stale entry that
-            // would drag it back. Re-queue it where it now belongs rather than
-            // running it early: a waiting character woken by its own heartbeat
-            // is the busy-loop the typed wait exists to end.
-            if inbox.due_at > now_ms {
-                deferred.push(Due {
-                    at: inbox.due_at,
-                    npc_id,
-                });
-                continue;
-            }
-            if !ready.contains(&npc_id) {
-                ready.push(npc_id);
+            // Registered before the deadline check could race a notify: a
+            // permit stored between the read above and this await completes
+            // the wait immediately.
+            let woken = waker.notified();
+            if due_at == NEVER {
+                woken.await;
+            } else {
+                let remaining = Duration::from_millis(due_at - now);
+                tokio::select! {
+                    _ = woken => {}
+                    _ = tokio::time::sleep(remaining) => {}
+                }
             }
         }
-        for d in deferred {
-            due.push(d);
-        }
-        ready
+    }
+
+    /// Every character due at `now_ms`, soonest deadline first — the
+    /// synchronous read of the state each [`Self::wait_due`] sleeps on, for
+    /// tests that drive the scheduler without standing the tasks up.
+    pub fn due_now(&self, now_ms: u64) -> Vec<u64> {
+        let inboxes = self.inboxes.lock().unwrap();
+        let mut due: Vec<(u64, u64)> = inboxes
+            .values()
+            .filter(|i| i.due_at <= now_ms)
+            .map(|i| (i.due_at, i.npc_id))
+            .collect();
+        due.sort_unstable();
+        due.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Whether this one character is due at `now_ms` — [`Self::due_now`]
+    /// narrowed to the inbox a test is watching.
+    #[cfg(test)]
+    fn is_due(&self, npc_id: u64, now_ms: u64) -> bool {
+        self.inboxes
+            .lock()
+            .unwrap()
+            .get(&npc_id)
+            .is_some_and(|i| i.due_at <= now_ms)
     }
 
     /// Run one character's tick.
@@ -877,14 +820,30 @@ impl Scheduler {
     /// character took. It is a closure so the scheduler can be tested — and
     /// reasoned about — without a GPU: the scheduling *is* the thing under test
     /// here, and a decode inside it would make every test a model test.
+    ///
+    /// [`Self::begin_tick`] then [`Self::end_tick`], with the closure between:
+    /// the live character task uses the two halves directly so it can *await*
+    /// its decode there, and this composition is what keeps the tests and the
+    /// task on one code path.
     pub fn tick<F>(&self, npc_id: u64, now_ms: u64, world_ms: u64, act: F) -> Option<TickRecord>
     where
         F: FnOnce(&[Event], &Window) -> Vec<String>,
     {
-        // The drain takes the lock and gives it straight back. The decode below
-        // can take seconds, and holding the inbox map across it would block
-        // every other character's `deliver` for that whole time — an event
-        // arriving for a second character would wait on the first one thinking.
+        let start = self.begin_tick(npc_id)?;
+        let acts = act(&start.events, &start.window);
+        self.end_tick(npc_id, now_ms, world_ms, start, acts)
+    }
+
+    /// The tick's first two phases: drain the inbox and land perception in the
+    /// window, handing back the snapshot the decode reads. `None` when there is
+    /// nothing to think about, or no such character — and going quiet is
+    /// *recorded*, not merely returned (see the body).
+    ///
+    /// The decode between this and [`Self::end_tick`] runs under no lock here:
+    /// it can take seconds, and holding the inbox map across it would block
+    /// every other character's `deliver` for that whole time.
+    pub fn begin_tick(&self, npc_id: u64) -> Option<TickStart> {
+        // The drain takes the lock and gives it straight back.
         let (events, cause) = {
             let mut inboxes = self.inboxes.lock().unwrap();
             let inbox = inboxes.get_mut(&npc_id)?;
@@ -970,11 +929,30 @@ impl Scheduler {
             inbox.window.clone()
         };
 
-        let acts = act(&events, &snapshot);
+        Some(TickStart {
+            events,
+            perceived,
+            cause,
+            window: snapshot,
+        })
+    }
 
+    /// The tick's third phase: land the acts, settle the next deadline, and
+    /// record the row. `None` when the character was retired while the decode
+    /// ran — its acts have nowhere to land, and nothing downstream wants a
+    /// record for a character that is gone.
+    pub fn end_tick(
+        &self,
+        npc_id: u64,
+        now_ms: u64,
+        world_ms: u64,
+        start: TickStart,
+        acts: Vec<String>,
+    ) -> Option<TickRecord> {
+        let TickStart {
+            perceived, cause, ..
+        } = start;
         let mut inboxes = self.inboxes.lock().unwrap();
-        // Retired while the decode ran. Its acts have nowhere to land and nothing downstream
-        // wants a record for a character that is gone.
         let inbox = inboxes.get_mut(&npc_id)?;
         for a in &acts {
             inbox.window.push_npc(a.clone(), world_ms);
@@ -1028,17 +1006,10 @@ impl Scheduler {
             // Filled in on the way out — see `recent`.
             ms_ago: 0,
         };
-        // An unscheduled character gets no heap entry at all. Pushing one at
-        // `NEVER` would be an entry that is never served and never removed, so
-        // the heap would grow by one per quiet tick for the life of the daemon.
-        let next = (inbox.due_at != NEVER).then_some(Due {
-            at: inbox.due_at,
-            npc_id,
-        });
+        // Nothing to queue: the character's own task returns to `wait_due`
+        // after this and reads the fresh `due_at` — `NEVER` parks it on its
+        // waker, a deadline sleeps it, zero runs it again at once.
         drop(inboxes);
-        if let Some(next) = next {
-            self.due.lock().unwrap().push(next);
-        }
 
         let mut recent = self.recent.lock().unwrap();
         recent.push_back(record.clone());
@@ -1198,12 +1169,12 @@ mod tests {
 
         // An act that answered: due now, and no event behind it.
         s.deliver(1, 0, Salience::NORMAL, say("the board says three names"));
-        assert_eq!(s.due_now(1_000), vec![1]);
+        assert!(s.is_due(1, 1_000));
         s.tick(1, 1_000, 0, |_, _| vec!["read the board".into()]);
         s.think_again(1);
 
         // The pass that finds an empty queue.
-        assert_eq!(s.due_now(2_000), vec![1], "it was not even due");
+        assert!(s.is_due(1, 2_000), "it was not even due");
         assert!(
             s.tick(1, 2_000, 0, |_, _| vec![]).is_none(),
             "there was nothing to drain, so there is no record"
@@ -1211,9 +1182,8 @@ mod tests {
 
         // The character must now be schedulable again by an ordinary arrival.
         s.deliver(1, 0, Salience::NORMAL, say("somebody comes in"));
-        assert_eq!(
-            s.due_now(3_000),
-            vec![1],
+        assert!(
+            s.is_due(1, 3_000),
             "the character was left claiming to be queued while nothing could \
              ever run it — every later arrival is silently dropped on the floor"
         );
@@ -1221,33 +1191,30 @@ mod tests {
         assert_eq!(rec.perceived.len(), 1);
     }
 
-    /// **A character thinking somewhere else is not given a turn here, and
-    /// loses nothing that arrives meanwhile.** What a reflection relies on: its
-    /// answer has to be the next thing the character reads about the act, so
-    /// the room cannot be allowed to give it a turn first — and every moment
-    /// delivers the room. Released, it thinks at once, on all of it.
-    #[test]
-    fn a_held_character_queues_what_arrives_and_thinks_when_released() {
+    /// **A character thinking somewhere else loses nothing that arrives
+    /// meanwhile.** Its task is awaiting a reflection's answer rather than
+    /// sitting in [`Scheduler::wait_due`], so nothing drains its inbox — and
+    /// every arrival stores a wake on its waker, so the moment the task
+    /// returns to its wait it thinks at once, on all of it.
+    #[tokio::test]
+    async fn what_arrives_while_a_character_thinks_elsewhere_is_read_on_return() {
         let s = sched();
         s.wake(1, 0, 0);
-        s.wake(2, 0, 0);
-        assert!(s.hold(1));
-        assert!(s.is_held(1));
 
+        // The character's task is elsewhere: nothing calls wait_due or tick.
         s.deliver(1, 0, Salience::NORMAL, say("somebody comes in"));
         s.deliver(1, 0, Salience::URGENT, say("an alarm"));
-        s.deliver(2, 0, Salience::NORMAL, say("the same room"));
-        assert_eq!(s.due_now(1_000), vec![2], "only the other one moves");
-        assert_eq!(s.inbox_depth(1), Some(2), "nothing was dropped");
+        assert_eq!(s.inbox_depth(1), Some(2), "something was dropped");
 
-        assert!(s.release(1));
-        assert!(!s.is_held(1));
-        assert_eq!(s.due_now(2_000), vec![1], "back at once");
-        let rec = s.tick(1, 2_000, 0, |_, _| vec![]).expect("ticked");
+        // Back from the other conversation: the stored wake completes at once…
+        let due = tokio::time::timeout(Duration::from_secs(1), s.wait_due(1))
+            .await
+            .expect("the stored wake was lost");
+        assert!(due);
+        // …and the one turn reads everything that queued up meanwhile.
+        let now = s.now_ms();
+        let rec = s.tick(1, now, 0, |_, _| vec![]).expect("ticked");
         assert_eq!(rec.perceived.len(), 2, "on everything it missed");
-
-        assert!(!s.hold(99), "nobody to hold");
-        assert!(s.release(1), "releasing twice is harmless");
     }
 
     /// **An act recorded before its result is completed with it.** A reflect
@@ -1259,7 +1226,7 @@ mod tests {
         let s = sched();
         s.wake(1, 0, 0);
         s.deliver(1, 0, Salience::NORMAL, say("a box sags"));
-        assert_eq!(s.due_now(1_000), vec![1]);
+        assert!(s.is_due(1, 1_000));
         s.tick(1, 1_000, 0, |_, _| vec!["reflect — it gave up".into()]);
 
         let done = "reflect — it gave up → I keep counting what gives up".to_string();
@@ -1293,21 +1260,18 @@ mod tests {
         let s = sched();
         s.wake(1, 0, 0);
         s.deliver(1, 0, Salience::NORMAL, say("a light goes out"));
-        s.due_now(1_000);
         s.tick(1, 1_000, 0, |_, _| vec!["reflect".into()]);
         s.pause_for(1, 1_000, pause_ms());
 
         // Its deadline comes round with nothing waiting.
-        let due = s.due_now(1_000 + pause_ms() + 1);
-        assert_eq!(due, vec![1]);
+        assert!(s.is_due(1, 1_000 + pause_ms() + 1));
         assert!(s
             .tick(1, 1_000 + pause_ms() + 1, 0, |_, _| vec![])
             .is_none());
 
         s.deliver(1, 0, Salience::URGENT, say("a door slams"));
-        assert_eq!(
-            s.due_now(1_000 + pause_ms() + 2_000),
-            vec![1],
+        assert!(
+            s.is_due(1, 1_000 + pause_ms() + 2_000),
             "an urgent arrival could not wake it"
         );
     }
@@ -1374,42 +1338,37 @@ mod tests {
     fn a_high_salience_event_preempts_and_becomes_due_immediately() {
         let s = sched();
         s.wake(1, 10_000, 0);
-        assert!(s.due_now(10_000).is_empty(), "not due yet");
+        assert!(!s.is_due(1, 10_000), "not due yet");
         s.deliver(1, 0, Salience::URGENT, say("the beam gives"));
         assert_eq!(s.census()[0].readiness, Readiness::Preempted);
-        assert_eq!(s.due_now(10_000), vec![1]);
+        assert!(s.is_due(1, 10_000));
     }
 
-    /// **A burst of urgent arrivals is one wake, not one wake each.**
-    ///
-    /// A character already at the front of the queue cannot be moved further
-    /// forward, so every preempting arrival after the first used to push a heap
-    /// entry that named a character already standing there — work proportional
-    /// to the burst, to schedule the single tick that drains the whole burst.
-    /// The tick itself is unaffected either way, which is what kept this
-    /// invisible: the character behaves correctly and the heap does the work.
-    #[test]
-    fn a_burst_of_preempting_arrivals_queues_one_wake() {
+    /// **A burst of urgent arrivals is one wake, not one wake each.** The
+    /// waker coalesces — twenty deliveries store one permit — and the single
+    /// tick that permit buys drains the whole burst.
+    #[tokio::test]
+    async fn a_burst_of_preempting_arrivals_is_one_wake_that_drains_it_all() {
         let s = sched();
         s.wake(1, 10_000, 0);
         for _ in 0..20 {
             s.deliver(1, 0, Salience::URGENT, say("the beam gives"));
         }
-        // One, for the whole burst. Twenty is the bug — an entry per arrival.
-        // (`wake` no longer stands one up: a character with an empty inbox is
-        // not scheduled at all.)
-        assert_eq!(s.due_len(), 1, "the burst queued one wake per arrival");
 
-        // And the one wake still drains all twenty.
-        assert_eq!(s.due_now(10_000), vec![1]);
+        assert!(tokio::time::timeout(Duration::from_secs(1), s.wait_due(1))
+            .await
+            .expect("the burst stored no wake"));
         let rec = s.tick(1, 10_000, 0, |_, _| vec![]).expect("ticked");
         assert_eq!(rec.perceived.len(), 20);
 
         // An arrival during the decode is a different case and must still wake
-        // the character: the tick had already set its next heartbeat, so this is
-        // the first at-zero entry rather than a duplicate of a standing one.
+        // the character: its permit was stored while the task was ticking, so
+        // the next wait completes at once.
         s.deliver(1, 0, Salience::URGENT, say("and again"));
-        assert_eq!(s.due_now(10_000), vec![1]);
+        assert!(s.is_due(1, 10_000));
+        assert!(tokio::time::timeout(Duration::from_secs(1), s.wait_due(1))
+            .await
+            .expect("the mid-decode arrival's wake was lost"));
     }
 
     /// Ordinary traffic waits for the character's own heartbeat. It is not
@@ -1421,26 +1380,6 @@ mod tests {
         s.deliver(1, 0, Salience::NORMAL, say("a rumour"));
         assert_eq!(s.census()[0].inbox_depth, 1);
         assert_eq!(s.census()[0].readiness, Readiness::Pending);
-    }
-
-    /// **The heap is a max-heap and the ordering is reversed.** Getting this
-    /// backwards produces a scheduler that runs the furthest-out character first,
-    /// which presents as a hang rather than as a wrong order.
-    #[test]
-    fn the_soonest_character_is_due_first() {
-        let s = sched();
-        s.wake(1, 0, 0);
-        s.wake(300, 0, 0);
-        // Both are due only because something reached them; 300's arrived
-        // later, so 1 must come off the heap first.
-        s.deliver(1, 0, Salience::NORMAL, say("first"));
-        s.tick(1, 0, 0, |_, _| vec![]);
-        s.deliver(1, 1, Salience::NORMAL, say("again"));
-        s.deliver(300, 2, Salience::NORMAL, say("later"));
-
-        let ready = s.due_now(1_000_000);
-        assert_eq!(ready.first(), Some(&1), "the heap ran the later one first");
-        assert!(ready.contains(&300));
     }
 
     /// A busy character drains everything at once — one better-informed step,
@@ -1493,13 +1432,13 @@ mod tests {
         let s = sched();
         s.wake(1, 0, 0);
         s.deliver(1, 0, Salience::NORMAL, say("something"));
-        assert!(s.due_now(0).contains(&1));
+        assert!(s.is_due(1, 0));
         s.tick(1, 0, 0, |_, _| vec!["speak — yes".into()])
             .expect("ticked");
 
         for at in [0, 10_000, 600_000, u64::MAX - 1] {
             assert!(
-                !s.due_now(at).contains(&1),
+                !s.is_due(1, at),
                 "a character with an empty inbox came due at {at}"
             );
         }
@@ -1547,10 +1486,9 @@ mod tests {
         assert!(s.set_pace(2, Pace::WORKING, 0));
 
         for at in [0, 4_000, 120_000, 600_000] {
-            let due = s.due_now(at);
-            assert!(!due.contains(&1), "the ambient one was due at {at}");
+            assert!(!s.is_due(1, at), "the ambient one was due at {at}");
             assert!(
-                !due.contains(&2),
+                !s.is_due(2, at),
                 "a working pace still put a quiet character on the schedule at {at}"
             );
         }
@@ -1578,20 +1516,23 @@ mod tests {
     fn changing_a_pace_does_not_schedule_a_thought() {
         let s = sched();
         s.wake(1, 0, 0);
-        s.due_now(u64::MAX); // clear the stagger entry `wake` leaves.
+        // A freshly-woken character starts unscheduled; a tick on something
+        // real parks it there again, and neither pace change below moves it.
+        s.deliver(1, 0, Salience::NORMAL, say("something"));
+        s.tick(1, 0, 0, |_, _| vec![]);
 
         s.set_pace(1, Pace::WORKING, 0);
         assert_eq!(s.pace_of(1), Some(Pace::WORKING));
         for at in [0, 4_000, 120_000] {
             assert!(
-                !s.due_now(at).contains(&1),
+                !s.is_due(1, at),
                 "quickening scheduled a character with an empty inbox at {at}"
             );
         }
 
         s.set_pace(1, Pace::AMBIENT, 0);
         assert_eq!(s.pace_of(1), Some(Pace::AMBIENT));
-        assert!(!s.due_now(u64::MAX - 1).contains(&1));
+        assert!(!s.is_due(1, u64::MAX - 1));
     }
 
     /// A pace cannot be set faster than the world moves — below that a
@@ -1809,10 +1750,7 @@ mod tests {
         s.wake(1, 0, 0);
         // Due because something reached it, not because it woke.
         s.deliver(1, 0, Salience::NORMAL, say("anything"));
-        assert!(
-            s.due_now(10_000).contains(&1),
-            "an arrival did not schedule it"
-        );
+        assert!(s.is_due(1, 10_000), "an arrival did not schedule it");
         s.tick(1, 0, 0, |_, _| vec![]);
 
         assert!(
@@ -1820,11 +1758,11 @@ mod tests {
             "there was a character to stop"
         );
         assert!(
-            !s.due_now(pause_ms() - 1).contains(&1),
+            !s.is_due(1, pause_ms() - 1),
             "it came back before the pause was up"
         );
         assert!(
-            s.due_now(pause_ms() + 1).contains(&1),
+            s.is_due(1, pause_ms() + 1),
             "the pause never ended, so it will never think again"
         );
     }
@@ -1892,10 +1830,10 @@ mod tests {
             let s = sched();
             s.wake(1, 0, 0);
             s.pause_for(1, 0, pause_ms());
-            assert!(!s.due_now(1).contains(&1), "it did not stop");
+            assert!(!s.is_due(1, 1), "it did not stop");
 
             s.deliver(1, 0, salience, kind);
-            assert!(s.due_now(1).contains(&1), "{what} did not bring it back");
+            assert!(s.is_due(1, 1), "{what} did not bring it back");
         }
     }
 
@@ -1920,11 +1858,11 @@ mod tests {
                 to: crate::engine::event::Addressed::You,
             },
         );
-        assert!(s.due_now(0).contains(&1), "it did not wake");
+        assert!(s.is_due(1, 0), "it did not wake");
         s.tick(1, 0, 0, |_, _| vec!["speak — yes".to_string()])
             .expect("it ticked");
         assert!(
-            !s.due_now(0).contains(&1),
+            !s.is_due(1, 0),
             "due again at the same instant — the busy-loop is back"
         );
     }
@@ -1947,12 +1885,9 @@ mod tests {
         })
         .expect("it ticked");
 
+        assert!(!s.is_due(1, pause_ms() - 1), "the pause was cut short");
         assert!(
-            !s.due_now(pause_ms() - 1).contains(&1),
-            "the pause was cut short"
-        );
-        assert!(
-            s.due_now(pause_ms() + 1).contains(&1),
+            s.is_due(1, pause_ms() + 1),
             "the pause became a character that never thinks again"
         );
     }
@@ -1976,7 +1911,7 @@ mod tests {
         .expect("it ticked");
 
         assert!(
-            s.due_now(0).contains(&1),
+            s.is_due(1, 0),
             "it was told something and given nowhere to put it"
         );
     }
@@ -2032,7 +1967,7 @@ mod tests {
             .expect("it ticked");
 
         assert!(
-            !s.due_now(u64::MAX - 1).contains(&1),
+            !s.is_due(1, u64::MAX - 1),
             "speaking scheduled its own next turn"
         );
     }
@@ -2088,27 +2023,44 @@ mod tests {
         assert_eq!(v["npc_id"].as_str().unwrap().parse::<u64>().unwrap(), big);
     }
 
-    /// A retired character's stale heap entries must not resurrect it.
-    #[test]
-    fn a_retired_character_is_not_scheduled() {
+    /// A retired character is gone: not due, not tickable — and its own task,
+    /// wherever it is waiting, is woken to find that out and exit.
+    #[tokio::test]
+    async fn a_retired_character_is_not_scheduled_and_its_wait_ends() {
         let s = sched();
         s.wake(1, 0, 0);
         s.deliver(1, 0, Salience::URGENT, say("x"));
         s.retire(1);
-        assert!(s.due_now(u64::MAX).is_empty());
+        assert!(!s.is_due(1, u64::MAX));
         assert!(s.tick(1, 0, 0, |_, _| vec![]).is_none());
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), s.wait_due(1))
+                .await
+                .expect("the retired character's wait never ended"),
+            "a wait on a retired character claimed it was due"
+        );
     }
 
-    /// Due lists must not contain a character twice — a preempt pushes a second
-    /// heap entry, and ticking the same character twice in one pass would drain
-    /// an inbox that the first tick already emptied.
-    #[test]
-    fn a_preempted_character_appears_once_in_the_due_list() {
-        let s = sched();
+    /// A character parked at `NEVER` sleeps on its waker alone: the wait is
+    /// still pending after real time has passed, and one delivery ends it.
+    #[tokio::test]
+    async fn an_unscheduled_character_sleeps_until_something_arrives() {
+        let s = Arc::new(sched());
         s.wake(1, 0, 0);
-        s.deliver(1, 0, Salience::URGENT, say("a"));
-        s.deliver(1, 0, Salience::URGENT, say("b"));
-        let due = s.due_now(u64::MAX);
-        assert_eq!(due.iter().filter(|id| **id == 1).count(), 1);
+
+        let waiting = tokio::spawn({
+            let s = Arc::clone(&s);
+            async move { s.wait_due(1).await }
+        });
+        // Genuinely parked: nothing has arrived, so the wait must not end.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "a quiet character's wait returned");
+
+        s.deliver(1, 0, Salience::NORMAL, say("something"));
+        let due = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the delivery did not wake the wait")
+            .expect("the waiting task panicked");
+        assert!(due);
     }
 }

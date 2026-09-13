@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn submitting_to_an_idle_engine_sends_a_wake() {
         use crate::scheduler::SchedulerRequest;
-        let (tx, rx) = crossbeam::channel::bounded(4);
+        let (tx, rx) = flume::bounded(4);
 
         // What `ConversationEngine::submit_guest` does, in the order it does
         // it: queue the job, then wake whatever is parked on the channel.

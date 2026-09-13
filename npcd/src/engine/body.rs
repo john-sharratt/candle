@@ -186,7 +186,7 @@ pub fn reflect() -> Outcome {
     // exists to end, and it put the character's words in its context twice.
     //
     // What comes back is the reflection's answer, which replaces this line —
-    // see `Runtime::begin_reflection`. This line is what a character reads
+    // see `Runtime::spawn_reflection`. This line is what a character reads
     // when no reflection can run — no mind to author the questions, or one
     // that failed before it answered — and it says
     // exactly that, in the character's own voice. See [`NO_REFLECTION`].

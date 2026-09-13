@@ -86,7 +86,7 @@ use candle_transformers::models::batched_inference::{
 use candle_transformers::models::delta_net::ExportedLayerState;
 
 use self::exported_state::{ExportedState, SharedState};
-use crossbeam::channel::{Receiver, Sender};
+use flume::{Receiver, Sender, TryRecvError};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -3441,8 +3441,8 @@ impl Scheduler {
                         return false;
                     }
                 }
-                Err(crossbeam::channel::TryRecvError::Empty) => return true,
-                Err(crossbeam::channel::TryRecvError::Disconnected) => return false,
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
             }
         }
     }
@@ -3550,6 +3550,49 @@ impl Scheduler {
                 // The sequence acts as the parent slot for a carved
                 // view inside this handler — rebind for clarity.
                 let parent_id = sequence_id;
+
+                // ── Abandoned-turn wind-down ─────────────────────────────
+                // The sequence-side guard admits one turn at a time, so a
+                // submit arriving while this parent still has a turn
+                // registered means the caller dropped that turn's handle —
+                // an async cancellation. That turn is wound down HERE,
+                // before the projection resets the parent under it: its
+                // decode is marked finished — the closed channel is what
+                // its next step would have discovered anyway — and the
+                // ordinary cleanup runs, so its view finalizes and its
+                // truncated turn seals first. Without this, the new turn's
+                // reset raced the old decode's finalize on one slot.
+                //
+                // Two states cannot be wound down and are refused instead,
+                // with an error on the NEW turn's channel: a turn whose
+                // event channel is still open (a live turn — racing a
+                // second decode onto the slot would interleave their KV),
+                // and a turn still in prefill (there is no finished-path to
+                // run for it; the caller retries once it drains).
+                let in_flight_views: Vec<SequenceId> = self
+                    .turn_views
+                    .iter()
+                    .filter(|(_, v)| v.parent_id == parent_id)
+                    .map(|(&view, _)| view)
+                    .collect();
+                let mut wind_down_refused = false;
+                for view in in_flight_views {
+                    match self.active_decodes.get_mut(&view) {
+                        Some(state) if state.event_tx.is_disconnected() => {
+                            state.finished = true;
+                        }
+                        // A live decode, or a turn still in prefill.
+                        Some(_) | None => wind_down_refused = true,
+                    }
+                }
+                self.cleanup_finished();
+                if wind_down_refused {
+                    let _ = event_tx.send(TurnEvent::Error(ConversationError::TurnInFlight {
+                        sequence_id: parent_id,
+                    }));
+                    return true;
+                }
+
                 // Derive the post-Done seal directly from the
                 // projection inputs.  When projection is supplied AND
                 // the slot has a registered target the request is by
@@ -5149,7 +5192,7 @@ impl Scheduler {
         // sends streamed `Token` events into it; the dropped receiver makes those
         // sends fail, which marks the decode finished — harmless, because
         // `cleanup_finished` reaps it the same way EOS / max_tokens would.
-        let (event_tx, event_rx) = crossbeam::channel::unbounded();
+        let (event_tx, event_rx) = flume::unbounded();
         // Keep the receiver alive for the decode's lifetime so per-token sends
         // succeed; it is dropped when the pass's slot is freed.
         self.compression_event_sinks.insert(slot, event_rx);
@@ -5427,7 +5470,7 @@ impl Scheduler {
         // Private event sink, kept alive so the prefill machinery's sends never
         // fail. This path has no decode, but `PrefillWork` still carries an
         // `event_tx`; the receiver is dropped with the slot in `free_summary_slot`.
-        let (event_tx, event_rx) = crossbeam::channel::unbounded();
+        let (event_tx, event_rx) = flume::unbounded();
         self.compression_event_sinks.insert(slot, event_rx);
 
         // Stash the turn content for the deferred seal, then enqueue the
@@ -11059,9 +11102,8 @@ mod tests {
     /// A scheduler over the CPU test session and a `DummyModel`, plus its
     /// request sender — for tests that drive handler-level state (belief
     /// lifecycle) rather than forwards.
-    pub(super) fn make_test_scheduler() -> (Scheduler, crossbeam::channel::Sender<SchedulerRequest>)
-    {
-        let (tx, rx) = crossbeam::channel::bounded(16);
+    pub(super) fn make_test_scheduler() -> (Scheduler, Sender<SchedulerRequest>) {
+        let (tx, rx) = flume::bounded(16);
         let session = make_test_session();
         let tokenizer = make_dummy_tokenizer();
         let scheduler = Scheduler::new(
@@ -11089,12 +11131,8 @@ mod tests {
     /// [`make_test_scheduler`] over a [`DummyRecurrentModel`], returning the
     /// probe as well so a test can read the state the scheduler's boxed model
     /// is carrying.
-    fn make_test_scheduler_recurrent() -> (
-        Scheduler,
-        crossbeam::channel::Sender<SchedulerRequest>,
-        RecurrentProbe,
-    ) {
-        let (tx, rx) = crossbeam::channel::bounded(16);
+    fn make_test_scheduler_recurrent() -> (Scheduler, Sender<SchedulerRequest>, RecurrentProbe) {
+        let (tx, rx) = flume::bounded(16);
         let session = make_test_session();
         let tokenizer = make_dummy_tokenizer();
         let model = DummyRecurrentModel::new();
@@ -11286,7 +11324,7 @@ mod tests {
             .expect("state");
         let slot = SequenceId(sched.session.create_sequence().expect("slot"));
 
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         sched.handle_request(SchedulerRequest::InstallRecurrentState {
             sequence_ids: vec![slot],
             state: SharedState::from(&state),
@@ -11387,7 +11425,7 @@ mod tests {
             .expect("state");
         let slot = SequenceId(sched.session.create_sequence().expect("slot"));
 
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         sched.handle_request(SchedulerRequest::InstallRecurrentState {
             sequence_ids: vec![slot],
             state: SharedState::from(&state),
@@ -11517,7 +11555,7 @@ mod tests {
             .map(|_| SequenceId(sched.session.create_sequence().expect("slot")))
             .collect();
 
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         sched.handle_request(SchedulerRequest::InstallRecurrentState {
             sequence_ids: slots.clone(),
             state: SharedState::from(&state),
@@ -12269,8 +12307,8 @@ mod tests {
 
     /// A `DecodeState` carrying nothing but the two fields the reasoning
     /// boundary is decided from.
-    fn boundary_state() -> (DecodeState, crossbeam::channel::Receiver<TurnEvent>) {
-        let (tx, rx) = crossbeam::channel::unbounded();
+    fn boundary_state() -> (DecodeState, Receiver<TurnEvent>) {
+        let (tx, rx) = flume::unbounded();
         let state = DecodeState {
             event_tx: tx,
             generated_tokens: TokenBuffer::default(),
@@ -12308,6 +12346,139 @@ mod tests {
             pending_mask: None,
         };
         (state, rx)
+    }
+
+    /// A scratch slot allocated through the ordinary handler, so the test's
+    /// sequences are real session slots rather than invented ids.
+    fn create_scratch_slot(scheduler: &mut Scheduler, conversation: &Conversation) -> SequenceId {
+        let (tx, rx) = flume::bounded(1);
+        scheduler.handle_request(SchedulerRequest::NewSequence {
+            conversation: conversation.clone(),
+            target: None,
+            parent: None,
+            response_tx: tx,
+        });
+        rx.recv().expect("scheduler reply").expect("slot allocated")
+    }
+
+    /// A minimal raw-path SubmitTurn (no projection, no substrate write) —
+    /// the request shape the abandoned-turn wind-down tests drive.
+    fn raw_submit_turn(parent: SequenceId, event_tx: Sender<TurnEvent>) -> SchedulerRequest {
+        SchedulerRequest::SubmitTurn {
+            seal_group: None,
+            sequence_id: parent,
+            projection_inputs: None,
+            prefill_tokens: TokenBuffer::from(vec![1u32, 2, 3]),
+            prefill_text: String::new(),
+            user_text: String::new(),
+            tags: Vec::new(),
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
+            no_think: false,
+            projection_offsets: Vec::new(),
+            prefill_assistant_text: String::new(),
+            post_decode_tokens: TokenBuffer::default(),
+            max_decode_tokens: 4,
+            sampling: SamplingConfig::default(),
+            event_tx,
+            reprojection: None,
+            disable_reprojection: false,
+            triggers: Arc::new(TriggerRegistry::new()),
+            turn_grammar: None,
+            free_tool_calls_from_penalties: false,
+        }
+    }
+
+    /// The wind-down half of the abandoned-turn contract: a `SubmitTurn` that
+    /// finds this parent's previous turn still registered — its handle
+    /// dropped, its event channel closed — finishes that turn through the
+    /// ordinary cleanup BEFORE the new turn touches the parent, so two
+    /// decodes never share a slot.
+    #[test]
+    fn a_submit_over_an_abandoned_turn_winds_it_down_first() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let view = create_scratch_slot(&mut scheduler, &conversation);
+
+        // The abandoned turn: a decode whose caller dropped its handle.
+        let (state, view_rx) = boundary_state();
+        drop(view_rx);
+        scheduler.active_decodes.insert(view, state);
+        scheduler.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: parent,
+                original_borrowed: BlockCount(0),
+                turn_start_parent_blocks: 0,
+                question_tokens: 0,
+            },
+        );
+
+        let (event_tx, event_rx) = flume::unbounded();
+        assert!(scheduler.handle_request(raw_submit_turn(parent, event_tx)));
+
+        // The abandoned decode was finalized (and the new turn has not begun
+        // decoding — it is queued as prefill), so no decode remains. The
+        // freed view slot's id may be recycled by the NEW turn's view, so the
+        // assertions observe the contract, not the slot id.
+        assert!(
+            scheduler.active_decodes.is_empty(),
+            "the abandoned decode must be finalized before the new turn runs"
+        );
+        assert_eq!(
+            scheduler.prefill_queue.len(),
+            1,
+            "the new turn must proceed into prefill"
+        );
+        assert!(
+            !matches!(
+                event_rx.try_recv(),
+                Ok(TurnEvent::Error(ConversationError::TurnInFlight { .. }))
+            ),
+            "the new turn must not be refused"
+        );
+    }
+
+    /// The refusal half: a previous turn that is registered but has no decode
+    /// to finish (still in prefill) cannot be wound down — the new submit is
+    /// refused with `TurnInFlight`, and the in-flight turn is left alone.
+    #[test]
+    fn a_submit_over_a_still_prefilling_turn_is_refused() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let view = create_scratch_slot(&mut scheduler, &conversation);
+
+        scheduler.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: parent,
+                original_borrowed: BlockCount(0),
+                turn_start_parent_blocks: 0,
+                question_tokens: 0,
+            },
+        );
+
+        let (event_tx, event_rx) = flume::unbounded();
+        assert!(scheduler.handle_request(raw_submit_turn(parent, event_tx)));
+
+        assert!(
+            matches!(
+                event_rx.try_recv(),
+                Ok(TurnEvent::Error(ConversationError::TurnInFlight { .. }))
+            ),
+            "a submit racing a still-prefilling turn must be refused"
+        );
+        assert!(
+            scheduler.prefill_queue.is_empty(),
+            "the refused turn must queue nothing"
+        );
+        assert!(
+            scheduler.turn_views.contains_key(&view),
+            "the refused submit must not disturb the in-flight turn"
+        );
     }
 
     /// The turn's own tokens, walked through the one funnel: exactly two cuts,
@@ -12566,7 +12737,7 @@ mod tests {
     #[test]
     fn create_view_with_explicit_ranges_creates_view() {
         let model = DummyModel::new();
-        let (_tx, rx) = crossbeam::channel::bounded(16);
+        let (_tx, rx) = flume::bounded(16);
         let model_box = Box::new(model) as Box<dyn ManagedBatchedModel + Send>;
         let session = make_test_session();
         let tokenizer = make_dummy_tokenizer();
@@ -12632,7 +12803,7 @@ mod tests {
     #[test]
     fn create_view_sentinel_with_zero_block_parent_yields_empty_view() {
         let model = DummyModel::new();
-        let (_tx, rx) = crossbeam::channel::bounded(16);
+        let (_tx, rx) = flume::bounded(16);
         let model_box = Box::new(model) as Box<dyn ManagedBatchedModel + Send>;
         let session = make_test_session();
         let tokenizer = make_dummy_tokenizer();
@@ -12777,7 +12948,7 @@ mod tests {
         let seq_id = SequenceId(raw_id);
         scheduler.carried_beliefs.insert(seq_id, seeded_belief());
 
-        let (rtx, rrx) = crossbeam::channel::bounded(1);
+        let (rtx, rrx) = flume::bounded(1);
         scheduler.handle_request(SchedulerRequest::ResetSequence {
             sequence_id: seq_id,
             response_tx: rtx,

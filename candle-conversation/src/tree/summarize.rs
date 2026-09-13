@@ -26,7 +26,9 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use crossbeam::channel::{Receiver, TryRecvError};
+use crate::handle::TurnEvent;
+use crate::scheduler::SchedulerRequest;
+use flume::{Receiver, Sender, TryRecvError};
 
 use crate::sequence_handle::SequenceId;
 use crate::stencil::TriggerRegistry;
@@ -166,16 +168,16 @@ pub(crate) struct SummarizationTask {
     /// Set by `abort()`. Checked at the top of `poll()`.
     cancelled: Arc<AtomicBool>,
     /// Live event stream from the scheduler for this sequence.
-    event_rx: Receiver<crate::handle::TurnEvent>,
+    event_rx: Receiver<TurnEvent>,
     /// Used to send `FreeSequence` when done or aborted.
-    scheduler_tx: crossbeam::channel::Sender<crate::scheduler::SchedulerRequest>,
+    scheduler_tx: Sender<SchedulerRequest>,
     /// `(start_turn_id, end_turn_id)` of the summarized window.
     span: (TurnId, TurnId),
     /// Optional observer channel: when set, streaming events (Token,
     /// Prefill, PrefillProgress, HealthWarning) are forwarded here before
     /// being consumed by `poll()`. This allows callers to monitor
     /// summarization inference in real time.
-    event_observer: Option<crossbeam::channel::Sender<crate::handle::TurnEvent>>,
+    event_observer: Option<Sender<TurnEvent>>,
 }
 
 impl SummarizationTask {
@@ -191,13 +193,12 @@ impl SummarizationTask {
     pub(crate) fn launch(
         snapshot: &SummarizationSnapshot,
         config: &ConversationTreeConfig,
-        scheduler_tx: crossbeam::channel::Sender<crate::scheduler::SchedulerRequest>,
+        scheduler_tx: Sender<SchedulerRequest>,
         tokenizer: &tokenizers::Tokenizer,
-        event_observer: Option<crossbeam::channel::Sender<crate::handle::TurnEvent>>,
+        event_observer: Option<Sender<TurnEvent>>,
     ) -> crate::Result<Self> {
         use crate::config::SamplingConfig;
         use crate::error::ConversationError;
-        use crate::scheduler::SchedulerRequest;
 
         // Tokenize the system prompt and window text together — the
         // summarisation slot is its own short-lived workspace; we
@@ -218,7 +219,7 @@ impl SummarizationTask {
         // NewSequence — one blocking round-trip; no inference happens here.
         // The summarisation task gets its own fresh `Conversation`
         // workspace; nothing shared with the caller's substrate.
-        let (resp_tx, resp_rx) = crossbeam::channel::bounded(1);
+        let (resp_tx, resp_rx) = flume::bounded(1);
         scheduler_tx
             .send(SchedulerRequest::NewSequence {
                 conversation: crate::projection::Conversation::new(),
@@ -247,7 +248,7 @@ impl SummarizationTask {
             repeat_last_n: 128,
             ..SamplingConfig::default()
         };
-        let (event_tx, event_rx) = crossbeam::channel::unbounded();
+        let (event_tx, event_rx) = flume::unbounded();
         if scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
                 // One turn, and it is the slot's tail.
@@ -299,7 +300,7 @@ impl SummarizationTask {
         if !self.freed {
             self.freed = true;
             self.scheduler_tx
-                .send(crate::scheduler::SchedulerRequest::FreeSequence {
+                .send(SchedulerRequest::FreeSequence {
                     sequence_id: self.seq_id,
                 })
                 .ok();
@@ -329,8 +330,6 @@ impl CognitiveTask for SummarizationTask {
     }
 
     fn poll(&mut self) -> TaskPoll {
-        use crate::handle::TurnEvent;
-
         // Check abort flag first.
         if self.cancelled.load(Ordering::Relaxed) {
             self.free_sequence();

@@ -91,30 +91,38 @@ pub async fn upload(
     let upload_bytes: u64 = accepted.iter().map(|a| a.bytes.len() as u64).sum();
     let upload_ms = recv_start.elapsed().as_millis() as u64;
 
-    // Stream events from a blocking task so the engine-bound phases (which
-    // hold the engine mutex and drive GPU work) never block the async
+    // Stream events from an async task; the disk-bound and engine-bound
+    // phases inside it run on the blocking pool so they never stall the
     // runtime. `tx` is bounded; SSE backpressure keeps memory flat.
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
-    tokio::task::spawn_blocking(move || {
-        let send = |ev: Event| tx.blocking_send(ev).is_ok();
-
-        // Progress `send`s are best-effort: a failed send means the client
-        // disconnected, but we must NOT bail before `record_uploads` — the
-        // bytes are already on disk and in the pane store, so skipping the
-        // substrate event would leave the pane and history divergent. We drain
-        // the writes regardless and gate only the expensive engine phases on
-        // the client still being connected (`tx.is_closed()`).
-        for (name, reason) in rejected {
-            let _ = send(named(
-                "file_rejected",
-                serde_json::json!({ "name": name, "reason": reason }),
-            ));
-        }
-
+    tokio::spawn(async move {
         // ── Phase 1: upload → disk + conv-file store ──────────────────────
-        let mut stored_any = false;
-        let mut upload_events: Vec<crate::session::UploadInfo> = Vec::new();
-        for f in &accepted {
+        //
+        // Disk writes and store bookkeeping — blocking work, so it runs whole
+        // on the blocking pool, streaming its events through the same channel.
+        //
+        // Progress `send`s are best-effort: a failed send means the client
+        // disconnected, but the phase must NOT bail before `record_uploads` —
+        // the bytes are already on disk and in the pane store, so skipping
+        // the substrate event would leave the pane and history divergent.
+        let phase_tx = tx.clone();
+        let phase_session = Arc::clone(&session);
+        let phase_id = id.clone();
+        let stored = tokio::task::spawn_blocking(move || {
+            let session = phase_session;
+            let id = phase_id;
+            let send = |ev: Event| phase_tx.blocking_send(ev).is_ok();
+
+            for (name, reason) in rejected {
+                let _ = send(named(
+                    "file_rejected",
+                    serde_json::json!({ "name": name, "reason": reason }),
+                ));
+            }
+
+            let mut stored_any = false;
+            let mut upload_events: Vec<crate::session::UploadInfo> = Vec::new();
+            for f in &accepted {
             // Write the raw bytes into the workspace uploads/ dir. The disk
             // write de-dupes the name, so the effective file name is whatever
             // actually landed on disk (`notes.txt` -> `notes-001.txt` on a
@@ -175,22 +183,34 @@ pub async fn upload(
             ));
         }
 
-        // Persist the upload events into the substrate (positioned by turn),
-        // so they recover with the conversation and replay inline in history.
-        // Always runs — even on a mid-stream disconnect — so the pane and the
-        // recovered history never diverge.
-        session.record_uploads(&id, &upload_events);
+            // Persist the upload events into the substrate (positioned by
+            // turn), so they recover with the conversation and replay inline
+            // in history. Always runs — even on a mid-stream disconnect — so
+            // the pane and the recovered history never diverge.
+            session.record_uploads(&id, &upload_events);
+            (stored_any, upload_events)
+        })
+        .await;
+        let Ok((stored_any, upload_events)) = stored else {
+            tracing::warn!("upload phase 1 panicked — nothing more to ingest");
+            let _ = tx.send(Event::default().event("done").data("[DONE]")).await;
+            return;
+        };
 
         // Phases 2–3 only make sense once something landed on disk.
         if stored_any {
             // ── Phase 2: read_file → substrate ────────────────────────────
-            // Run the ingest on a worker thread and poll its shared progress
-            // handle so the GUI gets a real per-scope bar (like the upload
-            // bar), not just a spinner.
-            let _ = send(named(
-                "phase",
-                serde_json::json!({ "phase": "read_file", "state": "start" }),
-            ));
+            // The ingest is blocking machinery (the per-file pool), so it runs
+            // on the blocking pool while this task watches its shared progress
+            // handle on an async tick — the GUI gets a real per-scope bar
+            // (like the upload bar), not just a spinner, and the tick doubles
+            // as the SSE cadence throttle.
+            let _ = tx
+                .send(named(
+                    "phase",
+                    serde_json::json!({ "phase": "read_file", "state": "start" }),
+                ))
+                .await;
             // Throwaway progress sink for the upload's read_file bar — silent so
             // it doesn't log "load step started Loading model".
             let progress = Arc::new(crate::loading::LoadProgress::silent());
@@ -200,45 +220,54 @@ pub async fn upload(
             // whole-workspace re-ingest.
             let paths: Vec<String> = upload_events.iter().map(|e| e.path.clone()).collect();
             let ingest_start = Instant::now();
-            let worker = std::thread::spawn(move || sess.read_file_phase(&paths, &prog));
-            while !worker.is_finished() {
-                let (current, total) = progress.step_progress();
-                if total > 0 {
-                    let s = progress.ingest_stats();
-                    let _ = send(named(
-                        "phase",
-                        serde_json::json!({
-                            "phase": "read_file",
-                            "state": "progress",
-                            "current": current,
-                            "total": total,
-                            // Live token counter feeds the modal's ingest stat
-                            // line (tokens & t/s).
-                            "prefillTokens": s.prefill_tokens,
-                        }),
-                    ));
+            let mut worker =
+                tokio::task::spawn_blocking(move || sess.read_file_phase(&paths, &prog));
+            let joined = loop {
+                tokio::select! {
+                    joined = &mut worker => break joined,
+                    _ = tokio::time::sleep(Duration::from_millis(150)) => {
+                        let (current, total) = progress.step_progress();
+                        if total > 0 {
+                            let s = progress.ingest_stats();
+                            let _ = tx
+                                .send(named(
+                                    "phase",
+                                    serde_json::json!({
+                                        "phase": "read_file",
+                                        "state": "progress",
+                                        "current": current,
+                                        "total": total,
+                                        // Live token counter feeds the modal's
+                                        // ingest stat line (tokens & t/s).
+                                        "prefillTokens": s.prefill_tokens,
+                                    }),
+                                ))
+                                .await;
+                        }
+                    }
                 }
-                std::thread::sleep(Duration::from_millis(150));
-            }
-            let (ingested, failed) = worker
-                .join()
+            };
+            let (ingested, failed) = joined
                 .unwrap_or(Ok((false, false)))
                 .unwrap_or((false, false));
             let ingest_ms = ingest_start.elapsed().as_millis() as u64;
             let s = progress.ingest_stats();
-            let _ = send(named(
-                "phase",
-                serde_json::json!({
-                    "phase": "read_file",
-                    "state": "done",
-                    "ingested": ingested,
-                    // At least one file couldn't be read (typically the GPU ran
-                    // out of KV VRAM mid-prefill) — the client shows this as a
-                    // failed stage instead of a silent "done" with no stats.
-                    "failed": failed,
-                    "prefillTokens": s.prefill_tokens,
-                }),
-            ));
+            let _ = tx
+                .send(named(
+                    "phase",
+                    serde_json::json!({
+                        "phase": "read_file",
+                        "state": "done",
+                        "ingested": ingested,
+                        // At least one file couldn't be read (typically the GPU
+                        // ran out of KV VRAM mid-prefill) — the client shows
+                        // this as a failed stage instead of a silent "done"
+                        // with no stats.
+                        "failed": failed,
+                        "prefillTokens": s.prefill_tokens,
+                    }),
+                ))
+                .await;
 
             // Summarisation is a fully background task — the upload NEVER waits
             // on it, shows no progress for it, and records nothing about it.
@@ -261,13 +290,15 @@ pub async fn upload(
             };
             let ids: Vec<u64> = upload_events.iter().map(|e| e.id).collect();
             session.record_upload_stats(&id, &ids, &stats);
-            let _ = send(named(
-                "stats",
-                serde_json::to_value(&stats).unwrap_or_default(),
-            ));
+            let _ = tx
+                .send(named(
+                    "stats",
+                    serde_json::to_value(&stats).unwrap_or_default(),
+                ))
+                .await;
         }
 
-        let _ = send(Event::default().event("done").data("[DONE]"));
+        let _ = tx.send(Event::default().event("done").data("[DONE]")).await;
     });
 
     let body = ReceiverStream::new(rx).map(Ok::<Event, std::convert::Infallible>);

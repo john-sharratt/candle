@@ -181,12 +181,12 @@ pub async fn run(s: &Arc<Authored>, request: Request) -> Result<Answer, ProseErr
 ///
 /// The fragments are a **preview**: tokenizer cleanup can revise a character
 /// already shown, so they concatenate to within a character or two of the final
-/// text, and the [`Answer`] is authoritative. `on_fragment` runs on the decode's
-/// blocking thread, so it must push and return.
+/// text, and the [`Answer`] is authoritative. `on_fragment` runs between decode
+/// awaits, so it must push and return.
 pub async fn run_streamed(
     s: &Arc<Authored>,
     request: Request,
-    on_fragment: impl FnMut(&str) + Send + 'static,
+    mut on_fragment: impl FnMut(&str) + Send + 'static,
 ) -> Result<Answer, ProseError> {
     request.check().map_err(ProseError::Refused)?;
     let Some(rt) = s.runtime.as_ref() else {
@@ -198,16 +198,12 @@ pub async fn run_streamed(
     };
     let seed = resolve_seed(request.seed);
     let (engine, cfg) = (minds.engine(), minds.base_config());
-    // Off the async pool: a decode is seconds of another thread's work, and
-    // blocking a tokio worker on it would take one of the runtime's few threads
-    // out of service for the duration.
-    tokio::task::spawn_blocking(move || {
-        let mut on_fragment = on_fragment;
-        crate::engine::prose::decode(&engine, &cfg, &request, seed, &mut on_fragment)
-    })
-    .await
-    .map_err(|e| ProseError::Failed(format!("the prose task did not finish: {e}")))?
-    .map_err(|e| ProseError::Failed(format!("{e:#}")))
+    // Awaited directly: the decode yields on the turn's event channel, so a
+    // long generation parks a future rather than a thread — and a caller that
+    // gives up drops the future, which stops the decode.
+    crate::engine::prose::decode(&engine, &cfg, &request, seed, &mut on_fragment)
+        .await
+        .map_err(|e| ProseError::Failed(format!("{e:#}")))
 }
 
 /// What a caller posts to `/v1/generate/prose`.

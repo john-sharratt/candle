@@ -529,16 +529,25 @@ async fn main() -> anyhow::Result<()> {
     //
     // The world itself is not persisted — who is standing where lives in RAM
     // and goes with the process — so this is what stops every character
-    // re-entering at the arrival door on every boot. `blocking_write`, because
-    // a world's metronome is a plain OS thread with no async context; the
-    // registry's own checkpoint gates make almost every call a map lookup, so
-    // the lock is held for nothing on a still world.
+    // re-entering at the arrival door on every boot.
+    //
+    // A fire-and-forget durable checkpoint: nothing waits on it, and
+    // `remember_place` is last-writer-wins by timestamp, so it may run wherever
+    // is cheapest. It reaches the app state's `tokio::sync::RwLock`, whose
+    // `blocking_write` panics on an async worker — and its callers are now
+    // async (the metronome moment sweep, act landing). So on a runtime it is
+    // deferred to the blocking pool; off one (the loader thread binding recalled
+    // bodies) it writes directly. See [`run_sink`].
     let place_state = authored.clone();
     runtime.set_place_sink(Arc::new(move |npc_id: u64, at: &str| {
-        place_state
-            .npcs
-            .blocking_write()
-            .remember_place(npc_id, at, now_ms_i64() as u64);
+        let state = place_state.clone();
+        let at = at.to_string();
+        run_sink(move || {
+            state
+                .npcs
+                .blocking_write()
+                .remember_place(npc_id, &at, now_ms_i64() as u64);
+        });
     }));
 
     // And how it feels, for the same reason and by the same route: a mood is
@@ -548,7 +557,11 @@ async fn main() -> anyhow::Result<()> {
     // is a map lookup.
     let mood_state = authored.clone();
     runtime.set_mood_sink(Arc::new(move |npc_id: u64, mood: &str| {
-        mood_state.npcs.blocking_write().remember_mood(npc_id, mood);
+        let state = mood_state.clone();
+        let mood = mood.to_string();
+        run_sink(move || {
+            state.npcs.blocking_write().remember_mood(npc_id, &mood);
+        });
     }));
 
     // The places the cast stands in, one world at a time.
@@ -772,17 +785,20 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    // Stop the tick driver on Ctrl-C, before the process goes.
+    // Stop the cast on Ctrl-C, before the process goes.
     //
     // Not cosmetic. A character's decode writes turns to the substrate, and a
-    // driver killed mid-tick leaves the redo log with a turn whose sealing never
-    // happened. Setting the flag lets the current tick finish and the loop exit
-    // at its next quiet moment — the same reason the flag exists at all.
+    // cast killed mid-tick leaves the redo log with a turn whose sealing never
+    // happened. Ordered: latch the flag (metronomes stop moving worlds,
+    // supervisors stop restarting), then cancel every character task — parked
+    // or mid-decode — and await them out, so every dropped turn future has
+    // released its scheduler slot before the process ends.
     let stopping = runtime.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("interrupt received — stopping the tick driver");
+            tracing::info!("interrupt received — stopping the cast");
             stopping.stop();
+            stopping.stop_characters().await;
         }
     });
 
@@ -796,6 +812,25 @@ async fn main() -> anyhow::Result<()> {
         .local_api("npcd", router)
         .serve()
         .await
+}
+
+/// Run a fire-and-forget persistence sink write wherever it is safe to block.
+///
+/// The write takes the app state's `tokio::sync::RwLock`, whose `blocking_write`
+/// panics inside an async execution context. The sinks are called from both
+/// worlds: async (the metronome moment sweep, act landing) and sync (the loader
+/// thread binding recalled bodies at startup). On a runtime the write is
+/// deferred to the blocking pool — detached, because nothing awaits a checkpoint
+/// and a dropped `spawn_blocking` handle still runs to completion; off one it
+/// runs inline. Ordering does not matter: every sink write is last-writer-wins
+/// per character.
+fn run_sink(write: impl FnOnce() + Send + 'static) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(write);
+        }
+        Err(_) => write(),
+    }
 }
 
 /// Wall-clock milliseconds as the narrative clock takes them.

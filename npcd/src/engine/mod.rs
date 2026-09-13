@@ -80,6 +80,7 @@ pub mod slash;
 pub mod sleep;
 pub mod station;
 pub mod stir;
+pub mod throwaway;
 pub mod tick;
 pub mod tools;
 pub mod watcher;
@@ -306,13 +307,9 @@ async fn substrate(
     // The layers are the mind's: every one `projection.yaml` declares, in its
     // order, whatever the engine is doing.
     let declared = projection::layers(&s.mind).unwrap_or_default();
-    let live = match minds_of(&s) {
-        Some(minds) => tokio::task::spawn_blocking(move || minds.layer_counts(npc_id))
-            .await
-            .ok()
-            .flatten(),
-        None => None,
-    };
+    // A brief engine-lock read (substrate counts), taken inline: it holds no
+    // lock across an await and costs the handler what any host-side read does.
+    let live = minds_of(&s).and_then(|minds| minds.layer_counts(npc_id));
     Json(json!({
         "layers": declared.iter().map(|l| {
             let name = l.get("name").and_then(Value::as_str).unwrap_or_default();
@@ -368,11 +365,9 @@ async fn layer(
         }))
         .into_response();
     };
-    let wanted = name.clone();
-    let page = tokio::task::spawn_blocking(move || minds.layer_page(npc_id, &wanted, LAYER_PAGE))
-        .await
-        .ok()
-        .flatten();
+    // Inline for the same reason as the counts above: a brief engine-lock
+    // read, no await under it.
+    let page = minds.layer_page(npc_id, &name, LAYER_PAGE);
     Json(json!({
         "layer": name,
         "conversations": page.as_ref().map(|p| json!(p.conversations)).unwrap_or(json!([])),

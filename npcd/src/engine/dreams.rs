@@ -37,6 +37,7 @@ use crate::engine::mind::Projected;
 use crate::engine::prompt::{Persona, Stance, STANCE_SELECTOR};
 use crate::engine::reflect::{plain_prose, think_off};
 use crate::engine::runtime::{drain, persist_signatures, PROJECTION_MARKER};
+use crate::engine::throwaway::Throwaway;
 
 /// The schema's dream layer, by its `name:`.
 pub const LAYER: &str = "dreams";
@@ -162,7 +163,7 @@ pub fn lines(story: &str) -> Vec<String> {
 ///
 /// Transient and then tombstoned, like a reflection: the dream that matters is
 /// the one [`keep`] writes, not the conversation that produced it.
-pub fn dream(
+pub async fn dream(
     engine: &Arc<Mutex<ConversationEngine>>,
     base_config: &SequenceConfig,
     projected: &Projected,
@@ -185,6 +186,10 @@ pub fn dream(
         engine.mark_timeline_transient(tl);
         (seq, tl)
     };
+    // Retired however this ends — the dream that matters is the one `keep`
+    // writes, and a caller that drops this future mid-decode leaves only a
+    // drop guard to run the tombstone.
+    let _retired = Throwaway::new(engine, timeline, "dream");
 
     let mut selection = projected.identities.selection_for(
         npc_id,
@@ -202,22 +207,18 @@ pub fn dream(
         .clone()
         .with_graceful_segment_close_after(0)
         .with_force_segment_close_after(1);
-    let answer = sequence.send_turn_with_options(
-        brief,
-        TurnOptions {
-            max_tokens: Some(DREAM_MAX_TOKENS),
-            turn_grammar: think_off(engine, base_config),
-            sampling: Some(sampling),
-            selection,
-            ..Default::default()
-        },
-    );
-
-    if let Ok(engine) = engine.lock() {
-        if let Err(e) = engine.tombstone_timeline(timeline) {
-            tracing::warn!("dream conversation {timeline} could not be retired: {e:?}");
-        }
-    }
+    let answer = sequence
+        .send_turn_with_options_async(
+            brief,
+            TurnOptions {
+                max_tokens: Some(DREAM_MAX_TOKENS),
+                turn_grammar: think_off(engine, base_config),
+                sampling: Some(sampling),
+                selection,
+                ..Default::default()
+            },
+        )
+        .await;
     drop(sequence);
 
     let story = plain_prose(&answer?.text);
@@ -246,7 +247,7 @@ pub struct Kept {
 /// The conversation is named `npc-<id>-dream-<timeline>` — **outside** the
 /// `npc-<id>-day-` prefix every conversation open sweeps, because a
 /// character's dreams outlive its days (§11, *Naming*).
-pub fn keep(
+pub async fn keep(
     engine: &Arc<Mutex<ConversationEngine>>,
     base_config: &SequenceConfig,
     projected: &Projected,
@@ -304,7 +305,7 @@ pub fn keep(
     }
 
     let tags = vec![LAYER.to_string(), tag(npc_id)];
-    let mut write = || -> anyhow::Result<()> {
+    let write = async {
         for (i, line) in written.iter().enumerate() {
             let addr = format!("{name}#{i}");
             let handle = sequence.submit_prefilled_turn(
@@ -314,18 +315,18 @@ pub fn keep(
                 SelectionState::new(),
                 tags.clone(),
             )?;
-            let (response, mut events) = drain(&handle, &addr);
+            let (response, mut events) = drain(&handle, &addr).await;
             let r = response.ok_or_else(|| anyhow::anyhow!("{addr}: no response"))?;
             sequence.finish_turn(handle, &r)?;
             persist_signatures(&mut sequence, &r, &mut events, &addr);
         }
-        Ok(())
+        Ok::<(), anyhow::Error>(())
     };
     // **Half a dream is not kept.** Its metadata is already down, so a dream
     // that stopped partway would be counted, sampled as an axis, and recalled a
     // few lines deep — a fragment standing in for a dream the character never
     // finished having.
-    if let Err(e) = write() {
+    if let Err(e) = write.await {
         drop(sequence);
         if let Err(t) = engine.lock().unwrap().tombstone_timeline(timeline) {
             tracing::warn!("{name}: the half-written dream could not be retired — {t:?}");

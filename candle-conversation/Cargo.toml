@@ -21,6 +21,14 @@ candle-nn = { workspace = true, features = ["cuda"] }
 candle-transformers = { workspace = true, features = ["cuda", "ruler-bench"] }
 crossbeam = { workspace = true }
 cudarc = { workspace = true }
+# Caller↔scheduler channels (SchedulerRequest queue, TurnEvent streams, one-shot replies,
+# guest receipts): one flume channel serves blocking and async receivers alike with no
+# runtime dependency (docs/async_wave_submission.md §3.1). crossbeam stays for the
+# engine-internal threads (persistence, summariser, writer pipeline).
+flume = { workspace = true }
+# Names the `Stream` trait `TurnHandle::stream_async` returns. A trait crate, not a
+# runtime — the executor stays the embedder's choice.
+futures-core = { workspace = true }
 fs2 = { workspace = true }
 # PNG encoding for the image guest's output. The guest hands the caller bytes
 # rather than a tensor: the pixels live in a buffer the drain's give-back
@@ -49,6 +57,10 @@ half = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+# `executor::block_on` (the current-thread executor the async-API tests run on)
+# and `StreamExt` for draining `stream_async`. Test-only: the crate itself
+# depends on no executor.
+futures = { workspace = true }
 half = { workspace = true }
 hf-hub = { workspace = true }
 tempfile = { workspace = true }

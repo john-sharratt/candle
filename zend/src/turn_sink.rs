@@ -19,6 +19,8 @@
 
 use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::Sequence;
+use futures::executor::block_on;
+use futures::future::join_all;
 use std::sync::Arc;
 
 /// Per-scope progress callback, invoked with a scope's ingested token count as it
@@ -252,33 +254,27 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
                         .map_err(|e| anyhow::anyhow!("fork_scope: {e}"))?,
                 );
             }
-            // Run each fork's two-turn round-trip concurrently; the scheduler
-            // co-batches their prefills + summary decodes on the shared wave.
+            // Run each fork's two-turn round-trip concurrently — one await per
+            // fork, all driven on this worker thread; the scheduler co-batches
+            // their prefills + summary decodes on the shared wave exactly as
+            // it did when each fork held a thread. `block_on` because this IS
+            // a blocking worker (the file pool's), and the round-trip futures
+            // wake on the engine's own channels — no timer, no I/O driver.
             let results: Vec<candle_conversation::Result<(u32, u32, usize)>> =
-                std::thread::scope(|s| {
-                    let handles: Vec<_> = forks
-                        .iter_mut()
-                        .zip(chunk.iter())
-                        .map(|(fork, (call_user, call_assistant, response_user))| {
-                            let tags = tags.clone();
-                            let triggers = Arc::clone(&triggers);
-                            s.spawn(move || {
-                                fork.ingest_scope_roundtrip_indices(
-                                    call_user,
-                                    call_assistant,
-                                    response_user,
-                                    tags,
-                                    max_summary_tokens,
-                                    triggers,
-                                )
-                            })
-                        })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| h.join().expect("scope ingest thread panicked"))
-                        .collect()
-                });
+                block_on(join_all(forks.iter_mut().zip(chunk.iter()).map(
+                    |(fork, (call_user, call_assistant, response_user))| {
+                        let tags = tags.clone();
+                        let triggers = Arc::clone(&triggers);
+                        fork.ingest_scope_roundtrip_indices_async(
+                            call_user,
+                            call_assistant,
+                            response_user,
+                            tags,
+                            max_summary_tokens,
+                            triggers,
+                        )
+                    },
+                )));
             // Splice the sealed pairs onto the file timeline in scope order. On the
             // first failure (a scope round-trip that errored, or a splice that
             // failed) STOP and tombstone every fork from that point on. The forks
