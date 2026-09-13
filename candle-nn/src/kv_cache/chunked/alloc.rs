@@ -2013,6 +2013,17 @@ impl ChunkedKvBacking {
     /// block must be pushed. Pure read over state + arena storage; extracted so
     /// the decision can be made under a guard while the allocation it implies
     /// happens outside one.
+    ///
+    /// **A tail below the writer boundary is sealed, whatever room it has.**
+    /// `inject_sealed_at_tail` puts every injected chunk under the boundary,
+    /// partial tail included; a write that then lands by position inside that
+    /// partial chunk bumps a sealed chunk's usage, and the rollback that should
+    /// undo it (`truncate_sequence_to_tokens`) clamps at the sealed boundary
+    /// and cannot. Measured on a resumed decode lease: the drafter's two rows
+    /// went into a 27-token sealed tail, the head layer read 2050 tokens
+    /// against an offset of 2048, and the header build refused the slot on
+    /// every wave it joined. So a sealed tail needs a fresh block exactly as a
+    /// full or a block-quantized one does.
     fn tail_needs_new_block(
         &self,
         state: &super::types::BlockTableState,
@@ -2024,8 +2035,9 @@ impl ChunkedKvBacking {
                 cw.gids.iter().all(|g| g.strong_count() <= cw.gids.len()),
                 "tail block must not be shared — fork should have copied it"
             );
+            let sealed = s.block_count() <= s.writer_start_idx();
             let is_full = (cw.offset as usize + cw.usage as usize) >= CHUNK_SIZE;
-            if is_full {
+            if sealed || is_full {
                 Some(true)
             } else {
                 // A block-quantized band cannot take a partial-token append —

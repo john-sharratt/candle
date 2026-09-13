@@ -17,6 +17,7 @@ mod arena_tests;
 mod backing_tests;
 mod chunk_ops_tests;
 mod compress_tests;
+mod decode_slot_resync_tests;
 pub mod dump_reader;
 mod gather_r16_tests;
 mod gpu_chunks_tests;

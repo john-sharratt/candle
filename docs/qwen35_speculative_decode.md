@@ -205,6 +205,23 @@ Naming the verifying sequences does three things inside the sweep:
    drafted nothing this step draft on the next, and it is the only way the first
    step after prefill ever acquires a seed.
 
+**A verify block is committed outside the decode kernel.** Its rows are written
+by the prefill kernel and their length committed on the host — in every layer,
+the head's included. The decode path meanwhile reuses a cached per-sequence slot
+buffer whose writer length only the decode kernel advances, on the device. So
+every such commit goes through `KvCache::commit_written_tokens`, which brings
+that buffer up to date: the writer slice patched in place when the block fit the
+chunk, the buffer rebuilt when the block crossed into the next one.
+
+Before it did, a fully accepted block left the head's buffer short by the block's
+length — the rollback resynced only when it trimmed something — and the next
+draft step wrote its token at the stale slot, over a committed one, while the
+slot the host counted was never written. In the zend ingest on the 3.6-35B that
+read as NaN in the head's decode attention: slots are recycled, so the unwritten
+slot held another sequence's KV, and under `tensor-assert` the claim poison.
+Before slots were recycled it read as zeros — a silently wrong draft rather than
+a fault, which is why it surfaced only then.
+
 ## 4. The rewind: replay, don't subtract
 
 After the accept the sequence must stand at `pos + m` with **every** piece of
@@ -337,6 +354,15 @@ compresses with the rest.
   and prefix must have ended in *different* states so it cannot pass by
   comparing a rewind to a no-op.
 * `qwen35::spec::tests` — the wave's scored rows split back to their blocks.
+* `qwen35::draft::tests::speculative_steps_leave_no_unwritten_head_position` —
+  §3's stale slot buffer. 160 draft → verify → accept → rollback steps on the 9B,
+  over prompts starting at different offsets within a chunk, reading the head's
+  committed history and each draft step's own write back after every step. Needs
+  `cuda,tensor-assert` and is `#[ignore]`d (about two minutes); without the
+  resync it fails within seconds. Its candle-nn half is
+  `chunked::tests::decode_slot_resync_tests`, which reads the buffer's lengths
+  back from the device for a block that fits the writer chunk and one that
+  spills.
 * `quantized_qwen35::tests::speculative_decode_9b` — §5, each budget validating
   its output at 100%.
 

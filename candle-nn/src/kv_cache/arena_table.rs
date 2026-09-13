@@ -222,6 +222,25 @@ impl ArenaFormatTag {
             Self::F32 | Self::F16 | Self::BF16 | Self::F8E4M3 | Self::F8E5M2
         )
     }
+
+    /// Whether the paged prefill and decode stores write a fresh token's K
+    /// into a band of this format: `R16` (with its Q capture) or a float
+    /// format they convert to.
+    ///
+    /// Every other tag makes `store_kv_chunk_arena` return without writing and
+    /// without a word, so a chunk in any other format must never be the one a
+    /// write resolves to. `F8E5M2` is out: the store has no case for it.
+    pub fn takes_active_k_writes(self) -> bool {
+        matches!(
+            self,
+            Self::R16 | Self::F32 | Self::F16 | Self::BF16 | Self::F8E4M3
+        )
+    }
+
+    /// The V side of [`Self::takes_active_k_writes`]: a float format only.
+    pub fn takes_active_v_writes(self) -> bool {
+        matches!(self, Self::F32 | Self::F16 | Self::BF16 | Self::F8E4M3)
+    }
 }
 
 impl ArenaFormatTag {

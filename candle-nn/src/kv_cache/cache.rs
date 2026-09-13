@@ -1206,6 +1206,35 @@ impl KvCache {
         Ok(())
     }
 
+    /// Commit `add` tokens written at `offset` by a path that is NOT the decode
+    /// kernel — a prefill, a speculative verify block — and bring the cached
+    /// decode slot buffer up to date with them.
+    ///
+    /// **Every such commit must come through here.** The decode kernel keeps
+    /// its slot buffer current itself: it commits each token's length on the
+    /// device, and the next step reuses the buffer as it stands. A commit made
+    /// anywhere else advances only the host (`set_len` deliberately never
+    /// writes the serialised buffer), so the buffer's writer slice is left
+    /// short by `add`, and the next decode step that reuses it writes its new
+    /// token at that stale slot — over a committed one — while the host counts
+    /// the slot the write should have filled. Nothing ever writes that slot:
+    /// it reads as whatever it last held, which since slots are recycled is
+    /// another sequence's KV, and under `tensor-assert` the claim poison.
+    ///
+    /// A write that stayed in the chunk the buffer was built for changed only
+    /// the writer slice, so it is patched in place; one that crossed into a
+    /// later chunk also left the full chunks behind it stale, so the buffer is
+    /// dropped and rebuilt from the host state on the next decode sync — see
+    /// `ChunkedKvBacking::refresh_decode_writer_slice`. A sequence with no
+    /// cached buffer has nothing to resync.
+    pub fn commit_written_tokens(&mut self, offset: usize, add: usize) -> Result<()> {
+        self.set_current_seq_len(offset + add)?;
+        if let CacheStorage::Chunked(c) = &self.k.storage {
+            c.backing.refresh_decode_writer_slice(&[(c.batch_idx, 0)])?;
+        }
+        Ok(())
+    }
+
     /// Truncate the cache to the specified sequence length.
     pub fn truncate(&mut self, seq_len: usize) -> Result<()> {
         self.k.truncate(seq_len)?;

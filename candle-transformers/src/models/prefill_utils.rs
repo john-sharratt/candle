@@ -14,7 +14,7 @@ use {
     candle::cuda_backend::cudarc::driver::{DevicePtr, DeviceRepr},
     candle_kernels::paged_glue::{run_paged_glue_bf16, run_paged_glue_fp16},
     candle_kernels::paged_prefill::*,
-    candle_nn::kv_cache::ChunkedKvBacking,
+    candle_nn::kv_cache::{ArenaFormatTag, ChunkedKvBacking},
     core::ffi::c_void,
     half::{bf16, f16},
 };
@@ -301,11 +301,27 @@ fn build_slot_headers(
             // once per table change.
             let writer_start_idx = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
             let mut chunks: Vec<(u16, u16)> = Vec::new();
+            // Per chunk: whether the paged stores write into it, and palette 0's
+            // K and V tags for the refusal below.
+            let mut writable: Vec<(bool, u8, u8)> = Vec::new();
             let mut cum: u32 = 0;
             cache.k_cache().chunked_visit_live_chunks(|it| {
                 for c in it {
                     cum = cum.saturating_add(c.token_count as u32);
                     chunks.push((c.offset, c.token_count));
+                    let k_ok = c
+                        .k_fmt
+                        .iter()
+                        .all(|&t| ArenaFormatTag::from_u8(t).takes_active_k_writes());
+                    let v_ok = c
+                        .v_fmt
+                        .iter()
+                        .all(|&t| ArenaFormatTag::from_u8(t).takes_active_v_writes());
+                    writable.push((
+                        k_ok && v_ok,
+                        c.k_fmt.first().copied().unwrap_or(u8::MAX),
+                        c.v_fmt.first().copied().unwrap_or(u8::MAX),
+                    ));
                 }
             });
             // Count invariant: the slices must cover EXACTLY the slot's recorded
@@ -346,6 +362,27 @@ fn build_slot_headers(
                      token layout but slice {buf_write} by the slot-state buffer",
                     layout.write_slice
                 );
+            }
+            // The chunk this slot's first new token lands in must be one the
+            // paged stores write: `store_kv_chunk_arena` returns without a word
+            // for a sealed format, so a quantized chunk with room left in it,
+            // standing where the writer should be, drops every token of the
+            // prefill — in every layer, with nothing faulting. Refuse and name
+            // it instead. The writer is the layout's, the same rule the kernel's
+            // `write_slice` follows; a layout with no writer is
+            // `assert_write_region_capacity`'s to refuse.
+            let w = layout.write_slice as usize;
+            if q_lens[slot_i] > 0 {
+                if let Some(&(false, k_tag, v_tag)) = writable.get(w) {
+                    let tokens = layout.chunks[w].1;
+                    candle::bail!(
+                        "slot header build: batch slot {slot_i}'s write chunk {w} ({tokens} \
+                         tokens) is in a format the paged stores cannot write (K tag {k_tag}, \
+                         V tag {v_tag}) — every token of this prefill would be dropped without \
+                         a fault. A sealed chunk with room left in it is standing in the \
+                         writer region."
+                    );
+                }
             }
             byte_offsets.push(pm_buf.len() * 4);
             let start = pm_buf.len();
@@ -697,9 +734,11 @@ fn paged_prefill_batched_impl<'w>(
     )?;
     g_kernel.end();
     // Per-sequence written length (each sequence advanced by its own q_lens[i],
-    // not the over-allocated max_add).
+    // not the over-allocated max_add). Written by this kernel, not the decode
+    // kernel, so the cached decode slot buffer is brought up to date with it —
+    // a verify block is exactly this commit on a sequence mid-decode.
     for ((cache, &off), &add) in caches.iter_mut().zip(offsets.iter()).zip(q_lens.iter()) {
-        cache.set_current_seq_len(off + add)?;
+        cache.commit_written_tokens(off, add)?;
     }
 
     // After each prefill layer, eagerly quantize all fully-sealed chunks so that
