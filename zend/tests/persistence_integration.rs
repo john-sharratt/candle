@@ -5,12 +5,16 @@
 /// the substrate from disk** and asserts the turns were recorded durably —
 /// the continuity a daemon restart relies on.
 ///
-/// Run with:
-///   cargo test -p zend --features cuda --test persistence_integration -- --nocapture
+/// Run with (daemon stopped — it needs the card alone):
+///   cargo test -p zend --features cuda --test persistence_integration -- --ignored --nocapture
 ///
 /// Gated on `cuda`: it needs a real GPU and the GGUF model on disk, so it
-/// is skipped in CPU-only CI. The substrate format itself is covered by the
-/// 73 CPU tests in `candle_conversation::persistence`.
+/// is skipped in CPU-only CI. `#[ignore]`d besides, because a boot runs the
+/// whole tool calibration before the first turn — minutes of wall-clock that
+/// a plain `cargo test -p zend --features cuda --tests` should not pay. It
+/// works in a throwaway workspace, so running it by name is safe. The
+/// substrate format itself is covered by the 73 CPU tests in
+/// `candle_conversation::persistence`.
 #[cfg(feature = "cuda")]
 mod persistence {
     use std::sync::Arc;
@@ -62,6 +66,7 @@ mod persistence {
     }
 
     #[test]
+    #[ignore = "boots the production model and runs the tool calibration at load: minutes, and needs the card alone"]
     fn turns_persist_and_recover_across_a_simulated_restart() {
         init_tracing();
 
