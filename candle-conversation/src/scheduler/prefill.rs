@@ -3121,18 +3121,9 @@ impl Scheduler {
             })?
         };
 
-        // Single exit for every prefill path: the forward wrote KV without the
-        // decode kernel's self-increment, so refresh the cached decode
-        // slot-state's writer slice with the advanced tail length. Without
-        // this, a mid-decode injection (a stencil static run, a think-steer
-        // continuation) is INVISIBLE to the following decode steps — the
-        // kernel attends the tail chunk at its stale pre-prefill length and
-        // the model decodes as if the injected tokens were never written.
-        // No-op for slots that haven't decoded yet.
-        self.session
-            .refresh_decode_slot_state(sequence_id.0)
-            .map_err(ConversationError::Model)?;
-
+        // The cached decode slot buffer is already current: the prefill's own
+        // commit (`KvCache::commit_written_tokens`) resynced it, which is the
+        // one place every write outside the decode kernel goes through.
         Ok(logits)
     }
 }

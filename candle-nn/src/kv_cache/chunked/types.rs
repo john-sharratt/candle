@@ -351,6 +351,22 @@ pub struct SealedSequence {
     pub location: super::ArenaLocation,
 }
 
+impl SealedSequence {
+    /// Drop the chunks at the tail that hold no token.
+    ///
+    /// A snapshot of a live slot takes every block, the empty writer and any
+    /// pad pushed after it included. Sealed, an empty block is a chunk in a
+    /// sealed format with room left in it; restored above a writer boundary it
+    /// is the chunk the next write resolves to, and the paged stores write
+    /// nothing into a sealed format. No position moves when they go — an
+    /// empty chunk adds nothing to the cumulative count.
+    pub fn drop_empty_tail(&mut self) {
+        while self.chunks.last().is_some_and(|c| c.token_count == 0) {
+            self.chunks.pop();
+        }
+    }
+}
+
 /// Per-block chunk window — combines physical chunk references (RAII `ChunkGid`s)
 /// with the window geometry (usage count and offset within the physical chunk).
 ///
@@ -572,6 +588,36 @@ impl SequenceState {
     #[inline]
     pub(crate) fn set_writer_start_idx(&mut self, idx: usize) {
         self.writer_start_idx = idx;
+    }
+
+    /// Move the writer boundary past every chunk in the writer region the
+    /// paged stores cannot write, answering whether it moved.
+    ///
+    /// A chunk sealed into a quantized format is read-only whatever room it
+    /// has left — `store_kv_chunk_arena` writes nothing into it — so above the
+    /// boundary the first such chunk with room is taken for the writer and
+    /// swallows the next write without a fault. Below the boundary it is what
+    /// every sealed partial tail is: a gap the next write steps over.
+    pub(crate) fn seal_unwritable_writer_region(&mut self) -> bool {
+        let unwritable = |c: &ChunkWindow| {
+            !c.k_fmt
+                .iter()
+                .all(|&t| ArenaFormatTag::from_u8(t).takes_active_k_writes())
+                || !c
+                    .v_fmt
+                    .iter()
+                    .all(|&t| ArenaFormatTag::from_u8(t).takes_active_v_writes())
+        };
+        let last = (self.writer_start_idx..self.chunks.len())
+            .rev()
+            .find(|&i| unwritable(&self.chunks[i]));
+        match last {
+            Some(i) => {
+                self.set_writer_start_idx(i + 1);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Total allocated blocks.
@@ -824,23 +870,27 @@ impl SequenceState {
         self.gpu_chunks.as_mut().clear();
     }
 
-    /// Re-serialise the WRITER REGION's slices — every chunk from the writer
-    /// boundary to the current writer — in the cached decode GPU buffer after
-    /// a prefill wrote tokens without the decode kernel's self-increment (a
-    /// prompt, a stencil static run, a think-steer continuation).
+    /// Bring the cached decode GPU buffer up to date after a commit made
+    /// outside the decode kernel — a prefill, a glue writeback, a speculative
+    /// verify block, a stencil static run.
     ///
-    /// The prefill write path keeps host state authoritative: `set_len`
-    /// tops up usages from the writer boundary through consecutive chunks to
-    /// the sequence length. The buffer, built before the prefill from the
-    /// same chunks (their chunks are allocated up front, so no append clears
-    /// it during the prefill), still carries their pre-prefill lengths, so
-    /// every chunk in that region is patched under the guard (async H→D on
-    /// drop) — the chunks below the boundary are shared and unwritten. This
-    /// is O(chunks the prefill wrote) against dropping and re-uploading the
-    /// entire per-layer table, which at depth costs megabytes of pinned
-    /// realloc and a stream sync per layer. A missing buffer is left for the
-    /// next decode sync's full rebuild; a shape mismatch (defensive) falls
-    /// back to full invalidation.
+    /// The decode kernel advances the buffer's writer length itself, on the
+    /// device; `set_len` advances only the host. Left alone, the next decode
+    /// reuses the buffer at the pre-commit length, writes its token over a
+    /// committed one, and leaves a slot the host counts unwritten.
+    ///
+    /// `set_len` tops up usages from the writer boundary through consecutive
+    /// chunks to the sequence length, so a commit that crossed into a later
+    /// chunk left every chunk it filled on the way stale, not only the writer.
+    /// The buffer, built from the same chunks (they are allocated up front, so
+    /// no append clears it during the write), therefore has the WRITER
+    /// REGION's slices — every chunk from the writer boundary to the current
+    /// writer — re-serialised under the guard (async H→D on drop); the chunks
+    /// below the boundary are shared and unwritten. This is O(chunks the
+    /// commit wrote) against dropping and re-uploading the entire per-layer
+    /// table, which at depth costs megabytes of pinned realloc and a stream
+    /// sync per layer. A missing buffer is left for the next decode sync's full
+    /// rebuild; a shape mismatch (defensive) falls back to full invalidation.
     pub(crate) fn refresh_decode_writer_slice(
         &mut self,
         n_kv_head: usize,
@@ -1022,9 +1072,16 @@ impl SequenceState {
 
     /// Extend with additional `ChunkWindow`s and invalidate the cached GPU
     /// slot buffer because the chunk layout has changed.
+    ///
+    /// An appended chunk the paged stores cannot write — a partial a mid-turn
+    /// seal quantized, arriving with a restored writer tail or a view folded
+    /// back into its parent — moves the writer boundary past it, so it is
+    /// never the chunk a write resolves to. See
+    /// [`Self::seal_unwritable_writer_region`].
     pub(crate) fn extend_chunks(&mut self, iter: impl IntoIterator<Item = ChunkWindow>) {
         self.chunks.extend(iter);
         self.gpu_chunks.as_mut().clear();
+        self.seal_unwritable_writer_region();
     }
 
     /// The chunks the serialised slot-state references, for a consumer to hold
@@ -1301,6 +1358,161 @@ mod slot_count_tests {
     #[test]
     fn a_buffer_longer_than_the_host_list_is_also_refused() {
         assert!(SequenceState::slot_counts_agree(8, 9).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod writer_region_tests {
+    use super::*;
+    use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
+    use crate::kv_cache::chunked::gid_pool::ChunkGid;
+
+    /// A window of `usage` tokens whose K bands are `tag` — V is F16 beside an
+    /// R16 K, as a live writer's is, and `tag` otherwise.
+    fn window(usage: u32, tag: ArenaFormatTag) -> ChunkWindow {
+        let v = if tag == ArenaFormatTag::R16 {
+            ArenaFormatTag::F16
+        } else {
+            tag
+        };
+        ChunkWindow {
+            gids: HeadGids::uniform(ChunkGid::detached(0), 1),
+            usage,
+            offset: 0,
+            k_pal: Arc::new(Vec::new()),
+            v_pal: Arc::new(Vec::new()),
+            k_scale: Arc::new(Vec::new()),
+            v_scale: Arc::new(Vec::new()),
+            k_fmt: Arc::new(vec![tag.as_u8(); N_PALETTE]),
+            v_fmt: Arc::new(vec![v.as_u8(); N_PALETTE]),
+            meta: None,
+        }
+    }
+
+    fn layer(windows: Vec<ChunkWindow>, writer_start: usize) -> SequenceState {
+        let mut s = SequenceState::new(None);
+        for w in windows {
+            s.push_chunk(w);
+        }
+        s.set_writer_start_idx(writer_start);
+        s
+    }
+
+    /// The measured shape: a tail restored above the boundary — sealed full
+    /// chunks, a sealed partial with room left in it, and the fresh writer the
+    /// seal pushed. The partial is the first chunk with room, so it would be
+    /// taken for the writer and swallow the next write; the boundary goes past
+    /// it, and the fresh writer is the writer again.
+    #[test]
+    fn a_sealed_partial_in_the_writer_region_moves_the_boundary_past_it() {
+        use ArenaFormatTag::*;
+        let mut s = layer(
+            vec![
+                window(32, Q8_KS),
+                window(32, Q3_0),
+                window(25, Q3_0),
+                window(0, R16),
+            ],
+            0,
+        );
+        assert_eq!(
+            s.decode_write_chunk_idx(),
+            2,
+            "the sealed partial is taken for the writer"
+        );
+        assert!(s.seal_unwritable_writer_region());
+        assert_eq!(s.writer_start_idx(), 3);
+        assert_eq!(s.decode_write_chunk_idx(), 3);
+    }
+
+    /// Every path that appends to a table goes through `extend_chunks` — a
+    /// restored writer tail, a view folded back into its parent — and any of
+    /// them can carry a chunk a mid-turn seal quantized. The append itself
+    /// keeps the boundary past it, so no caller has to remember to.
+    #[test]
+    fn extending_with_a_sealed_partial_moves_the_boundary_past_it() {
+        use ArenaFormatTag::*;
+        let mut s = layer(vec![window(32, Q8_KS)], 1);
+        s.extend_chunks(vec![window(32, Q3_0), window(25, Q3_0), window(0, R16)]);
+        assert_eq!(s.writer_start_idx(), 3);
+        assert_eq!(s.decode_write_chunk_idx(), 3);
+    }
+
+    /// A region the stores can write keeps its boundary; a sealed chunk below
+    /// the boundary is not the region's business.
+    #[test]
+    fn a_writable_region_keeps_its_boundary() {
+        use ArenaFormatTag::*;
+        let mut s = layer(vec![window(32, Q8_KS), window(32, R16), window(7, R16)], 1);
+        assert!(!s.seal_unwritable_writer_region());
+        assert_eq!(s.writer_start_idx(), 1);
+    }
+}
+
+#[cfg(test)]
+mod sealed_tail_tests {
+    use super::*;
+    use crate::kv_cache::arena_table::{ArenaFormatTag, ArenaLocation, N_PALETTE};
+    use crate::kv_cache::chunked::gid_pool::ChunkGid;
+
+    fn sealed_chunk(tokens: u16, tag: u8) -> SealedChunk {
+        SealedChunk {
+            gids: HeadGids::uniform(ChunkGid::detached(0), 1),
+            offset: 0,
+            token_count: tokens,
+            k_pal: Arc::new(Vec::new()),
+            v_pal: Arc::new(Vec::new()),
+            k_scale: Arc::new(Vec::new()),
+            v_scale: Arc::new(Vec::new()),
+            k_fmt: Arc::new(vec![tag; N_PALETTE]),
+            v_fmt: Arc::new(vec![tag; N_PALETTE]),
+            byte_size: 0,
+            meta: None,
+        }
+    }
+
+    fn sequence(chunks: Vec<SealedChunk>) -> SealedSequence {
+        let token_count = chunks.iter().map(|c| c.token_count as usize).sum();
+        SealedSequence {
+            chunks,
+            token_count,
+            chunk_size: CHUNK_SIZE,
+            location: ArenaLocation::Gpu,
+        }
+    }
+
+    /// A seal snapshots every block, the empty writer and any pad after it
+    /// included. Quantized, an empty block becomes a sealed-format chunk with
+    /// room left in it, which a later restore can stand where writes go — and
+    /// the paged stores skip a sealed format without a word. Dropping them
+    /// loses nothing: an empty chunk holds no token.
+    #[test]
+    fn trailing_empty_chunks_are_dropped_and_nothing_else() {
+        let q3 = ArenaFormatTag::Q3_0.as_u8();
+        let r16 = ArenaFormatTag::R16.as_u8();
+        let mut s = sequence(vec![
+            sealed_chunk(32, q3),
+            sealed_chunk(7, q3),
+            sealed_chunk(0, r16),
+            sealed_chunk(0, r16),
+        ]);
+        s.drop_empty_tail();
+        let counts: Vec<u16> = s.chunks.iter().map(|c| c.token_count).collect();
+        assert_eq!(counts, vec![32, 7]);
+        assert_eq!(s.token_count, 39);
+    }
+
+    /// An empty chunk inside the history is not the tail, and stays.
+    #[test]
+    fn an_empty_chunk_before_a_full_one_is_kept() {
+        let f16 = ArenaFormatTag::F16.as_u8();
+        let mut s = sequence(vec![
+            sealed_chunk(5, f16),
+            sealed_chunk(0, f16),
+            sealed_chunk(32, f16),
+        ]);
+        s.drop_empty_tail();
+        assert_eq!(s.chunks.len(), 3);
     }
 }
 

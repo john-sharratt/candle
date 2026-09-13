@@ -226,6 +226,23 @@ asserting **bit-identical** output every step (the live buffer's on-device write
 track the snapshot's offset-derived write-len exactly). The existing `arena_backed_matches_synthetic`
 already proved the single-step live path bit-exact.
 
+**The live buffer's one invariant: a commit outside the decode kernel must resync it.** The decode
+kernel is the only writer that advances the live buffer's writer length — on the device, one token per
+step. Anything else that commits tokens (a prefill or glue writeback, a speculative verify block)
+advances only the host (`set_len` never writes the serialised buffer), and the next decode step reuses
+the buffer as it stands. Left alone, the buffer's writer slice is short by the block: the decode writes
+its token at the stale slot, over a committed one, and the slot the host counts is never written — it
+reads as whatever it last held, another sequence's KV once slots are recycled and the claim poison
+under `tensor-assert`. That shipped on the Qwen3.6-35B MTP path and surfaced as NaN in the draft head's
+decode attention during the zend ingest (`docs/qwen35_speculative_decode.md` §3).
+
+So every such commit resyncs: `KvCache::commit_written_tokens` on the `KvCache` paths, and
+`refresh_decode_writer_slice` directly at the latent wave's own commit sites. The refresh patches the
+writer slice in place when the writer is still the chunk the buffer was built for, and drops the buffer
+for a rebuild when it is not — a block that crossed into the next chunk has also left the full
+predecessor's serialised length short, which no single-slice patch can repair. Gated by
+`chunked::tests::decode_slot_resync_tests`, which reads the lengths back from the device.
+
 Measured (n=8): **`wave_metadata` 8067 → 104.9 ms (77×, near zero)**, `decode:slot_reuse` 7471 → 23 ms,
 `decode_total` 28.0 → **19.1 s**. **Decode throughput n=8: 13.7 → 26.8 t/s (+96%, nearly doubled)** over
 this session's baseline; n=1 6.6 → 7.5. **100% correct** (StoryRewrite 1/1, 8/8). The residual ~105 ms is

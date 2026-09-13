@@ -523,6 +523,27 @@ mod tests {
         );
     }
 
+    /// **What the paged stores can write.** `store_kv_chunk_arena` writes a
+    /// fresh token's K into an R16 band (with its Q capture) or a float band,
+    /// and its V into a float band, and returns without a word for anything
+    /// else — so a writer chunk in any other format drops every token written
+    /// into it. Pinned tag by tag against the kernel's own branches.
+    #[test]
+    fn only_r16_and_the_float_formats_take_active_writes() {
+        use ArenaFormatTag::*;
+        for t in [R16, F32, F16, BF16, F8E4M3] {
+            assert!(t.takes_active_k_writes(), "{t:?} must take K writes");
+        }
+        for t in [F32, F16, BF16, F8E4M3] {
+            assert!(t.takes_active_v_writes(), "{t:?} must take V writes");
+        }
+        assert!(!R16.takes_active_v_writes(), "V has no Q-capture form");
+        for t in [Q8_0, Q8_KS, Q4_KS, Q3_0, Q2_0, Q0, F8E5M2, Invalid] {
+            assert!(!t.takes_active_k_writes(), "{t:?} must not take K writes");
+            assert!(!t.takes_active_v_writes(), "{t:?} must not take V writes");
+        }
+    }
+
     /// **The tag round-trip.** `ArenaFormatTag::to_kv_format` is the inverse of
     /// `from_kv_format`, and it is now load-bearing: with arenas untyped, the
     /// tag is the only path from a persisted byte back to a byte length. A

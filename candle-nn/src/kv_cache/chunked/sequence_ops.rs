@@ -1944,7 +1944,9 @@ impl ChunkedKvBacking {
     /// [`Self::split_off_writer_tail`]. Appends them to the slot's
     /// chunk list after whatever prefix has been re-injected; the
     /// writer boundary stays where the prefix's
-    /// [`Self::inject_sealed_at_tail`] left it.
+    /// [`Self::inject_sealed_at_tail`] left it — unless the tail carries a
+    /// chunk the paged stores cannot write (a mid-turn seal quantizes the
+    /// partial writer too), in which case the extend moves it past that chunk.
     pub fn extend_writer_tail(
         &self,
         batch_idx: usize,

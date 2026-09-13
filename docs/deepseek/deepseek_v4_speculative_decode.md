@@ -299,8 +299,11 @@ if all d confirmed:
 Per cycle we speculatively advance state for `d+1` tokens, then keep only the accepted prefix.
 Four pieces of state, three already truncatable:
 
-1. **Raw SWA arena (main model)** — the verify kernel writes the `d+1` latents and self-bumps
-   write-len (`commit_write_len`). On accept length `m ≤ d+1`, roll back with
+1. **Raw SWA arena (main model)** — the verify wave writes the `d+1` latents from the host
+   before each layer's launch, commits their length on the host (`set_len`), and brings the
+   cached decode slot buffer up to date with `refresh_decode_writer_slice` — a commit made
+   outside the decode kernel must, see `deepseek_perf_optimization_report.md` ("the live
+   buffer's one invariant"). On accept length `m ≤ d+1`, roll back with
    `truncate_sequence_to_tokens(seq, p+m)` (`sequence_ops.rs:2071`) + `set_sequence_offset`
    (`batched_inference.rs:2455`). **Present.** Needs a session-level token-granular wrapper
    (only a block-granular `truncate_sequence_to_blocks` wrapper exists at

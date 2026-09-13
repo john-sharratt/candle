@@ -1837,31 +1837,23 @@ impl BatchedEngine {
         // the virtual-slot headers must expose the block rows physically, and
         // each position map must cover [0, resident+s_len). `set_len`
         // deliberately never touches the serialized slot buffer (see its
-        // DMA-race comment), so the cached slot state must be brought up to
-        // date. Two arms, by whether the block FITS the current writer chunk:
-        //
-        // * Fits (the common case for a ≤block-size extension): the O(1)
-        //   writer-slice PATCH — only that one slice's length changed.
-        // * Crosses into a fresh chunk: full invalidation. The patch is
-        //   NOT enough here even though `push_chunk` cleared the buffer at
-        //   append time — an EARLIER wave's metadata build re-validated it
-        //   at pre-`set_len` lengths, so the spanned block's earlier rows
-        //   would read short through the stale predecessor slice (this
-        //   exact failure was measured as an acceptance collapse to
-        //   1.4 tok/step with a lossless-assert kill).
+        // DMA-race comment), so `refresh_decode_writer_slice` brings the cached
+        // slot state up to date: the O(1) writer-slice patch when the block
+        // stayed in the chunk the buffer was built for, a rebuild when it
+        // crossed into a fresh one. The patch is NOT enough there even though
+        // `push_chunk` cleared the buffer at append time — an EARLIER wave's
+        // metadata build re-validated it at pre-`set_len` lengths, so the
+        // spanned block's earlier rows would read short through the stale
+        // predecessor slice (measured as an acceptance collapse to 1.4
+        // tok/step with a lossless-assert kill).
         //
         // (Each block's write range was capacity-ensured ABOVE, so the
         // writeback snapshot covers every chunk `set_len` fills here.)
         if is_verify_wave {
             for &(vseq, resident, s_len) in &verify_groups {
                 for backing in session.backings() {
-                    let room = backing.decode_writer_room(vseq).unwrap_or(0);
                     backing.set_len(vseq, resident + s_len);
-                    if s_len <= room {
-                        backing.refresh_decode_writer_slice(&[(vseq, 0)])?;
-                    } else {
-                        backing.invalidate_decode_slot(vseq);
-                    }
+                    backing.refresh_decode_writer_slice(&[(vseq, 0)])?;
                 }
                 overrides.push((vseq, resident + s_len));
             }
@@ -2957,16 +2949,16 @@ impl BatchedEngine {
             ));
         }
 
-        // A batched prefill wrote its tokens via `write_contiguous` (not the
-        // decode kernel's on-device write-len self-increment), so each prefill
-        // seq's cached decode slot buffer — built at the pre-prefill base offset
-        // during this wave's metadata build — carries a STALE writer-slice
-        // length. The live-buffer decode path reuses that buffer, so the first
-        // decode after a SHORT prefill (one that never crossed a chunk boundary —
-        // which would itself have dropped the buffer) would read a stale window.
-        // Re-serialize the writer slice to the prefilled length now (all layers
-        // are absorbed in this final segment; O(1) per seq per layer, one-time
-        // after each prefill — steady-state decode never pays it).
+        // A batched prefill wrote its tokens outside the decode kernel (the
+        // writeback scatter, committed by `set_len`), so each prefill seq's
+        // cached decode slot buffer — built at the pre-prefill base offset
+        // during this wave's metadata build — is stale. The live-buffer decode
+        // path reuses that buffer, so resync it now: the writer slice is
+        // patched when the prefill stayed in the chunk the buffer was built
+        // for, and the buffer is rebuilt when it crossed into a later one, whose
+        // full predecessors a patch would leave short (all layers are absorbed
+        // in this final segment; one-time after each prefill — steady-state
+        // decode never pays it).
         for &pseq in prefill_seqs {
             session.refresh_decode_slot_state(pseq)?;
         }
