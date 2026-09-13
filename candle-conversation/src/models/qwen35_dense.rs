@@ -1,4 +1,4 @@
-//! Qwen3.5-9B (dense hybrid) model presets.
+//! Qwen3.5 dense hybrid model presets — the 9B and the 0.8B.
 //!
 //! The lineage's dense member: the same hybrid stack as its routed siblings —
 //! gated-DeltaNet layers carrying a recurrent state, attention layers carrying
@@ -16,10 +16,11 @@
 //! character's cost is the same whether it is the only one awake or one of a
 //! hundred.
 //!
-//! # One preset, and how a deployment changes it
+//! # The presets, and how a deployment changes them
 //!
 //! [`Model::Qwen35_9B_Q6`] is the stock instruct model, and it is what `npcd`
-//! runs. It carries no adapters: a preset's adapters are downloaded and loaded
+//! runs. [`Model::Qwen35_0_8B_Q8`] is the smallest member of the same lineage,
+//! which zend's end-to-end tool suite runs so each scenario boots in seconds. It carries no adapters: a preset's adapters are downloaded and loaded
 //! by every deployment that uses it, so one belongs here only if deployments
 //! are meant to run it. Worked examples of the adapter path live where they
 //! cost nothing — the gates, and `checkpoints.Qwen35_9B_LoRA` in the override.
@@ -111,6 +112,36 @@ pub(super) fn qwen35_9b_q6() -> ModelSpec {
         // `ModelBuilder::from_spec` — only `Model::custom` re-detects from the GGUF — so asking
         // for `"qwen3"` here is the whole decision, and it silently ran this model on the
         // previous generation's published numbers while the `qwen35` arm sat unreachable.
+        default_sampling: SamplingConfig::for_gguf_architecture(ARCH),
+        supports_thinking: true,
+        non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture(ARCH),
+    }
+}
+
+/// Qwen3.5-0.8B Q8_0 — the lineage's smallest dense member.
+///
+/// The same stack, dialect and tool-call style as [`qwen35_9b_q6`] — see that
+/// preset for why the dialect is `Qwen35`. Not an `-MTP-` repo: the 0.8B has no
+/// speculation head in any conversion. Q8_0 rather than the BF16 conversion, and
+/// the same pinned commit, because this is the checkpoint the gate runs and
+/// `QWEN35_0_8B_KV_FACTORS` was derived on (`quantized_qwen35::QWEN35_0_8B`).
+pub(super) fn qwen35_0_8b_q8() -> ModelSpec {
+    let chat_format = DialectType::Qwen35;
+    ModelSpec {
+        arch: ModelArch::Qwen35Dense,
+        loras: Vec::new(),
+        dialect: chat_format.dialect(),
+        chat_format,
+        model_repo: quantized_qwen35::QWEN35_0_8B.0.into(),
+        model_filename: quantized_qwen35::QWEN35_0_8B.2.into(),
+        prepared_from_source: false,
+        model_bytes: 811_843_840,
+        model_rev: quantized_qwen35::QWEN35_0_8B.1.into(),
+        gate_donor: None,
+        tokenizer_repo: quantized_qwen35::TOKENIZER_REPO.into(),
+        tokenizer_rev: quantized_qwen35::TOKENIZER_REV.into(),
+        default_system_prompt: PROMPT.into(),
+        max_seq_len: 8192,
         default_sampling: SamplingConfig::for_gguf_architecture(ARCH),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture(ARCH),
@@ -278,5 +309,22 @@ mod tests {
                 l.name
             );
         }
+    }
+
+    /// The 0.8B preset serves the bytes its gate measures, as the dense arch in
+    /// this family's own dialect — the facts the 9B's tests hold, for the
+    /// sibling zend's tool suite runs.
+    #[test]
+    fn the_small_preset_serves_the_checkpoint_its_gate_measures() {
+        let s = qwen35_0_8b_q8();
+        assert_eq!(s.model_repo, quantized_qwen35::QWEN35_0_8B.0);
+        assert_eq!(s.model_rev, quantized_qwen35::QWEN35_0_8B.1);
+        assert_eq!(s.model_filename, quantized_qwen35::QWEN35_0_8B.2);
+        assert_eq!(s.model_bytes, 811_843_840);
+        assert!(matches!(s.arch, ModelArch::Qwen35Dense));
+        assert!(matches!(s.chat_format, DialectType::Qwen35));
+        assert_eq!(s.dialect.no_think_block, "<think>\n\n</think>\n\n");
+        assert_eq!(s.dialect.call_style, CallStyle::JsonBlock);
+        assert!(s.loras.is_empty());
     }
 }

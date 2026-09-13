@@ -172,6 +172,12 @@ debug = true
 # Measured, five runs each: 522 ms → 435 ms. Optimising `npcd` itself would get
 # the rest and cost more compile time than the 87 ms is worth.
 #
+# `candle-conversation` and `tokenizers` are here for the tests that replay
+# selection over a real substrate or encode through a real vocabulary: host-side
+# scoring loops and BPE merges, no model loaded. Measured: `selection_replay`'s
+# golden baseline 107.7s → 7.2s, and each `token_bias` real-vocabulary test
+# ~26s → ~4.5s.
+#
 # `debug` is left at the profile default, so backtraces and debugger support are
 # unaffected; overflow checks and `debug_assert!` are `dev` settings and stay on.
 # Both profiles, because a crate is built twice for a test run and only one of
@@ -195,7 +201,19 @@ opt-level = 2
 [profile.dev.package.image]
 opt-level = 2
 
+[profile.dev.package.candle-conversation]
+opt-level = 2
+
+[profile.dev.package.tokenizers]
+opt-level = 2
+
 [profile.test.package.image]
+opt-level = 2
+
+[profile.test.package.candle-conversation]
+opt-level = 2
+
+[profile.test.package.tokenizers]
 opt-level = 2
 
 [profile.test.package.candle-core]

@@ -178,6 +178,21 @@ mod tests {
         get(&to).await
     }
 
+    /// The post slugs the blog index lists, in its order.
+    ///
+    /// Read off the entry headings rather than off every `/blog/` link on the
+    /// page: the `<head>` of every page also links the generated feed at
+    /// `/blog/feed.xml`, and a scrape that takes any `href="/blog/` counts that
+    /// as the first post.
+    fn listed_slugs(index: &str) -> Vec<String> {
+        index
+            .split("<h2><a href=\"/blog/")
+            .skip(1)
+            .filter_map(|s| s.split('"').next())
+            .map(str::to_owned)
+            .collect()
+    }
+
     #[tokio::test]
     async fn the_three_sections_render() {
         for path in ["/", "/blog", "/papers"] {
@@ -236,15 +251,7 @@ mod tests {
         let (status, html) = get("/blog").await;
         assert_eq!(status, 200);
 
-        // Slugs in the order the page lists them, first appearance only.
-        let mut seen: Vec<String> = Vec::new();
-        for chunk in html.split("href=\"/blog/").skip(1) {
-            if let Some(slug) = chunk.split('"').next() {
-                if !seen.iter().any(|s| s == slug) {
-                    seen.push(slug.to_string());
-                }
-            }
-        }
+        let seen = listed_slugs(&html);
 
         let expected = [
             "waves-and-the-pcie-bottleneck",
@@ -521,12 +528,7 @@ mod tests {
     #[tokio::test]
     async fn every_post_renders_with_its_figures_and_callouts() {
         let (_, index) = get("/blog").await;
-        let slugs: Vec<String> = index
-            .split("href=\"/blog/")
-            .skip(1)
-            .filter_map(|s| s.split('"').next())
-            .map(str::to_owned)
-            .collect();
+        let slugs = listed_slugs(&index);
         assert!(slugs.len() >= 5, "only {} posts on the index", slugs.len());
 
         for slug in &slugs {
@@ -568,12 +570,7 @@ mod tests {
     #[tokio::test]
     async fn no_post_leaks_escaped_markup_from_a_broken_html_block() {
         let (_, index) = get("/blog").await;
-        let slugs: Vec<String> = index
-            .split("href=\"/blog/")
-            .skip(1)
-            .filter_map(|s| s.split('"').next())
-            .map(str::to_owned)
-            .collect();
+        let slugs = listed_slugs(&index);
         assert!(!slugs.is_empty(), "no posts to check");
 
         for slug in &slugs {
@@ -614,17 +611,10 @@ mod tests {
     #[tokio::test]
     async fn a_post_renders_and_the_index_links_to_it() {
         let (_, index) = get("/blog").await;
-        assert!(
-            index.contains("href=\"/blog/"),
-            "the index lists no posts:\n{index}"
-        );
-
-        let slug = index
-            .split("href=\"/blog/")
-            .nth(1)
-            .and_then(|s| s.split('"').next())
-            .expect("a post link")
-            .to_string();
+        let slug = listed_slugs(&index)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("the index lists no posts:\n{index}"));
         let (status, html) = get(&format!("/blog/{slug}")).await;
         assert_eq!(status, 200);
         assert!(html.contains("<article class=\"prose\">"), "{html}");

@@ -271,4 +271,24 @@ mod tests {
         use super::super::Model;
         assert!(Model::Custom(base()).override_key().is_none());
     }
+
+    /// Every preset is reachable by its own name — the name a `--model` flag
+    /// or `models.override.yaml` gives resolves to exactly that variant — and
+    /// a name that is no preset resolves to nothing rather than to a default.
+    #[test]
+    fn every_preset_resolves_from_its_own_key() {
+        use super::super::Model;
+        for m in Model::PRESETS {
+            let key = m.override_key().expect("a preset is overridable");
+            let back = Model::from_override_key(&key).expect("its own key resolves");
+            assert_eq!(back.override_key().as_deref(), Some(key.as_str()));
+        }
+        assert_eq!(
+            Model::from_override_key("Qwen35_0_8B_Q8")
+                .and_then(|m| m.override_key())
+                .as_deref(),
+            Some("Qwen35_0_8B_Q8")
+        );
+        assert!(Model::from_override_key("NoSuchModel").is_none());
+    }
 }

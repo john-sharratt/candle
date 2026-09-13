@@ -1,8 +1,9 @@
 //! The single place zend decides which model it runs.
 //!
 //! Everything downstream — the downloader's repo/filename/size coordinates and
-//! the session's model builder — derives from [`model`], so the choice cannot
-//! drift between call sites.
+//! the session's model builder — derives from one [`resolve`] at load, so the
+//! choice cannot drift between call sites. A `--model` preset is taken as
+//! given; otherwise the card's measured VRAM picks the rung below.
 //!
 //! On a card that can seat it, Zen Code runs **Qwen3.8-Flash-Next**: 48 layers
 //! at 3:1, so 36 gated-DeltaNet layers carrying a recurrent state and 12
@@ -43,6 +44,8 @@
 use candle_conversation::models::Model;
 use std::sync::OnceLock;
 
+use crate::config::ModelChoice;
+
 /// Total VRAM above which the daemon runs Flash-Next rather than the 35B hybrid.
 ///
 /// Sized from the measured weight zone (~53.5 GB of dense trunk) plus room for
@@ -50,15 +53,27 @@ use std::sync::OnceLock;
 /// load Flash-Next, but would page its trunk to do so.
 const FLASH_NEXT_MIN_VRAM_BYTES: usize = 60 * 1024 * 1024 * 1024;
 
-/// The model zend runs, decided once per process.
+/// The model a daemon configured with `choice` runs.
 ///
-/// **Once** matters: `download.rs` calls this to resolve which artifact to fetch
-/// and `session.rs` calls it again to build the engine. Re-measuring between
-/// those two could hand back different answers — a card whose free/total figures
-/// shift, a device that failed to open the first time — and the daemon would
-/// then download one model and load another, with the mismatch surfacing as a
-/// missing-file error naming a model nobody selected.
-pub fn model() -> Model {
+/// A preset is taken as given. The measured rung is decided once per process
+/// ([`measured`]), and the session resolves once at load and hands the answer
+/// to both the downloader and the engine builder — so the artifact fetched and
+/// the model built are always the same one.
+pub fn resolve(choice: &ModelChoice) -> Model {
+    match choice {
+        ModelChoice::Preset(m) => Model::clone(m),
+        ModelChoice::MeasuredVram => measured(),
+    }
+}
+
+/// The ladder's answer for this card, decided once per process.
+///
+/// **Once** matters: re-measuring could hand back different answers — a card
+/// whose free/total figures shift, a device that failed to open the first time
+/// — and a daemon that resolved twice would then download one model and load
+/// another, with the mismatch surfacing as a missing-file error naming a model
+/// nobody selected.
+fn measured() -> Model {
     static CHOICE: OnceLock<Model> = OnceLock::new();
     CHOICE
         .get_or_init(|| {
@@ -105,18 +120,27 @@ fn total_vram_bytes() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{model_for_vram, FLASH_NEXT_MIN_VRAM_BYTES};
+    use super::{model_for_vram, resolve, FLASH_NEXT_MIN_VRAM_BYTES};
+    use crate::config::ModelChoice;
     use candle_conversation::models::{DialectType, Model, ModelArch};
 
     const GIB: usize = 1024 * 1024 * 1024;
 
     /// The spec assertions below deliberately name their model rather than
-    /// calling `model()`. `model()` now measures the card, so routing them
+    /// resolving the measured choice. That measures the card, so routing them
     /// through it would make every one of them assert against whatever hardware
     /// happened to run the suite — passing on this box, failing on a laptop, and
     /// testing the GPU rather than the spec either way.
     fn flash_next() -> Model {
         Model::Qwen38_FlashNext_Q4KO
+    }
+
+    /// A configured preset is run as given, whatever the card: `--model` never
+    /// consults the ladder.
+    #[test]
+    fn a_configured_preset_bypasses_the_ladder() {
+        let m = resolve(&ModelChoice::Preset(Box::new(Model::Qwen35_0_8B_Q8)));
+        assert!(matches!(m, Model::Qwen35_0_8B_Q8));
     }
 
     // ── The ladder ────────────────────────────────────────────────────

@@ -926,41 +926,53 @@ mod tests {
     #[test]
     fn the_head_carries_a_title_and_description() {
         let h = head(&meta());
-        assert!(h.contains("<title>Tokera</title>"), "{h}");
+        assert!(h.contains("<title>H · Tokera</title>"), "{h}");
         assert!(h.contains("name=\"description\" content=\"D\""), "{h}");
     }
 
-    /// The tab says `Tokera` on every page and keeps saying it.
+    /// The tab reads `<heading> · Tokera` on every page but the home page, which
+    /// reads `Tokera` alone.
     ///
-    /// A title that renames itself as you click is restless, and the page
-    /// already says what it is in letters an inch tall. The description still
-    /// varies per page — that is what search results and link previews read,
-    /// and it is not the thing sitting in front of you while you read.
+    /// The `<title>` is the line a search engine prints as the result, so pages
+    /// sharing one title are unfindable by their own names (see
+    /// [`Meta::heading`]). The home page is the one page whose heading IS the
+    /// brand, and it keeps the bare name rather than `Tokera · Tokera`.
     #[test]
-    fn the_tab_title_does_not_follow_the_page() {
-        let mut seen = std::collections::BTreeSet::new();
-        for nav in [Nav::Home, Nav::Blog, Nav::Papers] {
-            for width in [Width::Reading, Width::Wide, Width::Split] {
-                let m = Meta {
-                    heading: "something else entirely",
-                    nav,
-                    width,
-                    ..meta()
-                };
-                let h = head(&m);
-                let t = h
-                    .split("<title>")
-                    .nth(1)
-                    .and_then(|s| s.split("</title>").next())
-                    .expect("a title");
-                seen.insert(t.to_owned());
-            }
+    fn the_tab_title_is_the_heading_then_the_brand_except_at_home() {
+        let title_of = |m: &Meta| -> String {
+            let h = head(m);
+            h.split("<title>")
+                .nth(1)
+                .and_then(|s| s.split("</title>").next())
+                .expect("a title")
+                .to_owned()
+        };
+        for (kind, path) in [
+            (Kind::Article, "/blog/h"),
+            (Kind::Paper, "/papers/p"),
+            (Kind::Site, "/blog"),
+            (Kind::Error, "/"),
+        ] {
+            let m = Meta {
+                heading: "something else entirely",
+                kind,
+                path,
+                ..meta()
+            };
+            assert_eq!(
+                title_of(&m),
+                "something else entirely · Tokera",
+                "{path}: the tab does not name the page"
+            );
         }
-        assert_eq!(
-            seen,
-            ["Tokera".to_owned()].into_iter().collect(),
-            "the tab title changes with the page"
-        );
+        let home = Meta {
+            heading: "Tokera",
+            nav: Nav::Home,
+            kind: Kind::Site,
+            path: "/",
+            ..meta()
+        };
+        assert_eq!(title_of(&home), "Tokera");
     }
 
     #[test]

@@ -96,48 +96,27 @@ impl ToolBelief {
         self.acc.copy_from_slice(scores);
     }
 
-    /// Ceiling for **reporting** an accumulated belief — the GUI readout, a
-    /// projection tile, a threshold sweep's axis.
-    ///
-    /// The accumulator is a contraction: for the leader the step is
-    /// `s' = (1-β)s + fresh`, settling at `fresh/β` rather than running away. But
-    /// `fresh` is a normalized score with no ceiling of its own — a lock-on
-    /// "rides above" the 0–1000 band by design — so the settled value tracks the
-    /// input, and the input was measured at ~82,850 per projection, giving a
-    /// belief climbing toward ~207,000. A number that large is useless to read.
-    ///
-    /// **It must not be clamped inside [`Self::update`], and was, for one
-    /// measured hour.** Clamping the accumulator erases the margin the selector
-    /// ranks on: with reference-scaled probes pushing several tools past the
-    /// ceiling, `datetime` (143,035 before tonight) and `aead_encrypt` (461)
-    /// both read 5,000, tied, and the budget's three seats went in arbitrary
-    /// order — a live "what time is it?" turn then answered "there's no clock
-    /// tool available in my available tools", because the tool that would have
-    /// answered it lost a coin-flip. Ranking needs the full range; only the
-    /// display needs a bound.
-    ///
-    /// Nor can the clamp sit anywhere a score is read BACK: `PriorBelief::
-    /// from_selection` seeds the next reprojection's RelLeak from the persisted
-    /// selection's score, so a clamp upstream of the leaf re-enters the
-    /// accumulator one projection later and the ties return. It belongs only
-    /// where a score is rendered for a human and never consumed again.
-    ///
-    /// 5,000 leaves 6.25x of headroom over `CommittedToolScope`'s `min_score` of
-    /// 800, so a bounded readout still separates a strong hit from a marginal one.
-    pub const REPORT_CAP: f32 = 5_000.0;
-
-    /// One score as it should be REPORTED: the belief, bounded by
-    /// [`Self::REPORT_CAP`]. Never feed the result back into a belief — see that
-    /// constant's note on `PriorBelief`.
-    pub fn for_display(score: f32) -> f32 {
-        score.min(Self::REPORT_CAP)
-    }
-
     /// Apply one projection's per-tool scores, then leak.
     ///
-    /// Deliberately **unbounded** — the margin between a lock-on and a rival is
-    /// what the selector ranks on. See [`Self::REPORT_CAP`] for the bound, and
-    /// for what clamping here cost.
+    /// Deliberately **unbounded**. The accumulator is a contraction — for the
+    /// leader the step is `s' = (1-β)s + fresh`, settling at `fresh/β` rather
+    /// than running away — but `fresh` is a normalized score with no ceiling of
+    /// its own (a lock-on "rides above" the 0–1000 band by design), so the
+    /// settled value tracks the input: ~82,850 per projection settles near
+    /// ~207,000.
+    ///
+    /// **It must not be clamped here.** Clamping the accumulator erases the
+    /// margin the selector ranks on: with several tools past a 5,000 ceiling,
+    /// `datetime` (143,035) and `aead_encrypt` (461) both read 5,000, tied, and
+    /// the budget's three seats went in arbitrary order — a live "what time is
+    /// it?" turn then answered "there's no clock tool available in my available
+    /// tools", because the tool that would have answered it lost a coin-flip.
+    ///
+    /// Nor can a bound sit anywhere a score is read BACK: `PriorBelief::
+    /// from_selection` seeds the next reprojection's RelLeak from the persisted
+    /// selection's score, so a clamp upstream of the readout re-enters the
+    /// accumulator one projection later and the ties return. The only bound is
+    /// on the tile a human reads — zend's `ProjectTile::SCORE_CAP`.
     pub fn update(&mut self, scores: &[f32]) {
         debug_assert_eq!(scores.len(), self.acc.len(), "score/slot count mismatch");
         let m = self.acc.iter().copied().fold(0.0f32, f32::max);
@@ -192,17 +171,12 @@ mod tests {
     /// fixed point `fresh/beta`. Sustained evidence therefore rises and settles;
     /// it cannot run away or overflow, whatever the scale of the input.
     ///
-    /// Driven below [`ToolBelief::CAP`] on purpose, so what is measured here is
-    /// the contraction and not the ceiling. The cap is pinned separately by
-    /// `a_huge_sustained_score_saturates_at_the_cap`, which uses the magnitude
-    /// actually seen in production — a belief reported as climbing
-    /// 29,100 → 100,309 → 143,035 was converging on `fresh/β`, not diverging.
+    /// A belief reported in production as climbing 29,100 → 100,309 → 143,035
+    /// was converging on `fresh/β`, not diverging; this pins that it cannot do
+    /// otherwise, at a magnitude small enough to read the bound off directly.
     #[test]
     fn the_leader_converges_to_fresh_over_beta_and_never_exceeds_it() {
         let beta = 0.4f32;
-        // Deliberately below `ToolBelief::CAP`, so this measures the contraction
-        // itself rather than the ceiling — the cap is pinned separately by
-        // `a_huge_sustained_score_saturates_at_the_cap`.
         let fresh = 100.0f32;
         let bound = fresh / beta;
         let mut b = ToolBelief::with_beta(2, beta);
@@ -229,26 +203,26 @@ mod tests {
         assert_eq!(b.scores()[1], 0.0);
     }
 
-    /// **The bound is on the REPORT, and the accumulator keeps its margin.**
+    /// **The accumulator keeps its margin however far past a readout bound both
+    /// beliefs ride.**
     ///
-    /// Both halves matter and the second is the one that was broken: clamping
-    /// inside `update` tied `datetime` (143,035) with `aead_encrypt` (461) at
-    /// 5,000 apiece, and a live turn then answered "there's no clock tool
-    /// available" because the seats went in arbitrary order. So this asserts the
-    /// display is bounded AND that the underlying beliefs still rank.
+    /// Clamping inside `update` tied `datetime` (143,035) with `aead_encrypt`
+    /// (461) at 5,000 apiece, and a live turn then answered "there's no clock
+    /// tool available" because the seats went in arbitrary order. Two beliefs an
+    /// order of magnitude apart in evidence, both past the 5,000 the readout is
+    /// bounded at, must still rank.
     #[test]
-    fn the_report_is_bounded_but_the_belief_keeps_its_margin() {
+    fn a_lock_on_keeps_its_margin_past_the_readout_bound() {
+        const READOUT_BOUND: f32 = 5_000.0;
         let mut b = ToolBelief::with_beta(2, 0.4);
-        // Two slots that would both saturate a display bound, an order of
-        // magnitude apart in evidence.
         for _ in 0..200 {
             b.update(&[82_850.0, 8_285.0]);
         }
         let (strong, weak) = (b.scores()[0], b.scores()[1]);
 
         assert!(
-            strong > ToolBelief::REPORT_CAP && weak > ToolBelief::REPORT_CAP,
-            "both should exceed the report cap for this test to mean anything: \
+            strong > READOUT_BOUND && weak > READOUT_BOUND,
+            "both should exceed the readout bound for this test to mean anything: \
              {strong} / {weak}"
         );
         assert!(
@@ -256,10 +230,6 @@ mod tests {
             "the accumulator must keep the margin the selector ranks on: \
              {strong} vs {weak}"
         );
-        assert_eq!(ToolBelief::for_display(strong), ToolBelief::REPORT_CAP);
-        assert_eq!(ToolBelief::for_display(weak), ToolBelief::REPORT_CAP);
-        // And a score inside the band is reported untouched.
-        assert_eq!(ToolBelief::for_display(802.2), 802.2);
     }
 
     #[test]

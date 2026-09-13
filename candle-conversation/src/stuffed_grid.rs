@@ -39,7 +39,11 @@
 //! tokens. Padding with characters would not — BPE merges runs of whitespace, so
 //! `k` newline characters is not `k` tokens and the alignment would drift.
 
+use std::ops::Range;
+
 use candle_nn::CHUNK_SIZE;
+
+use crate::turn_layout::TurnLayout;
 
 /// One case to place in a stuffed grid.
 ///
@@ -84,8 +88,57 @@ pub struct CarvedRegion {
 
 impl CarvedRegion {
     /// The case's real tokens within the grid, excluding padding.
-    pub fn token_range(&self) -> std::ops::Range<usize> {
+    pub fn token_range(&self) -> Range<usize> {
         self.token_start..self.token_start + self.token_len
+    }
+
+    /// Every token the region's blocks hold: the case's real tokens, then its
+    /// padding.
+    ///
+    /// **This, not [`Self::token_range`], is what the region's turn pins.** The
+    /// seal captures whole blocks, so the K/V it persists holds the padding too,
+    /// and a turn's `token_ids` must align 1:1 with its K/V — the substrate's
+    /// `token_count == token_ids.len()` invariant, which cross-process replay
+    /// rebuilds the grid from. Pinning only the real tokens sealed, for a
+    /// 15-token question, 25 ids against a 32-token block.
+    pub fn sealed_range(&self) -> Range<usize> {
+        self.token_start..self.token_start + self.token_len + self.pad
+    }
+
+    /// The layout of this region's turn, tiling [`Self::sealed_range`] exactly.
+    ///
+    /// The padding follows the case's closing marker in the grid, so it is
+    /// recorded as part of that closing glue: the turn's owned tail is
+    /// `trailing_marker_len + pad` tokens. Every phase span — user, thinking,
+    /// response — therefore stays on the case's real tokens, which is what lets
+    /// a lensed scan never see the padding.
+    ///
+    /// `head_len` is the baked opener's standalone length, clamped here against
+    /// the region's user end: a tokenizer that merges across the head↔question
+    /// join makes the standalone count an approximation of where the question
+    /// starts, and an unclamped one could exceed the end and invert the span.
+    pub fn layout(
+        &self,
+        head_len: u32,
+        im_end_len: u32,
+        assistant_start_len: u32,
+        trailing_marker_len: u32,
+        question: String,
+    ) -> TurnLayout {
+        TurnLayout::from_flat_grid_with_tail(
+            head_len.min(self.user_content_end),
+            self.user_content_end,
+            self.assistant_content_start,
+            (self.token_len + self.pad) as u32,
+            im_end_len,
+            assistant_start_len,
+            trailing_marker_len + self.pad as u32,
+            question,
+            // A question exemplar has no assistant body; the empty turn is the
+            // point — routing happens on the question.
+            Some(String::new()),
+            false,
+        )
     }
 }
 
@@ -463,7 +516,7 @@ mod tests {
     #[test]
     fn phase_spans_land_on_real_tokens_and_never_on_padding() {
         use crate::normalization::Phase;
-        use crate::turn_layout::{phase_span_of, TurnLayout};
+        use crate::turn_layout::phase_span_of;
 
         // A case whose length is deliberately NOT a multiple of the block size,
         // so it carries real padding.
@@ -481,18 +534,7 @@ mod tests {
         let r = g.regions[0];
         assert!(r.pad > 0, "the fixture must actually exercise padding");
 
-        let layout = TurnLayout::from_flat_grid_with_tail(
-            head_len,
-            r.user_content_end,
-            r.assistant_content_start,
-            r.token_len as u32,
-            2,
-            2,
-            trailing,
-            "q".to_string(),
-            Some(String::new()),
-            false,
-        );
+        let layout = r.layout(head_len, 2, 2, trailing, "q".to_string());
 
         let user = phase_span_of(&layout.segments, Phase::User)
             .expect("a question exemplar has a user span");
@@ -515,6 +557,39 @@ mod tests {
                 "{phase:?} span {span:?} runs into the padding — the window is \
                  {window_len} tokens but only the first {} are real",
                 r.token_len,
+            );
+        }
+    }
+
+    /// **A region's turn pins exactly what its blocks hold** — the case's tokens,
+    /// then its padding — and its layout tiles that same run.
+    ///
+    /// The seal persists `token_ids` beside the K/V of `[block_from, block_to)`
+    /// and asserts the two are the same length; replay rebuilds the grid from
+    /// the ids. A 25-token case therefore pins 32 ids, the last 7 of them pad.
+    #[test]
+    fn a_regions_turn_pins_every_token_its_blocks_hold() {
+        let cases = vec![tagged_case(1, 25, 10), tagged_case(2, CHUNK_SIZE, 12)];
+        let g = plan_stuffed_grid(&cases, 999);
+
+        let r = g.regions[0];
+        let pinned = &g.tokens[r.sealed_range()];
+        assert_eq!(pinned.len(), (r.block_to - r.block_from) * CHUNK_SIZE);
+        let mut expected: Vec<u32> = (0..25).map(|i| 10_000 + i).collect();
+        expected.extend([999; 7]);
+        assert_eq!(pinned, &expected[..]);
+
+        // An exactly-aligned case carries no padding, so both ranges agree.
+        let r = g.regions[1];
+        assert_eq!(r.sealed_range(), r.token_range());
+        assert_eq!(g.tokens[r.sealed_range()].len(), CHUNK_SIZE);
+
+        for r in &g.regions {
+            let layout = r.layout(3, 2, 3, 2, "q".to_string());
+            assert_eq!(
+                layout.validate_tiling(r.sealed_range().len() as u32),
+                Ok(()),
+                "region {r:?}: the layout must tile every pinned token",
             );
         }
     }

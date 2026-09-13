@@ -13,14 +13,13 @@ use std::time::SystemTime;
 use futures::{Stream, StreamExt};
 use notify::RecommendedWatcher;
 
-use candle_conversation::models::Dialect;
+use candle_conversation::models::{Dialect, Model};
 use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::persistence::{content_hash, SUBSTRATE_DIR};
 use candle_conversation::projection::{
     self, Builder, GroupSchema, Reserved, SectionId, SelectionRule, SystemItem, SystemPromptItem,
     SystemPromptSchema, TimelineId, TurnIndex,
 };
-use candle_conversation::provenance::ToolBelief;
 use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
@@ -40,7 +39,7 @@ use crate::conv_file_store::ConvFileStore;
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::log_broadcast::LogBus;
-use crate::model_choice::model;
+use crate::model_choice;
 use crate::projection_event::ProjectionEventOut;
 use crate::refresh_ctx::RefreshContext;
 use crate::repo_scan::RepoMap;
@@ -573,6 +572,7 @@ impl InferenceState {
     #[allow(clippy::too_many_arguments)]
     fn load(
         mut proj_builder: Builder,
+        model: Model,
         model_path: PathBuf,
         tokenizer_path: PathBuf,
         workspace: PathBuf,
@@ -772,7 +772,7 @@ impl InferenceState {
         // workspace on this model, survives `--wipe-substrate`, and turns the
         // ~42 s expert repack into a read on every restart after the first.
         let expert_pack_dir = model_path.parent().map(|p| p.to_path_buf());
-        let mut builder = model()
+        let mut builder = model
             .builder()
             .system_prompt(&before_text)
             .model_path(model_path)
@@ -4025,7 +4025,7 @@ impl ZendSession {
         // the thing the margin is actually read for — becomes arbitrary.
         tiles.sort_by(|a, b| b.score.total_cmp(&a.score));
         for tile in &mut tiles {
-            tile.score = ToolBelief::for_display(tile.score);
+            tile.cap_score();
         }
 
         // Diagnostic: if `scored` is 0 while `query_tokens` > 0, the probe Q was
@@ -4468,6 +4468,9 @@ impl ZendSession {
         let skipped_layers = self.config.skipped_layers.clone();
         let ingest_dirs = self.config.ingest_dirs.clone();
         let compact_substrate = self.config.compact_substrate;
+        // Resolved once, here, and handed to both the downloader and the engine
+        // builder, so the artifact fetched and the model built are the same one.
+        let model = model_choice::resolve(&self.config.model);
         // Re-arm the process-scoped ingest-cancel latch for this load: it's shared
         // across the process (and the test binary), so clear any cancel left by a
         // prior load/shutdown before this one's ingest starts polling it. The
@@ -4512,7 +4515,7 @@ impl ZendSession {
                     }
                 };
                 let (model_path, tok_path) =
-                    match download_runtime.block_on(crate::download::ensure_model(&status_tx)) {
+                    match download_runtime.block_on(crate::download::ensure_model(&model, &status_tx)) {
                         Ok(p) => p,
                         Err(e) => {
                             // A missing model is fatal — the daemon cannot serve
@@ -4537,7 +4540,7 @@ impl ZendSession {
                 // cannot go on claiming a model zend has stopped running.
                 tracing::info!(
                     "loading inference engine ({}) …",
-                    model().spec().model_filename,
+                    model.clone().spec().model_filename,
                 );
                 let load_progress_for_blocking = Arc::clone(&load_progress);
                 // `InferenceState::load` is fully synchronous (CUDA model
@@ -4545,6 +4548,7 @@ impl ZendSession {
                 // on this thread — no `spawn_blocking` needed.
                 match InferenceState::load(
                     proj_builder,
+                    model,
                     model_path,
                     tok_path,
                     workspace,

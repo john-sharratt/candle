@@ -35,25 +35,94 @@
 //! The whole suite is `#[cfg(feature = "cuda")]`-gated (needs a real GPU
 //! and the GGUF weights on disk).  CPU-only CI skips it.
 //!
+//! Every scenario the 0.8B answers correctly runs in the default suite, on
+//! `Qwen35_0_8B_Q8` — the production model's lineage, dialect and tool-call
+//! style — against the suite's own workspace under `target/tmp`, thinking off.
+//! Each scenario boots its own daemon: ~9–13 s of model load and ~4–10 s of
+//! tool-section prefill before the query, ~20–30 s end to end. The prefill
+//! grows across the boots of one process (4.4 s on the first, 9.9 s on the
+//! second, same sections), which is where the spread comes from. The first run
+//! on a fresh workspace also calibrates the tool catalog once, ~35 s.
+//!
+//! A scenario the 0.8B answers wrongly runs on the production model against
+//! the live repo workspace, whose substrate carries that model's calibration,
+//! and is `#[ignore]`d. Run those by name, daemon stopped:
+//!
 //! ```text
-//! cargo test -p zend --test tools_integration --features cuda -- --nocapture
+//! cargo test -p zend --test tools_integration --features cuda -- --ignored --nocapture
 //! ```
 
 #[cfg(feature = "cuda")]
 mod tool_scenarios {
-    use std::sync::Arc;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
 
     use futures::StreamExt;
 
-    use zend::config::DaemonConfig;
+    use candle_conversation::models::Model;
+    use candle_conversation::persistence::SUBSTRATE_DIR;
+    use candle_conversation::SelectionState;
+    use zend::api::chat::dial_selection;
+    use zend::config::{DaemonConfig, ModelChoice};
     use zend::log_broadcast::LogBus;
     use zend::session::{StreamItem, ZendSession};
     use zend::types::{ChatMessage, Role};
 
-    /// Per-test load timeout.  Model load + tool catalog prefill at first
-    /// boot is ~30 s; a generous cap keeps cold-start tests honest while
-    /// still catching hangs.
+    /// Per-scenario cap. A scenario on a warm workspace is ~20–30 s; the first
+    /// run on a fresh one also calibrates the whole tool catalog once, which is
+    /// what this leaves room for while still catching a hang.
     const TIMEOUT_SECS: u64 = 900;
+
+    /// The model every default scenario runs: the production model's lineage,
+    /// dialect and tool-call style at 0.8B, so a scenario costs ~20–30 s rather
+    /// than the production model's ~76 s and the orchestration exercised is
+    /// still the real one.
+    const MODEL: Model = Model::Qwen35_0_8B_Q8;
+
+    /// Scenarios run one at a time. They share one workspace and its substrate
+    /// admits one daemon, so each boots, answers and shuts down before the next
+    /// opens it.
+    static SCENARIO: Mutex<()> = Mutex::new(());
+
+    /// The suite's own workspace, kept under `target/tmp` between runs.
+    ///
+    /// Not the live repo: its substrate holds another model's K/V and
+    /// calibration exemplars, which a different checkpoint cannot read. Not a
+    /// fresh temp dir either: the exemplars tool selection scores against live
+    /// in the substrate, and a fresh one would regenerate the whole catalog's on
+    /// every run. Kept here, calibration is paid once and every later boot
+    /// resumes it.
+    fn workspace() -> PathBuf {
+        let ws = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tools_integration_ws");
+        std::fs::create_dir_all(&ws).expect("create the suite's workspace");
+        ws
+    }
+
+    /// Past this size the suite's workspace is compacted on its next boot.
+    ///
+    /// Every boot re-seals the whole tool catalog into the redo log. The section
+    /// streams are content-addressed, so each boot's records supersede the last
+    /// boot's rather than adding live data — but a scenario's daemon lives far
+    /// too briefly for background maintenance to reclaim them, and left alone
+    /// the log grew ~140 MB a boot (4.83 GB before its first compaction). A
+    /// forced compaction on load sheds the dead records.
+    ///
+    /// The live store — mostly the calibration corpus — is ~1.2 GB, so the
+    /// bound sits above it. Below it every boot pays a ~2 s rewrite that
+    /// reclaims nothing (measured at 256 MiB: 1.7–2.2 s a boot, size unchanged).
+    const COMPACT_ABOVE_BYTES: u64 = 2 << 30;
+
+    /// Bytes the workspace's redo log occupies on disk.
+    fn substrate_bytes(ws: &Path) -> u64 {
+        std::fs::read_dir(ws.join(SUBSTRATE_DIR))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum()
+    }
 
     fn init_tracing() {
         let _ = tracing_subscriber::fmt()
@@ -62,21 +131,61 @@ mod tool_scenarios {
             .try_init();
     }
 
-    // A shared, process-wide daemon was tried here and reverted: one engine for
-    // all ten scenarios saves nine boots but accumulates every scenario into one
-    // substrate and KV pool, so each successive query scans a larger corpus under
-    // more relief pressure. Measured 758 s across ten fresh sessions against
-    // 952 s shared (and 958 s shared on a temp workspace, which additionally
-    // discards the calibration exemplars selection depends on). The per-query
-    // growth outruns the boot cost it removes.
+    // Each scenario boots its own daemon rather than sharing one. A shared
+    // engine accumulates every scenario into one substrate and KV pool, so each
+    // successive query scans a larger corpus under more relief pressure —
+    // measured slower than a boot per scenario on the production model (952 s
+    // shared against 758 s for ten fresh sessions).
 
-    /// Boot a ZendSession, wait for ready, send `prompt`, return the
-    /// concatenated assistant text.  Used by every scenario test.
+    /// Which model and workspace a scenario runs on.
+    #[derive(Clone, Copy)]
+    enum Rig {
+        /// The 0.8B on the suite's own workspace, thinking off, exactly as the
+        /// composer's toggle sends it. At 0.8B a reasoning block runs to the
+        /// token budget before the model ever calls a tool, so a thinking turn
+        /// would measure how long it deliberates rather than whether the
+        /// orchestration routes. Every scenario the 0.8B answers runs here.
+        Small,
+        /// The production model — the measured-VRAM ladder — on the live repo
+        /// workspace, whose substrate carries that model's calibration, with the
+        /// schema's default thinking. For a scenario the 0.8B answers wrongly;
+        /// `#[ignore]`d wherever it is used, since it pays the production boot.
+        Production,
+    }
+
+    /// [`run_on`] the small rig — what every scenario the 0.8B handles runs.
     async fn run_query(prompt: &str, conv_id: &str) -> String {
+        run_on(Rig::Small, prompt, conv_id).await
+    }
+
+    /// Boot a ZendSession on `rig`, wait for ready, send `prompt`, shut the
+    /// session down, and return the concatenated assistant text.
+    async fn run_on(rig: Rig, prompt: &str, conv_id: &str) -> String {
+        let (workspace, model, selection, compact_substrate) = match rig {
+            Rig::Small => {
+                let ws = workspace();
+                let compact = substrate_bytes(&ws) > COMPACT_ABOVE_BYTES;
+                (
+                    ws,
+                    ModelChoice::Preset(Box::new(MODEL)),
+                    dial_selection(None, None, Some(false)),
+                    compact,
+                )
+            }
+            // Never compacted from here: this is the live repo's substrate.
+            Rig::Production => (
+                std::env::current_dir().unwrap(),
+                ModelChoice::MeasuredVram,
+                SelectionState::default(),
+                false,
+            ),
+        };
         let log = LogBus::new();
         let config = DaemonConfig {
-            workspace: std::env::current_dir().unwrap(),
+            workspace,
             port: 0,
+            model,
+            compact_substrate,
             ..Default::default()
         };
         let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
@@ -96,7 +205,7 @@ mod tool_scenarios {
                 false,
                 zend::types::ToolMode::Comprehensive,
                 None,
-                candle_conversation::SelectionState::default(),
+                selection,
             )
             .await;
 
@@ -122,10 +231,13 @@ mod tool_scenarios {
         }
         eprintln!("\n\n[FINAL RESPONSE]\n{response}");
         eprintln!("[STATUS MESSAGES] {status_msgs:?}");
+        // Release the workspace's substrate for the next scenario.
+        session.shutdown().await;
         response
     }
 
     fn run_with_timeout<F: std::future::Future<Output = String> + Send + 'static>(f: F) -> String {
+        let _one_at_a_time = SCENARIO.lock().unwrap_or_else(|e| e.into_inner());
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -272,10 +384,15 @@ mod tool_scenarios {
 
     // ── Scenario 8: hash compute ─────────────────────────────────────────────
 
+    // On the production model: the 0.8B answered this one with a decimal
+    // integer rather than calling `hash_compute` (measured), so it pays the
+    // production boot and is `#[ignore]`d.
     #[test]
+    #[ignore = "runs on the production model, which the 0.8B cannot stand in for here"]
     fn hash_compute_query_uses_hash_tool() {
         init_tracing();
-        let response = run_with_timeout(run_query(
+        let response = run_with_timeout(run_on(
+            Rig::Production,
             "Compute the SHA256 hash of the text \"hello\".",
             "test-hash",
         ));

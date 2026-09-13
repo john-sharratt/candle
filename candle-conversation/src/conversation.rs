@@ -1859,7 +1859,8 @@ impl Sequence {
             "{}{}{}",
             user_message, self.config.dialect.user_end, assistant_start_marker,
         );
-        let formatted = format!("{assistant_head}{assistant_prefill}");
+        let lead = assistant_lead(closed_think, assistant_prefill);
+        let formatted = format!("{assistant_head}{lead}");
         let mut prefill_tokens = self.tokenize(&formatted)?;
 
         // A turn that begins inside a grammar carries that grammar's opening
@@ -2218,42 +2219,31 @@ impl Sequence {
         let assistant_start_len = self.tokenize(assistant_start)?.len() as u32;
         let trailing_len = self.tokenize(assistant_end)?.len() as u32;
         // The opener is the same text for every case, so it is measured once
-        // rather than per case. It is clamped against each region's user end
-        // below: a tokenizer that merges across the head↔question join makes the
-        // standalone count an approximation of where the question really starts,
-        // and an unclamped one could exceed the end and invert the span — which
-        // `phase_span_of` would then read backwards.
+        // rather than per case; `CarvedRegion::layout` clamps it against each
+        // region's user end. The opener is baked into every case's grid, so the
+        // user body starts past it — the non-zero start is what tells the layout
+        // the grid reserves room for a real opener.
         let head_len = self.tokenize(&head)?.len() as u32;
         let mut turns: Vec<CarvedTurn> = Vec::with_capacity(grid.regions.len());
         for (region, &src) in grid.regions.iter().zip(&sources) {
             let (question, tags) = &cases[src];
-            let layout = TurnLayout::from_flat_grid_with_tail(
-                // The opener is baked into every case's grid, so the user body
-                // starts past it — the non-zero start is what tells the layout
-                // the grid reserves room for a real opener.
-                head_len.min(region.user_content_end),
-                region.user_content_end,
-                region.assistant_content_start,
-                region.token_len as u32,
-                im_end_len,
-                assistant_start_len,
-                trailing_len,
-                question.clone(),
-                // A question exemplar has no assistant body; the empty turn is
-                // the point — routing happens on the question.
-                Some(String::new()),
-                false,
-            );
             turns.push(CarvedTurn {
                 region: *region,
                 content: TurnContent {
                     role: Role::User,
                     tags: tags.clone(),
-                    layout,
-                    // The region's own tokens, padding excluded: `token_ids`
-                    // must align 1:1 with the turn's K/V grid, and the padding
-                    // belongs to the block range, not to the turn's content.
-                    token_ids: TokenBuffer::from(grid.tokens[region.token_range()].to_vec()),
+                    layout: region.layout(
+                        head_len,
+                        im_end_len,
+                        assistant_start_len,
+                        trailing_len,
+                        question.clone(),
+                    ),
+                    // Every token the region's blocks hold, padding included:
+                    // the seal persists the whole block range, and `token_ids`
+                    // must align 1:1 with that K/V. See
+                    // `CarvedRegion::sealed_range`.
+                    token_ids: TokenBuffer::from(grid.tokens[region.sealed_range()].to_vec()),
                 },
             });
         }
@@ -5143,6 +5133,50 @@ mod window_sealed_tokens_tests {
     fn cap_probe_window_tolerates_a_zero_cap() {
         let probe = vec![WideQSig::default(); 1000];
         assert_eq!(cap_probe_window(probe, 0).len(), 65);
+    }
+}
+
+/// The assistant half of a turn's prefill, after its role marker: the dialect's
+/// closed reasoning block when the turn suppresses thinking that way, then the
+/// caller's own seed (a `<tool_call>` opener, say), which continues from after
+/// it.
+///
+/// **This is what makes thinking-off structural on Qwen3.5/3.8.** Those families
+/// have no `/no_think` soft switch, so `closed_think` — the second half of
+/// `Dialect::thinking_suppression` — is the whole of their suppression. Composed
+/// from the seed alone, a suppressed turn prefills no block while
+/// `assistant_content_start` still measures past one: thinking-off is a line of
+/// prose again, and the content span claims tokens the grid does not hold.
+fn assistant_lead(closed_think: &str, assistant_prefill: &str) -> String {
+    format!("{closed_think}{assistant_prefill}")
+}
+
+#[cfg(test)]
+mod assistant_lead_tests {
+    use super::assistant_lead;
+    use candle_transformers::models::dialect::Dialect;
+
+    /// A block-suppressing family's suppressed turn prefills its closed block,
+    /// and a caller's seed continues from after it — the block is scaffolding
+    /// ahead of the content, never after it.
+    #[test]
+    fn a_suppressed_qwen35_turn_opens_on_its_closed_block() {
+        let closed = Dialect::qwen35().thinking_suppression(true).1;
+        assert_eq!(assistant_lead(closed, ""), "<think>\n\n</think>\n\n");
+        assert_eq!(
+            assistant_lead(closed, "<tool_call>"),
+            "<think>\n\n</think>\n\n<tool_call>"
+        );
+    }
+
+    /// A thinking turn, or a family that suppresses with the soft switch in the
+    /// user turn, adds nothing: the lead is the caller's seed alone.
+    #[test]
+    fn a_thinking_turn_or_a_switch_family_leads_with_the_seed_alone() {
+        let on = Dialect::qwen35().thinking_suppression(false).1;
+        assert_eq!(assistant_lead(on, "<tool_call>"), "<tool_call>");
+        let switch = Dialect::chat_ml().thinking_suppression(true).1;
+        assert_eq!(assistant_lead(switch, "<tool_call>"), "<tool_call>");
     }
 }
 

@@ -67,8 +67,14 @@ fn host_info_localhost() {
 
 #[test]
 fn ping_icmp_structure() {
-    // ping_icmp may or may not be available (requires privileges on some OSes)
-    let resp = harness::invoke("ping_icmp", json!({"host": "127.0.0.1"}));
+    // ping_icmp may or may not be available (requires privileges on some OSes).
+    // One echo with a one-second reply timeout: the defaults (4 echoes, 5 s each)
+    // let a host that drops loopback ICMP hold the test for ~20 s, and this only
+    // checks the response's shape.
+    let resp = harness::invoke(
+        "ping_icmp",
+        json!({"host": "127.0.0.1", "count": 1, "timeout_sec": 1}),
+    );
     // Just check it returns some response — success or a known error
     if resp.get("error").is_none() {
         let r = harness::expect_success(resp);

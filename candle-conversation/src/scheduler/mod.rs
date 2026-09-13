@@ -7919,7 +7919,7 @@ impl Scheduler {
                 } = turn_content.unwrap_or_default();
                 let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
                 // Snapshot what the resume path needs before the substrate
-                // consumes `delta_gpu` / `token_ids` (Â§16.12 seal-time gather).
+                // consumes `delta_gpu` / `token_ids` (§16.12 seal-time gather).
                 let persist_token_ids: Vec<u32> = token_ids[..].to_vec();
                 debug_assert_eq!(
                     persist_token_ids.len(),
@@ -8362,7 +8362,7 @@ impl Scheduler {
     }
 
     /// Rebuild the workspace substrate from the persistence redo log on
-    /// daemon startup (Â§16.12 substrate reload).
+    /// daemon startup (§16.12 substrate reload).
     ///
     /// **Cold-only restart.** Every persisted turn stream is recovered in
     /// `(timeline, turn_index)` order; for each, tokens + wide-Q signatures
