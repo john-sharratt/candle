@@ -9,12 +9,20 @@
 ///   cargo test -p zend --features cuda --test persistence_integration -- --ignored --nocapture
 ///
 /// Gated on `cuda`: it needs a real GPU and the GGUF model on disk, so it
-/// is skipped in CPU-only CI. `#[ignore]`d besides, because a boot runs the
-/// whole tool calibration before the first turn — minutes of wall-clock that
-/// a plain `cargo test -p zend --features cuda --tests` should not pay. It
-/// works in a throwaway workspace, so running it by name is safe. The
-/// substrate format itself is covered by the 73 CPU tests in
-/// `candle_conversation::persistence`.
+/// is skipped in CPU-only CI. `#[ignore]`d besides, because it boots the
+/// production model, which a plain `cargo test -p zend --features cuda --tests`
+/// should not pay for or share the card with. It works in a throwaway
+/// workspace, so running it by name is safe. The substrate format itself is
+/// covered by the 73 CPU tests in `candle_conversation::persistence`.
+///
+/// **The workspace is a tool-free mind.** It carries the production schema as
+/// its `projection.yaml` override and an empty `tools/` folder, which
+/// `tool_def::init` reads as a deliberately empty catalog — so the boot seals
+/// no per-tool sections and calibrates nothing, whose exemplars this test
+/// never reads. The two tool-summary sections are still prefilled. What it
+/// exercises is unchanged: turns sealed through the production projection, a
+/// graceful checkpoint, a reopen from disk. Most of its wall-clock is the
+/// production model load.
 #[cfg(feature = "cuda")]
 mod persistence {
     use std::sync::Arc;
@@ -29,6 +37,11 @@ mod persistence {
     use zend::types::{ChatMessage, Role};
 
     const TIMEOUT_SECS: u64 = 600;
+
+    /// The bundled production schema, written into the throwaway workspace so
+    /// the boot runs the real projection while the empty `tools/` beside it
+    /// keeps the catalog — and so the calibration phase — empty.
+    const PRODUCTION_SCHEMA: &str = include_str!("../src/prompts/projection.yaml");
 
     fn init_tracing() {
         let _ = tracing_subscriber::fmt()
@@ -66,7 +79,7 @@ mod persistence {
     }
 
     #[test]
-    #[ignore = "boots the production model and runs the tool calibration at load: minutes, and needs the card alone"]
+    #[ignore = "boots the production model: needs the card alone"]
     fn turns_persist_and_recover_across_a_simulated_restart() {
         init_tracing();
 
@@ -84,6 +97,11 @@ mod persistence {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&workspace).unwrap();
+        // A tool-free mind: the production schema as the workspace override and
+        // an empty catalog, so the boot seals no per-tool sections and has
+        // nothing to calibrate. See the module docs.
+        std::fs::write(workspace.join("projection.yaml"), PRODUCTION_SCHEMA).unwrap();
+        std::fs::create_dir_all(workspace.join("tools")).unwrap();
 
         let ws = workspace.clone();
         let result = rt.block_on(async move {

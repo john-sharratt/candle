@@ -240,6 +240,14 @@ pub enum Model {
     /// here — see [`overrides`].
     Qwen35_9B_Q6,
 
+    /// Qwen3.5-0.8B Q8_0 — the lineage's smallest dense member (~0.8 GB), the
+    /// same hybrid stack, dialect and tool-call style as its larger siblings.
+    ///
+    /// What zend's end-to-end tool suite runs: it loads in seconds where the
+    /// production model takes most of a minute, and it speaks the production
+    /// model's dialect, so the orchestration the suite drives is the real one.
+    Qwen35_0_8B_Q8,
+
     // ── Qwen2 ──────────────────────────────────────────────────────────
     /// Qwen2-0.5B-Instruct Q4_0 — tiny, great for CI and testing (~0.4 GB).
     Qwen2_0_5B,
@@ -461,6 +469,34 @@ impl Model {
         }
     }
 
+    /// Every preset, in declaration order — what a name given on a command line
+    /// is resolved against ([`Self::from_override_key`]).
+    pub const PRESETS: &'static [Model] = &[
+        Model::Qwen3_8B_Q4,
+        Model::Qwen3_8B_Q6,
+        Model::Qwen3_14B_Q4,
+        Model::Qwen3_14B_Q5,
+        Model::Qwen3_14B_Q6,
+        Model::Qwen3_30B_A3B_Q4,
+        Model::Qwen3_30B_A3B_Q6,
+        Model::Qwen36_35B_A3B_Q4,
+        Model::Qwen38_FlashNext_Q4KO,
+        Model::Qwen35_9B_Q6,
+        Model::Qwen35_0_8B_Q8,
+        Model::Qwen2_0_5B,
+        Model::Hermes3_3B_Q6,
+        Model::Hermes3_70B_Q4,
+    ];
+
+    /// The preset whose [`Self::override_key`] is `key` — the variant's own
+    /// identifier, the same name `models.override.yaml` addresses it by.
+    pub fn from_override_key(key: &str) -> Option<Model> {
+        Self::PRESETS
+            .iter()
+            .find(|m| m.override_key().as_deref() == Some(key))
+            .cloned()
+    }
+
     /// Full specification for this model variant, as the repository declares it
     /// and before any local override.
     pub fn preset_spec(self) -> ModelSpec {
@@ -475,6 +511,7 @@ impl Model {
             Model::Qwen36_35B_A3B_Q4 => qwen36_moe::qwen36_35b_a3b_q4(),
             Model::Qwen38_FlashNext_Q4KO => qwen38_flash_next::qwen38_flash_next_q4ko(),
             Model::Qwen35_9B_Q6 => qwen35_dense::qwen35_9b_q6(),
+            Model::Qwen35_0_8B_Q8 => qwen35_dense::qwen35_0_8b_q8(),
             Model::Qwen3_30B_A3B_Q4 => qwen3_moe::qwen3_30b_a3b_q4(),
             Model::Qwen3_30B_A3B_Q6 => qwen3_moe::qwen3_30b_a3b_q6(),
             // Qwen2

@@ -6,6 +6,7 @@ use crate::config::{
     pick_max_hot_turns, DecodeHealthConfig, EngineConfig, SamplingConfig, SequenceConfig,
 };
 use crate::error::ConversationError;
+use crate::guest::checkpoint::gguf_header;
 use crate::models::DialectType;
 use crate::persistence::SharedSubstrate;
 use crate::projection::{CorruptTurnPolicy, LayerId};
@@ -1207,11 +1208,6 @@ impl ModelBuilder {
         Ok(engine)
     }
 
-    /// Read the GGUF header to extract model metadata.
-    ///
-    /// Returns architecture, sampling defaults, vocab_size, thinking support,
-    /// model name, and context length — everything needed to configure the
-    /// builder from the GGUF file itself.
     /// Check the loaded tokenizer against the checkpoint's **own** token table.
     ///
     /// `tokenizer.ggml.tokens` is the vocabulary the embedding and `lm_head`
@@ -1233,11 +1229,7 @@ impl ModelBuilder {
         tokenizer: &tokenizers::Tokenizer,
         model_path: &Path,
     ) -> crate::Result<()> {
-        use candle::quantized::gguf_file;
-
-        let mut file = std::fs::File::open(model_path)
-            .map_err(|e| ConversationError::Model(candle::Error::Msg(format!("open GGUF: {e}"))))?;
-        let ct = gguf_file::Content::read(&mut file).map_err(ConversationError::Model)?;
+        let ct = gguf_header(model_path).map_err(ConversationError::Model)?;
         let Some(tokens) = ct
             .metadata
             .get("tokenizer.ggml.tokens")
@@ -1318,11 +1310,17 @@ impl ModelBuilder {
         Ok(())
     }
 
+    /// Read the GGUF header to extract model metadata.
+    ///
+    /// Returns architecture, sampling defaults, vocab_size, thinking support,
+    /// model name, and context length — everything needed to configure the
+    /// builder from the GGUF file itself.
+    ///
+    /// Through [`gguf_header`], which parses once per process: an engine build
+    /// asks for this header three times (here, the tokenizer check, and
+    /// `engine_config`'s vocabulary width).
     fn detect_sampling_from_gguf(model_path: &Path) -> crate::Result<GgufInfo> {
-        use candle::quantized::gguf_file;
-        let mut file = std::fs::File::open(model_path)
-            .map_err(|e| ConversationError::Model(candle::Error::Msg(format!("open GGUF: {e}"))))?;
-        let ct = gguf_file::Content::read(&mut file).map_err(ConversationError::Model)?;
+        let ct = gguf_header(model_path).map_err(ConversationError::Model)?;
         let arch_str = ct
             .metadata
             .get("general.architecture")
@@ -1774,5 +1772,58 @@ impl std::fmt::Display for ModelBuilder {
             .strip_suffix(".gguf")
             .unwrap_or(&self.spec.model_filename);
         write!(f, "{name}")
+    }
+}
+
+#[cfg(test)]
+mod header_read_tests {
+    use super::ModelBuilder;
+    use crate::guest::checkpoint::cached_headers_for;
+    use crate::models::ModelArch;
+    use std::fs::File;
+    use std::io::Write;
+    use std::path::Path;
+
+    /// A GGUF v3 header: no tensors, one metadata entry,
+    /// `general.architecture = "qwen3"`.
+    fn write_gguf(path: &Path) {
+        let mut f = File::create(path).unwrap();
+        f.write_all(b"GGUF").unwrap();
+        f.write_all(&3u32.to_le_bytes()).unwrap(); // version
+        f.write_all(&0u64.to_le_bytes()).unwrap(); // tensor count
+        f.write_all(&1u64.to_le_bytes()).unwrap(); // metadata count
+        let key = b"general.architecture";
+        f.write_all(&(key.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(key).unwrap();
+        f.write_all(&8u32.to_le_bytes()).unwrap(); // value type: string
+        let value = b"qwen3";
+        f.write_all(&(value.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(value).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    /// **The builder reads its header through the process-wide cache.** It asks
+    /// for the header three times per engine build; read straight off an
+    /// unbuffered `File`, that was a syscall per field of a 248k-token table,
+    /// three times over, on every boot. A path the cache has never seen holds no
+    /// entry, so one after the call is the builder's own parse, cached.
+    #[test]
+    fn metadata_is_read_through_the_header_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "builder-header-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("m.gguf");
+        write_gguf(&p);
+        assert_eq!(cached_headers_for(&p), 0);
+
+        let info = ModelBuilder::detect_sampling_from_gguf(&p).unwrap();
+        assert!(matches!(info.arch, Some(ModelArch::Qwen3)));
+        assert_eq!(info.name, "<unknown>");
+        assert_eq!(cached_headers_for(&p), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

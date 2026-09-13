@@ -101,9 +101,9 @@ CLI flags (`src/main.rs`, `clap`-derived):
 | `--disable-layer <NAME>` (repeatable) | Take a projection layer (or section collection) **out of service** by schema name: not populated at boot, not refreshed by the watcher, excluded from the provenance gather, not normalization-warmed, not swept for crashed partials. Its turns stay in the substrate untouched — dropping the flag restores them — but while it is set they cannot be selected into any projection. An explicit upload into a disabled per-file layer is the one exception and still reads |
 | `--skip-layer <NAME>` (repeatable) | Keep a turn-sink layer fully **in service** — gathered, warmed, and swept for crashed partials — but read nothing from disk for it this boot (no startup ingest, no watcher-driven refresh). The flag for "the corpus is built, stop re-reading the disk". A layer named by both flags is simply disabled |
 | `--ingest-dir <layer>=<path>` (repeatable) | Override the content root a derived ingest layer reads from |
-| `--disable-summariser` | Skip spawning the background summary-forest thread |
 | `--compact-substrate` | Force a whole-store redo-log compaction on load |
 | `--wipe-substrate` | **Destructive** — delete `<workspace>/.substrate` before loading |
+| `--model <PRESET>` | Run this model preset, by its variant name (e.g. `Qwen35_0_8B_Q8`, `Qwen38_FlashNext_Q4KO`), instead of choosing one from the card's measured VRAM. A substrate holds one model's K/V, so pair a different model with its own `--working-dir` |
 
 Continue (`zen-vscode`) configuration points at the daemon as an OpenAI provider:
 

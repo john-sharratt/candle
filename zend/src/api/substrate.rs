@@ -367,3 +367,64 @@ pub struct ProjectTile {
     /// The full body (turn text, or the tool description) — clipped by the client.
     pub text: String,
 }
+
+impl ProjectTile {
+    /// Ceiling on a tile's REPORTED score.
+    ///
+    /// A tile's score is a belief, and a belief is deliberately unbounded
+    /// (`ToolBelief::update`): a lock-on settles at `fresh/β`, measured near
+    /// ~207,000, which is useless to read. The bound is applied to the tile and
+    /// nowhere upstream, because a tile is rendered for a human and never
+    /// consumed again — a clamp on anything read back (the accumulator, or the
+    /// persisted selection `PriorBelief::from_selection` reseeds from) ties the
+    /// leaders and makes the selection arbitrary.
+    ///
+    /// It bounds every tile kind alike: turn tiles and section tiles are both
+    /// beliefs on the same normalized band.
+    ///
+    /// 5,000 leaves 6.25x of headroom over `CommittedToolScope`'s `min_score` of
+    /// 800, so a bounded readout still separates a strong hit from a marginal
+    /// one.
+    pub const SCORE_CAP: f32 = 5_000.0;
+
+    /// Bound this tile's score for the readout.
+    ///
+    /// Call AFTER ranking: tiles sort on the raw belief, and clamping first ties
+    /// every leader past the cap, so the readout's order — the thing its margin
+    /// is read for — becomes arbitrary.
+    pub fn cap_score(&mut self) {
+        self.score = self.score.min(Self::SCORE_CAP);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tile(score: f32) -> ProjectTile {
+        ProjectTile {
+            kind: "section",
+            score,
+            selected: true,
+            layer: String::new(),
+            group: String::new(),
+            label: String::new(),
+            tokens: 0,
+            timeline: None,
+            index: None,
+            text: String::new(),
+        }
+    }
+
+    /// A score past the cap reports AT the cap; one inside it reports untouched.
+    #[test]
+    fn a_tile_score_is_bounded_at_the_cap_and_untouched_below_it() {
+        let mut past = tile(143_035.0);
+        past.cap_score();
+        assert_eq!(past.score, ProjectTile::SCORE_CAP);
+
+        let mut inside = tile(802.2);
+        inside.cap_score();
+        assert_eq!(inside.score, 802.2);
+    }
+}

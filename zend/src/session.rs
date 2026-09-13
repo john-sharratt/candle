@@ -13,14 +13,13 @@ use std::time::SystemTime;
 use futures::{Stream, StreamExt};
 use notify::RecommendedWatcher;
 
-use candle_conversation::models::Dialect;
+use candle_conversation::models::{Dialect, Model};
 use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::persistence::{content_hash, SUBSTRATE_DIR};
 use candle_conversation::projection::{
     self, Builder, GroupSchema, Reserved, SectionId, SelectionRule, SystemItem, SystemPromptItem,
     SystemPromptSchema, TimelineId, TurnIndex,
 };
-use candle_conversation::provenance::ToolBelief;
 use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
@@ -40,7 +39,7 @@ use crate::conv_file_store::ConvFileStore;
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::log_broadcast::LogBus;
-use crate::model_choice::model;
+use crate::model_choice;
 use crate::projection_event::ProjectionEventOut;
 use crate::refresh_ctx::RefreshContext;
 use crate::repo_scan::RepoMap;
@@ -573,6 +572,7 @@ impl InferenceState {
     #[allow(clippy::too_many_arguments)]
     fn load(
         mut proj_builder: Builder,
+        model: Model,
         model_path: PathBuf,
         tokenizer_path: PathBuf,
         workspace: PathBuf,
@@ -772,7 +772,7 @@ impl InferenceState {
         // workspace on this model, survives `--wipe-substrate`, and turns the
         // ~42 s expert repack into a read on every restart after the first.
         let expert_pack_dir = model_path.parent().map(|p| p.to_path_buf());
-        let mut builder = model()
+        let mut builder = model
             .builder()
             .system_prompt(&before_text)
             .model_path(model_path)
@@ -3369,6 +3369,12 @@ pub struct ZendSession {
     /// in-progress load has broken its ingest and drained the engine (on the
     /// loader thread, which owns it) before the process exits.
     load_thread: Mutex<Option<JoinHandle<()>>>,
+    /// Handle to the startup reconcile thread: it catches up files that changed
+    /// while the daemon was down, then warms the normalization levels, holding
+    /// the inference state for its whole run. [`Self::shutdown`] cancels and
+    /// joins it before draining the engine, so a stopped session never keeps its
+    /// model resident — or its scan on the device — behind the next one.
+    reconcile_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Snapshot returned by `GET /v1/status`. `loading` is `None` once the
@@ -3479,6 +3485,7 @@ impl ZendSession {
             started_at_ms,
             file_store,
             load_thread: Mutex::new(None),
+            reconcile_thread: Mutex::new(None),
         }
     }
 
@@ -4025,7 +4032,7 @@ impl ZendSession {
         // the thing the margin is actually read for — becomes arbitrary.
         tiles.sort_by(|a, b| b.score.total_cmp(&a.score));
         for tile in &mut tiles {
-            tile.score = ToolBelief::for_display(tile.score);
+            tile.cap_score();
         }
 
         // Diagnostic: if `scored` is 0 while `query_tokens` > 0, the probe Q was
@@ -4468,6 +4475,9 @@ impl ZendSession {
         let skipped_layers = self.config.skipped_layers.clone();
         let ingest_dirs = self.config.ingest_dirs.clone();
         let compact_substrate = self.config.compact_substrate;
+        // Resolved once, here, and handed to both the downloader and the engine
+        // builder, so the artifact fetched and the model built are the same one.
+        let model = model_choice::resolve(&self.config.model);
         // Re-arm the process-scoped ingest-cancel latch for this load: it's shared
         // across the process (and the test binary), so clear any cancel left by a
         // prior load/shutdown before this one's ingest starts polling it. The
@@ -4512,7 +4522,7 @@ impl ZendSession {
                     }
                 };
                 let (model_path, tok_path) =
-                    match download_runtime.block_on(crate::download::ensure_model(&status_tx)) {
+                    match download_runtime.block_on(crate::download::ensure_model(&model, &status_tx)) {
                         Ok(p) => p,
                         Err(e) => {
                             // A missing model is fatal — the daemon cannot serve
@@ -4537,7 +4547,7 @@ impl ZendSession {
                 // cannot go on claiming a model zend has stopped running.
                 tracing::info!(
                     "loading inference engine ({}) …",
-                    model().spec().model_filename,
+                    model.clone().spec().model_filename,
                 );
                 let load_progress_for_blocking = Arc::clone(&load_progress);
                 // `InferenceState::load` is fully synchronous (CUDA model
@@ -4545,6 +4555,7 @@ impl ZendSession {
                 // on this thread — no `spawn_blocking` needed.
                 match InferenceState::load(
                     proj_builder,
+                    model,
                     model_path,
                     tok_path,
                     workspace,
@@ -4639,7 +4650,7 @@ impl ZendSession {
                         // A no filesystem event fires for down-time edits, so this is what
                         // covers them.
                         let state_for_reconcile = Arc::clone(&state);
-                        std::thread::spawn(move || {
+                        let reconcile = std::thread::spawn(move || {
                             match state_for_reconcile.refresh_ingest_layers() {
                                 Ok(true) => tracing::info!(
                                     "startup background reconcile: ingest layers updated"
@@ -4672,6 +4683,7 @@ impl ZendSession {
                             conv.warm_collection_normalization(&schema);
                             conv.warm_ingest_normalization(&schema);
                         });
+                        *session_for_watcher.reconcile_thread.lock().unwrap() = Some(reconcile);
                         // The engine is up — only NOW mark ready and unblock
                         // submit-flow waiters. Skipped on the shutdown-during-ingest
                         // path (the `Ok(None)` arm below).
@@ -4726,6 +4738,19 @@ impl ZendSession {
             let _ = tokio::task::spawn_blocking(move || {
                 if h.join().is_err() {
                     tracing::warn!("shutdown: loader thread panicked");
+                }
+            })
+            .await;
+        }
+        //    Then the startup reconcile thread. It holds the inference state for
+        //    its whole run, and its warm-up scan stops between probes on the
+        //    cancel raised in step 1, so the join returns promptly — after which
+        //    nothing outside this call keeps the engine alive past the drain below.
+        let reconcile = self.reconcile_thread.lock().unwrap().take();
+        if let Some(h) = reconcile {
+            let _ = tokio::task::spawn_blocking(move || {
+                if h.join().is_err() {
+                    tracing::warn!("shutdown: reconcile thread panicked");
                 }
             })
             .await;
@@ -4915,7 +4940,7 @@ impl ZendSession {
 /// The [`projection::TimelineId`] a client `conv_id` maps to — a stable hash
 /// of the id. Deterministic across daemon restarts, so a reconnecting client
 /// resolves to the same timeline the substrate reload recovered (§16.12).
-fn timeline_for(conv_id: &str) -> projection::TimelineId {
+pub fn timeline_for(conv_id: &str) -> projection::TimelineId {
     let h = content_hash::hash_bytes(conv_id.as_bytes());
     projection::TimelineId::from_raw(h.lo.max(1)).expect("timeline id is non-zero")
 }

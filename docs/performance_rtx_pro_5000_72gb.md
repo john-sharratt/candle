@@ -7,10 +7,16 @@ extrapolated, and §4 — the limits — is as load-bearing as the tables.
 
 > **Machine:** see §1 · **Branch:** `qwen38-moe`
 >
-> **One measurement epoch.** Every table in §3 comes from a single sequential
-> sweep on one build: twelve depth gates, twelve width ladders, and the
-> flagship's two depth curves, run one `cargo test` invocation at a time so
-> exactly one model was ever resident.
+> **Two sweeps, one per axis.** The depth tables (§3.2–§3.5, and §3.6's two
+> depth curves) come from a single sequential sweep on one build, 2026-09-03:
+> twelve depth gates, twelve width ladders, and the flagship's two depth curves,
+> run one `cargo test` invocation at a time so exactly one model was ever
+> resident. The width tables (§3.6 *Width*, §3.7) report, cell by cell, the
+> **higher** of that sweep and a second, width-only sweep on 2026-09-13 (build
+> `2c5f065c` plus its working tree, same machine, driver and toolchain as §1).
+> A cell taken from the second sweep is marked **†**. A maximum of two runs sits
+> above either run alone by up to the 1–4% noise floor (§5), so the width cells
+> are best-of-two rather than single measurements.
 
 ---
 
@@ -421,57 +427,71 @@ sits behind ~128K tokens of unrelated padding, and the rename still validates.
 
 #### Width
 
-The flagship's ladder, aggregate across the batch:
+The flagship's ladder, aggregate across the batch — best of the two sweeps,
+† = 2026-09-13:
 
 | Mode | Ctx | Prefill t/s | Decode t/s | Compress |
 |---|---:|---:|---:|---:|
-| BF16 | 1 (cold) | 579.4 | 68.1 | — |
-| BF16 | 1 (warm) | 1,628.1 | 86.9 | — |
-| BF16 | 4 | 1,798.7 | 233.5 | — |
-| BF16 | 8 | 1,751.2 | 310.6 | — |
-| BF16 | 16 | 1,841.5 | 333.3 | — |
-| C0 | 2 | 1,808.6 | 146.4 | 2.29× |
-| C5 | 2 | 1,771.2 | 145.4 | 4.21× |
-| C8 | 2 | 1,838.2 | 139.5 | 5.43× |
-| C10 | 2 | 1,824.6 | 126.9 | 6.93× |
-| C10 | 8 | 1,857.7 | 295.9 | 6.89× |
+| BF16 | 1 (cold) | 589.7 † | 68.1 | — |
+| BF16 | 1 (warm) | 1,685.6 † | 86.9 | — |
+| BF16 | 4 | 1,878.7 † | 240.6 † | — |
+| BF16 | 8 | 1,880.9 † | 393.1 † | — |
+| BF16 | 16 | 1,959.8 † | 421.5 † | — |
+| C0 | 2 | 1,968.1 † | 146.4 | 2.29× |
+| C5 | 2 | 2,002.4 † | 145.4 | 4.21× |
+| C8 | 2 | 2,021.4 † | 139.5 | 5.43× |
+| C10 | 2 | 2,006.1 † | 135.4 † | 6.93× |
+| C10 | 8 | 2,003.4 † | 391.4 † | 6.89× |
 
-All rows validate at 100%. Decode returns **3.8× single-session throughput at 8
-contexts** and is flat from 8 to 16; prefill is already near the device's limit
-at one warm context (1,628 → 1,842 at ×16), so width buys decode, not prefill.
-The ladder's C0→C10 span costs **13% of decode** for **3.0× more compression**.
+All rows validate at 100% in both sweeps. The second sweep is the faster of the
+two on every prefill cell and on the widest decode cells — BF16 ×8 decode
+310.6 → 393.1 and ×16 333.3 → 421.5, C10 ×8 295.9 → 391.4 (+26–32%) — while
+the single-context and ×2 decode cells stay with the first. Decode returns
+**4.5× single-session throughput at 8 contexts** (86.9 → 393.1) and gains only
+another 7% from 8 to 16; prefill is already near the device's limit at one warm
+context (1,686 → 1,960 at ×16), so width buys decode, not prefill. The ladder's
+C0→C10 span costs **13% of decode in the first sweep and 4% in the second**
+(each measured within its own run) for **~3× more compression**. The C10
+ratios shown are the first sweep's; the second measured 6.75× and 6.73× — see
+§4 on compression between the sweeps.
 
 ### 3.7 Width across the fleet
 
 BF16 at one context against each model's widest measured point. Prompts are
-~700 tokens, so this axis is unaffected by context windows.
+~700 tokens, so this axis is unaffected by context windows. Each cell is the
+better of the two sweeps at the same mode and width, † = 2026-09-13; a
+**‡** widest point was measured only in the second sweep, whose ladder runs
+wider for that model than the first's did, so that cell is a single
+measurement rather than a best-of-two.
 
 | Model | ctx=1 prefill / decode | widest measured | prefill / decode |
 |---|---|---|---|
-| Qwen2-0.5B | 30,359.9 / 244.0 | ×60 | 75,846.1 / 4,562.4 |
-| Qwen3.5-0.8B | 21,078.9 / 168.8 | ×32 (C8) | 30,948.3 / 2,399.5 |
-| Llama-3.2-3B | 11,987.9 / 122.9 (C0) | ×10 (C8) | 12,797.2 / 729.2 |
-| Qwen3-30B-A3B | 8,165.7 / 80.0 | ×10 | 9,709.2 / 505.8 |
-| Qwen3.6-35B-A3B | 6,747.2 / 107.8 | ×64 (C10) | 6,645.6 / 1,144.9 |
-| Qwen3.5-35B-A3B | 6,731.3 / 109.4 | ×64 (C10) | 6,549.8 / 1,170.7 |
-| Qwen3-8B | 5,599.3 / 62.5 | ×10 (C8) | 6,006.0 / 460.1 |
-| Llama-2-7B | 5,518.9 / 91.5 | ×48 | 3,486.3 / 834.3 |
-| Qwen3.5-9B | 5,231.9 / 121.0 | ×20 (C8) | 5,537.6 / 869.9 |
-| Qwen3.8-27B | 1,527.1 / 57.1 | ×40 (C10) | 1,607.2 / 458.1 |
-| Qwen3.8-Flash-Next | 1,628.1 / 86.9 (warm) | ×16 | 1,841.5 / 333.3 |
+| Qwen2-0.5B | 31,482.4 † / 248.6 † | ×60 | 77,559.4 † / 4,839.8 † |
+| Qwen3.5-0.8B | 24,401.6 † / 168.8 | ×256 (C8) ‡ | 35,639.7 / 3,353.4 |
+| Llama-3.2-3B | 12,568.0 † / 129.9 † (C0) | ×10 (C8) | 13,546.5 † / 740.9 † |
+| Qwen3-30B-A3B | 8,165.7 / 80.0 | ×20 (Q8_0) ‡ | 9,759.3 / 580.3 |
+| Qwen3.5-35B-A3B | 7,231.9 † / 109.4 | ×64 (C10) | 7,133.2 † / 1,183.3 † |
+| Qwen3.6-35B-A3B | 7,191.7 † / 107.8 | ×64 (C10) | 7,140.5 † / 1,150.7 † |
+| Qwen3-8B | 5,876.5 † / 67.0 † | ×10 (C8) | 6,006.0 / 460.1 |
+| Llama-2-7B | 5,706.1 † / 94.3 † | ×48 | 3,679.8 † / 836.2 † |
+| Qwen3.5-9B | 5,523.9 † / 121.0 | ×20 (C8) | 5,837.5 † / 877.5 † |
+| Qwen3.8-27B | 1,725.0 † / 57.1 | ×40 (C10) | 1,717.6 † / 458.1 |
+| Qwen3.8-Flash-Next | 1,685.6 † / 86.9 (warm) | ×16 | 1,959.8 † / 421.5 † |
 | DeepSeek-V4-Flash | 333.3 / 15.0 (warm) | ×16 | 1,095.9 / 73.5 |
 
 Two shapes appear here. **Prefill saturates early** on every model — most are
 within 20% of their ×1 rate by ×4, and the 35Bs are flat from ×1 to ×64 — while
 **decode scales nearly linearly with width** until it too flattens. The 35B MoEs
-reach 1,145–1,171 t/s aggregate decode at 64 concurrent sessions against ~110 at
-one, a 10× return on concurrency.
+reach 1,151–1,183 t/s aggregate decode at 64 concurrent sessions against
+~108–109 at one, an 11× return on concurrency.
 
 DeepSeek-V4-Flash is the exception whose prefill is still climbing at ×16
 (333 → 1,096 t/s), having not yet reached the saturation the others hit by ×4.
 
 The ladders are not run at a common set of widths, so this table gives each
-model's own widest point rather than a shared column.
+model's own widest point rather than a shared column — and two ladders run
+wider in the second sweep than in the first (Qwen3.5-0.8B to ×256, Qwen3-30B-A3B
+to ×20), so a model's widest point can come from either sweep.
 
 ---
 
@@ -526,6 +546,39 @@ The rows are reported with their measured validity. One or two sessions in
 sixty-four degrading under maximum compression at maximum concurrency is a
 narrow enough failure that it is recorded as an open item rather than treated as
 a general result about either C10 or width.
+
+**It did not reproduce in the 2026-09-13 sweep.** Both rungs validated outright
+— every session at ×32 (7,178.4 / 953.2 t/s) and at ×64 (7,140.5 / 1,150.7 t/s)
+— so §3.7's ×64 cell for this model is a valid one. One clean run is not
+evidence the failure is gone, since it was already intermittent at one or two
+sessions in sixty-four; it stays open, recorded as not reproduced.
+
+### Compression ratios moved between the two sweeps, in both directions
+
+The width tables keep the **higher** ratio of the two sweeps, which for most
+models is the first sweep's. So their `Compress` cells overstate what the
+2026-09-13 build achieves at the top of the ladder on those models, and the
+difference is recorded here rather than absorbed by the maximum:
+
+| Model | C10, 09-03 → 09-13 | C8, 09-03 → 09-13 |
+|---|---:|---:|
+| Qwen3.5-0.8B | 4.68× → 4.11× | 3.88× → 3.83× |
+| Llama-3.2-3B | 4.63× → 4.34× | 3.90× → 3.95× |
+| Qwen3-8B | 6.21× → 5.85× | 4.85× → 4.85× |
+| Qwen3.5-9B | 6.29× → 5.87× | 4.96× → 4.91× |
+| Qwen3.5-35B-A3B | 7.10–7.14× → 6.20–6.23× | 5.40× → 5.13× |
+| Qwen3.6-35B-A3B | 6.65–6.68× → 6.04–6.06× | 5.18× → 5.04× |
+| Qwen3.8-Flash-Next | 6.89–6.93× → 6.73–6.75× | 5.43× → 5.43× |
+| **Qwen3.8-27B** | **5.44–5.45× → 5.56×** | **4.53× → 4.77×** |
+
+The movement is concentrated at C10 and runs both ways — Qwen3.8-27B compresses
+*better*. A ratio is bytes stored, so a different ratio at the same level means
+the adaptive ladder selected different formats: something in the compression
+policy or its per-model thresholds changed between the builds, and which change
+is **not established**. Throughput does not track it: prefill is higher in the
+second sweep on almost every cell, while decode is mixed (Qwen3-8B's widest
+point 460.1 → 432.3, Qwen3.8-27B's 458.1 → 436.7, against Flash-Next's
++26–32%).
 
 ### The validation column is weaker than the throughput column
 
@@ -617,11 +670,19 @@ one about production selection.
 
 ## 5. Provenance
 
-Every row measured in the sweep — including the ones the tables above omit — is
-in `performance_rtx_pro_5000_72gb_rows.tsv` beside this file: 146 rows of
-`test, label, depth, prompt_tokens, mode, int8, contexts, valid, prefill_tps,
-decode_tps, quantized_pct, compress, peak_tokens`, scraped from the run logs.
-Reproduce any row with the command in its test's `#[ignore]` attribute.
+Every row measured in each sweep — including the ones the tables above omit —
+is beside this file, one TSV per sweep, both with the columns `test, label,
+depth, prompt_tokens, mode, int8, contexts, valid, prefill_tps, decode_tps,
+quantized_pct, compress, peak_tokens`, scraped from the run logs:
+
+| File | Sweep | Rows |
+|---|---|---:|
+| `performance_rtx_pro_5000_72gb_rows.tsv` | 2026-09-03 — depth and width | 146 |
+| `performance_rtx_pro_5000_72gb_rows_2026-09-13.tsv` | 2026-09-13 — width only, build `2c5f065c` + working tree | 171 |
+
+A † cell in §3.6 *Width* or §3.7 is the second file's value; every other width
+cell is the first's. Reproduce any row with the command in its test's
+`#[ignore]` attribute.
 
 | Table | Test |
 |---|---|
@@ -631,8 +692,8 @@ Reproduce any row with the command in its test's `#[ignore]` attribute.
 | §3.6 Rewrite | `quantized_qwen38_moe::tests::profile_story_rewrite_vs_depth` |
 | §3.6 Width, §3.7 | `test_parallel_batched_forwarding*` |
 
-All runs were strictly sequential — one `cargo test` invocation per model, so
-exactly one model was ever resident and no run's VRAM sizing was perturbed by
-another's. Run-to-run variation is 1–4% on the width ladder and ~5% on the depth
+All runs in both sweeps were strictly sequential — one `cargo test` invocation
+per model, so exactly one model was ever resident and no run's VRAM sizing was
+perturbed by another's. Run-to-run variation is 1–4% on the width ladder and ~5% on the depth
 sweep, which is the noise floor any comparison in this document has to clear;
 differences smaller than that are not claimed as results.

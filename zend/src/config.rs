@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use candle_conversation::models::Model;
+
 /// Runtime configuration for the zend daemon.
 #[derive(Clone, Debug, Default)]
 pub struct DaemonConfig {
@@ -49,6 +51,22 @@ pub struct DaemonConfig {
     /// the eager whole-store rewrite instead of deferring it. Opt-in
     /// (`--compact-substrate`).
     pub compact_substrate: bool,
+    /// Which model the daemon runs (`--model <PRESET>`). Defaults to the
+    /// measured-VRAM ladder in `model_choice`.
+    pub model: ModelChoice,
+}
+
+/// Which model a daemon runs.
+#[derive(Clone, Debug, Default)]
+pub enum ModelChoice {
+    /// Pick from the card's measured VRAM — `model_choice`'s ladder. What a
+    /// daemon launched without `--model` runs.
+    #[default]
+    MeasuredVram,
+    /// Run this preset whatever the card. Boxed because `Model` carries a whole
+    /// `ModelSpec` in its `Custom` variant, which would otherwise size every
+    /// `DaemonConfig` to it.
+    Preset(Box<Model>),
 }
 
 /// Split the two layer flags into their final, DISJOINT sets: `(disabled,

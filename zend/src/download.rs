@@ -12,13 +12,13 @@ use std::path::{Path, PathBuf};
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 
-use crate::model_choice::model;
+use candle_conversation::models::Model;
 
 // ── Model coordinates ─────────────────────────────────────────────────────────
 //
-// The model repo/filename/size all come from `model_choice::model()` via the
-// library spec — the downloader never names a checkpoint itself, so it cannot
-// drift from what the session loads.
+// The model repo/filename/size all come from the spec of the model the session
+// resolved (`model_choice::resolve`) — the downloader never names a checkpoint
+// itself, so it cannot drift from what the session loads.
 
 const TOK_FILE: &str = "tokenizer.json";
 
@@ -28,12 +28,13 @@ const TOK_FILE: &str = "tokenizer.json";
 ///
 /// Progress is published on `status` so callers can surface it to users.
 pub async fn ensure_model(
+    model: &Model,
     status: &tokio::sync::watch::Sender<String>,
 ) -> anyhow::Result<(PathBuf, PathBuf)> {
     let dir = cache_dir();
     tokio::fs::create_dir_all(&dir).await?;
 
-    let spec = model().spec();
+    let spec = model.clone().spec();
     let model_path = if spec.prepared_from_source {
         resolve_prepared(&spec.model_repo, &spec.model_filename, &dir, status)?
     } else {

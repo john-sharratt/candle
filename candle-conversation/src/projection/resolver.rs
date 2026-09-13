@@ -16,6 +16,7 @@ use super::project::ProjectionTarget;
 use super::schema::{
     CorruptTurnPolicy, GroupSchema, LayerSchema, Schema, SystemPromptItem, SystemPromptSchema,
 };
+use crate::cancel::ingest_cancelled;
 use crate::error::ConversationError;
 use crate::normalization::{ChildKey, NormalizationCache, Phase, ScopeKey};
 use crate::persistence::content_hash::{
@@ -1331,6 +1332,12 @@ impl Conversation {
                         .collect()
                 };
                 for (source, probe, question) in &sigs {
+                    // Stops between probes once a shutdown asks: the warm-up
+                    // runs on a background thread that holds the engine, so it
+                    // must end with its session rather than after its last probe.
+                    if ingest_cancelled() {
+                        return;
+                    }
                     let _ = self.score_belief_collections(
                         &schema.system_prompt,
                         probe,
@@ -1452,6 +1459,10 @@ impl Conversation {
             .active_timelines_for_group(group.id)
             .collect();
         for &tl in &timelines {
+            // A shutdown ends the warm-up here too, not one timeline at a time.
+            if ingest_cancelled() {
+                break;
+            }
             self.warm_timeline(layer, group, tl);
         }
         timelines.len()
@@ -1484,6 +1495,11 @@ impl Conversation {
         // against ALL the file's exchanges, so this caps the one-time warm cost
         // without materially moving the level.
         for (source, sig) in sigs.iter().take(WARM_INGEST_PROBES_PER_TIMELINE) {
+            // Stops between probes once a shutdown asks — see
+            // `warm_collection_normalization`.
+            if ingest_cancelled() {
+                return;
+            }
             if sig.is_empty() {
                 continue;
             }

@@ -129,7 +129,10 @@ pub async fn completions(
 /// - `effort` 0..4  → `thinking_effort` = off / quick / balanced / deep / exhaustive
 /// - `verbosity` 0..4 → `response_length` = terse / concise / standard / detailed / comprehensive
 /// - `no_think` = present (suppress) when `effort == 0` or `think == false`, else absent
-fn dial_selection(
+///
+/// Public so a harness driving the session directly selects exactly what the
+/// HTTP API would for the same dials, rather than restating the mapping.
+pub fn dial_selection(
     effort: Option<u8>,
     verbosity: Option<u8>,
     think: Option<bool>,

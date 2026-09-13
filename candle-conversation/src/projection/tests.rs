@@ -2005,7 +2005,7 @@ layers:
 
 #[test]
 fn higher_scored_group_emitted_last_within_layer() {
-    // Doc Â§7: "Higher-scored groups appear *later* in the emitted list within
+    // Doc §7: "Higher-scored groups appear *later* in the emitted list within
     // their layer — closer to the bottom of the LLM's input."
     let yaml = r#"
 system_prompt:
@@ -3491,7 +3491,7 @@ layers:
 
 #[test]
 fn empty_target_group_does_not_emit_target_layer() {
-    // Doc Â§9.7: "Filter out empty groups and empty layers." No exception for
+    // Doc §9.7: "Filter out empty groups and empty layers." No exception for
     // the target group. If the target group has no turns, its layer should not
     // emit any turns (lower-layer groups still appear).
     let yaml = r#"

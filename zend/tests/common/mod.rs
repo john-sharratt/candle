@@ -56,8 +56,10 @@ const MAX_RESPONSE_TOKENS: usize = 512;
 ///
 /// Holds the `TempDir` so the directory outlives every engine opened on it —
 /// which is what makes a restart expressible: drop the engine, keep the disk.
+/// Every engine opened over it runs `model`.
 pub struct Workspace {
     dir: tempfile::TempDir,
+    model: Model,
 }
 
 /// Route the engine's WARNs to stderr, once per process.
@@ -81,10 +83,18 @@ fn init_tracing() {
 }
 
 impl Workspace {
+    /// A workspace whose engines run [`HYBRID`].
     pub fn new() -> Self {
+        Self::for_model(HYBRID)
+    }
+
+    /// A workspace whose engines run `model` — for a scenario that needs the
+    /// hybrid stack but not the production model's size.
+    pub fn for_model(model: Model) -> Self {
         init_tracing();
         Self {
             dir: tempfile::tempdir().expect("tempdir"),
+            model,
         }
     }
 
@@ -109,6 +119,7 @@ impl Workspace {
             self.path().to_path_buf(),
             device,
             PROJECTION_YAML.to_string(),
+            self.model.clone(),
         )
     }
 
@@ -121,7 +132,12 @@ impl Workspace {
     /// section ids, and two independent builders in one engine alias their
     /// numeric ids.)
     pub fn session_with_edited_prompt(&self, device: &Device) -> Session {
-        Session::open_with_yaml(self.path().to_path_buf(), device, edited_projection_yaml())
+        Session::open_with_yaml(
+            self.path().to_path_buf(),
+            device,
+            edited_projection_yaml(),
+            self.model.clone(),
+        )
     }
 }
 
@@ -220,11 +236,13 @@ pub struct Session {
     /// The projection schema this session's conversations are built from —
     /// `PROJECTION_YAML`, or an edited variant for the prompt-edit scenarios.
     yaml: String,
+    /// The model the engine runs; its dialect frames every conversation.
+    model: Model,
 }
 
 impl Session {
-    fn open_with_yaml(workspace: PathBuf, device: &Device, yaml: String) -> Self {
-        let (engine, prompt, config) = build_engine(workspace.clone(), device);
+    fn open_with_yaml(workspace: PathBuf, device: &Device, yaml: String, model: Model) -> Self {
+        let (engine, prompt, config) = build_engine(workspace.clone(), device, &model);
         await_substrate_reload(&engine);
         Self {
             engine,
@@ -232,6 +250,7 @@ impl Session {
             prompt,
             config,
             yaml,
+            model,
         }
     }
 
@@ -247,8 +266,12 @@ impl Session {
     /// builder (the constructor consumes one), so this rebuilds it — the same
     /// thing the daemon does per conversation.
     pub fn start(&self) -> Sequence {
-        let (builder, layer, group) =
-            projection_for_yaml(&self.yaml, &self.workspace, self.engine.tokenizer());
+        let (builder, layer, group) = projection_for_yaml(
+            &self.yaml,
+            &self.workspace,
+            self.engine.tokenizer(),
+            &self.model,
+        );
         self.engine
             .new_conversation_with_projection(
                 &self.prompt,
@@ -302,12 +325,13 @@ fn projection_for_yaml(
     yaml: &str,
     workspace: &Path,
     tokenizer: &tokenizers::Tokenizer,
+    model: &Model,
 ) -> (
     projection::Builder,
     candle_conversation::projection::LayerId,
     candle_conversation::projection::GroupId,
 ) {
-    let dialect = HYBRID.spec().dialect.clone();
+    let dialect = model.clone().spec().dialect;
     let workspace_str = workspace.display().to_string();
     let mut b = projection::Builder::from_yaml_with_vars_and_dialect(
         yaml,
@@ -335,8 +359,10 @@ fn projection_for_yaml(
 fn build_engine(
     workspace: PathBuf,
     device: &Device,
+    model: &Model,
 ) -> (ConversationEngine, String, SequenceConfig) {
-    let mut builder = HYBRID
+    let mut builder = model
+        .clone()
         .builder()
         .workspace_path(workspace)
         .sampling(SamplingConfig::argmax())

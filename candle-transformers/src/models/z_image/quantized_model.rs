@@ -621,6 +621,10 @@ mod tests {
     ///
     /// Asserts nothing — a benchmark that fails on a slower card is a test
     /// nobody runs.
+    ///
+    /// Built only with the `cuda` feature: `to_dynamic` and
+    /// `QMatMul::forward_dynamic` are the GPU backend's, and are what it measures.
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "GPU benchmark: the z-image projection baseline; run with --ignored --nocapture"]
     fn projection_baseline_at_z_image_size() -> Result<()> {

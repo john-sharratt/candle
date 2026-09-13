@@ -1475,8 +1475,8 @@ fn projections(log: &mut LogFile, only: Option<StreamId>, jsonl: bool) -> Result
 /// counting events is `wc -l` and grouping them is a field lookup.
 ///
 /// Scores are the RAW belief, unbounded — a projection tile's 5,000 display cap
-/// (`ToolBelief::REPORT_CAP`) is a reporting bound and is deliberately not
-/// applied here, because this view is where a lock-on's real margin is read.
+/// (zend's `ProjectTile::SCORE_CAP`) is a reporting bound and is deliberately
+/// not applied here, because this view is where a lock-on's real margin is read.
 fn print_projection_event_json(
     timeline: u64,
     turn: u32,

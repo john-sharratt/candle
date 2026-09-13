@@ -26,12 +26,13 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use candle_conversation::models::Model;
 use candle_conversation::relief_trace;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 use zend::api;
-use zend::config::{layer_flag_sets, DaemonConfig};
+use zend::config::{layer_flag_sets, DaemonConfig, ModelChoice};
 use zend::download;
 use zend::log_broadcast::{BusWriter, LogBus};
 use zend::session::ZendSession;
@@ -147,6 +148,25 @@ struct Cli {
     /// `~/.cache/zend/models/deepseek-v4-flash-mxfp4`.
     #[arg(long)]
     model_dir: Option<PathBuf>,
+
+    /// Run this model preset instead of choosing one from the card's measured
+    /// VRAM, by its variant name (e.g. `Qwen35_0_8B_Q8`, `Qwen38_FlashNext_Q4KO`).
+    #[arg(long, value_name = "PRESET", value_parser = parse_model)]
+    model: Option<Model>,
+}
+
+/// A `--model` value: the preset whose variant name it is.
+fn parse_model(name: &str) -> Result<Model, String> {
+    Model::from_override_key(name).ok_or_else(|| {
+        let known: Vec<String> = Model::PRESETS
+            .iter()
+            .filter_map(|m| m.override_key())
+            .collect();
+        format!(
+            "unknown model preset {name:?}; expected one of: {}",
+            known.join(", ")
+        )
+    })
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -359,6 +379,9 @@ async fn main() -> anyhow::Result<()> {
         skipped_layers: skipped_layers.clone(),
         ingest_dirs: ingest_dirs.clone(),
         compact_substrate: cli.compact_substrate,
+        model: cli.model.clone().map_or(ModelChoice::MeasuredVram, |m| {
+            ModelChoice::Preset(Box::new(m))
+        }),
     };
 
     if !disabled_layers.is_empty() {
