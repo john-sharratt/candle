@@ -449,11 +449,12 @@ fn dir_tags(unit: &DirUnit) -> Vec<String> {
 /// Strip auto-summarization from a [`SequenceConfig`] before using
 /// it to mint a utility-layer conversation (repo_map, code_reading).
 ///
-/// The legacy per-turn tree summarization (`summarize_every`) runs synchronously
-/// inside `finalize_turn_post_done` — `drain_cognitive_tasks` spin-polls each
-/// task to completion before `insert_turn` returns. For repo_map / code_reading,
-/// which carry hundreds of small structured turns (folder chains, scope reads),
-/// that would stall every unit behind the summarizer, so it stays off here. The
+/// The legacy per-turn tree summarization (`summarize_every`) stays off here.
+/// It does not block a turn — the task runs in the background and is applied
+/// at a later turn boundary — but every one re-reads its whole window as a
+/// fresh prefill on the scheduler. For repo_map / code_reading, which carry
+/// hundreds of small structured turns (folder chains, scope reads), that would
+/// queue a steady stream of those prefills behind ingest. The
 /// async AVL summariser is separate and unaffected: it runs on its own thread
 /// (wave-driven compression) and summarises every layer — including these —
 /// without blocking ingest, and provenance scans expand the compressed nodes on

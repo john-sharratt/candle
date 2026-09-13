@@ -169,6 +169,7 @@ seedConversations(now) -> Conversation[]           // initial list; active one h
                                                     // (live: GET list + GET :id for active)
 getConversation(id) -> Promise<Conversation>        // hydrate on demand (live: GET :id)
 getStatus() -> Promise<{state:"loading"|"ready", started_at_ms, detail, loading?, build}>  // GET /v1/status; gates the startup overlay; `build` (assets hash) drives the hot-reload check
+getToolSchemas() -> Promise<{[tool]: JSONSchema|null}>  // GET /v1/substrate/tools; tool-call cards list every parameter from it, defaults included
 archiveConversation(id) / unarchiveConversation(id) -> Promise<void>
 streamChatCompletion(conv, text, opts, handlers) -> { cancel() }
 mkProjEvent(conv, region) -> ProjectionSpan         // mock-only synthesis helper; live ignores

@@ -85,6 +85,11 @@
   .zmd .tool-call-arg-key { color: #9a9490; white-space: nowrap; }
   .zmd .tool-call-arg-sep { color: #5a5652; }
   .zmd .tool-call-arg-val { color: #b8d4a4; word-break: break-word; }
+  .zmd .tool-call-arg.dflt .tool-call-arg-key, .zmd .tool-call-arg.dflt .tool-call-arg-val { color: #6f6a64; }
+  .zmd .tool-call-arg.dflt .tool-call-arg-val { font-style: italic; }
+  .zmd .tool-call-name, .zmd .tool-call-badge { flex-shrink: 0; }
+  .zmd .tool-call-subject { color: #c7bdb0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .zmd .tool-call-detail { color: #7d766e; font-size: .76rem; white-space: nowrap; flex-shrink: 0; }
   .zmd details.tool-call-card > summary.tool-call-header { cursor: pointer; list-style: none; user-select: none; }
   .zmd details.tool-call-card > summary.tool-call-header::-webkit-details-marker { display: none; }
   .zmd details.tool-call-card:not([open]) > summary.tool-call-header { border-bottom: none; }
@@ -299,6 +304,8 @@ import { estateSwitcher } from './common/lib/estate.js';
 
   const S = {
     conversations: [],   // filled by the async seed at boot (mock is sync, live fetches)
+    toolSchemas: {},     // tool name → argument JSON Schema (GET /v1/substrate/tools)
+    toolSchemaGen: 0,    // bumped when toolSchemas lands; part of the render-cache key
     activeId: null,
     loaded: {},
     showArchived: (function () { try { return localStorage.getItem('zend.showArchived') === '1'; } catch (_) { return false; } })(),
@@ -545,26 +552,66 @@ import { estateSwitcher } from './common/lib/estate.js';
     const raw = (m ? m[1] : (content || '')).trim();
     let obj = null; try { obj = JSON.parse(raw); } catch (_) {}
     const isError = !!(obj && (obj.error || obj.detail));
-    return { raw, isError };
+    return { raw, isError, obj };
   }
-  // An expandable tool-call block: header (name + result badge), then the call
-  // parameters and — when the matching `<tool_response>` is paired in — the tool
-  // output. Defaults open while still streaming or when there's a result to read.
+  // A one-line account of what a call touched, for the collapsed header: the
+  // file or folder it named, then what came back — the excerpt's line range for
+  // a read, the entry count for a listing. Any other tool shows its first string
+  // argument. Either part is empty when there is nothing to say.
+  function toolSubject(name, args, resp) {
+    let subject = '';
+    if (typeof args.path === 'string') subject = args.path;
+    else if ('prefix' in args || name === 'file_list') subject = args.prefix || 'project root';
+    else {
+      const first = Object.values(args).find((v) => typeof v === 'string' && v);
+      if (first) subject = first;
+    }
+    let detail = '';
+    // file_read's excerpt header: `\npath (lines 1-900):` / `(lines 47-93 of 900)` / `(empty)`.
+    const hdr = resp && /^\s*\S[^\n]*? \((lines \d+-\d+(?: of \d+)?|empty)\):/.exec(resp.raw);
+    if (hdr) detail = hdr[1];
+    else if (resp && resp.obj && resp.obj.paging && typeof resp.obj.paging.total === 'number') {
+      const p = resp.obj.paging;
+      detail = p.total + (p.total === 1 ? ' file' : ' files') + (p.pages > 1 ? ' · page ' + (p.page + 1) + '/' + p.pages : '');
+    } else if (args.start_line != null || args.end_line != null) {
+      detail = 'lines ' + (args.start_line != null ? args.start_line : 1) + '-' + (args.end_line != null ? args.end_line : 'end');
+    }
+    return { subject, detail };
+  }
+  // Every parameter the tool takes: the ones the call passed, in call order,
+  // then the ones it left out — dimmed, with the default they took (the schema's
+  // `default`, else just "default"). Without a schema (catalog not fetched yet,
+  // or a tool it doesn't know) only the passed arguments are listed.
+  function toolArgRows(name, args) {
+    const show = (v) => (typeof v === 'string' ? v : JSON.stringify(v));
+    const row = (k, val, dflt) => '<div class="tool-call-arg' + (dflt ? ' dflt' : '') + '"><span class="tool-call-arg-key">' + esc(k) + '</span><span class="tool-call-arg-sep">:</span><span class="tool-call-arg-val">' + esc(val) + '</span></div>';
+    const schema = S.toolSchemas[name];
+    const props = (schema && schema.properties) || {};
+    const passed = Object.keys(args).map((k) => row(k, show(args[k]), false));
+    // A property may be a bare boolean schema (`true`), which has no `default`.
+    const hasDefault = (p) => !!p && typeof p === 'object' && 'default' in p;
+    const omitted = Object.keys(props).filter((k) => !(k in args)).map((k) =>
+      row(k, hasDefault(props[k]) ? show(props[k].default) + ' (default)' : 'default', true));
+    return passed.concat(omitted).join('');
+  }
+  // An expandable tool-call block: header (name, what it touched, result
+  // badge), then every parameter and — when the matching `<tool_response>` is
+  // paired in — the tool output.
   function toolCard(json, complete, output, running) {
     if (!complete) return '<div class="tool-call-card pending"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">Calling tool…</span></div></div>';
     let parsed;
     try { parsed = JSON.parse(json.trim()); } catch (e) { parsed = null; }
     const name = (parsed && parsed.name) || 'tool call';
-    const args = (parsed && (parsed.arguments || parsed.parameters || parsed.params)) || {};
-    const argsHtml = Object.entries(args).map(([k, v]) =>
-      '<div class="tool-call-arg"><span class="tool-call-arg-key">' + esc(k) + '</span><span class="tool-call-arg-sep">:</span><span class="tool-call-arg-val">' + esc(typeof v === 'string' ? v : JSON.stringify(v)) + '</span></div>'
-    ).join('');
-    // The running state takes precedence over any stashed output: while a `tool`
-    // running event still names this call, show the spinner — never a "result"
-    // badge — even if a result for an earlier same-named call is present. The
-    // result is shown only once the call is no longer running (its `done` event
-    // cleared it from `running`).
-    const isRunning = running && running.indexOf(name) !== -1;
+    let args = (parsed && (parsed.arguments || parsed.parameters || parsed.params)) || {};
+    // Some calls carry their arguments as a JSON-encoded string.
+    if (typeof args === 'string') { try { args = JSON.parse(args); } catch (_) { args = { arguments: args }; } }
+    if (!args || typeof args !== 'object' || Array.isArray(args)) args = {};
+    const argsHtml = toolArgRows(name, args);
+    // A card spins only while its OWN call is in flight: its tool is named in
+    // the running batch AND no result has been paired to it yet. Earlier calls
+    // to the same tool in this bubble already hold their results, so they stay
+    // resolved instead of spinning along with the newest one.
+    const isRunning = !!running && output == null && running.indexOf(name) !== -1;
     const resp = !isRunning && output != null ? toolResponseInfo(output) : null;
     const badge = isRunning
       ? '<span class="tool-call-badge run"><span class="tool-call-spin"></span>running…</span>'
@@ -574,8 +621,11 @@ import { estateSwitcher } from './common/lib/estate.js';
     const outHtml = resp
       ? '<div class="tool-call-out' + (resp.isError ? ' err' : '') + '"><div class="tool-call-out-label">' + (resp.isError ? 'Error' : 'Output') + '</div><pre class="tool-call-out-body">' + esc(resp.raw) + '</pre></div>'
       : '';
+    const sub = toolSubject(name, args, resp);
+    const subHtml = (sub.subject ? '<span class="tool-call-subject">' + esc(sub.subject) + '</span>' : '') +
+      (sub.detail ? '<span class="tool-call-detail">' + esc(sub.detail) + '</span>' : '');
     return '<details class="tool-call-card">' +
-      '<summary class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">' + esc(name) + '</span>' + badge +
+      '<summary class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">' + esc(name) + '</span>' + subHtml + badge +
       '<svg class="tool-call-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></summary>' +
       (argsHtml ? '<div class="tool-call-args">' + argsHtml + '</div>' : '') + outHtml + '</details>';
   }
@@ -678,12 +728,14 @@ import { estateSwitcher } from './common/lib/estate.js';
     // `toolOut[idx]` is rebuilt each render, so key by value. Join the outputs
     // exactly (NUL-separated — never in text) rather than a lossy length sum, so
     // two different output sets can't collide into a stale cache hit. Tool outputs
-    // are small, so the compare is cheap.
+    // are small, so the compare is cheap. The tool-schema generation is part of
+    // the key too: cards list their parameters from the catalog, which lands
+    // after the first render.
     const toKey = to ? to.join('\u0000') : '';
     const c = msg._htmlCache;
-    if (c && c.content === msg.content && c.open === open && c.toKey === toKey) return c.html;
+    if (c && c.content === msg.content && c.open === open && c.toKey === toKey && c.gen === S.toolSchemaGen) return c.html;
     const html = nodeHtml(msg, open, toolOutputs);
-    msg._htmlCache = { content: msg.content, open: open, toKey: toKey, html: html };
+    msg._htmlCache = { content: msg.content, open: open, toKey: toKey, gen: S.toolSchemaGen, html: html };
     return html;
   }
 
@@ -2824,6 +2876,17 @@ import { estateSwitcher } from './common/lib/estate.js';
     });
   }
 
+  // The tool catalog's argument schemas, fetched once the daemon is ready (it
+  // answers 503 while loading). Cards render with just the passed arguments
+  // until these land.
+  function loadToolSchemas() {
+    Promise.resolve(API.getToolSchemas()).then((s) => {
+      S.toolSchemas = s || {};
+      S.toolSchemaGen++;
+      render();
+    }).catch(() => {});
+  }
+
   // Boot/reload state. `reloadPolling` is true while pollStatus owns the screen
   // (initial load OR a detected daemon reload), so periodicSync stays out of the
   // way. `lastStartedAt` tracks the daemon's start stamp to detect restarts.
@@ -2839,6 +2902,7 @@ import { estateSwitcher } from './common/lib/estate.js';
         if (st.started_at_ms != null) lastStartedAt = st.started_at_ms;
         S.boot = null;
         initConversations();
+        loadToolSchemas();
       } else {
         S.boot = st || S.boot || LOADING_BOOT('Loading model');
         render();

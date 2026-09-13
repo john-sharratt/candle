@@ -105,6 +105,21 @@
       return Promise.resolve({ state: 'ready', started_at_ms: 0, detail: '', loading: null, build: 'mock' });
     },
 
+    // GET /v1/substrate/tools — argument schemas for the tools the seeded
+    // conversations call.
+    getToolSchemas() {
+      return Promise.resolve({
+        read_file: {
+          type: 'object',
+          required: ['path'],
+          properties: {
+            path: { type: 'string', description: 'File to read.' },
+            range: { type: ['string', 'null'], description: 'Line range, e.g. "1-40". Defaults to the whole file.' },
+          },
+        },
+      });
+    },
+
     // ── Files (conversation-scoped) ────────────────────────────────────────
     _seedFiles() {
       const files = [

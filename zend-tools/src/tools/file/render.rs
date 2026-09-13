@@ -26,7 +26,7 @@
 /// Header + language-tagged fence + `cat -n` numbered body, as one string. The
 /// caller frames it in `<tool_response>` tags.
 ///
-/// `total_lines` lets the header say `(lines 1-200 of 1135)` when the excerpt is
+/// `total_lines` lets the header say `(lines 47-93 of 1135)` when the excerpt is
 /// a slice of something longer — the continuation signal, carried in the text
 /// the model already reads rather than in a side-channel field it has to
 /// correlate. When the excerpt ends at the last line the header is the plain

@@ -3,8 +3,8 @@
 //! A `CognitiveTask` is a **consumer-side handle** to already-running
 //! background inference work. Once the tree has launched a task (allocated a
 //! scheduler slot, submitted the inference turn), it pushes the handle onto
-//! `pending_tasks`; `Sequence` drains and spin-polls each handle until it
-//! resolves.
+//! `pending_tasks`, where `ConversationTree::poll_tasks` checks it without
+//! blocking at every turn boundary until it resolves.
 //!
 //! The trait exposes only what the consumer needs:
 //! - [`kind()`](CognitiveTask::kind) — what type of work this is

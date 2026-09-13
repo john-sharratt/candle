@@ -28,7 +28,7 @@ use crate::sequence_handle::{BlockCount, SequenceId};
 use crate::stuffed_grid::{plan_stuffed_grid_with_indices, CaseGrid};
 use crate::token_buffer::TokenBuffer;
 use crate::tree::token_text::TokenizedText;
-use crate::tree::{CognitiveTask, ConversationTree, TaskPoll, TurnType};
+use crate::tree::{ConversationTree, TurnType};
 use crate::turn::{Role, Turn, TurnOptions};
 use crate::turn_layout::TurnLayout;
 use crate::TurnEvent;
@@ -3549,8 +3549,9 @@ impl Sequence {
     ///    `Done` arrived.
     /// 2. Persist the user/assistant entries to the cold store.
     /// 3. Commit the exchange to the conversation tree (which may
-    ///    queue cognitive tasks like summarisation).
-    /// 4. Drain any cognitive tasks the tree launched.
+    ///    launch cognitive tasks like summarisation).
+    /// 4. Apply any cognitive task that has finished — without waiting
+    ///    for the ones still running.
     /// 5. Prefill the next user-turn header into the KV cache.
     ///
     /// Returns the boundary text prefilled in step 5 so callers can
@@ -3589,9 +3590,10 @@ impl Sequence {
             Some((&self.scheduler_tx, &self.tokenizer)),
         );
 
-        // Drain pending cognitive tasks launched by the tree during
-        // finish_turn() and spin-poll each to completion before returning.
-        self.drain_cognitive_tasks();
+        // Apply any cognitive task that has finished. Tasks still running —
+        // including one `finish_turn` just launched — stay in flight and are
+        // picked up at a later turn boundary: the turn never waits on them.
+        self.poll_cognitive_tasks();
 
         // Each turn opens its own user role marker via the
         // `prefill_tokens` of the next `submit_turn` and closes the
@@ -4365,39 +4367,22 @@ impl Sequence {
         &mut self.tree
     }
 
-    /// Spin-poll a cognitive task to completion, applying the resulting
-    /// [`TreePatch`](crate::tree::TreePatch) to the tree if one arrives.
+    /// Apply every cognitive task (summarization, …) that has finished,
+    /// without blocking on the ones still running. Returns the number of
+    /// results applied to the tree.
     ///
-    /// After each [`TreePatch`] is applied, checks whether a recursive
-    /// segment-of-segments summarization should fire and, if so, queues the
-    /// new task onto the tree's `pending_tasks`. The outer drain loop in
-    /// `send()` then picks it up automatically.
-    ///
-    /// This is the "crude blocking" variant from the design doc — acceptable
-    /// for infrequent summarization events. Upgrade to async polling later.
-    fn run_task_blocking_inner(
-        tree: &mut ConversationTree,
-        task: &mut dyn CognitiveTask,
-        inference: Option<(
-            &crossbeam::channel::Sender<SchedulerRequest>,
-            &std::sync::Arc<tokenizers::Tokenizer>,
-        )>,
-    ) {
-        loop {
-            match task.poll() {
-                TaskPoll::Ready(patch) => {
-                    tree.apply_patch(patch);
-                    tree.check_and_trigger_segment_summarize(inference);
-                    return;
-                }
-                TaskPoll::Aborted => return,
-                TaskPoll::Failed(e) => {
-                    tracing::warn!("cognitive task failed: {}", e);
-                    return;
-                }
-                TaskPoll::Pending => std::thread::yield_now(),
-            }
-        }
+    /// Cognitive tasks run in the background on the scheduler: a turn
+    /// launches them and returns without waiting. This runs at every turn
+    /// boundary, and is public so a caller that wants a result sooner — or a
+    /// test waiting for one — can poll between turns.
+    pub fn poll_cognitive_tasks(&mut self) -> usize {
+        self.tree
+            .poll_tasks(Some((&self.scheduler_tx, &self.tokenizer)))
+    }
+
+    /// Number of cognitive tasks still running in the background.
+    pub fn pending_cognitive_tasks(&self) -> usize {
+        self.tree.pending_task_count()
     }
 
     /// Build the canonical token sequence for one completed turn.
@@ -4470,22 +4455,6 @@ impl Sequence {
             }
         }
         ids
-    }
-
-    /// Drain all pending cognitive tasks from the tree to completion,
-    /// re-draining after each batch to handle recursive tasks queued by
-    /// segment-of-segments summarization.
-    fn drain_cognitive_tasks(&mut self) {
-        let inference = Some((&self.scheduler_tx, &self.tokenizer));
-        loop {
-            let tasks = self.tree.drain_pending_tasks();
-            if tasks.is_empty() {
-                break;
-            }
-            for mut task in tasks {
-                Self::run_task_blocking_inner(&mut self.tree, task.as_mut(), inference);
-            }
-        }
     }
 }
 

@@ -33,7 +33,7 @@ use super::summarize::{
     SummarizationContent, SummarizationReason, SummarizationSegmentEntry, SummarizationSnapshot,
     SummarizationTask, SummarizationTurnEntry,
 };
-use super::task::CognitiveTask;
+use super::task::{CognitiveTask, TaskPoll};
 use super::token_text::TokenizedText;
 use super::types::{NodeId, TurnId, TurnType};
 use crate::prompts::TEMPORAL_MARKER_POSTFIX;
@@ -119,8 +119,10 @@ pub struct ConversationTree {
     ///
     /// Each entry is a launched [`SummarizationTask`] (or future task type)
     /// whose background inference is already running on the scheduler's
-    /// thread. `Sequence` drains this vec after each `finish_turn()` call
-    /// and polls / applies the results.
+    /// thread. [`poll_tasks`](Self::poll_tasks) checks them without blocking
+    /// at every turn boundary; a task stays here until it resolves, which is
+    /// also what the triggers' dedup reads to avoid launching a second task
+    /// over the same window.
     ///
     /// `Box<dyn CognitiveTask>` is not `Clone`; the field is deliberately
     /// excluded from the manual `Clone` impl — forks and test trees start
@@ -398,21 +400,11 @@ impl ConversationTree {
         previous_day: Option<i32>,
         inference: Option<(&Sender<SchedulerRequest>, &Arc<tokenizers::Tokenizer>)>,
     ) {
-        let mut should_summarize = false;
-        let mut reason = None;
-
-        if self.config.summarize_every > 0 {
-            let count = self.turns_since_last_summarize();
-            if count >= self.config.summarize_every {
-                should_summarize = true;
-                reason = Some(SummarizationReason::TurnCountReached { count });
-            }
-        }
+        let mut reason = self.turn_count_reason();
 
         if self.config.summarize_on_day_boundary {
             if let Some(prev) = previous_day {
                 if completed_turn.day > prev {
-                    should_summarize = true;
                     reason = Some(SummarizationReason::DayBoundary {
                         previous_day: prev,
                         new_day: completed_turn.day,
@@ -421,23 +413,44 @@ impl ConversationTree {
             }
         }
 
-        if should_summarize {
-            // Dedup: skip if any pending task already covers turns in this
-            // unsummarized window. `last_summarize_seq()` is the boundary
-            // — any task whose relevant range ends beyond it is covering
-            // the same window we are about to queue.
-            let last_seg_seq = self.last_summarize_seq().unwrap_or(0);
-            let already_pending = self.pending_tasks.iter().any(|t| {
-                t.relevant_turns()
-                    .is_some_and(|r| r.end().seq > last_seg_seq)
-            });
-            if already_pending {
-                tracing::debug!("summarization task already pending for this window — skipping");
-                return;
-            }
-            let snapshot = self.build_snapshot(reason.unwrap());
-            self.run_summarize(snapshot, inference);
+        if let Some(reason) = reason {
+            self.launch_turn_summary(reason, inference);
         }
+    }
+
+    /// The count-based trigger: `Some` once `summarize_every` turns have
+    /// completed since the last segment.
+    fn turn_count_reason(&self) -> Option<SummarizationReason> {
+        if self.config.summarize_every == 0 {
+            return None;
+        }
+        let count = self.turns_since_last_summarize();
+        (count >= self.config.summarize_every)
+            .then_some(SummarizationReason::TurnCountReached { count })
+    }
+
+    /// Launch a turn-window summarization, unless a task already in flight
+    /// covers this window.
+    fn launch_turn_summary(
+        &mut self,
+        reason: SummarizationReason,
+        inference: Option<(&Sender<SchedulerRequest>, &Arc<tokenizers::Tokenizer>)>,
+    ) {
+        // Dedup: skip if any pending task already covers turns in this
+        // unsummarized window. `last_summarize_seq()` is the boundary
+        // — any task whose relevant range ends beyond it is covering
+        // the same window we are about to queue.
+        let last_seg_seq = self.last_summarize_seq().unwrap_or(0);
+        let already_pending = self.pending_tasks.iter().any(|t| {
+            t.relevant_turns()
+                .is_some_and(|r| r.end().seq > last_seg_seq)
+        });
+        if already_pending {
+            tracing::debug!("summarization task already pending for this window — skipping");
+            return;
+        }
+        let snapshot = self.build_snapshot(reason);
+        self.run_summarize(snapshot, inference);
     }
 
     fn build_snapshot(&self, reason: SummarizationReason) -> SummarizationSnapshot {
@@ -570,23 +583,67 @@ impl ConversationTree {
         }
     }
 
-    /// Drain all pending cognitive task handles.
+    /// Poll every in-flight cognitive task once, without blocking, and apply
+    /// what has finished. Returns the number of patches applied.
     ///
-    /// Called by `Sequence::finish_turn()` immediately after
-    /// `tree.finish_turn()`. The caller polls each handle to completion
-    /// (crude blocking) or accumulates them for async polling at the next
-    /// turn boundary.
-    pub(crate) fn drain_pending_tasks(&mut self) -> Vec<Box<dyn CognitiveTask>> {
-        std::mem::take(&mut self.pending_tasks)
+    /// A task still running stays queued and is polled again at the next turn
+    /// boundary — the turn never waits on it. A finished summary is applied as
+    /// soon as it is seen, and each application re-runs both triggers:
+    ///
+    /// - **turn count** — turns that completed while the summary was in flight
+    ///   were skipped by the dedup (the in-flight task covered the window), so
+    ///   the count is re-checked against the new segment boundary here instead
+    ///   of waiting for the next turn to complete;
+    /// - **segment count** — the new segment may complete the set that the
+    ///   recursive segment-of-segments summarization compresses.
+    ///
+    /// Tasks those triggers launch are polled in the same call, which returns
+    /// once a pass applies nothing.
+    pub(crate) fn poll_tasks(
+        &mut self,
+        inference: Option<(&Sender<SchedulerRequest>, &Arc<tokenizers::Tokenizer>)>,
+    ) -> usize {
+        let mut applied = 0;
+        loop {
+            let mut ready = Vec::new();
+            self.pending_tasks.retain_mut(|task| match task.poll() {
+                TaskPoll::Pending => true,
+                TaskPoll::Ready(patch) => {
+                    ready.push(patch);
+                    false
+                }
+                TaskPoll::Aborted => false,
+                TaskPoll::Failed(e) => {
+                    tracing::warn!("cognitive task failed: {e}");
+                    false
+                }
+            });
+            if ready.is_empty() {
+                return applied;
+            }
+            for patch in ready {
+                self.apply_patch(patch);
+                applied += 1;
+                if let Some(reason) = self.turn_count_reason() {
+                    self.launch_turn_summary(reason, inference);
+                }
+                self.check_and_trigger_segment_summarize(inference);
+            }
+        }
+    }
+
+    /// Number of cognitive tasks still in flight.
+    pub(crate) fn pending_task_count(&self) -> usize {
+        self.pending_tasks.len()
     }
 
     /// Check whether enough top-level `Segment` nodes have accumulated to
     /// trigger a recursive (segment-of-segments) summarization.
     ///
-    /// Called by `Sequence::run_task_blocking_inner` immediately after
+    /// Called by [`poll_tasks`](Self::poll_tasks) immediately after
     /// `apply_patch` inserts a new segment. If the threshold is met a new
-    /// [`SummarizationTask`] is pushed onto `pending_tasks` and the
-    /// `Sequence`'s drain loop will pick it up automatically.
+    /// [`SummarizationTask`] is pushed onto `pending_tasks`, where the same
+    /// poll picks it up.
     pub(crate) fn check_and_trigger_segment_summarize(
         &mut self,
         inference: Option<(
@@ -660,13 +717,13 @@ impl ConversationTree {
     ///    `[start_turn.seq, end_turn.seq]` are extracted from the flat `nodes`
     ///    vec and stored as the segment's `children`, making the segment the
     ///    true structural parent of the turns it summarises.
-    /// 3. The segment (now with children) is appended to `nodes`, replacing
-    ///    the extracted turns.
+    /// 3. The segment (now with children) takes the extracted turns' place
+    ///    in `nodes` — before any node newer than its range, so the list stays
+    ///    chronological when turns completed while the summary ran.
     ///
     /// Non-segment patch nodes are appended as-is (future use).
     ///
-    /// Called by `Sequence`'s `run_task_blocking()` helper or the async
-    /// `drain_ready_tasks()` helper.
+    /// Called by [`poll_tasks`](Self::poll_tasks) when a task finishes.
     pub fn apply_patch(&mut self, patch: TreePatch) {
         for node in patch.appended {
             match node {
@@ -715,13 +772,27 @@ impl ConversationTree {
                             remaining.push_back(n);
                         }
                     }
-                    self.nodes = remaining;
                     // Sort children by ordering_seq defensively.
                     children.sort_by_key(|n| n.ordering_seq());
 
-                    let seg_with_children = seg.with_children(children);
-                    self.nodes
-                        .push_back(ConversationNode::Segment(seg_with_children));
+                    // Place the segment where its turns were: before the first
+                    // node newer than its range. A summary finishes in the
+                    // background, so turns may have completed since it launched,
+                    // and `nodes` must stay chronological — the trigger count
+                    // reads the newest node and the next window starts after
+                    // the newest segment.
+                    let mut segment = Some(ConversationNode::Segment(seg.with_children(children)));
+                    for n in remaining {
+                        if n.ordering_seq() > end_seq {
+                            if let Some(s) = segment.take() {
+                                self.nodes.push_back(s);
+                            }
+                        }
+                        self.nodes.push_back(n);
+                    }
+                    if let Some(s) = segment {
+                        self.nodes.push_back(s);
+                    }
                 }
                 other => {
                     // Non-segment nodes (future use) — append as-is.

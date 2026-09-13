@@ -10,6 +10,7 @@
  *   - archiveConversation (one-way)          POST …/archive
  *   - streamChatCompletion (token + status)  POST /v1/chat/completions (SSE)
  *   - subscribeLogs / seedLogs               WS /ws/logs (structured JSON frames)
+ *   - getToolSchemas                         GET /v1/substrate/tools
  *
  * Projection glue + section content ride along on getConversation (first-class
  * fields), so the projection panel renders the framing and expands sections
@@ -80,6 +81,16 @@
         detail: 'connecting to daemon…',
         loading: { current: 'Connecting', progress: 0, completed: [] },
       }));
+    },
+
+    // GET /v1/substrate/tools — each tool's argument JSON Schema, by name. The
+    // tool-call cards list every parameter from it, including the ones a call
+    // left at their defaults.
+    async getToolSchemas() {
+      const body = await getJSON('/v1/substrate/tools');
+      const out = {};
+      (body.tools || []).forEach((t) => { out[t.name] = t.parameters || null; });
+      return out;
     },
 
     // ── chat completion (SSE: status events + OpenAI chunk deltas) ──────────

@@ -9,8 +9,9 @@
 //! `build_snapshot()` produces a [`SummarizationSnapshot`]. `run_summarize()`
 //! (on `ConversationTree`) immediately calls [`SummarizationTask::launch()`]
 //! to start inference, then pushes the resulting task handle onto the tree's
-//! `pending_tasks` queue. `Sequence` drains that queue after each turn
-//! and spin-polls until all tasks resolve.
+//! `pending_tasks` queue. `ConversationTree::poll_tasks` checks that queue
+//! without blocking at every turn boundary and applies each task's patch once
+//! it finishes; the turn that launched it never waits.
 //!
 //! The inference backend (`scheduler_tx` + `tokenizer`) must be injected onto
 //! the tree via `ConversationTree::set_inference_backend()` before any turns

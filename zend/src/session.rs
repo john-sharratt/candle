@@ -3812,6 +3812,7 @@ impl ZendSession {
                     name: d.name.clone(),
                     description: d.description.clone(),
                     high_risk: d.high_risk,
+                    parameters: d.parameters.clone(),
                 })
                 .collect(),
         })

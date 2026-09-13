@@ -528,44 +528,47 @@ fn read_returns_a_numbered_fenced_excerpt() {
     );
 }
 
-/// A file longer than the cap comes back truncated, and the header says so —
-/// that is the continuation signal, in the text the model already reads.
+/// A long file comes back whole — there is no line cap — and because the
+/// excerpt ends at the last line the header is the plain `(lines a-b)` form.
 #[test]
-fn read_caps_a_long_file_and_reports_the_total() {
+fn read_returns_a_long_file_whole() {
     let dir = tempfile::tempdir().unwrap();
     let body: String = (1..=900).map(|i| format!("line {i}\n")).collect();
     write_disk(dir.path(), "big.rs", &body);
     let ctx = ToolContext::with_workspace(dir.path());
 
-    let first = harness::invoke_with_ctx("file_read", json!({"path": "big.rs"}), &ctx);
-    let text = first.as_str().unwrap();
+    let whole = harness::invoke_with_ctx("file_read", json!({"path": "big.rs"}), &ctx);
+    let text = whole.as_str().unwrap();
     assert!(
-        text.starts_with("\nbig.rs (lines 1-200 of 900):\n"),
-        "header must report the cap and the total: {}",
-        &text[..60.min(text.len())],
+        text.starts_with("\nbig.rs (lines 1-900):\n"),
+        "header must cover the whole file: {text:.60}"
     );
     assert!(text.contains("\n  1  line 1\n"), "right-aligned numbering");
-    assert!(text.contains("\n200  line 200\n"));
-    assert!(!text.contains("line 201"), "capped at 200 lines");
+    assert!(text.contains("\n201  line 201\n"), "no cap at 200 lines");
+    assert!(
+        text.ends_with("\n900  line 900\n```\n"),
+        "runs to the last line"
+    );
 
-    // The advertised continuation reads the next window.
-    let next = harness::invoke_with_ctx(
+    // A slice that stops short of the end says so, with the file's total.
+    let slice = harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "big.rs", "start_line": 201}),
+        json!({"path": "big.rs", "start_line": 201, "end_line": 400}),
         &ctx,
     );
-    let text = next.as_str().unwrap();
+    let text = slice.as_str().unwrap();
     assert!(
         text.starts_with("\nbig.rs (lines 201-400 of 900):\n"),
         "{text:.60}"
     );
     assert!(text.contains("201  line 201\n"));
+    assert!(!text.contains("line 401"));
 }
 
-/// An explicit range is honoured, and the cap still applies to it — otherwise a
-/// wide range would bypass the bound the unranged path enforces.
+/// An explicit range is honoured exactly, and a range wider than the file
+/// clamps to its end.
 #[test]
-fn read_honours_a_line_range_but_still_caps_it() {
+fn read_honours_a_line_range() {
     let dir = tempfile::tempdir().unwrap();
     let body: String = (1..=900).map(|i| format!("line {i}\n")).collect();
     write_disk(dir.path(), "big.rs", &body);
@@ -596,8 +599,8 @@ fn read_honours_a_line_range_but_still_caps_it() {
         greedy
             .as_str()
             .unwrap()
-            .starts_with("\nbig.rs (lines 1-200 of 900):\n"),
-        "a wide range must not bypass the cap",
+            .starts_with("\nbig.rs (lines 1-900):\n"),
+        "a range past the end clamps to the last line",
     );
 }
 

@@ -7,24 +7,22 @@
 //! Summarization is the only producer today. `ConversationTree::run_summarize`
 //! launches a `SummarizationTask` — a `CognitiveTask` whose inference runs on
 //! the scheduler — and pushes the handle onto the tree's `pending_tasks`.
-//! `Sequence::finish_turn` drains that queue via `drain_pending_tasks()` and
-//! spin-polls each handle; on `TaskPoll::Ready(patch)` it calls
+//! `ConversationTree::poll_tasks`, which `Sequence` calls at every turn
+//! boundary, polls each handle once without blocking; on
+//! `TaskPoll::Ready(patch)` it calls
 //! [`ConversationTree::apply_patch`](super::conversation_tree::ConversationTree::apply_patch)
-//! and then re-checks whether a recursive segment-of-segments summarization
-//! should fire.
+//! and then re-checks both summarization triggers.
 //!
-//! So patch application still happens on the main thread at a turn boundary,
-//! which is the property the design wanted — but by polling a task handle, not
-//! by receiving on a channel. The spin-poll is deliberately crude (see
-//! `Conversation::run_task_blocking_inner`): summarization is infrequent enough
-//! that blocking a turn boundary on it is acceptable for now.
+//! So patch application happens on the main thread at a turn boundary, which
+//! is the property the design wanted, and the turn that launched the work never
+//! waits for it: a summary still running is simply polled again at the next
+//! boundary.
 //!
 //! [`ConversationTree::fork`](super::conversation_tree::ConversationTree::fork)
 //! and [`ConversationTreeFork`](super::conversation_tree::ConversationTreeFork)
 //! offer the alternative — a `Send`-able snapshot plus a one-shot
 //! [`Receiver<TreePatch>`](crossbeam::channel::Receiver) for genuinely
-//! off-thread work. Nothing calls them yet; they are the seam for moving
-//! summarization off the turn boundary.
+//! off-thread work. Nothing calls them yet.
 
 use super::node::ConversationNode;
 

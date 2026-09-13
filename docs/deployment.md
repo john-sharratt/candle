@@ -65,7 +65,7 @@ Paths are relative to the repo root.
 | Machine | Service | Command line | Recorded |
 |---|---|---|---|
 | .5 | web | `target\release\web.exe --config web/web.yaml` | 2026-09-13, from the running process |
-| .5 | zend | `target\release\zend.exe D:\prog\candle --host 192.168.0.5 --port 8081 --skip-layer repo_map --skip-layer code_reading` | 2026-09-13, from past production runs (not yet confirmed by a `/down`) |
+| .5 | zend | `target\release\zend.exe D:\prog\candle --host 192.168.0.5 --port 8081 --skip-layer repo_map --skip-layer code_reading` | 2026-09-13, from the running process — its `--wipe-substrate` was a one-off the user asked for, so it is not replayed |
 | .6 | npcd | `target\release\npcd.exe --bind 0.0.0.0:8081 --content web/content/npcd --mind C:/Users/johna/prog/mind --forget-conversations` | 2026-09-13, from the user (not yet confirmed by a `/down`) |
 
 Notes on the arguments:
@@ -125,7 +125,7 @@ Expected results, as measured 2026-09-13:
 
 | Check | How | Healthy |
 |---|---|---|
-| zend on the LAN | `curl http://192.168.0.5:8081/v1/status` | `200` |
+| zend on the LAN | `curl http://192.168.0.5:8081/v1/status` | `"state":"ready"` — it answers `200` with `"state":"loading"` throughout startup |
 | npcd on the LAN | `curl http://192.168.0.6:8081/v1/status` | `200` |
 | gateway config | `target\release\web.exe --config web/web.yaml --check` | exit 0 |
 | gateway routing | `curl -H "Host: <name>" http://127.0.0.1/` for `tokera.com`, `code.tokera.com`, `bot.tokera.com` | `200` / `30x` / `401`; `503` = that upstream is down |

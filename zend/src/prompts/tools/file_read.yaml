@@ -25,12 +25,12 @@ questions:
 - pull up that source file so I can look at it
 - read back the notes file from this session
 category: Files
-description: 'Read a file''s content. Resolves against this session''s edits first, then falls through to the project''s working directory, so real project files can be read directly. Use for: reading a source file from the project, looking at what was previously written, inspecting a file the user uploaded into the chat, retrieving content the model needs to reference for editing or summarising, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what''s in", "open the file", "cat", "display the contents of". Returns the excerpt as numbered source in a fenced block, headed by the path and the line range it covers. At most 200 lines come back per call: when the header reads `(lines 1-200 of 900)` there is more, and the next call asks for start_line 201. For remote filesystems use remote_fs_session_get to download first, then file_read.'
+description: 'Read a file''s content. Resolves against this session''s edits first, then falls through to the project''s working directory, so real project files can be read directly. Use for: reading a source file from the project, looking at what was previously written, inspecting a file the user uploaded into the chat, retrieving content the model needs to reference for editing or summarising, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what''s in", "open the file", "cat", "display the contents of". Returns the excerpt as numbered source in a fenced block, headed by the path and the line range it covers. With no range the whole file comes back; start_line and end_line narrow it to a slice, and a header like `(lines 47-93 of 900)` marks the slice as part of a longer file. For remote filesystems use remote_fs_session_get to download first, then file_read.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
     end_line:
-      description: Last line to return, 1-based and inclusive. Defaults to the end of the file, capped so one call returns at most 200 lines.
+      description: Last line to return, 1-based and inclusive. Defaults to the end of the file.
       format: uint32
       minimum: 0.0
       type:
@@ -210,17 +210,17 @@ examples:
   show me the rest of that file<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The previous excerpt's header ended at line 200 and reported a larger total, so there is more to read. file_read caps a call at 200 lines,<|projection|> and the continuation is simply the next range: start_line 201. I leave end_line off and let the cap decide where this page stops.
+  The previous excerpt's header ended at line 93 and reported a larger total, so there is more after it. The continuation is simply the next range,<|projection|> start_line 94. I leave end_line off so the read runs to the end of the file.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/auth/handler.rs", "start_line": 201}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/auth/handler.rs", "start_line": 94}}
   </tool_call><|projection|>
 - |-
   read zend/src/tools.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  No range was given, so this reads from the top. file_read returns at most 200 lines per call — if the header comes back saying `(lines 1-200 of N)` there is more, and I can ask for<|projection|> start_line 201 next. Just the path for now.
+  No range was given, so this reads the whole file from the top — file_read returns every line<|projection|> when no range is named. Just the path for now.
   </think>
 
   <tool_call>
