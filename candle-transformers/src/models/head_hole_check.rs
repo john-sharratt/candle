@@ -91,7 +91,9 @@ enum RowCheck {
     /// Every position read holds finite values.
     Clean,
     /// The layer does not hold the whole range: it commits `held` tokens.
-    NotCommitted { held: usize },
+    NotCommitted {
+        held: usize,
+    },
     Hole(Hole),
 }
 
@@ -282,46 +284,54 @@ fn record_vs_host(
     n_kv_head: usize,
     head_dim: usize,
 ) -> String {
-    let read = || -> Result<String> {
-        // SAFETY: `table` is the header table the kernel just read, alive until
-        // the prefill call returns; one 16-byte header per batch row.
-        let hdr = parse_slot_header(&unsafe {
-            read_device(dev, table + (row * RECORD_BYTES) as u64, RECORD_BYTES)?
-        })?;
-        // SAFETY: the header names `n_slices` 16-byte slices at `slices_ptr`.
-        let slices = parse_slices(&unsafe {
-            read_device(dev, hdr.slices_ptr, hdr.n_slices as usize * RECORD_BYTES)?
-        })?;
-        let Some(slice) = slices.get(chunk) else {
-            return Ok(format!("the header holds {} slices, none at {chunk}", slices.len()));
-        };
-        let kc = cache.k_cache();
-        let (Some(backing), Some(batch)) = (kc.chunked_backing(), kc.chunked_batch_idx()) else {
-            return Ok("not chunked".to_string());
-        };
-        let blocks = backing.band_map(batch)?;
-        let Some(block) = blocks.get(chunk) else {
-            return Ok(format!("the host table holds {} chunks, none at {chunk}", blocks.len()));
-        };
-        let n_palette = (block.k.len() / n_kv_head.max(1)).max(1);
-        let bytes = head_record_bytes(head_dim, n_palette) * n_kv_head;
-        // SAFETY: `kvheads_ptr` names the chunk's `KvHead[n_kv_head]` record,
-        // `bytes` long, which the kernel just dereferenced.
-        let heads = parse_record(
-            &unsafe { read_device(dev, slice.kvheads_ptr, bytes)? },
-            n_kv_head,
-            head_dim,
-            n_palette,
-        )?;
-        let device_k = heads.first().map(|h| h.k_ptr.clone()).unwrap_or_default();
-        let host_k: Vec<u64> = block.k.iter().take(n_palette).map(|b| b.ptr).collect();
-        let (device_k_fmt, device_v_fmt) = heads
-            .first()
-            .map(|h| (h.k_fmt.clone(), h.v_fmt.clone()))
-            .unwrap_or_default();
-        let host_k_fmt: Vec<u8> = block.k.iter().take(n_palette).map(|b| b.fmt).collect();
-        let host_v_fmt: Vec<u8> = block.v.iter().take(n_palette).map(|b| b.fmt).collect();
-        Ok(format!(
+    let read =
+        || -> Result<String> {
+            // SAFETY: `table` is the header table the kernel just read, alive until
+            // the prefill call returns; one 16-byte header per batch row.
+            let hdr = parse_slot_header(&unsafe {
+                read_device(dev, table + (row * RECORD_BYTES) as u64, RECORD_BYTES)?
+            })?;
+            // SAFETY: the header names `n_slices` 16-byte slices at `slices_ptr`.
+            let slices = parse_slices(&unsafe {
+                read_device(dev, hdr.slices_ptr, hdr.n_slices as usize * RECORD_BYTES)?
+            })?;
+            let Some(slice) = slices.get(chunk) else {
+                return Ok(format!(
+                    "the header holds {} slices, none at {chunk}",
+                    slices.len()
+                ));
+            };
+            let kc = cache.k_cache();
+            let (Some(backing), Some(batch)) = (kc.chunked_backing(), kc.chunked_batch_idx())
+            else {
+                return Ok("not chunked".to_string());
+            };
+            let blocks = backing.band_map(batch)?;
+            let Some(block) = blocks.get(chunk) else {
+                return Ok(format!(
+                    "the host table holds {} chunks, none at {chunk}",
+                    blocks.len()
+                ));
+            };
+            let n_palette = (block.k.len() / n_kv_head.max(1)).max(1);
+            let bytes = head_record_bytes(head_dim, n_palette) * n_kv_head;
+            // SAFETY: `kvheads_ptr` names the chunk's `KvHead[n_kv_head]` record,
+            // `bytes` long, which the kernel just dereferenced.
+            let heads = parse_record(
+                &unsafe { read_device(dev, slice.kvheads_ptr, bytes)? },
+                n_kv_head,
+                head_dim,
+                n_palette,
+            )?;
+            let device_k = heads.first().map(|h| h.k_ptr.clone()).unwrap_or_default();
+            let host_k: Vec<u64> = block.k.iter().take(n_palette).map(|b| b.ptr).collect();
+            let (device_k_fmt, device_v_fmt) = heads
+                .first()
+                .map(|h| (h.k_fmt.clone(), h.v_fmt.clone()))
+                .unwrap_or_default();
+            let host_k_fmt: Vec<u8> = block.k.iter().take(n_palette).map(|b| b.fmt).collect();
+            let host_v_fmt: Vec<u8> = block.v.iter().take(n_palette).map(|b| b.fmt).collect();
+            Ok(format!(
             "header n_slices {} write_slice {}; slice {chunk} (offset {}, len {}, rope {}) record \
              at {:#x}: head 0 K bands {device_k:x?} on the device, {host_k:x?} in the host table \
              — {}; head 0 formats K {device_k_fmt:?} V {device_v_fmt:?} on the device, K \
@@ -334,7 +344,7 @@ fn record_vs_host(
             slice.kvheads_ptr,
             if device_k == host_k { "the same" } else { "DIFFERENT" },
         ))
-    };
+        };
     read().unwrap_or_else(|e| format!("unreadable ({e})"))
 }
 
@@ -482,7 +492,10 @@ pub(crate) fn check_history(
         return;
     };
     for (row, (&seq, &base)) in seqs.iter().zip(ends).enumerate() {
-        let Some(cache) = session.sequence_caches(seq).and_then(|c| c.caches.get(kv_layer)) else {
+        let Some(cache) = session
+            .sequence_caches(seq)
+            .and_then(|c| c.caches.get(kv_layer))
+        else {
             continue;
         };
         let len = base.min(window);
@@ -543,8 +556,13 @@ fn device_slices(dev: &CudaDevice, table: u64, row: usize) -> String {
         let slices = parse_slices(&unsafe {
             read_device(dev, hdr.slices_ptr, hdr.n_slices as usize * RECORD_BYTES)?
         })?;
-        let tail: Vec<(u16, u16, u32)> =
-            slices.iter().rev().take(6).rev().map(|s| (s.offset, s.len, s.rope)).collect();
+        let tail: Vec<(u16, u16, u32)> = slices
+            .iter()
+            .rev()
+            .take(6)
+            .rev()
+            .map(|s| (s.offset, s.len, s.rope))
+            .collect();
         Ok(format!(
             "n_slices {} write_slice {}, last six (offset, len, rope) {tail:?}",
             hdr.n_slices, hdr.write_slice

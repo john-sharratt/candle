@@ -623,13 +623,8 @@ fn decode_one(
         .chunked_live_chunks_as_sealed()
         .unwrap_or_default();
     let writer_start = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
-    let slot = SlotStateHost::from_sealed_chunks(
-        &chunks,
-        N_KV_HEAD,
-        HEAD_DIM,
-        &arena_info,
-        writer_start,
-    );
+    let slot =
+        SlotStateHost::from_sealed_chunks(&chunks, N_KV_HEAD, HEAD_DIM, &arena_info, writer_start);
     slot.assert_write_region_capacity(1, CHUNK_SIZE);
 
     let mut records: Vec<u8> = Vec::new();
@@ -734,13 +729,8 @@ fn decode_one_production(
         .chunked_live_chunks_as_sealed()
         .unwrap_or_default();
     let writer_start = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
-    let expect = SlotStateHost::from_sealed_chunks(
-        &chunks,
-        N_KV_HEAD,
-        HEAD_DIM,
-        &arena_info,
-        writer_start,
-    );
+    let expect =
+        SlotStateHost::from_sealed_chunks(&chunks, N_KV_HEAD, HEAD_DIM, &arena_info, writer_start);
     expect.assert_write_region_capacity(1, CHUNK_SIZE);
     let mut hdr = Vec::with_capacity(16);
     hdr.extend_from_slice(&n_slices.to_le_bytes());

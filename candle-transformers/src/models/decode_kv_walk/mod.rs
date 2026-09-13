@@ -125,7 +125,18 @@ pub(crate) unsafe fn walk(
     let mut dumps = 0usize;
     for &r in bad_rows {
         // SAFETY: the caller's contract, row by row.
-        let row = unsafe { walk_row(d, dev, headers_ptr, caches, r, n_kv_head, head_dim, &mut dumps) };
+        let row = unsafe {
+            walk_row(
+                d,
+                dev,
+                headers_ptr,
+                caches,
+                r,
+                n_kv_head,
+                head_dim,
+                &mut dumps,
+            )
+        };
         match row {
             Ok(t) => {
                 d.note(&format!("kvwalk.row{r}.tally"), format!("{t:?}"));
@@ -166,7 +177,10 @@ unsafe fn walk_row(
     let key = |s: &str| format!("kvwalk.row{r}.{s}");
     let mut t = Tally::default();
     let cache = caches.get(r).ok_or_else(|| {
-        candle::Error::Msg(format!("kv walk: row {r} is past the {} caches", caches.len()))
+        candle::Error::Msg(format!(
+            "kv walk: row {r} is past the {} caches",
+            caches.len()
+        ))
     })?;
 
     // SAFETY: the caller's contract — one header per cache.
@@ -194,7 +208,11 @@ unsafe fn walk_row(
         t.ptr_mismatch += 1;
         d.note(
             &key("block_count"),
-            format!("MISMATCH device {} host {}", hdr.n_slices, host_blocks.len()),
+            format!(
+                "MISMATCH device {} host {}",
+                hdr.n_slices,
+                host_blocks.len()
+            ),
         );
     }
     if hdr.n_slices == 0 {
@@ -255,7 +273,8 @@ unsafe fn walk_row(
                     if want != Some(dev_ptr) {
                         t.ptr_mismatch += 1;
                         slice_dirty = true;
-                        let host_ptr = want.map_or_else(|| "none".to_string(), |w| format!("{w:#x}"));
+                        let host_ptr =
+                            want.map_or_else(|| "none".to_string(), |w| format!("{w:#x}"));
                         d.note(
                             &key(&format!("{band}.ptr")),
                             format!("device {dev_ptr:#x} host {host_ptr}"),
@@ -315,32 +334,67 @@ mod tests {
 
     #[test]
     fn the_verdict_names_the_most_damning_finding() {
-        let clean = Tally { elems: 10, ..Tally::default() };
+        let clean = Tally {
+            elems: 10,
+            ..Tally::default()
+        };
         assert_eq!(clean.verdict(), "KV_CLEAN");
-        let nonfinite = Tally { nonfinite: 1, ..clean };
+        let nonfinite = Tally {
+            nonfinite: 1,
+            ..clean
+        };
         assert_eq!(nonfinite.verdict(), "NONFINITE_IN_READ_WINDOW");
-        let poison = Tally { poison: 1, ..nonfinite };
+        let poison = Tally {
+            poison: 1,
+            ..nonfinite
+        };
         assert_eq!(poison.verdict(), "POISON_IN_READ_WINDOW");
-        let mismatch = Tally { ptr_mismatch: 1, ..poison };
+        let mismatch = Tally {
+            ptr_mismatch: 1,
+            ..poison
+        };
         assert_eq!(mismatch.verdict(), "POINTER_MISMATCH");
-        let corrupt = Tally { header_corrupt: 1, ..mismatch };
+        let corrupt = Tally {
+            header_corrupt: 1,
+            ..mismatch
+        };
         assert_eq!(corrupt.verdict(), "HEADER_CORRUPT");
     }
 
     /// A walk that could not read everything must not claim the history clean.
     #[test]
     fn a_read_error_is_never_reported_clean() {
-        let t = Tally { read_errors: 1, elems: 10, ..Tally::default() };
+        let t = Tally {
+            read_errors: 1,
+            elems: 10,
+            ..Tally::default()
+        };
         assert_eq!(t.verdict(), "INCOMPLETE");
     }
 
     #[test]
     fn tallies_add_field_by_field() {
-        let mut a = Tally { poison: 1, elems: 3, ..Tally::default() };
-        a.add(&Tally { poison: 2, nonfinite: 4, elems: 5, read_errors: 1, ..Tally::default() });
+        let mut a = Tally {
+            poison: 1,
+            elems: 3,
+            ..Tally::default()
+        };
+        a.add(&Tally {
+            poison: 2,
+            nonfinite: 4,
+            elems: 5,
+            read_errors: 1,
+            ..Tally::default()
+        });
         assert_eq!(
             a,
-            Tally { poison: 3, nonfinite: 4, elems: 8, read_errors: 1, ..Tally::default() }
+            Tally {
+                poison: 3,
+                nonfinite: 4,
+                elems: 8,
+                read_errors: 1,
+                ..Tally::default()
+            }
         );
     }
 }

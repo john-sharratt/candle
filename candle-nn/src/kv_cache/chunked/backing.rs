@@ -23,10 +23,10 @@ use super::{
 };
 // Only the CUDA-gated compress-eligibility helper needs the sealed-sequence type.
 use super::size_class::{class_for_payload, payload_bytes_for_tag, SizeClass};
-#[cfg(feature = "cuda")]
-use super::SealedSequence;
 #[cfg(feature = "tensor-assert")]
 use super::writer_len_audit;
+#[cfg(feature = "cuda")]
+use super::SealedSequence;
 use crate::kv_cache::arena_table::{ArenaFormatTag, ArenaLocation, PerHeadEntry};
 // `N_PALETTE` is referenced by the intra-doc links throughout this file and by
 // the CUDA table builders; without `cuda` only the doc links are left, and they
@@ -981,6 +981,7 @@ impl ChunkedKvBacking {
     /// moves chunks belonging to every layer out of one donor, and each of those
     /// layers owns its own block table and its own records. Rewriting only this
     /// backing's would leave the others naming the slot the chunk left.
+    #[cfg(feature = "cuda")]
     fn rewrite_records_from(
         &self,
         arenas: &[usize],
@@ -2794,6 +2795,7 @@ impl ChunkedKvBacking {
 /// `chunk_capacity` is what bounds it, as that field's own docs say. Without
 /// this the address walks off the slab into the next tenant, which is the same
 /// silent write as a zero base by another route.
+#[cfg(any(feature = "cuda", test))]
 pub(super) fn slot_addr(
     info: &[crate::kv_cache::ResolvedArenaInfo],
     arena_idx: usize,

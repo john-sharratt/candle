@@ -55,7 +55,10 @@ pub(crate) fn parse_slot_header(b: &[u8]) -> Result<SlotHeader> {
 /// Parse a packed array of `TokenSlice`s.
 pub(crate) fn parse_slices(b: &[u8]) -> Result<Vec<TokenSlice>> {
     if !b.len().is_multiple_of(RECORD_BYTES) {
-        candle::bail!("token slices: {} bytes is not a whole number of 16-byte slices", b.len());
+        candle::bail!(
+            "token slices: {} bytes is not a whole number of 16-byte slices",
+            b.len()
+        );
     }
     Ok(b.chunks_exact(RECORD_BYTES)
         .map(|s| TokenSlice {
@@ -79,7 +82,11 @@ mod tests {
         b.extend_from_slice(&0xcc3e_8000_0000u64.to_le_bytes());
         assert_eq!(
             parse_slot_header(&b).unwrap(),
-            SlotHeader { n_slices: 7, write_slice: 6, slices_ptr: 0xcc3e_8000_0000 }
+            SlotHeader {
+                n_slices: 7,
+                write_slice: 6,
+                slices_ptr: 0xcc3e_8000_0000
+            }
         );
     }
 
@@ -100,8 +107,18 @@ mod tests {
         assert_eq!(
             parse_slices(&b).unwrap(),
             vec![
-                TokenSlice { offset: 0, len: 32, rope: 0, kvheads_ptr: 0x1000 },
-                TokenSlice { offset: 4, len: 9, rope: 32, kvheads_ptr: 0x2000 },
+                TokenSlice {
+                    offset: 0,
+                    len: 32,
+                    rope: 0,
+                    kvheads_ptr: 0x1000
+                },
+                TokenSlice {
+                    offset: 4,
+                    len: 9,
+                    rope: 32,
+                    kvheads_ptr: 0x2000
+                },
             ]
         );
     }

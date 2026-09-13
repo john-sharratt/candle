@@ -114,10 +114,16 @@ pub(crate) fn scan_band(
         return Ok(BandScan::default());
     };
     if bytes.len() < need {
-        candle::bail!("band scan: {} bytes, a band of format {fmt} needs {need}", bytes.len());
+        candle::bail!(
+            "band scan: {} bytes, a band of format {fmt} needs {need}",
+            bytes.len()
+        );
     }
     let u16_at = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
-    let mut s = BandScan { scanned: true, ..BandScan::default() };
+    let mut s = BandScan {
+        scanned: true,
+        ..BandScan::default()
+    };
     match layout(fmt) {
         Layout::Float { esz } => {
             let bf16 = fmt == ArenaFormatTag::BF16.as_u8();
@@ -136,7 +142,11 @@ pub(crate) fn scan_band(
                         }
                         _ => {
                             let b = bytes[o];
-                            let bad = if e5m2 { b & 0x7C == 0x7C } else { b & 0x7F == 0x7F };
+                            let bad = if e5m2 {
+                                b & 0x7C == 0x7C
+                            } else {
+                                b & 0x7F == 0x7F
+                            };
                             (bad, b == u8::MAX)
                         }
                     };
@@ -189,9 +199,18 @@ mod tests {
 
     #[test]
     fn payload_sizes_follow_the_accessor() {
-        assert_eq!(band_payload_bytes(ArenaFormatTag::F16.as_u8(), 64), Some(32 * 64 * 2));
-        assert_eq!(band_payload_bytes(ArenaFormatTag::R16.as_u8(), 64), Some(64 * 128));
-        assert_eq!(band_payload_bytes(ArenaFormatTag::Q8_0.as_u8(), 64), Some(64 * 34));
+        assert_eq!(
+            band_payload_bytes(ArenaFormatTag::F16.as_u8(), 64),
+            Some(32 * 64 * 2)
+        );
+        assert_eq!(
+            band_payload_bytes(ArenaFormatTag::R16.as_u8(), 64),
+            Some(64 * 128)
+        );
+        assert_eq!(
+            band_payload_bytes(ArenaFormatTag::Q8_0.as_u8(), 64),
+            Some(64 * 34)
+        );
         assert_eq!(band_payload_bytes(ArenaFormatTag::Q4_KS.as_u8(), 64), None);
     }
 
@@ -206,16 +225,40 @@ mod tests {
             }
         }
         let clean = scan_band(f16, &b, 2, 1..3).unwrap();
-        assert_eq!(clean, BandScan { scanned: true, elems: 4, nonfinite: 0, poison: 0 });
+        assert_eq!(
+            clean,
+            BandScan {
+                scanned: true,
+                elems: 4,
+                nonfinite: 0,
+                poison: 0
+            }
+        );
 
         // A NaN the kernel read, at (t = 2, d = 1).
         put16(&mut b, (2 * 2 + 1) * 2, F16_NAN);
         let bad = scan_band(f16, &b, 2, 1..3).unwrap();
-        assert_eq!(bad, BandScan { scanned: true, elems: 4, nonfinite: 1, poison: 0 });
+        assert_eq!(
+            bad,
+            BandScan {
+                scanned: true,
+                elems: 4,
+                nonfinite: 1,
+                poison: 0
+            }
+        );
 
         // Widening the window onto unwritten token 3 reads poison.
         let past = scan_band(f16, &b, 2, 1..4).unwrap();
-        assert_eq!(past, BandScan { scanned: true, elems: 6, nonfinite: 3, poison: 2 });
+        assert_eq!(
+            past,
+            BandScan {
+                scanned: true,
+                elems: 6,
+                nonfinite: 3,
+                poison: 2
+            }
+        );
     }
 
     /// Dim-major R16: the reserved half of each block is never counted.
@@ -231,13 +274,23 @@ mod tests {
         // The reserved u16 space (bytes 64..128 of each block) stays 0xFF.
         assert_eq!(
             scan_band(r16, &b, 2, 0..5).unwrap(),
-            BandScan { scanned: true, elems: 10, nonfinite: 0, poison: 0 }
+            BandScan {
+                scanned: true,
+                elems: 10,
+                nonfinite: 0,
+                poison: 0
+            }
         );
         // An unwritten value inside the window is poison.
         put16(&mut b, 128 + 4 * 2, u16::MAX);
         assert_eq!(
             scan_band(r16, &b, 2, 0..5).unwrap(),
-            BandScan { scanned: true, elems: 10, nonfinite: 1, poison: 1 }
+            BandScan {
+                scanned: true,
+                elems: 10,
+                nonfinite: 1,
+                poison: 1
+            }
         );
     }
 
@@ -264,7 +317,12 @@ mod tests {
         put16(&mut b, 34, F16_ONE);
         assert_eq!(
             scan_band(q8, &b, 2, 0..9).unwrap(),
-            BandScan { scanned: true, elems: 2, nonfinite: 1, poison: 0 }
+            BandScan {
+                scanned: true,
+                elems: 2,
+                nonfinite: 1,
+                poison: 0
+            }
         );
         // Nothing read, nothing judged.
         assert_eq!(scan_band(q8, &b, 2, 4..4).unwrap().elems, 0);
@@ -273,7 +331,10 @@ mod tests {
     #[test]
     fn an_opaque_format_is_reported_unscanned_not_clean() {
         let q4ks = ArenaFormatTag::Q4_KS.as_u8();
-        assert_eq!(scan_band(q4ks, &[0u8; 8], 2, 0..8).unwrap(), BandScan::default());
+        assert_eq!(
+            scan_band(q4ks, &[0u8; 8], 2, 0..8).unwrap(),
+            BandScan::default()
+        );
     }
 
     #[test]

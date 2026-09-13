@@ -22,8 +22,6 @@ use crate::models::decode_kv_walk::walk as walk_decode_kv;
 #[cfg(feature = "tensor-assert")]
 use crate::models::nan_capture::checkpoint_q8a128_with;
 use crate::models::operand_guard::expect_dtype;
-#[cfg(feature = "tensor-assert")]
-use candle::tensor_assert::Dump;
 #[cfg(feature = "cuda")]
 use crate::models::prefill_utils::paged_decode_attn;
 #[cfg(feature = "cuda")]
@@ -36,6 +34,8 @@ use crate::models::profile::{gpu_span, pipeline_record, profile_now, span};
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::quantized_matmul::QMatMul;
 use crate::utils::repeat_kv;
+#[cfg(feature = "tensor-assert")]
+use candle::tensor_assert::Dump;
 
 #[cfg(feature = "cuda")]
 use candle_kernels::CHUNK_SIZE;

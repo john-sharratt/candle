@@ -677,7 +677,10 @@ impl HybridBatched {
     /// enough waves) holds only the read half, but it takes the other back on
     /// its next wave — so the settled cost is what admission must reserve.
     pub fn recurrent_store_bytes(&self) -> usize {
-        RecurrentStateStore::reserved_bytes_for(&self.model.cfg.layer_kinds, &self.model.cfg.delta_net)
+        RecurrentStateStore::reserved_bytes_for(
+            &self.model.cfg.layer_kinds,
+            &self.model.cfg.delta_net,
+        )
     }
 
     /// The turn loop carves a child slot per turn and decodes on it, borrowing

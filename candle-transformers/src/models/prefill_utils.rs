@@ -261,8 +261,7 @@ fn build_slot_headers(
                 layout.chunks.len()
             );
         }
-        if layout.write_slice != buf_write && (layout.write_slice as usize) < layout.chunks.len()
-        {
+        if layout.write_slice != buf_write && (layout.write_slice as usize) < layout.chunks.len() {
             candle::bail!(
                 "slot header build: batch slot {slot_i} writes slice {} by the \
                  token layout but slice {buf_write} by the slot-state buffer",
@@ -637,7 +636,15 @@ fn paged_prefill_batched_impl<'w>(
     // table they were written through is alive — see `check_prefill_write`.
     #[cfg(feature = "tensor-assert")]
     if let Device::Cuda(dev) = q.device() {
-        check_prefill_write(caches, offsets, q_lens, headers_ptr, dev, n_kv_head, head_dim);
+        check_prefill_write(
+            caches,
+            offsets,
+            q_lens,
+            headers_ptr,
+            dev,
+            n_kv_head,
+            head_dim,
+        );
     }
 
     // After each prefill layer, eagerly quantize all fully-sealed chunks so that

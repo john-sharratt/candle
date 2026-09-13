@@ -78,8 +78,9 @@ pub(crate) fn parse_record(
 /// address is derived. An arena index with no entry (the empty gid's is out of
 /// range) serialises as 0, and so does it here.
 pub(crate) fn expected_ptr(info: &[ResolvedArenaInfo], arena_idx: usize, chunk_idx: usize) -> u64 {
-    info.get(arena_idx)
-        .map_or(0, |a| a.base_ptr + chunk_idx as u64 * a.chunk_byte_stride as u64)
+    info.get(arena_idx).map_or(0, |a| {
+        a.base_ptr + chunk_idx as u64 * a.chunk_byte_stride as u64
+    })
 }
 
 #[cfg(test)]
@@ -150,8 +151,16 @@ mod tests {
     #[test]
     fn the_expected_address_mirrors_the_serialiser() {
         let info = vec![
-            ResolvedArenaInfo { base_ptr: 0x1000, chunk_byte_stride: 256, chunk_capacity: 64 },
-            ResolvedArenaInfo { base_ptr: 0x9000, chunk_byte_stride: 128, chunk_capacity: 64 },
+            ResolvedArenaInfo {
+                base_ptr: 0x1000,
+                chunk_byte_stride: 256,
+                chunk_capacity: 64,
+            },
+            ResolvedArenaInfo {
+                base_ptr: 0x9000,
+                chunk_byte_stride: 128,
+                chunk_capacity: 64,
+            },
         ];
         assert_eq!(expected_ptr(&info, 0, 1), 0x1100);
         assert_eq!(expected_ptr(&info, 1, 2), 0x9100);

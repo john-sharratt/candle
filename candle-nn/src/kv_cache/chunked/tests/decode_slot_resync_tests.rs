@@ -47,7 +47,9 @@ fn write_outside_decode(cache: &mut KvCache, dev: &Device, offset: usize, n: usi
 fn device_lens(dev: &Device, backing: &ChunkedKvBacking, seq: usize, offset: usize) -> Vec<u16> {
     backing.ensure_for_offset(seq, offset, 1).unwrap();
     let info = backing.resolve_arena_info().unwrap();
-    let (ptrs, _, _) = backing.sync_decode_gpu_chunks(&[(seq, offset)], &info).unwrap();
+    let (ptrs, _, _) = backing
+        .sync_decode_gpu_chunks(&[(seq, offset)], &info)
+        .unwrap();
     let (ptr, n_slices, _) = ptrs[0];
     let Device::Cuda(cuda) = dev else {
         unreachable!("a CUDA test");
@@ -121,7 +123,9 @@ fn a_write_that_spills_into_the_next_chunk_is_counted_in_both() {
 fn rebuilds_on_sync(backing: &ChunkedKvBacking, seq: usize, offset: usize) -> u64 {
     backing.ensure_for_offset(seq, offset, 1).unwrap();
     let info = backing.resolve_arena_info().unwrap();
-    let (_, _, stats) = backing.sync_decode_gpu_chunks(&[(seq, offset)], &info).unwrap();
+    let (_, _, stats) = backing
+        .sync_decode_gpu_chunks(&[(seq, offset)], &info)
+        .unwrap();
     stats.rebuilds
 }
 
@@ -138,8 +142,15 @@ fn a_moved_arena_drops_the_decode_buffers_that_name_it() {
     let (backing, mut cache, seq) = setup(&dev);
 
     write_outside_decode(&mut cache, &dev, 0, 8);
-    assert_eq!(rebuilds_on_sync(&backing, seq, 8), 1, "the first sync builds the buffer");
-    let arena = backing.state.read().unwrap().sequences[seq].as_ref().unwrap().chunks_slice()[0]
+    assert_eq!(
+        rebuilds_on_sync(&backing, seq, 8),
+        1,
+        "the first sync builds the buffer"
+    );
+    let arena = backing.state.read().unwrap().sequences[seq]
+        .as_ref()
+        .unwrap()
+        .chunks_slice()[0]
         .gids
         .as_slice()[0]
         .arena_idx();

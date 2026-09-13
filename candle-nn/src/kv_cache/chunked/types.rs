@@ -1481,10 +1481,19 @@ mod writer_region_tests {
     fn a_sealed_partial_in_the_writer_region_moves_the_boundary_past_it() {
         use ArenaFormatTag::*;
         let mut s = layer(
-            vec![window(32, Q8_KS), window(32, Q3_0), window(25, Q3_0), window(0, R16)],
+            vec![
+                window(32, Q8_KS),
+                window(32, Q3_0),
+                window(25, Q3_0),
+                window(0, R16),
+            ],
             0,
         );
-        assert_eq!(s.decode_write_chunk_idx(), 2, "the sealed partial is taken for the writer");
+        assert_eq!(
+            s.decode_write_chunk_idx(),
+            2,
+            "the sealed partial is taken for the writer"
+        );
         assert!(s.seal_unwritable_writer_region());
         assert_eq!(s.writer_start_idx(), 3);
         assert_eq!(s.decode_write_chunk_idx(), 3);

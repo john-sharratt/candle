@@ -375,9 +375,7 @@ impl QuantizedMlp {
                     op.with_device_ptr(&dev, |p| {
                         // SAFETY: `p` names this operand's complete q8a128
                         // buffer of `n` bytes, held live for the closure.
-                        unsafe {
-                            checkpoint_q8a128("mlp.acts.int8", p, rows, cols, n, &dev)
-                        }
+                        unsafe { checkpoint_q8a128("mlp.acts.int8", p, rows, cols, n, &dev) }
                     })?;
                 }
                 checkpoint("mlp.gate_up_raw", &gu, &[], &dev)?;

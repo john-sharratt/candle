@@ -490,9 +490,7 @@ fn bump<'a>(
         inner.census.push(Carve {
             start,
             len,
-            label: wave_census::enabled()
-                .then(wave_census::label)
-                .flatten(),
+            label: wave_census::enabled().then(wave_census::label).flatten(),
         });
     }
     inner.forward_peak = inner.forward_peak.max(end);
@@ -543,9 +541,7 @@ fn bump_locked(inner: &mut Inner, name: &'static str, len: usize, align: usize) 
         inner.census.push(Carve {
             start,
             len,
-            label: wave_census::enabled()
-                .then(wave_census::label)
-                .flatten(),
+            label: wave_census::enabled().then(wave_census::label).flatten(),
         });
     }
     inner.forward_peak = inner.forward_peak.max(end);

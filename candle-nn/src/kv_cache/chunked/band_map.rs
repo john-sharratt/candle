@@ -43,8 +43,9 @@ pub struct WriterIndices {
 /// The address `serialize_kv_heads` gives a gid at `(arena_idx, chunk_idx)`:
 /// 0 when the arena has no entry, which is where the empty gid lands.
 fn band_ptr(info: &[ResolvedArenaInfo], arena_idx: usize, chunk_idx: usize) -> u64 {
-    info.get(arena_idx)
-        .map_or(0, |a| a.base_ptr + chunk_idx as u64 * a.chunk_byte_stride as u64)
+    info.get(arena_idx).map_or(0, |a| {
+        a.base_ptr + chunk_idx as u64 * a.chunk_byte_stride as u64
+    })
 }
 
 impl ChunkedKvBacking {
@@ -143,7 +144,11 @@ mod writer_tests {
         backing.set_len(seq, 40);
         assert_eq!(
             backing.writer_indices(seq).unwrap(),
-            WriterIndices { start: 0, writer: 1, chunks: 2 }
+            WriterIndices {
+                start: 0,
+                writer: 1,
+                chunks: 2
+            }
         );
     }
 }
@@ -156,8 +161,16 @@ mod tests {
     #[test]
     fn a_band_address_is_arena_base_plus_slot_stride() {
         let info = vec![
-            ResolvedArenaInfo { base_ptr: 0x1000, chunk_byte_stride: 256, chunk_capacity: 64 },
-            ResolvedArenaInfo { base_ptr: 0x9000, chunk_byte_stride: 128, chunk_capacity: 64 },
+            ResolvedArenaInfo {
+                base_ptr: 0x1000,
+                chunk_byte_stride: 256,
+                chunk_capacity: 64,
+            },
+            ResolvedArenaInfo {
+                base_ptr: 0x9000,
+                chunk_byte_stride: 128,
+                chunk_capacity: 64,
+            },
         ];
         assert_eq!(band_ptr(&info, 0, 1), 0x1100);
         assert_eq!(band_ptr(&info, 1, 2), 0x9100);

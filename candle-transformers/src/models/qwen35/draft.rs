@@ -688,7 +688,8 @@ mod tests {
             session.advance_sequence(seq, n)?;
         }
 
-        let argmax = |row: &Tensor| -> Result<u32> { row.flatten_all()?.argmax(0)?.to_scalar::<u32>() };
+        let argmax =
+            |row: &Tensor| -> Result<u32> { row.flatten_all()?.argmax(0)?.to_scalar::<u32>() };
         for step in 0..STEPS {
             // Where each sequence stands before the step: what its KV rolls back
             // to, plus however many block positions the accept keeps.

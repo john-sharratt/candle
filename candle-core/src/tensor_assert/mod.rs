@@ -445,7 +445,11 @@ pub fn check_now(t: &LiveTensor<'_>, name: &'static str, on_bad: impl FnOnce(&Fi
     }
 }
 
-fn try_check_now(t: &LiveTensor<'_>, name: &'static str, on_bad: impl FnOnce(&Finding)) -> Result<bool> {
+fn try_check_now(
+    t: &LiveTensor<'_>,
+    name: &'static str,
+    on_bad: impl FnOnce(&Finding),
+) -> Result<bool> {
     let Some(slot_idx) = names::slot_for(name) else {
         return Ok(false);
     };

@@ -6561,45 +6561,46 @@ impl Scheduler {
             })
             .collect();
 
-        let layers_restored = match self
-            .model
-            .restore_recurrent(slot_id.0, payload.schedule_hash, &layers)
-        {
-            Ok(true) => {
-                tracing::debug!(
-                    "restored recurrent state for timeline {timeline} at turn {} \
+        let layers_restored =
+            match self
+                .model
+                .restore_recurrent(slot_id.0, payload.schedule_hash, &layers)
+            {
+                Ok(true) => {
+                    tracing::debug!(
+                        "restored recurrent state for timeline {timeline} at turn {} \
                      ({} layers)",
-                    payload.turn_index,
-                    payload.layers.len(),
-                );
-                true
-            }
-            Ok(false) => {
-                // The model carries no recurrent state. A snapshot exists, so
-                // the timeline was sealed by a different model — worth saying,
-                // because it means this conversation's history was built under
-                // an architecture this process is not running.
-                tracing::warn!(
-                    "RECURRENT RESUME SKIPPED (model carries no recurrent state) for \
+                        payload.turn_index,
+                        payload.layers.len(),
+                    );
+                    true
+                }
+                Ok(false) => {
+                    // The model carries no recurrent state. A snapshot exists, so
+                    // the timeline was sealed by a different model — worth saying,
+                    // because it means this conversation's history was built under
+                    // an architecture this process is not running.
+                    tracing::warn!(
+                        "RECURRENT RESUME SKIPPED (model carries no recurrent state) for \
                      timeline {timeline}: a snapshot exists, so this conversation was \
                      sealed by a different model"
-                );
-                false
-            }
-            Err(e) => {
-                // `import` validates the schedule hash and every layer's
-                // geometry before touching a tensor, so this is a different
-                // model or a changed layer schedule, and the store is
-                // untouched. Recomputing is correct; doing it silently is not.
-                tracing::warn!(
-                    "RECURRENT RESUME REFUSED (hash or geometry mismatch) for timeline \
+                    );
+                    false
+                }
+                Err(e) => {
+                    // `import` validates the schedule hash and every layer's
+                    // geometry before touching a tensor, so this is a different
+                    // model or a changed layer schedule, and the store is
+                    // untouched. Recomputing is correct; doing it silently is not.
+                    tracing::warn!(
+                        "RECURRENT RESUME REFUSED (hash or geometry mismatch) for timeline \
                      {timeline} at turn {}: {e} — the conversation will continue with \
                      NO recurrent memory of its history.",
-                    payload.turn_index,
-                );
-                false
-            }
-        };
+                        payload.turn_index,
+                    );
+                    false
+                }
+            };
 
         // The model's own state, restored from the same record. Independent of
         // the layer restore above: a model may carry one, the other, or both,

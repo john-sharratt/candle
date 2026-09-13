@@ -147,7 +147,8 @@ impl Claim {
 type Provider = Box<dyn Fn(&mut Vec<Claim>) + Send + Sync + 'static>;
 
 fn providers() -> &'static RwLock<Vec<(&'static str, Provider)>> {
-    static P: std::sync::OnceLock<RwLock<Vec<(&'static str, Provider)>>> = std::sync::OnceLock::new();
+    static P: std::sync::OnceLock<RwLock<Vec<(&'static str, Provider)>>> =
+        std::sync::OnceLock::new();
     P.get_or_init(|| RwLock::new(Vec::new()))
 }
 

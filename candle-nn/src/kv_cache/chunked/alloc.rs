@@ -11,12 +11,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-// `wave_provenance` lives at the candle-core root and is not CUDA-gated; only
-// the `cuda_backend` re-export of it is. Reaching it through that re-export
-// made this file unbuildable without the `cuda` feature.
-#[cfg(feature = "cuda")]
 #[cfg(feature = "cuda")]
 use candle::cuda_backend::cudarc::driver::result::memcpy_dtod_sync;
+// `wave_provenance` lives at the candle-core root and is not CUDA-gated; only
+// the `cuda_backend` re-export of it is. Reaching it through that re-export
+// made this file unbuildable without the `cuda` feature. The import itself is
+// gated because every lease this file takes is a CUDA allocation.
+#[cfg(feature = "cuda")]
 use candle::wave_provenance::LeaseOrigin;
 use candle::{DType, Device, Result, Tensor};
 
@@ -40,8 +41,6 @@ use super::head_gids::HeadGids;
 #[cfg(feature = "cuda")]
 const ARENA_RELOCATE_FREE_MARGIN_REGIONS: usize = 2;
 
-#[cfg(feature = "tensor-assert")]
-use candle::tensor_assert::POISON_BYTE;
 #[cfg(feature = "cuda")]
 use super::region_pool;
 use super::size_class::{elems_per_chunk, SizeClass};
@@ -51,6 +50,8 @@ use crate::kv_cache::arena_table::ArenaFormatTag;
 use crate::kv_cache::chunked::backing::BackingInner;
 use crate::kv_cache::chunked::ArenaStorageState;
 use crate::kv_cache::{KvFormat, QuantFormat};
+#[cfg(feature = "tensor-assert")]
+use candle::tensor_assert::POISON_BYTE;
 
 /// How many bytes of KV the reservation can still hold: free regions × the
 /// region size.
@@ -929,6 +930,7 @@ impl ChunkedKvBacking {
     /// into the donor they came from. Answers `None` when that arena is full,
     /// which the caller reads as "leave the band where it is" rather than
     /// falling back to a fresh arena.
+    #[cfg(feature = "cuda")]
     pub(super) fn pool_allocate_from_arena(
         &self,
         key: super::arena::ArenaKey,

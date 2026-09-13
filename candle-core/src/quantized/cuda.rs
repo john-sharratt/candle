@@ -5927,7 +5927,9 @@ pub fn to_dynamic<'w>(
         op.with_device_ptr(device, |p| -> crate::Result<()> {
             // SAFETY: `p` names the operand the quantize kernel just wrote,
             // `elems` logical elements in the q8a128 packing.
-            unsafe { assert_device_quant("acts.q8a128.postquant", p, QTYPE_Q8A128V, elems, device) };
+            unsafe {
+                assert_device_quant("acts.q8a128.postquant", p, QTYPE_Q8A128V, elems, device)
+            };
             Ok(())
         })?;
     }

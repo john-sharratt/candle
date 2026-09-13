@@ -518,8 +518,17 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
-    /// Every file under `dir`, depth first. Sorted, so a failure names the same
-    /// file on every machine rather than whichever the filesystem yielded first.
+    /// The metadata zend's repo scan writes into every directory it indexes.
+    ///
+    /// Runtime output, gitignored, and different in every directory by
+    /// construction — it describes the directory it sits in. It is not part of
+    /// what either site ships, so a scan of the repo that reached `web/` or
+    /// `zend/web/` must not read as the shared framework drifting.
+    const SCAN_METADATA: &str = ".substrate.yaml";
+
+    /// Every file under `dir` a site ships, depth first — everything but the
+    /// scan metadata above. Sorted, so a failure names the same file on every
+    /// machine rather than whichever the filesystem yielded first.
     fn walk(dir: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut stack = vec![dir.to_path_buf()];
@@ -528,7 +537,7 @@ mod tests {
                 let p = e.path();
                 if p.is_dir() {
                     stack.push(p);
-                } else {
+                } else if p.file_name().is_some_and(|n| n != SCAN_METADATA) {
                     out.push(p);
                 }
             }

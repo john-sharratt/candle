@@ -161,7 +161,12 @@ mod tests {
     fn one_ahead_claims_a_position_the_layer_never_wrote() {
         assert_eq!(
             writer_disagreement(&layer(&[32, 31], 0), 64),
-            Some(WriterDisagreement { writer: 1, usage: 31, write_len: 32, committed: 63 })
+            Some(WriterDisagreement {
+                writer: 1,
+                usage: 31,
+                write_len: 32,
+                committed: 63
+            })
         );
     }
 
@@ -169,7 +174,12 @@ mod tests {
     fn one_behind_hides_a_committed_token() {
         assert_eq!(
             writer_disagreement(&layer(&[32, 31], 0), 62),
-            Some(WriterDisagreement { writer: 1, usage: 31, write_len: 30, committed: 63 })
+            Some(WriterDisagreement {
+                writer: 1,
+                usage: 31,
+                write_len: 30,
+                committed: 63
+            })
         );
     }
 
@@ -182,7 +192,12 @@ mod tests {
         assert_eq!(writer_disagreement(&l, 41), None);
         assert_eq!(
             writer_disagreement(&l, 42),
-            Some(WriterDisagreement { writer: 2, usage: 31, write_len: 32, committed: 41 })
+            Some(WriterDisagreement {
+                writer: 2,
+                usage: 31,
+                write_len: 32,
+                committed: 41
+            })
         );
     }
 

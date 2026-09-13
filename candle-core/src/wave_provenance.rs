@@ -397,7 +397,11 @@ mod epoch_ring_tests {
     fn an_address_never_stamped_is_absent() {
         note_q8a128_epoch(0x2000, 1);
         assert_eq!(q8a128_epoch_of(0x3000), None);
-        assert_eq!(q8a128_epoch_of(0), None, "the empty-slot sentinel is never an answer");
+        assert_eq!(
+            q8a128_epoch_of(0),
+            None,
+            "the empty-slot sentinel is never an answer"
+        );
     }
 }
 

@@ -192,7 +192,11 @@ mod tests {
         // about what the peak layer did.
         let carves: Vec<Carve> = [8192usize, 8192, 4096, 8192]
             .into_iter()
-            .map(|len| Carve { start: 0, len, label: None })
+            .map(|len| Carve {
+                start: 0,
+                len,
+                label: None,
+            })
             .collect();
         let mut hist: BTreeMap<usize, usize> = BTreeMap::new();
         for c in &carves {

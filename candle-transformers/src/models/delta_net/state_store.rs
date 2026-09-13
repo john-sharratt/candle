@@ -1091,6 +1091,7 @@ impl RecurrentStateStore {
     /// The replacement is allocated whole before a byte is copied, and the old
     /// regions are only dropped once the new state is installed: a span that
     /// refuses mid-way leaves the store exactly where it was.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     pub fn relocate_down(&mut self, free_regions: usize) -> Result<bool> {
         if self.open {
             return Ok(false);

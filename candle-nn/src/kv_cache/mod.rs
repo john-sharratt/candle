@@ -49,31 +49,28 @@ pub use chunked::fletcher_golden::{fletcher32_golden, fletcher32_golden_on, Gold
 /// simulated workload with no device in reach
 /// (`docs/vram_partition_behavioural_tests.md`).
 pub use chunked::growth_policy::{
-    kv_grow_step, kv_ground_shortfall, GrowthPolicy, Occupancy, Refusal,
+    kv_ground_shortfall, kv_grow_step, GrowthPolicy, Occupancy, Refusal,
 };
 /// A guest's pipeline stage. Defined in both configurations — `f(x)` when there
 /// is no GPU backend, since no guest arena can exist without one — because the
 /// model code that marks its stages is built in both.
 pub use chunked::guest_stage;
+#[cfg(feature = "cuda")]
+pub use chunked::persistence_domain_stats;
+#[cfg(feature = "cuda")]
+pub use chunked::slot_state_stats;
+/// The KV side's extents, published to the between-waves overlap audit.
+#[cfg(feature = "tensor-assert")]
+pub use chunked::span_claims;
+/// Where the tier may stand and what the KV side may reach — the span's
+/// arithmetic. Pure, and public for the same reason: three of the partition's
+/// worst defects were geometry, and none of them needed a GPU to find.
+pub use chunked::span_geometry;
 /// The region quantum, and the margin a wave's tier budget holds back for what
 /// moves between the wave's build and its placement. Arithmetic rather than
 /// device facts — a caller pricing a claim or composing a wave needs both on
 /// every backend, and every composer must hold back the same margin.
 pub use chunked::span_geometry::{REGION_BYTES, TIER_MARGIN_BYTES, TIER_MARGIN_REGIONS};
-#[cfg(feature = "cuda")]
-pub use chunked::persistence_domain_stats;
-#[cfg(feature = "cuda")]
-pub use chunked::slot_state_stats;
-/// Where the tier may stand and what the KV side may reach — the span's
-/// arithmetic. Pure, and public for the same reason: three of the partition's
-/// worst defects were geometry, and none of them needed a GPU to find.
-pub use chunked::span_geometry;
-/// The KV side's extents, published to the between-waves overlap audit.
-#[cfg(feature = "tensor-assert")]
-pub use chunked::span_claims;
-/// Band addresses from the host block table, for captures that read KV raw.
-#[cfg(feature = "tensor-assert")]
-pub use chunked::{BandAddr, BlockBands, BlockTableMutation, WriterIndices};
 pub use chunked::wave_plan::{
     ffn_work_dtype, BufferShape, Chain, DeltaNetWidths, Encoding, LayerPhase, ModelGeometry,
     SharedExpertWidths, WaveBuffer, WavePlan, WaveWidth, BUMP_ALIGNMENT,
@@ -102,6 +99,9 @@ pub use chunked::{
     set_weight_floor, span_end, transient_headroom_bytes, weight_capacity_bytes,
     weight_floor_after,
 };
+/// Band addresses from the host block table, for captures that read KV raw.
+#[cfg(feature = "tensor-assert")]
+pub use chunked::{BandAddr, BlockBands, BlockTableMutation, WriterIndices};
 /// The weight side of the reservation. Pure arithmetic, so it is available
 /// whether or not the crate was built with a GPU backend.
 pub use chunked::{

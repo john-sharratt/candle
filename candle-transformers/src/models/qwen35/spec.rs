@@ -50,11 +50,11 @@ use crate::models::delta_net::{
 };
 #[cfg(feature = "cuda")]
 use crate::models::wave_buffers::wave_empty;
+use candle_nn::kv_cache::ModelGeometry;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{begin_wave, LayerPhase, WaveGeneration};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{plan_wave_transient, WavePlan, WaveWidth};
-use candle_nn::kv_cache::ModelGeometry;
 
 /// The COHORT's stashed speculative blocks: every verifying sequence's rows in
 /// one set of shared buffers, so the replay that consumes them advances every
