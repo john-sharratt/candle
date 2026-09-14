@@ -22,8 +22,8 @@ use candle_conversation::models::{Dialect, Model};
 use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::persistence::{content_hash, SUBSTRATE_DIR};
 use candle_conversation::projection::{
-    self, Builder, GroupSchema, Reserved, SectionId, SelectionRule, SystemItem, SystemPromptItem,
-    SystemPromptSchema, TimelineId, TurnIndex,
+    self, Builder, GroupSchema, Reserved, SectionId, SectionLoads, SelectionRule, SystemItem,
+    SystemPromptItem, SystemPromptSchema, TimelineId, TurnIndex,
 };
 use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
@@ -672,15 +672,13 @@ impl InferenceState {
         // governs `top_k` so only the K most relevant tools survive
         // into any single projection.
         //
-        // Sections re-prefill on every daemon start in the current
-        // configuration — section cold-load is plumbed end-to-end but
-        // disabled on the runtime path (see Phase 2.5 in
-        // `persistence/thread.rs` and the matching scheduler filter
-        // notes).  Tool sections live hot for the daemon's lifetime
-        // and the manifest never grows section chunk records.  Cost
-        // is one prefill pass over the catalog per daemon start
-        // (~90 tools × short JSON line); cheap on the 4090 mobile
-        // baseline and easy to re-flip once cold-load is back.
+        // Sections are content-addressed in the redo log: a boot restores
+        // every section whose stream is already persisted as a cold marker
+        // (the next projection that needs it lifts it hot) and prefills only
+        // the rest, whose seals the persistence thread then writes. An
+        // unchanged catalog therefore costs no prefill and adds no records on
+        // the next boot (`tools_integration::a_second_boot_restores_every_
+        // prompt_section`).
         // Resolve the effective tool catalog before any consumer touches it: a
         // `<workspace>/tools/` folder (a mind/game's own tools) overrides the
         // bundled built-ins; absent it, the built-in coding-assistant catalog.
@@ -3921,6 +3919,15 @@ impl ZendSession {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let engine = state.engine.lock().unwrap();
         Some(engine.substrate_maintenance_status())
+    }
+
+    /// How this boot loaded its prompt sections — restored from the redo log or
+    /// prefilled — counted since the engine was built. `None` until the model is
+    /// loaded.
+    pub fn section_loads(&self) -> Option<SectionLoads> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let conv = { state.engine.lock().unwrap().conversation() };
+        Some(conv.section_loads())
     }
 
     /// Force one background-maintenance op now — the `POST /v1/debug/maintenance`
