@@ -400,7 +400,30 @@ impl BackingInner {
     }
 }
 
+/// The batch indices in `batch_entries` whose sequence holds a cached decode
+/// slot buffer, in entry order — the only ones a commit outside the decode
+/// kernel has anything to bring up to date. See
+/// [`ChunkedKvBacking::refresh_decode_writer_slice`].
+pub(crate) fn buffered_seq_indices(
+    state: &BlockTableState,
+    batch_entries: &[(usize, usize)],
+) -> Vec<usize> {
+    batch_entries
+        .iter()
+        .map(|&(seq_idx, _)| seq_idx)
+        .filter(|&seq_idx| {
+            matches!(state.sequences.get(seq_idx), Some(Some(seq)) if seq.has_decode_gpu_chunks())
+        })
+        .collect()
+}
+
 impl ChunkedKvBacking {
+    /// Whether `other` is a handle on this same backing — the same per-layer
+    /// block table, so a batch index means the same sequence in both.
+    pub(crate) fn shares_state_with(&self, other: &ChunkedKvBacking) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
     pub(super) fn set_block_gids_sharded_and_update_gpu(
         &self,
         batch_idx: usize,
@@ -964,9 +987,16 @@ impl ChunkedKvBacking {
     /// commit made outside the decode kernel — see
     /// [`super::types::SequenceState::refresh_decode_writer_slice`]. Every
     /// slice from the writer boundary to the writer is re-serialised in place,
-    /// O(chunks the commit wrote) per sequence per layer; sequences with no
-    /// cached buffer (never decoded, or cleared by a chunk-boundary append)
-    /// rebuild fully on the next decode sync instead.
+    /// O(chunks the commit wrote) per sequence per layer.
+    ///
+    /// **Only sequences holding a cached buffer are touched.** One that has
+    /// never decoded, or whose buffer a chunk-boundary append cleared, has
+    /// nothing to patch and rebuilds fully on its next decode sync, so it names
+    /// no arena; when no sequence in the call holds a buffer the call returns
+    /// before resolving any. That is every sequence of a fresh prefill, which
+    /// commits through here once per layer — the arena resolve it skips walks
+    /// the whole pooled arena map, and paid per sequence per layer it cost the
+    /// small models most of their prefill throughput.
     pub fn refresh_decode_writer_slice(&self, batch_entries: &[(usize, usize)]) -> Result<()> {
         let n_kv_head = self.inner.n_kv_head;
         let head_dim = self.inner.head_dim;
@@ -974,6 +1004,10 @@ impl ChunkedKvBacking {
             .state
             .write()
             .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let buffered = buffered_seq_indices(&state, batch_entries);
+        if buffered.is_empty() {
+            return Ok(());
+        }
         // Only the writer regions' arenas. The patch re-serialises the chunks
         // from each sequence's writer boundary to its writer, and it runs per
         // layer on every commit made outside the decode kernel — a verify block
@@ -981,9 +1015,9 @@ impl ChunkedKvBacking {
         // ~layers × sequences times a step for pointers nothing reads. Taken
         // under the state lock, so the region cannot change between naming its
         // arenas and serialising it.
-        let needed: HashSet<usize> = batch_entries
+        let needed: HashSet<usize> = buffered
             .iter()
-            .filter_map(|&(seq_idx, _)| state.sequences.get(seq_idx)?.as_ref())
+            .filter_map(|&seq_idx| state.sequences.get(seq_idx)?.as_ref())
             .filter_map(|seq| {
                 let wi = seq.decode_write_chunk_idx();
                 seq.chunks_slice().get(seq.writer_start_idx().min(wi)..=wi)
@@ -994,7 +1028,7 @@ impl ChunkedKvBacking {
             .map(|g| g.arena_idx())
             .collect();
         let arena_info = self.resolve_arena_info_for(&needed)?;
-        for &(seq_idx, _) in batch_entries {
+        for &seq_idx in &buffered {
             if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
                 seq.refresh_decode_writer_slice(n_kv_head, head_dim, &arena_info)?;
             }

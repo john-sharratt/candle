@@ -1849,12 +1849,22 @@ impl BatchedEngine {
         //
         // (Each block's write range was capacity-ensured ABOVE, so the
         // writeback snapshot covers every chunk `set_len` fills here.)
+        //
+        // Every block's length is set on a backing before that backing is
+        // refreshed once for all of them: one state lock and one arena resolve
+        // per backing, not one per verify group per backing.
         if is_verify_wave {
-            for &(vseq, resident, s_len) in &verify_groups {
-                for backing in session.backings() {
+            let entries: Vec<(usize, usize)> = verify_groups
+                .iter()
+                .map(|&(vseq, _, _)| (vseq, 0))
+                .collect();
+            for backing in session.backings() {
+                for &(vseq, resident, s_len) in &verify_groups {
                     backing.set_len(vseq, resident + s_len);
-                    backing.refresh_decode_writer_slice(&[(vseq, 0)])?;
                 }
+                backing.refresh_decode_writer_slice(&entries)?;
+            }
+            for &(vseq, resident, s_len) in &verify_groups {
                 overrides.push((vseq, resident + s_len));
             }
         }

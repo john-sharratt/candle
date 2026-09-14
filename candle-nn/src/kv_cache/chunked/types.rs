@@ -870,6 +870,14 @@ impl SequenceState {
         self.gpu_chunks.as_mut().clear();
     }
 
+    /// Whether a decode slot buffer is cached for this sequence — the one thing
+    /// [`Self::refresh_decode_writer_slice`] can bring up to date. A sequence
+    /// that has never decoded, or whose buffer a chunk-boundary append cleared,
+    /// has none, and rebuilds it in full on its next decode sync.
+    pub(crate) fn has_decode_gpu_chunks(&self) -> bool {
+        self.gpu_chunks.n_chunks() != 0
+    }
+
     /// Bring the cached decode GPU buffer up to date after a commit made
     /// outside the decode kernel — a prefill, a glue writeback, a speculative
     /// verify block, a stencil static run.

@@ -16,6 +16,7 @@
 use candle::cuda_backend::cudarc::driver::CudaSlice;
 use candle::{DType, Device, Tensor};
 
+use crate::kv_cache::chunked::backing::buffered_seq_indices;
 use crate::kv_cache::chunked::gpu_test_lock::gpu_serial;
 use crate::kv_cache::{ChunkedKvBacking, KvCache};
 
@@ -142,4 +143,69 @@ fn a_backing_refresh_after_a_spill_counts_both_chunks() {
         vec![32, 2],
         "the writer moved to the next chunk, so the buffer's other slices are stale too"
     );
+}
+
+/// A sequence that has never decoded holds no slot buffer, so a commit has
+/// nothing to bring up to date and the refresh must not name it — that is what
+/// lets a fresh prefill skip the arena resolve entirely. Once a decode sync
+/// builds the buffer, the same sequence is named.
+#[test]
+fn only_a_sequence_holding_a_decode_buffer_is_refreshed() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    write_outside_decode(&mut cache, &dev, 0, 8);
+    assert_eq!(
+        buffered_seq_indices(&backing.state.read().unwrap(), &[(seq, 0)]),
+        Vec::<usize>::new(),
+        "a prefilled sequence that has not decoded has no buffer to patch"
+    );
+
+    device_lens(&dev, &backing, seq, 8);
+    assert_eq!(
+        buffered_seq_indices(&backing.state.read().unwrap(), &[(seq, 0)]),
+        vec![seq]
+    );
+}
+
+/// The batched prefill commits a layer's whole batch at once. Every sequence in
+/// it must come out counted on the device, exactly as a commit per sequence
+/// would leave it.
+#[test]
+fn a_batch_commit_counts_every_sequence_on_the_device() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let backing = ChunkedKvBacking::new(2, N_KV_HEAD, HEAD_DIM, DType::F16, &dev, 256).unwrap();
+    let seqs = [
+        backing.alloc_sequence().unwrap(),
+        backing.alloc_sequence().unwrap(),
+    ];
+    let mut caches = seqs.map(|seq| {
+        let mut cache = KvCache::new(2, 256);
+        cache.set_chunked_backing(&backing, seq, None).unwrap();
+        cache
+    });
+    for (cache, &seq) in caches.iter_mut().zip(seqs.iter()) {
+        write_outside_decode(cache, &dev, 0, 8);
+        assert_eq!(device_lens(&dev, &backing, seq, 8)[0], 8);
+    }
+
+    // A verify block on both sequences, committed together.
+    let [c0, c1] = &mut caches;
+    let mut batch = [c0, c1];
+    KvCache::ensure_chunked_capacity_batch(&mut batch, &[8, 8], 4).unwrap();
+    let kv = Tensor::ones((1, N_KV_HEAD, 4, HEAD_DIM), DType::F16, &dev).unwrap();
+    for cache in batch.iter_mut() {
+        cache.chunked_write_kv(8, &kv, &kv).unwrap();
+    }
+    KvCache::commit_written_tokens_batch(&mut batch, &[8, 8], &[4, 4]).unwrap();
+
+    for &seq in &seqs {
+        assert_eq!(
+            device_lens(&dev, &backing, seq, 12)[0],
+            12,
+            "sequence {seq}: the reused buffer must count the batch-committed block"
+        );
+    }
 }

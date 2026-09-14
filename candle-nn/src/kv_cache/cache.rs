@@ -1235,6 +1235,59 @@ impl KvCache {
         Ok(())
     }
 
+    /// [`Self::commit_written_tokens`] for every cache of one batched write:
+    /// the caches of one layer, over one shared backing, as the batched prefill
+    /// holds them. Each cache's `adds[i]` tokens at `offsets[i]` are committed,
+    /// then the backing's decode slot buffers are brought up to date in a single
+    /// refresh rather than one per sequence — one state lock and one arena
+    /// resolve for the layer, and none at all when no sequence in the batch has
+    /// a cached buffer, which is every sequence of a fresh prefill.
+    pub fn commit_written_tokens_batch(
+        caches: &mut [&mut KvCache],
+        offsets: &[usize],
+        adds: &[usize],
+    ) -> Result<()> {
+        if caches.len() != offsets.len() || caches.len() != adds.len() {
+            candle::bail!(
+                "commit count mismatch: {} caches, {} offsets, {} lengths",
+                caches.len(),
+                offsets.len(),
+                adds.len()
+            )
+        }
+        let Some(first) = caches.first() else {
+            return Ok(());
+        };
+        let backing = match &first.k.storage {
+            CacheStorage::Chunked(c) => Some(c.backing.clone()),
+            CacheStorage::Contiguous { .. } => None,
+        };
+        let mut entries: Vec<(usize, usize)> = Vec::with_capacity(caches.len());
+        for (i, ((cache, &offset), &add)) in caches
+            .iter_mut()
+            .zip(offsets.iter())
+            .zip(adds.iter())
+            .enumerate()
+        {
+            cache.set_current_seq_len(offset + add)?;
+            if let (CacheStorage::Chunked(c), Some(backing)) = (&cache.k.storage, &backing) {
+                // One refresh names sequences by batch index on ONE backing's
+                // table; a cache on another backing would be looked up in the
+                // wrong table and silently left stale.
+                if !c.backing.shares_state_with(backing) {
+                    candle::bail!(
+                        "commit batch: cache {i} is on a different chunked backing from cache 0"
+                    );
+                }
+                entries.push((c.batch_idx, 0));
+            }
+        }
+        if let Some(backing) = backing {
+            backing.refresh_decode_writer_slice(&entries)?;
+        }
+        Ok(())
+    }
+
     /// Truncate the cache to the specified sequence length.
     pub fn truncate(&mut self, seq_len: usize) -> Result<()> {
         self.k.truncate(seq_len)?;
