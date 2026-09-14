@@ -327,10 +327,7 @@ impl LoopGuards {
     /// Forget a character's history — for one being retired, or one whose body
     /// has left the world.
     pub fn forget(&self, npc_id: u64) {
-        self.guards
-            .lock()
-            .expect("loop-guard lock")
-            .remove(&npc_id);
+        self.guards.lock().expect("loop-guard lock").remove(&npc_id);
     }
 }
 
@@ -353,8 +350,14 @@ mod tests {
     /// The salient text is the act's content argument, whichever one carries it.
     #[test]
     fn the_salient_text_is_the_content_argument() {
-        assert_eq!(salient(&act("ask", json!({"to": "Pax", "about": "the lights"}))), "the lights");
-        assert_eq!(salient(&act("tell", json!({"to": "Pax", "intent": "come here"}))), "come here");
+        assert_eq!(
+            salient(&act("ask", json!({"to": "Pax", "about": "the lights"}))),
+            "the lights"
+        );
+        assert_eq!(
+            salient(&act("tell", json!({"to": "Pax", "intent": "come here"}))),
+            "come here"
+        );
         assert_eq!(
             salient(&act("move_to", json!({"destination": "the deck"}))),
             "the deck"
@@ -392,7 +395,10 @@ mod tests {
         // tell is anti-repeat: struck the turn right after, back the turn after.
         let g2 = LoopGuards::new();
         took(&g2, 2, "tell", "hello");
-        assert!(g2.cooling(2).contains(&"tell".to_string()), "no immediate repeat");
+        assert!(
+            g2.cooling(2).contains(&"tell".to_string()),
+            "no immediate repeat"
+        );
         took(&g2, 2, "reflect", "thinking"); // a turn passes
         assert!(
             !g2.cooling(2).contains(&"tell".to_string()),
@@ -418,17 +424,34 @@ mod tests {
         let g = LoopGuards::new();
         // Two very similar `ask`s with a differently-named act between them, so
         // the exponential cooldown on `ask` has expired but the intents match.
-        assert!(!took(&g, 1, "ask", "what did you see in the corridor just now"));
+        assert!(!took(
+            &g,
+            1,
+            "ask",
+            "what did you see in the corridor just now"
+        ));
         // Breaker compares against prior same-act intents; the second near-match
         // fires it.
         let fired = took(&g, 1, "ask", "what did you see in the corridor just now");
         assert!(fired, "a near-verbatim repeat must trip the breaker");
         // A forced reflect: everything but reflect and move_to is struck.
         let cooling = g.cooling(1);
-        assert!(!cooling.contains(&"reflect".to_string()), "reflect stays reachable");
-        assert!(!cooling.contains(&"move_to".to_string()), "move_to stays reachable");
-        assert!(cooling.contains(&"ask".to_string()), "the looping act is struck");
-        assert!(cooling.contains(&"gesture".to_string()), "other acts are struck too");
+        assert!(
+            !cooling.contains(&"reflect".to_string()),
+            "reflect stays reachable"
+        );
+        assert!(
+            !cooling.contains(&"move_to".to_string()),
+            "move_to stays reachable"
+        );
+        assert!(
+            cooling.contains(&"ask".to_string()),
+            "the looping act is struck"
+        );
+        assert!(
+            cooling.contains(&"gesture".to_string()),
+            "other acts are struck too"
+        );
     }
 
     /// The forced reflect is single-shot: it clears the turn after, so it cannot
@@ -438,9 +461,17 @@ mod tests {
         let g = LoopGuards::new();
         took(&g, 1, "ask", "the same thing over and over here");
         assert!(took(&g, 1, "ask", "the same thing over and over here"));
-        assert!(g.cooling(1).contains(&"gesture".to_string()), "forced reflect this turn");
+        assert!(
+            g.cooling(1).contains(&"gesture".to_string()),
+            "forced reflect this turn"
+        );
         // The character reflects; next turn is free again (bar ordinary cooldowns).
-        took(&g, 1, "reflect", "I am going in circles and should try something else");
+        took(
+            &g,
+            1,
+            "reflect",
+            "I am going in circles and should try something else",
+        );
         assert!(
             !g.cooling(1).contains(&"gesture".to_string()),
             "the forced reflect did not clear"

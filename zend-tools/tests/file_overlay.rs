@@ -78,7 +78,7 @@ fn read_falls_through_to_the_workspace() {
     let ctx = ctx_for(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs"}),
+        json!({"path": "src/main.rs", "start_line": 1, "end_line": 200}),
         &ctx,
     ));
     assert_eq!(
@@ -104,7 +104,7 @@ fn workspace_mount_prefix_is_an_alias_for_the_root() {
     ] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_read",
-            json!({ "path": path }),
+            json!({ "path": path, "start_line": 1, "end_line": 200 }),
             &ctx,
         ));
         assert!(
@@ -118,7 +118,11 @@ fn workspace_mount_prefix_is_an_alias_for_the_root() {
 fn read_of_a_missing_workspace_path_is_not_found() {
     let dir = workspace();
     let ctx = ctx_for(&dir);
-    let resp = harness::invoke_with_ctx("file_read", json!({"path": "src/nope.rs"}), &ctx);
+    let resp = harness::invoke_with_ctx(
+        "file_read",
+        json!({"path": "src/nope.rs", "start_line": 1, "end_line": 200}),
+        &ctx,
+    );
     harness::expect_error(&resp, "not_found");
 }
 
@@ -127,8 +131,11 @@ fn read_of_a_missing_workspace_path_is_not_found() {
 fn parent_traversal_cannot_escape_the_workspace() {
     let dir = workspace();
     let ctx = ctx_for(&dir);
-    let resp =
-        harness::invoke_with_ctx("file_read", json!({"path": "../../../../etc/passwd"}), &ctx);
+    let resp = harness::invoke_with_ctx(
+        "file_read",
+        json!({"path": "../../../../etc/passwd", "start_line": 1, "end_line": 200}),
+        &ctx,
+    );
     harness::expect_error(&resp, "not_found");
 }
 
@@ -137,7 +144,11 @@ fn non_utf8_workspace_file_is_unreadable_not_missing() {
     let dir = workspace();
     std::fs::write(dir.path().join("blob.bin"), [0xffu8, 0xfe, 0x00, 0x01]).unwrap();
     let ctx = ctx_for(&dir);
-    let resp = harness::invoke_with_ctx("file_read", json!({"path": "blob.bin"}), &ctx);
+    let resp = harness::invoke_with_ctx(
+        "file_read",
+        json!({"path": "blob.bin", "start_line": 1, "end_line": 200}),
+        &ctx,
+    );
     harness::expect_error(&resp, "unreadable");
 }
 
@@ -202,7 +213,7 @@ fn list_omits_gitignored_and_hidden_paths() {
     // (`/workspace/.gitignore`) depend on.
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "/workspace/.gitignore"}),
+        json!({"path": "/workspace/.gitignore", "start_line": 1, "end_line": 200}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&resp), "target/\nsecret.txt");
@@ -251,7 +262,7 @@ fn edit_copies_the_workspace_file_up_and_leaves_disk_untouched() {
     // The session now sees the edited copy...
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs"}),
+        json!({"path": "src/main.rs", "start_line": 1, "end_line": 200}),
         &ctx,
     ));
     assert_eq!(
@@ -320,7 +331,11 @@ fn delete_hides_a_workspace_file_without_erasing_it() {
 
     // Gone from this session's view, both ways...
     harness::expect_error(
-        &harness::invoke_with_ctx("file_read", json!({"path": "docs/guide.md"}), &ctx),
+        &harness::invoke_with_ctx(
+            "file_read",
+            json!({"path": "docs/guide.md", "start_line": 1, "end_line": 200}),
+            &ctx,
+        ),
         "not_found",
     );
     let listed = paths(&harness::expect_success(harness::invoke_with_ctx(
@@ -369,7 +384,7 @@ fn writing_over_a_whiteout_resurrects_the_path_as_a_creation() {
     );
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "README.md"}),
+        json!({"path": "README.md", "start_line": 1, "end_line": 200}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&read), "# back");
@@ -520,7 +535,11 @@ fn list_entries_omit_the_modified_flag_when_unchanged() {
 fn read_returns_a_numbered_fenced_excerpt() {
     let dir = workspace();
     let ctx = ctx_for(&dir);
-    let resp = harness::invoke_with_ctx("file_read", json!({"path": "src/main.rs"}), &ctx);
+    let resp = harness::invoke_with_ctx(
+        "file_read",
+        json!({"path": "src/main.rs", "start_line": 1, "end_line": 3}),
+        &ctx,
+    );
     let text = resp.as_str().expect("file_read returns a rendered string");
     assert_eq!(
         text,
@@ -528,7 +547,26 @@ fn read_returns_a_numbered_fenced_excerpt() {
     );
 }
 
-/// A file longer than the cap comes back truncated, and the header says so —
+/// The line range is mandatory: a call that omits `start_line`, `end_line`, or
+/// both is rejected at argument parsing rather than defaulting to a window.
+#[test]
+fn read_without_a_full_line_range_is_invalid_arguments() {
+    let dir = workspace();
+    let ctx = ctx_for(&dir);
+    for args in [
+        json!({"path": "src/main.rs"}),
+        json!({"path": "src/main.rs", "start_line": 1}),
+        json!({"path": "src/main.rs", "end_line": 3}),
+    ] {
+        let resp = harness::invoke_with_ctx("file_read", args.clone(), &ctx);
+        assert_eq!(
+            resp["error"], "invalid_arguments",
+            "args {args} must be rejected: {resp}",
+        );
+    }
+}
+
+/// A range wider than the cap comes back truncated, and the header says so —
 /// that is the continuation signal, in the text the model already reads.
 #[test]
 fn read_caps_a_long_file_and_reports_the_total() {
@@ -537,7 +575,11 @@ fn read_caps_a_long_file_and_reports_the_total() {
     write_disk(dir.path(), "big.rs", &body);
     let ctx = ToolContext::with_workspace(dir.path());
 
-    let first = harness::invoke_with_ctx("file_read", json!({"path": "big.rs"}), &ctx);
+    let first = harness::invoke_with_ctx(
+        "file_read",
+        json!({"path": "big.rs", "start_line": 1, "end_line": 900}),
+        &ctx,
+    );
     let text = first.as_str().unwrap();
     assert!(
         text.starts_with("\nbig.rs (lines 1-200 of 900):\n"),
@@ -551,7 +593,7 @@ fn read_caps_a_long_file_and_reports_the_total() {
     // The advertised continuation reads the next window.
     let next = harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "big.rs", "start_line": 201}),
+        json!({"path": "big.rs", "start_line": 201, "end_line": 400}),
         &ctx,
     );
     let text = next.as_str().unwrap();
@@ -563,7 +605,7 @@ fn read_caps_a_long_file_and_reports_the_total() {
 }
 
 /// An explicit range is honoured, and the cap still applies to it — otherwise a
-/// wide range would bypass the bound the unranged path enforces.
+/// wide range would bypass the 200-line bound.
 #[test]
 fn read_honours_a_line_range_but_still_caps_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -609,7 +651,7 @@ fn read_past_the_end_clamps_into_the_file() {
     let ctx = ctx_for(&dir);
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs", "start_line": 9999}),
+        json!({"path": "src/main.rs", "start_line": 9999, "end_line": 9999}),
         &ctx,
     );
     let text = resp.as_str().unwrap();
@@ -625,7 +667,11 @@ fn read_of_an_empty_file_reports_empty() {
     let dir = workspace();
     write_disk(dir.path(), "blank.rs", "");
     let ctx = ctx_for(&dir);
-    let resp = harness::invoke_with_ctx("file_read", json!({"path": "blank.rs"}), &ctx);
+    let resp = harness::invoke_with_ctx(
+        "file_read",
+        json!({"path": "blank.rs", "start_line": 1, "end_line": 200}),
+        &ctx,
+    );
     assert_eq!(
         resp.as_str().unwrap(),
         "\nblank.rs (empty):\n\n```rust\n```\n"

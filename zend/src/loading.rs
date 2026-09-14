@@ -34,6 +34,11 @@ pub enum LoadStep {
     /// surfaced through the `detail` sub-status, so this one step covers an
     /// arbitrary number of ingest layers.
     Ingesting,
+    /// The tool catalog's score-normalization hit levels, relearned from its
+    /// corpus. They are runtime-only, so every start pays this — last, once the
+    /// corpus is complete, and before `ready`, because a query scored against
+    /// cold levels ranks the tools differently rather than merely lower.
+    Normalizing,
 }
 
 impl LoadStep {
@@ -46,6 +51,7 @@ impl LoadStep {
         LoadStep::Sections,
         LoadStep::CalibratingSections,
         LoadStep::Ingesting,
+        LoadStep::Normalizing,
     ];
 
     /// Human-readable label rendered in the loading overlay.
@@ -57,6 +63,7 @@ impl LoadStep {
             LoadStep::Sections => "Prefilling tool sections",
             LoadStep::CalibratingSections => "Calibrating sections",
             LoadStep::Ingesting => "Ingesting workspace",
+            LoadStep::Normalizing => "Normalizing scores",
         }
     }
 
@@ -74,6 +81,7 @@ impl LoadStep {
             LoadStep::Sections => "",
             LoadStep::CalibratingSections => "",
             LoadStep::Ingesting => "",
+            LoadStep::Normalizing => "",
         }
     }
 }

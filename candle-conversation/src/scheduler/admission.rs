@@ -74,27 +74,16 @@
 use candle_nn::kv_cache::KvFormat;
 use candle_nn::kv_cache::CHUNK_SIZE;
 
-/// Default admission-budget quantum: the byte step the setpoint grows by, and
-/// the floor it can never be cut below. 256 MiB is roughly 1300 tokens of
-/// unsealed KV on a 30B-class model — coarse enough that the controller is not
-/// chasing individual turns, fine enough that a card has many notches between
-/// the floor and its ceiling.
-const DEFAULT_ADMIT_QUANTUM_MB: usize = 256;
+/// Admission-budget quantum: the byte step the setpoint grows by, and the floor
+/// it can never be cut below. 256 MiB is roughly 1300 tokens of unsealed KV on a
+/// 30B-class model — coarse enough that the controller is not chasing individual
+/// turns, fine enough that a card has many notches between the floor and its
+/// ceiling.
+const ADMIT_QUANTUM_MB: u64 = 256;
 
-/// The admission-budget quantum in bytes, overridable at process start via
-/// `CANDLE_ADMIT_QUANTUM_MB` so it can be matched to a card without a rebuild.
-/// Cached on first read; `0`/unparseable falls back to
-/// [`DEFAULT_ADMIT_QUANTUM_MB`].
+/// The admission-budget quantum in bytes.
 pub(super) fn admit_quantum() -> u64 {
-    static Q: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *Q.get_or_init(|| {
-        let mb = std::env::var("CANDLE_ADMIT_QUANTUM_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&mb| mb > 0)
-            .unwrap_or(DEFAULT_ADMIT_QUANTUM_MB);
-        (mb * 1024 * 1024) as u64
-    })
+    ADMIT_QUANTUM_MB * 1024 * 1024
 }
 
 /// Minimum wall-clock between budget cuts driven by a STANDING CONDITION —

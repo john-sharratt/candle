@@ -1,3 +1,5 @@
+mod common;
+
 /// End-to-end session test — no HTTP layer, no CLI.
 ///
 /// Boots a ZendSession directly, submits a turn, and verifies that:
@@ -24,9 +26,10 @@ mod conversation {
 
     use futures::StreamExt;
 
+    use crate::common::{needs_compaction, production_workspace, run_conv_id};
     use zend::config::DaemonConfig;
     use zend::log_broadcast::LogBus;
-    use zend::session::{StreamItem, ZendSession};
+    use zend::session::{timeline_for, StreamItem, ZendSession};
     use zend::types::{ChatMessage, Role};
 
     /// **Thirty minutes, because the work is a daemon boot and not a forward.**
@@ -88,11 +91,14 @@ mod conversation {
 
     async fn run_conversation() {
         let log = LogBus::new();
+        let workspace = production_workspace();
         let config = DaemonConfig {
-            workspace: std::env::current_dir().unwrap(),
+            compact_substrate: needs_compaction(&workspace),
+            workspace,
             port: 0, // not starting HTTP
             ..Default::default()
         };
+        let conv_id = run_conv_id("test-conv");
 
         let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
 
@@ -100,15 +106,15 @@ mod conversation {
         session.start_loading();
 
         // Submit immediately; the stream must carry status events until ready.
-        let messages = vec![ChatMessage {
-            role: Role::User,
-            content: "What is 2 + 2?  Reply with just the number.".to_string(),
-        }];
+        let messages = vec![ChatMessage::new(
+            Role::User,
+            "What is 2 + 2?  Reply with just the number.",
+        )];
         let mut stream = session
             .submit(
                 messages,
                 Some(64),
-                "test-conv".to_string(),
+                conv_id.clone(),
                 None,
                 None,
                 false,
@@ -133,11 +139,17 @@ mod conversation {
                 }
                 StreamItem::Projection(_) => {}
                 StreamItem::Tool(_) => {}
+                StreamItem::Usage(_) => {}
             }
         }
 
         eprintln!("\n\n[FULL RESPONSE]\n{response}");
         eprintln!("[STATUS MESSAGES] {status_msgs:?}");
+        // Retire this run's conversation, so the reused workspace does not keep
+        // one per run; compaction reclaims it.
+        if let Some(Err(e)) = session.tombstone_timeline_raw(timeline_for(&conv_id).raw()) {
+            panic!("tombstoning {conv_id}: {e}");
+        }
 
         assert!(
             !status_msgs.is_empty(),

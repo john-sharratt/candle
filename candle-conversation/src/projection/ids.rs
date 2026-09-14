@@ -79,13 +79,19 @@ pub enum Reserved {
     /// and group so a job's turns never enter a character's projection; the
     /// caller closes the group per conversation, so one job never reads another's.
     Prose,
+    /// OpenAI-passthrough conversations — the client supplies the whole context
+    /// (its own system prompt and history) and the daemon runs it as-is. Their
+    /// own layer/group keep those turns out of every YAML projection; each
+    /// distinct system prompt's frame sections live in a partition of their own
+    /// (see [`super::Builder::for_reserved_corpus`]).
+    Passthrough,
 }
 
 impl Reserved {
     /// Number of reserved kinds — the width of the band at the very top of the
     /// u32 space that is disjoint from the `1..n` ids YAML allocates. Bump this
     /// when adding a `Reserved` variant.
-    pub const COUNT: u32 = 5;
+    pub const COUNT: u32 = 6;
 
     /// Per-kind offset from the top of the u32 range. Slot 0 = `u32::MAX`,
     /// slot 1 = `u32::MAX - 1`, etc.
@@ -96,6 +102,7 @@ impl Reserved {
             Reserved::ToolSummaryRestricted => 2,
             Reserved::Calibration => 3,
             Reserved::Prose => 4,
+            Reserved::Passthrough => 5,
         }
     }
 

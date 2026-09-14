@@ -367,6 +367,12 @@ fn tool_calls_keep_their_penalties_unless_the_schema_asks_otherwise() {
     ))
     .unwrap();
     assert!(asked.schema().free_tool_calls_from_penalties);
+
+    // A programmatic schema asks through the builder — the passthrough's way.
+    let built = Builder::from_yaml(SIMPLE_YAML)
+        .unwrap()
+        .free_tool_calls_from_penalties();
+    assert!(built.schema().free_tool_calls_from_penalties);
 }
 
 #[test]
@@ -4979,6 +4985,136 @@ fn top_k_force_tool_pin_overrides_belief_then_falls_back() {
         vec![framing, tools_intro, tool_b, tool_d, tools_outro],
         "unknown force_tool member must fall through to belief, not blank the collection"
     );
+}
+
+/// A mandatory member is emitted on every belief-driven projection and does NOT
+/// take one of the budget's slots: the top-k is filled from the other members.
+#[test]
+fn a_mandatory_member_adds_to_the_top_k_rather_than_taking_a_slot() {
+    use crate::projection::{ProjectionMode, SelectionState, FORCE_TOOL_SELECTOR};
+    let mut b = Builder::from_yaml(COLLECTION_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let framing = b.id_for_system_section("framing").unwrap();
+    let tools_intro = b.id_for_system_section("tools_intro").unwrap();
+    let tool_a = b.id_for_system_section("tool_a").unwrap();
+    let tool_b = b.id_for_system_section("tool_b").unwrap();
+    let tool_c = b.id_for_system_section("tool_c").unwrap();
+    let tool_d = b.id_for_system_section("tool_d").unwrap();
+    let tools_outro = b.id_for_system_section("tools_outro").unwrap();
+    let tools = b.id_for_system_collection("tools").unwrap();
+    let target = ProjectionTarget {
+        layer: dialogue,
+        group: convo,
+        timeline: TimelineId::for_test(1),
+    };
+    // top_k 2 over these scores alone keeps tool_b and tool_d; tool_c is the
+    // worst-scored member and would never be selected on belief.
+    let resolver = MockResolver::new()
+        .with_section_score(tool_a, 0.3)
+        .with_section_score(tool_b, 0.9)
+        .with_section_score(tool_c, 0.05)
+        .with_section_score(tool_d, 0.8);
+    let project = |b: &Builder, sel: &SelectionState| -> Vec<SectionId> {
+        b.project_with_selection(target, &resolver, ProjectionMode::Decode, sel)
+            .sealed_sections()
+            .map(|s| s.id)
+            .collect()
+    };
+
+    b.set_collection_member_mandatory(tools, tool_c).unwrap();
+    assert_eq!(
+        project(&b, &SelectionState::default()),
+        vec![framing, tools_intro, tool_b, tool_c, tool_d, tools_outro],
+        "the mandatory member is added to the belief top-2, in catalog order"
+    );
+
+    // Making the top scorer mandatory frees its slot: the top-2 is now drawn
+    // from the remaining members, so the next best (tool_a) comes in.
+    b.set_collection_member_mandatory(tools, tool_b).unwrap();
+    assert_eq!(
+        project(&b, &SelectionState::default()),
+        vec![
+            framing,
+            tools_intro,
+            tool_a,
+            tool_b,
+            tool_c,
+            tool_d,
+            tools_outro
+        ],
+        "mandatory members never count against the budget"
+    );
+
+    // A force pin still emits exactly the members it names.
+    let mut pin = SelectionState::new();
+    pin.select(FORCE_TOOL_SELECTOR, "tool_a");
+    assert_eq!(
+        project(&b, &pin),
+        vec![framing, tools_intro, tool_a, tools_outro],
+        "a force pin overrides mandatory members like it overrides belief"
+    );
+}
+
+/// A filter that drops a mandatory member drops it outright — the mandatory
+/// flag never resurrects a tool the tools mode excluded.
+#[test]
+fn a_retained_filter_drops_a_mandatory_member() {
+    use crate::projection::{ProjectionMode, SelectionState};
+    let mut b = Builder::from_yaml(COLLECTION_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let tool_a = b.id_for_system_section("tool_a").unwrap();
+    let tool_b = b.id_for_system_section("tool_b").unwrap();
+    let tool_c = b.id_for_system_section("tool_c").unwrap();
+    let tool_d = b.id_for_system_section("tool_d").unwrap();
+    let tools = b.id_for_system_collection("tools").unwrap();
+    let target = ProjectionTarget {
+        layer: dialogue,
+        group: convo,
+        timeline: TimelineId::for_test(1),
+    };
+    let resolver = MockResolver::new()
+        .with_section_score(tool_a, 0.3)
+        .with_section_score(tool_b, 0.9)
+        .with_section_score(tool_c, 0.05)
+        .with_section_score(tool_d, 0.8);
+    b.set_collection_member_mandatory(tools, tool_c).unwrap();
+    let keep: std::collections::HashSet<String> = ["tool_a", "tool_b", "tool_d"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    b.retain_collection_sections("tools", &keep).unwrap();
+    let ids: Vec<SectionId> = b
+        .project_with_selection(
+            target,
+            &resolver,
+            ProjectionMode::Decode,
+            &SelectionState::default(),
+        )
+        .sealed_sections()
+        .map(|s| s.id)
+        .collect();
+    assert!(
+        !ids.contains(&tool_c),
+        "a filtered-out mandatory member stays out"
+    );
+    assert!(
+        ids.contains(&tool_b) && ids.contains(&tool_d),
+        "belief top-2 unchanged"
+    );
+}
+
+#[test]
+fn mandatory_rejects_a_section_outside_the_collection() {
+    use crate::projection::ConstructionError;
+    let mut b = Builder::from_yaml(COLLECTION_YAML).unwrap();
+    let tools = b.id_for_system_collection("tools").unwrap();
+    let framing = b.id_for_system_section("framing").unwrap();
+    assert!(matches!(
+        b.set_collection_member_mandatory(tools, framing),
+        Err(ConstructionError::MandatoryMember(_))
+    ));
 }
 
 #[test]

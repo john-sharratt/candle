@@ -18,9 +18,7 @@
 //! model.
 
 use candle_conversation::stencil::TriggerRegistry;
-use candle_conversation::Sequence;
-use futures::executor::block_on;
-use futures::future::join_all;
+use candle_conversation::{Sequence, TurnText};
 use std::sync::Arc;
 
 /// Per-scope progress callback, invoked with a scope's ingested token count as it
@@ -46,7 +44,7 @@ pub trait InsertTurnSink {
     /// the staged projection events the production sink records for it.
     fn insert_prefill_turn(
         &mut self,
-        user: &str,
+        user: &TurnText,
         assistant: &str,
         tags: Vec<String>,
     ) -> anyhow::Result<usize>;
@@ -63,8 +61,8 @@ pub trait InsertTurnSink {
     /// final assistant half — no engine to decode it.
     fn ingest_chain(
         &mut self,
-        prefilled: &[(String, String)],
-        decode_user: &str,
+        prefilled: &[(TurnText, String)],
+        decode_user: &TurnText,
         tags: Vec<String>,
         _max_summary_tokens: usize,
         _force_tools: &[String],
@@ -92,11 +90,12 @@ pub trait InsertTurnSink {
         &mut self,
         call_user: &str,
         call_assistant: &str,
-        response_user: &str,
+        response_user: &TurnText,
         tags: Vec<String>,
         _max_summary_tokens: usize,
     ) -> anyhow::Result<usize> {
-        let a = self.insert_prefill_turn(call_user, call_assistant, tags.clone())?;
+        let a =
+            self.insert_prefill_turn(&TurnText::from(call_user), call_assistant, tags.clone())?;
         let b = self.insert_prefill_turn(response_user, "", tags)?;
         Ok(a + b)
     }
@@ -113,7 +112,7 @@ pub trait InsertTurnSink {
     /// and splice the sealed pairs back onto the file timeline in order.
     fn ingest_scopes(
         &mut self,
-        prepared: Vec<(String, String, String)>,
+        prepared: Vec<(String, String, TurnText)>,
         tags: Vec<String>,
         max_summary_tokens: usize,
         on_prefilled: &crate::turn_sink::ScopeProgressFn,
@@ -155,8 +154,8 @@ impl<'a> SequenceTurnSink<'a> {
 impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
     fn ingest_chain(
         &mut self,
-        prefilled: &[(String, String)],
-        decode_user: &str,
+        prefilled: &[(TurnText, String)],
+        decode_user: &TurnText,
         tags: Vec<String>,
         max_summary_tokens: usize,
         force_tools: &[String],
@@ -164,7 +163,7 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
         self.inner
             .ingest_roundtrip_chain(
                 prefilled,
-                decode_user,
+                decode_user.clone(),
                 tags,
                 max_summary_tokens,
                 force_tools,
@@ -175,20 +174,20 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
 
     fn insert_prefill_turn(
         &mut self,
-        user: &str,
+        user: &TurnText,
         assistant: &str,
         tags: Vec<String>,
     ) -> anyhow::Result<usize> {
         let start = std::time::Instant::now();
         tracing::debug!(
             target: "zend::turn_sink",
-            user_bytes = user.len(),
+            user_bytes = user.text().len(),
             assistant_bytes = assistant.len(),
             "insert_prefill_turn: calling Sequence::insert_turn_staged",
         );
         let result = self
             .inner
-            .insert_turn_staged(user, assistant, tags)
+            .insert_turn_staged(user.clone(), assistant, tags)
             .map_err(|e| anyhow::anyhow!("insert_turn_staged: {e}"));
         tracing::debug!(
             target: "zend::turn_sink",
@@ -203,7 +202,7 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
         &mut self,
         call_user: &str,
         call_assistant: &str,
-        response_user: &str,
+        response_user: &TurnText,
         tags: Vec<String>,
         max_summary_tokens: usize,
     ) -> anyhow::Result<usize> {
@@ -211,7 +210,7 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
             .ingest_scope_roundtrip(
                 call_user,
                 call_assistant,
-                response_user,
+                response_user.clone(),
                 tags,
                 max_summary_tokens,
                 Arc::clone(&self.triggers),
@@ -227,7 +226,7 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
     /// window in which a fork's K/V must stay HOT for the splice — stays bounded.
     fn ingest_scopes(
         &mut self,
-        prepared: Vec<(String, String, String)>,
+        prepared: Vec<(String, String, TurnText)>,
         tags: Vec<String>,
         max_summary_tokens: usize,
         on_prefilled: &crate::turn_sink::ScopeProgressFn,
@@ -254,27 +253,33 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
                         .map_err(|e| anyhow::anyhow!("fork_scope: {e}"))?,
                 );
             }
-            // Run each fork's two-turn round-trip concurrently — one await per
-            // fork, all driven on this worker thread; the scheduler co-batches
-            // their prefills + summary decodes on the shared wave exactly as
-            // it did when each fork held a thread. `block_on` because this IS
-            // a blocking worker (the file pool's), and the round-trip futures
-            // wake on the engine's own channels — no timer, no I/O driver.
+            // Run each fork's two-turn round-trip concurrently; the scheduler
+            // co-batches their prefills + summary decodes on the shared wave.
             let results: Vec<candle_conversation::Result<(u32, u32, usize)>> =
-                block_on(join_all(forks.iter_mut().zip(chunk.iter()).map(
-                    |(fork, (call_user, call_assistant, response_user))| {
-                        let tags = tags.clone();
-                        let triggers = Arc::clone(&triggers);
-                        fork.ingest_scope_roundtrip_indices_async(
-                            call_user,
-                            call_assistant,
-                            response_user,
-                            tags,
-                            max_summary_tokens,
-                            triggers,
-                        )
-                    },
-                )));
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = forks
+                        .iter_mut()
+                        .zip(chunk.iter())
+                        .map(|(fork, (call_user, call_assistant, response_user))| {
+                            let tags = tags.clone();
+                            let triggers = Arc::clone(&triggers);
+                            s.spawn(move || {
+                                fork.ingest_scope_roundtrip_indices(
+                                    call_user,
+                                    call_assistant,
+                                    response_user.clone(),
+                                    tags,
+                                    max_summary_tokens,
+                                    triggers,
+                                )
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("scope ingest thread panicked"))
+                        .collect()
+                });
             // Splice the sealed pairs onto the file timeline in scope order. On the
             // first failure (a scope round-trip that errored, or a splice that
             // failed) STOP and tombstone every fork from that point on. The forks
@@ -348,15 +353,16 @@ impl RecordingTurnSink {
 impl InsertTurnSink for RecordingTurnSink {
     fn insert_prefill_turn(
         &mut self,
-        user: &str,
+        user: &TurnText,
         assistant: &str,
         tags: Vec<String>,
     ) -> anyhow::Result<usize> {
-        self.turns
-            .push((user.to_string(), assistant.to_string(), tags));
+        let user = user.text();
         // No tokenizer in the recording sink — approximate the prefilled token
         // count by whitespace words so callers that surface a stat see a
         // plausible non-zero value in model-less tests.
-        Ok(user.split_whitespace().count() + assistant.split_whitespace().count())
+        let words = user.split_whitespace().count() + assistant.split_whitespace().count();
+        self.turns.push((user, assistant.to_string(), tags));
+        Ok(words)
     }
 }

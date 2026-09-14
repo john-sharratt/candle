@@ -586,7 +586,7 @@ impl PriorBelief {
     fn collection(
         &self,
         name: &str,
-        sections: &[SectionSchema],
+        sections: &[&SectionSchema],
     ) -> (Vec<f32>, Vec<bool>, Vec<bool>) {
         let map = self.beliefs.get(&GroupKey::Collection(name.to_string()));
         let mut scores = vec![0.0f32; sections.len()];
@@ -2428,13 +2428,21 @@ fn select_collection_sections<R: ContentResolver>(
             // hysteresis) decides the surviving set from the per-section scores,
             // seeded from the prior projection's belief so decay/reinforcement
             // carries across a turn. Each member's belief is recorded on `scores`.
-            let fresh: Vec<f32> = coll
+            // Mandatory members are emitted on every projection and sit OUTSIDE
+            // the belief budget: the policy picks its top-k from the other
+            // members only, so a mandatory `file_read` adds to the selection
+            // rather than taking one of its slots.
+            let candidates: Vec<&SectionSchema> = coll
                 .sections
+                .iter()
+                .filter(|s| !coll.mandatory.contains(&s.id))
+                .collect();
+            let fresh: Vec<f32> = candidates
                 .iter()
                 .map(|s| resolver.section_score(s.id))
                 .collect();
             let (prior_scores, prior_selected, prior_qualified) =
-                prior.collection(&coll.name, &coll.sections);
+                prior.collection(&coll.name, &candidates);
             // Early-decode grace: within the opening window the selection band is
             // lowered and carried picks are floored (see `PolicyConfig::windowed`),
             // so the submit guess and a still-accruing correct tool stay in scope.
@@ -2457,8 +2465,7 @@ fn select_collection_sections<R: ContentResolver>(
                 floor,
             );
             if tracing::enabled!(tracing::Level::TRACE) {
-                let scores_str = coll
-                    .sections
+                let scores_str = candidates
                     .iter()
                     .zip(&beliefs)
                     .map(|(s, b)| {
@@ -2473,10 +2480,25 @@ fn select_collection_sections<R: ContentResolver>(
                     .join(", ");
                 tracing::trace!(collection = %coll.name, scores = %scores_str, "belief selection");
             }
+            // Emit in catalog order: a mandatory member always, the rest as the
+            // belief selected them. A mandatory member's score is recorded for
+            // the event view, qualified by the same bar as everyone else.
+            let min_score = cfg.section_policy(0).min_score;
+            let mut beliefs = beliefs.into_iter();
             let mut out = Vec::new();
-            for (s, b) in coll.sections.iter().zip(&beliefs) {
-                scores.set_section(s.id, b.score, b.qualified);
-                if b.selected {
+            for s in &coll.sections {
+                let emit = if coll.mandatory.contains(&s.id) {
+                    let score = resolver.section_score(s.id);
+                    scores.set_section(s.id, score, score >= min_score);
+                    true
+                } else {
+                    let b = beliefs
+                        .next()
+                        .expect("one belief per non-mandatory member, in catalog order");
+                    scores.set_section(s.id, b.score, b.qualified);
+                    b.selected
+                };
+                if emit {
                     push_member_glue(&mut out, coll);
                     push_section_segment(&mut out, s);
                 }

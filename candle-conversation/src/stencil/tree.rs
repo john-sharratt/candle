@@ -147,7 +147,8 @@ impl FreeTextLimits {
 pub struct StencilTree {
     nodes: Vec<StencilNode>,
     root: NodeId,
-    eos: TokenId,
+    /// Every token that ends a turn, the canonical one first.
+    ends: Vec<TokenId>,
     fingerprint: u64,
     label: String,
     /// Tokens emitted to gracefully terminate the invocation if an
@@ -160,7 +161,7 @@ impl StencilTree {
     pub(crate) fn new(
         nodes: Vec<StencilNode>,
         root: NodeId,
-        eos: TokenId,
+        ends: Vec<TokenId>,
         fingerprint: u64,
         label: String,
         bail: Vec<TokenId>,
@@ -168,7 +169,7 @@ impl StencilTree {
         StencilTree {
             nodes,
             root,
-            eos,
+            ends,
             fingerprint,
             label,
             bail,
@@ -178,8 +179,14 @@ impl StencilTree {
     pub fn root(&self) -> NodeId {
         self.root
     }
+    /// The canonical end-of-turn id — the one the tree itself writes.
     pub fn eos(&self) -> TokenId {
-        self.eos
+        self.ends.first().copied().unwrap_or(0)
+    }
+    /// Whether `token` ends a turn. Any of the model's end tokens counts: the
+    /// decode loop seals on every one, so the session must intercept every one.
+    pub fn is_end(&self, token: TokenId) -> bool {
+        self.ends.contains(&token)
     }
     /// The graceful-termination token sequence (the bail set).
     pub fn bail(&self) -> &[TokenId] {

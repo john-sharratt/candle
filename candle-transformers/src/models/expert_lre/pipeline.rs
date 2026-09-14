@@ -2772,6 +2772,19 @@ impl PipelineState {
     /// It costs a full drain, and it is paid **only when the boundary actually
     /// moves** — a rare event at end of pass, against a retraction that already
     /// relocates or drops thousands of slots.
+    /// Make the device's CUDA context current on the calling thread — the
+    /// pipeline thread, at start (see `spawn_pipeline_thread`).
+    #[cfg(feature = "cuda")]
+    fn bind_device_to_thread(&self) -> Result<()> {
+        let Device::Cuda(cd) = &self.device else {
+            return Ok(());
+        };
+        cd.cuda_stream()
+            .context()
+            .bind_to_thread()
+            .map_err(candle::Error::wrap)
+    }
+
     #[cfg(feature = "cuda")]
     fn quiesce_before_handover(&self) -> Result<()> {
         let Device::Cuda(cd) = &self.device else {
@@ -3224,21 +3237,20 @@ pub(crate) fn spawn_pipeline_thread(
         .name("expert-pipeline".into())
         .spawn(move || {
             let _dead_on_exit = DeadFlagGuard(dead_flag);
-            // **A CUDA context is current per thread.** This thread does its
-            // own uploads — `compute_experts_grouped` stages routing indices
-            // with `memcpy_stod_from` — and a context bound on the thread that
-            // built the device is not bound here, so every one of them failed
-            // `CUDA_ERROR_INVALID_CONTEXT`. Only a card that streams experts
-            // reaches this path at all; one that holds them resident never
-            // does, which is how it stayed hidden. Bound once, for the thread's
-            // life. Failing to bind leaves nothing this thread can do, so it
-            // exits and the dead flag stops the dispatch relying on it.
+            // This thread issues raw CUDA calls (the grouped compute's
+            // host→device index copies among them) that need the device's
+            // context current on it, so it is bound once, here, before the
+            // first message — no request may depend on an earlier one of a
+            // different kind having bound it. A thread that cannot bind cannot
+            // serve anything, and every request it would take then fails with
+            // `CUDA_ERROR_INVALID_CONTEXT` naming a victim, not the cause.
             #[cfg(feature = "cuda")]
-            if let Device::Cuda(cd) = &state.device {
-                if let Err(e) = cd.cuda_stream().context().bind_to_thread() {
-                    tracing::error!("expert-pipeline: could not bind the CUDA context: {e}");
-                    return;
-                }
+            if let Err(e) = state.bind_device_to_thread() {
+                tracing::error!(
+                    target: "candle_transformers::expert_lre",
+                    "expert pipeline: could not bind the CUDA context to its thread: {e}"
+                );
+                return;
             }
             while let Ok(msg) = rx.recv() {
                 match msg {

@@ -8,8 +8,8 @@ use crate::persistence::record::DistillMode;
 use crate::persistence::thread::PersistenceThread;
 use crate::persistence::SharedSubstrate;
 use crate::projection::{
-    Builder, Conversation, GroupId, LayerId, PlainPromptFrames, ProjectionTarget, Reserved,
-    SectionId, TimelineId, TurnIndex,
+    Builder, CollectionWarm, Conversation, GroupId, LayerId, PlainPromptFrames, ProjectionTarget,
+    Reserved, Schema, SectionId, TimelineId, TurnIndex,
 };
 use crate::scheduler::{Scheduler, SchedulerRequest};
 use crate::sequence_handle::SequenceId;
@@ -22,6 +22,7 @@ use crate::stencil::{
 use crate::substrate::ConvCompression;
 use crate::summary_tree::{SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
+use crate::turn_text::literal_tokenizer;
 
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
@@ -32,8 +33,8 @@ use std::thread::JoinHandle;
 
 /// The compiled thinking-block steering trees, one per effort dial, built once
 /// at engine init (parallel to the tool-call registry).  Each turn derives its
-/// trigger registry by replacing the `<think>` trigger with the dial's tree —
-/// atomic and idempotent via [`TriggerRegistry::with_trigger`].
+/// trigger registry by binding the `<think>` trigger to the dial's tree, once —
+/// see [`TriggerRegistry::with_once_trigger`].
 pub struct ThinkSteering {
     /// `<think>` id — the trigger the dial's tree is bound to.
     think_open: TokenId,
@@ -66,6 +67,11 @@ impl ThinkSteering {
     /// that passes `TurnOptions::default()` gets an empty one and no steering at
     /// all — which is how the ingest summariser came to reason unchecked despite
     /// its dial reading `Off`. See `Sequence::no_think_triggers`.
+    ///
+    /// **The tree fires once per turn.** It steers the block that opens the
+    /// turn; a `<think>` the model writes after that is text and decodes freely
+    /// (see [`TriggerRegistry::with_once_trigger`]). The base's triggers — the
+    /// tool call — stay armed for every call the turn makes.
     pub fn registry_for(&self, base: &TriggerRegistry, mode: ThinkMode) -> Arc<TriggerRegistry> {
         let tree = match mode {
             ThinkMode::Off => &self.off,
@@ -74,7 +80,65 @@ impl ThinkSteering {
             ThinkMode::Deep => &self.deep,
             ThinkMode::Exhaustive => &self.exhaustive,
         };
-        Arc::new(base.with_trigger(self.think_open, Arc::clone(tree)))
+        Arc::new(base.with_once_trigger(self.think_open, Arc::clone(tree)))
+    }
+}
+
+#[cfg(test)]
+mod think_steering_tests {
+    use super::*;
+    use crate::stencil::{TestVocab, Vocab};
+
+    const THINK: TokenId = 151667;
+    const THINK_CLOSE: TokenId = 151668;
+    const TOOL_CALL: TokenId = 151657;
+
+    fn steering() -> ThinkSteering {
+        let v = TestVocab::new()
+            .with_special("<think>", THINK)
+            .with_special("</think>", THINK_CLOSE);
+        let env = ThinkSteerEnvelope {
+            think_open: THINK,
+            think_close: THINK_CLOSE,
+            eos: v.eos(),
+            after_close: "",
+        };
+        let tree =
+            |mode| Arc::new(compile(&compile_think_tree(mode, &env), &v).expect("think tree"));
+        ThinkSteering {
+            think_open: THINK,
+            off: tree(ThinkMode::Off),
+            quick: tree(ThinkMode::Quick),
+            balanced: tree(ThinkMode::Balanced),
+            deep: tree(ThinkMode::Deep),
+            exhaustive: tree(ThinkMode::Exhaustive),
+        }
+    }
+
+    /// The turn's think block is steered once; after it, `<think>` is text and
+    /// the tool-call trigger is still armed.
+    #[test]
+    fn the_think_block_fires_once_and_the_call_trigger_stays() {
+        let s = steering();
+        let tools = TriggerRegistry::new().with_trigger(TOOL_CALL, Arc::clone(&s.off));
+        for mode in [ThinkMode::Off, ThinkMode::Balanced, ThinkMode::Exhaustive] {
+            let turn = s.registry_for(&tools, mode);
+            assert!(
+                turn.driver_for(THINK).is_some(),
+                "{mode:?}: the opening block"
+            );
+            let rest = turn
+                .after_firing(THINK)
+                .unwrap_or_else(|| panic!("{mode:?}: the think trigger was not spent"));
+            assert!(
+                rest.driver_for(THINK).is_none(),
+                "{mode:?}: a later <think> is text"
+            );
+            assert!(
+                rest.driver_for(TOOL_CALL).is_some(),
+                "{mode:?}: calls stay armed"
+            );
+        }
     }
 }
 
@@ -160,6 +224,10 @@ pub struct ConversationEngine {
     /// The frame sections handed out to plain-prompt conversations, and the
     /// claim on each — see [`Self::plain_prompt_section`].
     plain_frames: Mutex<PlainPromptFrames>,
+    /// [`Self::tokenizer`] reading every chat tag as plain characters, for the
+    /// literal pieces of a turn — see [`crate::turn_text`]. Built once here: it
+    /// is a copy of the whole vocabulary.
+    literal_tokenizer: Arc<tokenizers::Tokenizer>,
 
     /// Engine-wide configuration.
     #[allow(dead_code)]
@@ -491,6 +559,7 @@ impl ConversationEngine {
         Ok(Self {
             scheduler_tx: tx,
             scheduler_handle: Mutex::new(Some(handle)),
+            literal_tokenizer: Arc::new(literal_tokenizer(&tokenizer)),
             tokenizer: Arc::new(tokenizer),
             plain_frames: Mutex::new(PlainPromptFrames::default()),
             config,
@@ -750,7 +819,7 @@ impl ConversationEngine {
     /// AFTER an ingest pass / reconcile finishes (never concurrently — it would
     /// starve the ingest writer). See
     /// [`crate::projection::Conversation::warm_ingest_normalization`].
-    pub fn warm_ingest_normalization(&self, schema: &crate::projection::Schema) {
+    pub fn warm_ingest_normalization(&self, schema: &Schema) {
         self.conversation.warm_ingest_normalization(schema);
     }
 
@@ -783,10 +852,23 @@ impl ConversationEngine {
     /// their own tag-scoped corpus. Call after load, once the corpus is stable —
     /// without it a collection's levels are cold on every process start but the
     /// one that built the corpus, which changes both the scale and the RANKING of
-    /// its scores. See
-    /// [`crate::projection::Conversation::warm_collection_normalization`].
-    pub fn warm_collection_normalization(&self, schema: &crate::projection::Schema) {
-        self.conversation.warm_collection_normalization(schema);
+    /// its scores. Runs on the scheduler thread, where the GPU gallery arena
+    /// scores the corpus in batch, and blocks until it is done. See
+    /// [`Conversation::warm_collection_normalization`].
+    pub fn warm_collection_normalization(&self, schema: &Schema) -> CollectionWarm {
+        let (tx, rx) = flume::bounded(1);
+        if self
+            .scheduler_tx
+            .send(SchedulerRequest::WarmCollectionNormalization {
+                conversation: self.conversation.clone(),
+                schema: Box::new(schema.clone()),
+                response_tx: tx,
+            })
+            .is_err()
+        {
+            return CollectionWarm::default();
+        }
+        rx.recv().unwrap_or_default()
     }
 
     /// Merge a `(key, value)` into `timeline`'s free-form `custom`
@@ -1237,10 +1319,9 @@ impl ConversationEngine {
     /// loop rather than the single-call assistant shape
     /// [`Self::compile_tool_stencil`] builds.
     pub fn compile_stencil(&self, spec: &crate::stencil::TreeSpec) -> crate::Result<StencilTree> {
-        let eos = self.config.eos_tokens.iter().next().copied().unwrap_or(0);
         let vocab = HfVocab::new(
             (*self.tokenizer).clone(),
-            eos,
+            &self.config.eos_tokens,
             self.config.vocab_size as u64,
         );
         compile(spec, &vocab)
@@ -1277,10 +1358,9 @@ impl ConversationEngine {
         let spec = compile_tool_call_tree(tools, &envelope).map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
         })?;
-        let eos = self.config.eos_tokens.iter().next().copied().unwrap_or(0);
         let vocab = HfVocab::new(
             (*self.tokenizer).clone(),
-            eos,
+            &self.config.eos_tokens,
             self.config.vocab_size as u64,
         );
         let tree = compile(&spec, &vocab).map_err(|e| {
@@ -1330,9 +1410,11 @@ impl ConversationEngine {
             // to the decoder the moment the block closes.
             after_close: "",
         };
+        // Every end token, so a think span intercepts whichever one the model
+        // samples — the canonical `eos` above is only what the tree writes.
         let vocab = HfVocab::new(
             (*self.tokenizer).clone(),
-            eos,
+            &self.config.eos_tokens,
             self.config.vocab_size as u64,
         );
         let compile_mode = |mode: ThinkMode| -> crate::Result<Arc<StencilTree>> {
@@ -1650,6 +1732,7 @@ impl ConversationEngine {
             self.scheduler_tx.clone(),
             sequence_id,
             Arc::clone(&self.tokenizer),
+            Arc::clone(&self.literal_tokenizer),
             system_prompt,
             builder,
             target,
@@ -1806,6 +1889,7 @@ impl ConversationEngine {
                     self.scheduler_tx.clone(),
                     sequence_id,
                     Arc::clone(&self.tokenizer),
+                    Arc::clone(&self.literal_tokenizer),
                     system_prompt,
                     builder.clone(),
                     f.target,

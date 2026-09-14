@@ -45,24 +45,27 @@
 //! workspace also calibrates the tool catalog once, ~35 s.
 //!
 //! A scenario the 0.8B answers wrongly runs on the production model against
-//! the live repo workspace, whose substrate carries that model's calibration,
-//! and is `#[ignore]`d. Run those by name, daemon stopped:
+//! the shared production workspace under `target/tmp`
+//! (`common::production_workspace`), where that model's catalog calibration is
+//! paid once, and is `#[ignore]`d. Run those by name, daemon stopped:
 //!
 //! ```text
 //! cargo test -p zend --test tools_integration --features cuda -- --ignored --nocapture
 //! ```
 
+mod common;
+
 #[cfg(feature = "cuda")]
 mod tool_scenarios {
-    use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex, OnceLock};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use futures::StreamExt;
 
+    use crate::common::{needs_compaction, production_workspace, run_conv_id};
     use candle::vram::host_pinned_bytes;
     use candle_conversation::models::Model;
-    use candle_conversation::persistence::SUBSTRATE_DIR;
     use candle_conversation::{SamplingConfig, SelectionState};
     use zend::api::chat::dial_selection;
     use zend::config::{DaemonConfig, ModelChoice};
@@ -100,32 +103,6 @@ mod tool_scenarios {
         ws
     }
 
-    /// Past this size the suite's workspace is compacted on its next boot.
-    ///
-    /// Every boot re-seals the whole tool catalog into the redo log. The section
-    /// streams are content-addressed, so each boot's records supersede the last
-    /// boot's rather than adding live data — but a scenario's daemon lives far
-    /// too briefly for background maintenance to reclaim them, and left alone
-    /// the log grew ~140 MB a boot (4.83 GB before its first compaction). A
-    /// forced compaction on load sheds the dead records.
-    ///
-    /// The live store — mostly the calibration corpus — is ~1.2 GB, so the
-    /// bound sits above it. Below it every boot pays a ~2 s rewrite that
-    /// reclaims nothing (measured at 256 MiB: 1.7–2.2 s a boot, size unchanged).
-    const COMPACT_ABOVE_BYTES: u64 = 2 << 30;
-
-    /// Bytes the workspace's redo log occupies on disk.
-    fn substrate_bytes(ws: &Path) -> u64 {
-        std::fs::read_dir(ws.join(SUBSTRATE_DIR))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|e| e.metadata().ok())
-            .filter(|m| m.is_file())
-            .map(|m| m.len())
-            .sum()
-    }
-
     fn init_tracing() {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
@@ -148,9 +125,9 @@ mod tool_scenarios {
         /// would measure how long it deliberates rather than whether the
         /// orchestration routes. Every scenario the 0.8B answers runs here.
         Small,
-        /// The production model — the measured-VRAM ladder — on the live repo
-        /// workspace, whose substrate carries that model's calibration, with the
-        /// schema's default thinking. For a scenario the 0.8B answers wrongly;
+        /// The production model — the measured-VRAM ladder — on the shared
+        /// production workspace, where that model's calibration is paid once,
+        /// with the schema's default thinking. For a scenario the 0.8B answers wrongly;
         /// `#[ignore]`d wherever it is used, since it pays the production boot.
         Production,
     }
@@ -163,37 +140,21 @@ mod tool_scenarios {
     /// Boot a ZendSession on `rig`, wait for ready, send `prompt`, shut the
     /// session down, and return the concatenated assistant text.
     async fn run_on(rig: Rig, prompt: &str, conv_id: &str) -> String {
-        // A conversation of this run's own. The workspace persists across runs,
-        // so a fixed id would resume every earlier run's conversation — its
-        // history and its recurrent memory — and the scenario would no longer be
-        // the one prompt it names.
-        static RUN: OnceLock<u128> = OnceLock::new();
-        let run = *RUN.get_or_init(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("the clock is past the epoch")
-                .as_nanos()
-        });
-        let conv_id = format!("{conv_id}-{run}");
-        let (workspace, model, selection, compact_substrate) = match rig {
-            Rig::Small => {
-                let ws = workspace();
-                let compact = substrate_bytes(&ws) > COMPACT_ABOVE_BYTES;
-                (
-                    ws,
-                    ModelChoice::Preset(Box::new(MODEL)),
-                    dial_selection(None, None, Some(false)),
-                    compact,
-                )
-            }
-            // Never compacted from here: this is the live repo's substrate.
+        // A conversation of this run's own — both workspaces persist across runs.
+        let conv_id = run_conv_id(conv_id);
+        let (workspace, model, selection) = match rig {
+            Rig::Small => (
+                workspace(),
+                ModelChoice::Preset(Box::new(MODEL)),
+                dial_selection(None, None, Some(false)),
+            ),
             Rig::Production => (
-                std::env::current_dir().unwrap(),
+                production_workspace(),
                 ModelChoice::MeasuredVram,
                 SelectionState::default(),
-                false,
             ),
         };
+        let compact_substrate = needs_compaction(&workspace);
         let log = LogBus::new();
         let config = DaemonConfig {
             workspace,
@@ -205,10 +166,7 @@ mod tool_scenarios {
         let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
         session.start_loading();
 
-        let messages = vec![ChatMessage {
-            role: Role::User,
-            content: prompt.to_string(),
-        }];
+        let messages = vec![ChatMessage::new(Role::User, prompt)];
         // Argmax, so a scenario is one fixed decode of its prompt. Left to the
         // daemon, sampling is reseeded from the clock every turn and the same
         // prompt passes or fails from one run to the next.
@@ -245,6 +203,7 @@ mod tool_scenarios {
                 StreamItem::Tool(status) => {
                     eprintln!("\n[TOOL {}] {:?}", status.phase, status.tools);
                 }
+                StreamItem::Usage(_) => {}
             }
         }
         eprintln!("\n\n[FINAL RESPONSE]\n{response}");

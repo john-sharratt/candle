@@ -408,6 +408,16 @@ impl Builder {
         &self.schema
     }
 
+    /// Lift every repetition penalty while a tool call is emitted — see
+    /// [`Schema::free_tool_calls_from_penalties`]. For a conversation whose
+    /// tool arguments are quotations: a path written twice in one call is only
+    /// correct if it repeats.
+    #[must_use]
+    pub fn free_tool_calls_from_penalties(mut self) -> Self {
+        self.schema.free_tool_calls_from_penalties = true;
+        self
+    }
+
     /// Look up a layer by id. Returns `None` only if the id was issued by
     /// a different builder.
     pub fn layer(&self, id: LayerId) -> Option<&LayerSchema> {
@@ -628,6 +638,10 @@ impl Builder {
             Some(CollLoc::TopLevel(ii)) => {
                 if let SystemPromptItem::Collection(coll) = &mut items[ii] {
                     coll.sections.retain(|s| keep.contains(&s.name));
+                    // A member dropped here is dropped even if mandatory: the
+                    // caller's filter (a tools mode) decides what may project.
+                    let kept: Vec<SectionId> = coll.sections.iter().map(|s| s.id).collect();
+                    coll.mandatory.retain(|id| kept.contains(id));
                 }
                 Ok(())
             }
@@ -765,6 +779,7 @@ impl Builder {
                 member_glue_tokens: None,
                 default: None,
                 budget_adaptive: None,
+                mandatory: Vec::new(),
             }));
         self.name_maps
             .collection_names
@@ -900,6 +915,44 @@ impl Builder {
                 }
                 Ok(())
             }
+            None => Err(ConstructionError::UnknownCollection(format!(
+                "CollectionId({collection:?})"
+            ))),
+        }
+    }
+
+    /// Mark `section` a mandatory member of the top-level `collection`: it is
+    /// emitted on every belief-driven projection, outside the policy's member
+    /// budget (see [`SectionCollection::mandatory`]). Errors when the collection
+    /// is unknown, when it is embedded in a section tree (those select by
+    /// provenance top-k, which has no budget to sit outside), or when it does
+    /// not hold `section`.
+    pub fn set_collection_member_mandatory(
+        &mut self,
+        collection: CollectionId,
+        section: SectionId,
+    ) -> Result<(), ConstructionError> {
+        let items = &mut self.schema.system_prompt.items;
+        match locate_collection(items, |c| c.id == collection) {
+            Some(CollLoc::TopLevel(ii)) => {
+                let SystemPromptItem::Collection(coll) = &mut items[ii] else {
+                    unreachable!("located a top-level collection")
+                };
+                if !coll.sections.iter().any(|s| s.id == section) {
+                    return Err(ConstructionError::MandatoryMember(format!(
+                        "{section:?} is not a member of collection {:?}",
+                        coll.name
+                    )));
+                }
+                if !coll.mandatory.contains(&section) {
+                    coll.mandatory.push(section);
+                }
+                Ok(())
+            }
+            Some(CollLoc::Tree { .. }) => Err(ConstructionError::MandatoryMember(format!(
+                "CollectionId({collection:?}) is embedded in a section tree, which selects \
+                 by provenance top-k and has no member budget to sit outside"
+            ))),
             None => Err(ConstructionError::UnknownCollection(format!(
                 "CollectionId({collection:?})"
             ))),
@@ -1178,8 +1231,9 @@ impl Builder {
         // decoded, so it has no prompt to frame.
         let summary_a_id = SectionId::new(section_id.raw() + 1);
         let schema = Schema {
-            // A single-section plain-prompt schema emits no tool calls, so the
-            // exemption has nothing to apply to either way.
+            // Off, like every schema that does not ask; a caller whose tool
+            // arguments are quotations asks with
+            // [`Builder::free_tool_calls_from_penalties`].
             free_tool_calls_from_penalties: false,
             system_prompt: SystemPromptSchema {
                 items: vec![SystemPromptItem::Section(SectionSchema {

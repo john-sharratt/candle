@@ -21,6 +21,7 @@ mod common;
 
 use candle::Device;
 use candle_conversation::models::Model;
+use candle_conversation::projection::SectionLoads;
 use common::{say, Workspace};
 
 const MODEL: Model = Model::Qwen35_0_8B_Q8;
@@ -155,5 +156,48 @@ fn a_held_shut_down_engine_costs_its_successor_no_turns() {
         "with a shut-down engine still held on the workspace, its successor's restart \
          recovered {recovered} of {sealed_turns} sealed turn(s); the snapshot is for \
          turn {snapshot_turn}"
+    );
+}
+
+/// **A restart restores every prompt section from the log instead of
+/// prefilling it again.**
+///
+/// Sections are content-addressed in the redo log, so an unchanged prompt has
+/// nothing left to compute on the next boot. On the hybrid lineage every
+/// restore used to be refused: the triage checked the persisted chunk grid
+/// against the model's transformer depth, while the grid holds one chunk list
+/// per KV backing — the attention layers only — so every boot prefilled the
+/// whole system prompt again, one section per forward.
+#[test]
+fn a_restart_restores_every_section_instead_of_prefilling_it() {
+    let device = Device::new_cuda(0).expect("cuda");
+    let ws = Workspace::for_model(MODEL);
+
+    let first = {
+        let (engine, _conv) = ws.open(&device);
+        let loads = engine.conversation().section_loads();
+        engine.shutdown().expect("clean shutdown");
+        loads
+    };
+    assert_eq!(
+        first.restored, 0,
+        "a fresh workspace has nothing to restore"
+    );
+    assert!(
+        first.prefilled > 0,
+        "the first open prefills the system prompt"
+    );
+
+    let (engine, _conv) = ws.open(&device);
+    let reopened = engine.conversation().section_loads();
+    assert_eq!(
+        reopened,
+        SectionLoads {
+            restored: first.prefilled,
+            prefilled: 0,
+        },
+        "the restart prefilled {} of the {} section(s) the first open sealed",
+        reopened.prefilled,
+        first.prefilled
     );
 }

@@ -9,7 +9,7 @@ use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnHandle, TurnResponse};
 use candle_transformers::models::delta_net::ExportedLayerState;
 
-use crate::persistence::content_hash::{hash_tokens, ContentChain, ContentHash};
+use crate::persistence::content_hash::{hash_tokens, section_stream_id, ContentChain, ContentHash};
 use crate::persistence::record::{BranchCheckpointPayload, SnapshotLayer};
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
@@ -155,6 +155,7 @@ pub(crate) fn window_sealed_tokens(
 }
 
 use crate::stencil::{StencilDriver, StencilTree, ThinkMode, TriggerRegistry};
+use crate::turn_text::{encode_pieces, TurnText};
 use flume::{Receiver, Sender};
 use std::sync::Arc;
 
@@ -271,6 +272,10 @@ pub struct Sequence {
 
     /// Shared tokenizer.
     tokenizer: Arc<tokenizers::Tokenizer>,
+
+    /// The tokenizer for literal text, which reads every chat tag as plain
+    /// characters — see [`crate::turn_text`].
+    literal_tokenizer: Arc<tokenizers::Tokenizer>,
 
     /// Sequence tree — the canonical turn history for this conversation.
     /// Holds system prompt (with token ids), paired user↔assistant exchanges
@@ -647,6 +652,7 @@ impl Sequence {
         scheduler_tx: Sender<SchedulerRequest>,
         sequence_id: SequenceId,
         tokenizer: Arc<tokenizers::Tokenizer>,
+        literal_tokenizer: Arc<tokenizers::Tokenizer>,
         system_prompt: &str,
         projection: Builder,
         target: ProjectionTarget,
@@ -685,6 +691,7 @@ impl Sequence {
             scheduler_tx,
             id: sequence_id,
             tokenizer,
+            literal_tokenizer,
             tree: ConversationTree::with_config(system_prompt, tree_config),
             selection: SelectionState::default(),
             pending_user: None,
@@ -1532,10 +1539,12 @@ impl Sequence {
             chain.prefix()
         };
         // ── Pass 2: triage what's left into two buckets ────────────────
-        //   - Persisted in the redo log under its content-addressed
-        //     stream id → restore from disk (`RestoreSection`).
+        //   - Durable in the redo log under its content-addressed stream id →
+        //     restore from disk (`RestoreSection`). Whether those chunks form a
+        //     whole grid is the scheduler's call, not this one's: it knows how
+        //     many KV backings the session holds, and on a hybrid that is the
+        //     attention layers, not the model's transformer depth.
         //   - Otherwise → ingest with a fresh prefill (`IngestSection`).
-        let n_layers = self.model_core.num_layers;
         let mut to_ingest: Vec<Pending<'_>> = Vec::with_capacity(candidates.len());
         let mut to_restore: Vec<Pending<'_>> = Vec::with_capacity(candidates.len());
         for (section_id, content) in candidates {
@@ -1549,36 +1558,22 @@ impl Sequence {
                 section_hash: hash_tokens(&tokens),
             };
             let debug_name = self.section_debug_name(section_id);
-            // Manifest check.  Only meaningful when the model's
-            // layer count is known; without backings (test harnesses
-            // that don't register a session) we can't compute
-            // `chunks_per_layer`, so we fall through to ingest.
-            let stream_id = crate::persistence::content_hash::section_stream_id(address);
-            if n_layers > 0
-                && self.substrate.section_stream_is_persisted(stream_id)
-                && self
-                    .substrate
-                    .section_stream_layout(stream_id, n_layers)
-                    .is_some()
-            {
-                to_restore.push(Pending {
-                    section_id,
-                    content,
-                    tokens,
-                    token_count,
-                    address,
-                    debug_name,
-                });
-                continue;
-            }
-            to_ingest.push(Pending {
+            let pending = Pending {
                 section_id,
                 content,
                 tokens,
                 token_count,
                 address,
                 debug_name,
-            });
+            };
+            if self
+                .substrate
+                .section_stream_is_persisted(section_stream_id(address))
+            {
+                to_restore.push(pending);
+            } else {
+                to_ingest.push(pending);
+            }
         }
         let total = to_ingest.len() + to_restore.len();
         if total == 0 {
@@ -1596,11 +1591,6 @@ impl Sequence {
         // cheap insurance).
         let mut restore_out: Vec<(SectionId, usize)> = Vec::with_capacity(to_restore.len());
         for item in to_restore.into_iter() {
-            let stream_id = crate::persistence::content_hash::section_stream_id(item.address);
-            let chunks_per_layer = self
-                .substrate
-                .section_stream_layout(stream_id, n_layers)
-                .unwrap_or(0);
             // Capture the content length for the progress callback
             // before `item.tokens` / `item.content` get consumed by
             // the request payload below.
@@ -1611,19 +1601,16 @@ impl Sequence {
                 .send(SchedulerRequest::RestoreSection {
                     conversation: self.substrate.clone(),
                     section_id: item.section_id,
-                    stream_id,
-                    address: item.address,
-                    chunks_per_layer,
+                    stream_id: section_stream_id(item.address),
                     tokens: item.tokens.clone(),
                     response_tx: tx,
                 })
                 .map_err(|_| ConversationError::SchedulerGone)?;
             match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
-                Ok(()) => {
-                    // Block count for diagnostics — the section is
-                    // now a cold-marker; the actual hot grid lands
-                    // when the next projection elevates it.  Use the
-                    // manifest's chunks_per_layer as the count.
+                Ok(chunks_per_layer) => {
+                    // Block count for diagnostics — the section is now a
+                    // cold-marker; the actual hot grid lands when the next
+                    // projection elevates it.
                     restore_out.push((item.section_id, chunks_per_layer));
                     on_section_done(item_section_id, item_content_len);
                 }
@@ -1637,6 +1624,11 @@ impl Sequence {
             }
             let _ = item.token_count;
         }
+
+        // Every section still in `to_ingest` — a refused restore included —
+        // costs a prefill from here on.
+        self.substrate
+            .record_section_loads(restore_out.len(), to_ingest.len());
 
         // Bulk-allocate-then-fire: allocate one scratch slot per
         // section first (cheap, no timeline minting), then fire every
@@ -1859,12 +1851,16 @@ impl Sequence {
         self.submit_turn_with_options(user_message, TurnOptions::default())
     }
 
-    /// Submit with per-turn options (sampling, max tokens).
+    /// Submit with per-turn options (sampling, max tokens). The user half's
+    /// literal pieces — a tool's output, a file's text — are spelled out so no
+    /// part of them becomes a control token; see [`TurnText`].
     pub fn submit_turn_with_options(
         &mut self,
-        user_message: &str,
+        user_message: impl Into<TurnText>,
         options: TurnOptions,
     ) -> crate::Result<TurnHandle> {
+        let user_message = user_message.into();
+        let user_text = user_message.text();
         if self.turn_in_flight {
             return Err(ConversationError::TurnInFlight {
                 sequence_id: self.id,
@@ -1974,13 +1970,17 @@ impl Sequence {
         // on the repo_map ingest: 22 of 22 summaries opened a block regardless, and
         // 12 of them stored the model's raw monologue as the summary.
         let closed_think = self.config.dialect.thinking_suppression(no_think).1;
-        let assistant_head = format!(
-            "{}{}{}",
-            user_message, self.config.dialect.user_end, assistant_start_marker,
-        );
+        // The user half is encoded piece by piece, then the markers and lead
+        // follow as one string, exactly as they always have. The half meets the
+        // markers on `user_end`, a registered tag the tokenizer splits at anyway,
+        // so the concatenation is the whole grid's encoding.
+        let user_tokens = self.encode_text(&user_message)?;
+        let markers = format!("{}{}", self.config.dialect.user_end, assistant_start_marker);
+        let assistant_head = format!("{user_text}{markers}");
         let lead = assistant_lead(closed_think, assistant_prefill);
         let formatted = format!("{assistant_head}{lead}");
-        let mut prefill_tokens = self.tokenize(&formatted)?;
+        let mut prefill_tokens = user_tokens.clone();
+        prefill_tokens.extend_from_slice(&self.tokenize(&format!("{markers}{lead}"))?);
 
         // A turn that begins inside a grammar carries that grammar's opening
         // scaffold in its prefill: everything from the tree's root up to the
@@ -2018,8 +2018,7 @@ impl Sequence {
         let post_decode_tokens = TokenBuffer::new();
 
         // Record the pending user turn (text + raw tokens for the tree).
-        let user_tokens = self.tokenize(user_message)?;
-        self.pending_user = Some(TokenizedText::new(user_message, user_tokens));
+        self.pending_user = Some(TokenizedText::new(user_text.as_str(), user_tokens.clone()));
 
         let sampling = options
             .sampling
@@ -2043,7 +2042,7 @@ impl Sequence {
         // by the scheduler, NOT part of the prefill — so the user body spans
         // `[0, len(user_msg))`.
         let user_content_start = 0;
-        let user_content_end = self.tokenize(user_message)?.len();
+        let user_content_end = user_tokens.len();
         // Assistant content begins after the assistant header AND after any
         // suppression block, but BEFORE a caller's own prefill — so that prefill's
         // K/V seals as part of the assistant turn while the block's does not.
@@ -2070,8 +2069,7 @@ impl Sequence {
         let assistant_content_start = if assistant_prefill.is_empty() {
             prefill_tokens.len()
         } else {
-            self.tokenize(&format!("{assistant_head}{closed_think}"))?
-                .len()
+            user_tokens.len() + self.tokenize(&format!("{markers}{closed_think}"))?.len()
         };
         // Clamp to the prefill length and force monotonic so a tokenizer that
         // merges across a join can never invert the windows at seal time.
@@ -2087,7 +2085,7 @@ impl Sequence {
             Some(self.projection_inputs()),
             formatted,
             prefill_tokens,
-            user_message.to_string(),
+            user_text,
             user_content_start,
             user_content_end,
             assistant_content_start,
@@ -2622,7 +2620,11 @@ impl Sequence {
     ///   the original decodes.
     ///
     /// Returns `Err(TurnInFlight)` if a turn is currently in progress.
-    pub fn insert_turn(&mut self, user_message: &str, assistant_text: &str) -> crate::Result<()> {
+    pub fn insert_turn(
+        &mut self,
+        user_message: impl Into<TurnText>,
+        assistant_text: &str,
+    ) -> crate::Result<()> {
         self.insert_turn_tagged(user_message, assistant_text, Vec::new())
     }
 
@@ -2631,11 +2633,11 @@ impl Sequence {
     /// `tags:` filter scopes its provenance gallery to.
     pub fn insert_turn_tagged(
         &mut self,
-        user_message: &str,
+        user_message: impl Into<TurnText>,
         assistant_text: &str,
         tags: Vec<String>,
     ) -> crate::Result<()> {
-        self.insert_turn_inner(user_message, assistant_text, tags)?;
+        self.insert_turn_inner(&user_message.into(), assistant_text, tags)?;
         Ok(())
     }
 
@@ -2654,12 +2656,12 @@ impl Sequence {
     /// ingested" metric.
     pub fn insert_turn_staged(
         &mut self,
-        user_message: &str,
+        user_message: impl Into<TurnText>,
         assistant_text: &str,
         tags: Vec<String>,
     ) -> crate::Result<usize> {
         let (assistant_content_start, turn_index, tokens) =
-            self.insert_turn_inner(user_message, assistant_text, tags)?;
+            self.insert_turn_inner(&user_message.into(), assistant_text, tags)?;
         let Some(idx) = turn_index else {
             // No substrate seal (no registered target) — nothing to key
             // events to; the turn itself was still prefilled.
@@ -2676,7 +2678,7 @@ impl Sequence {
     /// counting, which races the async summariser).
     fn insert_turn_inner(
         &mut self,
-        user_message: &str,
+        user_message: &TurnText,
         assistant_text: &str,
         tags: Vec<String>,
     ) -> crate::Result<(u32, Option<u32>, usize)> {
@@ -2706,33 +2708,30 @@ impl Sequence {
         // role-end comes through `post_decode_tokens` — no decode here, so the EOS
         // isn't emitted by the model; the projection's live `Generated` segments
         // supply the surrounding `user_start` / `/no_think` / `assistant_end`.
-        let formatted = format!(
-            "{}{}{}{}",
-            user_message,
-            self.config.dialect.user_end,
-            self.config.dialect.assistant_start,
-            assistant_text,
+        let user_text = user_message.text();
+        let markers = format!(
+            "{}{}",
+            self.config.dialect.user_end, self.config.dialect.assistant_start,
         );
-        let prefill_tokens = self.tokenize(&formatted)?;
+        let formatted = format!("{user_text}{markers}{assistant_text}");
+        // The user half piece by piece (see `submit_turn_with_options`), then the
+        // markers and the supplied reply as one string, exactly as before.
+        let user_tokens = self.encode_text(user_message)?;
+        let mut prefill_tokens = user_tokens.clone();
+        prefill_tokens.extend_from_slice(&self.tokenize(&format!("{markers}{assistant_text}"))?);
         let post_decode_tokens = TokenBuffer::new();
 
         // Content boundaries inside the sealed grid. The prefill grid is
         // `[user_msg][user_end][assistant_start][assistant_text]` (no leading
         // `user_start`, no baked `/no_think` — both are live `Generated`
         // segments). The user body spans `[0, len(user_msg))`; the assistant
-        // content begins after the `[user_end][assistant_start]` markers. Tokenise
-        // each prefix against the SAME strings the prefill is built from so the
-        // indices land on the real grid; clamp/monotonise so a tokenizer that
-        // merges across a join can never invert the windows.
-        let assistant_start_marker = self.config.dialect.assistant_start;
+        // content begins after the `[user_end][assistant_start]` markers. The grid
+        // is the user half's tokens then the markers', so the indices are their
+        // lengths; clamp/monotonise so a tokenizer that merges across a join can
+        // never invert the windows.
         let user_content_start = 0usize;
-        let user_content_end = self.tokenize(user_message)?.len();
-        let assistant_content_start = self
-            .tokenize(&format!(
-                "{}{}{}",
-                user_message, self.config.dialect.user_end, assistant_start_marker,
-            ))?
-            .len();
+        let user_content_end = user_tokens.len();
+        let assistant_content_start = user_tokens.len() + self.tokenize(&markers)?.len();
         let total = prefill_tokens.len();
         let user_content_start = (user_content_start.min(total)) as u32;
         let user_content_end =
@@ -2744,8 +2743,7 @@ impl Sequence {
         // Build the TokenizedText for both halves now — assistant
         // text is supplied directly, not decoded, so we can fill it
         // in without waiting on event_rx for token chunks.
-        let user_tokens = self.tokenize(user_message)?;
-        let user_tt = TokenizedText::new(user_message, user_tokens);
+        let user_tt = TokenizedText::new(user_text.as_str(), user_tokens);
         let asst_tokens = self.tokenize(assistant_text)?;
         let asst_tt = TokenizedText::new(assistant_text, asst_tokens);
 
@@ -2759,7 +2757,7 @@ impl Sequence {
             Some(self.projection_inputs()),
             formatted,
             prefill_tokens,
-            user_message.to_string(),
+            user_text,
             user_content_start,
             user_content_end,
             assistant_content_start,
@@ -2819,7 +2817,7 @@ impl Sequence {
         &mut self,
         call_user: &str,
         call_assistant: &str,
-        response_user: &str,
+        response_user: impl Into<TurnText>,
         tags: Vec<String>,
         max_summary_tokens: usize,
         triggers: Arc<TriggerRegistry>,
@@ -2847,13 +2845,13 @@ impl Sequence {
         &mut self,
         call_user: &str,
         call_assistant: &str,
-        response_user: &str,
+        response_user: impl Into<TurnText>,
         tags: Vec<String>,
         max_summary_tokens: usize,
         triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<(u32, u32, usize)> {
         let (idxs, tokens) = self.ingest_roundtrip_chain_indices(
-            &[(call_user.to_string(), call_assistant.to_string())],
+            &[(TurnText::from(call_user), call_assistant.to_string())],
             response_user,
             tags,
             max_summary_tokens,
@@ -2883,7 +2881,7 @@ impl Sequence {
     ) -> crate::Result<(u32, u32, usize)> {
         let (idxs, tokens) = self
             .ingest_roundtrip_chain_indices_async(
-                &[(call_user.to_string(), call_assistant.to_string())],
+                &[(TurnText::from(call_user), call_assistant.to_string())],
                 response_user,
                 tags,
                 max_summary_tokens,
@@ -2904,8 +2902,8 @@ impl Sequence {
     /// leaving it to a splice. Returns tokens ingested.
     pub fn ingest_roundtrip_chain(
         &mut self,
-        prefilled: &[(String, String)],
-        decode_user: &str,
+        prefilled: &[(TurnText, String)],
+        decode_user: impl Into<TurnText>,
         tags: Vec<String>,
         max_summary_tokens: usize,
         force_tools: &[String],
@@ -2948,8 +2946,8 @@ impl Sequence {
     /// decode below for why an empty registry is not enough here.
     pub fn ingest_roundtrip_chain_indices(
         &mut self,
-        prefilled: &[(String, String)],
-        decode_user: &str,
+        prefilled: &[(TurnText, String)],
+        decode_user: impl Into<TurnText>,
         tags: Vec<String>,
         max_summary_tokens: usize,
         force_tools: &[String],
@@ -2978,8 +2976,8 @@ impl Sequence {
     /// thread can hold every fork's decode in flight at once.
     pub async fn ingest_roundtrip_chain_indices_async(
         &mut self,
-        prefilled: &[(String, String)],
-        decode_user: &str,
+        prefilled: &[(TurnText, String)],
+        decode_user: impl Into<TurnText>,
         tags: Vec<String>,
         max_summary_tokens: usize,
         force_tools: &[String],
@@ -3036,8 +3034,8 @@ impl Sequence {
     /// tokens they cost, and the in-flight summary's handle.
     fn ingest_chain_submit(
         &mut self,
-        prefilled: &[(String, String)],
-        decode_user: &str,
+        prefilled: &[(TurnText, String)],
+        decode_user: impl Into<TurnText>,
         tags: Vec<String>,
         max_summary_tokens: usize,
         force_tools: &[String],
@@ -4137,6 +4135,7 @@ impl Sequence {
             scheduler_tx: self.scheduler_tx.clone(),
             id: new_seq_id,
             tokenizer: Arc::clone(&self.tokenizer),
+            literal_tokenizer: Arc::clone(&self.literal_tokenizer),
             tree: self.tree.clone(),
             selection: self.selection.clone(),
             pending_user: None,
@@ -4692,6 +4691,13 @@ impl Sequence {
         self.tokenizer
             .encode(text, false)
             .map(|enc| TokenBuffer::from(enc.get_ids()))
+            .map_err(|e| ConversationError::Tokenizer(e.to_string()))
+    }
+
+    /// Encode a user half piece by piece, its literal pieces spelled out — see
+    /// [`crate::turn_text`].
+    fn encode_text(&self, text: &TurnText) -> crate::Result<TokenBuffer> {
+        encode_pieces(&self.tokenizer, &self.literal_tokenizer, text)
             .map_err(|e| ConversationError::Tokenizer(e.to_string()))
     }
 

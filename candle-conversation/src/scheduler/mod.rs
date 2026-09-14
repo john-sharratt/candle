@@ -58,6 +58,7 @@ use crate::projection::{
     ResolvedSection, ResolvedTurn, SealedKind, SectionId, SelectionState, SystemPromptItem,
     TimelineId, TurnId, TurnIndex, TurnKey,
 };
+use crate::projection::{CollectionWarm, Schema};
 use crate::provenance::{
     encode_wide_sigs_with, extract_q_vector_r16, fold_fits, fold_provenance_fitted, FoldParams,
     GalleryArena, WideQSig,
@@ -432,15 +433,15 @@ pub(crate) enum SchedulerRequest {
     /// Recover a previously-persisted section directly from the redo
     /// log instead of running a fresh prefill.  Used when an ingest
     /// caller has computed a section's content-addressed stream id
-    /// and confirmed that the persistence manifest has durable chunks
-    /// for it.  The scheduler cold-loads the chunks into hot VRAM via
-    /// the same pipeline used for turn cold-loads, restores the
-    /// section into the substrate (`SectionEntryData` + residence
-    /// with both hot and cold installed), and replies with `Ok(())`.
+    /// and found durable chunks for it.  The scheduler checks those
+    /// chunks form a whole grid over the session's KV backings,
+    /// installs the section as a cold marker (the elevate path lifts
+    /// it when a projection needs it), reinstalls its index page for a
+    /// model that keeps per-position state, and replies with the
+    /// section's chunks per layer.
     ///
-    /// On any failure the scheduler falls back to a normal
-    /// `IngestSection` would be issued by the caller — this request
-    /// just reports `Err`.
+    /// An `Err` means "prefill it instead": the caller issues a normal
+    /// `IngestSection`.
     RestoreSection {
         /// Workspace conversation the section lands in.  Sections are
         /// shared substrate state — every conversation in the
@@ -450,14 +451,13 @@ pub(crate) enum SchedulerRequest {
         conversation: Conversation,
         section_id: SectionId,
         stream_id: StreamId,
-        address: ContentAddress,
-        chunks_per_layer: usize,
         /// Pre-tokenised section content — the same byte sequence
         /// the original prefill used.  Reused verbatim so we don't
         /// need to read the `Tokens` record back from disk just to
         /// repopulate `SectionEntryData::tokens`.
         tokens: TokenBuffer,
-        response_tx: Sender<Result<(), ConversationError>>,
+        /// The section's chunks per layer once restored.
+        response_tx: Sender<Result<usize, ConversationError>>,
     },
 
     /// Remove transient sections — a throwaway conversation's frame — once
@@ -619,6 +619,15 @@ pub(crate) enum SchedulerRequest {
     ReconstructSubstrate {
         conversation: Conversation,
         status: Arc<SubstrateReloadStatus>,
+    },
+
+    /// Warm the belief-driven section collections' hit levels from their own
+    /// tag-scoped corpus — on this thread, because the GPU gallery arena that
+    /// scores the corpus in batch lives here. Replies with what was warmed.
+    WarmCollectionNormalization {
+        conversation: Conversation,
+        schema: Box<Schema>,
+        response_tx: Sender<CollectionWarm>,
     },
 
     /// Reclaim VRAM by demoting the hot K/V of specific (already-sealed,
@@ -1954,9 +1963,11 @@ pub(super) struct ActiveSectionIngest {
 /// backing collection can't invalidate it mid-creep.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum WaveMember {
-    /// Dialogue-turn prefill — resolved in `active_prefills`; its full token set
-    /// flows through the layers and it is promoted to decode at the head.
-    Prefill { seq_id: usize },
+    /// Dialogue-turn prefill chunk — resolved in `active_prefills`; covers
+    /// `[offset, offset + advance)` of its token set (offset is stable until the
+    /// head, where the chunk is committed). The final chunk is promoted to
+    /// decode; an earlier one leaves the prefill active for the next group.
+    Prefill { seq_id: usize, advance: usize },
     /// Section-ingest chunk — resolved in `active_section_ingests`; covers
     /// `[offset, offset + advance)` (offset is stable until the head, where the
     /// chunk is advanced + sealed). Rides the cohort's creep so its expert loads
@@ -1968,7 +1979,7 @@ impl WaveMember {
     /// The session sequence this member occupies, whichever kind it is.
     pub(super) fn seq_id(&self) -> usize {
         match self {
-            WaveMember::Prefill { seq_id } => *seq_id,
+            WaveMember::Prefill { seq_id, .. } => *seq_id,
             WaveMember::Section { seq_id, .. } => *seq_id,
         }
     }
@@ -4061,6 +4072,10 @@ impl Scheduler {
 
             SchedulerRequest::FreeSequence { sequence_id } => {
                 tracing::debug!(target: "sched", "free_sequence {}", sequence_id);
+                // A turn view borrows this slot's blocks, so it cannot outlive
+                // them; and a view freed directly takes its registration with it.
+                self.discard_turn_views_of(sequence_id);
+                self.turn_views.remove(&sequence_id);
                 if let Err(e) = self.session.free_sequence(sequence_id.0) {
                     tracing::warn!("failed to free sequence {}: {}", sequence_id, e);
                 }
@@ -4111,6 +4126,8 @@ impl Scheduler {
                 sequence_id,
                 response_tx,
             } => {
+                // A turn view borrows the prefix this reset discards.
+                self.discard_turn_views_of(sequence_id);
                 let result = self
                     .session
                     .reset_sequence(sequence_id.0)
@@ -4234,8 +4251,6 @@ impl Scheduler {
                 conversation,
                 section_id,
                 stream_id,
-                address,
-                chunks_per_layer,
                 tokens,
                 response_tx,
             } => {
@@ -4243,8 +4258,6 @@ impl Scheduler {
                     &conversation,
                     section_id,
                     stream_id,
-                    address,
-                    chunks_per_layer,
                     tokens,
                 );
                 let _ = response_tx.send(result);
@@ -4572,6 +4585,17 @@ impl Scheduler {
                 status,
             } => {
                 self.reconstruct_substrate(&conversation, &status);
+                true
+            }
+
+            SchedulerRequest::WarmCollectionNormalization {
+                conversation,
+                schema,
+                response_tx,
+            } => {
+                let warm = conversation
+                    .warm_collection_normalization(&schema, self.gallery_arena.as_deref());
+                let _ = response_tx.send(warm);
                 true
             }
 
@@ -6031,7 +6055,9 @@ impl Scheduler {
         // frees its slot after its prefill has already drained out of the cohort,
         // so `was_member` is false and the held cohort is untouched.
         let was_member = self.wave_prefill_members.iter().any(|m| match m {
-            WaveMember::Prefill { seq_id } | WaveMember::Section { seq_id, .. } => *seq_id == id.0,
+            WaveMember::Prefill { seq_id, .. } | WaveMember::Section { seq_id, .. } => {
+                *seq_id == id.0
+            }
         });
         if was_member {
             self.reset_wave_prefill();
@@ -6056,6 +6082,48 @@ impl Scheduler {
         // its id is recycled (see [`Self::purge_freed_slot_scheduling_state`]).
         self.purge_freed_slot_scheduling_state(slot);
         self.prune_ingest_timeline(freed_target);
+    }
+
+    /// Drop a turn view that will never finish its decode — its prefill failed,
+    /// or the parent it borrows from is going away. Nothing on the view was
+    /// completed, so its K/V is abandoned rather than transferred and its model
+    /// state released rather than moved onto the parent.
+    ///
+    /// A view is otherwise released only when its decode completes or a
+    /// reprojection swaps it. An errored turn did neither, so its view kept the
+    /// parent's whole projected prefix borrowed for the daemon's lifetime, and
+    /// a failed wave never gave that KV back.
+    fn discard_turn_view(&mut self, view_id: SequenceId) {
+        if self.turn_views.remove(&view_id).is_none() {
+            return;
+        }
+        if let Err(e) = self.session.free_sequence(view_id.0) {
+            tracing::warn!("failed to free turn view {}: {}", view_id, e);
+        }
+        if let Err(e) = self.model.release_sequence(view_id.0) {
+            tracing::warn!(
+                "failed to release model state for turn view {}: {}",
+                view_id,
+                e
+            );
+        }
+        self.sampling_states.remove(&view_id);
+        self.slot_tokens.remove(&view_id);
+        self.slot_projection_state.remove(&view_id);
+        self.purge_freed_slot_scheduling_state(view_id);
+    }
+
+    /// [`Self::discard_turn_view`] for every view borrowing from `parent_id`.
+    fn discard_turn_views_of(&mut self, parent_id: SequenceId) {
+        let views: Vec<SequenceId> = self
+            .turn_views
+            .iter()
+            .filter(|(_, v)| v.parent_id == parent_id)
+            .map(|(id, _)| *id)
+            .collect();
+        for view in views {
+            self.discard_turn_view(view);
+        }
     }
 
     /// Drop a freed slot's timeline from [`Self::ingest_timelines`] once no
@@ -6454,6 +6522,7 @@ impl Scheduler {
                 tokens_generated: 1,
                 tokens_per_second: 0.0,
                 prefill_token_count,
+                context_tokens: self.session.sequence_offset(seq_id.0).unwrap_or(0),
                 sequence: self.session.get_sequence_stats(seq_id.0),
             },
             // `finish_immediately` fires before any decode starts and
@@ -6712,6 +6781,7 @@ impl Scheduler {
                 // slot is dropped during finalize and its sequence stats
                 // become unavailable.
                 let sequence_stats = self.session.get_sequence_stats(seq_id.0);
+                let context_tokens = self.session.sequence_offset(seq_id.0).unwrap_or(0);
 
                 // Auto-finalize: if this sequence is a scheduler-owned view
                 // (created by SubmitTurn), transfer its newly-written blocks
@@ -7075,6 +7145,7 @@ impl Scheduler {
                         tokens_generated,
                         tokens_per_second,
                         prefill_token_count: state.prefill_token_count,
+                        context_tokens,
                         sequence: sequence_stats,
                     },
                     seal: seal_result,
@@ -7098,10 +7169,8 @@ impl Scheduler {
         conversation: &Conversation,
         section_id: SectionId,
         stream_id: StreamId,
-        _address: ContentAddress,
-        _chunks_per_layer: usize,
         tokens: TokenBuffer,
-    ) -> Result<(), ConversationError> {
+    ) -> Result<usize, ConversationError> {
         // The cold→hot section install goes through the adaptive-format
         // restore machinery (`alloc_sealed_block` + per-band arena writes),
         // which does not alias K≡V. A single-latent backing (DeepSeek's
@@ -7119,19 +7188,51 @@ impl Scheduler {
                     .into(),
             ));
         }
+        // One chunk list per KV backing — the count the persistence thread
+        // wrote the section with. On a hybrid that is the attention layers
+        // (plus any draft head), not the model's transformer depth; dividing
+        // the persisted grid by the depth refused every section whose chunk
+        // total it did not happen to divide, so every boot prefilled the whole
+        // system prompt again.
         let n_layers = self.session.num_layers();
 
         // 1. Resolve cold refs from the manifest — these point at
         //    each chunk's `(log_offset, record_len, token_count)` in
         //    the redo log.  Installed alone (with hot = None) so the
         //    elevate path can lift the section when a projection
-        //    needs it.
+        //    needs it.  A stream with no whole grid is not restorable,
+        //    and saying so sends the caller to a prefill.
         let cold_refs = conversation
             .recover_section_cold_refs(stream_id, n_layers)
             .map_err(ConversationError::Model)?
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                ConversationError::Channel(format!(
+                    "section {section_id:?}: stream {stream_id:?} holds no durable \
+                     chunks — re-ingest"
+                ))
+            })?;
 
-        // 2. Install as a cold-marker.  `sealed_hot = Vec::new()`
+        // 2. The section's index page, for a model that keeps per-position
+        //    state. It is computed from hidden states, so borrowing the K/V
+        //    does not bring it along; a section restored without it would
+        //    reach every projection unindexed, and a prefill is the only way
+        //    to rebuild it.
+        let page = if self.model.carries_positional_state() {
+            let page = conversation
+                .read()
+                .section_index_page(stream_id)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| {
+                    ConversationError::Channel(format!(
+                        "section {section_id:?}: persisted without its index page — re-ingest"
+                    ))
+                })?;
+            Some(page)
+        } else {
+            None
+        };
+
+        // 3. Install as a cold-marker.  `sealed_hot = Vec::new()`
         //    leaves `residence.hot = None`; `cold_refs` lands in
         //    `residence.cold` so `elevate_to_hot` can lift the
         //    section on the first projection that selects it.
@@ -7139,9 +7240,9 @@ impl Scheduler {
         //    per-chunk token counts across one layer's
         //    StoredSequence).
         let token_count = cold_refs.first().map(|s| s.token_count).unwrap_or(0);
+        let chunks_per_layer = cold_refs.first().map(|s| s.chunks.len()).unwrap_or(0);
         let tokens_arc = Arc::new(tokens[..].to_vec());
-        let mut view = conversation.write();
-        view.restore_section(
+        conversation.write().restore_section(
             section_id,
             stream_id,
             token_count,
@@ -7149,7 +7250,10 @@ impl Scheduler {
             cold_refs,
             tokens_arc,
         );
-        Ok(())
+        if let Some(page) = page {
+            self.section_positional.insert(section_id, Arc::new(page));
+        }
+        Ok(chunks_per_layer)
     }
 
     /// A unit's own tokens begin on `slot`: close its index so the prefix ahead
@@ -7430,16 +7534,30 @@ impl Scheduler {
         // the piece covers its own tokens and no others.
         match self.model.seal_positional_state(sequence_id.0) {
             Ok(Some(blob)) => {
+                // Persisted beside the section's chunks, under the same stream
+                // id, so a restart that restores the section from the log can
+                // hand a projection its index as well as its K/V.
+                match self.slot_conversations.get(&sequence_id) {
+                    Some(conversation) => {
+                        conversation.enqueue_index_page(section_stream_id(address), blob.clone())
+                    }
+                    None => tracing::warn!(
+                        section = section_id.raw(),
+                        seq = sequence_id.0,
+                        "section index page not persisted: the slot has no conversation, \
+                         so a restart prefills this section again instead of restoring it",
+                    ),
+                }
                 self.section_positional.insert(section_id, Arc::new(blob));
             }
-            // **`None` is not "nothing to do" — it is a section with no index.**
-            // It used to be swallowed, and that silence is what let an entire
-            // system prompt reach the model unindexed: every section returned
-            // `None`, the assembler had no blob to push, and the shortfall
-            // surfaced only when the prefix grew past the QSA identity
-            // threshold and a select refused — thousands of tokens and one
-            // conversation later, naming the slot rather than the seal.
-            Ok(None) => tracing::warn!(
+            // **`None` from a model that keeps per-position state is a section
+            // with no index.** It used to be swallowed, and that silence is what
+            // let an entire system prompt reach the model unindexed: every
+            // section returned `None`, the assembler had no blob to push, and
+            // the shortfall surfaced only when the prefix grew past the QSA
+            // identity threshold and a select refused — thousands of tokens and
+            // one conversation later, naming the slot rather than the seal.
+            Ok(None) if self.model.carries_positional_state() => tracing::warn!(
                 section = section_id.raw(),
                 seq = sequence_id.0,
                 n_tokens,
@@ -7447,6 +7565,9 @@ impl Scheduler {
                  state for this slot, so anything borrowing its tokens selects against \
                  a prefix it never indexed",
             ),
+            // A model that keeps no per-position state seals no page, and
+            // nothing is missing.
+            Ok(None) => {}
             Err(e) => {
                 // Not fatal to the seal — the K/V is committed — but the next
                 // ingest to borrow this section will have to say so.
@@ -12494,7 +12615,7 @@ mod tests {
         let view = create_scratch_slot(&mut scheduler, &conversation);
 
         // The view was registered before prefill; the prefill then faulted and
-        // was drained, which reclaims the view.
+        // was drained, which discards the view.
         scheduler.turn_views.insert(
             view,
             ViewState {
@@ -12504,7 +12625,7 @@ mod tests {
                 question_tokens: 0,
             },
         );
-        scheduler.reclaim_failed_view(view);
+        scheduler.discard_turn_view(view);
         assert!(
             !scheduler.turn_views.contains_key(&view),
             "the failed view must be let go, not left dangling under its parent"
@@ -13009,6 +13130,66 @@ mod tests {
         );
     }
 
+    /// Carve a turn view over `parent` and register it the way SubmitTurn does.
+    pub(super) fn register_turn_view(scheduler: &mut Scheduler, parent: SequenceId) -> SequenceId {
+        let (view, borrowed) = scheduler.create_view(parent, &[]).expect("carve");
+        scheduler.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: parent,
+                original_borrowed: borrowed,
+                turn_start_parent_blocks: borrowed.0,
+                question_tokens: 0,
+            },
+        );
+        view
+    }
+
+    /// **A turn view cannot outlive the parent it borrows from.** Freeing the
+    /// parent used to leave the view registered and its slot live, holding the
+    /// parent's prefix borrowed with nothing left to release it.
+    #[test]
+    fn freeing_a_parent_frees_its_turn_view() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let parent = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let view = register_turn_view(&mut scheduler, parent);
+
+        scheduler.handle_request(SchedulerRequest::FreeSequence {
+            sequence_id: parent,
+        });
+
+        assert!(scheduler.turn_views.is_empty(), "the view is unregistered");
+        assert!(
+            scheduler.session.sequence_offset(view.0).is_none(),
+            "the view's slot is released"
+        );
+    }
+
+    /// A reset discards the prefix a turn view borrows, so it takes the view.
+    #[test]
+    fn resetting_a_parent_frees_its_turn_view() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let parent = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let view = register_turn_view(&mut scheduler, parent);
+
+        let (rtx, rrx) = crossbeam::channel::bounded(1);
+        scheduler.handle_request(SchedulerRequest::ResetSequence {
+            sequence_id: parent,
+            response_tx: rtx,
+        });
+        rrx.recv().expect("reset response").expect("reset ok");
+
+        assert!(scheduler.turn_views.is_empty(), "the view is unregistered");
+        assert!(
+            scheduler.session.sequence_offset(view.0).is_none(),
+            "the view's slot is released"
+        );
+        assert!(
+            scheduler.session.sequence_offset(parent.0).is_some(),
+            "the reset parent stays live"
+        );
+    }
+
     /// **A resumed slot seeds its carried belief from the recovered selection
     /// events — the same fold the live seal harvest performs.**
     ///
@@ -13131,7 +13312,10 @@ mod tests {
         // otherwise the recycled slot id re-enters the next wave-group assembly
         // alongside the stale member and trips the "appears in more than one
         // group" guard.
-        scheduler.wave_prefill_members = vec![WaveMember::Prefill { seq_id: seq_id.0 }];
+        scheduler.wave_prefill_members = vec![WaveMember::Prefill {
+            seq_id: seq_id.0,
+            advance: 1,
+        }];
         scheduler.wave_prefill_cursor = 7;
 
         scheduler.handle_request(SchedulerRequest::FreeSequence {
@@ -13157,7 +13341,10 @@ mod tests {
         // A DIFFERENT slot is the sole cohort member. Freeing `freed` must leave
         // the held cohort untouched — resetting it on every unrelated free would
         // throw away the survivors' partial prefill progress each wave.
-        scheduler.wave_prefill_members = vec![WaveMember::Prefill { seq_id: member.0 }];
+        scheduler.wave_prefill_members = vec![WaveMember::Prefill {
+            seq_id: member.0,
+            advance: 1,
+        }];
         scheduler.wave_prefill_cursor = 3;
 
         scheduler.handle_request(SchedulerRequest::FreeSequence { sequence_id: freed });

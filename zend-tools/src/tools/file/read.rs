@@ -13,22 +13,26 @@ use crate::{RegisteredTool, Tool, ToolContext};
 /// uncapped read is a context hazard the same way an uncapped listing was. At
 /// ~10 tokens a line this keeps a response near 2k tokens.
 ///
-/// The cap applies whether or not a range was asked for: a caller that requests
-/// 1-5000 gets the first 200 with the header saying so, which is the same
-/// continuation signal an unranged read gets. Otherwise the cap would be
-/// bypassable by naming a wide range.
+/// A caller that requests 1-5000 gets the first 200 with the header saying so,
+/// so the cap cannot be bypassed by naming a wide range.
 pub const MAX_READ_LINES: u32 = 200;
 
+/// Every field is required, the range included. With the range optional the
+/// model wrote `{"path": …}` alone even after planning a range in its reasoning
+/// — measured live, a request for lines 598-630 read lines 1-200 six times over
+/// — so a read now always names the lines it wants, and the constrained decoder
+/// forces them in `path, start_line, end_line` order.
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ReadRequest {
     /// Path of the file to read — a project file from the working directory, or one this session created (e.g. `src/main.rs`, or `/workspace/src/main.rs`). Required.
     #[validate(length(min = 1))]
     pub path: String,
-    /// First line to return, 1-based. Defaults to 1 (the start of the file).
-    pub start_line: Option<u32>,
-    /// Last line to return, 1-based and inclusive. Defaults to the end of the
-    /// file, capped so one call returns at most 200 lines.
-    pub end_line: Option<u32>,
+    /// First line to return, 1-based. Use 1 to read from the top of the file. Required.
+    #[validate(range(min = 1))]
+    pub start_line: u32,
+    /// Last line to return, 1-based and inclusive. At most 200 lines come back per call, so a range wider than that stops at start_line + 199. Required.
+    #[validate(range(min = 1))]
+    pub end_line: u32,
 }
 
 pub struct FileRead;
@@ -36,17 +40,14 @@ pub struct FileRead;
 impl Tool for FileRead {
     const NAME: &'static str = "file_read";
     const DESCRIPTION: &'static str =
-        "Read a file's content. Resolves against this session's edits first, then \
-         falls through to the project's working directory, so real project files \
-         can be read directly. Use for: reading a source file from the project, \
-         looking at what was previously written, inspecting a file the user \
-         uploaded into the chat, checking the current state of a draft after \
-         edits. Triggered by \"show me the file\", \"read\", \"what's in\", \"open \
-         the file\", \"cat\", \"display the contents of\". Returns the excerpt as \
-         numbered source in a fenced block, headed by the path and the line range \
-         it covers. At most 200 lines come back per call: when the header reads \
-         `(lines 1-200 of 900)` there is more, and the next call asks for \
-         start_line 201. For remote filesystems use remote_fs_session_get to \
+        "Read a range of lines from a file. Resolves against this session's edits \
+         first, then falls through to the project's working directory, so real \
+         project files can be read directly. path, start_line and end_line are all \
+         required: to read a file from the top ask for lines 1-200. Returns the \
+         excerpt as numbered source in a fenced block, headed by the path and the \
+         line range it covers. At most 200 lines come back per call: when the \
+         header reads `(lines 1-200 of 900)` there is more, and the next call asks \
+         for start_line 201. For remote filesystems use remote_fs_session_get to \
          download first, then file_read.";
 
     type Request = ReadRequest;
@@ -82,8 +83,8 @@ impl Tool for FileRead {
 
         // Clamp into the file, then cap the span. `start` past the end reads the
         // last line rather than returning nothing a model would read as "empty".
-        let start = req.start_line.unwrap_or(1).clamp(1, total);
-        let requested_end = req.end_line.unwrap_or(total).clamp(start, total);
+        let start = req.start_line.clamp(1, total);
+        let requested_end = req.end_line.clamp(start, total);
         let end = requested_end.min(start + MAX_READ_LINES - 1);
 
         let body = all[(start - 1) as usize..end as usize].join("\n");

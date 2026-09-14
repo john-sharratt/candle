@@ -626,7 +626,14 @@ mod tests {
         let r = g.regions[0];
         assert!(r.pad > 0, "the fixture must actually exercise padding");
 
-        let layout = r.layout(head_len, 2, 2, trailing, "q".to_string(), "a dream".to_string());
+        let layout = r.layout(
+            head_len,
+            2,
+            2,
+            trailing,
+            "q".to_string(),
+            "a dream".to_string(),
+        );
 
         let response = phase_span_of(&layout.segments, Phase::Response)
             .expect("a prefilled assistant turn has a response span");

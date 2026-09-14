@@ -1330,6 +1330,7 @@ fn build_system_prompt(
                         &label,
                         coll_budget_adaptive.as_ref(),
                     )?,
+                    mandatory: Vec::new(),
                 }));
             }
             YamlSystemPromptItem::SectionTree { nodes } => {
@@ -2056,6 +2057,7 @@ fn build_section_tree<'a>(
                     member_glue_tokens: None,
                     budget_adaptive: None,
                     default: None,
+                    mandatory: Vec::new(),
                 };
                 // Capture the branch templates so runtime member additions
                 // (the tool catalog) can seal ×branch without re-deriving them.

@@ -3321,8 +3321,7 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                 continue;
             };
 
-            let mut awaiting_reflection: Option<(oneshot::Receiver<String>, Owed)> =
-                None;
+            let mut awaiting_reflection: Option<(oneshot::Receiver<String>, Owed)> = None;
             // The curated prose the character read, captured out of the think
             // step so the tick record reports it in place of the raw events —
             // what the pulse shows is then what went to the model.
@@ -3397,9 +3396,7 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                                     && crate::engine::tools::narrates(a.tool)
                                 {
                                     match minds.narrate_act(id, &p.as_persona(), a).await {
-                                        Ok(Some(n)) => {
-                                            (format!("{} {LANDED} {n}", a.summary()), n)
-                                        }
+                                        Ok(Some(n)) => (format!("{} {LANDED} {n}", a.summary()), n),
                                         _ => (r.feed, r.answer),
                                     }
                                 } else {
@@ -3462,9 +3459,7 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                                 .parsed
                                 .acts
                                 .iter()
-                                .map(|a| {
-                                    (a.tool.to_string(), crate::engine::loopguard::salient(a))
-                                })
+                                .map(|a| (a.tool.to_string(), crate::engine::loopguard::salient(a)))
                                 .collect();
                             if rt.loop_guards.record(id, &taken) {
                                 minds

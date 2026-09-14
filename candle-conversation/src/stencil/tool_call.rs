@@ -14,8 +14,17 @@
 //!   JSON value (`Terminator::JsonValue`), lookahead-terminated at the enclosing
 //!   `,`/`}`, which the session pushes back to the next node.  This guarantees
 //!   valid JSON structure without strictly enforcing the scalar type.
+//!
+//! **A key stops where the model's own token begins.** A value with a lead-in
+//! (a string's opening `"`) is keyed through it — `"path": "` ends on the ` "`
+//! token the model writes there anyway. A value with none is keyed up to `":`
+//! and no further, so the model writes ` [`, ` ["`, ` 5` or ` true` as the one
+//! token it was trained on. A key ending in a bare space leaves the model
+//! mid-token: grammar-written calls came out `"commands":  [` with the space
+//! doubled, and on one Cline turn the first token for the value was a space
+//! and a closer, which ended it empty — `{"commands":  }}`, not a call.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -72,8 +81,15 @@ impl ToolSpec {
     /// (`["integer","null"]`); the non-`null` member is used.  An `enum` of
     /// strings becomes a constrained branch.  Unknown/compound types fall back
     /// to "any JSON value" (still structurally validated).
+    ///
+    /// **Required parameters come in the order the `required` list names them**,
+    /// and the tree emits them in that order. The properties object iterates
+    /// alphabetically, which would force a range read as `end_line, path,
+    /// start_line`; the `required` list is the one place a schema states the
+    /// order its author means (`path, start_line, end_line`). Optional
+    /// parameters follow, in property order.
     pub fn from_json_schema(name: &str, schema: &Value) -> ToolSpec {
-        let required: BTreeSet<&str> = schema
+        let required: Vec<&str> = schema
             .get("required")
             .and_then(|r| r.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
@@ -94,11 +110,18 @@ impl ToolSpec {
                 params.push(Param {
                     name: pname.clone(),
                     ty: parse_param_type(pschema),
-                    required: required.contains(pname.as_str()),
+                    required: required.contains(&pname.as_str()),
                     enum_values,
                 });
             }
         }
+        // Stable, so optionals keep their property order behind the required.
+        params.sort_by_key(|p| {
+            required
+                .iter()
+                .position(|r| *r == p.name)
+                .unwrap_or(usize::MAX)
+        });
         ToolSpec {
             name: name.to_string(),
             params,
@@ -638,9 +661,16 @@ impl ToolTreeBuilder<'_> {
                 "{}{}{}",
                 self.env.param_open, p.name, self.env.param_name_close
             ),
+            // Through the lead-in when there is one, else up to the colon: the
+            // space before a value is the first byte of the model's own token
+            // (` [`, ` 5`, ` true`), and a key ending on it leaves the model
+            // mid-token. See the module docs.
             CallStyle::JsonBlock | CallStyle::Lines => {
                 let sep = if first { "" } else { ", " };
-                format!("{sep}\"{}\": {leadin}", p.name)
+                match leadin {
+                    "" => format!("{sep}\"{}\":", p.name),
+                    _ => format!("{sep}\"{}\": {leadin}", p.name),
+                }
             }
         }
     }
@@ -749,13 +779,15 @@ impl ToolTreeBuilder<'_> {
             ParamType::Boolean => Ok((
                 "",
                 self.spec.push(NodeSpec::Branch {
-                    arms: vec![("true".into(), next), ("false".into(), next)],
+                    // The key ends at the colon, so each arm carries its space.
+                    arms: vec![(" true".into(), next), (" false".into(), next)],
                 }),
             )),
             // Numbers, arrays, and objects are emitted as any structurally-valid
             // JSON value, lookahead-terminated at the enclosing `,`/`}` (the
             // session pushes that delimiter back).  This guarantees valid JSON
-            // structure; it does not strictly enforce the scalar type.
+            // structure; it does not strictly enforce the scalar type. The
+            // value's leading space is the model's — see [`Self::key`].
             ParamType::Integer | ParamType::Number | ParamType::Array | ParamType::Object => Ok((
                 "",
                 self.spec.push(NodeSpec::FreeText {
@@ -1253,5 +1285,29 @@ mod tests {
         let spec = compile_tool_call_tree(&tools, &ToolCallEnvelope::qwen3()).unwrap();
         let tree = compile(&spec, &v).unwrap();
         assert!(tree.len() > 5);
+    }
+
+    /// Required parameters take the `required` list's order, not the
+    /// properties' alphabetical one; optionals follow in property order.
+    #[test]
+    fn required_params_follow_the_required_list_order() {
+        let spec = ToolSpec::from_json_schema(
+            "file_read",
+            &serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "end_line": {"type": "integer"},
+                    "note": {"type": "string"},
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer"},
+                    "after": {"type": "string"}
+                },
+                "required": ["path", "start_line", "end_line"]
+            }),
+        );
+        let names: Vec<&str> = spec.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["path", "start_line", "end_line", "after", "note"]);
+        assert!(spec.params[..3].iter().all(|p| p.required));
+        assert!(spec.params[3..].iter().all(|p| !p.required));
     }
 }

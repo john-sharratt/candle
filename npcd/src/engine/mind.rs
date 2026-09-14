@@ -871,8 +871,13 @@ impl Minds {
             (narrator::PRIME_INPUT, narrator::PRIME_NARRATION),
             (narrator::PRIME_ACT_INPUT, narrator::PRIME_ACT_NARRATION),
         ] {
-            let handle =
-                fork.submit_prefilled_turn(user, assistant, "\u{0}\u{0}", SelectionState::new(), Vec::new())?;
+            let handle = fork.submit_prefilled_turn(
+                user,
+                assistant,
+                "\u{0}\u{0}",
+                SelectionState::new(),
+                Vec::new(),
+            )?;
             let primed = handle.wait()?;
             fork.finish_turn(handle, &primed)?;
         }

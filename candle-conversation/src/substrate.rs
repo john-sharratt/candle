@@ -1342,9 +1342,10 @@ pub struct StreamRuntime {
     /// recent (re)projection — the decode→decode (`Q·Q`) consensus substrate. Last-writer-wins;
     /// rebuilt from the redo log on replay. `None` until the first projection writes it.
     pub wide_q_sigs: Option<Vec<u8>>,
-    /// The turn's QSA index page — the compressed index rows covering exactly
-    /// this turn's tokens, as sealed. Last-writer-wins, rebuilt from the redo
-    /// log on replay, `None` for a turn sealed by a model that indexes nothing.
+    /// The QSA index page of a turn or a prompt section — the compressed index
+    /// rows covering exactly its tokens, as sealed. Last-writer-wins, rebuilt
+    /// from the redo log on replay, `None` for a piece sealed by a model that
+    /// indexes nothing.
     ///
     /// A projection that borrows this turn's K/V needs these rows handed over
     /// with it: the index is computed from hidden states, so unlike the K/V it
@@ -4147,8 +4148,8 @@ impl Substrate {
                 self.evict_decoded_wide_sig(stream_id);
             }
             RecordType::TurnIndexPage => {
-                // Opaque QSA index-page bytes, last-writer-wins per turn stream
-                // id — a re-seal of the same turn replaces the page.
+                // Opaque QSA index-page bytes, last-writer-wins per stream id —
+                // a turn's or a prompt section's; a re-seal replaces the page.
                 self.streams.entry(stream_id).or_default().index_page =
                     Some(entry.record.payload.clone());
             }
@@ -5161,6 +5162,16 @@ impl Substrate {
             .and_then(|s| s.index_page.as_deref())
     }
 
+    /// The stored QSA index page for a prompt section, keyed by the section's
+    /// content-addressed stream id — the section counterpart of
+    /// [`Self::index_page_blob`], and what a section restored from the log
+    /// hands the model in place of the page its prefill would have sealed.
+    pub fn section_index_page(&self, stream_id: StreamId) -> Option<&[u8]> {
+        self.streams
+            .get(&stream_id)
+            .and_then(|s| s.index_page.as_deref())
+    }
+
     /// A sealed turn's gather-scope tags, as persisted on its `TurnDecl`.
     ///
     /// These are what route a seal-time normalization observation to the scopes
@@ -5419,6 +5430,23 @@ impl Substrate {
                     .map(|hot| (entry.residence, slot.stream_id, hot.clone()))
             })
             .collect()
+    }
+
+    /// Count of section residences awaiting their redo-log write — the COUNT
+    /// companion to [`Self::snapshot_pending_section_cold`], with its exact
+    /// filter, so the shutdown drain keeps passing until every sealed section
+    /// is durable rather than stopping once the turn tiers are empty.
+    pub fn pending_section_cold_count(&self) -> usize {
+        self.sections
+            .values()
+            .filter(|entry| {
+                let slot = &self.residence[entry.residence.0];
+                slot.hot.is_some()
+                    && slot.cold.is_none()
+                    && slot.stream_id != StreamId::default()
+                    && !slot.pending_quantize
+            })
+            .count()
     }
 
     /// Mark a section residence as awaiting the scheduler's quantize

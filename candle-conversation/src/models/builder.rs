@@ -3,7 +3,8 @@
 
 use super::{Model, ModelArch, ModelSpec};
 use crate::config::{
-    pick_max_hot_turns, DecodeHealthConfig, EngineConfig, SamplingConfig, SequenceConfig,
+    pick_max_hot_turns, DecodeHealthConfig, EngineConfig, SamplingConfig, SchedulerConfig,
+    SequenceConfig,
 };
 use crate::error::ConversationError;
 use crate::guest::checkpoint::gguf_header;
@@ -139,10 +140,11 @@ pub struct ModelBuilder {
     expert_pack_dir: Option<PathBuf>,
     /// Override for [`SchedulerConfig::large_prefill_max_tokens`].
     ///
-    /// `None` keeps the default, which is sized for interactive serving where
-    /// only a turn or two is ever queued. A workload that reliably has more than
-    /// that waiting — a bulk ingest — wants it at the model ceiling instead; see
-    /// [`ModelBuilder::prefill_pass_tokens`].
+    /// `None` sizes it to the card at engine start
+    /// ([`SchedulerConfig::prefill_pass_tokens_for_vram`]: 2048 on a 16 GB card,
+    /// 4096 on the 24 GB class, 8192 on 64 GB and up). A workload that reliably
+    /// has more than a turn or two waiting — a bulk ingest — may want it at the
+    /// model ceiling instead; see [`ModelBuilder::prefill_pass_tokens`].
     prefill_pass_tokens: Option<usize>,
     /// LoRA adapters to load alongside the base weights — `(name, directory)`.
     ///
@@ -1143,6 +1145,23 @@ impl ModelBuilder {
         self.health_config.resolve_structural_tokens(&tokenizer);
 
         let mut config = self.engine_config(&tokenizer);
+        // Size the prefill forward to the card unless the caller chose it.
+        if self.prefill_pass_tokens.is_none() {
+            let total_vram = match device {
+                Device::Cuda(d) => d
+                    .mem_get_info()
+                    .map(|(_free, total)| total as u64)
+                    .unwrap_or(0),
+                _ => 0,
+            };
+            config.scheduler.large_prefill_max_tokens =
+                SchedulerConfig::prefill_pass_tokens_for_vram(total_vram);
+            tracing::info!(
+                total_vram_gib = total_vram / (1 << 30),
+                prefill_pass_tokens = config.scheduler.large_prefill_max_tokens,
+                "prefill forward sized to the card"
+            );
+        }
 
         // Embed the raw `tokenizer.json` so the substrate log is a
         // self-contained, offline-detokenizable image. Written once per

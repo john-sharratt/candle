@@ -520,11 +520,19 @@ mod tests {
 
     /// Every file under `dir`, depth first. Sorted, so a failure names the same
     /// file on every machine rather than whichever the filesystem yielded first.
+    ///
+    /// Hidden entries are skipped: they are not the framework. The daemon writes
+    /// its own folder metadata (`.substrate.yaml`) into every folder it maps,
+    /// and each copy names its own folder's path — comparing them reported
+    /// drift between two copies of the framework that were identical.
     fn walk(dir: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut stack = vec![dir.to_path_buf()];
         while let Some(d) = stack.pop() {
             for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                if e.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
                 let p = e.path();
                 if p.is_dir() {
                     stack.push(p);

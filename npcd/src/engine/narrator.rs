@@ -215,7 +215,12 @@ fn presence(company: &[String]) -> String {
 /// `sketch` is a compact one-line character sketch (the caller builds it from
 /// the persona); `company` is everyone present, by the names the focal character
 /// knows them by.
-pub fn build_turn(name: &str, sketch: &str, company: &[String], events: &[Event]) -> Option<String> {
+pub fn build_turn(
+    name: &str,
+    sketch: &str,
+    company: &[String],
+    events: &[Event],
+) -> Option<String> {
     let lines: Vec<String> = events.iter().filter_map(event_line).collect();
     if lines.is_empty() {
         return None;
@@ -405,7 +410,8 @@ mod tests {
     /// can re-voice it — and the three readings stay distinct.
     #[test]
     fn speech_lines_are_actor_relative() {
-        let to_you = event_line(&speech("Vael", "that the shaft is failing", Addressed::You)).unwrap();
+        let to_you =
+            event_line(&speech("Vael", "that the shaft is failing", Addressed::You)).unwrap();
         let overheard = event_line(&speech(
             "Vael",
             "that Pax is stalling",
@@ -457,7 +463,9 @@ mod tests {
             "Ulysses",
             "sharp",
             &["Pax".into()],
-            &[ev(EventKind::Situation { text: "You are here.".into() })]
+            &[ev(EventKind::Situation {
+                text: "You are here.".into()
+            })]
         )
         .is_none());
     }
@@ -488,13 +496,23 @@ mod tests {
                 text: "Vael Fane left".into(),
             }),
         ];
-        let turn = build_turn("Ulysses Thorne", "sharp, impatient", &["Pax".into(), "Vael".into()], &events)
-            .unwrap();
+        let turn = build_turn(
+            "Ulysses Thorne",
+            "sharp, impatient",
+            &["Pax".into(), "Vael".into()],
+            &events,
+        )
+        .unwrap();
         assert!(turn.starts_with("YOU: Ulysses Thorne — sharp, impatient\n"));
-        assert!(turn.contains("STATE: You are at the lift and the stair of the command level. Near you: Pax, Vael.\n"));
+        assert!(turn.contains(
+            "STATE: You are at the lift and the stair of the command level. Near you: Pax, Vael.\n"
+        ));
         assert!(turn.contains("1. Vael — speaks to you — meaning: \"that the shaft is failing\"\n"));
         assert!(turn.contains("2. Vael Fane left\n"));
-        assert!(!turn.contains("Because Pax"), "the mechanical affordance line must not appear");
+        assert!(
+            !turn.contains("Because Pax"),
+            "the mechanical affordance line must not appear"
+        );
     }
 
     /// The no-think prefill rides back at the head of the decode, and a stray
@@ -523,7 +541,10 @@ mod tests {
             "You move toward the door."
         );
         // A block after the prefill that is itself unclosed — drop from it.
-        assert_eq!(strip_reasoning("<think>\n\n</think>\n\n<think>still going"), "");
+        assert_eq!(
+            strip_reasoning("<think>\n\n</think>\n\n<think>still going"),
+            ""
+        );
         // Prose fenced as markdown — peel the fence.
         assert_eq!(
             strip_reasoning("```markdown\nA gull cries once.\n```"),
@@ -532,17 +553,26 @@ mod tests {
         // A runaway that never closed is nothing but reasoning — dropped whole.
         assert_eq!(strip_reasoning("<think>still going and going"), "");
         // Plain prose is untouched.
-        assert_eq!(strip_reasoning("  A gull cries once.  "), "A gull cries once.");
+        assert_eq!(
+            strip_reasoning("  A gull cries once.  "),
+            "A gull cries once."
+        );
     }
 
     /// The sketch is clipped to a sentence-bounded budget and pairs identity with
     /// manner.
     #[test]
     fn the_sketch_is_compact() {
-        let s = sketch("An archivist aboard the vault. He was born under the third dome.", "curt");
+        let s = sketch(
+            "An archivist aboard the vault. He was born under the third dome.",
+            "curt",
+        );
         assert!(s.starts_with("An archivist aboard the vault."), "{s}");
         assert!(s.ends_with("curt"), "{s}");
         let long = "word ".repeat(100);
-        assert!(sketch(&long, "").chars().count() <= 202, "identity is clipped");
+        assert!(
+            sketch(&long, "").chars().count() <= 202,
+            "identity is clipped"
+        );
     }
 }

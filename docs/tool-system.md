@@ -522,7 +522,7 @@ Create a new file or overwrite an existing one in the in-memory virtual filesyst
 
 ### `file_read`
 
-Read a file's content from the session VFS. Use for: looking at what was previously written, inspecting a file the user uploaded into the chat, retrieving content the model needs to reference for editing or summarising, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what's in", "open the file", "cat", "display the contents of". Returns the path, full content as a string, and line count. Limited to files in the in-memory VFS — for remote filesystems use `remote_fs_session_get` to download first, then `file_read`.
+Read a range of lines from a file in the session VFS. Use for: looking at what was previously written, inspecting a file the user uploaded into the chat, retrieving content the model needs to reference for editing or summarising, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what's in", "open the file", "cat", "display the contents of". `path`, `start_line` and `end_line` are all required — to read a file from the top, ask for lines 1-200. Returns the excerpt as numbered source in a fenced block, headed by the path and the line range it covers. Limited to files in the in-memory VFS — for remote filesystems use `remote_fs_session_get` to download first, then `file_read`.
 
 **Parameters**
 
@@ -530,23 +530,39 @@ Read a file's content from the session VFS. Use for: looking at what was previou
 {
   "type": "object",
   "properties": {
-    "path": {"type": "string"}
+    "path": {"type": "string"},
+    "start_line": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "First line to return, 1-based."
+    },
+    "end_line": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Last line to return, 1-based and inclusive."
+    }
   },
-  "required": ["path"]
+  "required": ["path", "start_line", "end_line"]
 }
 ```
 
 **Returns**
 
-```json
-{
-  "path": "src/main.rs",
-  "content": "fn main() {\n    println!(\"hello\");\n}\n",
-  "lines": 3
-}
-```
+A rendered string, not a JSON object:
 
-**Errors.** Missing file returns `{"error": "not_found", "path": "..."}`.
+````
+src/main.rs (lines 1-3):
+
+```rust
+1  fn main() {
+2      println!("hello");
+3  }
+```
+````
+
+`start_line` is clamped into `[1, total]` and `end_line` into `[start_line, total]`. At most 200 lines come back per call — a wider range stops at `start_line + 199`. When the excerpt stops before the end of the file the header reads `(lines 1-200 of 900)`, which is the signal to continue with `start_line` 201; otherwise it reads `(lines a-b)`. An empty file reads as `(empty)`.
+
+**Errors.** Missing file returns `{"error": "not_found", "path": "..."}`. A call missing `start_line` or `end_line` returns `{"error": "invalid_arguments", ...}`.
 
 ---
 

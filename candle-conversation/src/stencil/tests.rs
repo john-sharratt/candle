@@ -77,12 +77,13 @@ fn write_file_with_optional_included() {
     let tree = tree_of(&three_tool_catalog(), &v);
     // name "write_file"; path value "a.txt\""; then the optional gate must be
     // chosen via the `create` arm — but that's a Branch, so the decode step that
-    // selects it is the first token of `, "create": ` which is ','.
+    // selects it is the first token of `, "create":` which is ','. In this
+    // byte vocab ` true`/` false` share their space, which the compiler
+    // prefills; a real vocab has each as one token.
     let mut script = bytes_of("write_file\"");
     script.extend(bytes_of("a.txt\"")); // path value + close quote
-                                        // optional gate: choose ", \"create\": " (starts with ',') then boolean "true"
-    script.extend(bytes_of(", \"create\": ")); // walk the gate arm trie
-    script.extend(bytes_of("true")); // boolean branch
+    script.extend(bytes_of(", \"create\":")); // walk the gate arm trie
+    script.extend(bytes_of("true")); // boolean branch, after the shared space
     let run = simulate(tree, &v, Oracle::Scripted(script), 2000).unwrap();
     let text = run.text(&v);
     let parsed: serde_json::Value = serde_json::from_str(json_body(&text)).unwrap();
@@ -245,7 +246,7 @@ fn array_value_via_pushback() {
         .unwrap(),
     );
     // a nested array whose inner commas/brackets must not terminate early.
-    let script = bytes_of("[1,[2,3],4]}");
+    let script = bytes_of(" [1,[2,3],4]}");
     let run = simulate(tree, &v, Oracle::Scripted(script), 2000).unwrap();
     let text = run.text(&v);
     let parsed: serde_json::Value = serde_json::from_str(json_body(&text)).unwrap();
@@ -354,7 +355,7 @@ fn every_tool_path_yields_valid_json() {
         [
             bytes_of("write_file\""),
             bytes_of("y\""),
-            bytes_of(", \"create\": "),
+            bytes_of(", \"create\":"),
             bytes_of("false"),
             bytes_of("}}\n</tool_call>"),
         ]
