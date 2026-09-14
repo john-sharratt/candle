@@ -285,12 +285,17 @@ pub struct DeltaNetWidths {
 ///
 /// An ordinary SwiGLU every token goes through, scaled by a per-token
 /// `sigmoid(w_gate · x)` and summed with the routed combine — Qwen3.5/3.6's
-/// MoE. Only part of it lands on the span: the fused gate/up projection, the
-/// SiLU, the product, the gate's tile-wide projection, its sigmoid, and the
-/// final sum. The down projection goes through `forward_live_as`, whose int8 arm
-/// quantizes its operand and so breaks provenance; its result, and the gated
-/// product built on it, come off the CUDA pool and are not priced here.
-/// Measured on Qwen3.5-35B-A3B at 2,100 rows: exactly those six carves.
+/// MoE. Every step of it lands on the span: the fused gate/up projection, the
+/// SiLU, the product, the down projection's q8a128 operand and its result, the
+/// gate's tile-wide projection, its sigmoid, the gated product, and the final
+/// sum. Measured on Qwen3.5-35B-A3B at 2,100 rows: those nine carves.
+///
+/// **An uncharged carve here is not slack somewhere else.** The FFN generation
+/// is sized to exactly this chain, and the shared half carves before the routed
+/// one, so a shared buffer the plan omits leaves the routed down projection —
+/// the chain's last large carve — without room. It then declines to the CUDA
+/// pool (`ArenaFull`, silently) on every layer, and the tier reserves bytes
+/// nothing ever carves: both symptoms of one missing declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SharedExpertWidths {
     /// The shared SwiGLU's intermediate width.
@@ -692,12 +697,21 @@ pub enum WaveBuffer {
     SharedAct,
     /// `silu(gate) ⊙ up` — what the shared down projection consumes.
     SharedGated,
+    /// The shared down projection's operand: [`Self::SharedGated`] quantized to
+    /// q8a128, in the generation the product was carved in.
+    SharedDownOperand,
+    /// The shared expert's down projection, `hidden` wide in `work_dtype` — the
+    /// width of the routed combine it is summed into.
+    SharedDown,
     /// The shared expert's gate projection, a KO tile wide; only column 0 is
     /// the gate, the rest are the padding rows' zeros.
     SharedGateLogits,
     /// `sigmoid` of that column: one scalar per token, and the one shared
     /// buffer whose length is rarely a multiple of the alignment.
     SharedGateSigmoid,
+    /// `down · sigmoid(gate)` — the gated shared contribution
+    /// [`Self::MoeSharedSum`] adds to the routed combine.
+    SharedGatedOut,
     /// The router's per-token logits over every expert. Both paths.
     RouterLogits,
     /// Top-k routing weights, in F32. Both paths.
@@ -756,7 +770,7 @@ pub enum WaveBuffer {
     MoeCombine,
     /// `routed + gated shared` — the layer's output on a stack with a shared
     /// expert. It carves beside the routed combine because that is its first
-    /// operand; the gated shared half it adds is on the pool.
+    /// operand; the gated shared half it adds is [`Self::SharedGatedOut`].
     MoeSharedSum,
 
     // ── The dense FFN ───────────────────────────────────────────────────────
@@ -966,8 +980,11 @@ impl WaveBuffer {
             | Self::SharedGateUp
             | Self::SharedAct
             | Self::SharedGated
+            | Self::SharedDownOperand
+            | Self::SharedDown
             | Self::SharedGateLogits
             | Self::SharedGateSigmoid
+            | Self::SharedGatedOut
             | Self::RouterLogits
             | Self::RouteWeights
             | Self::RouteIndices
@@ -1164,8 +1181,11 @@ impl WaveBuffer {
             Self::SharedGateUp
             | Self::SharedAct
             | Self::SharedGated
+            | Self::SharedDownOperand
+            | Self::SharedDown
             | Self::SharedGateLogits
             | Self::SharedGateSigmoid
+            | Self::SharedGatedOut
             | Self::MoeSharedSum
                 if !g.is_moe() || g.shared_expert.is_none() =>
             {
@@ -1173,6 +1193,8 @@ impl WaveBuffer {
             }
             Self::SharedGateUp => dense(rows, 2 * shared.intermediate, g.work_dtype()),
             Self::SharedAct | Self::SharedGated => dense(rows, shared.intermediate, g.work_dtype()),
+            Self::SharedDownOperand => q8(rows, shared.intermediate),
+            Self::SharedDown | Self::SharedGatedOut => dense(rows, g.hidden, g.work_dtype()),
             Self::SharedGateLogits => dense(rows, shared.gate_cols, g.work_dtype()),
             Self::SharedGateSigmoid => dense(rows, 1, g.work_dtype()),
             Self::MoeSharedSum => dense(rows, g.hidden, g.work_dtype()),
@@ -1823,8 +1845,11 @@ mod tests {
                             WaveBuffer::SharedGateUp
                                 | WaveBuffer::SharedAct
                                 | WaveBuffer::SharedGated
+                                | WaveBuffer::SharedDownOperand
+                                | WaveBuffer::SharedDown
                                 | WaveBuffer::SharedGateLogits
                                 | WaveBuffer::SharedGateSigmoid
+                                | WaveBuffer::SharedGatedOut
                                 | WaveBuffer::MoeSharedSum
                         ) && g.shared_expert.is_none())
                         // The head's two alternatives: a packed session carves
@@ -2216,10 +2241,10 @@ mod tests {
         );
     }
 
-    /// **A shared expert's carves are priced, and only the ones on the span.**
-    /// Its down projection and the gated product built on it come off the
-    /// pool; charging them would be slack, omitting the six that are here was
-    /// an overrun the down-cast overcharge happened to hide.
+    /// **A shared expert's carves are priced — all nine.** Its down projection,
+    /// the q8a128 operand that feeds it and the gated product built on it carve
+    /// from the FFN generation like the rest; left out of the plan, they took
+    /// the routed down projection's room and pushed it onto the CUDA pool.
     #[test]
     fn the_shared_expert_ffn_is_the_measured_generation() {
         let bf16 = WavePlan::new(moe_35b());
@@ -2246,8 +2271,11 @@ mod tests {
             WaveBuffer::SharedGateUp,
             WaveBuffer::SharedAct,
             WaveBuffer::SharedGated,
+            WaveBuffer::SharedDownOperand,
+            WaveBuffer::SharedDown,
             WaveBuffer::SharedGateLogits,
             WaveBuffer::SharedGateSigmoid,
+            WaveBuffer::SharedGatedOut,
             WaveBuffer::MoeSharedSum,
         ] {
             assert_eq!(b.bytes(&moe(), width), 0, "{b:?}");
@@ -2511,13 +2539,15 @@ mod tests {
     const MEASURED_FFN_F16_9880: usize = 1_491_366_400;
 
     /// The same generation on Qwen3.5-35B-A3B, whose MoE adds a shared expert:
-    /// six more carves (gate/up, SiLU, product, gate tile, sigmoid, the final
-    /// sum) and the alignment pads the sigmoid and the routing tables leave.
+    /// nine more carves (gate/up, SiLU, product, the down projection's q8a128
+    /// operand and its result, gate tile, sigmoid, the gated product, the final
+    /// sum) and the alignment pads the sigmoid, the down operand and the routing
+    /// tables leave.
     ///
-    /// * BF16, 2,100 rows: 20 carves, 836 B lost to alignment.
-    /// * F16, 1,070 rows: 21 carves — the result cast again — 680 B lost.
-    const MEASURED_FFN_35B_BF16_2100: usize = 287_024_640;
-    const MEASURED_FFN_35B_F16_1070: usize = 150_628_864;
+    /// * BF16, 2,100 rows: 23 carves, 836 B lost to alignment.
+    /// * F16, 1,070 rows: 24 carves — the result cast again — 808 B lost.
+    const MEASURED_FFN_35B_BF16_2100: usize = 305_437_440;
+    const MEASURED_FFN_35B_F16_1070: usize = 160_010_752;
 
     /// Qwen3.5-35B-A3B's FFN shapes. The FFN chain takes nothing from the
     /// attention side, so only the fields it reads are the checkpoint's.

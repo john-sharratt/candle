@@ -1509,26 +1509,44 @@ the mixer is the target.
 was priced as Qwen3-MoE's routed chain alone; the shared expert — an ordinary
 SwiGLU every token also goes through, gated by `sigmoid(w_gate · x)` — was not
 declared. A census of Qwen3.5-35B-A3B at 2,100 rows (BF16, shared intermediate
-512) shows exactly six of its steps on the span, in this order before the router:
+512) shows all nine of its steps on the span, in this order before the router:
 
 | carve | bytes | what |
 |---|---|---|
 | `to_dynamic` | 4,300,800 | fused `[gate \| up]`, 2 × 512 × work dtype |
 | `Silu` | 2,150,400 | `silu(gate)` |
 | `Mul` | 2,150,400 | `silu(gate) ⊙ up` |
+| `repack_to_host` | 1,209,600 | that product as q8a128 — the down projection's operand |
+| `to_dynamic` | 8,601,600 | the shared down projection, `hidden` × work dtype |
 | `to_dynamic` | 134,400 | the gate projection, padded to one 32-column KO tile |
 | `Sigmoid` | 4,200 | one scalar per token |
+| `Mul` | 8,601,600 | `down · sigmoid(gate)` |
 | `Add` | 8,601,600 | `routed + gated`, carved beside the routed combine |
 
-The shared **down projection** and `y · gate` do *not* appear: `forward_live_as`'s
-int8 arm quantizes its operand, which breaks provenance, so both come off the
-CUDA pool. They are priced nowhere — charging them would be slack. The six that
-are here are `ModelGeometry::shared_expert` (`SharedExpertWidths { intermediate,
-gate_cols }`), and `priced_intermediate` no longer folds the shared width into
-the routed experts' with a `max`. The plan now prices this generation to the
-byte, 287,024,640 B including the 836 B of alignment the sigmoid and the routing
-tables leave; the F16 session adds the `to_dtype_mut` result cast and prices to
-the byte as well (150,628,864 B at 1,070 rows).
+These are `ModelGeometry::shared_expert` (`SharedExpertWidths { intermediate,
+gate_cols }`), and `priced_intermediate` does not fold the shared width into the
+routed experts' with a `max`. The plan prices this generation to the byte:
+305,437,440 B including the 836 B of alignment the sigmoid, the down operand and
+the routing tables leave; the F16 session adds the `to_dtype_mut` result cast and
+prices to the byte as well (160,010,752 B at 1,070 rows).
+
+**The down projection and `y · gate` joined the span later (2026-09-15).** When
+this section was first written they came off the CUDA pool — `forward_live_as`'s
+int8 arm quantized its operand without provenance — and were deliberately left
+unpriced. Once the shared projection kept its operand in the generation, all
+three buffers carved, the plan still charged only six, and the FFN arena was
+short by exactly them. Because the shared half carves before the routed chain,
+the shortfall landed on the routed **down projection**, the chain's last large
+carve: at 2,100 rows the carves before it came to 159,066,600 B, the down
+output needed 137,625,600 more, the arena held 287,024,640, and the allocation
+declined `ArenaFull` to the CUDA pool — silently, on every MoE layer, at every
+width. The tier then reserved the down projection's bytes and never carved
+them: 448 MiB unused at the widest gate forward (8,280 rows), which the
+tier-exactness assertion reported, while the forbidden-allocation report showed
+the pooled down outputs. One missing declaration, both symptoms. Declaring the
+three buffers restores the down projection to the span, and the gate's FFN
+phase is exact again at every width (1,238,208,000 B reserved and used at 8,280
+rows).
 
 ### 7.16 The fused prefill scan (design)
 
