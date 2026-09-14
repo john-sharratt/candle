@@ -472,6 +472,24 @@ impl Minds {
                 }
             }
         }
+        // Also prove the grammar compiles for a character standing at the
+        // command table, where `collect_mission` / `report_done` / `report_stuck`
+        // enter the mask. `nowhere()` never carries a station's acts, so the
+        // empty-room check above cannot see them, and a table grammar that would
+        // not compile would otherwise surface only when a character first stands
+        // there — as a `<think>` block with no tree to close it. Logged loudly,
+        // not fatal: the per-turn `opening` gate makes such a turn free-decode
+        // cleanly rather than run to the token ceiling.
+        let mut at_table = tools::Within::nowhere();
+        at_table.station = vec!["order-table".to_string()];
+        for level in LEVELS {
+            if let Err(e) = compile_act_loop(&engine, &base_config, level, &at_table) {
+                tracing::error!(
+                    "the {level:?} grammar at the command table would not compile: {e:#} — \
+                     characters there will free-decode"
+                );
+            }
+        }
         match ok {
             true => tracing::info!(
                 "turn grammar armed over {} acts, {} per turn — every turn is a reasoning block \
@@ -715,11 +733,12 @@ impl Minds {
         // same mode, the grammar below is compiled from. See `compile_act_loop`.
         let mut selection = selection;
         tools::show_within(&mut selection, Mode::Physical, within);
+        let turn_grammar = self.grammar_for(thinking, within);
         let options = TurnOptions {
-            turn_grammar: self.grammar_for(thinking, within),
+            assistant_prefill: self.opening(thinking, turn_grammar.is_some()),
+            turn_grammar,
             sampling: Some(self.sampling_for(thinking)),
             selection,
-            assistant_prefill: self.opening(thinking),
             ..Default::default()
         };
         let response = sequence
@@ -796,11 +815,15 @@ impl Minds {
             .with_think_mode(thinking.mode(), self.base_config.max_response_tokens)
     }
 
-    fn opening(&self, thinking: identity::Deliberation) -> Option<String> {
-        // Nothing to prefill when no grammar compiled — the turn free-decodes,
-        // and seeding a marker no tree is bound to would commit it to a shape
-        // nothing then enforces.
-        if !self.grammar_ok {
+    fn opening(&self, thinking: identity::Deliberation, grammar_ready: bool) -> Option<String> {
+        // Nothing to prefill when *this turn* compiled no grammar — it
+        // free-decodes, and seeding a marker no tree is bound to would commit it
+        // to a shape nothing then enforces. Worse for a reasoning block: an
+        // opened `<think>` with no tree to steer it shut runs to the token
+        // ceiling and the turn never ends. Gated on the turn's own grammar, not
+        // a boot-time flag — a grammar can compile for an empty room and fail
+        // for this one (the acts a station adds), which the flag cannot know.
+        if !grammar_ready {
             return None;
         }
         Some(match thinking {
@@ -1515,11 +1538,13 @@ impl Minds {
         // what it can decode. A character alone reads no `tell`; one standing at
         // a chronicle terminal reads the terminal's acts until it walks away.
         tools::show_within(&mut selection, Mode::Physical, within);
+        let turn_grammar = self.grammar_for(identity::Deliberation::default(), within);
         let options = TurnOptions {
-            turn_grammar: self.grammar_for(identity::Deliberation::default(), within),
+            assistant_prefill: self
+                .opening(identity::Deliberation::default(), turn_grammar.is_some()),
+            turn_grammar,
             sampling: Some(self.sampling_for(identity::Deliberation::default())),
             selection,
-            assistant_prefill: self.opening(identity::Deliberation::default()),
             // **Inside its own dreams' scope.** A turn teaches the hit levels of
             // the scopes its tags name, and the dream group is scoped to this
             // character's tag — so without it a character's own turns, the only

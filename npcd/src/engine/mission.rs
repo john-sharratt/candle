@@ -198,45 +198,22 @@ impl Mission {
         Some(lines.join("\n"))
     }
 
-    /// The first step not yet ticked off — the one thing to do next.
-    pub fn next_step(&self) -> Option<&str> {
-        self.todo
-            .iter()
-            .find(|step| !step.done)
-            .map(|step| step.text.trim())
-    }
-
     /// The mission as a standing instruction — what a character reads each quiet
-    /// turn while it carries one.
-    ///
-    /// The ask, the steps with their progress, and a pointer at the **next**
-    /// unfinished step. A standing task restated every quiet turn must name the
-    /// next thing once rather than describe the whole plan — the lesson recorded
-    /// on [`crate::engine::runtime::NO_MISSION`], where a plan in the most-recent
-    /// window position turned every turn into motion. When every step is done it
-    /// points home to the command desk, so the loop closes on a report rather
-    /// than trailing off.
+    /// turn while it carries one: the ask, the steps that see it through, and
+    /// where it ends. It ends at the command table, because that is where a
+    /// mission is reported and the next taken up — so the loop closes on a report
+    /// rather than trailing off. A character judges for itself when the work is
+    /// done; the steps are the shape of it, not a checklist it ticks.
     pub fn standing_text(&self) -> String {
         let mut out = format!("What has been asked of you: {}", self.mission_text());
         if let Some(tasks) = self.task_text() {
-            out.push_str("\nYou are working through:\n");
+            out.push_str("\nThe steps that see it through:\n");
             out.push_str(&tasks);
         }
-        match self.next_step() {
-            Some(step) => {
-                out.push_str("\nThe next thing to do is: ");
-                out.push_str(step);
-                out.push('.');
-            }
-            // Steps existed and are all done: the work is finished, so the one
-            // thing left is to say so — with `report_done` (or `report_stuck`).
-            None if !self.todo.is_empty() => out.push_str(
-                "\nEvery step is done. Report how it went now with `report_done` \
-                 (or `report_stuck` if it could not be finished).",
-            ),
-            // A mission with no steps at all is carried on its ask alone.
-            None => {}
-        }
+        out.push_str(
+            "\nCarry it out. When it is done, go back to the command table and report it with \
+             `report_done` — or `report_stuck` if it cannot be finished — and take up the next.",
+        );
         out
     }
 
@@ -597,29 +574,26 @@ mod tests {
     }
 
     #[test]
-    fn standing_text_names_the_ask_the_steps_and_the_next_thing() {
-        let mut m = a_mission();
-        assert_eq!(m.next_step(), Some("step one"));
-        assert_eq!(
-            m.standing_text(),
-            "What has been asked of you: Do the thing.\n\
-             You are working through:\n\
-             [ ] step one\n\
-             [ ] step two\n\
-             The next thing to do is: step one."
+    fn standing_text_names_the_ask_the_steps_and_where_it_ends() {
+        let m = a_mission();
+        let text = m.standing_text();
+        assert!(text.starts_with("What has been asked of you: Do the thing."));
+        assert!(text.contains("The steps that see it through:"));
+        assert!(text.contains("step one") && text.contains("step two"));
+        // It ends by pointing back to the command table to report and take the
+        // next — the loop closes there, not out in the world.
+        assert!(text.contains("go back to the command table and report it with `report_done`"));
+        // A mission carried on its ask alone still ends at the table.
+        let bare = Mission::new(
+            "Just be.",
+            vec![],
+            Origin::Random {
+                routine: "x".into(),
+            },
         );
-        // Once a step is ticked, the pointer moves to the next open one.
-        m.check_off("step one");
-        assert_eq!(m.next_step(), Some("step two"));
-        assert!(m
+        assert!(bare
             .standing_text()
-            .ends_with("The next thing to do is: step two."));
-        // Every step done points at reporting it.
-        m.check_off("step two");
-        assert_eq!(m.next_step(), None);
-        assert!(m
-            .standing_text()
-            .contains("Report how it went now with `report_done`"));
+            .contains("go back to the command table"));
     }
 
     #[test]

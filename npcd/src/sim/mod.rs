@@ -72,6 +72,12 @@ pub struct Sim {
     /// task yet — the correct reading of an absent field, not a migration.
     #[serde(default)]
     pub missions: Missions,
+    /// Whether the command table is open — handing out missions and calling
+    /// characters with none to come and take one. `serde(default)` (false): a
+    /// world loads with the table shut until an operator opens it, and a saved
+    /// world from before the table existed reads as shut, which is correct.
+    #[serde(default)]
+    pub table_open: bool,
     /// What the world is made of, as the Makers hold it — see [`record`].
     pub record: record::Record,
     /// Every conversation carried on a handset — see [`phone`].

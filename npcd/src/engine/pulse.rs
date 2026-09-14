@@ -847,8 +847,7 @@ fn describe_catalog(part_names: &PartNames) -> Value {
                     | Availability::Nearby
                     | Availability::AmongOthers
                     | Availability::Embodied
-                    | Availability::AwayFromHome
-                    | Availability::OnMission => true,
+                    | Availability::AwayFromHome => true,
                     Availability::PhysicalOnly => **m == Mode::Physical,
                     Availability::MessagingOnly => m.remote(),
                     Availability::Pictorial => m.carries_pictures(),
@@ -899,7 +898,6 @@ fn describe_catalog(part_names: &PartNames) -> Value {
                     Availability::AmongOthers => json!("two or more others here"),
                     Availability::Embodied => json!("a body"),
                     Availability::AwayFromHome => json!("being somewhere that is not home"),
-                    Availability::OnMission => json!("carrying a mission"),
                     Availability::PhysicalOnly => json!("being present"),
                     Availability::MessagingOnly => json!("being at a distance"),
                     Availability::Pictorial => json!("a channel that carries pictures"),

@@ -192,6 +192,12 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             Role::User,
             get(mission_api::status).post(mission_api::lodge),
         )
+        // Call off one owned character's mission.
+        .route(
+            "/v1/npc/:nid/mission/cancel",
+            Role::User,
+            post(mission_api::cancel),
+        )
         // ── the world's open channel ────────────────────────────────────────
         //
         // The standing group every character joins on arrival — see
@@ -239,6 +245,20 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         // shaped sibling of `broadcast`. Admin for the same reason: it reaches
         // every character, including ones the caller does not own.
         .route("/v1/pulse/announce", Role::Admin, post(pulse::announce))
+        // The command table: open it to call the cast to take up missions, shut
+        // it to stand them down. Admin — it reaches the whole cast, and drives
+        // every character, including ones the caller does not own.
+        .route(
+            "/v1/pulse/command-table",
+            Role::Admin,
+            post(mission_api::command_table),
+        )
+        // Clear the whole board's missions at once.
+        .route(
+            "/v1/pulse/missions/cancel",
+            Role::Admin,
+            post(mission_api::cancel_all),
+        )
         // ── generation ──────────────────────────────────────────────────────
         .route(
             "/v1/generate/description",

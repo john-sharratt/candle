@@ -2,18 +2,17 @@
 //! progress on it wherever the work happens, and report how it went back at the
 //! desk.
 //!
-//! # Two homes, on purpose
+//! # One place: the command table
 //!
-//! Collecting a mission deliberately is an `AtPart` act on the command desk
-//! (`order-table`) — where an operator-lodged mission is picked up. Everything
-//! else a character does with a mission is [`Availability::OnMission`], carried
-//! with the mission rather than with a place: recording progress and reporting
-//! how it went both happen wherever the character is, because the moment a step
-//! is finished — or the whole thing is — is wherever the work that finished it
-//! happened, not back at a desk. Requiring a walk back to report would strand a
-//! character that could not find its way, and the point is that the loop closes
-//! on its own. (Most missions never need the desk act at all: the engine hands
-//! an idle character its next mission itself — see `Runtime::ensure_mission`.)
+//! A mission is taken up and answered for at the command table (`order-table`),
+//! and carried out in the world between. All three acts are `AtPart` on that
+//! part, so they are in a character's grammar only while it stands at the table —
+//! it is called there when the table opens (see `Runtime::TO_THE_TABLE` and the
+//! tannoy the command-table API sends), takes one up, goes and does it, and
+//! comes back to report and take the next. Keeping the acts to the table is also
+//! what keeps a character *out working* free of them: its grammar while it
+//! travels and reads and talks is the ordinary one, unchanged by carrying a
+//! mission.
 //!
 //! The rich shape of a mission (the ask, the steps, the answer, the pass/fail
 //! report) lives in [`crate::engine::mission`]; whose it is lives in
@@ -48,16 +47,16 @@ macro_rules! desk {
     };
 }
 
-/// An act taken on the mission you are carrying, wherever you are.
-macro_rules! on_mission {
+/// An act taken at the command desk that names one thing.
+macro_rules! desk_on {
     ($name:literal, $desc:literal, $arg:literal, $argdesc:literal,
      $situation:literal, $call:literal, $because:literal) => {
         Tool {
             name: $name,
-            at: &[],
+            at: COMMAND_DESK,
             category: "Command",
             plane: Plane::World,
-            availability: Availability::OnMission,
+            availability: Availability::AtPart,
             description: $desc,
             params: &[Param {
                 name: $arg,
@@ -76,71 +75,43 @@ macro_rules! on_mission {
 
 pub const COLLECT_MISSION: Tool = desk!(
     "collect_mission",
-    "Take up a mission from the desk — the one set for you, or, if none is, the next thing worth \
-     doing. It becomes what you are working on until you report it done.",
-    "You are at the command desk with nothing you have been asked to do, and it is where work is \
+    "Take up a mission from the table — the one set for you, or, if none is, the next thing worth \
+     doing. It becomes what you are working on until you come back and report it.",
+    "You are at the command table with nothing you have been asked to do, and it is where work is \
      handed out.",
-    "A mission taken is a mission somebody can hold you to; standing at the desk without one is \
+    "A mission taken is a mission somebody can hold you to; standing at the table without one is \
      standing idle where the work is."
 );
 
-pub const REPORT_DONE: Tool = on_mission!(
+pub const REPORT_DONE: Tool = desk_on!(
     "report_done",
-    "Report the mission you were carrying as done, and say what you found or concluded. This \
-     closes it and files your answer, which is how anyone else learns what came of it. Do this \
-     once every step is finished.",
+    "Back at the command table, report the mission you were carrying as done, and say what you \
+     found or concluded. This closes it and files your answer, which is how anyone else learns \
+     what came of it — and it frees you to take up the next.",
     "account",
     "What you found, made, or concluded — the answer the mission was for.",
-    "Every step of your mission is done and you are ready to say what came of it.",
+    "You have carried out your mission and come back to the table to say what came of it.",
     r#"{"account":"the record holds, except the eastern date, which cannot be reconciled with the charge"}"#,
     "Work nobody reported is work nobody can build on, and the answer is the point of having gone."
 );
 
-pub const REPORT_STUCK: Tool = on_mission!(
+pub const REPORT_STUCK: Tool = desk_on!(
     "report_stuck",
-    "Report that the mission cannot be finished, and say why. This closes it as not done — an \
-     honest account of what stopped you, not a thing to be ashamed of.",
+    "Back at the command table, report that the mission cannot be finished, and say why. This \
+     closes it as not done — an honest account of what stopped you, not a thing to be ashamed of \
+     — and frees you to take up another.",
     "why",
     "What stopped you — what you tried, and where it would not go.",
-    "You have carried a mission as far as it will go and it will not finish.",
+    "You have carried a mission as far as it will go, and come back to the table to say it will \
+     not finish.",
     r#"{"why":"the record it asked me to read is not filed anywhere I could find, and nobody here has seen it"}"#,
     "A mission that cannot be done is worth knowing about; a character that abandons one silently \
      leaves it believed to be still in hand."
 );
 
-pub const STEP_DONE: Tool = on_mission!(
-    "step_done",
-    "Mark one step of your mission finished, as you finish it. This is how the mission's list \
-     tracks where you actually are.",
-    "step",
-    "The step you have just finished, in the words your mission lists it under.",
-    "You have just done one of the things your mission set out, and there are more to go.",
-    r#"{"step":"read 'the-charge'"}"#,
-    "Ticking it off as it happens is what keeps the standing list honest; leaving it drives you to \
-     redo work you have already done."
-);
-
-pub const ADD_STEP: Tool = on_mission!(
-    "add_step",
-    "Add a step to your mission that it did not foresee — work you have discovered you need to do \
-     to finish it.",
-    "step",
-    "The step to add, in your own words.",
-    "Working your mission has turned up something it did not list that has to be done for it to be \
-     finished.",
-    r#"{"step":"ask Wren where the second ledger was moved to"}"#,
-    "A mission you discover more of is a mission being taken seriously; the list is yours to keep \
-     true to the work, not a fixed order to follow blindly."
-);
-
-/// Every mission act, for the catalog.
-pub const MISSION_ACTS: &[Tool] = &[
-    COLLECT_MISSION,
-    REPORT_DONE,
-    REPORT_STUCK,
-    STEP_DONE,
-    ADD_STEP,
-];
+/// Every mission act, for the catalog. All at the command table: a mission is
+/// taken up and answered for there, and carried out in the world between.
+pub const MISSION_ACTS: &[Tool] = &[COLLECT_MISSION, REPORT_DONE, REPORT_STUCK];
 
 /// Whether a tool is one of these, for the dispatcher.
 pub fn is_mine(tool: &str) -> bool {

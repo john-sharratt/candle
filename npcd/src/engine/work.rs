@@ -157,30 +157,6 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                 },
             )
         }
-        "step_done" => {
-            let Some(step) = text(a, "step") else {
-                return Outcome::Refused(
-                    "You meant to mark a step done, but did not say which.".into(),
-                );
-            };
-            hosted.with_sim(|s| match s.missions.check_off(body, &step) {
-                true => Outcome::Did(format!("Step done: {step}.")),
-                false => Outcome::Refused(format!(
-                    "That is not a step still open on your mission: {step}."
-                )),
-            })
-        }
-        "add_step" => {
-            let Some(step) = text(a, "step") else {
-                return Outcome::Refused("You meant to add a step, but did not say what.".into());
-            };
-            hosted.with_sim(|s| match s.missions.add_todo(body, &step) {
-                true => Outcome::Did(format!("Added to your mission: {step}.")),
-                false => Outcome::Refused(format!(
-                    "That is blank, or already a step on your mission: {step}."
-                )),
-            })
-        }
         other => Outcome::Refused(format!("`{other}` is not a mission act.")),
     }
 }
@@ -196,8 +172,8 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         return library(hosted, body, act.tool, a);
     }
     // The mission acts before the subject is looked for: `collect_mission`
-    // names nothing, and the rest carry their subject under `account` / `why` /
-    // `step`, which the shared [`subject`] list does not scan.
+    // names nothing, and the reports carry their subject under `account` / `why`,
+    // which the shared [`subject`] list does not scan.
     if crate::engine::mission_acts::is_mine(act.tool) {
         return mission(hosted, body, act);
     }
@@ -2199,13 +2175,9 @@ mod tests {
     #[test]
     fn a_mission_is_collected_worked_and_reported() {
         let h = vault();
-        // Nothing to report, or to record progress on, before collecting.
+        // Nothing to report before collecting.
         assert!(matches!(
             perform(&h, "m1", &act("report_done", json!({"account":"nothing"}))),
-            Outcome::Refused(_)
-        ));
-        assert!(matches!(
-            perform(&h, "m1", &act("step_done", json!({"step":"anything"}))),
             Outcome::Refused(_)
         ));
 
@@ -2220,33 +2192,6 @@ mod tests {
             perform(&h, "m1", &act("collect_mission", json!({}))),
             Outcome::Refused(_)
         ));
-
-        // Its first step can be ticked off; a step it never had cannot.
-        let step = h.sim(|s| {
-            s.missions
-                .active("m1")
-                .unwrap()
-                .next_step()
-                .unwrap()
-                .to_string()
-        });
-        assert!(perform(&h, "m1", &act("step_done", json!({ "step": step }))).happened());
-        assert!(matches!(
-            perform(
-                &h,
-                "m1",
-                &act("step_done", json!({"step":"a step it never had"}))
-            ),
-            Outcome::Refused(_)
-        ));
-
-        // A discovered step is added to the list.
-        assert!(perform(
-            &h,
-            "m1",
-            &act("add_step", json!({"step":"ask somebody where it went"}))
-        )
-        .happened());
 
         // Reporting done closes it, frees the character, and files the answer so
         // an operator can still read it.

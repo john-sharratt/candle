@@ -3244,8 +3244,10 @@ mod tests {
                 ("/v1/interaction/:ix/stream", "user"),
                 // Messaging a character on its handset.
                 ("/v1/npc/:nid/message", "user"),
-                // Lodging a mission for a character and reading how it went.
+                // Lodging a mission for a character and reading how it went, and
+                // calling one off.
                 ("/v1/npc/:nid/mission", "user"),
+                ("/v1/npc/:nid/mission/cancel", "user"),
                 // The world's open channel: reading is a user's, speaking on it
                 // is a creator's, because it reaches every character in a world.
                 ("/v1/world/:wid/channel", "user"),
@@ -3270,6 +3272,10 @@ mod tests {
                 // reason.
                 ("/v1/pulse/broadcast", "admin"),
                 ("/v1/pulse/announce", "admin"),
+                // The command table and clearing the board — admin, they drive
+                // the whole cast.
+                ("/v1/pulse/command-table", "admin"),
+                ("/v1/pulse/missions/cancel", "admin"),
                 // Generation on the resident model, over the caller's own cast.
                 ("/v1/generate/description", "user"),
                 ("/v1/generate/description/stream", "user"),

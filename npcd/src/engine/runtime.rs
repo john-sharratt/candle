@@ -59,7 +59,6 @@ use crate::engine::ingest;
 use crate::engine::life;
 use crate::engine::loading::{LoadProgress, LoadStep};
 use crate::engine::mind::{frame_fingerprint, Minds, Projected};
-use crate::engine::mission::bank::Facts;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::reflect;
 use crate::engine::schema;
@@ -483,6 +482,22 @@ pub const NO_MISSION: &str = "Nothing has been asked of you, and you are on your
                               within reach — a ledger, a filed story, a date on the wall — and \
                               carry it far enough to have a view about it you could defend.";
 
+/// What a character with no mission is set on **while the command table is
+/// open**: go to it and take one up.
+///
+/// The standing task while the table is open, so an idle character reads it and
+/// makes its way there rather than settling into the room it is in. It names the
+/// act (`collect_mission`), because an instruction that names the branch the
+/// grammar has an arm for lands where one that only describes the wish does not —
+/// the lesson [`IN_COMPANY`] records. The loud call that reaches a character
+/// mid-conversation is the tannoy the table's opening sends; this is what keeps
+/// drawing one that has drifted, and what a character reads on its way.
+pub const TO_THE_TABLE: &str =
+    "The command table is open, and there is work to take up. Make your \
+                                way to the command room, and at the table take up a mission with \
+                                `collect_mission`. Carry it out, and when it is done come back and \
+                                take up the next.";
+
 /// How long a character must go without news before the standing task is
 /// restated to it.
 ///
@@ -776,9 +791,22 @@ impl Runtime {
         // A carried mission *is* the standing task, so it replaces the "nothing
         // has been asked of you" default outright — it does not fill a hole that
         // default was leaving (see [`NO_MISSION`]). The mission's own text names
-        // the next step and, when the steps run out, points home to the desk.
-        if let Some(text) = hosted.sim(|s| s.missions.active(&body).map(|m| m.standing_text())) {
+        // the next step and, when the steps run out, points at reporting it.
+        //
+        // With no mission but the command table open, the standing task is to go
+        // and take one up — so an idle character makes its way there rather than
+        // settling where it stands. See [`TO_THE_TABLE`].
+        let (on_mission, table_open) = hosted.sim(|s| {
+            (
+                s.missions.active(&body).map(|m| m.standing_text()),
+                s.table_open,
+            )
+        });
+        if let Some(text) = on_mission {
             return Some(text);
+        }
+        if table_open {
+            return Some(TO_THE_TABLE.to_string());
         }
         // Who is here — which decides *which* standing task this is, and, when
         // there is company, is itself the most useful thing in it. Reading the
@@ -808,32 +836,41 @@ impl Runtime {
         })
     }
 
-    /// Make sure a character always has something asked of it.
+    /// Open or shut the command table on every loaded world.
     ///
-    /// If it has a body and no open mission, it collects one — a mission lodged
-    /// for it if any waits, otherwise a routine drawn from the bank against who
-    /// and what is around. This is what keeps the cast **continuously** on
-    /// missions with nobody lodging one for each: a character that finishes and
-    /// reports is given the next on its following quiet turn. One already on a
-    /// mission is left as it is.
-    pub fn ensure_mission(&self, npc_id: u64) {
-        let Some((hosted, body)) = self.body_of(npc_id) else {
-            return;
-        };
-        let me = hosted
-            .read(|w| w.actor(&body).map(|actor| actor.name.clone()))
-            .unwrap_or_default();
-        hosted.with_sim(|s| {
-            if s.missions.is_on_mission(&body) {
-                return;
+    /// The state the standing task ([`TO_THE_TABLE`]) and `collect_mission` read.
+    /// Opening it does not itself call anyone — [`Self::call_to_table`] sends the
+    /// tannoy and the chat-channel line that do.
+    pub fn set_table_open(&self, open: bool) {
+        for id in self.hosted.ids() {
+            if let Some(hosted) = self.hosted.get(&id) {
+                hosted.with_sim(|s| s.table_open = open);
             }
-            let (makers, records) = s.mission_material(&me);
-            let facts = Facts {
-                makers: &makers,
-                records: &records,
-            };
-            s.missions.collect(&body, &facts);
-        });
+        }
+    }
+
+    /// Post one line to every loaded world's standing chat channel, as the
+    /// command table — the channel half of a call to the table.
+    pub fn say_to_all_channels(&self, from: &str, text: &str) {
+        for id in self.hosted.ids() {
+            let _ = self.say_on_channel(&id, from, text);
+        }
+    }
+
+    /// Cancel a character's open mission, if it has one. Returns whether one was
+    /// cancelled — it is called off, not reported, so it is not kept.
+    pub fn cancel_mission(&self, npc_id: u64) -> bool {
+        self.body_of(npc_id)
+            .is_some_and(|(hosted, body)| hosted.with_sim(|s| s.missions.cancel(&body)))
+    }
+
+    /// Cancel every character's open mission. Returns how many were cancelled.
+    pub fn cancel_all_missions(&self) -> usize {
+        self.scheduler
+            .census()
+            .into_iter()
+            .filter(|c| self.cancel_mission(c.npc_id))
+            .count()
     }
 
     /// Take a character's body away, and let it settle back to reacting.
@@ -3327,12 +3364,13 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
             // task is not news, so nothing it does moves the first
             // clock — and a character nobody is talking to is handed it
             // again on every tick.
+            // The standing-task nudge rides a quiet-stretch gate: delivery makes
+            // a character due at once (see `Scheduler::deliver`), so firing it
+            // every tick would be a tight re-tick loop. When the command table is
+            // open, an idle character with no mission reads "go to the table and
+            // take one up" here (see `nudge_for`); the loud call that breaks a
+            // busy one out of conversation is the tannoy the enable API sends.
             if rt.scheduler.nudge_due(id, world_ms, IDLE_AFTER_MS) {
-                // A character with nothing in hand is given something before it
-                // is told its standing task — so the standing task it then reads
-                // is a mission to carry out, not "nothing has been asked of you".
-                // This is what makes the cast pick missions up on their own.
-                rt.ensure_mission(id);
                 if let Some(text) = rt.nudge_for(id) {
                     rt.scheduler.deliver(
                         id,
@@ -3361,7 +3399,6 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
             let Some(mut start) = rt.scheduler.begin_tick(id) else {
                 continue;
             };
-
             let mut awaiting_reflection: Option<(oneshot::Receiver<String>, Owed)> = None;
             // The curated prose the character read, captured out of the think
             // step so the tick record reports it in place of the raw events —
@@ -4678,8 +4715,12 @@ mod tests {
         assert!(nudge.starts_with("What has been asked of you:"), "{nudge}");
         assert!(nudge.contains("the-charge"), "{nudge}");
         assert!(
-            nudge.contains("The next thing to do is: go to the archives."),
-            "{nudge}"
+            nudge.contains("go to the archives"),
+            "the steps are shown: {nudge}"
+        );
+        assert!(
+            nudge.contains("go back to the command table and report it with `report_done`"),
+            "the mission points back to the table: {nudge}"
         );
         assert_ne!(
             nudge, NO_MISSION,

@@ -122,6 +122,12 @@ impl Missions {
         self.active.get_mut(body).is_some_and(|m| m.add_todo(step))
     }
 
+    /// Cancel the body's open mission without a report — it is called off, not
+    /// finished, so it is not kept in `done`. Returns whether there was one.
+    pub fn cancel(&mut self, body: &str) -> bool {
+        self.active.remove(body).is_some()
+    }
+
     /// File the body's completion report, closing the open mission and keeping
     /// it in `done` so its outcome and answer can still be read. Returns the
     /// closed mission, or `None` if the body had no open mission to report.
@@ -249,6 +255,19 @@ mod tests {
         assert!(drawn.is_open());
         assert!(!drawn.todo.is_empty(), "a routine gives steps to act on");
         assert!(matches!(drawn.origin, Origin::Random { .. }));
+    }
+
+    #[test]
+    fn cancelling_removes_the_open_mission_without_recording_it() {
+        let mut m = Missions::default();
+        m.assign("bram", a_mission("do the thing"));
+        assert!(m.cancel("bram"), "an open mission is cancelled");
+        assert!(!m.is_on_mission("bram"));
+        assert!(
+            m.done("bram").is_none(),
+            "a cancelled mission is not a finished one"
+        );
+        assert!(!m.cancel("bram"), "nothing to cancel twice");
     }
 
     #[test]

@@ -150,6 +150,100 @@ pub async fn status(
     Json(json!({ "on_mission": on_mission, "mission": mission })).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TableBody {
+    /// Open the command table, or shut it.
+    open: bool,
+}
+
+/// `POST /v1/pulse/command-table` — open or shut the command table.
+///
+/// Opening it calls every character to the table — over the chat channel and
+/// the tannoy — and sets the standing task, so a character with no mission
+/// breaks off, makes its way there, and takes one up (with `collect_mission`),
+/// carries it out, reports, and comes back for the next until the table shuts.
+/// Shutting it stands the cast down: missions in hand are finished, no new ones
+/// given. Admin, like `broadcast`: it reaches the whole cast.
+pub async fn command_table(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Json(body): Json<TableBody>,
+) -> Response {
+    if let Err(r) = owner_of(&s, &headers).await {
+        return *r;
+    }
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("the command table");
+    };
+    rt.set_table_open(body.open);
+
+    let (line, salience) = if body.open {
+        (
+            "The command table is open. Any of you without a task in hand, come to the command \
+             room and take one up."
+                .to_string(),
+            Salience::URGENT,
+        )
+    } else {
+        (
+            "The command table is closed. Finish the task you are holding; no new ones are being \
+             given out."
+                .to_string(),
+            Salience::NORMAL,
+        )
+    };
+    // The chat channel — a line on every world's standing channel.
+    rt.say_to_all_channels("Command", &line);
+    // The tannoy — one announcement to the whole cast, loud enough on opening to
+    // break a character off what it is doing. Each reads it on its own clock.
+    let mut when: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for c in rt.scheduler.census() {
+        when.insert(c.npc_id, s.world_ms(c.npc_id).await);
+    }
+    let reached = rt.scheduler.broadcast(
+        |id| when.get(&id).copied().unwrap_or(0),
+        salience,
+        EventKind::Announcement { text: line },
+    );
+
+    Json(json!({ "open": body.open, "called": reached })).into_response()
+}
+
+/// `POST /v1/pulse/missions/cancel` — call off every character's mission.
+///
+/// The whole cast at once — for clearing the board before opening the table so
+/// everyone is called to take a fresh one. Admin: it reaches characters the
+/// caller does not own.
+pub async fn cancel_all(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Response {
+    if let Err(r) = owner_of(&s, &headers).await {
+        return *r;
+    }
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("cancelling missions");
+    };
+    let cancelled = rt.cancel_all_missions();
+    Json(json!({ "cancelled": cancelled })).into_response()
+}
+
+/// `POST /v1/npc/:nid/mission/cancel` — call off one character's mission.
+pub async fn cancel(
+    State(s): State<Arc<Authored>>,
+    Path(nid): Path<u64>,
+    headers: HeaderMap,
+) -> Response {
+    let (_, owner) = match owner_of(&s, &headers).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    if s.npcs.read().await.visible_to(nid, &owner).is_none() {
+        return err(StatusCode::NOT_FOUND, "not_found", "no such character");
+    }
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("cancelling a mission");
+    };
+    Json(json!({ "cancelled": rt.cancel_mission(nid) })).into_response()
+}
+
 /// One mission, as an operator reads it back.
 fn mission_view(m: &Mission) -> Value {
     json!({

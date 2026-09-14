@@ -131,17 +131,6 @@ pub enum Availability {
     /// ladder is for — the same shape as [`Availability::Nearby`], where what
     /// decides is a fact about the room rather than a value in the call.
     AwayFromHome,
-    /// Only while the body is carrying an open mission.
-    ///
-    /// **A fact about the body, decided per turn** — the same shape as
-    /// [`Availability::AwayFromHome`]. Ticking a step off or adding one is
-    /// meaningless with no mission to record it against, and offering it anyway
-    /// invites a character with nothing to track to invent a step to track;
-    /// absent rather than present-and-refused, like everything else conditional
-    /// here. Where a mission is *taken up* and *reported* is the command desk
-    /// (`AtPart`), but progress on it is recorded wherever the work happens, so
-    /// this rides with the mission rather than with a place.
-    OnMission,
     /// Only for a mind with a body.
     ///
     /// **Not a special case for one character.** Keeper has no body and never
@@ -985,10 +974,6 @@ pub fn for_body(mode: Mode, embodied: bool) -> Vec<&'static Tool> {
             // it walks. The prompt is written once, so this is the situation's
             // to offer — the same reason `Nearby` is absent here.
             Availability::AwayFromHome => false,
-            // Depends on whether the body carries a mission, which the prompt is
-            // written once and cannot know. The situation offers it, like the
-            // rest of the conditional acts.
-            Availability::OnMission => false,
         })
         .collect()
 }
@@ -1588,11 +1573,6 @@ pub struct Within {
     /// which are the same answer to the only question it is asked: is there a
     /// journey home to make.
     pub away_from_home: bool,
-    /// Whether this body is carrying an open mission — what
-    /// [`Availability::OnMission`] reads. `false` for a body with no world and
-    /// for one that has been given nothing, both the same answer to the only
-    /// question asked: is there a mission whose steps there is progress to record.
-    pub on_mission: bool,
     /// This character's own name, as the world writes it.
     ///
     /// Needed because some live sets are about the *relationship* between this
@@ -1676,7 +1656,6 @@ impl Within {
         // A world with no muster point is one nobody can be called back to, so
         // there is no journey home from anywhere in it.
         self.away_from_home = sim.homes().iter().any(|home| home != place);
-        self.on_mission = sim.missions.is_on_mission(body);
         // The phone. Empty without a handset in the pack, which is what takes
         // every messaging act out of the grammar for somebody who has not got
         // one — or has had it taken off them.
@@ -1735,9 +1714,6 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
             Availability::AmongOthers => within.company.len() >= 2,
             // A journey home is only a journey from somewhere else.
             Availability::AwayFromHome => within.away_from_home,
-            // Carried with the mission, not with a place, so a step can be
-            // ticked off wherever the work that finished it happened.
-            Availability::OnMission => within.on_mission,
             // The map decides. A station in the room is what puts its acts in
             // reach, and walking out takes them with you.
             Availability::AtPart => within.station.iter().any(|s| s == t.name),
