@@ -157,9 +157,10 @@ fn a_stuffed_group_records_its_memory_at_the_last_case() {
     let sealed_turns = engine.conversation().read().turn_count(timeline);
     assert_eq!(sealed_turns, 4, "one sealed turn per case");
     // Polls until the record for exactly this turn is readable, and panics if
-    // the newest record names any other turn.
-    let record = sealed_memory_at(&engine, timeline, (sealed_turns - 1) as u32);
-    assert_eq!(record.turn_index, (sealed_turns - 1) as u32);
+    // none has appeared within its window — before the fix the only record named
+    // turn 0, so this waited out the window and failed.
+    let record = sealed_memory_at(&engine, timeline, sealed_turns - 1);
+    assert_eq!(record.turn_index, sealed_turns - 1);
 }
 
 /// **A resumed conversation's new turns survive the next restart too.**

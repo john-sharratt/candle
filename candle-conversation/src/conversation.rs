@@ -2434,13 +2434,16 @@ impl Sequence {
     /// region, the index of the case it came from — a case with no tokens on
     /// either half claims no region, so the two are not 1:1.
     ///
-    /// **Every case is masked to itself.** A stuffed grid is block-diagonal, not
-    /// causal across cases: region N does not attend to regions before it, which
-    /// is exactly what keeps one exemplar's `sign(Q)` window off its neighbour's
-    /// tokens. A caller wanting each turn to see the ones before it (a running
-    /// dialogue) must submit them one at a time; a caller whose cases are
-    /// independent memories signed against the substrate (calibration exemplars,
-    /// the lines of a dream) gets them all in one forward.
+    /// **Cases are separated by blocks, not by the mask.** The grid is one causal
+    /// prefill: region N attends to the regions before it, and on a hybrid model
+    /// the recurrent layers carry them forward as well. What the block alignment
+    /// guarantees is that no exemplar's `sign(Q)` *window* holds a neighbour's
+    /// tokens; each exemplar's queries are still computed in the context of the
+    /// cases laid down ahead of it. A caller wanting each turn's context to be its
+    /// own history (a running dialogue) submits them one at a time; a caller whose
+    /// cases are independent memories signed against the substrate (calibration
+    /// exemplars, the lines of a dream) gets them all in one forward, with that
+    /// shared context.
     pub fn submit_prefilled_turn_group(
         &mut self,
         cases: &[(String, String, Vec<String>)],

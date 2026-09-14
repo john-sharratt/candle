@@ -260,10 +260,11 @@ pub struct Kept {
 /// (`submit_prefilled_turn_group`), so the dream costs one round trip rather
 /// than one per line — the same batching zend's calibration ingest uses, for
 /// the same reason (the forward costs about the same for 3,500 tokens as for
-/// 350). The grid is block-diagonal, so a line is signed against the
-/// character's memory, not against its sibling lines: each line's recall hook
-/// is what *it* evokes, which is what a line surfacing on its own resonance
-/// wants.
+/// 350). Every line starts on its own block, so each line's `sign(Q)` window
+/// holds only its own tokens — its recall hook is what *it* evokes, which is
+/// what a line surfacing on its own resonance wants. The grid is one causal
+/// prefill, though, so each line's queries are computed with the lines before
+/// it in context.
 ///
 /// The conversation is named `npc-<id>-dream-<timeline>` — **outside** the
 /// `npc-<id>-day-` prefix every conversation open sweeps, because a

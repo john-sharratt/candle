@@ -1750,8 +1750,9 @@ pub(crate) enum SealAction {
     /// A stuffed prefill lays many cases down in a single forward
     /// ([`crate::stuffed_grid`]); this seals each one to its own block range, so
     /// each gets its own substrate turn and its own `sign(Q)` gallery window.
-    /// Every region but the last names an explicit [`SealEnd::At`] — without
-    /// one, the first seal would run to the slot's end and swallow the rest.
+    /// Every region names an explicit [`SealEnd::At`] — without one, the first
+    /// seal would run to the slot's end and swallow the rest — and only the last
+    /// records the slot's recurrent state, which describes the whole grid.
     ///
     /// Ordered, and sealed in order: a turn's substrate index is assigned as it
     /// is written, so out-of-order seals would record the group's turns in a
@@ -2005,6 +2006,17 @@ fn resolve_seal_range(
         SealEnd::At(to) => to.min(slot_end),
     };
     (to > from).then_some((from, to))
+}
+
+/// Whether a turn seal asks the model for the slot's recurrent state.
+///
+/// Only a seal that **owns** the state (`records_recurrent_state`: the one turn
+/// on its slot, or a stuffed group's last region) on a timeline that **keeps**
+/// it (not ephemeral — an ephemeral payload is dropped on arrival) asks. A seal
+/// that does not ask has not been told "no state" by the model, and must not be
+/// read as that.
+fn recurrent_export_asked(ephemeral: bool, records_recurrent_state: bool) -> bool {
+    !ephemeral && records_recurrent_state
 }
 
 /// An in-flight section ingest — CPU setup is done, awaiting the batched
@@ -8207,6 +8219,7 @@ impl Scheduler {
     ) -> Option<SealResult> {
         let mut last = None;
         let mut sealed = 0usize;
+        let mut last_region_sealed = false;
         for (i, turn) in turns.iter().enumerate() {
             match self.perform_seal_and_write(
                 seal_slot,
@@ -8225,6 +8238,7 @@ impl Scheduler {
             ) {
                 Ok(Some(result)) => {
                     sealed += 1;
+                    last_region_sealed = i + 1 == turns.len();
                     last = Some(result);
                 }
                 Ok(None) => tracing::warn!(
@@ -8239,6 +8253,19 @@ impl Scheduler {
                     "carved turn seal failed: {e}",
                 ),
             }
+        }
+        // The last region is the only one that records the slot's recurrent
+        // state. When it did not seal but earlier ones did, the group's turns are
+        // in the substrate with no memory record naming any of them, and a resume
+        // installs the newest record from before the group — behind their K/V.
+        if sealed > 0 && !last_region_sealed && self.model.carries_recurrent_state() {
+            tracing::warn!(
+                sealed,
+                of = turns.len(),
+                "a stuffed group's last region did not seal, so no memory record \
+                 names the group: a resume of this timeline installs the newest \
+                 earlier record, which is behind the group's sealed turns",
+            );
         }
         tracing::debug!(
             target: "candle_conversation::scheduler",
@@ -8693,7 +8720,7 @@ impl Scheduler {
                 // ephemeral timeline, whose payload would be dropped on arrival,
                 // and not for a carved region that is not its group's last, which
                 // does not own the slot's state (`records_recurrent_state`).
-                let records_state = !ephemeral && records_recurrent_state;
+                let records_state = recurrent_export_asked(ephemeral, records_recurrent_state);
                 let t_export = Instant::now();
                 // The model's other recurrence, in its own encoding. Exported at
                 // the same instant as `layers` — one seal, one state — so the
@@ -8755,9 +8782,9 @@ impl Scheduler {
                         // restores it (`materialise_recurrent`).
                         //
                         // Only on this branch, for two different reasons.
-                        // `Err` already warns that resume will recompute from
-                        // zeros, and evicting there would turn "cannot resume"
-                        // into "resumed, fluent, and forgotten". A skipped export
+                        // `Err` already warns that no record names the turn, and
+                        // evicting there would throw away the only copy of the
+                        // state the slot's next turn continues from. A skipped export
                         // has no snapshot to restore from: on an ephemeral
                         // timeline evicting would cut the state out from under
                         // the *next* turn of a fork that has several, and on a
@@ -8811,11 +8838,15 @@ impl Scheduler {
                     Some(Ok(None)) => {}
                     Some(Err(e)) => {
                         // Not fatal to the seal — the turn's K/V and text are
-                        // already committed — but it means this conversation
-                        // cannot be resumed from here, so it must be visible.
+                        // already committed — but no memory record names this
+                        // turn, and a resume only refuses a record that is too
+                        // NEW. It installs the newest earlier one, whose state is
+                        // behind this turn's K/V, so it must be visible here.
                         tracing::warn!(
                             "recurrent snapshot export failed for turn {} (the turn is \
-                             sealed, but resuming it will recompute from zeros): {}",
+                             sealed, but no memory record names it: a resume installs \
+                             the timeline's newest earlier record, which is behind this \
+                             turn's K/V, or the sequence-start state if there is none): {}",
                             idx.0,
                             e,
                         );
@@ -13167,6 +13198,28 @@ mod tests {
             "so its store stands"
         );
         assert_eq!(probe.get(slot.0), Some(ZERO_STATE));
+    }
+
+    /// **A seal asks for the slot's recurrent state only when it both owns it
+    /// and will keep it.** An earlier region of a stuffed group does not own the
+    /// state (the recurrence ran through the whole grid, so it is the last
+    /// region's), and an ephemeral timeline drops the payload on arrival. Every
+    /// one of the three "no" rows was once an ask: the group's first region
+    /// recorded the end-of-grid state under its own index and evicted it, and
+    /// each calibration seal exported, discarded, and then warned that the model
+    /// had returned no state.
+    #[test]
+    fn a_seal_asks_for_recurrent_state_only_when_it_owns_and_keeps_it() {
+        assert!(
+            recurrent_export_asked(false, true),
+            "a durable turn that owns it"
+        );
+        assert!(
+            !recurrent_export_asked(false, false),
+            "a stuffed group's earlier region"
+        );
+        assert!(!recurrent_export_asked(true, true), "an ephemeral timeline");
+        assert!(!recurrent_export_asked(true, false));
     }
 
     /// **T7.3 — a snapshot newer than the recovered history is rejected.**
