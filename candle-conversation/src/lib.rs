@@ -27,7 +27,7 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
 #![allow(clippy::large_enum_variant)]
-#![allow(clippy::chunks_exact_to_as_chunks)]
+#![allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 
 //! Turn-based conversation engine for the candle inference stack.
 //!

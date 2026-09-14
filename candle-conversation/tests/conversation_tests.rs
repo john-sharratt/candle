@@ -1195,7 +1195,7 @@ fn test_fork_close_does_not_affect_base() {
     // Create and destroy 3 forks in sequence.
     for i in 0..3 {
         let mut fork = base.fork().expect("fork failed");
-        fork.insert_turn(&format!("Round {}.", i), &format!("Noted round {}.", i))
+        fork.insert_turn(format!("Round {}.", i), &format!("Noted round {}.", i))
             .expect("insert_turn failed");
         let resp = fork.send_turn("Which round?").expect("send failed");
         eprintln!("Fork {}: {}", i, resp.text);
