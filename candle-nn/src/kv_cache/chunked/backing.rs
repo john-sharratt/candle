@@ -7,7 +7,6 @@
 use ahash::{HashMap, HashMapExt};
 use candle::quantized::GgmlDType;
 use std::cmp;
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use candle::quantized::pinned_staging::{Generation, PinnedStager};
@@ -398,23 +397,6 @@ impl BackingInner {
         }
         Ok(())
     }
-}
-
-/// The batch indices in `batch_entries` whose sequence holds a cached decode
-/// slot buffer, in entry order — the only ones a commit outside the decode
-/// kernel has anything to bring up to date. See
-/// [`ChunkedKvBacking::refresh_decode_writer_slice`].
-pub(crate) fn buffered_seq_indices(
-    state: &BlockTableState,
-    batch_entries: &[(usize, usize)],
-) -> Vec<usize> {
-    batch_entries
-        .iter()
-        .map(|&(seq_idx, _)| seq_idx)
-        .filter(|&seq_idx| {
-            matches!(state.sequences.get(seq_idx), Some(Some(seq)) if seq.has_decode_gpu_chunks())
-        })
-        .collect()
 }
 
 impl ChunkedKvBacking {
@@ -983,54 +965,21 @@ impl ChunkedKvBacking {
         Some(chunks)
     }
 
-    /// Bring each sequence's cached decode slot buffer up to date after a
-    /// commit made outside the decode kernel — see
-    /// [`super::types::SequenceState::refresh_decode_writer_slice`]. Every
-    /// slice from the writer boundary to the writer is re-serialised in place,
-    /// O(chunks the commit wrote) per sequence per layer.
-    ///
-    /// **Only sequences holding a cached buffer are touched.** One that has
-    /// never decoded, or whose buffer a chunk-boundary append cleared, has
-    /// nothing to patch and rebuilds fully on its next decode sync, so it names
-    /// no arena; when no sequence in the call holds a buffer the call returns
-    /// before resolving any. That is every sequence of a fresh prefill, which
-    /// commits through here once per layer — the arena resolve it skips walks
-    /// the whole pooled arena map, and paid per sequence per layer it cost the
-    /// small models most of their prefill throughput.
+    /// Record a commit made outside the decode kernel on each sequence's
+    /// cached decode slot buffer — see
+    /// [`super::types::SequenceState::mark_decode_writer_stale`]. The writer
+    /// region is re-serialised by the next sync that reads the buffer, not
+    /// here: this runs once per layer of every prefill, with that layer's
+    /// attention still queued, and costs one state lock and a flag per
+    /// sequence — no arena resolve, no serialisation, no upload.
     pub fn refresh_decode_writer_slice(&self, batch_entries: &[(usize, usize)]) -> Result<()> {
-        let n_kv_head = self.inner.n_kv_head;
-        let head_dim = self.inner.head_dim;
         let mut state = self
             .state
             .write()
             .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-        let buffered = buffered_seq_indices(&state, batch_entries);
-        if buffered.is_empty() {
-            return Ok(());
-        }
-        // Only the writer regions' arenas. The patch re-serialises the chunks
-        // from each sequence's writer boundary to its writer, and it runs per
-        // layer on every commit made outside the decode kernel — a verify block
-        // among them — so a resolve of every arena there is would be paid
-        // ~layers × sequences times a step for pointers nothing reads. Taken
-        // under the state lock, so the region cannot change between naming its
-        // arenas and serialising it.
-        let needed: HashSet<usize> = buffered
-            .iter()
-            .filter_map(|&seq_idx| state.sequences.get(seq_idx)?.as_ref())
-            .filter_map(|seq| {
-                let wi = seq.decode_write_chunk_idx();
-                seq.chunks_slice().get(seq.writer_start_idx().min(wi)..=wi)
-            })
-            .flat_map(|region| region.iter())
-            .flat_map(|cw| cw.gids.as_slice().iter())
-            .filter(|g| !g.is_empty())
-            .map(|g| g.arena_idx())
-            .collect();
-        let arena_info = self.resolve_arena_info_for(&needed)?;
-        for &seq_idx in &buffered {
+        for &(seq_idx, _) in batch_entries {
             if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
-                seq.refresh_decode_writer_slice(n_kv_head, head_dim, &arena_info)?;
+                seq.mark_decode_writer_stale();
             }
         }
         Ok(())
@@ -1217,6 +1166,46 @@ impl ChunkedKvBacking {
             results.push(result);
         }
         Ok((results, pins, stats))
+    }
+
+    /// Build the decode slot buffer of every sequence in `batch_entries` that
+    /// has none, ahead of its first decode step — see
+    /// [`super::types::SequenceState::prime_decode_gpu_chunks`]. A buffer that
+    /// exists is left to the decode sync, which brings a stale writer region up
+    /// to date itself. The arena table is resolved only when some sequence
+    /// actually needs a build: after a prefill into buffers that already exist,
+    /// the call costs one read of the block table.
+    pub fn prime_decode_gpu_chunks(&self, batch_entries: &[(usize, usize)]) -> Result<()> {
+        let needs_build = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            batch_entries.iter().any(|&(seq_idx, _)| {
+                matches!(state.sequences.get(seq_idx), Some(Some(seq)) if seq.needs_decode_rebuild())
+            })
+        };
+        if !needs_build {
+            return Ok(());
+        }
+        // Resolved before the state lock: the arena table sits behind the
+        // storage lock, not this one.
+        let arena_info = self.resolve_arena_info()?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        for &(seq_idx, seq_offset) in batch_entries {
+            if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
+                seq.prime_decode_gpu_chunks(
+                    self.inner.n_kv_head,
+                    self.inner.head_dim,
+                    seq_offset,
+                    &arena_info,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Like [`Self::sync_decode_gpu_chunks`], but each returned `slices_ptr` is

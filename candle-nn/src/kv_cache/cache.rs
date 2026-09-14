@@ -1051,7 +1051,10 @@ impl KvCache {
     /// Prime the persistent decode slot-state buffers after prefill.
     ///
     /// This materializes the per-sequence GPU slot headers ahead of the first
-    /// decode token so decode can immediately reuse them on the hot path.
+    /// decode token so decode can immediately reuse them on the hot path. Only
+    /// a missing buffer is built: one that exists is left to the decode sync,
+    /// which re-serialises its writer region if the prefill's commit marked it
+    /// (`ChunkedKvBacking::prime_decode_gpu_chunks`).
     pub fn prime_chunked_decode_slots_batch(caches: &mut [&mut KvCache]) -> Result<()> {
         if caches.is_empty() {
             return Ok(());
@@ -1077,9 +1080,7 @@ impl KvCache {
         // full and the next decode token needs a new chunk that isn't allocated yet.
         // ensure_for_batch_entries(entries, 1) allocates that chunk if needed.
         backing.ensure_for_batch_entries(&entries, 1)?;
-        let arena_info = backing.resolve_arena_info()?;
-        let _ = backing.sync_decode_gpu_chunks(&entries, &arena_info)?;
-        Ok(())
+        backing.prime_decode_gpu_chunks(&entries)
     }
 
     /// Finalize sequences after generation completes.
@@ -1221,12 +1222,12 @@ impl KvCache {
     /// it reads as whatever it last held, which since slots are recycled is
     /// another sequence's KV, and under `tensor-assert` the claim poison.
     ///
-    /// A write that stayed in the chunk the buffer was built for changed only
-    /// the writer slice, so it is patched in place; one that crossed into a
-    /// later chunk also left the full chunks behind it stale, so the buffer is
-    /// dropped and rebuilt from the host state on the next decode sync — see
-    /// `ChunkedKvBacking::refresh_decode_writer_slice`. A sequence with no
-    /// cached buffer has nothing to resync.
+    /// The buffer is marked, not rewritten: the next slot-state sync — which
+    /// every reader of the buffer goes through — re-serialises its writer
+    /// region from the host state before handing it out, so the commit itself
+    /// costs the stream nothing. See `SequenceState::mark_decode_writer_stale`.
+    /// A sequence with no cached buffer has nothing to mark; its next sync
+    /// rebuilds it.
     pub fn commit_written_tokens(&mut self, offset: usize, add: usize) -> Result<()> {
         self.set_current_seq_len(offset + add)?;
         if let CacheStorage::Chunked(c) = &self.k.storage {
@@ -1238,10 +1239,8 @@ impl KvCache {
     /// [`Self::commit_written_tokens`] for every cache of one batched write:
     /// the caches of one layer, over one shared backing, as the batched prefill
     /// holds them. Each cache's `adds[i]` tokens at `offsets[i]` are committed,
-    /// then the backing's decode slot buffers are brought up to date in a single
-    /// refresh rather than one per sequence — one state lock and one arena
-    /// resolve for the layer, and none at all when no sequence in the batch has
-    /// a cached buffer, which is every sequence of a fresh prefill.
+    /// then the backing's decode slot buffers are marked in a single call —
+    /// one state lock for the layer rather than one per sequence.
     pub fn commit_written_tokens_batch(
         caches: &mut [&mut KvCache],
         offsets: &[usize],

@@ -23,7 +23,6 @@ use candle::cuda_backend::cudarc::driver::result::stream::launch_host_function;
 use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use candle::{DType, Device, Tensor};
 
-use crate::kv_cache::chunked::backing::buffered_seq_indices;
 use crate::kv_cache::chunked::gpu_test_lock::gpu_serial;
 use crate::kv_cache::{ChunkedKvBacking, KvCache};
 
@@ -240,28 +239,76 @@ fn a_backing_refresh_after_a_spill_counts_both_chunks() {
     );
 }
 
-/// A sequence that has never decoded holds no slot buffer, so a commit has
-/// nothing to bring up to date and the refresh must not name it — that is what
-/// lets a fresh prefill skip the arena resolve entirely. Once a decode sync
-/// builds the buffer, the same sequence is named.
+/// A commit touches no device bytes. The cached buffer keeps its pre-commit
+/// lengths until the next sync, which re-serialises the writer region before
+/// handing the buffer — the same buffer, at the same pointer — to its reader.
+/// So a prefill layer's commit costs the stream nothing, and whatever was
+/// queued against the buffer before it reads what it was queued against.
 #[test]
-fn only_a_sequence_holding_a_decode_buffer_is_refreshed() {
+fn a_commit_leaves_the_buffer_to_the_next_sync() {
     let _gpu = gpu_serial();
     let dev = Device::new_cuda(0).unwrap();
     let (backing, mut cache, seq) = setup(&dev);
 
     write_outside_decode(&mut cache, &dev, 0, 8);
+    let (ptr, n_slices) = live_slot(&backing, seq, 8);
+    let kv = write_kv_ahead(&mut cache, &dev, 8, 4);
+    cache.commit_written_tokens(8, 4).unwrap();
+    dev.synchronize().unwrap();
     assert_eq!(
-        buffered_seq_indices(&backing.state.read().unwrap(), &[(seq, 0)]),
-        Vec::<usize>::new(),
-        "a prefilled sequence that has not decoded has no buffer to patch"
+        read_lens(&dev, ptr, n_slices),
+        vec![8],
+        "the commit wrote the device buffer; only the next sync may"
     );
+    assert_eq!(live_slot(&backing, seq, 12), (ptr, n_slices));
+    assert_eq!(read_lens(&dev, ptr, n_slices), vec![12]);
+    drop(kv);
+}
 
-    device_lens(&dev, &backing, seq, 8);
+/// The prime after a prefill builds only a MISSING buffer. One that exists is
+/// left to the decode step's sync, stale writer region and all: the prime runs
+/// once per prefill layer, and an upload there sits between that layer's
+/// kernels and the next.
+#[test]
+fn a_prime_leaves_an_existing_buffer_to_the_decode_sync() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    write_outside_decode(&mut cache, &dev, 0, 8);
+    let (ptr, n_slices) = live_slot(&backing, seq, 8);
+    let kv = write_kv_ahead(&mut cache, &dev, 8, 4);
+    cache.commit_written_tokens(8, 4).unwrap();
+    KvCache::prime_chunked_decode_slots_batch(&mut [&mut cache]).unwrap();
+    dev.synchronize().unwrap();
     assert_eq!(
-        buffered_seq_indices(&backing.state.read().unwrap(), &[(seq, 0)]),
-        vec![seq]
+        read_lens(&dev, ptr, n_slices),
+        vec![8],
+        "the prime rewrote a buffer the decode sync owns bringing up to date"
     );
+    assert_eq!(live_slot(&backing, seq, 12), (ptr, n_slices));
+    assert_eq!(read_lens(&dev, ptr, n_slices), vec![12]);
+    drop(kv);
+}
+
+/// A sequence with no buffer — a fresh prefill — gets one from the prime, so
+/// the first decode step reuses it rather than building it.
+#[test]
+fn a_prime_builds_a_missing_buffer() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    write_outside_decode(&mut cache, &dev, 0, 8);
+    KvCache::prime_chunked_decode_slots_batch(&mut [&mut cache]).unwrap();
+    let info = backing.resolve_arena_info().unwrap();
+    let (ptrs, _, stats) = backing.sync_decode_gpu_chunks(&[(seq, 8)], &info).unwrap();
+    assert_eq!(
+        (stats.rebuilds, stats.reuses),
+        (0, 1),
+        "the decode sync rebuilt a buffer the prime should have built"
+    );
+    assert_eq!(read_lens(&dev, ptrs[0].0, ptrs[0].1 as usize), vec![8]);
 }
 
 /// The harness first: work enqueued behind a closed [`StreamGate`] does not
@@ -291,21 +338,23 @@ fn a_closed_gate_holds_the_work_behind_it() {
     assert!(behind.is_complete());
 }
 
-/// **A queued upload keeps its bytes, and the next commit does not wait for
-/// it.**
+/// **A queued upload keeps its bytes, and the next commit and sync do not
+/// wait for it.**
 ///
 /// A prefill commits each layer's tokens while that layer's slot-state upload
 /// is still queued behind the attention kernel — and that kernel must read the
-/// pre-commit lengths. So a commit may neither rewrite the bytes the queued
-/// upload will carry nor hold the host until it has run: the first hands the
-/// kernel lengths from its future, the second stops the host running ahead of
-/// the GPU at every layer of every prefill.
+/// pre-commit lengths. So neither a commit nor the sync that uploads its
+/// lengths may rewrite the bytes a queued upload will carry, nor hold the host
+/// until it has run: the first hands the kernel lengths from its future, the
+/// second stops the host running ahead of the GPU at every layer of every
+/// prefill.
 ///
-/// A gate is closed across the stream; a first commit's upload queues behind
-/// it; a device copy of the slot queues behind the upload — the reader that must
-/// see the first commit's lengths — and a second commit follows at once.
+/// A gate is closed across the stream; a first commit's sync queues its upload
+/// behind it; a device copy of the slot queues behind the upload — the reader
+/// that must see the first commit's lengths — and a second commit and sync
+/// follow at once.
 #[test]
-fn a_queued_upload_keeps_its_bytes_and_the_next_commit_does_not_wait() {
+fn a_queued_upload_keeps_its_bytes_and_the_next_sync_does_not_wait() {
     let _gpu = gpu_serial();
     let dev = Device::new_cuda(0).unwrap();
     let Device::Cuda(cuda) = &dev else {
@@ -327,9 +376,10 @@ fn a_queued_upload_keeps_its_bytes_and_the_next_commit_does_not_wait() {
     dev.synchronize().unwrap();
 
     let gate = StreamGate::close_on(&stream);
-    // The first commit: its upload queues behind the gate.
+    // The first commit; its sync queues the upload behind the gate.
     let t0 = Instant::now();
     cache.commit_written_tokens(8, 4).unwrap();
+    assert_eq!(live_slot(&backing, seq, 12), (ptr, n_slices));
     let first_commit = t0.elapsed();
     {
         let (probe_ptr, _record) = probe.device_ptr(&stream);
@@ -337,9 +387,10 @@ fn a_queued_upload_keeps_its_bytes_and_the_next_commit_does_not_wait() {
         // and the copy is ordered on the stream every slot-state upload uses.
         unsafe { memcpy_dtod_async(probe_ptr, ptr, bytes, stream.cu_stream()) }.unwrap();
     }
-    // The second commit, at once.
+    // The second commit and sync, at once.
     let t0 = Instant::now();
     cache.commit_written_tokens(12, 4).unwrap();
+    assert_eq!(live_slot(&backing, seq, 16), (ptr, n_slices));
     let second_commit = t0.elapsed();
 
     gate.open();
@@ -356,16 +407,16 @@ fn a_queued_upload_keeps_its_bytes_and_the_next_commit_does_not_wait() {
     // that does not returns in microseconds.
     assert!(
         first_commit < StreamGate::TIMEOUT / 4 && second_commit < StreamGate::TIMEOUT / 4,
-        "a commit held the host (first {first_commit:?}, second {second_commit:?}) — it \
-         waited for work the closed gate holds for up to {:?}",
+        "a commit and its sync held the host (first {first_commit:?}, second \
+         {second_commit:?}) — they waited for work the closed gate holds for up to {:?}",
         StreamGate::TIMEOUT
     );
 }
 
-/// Two uploads queued behind unfinished work, and a third commit behind them:
-/// the third finds both staging buffers still read by queued copies and waits
-/// for the older one — and every reader still sees exactly the bytes its upload
-/// was issued with.
+/// Two uploads queued behind unfinished work, and a third commit's sync behind
+/// them: the third finds both staging buffers still read by queued copies and
+/// waits for the older one — and every reader still sees exactly the bytes its
+/// upload was issued with.
 #[test]
 fn every_queued_upload_keeps_its_bytes_when_both_staging_buffers_are_in_flight() {
     let _gpu = gpu_serial();
@@ -391,15 +442,17 @@ fn every_queued_upload_keeps_its_bytes_when_both_staging_buffers_are_in_flight()
     let gate = StreamGate::close_on(&stream);
     for (probe, offset) in probes.iter().zip([8, 12]) {
         cache.commit_written_tokens(offset, 4).unwrap();
+        assert_eq!(live_slot(&backing, seq, offset + 4), (ptr, n_slices));
         let (probe_ptr, _record) = probe.device_ptr(&stream);
         // SAFETY: both ranges are live device allocations of `bytes` bytes,
         // and the copy is ordered on the stream every slot-state upload uses.
         unsafe { memcpy_dtod_async(probe_ptr, ptr, bytes, stream.cu_stream()) }.unwrap();
     }
-    // The third commit waits for the first upload, which is behind the gate:
+    // The third sync waits for the first upload, which is behind the gate:
     // open it from another thread once that wait has begun.
     let opener = gate.open_after(Duration::from_millis(200));
     cache.commit_written_tokens(16, 4).unwrap();
+    assert_eq!(live_slot(&backing, seq, 20), (ptr, n_slices));
     opener.join().unwrap();
 
     dev.synchronize().unwrap();
