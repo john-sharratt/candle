@@ -33,7 +33,8 @@ use serde_json::{json, Value};
 use web::auth::{Identity, Role};
 
 use crate::api::{err, owner_of, Authored};
-use crate::engine::event::Salience;
+use crate::engine::event::{Addressed, Event, EventKind, Salience};
+use crate::engine::runtime::Runtime;
 use crate::engine::slash;
 
 /// How many ticks a feed request may ask for. The scheduler's own ring is the
@@ -434,6 +435,75 @@ pub async fn broadcast(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct AnnounceBody {
+    /// What is put to the world.
+    text: String,
+}
+
+/// The event an `/announce` becomes, before it meets the scheduler.
+///
+/// Pure, so the trim and the one refusal — an announcement with nothing in it —
+/// are tested without a runtime. There is no salience to choose: an announcement
+/// to the whole world is [`Salience::URGENT`] by definition, which the handler
+/// supplies.
+fn announce_event(body: AnnounceBody) -> Option<EventKind> {
+    let text = body.text.trim();
+    (!text.is_empty()).then(|| EventKind::Announcement {
+        text: text.to_owned(),
+    })
+}
+
+/// `POST /v1/pulse/announce` — put one word to the whole world at once.
+///
+/// The plain, announcement-shaped sibling of [`broadcast`], and the world-scale
+/// counterpart of [`direct`]: no `/` notation to parse and no per-character
+/// address, just a line every character reads as a word put to everyone. Always
+/// [`Salience::URGENT`] — the only announcements worth sending this way are the
+/// ones nobody is exempt from, and it rouses even a waiting character, which is
+/// how it fits the cast's ambient idle without a mechanism of its own. Admin,
+/// like `broadcast`: it reaches characters the caller does not own.
+pub async fn announce(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Json(body): Json<AnnounceBody>,
+) -> Response {
+    if let Err(r) = owner_of(&s, &headers).await {
+        return *r;
+    }
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_scheduler();
+    };
+    let Some(kind) = announce_event(body) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "empty_announcement",
+            "an announcement needs something in it",
+        );
+    };
+    // What every character will read. Announcement prose does not depend on the
+    // clock, so a nominal stamp is enough for the echo.
+    let prose = Event::new(0, 0, Salience::URGENT, kind.clone()).prose();
+    // Each character reads it on its own world's clock; there is no single
+    // instant to stamp them all with — the same resolve `broadcast` makes.
+    let mut when: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for c in rt.scheduler.census() {
+        when.insert(c.npc_id, s.world_ms(c.npc_id).await);
+    }
+    let reached = rt.scheduler.broadcast(
+        |id| when.get(&id).copied().unwrap_or(0),
+        Salience::URGENT,
+        kind,
+    );
+    Json(json!({
+        "delivered": true,
+        "reached": reached,
+        "salience": Salience::URGENT.get(),
+        "prose": prose,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
 pub struct InjectBody {
     /// The operator's line, `/`-prefixed or not.
     line: String,
@@ -477,32 +547,153 @@ pub async fn inject(
     // `/sleep` carries a placeholder day the parser cannot know; the clock is
     // the only thing that can fill it in.
     let kind = match parsed.kind {
-        crate::engine::event::EventKind::Sleep { .. } => crate::engine::event::EventKind::Sleep {
+        EventKind::Sleep { .. } => EventKind::Sleep {
             day: crate::engine::sleep::day_of(world_ms),
         },
         other => other,
     };
-    let prose =
-        crate::engine::event::Event::new(0, world_ms, parsed.salience, kind.clone()).prose();
+    // The command it parsed is the one thing `direct` has no need of — showing
+    // an operator the console command their line became.
+    deliver_and_report(
+        rt,
+        nid,
+        world_ms,
+        parsed.salience,
+        kind,
+        json!({ "command": parsed.command }),
+    )
+}
 
-    if !rt.scheduler.deliver(nid, world_ms, parsed.salience, kind) {
+/// Put an event on a character's inbox and answer with what it became.
+///
+/// The shared tail of [`inject`] and [`direct`]: stamp the world clock into the
+/// event's prose, hand it to the scheduler, and report the prose the character
+/// will read — the thing that decides how the line lands — or a 503 when the
+/// character exists but is not yet in the scheduler. `extra` is folded onto the
+/// response object, carrying the one field a caller adds beyond the common set.
+fn deliver_and_report(
+    rt: &Runtime,
+    nid: u64,
+    world_ms: u64,
+    salience: Salience,
+    kind: EventKind,
+    extra: Value,
+) -> Response {
+    let prose = Event::new(0, world_ms, salience, kind.clone()).prose();
+    if !rt.scheduler.deliver(nid, world_ms, salience, kind) {
         return err(
             StatusCode::SERVICE_UNAVAILABLE,
             "not_awake",
             "the character exists but is not in the scheduler — the engine is still loading",
         );
     }
-    Json(json!({
+    let mut body = json!({
         "delivered": true,
-        "command": parsed.command,
-        "salience": parsed.salience.get(),
-        "preempts": parsed.salience.preempts(),
-        // What the character will actually read. The point of showing it back
-        // is that an operator can see the prose their command became, which is
-        // the thing that decides how it lands.
+        "salience": salience.get(),
+        "preempts": salience.preempts(),
         "prose": prose,
-    }))
-    .into_response()
+    });
+    if let (Value::Object(map), Value::Object(more)) = (&mut body, extra) {
+        map.extend(more);
+    }
+    Json(body).into_response()
+}
+
+/// The body of a `/direct` — a line spoken straight into a character's world.
+#[derive(Debug, Deserialize)]
+pub struct DirectBody {
+    /// What the character hears said.
+    text: String,
+    /// Who is heard to say it. Absent means the operator, under the same name
+    /// the rest of the daemon speaks to a character with — see
+    /// [`crate::engine::speaking_as`]. A named voice is how a mission-giver, a
+    /// terminal, or another character reaches a character in-world without the
+    /// operator standing in for them.
+    #[serde(default)]
+    speaker: Option<String>,
+    /// How loudly it lands. Absent is [`Salience::URGENT`], because the whole
+    /// point of the route is to reach the character now — the sibling
+    /// person-to-character path (`environment.rs`, `phone::Kind::Direct`) uses
+    /// the same, and a quieter default would sit in a waiting character's inbox
+    /// unheard until its next scheduled thought. A caller that wants it to wait
+    /// its turn passes a lower figure; at or above [`Salience::PREEMPT_AT`] it
+    /// cuts into a turn the character is mid-way through, and a wire value out of
+    /// range is clamped, not rejected.
+    #[serde(default)]
+    salience: Option<f32>,
+    /// Who it was aimed at, from this character's side. Absent is
+    /// [`Addressed::You`] — a direct line is by definition aimed at the one it
+    /// reaches, unlike a line thrown to the room.
+    #[serde(default)]
+    to: Option<Addressed>,
+}
+
+/// The event a `/direct` becomes, before it meets a clock or the scheduler.
+///
+/// Pure, so the defaults, the trim, and the salience clamp are tested without a
+/// runtime — the handler adds only the world time and the delivery. `None` is a
+/// line with nothing in it, which is the one body this route refuses.
+fn direct_event(body: DirectBody, operator: &str) -> Option<(Salience, EventKind)> {
+    let text = body.text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let speaker = match body.speaker.as_deref().map(str::trim) {
+        Some(named) if !named.is_empty() => named.to_owned(),
+        _ => operator.to_owned(),
+    };
+    let salience = body.salience.map_or(Salience::URGENT, Salience::new);
+    let to = body.to.unwrap_or(Addressed::You);
+    Some((
+        salience,
+        EventKind::Speech {
+            speaker,
+            text: text.to_owned(),
+            to,
+        },
+    ))
+}
+
+/// `POST /v1/npc/:nid/direct` — speak a line straight into a character's world.
+///
+/// **The influence primitive, and deliberately not [`inject`].** `inject` is the
+/// operator console's `/` notation: it parses a command, and it attributes the
+/// line to the operator because a console has no other voice. `direct` is the
+/// plain case underneath — a line, a speaker, a loudness — so a mission-giver, a
+/// terminal, or another character can reach a character in-world without the
+/// operator standing in for them, and so a caller that already knows what it
+/// wants said does not have to phrase it as a slash command to be understood.
+///
+/// Ownership is checked, like `inject` and unlike the feed: putting words in a
+/// character's ear is a write to something somebody owns.
+pub async fn direct(
+    State(s): State<Arc<Authored>>,
+    Path(nid): Path<u64>,
+    headers: HeaderMap,
+    Json(body): Json<DirectBody>,
+) -> Response {
+    let (id, owner) = match owner_of(&s, &headers).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    if s.npcs.read().await.visible_to(nid, &owner).is_none() {
+        return err(StatusCode::NOT_FOUND, "not_found", "no such character");
+    }
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_scheduler();
+    };
+
+    let operator = crate::engine::speaking_as(&id, &owner, &s.roles);
+    let Some((salience, kind)) = direct_event(body, &operator) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "empty_message",
+            "a direct line needs something in it",
+        );
+    };
+
+    let world_ms = s.world_ms(nid).await;
+    deliver_and_report(rt, nid, world_ms, salience, kind, json!({}))
 }
 
 /// `GET /v1/commands` — the `/` vocabulary, for the console's autocomplete.
@@ -763,6 +954,162 @@ fn no_scheduler() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A body with a speaker: `serde` fills the `Option` fields we do not send.
+    fn direct_body(text: &str, speaker: Option<&str>, salience: Option<f32>) -> DirectBody {
+        DirectBody {
+            text: text.to_owned(),
+            speaker: speaker.map(str::to_owned),
+            salience,
+            to: None,
+        }
+    }
+
+    /// The bare case: a line and nothing else is the operator, aimed at the
+    /// character it reaches, loud enough to be heard now — the route exists to
+    /// reach the character, so its default rouses a waiting one rather than
+    /// sitting unheard until the next scheduled thought. Everything a caller can
+    /// leave out has a defined default, because most direct lines will leave all
+    /// of it out.
+    #[test]
+    fn a_bare_direct_line_is_the_operator_aimed_at_you_and_loud_enough_to_rouse() {
+        let (salience, kind) =
+            direct_event(direct_body("the east door is open", None, None), "Mira")
+                .expect("a line with words in it is delivered");
+        assert_eq!(salience, Salience::URGENT);
+        assert!(
+            salience.rouses(),
+            "the default must reach a waiting character"
+        );
+        assert_eq!(
+            kind,
+            EventKind::Speech {
+                speaker: "Mira".to_owned(),
+                text: "the east door is open".to_owned(),
+                to: Addressed::You,
+            }
+        );
+    }
+
+    /// The influence the route exists for: a named voice reaches the character
+    /// in the operator's place, so a mission-giver or a terminal can speak
+    /// without the operator standing in for them.
+    #[test]
+    fn a_named_speaker_takes_the_operators_place() {
+        let (_, kind) = direct_event(
+            direct_body("come to the desk", Some("The Archivist"), None),
+            "Mira",
+        )
+        .expect("delivered");
+        let EventKind::Speech { speaker, .. } = kind else {
+            panic!("a direct line is speech");
+        };
+        assert_eq!(speaker, "The Archivist");
+    }
+
+    /// A speaker field that is present but blank is not a voice — it falls back
+    /// to the operator rather than putting an empty name in the character's ear.
+    #[test]
+    fn a_blank_speaker_falls_back_to_the_operator() {
+        let (_, kind) =
+            direct_event(direct_body("hello", Some("   "), None), "Mira").expect("delivered");
+        let EventKind::Speech { speaker, .. } = kind else {
+            panic!("speech");
+        };
+        assert_eq!(speaker, "Mira");
+    }
+
+    /// A line with nothing in it is the one body the route refuses — an empty
+    /// utterance is not influence, and delivering it would put a blank speech
+    /// event on the character's inbox.
+    #[test]
+    fn a_blank_line_is_refused() {
+        assert!(direct_event(direct_body("   ", None, None), "Mira").is_none());
+        assert!(direct_event(direct_body("", Some("The Archivist"), Some(0.9)), "Mira").is_none());
+    }
+
+    /// The text is trimmed before it is spoken, like a message — leading and
+    /// trailing whitespace is transport, not part of what was said.
+    #[test]
+    fn the_line_is_trimmed() {
+        let (_, kind) =
+            direct_event(direct_body("  go now  ", None, None), "Mira").expect("delivered");
+        let EventKind::Speech { text, .. } = kind else {
+            panic!("speech");
+        };
+        assert_eq!(text, "go now");
+    }
+
+    /// A wire salience is clamped through the same path a constructed one is, so
+    /// an out-of-range figure lands at the edge and still orders correctly — an
+    /// urgent line at `2.0` preempts, it is not rejected for being over one.
+    #[test]
+    fn a_wire_salience_is_clamped_and_still_preempts() {
+        let (salience, _) =
+            direct_event(direct_body("now", None, Some(2.0)), "Mira").expect("delivered");
+        assert_eq!(salience.get(), 1.0);
+        assert!(salience.preempts());
+
+        let (idle, _) =
+            direct_event(direct_body("mm", None, Some(-1.0)), "Mira").expect("delivered");
+        assert_eq!(idle.get(), 0.0);
+        assert!(!idle.preempts());
+    }
+
+    /// The address survives from the body — a line can be thrown to the room,
+    /// overheard by the character, rather than aimed at it, when the caller says
+    /// so; the default is only what fills the field's absence.
+    #[test]
+    fn an_explicit_address_is_kept() {
+        let body = DirectBody {
+            text: "the hall is closing".to_owned(),
+            speaker: None,
+            salience: None,
+            to: Some(Addressed::Room),
+        };
+        let (_, kind) = direct_event(body, "Mira").expect("delivered");
+        let EventKind::Speech { to, .. } = kind else {
+            panic!("speech");
+        };
+        assert_eq!(to, Addressed::Room);
+    }
+
+    /// An announcement becomes a world-scale `Announcement` event, trimmed, and
+    /// renders as a word put to everyone rather than a thing in the room — the
+    /// framing is the whole reason it is its own kind and not a `Description`.
+    #[test]
+    fn an_announcement_is_a_world_event_read_as_reaching_everyone() {
+        let kind = announce_event(AnnounceBody {
+            text: "  the eastern gate is sealed  ".to_owned(),
+        })
+        .expect("a line with words in it is announced");
+        assert_eq!(
+            kind,
+            EventKind::Announcement {
+                text: "the eastern gate is sealed".to_owned(),
+            }
+        );
+        let prose = Event::new(0, 0, Salience::URGENT, kind).prose();
+        assert_eq!(
+            prose,
+            "Word goes out across the world: the eastern gate is sealed"
+        );
+    }
+
+    /// A blank announcement is the one body the route refuses — an empty word to
+    /// the world is not an announcement, and broadcasting it would put a blank
+    /// event on every character's inbox at once.
+    #[test]
+    fn a_blank_announcement_is_refused() {
+        assert!(announce_event(AnnounceBody {
+            text: "   ".to_owned()
+        })
+        .is_none());
+        assert!(announce_event(AnnounceBody {
+            text: String::new()
+        })
+        .is_none());
+    }
 
     /// The feed's bound has to be enforced on the request, not trusted from it —
     /// `?limit=1000000` would otherwise render the scheduler's whole ring into

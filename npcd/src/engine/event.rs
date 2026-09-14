@@ -201,6 +201,14 @@ pub enum Addressed {
 pub enum EventKind {
     /// Something happened, described in words. The general case.
     Description { text: String },
+    /// A word put to the whole world at once — a proclamation, a klaxon, an
+    /// announcement from the command desk. Its own kind rather than a
+    /// `Description`, for the reason `Operator` is its own kind: it reads as
+    /// something said *to everyone*, not as something that happened in the
+    /// character's own room, and Pulse can then pick announcements out of the
+    /// feed. Delivered by broadcast at a salience that reaches even a waiting
+    /// character — see `pulse::announce`.
+    Announcement { text: String },
     /// Someone said something to, or near, the character.
     Speech {
         speaker: String,
@@ -283,6 +291,7 @@ impl EventKind {
     pub fn tag(&self) -> &'static str {
         match self {
             EventKind::Description { .. } => "description",
+            EventKind::Announcement { .. } => "announcement",
             EventKind::Speech { .. } => "speech",
             EventKind::Message { .. } => "message",
             EventKind::Situation { .. } => "situation",
@@ -352,6 +361,12 @@ impl Event {
     pub fn prose(&self) -> String {
         match &self.kind {
             EventKind::Description { text } => text.trim().to_string(),
+            // Framed as reaching everyone, so the character reads it as a word
+            // put to the whole world rather than as something that happened in
+            // front of it — the one thing the raw text cannot say for itself.
+            EventKind::Announcement { text } => {
+                format!("Word goes out across the world: {}", text.trim())
+            }
             EventKind::Speech { speaker, text, to } => {
                 let t = text.trim();
                 // Three readings of one utterance, and the difference between

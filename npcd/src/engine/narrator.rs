@@ -171,6 +171,12 @@ fn event_line(e: &Event) -> Option<String> {
             let t = text.trim();
             (!t.is_empty()).then(|| t.to_string())
         }
+        // A word put to the whole world — framed as reaching everyone so the
+        // narrator re-voices it as an announcement, not a thing in the room.
+        EventKind::Announcement { text } => {
+            let t = text.trim();
+            (!t.is_empty()).then(|| format!("word reaches everyone across the world: {t}"))
+        }
         // Authored, addressed to the focal character already — pass through.
         EventKind::Nudge { text } | EventKind::Operator { text } => {
             let t = text.trim();
@@ -333,10 +339,7 @@ pub fn strip_reasoning(text: &str) -> String {
     // after it (a second empty one, or one it fills with task reasoning); a single
     // strip left the second block in the character's perception. Each block may
     // close with `</think>` or the `/thought` variant this checkpoint also emits.
-    loop {
-        let Some(rest) = t.strip_prefix("<think>") else {
-            break;
-        };
+    while let Some(rest) = t.strip_prefix("<think>") {
         let close = ["</think>", "/thought"]
             .iter()
             .filter_map(|m| rest.find(m).map(|i| (i, m.len())))
@@ -352,8 +355,8 @@ pub fn strip_reasoning(text: &str) -> String {
     let mut out = t.trim();
     if let Some(rest) = out.strip_prefix("```") {
         out = rest
-            .splitn(2, '\n')
-            .nth(1)
+            .split_once('\n')
+            .map(|x| x.1)
             .unwrap_or("")
             .trim()
             .trim_end_matches('`')

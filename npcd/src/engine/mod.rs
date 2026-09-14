@@ -65,6 +65,7 @@ pub mod life;
 pub mod loading;
 pub mod loopguard;
 pub mod mind;
+pub mod mission;
 pub mod narrator;
 pub mod perceived;
 pub mod persona;
@@ -213,10 +214,19 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         // author wrote, not the simulation running from them.
         .route("/v1/pulse/world", Role::User, get(pulse::world))
         .route("/v1/npc/:nid/pulse", Role::User, post(pulse::inject))
+        // A line spoken straight into a character's world, from any in-world
+        // voice at a chosen loudness — the influence primitive under the
+        // console's `/` notation. `User` plus the ownership check inside, like
+        // `pulse`: it reaches only a character the caller owns.
+        .route("/v1/npc/:nid/direct", Role::User, post(pulse::direct))
         .route("/v1/npc/:nid/window", Role::User, get(pulse::window))
         // Admin: it reaches characters the caller does not own, which every
         // other route on this daemon refuses to do.
         .route("/v1/pulse/broadcast", Role::Admin, post(pulse::broadcast))
+        // A plain announcement to the whole world at URGENT — the announcement-
+        // shaped sibling of `broadcast`. Admin for the same reason: it reaches
+        // every character, including ones the caller does not own.
+        .route("/v1/pulse/announce", Role::Admin, post(pulse::announce))
         // ── generation ──────────────────────────────────────────────────────
         .route(
             "/v1/generate/description",

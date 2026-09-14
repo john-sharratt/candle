@@ -3199,6 +3199,89 @@ mod tests {
         );
     }
 
+    /// The same whole-table assertion, for the engine's routes.
+    ///
+    /// **These are merged into the router separately** (`main.rs` builds
+    /// `engine::api(..)` and `.merge`s it), so the table above — which is built
+    /// from this crate's `api(..)` alone — never saw them, and the three routes
+    /// that reach a character somebody else owns (`/simulate`, `/pulse/broadcast`,
+    /// `/tools/calibrate`, all `admin`) had no guard test at all. This closes
+    /// that: read the `user` rows against their ownership checks, and the two
+    /// `creator` rows (the world channel's write side and a world posting)
+    /// against the fact that they reach a whole world at once, which ownership
+    /// cannot express.
+    #[test]
+    fn the_engine_route_table_is_what_we_think_it_is() {
+        let api = crate::engine::api(state(tmp("engine_table")));
+        let got: Vec<(&str, &str)> = api
+            .declared()
+            .iter()
+            .map(|r| (r.path, r.min.as_str()))
+            .collect();
+
+        assert_eq!(
+            got,
+            [
+                // The substrate as it actually is, and the character's memory —
+                // reads of one owned character.
+                ("/v1/npc/:nid/substrate", "user"),
+                ("/v1/npc/:nid/substrate/layer/:layer", "user"),
+                ("/v1/npc/:nid/substrate/turn/:layer/:turn", "user"),
+                ("/v1/npc/:nid/memory", "user"),
+                // The scenario harness: admin, because it spends the card's time
+                // and reports the daemon's own prompt.
+                ("/v1/simulate", "admin"),
+                // Instruments over one owned character.
+                ("/v1/npc/:nid/projection", "user"),
+                ("/v1/npc/:nid/projection/:tick", "user"),
+                ("/v1/npc/:nid/monitor", "user"),
+                ("/v1/npc/:nid/project", "user"),
+                ("/v1/npc/:nid/perceive", "user"),
+                // Interactions with one owned character.
+                ("/v1/npc/:nid/interaction", "user"),
+                ("/v1/interaction/:ix", "user"),
+                ("/v1/interaction/:ix/inject", "user"),
+                ("/v1/interaction/:ix/stream", "user"),
+                // Messaging a character on its handset.
+                ("/v1/npc/:nid/message", "user"),
+                // The world's open channel: reading is a user's, speaking on it
+                // is a creator's, because it reaches every character in a world.
+                ("/v1/world/:wid/channel", "user"),
+                ("/v1/world/:wid/channel", "creator"),
+                ("/v1/world/:wid/posting", "creator"),
+                // The act vocabulary. Reading the catalog and the command list
+                // is a user's; calibrating an act spends the engine, so admin.
+                ("/v1/tools", "user"),
+                ("/v1/tools/calibrate", "admin"),
+                ("/v1/commands", "user"),
+                // Pulse: the cast's loop as an instrument, and reaching into it.
+                ("/v1/pulse", "user"),
+                ("/v1/pulse/census", "user"),
+                ("/v1/pulse/world", "user"),
+                ("/v1/npc/:nid/pulse", "user"),
+                // The influence primitive: a line into one owned character's
+                // world. `user` plus the ownership check, exactly like `pulse`.
+                ("/v1/npc/:nid/direct", "user"),
+                ("/v1/npc/:nid/window", "user"),
+                // Broadcast and announce reach characters the caller does not
+                // own — the two pulse routes that are admin for exactly that
+                // reason.
+                ("/v1/pulse/broadcast", "admin"),
+                ("/v1/pulse/announce", "admin"),
+                // Generation on the resident model, over the caller's own cast.
+                ("/v1/generate/description", "user"),
+                ("/v1/generate/description/stream", "user"),
+                ("/v1/generate/name", "user"),
+                ("/v1/generate/attributes", "user"),
+                ("/v1/image/generate", "user"),
+                ("/v1/image/models", "user"),
+                ("/v1/image/queue", "user"),
+                // The push stream.
+                ("/ws/events", "user"),
+            ]
+        );
+    }
+
     /// **The finding this closes.** Every route that changes a file on disk was
     /// reachable with no headers at all: `PUT /v1/world/x` returned 200 and
     /// wrote into the mind, `DELETE` returned 204 and removed it. The mind is
