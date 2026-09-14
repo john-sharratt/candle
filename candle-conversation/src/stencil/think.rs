@@ -437,6 +437,7 @@ mod tests {
     use crate::stencil::compile::compile;
     use crate::stencil::driver::{Healed, StencilDriver, StepMask};
     use crate::stencil::tree::StencilTree;
+    use crate::stencil::trigger::TriggerRegistry;
     use crate::stencil::vocab::{TestVocab, Vocab};
 
     const THINK_OPEN_ID: TokenId = 151667;
@@ -736,6 +737,36 @@ mod tests {
         assert_eq!(d.stats().intercepted_closes, 1);
     }
 
+    /// **Every end-of-turn token closes the span, not just the canonical one.**
+    ///
+    /// Qwen ends a turn on `<|im_end|>` or `<|endoftext|>`, and the decode loop
+    /// seals on either. A tree that watched only the canonical id let the other
+    /// through: measured live, a 1,282-token turn stopped mid-thought on
+    /// "…inside `" with the block never closed and no call ever made.
+    #[test]
+    fn balanced_closes_on_any_end_of_turn_token() {
+        let v = vocab().with_end(257);
+        assert_ne!(
+            v.eos(),
+            257,
+            "257 is the second end token, not the canonical one"
+        );
+        let spec = compile_think_tree(ThinkMode::Balanced, &env());
+        let mut d = StencilDriver::new(Arc::new(
+            compile(&spec, &v).expect("think tree must compile cleanly"),
+        ));
+
+        let (mask, _) = step_to_decode(&mut d, &v);
+        assert!(matches!(mask, StepMask::Free { .. }));
+        free_decode(&mut d, 5);
+
+        assert_eq!(d.accept(257, &v.token_bytes(257)), Healed::Drop);
+        let (mask, closed) = step_to_decode(&mut d, &v);
+        assert_eq!(closed, "</think>");
+        assert!(matches!(mask, StepMask::Done));
+        assert!(d.is_done());
+    }
+
     /// **The upper dials close on the model's FIRST close, like every other dial.**
     ///
     /// `Deep`'s extra depth is budget, not injection, so the first `</think>`
@@ -780,6 +811,51 @@ mod tests {
         assert_eq!(closed, "</think>");
         assert!(matches!(mask, StepMask::Done));
         assert_eq!(d.stats().intercepted_closes, 1);
+    }
+
+    /// **A reply cannot end with its reasoning still open.** Bound beside a
+    /// client's call grammar, the block's tree takes an EOS sampled after a long
+    /// plan as the block's close, not the turn's: it drops the EOS, writes
+    /// `</think>`, and hands decode back with the call trigger still armed.
+    /// Measured on a Cline turn with no tree bound: the model opened a block,
+    /// planned in it, sampled EOS, and the client received only reasoning — no
+    /// answer and no call — and ended the task.
+    #[test]
+    fn eos_after_a_plan_closes_the_block_beside_the_call_grammar() {
+        const TOOL_CALL_ID: TokenId = 151657;
+        let v = vocab();
+        let call_tree = {
+            let mut s = TreeSpec::new("call");
+            let end = s.push(NodeSpec::End);
+            s.root = s.push(NodeSpec::Static {
+                text: "{".into(),
+                next: end,
+            });
+            Arc::new(compile(&s, &v).unwrap())
+        };
+        let tools = TriggerRegistry::new().with_trigger(TOOL_CALL_ID, call_tree);
+        let turn = tools.with_trigger(THINK_OPEN_ID, tree_for(ThinkMode::Balanced));
+
+        let mut d = turn
+            .driver_for(THINK_OPEN_ID)
+            .expect("<think> must enter the steering tree");
+        let (mask, _) = step_to_decode(&mut d, &v);
+        assert!(matches!(mask, StepMask::Free { .. }));
+        free_decode(&mut d, 120);
+
+        let eos = v.eos();
+        assert_eq!(
+            d.accept(eos, &v.token_bytes(eos)),
+            Healed::Drop,
+            "an EOS inside the block must not end the turn"
+        );
+        let (mask, closed) = step_to_decode(&mut d, &v);
+        assert_eq!(closed, "</think>");
+        assert!(matches!(mask, StepMask::Done));
+        assert!(
+            turn.driver_for(TOOL_CALL_ID).is_some(),
+            "the call grammar must still be armed once the block has closed"
+        );
     }
 
     /// The whole prefill sequence of the widest dial, in order: the block-opening

@@ -536,6 +536,12 @@ pub struct SectionCollection {
     /// Concept B: mass-driven member-budget extension (`k` grows with the
     /// collection's attention mass, capped at `absolute_max`). `None` = static.
     pub budget_adaptive: Option<MemberBudgetAdaptive>,
+    /// Members emitted on every belief-driven projection, outside the budget:
+    /// the policy selects its top-k from the OTHER members, so a mandatory
+    /// member adds to the selection instead of taking one of its slots. Set per
+    /// member at runtime (`Builder::set_collection_member_mandatory`), e.g. from
+    /// a tool definition's `mandatory: true`.
+    pub mandatory: Vec<SectionId>,
 }
 
 impl Default for SectionCollection {
@@ -552,6 +558,7 @@ impl Default for SectionCollection {
             member_glue_tokens: None,
             default: None,
             budget_adaptive: None,
+            mandatory: Vec::new(),
         }
     }
 }

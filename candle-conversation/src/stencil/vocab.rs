@@ -22,8 +22,15 @@ pub trait Vocab {
     /// by healing).  Special/control tokens with no textual content return `&[]`.
     fn token_bytes(&self, token: TokenId) -> Vec<u8>;
 
-    /// The end-of-sequence token id.
+    /// The canonical end-of-sequence token id — the one a tree writes when it
+    /// has to end a turn itself. Always the first of [`Self::end_tokens`].
     fn eos(&self) -> TokenId;
+
+    /// Every token that ends a turn. A model has more than one (Qwen: both
+    /// `<|im_end|>` and `<|endoftext|>`), and the decode loop seals on any of
+    /// them, so a steered span must intercept every one — watching only the
+    /// canonical id let the other end a reply from inside an open think block.
+    fn end_tokens(&self) -> Vec<TokenId>;
 
     /// A stable fingerprint of this vocabulary.  Stored on a compiled tree so a
     /// later mismatch (tree compiled against a different tokenizer) fails loudly.
@@ -50,7 +57,8 @@ pub trait Vocab {
 pub struct TestVocab {
     /// (bytes, id), sorted by descending byte-length for longest-match.
     specials: Vec<(Vec<u8>, TokenId)>,
-    eos: TokenId,
+    /// End-of-turn ids, the canonical one first.
+    ends: Vec<TokenId>,
 }
 
 impl Default for TestVocab {
@@ -64,7 +72,7 @@ impl TestVocab {
     pub fn new() -> Self {
         TestVocab {
             specials: Vec::new(),
-            eos: 256,
+            ends: vec![256],
         }
     }
 
@@ -77,9 +85,15 @@ impl TestVocab {
         self
     }
 
-    /// Override the eos id.
+    /// Override the canonical eos id.
     pub fn with_eos(mut self, id: TokenId) -> Self {
-        self.eos = id;
+        self.ends[0] = id;
+        self
+    }
+
+    /// Add a further end-of-turn id beside the canonical one.
+    pub fn with_end(mut self, id: TokenId) -> Self {
+        self.ends.push(id);
         self
     }
 }
@@ -107,7 +121,7 @@ impl Vocab for TestVocab {
         if token < 256 {
             return vec![token as u8];
         }
-        if token == self.eos {
+        if self.ends.contains(&token) {
             return Vec::new();
         }
         for (s, id) in &self.specials {
@@ -119,12 +133,16 @@ impl Vocab for TestVocab {
     }
 
     fn eos(&self) -> TokenId {
-        self.eos
+        self.ends[0]
+    }
+
+    fn end_tokens(&self) -> Vec<TokenId> {
+        self.ends.clone()
     }
 
     fn fingerprint(&self) -> u64 {
         let mut h = DefaultHasher::new();
-        self.eos.hash(&mut h);
+        self.ends.hash(&mut h);
         for (s, id) in &self.specials {
             s.hash(&mut h);
             id.hash(&mut h);
@@ -140,15 +158,18 @@ impl Vocab for TestVocab {
 /// against a real model.
 pub struct HfVocab {
     tok: tokenizers::Tokenizer,
-    eos: TokenId,
+    /// End-of-turn ids, the canonical one first.
+    ends: Vec<TokenId>,
     fingerprint: u64,
 }
 
 impl HfVocab {
-    pub fn new(tok: tokenizers::Tokenizer, eos: TokenId, fingerprint: u64) -> Self {
+    /// `ends` is every token that ends a turn, the canonical one first (the
+    /// engine passes its `eos_tokens`, whose first is the dialect's own end).
+    pub fn new(tok: tokenizers::Tokenizer, ends: &[TokenId], fingerprint: u64) -> Self {
         HfVocab {
             tok,
-            eos,
+            ends: ends.to_vec(),
             fingerprint,
         }
     }
@@ -170,7 +191,11 @@ impl Vocab for HfVocab {
     }
 
     fn eos(&self) -> TokenId {
-        self.eos
+        self.ends.first().copied().unwrap_or(0)
+    }
+
+    fn end_tokens(&self) -> Vec<TokenId> {
+        self.ends.clone()
     }
 
     fn fingerprint(&self) -> u64 {
@@ -209,6 +234,14 @@ mod tests {
         let v = TestVocab::new().with_special("<tool_call>", 1000);
         assert_eq!(v.token_bytes(1000), b"<tool_call>");
         assert_eq!(v.token_bytes(v.eos()), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn end_tokens_lead_with_the_canonical_eos() {
+        let v = TestVocab::new().with_end(300);
+        assert_eq!(v.eos(), 256);
+        assert_eq!(v.end_tokens(), vec![256, 300]);
+        assert!(v.token_bytes(300).is_empty(), "an end token has no text");
     }
 
     #[test]

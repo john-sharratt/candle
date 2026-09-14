@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex};
 
 use candle_conversation::projection::{Builder, GroupId, LayerId, TimelineId};
 use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
-use candle_conversation::{ConversationEngine, SequenceConfig};
+use candle_conversation::{ConversationEngine, SequenceConfig, TurnText};
 use sha2::{Digest, Sha256};
 
 use crate::ingest_report::Failures;
@@ -174,7 +174,7 @@ fn emit_file_turns<S: InsertTurnSink>(
     // then splices the sealed pairs back onto this file's timeline in order; the
     // model-less test sink runs them serially. Either way the inter-turn seams
     // stay regenerated live glue (see `Sequence::ingest_scope_roundtrip_indices`).
-    let prepared: Vec<(String, String, String)> = scopes
+    let prepared: Vec<(String, String, TurnText)> = scopes
         .iter()
         .map(|scope| {
             let body = slice_lines(bytes, &line_offsets, scope.start_line, scope.end_line);

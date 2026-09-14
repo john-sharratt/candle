@@ -670,7 +670,7 @@ fn test_recursive_summarization_two_levels() {
     // Summarization tasks still do real inference when they fire.
     for i in 1..=6u32 {
         let asst = format!("Acknowledged turn {i}.");
-        conv.insert_turn(&format!("Recursive test turn {i}."), &asst)
+        conv.insert_turn(format!("Recursive test turn {i}."), &asst)
             .expect("insert_turn failed");
         eprintln!("Inserted turn {i}");
     }

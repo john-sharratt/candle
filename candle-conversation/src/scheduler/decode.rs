@@ -1052,6 +1052,11 @@ impl Scheduler {
                         if let Some(driver) = state.triggers.driver_for(token) {
                             // A trigger token (e.g. `<tool_call>`) opened a grammar:
                             // steer the rest of this call to the catalog's shape.
+                            // A once-trigger (the think block) is spent by firing,
+                            // so the rest of the turn decodes that token as text.
+                            if let Some(rest) = state.triggers.after_firing(token) {
+                                state.triggers = Arc::new(rest);
+                            }
                             tracing::debug!(
                                 target: "candle_conversation::stencil",
                                 seq_id = seq_id.0,

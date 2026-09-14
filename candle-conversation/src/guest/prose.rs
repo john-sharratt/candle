@@ -2415,7 +2415,10 @@ fn choice_stencil(
     tokenizer: &tokenizers::Tokenizer,
     arms: &[String],
 ) -> candle::Result<StencilDriver> {
-    let vocab = HfVocab::new(tokenizer.clone(), eos_id(tokenizer), fingerprint(tokenizer));
+    // Every end-of-turn token, the lowest id first as the canonical one.
+    let mut ends = eos_tokens(tokenizer);
+    ends.sort_unstable();
+    let vocab = HfVocab::new(tokenizer.clone(), &ends, fingerprint(tokenizer));
     for arm in arms {
         let n = vocab.encode(arm).len();
         if n != 1 {
@@ -2438,15 +2441,6 @@ fn choice_stencil(
     let tree = compile(&spec, &vocab)
         .map_err(|e| candle::Error::Msg(format!("prose guest: compiling the stencil: {e}")))?;
     Ok(StencilDriver::new(Arc::new(tree)))
-}
-
-/// The tokenizer's end-of-sequence id, for the stencil's vocab.
-///
-/// The stencil only needs it to know which token ends a free-text span, and a
-/// choice tree has none — so a vocab that could not find one is still usable and
-/// `0` is a safe stand-in rather than a reason to refuse the job.
-fn eos_id(tokenizer: &tokenizers::Tokenizer) -> u32 {
-    eos_tokens(tokenizer).into_iter().min().unwrap_or(0)
 }
 
 /// A cheap identity for the tokenizer a tree was compiled against.

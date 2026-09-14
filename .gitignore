@@ -69,6 +69,10 @@ candle-kernels/build_tool/
 .substrate/
 .substrate.*/
 
+# Per-folder substrate metadata — the daemon writes a `.substrate.yaml` (summary,
+# distinctive terms, retrieval questions) into every folder it maps.
+.substrate.yaml
+
 # Endpoint-managed upload staging dir — the zend daemon writes user-uploaded
 # files here at runtime; they are workspace content, never repo content.
 uploads/

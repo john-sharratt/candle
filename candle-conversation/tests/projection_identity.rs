@@ -76,6 +76,7 @@ use candle_conversation::{
     models::{Model, ModelBuilder},
     ConversationEngine, SamplingConfig, SequenceConfig,
 };
+use tempfile::TempDir;
 
 /// The stack whose projection this exercises: gated DeltaNet + QSA index, the
 /// only lineage that carries per-position state a projection has to move.
@@ -229,17 +230,12 @@ fn init_tracing() {
 /// another vocabulary would silently change what every recorded turn says); the
 /// bug is the test reaching for a substrate it does not own. Each run gets its
 /// own, and takes the projection through a real substrate rather than none.
-fn private_workspace() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "projection_identity_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&dir).expect("create private workspace");
-    dir
+///
+/// A `TempDir`, so the substrate it seals is removed when the test ends. A
+/// named directory per run was never removed, and left a whole substrate in
+/// the temp folder every time the test ran.
+fn private_workspace() -> TempDir {
+    tempfile::tempdir().expect("create private workspace")
 }
 
 fn engine(workspace: &std::path::Path) -> ConversationEngine {
@@ -495,7 +491,7 @@ fn reasoning_len(text: &str) -> usize {
 #[ignore]
 fn projection_is_the_identity_when_nothing_is_dropped() {
     let workspace = private_workspace();
-    let eng = engine(&workspace);
+    let eng = engine(workspace.path());
 
     // Every arm on ONE engine, in order, control first. The control is the
     // prefill path (append-only, nothing sealed mid-conversation); every other

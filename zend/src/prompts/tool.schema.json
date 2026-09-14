@@ -26,6 +26,11 @@
       "default": false,
       "description": "Side-effecting or outward-facing (mutation, code execution, remote/network access, credentials). Omitted in the Restricted tools mode."
     },
+    "mandatory": {
+      "type": "boolean",
+      "default": false,
+      "description": "Projected on every turn, outside the `tools` collection's top-k selection: provenance still picks its usual number of tools and this one is added on top rather than taking a slot. For tools every coding turn needs whatever the question (reading and listing files). A tools mode that excludes the tool still excludes it."
+    },
     "parameters": {
       "type": "object",
       "description": "JSON Schema for the call arguments (the tool's Request type). Rendered into the `{name,description,parameters}` line the model reads, and used to build the constrained-decode stencil that forces valid call JSON."

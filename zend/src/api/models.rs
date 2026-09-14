@@ -1,18 +1,25 @@
 use axum::Json;
 use serde::Serialize;
 
+use crate::passthrough::PASSTHROUGH_MODEL;
+
 /// `GET /v1/models`
 ///
 /// OpenAI-compatible model listing.  Continue queries this on startup to
-/// populate the model selector.
+/// populate the model selector. `zen-code` runs the daemon's own projection;
+/// [`PASSTHROUGH_MODEL`] runs the client's context as-is (see
+/// [`crate::passthrough`]).
 pub async fn list() -> Json<ModelList> {
     Json(ModelList {
         object: "list",
-        data: vec![ModelObject {
-            id: "zen-code".into(),
-            object: "model",
-            owned_by: "zend".into(),
-        }],
+        data: ["zen-code", PASSTHROUGH_MODEL]
+            .into_iter()
+            .map(|id| ModelObject {
+                id: id.into(),
+                object: "model",
+                owned_by: "zend".into(),
+            })
+            .collect(),
     })
 }
 

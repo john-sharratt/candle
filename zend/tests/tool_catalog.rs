@@ -136,6 +136,22 @@ fn install_tool_catalog_returns_section_ids_in_registry_order() {
     );
 }
 
+/// `file_read` and `file_list` are marked mandatory on the `tools` collection,
+/// so they project on every turn on top of the belief top-k.
+#[test]
+fn install_tool_catalog_marks_the_mandatory_tools() {
+    let mut builder = build_test_projection();
+    let installed = install_tool_catalog(&mut builder).unwrap();
+    let coll = tools_collection(&builder).expect("tools collection must exist");
+    let mut names: Vec<&str> = installed
+        .iter()
+        .filter(|(_, id, _)| coll.mandatory.contains(id))
+        .map(|(n, _, _)| n.as_str())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["file_list", "file_read"]);
+}
+
 #[test]
 fn install_tool_catalog_emits_valid_hermes_json_lines() {
     let mut builder = build_test_projection();
@@ -394,7 +410,7 @@ fn format_tool_responses_produces_one_block_per_result() {
             response: json!({"result": 4}),
         },
     ];
-    let formatted = format_tool_responses(&results);
+    let formatted = format_tool_responses(&results).text();
     let n_open = formatted.matches("<tool_response>").count();
     let n_close = formatted.matches("</tool_response>").count();
     assert_eq!(n_open, 2);
@@ -417,7 +433,7 @@ fn format_tool_responses_escapes_nested_json_correctly() {
             "array": [1, 2, 3],
         }),
     }];
-    let formatted = format_tool_responses(&results);
+    let formatted = format_tool_responses(&results).text();
     assert!(formatted.starts_with("<tool_response>"));
     assert!(formatted.contains("</tool_response>"));
     assert!(formatted.contains("\"nested\""));

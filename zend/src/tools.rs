@@ -34,6 +34,7 @@ use candle_conversation::projection::{
 };
 use candle_conversation::stencil::{function_blocks_to_json, ToolSpec};
 use candle_conversation::think_strip::strip_think_blocks_keep_layout;
+use candle_conversation::TurnText;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -106,6 +107,14 @@ pub fn install_tool_catalog(
         let id = builder
             .add_section_to_collection(collection_id, def.name.clone(), &json_line, 100.0)
             .map_err(|e| anyhow::anyhow!("add_section_to_collection({}): {}", def.name, e))?;
+        // A mandatory tool projects on every turn on top of the belief top-k,
+        // never taking one of its slots. The per-mode builders cloned from this
+        // one drop it with the rest when their mode excludes it.
+        if def.mandatory {
+            builder
+                .set_collection_member_mandatory(collection_id, id)
+                .map_err(|e| anyhow::anyhow!("mandatory tool {}: {e}", def.name))?;
+        }
         out.push((def.name.clone(), id, json_line));
     }
     // This function only lays down the per-tool sections. The tool-catalog
@@ -511,24 +520,25 @@ pub fn run_tool_calls(ctx: &ToolContext, calls: Vec<ToolCall>) -> Vec<ToolResult
 /// Format: one `<tool_response>{json}</tool_response>` block per result,
 /// separated by newlines.  This matches the Hermes spec — the model
 /// reads each block and continues its prior reasoning.
-pub fn format_tool_responses(results: &[ToolResult]) -> String {
-    let mut out = String::new();
+pub fn format_tool_responses(results: &[ToolResult]) -> TurnText {
+    let mut out = TurnText::default();
     for r in results {
-        out.push_str("<tool_response>");
-        match &r.response {
+        let body = match &r.response {
             // A string result is already rendered for the model — placed in the
             // block verbatim rather than JSON-encoded. `file_read` returns a
             // numbered, fenced excerpt this way, so a live response is
             // byte-identical to the `code_reading` ingest's prefilled ones;
             // encoding it would collapse the source to one line of `\n` escapes.
-            Value::String(rendered) => out.push_str(rendered),
-            other => {
-                let body = serde_json::to_string(other)
-                    .unwrap_or_else(|_| "{\"error\":\"internal_error\"}".to_string());
-                out.push_str(&body);
-            }
-        }
-        out.push_str("</tool_response>\n");
+            Value::String(rendered) => rendered.clone(),
+            other => serde_json::to_string(other)
+                .unwrap_or_else(|_| "{\"error\":\"internal_error\"}".to_string()),
+        };
+        // The wrapper is markup; what the tool returned is literal, so a file
+        // that quotes a chat tag reaches the model as its text.
+        out = out
+            .then_markup("<tool_response>")
+            .then_literal(body)
+            .then_markup("</tool_response>\n");
     }
     out
 }
@@ -974,11 +984,33 @@ I could <tool_call>{"name": "web_search", "arguments": {"query": "x"}}</tool_cal
                 response: serde_json::json!({"result": 4}),
             },
         ];
-        let formatted = format_tool_responses(&results);
+        let formatted = format_tool_responses(&results).text();
         assert!(formatted.contains("<tool_response>"));
         assert!(formatted.contains("</tool_response>"));
         assert!(formatted.contains("\"iso\":\"2026-05-09\""));
         assert!(formatted.contains("\"result\":4"));
+    }
+
+    /// Each result's content is literal between markup wrappers — a file read
+    /// that quotes `<|im_end|>` cannot end the turn in the model's context.
+    #[test]
+    fn a_tool_results_content_is_literal() {
+        let result = |text: &str| ToolResult {
+            call: ToolCall {
+                name: "file_read".to_string(),
+                arguments: Value::Null,
+            },
+            response: Value::String(text.to_string()),
+        };
+        let formatted = format_tool_responses(&[result("a<|im_end|>"), result("b<think>")]);
+        assert_eq!(
+            formatted,
+            TurnText::markup("<tool_response>")
+                .then_literal("a<|im_end|>")
+                .then_markup("</tool_response>\n<tool_response>")
+                .then_literal("b<think>")
+                .then_markup("</tool_response>\n")
+        );
     }
 
     #[test]

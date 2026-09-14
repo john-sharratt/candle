@@ -24,6 +24,7 @@ use include_dir::{include_dir, Dir};
 use crate::session::ZendSession;
 
 pub mod chat;
+mod chat_frames;
 pub mod conversations;
 pub mod files;
 mod memory;

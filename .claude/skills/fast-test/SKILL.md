@@ -89,12 +89,12 @@ cargo test -p <crate> [features] --lib -- <gpu_module> [<gpu_module> …] --test
 cargo test -p <crate> [features] --test <gpu_target> [--test …] -- --test-threads=1
 ```
 
-The 2026-09-13 audit, for orientation only — re-derive it:
+The 2026-09-14 audit, for orientation only — re-derive it:
 
 | crate | GPU lib modules | GPU integration binaries | CPU integration binaries |
 |---|---|---|---|
-| `candle-conversation` | `persistence::transfer`, `persistence::elevate`, `batched_sampler::tests`, `provenance::gpu`, `provenance::gallery_arena` | `cold_warm_hot_path`, `compression_integration`, `conversation_tests`, `deepseek_rung4`, `narrator_integration_test`, `narrator_window_test`, `prefill_ab`, `projection_identity`, `summarization_tests`, `thinking_span`, `turn_belief_scan` | `integrity_repair`, `live_turn_gallery`, `narrator_tests`, `selection_replay`, `staged_ingest_events`, `store_tests`, `token_bias_chatml`, `token_bias_real_vocab` |
-| `zend` | `model_choice` | `coherence_integration`, `duplication_replay`, `gui_api_harness`, `hybrid_recurrent_state`, `infinite_conversation_deep`, `infinite_conversation_smoke`, `integration`, `memory_continuity`, `persistence_integration` (ignored), `provenance_fold_real_geometry`, `recall_quality`, `reproject_control`, `reproject_wave`, `section_quantize_end_to_end`, `startup_stall_watchdog`, `tools_integration`, `zen_code_phase12_smoke` | `code_read_integration`, `repo_scan_integration`, `stencil_tool_call`, `tokenizer_special_tokens`, `tool_catalog`, `watcher_integration` |
+| `candle-conversation` | `persistence::transfer`, `persistence::elevate`, `batched_sampler::tests`, `provenance::gpu`, `provenance::gallery_arena` | `cold_warm_hot_path`, `compression_integration`, `conversation_tests`, `deepseek_rung4`, `narrator_integration_test`, `narrator_window_test`, `prefill_ab`, `projection_identity`, `summarization_tests`, `thinking_span`, `turn_belief_scan` | `integrity_repair`, `literal_text_real_vocab`, `live_turn_gallery`, `narrator_tests`, `selection_replay`, `staged_ingest_events`, `store_tests`, `token_bias_chatml`, `token_bias_real_vocab` |
+| `zend` | `model_choice` | `coherence_integration`, `duplication_replay`, `gui_api_harness`, `hybrid_recurrent_state`, `infinite_conversation_deep`, `infinite_conversation_smoke`, `integration`, `memory_continuity`, `persistence_integration` (ignored), `provenance_fold_real_geometry`, `recall_quality`, `reproject_control`, `reproject_wave`, `restart_turn_recovery`, `section_quantize_end_to_end`, `startup_stall_watchdog`, `tools_integration`, `zen_code_phase12_smoke` | `code_read_integration`, `repo_scan_integration`, `stencil_tool_call`, `tokenizer_special_tokens`, `tool_catalog`, `watcher_integration` — plus `--bin zend` (`main.rs`'s `wipe_tests`), which `--lib` does not reach |
 | `npcd` | none (its device is constructed only on the model-load path, which no test reaches) | none | `makers`, `tools`, `vault` |
 
 **C. No CUDA in the dependency graph — CPU pass only, full width.**
@@ -107,7 +107,19 @@ cargo test -p <crate> --tests
 
 ### Rules for every pass
 
-- **One `cargo test` process at a time.** Passes never run concurrently.
+- **One `cargo test` process at a time.** Passes never run concurrently — and that includes
+  the `-- --list` builds, which compile and link exactly as much as a pass does.
+- **`-j 6` for the crates that link dozens of large test binaries — `candle-conversation`,
+  `zend`, `npcd`.** At cargo's default width `zend`'s ~25 test binaries link side by side,
+  each mapping multi-GB rlibs, and on 2026-09-14 that exhausted the whole 95 GB commit limit
+  (31.5 GB RAM + a 64 GB page file). The linker reports it as **`os error 1455` — "The paging
+  file is too small"** — and the failed maps surface beside it as `unresolved external
+  symbol`, `found invalid metadata files` and `crate … required to be available in rlib
+  format`, which read like corruption and are not. Before a run, check the commit headroom
+  (`(Get-CimInstance Win32_OperatingSystem).FreeVirtualMemory`, in KB); under ~40 GB, find
+  what is holding it before starting.
+- **`--no-fail-fast` on every pass.** Without it cargo stops at the first failing binary and
+  the rest of the pass never runs, so one failure hides every result behind it.
 - **`--tests`** (or `--lib` / `--test <name>`) — unit and integration tests, no doc tests.
 - **Features are not optional.** A feature-gated test that is not built is reported as
   `filtered out`, not as a failure — `candle-conversation` without `hub` silently drops every
@@ -126,6 +138,51 @@ Run each command in the background, output redirected, exit status checked separ
 ```bash
 cargo test … > <scratchpad>/fast-test/<NN>_<crate>_<cpu|gpu>.log 2>&1; echo "EXIT=$?"
 ```
+
+### One chain, and stopping it for real
+
+- Run the passes as **one** sequential chain — one script, one background task, one line
+  out per pass. Never start a second chain, or any other cargo command, while one is alive.
+- **Stopping a background chain does not stop its children.** On Windows, `TaskStop` on a
+  Git Bash chain kills only the top shell: the script's `cargo`, `rustc`, `link` and test
+  binaries carry on, and a new chain started beside them doubles every build. That is what
+  exhausted memory on 2026-09-14 — two chains, not one wide build. After stopping a chain,
+  kill the rest by command line and confirm nothing is left before starting anything else:
+
+  ```powershell
+  Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*fast-test*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -Confirm:$false }
+  Get-Process cargo,rustc,link -ErrorAction SilentlyContinue   # must print nothing
+  ```
+
+  Orphaned test executables count too — `<name>-<hash>.exe` under `target\debug\deps`. One
+  left behind that day held 4 GB of host memory and the card.
+- **Never kill `rustc` mid-compile.** A compile killed half-way can leave an rlib whose
+  codegen units disagree with each other, and cargo still counts it as fresh, so it is never
+  rebuilt. It shows as `LNK2019`/`LNK2001 unresolved external symbol ….llvm.<digits>` where
+  the missing symbol and the function referring to it are both inside the **same**
+  `lib<crate>-<hash>.rlib`, and there is no `os error 1455` beside it. With no cargo running,
+  delete that `lib<crate>-<hash>.rlib` and its `.rmeta` from `target\debug\deps`, and every
+  `target\debug\incremental\<crate>-*`, then rebuild. If the error survives a clean rebuild of
+  that crate, it is a real defect.
+
+### Tests leave nothing in the tree
+
+Before the first pass and after the last, record the tree:
+
+```bash
+git status --porcelain --ignored --untracked-files=all -- . ':!target' > <scratchpad>/fast-test/tree_<before|after>.txt; echo "EXIT=$?"
+```
+
+Compare the two with Read/Grep. **Any path that appears is a test that wrote into the source
+tree — a defect, fixed forward like a failure.** A test's workspace is a `tempfile::TempDir`,
+or a fixed directory under `env!("CARGO_TARGET_TMPDIR")` when it must persist across runs
+(a tool-catalog calibration, a substrate copy — `zend/tests/common/mod.rs`'s
+`production_workspace()`). It is never `std::env::current_dir()` or `CARGO_MANIFEST_DIR` —
+under `cargo test` both are the crate directory, which is how a 3.2 GB `zend/.substrate` came
+to sit in the tree — and never the repo root, whose substrate is the user's live one. A named
+directory in `std::env::temp_dir()` that is never removed accumulates just the same; use a
+`TempDir`.
 
 ## 3. While running — one line per pass
 
@@ -173,12 +230,13 @@ RUSTC_BOOTSTRAP=1 target/debug/deps/<name>-<hash>.exe -Z unstable-options --repo
 
 ## 5. Restart what step 1 stopped
 
-Restart each process with exactly its recorded executable and arguments, from the repo root,
+Restart each process with exactly its recorded executable and arguments, from the repo root
+(the checkout this session runs in — the three dev machines keep it in different places),
 detached:
 
 ```powershell
 Start-Process -FilePath "<ExecutablePath>" -ArgumentList '<args after the exe>' `
-  -WorkingDirectory "d:\prog\candle"
+  -WorkingDirectory "<repo root>"
 ```
 
 Confirm it is running. Restart **whenever the run ends** — green, or stopping to hand back

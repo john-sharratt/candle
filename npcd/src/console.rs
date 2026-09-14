@@ -390,6 +390,13 @@ mod tests {
             for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{dir:?}: {e}")) {
                 let path = entry.expect("readable").path();
                 let name = path.file_name().expect("named").to_owned();
+                // Hidden entries are not the library. The daemon writes its own
+                // folder metadata (`.substrate.yaml`) into every folder it maps,
+                // and each copy names its own folder's path — comparing them
+                // reported drift between two libraries that were identical.
+                if name.to_string_lossy().starts_with('.') {
+                    continue;
+                }
                 let here = rel.join(&name);
                 if path.is_dir() {
                     queue.push(here);

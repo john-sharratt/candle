@@ -84,7 +84,7 @@ tests/
 | Group | Tools | Client | Notes |
 |-------|-------|--------|-------|
 | **Shared utilities** | `datetime`, `calculator`, `unit_convert`, `random`, `web_search`, `web_fetch`, `weather` | Both | No session state |
-| **Virtual filesystem** | `file_{write,read,edit,list,delete,present}` | Web chat only | Per-session in-memory; 10 MiB cap |
+| **Virtual filesystem** | `file_{write,read,edit,list,delete,present}` | Web chat only | Per-session in-memory; 10 MiB cap; `file_read` requires `start_line` and `end_line` |
 | **Notes** | `notes_{write,read,search,list}` | Web chat only | Cross-conversation persistent KV store |
 | **Credentials** | `credential_{save,list,delete}` | Web chat only | In-memory encrypted store |
 | **SSH sessions** | `ssh_session_{open,exec,exec_async,poll,list,close}` | Web chat only | russh; TOFU host key; sentinel/nonce exec |
