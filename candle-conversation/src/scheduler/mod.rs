@@ -75,7 +75,7 @@ use crate::summary_tree::{
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::turn_layout::{GlueKind, KvSpan, TurnLayout, TurnSegment};
-use crate::{SubstrateReloadStatus, TurnStats};
+use crate::{FinishReason, SubstrateReloadStatus, TurnStats};
 
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{Device, Tensor};
@@ -1283,6 +1283,10 @@ struct DecodeState {
     pending_page_cut_after: Option<u32>,
     /// Whether this sequence has finished (EOS or max_tokens).
     finished: bool,
+    /// Why it finished, once it has. [`FinishReason::Length`] only when the
+    /// response budget ran out, set where the budget is checked; every other
+    /// ending — end-of-sequence, a completed stencil, an abort — is a `Stop`.
+    finish: FinishReason,
     /// Decode start time (for stats).
     decode_start: Instant,
     /// Microseconds this turn actually spent INSIDE decode forwards.
@@ -5253,6 +5257,7 @@ impl Scheduler {
             free_tool_calls_from_penalties: false,
             prefill_assistant_text: String::new(),
             finished: false,
+            finish: FinishReason::Stop,
             decode_start: Instant::now(),
             decode_busy_us: 0,
             prefill_ms,
@@ -6498,7 +6503,9 @@ impl Scheduler {
         }
     }
 
-    /// Handle the case where generation finishes on the first token (EOS or max=0).
+    /// Handle the case where generation finishes on the first token (EOS or
+    /// max=0); `finish` says which.
+    #[allow(clippy::too_many_arguments)]
     fn finish_immediately(
         &self,
         seq_id: SequenceId,
@@ -6507,6 +6514,7 @@ impl Scheduler {
         prefill_ms: f64,
         turn_start: Instant,
         prefill_token_count: usize,
+        finish: FinishReason,
     ) {
         let skip = !self.show_special_tokens;
         // Persist verbatim (see the main finish path) — no think-stripping here.
@@ -6523,6 +6531,7 @@ impl Scheduler {
                 tokens_per_second: 0.0,
                 prefill_token_count,
                 context_tokens: self.session.sequence_offset(seq_id.0).unwrap_or(0),
+                finish,
                 sequence: self.session.get_sequence_stats(seq_id.0),
             },
             // `finish_immediately` fires before any decode starts and
@@ -7146,6 +7155,7 @@ impl Scheduler {
                         tokens_per_second,
                         prefill_token_count: state.prefill_token_count,
                         context_tokens,
+                        finish: state.finish,
                         sequence: sequence_stats,
                     },
                     seal: seal_result,
@@ -12443,6 +12453,7 @@ mod tests {
             free_tool_calls_from_penalties: false,
             prefill_assistant_text: String::new(),
             finished: false,
+            finish: FinishReason::Stop,
             decode_start: Instant::now(),
             decode_busy_us: 0,
             prefill_ms: 0.0,

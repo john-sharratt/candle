@@ -113,7 +113,7 @@ pub use scheduler::provenance_capture_path_counts;
 pub use scheduler::recurrent_state_cost;
 pub use scheduler::relief_trace;
 pub use sequence_handle::SequenceId;
-pub use stats::TurnStats;
+pub use stats::{FinishReason, TurnStats};
 pub use token_buffer::TokenBuffer;
 pub use tree::TokenizedText;
 pub use turn::{Role, Turn, TurnId, TurnOptions};

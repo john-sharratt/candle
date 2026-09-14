@@ -152,7 +152,7 @@ mod coherence {
                 StreamItem::Tool(status) => {
                     eprintln!("\n[TOOL {}] {:?}", status.phase, status.tools);
                 }
-                StreamItem::Usage(_) => {}
+                StreamItem::TurnEnd { .. } => {}
             }
         }
         eprintln!("\n\n[FINAL RESPONSE — {token_events} token events]\n{response}");

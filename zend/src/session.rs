@@ -28,6 +28,7 @@ use candle_conversation::projection::{
 use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
+use candle_conversation::FinishReason;
 use candle_conversation::TurnText;
 use candle_conversation::{
     ConversationEngine, GlueMarkers, ProjectionEvent, Sequence, ThinkSteering, TokenDecoder,
@@ -118,10 +119,14 @@ pub enum StreamItem {
     /// A tool-execution lifecycle notice (running / done) for the in-flight
     /// tool cards.  Display-only: never part of the collected completion body.
     Tool(ToolStatusOut),
-    /// A finished turn's token counts, which become the reply's `usage`. Sent
-    /// once per turn; a reply the daemon answers over several turns sends one
-    /// for each.
-    Usage(Usage),
+    /// A finished turn: its token counts, which become the reply's `usage`, and
+    /// how it ended, which becomes its `finish_reason`. Sent once per turn; a
+    /// reply the daemon answers over several turns sends one for each and ends
+    /// the way its last turn did.
+    TurnEnd {
+        usage: Usage,
+        finish: FinishReason,
+    },
 }
 
 /// Process-global monotonic id for projection events, so dot ids stay unique
@@ -3066,13 +3071,16 @@ fn run_inference_stream(
                                 prefill_ms = resp.stats.prefill_ms as u32,
                                 "turn complete",
                             );
-                            // Report context usage to the client (main's feature),
-                            // async like the rest of this stream.
+                            // Report the finished turn — usage + finish_reason —
+                            // to the client, async like the rest of this stream.
                             let _ = tx
-                                .send(Ok(StreamItem::Usage(Usage::for_turn(
-                                    resp.stats.context_tokens,
-                                    resp.stats.tokens_generated,
-                                ))))
+                                .send(Ok(StreamItem::TurnEnd {
+                                    usage: Usage::for_turn(
+                                        resp.stats.context_tokens,
+                                        resp.stats.tokens_generated,
+                                    ),
+                                    finish: resp.stats.finish,
+                                }))
                                 .await;
                             done_resp = Some(resp);
                         }
@@ -3468,10 +3476,10 @@ async fn passthrough_turn(
         }
     }
     let _ = tx
-        .send(Ok(StreamItem::Usage(Usage::for_turn(
-            resp.stats.context_tokens,
-            resp.stats.tokens_generated,
-        ))))
+        .send(Ok(StreamItem::TurnEnd {
+            usage: Usage::for_turn(resp.stats.context_tokens, resp.stats.tokens_generated),
+            finish: resp.stats.finish,
+        }))
         .await;
     if let Err(e) = live.seq.finish_turn(handle, &resp) {
         tracing::warn!(key, "passthrough: finish_turn: {e}");
