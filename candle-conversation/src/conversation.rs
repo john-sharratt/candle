@@ -567,18 +567,6 @@ fn first_non_finite_layer(layers: &[ExportedLayerState]) -> Option<(u32, &'stati
     })
 }
 
-/// Which `summarize_examples` option matches a round-trip chain of
-/// `prefilled_pairs` prefilled `(user, assistant)` pairs: one pair is a
-/// `code_reading` scope read (request → call → excerpt → summary), more is the
-/// `repo_map` folder walk (request → list → listing → read → excerpt → summary).
-fn examples_shape(prefilled_pairs: usize) -> &'static str {
-    if prefilled_pairs > 1 {
-        "folder"
-    } else {
-        "file"
-    }
-}
-
 impl Sequence {
     /// Create a new conversation backed by a full projection [`Builder`].
     ///
@@ -2789,23 +2777,24 @@ impl Sequence {
         force_tools: &[String],
         triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<(Vec<u32>, usize)> {
-        // A scope round-trip is a SUMMARIZATION task, not the dialogue agent. Drive
-        // the shared system prompt into its summarizer mode via selection — the
-        // generic, per-mode section-toggling design rather than a bespoke per-layer
-        // prompt string:
-        //   - tools ON, force-pinned to the tools the prefill calls: the chain
-        //     PREFILLS tool_calls and their tool_responses, so the projection must
-        //     present a coherent tool context or the model can't connect the
-        //     prefill to any capability and degrades (refusals, off-language,
-        //     hallucinated tool chatter). Enable the tool block and force-select
-        //     exactly those tools (see `FORCE_TOOL_SELECTOR`) — present, coherent,
-        //     no belief-driven catalog noise.
-        //   - `persona = summarize`: swaps the "You are Zen, pair programming…"
-        //     dialogue frame for the terse code-summarizer frame (content-provided,
-        //     English, summary-only) — the fix for the reasoning/refusal/off-language
-        //     summaries the conversational persona produced.
-        //   - `response_length = terse`: the default `standard` length section says
-        //     "a short paragraph or two", which fights the two-sentence goal.
+        // A scope round-trip frames on the dialogue prompt itself — the persona is
+        // deliberately left alone. The turns it seals are later borrowed into
+        // dialogue projections, and borrowed K/V carries the framing it was computed
+        // under, and on the append-only ingest path that framing is NOT this
+        // selection's to set: the prefix is the one priming injected at creation
+        // (the schema's sections at each tree's default branch) and
+        // `skip_projection` means no turn ever rebuilds it. The ingest's prompt is
+        // therefore the same shared prompt KV a chat conversation uses, and the
+        // schema's defaults are where its content is decided — see the
+        // `tool_call_example` note in `projection.yaml`.
+        //
+        // The tool pin below stays because it is not ingest-only: any caller that
+        // DOES re-project needs a coherent tool context, since the chain PREFILLS
+        // `tool_call`s and their `tool_response`s and a model shown neither the
+        // block nor those tools degrades (refusals, off-language, hallucinated tool
+        // chatter). Enable the block and force-select exactly the prefilled tools
+        // (see `FORCE_TOOL_SELECTOR`) — coherent, with no belief-driven catalog
+        // noise.
         self.selection.set_optional(
             crate::projection::TOOLS_ENABLED_SELECTOR,
             crate::projection::OptionalState::Present,
@@ -2813,17 +2802,6 @@ impl Sequence {
         let pinned_tools = force_tools.join(&crate::projection::FORCE_TOOL_SEPARATOR.to_string());
         self.selection
             .select(crate::projection::FORCE_TOOL_SELECTOR, pinned_tools.clone());
-        self.selection.select("persona", "summarize");
-        self.selection.select("response_length", "terse");
-        //   - `summarize_examples`: stuff worked example turns between the system
-        //     prompt and this chain's turns so the model imitates the exact
-        //     request→summary shape. The option names the SHAPE of this chain
-        //     (`file` for a scope read, `folder` for a directory round-trip),
-        //     because an example teaches the subject as much as the format: shown
-        //     the file examples, a folder chain summarises the excerpt it was
-        //     handed rather than the directory it was asked about.
-        self.selection
-            .select("summarize_examples", examples_shape(prefilled.len()));
         // The prefilled turns — each `[user][assistant]` written verbatim, with
         // staged provenance so a later scan can resolve sig hit → event → turn.
         let mut indices: Vec<u32> = Vec::with_capacity(prefilled.len() + 1);
@@ -2850,11 +2828,12 @@ impl Sequence {
         // frequently off-language (Chinese/Japanese) — reasoning, leaving a truncated
         // "thought" as the stored summary.
         //
-        // **Three layers, and only the last one is structural.** The caller frames
-        // the conversation as a summarizer (`thinking_effort = off` resolved into
-        // the static system prompt) and `NO_THINK_SELECTOR` adds the `/no_think`
-        // glue below — both of which the model may simply ignore, because both are
-        // text. `apply_think_mode` then programs the sampler's segment-close
+        // **Three layers, and only the last one is structural.** `NO_THINK_SELECTOR`
+        // adds the `/no_think` glue below, baked into this turn's own prefill — which
+        // the model may simply ignore, because it is text. (Nothing in the prompt
+        // helps: an append-only ingest is framed by the primed shared prompt at its
+        // default branch, whose thinking dial is the dialogue's.)
+        // `apply_think_mode` then programs the sampler's segment-close
         // budget, which for `Off` at a short summary budget collapses to a forced
         // empty block. That is enforcement, but it is *sampler* enforcement: it
         // fires only once the model has already opened the block, and it depends on
@@ -2938,11 +2917,12 @@ impl Sequence {
     /// `adopt_turn` can reference its sealed K/V) but has its own scheduler slot
     /// + timeline, so scopes ingest concurrently without ordering conflicts.
     pub fn fork_scope(&self) -> crate::Result<Sequence> {
-        // Do NOT mark the fork append-only / evict_when_cold: `adopt_turn` requires
-        // the fork's turns to still be HOT at splice, so auto-evicting them would
-        // race the splice ("source K/V not hot"). The fork's orphaned hot is freed
-        // instead at `tombstone_timeline` (below), where the file timeline's cloned
-        // chunk handles keep the shared KV alive.
+        // Do NOT mark the fork append-only / evict_when_cold, and DO mark it a
+        // splice source: `adopt_turn` reads the fork's turns from their HOT copy
+        // and nothing else, and a splice source's hot copy is exempt from every
+        // automatic hot-drop — relief, the idle demote, the migrate install —
+        // until the fork's `tombstone_timeline` (below) frees it, the file
+        // timeline's cloned chunk handles keeping the shared KV alive.
         //
         // DO mark the fork timeline transient: its sealed KV is spliced by REFERENCE
         // onto the file timeline (which writes its own durable cold copy) and then
@@ -2953,6 +2933,7 @@ impl Sequence {
             .substrate
             .mint_timeline(self.target.layer, self.target.group);
         self.substrate.mark_timeline_transient(fork_timeline);
+        self.substrate.mark_timeline_splice_source(fork_timeline);
         // A scope fork is a fresh timeline: it ingests its own scope against the
         // system prompt and holds none of the file conversation's dialogue, so
         // it must not inherit the file conversation's memory either.

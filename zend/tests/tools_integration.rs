@@ -64,11 +64,11 @@ mod tool_scenarios {
     use candle_conversation::models::Model;
     use candle_conversation::persistence::SUBSTRATE_DIR;
     use candle_conversation::{SamplingConfig, SelectionState};
-    use zend::api::chat::dial_selection;
+    use zend::api::chat::{apply_tools_dial, dial_selection};
     use zend::config::{DaemonConfig, ModelChoice};
     use zend::log_broadcast::LogBus;
     use zend::session::{timeline_for, StreamItem, ZendSession};
-    use zend::types::{ChatMessage, Role};
+    use zend::types::{ChatMessage, Role, ToolMode};
 
     /// Per-scenario cap. A scenario on a warm workspace is ~10 s; the first run
     /// on a fresh one also calibrates the whole tool catalog once, which is what
@@ -175,7 +175,7 @@ mod tool_scenarios {
                 .as_nanos()
         });
         let conv_id = format!("{conv_id}-{run}");
-        let (workspace, model, selection, compact_substrate) = match rig {
+        let (workspace, model, mut selection, compact_substrate) = match rig {
             Rig::Small => {
                 let ws = workspace();
                 let compact = substrate_bytes(&ws) > COMPACT_ABOVE_BYTES;
@@ -194,6 +194,9 @@ mod tool_scenarios {
                 false,
             ),
         };
+        // The tool prompt a chat turn gets — the block AND its worked call — so
+        // the suite exercises what a user is shown, not a catalog with no example.
+        apply_tools_dial(&mut selection, ToolMode::Comprehensive);
         let log = LogBus::new();
         let config = DaemonConfig {
             workspace,
@@ -221,7 +224,7 @@ mod tool_scenarios {
                 None,
                 None,
                 false,
-                zend::types::ToolMode::Comprehensive,
+                ToolMode::Comprehensive,
                 None,
                 selection,
             )

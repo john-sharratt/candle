@@ -3200,8 +3200,11 @@ impl Scheduler {
             let _ = d.cuda_context().bind_to_thread();
         }
 
-        // Resident gallery arena for the paged belief scan. Folded-signature
-        // geometry: 12 heads × 2 words (head_dim 128) = wpt 24, 3 layer-groups.
+        // Resident gallery arena for the paged belief scan, built for this
+        // model's fold (`prov_fold`): `words_per_token` u64 per token across its
+        // layer-groups. It must match the signatures the captures produce — a
+        // fixed Qwen3-30B width (24) here dropped every token of any other
+        // geometry (Qwen2-0.5B folds to 6) and zeroed the scan without a word.
         // `new` errors (→ None) on a non-CUDA device; it allocates no VRAM until
         // the first turn is made resident.
         //
@@ -3240,7 +3243,13 @@ impl Scheduler {
             "decode capabilities at load (draft_budget 0 ⇒ NO speculation: one token per forward)"
         );
 
-        let gallery_arena = GalleryArena::new(&device, 24, 3).map(Arc::new).ok();
+        let gallery_arena = GalleryArena::new(
+            &device,
+            prov_fold.words_per_token(),
+            prov_fold.group_sizes.len(),
+        )
+        .map(Arc::new)
+        .ok();
         let sampler = BatchedSampler::new(
             device.clone(),
             vocab_size,
@@ -8605,17 +8614,59 @@ impl Scheduler {
                                             .index_page_blob(target.timeline, idx)
                                             .map(|b| b.to_vec())
                                     });
+                            // The stored page is a framed LIST of pages, and the
+                            // model reads one page at a time — see
+                            // `index_pages::push_in_order`. However the pages fare,
+                            // the slot finishes past this turn's whole width, so the
+                            // next turn's rows land where its K/V does: the same rule
+                            // `apply_projection` follows.
+                            let width = sealed.first().map_or(0, |s| s.token_count);
+                            let model: &(dyn ManagedBatchedModel + Send) = &*self.model;
+                            let carries = model.carries_positional_state();
+                            // A skip that fails leaves every later turn's rows short
+                            // of their K/V, so it is reported rather than dropped.
+                            let advance = |gap: usize| {
+                                if !carries {
+                                    return;
+                                }
+                                if let Err(e) = model.push_positional_gap(scratch, gap) {
+                                    tracing::warn!(
+                                        "memory catch-up: turn {idx} could not advance the \
+                                         replay slot over {gap} unindexed token(s) ({e}) — \
+                                         every later turn's rows now sit short of their K/V"
+                                    );
+                                }
+                            };
                             match page {
                                 Some(blob) => {
-                                    if let Err(e) = self.model.push_positional_state(scratch, &blob)
-                                    {
-                                        tracing::warn!(
-                                            "memory catch-up: turn {idx} index page refused \
-                                             ({e})"
-                                        );
+                                    let pushed = index_pages::push_in_order(
+                                        &blob,
+                                        |p| model.push_positional_state(scratch, p).map(|_| ()),
+                                        &advance,
+                                    );
+                                    match pushed {
+                                        Ok(pushed) => {
+                                            if let Some(e) = &pushed.refused {
+                                                tracing::warn!(
+                                                    "memory catch-up: turn {idx} index page \
+                                                     refused ({e}) — advanced over {} unindexed \
+                                                     token(s)",
+                                                    pushed.gap
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "memory catch-up: turn {idx} index pages \
+                                                 unreadable ({e}) — the replay selects against \
+                                                 a prefix it never indexed"
+                                            );
+                                            advance(width);
+                                        }
                                     }
                                 }
-                                None if self.model.carries_positional_state() => {
+                                None if carries => {
+                                    advance(width);
                                     tracing::warn!(
                                         "memory catch-up: turn {idx} has no index page — the \
                                          replay selects against a prefix it never indexed"

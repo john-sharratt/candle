@@ -283,6 +283,12 @@ pub struct Substrate {
     /// qualifies. In-memory only — the flag is re-derived on load, never a
     /// redo-log marker.
     transient_timelines: HashSet<TimelineId>,
+    /// Timelines whose turns are **splice sources** — code_read scope forks,
+    /// whose sealed turns `adopt_turn` re-records onto the file timeline by
+    /// reference. Residences are flagged [`SequenceResidence::splice_source`];
+    /// see [`Self::mark_timeline_splice_source`]. In-memory only: a fork is
+    /// tombstoned at its splice and never reloaded.
+    splice_source_timelines: HashSet<TimelineId>,
     /// Individual `(timeline, turn_index)` turns flagged dead by a **turn-scoped**
     /// [`RecordType::Tombstone`] (`turn_index = Some`), leaving the rest of their
     /// timeline live. Written by the per-layer `drop_turn` corrupt-turn policy.
@@ -493,6 +499,15 @@ pub struct SequenceResidence {
     /// behind). Hot/warm are still allowed — `adopt_turn` needs the fork hot — and
     /// the warm RAM is freed at `tombstone_timeline` since no cold copy will land.
     pub no_cold_persist: bool,
+    /// `true` for a turn on a splice-source timeline (a code_read scope fork)
+    /// until the fork is tombstoned. `adopt_turn` splices from the HOT copy and
+    /// nothing else, so no automatic hot-drop may take it: not the migrate's
+    /// install, the cold-land offload, the idle demote, working-set turnover,
+    /// budget relief, or the ingest demotes. The fork's tombstone — which clears
+    /// this flag — is what frees it. Without the flag, a fork whose warm copy had
+    /// landed lost its hot copy to relief between its seal and its splice, and
+    /// the splice failed with "source K/V not hot".
+    pub splice_source: bool,
 }
 
 /// One layer's KV sequence as it lives in the redo log. Mirrors
@@ -1405,6 +1420,7 @@ impl Substrate {
             evict_when_cold: false,
             cold_pending: false,
             no_cold_persist: false,
+            splice_source: false,
         });
         idx
     }
@@ -1555,7 +1571,9 @@ impl Substrate {
         // pass, once it leaves the working set (the `evict_when_cold` flag stays
         // set). Dropping it here is a free-under-read against the in-flight
         // forward on the shared stream. See [`Self::working_set_pins`].
-        if self.working_set_pins.contains(&residence) {
+        // A splice source keeps hot until its fork's tombstone — see
+        // [`SequenceResidence::splice_source`].
+        if self.working_set_pins.contains(&residence) || self.residence[residence.0].splice_source {
             return;
         }
         if self.residence[residence.0].hot.take().is_some() {
@@ -1640,7 +1658,7 @@ impl Substrate {
         // The drop returns arena chunks to the pool / frees the CPU copy. Runs
         // under the persistence thread's substrate write lock (Phase 2.5), so
         // the arena free is serialised with the scheduler's allocations.
-        if !slot.evict_when_cold || pinned {
+        if !slot.evict_when_cold || pinned || slot.splice_source {
             return;
         }
         let had_hot = slot.hot.take().is_some();
@@ -1779,6 +1797,7 @@ impl Substrate {
                 slot.hot.is_some()
                     && slot.warm.is_some()
                     && !slot.pending_quantize
+                    && !slot.splice_source
                     && idle_for(slot.last_used_epoch, epoch) > grace
             })
             .collect();
@@ -1825,7 +1844,11 @@ impl Substrate {
                 let slot = &self.residence[r.0];
                 (slot.hot.is_some(), slot.warm.is_some())
             };
-            if has_hot && has_warm && !self.working_set_pins.contains(r) {
+            if has_hot
+                && has_warm
+                && !self.working_set_pins.contains(r)
+                && !self.residence[r.0].splice_source
+            {
                 self.residence[r.0].hot = None;
                 Self::remove_from_lru(&mut self.hot_lru, *r);
             }
@@ -2431,7 +2454,8 @@ impl Substrate {
                     return None;
                 }
                 let slot = &self.residence[idx.0];
-                (slot.hot.is_some() && slot.warm.is_some()).then_some((idx, slot.byte_size))
+                (slot.hot.is_some() && slot.warm.is_some() && !slot.splice_source)
+                    .then_some((idx, slot.byte_size))
             })
             .collect();
 
@@ -2506,7 +2530,7 @@ impl Substrate {
                 continue;
             }
             let slot = &self.residence[idx.0];
-            if slot.hot.is_some() && slot.warm.is_some() {
+            if slot.hot.is_some() && slot.warm.is_some() && !slot.splice_source {
                 freed += slot.byte_size;
                 victims.push(idx);
             }
@@ -2556,7 +2580,7 @@ impl Substrate {
                 let slot = &self.residence[residence.0];
                 (slot.hot.is_some(), slot.warm.is_some())
             };
-            if has_hot && has_warm {
+            if has_hot && has_warm && !self.residence[residence.0].splice_source {
                 self.residence[residence.0].hot = None;
                 Self::remove_from_lru(&mut self.hot_lru, residence);
                 demoted += 1;
@@ -2642,7 +2666,7 @@ impl Substrate {
                 continue;
             }
             let slot = &self.residence[idx.0];
-            if slot.hot.is_some() && slot.warm.is_some() {
+            if slot.hot.is_some() && slot.warm.is_some() && !slot.splice_source {
                 freed += slot.byte_size;
                 victims.push(idx);
             }
@@ -3664,6 +3688,7 @@ impl Substrate {
         // says more than they do: its records go wholesale, so nothing needs to
         // know which of its turns were retired first.
         self.tombstoned_turns.retain(|(tl, _)| *tl != timeline);
+        self.splice_source_timelines.remove(&timeline);
         // A tombstoned timeline's KV is dead — release its resident VRAM NOW rather
         // than wait for compaction. Its chunks survive for any other holder: a
         // code_read scope fork's two turns are spliced onto the file timeline
@@ -3678,6 +3703,10 @@ impl Substrate {
             None => return,
         };
         for r in &residences {
+            // No longer a splice source: whatever was going to adopt from it has,
+            // or never will. Cleared before the hot drop so a late migrate install
+            // on this residence drops the hot copy it re-adds instead of keeping it.
+            self.residence[r.0].splice_source = false;
             // Flag evict_when_cold BEFORE dropping hot: it closes the race where the
             // persistence thread snapshotted this residence's hot before the
             // tombstone and installs it after — `install_warm_and_evict_hot` (which
@@ -3745,6 +3774,22 @@ impl Substrate {
     /// which skips such a timeline entirely.
     pub fn is_timeline_transient(&self, timeline: TimelineId) -> bool {
         self.transient_timelines.contains(&timeline)
+    }
+
+    /// Mark `timeline` as a **splice source**: its turns keep their hot copy
+    /// until the timeline is tombstoned (see [`SequenceResidence::splice_source`]).
+    /// Call it right after minting a code_read scope fork, before its first turn
+    /// seals — like [`Self::mark_timeline_transient`], it flags the residences
+    /// already allocated and every later one.
+    pub fn mark_timeline_splice_source(&mut self, timeline: TimelineId) {
+        self.splice_source_timelines.insert(timeline);
+        let residences: Vec<ResidenceIndex> = match self.timelines.get(&timeline) {
+            Some(entry) => entry.turns.values().map(|t| t.content.residence).collect(),
+            None => return,
+        };
+        for r in residences {
+            self.residence[r.0].splice_source = true;
+        }
     }
 
     /// Whether `timeline` has been tombstoned.
@@ -4264,6 +4309,9 @@ impl Substrate {
         // only strand an orphan. See `mark_timeline_transient` / `no_cold_persist`.
         if self.transient_timelines.contains(&timeline) {
             self.residence[residence.0].no_cold_persist = true;
+        }
+        if self.splice_source_timelines.contains(&timeline) {
+            self.residence[residence.0].splice_source = true;
         }
         let block_start = write.block_start;
         let block_end = write.block_end;
@@ -6112,6 +6160,88 @@ mod tests {
             sub.residence[f_res.0].warm.is_none(),
             "transient fork's warm freed at tombstone"
         );
+    }
+
+    /// A code_read scope fork's turns are splice sources: `adopt_turn` reads the
+    /// hot copy and nothing else, so no automatic hot-drop may take it before the
+    /// fork is tombstoned — even with its warm copy landed and every eviction
+    /// path asked for everything. An ordinary turn in the same state IS evicted
+    /// (the control), and the fork's tombstone frees its hot copy.
+    #[test]
+    fn a_splice_source_keeps_its_hot_copy_until_tombstoned() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let normal_tl = alloc.next();
+        let fork_tl = alloc.next();
+        let mut sub = Substrate::new();
+        sub.register_timeline(normal_tl, layer, group);
+        sub.register_timeline(fork_tl, layer, group);
+        sub.mark_timeline_transient(fork_tl);
+        sub.mark_timeline_splice_source(fork_tl);
+
+        let migrate = |_input: &[SealedSequence]| -> candle::Result<Vec<SealedSequence>> {
+            Ok(vec![minimal_sealed_layer(), minimal_sealed_layer()])
+        };
+        let write = || TurnPartWrite {
+            layout: TurnLayout::from_flat_grid(
+                0,
+                0,
+                0,
+                3,
+                0,
+                0,
+                String::new(),
+                Some("x".to_string()),
+                false,
+            ),
+            token_count: 3,
+            block_end: 1,
+            sealed_gpu: Some(Arc::new(vec![])),
+            ..Default::default()
+        };
+        let n_idx = sub.append_complete(normal_tl, write(), migrate).unwrap();
+        let f_idx = sub.append_complete(fork_tl, write(), migrate).unwrap();
+        let n_res = sub.turn_residence(normal_tl, n_idx).unwrap();
+        let f_res = sub.turn_residence(fork_tl, f_idx).unwrap();
+        assert!(sub.residence[f_res.0].splice_source);
+        assert!(!sub.residence[n_res.0].splice_source);
+
+        // Both warm-backed, so every hot-drop path's precondition holds.
+        sub.install_warm(n_res, vec![minimal_sealed_layer(), minimal_sealed_layer()]);
+        sub.install_warm(f_res, vec![minimal_sealed_layer(), minimal_sealed_layer()]);
+
+        sub.evict_hot_to_free(&[], &[], u64::MAX);
+        assert!(
+            sub.turn_sealed_of(normal_tl, n_idx).is_none(),
+            "control: relief evicts an ordinary warm-backed turn"
+        );
+        assert!(
+            sub.turn_sealed_of(fork_tl, f_idx).is_some(),
+            "relief must not take a splice source"
+        );
+
+        let fork_key = TurnKey {
+            timeline: fork_tl,
+            index: f_idx,
+        };
+        sub.evict_hot_except(&[], &[]);
+        sub.demote_idle_hot(0);
+        sub.demote_turns_to_warm(&[fork_key]);
+        let ingest: HashSet<TimelineId> = [fork_tl].into_iter().collect();
+        sub.demote_cold_ingest(&ingest, &[], &[], 0, u64::MAX);
+        sub.mark_timeline_evict_when_cold(fork_tl);
+        assert!(
+            sub.turn_sealed_of(fork_tl, f_idx).is_some(),
+            "no demote path takes a splice source"
+        );
+
+        sub.tombstone_timeline(fork_tl);
+        assert!(
+            sub.turn_sealed_of(fork_tl, f_idx).is_none(),
+            "the fork's tombstone frees its hot copy"
+        );
+        assert!(!sub.residence[f_res.0].splice_source);
     }
 
     /// `append_complete` calls the migration closure and installs the

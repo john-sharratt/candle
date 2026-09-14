@@ -483,24 +483,24 @@ pub(crate) fn utility_config(mut config: SequenceConfig) -> SequenceConfig {
 /// so a co-located `code_reading` pass doesn't re-walk, plus the [`DirState`]
 /// the refresh path compares against.
 ///
-/// The closing decode is a summary *of the folder* because
-/// [`layer_system_prompt`] frames the conversation with [`SUMMARIZE_BRANCH`] —
-/// the summarizer persona plus the FOLDER-shaped worked examples. Both parts
-/// matter, and neither can be selected at runtime: the prompt is a static string
-/// and `disable_reprojection` (see [`utility_config`]) means the conversation
-/// never re-projects, so the selections
-/// `ingest_roundtrip_chain_indices` sets can never materialise.
+/// The closing decode is a summary *of the folder* because the request names the
+/// folder. The conversation itself frames on the shared prompt — the schema's
+/// own sections, injected by priming at the default branch (see
+/// [`shared_system_prompt`]) — and `disable_reprojection` (see
+/// [`utility_config`]) means it never re-projects, so nothing a runtime
+/// selection sets can change that framing.
 #[allow(clippy::too_many_arguments)]
 pub fn ingest_repo_map(
     engine: &Mutex<ConversationEngine>,
     proj_builder: projection::Builder,
     workspace: &Path,
+    max_depth: Option<usize>,
     config: SequenceConfig,
     progress: &Arc<LoadProgress>,
     layer_name: &str,
     group_name: &str,
 ) -> anyhow::Result<(RepoMap, DirState, IngestReport)> {
-    let map = walk_workspace(workspace);
+    let map = walk_workspace(workspace, max_depth);
     let units = build_units(&map, workspace);
 
     tracing::info!(
@@ -520,7 +520,7 @@ pub fn ingest_repo_map(
     // this pass does, so it belongs to the caller — see
     // [`retire_crashed_partials`].
     let present: HashSet<&str> = units.iter().map(|u| u.dir.as_str()).collect();
-    reconcile_deleted(engine, &present);
+    reconcile_deleted(engine, &map, &present);
     let report = run_dir_pool(engine, &plan, workspace, &units, progress);
     Ok((map, dir_state_from_substrate(engine), report))
 }
@@ -554,6 +554,7 @@ pub fn refresh_repo_map(
     group_name: &str,
 ) -> anyhow::Result<RefreshOutcome> {
     let units = build_units(map, workspace);
+    let prior = prior.without_frozen(map);
     if prior.equivalent_to(&units) {
         tracing::trace!("repo map refresh: no directory hash changed, skipping refresh");
         return Ok(RefreshOutcome::NoOp);
@@ -575,7 +576,7 @@ pub fn refresh_repo_map(
         group_name,
     )?;
     let present: HashSet<&str> = units.iter().map(|u| u.dir.as_str()).collect();
-    reconcile_deleted(ctx.engine, &present);
+    reconcile_deleted(ctx.engine, map, &present);
     let report = run_dir_pool(ctx.engine, &plan, workspace, &units, progress);
     crate::ingest_report::publish(PASS_NAME, report);
     Ok(RefreshOutcome::Replaced {
@@ -622,7 +623,6 @@ impl IngestPlan {
         // Append-only ingest layer (in-memory flag, re-applied every load): folder
         // summaries score self-local during ingest, so a summary is grounded in its
         // own folder rather than derailed by cross-directory retrieval.
-        validate_summarize_branch(proj_builder)?;
         let triggers = {
             let en = engine.lock().unwrap();
             en.compile_think_steering()?
@@ -639,7 +639,7 @@ impl IngestPlan {
             layer,
             group,
             proj_builder: proj_builder.clone(),
-            system_prompt: layer_system_prompt(proj_builder, layer_name, config),
+            system_prompt: shared_system_prompt(proj_builder, layer_name, config),
             config: utility_config(config.clone()),
             triggers,
             envelope,
@@ -652,10 +652,14 @@ impl IngestPlan {
 /// visits directories that still exist) and those removed between refreshes.
 /// A still-present *changed* directory is handled by [`process_one_dir`], which
 /// supersedes its own stale generation.
-fn reconcile_deleted(engine: &Mutex<ConversationEngine>, present: &HashSet<&str>) {
+///
+/// A directory at or past `map`'s `--max-depth` bound is FROZEN, not deleted:
+/// the walk read none of its files, so its absence from `present` proves
+/// nothing.
+fn reconcile_deleted(engine: &Mutex<ConversationEngine>, map: &RepoMap, present: &HashSet<&str>) {
     let e = engine.lock().unwrap();
     for (tl, dir) in e.conversations_with_metadata_key(DIR_KEY) {
-        if !present.contains(dir.as_str()) {
+        if !present.contains(dir.as_str()) && !map.is_frozen_dir(&dir) {
             if let Err(err) = e.tombstone_timeline(tl) {
                 tracing::warn!(
                     target: "zend::repo_scan",
@@ -1206,38 +1210,22 @@ fn process_one_dir(
     Ok(())
 }
 
-/// The section-tree branch an ingest conversation frames on: the terse
-/// code-summarization engine, with the worked request→summary examples stuffed
-/// in. Node id → option id; a node not named here keeps its schema default.
+/// The shared system prompt every ingest layer frames on, wrapped in the
+/// engine's dialect markers. Used by `repo_map`, `code_reading` and the raw
+/// layers so all three read from one place.
 ///
-/// This has to be resolved into the STATIC system prompt rather than left to a
-/// runtime `Selection`: an ingest conversation is created with an explicit
-/// prompt string and runs with `disable_reprojection` (see [`utility_config`]),
-/// so it never re-projects and a later selection change can never materialise.
-const SUMMARIZE_BRANCH: &[(&str, &str)] = &[
-    // The conversational "You are Zen, pair programming…" frame makes the model
-    // reason aloud, refuse, or chat; `summarize` pins content-is-provided,
-    // English, summary-only.
-    ("persona", "summarize"),
-    // `standard` says "a short paragraph or two", which fights "two sentences".
-    ("response_length", "terse"),
-    // Worked examples of THIS ingest's round-trip. The shape teaches the
-    // subject: shown the `code_reading` file examples, a folder decode
-    // faithfully summarises the excerpt it was just handed ("The `mod.rs` file
-    // outlines…") rather than the directory it was asked about.
-    ("summarize_examples", "folder"),
-    // An ingest turn supplies its content; there is nothing to reason about.
-    ("thinking_effort", "off"),
-];
-
-/// Pull the layer's system prompt out of the schema and wrap it with the
-/// engine's dialect markers.
-///
-/// Mirrors the dialogue layer's `pre_collection_prelude` (`session.rs`): fixed
-/// sections verbatim, plus each section-tree node's *chosen* option — chosen
-/// here by [`SUMMARIZE_BRANCH`] rather than by the tree's defaults, so the
-/// conversation is framed as the summarizer it is.
-fn layer_system_prompt(
+/// **This text does not become K/V, and that is the point.** A conversation's
+/// prompt K/V is the schema's own content-addressed sections, injected by the
+/// priming projection at creation (`Sequence::new_with_projection` →
+/// `PrimingProjection`) — the same stored sections a chat conversation injects.
+/// An append-only ingest never re-projects (`skip_projection`), so that primed
+/// prefix is its prompt for the conversation's whole life and no runtime
+/// selection can alter it. What this string is for is the in-memory tree's
+/// per-turn formatting; it walks the schema at the SAME default branch priming
+/// uses, so the text mirrors the K/V rather than describing a prompt that never
+/// existed. Changing what an ingest is framed by means changing the schema's
+/// defaults.
+pub(crate) fn shared_system_prompt(
     builder: &projection::Builder,
     layer_name: &str,
     config: &SequenceConfig,
@@ -1248,19 +1236,19 @@ fn layer_system_prompt(
     );
     config
         .dialect
-        .format_system_prompt(&ingest_prompt_body(builder))
+        .format_system_prompt(&shared_prompt_body(builder))
 }
 
-/// The unwrapped body of [`layer_system_prompt`] — the schema walk, with no
-/// dialect framing. Split out so the assembled prompt can be asserted directly.
-fn ingest_prompt_body(builder: &projection::Builder) -> String {
+/// The unwrapped body of [`shared_system_prompt`] — the schema walk at the
+/// default branch, with no dialect framing. Split out so the assembled prompt
+/// can be asserted directly.
+pub(crate) fn shared_prompt_body(builder: &projection::Builder) -> String {
     use projection::SystemPromptItem;
     let mut body = String::new();
     for item in &builder.schema().system_prompt.items {
         match item {
             SystemPromptItem::Section(s) => body.push_str(&s.content),
             SystemPromptItem::SectionTree(tree) => {
-                let (selection, _) = summarize_selection(tree);
                 for node in &tree.nodes {
                     // A collection node has no options of its own; its members
                     // are provenance-selected and live-prefilled at projection.
@@ -1276,7 +1264,7 @@ fn ingest_prompt_body(builder: &projection::Builder) -> String {
                     if node.glue.is_some() {
                         continue;
                     }
-                    if let Some(option) = node.options.get(node.chosen(&selection)) {
+                    if let Some(option) = node.options.get(node.chosen(&tree.default_selection)) {
                         body.push_str(&option.content);
                     }
                 }
@@ -1286,62 +1274,6 @@ fn ingest_prompt_body(builder: &projection::Builder) -> String {
         }
     }
     body
-}
-
-/// `tree`'s default selection with [`SUMMARIZE_BRANCH`] applied, plus the branch
-/// entries this tree could not resolve.
-///
-/// A node the tree does not declare at all is not a miss — the branch spans two
-/// trees, so each sees only its own nodes. A node that IS declared but lacks the
-/// named option is a miss: the schema and this ingest disagree about what the
-/// option is called, and the prompt silently loses that framing.
-fn summarize_selection(tree: &projection::SectionTree) -> (Vec<u8>, Vec<String>) {
-    let mut selection = tree.default_selection.clone();
-    let mut unresolved = Vec::new();
-    for (node_id, option_id) in SUMMARIZE_BRANCH {
-        let Some(node) = tree.nodes.iter().find(|n| n.name == *node_id) else {
-            continue;
-        };
-        let Some(dim) = node.dim else {
-            continue; // mandatory node — one option, nothing to select
-        };
-        let Some(idx) = node.options.iter().position(|o| o.id == *option_id) else {
-            let have: Vec<&str> = node.options.iter().map(|o| o.id.as_str()).collect();
-            unresolved.push(format!(
-                "node {node_id:?} has no option {option_id:?} (declares {have:?})"
-            ));
-            continue;
-        };
-        if let Some(slot) = selection.get_mut(dim) {
-            *slot = idx as u8;
-        }
-    }
-    (selection, unresolved)
-}
-
-/// Fail the ingest if the schema cannot supply the summarizer framing.
-///
-/// This is deliberately a hard error, not a warning. Without the branch the
-/// decode runs as the dialogue agent and writes chat — "would you like me to
-/// read any of these files?" — or an implementation plan, and every folder in
-/// the layer is quietly worthless. A stale or hand-edited workspace
-/// `projection.yaml` (`--working-dir`) is exactly how that happens, and it
-/// happened: the bundled schema had the option, the workspace copy did not, and
-/// three ingest runs produced garbage behind a single warning line.
-fn validate_summarize_branch(builder: &projection::Builder) -> anyhow::Result<()> {
-    let unresolved: Vec<String> = builder
-        .schema()
-        .system_prompt
-        .section_trees()
-        .flat_map(|t| summarize_selection(t).1)
-        .collect();
-    if unresolved.is_empty() {
-        return Ok(());
-    }
-    Err(anyhow::anyhow!(
-        "projection schema cannot supply the repo_map summarizer framing: {}.          The ingest would decode chat instead of folder summaries — check the          workspace `projection.yaml` is in step with the bundled one.",
-        unresolved.join("; "),
-    ))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1446,87 +1378,40 @@ mod tests {
         .expect("projection.yaml must parse")
     }
 
-    /// The system prompt an ingest conversation is actually created with — the
-    /// artifact, not a proxy for it. It must frame the model as the summarizer
-    /// and carry the worked examples, or the folder decode answers a
-    /// summary request conversationally.
+    /// The prompt every ingest layer frames on is the SHARED one at the schema's
+    /// default branch — the same content priming injects as K/V, and the same
+    /// sections a chat conversation injects. Two things must hold: the dialogue
+    /// persona (an ingest turn is borrowed into dialogue projections and carries
+    /// the framing it was computed under), and NO tool-call demonstration (its
+    /// question sits in the prompt, and the closing decode — whose last user turn
+    /// is a tool response — answers that question instead of summarizing).
+    ///
+    /// The demonstration is asserted against the DEFAULT branch deliberately:
+    /// an append-only ingest cannot select anything, so the default is the only
+    /// thing that decides this.
     #[test]
-    fn the_ingest_prompt_is_framed_as_the_summarizer() {
+    fn the_ingest_prompt_is_the_shared_prompt_at_its_default_branch() {
         let builder = bundled_builder();
-        let prompt = ingest_prompt_body(&builder);
+        let prompt = shared_prompt_body(&builder);
 
         assert!(
-            prompt.contains("You are a code-summarization engine"),
-            "the summarize persona must be in the prompt",
+            prompt.contains("You are Zen"),
+            "the ingest must frame on the dialogue persona its turns are projected into",
         );
         assert!(
-            !prompt.contains("You are Zen"),
-            "the dialogue persona must NOT be — it is what produces chat replies",
-        );
-        // The examples must be the FOLDER shape and ONLY the folder shape. An
-        // example teaches the subject as much as the format: shown a scope read,
-        // the folder decode summarises the excerpt it was handed ("The `mod.rs`
-        // file outlines…") instead of the directory it was asked about.
-        assert!(
-            prompt.contains("Summarize the `worker/scheduling/` folder"),
-            "the worked FOLDER examples must survive the walk past the tool catalog",
+            !prompt.contains("code-summarization engine"),
+            "no second persona — a turn sealed under one hijacks the dialogue it is \
+             borrowed into",
         );
         assert!(
-            prompt.contains("This folder throttles requests per tenant"),
-            "both folder examples must be present",
+            !prompt.contains("Summarize the `worker/scheduling/` folder"),
+            "no worked summarize examples — they teach the dialogue to summarize too",
         );
         assert!(
-            !prompt.contains("Jitter returns"),
-            "the code_reading FILE examples must NOT be — they teach the wrong subject",
+            !prompt.contains("what is the IP address of example.com"),
+            "no tool-call demonstration — the ingest decode answers its question \
+             instead of summarizing",
         );
-    }
-
-    /// A schema that cannot supply the summarizer framing must FAIL the ingest,
-    /// not warn. A stale workspace `projection.yaml` did exactly this: the
-    /// bundled schema declared the option, the `--working-dir` copy did not, and
-    /// three ingest runs decoded chat instead of folder summaries behind a single
-    /// warning line.
-    #[test]
-    fn the_bundled_schema_supplies_the_whole_summarizer_branch() {
-        validate_summarize_branch(&bundled_builder())
-            .expect("the bundled schema must declare every SUMMARIZE_BRANCH option");
-    }
-
-    /// The same schema with the examples option renamed — the exact shape of the
-    /// stale-copy bug — is rejected, naming what is missing.
-    #[test]
-    fn a_schema_missing_a_branch_option_is_rejected() {
-        // `include_str!` hands back the checkout's own line endings, while Rust
-        // normalizes the CRLF in THIS file's string literals to LF. On a CRLF
-        // checkout (`core.autocrlf=true`, the Windows default) an exact-line
-        // pattern therefore matches nothing, and `replace` reports success
-        // having changed nothing — leaving the schema intact and this test
-        // asserting that a VALID schema is rejected. Normalize first, then prove
-        // the edit actually landed.
-        let yaml = include_str!("../prompts/projection.yaml").replace("\r\n", "\n");
-        let mutated = yaml.replace(
-            "            - id: folder\n",
-            "            - id: renamed_away\n",
-        );
-        assert_ne!(
-            mutated, yaml,
-            "the `- id: folder` option moved or was re-indented — this test's \
-             pattern is stale and was silently mutating nothing"
-        );
-        let yaml = mutated;
-        let dialect = candle_conversation::models::Dialect::chat_ml();
-        let builder = projection::Builder::from_yaml_with_vars_and_dialect(
-            &yaml,
-            &[("workspace", "test")],
-            Some(&dialect),
-        )
-        .expect("still parses");
-
-        let err = validate_summarize_branch(&builder)
-            .expect_err("a schema without the folder examples must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("summarize_examples"), "{msg}");
-        assert!(msg.contains("folder"), "names the missing option: {msg}");
     }
 
     /// `repo_map` keys its invalidation sweep on `dir`, `code_read` on `path`.

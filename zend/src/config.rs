@@ -45,6 +45,12 @@ pub struct DaemonConfig {
     /// Scopes a rebuild to a subtree (e.g. `code_reading=zend/src`) so the
     /// substrate stays small instead of absorbing the whole workspace.
     pub ingest_dirs: HashMap<String, String>,
+    /// `--max-depth <N>`: how deep, in path components below each layer's
+    /// content root, the `repo_map` and `code_reading` walks and the watcher
+    /// read (`1` = the root's own files, `2` = one folder down). Content already
+    /// ingested from deeper is FROZEN — kept and still retrievable, but never
+    /// re-read and never retired by the deleted-path sweeps. `None` = unbounded.
+    pub max_depth: Option<usize>,
     /// Force a whole-store redo-log compaction once during load, after the
     /// substrate reload and before serving. Normally reclaim is incremental and
     /// background (the persistence-thread maintenance pass); this flag forces

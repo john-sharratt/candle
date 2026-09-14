@@ -167,9 +167,9 @@ impl SystemPromptSchema {
     /// `projection.yaml` declares two, and a branch entry naming a node in the
     /// second is invisible to anything that reads only the first. That is not
     /// hypothetical: this returned `Option<&SectionTree>` on the premise that
-    /// "a schema has at most one", and the ingest's summarizer validation
-    /// silently skipped `summarize_examples` — the exact option the validation
-    /// exists to pin — because it lives in the second tree.
+    /// "a schema has at most one", and a branch validation that read only the
+    /// first tree silently skipped the option it existed to pin, because that
+    /// option lived in the second.
     pub fn section_trees(&self) -> impl Iterator<Item = &SectionTree> {
         self.items.iter().filter_map(|it| match it {
             SystemPromptItem::SectionTree(t) => Some(t),

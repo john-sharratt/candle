@@ -75,8 +75,7 @@ pub const CHAIN_TOOLS: &[&str] = &["file_list", "file_read"];
 /// and asked to summarize from filenames alone the model has answered "there
 /// isn't enough information available here yet to summarize them accurately",
 /// which seals as that folder's `repo_map` entry. Saying that names and paths
-/// are a legitimate basis removes the excuse; `summarize_examples` already
-/// teaches the shape.
+/// are a legitimate basis removes the excuse.
 pub fn render_request(unit: &DirUnit) -> String {
     let folder = folder_phrase(unit);
     let tail = SUMMARY_ASK;

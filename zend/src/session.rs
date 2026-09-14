@@ -24,11 +24,12 @@ use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
 use candle_conversation::{
-    ConversationEngine, GlueMarkers, ProjectionEvent, Sequence, ThinkSteering, TokenDecoder,
-    TurnEvent, TurnHandle, TurnResponse,
+    ConversationEngine, GlueMarkers, OptionalState, ProjectionEvent, Sequence, ThinkSteering,
+    TokenDecoder, TurnEvent, TurnHandle, TurnResponse,
 };
 use serde_json::Value;
 
+use crate::api::chat::TOOL_EXAMPLE_SELECTOR;
 use crate::api::substrate::{
     ConvView, Counts, GroupView, LayerConversations, LayerView, ProjectTile, ProjectView,
     SectionView, SegmentView, Storage, SubstrateOverview, SystemPromptView, TimelineDetail,
@@ -45,8 +46,10 @@ use crate::refresh_ctx::RefreshContext;
 use crate::repo_scan::RepoMap;
 use crate::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, ToolHost,
+    CALIB_TOOL_SELECTOR,
 };
 use crate::types::{ChatMessage, Role, ToolMode};
+use crate::watcher::WatchDepth;
 
 const PROJECTION_SCHEMA_TEMPLATE: &str = include_str!("prompts/projection.yaml");
 
@@ -224,6 +227,9 @@ struct InferenceState {
     /// Workspace root captured at startup — the refresh path
     /// re-walks from here on every filesystem event.
     workspace: PathBuf,
+    /// `--max-depth`: the path-component bound the `repo_map` / `code_reading`
+    /// walks run under, and the watcher's event filter. `None` = unbounded.
+    max_depth: Option<usize>,
     /// Projection builder + sequence config kept alive for the
     /// atomic refresh paths.  Minting a fresh ingest-layer timeline
     /// after a file change reuses the same schema clone and the same
@@ -579,6 +585,7 @@ impl InferenceState {
         disabled_layers: HashSet<String>,
         skipped_layers: HashSet<String>,
         ingest_dirs: HashMap<String, String>,
+        max_depth: Option<usize>,
         compact_substrate: bool,
         progress: Arc<LoadProgress>,
         status_tx: tokio::sync::watch::Sender<String>,
@@ -1488,8 +1495,14 @@ impl InferenceState {
                     };
                     // Pin exactly this tool: `SelectionRule::Named` emits only the
                     // catalog member whose name matches the selector value.
+                    opts.selection.select(CALIB_TOOL_SELECTOR, name);
+                    // An exemplar is a tool-using turn, so it is sealed behind the
+                    // prefix a tool-using chat turn gets — the demonstration
+                    // included. Selected explicitly because the schema defaults it
+                    // ABSENT for the ingest layers, which cannot select anything
+                    // (see `projection.yaml`).
                     opts.selection
-                        .select(crate::tools::CALIB_TOOL_SELECTOR, name);
+                        .set_optional(TOOL_EXAMPLE_SELECTOR, OptionalState::Present);
                     // Fast path: prefill the tool file's ChatML trajectory verbatim
                     // in one batched forward pass instead of decoding it token by
                     // token — the wide-Q is captured identically at seal. Prefill
@@ -1814,6 +1827,7 @@ impl InferenceState {
                         &engine,
                         proj_builder_refresh.clone(),
                         &content_root,
+                        max_depth,
                         conv_config.clone(),
                         &progress,
                         &il.name,
@@ -1850,9 +1864,9 @@ impl InferenceState {
                     // the expensive GPU prefill is still skipped for the files
                     // already covered.
                     let prior = crate::code_read::code_read_state_from_substrate(&engine);
-                    let map = walk_cache
-                        .entry(il.folder.clone())
-                        .or_insert_with(|| crate::repo_scan::walk_workspace(&content_root));
+                    let map = walk_cache.entry(il.folder.clone()).or_insert_with(|| {
+                        crate::repo_scan::walk_workspace(&content_root, max_depth)
+                    });
                     let uncovered = map
                         .files
                         .iter()
@@ -1968,6 +1982,7 @@ impl InferenceState {
             shutting_down: AtomicBool::new(false),
             ingest_convs: Mutex::new(ingest_convs),
             ingest_layers,
+            max_depth,
             refresh_builder: proj_builder_refresh,
             refresh_config: conv_config.clone(),
             mode_builders,
@@ -2025,6 +2040,7 @@ impl InferenceState {
         let progress = Arc::new(LoadProgress::silent());
         // Walk each distinct content folder at most once per burst.
         let mut walk_cache: HashMap<String, RepoMap> = HashMap::new();
+        let max_depth = self.max_depth;
         let mut any = false;
         for il in &self.ingest_layers {
             // Cooperative shutdown: stop the background reconcile between layers so
@@ -2047,9 +2063,9 @@ impl InferenceState {
                     let Some(prior_state) = prior_state else {
                         continue;
                     };
-                    let map = walk_cache
-                        .entry(il.folder.clone())
-                        .or_insert_with(|| crate::repo_scan::walk_workspace(&content_root));
+                    let map = walk_cache.entry(il.folder.clone()).or_insert_with(|| {
+                        crate::repo_scan::walk_workspace(&content_root, max_depth)
+                    });
                     let ctx = self.refresh_ctx();
                     let outcome = crate::repo_scan::refresh_repo_map(
                         &ctx,
@@ -2080,9 +2096,9 @@ impl InferenceState {
                     let Some(prior_state) = prior_state else {
                         continue;
                     };
-                    let map = walk_cache
-                        .entry(il.folder.clone())
-                        .or_insert_with(|| crate::repo_scan::walk_workspace(&content_root));
+                    let map = walk_cache.entry(il.folder.clone()).or_insert_with(|| {
+                        crate::repo_scan::walk_workspace(&content_root, max_depth)
+                    });
                     let ctx = self.refresh_ctx();
                     let outcome = crate::code_read::refresh_code_reading(
                         &ctx,
@@ -2137,6 +2153,24 @@ impl InferenceState {
             }
         }
         Ok(any)
+    }
+
+    /// The watcher's `--max-depth` filter: the bound, measured from the content
+    /// root of each layer whose walk it bounds (`repo_map`, `code_reading`),
+    /// with every raw layer's folder left unbounded. `None` when no bound was
+    /// given — every event counts.
+    fn watch_depth(&self) -> Option<WatchDepth> {
+        let max = self.max_depth?;
+        let root_of = |il: &IngestLayer| self.workspace.join(&il.folder);
+        let walked = |il: &&IngestLayer| matches!(il.mode, IngestMode::Folders | IngestMode::Files);
+        Some(WatchDepth::new(
+            max,
+            self.ingest_layers.iter().filter(walked).map(root_of),
+            self.ingest_layers
+                .iter()
+                .filter(|il| !walked(il))
+                .map(root_of),
+        ))
     }
 
     /// Ingest **only** the given workspace-relative files into the projection's
@@ -4475,6 +4509,7 @@ impl ZendSession {
         let disabled_layers = self.config.disabled_layers.clone();
         let skipped_layers = self.config.skipped_layers.clone();
         let ingest_dirs = self.config.ingest_dirs.clone();
+        let max_depth = self.config.max_depth;
         let compact_substrate = self.config.compact_substrate;
         // Resolved once, here, and handed to both the downloader and the engine
         // builder, so the artifact fetched and the model built are the same one.
@@ -4563,6 +4598,7 @@ impl ZendSession {
                     disabled_layers,
                     skipped_layers,
                     ingest_dirs,
+                    max_depth,
                     compact_substrate,
                     load_progress_for_blocking,
                     status_tx.clone(),
@@ -4636,6 +4672,7 @@ impl ZendSession {
                         });
                         match crate::watcher::spawn(
                             &state.workspace,
+                            state.watch_depth(),
                             on_refresh,
                             on_uploads_changed,
                         ) {

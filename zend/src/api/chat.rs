@@ -16,7 +16,7 @@ use candle_conversation::{OptionalState, SelectionState, NO_THINK_SELECTOR};
 use crate::session::{StreamItem, ZendSession};
 use crate::types::{
     AssistantMessage, ChatCompletion, ChatCompletionChunk, ChatCompletionRequest, ChatMessage,
-    ChunkChoice, CompletionChoice, Delta, Role,
+    ChunkChoice, CompletionChoice, Delta, Role, ToolMode,
 };
 
 /// The `optional_group` selector that gates the whole tool block in the dialogue
@@ -27,7 +27,26 @@ const TOOLS_ENABLED_SELECTOR: &str = "tools_enabled";
 /// The `optional` node holding the tool-call FORMAT demonstration (its `id:` in
 /// `projection.yaml`). Tracks the tools dial: a no-tools turn must not be shown
 /// a worked tool call, which would contradict a prompt that lists no tools.
-const TOOL_EXAMPLE_SELECTOR: &str = "tool_call_example";
+pub(crate) const TOOL_EXAMPLE_SELECTOR: &str = "tool_call_example";
+
+/// Map the composer's tools dial onto the tool block: the whole block
+/// (`tools_enabled`) and its worked demonstration (`tool_call_example`) are
+/// present together or absent together.
+///
+/// Public so a harness driving the session directly projects the same tool
+/// prompt the HTTP API does. The schema defaults the demonstration ABSENT —
+/// the ingest layers cannot select it away — so a caller that skips this shows
+/// the model a tool catalog with no worked call, which no chat turn ever sees.
+pub fn apply_tools_dial(selection: &mut SelectionState, tools_mode: ToolMode) {
+    let tools_present = if matches!(tools_mode, ToolMode::None) {
+        OptionalState::Absent
+    } else {
+        OptionalState::Present
+    };
+    selection.set_optional(TOOLS_ENABLED_SELECTOR, tools_present);
+    // The worked example follows the block it demonstrates.
+    selection.set_optional(TOOL_EXAMPLE_SELECTOR, tools_present);
+}
 
 /// `POST /v1/chat/completions`
 pub async fn completions(
@@ -76,14 +95,7 @@ pub async fn completions(
     // on the tools dial via the `tools_enabled` optional_group: `None` omits the
     // entire block (markers included), the other modes show it. Which *members*
     // appear under Restricted vs Comprehensive is still the mode_builders' job.
-    let tools_present = if matches!(tools_mode, crate::types::ToolMode::None) {
-        OptionalState::Absent
-    } else {
-        OptionalState::Present
-    };
-    selection.set_optional(TOOLS_ENABLED_SELECTOR, tools_present);
-    // The worked example follows the block it demonstrates.
-    selection.set_optional(TOOL_EXAMPLE_SELECTOR, tools_present);
+    apply_tools_dial(&mut selection, tools_mode);
     let messages = req.messages;
     if req.stream {
         stream_sse(
@@ -475,6 +487,24 @@ mod dial_tests {
         );
         // The response-length dial is unaffected.
         assert_eq!(sel.get("response_length"), Some("standard"));
+    }
+
+    /// The tools dial moves the tool block and its worked call together: every
+    /// mode that shows tools shows the demonstration too, and `None` hides both.
+    /// The schema defaults the demonstration absent, so a caller that skipped
+    /// this would show a catalog with no worked call.
+    #[test]
+    fn tools_dial_moves_the_block_and_its_demonstration_together() {
+        for (mode, want) in [
+            (ToolMode::Comprehensive, OptionalState::Present),
+            (ToolMode::Restricted, OptionalState::Present),
+            (ToolMode::None, OptionalState::Absent),
+        ] {
+            let mut sel = SelectionState::new();
+            apply_tools_dial(&mut sel, mode);
+            assert_eq!(sel.optional(TOOLS_ENABLED_SELECTOR), Some(want), "{mode:?}");
+            assert_eq!(sel.optional(TOOL_EXAMPLE_SELECTOR), Some(want), "{mode:?}");
+        }
     }
 
     #[test]

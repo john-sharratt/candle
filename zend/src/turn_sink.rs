@@ -254,31 +254,39 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
             }
             // Run each fork's two-turn round-trip concurrently; the scheduler
             // co-batches their prefills + summary decodes on the shared wave.
-            let results: Vec<candle_conversation::Result<(u32, u32, usize)>> =
-                std::thread::scope(|s| {
-                    let handles: Vec<_> = forks
-                        .iter_mut()
-                        .zip(chunk.iter())
-                        .map(|(fork, (call_user, call_assistant, response_user))| {
-                            let tags = tags.clone();
-                            let triggers = Arc::clone(&triggers);
-                            s.spawn(move || {
-                                fork.ingest_scope_roundtrip_indices(
-                                    call_user,
-                                    call_assistant,
-                                    response_user,
-                                    tags,
-                                    max_summary_tokens,
-                                    triggers,
-                                )
-                            })
+            //
+            // A thread that panics is joined as an ERROR, not re-raised. Every
+            // fork is a splice source, exempt from every automatic hot-drop until
+            // it is tombstoned — so unwinding out of here would skip the cleanup
+            // below and pin those forks' K/V on the device for the life of the
+            // process. As an error it takes the same path as a failed round-trip.
+            let results: Vec<anyhow::Result<(u32, u32, usize)>> = std::thread::scope(|s| {
+                let handles: Vec<_> = forks
+                    .iter_mut()
+                    .zip(chunk.iter())
+                    .map(|(fork, (call_user, call_assistant, response_user))| {
+                        let tags = tags.clone();
+                        let triggers = Arc::clone(&triggers);
+                        s.spawn(move || {
+                            fork.ingest_scope_roundtrip_indices(
+                                call_user,
+                                call_assistant,
+                                response_user,
+                                tags,
+                                max_summary_tokens,
+                                triggers,
+                            )
                         })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| h.join().expect("scope ingest thread panicked"))
-                        .collect()
-                });
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| match h.join() {
+                        Ok(res) => res.map_err(|e| anyhow::anyhow!("{e}")),
+                        Err(_) => Err(anyhow::anyhow!("scope ingest thread panicked")),
+                    })
+                    .collect()
+            });
             // Splice the sealed pairs onto the file timeline in scope order. On the
             // first failure (a scope round-trip that errored, or a splice that
             // failed) STOP and tombstone every fork from that point on. The forks

@@ -202,79 +202,31 @@ fn install_tool_catalog_leaves_static_sections_untouched() {
     }
 }
 
-/// The ingest summariser drives the shared system prompt into summarizer mode via
-/// `selection.select("persona", "summarize")` (see `ingest_scope_roundtrip`). That
-/// call silently no-ops if the ids don't match the schema, so pin them: the parsed
-/// `projection.yaml` must expose a `persona` SELECTOR (>1 option) carrying both an
-/// `assistant` and a `summarize` option.
+/// Every turn — ingested or live — is sealed under the one dialogue persona.
+/// Ingested turns are borrowed into dialogue projections, and borrowed K/V
+/// carries the framing it was computed under: turns sealed under a second,
+/// summarizer persona made a dialogue answer the ingest's request instead of the
+/// user's. Pin that the schema offers no second persona anything could select,
+/// and no worked summarize examples to stuff.
 #[test]
-fn persona_selector_exposes_assistant_and_summarize() {
+fn persona_offers_only_the_dialogue_frame() {
     let builder = build_test_projection();
-    let tree = builder
-        .schema()
-        .system_prompt
-        .section_trees()
-        .next()
-        .expect("system prompt has a section_tree");
-    let persona = tree
-        .nodes
-        .iter()
-        .find(|n| n.name == "persona")
-        .expect("section_tree has a `persona` node");
-    let opt_ids: Vec<&str> = persona.options.iter().map(|o| o.id.as_str()).collect();
-    assert!(
-        persona.options.len() >= 2,
-        "persona must be a selector (>1 option) so the ingest can select it: {opt_ids:?}"
-    );
-    assert!(
-        opt_ids.contains(&"assistant"),
-        "persona options: {opt_ids:?}"
-    );
-    assert!(
-        opt_ids.contains(&"summarize"),
-        "persona options: {opt_ids:?}"
-    );
-}
-
-/// The ingest stuffs few-shot summarizer example TURNS via
-/// `set_optional("summarize_examples", Present)`. Pin that the parsed schema
-/// exposes a `summarize_examples` optional node carrying real example turns
-/// (ChatML assistant markers + a sample summary), so the id resolves and the
-/// stuffing actually lands.
-#[test]
-fn summarize_examples_optional_carries_stuffed_turns() {
-    let builder = build_test_projection();
-    let node = builder
+    let nodes: Vec<_> = builder
         .schema()
         .system_prompt
         .section_trees()
         .flat_map(|t| t.nodes.iter())
-        .find(|n| n.name == "summarize_examples")
-        .expect("schema has a `summarize_examples` optional node");
-    let content: String = node.options.iter().map(|o| o.content.as_str()).collect();
+        .collect();
+    let persona = nodes
+        .iter()
+        .find(|n| n.name == "persona")
+        .expect("section_tree has a `persona` node");
+    let opt_ids: Vec<&str> = persona.options.iter().map(|o| o.id.as_str()).collect();
+    assert_eq!(opt_ids, vec!["assistant"], "persona options: {opt_ids:?}");
     assert!(
-        content.contains("<|im_start|>assistant"),
-        "stuffed content must be real example TURNS (assistant markers)",
-    );
-    assert!(
-        content.contains("Jitter returns"),
-        "stuffed content must carry the sample summaries",
-    );
-    // The `repo_map` ingest reuses these examples for a FOLDER chain (list, then
-    // read the anchor, then summarise), which is a different shape from the
-    // code_reading scope read. Without a worked example of it the model imitates
-    // the file shape and describes the anchor file instead of the folder.
-    assert!(
-        content.contains("Summarize the `worker/scheduling/` folder"),
-        "stuffed content must carry a folder-shaped example for repo_map",
-    );
-    assert!(
-        content.contains("\"name\":\"file_list\""),
-        "the folder example must show the listing call the repo_map chain prefills",
-    );
-    assert!(
-        content.contains("This folder decides which tenant's jobs run next"),
-        "the folder example must end in a folder summary, not a file summary",
+        nodes.iter().all(|n| n.name != "summarize_examples"),
+        "no worked summarize examples — stuffed into an ingest prefix they teach \
+         every borrowed turn to summarize",
     );
 }
 

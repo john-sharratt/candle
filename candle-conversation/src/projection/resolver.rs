@@ -2005,13 +2005,15 @@ impl Conversation {
     /// layout + block range are preserved verbatim so the inter-turn seams stay
     /// LIVE GLUE (the correctness property code_read requires — a baked seam goes
     /// stale on re-injection). `tags` are supplied by the caller (the scope's
-    /// `["code", <path>]`). The source turn must be HOT — splice right after the
-    /// fork completes, before the persistence thread migrates it warm.
+    /// `["code", <path>]`). The source turn must be HOT, which its fork
+    /// guarantees by being a splice source ([`Self::mark_timeline_splice_source`]):
+    /// no eviction path drops a splice source's hot copy before its tombstone.
     ///
-    /// Persists three records for the adopted turn: the `TurnDecl` (via
-    /// [`Self::record_turn`]), the token ids, and the wide-Q provenance sigs
+    /// Persists four records for the adopted turn: the `TurnDecl` (via
+    /// [`Self::record_turn`]), the token ids, the wide-Q provenance sigs
     /// (re-keyed onto the new stream so a provenance scan of the file timeline
-    /// admits the turn).
+    /// admits the turn), and the QSA index page (re-keyed so a projection that
+    /// borrows the turn's K/V can also select it).
     pub fn adopt_turn(
         &self,
         from_tl: TimelineId,
@@ -2021,7 +2023,7 @@ impl Conversation {
         tags: Vec<String>,
     ) -> candle::Result<TurnIndex> {
         use crate::persistence::content_hash::turn_stream_id;
-        let (layout, token_ids, block_range, sigs_blob) = {
+        let (layout, token_ids, block_range, sigs_blob, index_page) = {
             let r = self.read();
             let layout = r
                 .turn_layout(from_tl, from_idx)
@@ -2031,14 +2033,17 @@ impl Conversation {
                 .turn_block_range(from_tl, from_idx)
                 .ok_or_else(|| candle::Error::Msg("adopt_turn: no block range".into()))?;
             let sigs_blob = r.wide_q_sigs_blob(from_tl, from_idx).map(|b| b.to_vec());
-            (layout, token_ids, block_range, sigs_blob)
+            let index_page = r.index_page_blob(from_tl, from_idx).map(|b| b.to_vec());
+            (layout, token_ids, block_range, sigs_blob, index_page)
         };
         let sealed = self
             .read()
             .turn_sealed_of(from_tl, from_idx)
             .ok_or_else(|| {
                 candle::Error::Msg(
-                    "adopt_turn: source K/V not hot (migrated) — splice sooner".into(),
+                    "adopt_turn: source K/V not hot — its timeline is not a splice \
+                     source, or was already tombstoned"
+                        .into(),
                 )
             })?;
         let token_count = token_ids.len();
@@ -2068,6 +2073,14 @@ impl Conversation {
         self.enqueue_tokens(stream_id, token_ids.clone());
         if let Some(blob) = sigs_blob {
             self.enqueue_wide_q_sigs(stream_id, blob);
+        }
+        // The QSA index page is keyed by stream exactly like the sigs, and the
+        // fork is tombstoned right after the splice — a page left under the
+        // fork's stream is unreachable, and every projection that borrows this
+        // turn then holds K/V its attention layers cannot select. A source that
+        // sealed no page adopts none; the projection says so when it injects.
+        if let Some(page) = index_page {
+            self.enqueue_index_page(stream_id, page);
         }
         Ok(idx)
     }
@@ -2920,6 +2933,13 @@ impl Conversation {
     /// there is no redo-log record.
     pub fn mark_timeline_transient(&self, timeline: TimelineId) {
         self.write().mark_timeline_transient(timeline);
+    }
+
+    /// Mark a code_read scope fork's timeline as a **splice source**: its turns
+    /// keep their hot copy — the only copy [`Self::adopt_turn`] reads — until the
+    /// fork is tombstoned. See `Substrate::mark_timeline_splice_source`.
+    pub fn mark_timeline_splice_source(&self, timeline: TimelineId) {
+        self.write().mark_timeline_splice_source(timeline);
     }
 
     /// Couple `from_turn` to the tool response that follows it — in-RAM (so this
@@ -3916,8 +3936,79 @@ mod tests {
         collection_warm_plan, selected_in_collection, subwindow_bounds, Conversation, Observe,
     };
 
+    use std::sync::Arc;
+
+    use crate::persistence::content_hash::turn_stream_id;
+    use crate::projection::{GroupId, LayerId, TimelineId};
+    use crate::substrate::TurnPartWrite;
+    use crate::token_buffer::TokenBuffer;
+    use crate::turn::Role;
+    use candle_nn::kv_cache::{ArenaLocation, SealedChunk, SealedSequence};
+
     fn tags(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **A spliced turn keeps its index page.**
+    ///
+    /// `adopt_turn` moves a scope fork's sealed turn onto the file timeline by
+    /// reference and re-keys it to a new stream. The turn's QSA index page is
+    /// keyed by stream as well, and the fork is tombstoned straight after the
+    /// splice — so a page left under the fork's stream is gone, and every
+    /// projection that later borrows the turn past the identity threshold holds
+    /// K/V its attention layers cannot select. That was every code_reading turn
+    /// of an ingest: a greeting carried ~16k tokens no index covered, and the
+    /// model answered an earlier question instead of the greeting.
+    #[test]
+    fn an_adopted_turn_carries_its_index_page_onto_the_new_stream() {
+        let conv = Conversation::ephemeral();
+        let layer = LayerId::from_raw(1).expect("layer id");
+        let group = GroupId::from_raw(1).expect("group id");
+        let fork = TimelineId::from_raw(7).expect("fork timeline id");
+        let file = TimelineId::from_raw(8).expect("file timeline id");
+        conv.register_timeline(fork, layer, group);
+        conv.register_timeline(file, layer, group);
+        conv.mark_timeline_splice_source(fork);
+
+        let sealed = Arc::new(vec![SealedSequence {
+            chunks: vec![SealedChunk::for_test(1000, 4)],
+            token_count: 4,
+            chunk_size: 32,
+            location: ArenaLocation::Gpu,
+        }]);
+        let from = conv
+            .record_turn(
+                fork,
+                Role::Assistant,
+                TurnPartWrite {
+                    token_ids: TokenBuffer::from(vec![11, 12, 13, 14]),
+                    token_count: 4,
+                    block_start: 0,
+                    block_end: 1,
+                    sealed_gpu: Some(sealed),
+                    ..Default::default()
+                },
+                |seqs| Ok(seqs.to_vec()),
+            )
+            .expect("record the fork's turn");
+        let page = vec![0xA5u8, 0x5A, 0x01, 0x02, 0x03];
+        conv.enqueue_index_page(turn_stream_id(fork.raw(), from.0), page.clone());
+
+        let adopted = conv
+            .adopt_turn(
+                fork,
+                from,
+                file,
+                Role::Assistant,
+                tags(&["code", "src/lib.rs"]),
+            )
+            .expect("adopt the fork's turn");
+
+        assert_eq!(
+            conv.read().index_page_blob(file, adopted),
+            Some(page.as_slice()),
+            "the adopted turn must carry the fork's index page under its own stream"
+        );
     }
 
     /// **An ephemeral conversation takes its directory with it.**

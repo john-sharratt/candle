@@ -21,7 +21,7 @@ async fn watcher_fires_callback_on_file_create() {
     });
 
     let on_uploads: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-    let _watcher = zend::watcher::spawn(&workspace, cb, on_uploads).expect("watcher started");
+    let _watcher = zend::watcher::spawn(&workspace, None, cb, on_uploads).expect("watcher started");
     // Allow the watcher's background task a moment to arm before we
     // start writing — notify's recommended_watcher has a small
     // startup delay.
@@ -51,7 +51,7 @@ async fn watcher_debounces_event_bursts_into_one_call() {
     });
 
     let on_uploads: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-    let _watcher = zend::watcher::spawn(&workspace, cb, on_uploads).expect("watcher started");
+    let _watcher = zend::watcher::spawn(&workspace, None, cb, on_uploads).expect("watcher started");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Fire a tight burst of 20 file creates over ~50 ms.

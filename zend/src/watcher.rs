@@ -14,7 +14,7 @@
 //! permission / xattr changes) are filtered out before they reach
 //! the debounce window so the burst counter stays meaningful.
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +31,55 @@ pub const DEBOUNCE_WINDOW: Duration = Duration::from_millis(500);
 /// operation must not block the refresh forever.
 pub const MAX_DEBOUNCE_HOLD: Duration = Duration::from_secs(5);
 
+/// `--max-depth` for the watcher. An event counts toward the source refresh
+/// only when its path lies within `max` path components of a bounded layer's
+/// content root — exactly what the `repo_map` / `code_reading` walks read — or
+/// anywhere under an unbounded layer's root (a raw layer's folder, which the
+/// bound does not cover). Anything else is frozen or outside every walk, so its
+/// events are dropped instead of buying a re-walk that cannot change anything.
+#[derive(Debug, Clone)]
+pub struct WatchDepth {
+    max: usize,
+    bounded: Vec<PathBuf>,
+    unbounded: Vec<PathBuf>,
+}
+
+impl WatchDepth {
+    pub fn new(
+        max: usize,
+        bounded: impl IntoIterator<Item = PathBuf>,
+        unbounded: impl IntoIterator<Item = PathBuf>,
+    ) -> Self {
+        Self {
+            max,
+            bounded: bounded.into_iter().map(|r| without_cur_dir(&r)).collect(),
+            unbounded: unbounded.into_iter().map(|r| without_cur_dir(&r)).collect(),
+        }
+    }
+
+    /// Whether an event at `path` can move anything a walk reads.
+    fn admits(&self, path: &Path) -> bool {
+        self.unbounded.iter().any(|root| path.starts_with(root))
+            || self.bounded.iter().any(|root| {
+                path.strip_prefix(root).is_ok_and(|rel| {
+                    rel.components()
+                        .filter(|c| matches!(c, Component::Normal(_)))
+                        .count()
+                        <= self.max
+                })
+            })
+    }
+}
+
+/// `root` with its `.` components dropped: a layer's content root defaults to
+/// `workspace.join(".")`, which no event path spells, so a prefix match against
+/// it as written would admit nothing.
+fn without_cur_dir(root: &Path) -> PathBuf {
+    root.components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect()
+}
+
 /// Spawn the watcher in the background.  Filesystem events that
 /// can move either the repo-map or code-reading hash record
 /// (create / remove / rename / content-modify) trigger a refresh on
@@ -41,14 +90,19 @@ pub const MAX_DEBOUNCE_HOLD: Duration = Duration::from_secs(5);
 /// Returns the [`RecommendedWatcher`] so the caller can keep it
 /// alive for the daemon's lifetime; dropping it stops the watch.
 /// The dispatch task runs detached on the global executor.
+///
+/// `depth` is the `--max-depth` filter ([`WatchDepth`]); `None` lets every
+/// non-ignored source path through.
 pub fn spawn(
     workspace: &Path,
+    depth: Option<WatchDepth>,
     on_refresh: Arc<dyn Fn() + Send + Sync + 'static>,
     on_uploads_changed: Arc<dyn Fn() + Send + Sync + 'static>,
 ) -> anyhow::Result<RecommendedWatcher> {
     let (src_tx, src_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let (up_tx, up_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let root = workspace.to_path_buf();
+    let max_depth = depth.as_ref().map(|d| d.max);
     let mut watcher = notify::recommended_watcher(move |res: NotifyResult<Event>| {
         let Ok(event) = res else {
             return;
@@ -70,7 +124,7 @@ pub fn spawn(
         //
         // The daemon's own `.substrate/` redo-log writes and build/VCS churn are
         // ignored entirely (see `is_ignored_path`), so they drive neither.
-        let Signal { source, uploads } = classify(&event.paths, &root);
+        let Signal { source, uploads } = classify(&event.paths, &root, depth.as_ref());
         if source {
             let _ = src_tx.send(());
         }
@@ -79,7 +133,7 @@ pub fn spawn(
         }
     })?;
     watcher.watch(workspace, RecursiveMode::Recursive)?;
-    tracing::info!(workspace = %workspace.display(), "repo-map watcher armed");
+    tracing::info!(workspace = %workspace.display(), max_depth = ?max_depth, "repo-map watcher armed");
 
     spawn_debounced(src_rx, on_refresh);
     spawn_debounced(up_rx, on_uploads_changed);
@@ -172,10 +226,11 @@ struct Signal {
 
 /// Route a burst's `paths` (relative to workspace `root`) to the refresh signal,
 /// the uploads-reconcile signal, or neither. Ignored paths (`.substrate/`,
-/// `.git/`, `target/`, `node_modules/`) contribute to neither. A path-less event
-/// is backend-specific noise we can't localise — treated conservatively as a
-/// source change so a real edit is never missed.
-fn classify(paths: &[std::path::PathBuf], root: &Path) -> Signal {
+/// `.git/`, `target/`, `node_modules/`) contribute to neither, and neither does a
+/// source path the `--max-depth` filter (`depth`) does not admit. A path-less
+/// event is backend-specific noise we can't localise — treated conservatively
+/// as a source change so a real edit is never missed.
+fn classify(paths: &[PathBuf], root: &Path, depth: Option<&WatchDepth>) -> Signal {
     let mut source = false;
     let mut uploads = false;
     for p in paths {
@@ -184,7 +239,7 @@ fn classify(paths: &[std::path::PathBuf], root: &Path) -> Signal {
         }
         if is_top_level_uploads(p, root) {
             uploads = true;
-        } else {
+        } else if depth.is_none_or(|d| d.admits(p)) {
             source = true;
         }
     }
@@ -304,7 +359,7 @@ mod tests {
     #[test]
     fn classify_routes_source_edits_to_refresh_only() {
         let root = Path::new("ws");
-        let s = classify(&paths(&["ws/src/main.rs"]), root);
+        let s = classify(&paths(&["ws/src/main.rs"]), root, None);
         assert_eq!(
             s,
             Signal {
@@ -320,7 +375,7 @@ mod tests {
         // — it drives the tombstone reconcile (and never the source refresh, so
         // it can't race the endpoint's measured read_file).
         let root = Path::new("ws");
-        let s = classify(&paths(&["ws/uploads/notes.py"]), root);
+        let s = classify(&paths(&["ws/uploads/notes.py"]), root, None);
         assert_eq!(
             s,
             Signal {
@@ -328,7 +383,7 @@ mod tests {
                 uploads: true
             }
         );
-        let nested = classify(&paths(&["ws/uploads/nested/a.rs"]), root);
+        let nested = classify(&paths(&["ws/uploads/nested/a.rs"]), root, None);
         assert_eq!(
             nested,
             Signal {
@@ -342,7 +397,7 @@ mod tests {
     fn classify_mixed_burst_drives_both() {
         // An editor save and an upload landing in the same debounce window.
         let root = Path::new("ws");
-        let s = classify(&paths(&["ws/src/main.rs", "ws/uploads/a.py"]), root);
+        let s = classify(&paths(&["ws/src/main.rs", "ws/uploads/a.py"]), root, None);
         assert_eq!(
             s,
             Signal {
@@ -359,6 +414,7 @@ mod tests {
         let s = classify(
             &paths(&["ws/.substrate/substrate.log", "ws/target/debug/x"]),
             root,
+            None,
         );
         assert_eq!(
             s,
@@ -372,7 +428,7 @@ mod tests {
     #[test]
     fn classify_pathless_event_is_conservatively_source() {
         let root = Path::new("ws");
-        let s = classify(&[], root);
+        let s = classify(&[], root, None);
         assert_eq!(
             s,
             Signal {
@@ -387,7 +443,7 @@ mod tests {
         // A real project's nested `src/uploads/` is ordinary source, never the
         // endpoint-managed dir.
         let root = Path::new("ws");
-        let s = classify(&paths(&["ws/src/uploads/real.rs"]), root);
+        let s = classify(&paths(&["ws/src/uploads/real.rs"]), root, None);
         assert_eq!(
             s,
             Signal {
@@ -395,6 +451,44 @@ mod tests {
                 uploads: false
             }
         );
+    }
+
+    /// `--max-depth 2` over the default content root (`ws/.`): the root's own
+    /// files and one folder down drive a refresh; deeper paths are frozen, so
+    /// their events drive nothing. Unbounded, everything counts.
+    #[test]
+    fn a_depth_bound_drops_events_past_it() {
+        let root = Path::new("ws");
+        let depth = WatchDepth::new(2, [PathBuf::from("ws/.")], Vec::new());
+        let source = |list: &[&str], d: Option<&WatchDepth>| classify(&paths(list), root, d).source;
+        assert!(source(&["ws/a.rs"], Some(&depth)));
+        assert!(source(&["ws/src/b.rs"], Some(&depth)));
+        assert!(!source(&["ws/src/deep/c.rs"], Some(&depth)));
+        assert!(
+            source(&["ws/src/deep/c.rs", "ws/a.rs"], Some(&depth)),
+            "a burst with one shallow path still refreshes"
+        );
+        assert!(source(&["ws/src/deep/c.rs"], None));
+        // Uploads are routed as before, whatever the bound.
+        assert!(classify(&paths(&["ws/uploads/a/b/c.py"]), root, Some(&depth)).uploads);
+    }
+
+    /// The bound is measured from each layer's own root (`--ingest-dir
+    /// code_reading=zend/src`); a path under no walked root is out of reach, and
+    /// an unbounded (raw) layer's folder admits any depth.
+    #[test]
+    fn a_depth_bound_is_measured_from_each_layer_root() {
+        let root = Path::new("ws");
+        let depth = WatchDepth::new(
+            1,
+            [PathBuf::from("ws/zend/src")],
+            [PathBuf::from("ws/responses")],
+        );
+        let source = |list: &[&str]| classify(&paths(list), root, Some(&depth)).source;
+        assert!(source(&["ws/zend/src/main.rs"]));
+        assert!(!source(&["ws/zend/src/api/mod.rs"]));
+        assert!(!source(&["ws/README.md"]));
+        assert!(source(&["ws/responses/greet/hello.chatml"]));
     }
 
     #[test]

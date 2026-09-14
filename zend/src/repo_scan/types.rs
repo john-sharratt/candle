@@ -174,11 +174,61 @@ pub struct RepoMap {
     /// as `*.txt`. Carving one produces hundreds of garbage scopes that blow
     /// the ingest co-batch's VRAM budget.
     pub files_skipped_binary: usize,
+    /// The `--max-depth` bound the walk ran under, in path components below the
+    /// content root (`None` = unbounded). Nothing deeper was read — which is not
+    /// the same as absent: see [`RepoMap::is_frozen_file`].
+    pub max_depth: Option<usize>,
+}
+
+impl RepoMap {
+    /// Whether a root-relative file `path` lies past the depth bound. Its
+    /// ingested content is FROZEN: never re-read, and never retired by the
+    /// deleted-path sweep either, because the walk not seeing it says nothing
+    /// about whether it still exists.
+    pub fn is_frozen_file(&self, path: &str) -> bool {
+        self.max_depth.is_some_and(|d| path_depth(path) > d)
+    }
+
+    /// Whether directory `dir` (`zend/src/`, or `"."` for the root) was cut off
+    /// by the depth bound. A directory's own files sit one component deeper
+    /// than it, so a directory AT the bound had none walked. Frozen for the same
+    /// reason as [`Self::is_frozen_file`].
+    pub fn is_frozen_dir(&self, dir: &str) -> bool {
+        self.max_depth.is_some_and(|d| path_depth(dir) >= d)
+    }
+}
+
+/// Path components in a `/`-separated root-relative path; the root (`"."`) is 0.
+fn path_depth(path: &str) -> usize {
+    path.split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .count()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Language;
+    use super::{Language, RepoMap};
+
+    /// With `--max-depth 2`: the root's files and one folder down are walked;
+    /// anything deeper — and a directory at the bound, whose files are deeper —
+    /// is frozen. Unbounded, nothing is.
+    #[test]
+    fn the_depth_bound_freezes_what_lies_past_it() {
+        let bounded = RepoMap {
+            max_depth: Some(2),
+            ..RepoMap::default()
+        };
+        assert!(!bounded.is_frozen_file("a.rs"));
+        assert!(!bounded.is_frozen_file("src/b.rs"));
+        assert!(bounded.is_frozen_file("src/deep/c.rs"));
+        assert!(!bounded.is_frozen_dir("."));
+        assert!(!bounded.is_frozen_dir("src/"));
+        assert!(bounded.is_frozen_dir("src/deep/"));
+
+        let open = RepoMap::default();
+        assert!(!open.is_frozen_file("a/b/c/d/e.rs"));
+        assert!(!open.is_frozen_dir("a/b/c/d/"));
+    }
 
     /// The kernels are the engine. While `.cu`/`.cuh` were off the allowlist the
     /// walk dropped all 293 of them, which took them out of BOTH layers built
