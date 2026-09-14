@@ -624,6 +624,11 @@ pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactor
     // (2026-09-12): confirm there on its next sweep, and if this pair fails
     // there, the row has outgrown a single constant (the 27B's checkpoint is
     // already chosen per card; a row may have to be).
+    //
+    // Confirmed 2026-09-15 on the sm_120 box (RTX PRO 5000, int8 `prec`):
+    // 0.85/1.45 validated every C row, C10 ×10 included, in two sweeps, at C10
+    // 5.13× against 1.07/1.85's 5.87× there. One constant holds on both cards;
+    // the price on this one is 13 % of the top rung's compression.
     k_hi: 0.85,
     k_low: 0.85,
     v_hi: 1.45,
@@ -955,6 +960,11 @@ pub const QWEN36_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFacto
 /// sm_120 box's standing 10/10 at 0.8/2.05 (2026-09-13, Q6_K) has NOT been
 /// re-run at this pair: confirm there on its next sweep — a fail there means
 /// the row needs the same per-card resolution the checkpoint already has.
+///
+/// **Confirmed 2026-09-15 on the sm_120 box** (RTX PRO 5000, Q6_K, int8
+/// `perf`): 0.7/1.4 validated every C row, C10 ×40 included, in two sweeps, at
+/// C10 4.81× against 0.8/2.05's 5.56× there. One constant holds on both cards;
+/// the price on this one is 13 % of the top rung's compression.
 pub const QWEN38_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
     k_hi: 0.7,
     k_low: 0.7,

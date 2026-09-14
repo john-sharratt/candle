@@ -1432,6 +1432,10 @@ impl TestParams {
         } else {
             Vec::new()
         };
+        // Start from an idle device: work still queued from the previous
+        // config — its teardown's frees and recycling — would otherwise run
+        // inside this config's prompt timer and be reported as its prefill.
+        self.device.synchronize()?;
         let prompt_start = std::time::Instant::now();
         let t_prompt_total = profile_now();
         let mut repeat_base_logits: Option<Vec<Tensor>> = None;
