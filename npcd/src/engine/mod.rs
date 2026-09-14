@@ -67,6 +67,7 @@ pub mod loopguard;
 pub mod mind;
 pub mod mission;
 pub mod mission_acts;
+pub mod mission_api;
 pub mod narrator;
 pub mod perceived;
 pub mod persona;
@@ -180,6 +181,16 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             "/v1/npc/:nid/message",
             Role::User,
             get(get_messages).post(post_message),
+        )
+        // ── missions ────────────────────────────────────────────────────────
+        //
+        // Lodge a mission for a character, and read how one turned out. `User`
+        // plus the ownership check inside, like everything else that writes to
+        // one owned character — a mission is a thing asked of somebody's cast.
+        .route(
+            "/v1/npc/:nid/mission",
+            Role::User,
+            get(mission_api::status).post(mission_api::lodge),
         )
         // ── the world's open channel ────────────────────────────────────────
         //

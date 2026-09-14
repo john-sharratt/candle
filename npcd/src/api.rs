@@ -3244,6 +3244,8 @@ mod tests {
                 ("/v1/interaction/:ix/stream", "user"),
                 // Messaging a character on its handset.
                 ("/v1/npc/:nid/message", "user"),
+                // Lodging a mission for a character and reading how it went.
+                ("/v1/npc/:nid/mission", "user"),
                 // The world's open channel: reading is a user's, speaking on it
                 // is a creator's, because it reaches every character in a world.
                 ("/v1/world/:wid/channel", "user"),
