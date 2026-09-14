@@ -106,7 +106,7 @@ mod tests {
     /// Merging an all-absent override is the identity.
     ///
     /// Deliberately *not* asserted through [`apply`], which reads the document
-    /// embedded on whichever machine is running the test — and this machine may
+    /// on whichever machine is running the test — and this machine may
     /// well have a real override. A test that asserted "nothing is overridden"
     /// would then fail because the feature works, which is the least useful
     /// failure a test can produce.

@@ -14,19 +14,21 @@
 //! visible in the source tree, and nothing about the source tree has to change
 //! to use one.
 //!
-//! # How it reaches the binary
+//! # How it reaches the process
 //!
-//! A build script — `candle-transformers/build.rs` — copies the file into
-//! `OUT_DIR` and this module includes *that*. The indirection is what makes the
-//! file optional: `include_str!` on a gitignored path fails to compile the
-//! instant the file is absent, which would break every clone that does not have
-//! one, CI included. The build script writes an empty document instead, and an
-//! empty document overrides nothing.
+//! Read once, at first use, from the workspace root. The path is this crate's
+//! manifest directory's parent, fixed at compile time, so it does not depend on
+//! the working directory a binary or a test runs from. An absent file is an
+//! empty document, and an empty document overrides nothing; an edit takes effect
+//! at the next process start, with nothing to rebuild.
 //!
-//! `cargo:rerun-if-changed` is set on the real path, so editing the override
-//! rebuilds. Note that cargo compares *mtimes*: restoring a file with a
-//! preserved timestamp (a `mv` back, some archive extractions) can look older
-//! than the last build and be missed — `touch models.override.yaml` forces it.
+//! **Not a build script.** Embedding the file through `OUT_DIR` needs
+//! `cargo:rerun-if-changed` on it, and cargo treats a watched path that does not
+//! exist as stale on every invocation — so on every machine without an override
+//! every cargo command reran the script and recompiled this crate, 70–80 s in
+//! release. A binary copied to another machine reads the path it was built at,
+//! finds nothing, and runs the repository's own checkpoints: the same answer a
+//! clone without the file gets.
 //!
 //! # Two sections, because there are two kinds of coordinate
 //!
@@ -59,14 +61,39 @@
 //! repository still described the old one.
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
+use std::path::Path;
+use std::sync::OnceLock;
 
 use serde::Deserialize;
 
-/// The override document, embedded at build time.
+/// Where the override lives: the workspace root, one level above this crate.
+const OVERRIDE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models.override.yaml");
+
+/// The override document, read once per process.
 ///
 /// Empty when no `models.override.yaml` exists, which is the ordinary case for
 /// anyone who has not written one.
-const DOCUMENT: &str = include_str!(concat!(env!("OUT_DIR"), "/models.override.yaml"));
+fn document_text() -> &'static str {
+    static TEXT: OnceLock<String> = OnceLock::new();
+    TEXT.get_or_init(|| read_document(Path::new(OVERRIDE_PATH)))
+}
+
+/// The document at `path`, or an empty one when there is no file there.
+///
+/// A file that exists and cannot be read panics rather than reading as empty,
+/// for the reason [`document`] gives: an override that is silently not applied
+/// loads the wrong model.
+fn read_document(path: &Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
+        Err(e) => panic!(
+            "models.override.yaml exists at {} but cannot be read: {e}",
+            path.display()
+        ),
+    }
+}
 
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -145,7 +172,7 @@ fn main_revision() -> String {
     "main".to_owned()
 }
 
-/// Parse the embedded document, or panic with the parse error.
+/// Parse the workspace's document, or panic with the parse error.
 ///
 /// **Panicking is correct here.** This runs while resolving which checkpoint to
 /// load, and the alternatives are worse in the same way: a silently-ignored
@@ -154,15 +181,16 @@ fn main_revision() -> String {
 /// configuration error on the machine that wrote it, discovered on the first
 /// run, with the parse error in hand.
 fn document() -> Document {
-    // Whitespace-only covers both the absent file (the build script writes an
-    // empty string) and a file holding only comments.
-    if DOCUMENT.trim().is_empty() {
+    let text = document_text();
+    // Whitespace-only covers both the absent file (read as an empty document)
+    // and a file holding only comments.
+    if text.trim().is_empty() {
         return Document::default();
     }
-    serde_yaml::from_str(DOCUMENT).unwrap_or_else(|e| {
+    serde_yaml::from_str(text).unwrap_or_else(|e| {
         panic!(
             "models.override.yaml is malformed: {e}\n\
-             It is read from the workspace root at build time. Fix it or delete it; \
+             It is read from the workspace root at startup. Fix it or delete it; \
              an override that cannot be parsed is not applied, and running the wrong \
              model silently is worse than failing here."
         )
@@ -220,13 +248,25 @@ mod tests {
         serde_yaml::from_str(yaml).expect("parse")
     }
 
-    /// **The embedded document must parse.** It is `include_str!`'d, so this
-    /// runs against whatever is really on this machine — an override file with a
-    /// typo fails here rather than at the first model load.
+    /// **The workspace's document must parse.** It is read from the workspace
+    /// root, so this runs against whatever is really on this machine — an
+    /// override file with a typo fails here rather than at the first model load.
     #[test]
-    fn the_embedded_document_parses() {
+    fn the_workspace_document_parses() {
         let _ = document();
         let _ = active_keys();
+    }
+
+    /// **An absent file is an empty document; a present one is read verbatim.**
+    /// The first is every clone without an override, so it must not be an
+    /// error — and it must not need a rebuild to notice the file appearing.
+    #[test]
+    fn a_missing_file_is_an_empty_document_and_a_present_one_is_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("models.override.yaml");
+        assert_eq!(read_document(&path), "");
+        std::fs::write(&path, "models: {}\n").expect("write the override");
+        assert_eq!(read_document(&path), "models: {}\n");
     }
 
     /// No file, an empty one, or one that is only comments: no entries.

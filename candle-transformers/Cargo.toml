@@ -42,6 +42,7 @@ tokenizers = { workspace = true, optional = true }
 [dev-dependencies]
 hf-hub = { workspace = true }
 tokenizers = { workspace = true }
+tempfile = { workspace = true }
 # `env-filter` so the gate's subscriber takes its level and targets from
 # RUST_LOG. Without it the only thing expressible is a hard max level, which
 # cannot reach a per-target `debug` — and the elastic boundary reports every
