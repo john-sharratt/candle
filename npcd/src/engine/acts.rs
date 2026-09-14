@@ -75,6 +75,19 @@ use super::tools::{Availability, Example, Param, Plane, Tool};
 /// same thing with `/act` (`engine::slash`), so the two halves of one exchange —
 /// what you do to a character and what it does back — had different names for
 /// one idea. One concept, one word, whichever side of the room it comes from.
+///
+/// # It is physical, and the description has to fight for that
+///
+/// A generic verb over a specific one is the trade `act` makes, and its cost is
+/// the opposite of `touch`'s: where `touch` was too gentle to reach for in a
+/// fight, `act` is broad enough that a model reaches for it to *speak*. It was
+/// caught calling `act` where `tell` was meant — and the description invited it,
+/// by saying "Like `tell`, you give what you MEAN by it", which likens the two
+/// acts at the exact point they must not be confused. So the description no
+/// longer compares it to speech; it rules speech out by name (`tell`, `ask`,
+/// `whisper`, `shout` for words; `gesture` for a signal; `reflect` for a
+/// thought) and states, more than once, that this is only ever a body on a body.
+/// The name is read first, but the description is what stops the near miss.
 pub const ACT: Tool = Tool {
     name: "act",
     at: &[],
@@ -90,12 +103,18 @@ pub const ACT: Tool = Tool {
     // out of fifty-three, and the answer to that is the cooldown a self-act
     // serves, not taking the act away. See `cooldown::SELF_ACT`.
     availability: Availability::PhysicalOnly,
-    description: "Do something physical to one person here. Anything your body can do to \
-                  theirs: steady them, block their way, take something out of their hand, put \
-                  yourself between them and something else — or put them on the floor, break \
-                  their grip, hurt them. Like `tell`, you give what you MEAN by it and not the \
-                  choreography; the narrator renders the movement. They feel it, they may \
-                  refuse it, and what they do next is theirs.",
+    description: "Make PHYSICAL contact with one person here — something your body does to \
+                  theirs, and nothing you say. Hands-on only: steady them, block their way, \
+                  take something out of their hand, put yourself between them and something \
+                  else — or put them on the floor, break their grip, hurt them. **This is not \
+                  how you say anything.** To tell, ask, warn, promise or order somebody, use \
+                  `tell`, `ask`, `whisper` or `shout`; to signal without touching, `gesture`; \
+                  to stop and take stock, `reflect`. This is only ever the act of a body on a \
+                  body. You give what you MEAN by the contact, not the choreography; the \
+                  narrator renders the movement. They feel it, they may refuse it, and what \
+                  they do next is theirs. On `yourself` it is still physical — binding a wound, \
+                  getting your own weapon clear, dragging yourself up — never a feeling or a \
+                  thought.",
     params: &[
         Param {
             name: "on",

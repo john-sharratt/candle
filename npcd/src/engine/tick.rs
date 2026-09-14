@@ -431,8 +431,10 @@ impl Inbox {
 /// moment after the drain.
 pub struct TickStart {
     pub events: Vec<Event>,
-    /// The events as prose — exactly what goes to the model, and what the
-    /// record reports.
+    /// The raw events as prose. The record reports the narrator's curated
+    /// rendering instead when one is produced (the tick loop overrides this
+    /// before `end_tick`); this is the fallback for a tick with nothing to
+    /// narrate. See `crate::engine::narrator`.
     pub perceived: Vec<String>,
     pub cause: Readiness,
     pub window: Window,
@@ -460,7 +462,9 @@ pub struct TickRecord {
     pub at_ms: u64,
     /// The world-clock instant the character reasoned about.
     pub world_ms: u64,
-    /// What it perceived, as prose — exactly what went to the model.
+    /// What it perceived, as prose — the narrator's curated third-person
+    /// rendering of the events, which is what went to the model, or the raw
+    /// events on a tick with nothing to narrate.
     pub perceived: Vec<String>,
     /// Why it ran now.
     pub cause: Readiness,

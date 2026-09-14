@@ -1007,6 +1007,23 @@ pub fn by_name(name: &str) -> Option<&'static Tool> {
     CATALOG.iter().find(|t| t.name == name)
 }
 
+/// Whether this act's outcome is *narrated* for the character to read back,
+/// rather than handed the bare confirmation the world gives it ("You tell
+/// Pax.").
+///
+/// The intent-carrying speech and expression acts: what a character *means* by
+/// one is the whole of it, and the world's reply is a bare acknowledgement that
+/// drops the intent — so the character reads back a rendering of what it did
+/// instead. Acts with a real, fixed reply are absent on purpose: a `move_to`
+/// reports the distance left, a world act reports what changed, and that reply
+/// *is* the information, not a placeholder for it.
+pub fn narrates(tool: &str) -> bool {
+    matches!(
+        tool,
+        "tell" | "ask" | "whisper" | "shout" | "gesture" | "act"
+    )
+}
+
 /// The system-prompt collection every tool is installed into — see [`install`].
 pub const COLLECTION: &str = "tools";
 

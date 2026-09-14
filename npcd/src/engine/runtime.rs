@@ -364,6 +364,12 @@ pub struct Runtime {
     /// acting: a character that moved between bodies mid-fight would otherwise
     /// get a free swing.
     pub cooldowns: crate::engine::cooldown::Cooldowns,
+    /// How each character is kept out of a behavioural loop, in turns rather than
+    /// in real time — the counterpart to [`Self::cooldowns`], which paces the
+    /// body. Exponential cooldown on a repeated act, a protected set that keeps
+    /// a character interacting, and a closeness breaker that forces a reflect
+    /// when an act loops in all but wording. See [`crate::engine::loopguard`].
+    pub loop_guards: crate::engine::loopguard::LoopGuards,
     /// Set on shutdown so every character task stops at its next wait rather
     /// than being killed mid-tick with a half-written turn.
     stopping: AtomicBool,
@@ -575,6 +581,7 @@ impl Runtime {
             reflect_domain: AtomicUsize::new(0),
             feelings: RwLock::new(Vec::new()),
             cooldowns: crate::engine::cooldown::Cooldowns::new(),
+            loop_guards: crate::engine::loopguard::LoopGuards::new(),
             stopping: AtomicBool::new(false),
             spawner: tokio::runtime::Handle::try_current().ok(),
             tasks: Mutex::new(BTreeMap::new()),
@@ -837,10 +844,19 @@ impl Runtime {
             // Never where it stands — see [`body::reachable`]. Walking to your
             // own room was refused, and refusal is not a lesson.
             places: body::reachable(&hosted, &body),
-            // What this body has done too recently to do again. Asked here, at
+            // What this body has done too recently to do again, and what the
+            // loop guard has struck to break a repetition. Both asked here, at
             // the one place a situation is composed, so no route can build a
-            // grammar that has forgotten about it.
-            cooling: self.cooldowns.cooling(npc_id),
+            // grammar that has forgotten about either. The real-time body pace
+            // and the turn-based loop break are two different rate limits; their
+            // union is what the grammar is built without.
+            cooling: {
+                let mut cooling = self.cooldowns.cooling(npc_id);
+                cooling.extend(self.loop_guards.cooling(npc_id));
+                cooling.sort_unstable();
+                cooling.dedup();
+                cooling
+            },
             feelings: self.feelings.read().unwrap().clone(),
             me: hosted.read(|w| w.actor(&body).map(|a| a.name.clone()).unwrap_or_default()),
             ..Default::default()
@@ -1541,14 +1557,40 @@ impl Runtime {
             .await
         {
             Ok(kept) => tracing::info!(
-                "npc {npc_id}: dreamt, {} line(s) kept in {:?} — {} dream(s) now; it opens: {}",
+                "npc {npc_id}: dreamt, {} line(s) kept in {:?} — {} dream(s) now:\n{}",
                 kept.lines.len(),
                 started.elapsed(),
                 minds.dreams_kept(npc_id),
-                kept.lines.first().map(String::as_str).unwrap_or_default(),
+                kept.lines.join("\n"),
             ),
             Err(e) => tracing::warn!("npc {npc_id}: the dream was not kept — {e:#}"),
         }
+    }
+
+    /// Dream a supplied brief once, on demand, and **return** it — the one-off
+    /// counterpart to [`Self::dream_now`], which logs and discards because
+    /// nobody is waiting. Here a caller hands the premise and sees what the
+    /// dreamer makes of it (the dream API). It is kept, like any dream, so it
+    /// also lands on the character's dream layer.
+    pub async fn dream_once(
+        &self,
+        npc_id: u64,
+        brief: &str,
+        assumption: &str,
+    ) -> anyhow::Result<crate::engine::dreams::Kept> {
+        let minds = self
+            .minds
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no engine — the daemon is still loading"))?;
+        let who = self
+            .persona_of_async(npc_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no such character, or it has no persona"))?;
+        minds
+            .dream(npc_id, &who.as_persona(), brief, assumption)
+            .await
     }
 
     /// Claim this character's one reflection slot, if a reflection can run.
@@ -3275,27 +3317,27 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
             // the first two and the last — [`Scheduler::begin_tick`] /
             // [`Scheduler::end_tick`] are `tick` split at exactly that
             // seam, so this loop and the scheduler tests run one path.
-            let Some(start) = rt.scheduler.begin_tick(id) else {
+            let Some(mut start) = rt.scheduler.begin_tick(id) else {
                 continue;
             };
 
             let mut awaiting_reflection: Option<(oneshot::Receiver<String>, Owed)> =
                 None;
+            // The curated prose the character read, captured out of the think
+            // step so the tick record reports it in place of the raw events —
+            // what the pulse shows is then what went to the model.
+            let mut narrated: Option<String> = None;
             let done = match (minds.as_ref(), persona.as_ref()) {
                 (Some(minds), Some(p)) => {
                     match minds
-                        .think(
-                            id,
-                            &p.as_persona(),
-                            p.mode,
-                            day,
-                            &start.events,
-                            &start.window,
-                            &within,
-                        )
+                        .think(id, &p.as_persona(), p.mode, day, &start.events, &within)
                         .await
                     {
                         Ok(t) => {
+                            // The curated prose this tick read, for the record.
+                            if !t.perception.is_empty() {
+                                narrated = Some(t.perception.clone());
+                            }
                             // Reported, never swallowed: a character failing
                             // to act and one choosing not to look identical
                             // from outside and need completely different
@@ -3345,7 +3387,25 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                             let mut reflecting: Option<(Owed, [String; 3])> = None;
                             for a in &t.parsed.acts {
                                 let r = rt.record_act(id, a);
-                                done.push(r.feed);
+                                // Intent-carrying acts read back a narration of
+                                // what they did, not the bare "You tell X." the
+                                // world hands them — and the same line shows in
+                                // the feed. Only when the act landed; a narration
+                                // failure keeps the plain reply. See
+                                // `tools::narrates` / `Minds::narrate_act`.
+                                let (feed, answer) = if r.landed
+                                    && crate::engine::tools::narrates(a.tool)
+                                {
+                                    match minds.narrate_act(id, &p.as_persona(), a).await {
+                                        Ok(Some(n)) => {
+                                            (format!("{} {LANDED} {n}", a.summary()), n)
+                                        }
+                                        _ => (r.feed, r.answer),
+                                    }
+                                } else {
+                                    (r.feed, r.answer)
+                                };
+                                done.push(feed);
                                 if a.tool == "reflect"
                                     && r.landed
                                     && reflecting.is_none()
@@ -3374,7 +3434,7 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                                         [arg("situation"), arg("inner_thoughts"), arg("feeling")],
                                     ));
                                 }
-                                answers.push(r.answer);
+                                answers.push(answer);
                                 // A pause that landed stops the character
                                 // here. Armed after the act rather than
                                 // inside it because going quiet is
@@ -3386,6 +3446,33 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                                 // straight back, so it has a turn in which
                                 // to use what it was told.
                                 rt.arm_followup(id, a);
+                            }
+                            // **Fold this decode into the loop guard.** Every
+                            // well-formed act, with what it meant, in call
+                            // order — the guard escalates a repeated act out of
+                            // the next grammar and, when an act loops in all but
+                            // wording, forces a reflect. The break has to be
+                            // *explained*, so a fired breaker delivers a nudge
+                            // that rides the next turn as a `<tool_response>` —
+                            // the model demonstrably reads a bare redirect and
+                            // repeats anyway, so the guarantee is the forced
+                            // reflect and this only says why. See
+                            // [`crate::engine::loopguard`].
+                            let taken: Vec<(String, String)> = t
+                                .parsed
+                                .acts
+                                .iter()
+                                .map(|a| {
+                                    (a.tool.to_string(), crate::engine::loopguard::salient(a))
+                                })
+                                .collect();
+                            if rt.loop_guards.record(id, &taken) {
+                                minds
+                                    .deliver_outcomes(
+                                        id,
+                                        vec![crate::engine::loopguard::NUDGE.to_string()],
+                                    )
+                                    .await;
                             }
                             // **And the character is told what came of it.**
                             //
@@ -3426,6 +3513,12 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                 // answer rather than an invented one.
                 _ => Vec::new(),
             };
+            // Report the curated prose as what was perceived, when a narration
+            // was produced — the raw events behind it are not what the model
+            // read. A quiet tick with no narration keeps its raw perceived.
+            if let Some(prose) = narrated {
+                start.perceived = vec![prose];
+            }
             rt.scheduler.end_tick(id, now_ms, world_ms, start, done);
 
             // The turn reflected: its answer has to be the next thing

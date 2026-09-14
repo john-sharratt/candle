@@ -59,7 +59,7 @@ use candle_conversation::stencil::{
     ToolCallEnvelope,
 };
 use candle_conversation::{
-    ConversationEngine, SamplingConfig, Sequence, SequenceConfig, TurnOptions,
+    ConversationEngine, SamplingConfig, SelectionState, Sequence, SequenceConfig, TurnOptions,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -69,6 +69,7 @@ use crate::engine::dreams;
 use crate::engine::event::Event;
 use crate::engine::identity;
 use crate::engine::layers;
+use crate::engine::narrator;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::reflect;
 use crate::engine::retention;
@@ -76,7 +77,7 @@ use crate::engine::schema::ReflectionTurns;
 use crate::engine::sleep::conversation_id;
 use crate::engine::throwaway::Throwaway;
 use crate::engine::tools::{self, for_mode, Mode};
-use crate::engine::window::{Speaker, Window};
+use crate::engine::window::Speaker;
 
 /// How many completed exchanges the GPU sequence carries per turn.
 ///
@@ -107,6 +108,12 @@ const META_FRAME: &str = "frame_sha256";
 /// A character's live conversation.
 struct Live {
     sequence: Sequence,
+    /// The character's narrator thread — forked from the shared base, projection
+    /// off, a short window. Each tick's events are decoded through this into the
+    /// third-person prose the character actually reads, in place of the raw event
+    /// concatenation. Its lifecycle matches [`Self::sequence`]: opened beside it,
+    /// rolled over with it, tombstoned with it. See [`crate::engine::narrator`].
+    narrator: Sequence,
     /// The day this conversation belongs to. A mismatch against the world's day
     /// is what triggers the roll-over.
     day: u64,
@@ -190,6 +197,12 @@ pub struct Minds {
     /// Each conversation behind its own async lock, so a decode holds only the
     /// character that is thinking — see the module's *Locking* note.
     live: Mutex<HashMap<u64, Arc<ConversationLock<Live>>>>,
+    /// The one narrator conversation every character's narrator thread forks
+    /// from. Created once, on first use, holding only [`crate::engine::narrator::SYSTEM`]
+    /// and nothing else — so that prefix is prefilled a single time and its K/V
+    /// is shared across every fork. Never decoded on itself; it exists only to be
+    /// forked. `None` until the first character opens its conversation.
+    narrator_base: Mutex<Option<Sequence>>,
     /// How many turns stay verbatim in the redo log, or `None` to keep them all.
     ///
     /// **Off unless the projection asks for it**, because most conversations are
@@ -338,8 +351,9 @@ fn compile_act_loop(
             Some(compile_think_tree(thinking.mode(), &steer))
         }
     };
+    let specs = tools::specs_within(Mode::Physical, within);
     let spec = compile_action_loop(
-        &tools::specs_within(Mode::Physical, within),
+        &specs,
         &env,
         tools::ACTS_PER_TURN,
         cfg.dialect.assistant_end,
@@ -389,6 +403,11 @@ pub struct Thought {
     /// one that quietly stopped being written. Ordinarily one; more than one
     /// means a gap was being closed.
     pub retired: u32,
+    /// The curated third-person prose the character actually read this tick — the
+    /// narrator's rendering of the events, or empty on a quiet tick with nothing
+    /// to narrate. Reported so the pulse view shows what went to the model rather
+    /// than the raw events behind it. See [`crate::engine::narrator`].
+    pub perception: String,
 }
 
 impl Minds {
@@ -474,6 +493,7 @@ impl Minds {
             grammar_ok: ok,
             projection: RwLock::new(None),
             live: Mutex::new(HashMap::new()),
+            narrator_base: Mutex::new(None),
             keep_turns: None,
             reflection: None,
         }
@@ -792,6 +812,131 @@ impl Minds {
             // reasoning, out the other side, and into the calls.
             _ => "<think>".to_string(),
         })
+    }
+
+    /// Fork a fresh narrator thread for a character, creating the shared base on
+    /// first use.
+    ///
+    /// The base holds only [`narrator::SYSTEM`] and is never decoded on, so that
+    /// prefix is prefilled once and every fork shares its K/V — the whole of the
+    /// narrator's cost after the first is the short per-tick decode. A fork
+    /// carries the base's short window and, because it is a plain
+    /// [`ConversationEngine::new_conversation`], no projection: a narrator
+    /// gathers nothing.
+    ///
+    /// Tagged with a derived `narrator-<id>-day-<n>` conv id so its stale
+    /// generations are retired by the same prefix sweep as the action
+    /// conversation — see [`retire_superseded`]. It is not rejoined across a
+    /// restart: the narration is derived prose, cheaply rebuilt from a fresh
+    /// window, so a restart simply starts a new thread.
+    fn open_narrator(&self, npc_id: u64, day: u64) -> anyhow::Result<Sequence> {
+        // The base lock is held only to create-if-needed and fork; priming (a
+        // blocking seal) happens on the fork after it is released, so one
+        // character's open does not queue the whole cast's behind it.
+        let mut fork = {
+            let mut base = self.narrator_base.lock().unwrap();
+            if base.is_none() {
+                let mut cfg = self.base_config.clone();
+                cfg.context_window_turns = narrator::WINDOW_TURNS;
+                let seq = self
+                    .engine
+                    .lock()
+                    .unwrap()
+                    .new_conversation(narrator::SYSTEM, cfg)?;
+                *base = Some(seq);
+            }
+            base.as_ref().expect("just created").fork()?
+        };
+        let id = format!("narrator-{npc_id}-day-{day}");
+        if let Err(e) = self
+            .engine
+            .lock()
+            .unwrap()
+            .set_conversation_conv_id(fork.timeline_id(), &id)
+        {
+            tracing::warn!(
+                "narrator {id} could not be named in the log: {e:?} — its stale generations may \
+                 not be retired"
+            );
+        }
+        // **Prime the thread with worked exchanges.** A freshly-forked thread
+        // holds only the system prefix, and the model's first decode on it
+        // sometimes echoes its own input turn instead of narrating it. Prefilled
+        // examples (input, then its narration) give the first real decode a
+        // precedent to follow — no decode here, both sides are given. Two shapes
+        // are primed: a scene turn, and an own-act turn (whose actor is the
+        // focal character), so both the perception and the act-outcome decodes
+        // land on a precedent rather than a cold start.
+        for (user, assistant) in [
+            (narrator::PRIME_INPUT, narrator::PRIME_NARRATION),
+            (narrator::PRIME_ACT_INPUT, narrator::PRIME_ACT_NARRATION),
+        ] {
+            let handle =
+                fork.submit_prefilled_turn(user, assistant, "\u{0}\u{0}", SelectionState::new(), Vec::new())?;
+            let primed = handle.wait()?;
+            fork.finish_turn(handle, &primed)?;
+        }
+        Ok(fork)
+    }
+
+    /// The turn options for a narrator decode: capped short, no grammar (free
+    /// prose), and prefilled with the dialect's closed no-think block so the
+    /// narration is not preceded — or replaced — by a reasoning block. Without
+    /// this the model opens `<think>` on its own and sometimes reasons about the
+    /// task there, and that reasoning becomes the character's perception. The
+    /// prefill rides back at the head of the decode, so [`narrator::strip_reasoning`]
+    /// removes it before the prose is used.
+    fn narrator_options(&self) -> TurnOptions {
+        TurnOptions {
+            max_tokens: Some(narrator::MAX_TOKENS),
+            sampling: Some(self.base_config.sampling.clone()),
+            assistant_prefill: Some(self.base_config.dialect.no_think_block.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Narrate the character's **own** act, for the tool response it reads back
+    /// and the feed the GUI shows — in place of the bare confirmation the world
+    /// gives an intent-carrying act ("You tell Pax."). Only the acts
+    /// [`tools::narrates`] names come through here; anything with a real, fixed
+    /// reply keeps it.
+    ///
+    /// Runs on the character's own narrator thread, so what it did is voiced in
+    /// the same running narrative as the scene around it. `None` when the act
+    /// carries no intent to render, or the character has no live conversation.
+    pub async fn narrate_act(
+        &self,
+        npc_id: u64,
+        persona: &Persona<'_>,
+        act: &act::Act,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(line) = own_act_line(act) else {
+            return Ok(None);
+        };
+        let Some(live) = self.live.lock().unwrap().get(&npc_id).map(Arc::clone) else {
+            return Ok(None);
+        };
+        // Whoever the act is aimed at, so the narration has them present.
+        let near: Vec<String> = ["to", "on"]
+            .iter()
+            .filter_map(|k| act.args.get(*k).and_then(|v| v.as_str()))
+            .map(str::to_string)
+            .collect();
+        let turn = narrator::build_act_turn(
+            persona.name,
+            &narrator::sketch(persona.identity, persona.manner),
+            &near,
+            &line,
+        );
+        let raw = {
+            let mut live = live.lock().await;
+            live.narrator
+                .send_turn_with_options_async(&turn, self.narrator_options())
+                .await?
+                .text
+        };
+        let narration = narrator::strip_reasoning(&raw);
+        Ok((!narration.is_empty()).then_some(narration))
     }
 
     /// The whole-turn grammar the reply **begins inside**.
@@ -1162,6 +1307,7 @@ impl Minds {
         if let Some((sequence, watermark)) = rejoined {
             return Ok(Live {
                 sequence,
+                narrator: self.open_narrator(npc_id, day)?,
                 day,
                 id,
                 // Not zero: a conversation this deep has already retired its
@@ -1228,6 +1374,7 @@ impl Minds {
         }
         Ok(Live {
             sequence,
+            narrator: self.open_narrator(npc_id, day)?,
             day,
             id,
             retired_through: 0,
@@ -1241,11 +1388,10 @@ impl Minds {
     /// character that chose to do nothing produce the same empty act list, and
     /// the caller has to be able to tell them apart — Pulse renders them
     /// differently, and it should.
-    // Eight, and each is a different axis of one turn: who, as what, in what
-    // mode, on what day, given what arrived, against what it remembers, and
-    // from what the room offers. Bundling them into a struct would name the
-    // bundle rather than the axes and hide that every caller must supply all of
-    // them — which is the property that matters.
+    // Each is a different axis of one turn: who, as what, in what mode, on what
+    // day, given what arrived, and from what the room offers. Bundling them into
+    // a struct would name the bundle rather than the axes and hide that every
+    // caller must supply all of them — which is the property that matters.
     #[allow(clippy::too_many_arguments)]
     pub async fn think(
         &self,
@@ -1254,7 +1400,6 @@ impl Minds {
         mode: Mode,
         day: u64,
         events: &[Event],
-        window: &Window,
         within: &tools::Within,
     ) -> anyhow::Result<Thought> {
         let mut thought = Thought::default();
@@ -1312,8 +1457,12 @@ impl Minds {
         // again. A fat batch is one better-informed thinking step rather than
         // several thrashing ones — the mind design is explicit that this is
         // what a busy character should get.
-        let answers = std::mem::take(&mut conversation.lock().await.pending);
-        let perception = compose(&answers, events, window);
+        //
+        // The answers and the perception are built inside the decode block
+        // below, under the character's own lock: the events are first curated
+        // into prose by this character's narrator thread (see
+        // [`crate::engine::narrator`]), so the turn is one decode's worth of
+        // narrator work followed by the act decode, both under the one guard.
         // **The act stencil is armed here, not hoped for.** `act::parse` reads
         // the decode, and what it reads is a grammar's output rather than a
         // guess at one: the name is a real tool, the required parameters are
@@ -1379,6 +1528,38 @@ impl Minds {
             // *Locking* note): it is what makes one turn at a time per
             // character true while the rest of the cast decodes concurrently.
             let mut live = conversation.lock().await;
+            // The answers to last turn's acts, taken here so they die with the
+            // conversation on a roll-over rather than being delivered into one
+            // that never asked the questions.
+            let answers = std::mem::take(&mut live.pending);
+            // **Curate this tick's events into prose.** The raw events —
+            // first-person intent, condensed "does it:" action lines — are
+            // decoded through this character's narrator thread into the
+            // third-person passage it actually reads. Two decodes under the one
+            // guard: the narrator, then the act. A quiet tick with nothing to
+            // narrate skips the narrator decode entirely. See
+            // [`crate::engine::narrator`].
+            let narration = match narrator::build_turn(
+                persona.name,
+                &narrator::sketch(persona.identity, persona.manner),
+                &within.company,
+                events,
+            ) {
+                Some(turn) => {
+                    let raw = live
+                        .narrator
+                        .send_turn_with_options_async(&turn, self.narrator_options())
+                        .await?
+                        .text;
+                    narrator::strip_reasoning(&raw)
+                }
+                None => String::new(),
+            };
+            let narration = narration.trim().to_string();
+            // What the pulse reports as perceived: the curated prose, not the
+            // raw events behind it — this is what actually went to the model.
+            thought.perception = narration.clone();
+            let perception = compose_narrated(&answers, &narration);
             let response = live
                 .sequence
                 .send_turn_with_options_async(&perception, options)
@@ -1605,15 +1786,21 @@ fn retire_superseded(
     npc_id: u64,
     keep: Option<TimelineId>,
 ) -> usize {
-    let prefix = format!("npc-{npc_id}-day-");
     let Ok(engine) = engine.lock() else {
         return 0;
     };
-    let stale: Vec<(TimelineId, String)> = engine
-        .conversations_with_conv_id_prefix(&prefix)
-        .into_iter()
-        .filter(|(tl, _)| Some(*tl) != keep)
-        .collect();
+    // Both the action conversations and their narrator threads, by their two
+    // conv-id namespaces. The narrator thread is never rejoined — its prose is
+    // derived and cheaply rebuilt — so every stale narrator generation goes,
+    // and only the just-rejoined action timeline (`keep`) is spared.
+    let stale: Vec<(TimelineId, String)> = [
+        format!("npc-{npc_id}-day-"),
+        format!("narrator-{npc_id}-day-"),
+    ]
+    .iter()
+    .flat_map(|prefix| engine.conversations_with_conv_id_prefix(prefix))
+    .filter(|(tl, _)| Some(*tl) != keep)
+    .collect();
     if stale.is_empty() {
         return 0;
     }
@@ -1643,13 +1830,18 @@ fn retire_superseded(
 /// yesterday's turns selectable — untidy, and strictly better than refusing to
 /// open today's conversation over it.
 fn retire(engine: &Arc<Mutex<ConversationEngine>>, l: &Live) {
-    let timeline = l.sequence.timeline_id();
-    match engine.lock().unwrap().tombstone_timeline(timeline) {
+    let engine = engine.lock().unwrap();
+    match engine.tombstone_timeline(l.sequence.timeline_id()) {
         Ok(()) => tracing::info!("conversation {} retired (tombstoned)", l.id),
         Err(e) => tracing::warn!(
             "conversation {} could not be tombstoned: {e:?} — yesterday stays selectable",
             l.id
         ),
+    }
+    // The narrator thread rides with the conversation it narrates: tombstoned
+    // beside it so its derived prose does not outlive the day it belonged to.
+    if let Err(e) = engine.tombstone_timeline(l.narrator.timeline_id()) {
+        tracing::warn!("narrator for {} could not be tombstoned: {e:?}", l.id);
     }
 }
 
@@ -1685,15 +1877,50 @@ fn retire(engine: &Arc<Mutex<ConversationEngine>>, l: &Live) {
 /// those 23 acts was `reflect` — with no act ever visibly causing anything,
 /// there was nothing to prefer about acting over thinking.
 ///
-/// # The window
+/// # The world half is now curated prose
 ///
-/// Still *not* pasted in: the sequence carries its own bounded tail
-/// (`context_window_turns`) and the substrate carries the rest, so repeating
-/// the window here would put the same turns in the context twice — once
-/// verbatim from us and once from the sequence's own history — and teach the
-/// model that everything happens twice.
-fn compose(answers: &[String], events: &[Event], window: &Window) -> String {
-    let _ = window;
+/// The events are no longer rendered one-per-line here — they are decoded into a
+/// single third-person passage by the character's narrator thread (see
+/// [`crate::engine::narrator`]) and handed in as `narration`. This function only
+/// assembles the turn: the answers as `<tool_response>` blocks, then that
+/// passage. When there is nothing to narrate, `narration` is empty and the turn
+/// is the answers alone.
+///
+/// The window is still not pasted in: the sequence carries its own bounded tail
+/// (`context_window_turns`) and the substrate carries the rest, so repeating it
+/// here would teach the model that everything happens twice.
+/// The one-line description of a character's own act for the narrator, or `None`
+/// when the act carries no intent to render.
+///
+/// The actor is the focal character, so it opens with `you —` and the
+/// [`narrator::SYSTEM`] person rule renders "You tell Pax that …". The verb
+/// names the act and its target; the intent is the substance to voice.
+fn own_act_line(act: &act::Act) -> Option<String> {
+    let arg = |k: &str| {
+        act.args
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let intent = arg("intent").or_else(|| arg("about"))?;
+    let to = arg("to").or_else(|| arg("on"));
+    let verb = match act.tool {
+        "tell" => format!("tell {}", to.unwrap_or("them")),
+        "ask" => format!("ask {}", to.unwrap_or("them")),
+        "whisper" => format!("whisper to {}", to.unwrap_or("them")),
+        "shout" => "shout to the room".to_string(),
+        "gesture" => match to {
+            Some(t) => format!("gesture to {t}"),
+            None => "gesture".to_string(),
+        },
+        "act" => format!("act on {}", to.unwrap_or("yourself")),
+        other => other.to_string(),
+    };
+    Some(format!("you — {verb} — meaning: \"{intent}\""))
+}
+
+fn compose_narrated(answers: &[String], narration: &str) -> String {
     let mut s = String::new();
     for a in answers {
         // The block is newline-delimited inside the tags because an outcome is
@@ -1703,17 +1930,12 @@ fn compose(answers: &[String], events: &[Event], window: &Window) -> String {
         s.push_str(a.trim());
         s.push_str("\n</tool_response>\n");
     }
-    // One blank line between the answers and the world, so the two are visibly
-    // different kinds of thing rather than one run-on block.
-    if !answers.is_empty() && !events.is_empty() {
+    // One blank line between the answers and the narration, so the two are
+    // visibly different kinds of thing rather than one run-on block.
+    if !answers.is_empty() && !narration.is_empty() {
         s.push('\n');
     }
-    for (i, e) in events.iter().enumerate() {
-        if i > 0 {
-            s.push_str("\n\n");
-        }
-        s.push_str(&e.prose());
-    }
+    s.push_str(narration);
     s
 }
 
@@ -1728,7 +1950,6 @@ pub fn render_turn(speaker: Speaker, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::event::{EventKind, Salience};
 
     /// The fingerprint is what decides whether a conversation on disk is still
     /// this character's to continue, so the same frame has to produce the same
@@ -1768,41 +1989,21 @@ mod tests {
         }
     }
 
-    fn ev(text: &str) -> Event {
-        Event::new(
-            0,
-            0,
-            Salience::NORMAL,
-            EventKind::Description { text: text.into() },
-        )
-    }
-
-    /// A fat batch arrives as one message, in order — one better-informed
-    /// thinking step rather than several thrashing ones.
-    #[test]
-    fn a_batch_composes_in_arrival_order() {
-        let w = Window::with_default_cap();
-        let s = compose(&[], &[ev("the gate opens"), ev("someone shouts")], &w);
-        assert_eq!(s, "the gate opens\n\nsomeone shouts");
-    }
-
-    /// **An act is answered, and the answer comes first.**
+    /// **An act is answered, and the answer comes first**, then the narration.
     ///
     /// The protocol admits no other order: a result answers the turn before it,
     /// so nothing may come between a call and its response. Measured before
     /// this existed — 23 calls, 0 responses, and all 23 acts `reflect`.
     #[test]
-    fn an_answer_leads_the_turn_and_the_world_follows_it() {
-        let w = Window::with_default_cap();
-        let s = compose(
+    fn an_answer_leads_the_turn_and_the_narration_follows_it() {
+        let s = compose_narrated(
             &["You moved to the sorting room.".to_string()],
-            &[ev("the air near the door is fresher")],
-            &w,
+            "The air near the door is noticeably fresher than by the wall.",
         );
         assert_eq!(
             s,
             "<tool_response>\nYou moved to the sorting room.\n</tool_response>\n\n\
-             the air near the door is fresher"
+             The air near the door is noticeably fresher than by the wall."
         );
     }
 
@@ -1810,14 +2011,12 @@ mod tests {
     /// character reading them back can tell which answer belongs to which act.
     #[test]
     fn every_call_gets_its_own_block_in_call_order() {
-        let w = Window::with_default_cap();
-        let s = compose(
+        let s = compose_narrated(
             &[
                 "You moved to the sorting room.".to_string(),
                 "Nobody there answered to that name.".to_string(),
             ],
-            &[],
-            &w,
+            "",
         );
         assert_eq!(s.matches("<tool_response>").count(), 2);
         assert_eq!(s.matches("</tool_response>").count(), 2);
@@ -1831,51 +2030,33 @@ mod tests {
     /// not work" from "nothing happened", and the two want different next acts.
     #[test]
     fn a_refusal_is_returned_like_any_other_answer() {
-        let w = Window::with_default_cap();
-        let s = compose(
-            &["You cannot reach the vault from here.".to_string()],
-            &[],
-            &w,
-        );
+        let s = compose_narrated(&["You cannot reach the vault from here.".to_string()], "");
         assert!(s.starts_with("<tool_response>\n"));
         assert!(s.contains("cannot reach the vault"));
     }
 
-    /// With nothing to report the turn is exactly what it always was — no
-    /// empty wrapper for the model to read as a result that never came.
+    /// With no acts behind it the turn is the narration alone — no empty wrapper
+    /// for the model to read as a result that never came.
     #[test]
     fn a_turn_with_no_acts_behind_it_carries_no_wrapper() {
-        let w = Window::with_default_cap();
-        let s = compose(&[], &[ev("it rains")], &w);
-        assert_eq!(s, "it rains");
+        let s = compose_narrated(&[], "Rain starts against the panes.");
+        assert_eq!(s, "Rain starts against the panes.");
         assert!(!s.contains("tool_response"));
     }
 
-    /// An answer with no world event behind it still stands on its own — a
-    /// character that acted during a quiet moment is told what happened.
+    /// An answer with nothing to narrate still stands on its own — a character
+    /// that acted during a quiet moment is told what happened.
     #[test]
     fn an_answer_alone_does_not_trail_a_blank_line() {
-        let w = Window::with_default_cap();
-        let s = compose(&["You put it down.".to_string()], &[], &w);
+        let s = compose_narrated(&["You put it down.".to_string()], "");
         assert_eq!(s, "<tool_response>\nYou put it down.\n</tool_response>\n");
     }
 
-    /// **The window must not be pasted in.** The sequence carries its own
-    /// bounded tail, so repeating it here would put the same turns in the
-    /// context twice and teach the model that everything happens twice.
+    /// A quiet tick with nothing to narrate and nothing owed composes to
+    /// nothing.
     #[test]
-    fn the_window_is_not_repeated_into_the_message() {
-        let mut w = Window::with_default_cap();
-        w.push_world("something that already happened", 0, None);
-        w.push_npc("and what I did about it", 0);
-        let s = compose(&[], &[ev("something new")], &w);
-        assert_eq!(s, "something new");
-        assert!(!s.contains("already happened"));
-    }
-
-    #[test]
-    fn an_empty_batch_composes_to_nothing() {
-        assert_eq!(compose(&[], &[], &Window::with_default_cap()), "");
+    fn an_empty_turn_composes_to_nothing() {
+        assert_eq!(compose_narrated(&[], ""), "");
     }
 
     /// A restart mid-day opens a second timeline, and it must carry the same

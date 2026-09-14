@@ -385,6 +385,7 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         // `User` for the same reason the portrait route is: it is *your own*
         // character, and the handler refuses one that is not.
         .route("/v1/npc/:nid/reflect", Role::User, post(post_reflect))
+        .route("/v1/npc/:nid/dream", Role::User, post(post_dream))
         .route(
             "/v1/npc/:nid/modulation",
             Role::User,
@@ -706,6 +707,89 @@ async fn post_reflect(
         Err(e) => err(
             StatusCode::SERVICE_UNAVAILABLE,
             "reflect_failed",
+            &format!("{e}"),
+        ),
+    }
+}
+
+/// `POST /v1/npc/:nid/dream` — decode a single dream on demand.
+///
+/// A dream ordinarily falls out of a reflection on the character's own clock,
+/// sporadically. This decodes one now from a supplied `brief` — the
+/// present-tense premise the dreamer lives through — so a caller can see what
+/// the dreaming produces without waiting for the tick that would have asked for
+/// it. It is kept like any dream, so it also lands on the character's dream
+/// layer.
+///
+/// **Serial**, like the reflection route: it holds the request for the decode
+/// and stops the cast while it runs, which is what a dream costs.
+async fn post_dream(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(nid): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let (id, owner) = match owner_of(&s, &headers).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let Ok(npc_id) = nid.parse::<u64>() else {
+        return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
+    };
+    // Ownership — unless the caller may see the whole cast (admin or creator).
+    // An on-demand dream is an inspection tool: an operator watching the mind
+    // should be able to poke any character in it, the same way the pulse already
+    // lets them read one.
+    if !s.roles.of(Some(&id)).at_least(Role::Admin) {
+        if let Err(e) = s.npcs.read().await.get(npc_id, &owner) {
+            return npc_err(e);
+        }
+    }
+
+    // The premise the dream is decoded from — present tense, the dreamer living
+    // it. Required: a dream with no premise dreams nothing.
+    let brief = body
+        .get("brief")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if brief.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "brief_required",
+            "a dream needs a `brief` — the present-tense premise it dreams from",
+        );
+    }
+    // The axis the dream suspends, recorded on the kept dream. Optional: a
+    // one-off dream asked for by hand need not name one.
+    let assumption = body
+        .get("assumption")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .unwrap_or("a dream asked for by hand")
+        .to_string();
+
+    let Some(rt) = s.runtime.clone() else {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_engine",
+            "this daemon has no engine",
+        );
+    };
+    match rt.dream_once(npc_id, &brief, &assumption).await {
+        Ok(kept) => Json(json!({
+            // Stringified for the same reason every id on the wire is: a u64
+            // past 2^53 does not survive a JavaScript client exact.
+            "timeline": kept.timeline.to_string(),
+            "lines": kept.lines,
+            "text": kept.lines.join("\n"),
+        }))
+        .into_response(),
+        Err(e) => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "dream_failed",
             &format!("{e}"),
         ),
     }
@@ -3092,6 +3176,7 @@ mod tests {
                 ("/v1/npc/:nid/agency", "user"),
                 ("/v1/npc/:nid/agency/:sid", "user"),
                 ("/v1/npc/:nid/reflect", "user"),
+                ("/v1/npc/:nid/dream", "user"),
                 ("/v1/npc/:nid/modulation", "user"),
                 // A portrait, and the bytes back. `user` rather than open: an
                 // id is a content hash and unguessable, and unguessable is not

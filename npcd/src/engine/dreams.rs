@@ -36,7 +36,7 @@ use crate::engine::identity;
 use crate::engine::mind::Projected;
 use crate::engine::prompt::{Persona, Stance, STANCE_SELECTOR};
 use crate::engine::reflect::{plain_prose, think_off};
-use crate::engine::runtime::{drain, persist_signatures, PROJECTION_MARKER};
+use crate::engine::runtime::{drain, persist_signatures};
 use crate::engine::throwaway::Throwaway;
 
 /// The schema's dream layer, by its `name:`.
@@ -199,12 +199,25 @@ pub async fn dream(
         identity::Deliberation::default(),
     );
     selection.select(STANCE_SELECTOR, Stance::Dreaming.id());
-    // The reflection's reasoning suppression, for the same reason: a dream
-    // wants no deliberation at all, and a `<think>` opened inside it would be
-    // the model planning the dream in the voice of the dreamer.
+    // **A dream is prose, and the act sampling ruins it.**
+    //
+    // `base_config.sampling` is tuned by `for_character_dialogue` to break the
+    // character's *act*-selection loop: a DRY penalty that punishes any repeated
+    // pair of tokens (base 1.75, allowed length 2), plus presence and cross-turn
+    // penalties. Over a seven-hundred-token dream those forbid the natural word
+    // the moment it would repeat — parallel phrasing, a refrain, the same object
+    // named twice — so the vocabulary is pushed ever further from what the
+    // sentence wanted, and the dream that opens cleanly reaches for stranger and
+    // stranger synonyms as it goes. A dream keeps its own rhythm: the
+    // repetition penalties come off, and only the reasoning suppression stays (a
+    // `<think>` opened inside a dream is the model planning it in the dreamer's
+    // voice — see the reflection).
     let sampling = base_config
         .sampling
         .clone()
+        .with_dry_penalty(0.0, 1.0, 0, 0)
+        .with_presence_penalty(0.0)
+        .with_cross_turn_penalty(0.0)
         .with_graceful_segment_close_after(0)
         .with_force_segment_close_after(1);
     let answer = sequence
@@ -238,11 +251,19 @@ pub struct Kept {
 /// Write a dream to the character's dream layer, one line per turn.
 ///
 /// **Every line is a turn, and every turn is signed.** Each is prefilled — the
-/// words are already written — with [`LABEL`] as its user half, and its
-/// projection is persisted as it seals: what the gather selected out of the
-/// substrate at that line, which is the hook a later scan pulls the line back
-/// on. The lines go in order into one conversation, so each is sealed after the
-/// ones before it and its signature is taken with them in view.
+/// words are already written — with [`LABEL`] as its user half and the line as
+/// its assistant half, and its own `sign(Q)` window is captured as it seals:
+/// the hook a later scan pulls the line back on.
+///
+/// **The whole dream is one forward.** The lines are stuffed into a single
+/// prefill grid and carved back into one turn each
+/// (`submit_prefilled_turn_group`), so the dream costs one round trip rather
+/// than one per line — the same batching zend's calibration ingest uses, for
+/// the same reason (the forward costs about the same for 3,500 tokens as for
+/// 350). The grid is block-diagonal, so a line is signed against the
+/// character's memory, not against its sibling lines: each line's recall hook
+/// is what *it* evokes, which is what a line surfacing on its own resonance
+/// wants.
 ///
 /// The conversation is named `npc-<id>-dream-<timeline>` — **outside** the
 /// `npc-<id>-day-` prefix every conversation open sweeps, because a
@@ -274,8 +295,9 @@ pub async fn keep(
     engine.lock().unwrap().mark_layer_append_only(layer);
 
     let mut cfg = base_config.clone();
-    // Every earlier line in view of the next one: the dream is one piece, and
-    // a line signed without the lines before it is a line out of context.
+    // The whole dream is written in one forward (see `keep`), so the per-turn
+    // window is not what orders the lines — the stuffed grid is, and it masks
+    // each line to itself. Held at the dream's own length so nothing clips it.
     cfg.context_window_turns = MAX_LINES;
     // Opened to this character's own dreams, so its own lines are in scope of
     // its own projection — and so is nobody else's.
@@ -305,21 +327,32 @@ pub async fn keep(
     }
 
     let tags = vec![LAYER.to_string(), tag(npc_id)];
+    // The inert id each line is padded up to a block boundary with — the
+    // dialect's turn terminator, which lands in the padding tail after the
+    // line's closing marker, outside every phase span.
+    let pad_token = engine
+        .lock()
+        .unwrap()
+        .tokenizer()
+        .encode(base_config.dialect.assistant_end, false)
+        .ok()
+        .and_then(|e| e.get_ids().last().copied())
+        .unwrap_or(0);
+    // One case per line: [`LABEL`] as the user half, the line as the assistant
+    // half, every case tagged as this character's own dream so its projection
+    // stays self-local.
+    let cases: Vec<(String, String, Vec<String>)> = written
+        .iter()
+        .map(|line| (LABEL.to_string(), line.clone(), tags.clone()))
+        .collect();
     let write = async {
-        for (i, line) in written.iter().enumerate() {
-            let addr = format!("{name}#{i}");
-            let handle = sequence.submit_prefilled_turn(
-                LABEL,
-                line,
-                PROJECTION_MARKER,
-                SelectionState::new(),
-                tags.clone(),
-            )?;
-            let (response, mut events) = drain(&handle, &addr).await;
-            let r = response.ok_or_else(|| anyhow::anyhow!("{addr}: no response"))?;
-            sequence.finish_turn(handle, &r)?;
-            persist_signatures(&mut sequence, &r, &mut events, &addr);
-        }
+        // All the lines in one forward, carved back into one signed turn each.
+        let (handle, _regions) =
+            sequence.submit_prefilled_turn_group(&cases, SelectionState::new(), pad_token)?;
+        let (response, mut events) = drain(&handle, &name).await;
+        let r = response.ok_or_else(|| anyhow::anyhow!("{name}: no response"))?;
+        sequence.finish_turn(handle, &r)?;
+        persist_signatures(&mut sequence, &r, &mut events, &name);
         Ok::<(), anyhow::Error>(())
     };
     // **Half a dream is not kept.** Its metadata is already down, so a dream
