@@ -146,6 +146,19 @@ pub struct ChatCompletionRequest {
     /// set, so later turns need not repeat it.
     #[serde(default)]
     pub identity: Option<String>,
+    /// OpenAI stream options. `include_usage` asks for a last chunk carrying
+    /// the reply's token counts — Cline sends it, and its context meter reads
+    /// nothing else.
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+}
+
+/// The request's `stream_options`.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct StreamOptions {
+    /// Send a last chunk with the reply's `usage` before `[DONE]`.
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 /// Which slice of the tool catalog a conversation projects. Maps to the GUI
@@ -221,6 +234,7 @@ mod request_tests {
         let texts: Vec<&str> = req.messages.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(texts, ["sys", "task\n\nenv", "", "result"]);
         assert_eq!(req.messages[3].role, Role::Tool);
+        assert!(req.stream_options.is_some_and(|o| o.include_usage));
     }
 
     #[test]
@@ -257,6 +271,47 @@ mod request_tests {
     }
 }
 
+// ── Token usage ───────────────────────────────────────────────────────────────
+
+/// A reply's token counts, in OpenAI's `usage` shape.
+///
+/// `prompt_tokens` is what the model actually attended to — the projected
+/// context and this turn's prompt — not the length of the transcript the
+/// client sent: the daemon projects a conversation rather than replaying it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+impl Usage {
+    /// One turn's usage, from the tokens it had attended to by its end
+    /// (`TurnStats::context_tokens`, which includes its own generation) and
+    /// the tokens it generated.
+    pub fn for_turn(context_tokens: usize, generated: usize) -> Self {
+        let prompt = context_tokens.saturating_sub(generated) as u64;
+        let completion = generated as u64;
+        Self {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+        }
+    }
+
+    /// This reply's usage with a later turn of the same reply folded in — the
+    /// daemon answers over several turns when it runs its own tools. The
+    /// context is the latest turn's; the generated tokens add up.
+    pub fn then(self, next: Usage) -> Self {
+        let completion = self.completion_tokens + next.completion_tokens;
+        Self {
+            prompt_tokens: next.prompt_tokens,
+            completion_tokens: completion,
+            total_tokens: next.prompt_tokens + completion,
+        }
+    }
+}
+
 // ── Streaming response (SSE) ──────────────────────────────────────────────────
 
 /// One SSE data frame in the OpenAI streaming format.
@@ -268,6 +323,10 @@ pub struct ChatCompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    /// The reply's token counts: only on the last chunk, whose `choices` is
+    /// empty, and only when the request asked for them (`stream_options`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -325,6 +384,7 @@ pub struct ChatCompletion {
     pub created: u64,
     pub model: String,
     pub choices: Vec<CompletionChoice>,
+    pub usage: Usage,
 }
 
 #[derive(Debug, Serialize)]
@@ -353,4 +413,67 @@ pub struct ResponseToolCall {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub function: ResponseFunction,
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    fn chunk(usage: Option<Usage>) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: "c".into(),
+            object: "chat.completion.chunk",
+            created: 7,
+            model: "passthrough".into(),
+            choices: Vec::new(),
+            usage,
+        }
+    }
+
+    /// The context a turn ends with holds its own generation; the prompt is
+    /// what the model read before it.
+    #[test]
+    fn a_turns_prompt_is_the_context_it_read_before_generating() {
+        assert_eq!(
+            Usage::for_turn(6157, 157),
+            Usage {
+                prompt_tokens: 6000,
+                completion_tokens: 157,
+                total_tokens: 6157,
+            }
+        );
+    }
+
+    /// A reply answered over two turns reports the later turn's context and
+    /// both turns' generation.
+    #[test]
+    fn a_later_turn_carries_the_context_and_adds_its_generation() {
+        let reply = Usage::for_turn(1000, 100).then(Usage::for_turn(1300, 200));
+        assert_eq!(
+            reply,
+            Usage {
+                prompt_tokens: 1100,
+                completion_tokens: 300,
+                total_tokens: 1400,
+            }
+        );
+    }
+
+    /// The last streamed chunk, byte for byte as a client reads it.
+    #[test]
+    fn the_usage_chunk_has_no_choices_and_the_counts() {
+        assert_eq!(
+            serde_json::to_string(&chunk(Some(Usage::for_turn(10, 4)))).unwrap(),
+            r#"{"id":"c","object":"chat.completion.chunk","created":7,"model":"passthrough","choices":[],"usage":{"prompt_tokens":6,"completion_tokens":4,"total_tokens":10}}"#
+        );
+    }
+
+    /// Every other chunk leaves the field out rather than sending `null`.
+    #[test]
+    fn a_content_chunk_carries_no_usage_field() {
+        assert_eq!(
+            serde_json::to_string(&chunk(None)).unwrap(),
+            r#"{"id":"c","object":"chat.completion.chunk","created":7,"model":"passthrough","choices":[]}"#
+        );
+    }
 }

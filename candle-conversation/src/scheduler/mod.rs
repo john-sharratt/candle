@@ -58,6 +58,7 @@ use crate::projection::{
     ResolvedSection, ResolvedTurn, SealedKind, SectionId, SelectionState, SystemPromptItem,
     TimelineId, TurnId, TurnIndex, TurnKey,
 };
+use crate::projection::{CollectionWarm, Schema};
 use crate::provenance::{
     encode_wide_sigs_with, extract_q_vector_r16, fold_fits, fold_provenance_fitted, FoldParams,
     GalleryArena, WideQSig,
@@ -432,15 +433,15 @@ pub(crate) enum SchedulerRequest {
     /// Recover a previously-persisted section directly from the redo
     /// log instead of running a fresh prefill.  Used when an ingest
     /// caller has computed a section's content-addressed stream id
-    /// and confirmed that the persistence manifest has durable chunks
-    /// for it.  The scheduler cold-loads the chunks into hot VRAM via
-    /// the same pipeline used for turn cold-loads, restores the
-    /// section into the substrate (`SectionEntryData` + residence
-    /// with both hot and cold installed), and replies with `Ok(())`.
+    /// and found durable chunks for it.  The scheduler checks those
+    /// chunks form a whole grid over the session's KV backings,
+    /// installs the section as a cold marker (the elevate path lifts
+    /// it when a projection needs it), reinstalls its index page for a
+    /// model that keeps per-position state, and replies with the
+    /// section's chunks per layer.
     ///
-    /// On any failure the scheduler falls back to a normal
-    /// `IngestSection` would be issued by the caller — this request
-    /// just reports `Err`.
+    /// An `Err` means "prefill it instead": the caller issues a normal
+    /// `IngestSection`.
     RestoreSection {
         /// Workspace conversation the section lands in.  Sections are
         /// shared substrate state — every conversation in the
@@ -450,14 +451,13 @@ pub(crate) enum SchedulerRequest {
         conversation: Conversation,
         section_id: SectionId,
         stream_id: StreamId,
-        address: ContentAddress,
-        chunks_per_layer: usize,
         /// Pre-tokenised section content — the same byte sequence
         /// the original prefill used.  Reused verbatim so we don't
         /// need to read the `Tokens` record back from disk just to
         /// repopulate `SectionEntryData::tokens`.
         tokens: TokenBuffer,
-        response_tx: Sender<Result<(), ConversationError>>,
+        /// The section's chunks per layer once restored.
+        response_tx: Sender<Result<usize, ConversationError>>,
     },
 
     /// Pre-warm a freshly-allocated slot by injecting the static system-prompt
@@ -605,6 +605,15 @@ pub(crate) enum SchedulerRequest {
     ReconstructSubstrate {
         conversation: Conversation,
         status: Arc<SubstrateReloadStatus>,
+    },
+
+    /// Warm the belief-driven section collections' hit levels from their own
+    /// tag-scoped corpus — on this thread, because the GPU gallery arena that
+    /// scores the corpus in batch lives here. Replies with what was warmed.
+    WarmCollectionNormalization {
+        conversation: Conversation,
+        schema: Box<Schema>,
+        response_tx: Sender<CollectionWarm>,
     },
 
     /// Reclaim VRAM by demoting the hot K/V of specific (already-sealed,
@@ -4185,8 +4194,6 @@ impl Scheduler {
                 conversation,
                 section_id,
                 stream_id,
-                address,
-                chunks_per_layer,
                 tokens,
                 response_tx,
             } => {
@@ -4194,8 +4201,6 @@ impl Scheduler {
                     &conversation,
                     section_id,
                     stream_id,
-                    address,
-                    chunks_per_layer,
                     tokens,
                 );
                 let _ = response_tx.send(result);
@@ -4509,6 +4514,17 @@ impl Scheduler {
                 status,
             } => {
                 self.reconstruct_substrate(&conversation, &status);
+                true
+            }
+
+            SchedulerRequest::WarmCollectionNormalization {
+                conversation,
+                schema,
+                response_tx,
+            } => {
+                let warm = conversation
+                    .warm_collection_normalization(&schema, self.gallery_arena.as_deref());
+                let _ = response_tx.send(warm);
                 true
             }
 
@@ -6435,6 +6451,7 @@ impl Scheduler {
                 tokens_generated: 1,
                 tokens_per_second: 0.0,
                 prefill_token_count,
+                context_tokens: self.session.sequence_offset(seq_id.0).unwrap_or(0),
                 sequence: self.session.get_sequence_stats(seq_id.0),
             },
             // `finish_immediately` fires before any decode starts and
@@ -6689,6 +6706,7 @@ impl Scheduler {
                 // slot is dropped during finalize and its sequence stats
                 // become unavailable.
                 let sequence_stats = self.session.get_sequence_stats(seq_id.0);
+                let context_tokens = self.session.sequence_offset(seq_id.0).unwrap_or(0);
 
                 // Auto-finalize: if this sequence is a scheduler-owned view
                 // (created by SubmitTurn), transfer its newly-written blocks
@@ -7052,6 +7070,7 @@ impl Scheduler {
                         tokens_generated,
                         tokens_per_second,
                         prefill_token_count: state.prefill_token_count,
+                        context_tokens,
                         sequence: sequence_stats,
                     },
                     seal: seal_result,
@@ -7075,10 +7094,8 @@ impl Scheduler {
         conversation: &Conversation,
         section_id: SectionId,
         stream_id: StreamId,
-        _address: ContentAddress,
-        _chunks_per_layer: usize,
         tokens: TokenBuffer,
-    ) -> Result<(), ConversationError> {
+    ) -> Result<usize, ConversationError> {
         // The cold→hot section install goes through the adaptive-format
         // restore machinery (`alloc_sealed_block` + per-band arena writes),
         // which does not alias K≡V. A single-latent backing (DeepSeek's
@@ -7096,19 +7113,51 @@ impl Scheduler {
                     .into(),
             ));
         }
+        // One chunk list per KV backing — the count the persistence thread
+        // wrote the section with. On a hybrid that is the attention layers
+        // (plus any draft head), not the model's transformer depth; dividing
+        // the persisted grid by the depth refused every section whose chunk
+        // total it did not happen to divide, so every boot prefilled the whole
+        // system prompt again.
         let n_layers = self.session.num_layers();
 
         // 1. Resolve cold refs from the manifest — these point at
         //    each chunk's `(log_offset, record_len, token_count)` in
         //    the redo log.  Installed alone (with hot = None) so the
         //    elevate path can lift the section when a projection
-        //    needs it.
+        //    needs it.  A stream with no whole grid is not restorable,
+        //    and saying so sends the caller to a prefill.
         let cold_refs = conversation
             .recover_section_cold_refs(stream_id, n_layers)
             .map_err(ConversationError::Model)?
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                ConversationError::Channel(format!(
+                    "section {section_id:?}: stream {stream_id:?} holds no durable \
+                     chunks — re-ingest"
+                ))
+            })?;
 
-        // 2. Install as a cold-marker.  `sealed_hot = Vec::new()`
+        // 2. The section's index page, for a model that keeps per-position
+        //    state. It is computed from hidden states, so borrowing the K/V
+        //    does not bring it along; a section restored without it would
+        //    reach every projection unindexed, and a prefill is the only way
+        //    to rebuild it.
+        let page = if self.model.carries_positional_state() {
+            let page = conversation
+                .read()
+                .section_index_page(stream_id)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| {
+                    ConversationError::Channel(format!(
+                        "section {section_id:?}: persisted without its index page — re-ingest"
+                    ))
+                })?;
+            Some(page)
+        } else {
+            None
+        };
+
+        // 3. Install as a cold-marker.  `sealed_hot = Vec::new()`
         //    leaves `residence.hot = None`; `cold_refs` lands in
         //    `residence.cold` so `elevate_to_hot` can lift the
         //    section on the first projection that selects it.
@@ -7116,9 +7165,9 @@ impl Scheduler {
         //    per-chunk token counts across one layer's
         //    StoredSequence).
         let token_count = cold_refs.first().map(|s| s.token_count).unwrap_or(0);
+        let chunks_per_layer = cold_refs.first().map(|s| s.chunks.len()).unwrap_or(0);
         let tokens_arc = Arc::new(tokens[..].to_vec());
-        let mut view = conversation.write();
-        view.restore_section(
+        conversation.write().restore_section(
             section_id,
             stream_id,
             token_count,
@@ -7126,7 +7175,10 @@ impl Scheduler {
             cold_refs,
             tokens_arc,
         );
-        Ok(())
+        if let Some(page) = page {
+            self.section_positional.insert(section_id, Arc::new(page));
+        }
+        Ok(chunks_per_layer)
     }
 
     /// A unit's own tokens begin on `slot`: close its index so the prefix ahead
@@ -7407,16 +7459,30 @@ impl Scheduler {
         // the piece covers its own tokens and no others.
         match self.model.seal_positional_state(sequence_id.0) {
             Ok(Some(blob)) => {
+                // Persisted beside the section's chunks, under the same stream
+                // id, so a restart that restores the section from the log can
+                // hand a projection its index as well as its K/V.
+                match self.slot_conversations.get(&sequence_id) {
+                    Some(conversation) => {
+                        conversation.enqueue_index_page(section_stream_id(address), blob.clone())
+                    }
+                    None => tracing::warn!(
+                        section = section_id.raw(),
+                        seq = sequence_id.0,
+                        "section index page not persisted: the slot has no conversation, \
+                         so a restart prefills this section again instead of restoring it",
+                    ),
+                }
                 self.section_positional.insert(section_id, Arc::new(blob));
             }
-            // **`None` is not "nothing to do" — it is a section with no index.**
-            // It used to be swallowed, and that silence is what let an entire
-            // system prompt reach the model unindexed: every section returned
-            // `None`, the assembler had no blob to push, and the shortfall
-            // surfaced only when the prefix grew past the QSA identity
-            // threshold and a select refused — thousands of tokens and one
-            // conversation later, naming the slot rather than the seal.
-            Ok(None) => tracing::warn!(
+            // **`None` from a model that keeps per-position state is a section
+            // with no index.** It used to be swallowed, and that silence is what
+            // let an entire system prompt reach the model unindexed: every
+            // section returned `None`, the assembler had no blob to push, and
+            // the shortfall surfaced only when the prefix grew past the QSA
+            // identity threshold and a select refused — thousands of tokens and
+            // one conversation later, naming the slot rather than the seal.
+            Ok(None) if self.model.carries_positional_state() => tracing::warn!(
                 section = section_id.raw(),
                 seq = sequence_id.0,
                 n_tokens,
@@ -7424,6 +7490,9 @@ impl Scheduler {
                  state for this slot, so anything borrowing its tokens selects against \
                  a prefix it never indexed",
             ),
+            // A model that keeps no per-position state seals no page, and
+            // nothing is missing.
+            Ok(None) => {}
             Err(e) => {
                 // Not fatal to the seal — the K/V is committed — but the next
                 // ingest to borrow this section will have to say so.

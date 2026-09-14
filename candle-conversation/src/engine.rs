@@ -8,7 +8,8 @@ use crate::persistence::record::DistillMode;
 use crate::persistence::thread::PersistenceThread;
 use crate::persistence::SharedSubstrate;
 use crate::projection::{
-    Builder, Conversation, GroupId, LayerId, ProjectionTarget, Reserved, TimelineId,
+    Builder, CollectionWarm, Conversation, GroupId, LayerId, ProjectionTarget, Reserved, Schema,
+    TimelineId,
 };
 use crate::scheduler::{Scheduler, SchedulerRequest};
 use crate::sequence_handle::SequenceId;
@@ -814,7 +815,7 @@ impl ConversationEngine {
     /// AFTER an ingest pass / reconcile finishes (never concurrently — it would
     /// starve the ingest writer). See
     /// [`crate::projection::Conversation::warm_ingest_normalization`].
-    pub fn warm_ingest_normalization(&self, schema: &crate::projection::Schema) {
+    pub fn warm_ingest_normalization(&self, schema: &Schema) {
         self.conversation.warm_ingest_normalization(schema);
     }
 
@@ -822,10 +823,23 @@ impl ConversationEngine {
     /// their own tag-scoped corpus. Call after load, once the corpus is stable —
     /// without it a collection's levels are cold on every process start but the
     /// one that built the corpus, which changes both the scale and the RANKING of
-    /// its scores. See
-    /// [`crate::projection::Conversation::warm_collection_normalization`].
-    pub fn warm_collection_normalization(&self, schema: &crate::projection::Schema) {
-        self.conversation.warm_collection_normalization(schema);
+    /// its scores. Runs on the scheduler thread, where the GPU gallery arena
+    /// scores the corpus in batch, and blocks until it is done. See
+    /// [`Conversation::warm_collection_normalization`].
+    pub fn warm_collection_normalization(&self, schema: &Schema) -> CollectionWarm {
+        let (tx, rx) = channel::bounded(1);
+        if self
+            .scheduler_tx
+            .send(SchedulerRequest::WarmCollectionNormalization {
+                conversation: self.conversation.clone(),
+                schema: Box::new(schema.clone()),
+                response_tx: tx,
+            })
+            .is_err()
+        {
+            return CollectionWarm::default();
+        }
+        rx.recv().unwrap_or_default()
     }
 
     /// Merge a `(key, value)` into `timeline`'s free-form `custom`

@@ -13,10 +13,12 @@ use std::time::Instant;
 use super::event::{decode_events, ProjectionSelection, SystemItem};
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
-use super::schema::{CorruptTurnPolicy, LayerSchema, Schema, SystemPromptItem, SystemPromptSchema};
+use super::schema::{
+    CorruptTurnPolicy, LayerSchema, Schema, SectionCollection, SystemPromptItem, SystemPromptSchema,
+};
 use crate::cancel::ingest_cancelled;
 use crate::error::ConversationError;
-use crate::normalization::{ChildKey, NormalizationCache, Phase, ScopeKey};
+use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
 use crate::persistence::content_hash::{
     branch_checkpoint_stream_id, snapshot_stream_id, turn_stream_id, ContentHash,
 };
@@ -34,8 +36,8 @@ use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
 use crate::provenance::gallery_arena::{PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
 use crate::provenance::{
-    decode_wide_sigs_for_scoring, score_slots_grouped, score_slots_weighted, FusionMode,
-    GalleryArena, WideQSig,
+    decode_wide_sigs_for_scoring, score_slots_fused, score_slots_grouped, score_slots_weighted,
+    FusionMode, GalleryArena, WideQSig,
 };
 use crate::scheduler::note_persistence_maint_us;
 use crate::substrate::{
@@ -70,6 +72,25 @@ const WARM_INGEST_PROBES_PER_TIMELINE: usize = 8;
 /// on a different scale from their neighbours. Same asymmetric-EWMA convergence
 /// argument as [`WARM_INGEST_PROBES_PER_TIMELINE`].
 const WARM_COLLECTION_PROBES_PER_MEMBER: usize = 8;
+
+/// Exemplar probes per GPU gallery scan during the collection warm-up. The whole
+/// corpus fits one launch comfortably (~744 probes on the tool catalog), but the
+/// probe upload is `probe tokens × words per token` and grows with the corpus, so
+/// the batch bounds it; each launch reuses the segment's cached index.
+const WARM_GPU_PROBE_BATCH: usize = 128;
+
+/// What a collection warm-up did — see
+/// [`Conversation::warm_collection_normalization`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CollectionWarm {
+    /// Collection members the corpus had exemplars for.
+    pub members: usize,
+    /// Exemplar probes folded into the levels.
+    pub probes: usize,
+    /// Of the per-collection scans, the probes scored on the GPU gallery arena;
+    /// the rest ran on the CPU.
+    pub gpu_probes: usize,
+}
 
 /// Whether a scoring pass teaches the normalization levels, and — when it does —
 /// which lens the observation belongs to.
@@ -263,6 +284,12 @@ pub struct Conversation {
     /// change misses and refills exactly once, and the phases that open many
     /// conversations all open them on a single shared prompt branch.
     branch_checkpoint: Arc<Mutex<Option<(ContentHash, Arc<BranchCheckpointPayload>)>>>,
+    /// How this workspace's prompt sections came to be resident since it was
+    /// opened: restored from the redo log, or prefilled. A restart on an
+    /// unchanged prompt restores every one; a prefill there is a section the
+    /// log failed to bring back, paid as a forward pass on every boot. See
+    /// [`Self::section_loads`].
+    section_loads: Arc<SectionLoadCounters>,
     /// The throwaway directory an [`Self::ephemeral`] conversation's log lives
     /// in, removed when the last clone of that conversation drops.
     ///
@@ -290,6 +317,21 @@ pub struct Conversation {
     /// `Drop`. Holding it is the feature.
     #[allow(dead_code)]
     ephemeral_dir: Option<Arc<TempDirGuard>>,
+}
+
+/// Running totals behind [`Conversation::section_loads`].
+#[derive(Default)]
+struct SectionLoadCounters {
+    restored: AtomicU64,
+    prefilled: AtomicU64,
+}
+
+/// How many prompt sections a workspace restored from its redo log, and how
+/// many it prefilled, since the handle was opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SectionLoads {
+    pub restored: u64,
+    pub prefilled: u64,
 }
 
 /// Removes a directory when the last holder drops it.
@@ -394,6 +436,7 @@ impl Conversation {
             normalization_warm: Arc::new(AtomicBool::new(false)),
             writer,
             branch_checkpoint: Arc::new(Mutex::new(None)),
+            section_loads: Arc::default(),
             // The directory goes when the last clone of this conversation does.
             // See the field's own note for what it cost not to have this.
             ephemeral_dir: Some(Arc::new(TempDirGuard::new(dir))),
@@ -439,6 +482,7 @@ impl Conversation {
             normalization_warm: Arc::new(AtomicBool::new(false)),
             writer,
             branch_checkpoint: Arc::new(Mutex::new(None)),
+            section_loads: Arc::default(),
         }
     }
 
@@ -738,13 +782,12 @@ impl Conversation {
             }
             // **A warm-up pass skips the collections it cannot teach.**
             //
-            // `warm_collection_normalization` replays one collection's own
-            // exemplars, but hands the WHOLE system prompt to this loop, so every
-            // other collection is scanned too — and `teaches` then discards the
-            // observation because the probe's tags are not in its scope. The
-            // caller drops the returned scores (`let _ = …`), so that scan
-            // produces nothing at all: on the tool corpus it is up to 512 probes
-            // against ~3,000 exemplars, on the CPU path, at load.
+            // The dialogue replay (`warm_normalization_from_substrate`) hands the
+            // WHOLE system prompt to this loop, so every collection is scanned —
+            // and `teaches` then discards the observation for any collection the
+            // probe's tags are not inside. The caller drops the returned scores
+            // (`let _ = …`), so that scan produces nothing at all: on the tool
+            // corpus it is up to 512 probes against ~3,000 exemplars, at load.
             //
             // Only a teaching pass may be skipped this way. `Observe::No` is the
             // LIVE reprojection, whose scores are the whole point — `teaches` is
@@ -1220,14 +1263,28 @@ impl Conversation {
     /// its own self-match magnitude and erase exactly the contrast the gate
     /// provides.
     ///
-    /// Call once after the corpus is stable (load complete), never concurrently
-    /// with an ingest writer — same read-lock starvation hazard as the ingest
-    /// warm-up. The substrate lock is taken to gather signatures and released
-    /// before any scoring call.
-    pub fn warm_collection_normalization(&self, schema: &Schema) {
-        let mut warmed_members = 0usize;
-        let mut probes_run = 0usize;
-        for item in &schema.system_prompt.items {
+    /// **Scored in batch, not probe by probe.** A warm-up observation is the
+    /// seal-time one — the probe's whole-turn raw scores folded into the
+    /// collection's hit levels — so it needs none of the live scan's other work:
+    /// no normalization (pure, and its result was discarded) and no question
+    /// scan (read only by the normalized fusion). The corpus's exemplars are
+    /// gathered once and scored against each collection's gallery in a few GPU
+    /// launches when `arena` is given, which is why this runs on the scheduler
+    /// thread. One CPU scan per probe was ~0.55 s on the tool catalog — seven to
+    /// ten minutes of load for 744 probes.
+    ///
+    /// Call once the corpus is stable (load complete), never concurrently with an
+    /// ingest writer — the same read-lock starvation hazard as the ingest warm-up.
+    /// The substrate lock is taken to gather signatures and released before any
+    /// scoring call.
+    pub fn warm_collection_normalization(
+        &self,
+        schema: &Schema,
+        arena: Option<&GalleryArena>,
+    ) -> CollectionWarm {
+        let mut warm = CollectionWarm::default();
+        let sp = &schema.system_prompt;
+        for item in &sp.items {
             let SystemPromptItem::Collection(coll) = item else {
                 continue;
             };
@@ -1244,8 +1301,7 @@ impl Conversation {
             let member_names: HashSet<&str> =
                 coll.sections.iter().map(|s| s.name.as_str()).collect();
             // Plan first (cheap, from declarations only), then fetch signatures for
-            // exactly the turns the plan keeps — the substrate lock is released
-            // before any scoring call, and the cap does not pay to decode
+            // exactly the turns the plan keeps — the cap does not pay to decode
             // signatures it discards.
             let plan = {
                 let sub = self.inner.read().unwrap();
@@ -1264,64 +1320,150 @@ impl Conversation {
                     WARM_COLLECTION_PROBES_PER_MEMBER,
                 )
             };
-            for (_member, keys) in plan {
-                // Each probe is an exemplar's whole signature, paired with its
-                // own QUESTION sub-window. The pair matters: the collection's
-                // undivided levels are learned on whole turns and the phase
-                // lens's on questions, which is what each is read with live. A
-                // phase level learned from a whole-turn probe would sit on a
-                // different band from the one the live query lands on, and the
-                // max-fusion would then be decided by the mismatch rather than
-                // by the evidence.
-                let sigs: Vec<(u64, Vec<WideQSig>, Vec<WideQSig>)> = {
-                    let sub = self.inner.read().unwrap();
-                    keys.iter()
-                        .filter_map(|(tl, idx)| {
-                            let sid = turn_stream_id(*tl, *idx);
-                            let sig = sub.decoded_wide_sig(sid)?;
-                            let q = sub
-                                .turn_phase_span(sid, Phase::User)
-                                .filter(|r| r.end <= sig.len())
-                                .map(|r| sig[r].to_vec())
-                                .unwrap_or_default();
-                            Some((sid.0, sig.as_ref().clone(), q))
-                        })
-                        .filter(|(_, s, _)| !s.is_empty())
-                        .collect()
-                };
-                for (source, probe, question) in &sigs {
-                    // Stops between probes once a shutdown asks: the warm-up
-                    // runs on a background thread that holds the engine, so it
-                    // must end with its session rather than after its last probe.
-                    if ingest_cancelled() {
-                        return;
-                    }
-                    let _ = self.score_belief_collections(
-                        &schema.system_prompt,
-                        probe,
-                        (!question.is_empty()).then_some(question.as_slice()),
-                        // These probes ARE this collection's corpus — selected by
-                        // its own scope tags — so they are inside the lens, and
-                        // keyed on the turn so re-running this on every load is
-                        // free after the first.
-                        Observe::Yes {
-                            tags: &coll.policy.tags,
-                            source: *source,
-                        },
-                        None,
-                    );
-                    probes_run += 1;
-                }
-                warmed_members += 1;
+            warm.members += plan.len();
+            // Every planned exemplar's whole-turn signature, in plan order — the
+            // order the levels fold them in, which the asymmetric EWMA is not
+            // indifferent to.
+            let probes: Vec<(u64, Arc<Vec<WideQSig>>)> = {
+                let sub = self.inner.read().unwrap();
+                plan.iter()
+                    .flat_map(|(_, keys)| keys.iter())
+                    .filter_map(|(tl, idx)| {
+                        let sid = turn_stream_id(*tl, *idx);
+                        sub.decoded_wide_sig(sid).map(|sig| (sid.0, sig))
+                    })
+                    .filter(|(_, sig)| !sig.is_empty())
+                    .collect()
+            };
+            if probes.is_empty() {
+                continue;
             }
+            // The probes are this collection's corpus, so they teach every
+            // collection whose scope they fall inside — its own, and any other
+            // sharing a scope tag. The same set the per-probe scan over the whole
+            // system prompt taught.
+            let observer = Observe::Yes {
+                tags: &coll.policy.tags,
+                source: 0,
+            };
+            for item in &sp.items {
+                let SystemPromptItem::Collection(taught) = item else {
+                    continue;
+                };
+                if taught.sections.is_empty() || !observer.teaches(&taught.policy.tags) {
+                    continue;
+                }
+                match self.fold_warm_probes(taught, &probes, arena) {
+                    Some(true) => warm.gpu_probes += probes.len(),
+                    Some(false) => {}
+                    // A shutdown asked: the warm-up must end with its session.
+                    None => return warm,
+                }
+            }
+            warm.probes += probes.len();
         }
         tracing::info!(
-            members = warmed_members,
-            probes = probes_run,
+            members = warm.members,
+            probes = warm.probes,
+            gpu_probes = warm.gpu_probes,
             "normalization warm-up: learned per-member hit levels for tag-scoped section \
              collections (0 ⇒ no additive belief-driven collection had a tagged corpus — \
              collection levels stay cold and scores are not comparable across members)"
         );
+        warm
+    }
+
+    /// Fold `probes` into `taught`'s hit levels, in order — each probe's raw
+    /// whole-turn scores against `taught`'s gallery, observed under the probe's
+    /// stream id, exactly as the seal-time scan observes it. `Some(true)` when
+    /// the GPU arena scored them, `Some(false)` for the CPU (no arena, a
+    /// non-additive law the arena does not scan, an empty gallery, or a launch
+    /// that failed), `None` when a shutdown stopped it part-way.
+    fn fold_warm_probes(
+        &self,
+        taught: &SectionCollection,
+        probes: &[(u64, Arc<Vec<WideQSig>>)],
+        arena: Option<&GalleryArena>,
+    ) -> Option<bool> {
+        let n = taught.sections.len();
+        let slot_of = |name: &str| taught.sections.iter().position(|s| s.name == name);
+        let (windows, slots, sids) =
+            self.belief_gallery(&taught.name, &taught.policy.tags, slot_of);
+        if windows.is_empty() {
+            return Some(false);
+        }
+        let weights = &taught.policy.layer_weights;
+        let fusion = taught.policy.scan.fusion;
+        let queries: Vec<&[WideQSig]> = probes.iter().map(|(_, p)| p.as_slice()).collect();
+        let gpu: Option<Vec<Vec<f32>>> = match (arena, fusion) {
+            (Some(arena), FusionMode::Additive) => {
+                let segments = [PagedSegment {
+                    windows: windows
+                        .iter()
+                        .zip(&sids)
+                        .zip(&slots)
+                        .map(|((w, sid), &case)| PagedWindow {
+                            sid: *sid,
+                            fingerprint: sig_fingerprint(w),
+                            turn: w.as_slice(),
+                            start: 0,
+                            end: w.len(),
+                            case,
+                        })
+                        .collect(),
+                    n_cases: n,
+                }];
+                let mut raw = Vec::with_capacity(queries.len());
+                let mut scanned = true;
+                for batch in queries.chunks(WARM_GPU_PROBE_BATCH) {
+                    if ingest_cancelled() {
+                        return None;
+                    }
+                    match arena.scan_weighted(&segments, batch, weights) {
+                        Ok(out) => raw.extend(out),
+                        Err(e) => {
+                            tracing::debug!(
+                                target: "provenance",
+                                "GPU warm-up scan unavailable, using CPU: {e}"
+                            );
+                            scanned = false;
+                            break;
+                        }
+                    }
+                }
+                scanned.then_some(raw)
+            }
+            _ => None,
+        };
+        let on_gpu = gpu.is_some();
+        let raw = match gpu {
+            Some(raw) => raw,
+            None => {
+                let gallery: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
+                let mut raw = Vec::with_capacity(queries.len());
+                for query in &queries {
+                    if ingest_cancelled() {
+                        return None;
+                    }
+                    raw.push(score_slots_fused(
+                        query, &gallery, &slots, n, weights, fusion,
+                    ));
+                }
+                raw
+            }
+        };
+        let scope = ScopeKey::collection(taught.id.raw() as u64, taught.name.as_str());
+        let mut cache = self.normalization.lock().unwrap();
+        for ((source, probe), scores) in probes.iter().zip(&raw) {
+            let pairs: Vec<(ChildKey, f32)> = taught
+                .sections
+                .iter()
+                .zip(scores)
+                .map(|(s, &v)| (ChildKey::named(s.name.clone()), v))
+                .collect();
+            cache.observe(&scope, *source, &pairs, probe.len());
+        }
+        Some(on_gpu)
     }
 
     /// Warm the append-only INGEST groups' per-file / per-cluster hit levels from
@@ -3243,8 +3385,9 @@ impl Conversation {
             .enqueue(WriteJob::WideQSigs { stream_id, payload });
     }
 
-    /// Enqueue a turn's QSA index page, mirroring it in RAM first so this
-    /// session's own projections can borrow the turn immediately.
+    /// Enqueue a turn's or a prompt section's QSA index page under its stream
+    /// id, mirroring it in RAM first so this session's own projections can
+    /// borrow the piece immediately.
     pub fn enqueue_index_page(&self, stream_id: StreamId, payload: Vec<u8>) {
         self.write().set_index_page_blob(stream_id, payload.clone());
         self.writer
@@ -3438,21 +3581,23 @@ impl Conversation {
             .unwrap_or(false)
     }
 
-    /// Snapshot a persisted section stream's `chunks_per_layer` for the
-    /// cold-load path — `manifest.chunks.len() / n_layers` — when the
-    /// stream is known and its chunk count divides evenly, otherwise `None`.
-    pub fn section_stream_layout(&self, stream_id: StreamId, n_layers: usize) -> Option<usize> {
-        drop(self.persistence.lock().unwrap());
-        let substrate = self.read();
-        let entry = substrate.stream_of(stream_id)?;
-        if entry.chunks.is_empty() || n_layers == 0 {
-            return None;
+    /// Count one section-ingest triage's outcome — see [`Self::section_loads`].
+    pub fn record_section_loads(&self, restored: usize, prefilled: usize) {
+        self.section_loads
+            .restored
+            .fetch_add(restored as u64, Ordering::Relaxed);
+        self.section_loads
+            .prefilled
+            .fetch_add(prefilled as u64, Ordering::Relaxed);
+    }
+
+    /// Prompt sections restored from the redo log, and prefilled, since this
+    /// workspace was opened.
+    pub fn section_loads(&self) -> SectionLoads {
+        SectionLoads {
+            restored: self.section_loads.restored.load(Ordering::Relaxed),
+            prefilled: self.section_loads.prefilled.load(Ordering::Relaxed),
         }
-        let total = entry.chunks.len();
-        if total % n_layers != 0 {
-            return None;
-        }
-        Some(total / n_layers)
     }
 
     /// Cold-load a persisted section's chunks back into hot VRAM via

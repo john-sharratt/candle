@@ -9,7 +9,7 @@ use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnHandle, TurnResponse};
 use candle_transformers::models::delta_net::ExportedLayerState;
 
-use crate::persistence::content_hash::{hash_tokens, ContentChain, ContentHash};
+use crate::persistence::content_hash::{hash_tokens, section_stream_id, ContentChain, ContentHash};
 use crate::persistence::record::{BranchCheckpointPayload, SnapshotLayer};
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
@@ -1490,10 +1490,12 @@ impl Sequence {
             chain.prefix()
         };
         // ── Pass 2: triage what's left into two buckets ────────────────
-        //   - Persisted in the redo log under its content-addressed
-        //     stream id → restore from disk (`RestoreSection`).
+        //   - Durable in the redo log under its content-addressed stream id →
+        //     restore from disk (`RestoreSection`). Whether those chunks form a
+        //     whole grid is the scheduler's call, not this one's: it knows how
+        //     many KV backings the session holds, and on a hybrid that is the
+        //     attention layers, not the model's transformer depth.
         //   - Otherwise → ingest with a fresh prefill (`IngestSection`).
-        let n_layers = self.model_core.num_layers;
         let mut to_ingest: Vec<Pending<'_>> = Vec::with_capacity(candidates.len());
         let mut to_restore: Vec<Pending<'_>> = Vec::with_capacity(candidates.len());
         for (section_id, content) in candidates {
@@ -1507,36 +1509,22 @@ impl Sequence {
                 section_hash: hash_tokens(&tokens),
             };
             let debug_name = self.section_debug_name(section_id);
-            // Manifest check.  Only meaningful when the model's
-            // layer count is known; without backings (test harnesses
-            // that don't register a session) we can't compute
-            // `chunks_per_layer`, so we fall through to ingest.
-            let stream_id = crate::persistence::content_hash::section_stream_id(address);
-            if n_layers > 0
-                && self.substrate.section_stream_is_persisted(stream_id)
-                && self
-                    .substrate
-                    .section_stream_layout(stream_id, n_layers)
-                    .is_some()
-            {
-                to_restore.push(Pending {
-                    section_id,
-                    content,
-                    tokens,
-                    token_count,
-                    address,
-                    debug_name,
-                });
-                continue;
-            }
-            to_ingest.push(Pending {
+            let pending = Pending {
                 section_id,
                 content,
                 tokens,
                 token_count,
                 address,
                 debug_name,
-            });
+            };
+            if self
+                .substrate
+                .section_stream_is_persisted(section_stream_id(address))
+            {
+                to_restore.push(pending);
+            } else {
+                to_ingest.push(pending);
+            }
         }
         let total = to_ingest.len() + to_restore.len();
         if total == 0 {
@@ -1554,11 +1542,6 @@ impl Sequence {
         // cheap insurance).
         let mut restore_out: Vec<(SectionId, usize)> = Vec::with_capacity(to_restore.len());
         for item in to_restore.into_iter() {
-            let stream_id = crate::persistence::content_hash::section_stream_id(item.address);
-            let chunks_per_layer = self
-                .substrate
-                .section_stream_layout(stream_id, n_layers)
-                .unwrap_or(0);
             // Capture the content length for the progress callback
             // before `item.tokens` / `item.content` get consumed by
             // the request payload below.
@@ -1569,19 +1552,16 @@ impl Sequence {
                 .send(SchedulerRequest::RestoreSection {
                     conversation: self.substrate.clone(),
                     section_id: item.section_id,
-                    stream_id,
-                    address: item.address,
-                    chunks_per_layer,
+                    stream_id: section_stream_id(item.address),
                     tokens: item.tokens.clone(),
                     response_tx: tx,
                 })
                 .map_err(|_| ConversationError::SchedulerGone)?;
             match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
-                Ok(()) => {
-                    // Block count for diagnostics — the section is
-                    // now a cold-marker; the actual hot grid lands
-                    // when the next projection elevates it.  Use the
-                    // manifest's chunks_per_layer as the count.
+                Ok(chunks_per_layer) => {
+                    // Block count for diagnostics — the section is now a
+                    // cold-marker; the actual hot grid lands when the next
+                    // projection elevates it.
                     restore_out.push((item.section_id, chunks_per_layer));
                     on_section_done(item_section_id, item_content_len);
                 }
@@ -1595,6 +1575,11 @@ impl Sequence {
             }
             let _ = item.token_count;
         }
+
+        // Every section still in `to_ingest` — a refused restore included —
+        // costs a prefill from here on.
+        self.substrate
+            .record_section_loads(restore_out.len(), to_ingest.len());
 
         // Bulk-allocate-then-fire: allocate one scratch slot per
         // section first (cheap, no timeline minting), then fire every

@@ -7,7 +7,9 @@
 //! retrieval target IS the turn, so each candidate turn is its own slot.
 
 use candle_conversation::persistence::content_hash::turn_stream_id;
-use candle_conversation::projection::{Builder, Observe, ProjectionTarget};
+use candle_conversation::projection::{
+    Builder, CollectionWarm, Conversation, Observe, ProjectionTarget, TimelineId,
+};
 use candle_conversation::provenance::{encode_wide_sigs, WideQSig};
 use candle_conversation::substrate::{ProjectionScores, TurnPartWrite};
 use candle_conversation::turn::Role;
@@ -720,6 +722,197 @@ fn score_belief_collections_gpu_matches_cpu() {
             gpu.section(s.id).to_bits(),
             gpu2.section(s.id).to_bits(),
             "cached collection scan must be bit-identical"
+        );
+    }
+}
+
+/// A tool-catalog-shaped collection: one scope tag (`tool`), and members named
+/// by the second tag on each corpus turn — the shape the warm-up plans over.
+const WARM_YAML: &str = r#"
+system_prompt:
+  items:
+    - kind: section
+      id: frame
+      content: "frame"
+    - kind: collection
+      name: tools
+      selection: { kind: top_k, k: 2 }
+      policy:
+        tags: ["tool"]
+      sections:
+        - id: alpha
+          content: "alpha tool"
+        - id: beta
+          content: "beta tool"
+        - id: gamma
+          content: "gamma tool"
+layers:
+  - name: mem
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 40
+    groups:
+      - id: clusters
+        selection: { kind: top_k, k: 2 }
+"#;
+
+/// Record [`WARM_YAML`]'s corpus: two exemplars each for `alpha` and `beta`,
+/// none for `gamma`, windows of different lengths. Returns each exemplar's
+/// stream id and window in the order the warm-up plan folds them — members by
+/// name, then turns by index — which is recording order here.
+fn record_warm_corpus(conv: &Conversation, builder: &Builder) -> Vec<(u64, Vec<WideQSig>)> {
+    let layer = builder.id_for_layer("mem").unwrap();
+    let group = builder.id_for_group("clusters").unwrap();
+    let timeline = TimelineId::from_raw(31).expect("timeline id");
+    conv.register_timeline(timeline, layer, group);
+    let exemplars: [(&str, u64, usize); 4] = [
+        ("alpha", 0xAAAA_AAAA_AAAA_AAAA, 40),
+        ("alpha", 0xABAB_ABAB_ABAB_ABAB, 17),
+        ("beta", 0x5555_5555_5555_5555, 33),
+        ("beta", 0x1234_5678_9ABC_DEF0, 8),
+    ];
+    exemplars
+        .iter()
+        .map(|&(member, fill, len)| {
+            let idx = conv
+                .record_turn(
+                    timeline,
+                    Role::User,
+                    TurnPartWrite {
+                        token_count: 4,
+                        tags: vec!["tool".to_string(), member.to_string()],
+                        ..Default::default()
+                    },
+                    |seqs| Ok(seqs.to_vec()),
+                )
+                .expect("record_turn");
+            let sid = turn_stream_id(timeline.raw(), idx.0);
+            let window: Vec<WideQSig> = (0..len).map(|_| sig(fill)).collect();
+            conv.persist_wide_q_sigs(sid, &encode_wide_sigs(&window))
+                .expect("persist sigs");
+            (sid.0, window)
+        })
+        .collect()
+}
+
+/// **The batched warm-up learns exactly what probe-by-probe scoring learned.**
+///
+/// The warm-up used to run every planned exemplar through the live collection
+/// scan with `Observe::Yes` — about half a second each on the CPU, seven to ten
+/// minutes of load on the tool catalog. It now gathers the exemplars once and
+/// folds their raw scores directly. On the CPU that must be bit-identical: the
+/// same scorer, the same observations, in the same order — so every normalized
+/// score read afterwards is the same bits.
+#[test]
+fn the_batched_collection_warm_up_learns_what_probe_by_probe_scoring_learned() {
+    let builder = Builder::from_yaml(WARM_YAML).unwrap();
+    let sp = &builder.schema().system_prompt;
+    let coll = sp.collection_named("tools").expect("tools collection");
+    let scope = vec!["tool".to_string()];
+    let probe: Vec<WideQSig> = (0..6).map(|_| sig(0xAAAA_AAAA_AAAA_AAAA)).collect();
+
+    // The reference: the warm-up as it used to run.
+    let ref_dir = tempfile::tempdir().unwrap();
+    let reference = open_conversation(ref_dir.path());
+    for (source, window) in record_warm_corpus(&reference, &builder) {
+        let _ = reference.score_belief_collections(
+            sp,
+            &window,
+            None,
+            Observe::Yes {
+                tags: &scope,
+                source,
+            },
+            None,
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let conv = open_conversation(dir.path());
+    record_warm_corpus(&conv, &builder);
+    let cold = conv.score_belief_collections(sp, &probe, None, Observe::No, None);
+    let warm = conv.warm_collection_normalization(builder.schema(), None);
+    assert_eq!(
+        warm,
+        CollectionWarm {
+            members: 2,
+            probes: 4,
+            gpu_probes: 0,
+        },
+        "two members have exemplars; all four were folded, on the CPU"
+    );
+
+    let want = reference.score_belief_collections(sp, &probe, None, Observe::No, None);
+    let got = conv.score_belief_collections(sp, &probe, None, Observe::No, None);
+    for s in &coll.sections {
+        assert_eq!(
+            got.section(s.id).to_bits(),
+            want.section(s.id).to_bits(),
+            "section {}: the batched warm-up learned a different level",
+            s.name
+        );
+    }
+    assert!(
+        coll.sections
+            .iter()
+            .any(|s| cold.section(s.id) != got.section(s.id)),
+        "the warm-up changed no level — the probe scores exactly as it did cold"
+    );
+}
+
+/// The warm-up on the GPU arena learns the CPU's levels. The arena scan equals
+/// the CPU scorer up to fast-math rounding, so the levels agree to the same
+/// tolerance and the ranking they drive is the same. Skips without CUDA.
+#[test]
+fn the_gpu_collection_warm_up_learns_the_cpu_levels() {
+    let device = match candle::Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(_) => return, // no GPU here — skip
+    };
+    let builder = Builder::from_yaml(WARM_YAML).unwrap();
+    let sp = &builder.schema().system_prompt;
+    let coll = sp.collection_named("tools").expect("tools collection");
+    let probe: Vec<WideQSig> = (0..6).map(|_| sig(0xAAAA_AAAA_AAAA_AAAA)).collect();
+
+    let cpu_dir = tempfile::tempdir().unwrap();
+    let cpu = open_conversation(cpu_dir.path());
+    record_warm_corpus(&cpu, &builder);
+    cpu.warm_collection_normalization(builder.schema(), None);
+
+    let gpu_dir = tempfile::tempdir().unwrap();
+    let gpu = open_conversation(gpu_dir.path());
+    record_warm_corpus(&gpu, &builder);
+    let arena = candle_conversation::provenance::GalleryArena::new(&device, 24, 3).unwrap();
+    let warm = gpu.warm_collection_normalization(builder.schema(), Some(&arena));
+    assert_eq!(
+        warm,
+        CollectionWarm {
+            members: 2,
+            probes: 4,
+            gpu_probes: 4,
+        },
+        "every exemplar is scored on the arena"
+    );
+
+    let from_cpu = cpu.score_belief_collections(sp, &probe, None, Observe::No, None);
+    let from_gpu = gpu.score_belief_collections(sp, &probe, None, Observe::No, None);
+    for s in &coll.sections {
+        let c = from_cpu.section(s.id);
+        let g = from_gpu.section(s.id);
+        assert!(
+            (c - g).abs() <= 1e-3 * (1.0 + c.abs().max(g.abs())),
+            "section {}: CPU-warmed {c} vs GPU-warmed {g} exceeds tolerance",
+            s.name
         );
     }
 }

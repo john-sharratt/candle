@@ -25,6 +25,13 @@ pub struct TurnStats {
     /// without a separate prefill-only capture.
     pub prefill_token_count: usize,
 
+    /// Tokens the model attended to by the end of the turn — the projected
+    /// context, this turn's prefill and every token it generated: the decoding
+    /// view's length, read before the view is finalized. A count of tokens,
+    /// unlike [`SequenceStats::active_tokens`], which adds up every layer's
+    /// cache.
+    pub context_tokens: usize,
+
     /// Represents all the stats for the sequence
     pub sequence: SequenceStats,
 }

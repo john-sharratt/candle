@@ -18,7 +18,7 @@ use crate::openai_tools::{wire_function, Call};
 use crate::reasoning_split::{Piece, ReasoningSplit};
 use crate::think_gate::{gate_leading_think, ThinkGate};
 use crate::tool_call_split::{Out, ToolCallSplit};
-use crate::types::{ChatCompletionChunk, ChunkChoice, Delta, DeltaToolCall};
+use crate::types::{ChatCompletionChunk, ChunkChoice, Delta, DeltaToolCall, Usage};
 
 /// How a reply's text is shaped for the client.
 pub struct Framing {
@@ -53,6 +53,8 @@ struct State {
     gate_open: bool,
     reasoning: Option<ReasoningSplit>,
     tools: Option<ToolCallSplit>,
+    /// The reply's token counts, folded over its turns; none until one ends.
+    usage: Option<Usage>,
 }
 
 impl Framer {
@@ -68,6 +70,7 @@ impl Framer {
                 gate_open: false,
                 reasoning: framing.split_reasoning.then(ReasoningSplit::default),
                 tools: framing.tools.map(ToolCallSplit::new),
+                usage: None,
             }),
         }
     }
@@ -113,6 +116,30 @@ impl Framer {
         let calls = self.state.lock().unwrap().calls;
         let reason = if calls > 0 { "tool_calls" } else { "stop" };
         self.chunk(Delta::default(), Some(reason))
+    }
+
+    /// Fold in a finished turn's token counts.
+    pub fn usage(&self, usage: Usage) {
+        let mut s = self.state.lock().unwrap();
+        s.usage = Some(match s.usage {
+            Some(before) => before.then(usage),
+            None => usage,
+        });
+    }
+
+    /// The last chunk before `[DONE]` for a client that asked for usage: no
+    /// choices, just the reply's token counts. `None` when no turn reported
+    /// any — a reply that failed before its turn finished.
+    pub fn usage_chunk(&self) -> Option<anyhow::Result<Event>> {
+        let usage = self.state.lock().unwrap().usage?;
+        Some(encode(&ChatCompletionChunk {
+            id: self.id.clone(),
+            object: "chat.completion.chunk",
+            created: self.created,
+            model: self.model.clone(),
+            choices: Vec::new(),
+            usage: Some(usage),
+        }))
     }
 
     fn frames(&self, s: &mut State, piece: Piece) -> Vec<anyhow::Result<Event>> {
@@ -172,7 +199,7 @@ impl Framer {
     }
 
     fn chunk(&self, delta: Delta, finish_reason: Option<&'static str>) -> anyhow::Result<Event> {
-        let chunk = ChatCompletionChunk {
+        encode(&ChatCompletionChunk {
             id: self.id.clone(),
             object: "chat.completion.chunk",
             created: self.created,
@@ -182,11 +209,16 @@ impl Framer {
                 delta,
                 finish_reason,
             }],
-        };
-        serde_json::to_string(&chunk)
-            .map_err(|e| anyhow::anyhow!(e))
-            .map(|data| Event::default().data(data))
+            usage: None,
+        })
     }
+}
+
+/// One chunk as an SSE `data:` frame.
+fn encode(chunk: &ChatCompletionChunk) -> anyhow::Result<Event> {
+    serde_json::to_string(chunk)
+        .map_err(|e| anyhow::anyhow!(e))
+        .map(|data| Event::default().data(data))
 }
 
 /// **Hold a leading empty think block off the wire** — the daemon's own

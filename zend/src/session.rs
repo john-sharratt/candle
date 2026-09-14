@@ -51,7 +51,7 @@ use crate::think_budget;
 use crate::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, ToolHost,
 };
-use crate::types::{ChatMessage, Role, ToolMode};
+use crate::types::{ChatMessage, Role, ToolMode, Usage};
 
 const PROJECTION_SCHEMA_TEMPLATE: &str = include_str!("prompts/projection.yaml");
 
@@ -114,6 +114,10 @@ pub enum StreamItem {
     /// A tool-execution lifecycle notice (running / done) for the in-flight
     /// tool cards.  Display-only: never part of the collected completion body.
     Tool(ToolStatusOut),
+    /// A finished turn's token counts, which become the reply's `usage`. Sent
+    /// once per turn; a reply the daemon answers over several turns sends one
+    /// for each.
+    Usage(Usage),
 }
 
 /// Process-global monotonic id for projection events, so dot ids stay unique
@@ -2990,6 +2994,10 @@ fn run_inference_stream(
                             prefill_ms = resp.stats.prefill_ms as u32,
                             "turn complete",
                         );
+                        let _ = tx.blocking_send(Ok(StreamItem::Usage(Usage::for_turn(
+                            resp.stats.context_tokens,
+                            resp.stats.tokens_generated,
+                        ))));
                         done_resp = Some(resp);
                     }
                     TurnEvent::Error(e) => {
@@ -3355,6 +3363,10 @@ fn passthrough_turn(
             let _ = tx.blocking_send(Ok(StreamItem::Token(tail.to_string())));
         }
     }
+    let _ = tx.blocking_send(Ok(StreamItem::Usage(Usage::for_turn(
+        resp.stats.context_tokens,
+        resp.stats.tokens_generated,
+    ))));
     if let Err(e) = live.seq.finish_turn(handle, &resp) {
         tracing::warn!(key, "passthrough: finish_turn: {e}");
     }
@@ -4774,6 +4786,17 @@ impl ZendSession {
                     Ok(Some(state)) => {
                         *slot.write().unwrap() = Some(Arc::clone(&state));
                         tracing::info!("inference engine ready");
+                        // The last load step: the tool catalog's normalization hit
+                        // levels, relearned from its corpus in batch on the GPU.
+                        // Before `ready`, so no query is ever scored against cold
+                        // levels — and no live turn competes with the warm-up.
+                        load_progress.set_step(LoadStep::Normalizing);
+                        let schema = state.refresh_builder.schema().clone();
+                        state
+                            .engine
+                            .lock()
+                            .unwrap()
+                            .warm_collection_normalization(&schema);
                         status_tx.send(String::new()).ok();
                         // Substrate persistence runs in the engine's own
                         // thread (`PersistenceThread`) — 5 s tick + per-turn
@@ -4878,14 +4901,8 @@ impl ZendSession {
                             let conv =
                                 { state_for_reconcile.engine.lock().unwrap().conversation() };
                             let schema = state_for_reconcile.refresh_builder.schema().clone();
-                            // The tool catalog's levels first: they are what every
-                            // conversation's tool selection is scored on, they are
-                            // rebuilt empty on each process load, and the dialogue
-                            // replay cannot teach them (its probes are the untagged
-                            // turns; the tool corpus is tagged). Cold, the scores are
-                            // not merely smaller but differently ORDERED, so a tool
-                            // query resolves to the wrong tool.
-                            conv.warm_collection_normalization(&schema);
+                            // The tool catalog's levels are warmed by the load's
+                            // `Normalizing` step, before ready.
                             conv.warm_ingest_normalization(&schema);
                         });
                         *session_for_watcher.reconcile_thread.lock().unwrap() = Some(reconcile);
