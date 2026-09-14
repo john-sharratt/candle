@@ -88,6 +88,16 @@ pub struct ConversationTree {
     /// before the first turn.
     last_turn_day: Option<i32>,
 
+    /// A day boundary a turn crossed that no queued summary covers yet.
+    ///
+    /// The day-boundary trigger fires on one turn only — the first of the new
+    /// day — so when a summary is still running as that turn completes, the
+    /// dedup skips it, and the running summary's completion re-checks only the
+    /// turn count, which may be below its threshold. Held here, the boundary is
+    /// served by the first [`due_summaries`](Self::due_summaries) that can queue
+    /// it, and dropped once no unsummarised turn is left to split.
+    pub(crate) owed_day_boundary: Option<SummarizationReason>,
+
     /// Character beliefs — static declarative propositions injected into
     /// every system prompt regardless of turn type.
     ///
@@ -154,6 +164,7 @@ impl Clone for ConversationTree {
             time_source: Arc::clone(&self.time_source),
             next_seq: self.next_seq,
             last_turn_day: self.last_turn_day,
+            owed_day_boundary: self.owed_day_boundary.clone(),
             beliefs: self.beliefs.clone(),
             plan: self.plan.clone(),
             pending_tasks: Vec::new(),
@@ -191,6 +202,7 @@ impl ConversationTree {
             time_source: Arc::new(WallClockTimeSource::new()),
             next_seq: 1,
             last_turn_day: None,
+            owed_day_boundary: None,
             beliefs: None,
             plan: None,
             pending_tasks: Vec::new(),
@@ -261,6 +273,7 @@ impl ConversationTree {
         self.nodes.clear();
         self.next_seq = 1;
         self.last_turn_day = None;
+        self.owed_day_boundary = None;
         self.plan = None;
         self.pending_tasks.clear();
     }
@@ -400,22 +413,17 @@ impl ConversationTree {
         previous_day: Option<i32>,
         inference: Option<(&Sender<SchedulerRequest>, &Arc<tokenizers::Tokenizer>)>,
     ) {
-        let mut reason = self.turn_count_reason();
-
         if self.config.summarize_on_day_boundary {
             if let Some(prev) = previous_day {
                 if completed_turn.day > prev {
-                    reason = Some(SummarizationReason::DayBoundary {
+                    self.owed_day_boundary = Some(SummarizationReason::DayBoundary {
                         previous_day: prev,
                         new_day: completed_turn.day,
                     });
                 }
             }
         }
-
-        if let Some(reason) = reason {
-            self.launch_turn_summary(reason, inference);
-        }
+        self.launch_due_summaries(inference);
     }
 
     /// The count-based trigger: `Some` once `summarize_every` turns have
@@ -429,17 +437,47 @@ impl ConversationTree {
             .then_some(SummarizationReason::TurnCountReached { count })
     }
 
-    /// Launch a turn-window summarization, unless a task already in flight
-    /// covers this window.
-    fn launch_turn_summary(
+    /// Launch every summarization [`due_summaries`](Self::due_summaries)
+    /// returns.
+    fn launch_due_summaries(
         &mut self,
-        reason: SummarizationReason,
         inference: Option<(&Sender<SchedulerRequest>, &Arc<tokenizers::Tokenizer>)>,
     ) {
+        for snapshot in self.due_summaries() {
+            self.run_summarize(snapshot, inference);
+        }
+    }
+
+    /// The summarizations due now, as snapshots ready to launch: the
+    /// segment-of-segments summary, then the turn-window summary. Each is
+    /// skipped while a task already in flight covers its window.
+    ///
+    /// Handing out a day-boundary snapshot clears
+    /// [`owed_day_boundary`](Self::owed_day_boundary): the boundary is owed
+    /// until a summary is queued for it.
+    pub(crate) fn due_summaries(&mut self) -> Vec<SummarizationSnapshot> {
+        let mut due = Vec::new();
+        due.extend(self.due_segment_summary());
+        due.extend(self.due_turn_summary());
+        due
+    }
+
+    /// The turn-window summary, if one is due — an owed day boundary first,
+    /// else the turn count.
+    fn due_turn_summary(&mut self) -> Option<SummarizationSnapshot> {
+        // Nothing unsummarised is left to split, so no boundary is owed either.
+        if self.turns_since_last_summarize() == 0 {
+            self.owed_day_boundary = None;
+            return None;
+        }
+        let reason = self
+            .owed_day_boundary
+            .clone()
+            .or_else(|| self.turn_count_reason())?;
         // Dedup: skip if any pending task already covers turns in this
-        // unsummarized window. `last_summarize_seq()` is the boundary
-        // — any task whose relevant range ends beyond it is covering
-        // the same window we are about to queue.
+        // unsummarized window. `last_summarize_seq()` is the boundary — any
+        // task whose relevant range ends beyond it is covering the same window
+        // we are about to queue. An owed boundary stays owed until it lands.
         let last_seg_seq = self.last_summarize_seq().unwrap_or(0);
         let already_pending = self.pending_tasks.iter().any(|t| {
             t.relevant_turns()
@@ -447,10 +485,10 @@ impl ConversationTree {
         });
         if already_pending {
             tracing::debug!("summarization task already pending for this window — skipping");
-            return;
+            return None;
         }
-        let snapshot = self.build_snapshot(reason);
-        self.run_summarize(snapshot, inference);
+        self.owed_day_boundary = None;
+        Some(self.build_snapshot(reason))
     }
 
     fn build_snapshot(&self, reason: SummarizationReason) -> SummarizationSnapshot {
@@ -588,14 +626,15 @@ impl ConversationTree {
     ///
     /// A task still running stays queued and is polled again at the next turn
     /// boundary — the turn never waits on it. A finished summary is applied as
-    /// soon as it is seen, and each application re-runs both triggers:
+    /// soon as it is seen, and each application re-runs the triggers
+    /// ([`due_summaries`](Self::due_summaries)):
     ///
-    /// - **turn count** — turns that completed while the summary was in flight
-    ///   were skipped by the dedup (the in-flight task covered the window), so
-    ///   the count is re-checked against the new segment boundary here instead
-    ///   of waiting for the next turn to complete;
     /// - **segment count** — the new segment may complete the set that the
-    ///   recursive segment-of-segments summarization compresses.
+    ///   recursive segment-of-segments summarization compresses;
+    /// - **turn window** — turns that completed while the summary was in flight
+    ///   were skipped by the dedup (the in-flight task covered the window), so
+    ///   an owed day boundary, else the turn count, is re-checked against the
+    ///   new segment boundary here instead of waiting for the next turn.
     ///
     /// Tasks those triggers launch are polled in the same call, which returns
     /// once a pass applies nothing.
@@ -624,10 +663,7 @@ impl ConversationTree {
             for patch in ready {
                 self.apply_patch(patch);
                 applied += 1;
-                if let Some(reason) = self.turn_count_reason() {
-                    self.launch_turn_summary(reason, inference);
-                }
-                self.check_and_trigger_segment_summarize(inference);
+                self.launch_due_summaries(inference);
             }
         }
     }
@@ -637,22 +673,11 @@ impl ConversationTree {
         self.pending_tasks.len()
     }
 
-    /// Check whether enough top-level `Segment` nodes have accumulated to
-    /// trigger a recursive (segment-of-segments) summarization.
-    ///
-    /// Called by [`poll_tasks`](Self::poll_tasks) immediately after
-    /// `apply_patch` inserts a new segment. If the threshold is met a new
-    /// [`SummarizationTask`] is pushed onto `pending_tasks`, where the same
-    /// poll picks it up.
-    pub(crate) fn check_and_trigger_segment_summarize(
-        &mut self,
-        inference: Option<(
-            &crossbeam::channel::Sender<SchedulerRequest>,
-            &std::sync::Arc<tokenizers::Tokenizer>,
-        )>,
-    ) {
+    /// The recursive (segment-of-segments) summary, if enough top-level
+    /// `Segment` nodes have accumulated and no task in flight covers them.
+    fn due_segment_summary(&self) -> Option<SummarizationSnapshot> {
         if self.config.segment_summarize_every == 0 {
-            return;
+            return None;
         }
         let seg_count = self
             .nodes
@@ -660,10 +685,13 @@ impl ConversationTree {
             .filter(|n| n.as_segment().is_some())
             .count() as u32;
         if seg_count < self.config.segment_summarize_every {
-            return;
+            return None;
         }
-        // Dedup: skip if a pending task already covers the max end_turn.seq
-        // of the current top-level segments.
+        // Dedup: skip if a task in flight already summarises the segmented
+        // history — its range starts inside it and reaches the newest segment.
+        // A turn-window task is not coverage: it starts after the newest
+        // segment, and counting it starved this summary whenever turns arrived
+        // faster than summaries finished.
         let max_end_seq = self
             .nodes
             .iter()
@@ -673,15 +701,17 @@ impl ConversationTree {
             .unwrap_or(0);
         let already_pending = self.pending_tasks.iter().any(|t| {
             t.relevant_turns()
-                .is_some_and(|r| r.end().seq >= max_end_seq)
+                .is_some_and(|r| r.start().seq <= max_end_seq && r.end().seq >= max_end_seq)
         });
         if already_pending {
             tracing::debug!("segment-level summarization task already pending — skipping");
-            return;
+            return None;
         }
-        let snapshot = self
-            .build_segment_snapshot(SummarizationReason::SegmentCountReached { count: seg_count });
-        self.run_summarize(snapshot, inference);
+        Some(
+            self.build_segment_snapshot(SummarizationReason::SegmentCountReached {
+                count: seg_count,
+            }),
+        )
     }
 
     // ── Fork / Patch ───────────────────────────────────────────────────
@@ -710,9 +740,10 @@ impl ConversationTree {
     ///
     /// For each [`ConversationNode::Segment`] in the patch:
     ///
-    /// 1. **Duplicate guard** — if any existing segment already has an
-    ///    `end_turn.seq ≥` the incoming segment's, the patch node is silently
-    ///    discarded.
+    /// 1. **Duplicate guard** — if an existing segment already spans the
+    ///    incoming segment's whole range (`start_turn.seq ≤` and
+    ///    `end_turn.seq ≥` it), the patch node is silently discarded. A segment
+    ///    that spans existing ones becomes their parent instead.
     /// 2. **Parent promotion** — the turn nodes whose `seq` falls in
     ///    `[start_turn.seq, end_turn.seq]` are extracted from the flat `nodes`
     ///    vec and stored as the segment's `children`, making the segment the
@@ -731,13 +762,22 @@ impl ConversationTree {
                     let start_seq = seg.0.segment_id.start_turn.seq;
                     let end_seq = seg.0.segment_id.end_turn.seq;
 
-                    // Idempotency: discard if this window is already covered.
+                    // Idempotency: discard if an existing segment already spans
+                    // this whole window — the same window delivered twice, or a
+                    // level-1 window after its level-2 parent. Reaching the same
+                    // END is not enough: a segment-of-segments summary always
+                    // ends where the newest segment it absorbs ends, and treating
+                    // that as a duplicate dropped every such parent and relaunched
+                    // it forever.
                     let already_covered = self
                         .nodes
                         .iter()
                         .rev()
                         .filter_map(|n| n.as_segment())
-                        .any(|s| s.0.segment_id.end_turn.seq >= end_seq);
+                        .any(|s| {
+                            s.0.segment_id.start_turn.seq <= start_seq
+                                && s.0.segment_id.end_turn.seq >= end_seq
+                        });
                     if already_covered {
                         tracing::debug!(
                             end_seq,
