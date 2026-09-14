@@ -12481,6 +12481,53 @@ mod tests {
         );
     }
 
+    /// The errored-prefill counterpart to the dropped-handle wind-down: a turn
+    /// view whose prefill FAILED (its error surfaced and it was drained from
+    /// `active_prefills`) must be let go, or the parent's next submit is refused
+    /// with `TurnInFlight` forever — a character alive and scheduled that never
+    /// acts again after one faulted wave. This is the regression for that wedge.
+    #[test]
+    fn a_failed_prefill_view_is_reclaimed_so_the_parent_is_submittable() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let view = create_scratch_slot(&mut scheduler, &conversation);
+
+        // The view was registered before prefill; the prefill then faulted and
+        // was drained, which reclaims the view.
+        scheduler.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: parent,
+                original_borrowed: BlockCount(0),
+                turn_start_parent_blocks: 0,
+                question_tokens: 0,
+            },
+        );
+        scheduler.reclaim_failed_view(view);
+        assert!(
+            !scheduler.turn_views.contains_key(&view),
+            "the failed view must be let go, not left dangling under its parent"
+        );
+
+        // The parent is submittable again — not the permanent TurnInFlight the
+        // dangling view produced.
+        let (event_tx, event_rx) = flume::unbounded();
+        assert!(scheduler.handle_request(raw_submit_turn(parent, event_tx)));
+        assert!(
+            !matches!(
+                event_rx.try_recv(),
+                Ok(TurnEvent::Error(ConversationError::TurnInFlight { .. }))
+            ),
+            "a submit after a failed view is reclaimed must not be refused"
+        );
+        assert_eq!(
+            scheduler.prefill_queue.len(),
+            1,
+            "the new turn must proceed into prefill"
+        );
+    }
+
     /// The turn's own tokens, walked through the one funnel: exactly two cuts,
     /// at the turn's first token and at the token after `</think>`.
     ///

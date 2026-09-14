@@ -1531,9 +1531,11 @@ impl InferenceState {
                             // share this submission's pinned selection, which is
                             // correct precisely because a group is one tool's.
                             CalibCase::Questions { questions, .. } => {
-                                let group: Vec<(String, Vec<String>)> = questions
+                                // A question exemplar's assistant half is empty —
+                                // the routing happens on the question.
+                                let group: Vec<(String, String, Vec<String>)> = questions
                                     .iter()
-                                    .map(|q| (q.clone(), opts.tags.clone()))
+                                    .map(|q| (q.clone(), String::new(), opts.tags.clone()))
                                     .collect();
                                 (
                                     conv.submit_prefilled_turn_group(

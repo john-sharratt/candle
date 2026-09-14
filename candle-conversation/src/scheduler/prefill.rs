@@ -2502,6 +2502,30 @@ impl Scheduler {
     /// Drain finished or errored entries from `active_prefills`. Errored
     /// entries emit `TurnEvent::Error`; finished entries are passed to
     /// `finalise_prefill` (which samples the first token and inserts into
+    /// Let go of a carved turn view whose prefill failed before it could become
+    /// a decode, so its parent is submittable again.
+    ///
+    /// Only a scheduler-owned view is touched: a raw prefill (summariser, RULER)
+    /// has no `turn_views` entry and owns its own slot, which its caller resets —
+    /// so a missing entry means there is nothing here to reclaim. The view's K/V
+    /// is **discarded, never moved onto the parent**: the prefill faulted, so its
+    /// tail is partial or garbage, and the parent still holds the sealed state it
+    /// had before the turn (its caller's `abort_turn` resets it besides). This is
+    /// the same standalone view free the reprojection path performs; the model's
+    /// `release_sequence` is a no-op for this backend, so freeing the session
+    /// slot is the whole teardown.
+    pub(super) fn reclaim_failed_view(&mut self, view_id: SequenceId) {
+        if self.turn_views.remove(&view_id).is_none() {
+            return;
+        }
+        self.active_decodes.remove(&view_id);
+        self.sampling_states.remove(&view_id);
+        self.slot_tokens.remove(&view_id);
+        if let Err(e) = self.session.free_sequence(view_id.0) {
+            tracing::warn!("reclaiming failed prefill view {view_id}: {e}");
+        }
+    }
+
     /// `active_decodes`).
     pub(super) fn promote_finished_prefills_to_decodes(&mut self) {
         // Use swap_remove for efficiency; iterate from the back.
@@ -2555,6 +2579,20 @@ impl Scheduler {
             }
             if let Some(e) = error {
                 let _ = work.event_tx.send(TurnEvent::Error(e));
+                // **Reclaim the carved view, or the sequence wedges forever.**
+                //
+                // The view was registered in `turn_views` before the prefill ran
+                // and never reached `active_decodes`, so `cleanup_finished` will
+                // not finalize it. A view left dangling under its parent makes the
+                // parent's next `SubmitTurn` wind-down refuse with `TurnInFlight`
+                // — it sees a view that is neither a droppable live decode nor a
+                // finished one, treats it as "still prefilling", and refuses every
+                // turn after. That is a character alive and scheduled that never
+                // acts again after one faulted wave (observed live: a wave-group
+                // forward failure wedging one member permanently while the rest
+                // recovered). Every prefill-error path drains through here, so
+                // this is the one place that has to let go.
+                self.reclaim_failed_view(work.sequence_id);
                 continue;
             }
             let logits = match final_logits {

@@ -2251,7 +2251,8 @@ impl Sequence {
     /// block range.
     ///
     /// The batched form of [`Self::submit_prefilled_turn`]. Each case is a
-    /// question exemplar — a user turn followed by an empty assistant turn — and
+    /// prefilled turn — a user half and an assistant half, either of which may
+    /// be empty — and
     /// they are laid end to end by [`crate::stuffed_grid`], every case starting
     /// on a block boundary so no two share a block and no exemplar's `sign(Q)`
     /// window carries its neighbour's tokens.
@@ -2274,12 +2275,22 @@ impl Sequence {
     /// `tags` is required per case rather than defaulted for the same reason: a
     /// case with empty tags falls through to the group's selection.
     ///
-    /// `cases` pair the user question with that case's tags. Returns the
-    /// streaming handle plus, for each sealed region, the index of the case it
-    /// came from — empty cases claim no region, so the two are not 1:1.
+    /// Each case is `(user, assistant, tags)`: the user half, the assistant half
+    /// (empty for a question exemplar, the prefilled body for a dream line), and
+    /// that case's tags. Returns the streaming handle plus, for each sealed
+    /// region, the index of the case it came from — a case with no tokens on
+    /// either half claims no region, so the two are not 1:1.
+    ///
+    /// **Every case is masked to itself.** A stuffed grid is block-diagonal, not
+    /// causal across cases: region N does not attend to regions before it, which
+    /// is exactly what keeps one exemplar's `sign(Q)` window off its neighbour's
+    /// tokens. A caller wanting each turn to see the ones before it (a running
+    /// dialogue) must submit them one at a time; a caller whose cases are
+    /// independent memories signed against the substrate (calibration exemplars,
+    /// the lines of a dream) gets them all in one forward.
     pub fn submit_prefilled_turn_group(
         &mut self,
-        cases: &[(String, Vec<String>)],
+        cases: &[(String, String, Vec<String>)],
         selection: SelectionState,
         pad_token: u32,
     ) -> crate::Result<(TurnHandle, Vec<usize>)> {
@@ -2301,10 +2312,14 @@ impl Sequence {
         let assistant_end = self.config.dialect.assistant_end;
 
         let mut grids: Vec<CaseGrid> = Vec::with_capacity(cases.len());
-        for (question, _) in cases {
+        for (question, answer, _) in cases {
             let user_prefix = format!("{head}{question}");
             let assistant_head = format!("{user_prefix}{user_end}{assistant_start}");
-            let whole = format!("{assistant_head}{assistant_end}");
+            // The assistant body sits between its opener and closer. Empty for a
+            // question exemplar (the routing is on the question); the prefilled
+            // line for a dream. Its token span is measured below as the run past
+            // `assistant_head`.
+            let whole = format!("{assistant_head}{answer}{assistant_end}");
             // Tokenised as cumulative prefixes of ONE string, so a tokenizer
             // that merges across a join reports bounds on the same ids the model
             // will see. Measuring the pieces separately and summing would drift
@@ -2345,7 +2360,7 @@ impl Sequence {
         let head_len = self.tokenize(&head)?.len() as u32;
         let mut turns: Vec<CarvedTurn> = Vec::with_capacity(grid.regions.len());
         for (region, &src) in grid.regions.iter().zip(&sources) {
-            let (question, tags) = &cases[src];
+            let (question, answer, tags) = &cases[src];
             turns.push(CarvedTurn {
                 region: *region,
                 content: TurnContent {
@@ -2357,6 +2372,7 @@ impl Sequence {
                         assistant_start_len,
                         trailing_len,
                         question.clone(),
+                        answer.clone(),
                     ),
                     // Every token the region's blocks hold, padding included:
                     // the seal persists the whole block range, and `token_ids`
