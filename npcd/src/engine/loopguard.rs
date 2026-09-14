@@ -18,6 +18,7 @@
 //!     recomputed one — installed and decoded, it is coherent and carries no
 //!     collapse),
 //!   - context breadth (a narrow window vs the full ~20k-token history).
+//!
 //! Under the real tool grammar and the real sampler the loop reproduces from any
 //! of those. So it is a **behavioural attractor of constrained act-selection in a
 //! non-resolving situation**, not corruption in anything stored — which is why
@@ -43,17 +44,17 @@
 //!    few same-act intents catches a near-verbatim loop the cooldown alone can
 //!    ride — an A-B-A-B cycle, or paraphrase repeats of the same act name. On
 //!    detection it fires a graduated breaker, three parts covering each other:
-//!      a. a **nudge** into the next turn's perception ("you seem stuck, try
-//!         something different"). Weak alone — the model demonstrably reads such
-//!         self-nudges and repeats anyway — so it only *explains* the redirect;
-//!      b. an **adaptive cooldown** on the offending act for `repetitions + 1`
-//!         turns. This is the *guarantee*: whatever the model concludes, it
-//!         cannot re-emit the act;
-//!      c. a **forced single reflect** next turn — everything but `reflect` (and
-//!         `move_to`, so the grammar is never empty) is struck. `reflect` is a
-//!         genuinely different activity (the entropy channel), and when the
-//!         character returns the offending act is still cooled, so it must land
-//!         somewhere new. Single-shot, so it cannot become a reflect loop itself.
+//!    a. a **nudge** into the next turn's perception ("you seem stuck, try
+//!    something different"). Weak alone — the model demonstrably reads such
+//!    self-nudges and repeats anyway — so it only *explains* the redirect;
+//!    b. an **adaptive cooldown** on the offending act for `repetitions + 1`
+//!    turns. This is the *guarantee*: whatever the model concludes, it
+//!    cannot re-emit the act;
+//!    c. a **forced single reflect** next turn — everything but `reflect` (and
+//!    `move_to`, so the grammar is never empty) is struck. `reflect` is a
+//!    genuinely different activity (the entropy channel), and when the
+//!    character returns the offending act is still cooled, so it must land
+//!    somewhere new. Single-shot, so it cannot become a reflect loop itself.
 //!    Per-act opt-out: acts the game *wants* repeated (`act` — a fight needs
 //!    repetition) skip the whole guard, paced only by `cooldown`'s fight rate.
 //!
