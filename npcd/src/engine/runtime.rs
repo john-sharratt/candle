@@ -59,6 +59,7 @@ use crate::engine::ingest;
 use crate::engine::life;
 use crate::engine::loading::{LoadProgress, LoadStep};
 use crate::engine::mind::{frame_fingerprint, Minds, Projected};
+use crate::engine::mission::bank::Facts;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::reflect;
 use crate::engine::schema;
@@ -805,6 +806,34 @@ impl Runtime {
                 ),
             ),
         })
+    }
+
+    /// Make sure a character always has something asked of it.
+    ///
+    /// If it has a body and no open mission, it collects one — a mission lodged
+    /// for it if any waits, otherwise a routine drawn from the bank against who
+    /// and what is around. This is what keeps the cast **continuously** on
+    /// missions with nobody lodging one for each: a character that finishes and
+    /// reports is given the next on its following quiet turn. One already on a
+    /// mission is left as it is.
+    pub fn ensure_mission(&self, npc_id: u64) {
+        let Some((hosted, body)) = self.body_of(npc_id) else {
+            return;
+        };
+        let me = hosted
+            .read(|w| w.actor(&body).map(|actor| actor.name.clone()))
+            .unwrap_or_default();
+        hosted.with_sim(|s| {
+            if s.missions.is_on_mission(&body) {
+                return;
+            }
+            let (makers, records) = s.mission_material(&me);
+            let facts = Facts {
+                makers: &makers,
+                records: &records,
+            };
+            s.missions.collect(&body, &facts);
+        });
     }
 
     /// Take a character's body away, and let it settle back to reacting.
@@ -3299,6 +3328,11 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
             // clock — and a character nobody is talking to is handed it
             // again on every tick.
             if rt.scheduler.nudge_due(id, world_ms, IDLE_AFTER_MS) {
+                // A character with nothing in hand is given something before it
+                // is told its standing task — so the standing task it then reads
+                // is a mission to carry out, not "nothing has been asked of you".
+                // This is what makes the cast pick missions up on their own.
+                rt.ensure_mission(id);
                 if let Some(text) = rt.nudge_for(id) {
                     rt.scheduler.deliver(
                         id,

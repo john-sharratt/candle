@@ -4,13 +4,16 @@
 //!
 //! # Two homes, on purpose
 //!
-//! Collecting a mission and reporting on it are `AtPart` acts on the command
-//! desk (`order-table`): a mission is *given* and *answered for* in one place,
-//! which is what makes the desk a place a character returns to rather than a
-//! menu it carries. Recording progress — ticking a step off, adding one the
-//! mission did not foresee — is [`Availability::OnMission`], carried with the
-//! mission rather than with a place, because the moment a step is finished is
-//! wherever the work that finished it happened, not back at the desk.
+//! Collecting a mission deliberately is an `AtPart` act on the command desk
+//! (`order-table`) — where an operator-lodged mission is picked up. Everything
+//! else a character does with a mission is [`Availability::OnMission`], carried
+//! with the mission rather than with a place: recording progress and reporting
+//! how it went both happen wherever the character is, because the moment a step
+//! is finished — or the whole thing is — is wherever the work that finished it
+//! happened, not back at a desk. Requiring a walk back to report would strand a
+//! character that could not find its way, and the point is that the loop closes
+//! on its own. (Most missions never need the desk act at all: the engine hands
+//! an idle character its next mission itself — see `Runtime::ensure_mission`.)
 //!
 //! The rich shape of a mission (the ask, the steps, the answer, the pass/fail
 //! report) lives in [`crate::engine::mission`]; whose it is lives in
@@ -39,32 +42,6 @@ macro_rules! desk {
             examples: &[Example {
                 situation: $situation,
                 call: "{}",
-                because: $because,
-            }],
-        }
-    };
-}
-
-/// An act taken at the command desk that names one thing.
-macro_rules! desk_on {
-    ($name:literal, $desc:literal, $arg:literal, $argdesc:literal,
-     $situation:literal, $call:literal, $because:literal) => {
-        Tool {
-            name: $name,
-            at: COMMAND_DESK,
-            category: "Command",
-            plane: Plane::World,
-            availability: Availability::AtPart,
-            description: $desc,
-            params: &[Param {
-                name: $arg,
-                ty: "string",
-                required: true,
-                description: $argdesc,
-            }],
-            examples: &[Example {
-                situation: $situation,
-                call: $call,
                 because: $because,
             }],
         }
@@ -107,28 +84,28 @@ pub const COLLECT_MISSION: Tool = desk!(
      standing idle where the work is."
 );
 
-pub const REPORT_DONE: Tool = desk_on!(
+pub const REPORT_DONE: Tool = on_mission!(
     "report_done",
-    "Report the mission you were carrying as done, back at the desk, and say what you found or \
-     concluded. This closes it and is how anyone else learns the answer.",
+    "Report the mission you were carrying as done, and say what you found or concluded. This \
+     closes it and files your answer, which is how anyone else learns what came of it. Do this \
+     once every step is finished.",
     "account",
     "What you found, made, or concluded — the answer the mission was for.",
-    "Every step of your mission is done and you have come back to the desk to say so.",
+    "Every step of your mission is done and you are ready to say what came of it.",
     r#"{"account":"the record holds, except the eastern date, which cannot be reconciled with the charge"}"#,
     "Work nobody reported is work nobody can build on, and the answer is the point of having gone."
 );
 
-pub const REPORT_STUCK: Tool = desk_on!(
+pub const REPORT_STUCK: Tool = on_mission!(
     "report_stuck",
-    "Report back at the desk that the mission cannot be finished, and say why. This closes it as \
-     not done — an honest account of what stopped you, not a thing to be ashamed of.",
+    "Report that the mission cannot be finished, and say why. This closes it as not done — an \
+     honest account of what stopped you, not a thing to be ashamed of.",
     "why",
     "What stopped you — what you tried, and where it would not go.",
-    "You have carried a mission as far as it will go and it will not finish; you are back at the \
-     desk to say so.",
+    "You have carried a mission as far as it will go and it will not finish.",
     r#"{"why":"the record it asked me to read is not filed anywhere I could find, and nobody here has seen it"}"#,
     "A mission that cannot be done is worth knowing about; a character that abandons one silently \
-     leaves the desk believing it is still in hand."
+     leaves it believed to be still in hand."
 );
 
 pub const STEP_DONE: Tool = on_mission!(

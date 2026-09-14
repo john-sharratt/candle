@@ -110,13 +110,7 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                 .read(|w| w.actor(body).map(|actor| actor.name.clone()))
                 .unwrap_or_default();
             hosted.with_sim(|s| {
-                let makers: Vec<String> = s
-                    .contacts_roster()
-                    .into_iter()
-                    .filter(|name| *name != me)
-                    .collect();
-                let mut records = s.record.names_of(Kind::Era);
-                records.extend(s.record.names_of(Kind::Story));
+                let (makers, records) = s.mission_material(&me);
                 let facts = Facts {
                     makers: &makers,
                     records: &records,

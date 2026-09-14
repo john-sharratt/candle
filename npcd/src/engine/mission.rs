@@ -229,9 +229,10 @@ impl Mission {
                 out.push('.');
             }
             // Steps existed and are all done: the work is finished, so the one
-            // thing left is to go and say so.
+            // thing left is to say so — with `report_done` (or `report_stuck`).
             None if !self.todo.is_empty() => out.push_str(
-                "\nEvery step is done. Go back to the command desk and report how it went.",
+                "\nEvery step is done. Report how it went now with `report_done` \
+                 (or `report_stuck` if it could not be finished).",
             ),
             // A mission with no steps at all is carried on its ask alone.
             None => {}
@@ -613,12 +614,12 @@ mod tests {
         assert!(m
             .standing_text()
             .ends_with("The next thing to do is: step two."));
-        // Every step done points home to the desk.
+        // Every step done points at reporting it.
         m.check_off("step two");
         assert_eq!(m.next_step(), None);
         assert!(m
             .standing_text()
-            .ends_with("Go back to the command desk and report how it went."));
+            .contains("Report how it went now with `report_done`"));
     }
 
     #[test]

@@ -493,6 +493,22 @@ impl Sim {
         self.roster.clone()
     }
 
+    /// The material a random routine is built around, for a body named `me`: the
+    /// other makers to visit and the records to consult. `me` is left out of the
+    /// makers so a routine never sends a character to visit itself. Shared by the
+    /// desk's `collect_mission` and the engine's idle auto-assignment so the two
+    /// draw from the same world.
+    pub fn mission_material(&self, me: &str) -> (Vec<String>, Vec<String>) {
+        let makers = self
+            .contacts_roster()
+            .into_iter()
+            .filter(|name| name != me)
+            .collect();
+        let mut records = self.record.names_of(record::Kind::Era);
+        records.extend(self.record.names_of(record::Kind::Story));
+        (makers, records)
+    }
+
     /// How many messages are waiting for somebody across every thread.
     pub fn messages_waiting(&self, me: &str) -> usize {
         self.threads.waiting_for(me)
