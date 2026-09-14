@@ -110,7 +110,7 @@ impl Telemetry {
         );
         // **Say so when this is not the repository's checkpoint.** An operator
         // reading a console that names a model they did not expect should learn
-        // why from the log rather than by going looking for a build script. The
+        // why from the log rather than by going looking for an override file. The
         // line is absent on a machine with no `models.override.yaml`, which is
         // the ordinary case.
         let overridden = candle_conversation::models::overrides::active_keys();

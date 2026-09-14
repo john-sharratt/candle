@@ -26,9 +26,10 @@
 //! `cargo:rerun-if-changed` on it, and cargo treats a watched path that does not
 //! exist as stale on every invocation — so on every machine without an override
 //! every cargo command reran the script and recompiled this crate, 70–80 s in
-//! release. A binary copied to another machine reads the path it was built at,
-//! finds nothing, and runs the repository's own checkpoints: the same answer a
-//! clone without the file gets.
+//! release. A binary copied to another machine reads the path it was built at:
+//! where nothing is there it runs the repository's own checkpoints, the same
+//! answer a clone without the file gets; where the path cannot even be checked
+//! (another user's home directory), it stops rather than guess.
 //!
 //! # Two sections, because there are two kinds of coordinate
 //!
@@ -81,15 +82,18 @@ fn document_text() -> &'static str {
 
 /// The document at `path`, or an empty one when there is no file there.
 ///
-/// A file that exists and cannot be read panics rather than reading as empty,
-/// for the reason [`document`] gives: an override that is silently not applied
-/// loads the wrong model.
+/// Any other failure panics rather than reading as empty — a file that is there
+/// and unreadable, or a path that cannot be checked at all — for the reason
+/// [`document`] gives: an override that is silently not applied loads the wrong
+/// model.
 fn read_document(path: &Path) -> String {
     match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
         Err(e) => panic!(
-            "models.override.yaml exists at {} but cannot be read: {e}",
+            "models.override.yaml at {} could not be read: {e}. Fix its permissions \
+             or remove it; an override that cannot be read is not applied, and \
+             running the wrong model silently is worse than failing here.",
             path.display()
         ),
     }
@@ -227,7 +231,7 @@ pub fn checkpoint(key: &str, default: Checkpoint) -> Checkpoint {
 ///
 /// For logging at startup. An operator looking at a console that names a model
 /// they did not expect should be able to find out in one line whether an
-/// override did it, rather than reading a build script.
+/// override did it, rather than going looking for the file.
 pub fn active_keys() -> Vec<String> {
     let d = document();
     let mut k: Vec<String> = d

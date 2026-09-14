@@ -89,7 +89,7 @@ fn merge(o: &model_overrides::ModelOverride, mut spec: ModelSpec) -> ModelSpec {
 /// Which presets and checkpoints this machine overrides, for startup logging.
 ///
 /// An operator reading a console that names a model they did not expect should
-/// learn why from one line, rather than by going looking for a build script.
+/// learn why from one line, rather than by going looking for an override file.
 pub fn active_keys() -> Vec<String> {
     model_overrides::active_keys()
 }

@@ -9028,26 +9028,28 @@ impl Scheduler {
 
     /// Tokens one prefill forward may carry — see [`admit::prefill_pass_budget`].
     ///
-    /// The model's cap is priced against the tier budget the fill published, so
-    /// a forward that composes no wave of its own — a raw prefill, a branch
-    /// checkpoint, a reprojection's gap-fill — is still sized to ground the tier
-    /// can be placed on. It is floored at [`prefill::PREFILL_MIN_ADVANCE`]: a
-    /// budget that reads zero between fills still leaves a forward its least
-    /// chunk, and the placement is the judge of that chunk. The grouped paths
-    /// bound their rows by the same budget against the head they actually carry
+    /// The model's cap is priced against the tier budget the last fill
+    /// published, so a forward that composes no wave of its own — a raw
+    /// prefill, a branch checkpoint, a reprojection's gap-fill — is sized
+    /// against the tier as the scheduler last measured it, not by the target
+    /// alone. It is floored at [`prefill::PREFILL_MIN_ADVANCE`], so a budget
+    /// that reads zero between fills still leaves a forward its least chunk,
+    /// and capped again by what the KV side can back, which the floor never
+    /// buys past. The grouped paths bound each member's advance by this and
+    /// their rows by the same budget against the head they actually carry
     /// (`build_section_batch`'s `rows_left`, `form_wave_group`'s
-    /// `prefill_rows`), which never exceeds this.
+    /// `prefill_rows`).
     ///
     /// Read per forward rather than once at construction: the budget and the KV
     /// side's room move with every claim.
     fn prefill_pass_budget(&self) -> usize {
+        let dtype = self.session.activation_dtype();
+        let tier = self.session.tier_budget_bytes();
         admit::prefill_pass_budget(
             self.max_prefill_pass_tokens,
-            self.model.prefill_width_cap(
-                self.session.activation_dtype(),
-                WaveWidth::decode(0),
-                self.session.tier_budget_bytes(),
-            ),
+            self.model
+                .prefill_width_cap(dtype, WaveWidth::decode(0), tier),
+            self.model.kv_width_cap(dtype),
             prefill::PREFILL_MIN_ADVANCE,
         )
     }
