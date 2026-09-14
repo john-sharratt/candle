@@ -1,13 +1,13 @@
 # Open items
 
-State as of `3d9ed922` (on `main` and `qwen38-moe`, pushed), plus the **uncommitted**
-working-tree fixes recorded under "Fixed" below. Nothing here is speculative: every claim
+State as of `3d9ed922` (on `main` and `qwen38-moe`, pushed), plus the fixes recorded under
+"Fixed" below, committed in `81e487b5`. Nothing here is speculative: every claim
 has the command or file:line that produced it, and the one claim that is code-derived rather
 than measured says so and names what would falsify it.
 
 ---
 
-## Fixed in the working tree (uncommitted)
+## Fixed (committed in `81e487b5`)
 
 ### 1. `persistence_integration` — the carved calibration seal, not the scheduler
 
@@ -128,21 +128,31 @@ most models, higher on Qwen3.8-27B; cause not established).
 
 ## Open — found while speeding up the tests
 
-### 8. Every zend boot re-seals the whole tool catalog into the redo log
+### 8. Every zend boot re-seals the whole tool catalog into the redo log — RESOLVED
 
-Section streams are content-addressed (`section_stream_id`), so each boot's records supersede
-the last boot's — dead records that only compaction reclaims. A short-lived session never
-compacts: the `tools_integration` workspace grew ~140 MB a boot (4.83 GB before its first
-forced compaction; the live store is ~1.2 GB). The comment at `zend/src/session.rs` ~636
-("the manifest never grows section chunk records") is contradicted by the census. A
-long-running daemon pays it once per restart and reclaims it in background maintenance.
+Section streams are content-addressed (`section_stream_id`), so a section prefilled again
+supersedes the last boot's records — dead records only compaction reclaims; the
+`tools_integration` workspace grew ~140 MB a boot. The cause was the restore triage refusing
+every section on the hybrid lineage (the persisted grid checked against transformer depth
+instead of the KV backing count), fixed in `01b5c559`: a refused restore falls back to a
+prefill, and the prefill's seal is the rewrite. `tools_integration::
+a_second_boot_restores_every_prompt_section` boots a `ZendSession` twice on the suite's
+workspace — the tool catalog included, which only a zend boot installs — and asserts the
+second boot prefills no prompt section (passes, 23 s). The `zend/src/session.rs` comment that
+called section cold-load disabled now describes the triage.
 
-### 9. Tool-section prefill slows across boots within one process
+### 9. Tool-section prefill slows across boots within one process — does not reproduce
 
-Same 93 sections, same workspace: 4.4 s on a process's first `ZendSession` boot, 9.9 s on
-its second. A suite of fresh sessions therefore creeps (20 → 30 s a scenario), and the
-compaction bound does not affect it. Engine-side per-process state — allocator pools not
-returning memory between sessions is the likeliest — not established.
+Measured 2026-09-13: same 93 sections, same workspace, 4.4 s on a process's first
+`ZendSession` boot and 9.9 s on its second. That was with every section refused by the
+restore triage and prefilled (item 8). Re-measured 2026-09-15 by the two-boot test above
+run with `--nocapture`: the "Prefilling tool sections" step takes **207 ms on the first boot
+and 197 ms on the second**, because both now restore. Of the per-process candidates, the
+first is refuted by the same log: boot 2 prints "a reservation already exists — this model's
+weights load through the CUDA pool", but `close_load` then retracts the previous model's
+weight zone and the dense block locks inside the span at 250 MiB exactly as on boot 1. A
+second boot that genuinely prefills (a changed catalog) has not been timed, so whether
+per-process state slows a real prefill is not established; nothing in this path pays it.
 
 ---
 
