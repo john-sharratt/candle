@@ -77,6 +77,7 @@ pub mod profile {
 }
 pub mod prompts;
 pub mod provenance;
+mod recovered_message;
 pub(crate) mod scheduler;
 mod sequence_handle;
 mod stats;
@@ -106,6 +107,7 @@ pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
 pub use projection::{
     BucketKind, OptionalState, ProjectionBucket, ProjectionEvent, SelectionState, NO_THINK_SELECTOR,
 };
+pub use recovered_message::RecoveredMessage;
 pub use scheduler::branch_checkpoint_counts;
 pub use scheduler::memory_report;
 pub use scheduler::phase_ring;

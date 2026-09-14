@@ -3,6 +3,7 @@
 //!
 //! [`router`] wires the OpenAI-compatible `/v1/chat/completions` endpoint plus
 //! zend's own REST surface to per-resource submodules — `chat`, `conversations`,
+//! `projections` (one projection point in full, for the projection panel),
 //! `files` (conversation-attached uploads), `models`, `status`
 //! (telemetry/maintenance), `substrate` (layer/timeline inspection + projection
 //! debug), `telemetry`, and `ws_logs` (the log websocket). UI assets are
@@ -25,11 +26,13 @@ use crate::session::ZendSession;
 
 pub mod chat;
 mod chat_frames;
+mod compressed;
 pub mod conversations;
 pub mod files;
 mod memory;
 pub mod models;
 pub mod profile;
+pub mod projections;
 mod repo_map;
 pub mod status;
 pub mod substrate;
@@ -121,6 +124,14 @@ pub fn router(session: Arc<ZendSession>) -> Router {
         .route(
             "/v1/conversations/:id/archive",
             post(conversations::archive),
+        )
+        .route(
+            "/v1/conversations/:id/projections/:turn/:event",
+            get(projections::get),
+        )
+        .route(
+            "/v1/conversations/:id/projection-context",
+            post(projections::context),
         )
         .route("/ws/logs", get(ws_logs::handler))
         .with_state(session)

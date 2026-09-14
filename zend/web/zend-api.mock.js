@@ -60,7 +60,7 @@
               '}',
               '```', '',
               'Each frame is **idempotent**, so a torn write at the tail is simply skipped on the next boot — there is no separate fsck pass.',
-            ]) },
+            ]), thinking: [{ tokens: 57, exact: true }] },
           ],
         },
         { id: '2', title: 'Why is decode latency spiking under load?', archived: false, updated_ms: now - 9e5, turn_count: 4, history: [] },
@@ -76,14 +76,14 @@
 
     // GET /v1/conversations/{id} — lazily hydrate a conversation's history.
     // The active conv (id '1') is already hydrated; others get a canned exchange
-    // synthesized from the title so lazy-hydrate-on-select is demonstrable.
+    // synthesized from the title so lazy-hydrate-on-select is demonstrable. The
+    // wait is long enough for the pane's loading state to be seen.
     async getConversation(id) {
-      await delay(110);
-      const panel = this._panelData();
+      await delay(350);
       const seed = (this._convs || []).find((c) => c.id === String(id));
-      if (seed && seed.history && seed.history.length) return Object.assign({}, seed, panel);
+      if (seed && seed.history && seed.history.length) return Object.assign({}, seed);
       const title = seed ? seed.title : 'Conversation';
-      return Object.assign({
+      return {
         id: String(id), title,
         archived: seed ? seed.archived : false,
         updated_ms: seed ? seed.updated_ms : Date.now(),
@@ -95,10 +95,28 @@
             'This is a hydrated view of **' + title + '** — recovered from the substrate redo log and split back into role bubbles on the server.',
           ]) },
         ],
-      }, panel);
+      };
     },
 
     archiveConversation(id) { return delay(60); },
+
+    // GET /v1/conversations/{id}/projections/{turn}/{event} — one recorded point
+    // in full, with the panel context. `turn` counts the assistant bubbles that
+    // carry points, as the daemon's records do.
+    async getProjectionDetail(convId, turn, event) {
+      await delay(90);
+      const conv = (this._convs || []).find((c) => c.id === String(convId));
+      const bubbles = conv ? conv.history.filter((m) => m.role === 'assistant' && m.spans && m.spans.length) : [];
+      const span = bubbles[turn] && bubbles[turn].spans[event];
+      if (!span) throw new Error('GET /v1/conversations/' + convId + '/projections/' + turn + '/' + event + ' -> 404');
+      return Object.assign({ span }, this._panelData());
+    },
+    // POST /v1/conversations/{id}/projection-context — the panel context for a
+    // point streamed live, which the client already holds in full.
+    async getProjectionContext(convId, turns) {
+      await delay(60);
+      return this._panelData();
+    },
 
     // GET /v1/status — the mock daemon is always ready (no model to load).
     getStatus() {
@@ -394,31 +412,70 @@
       const asst = conv.history.find((m) => m.role === 'assistant');
       if (!asst) return;
       // One event per recovered decode (the hydrated turn had reasoning, so
-      // seed a think-phase and an answer-phase dot).
-      asst.spans = [this.mkProjEvent(conv, 'think'), this.mkProjEvent(conv, 'answer')];
+      // seed a think-phase and an answer-phase dot). Recorded points carry their
+      // address, as a loaded history's do, so opening one goes through
+      // getProjectionDetail.
+      asst.spans = [this.mkProjEvent(conv, 'think'), this.mkProjEvent(conv, 'answer')]
+        .map((sp, k) => Object.assign(sp, { turn: 0, event: k }));
     },
 
     // ── Chat completion (SSE-like stream) ──────────────────────────────────
+    // A message asking to read a file runs one tool round first, as the daemon
+    // does: the call streams, the tool runs (`tool` running → done), and its
+    // result is prefilled with progress (`prefill` events) before the answer.
     streamChatCompletion(conv, text, opts, handlers) {
-      const reply = this.cannedReply(text, opts);
-      const tokens = reply.match(/\S+\s*|\s+/g) || [reply];
-      let i = -1, started = false, acc = '', thinkEmitted = false;
-      const timer = setInterval(() => {
-        if (!started) { started = true; handlers.onStatus(''); return; }
-        i++;
-        if (i >= tokens.length) {
-          clearInterval(timer);
-          handlers.onProjection(this.mkProjEvent(conv, 'answer')); // decode-end event (final t/s)
-          handlers.onDone();
-          return;
-        }
-        acc += tokens[i];
-        handlers.onToken(tokens[i]);
-        // A think-phase event lands on the timeline the moment reasoning closes.
-        if (!thinkEmitted && acc.includes('</think>')) { thinkEmitted = true; handlers.onProjection(this.mkProjEvent(conv, 'think')); }
-        if (i % 7 === 0 && handlers.onLog) handlers.onLog();
-      }, 34);
-      return { cancel: () => clearInterval(timer) };
+      const timers = [];
+      let cancelled = false;
+      const later = (ms, fn) => { timers.push(setTimeout(() => { if (!cancelled) fn(); }, ms)); };
+      const streamText = (reply, then) => {
+        const tokens = reply.match(/\S+\s*|\s+/g) || [reply];
+        let i = 0, acc = '', thinkEmitted = false, thinkClosed = false;
+        const timer = setInterval(() => {
+          if (cancelled) { clearInterval(timer); return; }
+          if (i >= tokens.length) { clearInterval(timer); then(); return; }
+          acc += tokens[i];
+          // The reasoning's running count and, at `</think>`, its total — sent
+          // ahead of the token that carries it, as the daemon does.
+          if (!thinkClosed && acc.includes('<think>') && handlers.onThink) {
+            thinkClosed = acc.includes('</think>');
+            handlers.onThink({ tokens: i + 1, done: thinkClosed });
+          }
+          handlers.onToken(tokens[i]);
+          // A think-phase event lands on the timeline the moment reasoning closes.
+          if (!thinkEmitted && acc.includes('</think>')) { thinkEmitted = true; handlers.onProjection(this.mkProjEvent(conv, 'think')); }
+          if (i % 7 === 0 && handlers.onLog) handlers.onLog();
+          i++;
+        }, 34);
+        timers.push(timer);
+      };
+      const answer = () => streamText(this.cannedReply(text, opts), () => {
+        handlers.onProjection(this.mkProjEvent(conv, 'answer')); // decode-end event (final t/s)
+        handlers.onDone();
+      });
+      const toolRound = () => {
+        const path = 'crates/substrate/src/redo.rs';
+        streamText('<tool_call>{"name":"read_file","arguments":{"path":"' + path + '"}}</tool_call>\n\n', () => {
+          if (handlers.onTool) handlers.onTool({ phase: 'running', tools: ['read_file'] });
+          later(250, () => {
+            if (handlers.onTool) handlers.onTool({ phase: 'done', tools: ['read_file'], results: [{ path, content: this._fileContent[1] || '' }], tokens: [2140] });
+            const total = 18432, steps = 8;
+            let step = 0;
+            const tick = () => {
+              if (handlers.onPrefill) handlers.onPrefill({ done: Math.round((total * step) / steps), total });
+              if (step >= steps) { answer(); return; }
+              step += 1;
+              later(160, tick);
+            };
+            tick();
+          });
+        });
+      };
+      later(34, () => {
+        handlers.onStatus('');
+        if (/\bread\b[\s\S]*\bfile\b/i.test(text || '')) toolRound();
+        else answer();
+      });
+      return { cancel: () => { cancelled = true; timers.forEach((t) => { clearInterval(t); clearTimeout(t); }); } };
     },
 
     thinkFor(userText, effort) {
@@ -479,10 +536,11 @@
     },
 
     // ── Windowed substrate ─────────────────────────────────────────────────
-    // { content: name→authored text, glue: dialect framing markers }. Section
-    // names match mkProjEvent's selection; the panel shows a section's text when
-    // expanded and renders the glue between rows. Returned as part of
-    // getConversation (first-class), so the panel needs no extra fetch.
+    // The panel context: section text by name, the dialect glue, the selected
+    // turns' bodies and the target layer. Section names match mkProjEvent's
+    // selection; the panel shows a section's text when expanded and renders the
+    // glue between rows. Returned by getProjectionDetail / getProjectionContext
+    // when the panel opens, as the daemon's routes do.
     _panelData() {
       const content = {
         agent_identity: J([

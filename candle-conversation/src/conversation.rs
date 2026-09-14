@@ -7,6 +7,7 @@
 use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnHandle, TurnResponse};
+use crate::recovered_message::{tool_response_lengths, RecoveredMessage, TOOL_RESPONSE_OPEN};
 use candle_transformers::models::delta_net::ExportedLayerState;
 
 use crate::persistence::content_hash::{hash_tokens, section_stream_id, ContentChain, ContentHash};
@@ -4359,32 +4360,40 @@ impl Sequence {
         self.tree.system_prompt_text()
     }
 
-    /// Every recovered turn in the given timeline, split into a
-    /// `User` half and an `Assistant` half — for re-populating a
-    /// sidebar after restart.
+    /// Recover the conversation in `timeline` as bubbles — one per non-empty
+    /// half of each turn, in order: the user's message (exactly what
+    /// `submit_turn` received), then the assistant's reply (the decoded body).
+    /// Both texts come straight off the turn's `user_text` and `assistant_text`
+    /// — no re-tokenising, no marker scanning, no decoding. See
+    /// [`RecoveredMessage`] for what else each bubble carries.
     ///
-    /// Each turn surfaces as two `(Role, String)` entries in order:
-    /// the user's message (exactly what `submit_turn` received) then
-    /// the assistant's reply (the decoded body).  Both strings come
-    /// straight off `TurnPart::user_text` and `assistant_text` — no
-    /// re-tokenising, no marker scanning, no decoding.
-    /// Recovered turn history for `timeline`. When `include_ghost_summaries` is
-    /// false, the ghost summary turns the summariser appends to the timeline
-    /// (`SummaryOfTurns` / `SummaryOfSummaries` tree nodes) are skipped — they
-    /// exist for provenance/projection, not for the conversation view. Pass
-    /// `true` for substrate-level views that legitimately surface them.
-    /// Recover the conversation as `(role, text, no_think)` bubbles — one per
-    /// non-empty half of each turn, in order.  `no_think` is the turn's recorded
-    /// thinking-suppressed flag, set on the USER bubble so the GUI can re-render
-    /// the `/no_think` soft-switch on prior turns exactly as the assembler does
-    /// for the model (see `turn_no_think`); the assistant bubble carries `false`.
+    /// When `include_ghost_summaries` is false, the ghost summary turns the
+    /// summariser appends to the timeline (`SummaryOfTurns` /
+    /// `SummaryOfSummaries` tree nodes) are skipped — they exist for
+    /// provenance/projection, not for the conversation view. Pass `true` for
+    /// substrate-level views that legitimately surface them.
     pub fn recovered_history(
         &self,
         timeline: TimelineId,
         include_ghost_summaries: bool,
-    ) -> Vec<(Role, String, bool)> {
+    ) -> Vec<RecoveredMessage> {
         let read = self.substrate.read();
-        let mut out: Vec<(Role, String, bool)> = Vec::new();
+        // Only a turn whose reasoning K/V was dropped needs this: its length is
+        // then an estimate from the prose it kept.
+        let estimate = |text: &str| {
+            self.tokenizer
+                .encode(text, false)
+                .map(|e| e.len() as u32)
+                .unwrap_or(0)
+        };
+        // The ids of the marker that opens each tool result, for measuring a
+        // tool-response turn's blocks in its own sealed ids.
+        let response_open: Vec<u32> = self
+            .tokenizer
+            .encode(TOOL_RESPONSE_OPEN, false)
+            .map(|e| e.get_ids().to_vec())
+            .unwrap_or_default();
+        let mut out: Vec<RecoveredMessage> = Vec::new();
         for idx in read.turn_indices(timeline) {
             if !include_ghost_summaries
                 && read
@@ -4397,13 +4406,55 @@ impl Sequence {
             let assistant_text = read.assistant_text_of(timeline, idx);
             let no_think = read.turn_no_think(timeline, idx);
             if !user_text.is_empty() {
-                out.push((Role::User, user_text, no_think));
+                let tool_tokens = if user_text.contains(TOOL_RESPONSE_OPEN) {
+                    // The user body's ids, where the layout places them in the
+                    // turn's grid.
+                    let body: Vec<u32> = read
+                        .turn_layout(timeline, idx)
+                        .and_then(|layout| {
+                            let span = layout.user_span();
+                            read.token_ids_of(timeline, idx)
+                                .get(span.offset as usize..span.end() as usize)
+                                .map(<[u32]>::to_vec)
+                        })
+                        .unwrap_or_default();
+                    tool_response_lengths(&body, &response_open)
+                } else {
+                    Vec::new()
+                };
+                out.push(RecoveredMessage {
+                    role: Role::User,
+                    text: user_text,
+                    no_think,
+                    thinking: None,
+                    tool_tokens,
+                });
             }
             if !assistant_text.is_empty() {
-                out.push((Role::Assistant, assistant_text, false));
+                let thinking = read
+                    .turn_layout(timeline, idx)
+                    .and_then(|layout| layout.thinking_length(estimate));
+                out.push(RecoveredMessage {
+                    role: Role::Assistant,
+                    text: assistant_text,
+                    no_think: false,
+                    thinking,
+                    tool_tokens: Vec::new(),
+                });
             }
         }
         out
+    }
+
+    /// How many tokens `text` becomes as a turn's user half — encoded exactly
+    /// as a submitted turn is, markup and literal pieces each by their own
+    /// tokenizer. A tool result measured this way before it is submitted has
+    /// the length its block shows once the turn is sealed
+    /// ([`RecoveredMessage::tool_tokens`]).
+    pub fn encoded_len(&self, text: &TurnText) -> usize {
+        encode_pieces(&self.tokenizer, &self.literal_tokenizer, text)
+            .map(|ids| ids.len())
+            .unwrap_or(0)
     }
 
     /// The two verbatim halves — `(user_text, assistant_text)` — of turn `index`

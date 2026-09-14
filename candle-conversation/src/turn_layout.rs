@@ -156,6 +156,126 @@ pub struct TurnLayout {
     pub segments: Vec<TurnSegment>,
 }
 
+/// How long a turn's reasoning was, in tokens.
+///
+/// `exact` when every reasoning segment is still real: its K/V span is the
+/// decode's own count of the generated tokens through `</think>`, recorded at
+/// seal. A segment whose K/V was dropped keeps only its prose, and a decode →
+/// text → encode round trip need not give back the count it started from, so
+/// that length is an estimate and says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ThinkingLength {
+    pub tokens: u32,
+    pub exact: bool,
+}
+
+impl TurnLayout {
+    /// The turn's reasoning length: the summed K/V spans of its `Thinking`
+    /// segments, with `estimate` counting the prose of any that are ethereal.
+    /// `None` when the turn did not reason.
+    pub fn thinking_length(&self, estimate: impl Fn(&str) -> u32) -> Option<ThinkingLength> {
+        let mut total: Option<ThinkingLength> = None;
+        for seg in &self.segments {
+            let TurnSegment::Thinking { text, kv } = seg else {
+                continue;
+            };
+            let (tokens, exact) = match kv {
+                Some(kv) => (kv.len, true),
+                None => (estimate(text), false),
+            };
+            let sum = total.get_or_insert(ThinkingLength {
+                tokens: 0,
+                exact: true,
+            });
+            sum.tokens += tokens;
+            sum.exact &= exact;
+        }
+        total
+    }
+}
+
+#[cfg(test)]
+mod thinking_length_tests {
+    use super::*;
+
+    fn thinking(text: &str, kv: Option<KvSpan>) -> TurnSegment {
+        TurnSegment::Thinking {
+            text: text.into(),
+            kv,
+        }
+    }
+
+    fn answer(offset: u32, len: u32) -> TurnSegment {
+        TurnSegment::Assistant {
+            text: None,
+            kv: KvSpan::new(offset, len),
+        }
+    }
+
+    /// An estimator that must not be consulted: a real span is already exact.
+    fn never(_: &str) -> u32 {
+        panic!("a real reasoning span was re-estimated from its prose")
+    }
+
+    #[test]
+    fn a_real_reasoning_span_is_its_exact_length() {
+        let layout = TurnLayout {
+            segments: vec![
+                thinking("<think>why</think>", Some(KvSpan::new(4, 212))),
+                answer(216, 9),
+            ],
+        };
+        assert_eq!(
+            layout.thinking_length(never),
+            Some(ThinkingLength {
+                tokens: 212,
+                exact: true
+            })
+        );
+    }
+
+    #[test]
+    fn a_dropped_reasoning_span_is_estimated_from_its_prose() {
+        let layout = TurnLayout {
+            segments: vec![thinking("<think>one two three</think>", None), answer(4, 9)],
+        };
+        let words = |t: &str| t.split_whitespace().count() as u32;
+        assert_eq!(
+            layout.thinking_length(words),
+            Some(ThinkingLength {
+                tokens: 3,
+                exact: false
+            })
+        );
+    }
+
+    #[test]
+    fn real_and_dropped_segments_sum_and_the_total_is_an_estimate() {
+        let layout = TurnLayout {
+            segments: vec![
+                thinking("a", Some(KvSpan::new(0, 40))),
+                thinking("b c", None),
+                answer(40, 5),
+            ],
+        };
+        assert_eq!(
+            layout.thinking_length(|_| 7),
+            Some(ThinkingLength {
+                tokens: 47,
+                exact: false
+            })
+        );
+    }
+
+    #[test]
+    fn a_turn_that_did_not_reason_has_no_length() {
+        let layout = TurnLayout {
+            segments: vec![answer(0, 12)],
+        };
+        assert_eq!(layout.thinking_length(never), None);
+    }
+}
+
 /// A tiling inconsistency — the segment vector does not describe a contiguous,
 /// gap-free K/V grid.
 #[derive(Debug, Clone, PartialEq, Eq)]

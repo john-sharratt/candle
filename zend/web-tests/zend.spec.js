@@ -81,17 +81,16 @@ test.describe('1.1 sidebar', () => {
     await expect(page.locator('.z-rail')).toBeVisible();
   });
 
-  test('show-archived reveals archived rows; archive then restore', async ({ page }) => {
+  test('show-archived reveals archived rows; archiving asks first', async ({ page }) => {
     await boot(page);
     await page.getByTitle('Expand sidebar').click();
     // archived conv (#5) hidden by default
     await expect(page.getByText('Scratch notes on WS reconnect backoff')).toHaveCount(0);
     await page.getByText('Show archived').click();
     await expect(page.getByText('Scratch notes on WS reconnect backoff')).toBeVisible();
-    // restore it
-    await page.getByTitle('Restore conversation').first().click();
-    // archive a live one
+    // Archiving is one-way (there is no restore), so it confirms first.
     await page.getByTitle('Archive conversation').first().click();
+    await expect(page.getByText('Archive conversation?')).toBeVisible();
   });
 
   test('selecting a conversation hydrates it', async ({ page }) => {
@@ -337,6 +336,110 @@ test.describe('1.9 logs', () => {
     await page.getByText('Clear', { exact: true }).click();
     await page.getByTitle('Hide logs').click();
     await expect(page.locator('.z-logs')).toHaveCount(0);
+  });
+});
+
+test.describe('1.11 opening a conversation', () => {
+  const HOME = /Good (Morning|Afternoon|Evening)\./;
+
+  test('the pane shows the conversation loading, under its title, until the history lands', async ({ page }) => {
+    await boot(page);
+    await page.getByTitle('Expand sidebar').click();
+    await page.getByText('Explain the tokenizer ChatML decoder').click();
+    // Never the home page: the conversation's own pane, loading.
+    await expect(page.locator('.z-convload')).toBeVisible();
+    await expect(page.getByRole('heading', { name: HOME })).toHaveCount(0);
+    await expect(page.locator('.z-convtitle')).toContainText('Explain the tokenizer ChatML decoder');
+    // Then the history, and the loading state is gone.
+    await expect(page.locator('.zmd').first()).toBeVisible();
+    await expect(page.locator('.z-convload')).toHaveCount(0);
+    await expect(page.locator('.z-convtitle')).toContainText('Explain the tokenizer ChatML decoder');
+  });
+
+  test('on a phone the title opens the conversation’s actions, and archive works from there', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await boot(page, { conv: '1' });
+    await expect(page.locator('.z-convtitle')).toContainText('Trace the substrate redo log replay');
+    await page.locator('.z-convtitle').click();
+    await page.getByRole('menuitem', { name: 'Archive conversation' }).click();
+    await page.getByRole('button', { name: 'Archive', exact: true }).click();
+    // The archived conversation is gone from the header, and the pane never
+    // falls back to the home page while the next one loads.
+    await expect(page.locator('.z-convtitle')).not.toContainText('Trace the substrate redo log replay');
+    await expect(page.getByRole('heading', { name: HOME })).toHaveCount(0);
+  });
+
+  test('a tool round shows its result’s prefill progress, gone once the answer starts', async ({ page }) => {
+    await boot(page, { conv: '2' });
+    await expect(page.locator('.zmd').first()).toBeVisible();
+    const ta = page.locator('#zend-prompt');
+    await ta.fill('read the redo file for me');
+    await ta.press('Enter');
+    const bar = page.locator('.tool-prefill');
+    await expect(bar).toBeVisible({ timeout: 5000 });
+    await expect(bar).toContainText('Reading tool output');
+    await expect(bar).toContainText('18.4k tokens');
+    // Prefill done → the bar goes, the tool card stays, the answer streams.
+    await expect(bar).toHaveCount(0, { timeout: 5000 });
+    await expect(page.locator('[data-msg]').last().locator('.tool-call-card')).toBeVisible();
+    await expect(page.locator('[data-msg]').last().locator('.zmd')).toContainText('redo log', { timeout: 10000 });
+  });
+
+  test('an expanded tool card shows its output’s length in tokens', async ({ page }) => {
+    await boot(page, { conv: '2' });
+    await expect(page.locator('.zmd').first()).toBeVisible();
+    const ta = page.locator('#zend-prompt');
+    await ta.fill('read the redo file for me');
+    await ta.press('Enter');
+    const card = page.locator('[data-msg]').last().locator('details.tool-call-card');
+    await expect(card.locator('.tool-call-badge.ok')).toBeVisible({ timeout: 5000 });
+    await card.locator('summary').click();
+    await expect(card.locator('.tool-call-out-tokens')).toHaveText('2,140 tokens');
+  });
+});
+
+test.describe('1.12 thinking token count', () => {
+  test('a running think block shows its token count over the ticker, then its total', async ({ page }) => {
+    await boot(page);
+    const ta = page.locator('#zend-prompt');
+    await ta.fill('walk me through the request lifecycle');
+    await ta.press('Enter');
+    const count = page.locator('.think-streaming .think-count');
+    await expect(count).toBeVisible({ timeout: 5000 });
+    await expect(count).toHaveText(/^\d[\d,]* tokens?$/);
+    // The count leads; the ticker runs beside it.
+    await expect(page.locator('.think-track > :first-child')).toHaveClass(/think-count/);
+    await expect(page.locator('.think-track.counted')).toBeVisible();
+    // Closed: the collapsed block is labelled with the total.
+    await expect(page.locator('[data-msg]').last().locator('.think-summary'))
+      .toContainText(/Thought process · \d[\d,]* tokens/, { timeout: 5000 });
+  });
+
+  test('a loaded turn’s think block is labelled with its recorded length', async ({ page }) => {
+    await boot(page, { conv: '1' });
+    await expect(page.locator('.think-summary').first()).toContainText('Thought process · 57 tokens');
+  });
+});
+
+test.describe('1.13 phone chrome', () => {
+  test('the top-right menu closes on a click away, and on Escape', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await boot(page);
+    await page.getByTitle('More').click();
+    await expect(page.getByTitle('Show logs')).toBeVisible();
+    await page.mouse.click(195, 500);
+    await expect(page.getByTitle('Show logs')).toHaveCount(0);
+    await page.getByTitle('More').click();
+    await expect(page.getByTitle('Show logs')).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(page.getByTitle('Show logs')).toHaveCount(0);
+  });
+
+  test('the first paint never claims the daemon is starting', async ({ page }) => {
+    await page.goto(URL);
+    await expect(page.getByText('Starting up')).toHaveCount(0);
+    await page.waitForFunction(() => window.__ZEND_READY__ === true);
+    await expect(page.getByText('Starting up')).toHaveCount(0);
   });
 });
 

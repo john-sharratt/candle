@@ -29,6 +29,8 @@ use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
 use candle_conversation::FinishReason;
+use candle_conversation::RecoveredMessage;
+use candle_conversation::Role as TurnRole;
 use candle_conversation::TurnText;
 use candle_conversation::{
     ConversationEngine, GlueMarkers, OptionalState, ProjectionEvent, Sequence, ThinkSteering,
@@ -54,6 +56,7 @@ use crate::projection_event::ProjectionEventOut;
 use crate::refresh_ctx::RefreshContext;
 use crate::repo_scan::RepoMap;
 use crate::think_budget;
+use crate::think_progress::{ThinkProgress, ThinkUpdate};
 use crate::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, ToolHost,
     CALIB_TOOL_SELECTOR,
@@ -109,6 +112,11 @@ pub struct ToolStatusOut {
     /// resolve the in-flight cards immediately, before the post-stream hydrate.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub results: Vec<Value>,
+    /// Each result's length in tokens as it will sit in the context, in the
+    /// same order — encoded as the next turn will encode it, so it is the length
+    /// the reloaded history shows for that result. `"done"` notice only.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tokens: Vec<usize>,
 }
 
 /// Items yielded by [`ZendSession::submit`].
@@ -122,6 +130,21 @@ pub enum StreamItem {
     /// A tool-execution lifecycle notice (running / done) for the in-flight
     /// tool cards.  Display-only: never part of the collected completion body.
     Tool(ToolStatusOut),
+    /// How far the prefill of the turn's input has got, in tokens. A tool
+    /// round's results can run to tens of thousands of tokens, and this is the
+    /// only sign of progress the GUI has before the answer starts. Display-only.
+    Prefill {
+        done: usize,
+        total: usize,
+    },
+    /// The turn's reasoning so far, in generated tokens — sent while its
+    /// `<think>` block is open, and once more (`done`) with the total when it
+    /// closes. Counted as the turn records it (see `think_progress`), so the
+    /// total is what a reloaded history shows. Display-only.
+    Think {
+        tokens: usize,
+        done: bool,
+    },
     /// A finished turn: its token counts, which become the reply's `usage`, and
     /// how it ended, which becomes its `finish_reason`. Sent once per turn; a
     /// reply the daemon answers over several turns sends one for each and ends
@@ -140,11 +163,6 @@ static PROJ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 
 struct ConvState {
     conv: Sequence,
-    /// The tools mode last applied to this conversation's projection (set each
-    /// turn in `run_inference_stream`). The projection panel uses it to display
-    /// the tool summary that was actually injected — the restricted (safe-subset)
-    /// summary in Restricted mode, the full one in Comprehensive, none in None.
-    tool_mode: ToolMode,
     /// The identity this conversation speaks as (a sub-folder of `identities/`),
     /// or `None` for the default / no identity. Seeded from the substrate on
     /// fork, overridden when a request carries an explicit `identity`, and used
@@ -215,6 +233,14 @@ struct InferenceState {
     /// in-flight exclusivity, and an async lock is what lets it live across an
     /// await without pinning a thread.
     conversations: Mutex<HashMap<String, Arc<ConvLock<ConvState>>>>,
+    /// The tools mode last applied to each conversation's projection, keyed like
+    /// `conversations` and set at the start of every turn. The projection panel
+    /// reads it to show the tool summary that was actually injected — the
+    /// restricted (safe-subset) summary in Restricted mode, the full one in
+    /// Comprehensive, none in None. Kept outside the per-conversation lock
+    /// because that lock is held for a whole turn, tool rounds included: a panel
+    /// reading the mode through it waited for the turn to finish.
+    tool_modes: Mutex<HashMap<String, ToolMode>>,
     /// System-prompt already prefilled; all new conversations fork from this.
     base_conv: Mutex<Sequence>,
     /// Queue feeding the dedicated titler task. The request path enqueues a
@@ -2041,6 +2067,7 @@ impl InferenceState {
             decoder,
             engine,
             conversations: Mutex::new(HashMap::new()),
+            tool_modes: Mutex::new(HashMap::new()),
             base_conv: Mutex::new(base_conv),
             titler_tx,
             titler_worker: Mutex::new(None),
@@ -2717,7 +2744,6 @@ fn run_inference_stream(
                     Ok(conv) => {
                         let arc = Arc::new(ConvLock::new(ConvState {
                             conv,
-                            tool_mode: ToolMode::default(),
                             identity: stored_identity.clone(),
                         }));
                         map.insert(conv_id.clone(), Arc::clone(&arc));
@@ -2831,7 +2857,7 @@ fn run_inference_stream(
         // tools mode — Comprehensive restores the full catalog (so switching a
         // conversation back from Restricted/None works), Restricted drops the
         // high-risk tools, None drops the whole catalog.
-        // `cs.tool_mode` records the mode actually applied, so the projection
+        // `tool_modes` records the mode actually applied, so the projection
         // panel shows the matching tool summary.
         if let Some(ref coll) = force_hires {
             match build_hires_projection(&state, coll, cs.identity.as_deref()) {
@@ -2839,7 +2865,11 @@ fn run_inference_stream(
                     cs.conv.set_projection(b);
                     // The capture override forces the full catalog (AllVisible),
                     // so the panel should show the comprehensive summary.
-                    cs.tool_mode = ToolMode::Comprehensive;
+                    state
+                        .tool_modes
+                        .lock()
+                        .unwrap()
+                        .insert(conv_id.clone(), ToolMode::Comprehensive);
                     tracing::info!(conv_id = %conv_id, collection = %coll,
                         "force-high-resolution: collection forced to AllVisible");
                 }
@@ -2876,7 +2906,11 @@ fn run_inference_stream(
                 IdentityScope::Unscoped => (state.mode_builders.get(tools_mode), None),
             };
             cs.conv.set_projection(proj);
-            cs.tool_mode = tools_mode;
+            state
+                .tool_modes
+                .lock()
+                .unwrap()
+                .insert(conv_id.clone(), tools_mode);
             tracing::info!(conv_id = %conv_id, ?tools_mode, identity = ?applied, "projection applied");
         }
 
@@ -3003,6 +3037,7 @@ fn run_inference_stream(
             // non-blank token and streams from then on, so a thinking turn is
             // never held back waiting for its own close.
             let mut think_resolved = false;
+            let mut think_progress = ThinkProgress::default();
             let mut done_resp = None;
             let mut turn_error: Option<anyhow::Error> = None;
             let mut client_gone = false;
@@ -3017,6 +3052,20 @@ fn run_inference_stream(
                             if turn_error.is_none() {
                                 tokens.push(id);
                                 let text = state.decoder.decode(&tokens);
+                                if let Some(update) = think_progress.observe(&text, tokens.len()) {
+                                    let (count, done) = match update {
+                                        ThinkUpdate::Running(n) => (n, false),
+                                        ThinkUpdate::Done(n) => (n, true),
+                                    };
+                                    let progress = StreamItem::Think {
+                                        tokens: count,
+                                        done,
+                                    };
+                                    if tx.send(Ok(progress)).await.is_err() {
+                                        client_gone = true;
+                                        break;
+                                    }
+                                }
                                 // Once the post-</think> answer opens with `{`, it's a
                                 // (usually un-tagged) tool-call object: stop streaming
                                 // here and hold the rest, so the flush can wrap it.
@@ -3138,6 +3187,19 @@ fn run_inference_stream(
                             turn_events.push(out.clone());
                             let _ = tx.send(Ok(StreamItem::Projection(out))).await;
                         }
+                        TurnEvent::PrefillProgress {
+                            tokens_done,
+                            tokens_total,
+                        } => {
+                            let progress = StreamItem::Prefill {
+                                done: tokens_done,
+                                total: tokens_total,
+                            };
+                            if tx.send(Ok(progress)).await.is_err() {
+                                client_gone = true;
+                                break;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -3215,6 +3277,7 @@ fn run_inference_stream(
                         phase: "running",
                         tools: tool_names.clone(),
                         results: Vec::new(),
+                        tokens: Vec::new(),
                     })))
                     .await;
             }
@@ -3284,11 +3347,21 @@ fn run_inference_stream(
                     break;
                 }
             };
+            // Each result measured as its own block of the turn it is about to
+            // become — the length its card shows.
+            let tokens = results
+                .iter()
+                .map(|r| {
+                    cs.conv
+                        .encoded_len(&format_tool_responses(std::slice::from_ref(r)))
+                })
+                .collect();
             let _ = tx
                 .send(Ok(StreamItem::Tool(ToolStatusOut {
                     phase: "done",
                     tools: tool_names,
                     results: results.iter().map(|r| r.response.clone()).collect(),
+                    tokens,
                 })))
                 .await;
             current_message = format_tool_responses(&results);
@@ -4553,41 +4626,48 @@ impl ZendSession {
     /// Decoded turn history for a single recovered conversation — backs
     /// `GET /v1/conversations/{id}`. Returns `None` when the model isn't
     /// loaded yet; an empty `Vec` when the conv_id has no recovered turns.
-    pub fn conversation_history(&self, conv_id: &str) -> Option<Vec<(Role, String, bool)>> {
+    pub fn conversation_history(&self, conv_id: &str) -> Option<Vec<RecoveredMessage>> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         if let Some(timeline) = passthrough::timeline_of(conv_id) {
             // A passthrough conversation's turns are the client's exchanges.
             let engine = state.engine.lock().unwrap();
+            let bubble = |role, text| RecoveredMessage {
+                role,
+                text,
+                no_think: false,
+                thinking: None,
+                tool_tokens: Vec::new(),
+            };
             return Some(
                 passthrough::held_history(&engine, timeline)
                     .into_iter()
                     .flat_map(|e| {
                         [
-                            (Role::User, e.user.text(), false),
-                            (Role::Assistant, e.assistant, false),
+                            bubble(TurnRole::User, e.user.text()),
+                            bubble(TurnRole::Assistant, e.assistant),
                         ]
                     })
                     .collect(),
             );
         }
         let timeline = timeline_for(conv_id);
-        let raw = {
-            let base = state.base_conv.lock().unwrap();
-            // Conversation view: hide the summariser's ghost summary turns.
-            base.recovered_history(timeline, false)
-        };
-        let decoded = raw
-            .into_iter()
-            .map(|(role, text, no_think)| {
-                let role = match role {
-                    candle_conversation::Role::User => Role::User,
-                    candle_conversation::Role::Assistant => Role::Assistant,
-                    candle_conversation::Role::System => Role::System,
-                };
-                (role, text, no_think)
-            })
-            .collect();
-        Some(decoded)
+        let base = state.base_conv.lock().unwrap();
+        // Conversation view: hide the summariser's ghost summary turns.
+        Some(base.recovered_history(timeline, false))
+    }
+
+    /// The conversation's sidebar title — the titler's label, or the one an
+    /// upload gave it. `None` when the model isn't loaded or nothing has
+    /// labelled the conversation yet.
+    pub fn conversation_label(&self, conv_id: &str) -> Option<String> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let timeline = passthrough::timeline_of(conv_id).unwrap_or_else(|| timeline_for(conv_id));
+        let label = state
+            .engine
+            .lock()
+            .unwrap()
+            .conversation_label_of(timeline)?;
+        (!label.is_empty()).then_some(label)
     }
 
     /// Record a batch of just-uploaded files as an event in the substrate,
@@ -4739,7 +4819,7 @@ impl ZendSession {
     /// mode. Backs the projection panel's expandable section text — resolved on
     /// demand, never stored in the projection event. The schema is workspace-wide;
     /// `conv_id` selects which tool summary (restricted vs comprehensive) to serve.
-    pub async fn section_content(&self, conv_id: &str) -> Option<Vec<(String, String)>> {
+    pub fn section_content(&self, conv_id: &str) -> Option<Vec<(String, String)>> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let mut out = {
             let base = state.base_conv.lock().unwrap();
@@ -4751,15 +4831,13 @@ impl ZendSession {
         // (safe-subset) summary in Restricted, the full one in Comprehensive, and
         // none in None (no tools are projected) — under the key the projection
         // event uses (`<collection> summary`) so the panel expands the right list.
-        // Copy the Arc out and release the conversations-map lock before locking
-        // the per-conversation state: the inference task holds a conversation's
-        // lock for its entire decode, so awaiting it while still holding the map
-        // mutex would stall every other conversation's turn submission.
-        let cs = state.conversations.lock().unwrap().get(conv_id).cloned();
-        let mode = match cs {
-            Some(cs) => cs.lock().await.tool_mode,
-            None => ToolMode::default(),
-        };
+        let mode = state
+            .tool_modes
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .copied()
+            .unwrap_or_default();
         let restricted = match mode {
             ToolMode::None => return Some(out),
             ToolMode::Restricted => true,

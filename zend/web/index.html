@@ -105,6 +105,27 @@
   .zmd .tool-call-out-label { font-size: .68rem; color: #9a9490; margin-bottom: .25rem; text-transform: uppercase; letter-spacing: .04em; }
   .zmd .tool-call-out-body { margin: 0; padding: .4rem .55rem; background: #1a1816; border: 1px solid #2e2b27; border-radius: 5px; color: #c7bdb0; font-size: .78rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-height: 18rem; overflow: auto; }
   .zmd .tool-call-out.err .tool-call-out-body { color: #e0b0a6; border-color: #4a322c; }
+  /* A tool round's results being read into the context before the answer
+     starts: the tool card's chrome with a determinate bar, drawn after the cards
+     and removed the moment the prefill finishes. */
+  .zmd .tool-prefill { margin: .5rem 0; background: #26231f; border: 1px solid #38342f; border-left: 3px solid #8c5f28; border-radius: 8px; padding: .45rem .75rem .6rem; font-family: "Cascadia Code","Fira Code","JetBrains Mono",Consolas,monospace; font-size: .82rem; }
+  .zmd .tool-prefill-head { display: flex; align-items: center; flex-wrap: wrap; gap: .2rem .5rem; margin-bottom: .45rem; }
+  .zmd .tool-prefill-label { font-weight: 600; color: #c98a3e; letter-spacing: .02em; }
+  .zmd .tool-prefill-count { margin-left: auto; color: #7d766e; font-size: .76rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .zmd .tool-prefill-track { height: 4px; background: #1a1816; border-radius: 2px; overflow: hidden; }
+  .zmd .tool-prefill-bar { position: relative; overflow: hidden; height: 100%; background: linear-gradient(90deg, #8c5f28, #e0a85a); border-radius: 2px; }
+  /* Motion, so a long read is visibly alive between progress steps: a sheen
+     sweeping along the filled bar, and the gear turning. Each is phased from
+     the clock (`--zsheen` / `--zgear`, set as the card is drawn), so the
+     card being redrawn on every progress step does not restart them. */
+  @keyframes zsheen { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+  .zmd .tool-prefill-bar::after { content: ''; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255,238,205,0.6), transparent); transform: translateX(-100%); animation: zsheen 1.4s ease-in-out infinite; animation-delay: var(--zsheen, 0ms); }
+  .zmd .tool-prefill .tool-call-icon { display: inline-block; animation: zspin 2.4s linear infinite; animation-delay: var(--zgear, 0ms); }
+  @media (prefers-reduced-motion: reduce) { .zmd .tool-prefill-bar::after, .zmd .tool-prefill .tool-call-icon { animation: none; } }
+  /* An expanded tool card's output header: the label, and on the right the
+     output's length in tokens as it sits in the context. */
+  .zmd .tool-call-out-label { display: flex; align-items: baseline; justify-content: space-between; gap: .5rem; }
+  .zmd .tool-call-out-tokens { text-transform: none; letter-spacing: 0; color: #7d766e; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .zmd .think-block { margin: .1rem 0 .9rem; }
   .zmd .think-summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: .45rem; font-size: .8rem; color: #7c736a; user-select: none; padding: .2rem 0; transition: color .13s; }
   .zmd .think-summary:hover { color: #9a9490; }
@@ -121,9 +142,15 @@
      most recent thoughts through a bright centre band, showing progress + speed. */
   .zmd .think-streaming { margin: .1rem 0 .9rem; }
   .zmd .think-head { display: inline-flex; align-items: center; gap: .45rem; max-width: 100%; }
-  .zmd .think-ticker { width: 20rem; max-width: 55vw; overflow: hidden; white-space: nowrap; font-size: .8rem; line-height: 1.5; color: #8a8074; opacity: .6;
+  /* The token count leads, in a chip on its own ground; the ticker runs faded
+     beside it. */
+  .zmd .think-track { position: relative; width: 20rem; max-width: 55vw; display: flex; align-items: center; gap: .55rem; }
+  .zmd .think-ticker { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; font-size: .8rem; line-height: 1.5; color: #8a8074; opacity: .6; transition: opacity .3s;
     -webkit-mask-image: linear-gradient(90deg, transparent, #000 40%, #000 60%, transparent);
             mask-image: linear-gradient(90deg, transparent, #000 40%, #000 60%, transparent); }
+  .zmd .think-track.counted .think-ticker { opacity: .26; }
+  .zmd .think-count { flex-shrink: 0; padding: .05rem .6rem; border-radius: 999px; background: #211d1b; border: 1px solid #4a3a3e; color: #f3d2bd; font-size: .74rem; font-weight: 650; line-height: 1.45; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .zmd .think-tokens { font-variant-numeric: tabular-nums; }
   .zmd .zdots { display: inline-flex; gap: 5px; align-items: center; margin-left: 6px; }
   .zmd .zdots i { width: 7px; height: 7px; border-radius: 50%; background: #5a5652; display: inline-block; animation: zdot 1.3s ease-in-out infinite; }
   .zmd .zdots i:nth-child(2) { animation-delay: .22s; } .zmd .zdots i:nth-child(3) { animation-delay: .44s; }
@@ -157,6 +184,12 @@
   /* ── Ring spinner + loading card (startup overlay + in-chat waiting) ───── */
   @keyframes zspin { to { transform: rotate(360deg); } }
   .z-spin { width: 15px; height: 15px; border-radius: 50%; border: 2px solid #c98a3e; border-top-color: transparent; animation: zspin .9s linear infinite; flex-shrink: 0; box-sizing: border-box; }
+  /* The first paint, before the daemon has answered. Invisible for its first
+     moments — most loads are done by then — then a quiet "Getting ready". */
+  @keyframes zfadein { to { opacity: 1; } }
+  .z-splash { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .9rem; background: #1c1917; color: #8a8074; font-size: .9rem; letter-spacing: .01em; opacity: 0; animation: zfadein .3s ease-out .35s forwards; }
+  .z-splash-mark { animation: zpulse 1.8s ease-in-out infinite; }
+  @media (prefers-reduced-motion: reduce) { .z-splash { animation-duration: .01s; } .z-splash-mark { animation: none; } }
   .z-load-card { width: min(520px, 90%); padding: 2rem 2.25rem; background: #1c1a18; border: 1px solid #38342f; border-radius: 14px; box-shadow: 0 10px 32px rgba(0,0,0,0.45); }
   .z-load-eyebrow { font-size: .78rem; font-weight: 650; color: #8a7b6a; letter-spacing: .08em; text-transform: uppercase; margin: 0 0 1.2rem; }
   .z-load-row { display: flex; align-items: center; gap: .75rem; margin-bottom: .95rem; }
@@ -181,6 +214,26 @@
   }
   @media (max-width: 560px) { .z-dial-label { display: none !important; } }
   .z-chatscroll > div:last-child { margin-bottom: 2.5rem !important; }
+  /* The open conversation's header: its title, which opens the conversation's
+     own actions. The padding clears the floating Appearance button on the left
+     and the top-right actions, which sit over the header's ends. */
+  .z-convhead { flex-shrink: 0; height: 56px; display: flex; align-items: center; padding: 0 8.25rem 0 7rem; border-bottom: 1px solid #2a2622; position: relative; }
+  .z-convtitle { display: inline-flex; align-items: center; gap: .45rem; max-width: 100%; min-width: 0; height: 34px; padding: 0 .6rem; border-radius: 8px; border: 1px solid transparent; background: none; color: #ece8e4; font: inherit; font-size: .92rem; font-weight: 600; cursor: pointer; }
+  .z-convtitle:hover, .z-convtitle.open { background: #26231f; border-color: #38342f; }
+  .z-convtitle:focus-visible, .z-convmenu-item:focus-visible { outline: 2px solid #c98a3e; outline-offset: 1px; }
+  .z-convtitle .t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .z-convbadge { flex-shrink: 0; font-size: .62rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: #8a8074; border: 1px solid #38342f; border-radius: 4px; padding: .05rem .35rem; }
+  .z-convmenu { position: absolute; top: calc(100% + 6px); left: 0; z-index: 40; min-width: 220px; background: #26231f; border: 1px solid #4a443e; border-radius: 10px; box-shadow: 0 12px 30px rgba(0,0,0,0.6); padding: 5px; }
+  .z-convmenu-label { font-size: .62rem; text-transform: uppercase; letter-spacing: .07em; color: #7c736a; padding: 5px 9px 4px; }
+  .z-convmenu-item { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 36px; padding: 7px 9px; border: none; background: transparent; color: #cfc8c0; border-radius: 6px; cursor: pointer; font: inherit; font-size: .82rem; text-align: left; }
+  .z-convmenu-item:hover { background: #2f2b27; }
+  .z-convmenu-item.danger { color: #e3a58f; }
+  .z-convmenu-item.danger:hover { background: rgba(180,70,47,0.16); }
+  .z-convmenu-note { max-width: 250px; padding: 4px 9px 8px; font-size: .76rem; line-height: 1.45; color: #8a8074; }
+  /* A conversation opened but not yet fetched (or one that failed to load). */
+  .z-convload { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .85rem; padding: 0 1.5rem 3rem; color: #9a9490; font-size: .88rem; text-align: center; }
+  .z-convload .z-spin { width: 22px; height: 22px; border-width: 2.5px; }
+  @media (max-width: 820px) { .z-convhead { padding: 0 3.9rem 0 6.9rem; } .z-convtitle { font-size: .88rem; } }
 </style>
 <!-- The estate switcher's styles, shared with tokera.com and the npcd console.
      A copy, because this app embeds its own assets and cannot read the shared
@@ -312,6 +365,9 @@ import { estateSwitcher } from './common/lib/estate.js';
     sidebarCollapsed: false,
     sidebarDrawer: false,   // narrow only: the conversation list open as an overlay drawer
     confirm: null,          // in-app confirm dialog: { title, body, confirmLabel, danger, onConfirm }
+    hydrating: {},          // conv id → true while its first fetch is in flight (the pane shows it loading)
+    loadError: {},          // conv id → why its first fetch failed (the pane offers a retry)
+    convMenuOpen: false,    // the open conversation's actions menu, under its title
     narrow: (typeof window !== 'undefined' && window.innerWidth < NARROW_W),
     wide: (typeof window !== 'undefined' && window.innerWidth >= WIDE_W),
     sidebarW: 220,
@@ -330,7 +386,9 @@ import { estateSwitcher } from './common/lib/estate.js';
     themeMenuOpen: false,
     substrateOpen: false,
     substrateNode: null,
-    substrateMsg: null,            // the assistant bubble the panel was opened from (decoded tail)
+    substrateLoading: false,       // the panel's point / context fetch is in flight
+    substrateError: null,          // why that fetch failed
+    substrateMsg: null,           // the assistant bubble the panel was opened from (decoded tail)
     substrateUserMsg: null,        // the user message preceding it (the active turn body)
     substrateHistory: [],          // prior conversation messages (verbatim, with roles)
     substrateContent: null,        // name → authored section text (fetched lazily)
@@ -346,7 +404,9 @@ import { estateSwitcher } from './common/lib/estate.js';
     fileView: null,
     thinkOpen: {},
     upload: null,
-    boot: { state: 'loading', detail: '', loading: { current: 'Starting', progress: 0, completed: [] } },
+    // `connecting` until the daemon first answers (a quiet splash); the startup
+    // card only when it reports that it is actually loading.
+    boot: { state: 'connecting' },
   };
 
   let chatEl = null, logEl = null, promptEl = null, filesListEl = null, substrateEl = null;
@@ -541,6 +601,11 @@ import { estateSwitcher } from './common/lib/estate.js';
     const t = (content || '').trim();
     return t.indexOf('<tool_response>') !== -1 && t.indexOf('</tool_response>') !== -1;
   }
+  // The `<tool_response>…</tool_response>` blocks of a tool-response turn, one
+  // per call, in order.
+  function toolResponseBlocks(content) {
+    return String(content || '').match(/<tool_response>[\s\S]*?<\/tool_response>/g) || [content];
+  }
   // Pull the inner payload out of a `<tool_response>…</tool_response>` turn and
   // classify it (an `error`/`detail` key ⇒ the call failed).
   function toolResponseInfo(content) {
@@ -597,7 +662,9 @@ import { estateSwitcher } from './common/lib/estate.js';
   // An expandable tool-call block: header (name, what it touched, result
   // badge), then every parameter and — when the matching `<tool_response>` is
   // paired in — the tool output.
-  function toolCard(json, complete, output, running) {
+  // `tokens`: the output's length in tokens as it sits in the context, when
+  // the daemon reported it.
+  function toolCard(json, complete, output, running, tokens) {
     if (!complete) return '<div class="tool-call-card pending"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">Calling tool…</span></div></div>';
     let parsed;
     try { parsed = JSON.parse(json.trim()); } catch (e) { parsed = null; }
@@ -619,7 +686,9 @@ import { estateSwitcher } from './common/lib/estate.js';
         ? '<span class="tool-call-badge ' + (resp.isError ? 'err' : 'ok') + '">' + (resp.isError ? 'error' : 'result') + '</span>'
         : '<span class="tool-call-badge pend">no result</span>';
     const outHtml = resp
-      ? '<div class="tool-call-out' + (resp.isError ? ' err' : '') + '"><div class="tool-call-out-label">' + (resp.isError ? 'Error' : 'Output') + '</div><pre class="tool-call-out-body">' + esc(resp.raw) + '</pre></div>'
+      ? '<div class="tool-call-out' + (resp.isError ? ' err' : '') + '"><div class="tool-call-out-label"><span>' + (resp.isError ? 'Error' : 'Output') + '</span>' +
+        (tokens != null ? '<span class="tool-call-out-tokens">' + fmtTokens(tokens) + '</span>' : '') +
+        '</div><pre class="tool-call-out-body">' + esc(resp.raw) + '</pre></div>'
       : '';
     const sub = toolSubject(name, args, resp);
     const subHtml = (sub.subject ? '<span class="tool-call-subject">' + esc(sub.subject) + '</span>' : '') +
@@ -629,27 +698,48 @@ import { estateSwitcher } from './common/lib/estate.js';
       '<svg class="tool-call-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></summary>' +
       (argsHtml ? '<div class="tool-call-args">' + argsHtml + '</div>' : '') + outHtml + '</details>';
   }
+  // The prefill of a tool round's results: tokens read so far of the total, as
+  // a count and a bar, in the tool card's chrome.
+  function prefillCard(p) {
+    const pct = Math.max(0, Math.min(100, Math.floor((p.done / p.total) * 100)));
+    // Negative delays put each animation where the clock says it is, so a
+    // redraw continues the motion rather than starting it over.
+    const t = Math.round(_now());
+    const phase = '--zsheen:-' + (t % 1400) + 'ms; --zgear:-' + (t % 2400) + 'ms;';
+    return '<div class="tool-prefill" role="progressbar" aria-label="Reading tool output" aria-valuemin="0" aria-valuemax="' + p.total + '" aria-valuenow="' + p.done + '" style="' + phase + '">' +
+      '<div class="tool-prefill-head"><span class="tool-call-icon">⚙</span><span class="tool-prefill-label">Reading tool output</span>' +
+      '<span class="tool-prefill-count">' + fmtTok(p.done) + ' / ' + fmtTok(p.total) + ' tokens · ' + pct + '%</span></div>' +
+      '<div class="tool-prefill-track"><div class="tool-prefill-bar" style="width:' + pct + '%"></div></div></div>';
+  }
   const THINK_BRAIN = '<svg class="think-brain" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round">' +
     '<path d="M12.4 18.4C12.5 19.8 12.2 21 12.6 22L13.8 22C14 21 13.8 19.6 14 18.4 15.1 18.8 16.4 18.6 17 17.6 18.4 17.6 19.4 16.3 19.2 14.9 20.3 14.4 20.6 13 19.8 12.1 20.5 11.2 20.4 9.8 19.3 9.4 19.3 7.9 18 6.8 16.5 7 16 5.9 14.6 5.4 13.4 5.9 12.7 5 11.3 5 10.5 5.7 9.6 5.1 8.2 5.4 7.8 6.6 6.4 6.6 5.3 7.8 5.6 9.1 4.5 9.4 4 10.7 4.7 11.7 4 12.5 4.1 13.9 5.1 14.4 5 15.7 5.7 17 7 17.3 7.6 18.5 9.1 19 10.4 18.6 11 18.5 11.8 18.4 12.4 18.4Z" fill="#f3d2bd" stroke="#3f2c25" stroke-width="0.9"/>' +
     '<path d="M10.5 5.7C9.6 5.1 8.2 5.4 7.8 6.6 6.4 6.6 5.3 7.8 5.6 9.1 4.5 9.4 4 10.7 4.7 11.7 4 12.5 4.1 13.9 5.1 14.4 5 15.7 5.7 17 7 17.3 7.6 18.5 9.1 19 10.4 18.6 10.7 14.5 10.6 9.4 10.5 5.7Z" fill="#e8917f" stroke="#3f2c25" stroke-width="0.9"/>' +
     '</svg>';
+  // "1,234 tokens" — the reasoning's length as the thinking block shows it.
+  function fmtTokens(n) { return Number(n).toLocaleString() + (n === 1 ? ' token' : ' tokens'); }
   function renderThink(seg, open) {
     // Still thinking: a NON-collapsible header (no chevron, no click toggle — the
     // expand affordance is withheld until the block finishes, since it can't expand
     // mid-stream anyway) plus a ticker of the most recent words, right-pinned so
-    // new words roll leftward through the mask's bright centre band.
+    // new words roll leftward — faded under the running token count once the
+    // daemon reports one.
     if (!seg.complete) {
       const w = (seg.body || '').trim().split(/\s+/).filter(Boolean);
       const tick = esc(w.slice(-24).join(' '));
+      const count = seg.tokens != null ? '<span class="think-count" aria-live="off">' + fmtTokens(seg.tokens) + '</span>' : '';
       return '<div class="think-block think-streaming"><div class="think-head">' +
         THINK_BRAIN +
         '<span class="think-label think-pulse">Thinking…</span>' +
-        '<div class="think-ticker">' + tick + '</div>' +
+        '<div class="think-track' + (count ? ' counted' : '') + '">' + count + '<div class="think-ticker">' + tick + '</div></div>' +
         '</div></div>';
     }
-    // Finished: the collapsible block, expandable/collapsible as before.
+    // Finished: the collapsible block, labelled with the reasoning's length in
+    // tokens (≈ when the turn's reasoning K/V was dropped and the count is an
+    // estimate from its prose), or in words where no count is known.
     const words = (seg.body || '').trim().split(/\s+/).filter(Boolean).length;
-    const label = 'Thought process · ' + words + (words === 1 ? ' word' : ' words');
+    const label = 'Thought process · ' + (seg.length
+      ? '<span class="think-tokens">' + (seg.length.exact ? '' : '≈') + fmtTokens(seg.length.tokens) + '</span>'
+      : words + (words === 1 ? ' word' : ' words'));
     const body = renderMd((seg.body || '').trim());
     // Carry the think's raw char range so applyProjSegments can split its bar
     // proportionally when several projections fired inside it.
@@ -660,17 +750,21 @@ import { estateSwitcher } from './common/lib/estate.js';
       '<svg class="think-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
       '</summary><div class="think-body">' + body + '</div></details>';
   }
-  function renderContent(text, streaming, open, toolOutputs, running) {
+  // `think` (optional) carries the reasoning lengths: `lengths[k]` for the k-th
+  // completed think block, `live` for the one still open.
+  function renderContent(text, streaming, open, toolOutputs, running, think, toolTokens) {
     const segs = [];
+    const lengths = (think && think.lengths) || [];
+    let thinkNo = 0;
     let rem = text;
     // `offset` is this `<think>…</think>`'s exact char range in the raw text
     // (the regex runs first, on the original `text`), so a completed think can
     // map projection char-offsets onto its own span for proportional sub-bars.
-    rem = rem.replace(/<think>([\s\S]*?)<\/think>/g, (m, body, offset) => { const mk = ' SEG:' + segs.length + ' '; segs.push({ kind: 'think', complete: true, body, c0: offset, c1: offset + m.length }); return mk; });
+    rem = rem.replace(/<think>([\s\S]*?)<\/think>/g, (m, body, offset) => { const mk = ' SEG:' + segs.length + ' '; segs.push({ kind: 'think', complete: true, body, c0: offset, c1: offset + m.length, length: lengths[thinkNo++] || null }); return mk; });
     rem = rem.replace(/<tool_call>([\s\S]*?)<\/tool_call>/g, (m, json) => { const mk = ' SEG:' + segs.length + ' '; segs.push({ kind: 'tool', complete: true, json }); return mk; });
     let openIdx = rem.lastIndexOf('<think>');
     if (openIdx !== -1) {
-      if (streaming) { const mk = ' SEG:' + segs.length + ' '; segs.push({ kind: 'think', complete: false, body: rem.slice(openIdx + 7) }); rem = rem.slice(0, openIdx) + mk; }
+      if (streaming) { const mk = ' SEG:' + segs.length + ' '; segs.push({ kind: 'think', complete: false, body: rem.slice(openIdx + 7), tokens: think && think.live != null ? think.live : null }); rem = rem.slice(0, openIdx) + mk; }
       else rem = rem.slice(0, openIdx);
     }
     openIdx = rem.lastIndexOf('<tool_call>');
@@ -691,17 +785,21 @@ import { estateSwitcher } from './common/lib/estate.js';
       else {
         const s = segs[parseInt(parts[i], 10)];
         if (s.kind === 'think') { html += renderThink(s, open); }
-        else { html += toolCard(s.json, s.complete, toolOutputs ? toolOutputs[toolIdx] : null, running); toolIdx++; }
+        else { html += toolCard(s.json, s.complete, toolOutputs ? toolOutputs[toolIdx] : null, running, toolTokens ? toolTokens[toolIdx] : null); toolIdx++; }
       }
     }
     return html;
   }
-  function nodeHtml(msg, open, toolOutputs) {
+  function nodeHtml(msg, open, toolOutputs, toolTokens) {
+    // Paired from the history (`toolOutputs`/`toolTokens`), or stashed on the
+    // streaming message by the `tool` done events.
+    const tokens = toolTokens || msg.toolTokens;
     // A turn that failed says so, in the bubble, whether or not it produced any
     // text first. Without this a failed turn renders as an empty assistant
     // message — indistinguishable from the model having nothing to say.
+    const think = { lengths: msg.thinking, live: msg.thinkLive };
     if (msg.error) {
-      const body = msg.content ? renderContent(msg.content, false, open, toolOutputs || msg.toolOutputs, null) : '';
+      const body = msg.content ? renderContent(msg.content, false, open, toolOutputs || msg.toolOutputs, null, think, tokens) : '';
       return body + '<div class="zerr" role="alert"><b>Generation failed.</b> ' + esc(msg.error) + '</div>';
     }
     if (msg.streaming && !msg.content) {
@@ -713,7 +811,10 @@ import { estateSwitcher } from './common/lib/estate.js';
     // During streaming `toolOutputs` isn't passed, so fall back to the results
     // stashed on the message by `tool` done events; `runningTools` drives the
     // in-flight spinners.  Both are discarded when the stream hydrates.
-    let html = renderContent(msg.content, !!msg.streaming, open, toolOutputs || msg.toolOutputs, msg.runningTools);
+    let html = renderContent(msg.content, !!msg.streaming, open, toolOutputs || msg.toolOutputs, msg.runningTools, think, tokens);
+    // A tool round's results being read in: drawn after the tool cards while the
+    // prefill runs, so the wait before the answer shows its progress.
+    if (msg.streaming && msg.prefill && msg.toolOutputs && msg.toolOutputs.length) html += prefillCard(msg.prefill);
     if (msg.streaming) html += '<span class="zcursor"></span>';
     return html;
   }
@@ -722,8 +823,8 @@ import { estateSwitcher } from './common/lib/estate.js';
   // message. A finished message's `content` is a stable string ref → `===` is O(1),
   // so all unchanged bubbles are cache hits and only the changed/streaming one is
   // re-parsed. Streaming messages are never cached (they change every frame).
-  function nodeHtmlMemo(msg, open, toolOutputs) {
-    if (msg.streaming) return nodeHtml(msg, open, toolOutputs);
+  function nodeHtmlMemo(msg, open, toolOutputs, toolTokens) {
+    if (msg.streaming) return nodeHtml(msg, open, toolOutputs, toolTokens);
     const to = toolOutputs || msg.toolOutputs || null;
     // `toolOut[idx]` is rebuilt each render, so key by value. Join the outputs
     // exactly (NUL-separated — never in text) rather than a lossy length sum, so
@@ -733,9 +834,12 @@ import { estateSwitcher } from './common/lib/estate.js';
     // after the first render.
     const toKey = to ? to.join('\u0000') : '';
     const c = msg._htmlCache;
-    if (c && c.content === msg.content && c.open === open && c.toKey === toKey && c.gen === S.toolSchemaGen) return c.html;
-    const html = nodeHtml(msg, open, toolOutputs);
-    msg._htmlCache = { content: msg.content, open: open, toKey: toKey, gen: S.toolSchemaGen, html: html };
+    // The reasoning lengths label the think blocks, so they are part of the key.
+    const thKey = (msg.thinking || []).map((t) => t.tokens + (t.exact ? '' : '~')).join(',') +
+      '|' + (toolTokens || msg.toolTokens || []).join(',');
+    if (c && c.content === msg.content && c.open === open && c.toKey === toKey && c.thKey === thKey && c.gen === S.toolSchemaGen) return c.html;
+    const html = nodeHtml(msg, open, toolOutputs, toolTokens);
+    msg._htmlCache ={ content: msg.content, open: open, toKey: toKey, thKey: thKey, gen: S.toolSchemaGen, html: html };
     return html;
   }
 
@@ -791,20 +895,31 @@ import { estateSwitcher } from './common/lib/estate.js';
   }
 
   // ── actions ──────────────────────────────────────────────────────────────
-  function selectConv(id) { writeHashConv(id); setState({ activeId: id, sidebarDrawer: false }, () => { hydrateIfNeeded(id); scrollChat(); if (!S.narrow) focusPrompt(); }); }
+  function selectConv(id) {
+    writeHashConv(id);
+    // Before the render, so the first frame already shows the conversation
+    // loading — not the home page its still-empty history would draw.
+    hydrateIfNeeded(id);
+    setState({ activeId: id, sidebarDrawer: false, convMenuOpen: false }, () => { scrollChat(); if (!S.narrow) focusPrompt(); });
+  }
   function hydrateIfNeeded(id) {
     const conv = S.conversations.find((c) => c.id === id);
     if (!conv || S.loaded[id]) return;
     S.loaded[id] = true;
-    hydrateConv(id);
+    hydrateConv(id, true);
   }
+  function retryLoad(id) { S.loaded[id] = false; delete S.loadError[id]; hydrateIfNeeded(id); render(); }
   // Fetch the persisted conversation and replace local history with it — the
-  // authoritative per-turn split plus the full projection timeline. Used on
-  // first open (via hydrateIfNeeded) AND after a stream completes: the live
-  // view accumulates a whole tool loop into one streaming bubble, so this
-  // reconciles it to the real turns without the user having to reload.
-  function hydrateConv(id) {
+  // authoritative per-turn split plus the projection timeline. Used on first
+  // open (`first`, via hydrateIfNeeded: the pane shows it loading, and a failure
+  // offers a retry) AND after a stream completes: the live view accumulates a
+  // whole tool loop into one streaming bubble, so this reconciles it to the
+  // real turns without the user having to reload (a failure there keeps the
+  // live view it already has).
+  function hydrateConv(id, first) {
+    if (first) { S.hydrating[id] = true; delete S.loadError[id]; }
     API.getConversation(id).then((full) => {
+      delete S.hydrating[id];
       const patch = { history: full.history || [] };
       if (full.title != null) patch.title = full.title;
       if (full.turn_count != null) patch.turn_count = full.turn_count;
@@ -812,17 +927,15 @@ import { estateSwitcher } from './common/lib/estate.js';
       // history tiles ride along in `history` as role:"upload" messages).
       if (full.uploads) patch.files = full.uploads;
       S.conversations = S.conversations.map((c) => c.id === id ? Object.assign({}, c, patch) : c);
-      // Glue + section content are workspace-wide — store globally so the
-      // projection panel renders the framing and expands sections with no fetch.
-      if (full.sectionContent) S.substrateContent = full.sectionContent;
-      if (full.turnContent) S.substrateTurnContent = full.turnContent;
-      if (full.targetLayer) S.substrateTargetLayer = full.targetLayer;
-      if (full.glue) S.substrateGlue = full.glue;
       render();
       if (S.activeId === id) scrollChat();
+    }).catch((e) => {
+      delete S.hydrating[id];
+      if (first) { S.loaded[id] = false; S.loadError[id] = (e && e.message) || String(e); }
+      render();
     });
   }
-  function newConv() { writeHashConv(null); setState({ activeId: null, promptValue: '', sidebarDrawer: false }, focusPrompt); }
+  function newConv() { writeHashConv(null); setState({ activeId: null, promptValue: '', sidebarDrawer: false, convMenuOpen: false }, focusPrompt); }
   function archiveConv(id, e) {
     if (e) e.stopPropagation();
     // Archiving is one-way and lossy: the KV cache is discarded and the
@@ -845,7 +958,11 @@ import { estateSwitcher } from './common/lib/estate.js';
       activeId = vis.length ? vis[0].id : null;
     }
     writeHashConv(activeId);   // keep the URL in sync so a reload doesn't restore the just-archived chat
-    setState({ conversations, activeId, confirm: null }, focusPrompt);
+    S.conversations = conversations;
+    // The conversation it lands on may never have been opened: load it, rather
+    // than show its empty history as the home page.
+    if (activeId) hydrateIfNeeded(activeId);
+    setState({ activeId, confirm: null, convMenuOpen: false }, focusPrompt);
   }
   function toggleArchived() {
     const showArchived = !S.showArchived;
@@ -861,6 +978,9 @@ import { estateSwitcher } from './common/lib/estate.js';
     if (!text) return;
     const conv = activeConv();
     if (conv && conv.streaming) return;
+    // Its history has not arrived yet: a send now would read as the first
+    // message of an empty conversation (and retitle it).
+    if (conv && S.hydrating[conv.id]) return;
     let conversations = S.conversations.slice();
     let activeId = S.activeId;
     let target;
@@ -966,18 +1086,35 @@ import { estateSwitcher } from './common/lib/estate.js';
     const opts = { think: S.effortLevel !== 0, effort: S.effortLevel, verbosity: S.verbosityLevel, tools: ['none', 'restricted', 'comprehensive'][S.toolsLevel] };
     stream = API.streamChatCompletion(conv, userText, opts, {
       onStatus: (s) => patchStream(convId, (m) => { m.status = s; }),
-      onToken: (delta) => { patchStream(convId, (m) => { m.content += delta; m.status = ''; }); },
+      onToken: (delta) => { patchStream(convId, (m) => { m.content += delta; m.status = ''; m.prefill = null; }); },
       onProjection: (span) => appendProjection(convId, span),
       // Tool lifecycle: `running` names the in-flight tools (drives the card
       // spinners); `done` stashes their results so the cards resolve at once,
       // and clears the spinners. Both are superseded by the post-stream hydrate.
       onTool: (st) => patchStream(convId, (m) => {
+        m.prefill = null;
         if (st && st.phase === 'running') {
           m.runningTools = st.tools || [];
         } else {
-          m.toolOutputs = (m.toolOutputs || []).concat((st && st.results) || []);
+          const results = (st && st.results) || [];
+          m.toolOutputs = (m.toolOutputs || []).concat(results);
+          // One length per result, kept aligned with the outputs.
+          m.toolTokens = (m.toolTokens || []).concat(results.map((_, k) => (st.tokens || [])[k]));
           m.runningTools = [];
         }
+      }),
+      // How far the next turn's input has been read in. After a tool round that
+      // is the tools' results, which can be long; the bar under the cards shows
+      // it and goes the moment the prefill completes (or the answer starts).
+      // The reasoning's length as the daemon counts it: `live` while a think
+      // block runs, and each block's total (in order) once it closes.
+      onThink: (t) => patchStream(convId, (m) => {
+        if (!t) return;
+        if (t.done) { m.thinking = (m.thinking || []).concat([{ tokens: t.tokens, exact: true }]); m.thinkLive = null; }
+        else m.thinkLive = t.tokens;
+      }),
+      onPrefill: (p) => patchStream(convId, (m) => {
+        m.prefill = (p && p.total > 0 && p.done < p.total) ? { done: p.done, total: p.total } : null;
       }),
       onLog: () => addLog(API.nextLogLine()),
       // The stream failed rather than finished. Record it on the message so the
@@ -1144,10 +1281,10 @@ import { estateSwitcher } from './common/lib/estate.js';
   }
 
   function openSubstrate(node, msg) {
-    // The projection node carries its own `selection` (what provenance picked
-    // AND skipped, per section). The glue markers and section content are loaded
-    // with the conversation (hydrateIfNeeded → S.substrateGlue/substrateContent),
-    // so the panel renders the framing and expands sections with no extra fetch.
+    // The panel shows the point's `selection` (what provenance picked AND
+    // skipped, per section) beside its context — the glue markers, the section
+    // text and the selected turns' bodies — all fetched now, when it opens
+    // (`loadSubstrate`); a conversation's history carries its points light.
     // `msg` is the assistant bubble the dot sits on. The conversation part of
     // the materialized context is the real exchanges that precede it — the GUI
     // holds them verbatim (with roles + content), whereas `sel.turns` carries no
@@ -1166,15 +1303,32 @@ import { estateSwitcher } from './common/lib/estate.js';
     // Snapshot the bubble (shallow copy) so the panel is a point-in-time view: the
     // streaming message is now mutated in place (see `patchStream`), so holding a
     // live ref would let the panel's content/spans drift as more tokens arrive.
-    setState({ substrateOpen: true, substrateNode: node, substrateMsg: msg ? Object.assign({}, msg) : null, substrateUserMsg: userMsg, substrateHistory: hist, substrateExpanded: {}, substrateGroupOpen: {} });
-    // Fallback: if a panel opens before any conversation hydrated (e.g. a brand
-    // new chat), pull the workspace-wide glue + content via the main GET.
-    if (S.substrateContent == null) {
-      const conv = activeConv();
-      if (conv) API.getConversation(conv.id)
-        .then((full) => setState({ substrateContent: full.sectionContent || {}, substrateTurnContent: full.turnContent || {}, substrateTargetLayer: full.targetLayer || S.substrateTargetLayer, substrateGlue: full.glue || S.substrateGlue }))
-        .catch(() => setState({ substrateContent: {} }));
-    }
+    setState({ substrateOpen: true, substrateNode: node, substrateLoading: true, substrateError: null, substrateMsg: msg ? Object.assign({}, msg) : null, substrateUserMsg: userMsg, substrateHistory: hist, substrateExpanded: {}, substrateGroupOpen: {} });
+    loadSubstrate(node);
+  }
+  // Fetch what the panel shows for `node`. A point from a loaded history is
+  // light — addressed by (turn, event) and fetched in full with its context; a
+  // point streamed live already holds its selection, so only the context is
+  // asked for. A reply for a point no longer on screen is dropped.
+  function loadSubstrate(node) {
+    const conv = activeConv();
+    if (!conv || !node) { setState({ substrateLoading: false }); return; }
+    const addressed = node.turn != null && node.event != null;
+    const req = addressed
+      ? API.getProjectionDetail(conv.id, node.turn, node.event).then((d) => ({
+          // Keep the bar's own fields (its id and the derived `_tps` & co.); take
+          // the selection and spine from the full point.
+          full: Object.assign({}, d.span, node, { selection: d.span.selection, materialized: d.span.materialized }),
+          ctx: d,
+        }))
+      : API.getProjectionContext(conv.id, (node.selection && node.selection.turns) || []).then((ctx) => ({ full: node, ctx }));
+    req.then((r) => {
+      if (!S.substrateOpen || S.substrateNode !== node) return;
+      setState({ substrateNode: r.full, substrateLoading: false, substrateContent: r.ctx.sectionContent || {}, substrateTurnContent: r.ctx.turnContent || {}, substrateGlue: r.ctx.glue || null, substrateTargetLayer: r.ctx.targetLayer || '' });
+    }).catch((e) => {
+      if (!S.substrateOpen || S.substrateNode !== node) return;
+      setState({ substrateLoading: false, substrateError: (e && e.message) || String(e) });
+    });
   }
 
   // ── helpers ────────────────────────────────────────────────────────────
@@ -1220,6 +1374,12 @@ import { estateSwitcher } from './common/lib/estate.js';
     hideProjPopover();
     // Startup: while the daemon loads the model / builds the substrate, show the
     // loading overlay — plus Logs + Perf so the build can be watched in realtime.
+    if (S.boot && S.boot.state === 'connecting') {
+      promptEl = chatEl = logEl = filesListEl = null;
+      root.innerHTML = '';
+      root.appendChild(buildSplash());
+      return;
+    }
     if (S.boot && S.boot.state !== 'ready') {
       // Preserve the log panel's scroll across this full re-render (fired on each
       // status poll): keep the exact position, or stay pinned to the tail if the
@@ -1394,10 +1554,16 @@ import { estateSwitcher } from './common/lib/estate.js';
     // This also gates file drag-and-drop (`canDropFiles`): uploads are only
     // accepted once the chat view is showing, never on the home/greeting screen.
     const uploadingHere = !!(conv && S.upload && S.upload.convId === conv.id);
+    // Opened but not fetched yet (or the fetch failed): the conversation's own
+    // pane — its title, and a loading state or a retry — never the home page
+    // its still-empty history would otherwise draw.
+    const pending = !!(conv && conv.history.length === 0 && (S.hydrating[conv.id] || S.loadError[conv.id]));
     const isEmpty = !conv
-      || (conv.history.length === 0 && !(conv.files && conv.files.length) && !uploadingHere);
+      || (!pending && conv.history.length === 0 && !(conv.files && conv.files.length) && !uploadingHere);
+    const body = pending ? (S.loadError[conv.id] ? buildConvLoadError(conv) : buildConvLoading())
+      : isEmpty ? buildEmptyState() : buildChat(conv);
     const inner = h('div', { style: 'flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; position:relative;' },
-      isEmpty ? buildEmptyState() : buildChat(conv));
+      isEmpty ? null : buildConvHeader(conv), body);
 
     const dropZone = h('div', {
       class: 'z-dropzone',
@@ -1413,6 +1579,42 @@ import { estateSwitcher } from './common/lib/estate.js';
 
     return h('div', { style: 'flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; background:#1c1917;' },
       dropZone, buildComposer());
+  }
+
+  // The open conversation's header: its title, which is also the button for
+  // the conversation's own actions. On a desktop those sit on the sidebar row
+  // too; on a phone the sidebar is folded away, so this is where they are.
+  function buildConvHeader(conv) {
+    const open = S.convMenuOpen;
+    const btn = h('button', { class: 'z-convtitle' + (open ? ' open' : ''), title: conv.title, 'aria-haspopup': 'menu', 'aria-expanded': open ? 'true' : 'false', onClick: () => setState({ convMenuOpen: !open }) },
+      conv.archived ? h('span', { class: 'z-convbadge' }, 'Archived') : null,
+      h('span', { class: 't' }, conv.title || 'Conversation'),
+      h('span', { style: 'display:flex; color:#8a8074;', html: ICON.chevron }));
+    const wrap = h('div', { style: 'position:relative; display:flex; min-width:0; max-width:100%;' }, btn);
+    if (open) {
+      wrap.appendChild(h('div', { onClick: () => setState({ convMenuOpen: false }), style: 'position:fixed; inset:0; z-index:39;' }));
+      wrap.appendChild(buildConvMenu(conv));
+    }
+    return h('div', { class: 'z-convhead' }, wrap);
+  }
+  function buildConvMenu(conv) {
+    const item = conv.archived
+      ? h('div', { class: 'z-convmenu-note' }, 'Archived — a read-only record. It can’t be reopened or continued.')
+      : h('button', { class: 'z-convmenu-item danger', role: 'menuitem', onClick: () => { S.convMenuOpen = false; archiveConv(conv.id); } },
+          h('span', { style: 'display:flex;', html: ICON.archive }), 'Archive conversation');
+    return h('div', { class: 'z-convmenu', role: 'menu' }, h('div', { class: 'z-convmenu-label' }, 'This conversation'), item);
+  }
+  // A conversation opened but not fetched yet: its title is already in the
+  // header, and this holds the pane until the history lands.
+  function buildConvLoading() {
+    return h('div', { class: 'z-convload', role: 'status', 'aria-live': 'polite' },
+      h('div', { class: 'z-spin' }), 'Loading conversation…');
+  }
+  function buildConvLoadError(conv) {
+    return h('div', { class: 'z-convload', role: 'alert' },
+      h('div', { style: 'color:#e0b0a6; font-weight:600;' }, 'This conversation didn’t load.'),
+      h('div', { style: 'max-width:28rem; font-size:0.78rem; color:#7c736a; word-break:break-word;' }, S.loadError[conv.id]),
+      h('button', { onClick: () => retryLoad(conv.id), style: 'height:32px; padding:0 0.9rem; border-radius:8px; border:none; background:' + ACCENT + '; color:#fff; font:inherit; font-size:0.8rem; font-weight:600; cursor:pointer;' }, 'Try again'));
   }
 
   function buildAppearance() {
@@ -1477,12 +1679,21 @@ import { estateSwitcher } from './common/lib/estate.js';
     // <tool_response> is the OUTPUT of the most recent assistant turn's tool
     // call, not a chat bubble of its own — fold it into that call's card (in
     // call order) and hide the raw bubble.
+    // A round of several calls answers with one `<tool_response>` block per
+    // call, in call order: each block pairs with its own card, along with its
+    // length in tokens (`tool_tokens`, one per block).
     const toolOut = {};
+    const toolTok = {};
     const skipMsg = {};
     conv.history.forEach((m, i) => {
       if (m.role === 'user' && isToolResponse(m.content)) {
         for (let j = i - 1; j >= 0; j--) {
-          if (conv.history[j].role === 'assistant') { (toolOut[j] = toolOut[j] || []).push(m.content); break; }
+          if (conv.history[j].role === 'assistant') {
+            const blocks = toolResponseBlocks(m.content);
+            (toolOut[j] = toolOut[j] || []).push(...blocks);
+            (toolTok[j] = toolTok[j] || []).push(...blocks.map((_, k) => (m.tool_tokens || [])[k]));
+            break;
+          }
         }
         skipMsg[i] = true;
       }
@@ -1499,7 +1710,7 @@ import { estateSwitcher } from './common/lib/estate.js';
           turnCopyBtn(m, 'right:0;')));
       } else {
         const open = !!S.thinkOpen[conv.id + ':' + idx];
-        const zmd = h('div', { class: 'zmd', style: 'flex:1; min-width:0; word-break:break-word; line-height:1.7;', html: nodeHtmlMemo(m, open, toolOut[idx]) });
+        const zmd = h('div', { class: 'zmd', style: 'flex:1; min-width:0; word-break:break-word; line-height:1.7;', html: nodeHtmlMemo(m, open, toolOut[idx], toolTok[idx]) });
         // Draw the projection bars by measuring the inline anchors — deferred to
         // the next frame because `zmd` isn't in the document yet (the scroller is
         // attached by the caller after buildChat returns), and getBoundingClientRect
@@ -1725,6 +1936,8 @@ import { estateSwitcher } from './common/lib/estate.js';
     substrate: '<svg viewBox="0 0 14 14" fill="none" style="width:12px;height:12px;"><path d="M7 1.2 12.5 4 7 6.8 1.5 4 7 1.2ZM1.5 7 7 9.8 12.5 7M1.5 10 7 12.8 12.5 10" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/></svg>',
     project: '<svg viewBox="0 0 14 14" fill="none" style="width:12px;height:12px;"><path d="M1.8 7h6.4M6.2 4.2 9 7l-2.8 2.8M10.5 2.5v9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     menu: '<svg viewBox="0 0 16 16" fill="none" style="width:15px;height:15px;"><circle cx="8" cy="3" r="1.4" fill="currentColor"/><circle cx="8" cy="8" r="1.4" fill="currentColor"/><circle cx="8" cy="13" r="1.4" fill="currentColor"/></svg>',
+    chevron: '<svg viewBox="0 0 10 10" fill="none" style="width:9px;height:9px;"><path d="M2 3.5l3 3 3-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    archive: '<svg viewBox="0 0 14 14" fill="none" style="width:13px;height:13px;"><path d="M1.8 2.4h10.4v2.7H1.8zM2.8 5.1v6.5h8.4V5.1M5.6 7.5h2.8" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   };
 
   // The top-right action set. `href` opens a new tab (external page); otherwise
@@ -1768,7 +1981,10 @@ import { estateSwitcher } from './common/lib/estate.js';
     // pills don't eat the (already tight) horizontal space.
     if (S.narrow) {
       const wrap = h('div', { style: pos + '; top:14px; right:14px; z-index:' + z + '; display:flex; flex-direction:column; align-items:flex-end; gap:8px;' });
-      wrap.appendChild(h('button', { onClick: () => setState({ topMenuOpen: !S.topMenuOpen }), title: 'More', style: menuBtnStyle(S.topMenuOpen), html: ICON.menu }));
+      // Open: a click anywhere else closes it. The backdrop sits under the
+      // button and the menu, inside this layer, over everything below.
+      if (S.topMenuOpen) wrap.appendChild(h('div', { onClick: () => setState({ topMenuOpen: false }), style: 'position:fixed; inset:0; z-index:-1;' }));
+      wrap.appendChild(h('button', { onClick: () => setState({ topMenuOpen: !S.topMenuOpen }), title: 'More', 'aria-expanded': S.topMenuOpen ? 'true' : 'false', style: menuBtnStyle(S.topMenuOpen), html: ICON.menu }));
       if (S.topMenuOpen) {
         const menu = h('div', { style: 'display:flex; flex-direction:column; gap:4px; padding:5px; border-radius:10px; border:1px solid #50493f; background:#2b2723; box-shadow:0 12px 30px rgba(0,0,0,0.72), 0 3px 8px rgba(0,0,0,0.5);' });
         actions.forEach((a) => menu.appendChild(actionEl(a, menuItemStyle(a.active))));
@@ -1802,8 +2018,9 @@ import { estateSwitcher } from './common/lib/estate.js';
       return wrap;
     }
     const streaming = !!(conv && conv.streaming);
-    const ready = S.promptValue.trim().length > 0 && !streaming;
-    const sendHint = streaming ? 'Generating…' : (ready ? '↵ send' : '');
+    const loadingHere = !!(conv && S.hydrating[conv.id]);
+    const ready = S.promptValue.trim().length > 0 && !streaming && !loadingHere;
+    const sendHint = streaming ? 'Generating…' : loadingHere ? 'Loading…' : (ready ? '↵ send' : '');
 
     const ta = h('textarea', {
       id: 'zend-prompt', rows: '1', placeholder: 'Message…   ↵ to send · ⇧↵ for newline', autocomplete: 'off', spellcheck: 'true',
@@ -1903,12 +2120,13 @@ import { estateSwitcher } from './common/lib/estate.js';
     e.target.style.overflowY = ht > 200 ? 'auto' : 'hidden';
     const conv = activeConv();
     const streaming = !!(conv && conv.streaming);
-    const ready = S.promptValue.trim().length > 0 && !streaming;
+    const loadingHere = !!(conv && S.hydrating[conv.id]);
+    const ready = S.promptValue.trim().length > 0 && !streaming && !loadingHere;
     const box = e.target.parentNode;
     const btn = box.querySelector('button[aria-label="Send"]');
     if (btn) { btn.disabled = !ready; btn.style.opacity = ready ? 1 : 0.3; btn.style.cursor = ready ? 'pointer' : 'default'; }
     const hint = box.querySelector('.z-sendhint');
-    if (hint) hint.textContent = streaming ? 'Generating…' : (ready ? '↵ send' : '');
+    if (hint) hint.textContent = streaming ? 'Generating…' : loadingHere ? 'Loading…' : (ready ? '↵ send' : '');
   }
   function onPromptKeyDown(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(S.promptValue); } }
 
@@ -2691,15 +2909,26 @@ import { estateSwitcher } from './common/lib/estate.js';
       pushMsg('assistant', liveText, { layer: targetLayer, key: 'conv::live', noGlue: true, colorize: true, label: 'turn', suffix: ' · decoding', open: true });
     }
 
-    const empty = !sel.system.length && !(sel.turns || []).length && !um && !dm;
+    const waiting = S.substrateLoading || !!S.substrateError;
+    const empty = !waiting && !sel.system.length && !(sel.turns || []).length && !um && !dm;
+    const stateBox = 'flex:1; min-height:160px; display:flex; align-items:center; justify-content:center; gap:10px; padding:30px; font-size:0.82rem; background:#161412; text-align:center;';
+    const content = S.substrateLoading
+      ? h('div', { role: 'status', style: stateBox + ' color:#8a8178;' }, h('span', { class: 'zspin' }), 'Loading this projection…')
+      : S.substrateError
+        ? h('div', { role: 'alert', style: stateBox + ' flex-direction:column; color:#d99a8f;' },
+            h('div', {}, 'This projection didn’t load. ' + S.substrateError),
+            h('button', { onClick: () => { setState({ substrateLoading: true, substrateError: null }); loadSubstrate(S.substrateNode); }, style: 'font-size:0.76rem; color:#ece8e4; background:#232120; border:1px solid #38342f; border-radius:7px; padding:5px 12px; cursor:pointer; font-family:inherit;' }, 'Try again'))
+        : empty
+          ? h('div', { style: 'flex:1; padding:30px; color:#7c736a; font-size:0.85rem; background:#161412;' }, 'No selection recorded for this projection.')
+          : body;
     const modal = h('div', { class: 'z-modal', onClick: (e) => e.stopPropagation(), style: 'width:min(880px,95%); max-height:86vh; display:flex; flex-direction:column; background:#1c1a18; border:1px solid #38342f; border-radius:14px; box-shadow:0 18px 60px rgba(0,0,0,0.6); overflow:hidden;' },
       h('div', { style: 'flex-shrink:0; display:flex; align-items:flex-start; gap:12px; padding:15px 17px; border-bottom:1px solid #2e2b27;' },
         h('div', { style: 'flex:1; min-width:0;' },
           h('div', { style: 'font-size:0.95rem; font-weight:650; color:#ece8e4;' }, 'Projection selection'),
           h('div', { style: 'font-size:0.73rem; color:#7c736a; font-family:ui-monospace,monospace; margin-top:3px; word-break:break-word;' }, !node ? '' : ((node.step || '') + ' · materialized ' + fmtTok(node.materialized_tokens) + ' / ' + fmtTok(node.substrate_tokens) + ' tokens' + (node._tps ? ' · ' + Math.round(node._tps) + ' t/s' : '')))),
-        empty ? null : h('button', { onClick: (e) => copyText(substrateAllText(node), e.currentTarget, 'Copied', 'Copy all'), style: 'flex-shrink:0; font-size:0.74rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:7px; padding:5px 11px; cursor:pointer; font-family:inherit;' }, 'Copy all'),
+        (empty || waiting) ? null : h('button', { onClick: (e) => copyText(substrateAllText(node), e.currentTarget, 'Copied', 'Copy all'), style: 'flex-shrink:0; font-size:0.74rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:7px; padding:5px 11px; cursor:pointer; font-family:inherit;' }, 'Copy all'),
         h('button', { onClick: () => setState({ substrateOpen: false }), style: closeBtnStyle() }, '×')),
-      empty ? h('div', { style: 'flex:1; padding:30px; color:#7c736a; font-size:0.85rem; background:#161412;' }, 'No selection recorded for this projection.') : body);
+      content);
     return h('div', { class: 'z-modal-ov', onClick: () => setState({ substrateOpen: false }), style: modalOvStyle(400) }, modal);
   }
 
@@ -2772,7 +3001,15 @@ import { estateSwitcher } from './common/lib/estate.js';
     }
   }
 
-  // ── startup / model-loading overlay (GET /v1/status) ─────────────────────
+  // ── first paint, and the startup / model-loading overlay (GET /v1/status) ─
+  // Before the daemon has answered, the page is arriving, not starting: a
+  // quiet mark and "Getting ready…", faded in only if the wait outlasts a
+  // moment. The startup card below is for a daemon that says it is loading.
+  function buildSplash() {
+    return h('div', { class: 'z-splash', role: 'status', 'aria-live': 'polite' },
+      h('div', { class: 'z-splash-mark', html: starLogo(40, '#26231f', 8) }),
+      h('div', {}, 'Getting ready…'));
+  }
   function buildLoadingScreen(boot) {
     const ld = (boot && boot.loading) || { current: 'Loading model', progress: 0, completed: [] };
     const pct = Math.round((ld.progress || 0) * 100);
@@ -2805,6 +3042,8 @@ import { estateSwitcher } from './common/lib/estate.js';
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     if (S.themeMenuOpen) setState({ themeMenuOpen: false });
+    else if (S.convMenuOpen) setState({ convMenuOpen: false });
+    else if (S.topMenuOpen) setState({ topMenuOpen: false });
     else if (S.openMenu) setState({ openMenu: null });
     else if (S.fileView) setState({ fileView: null });
     else if (S.substrateOpen) setState({ substrateOpen: false });
@@ -2848,8 +3087,13 @@ import { estateSwitcher } from './common/lib/estate.js';
   // way we pick an active conversation (prefer hydrated, else first) + hydrate.
   logUnsub = API.subscribeLogs((line) => addLog(line));
 
-  function initConversations() {
-    Promise.resolve(API.seedConversations(now)).then((list) => {
+  // `prefetched` is a list request already in flight (the first load asks for
+  // it alongside the status); without one, or if it failed, ask now.
+  function initConversations(prefetched) {
+    const listed = prefetched
+      ? prefetched.then((list) => list || API.seedConversations(now))
+      : Promise.resolve(API.seedConversations(now));
+    listed.then((list) => {
       S.conversations = list || [];
       const hashId = readHashConv();
       // Restore ONLY the conversation the user actually had open (carried in the
@@ -2865,9 +3109,10 @@ import { estateSwitcher } from './common/lib/estate.js';
         const a = S.conversations.find((c) => c.id === S.activeId);
         S.loaded[S.activeId] = !!(a && a.history && a.history.length);
       }
+      // Before the first render, so a restored conversation shows loading.
+      if (S.activeId && !S.loaded[S.activeId]) hydrateIfNeeded(S.activeId);
       render();
       focusPrompt();
-      if (S.activeId && !S.loaded[S.activeId]) hydrateIfNeeded(S.activeId);
       window.__ZEND_READY__ = true;
     }).catch((e) => {
       if (window.console) console.error('seedConversations failed', e);
@@ -2894,14 +3139,16 @@ import { estateSwitcher } from './common/lib/estate.js';
   let reloadPolling = false;
   const LOADING_BOOT = (label) => ({ state: 'loading', detail: '', loading: { current: label, progress: 0, completed: [] } });
 
-  function pollStatus() {
+  // `prefetchedList`: see `initConversations`. Only the first poll has one — a
+  // list fetched while the daemon was still loading would be empty.
+  function pollStatus(prefetchedList) {
     Promise.resolve(API.getStatus()).then((st) => {
       checkBuild(st);   // capture the build id on first sighting
       if (st && st.state === 'ready') {
         reloadPolling = false;
         if (st.started_at_ms != null) lastStartedAt = st.started_at_ms;
         S.boot = null;
-        initConversations();
+        initConversations(prefetchedList);
         loadToolSchemas();
       } else {
         S.boot = st || S.boot || LOADING_BOOT('Loading model');
@@ -2984,9 +3231,13 @@ import { estateSwitcher } from './common/lib/estate.js';
     });
   }
 
-  render();      // loading overlay (S.boot starts in the loading state)
-  reloadPolling = true;   // the initial model-load poll owns the loading screen
-  pollStatus();
+  render();      // the first paint: the quiet "Getting ready" splash
+  reloadPolling = true;   // the initial poll owns the screen until the daemon is ready
+  // Ask for the status and the conversation list together. On the usual load
+  // the daemon is already up, so the list is in hand the moment the status
+  // says so: one round trip to the first real paint, not two in a row.
+  const firstList = Promise.resolve(API.seedConversations(now)).catch(() => null);
+  pollStatus(firstList);
   setInterval(periodicSync, 5000);
 })();
 </script>

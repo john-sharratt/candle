@@ -253,6 +253,16 @@ fn stream_sse(
                 .map_err(|e| anyhow::anyhow!(e))
                 .map(|data| Event::default().event("tool").data(data))],
 
+            Ok(StreamItem::Prefill { done, total }) => {
+                let data = serde_json::json!({ "done": done, "total": total }).to_string();
+                vec![Ok(Event::default().event("prefill").data(data))]
+            }
+
+            Ok(StreamItem::Think { tokens, done }) => {
+                let data = serde_json::json!({ "tokens": tokens, "done": done }).to_string();
+                vec![Ok(Event::default().event("think").data(data))]
+            }
+
             Ok(StreamItem::Token(text)) => tokens.token(text),
 
             Ok(StreamItem::TurnEnd { usage, finish }) => {
@@ -306,6 +316,8 @@ async fn collect_completion(
             Ok(StreamItem::Status(_)) => {} // status events are display-only
             Ok(StreamItem::Projection(_)) => {} // timeline-only; not in the collected body
             Ok(StreamItem::Tool(_)) => {}   // tool lifecycle; display-only, not in the body
+            Ok(StreamItem::Prefill { .. }) => {} // prefill progress; display-only
+            Ok(StreamItem::Think { .. }) => {} // reasoning progress; display-only
             Ok(StreamItem::TurnEnd {
                 usage: turn,
                 finish: ended,

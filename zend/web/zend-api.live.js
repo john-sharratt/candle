@@ -8,13 +8,17 @@
  * gui_api_harness integration test):
  *   - seedConversations / getConversation   GET /v1/conversations[/{id}]
  *   - archiveConversation (one-way)          POST …/archive
- *   - streamChatCompletion (token + status)  POST /v1/chat/completions (SSE)
+ *   - getProjectionDetail                    GET …/{id}/projections/{turn}/{event}
+ *   - getProjectionContext                   POST …/{id}/projection-context
+ *   - streamChatCompletion (token + status + think + prefill)  POST /v1/chat/completions (SSE)
  *   - subscribeLogs / seedLogs               WS /ws/logs (structured JSON frames)
  *   - getToolSchemas                         GET /v1/substrate/tools
  *
- * Projection glue + section content ride along on getConversation (first-class
- * fields), so the projection panel renders the framing and expands sections
- * with no extra round-trip.
+ * A conversation's history carries its projection points light (the fields
+ * the timeline draws, plus each point's `turn`/`event` address). The projection
+ * panel fetches what it shows when it opens: a point in full with its context
+ * (getProjectionDetail), or — for a point streamed live, which arrives in full
+ * but unaddressed — the context alone (getProjectionContext).
  * ========================================================================== */
 (function () {
   'use strict';
@@ -49,28 +53,36 @@
     },
     async getConversation(id) {
       // The daemon returns role-split, /no_think-stripped bubbles (decision 9),
-      // plus the workspace-wide projection glue + section content (first-class,
-      // so the projection panel needs no extra round-trip).
+      // each assistant bubble's projection points light.
       const body = await getJSON('/v1/conversations/' + enc(id));
-      const sectionContent = {};
-      (body.section_content || []).forEach((s) => { sectionContent[s.name] = s.content; });
-      // Keyed by group::timeline::index — one group holds many conversations
-      // (code_read: one per file) and turn indices repeat across them, so the
-      // timeline is a load-bearing part of the key. `text` is absent for turns
-      // whose Tokens record was lost; consumers fall back to the halves.
-      const turnContent = {};
-      (body.turn_content || []).forEach((t) => { turnContent[t.group + '::' + t.timeline + '::' + t.index] = { text: t.text, user: t.user, assistant: t.assistant, layout: t.layout }; });
       return {
         id: String(id),
-        history: (body.messages || []).map((m) => ({ role: m.role, content: m.content, no_think: !!m.no_think, spans: m.spans || [], files: m.files || [] })),
-        glue: body.glue || null,
-        sectionContent,
-        turnContent,
-        targetLayer: body.target_layer || '',
+        title: body.title,
+        // `thinking` ({tokens, exact}) is the turn's reasoning length; the UI
+        // keeps one per think block, in order.
+        history: (body.messages || []).map((m) => ({ role: m.role, content: m.content, no_think: !!m.no_think, thinking: m.thinking ? [m.thinking] : [], tool_tokens: m.tool_tokens || [], spans: m.spans || [], files: m.files || [] })),
         uploads: body.uploads || [],
       };
     },
     archiveConversation(id) { return postVoid('/v1/conversations/' + enc(id) + '/archive'); },
+
+    // One recorded projection point in full — its selection and materialized
+    // spine — with the panel context beside it.
+    async getProjectionDetail(convId, turn, event) {
+      const body = await getJSON('/v1/conversations/' + enc(convId) + '/projections/' + Number(turn) + '/' + Number(event));
+      return Object.assign({ span: body.span }, panelContext(body));
+    },
+    // The panel context alone, for a point already held in full: `turns` is
+    // its `selection.turns`, sent as they are.
+    async getProjectionContext(convId, turns) {
+      const r = await fetch('/v1/conversations/' + enc(convId) + '/projection-context', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({ turns: turns || [] }),
+      });
+      if (!r.ok) throw new Error('POST projection-context -> ' + r.status);
+      return panelContext(await r.json());
+    },
 
     // GET /v1/status — daemon loading state (drives the startup overlay). If the
     // daemon isn't reachable yet, report a synthetic "connecting" loading state.
@@ -242,6 +254,19 @@
     mkProjEvent: ni('mkProjEvent'),
   };
 
+  // The panel context as the UI keeps it: section text by name, and turn bodies
+  // keyed by group::timeline::index — one group holds many conversations
+  // (code_read: one per file) and turn indices repeat across them, so the
+  // timeline is a load-bearing part of the key. `text` is absent for turns
+  // whose Tokens record was lost; consumers fall back to the halves.
+  function panelContext(body) {
+    const sectionContent = {};
+    (body.section_content || []).forEach((s) => { sectionContent[s.name] = s.content; });
+    const turnContent = {};
+    (body.turn_content || []).forEach((t) => { turnContent[t.group + '::' + t.timeline + '::' + t.index] = { text: t.text, user: t.user, assistant: t.assistant, layout: t.layout }; });
+    return { glue: body.glue || null, sectionContent, turnContent, targetLayer: body.target_layer || '' };
+  }
+
   // Parse one upload SSE frame -> the upload handlers.
   function handleUploadFrame(frame, handlers, metas) {
     let event = null;
@@ -295,6 +320,14 @@
     }
     if (event === 'tool') {
       try { if (handlers.onTool) handlers.onTool(JSON.parse(data)); } catch (_) {}
+      return;
+    }
+    if (event === 'think') {
+      try { if (handlers.onThink) handlers.onThink(JSON.parse(data)); } catch (_) {}
+      return;
+    }
+    if (event === 'prefill') {
+      try { if (handlers.onPrefill) handlers.onPrefill(JSON.parse(data)); } catch (_) {}
       return;
     }
     if (data === '[DONE]') { handlers.onDone(); return; }
