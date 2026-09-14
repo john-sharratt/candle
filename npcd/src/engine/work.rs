@@ -92,6 +92,18 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     let a = &act.args;
     match act.tool {
         "collect_mission" => {
+            // **One mission at a time.** `collect_mission` is offered whenever a
+            // body stands at the desk, including when it has come back to report
+            // — so without this a character could draw a fresh mission over an
+            // open one, discarding the answer it built and never filing it to
+            // `done`. Report it first; then the desk has something new to give.
+            if hosted.sim(|s| s.missions.is_on_mission(body)) {
+                return Outcome::Refused(
+                    "You are already carrying a mission. Report how it went at the \
+                     desk — report_done or report_stuck — before taking another."
+                        .into(),
+                );
+            }
             // The character's own name, so a routine that would send it to visit
             // "the makers here" is not built around visiting itself.
             let me = hosted
@@ -120,6 +132,9 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                 );
             };
             hosted.with_sim(|s| {
+                // The account is both the report's notes (how it went) and the
+                // answer (what was found) — for a mission done, the two are the
+                // same line, so it is filed under both.
                 match s
                     .missions
                     .report(body, Verdict::Pass, &account, Some(account.clone()))
@@ -2204,6 +2219,13 @@ mod tests {
         // records indexed) and makes it the body's open one.
         assert!(perform(&h, "m1", &act("collect_mission", json!({}))).happened());
         assert!(h.sim(|s| s.missions.is_on_mission("m1")));
+
+        // A second collect while already carrying one is refused — one at a
+        // time, so a mission in progress is never discarded by drawing another.
+        assert!(matches!(
+            perform(&h, "m1", &act("collect_mission", json!({}))),
+            Outcome::Refused(_)
+        ));
 
         // Its first step can be ticked off; a step it never had cannot.
         let step = h.sim(|s| {

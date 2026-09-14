@@ -292,6 +292,7 @@ impl Inbox {
             kind,
             EventKind::Speech { .. }
                 | EventKind::Description { .. }
+                | EventKind::Announcement { .. }
                 | EventKind::Entity { .. }
                 | EventKind::Operator { .. }
                 | EventKind::Wake { .. }
@@ -1627,6 +1628,26 @@ mod tests {
     /// conversation is mostly gaps. Two characters alternated for a hundred
     /// turns, each hearing the other speak and then, in the pause before the
     /// reply, being told that nothing had been asked of it.
+    /// **A world announcement is news.** It is something that happened, put to
+    /// everyone at once — so it resets the quiet clock and is not talked over by
+    /// the standing task on the very next tick. Left off the news list, an
+    /// announcement is read once and then buried under "nothing has been asked
+    /// of you" in the most recent window slot.
+    #[test]
+    fn a_world_announcement_counts_as_news() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.deliver(
+            1,
+            0,
+            Salience::URGENT,
+            EventKind::Announcement {
+                text: "the gate is sealed".into(),
+            },
+        );
+        assert_eq!(s.quiet_for(1, 0), Some(0), "an unread announcement is news");
+    }
+
     #[test]
     fn a_pause_in_a_conversation_does_not_read_as_a_quiet_character() {
         let s = sched();
