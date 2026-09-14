@@ -176,29 +176,29 @@ pub async fn run(
     // that ran against invented content would be measuring the content.
     let feelings = rt.feelings();
 
-    // Blocking: a decode is seconds and this is an axum worker. Moved off it so
-    // a scenario does not stall the console's polling for the length of a
-    // generation.
-    let probe = tokio::task::spawn_blocking(move || {
-        let persona = persona_of(&scenario, &world, &mission);
-        let within = crate::engine::tools::Within {
-            company: scenario.company.clone(),
-            places: scenario.places.clone(),
-            cooling: scenario.cooling.clone(),
-            // **The daemon's own vocabulary, not the scenario's.** Which
-            // registers exist is a fact about the mind this daemon loaded, the
-            // same for every character in it — so a probe that made it up would
-            // be testing a grammar no live character is ever handed, which is
-            // the one thing a probe must not do.
-            feelings: feelings.clone(),
-            // A probe stands in no world, so it carries nothing, works nothing
-            // and has nothing to shoot. The acts that need those are absent
-            // from what it is offered, which is the right answer rather than a
-            // limitation: a scenario asks what a character would say, and the
-            // things it would say them about are what the scenario supplies.
-            ..Default::default()
-        };
-        minds.probe(
+    // Awaited directly: the decode yields on its turn channel, so a scenario
+    // parks a future rather than an axum worker — and a console that stops
+    // polling drops it, which stops the decode.
+    let persona = persona_of(&scenario, &world, &mission);
+    let within = crate::engine::tools::Within {
+        company: scenario.company.clone(),
+        places: scenario.places.clone(),
+        cooling: scenario.cooling.clone(),
+        // **The daemon's own vocabulary, not the scenario's.** Which
+        // registers exist is a fact about the mind this daemon loaded, the
+        // same for every character in it — so a probe that made it up would
+        // be testing a grammar no live character is ever handed, which is
+        // the one thing a probe must not do.
+        feelings: feelings.clone(),
+        // A probe stands in no world, so it carries nothing, works nothing
+        // and has nothing to shoot. The acts that need those are absent
+        // from what it is offered, which is the right answer rather than a
+        // limitation: a scenario asks what a character would say, and the
+        // things it would say them about are what the scenario supplies.
+        ..Default::default()
+    };
+    let probe = minds
+        .probe(
             &persona,
             Mode::Physical,
             thinking,
@@ -206,11 +206,10 @@ pub async fn run(
             scenario.projected,
             &within,
         )
-    })
-    .await;
+        .await;
 
     match probe {
-        Ok(Ok(p)) => Json(Outcome {
+        Ok(p) => Json(Outcome {
             acts: p.parsed.acts.iter().map(|a| a.summary()).collect(),
             rejected: p.parsed.rejected.iter().map(|r| r.line()).collect(),
             narration: p.parsed.narration.clone(),
@@ -223,23 +222,18 @@ pub async fn run(
             raw: p.raw,
         })
         .into_response(),
-        Ok(Err(e)) => err(
+        Err(e) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "probe_failed",
             &format!("{e:#}"),
         ),
-        Err(e) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "probe_panicked",
-            &format!("{e}"),
-        ),
     }
 }
 
-/// The persona a scenario describes, rebuilt inside the blocking task.
+/// The persona a scenario describes.
 ///
-/// Rebuilt rather than moved because [`Persona`] borrows every field, and the
-/// scenario that owns them has to cross a thread boundary to reach the decode.
+/// Built from borrows because [`Persona`] borrows every field, and the
+/// scenario that owns them outlives the decode await.
 fn persona_of<'a>(s: &'a Scenario, world: &'a str, mission: &'a str) -> Persona<'a> {
     Persona {
         name: &s.name,
@@ -256,5 +250,6 @@ fn persona_of<'a>(s: &'a Scenario, world: &'a str, mission: &'a str) -> Persona<
         situation: "",
         world,
         place: "",
+        building: "",
     }
 }

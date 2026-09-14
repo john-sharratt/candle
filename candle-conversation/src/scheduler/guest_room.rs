@@ -132,18 +132,15 @@ impl Scheduler {
 mod tests {
     use super::*;
     use crate::guest::model::testing::FakeGuest;
-    use crate::guest::work::{Guest, GuestError, ProseRequest};
+    use crate::guest::work::{Guest, GuestError, MatteRequest};
     use crate::guest::{GuestModel, GuestRequest};
     use std::sync::atomic::AtomicUsize;
 
-    fn prose() -> GuestRequest {
-        GuestRequest::Prose(ProseRequest {
-            system: String::new(),
-            prompt: "the yard".into(),
-            max_tokens: 8,
-            temperature: None,
-            seed: None,
-            choices: None,
+    fn matte() -> GuestRequest {
+        GuestRequest::Matte(MatteRequest {
+            pixels: vec![0; 4 * 4 * 3],
+            width: 4,
+            height: 4,
         })
     }
 
@@ -191,12 +188,12 @@ mod tests {
     #[test]
     fn submitting_to_an_idle_engine_sends_a_wake() {
         use crate::scheduler::SchedulerRequest;
-        let (tx, rx) = crossbeam::channel::bounded(4);
+        let (tx, rx) = flume::bounded(4);
 
         // What `ConversationEngine::submit_guest` does, in the order it does
         // it: queue the job, then wake whatever is parked on the channel.
         let guests = Guests::new();
-        let _receipt = guests.queue.submit(prose()).unwrap();
+        let _receipt = guests.queue.submit(matte()).unwrap();
         tx.send(SchedulerRequest::Wake).unwrap();
 
         assert!(
@@ -217,11 +214,11 @@ mod tests {
     fn a_job_for_an_unconfigured_guest_is_cleared_without_a_drain() {
         let (mut scheduler, _tx) = super::super::tests::make_test_scheduler();
         let guests = Arc::new(Guests::new());
-        let receipt = guests.queue.submit(prose()).unwrap();
+        let receipt = guests.queue.submit(matte()).unwrap();
 
         assert!(scheduler.drain_guests(&guests).is_none());
         assert_eq!(guests.queue.depth(), 0, "the job stayed queued");
-        assert_eq!(receipt.wait(), Err(GuestError::Unavailable(Guest::Prose)));
+        assert_eq!(receipt.wait(), Err(GuestError::Unavailable(Guest::Matte)));
     }
 
     /// **A queued job reaches a drain, and its caller is answered either way.**
@@ -241,13 +238,13 @@ mod tests {
     fn a_queued_job_is_taken_and_its_caller_answered() {
         let (mut scheduler, _tx) = super::super::tests::make_test_scheduler();
         let runs = Arc::new(AtomicUsize::new(0));
-        let guests = guests_with(Guest::Prose, Arc::clone(&runs));
-        let receipt = guests.queue.submit(prose()).unwrap();
+        let guests = guests_with(Guest::Matte, Arc::clone(&runs));
+        let receipt = guests.queue.submit(matte()).unwrap();
 
         let report = scheduler
             .drain_guests(&guests)
             .expect("a queued job did not reach a drain");
-        assert_eq!(report.guest, Some(Guest::Prose));
+        assert_eq!(report.guest, Some(Guest::Matte));
         assert_eq!(report.jobs, 1);
         assert_eq!(guests.queue.depth(), 0);
         assert!(!guests.has_work(), "the job was left in the queue");

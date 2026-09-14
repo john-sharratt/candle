@@ -10,7 +10,7 @@
 //! model chooses is how much one looks like something it has done before.
 //!
 //! The fiction is unharmed by it. The part's own prose stays in the vault's
-//! voice; the identifier is git. That is the same split `say` keeps by taking an
+//! voice; the identifier is git. That is the same split `tell` keeps by taking an
 //! intent while the narrator writes the words — the surface carries the story,
 //! the mechanism is plain.
 //!

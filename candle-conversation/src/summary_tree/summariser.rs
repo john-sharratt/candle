@@ -28,7 +28,12 @@ use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crossbeam::channel::{self, Receiver, Sender};
+// The trigger/shutdown channels are the summariser's own thread plumbing and stay
+// crossbeam, under role names — so the bare `Sender` in this file means the same
+// flume type it means everywhere else in the crate (the scheduler-facing request
+// channel and its one-shot replies; docs/async_wave_submission.md §3.1).
+use crossbeam::channel::{self, Receiver as TriggerReceiver, Sender as TriggerSender};
+use flume::Sender;
 
 use crate::persistence::record::TreeMetadataPayload;
 use crate::projection::{Conversation, TimelineId, TurnIndex};
@@ -70,7 +75,7 @@ pub const SUMMARISER_TICK: Duration = Duration::from_millis(250);
 /// summariser without needing the [`SummariserThread`] handle.
 #[derive(Clone)]
 pub struct SummariserTrigger {
-    tx: Sender<()>,
+    tx: TriggerSender<()>,
 }
 
 impl SummariserTrigger {
@@ -93,8 +98,8 @@ impl SummariserTrigger {
 /// final pass, and joins the thread.
 pub struct SummariserThread {
     handle: Mutex<Option<JoinHandle<()>>>,
-    trigger_tx: Sender<()>,
-    shutdown_tx: Sender<()>,
+    trigger_tx: TriggerSender<()>,
+    shutdown_tx: TriggerSender<()>,
 }
 
 impl SummariserThread {
@@ -181,8 +186,8 @@ fn run_loop(
     conversation: Conversation,
     runner: Arc<dyn ProbeRunner>,
     max_concurrent: usize,
-    trigger_rx: Receiver<()>,
-    shutdown_rx: Receiver<()>,
+    trigger_rx: TriggerReceiver<()>,
+    shutdown_rx: TriggerReceiver<()>,
 ) {
     loop {
         let mut shutting_down = false;
@@ -704,7 +709,7 @@ pub fn summary_probe_concurrency(device: &candle::Device) -> usize {
 
 impl ProbeRunner for ChannelProbeRunner {
     fn run(&self, request: ProbeRequest) -> Result<ProbeResponse, ProbeError> {
-        let (response_tx, response_rx) = crossbeam::channel::bounded(1);
+        let (response_tx, response_rx) = flume::bounded(1);
         let scheduler_request = SchedulerRequest::SubmitSummaryProbe {
             timeline: request.timeline,
             kind: request.kind,
@@ -728,10 +733,9 @@ impl ProbeRunner for ChannelProbeRunner {
         // Submit every probe first (non-blocking sends) so the scheduler
         // registers all their decodes before the next decode quantum — they
         // then batch into a single forward instead of running one at a time.
-        let mut receivers: Vec<Result<Receiver<Result<TurnIndex, ProbeError>>, ProbeError>> =
-            Vec::with_capacity(requests.len());
+        let mut receivers = Vec::with_capacity(requests.len());
         for request in requests {
-            let (response_tx, response_rx) = crossbeam::channel::bounded(1);
+            let (response_tx, response_rx) = flume::bounded(1);
             let scheduler_request = SchedulerRequest::SubmitSummaryProbe {
                 timeline: request.timeline,
                 kind: request.kind,

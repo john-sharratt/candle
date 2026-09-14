@@ -604,10 +604,30 @@ pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactor
     // belongs to the code it was derived against, and picking between two
     // branches' rows by their VALUES rather than by re-measuring is how a merge
     // ships a combination neither side ever ran.
-    k_hi: 1.07,
-    k_low: 1.07,
-    v_hi: 1.85,
-    v_low: 1.85,
+    //
+    // Re-derived 2026-09-14 on the RTX 3090 (sm_86, gate at int8 `prec`):
+    // 1.07/1.85 — 10/10 on the sm_120 box two days earlier — scored 9/10 here
+    // three runs straight (session 9 diverges at char 23, the single-name
+    // signature), at C10 5.86×. So a row also belongs to the CARD it was
+    // measured on: the int8 numeric path differs per arch, and the edge moves
+    // with it. Stepped straight to main's deep-margin pair rather than walking
+    // the edge (this row's own note: buy standing margin):
+    //
+    // | k    | v    | C10 ×10 (sm_86) | ratio |
+    // |------|------|-----------------|-------|
+    // | 1.07 | 1.85 | 9/10 ✗ ×3       | 5.86× |
+    // | 0.85 | 1.45 | 10/10 ✓ ×3      | 5.13× |
+    //
+    // Cost: 5.86× → 5.13× (the 5.86× row was red, so against working
+    // compression the baseline is the sm_120 box's 5.87×). The sm_120 box has
+    // NOT run 0.85/1.45 on this branch — its standing 10/10 is 1.07/1.85
+    // (2026-09-12): confirm there on its next sweep, and if this pair fails
+    // there, the row has outgrown a single constant (the 27B's checkpoint is
+    // already chosen per card; a row may have to be).
+    k_hi: 0.85,
+    k_low: 0.85,
+    v_hi: 1.45,
+    v_low: 1.45,
 };
 
 /// Qwen3.5-35B-A3B (routed hybrid).
@@ -917,11 +937,29 @@ pub const QWEN36_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFacto
 ///
 /// **The edge is NOT bracketed** — passed on the first step and was not walked
 /// further, so the margin is unmeasured. Same caveat as the 3.6 row.
+///
+/// **Re-derived 2026-09-14 on the RTX 3090** (24 GB → the gate pins Q4_K_M;
+/// sm_86, int8 `perf`) after 0.8/2.05 scored 9/10 three runs straight
+/// (session 4, char 32, a single verb — "had"→"has"). Walked down this row's
+/// own measured surface, and the divergence MOVED with the step (session 4 →
+/// session 1, verb → name), so this was the knob and not a candidate ceiling:
+///
+/// | k   | v    | C10 ×10 (sm_86, Q4_K_M) | ratio |
+/// |-----|------|--------------------------|-------|
+/// | 0.8 | 2.05 | 9/10 ✗ ×3                | 5.52× |
+/// | 0.7 | 1.8  | 9/10 ✗                   | —     |
+/// | 0.7 | 1.4  | 10/10 ✓ ×3               | 4.78× |
+///
+/// "Weight precision is a term" (above) now has a third point: Q6_K holds
+/// 0.8/2.05, Q3_K_M held 0.7/1.8, and Q4_K_M on sm_86 needs 0.7/1.4. The
+/// sm_120 box's standing 10/10 at 0.8/2.05 (2026-09-13, Q6_K) has NOT been
+/// re-run at this pair: confirm there on its next sweep — a fail there means
+/// the row needs the same per-card resolution the checkpoint already has.
 pub const QWEN38_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 0.8,
-    k_low: 0.8,
-    v_hi: 2.05,
-    v_low: 2.05,
+    k_hi: 0.7,
+    k_low: 0.7,
+    v_hi: 1.4,
+    v_low: 1.4,
 };
 
 /// Qwen3.8-Flash-Next (`qwen4exp`) — the 512-expert sparse-attention hybrid.

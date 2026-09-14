@@ -16,6 +16,7 @@ use candle::{DType, Device};
 use candle_nn::kv_cache::{class_for_format, elems_per_chunk, KvFormat, SizeClass, N_PALETTE};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_model::BatchedInference;
+use candle_transformers::models::qwen35::TensorOverride;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -215,8 +216,8 @@ impl ModelBuilder {
     ///
     /// ```ignore
     /// let mut guests = GuestRegistry::new();
-    /// guests.register(Guest::Prose, move || {
-    ///     Box::new(ProseGuest::new(ProseSpec::hermes3_3b(&gguf, &tok)))
+    /// guests.register(Guest::Matte, move || {
+    ///     Box::new(MatteGuest::new(MatteSpec::new(onnx.clone(), MatteFamily::default())))
     /// });
     /// let engine = ModelBuilder::from_spec(spec).guests(guests).engine(&device)?;
     /// ```
@@ -410,6 +411,8 @@ impl ModelBuilder {
             // checkpoint is refused outright if its recurrent gates are quantized — which is
             // the right answer when the caller chose the file themselves.
             gate_donor: None,
+            // Nor anything to assemble it from: a custom model is the one file handed over.
+            tensor_overrides: Vec::new(),
             tokenizer_repo: String::new(),
             // A custom model is built from local files; there is no repo to
             // pin a revision of.
@@ -814,6 +817,21 @@ impl ModelBuilder {
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> crate::Result<Box<dyn crate::ManagedBatchedModel + Send>> {
         let max_seq = self.max_seq_len;
+        // **Only the qwen35 loader reads a tensor from another checkpoint.** A spec naming one
+        // for any other arch would load the primary's own copy and serve a model nobody asked
+        // for under this spec's name, so it is refused rather than served.
+        if !self.spec.tensor_overrides.is_empty()
+            && !matches!(
+                self.spec.arch,
+                ModelArch::Qwen35Hybrid | ModelArch::Qwen35Dense
+            )
+        {
+            return Err(ConversationError::Other(format!(
+                "{:?} cannot take tensors from another checkpoint, and this spec names {}",
+                self.spec.arch,
+                self.spec.tensor_overrides.len()
+            )));
+        }
         match self.spec.arch {
             ModelArch::Qwen3 => {
                 use candle_transformers::models::quantized_qwen3::ModelWeights;
@@ -918,6 +936,7 @@ impl ModelBuilder {
                 ))
             }
             ModelArch::Qwen35Hybrid => {
+                use candle::quantized::Int8Mode;
                 use candle_transformers::models::quantized_qwen36_moe;
                 use candle_transformers::models::qwen35::Qwen35LoadOptions;
                 // Per-layer progress not yet wired for this arch.
@@ -930,13 +949,26 @@ impl ModelBuilder {
                     model_path,
                     device,
                     Qwen35LoadOptions {
-                        // Without a directory the pack is EPHEMERAL — written to
-                        // the system temp dir and unlinked as soon as it is
-                        // published, so every boot repacks all 41 layers (53 s
-                        // measured on the 3.6-35B) instead of reading the one
-                        // beside the checkpoint.
-                        expert_pack_dir: self.expert_pack_dir.clone(),
+                        // Beside the checkpoint unless the caller named a
+                        // directory. Without one the pack is EPHEMERAL — written
+                        // to the system temp dir and unlinked as soon as it is
+                        // published — so every boot repacks all 41 layers (53 s
+                        // measured on the 3.6-35B). Beside the file it is shared
+                        // by every caller of this checkpoint and read on every
+                        // boot after the first, which is where zend puts it too.
+                        expert_pack_dir: self
+                            .expert_pack_dir
+                            .clone()
+                            .or_else(|| model_path.parent().map(Path::to_path_buf)),
+                        // `auto`, not the loader's size-weighed default. `auto_sized` asks
+                        // whether the file fits in 70% of free VRAM, which is a dense model's
+                        // question: a routed checkpoint pages its experts through the three-tier
+                        // cache, so its file size is not its resident size — and the question
+                        // answers `Performance` for a 21.7 GB file on a 24 GB card that runs
+                        // `Precision` with every gate row valid.
+                        int8mode: Some(Int8Mode::auto(device)),
                         gate_donor_path: self.gate_donor_path(model_path)?,
+                        tensor_overrides: self.tensor_overrides()?,
                         ..Default::default()
                     },
                 )
@@ -959,6 +991,7 @@ impl ModelBuilder {
                     device,
                     Qwen35LoadOptions {
                         gate_donor_path: self.gate_donor_path(model_path)?,
+                        tensor_overrides: self.tensor_overrides()?,
                         ..Default::default()
                     },
                 )
@@ -1533,6 +1566,36 @@ impl ModelBuilder {
     #[cfg(not(feature = "hub"))]
     fn gate_donor_path(&self, _: &Path) -> crate::Result<Option<PathBuf>> {
         Ok(None)
+    }
+
+    /// The spec's [`ModelSpec::tensor_overrides`], each resolved to a local file at its pinned
+    /// revision.
+    ///
+    /// Unlike the gate donor these are fetched unconditionally: the spec names them because the
+    /// model it describes is made of them, not as a repair held in reserve.
+    #[cfg(feature = "hub")]
+    fn tensor_overrides(&self) -> crate::Result<Vec<TensorOverride>> {
+        self.spec
+            .tensor_overrides
+            .iter()
+            .map(|t| {
+                let path = self.resolve_repo_file(&t.repo, &t.revision, &t.filename)?;
+                Ok(TensorOverride::new(t.tensor.clone(), path))
+            })
+            .collect()
+    }
+
+    /// Without the hub there is nowhere to fetch an override from, and loading without it would
+    /// serve a different model under this spec's name — so a spec that names one is refused.
+    #[cfg(not(feature = "hub"))]
+    fn tensor_overrides(&self) -> crate::Result<Vec<TensorOverride>> {
+        match self.spec.tensor_overrides.first() {
+            None => Ok(Vec::new()),
+            Some(t) => Err(ConversationError::Download(format!(
+                "`{}` is read from {}, and this build has no `hub` feature to fetch it with",
+                t.tensor, t.repo
+            ))),
+        }
     }
 
     /// The checkpoint and the tokenizer, each at its pinned revision.

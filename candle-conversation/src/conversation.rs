@@ -6,10 +6,10 @@
 
 use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
-use crate::handle::{SealResult, TurnHandle, TurnResponse};
+use crate::handle::{SealResult, TurnEvent, TurnHandle, TurnResponse};
 use candle_transformers::models::delta_net::ExportedLayerState;
 
-use crate::persistence::content_hash::{hash_tokens, ContentChain, ContentHash};
+use crate::persistence::content_hash::{hash_tokens, section_stream_id, ContentChain, ContentHash};
 use crate::persistence::record::{BranchCheckpointPayload, SnapshotLayer};
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
@@ -31,7 +31,6 @@ use crate::tree::token_text::TokenizedText;
 use crate::tree::{ConversationTree, TurnType};
 use crate::turn::{Role, Turn, TurnOptions};
 use crate::turn_layout::TurnLayout;
-use crate::TurnEvent;
 use candle_nn::kv_cache::{SealedChunk, SealedSequence};
 use candle_transformers::models::batched_inference::ModelCoreProperties;
 use candle_transformers::models::dialect::Dialect;
@@ -157,7 +156,7 @@ pub(crate) fn window_sealed_tokens(
 
 use crate::stencil::{StencilDriver, StencilTree, ThinkMode, TriggerRegistry};
 use crate::turn_text::{encode_pieces, TurnText};
-use crossbeam::channel::Sender;
+use flume::{Receiver, Sender};
 use std::sync::Arc;
 
 /// One code scope to ingest in parallel — the `(user, assistant)` pair a single
@@ -204,6 +203,59 @@ fn fork_inherits_history(parent: TimelineId, fork: TimelineId) -> InheritsHistor
         InheritsHistory::Yes
     } else {
         InheritsHistory::No
+    }
+}
+
+/// Keeps a drop-cancelled [`Sequence::send_turn_with_options_async`] from
+/// wedging its sequence.
+///
+/// Submitting a turn latches `turn_in_flight`, and only `finish_turn` /
+/// `abort_turn` unlatch it — neither of which runs when the async send's
+/// future is dropped mid-await (a task abort, a timeout). The blocking send
+/// can never be abandoned there, so this state was unreachable before the
+/// async path existed. Armed across the await, this clears the caller-side
+/// turn state on drop; disarmed on the settled path, where `finish_turn` /
+/// `abort_turn` own the cleanup.
+///
+/// The scheduler needs no message and gets none: the dropped [`TurnHandle`]
+/// closes the event channel, and the scheduler winds the turn down — at its
+/// next decode step, or at this sequence's next `SubmitTurn`, whose handler
+/// finalizes an abandoned turn before resetting the parent under it (a
+/// submit that catches the old turn still live or still prefilling is
+/// refused with `TurnInFlight` and retried, never raced). Deliberately NOT
+/// [`Sequence::abort_turn`], which resets the slot's whole KV through a
+/// blocking scheduler round trip — a decode's worth of state and a parked
+/// executor thread are the wrong price for a cancellation.
+///
+/// What a cancelled turn leaves behind, stated rather than hidden: the
+/// decoded-so-far seals into the timeline as a truncated turn (the same
+/// record a crash between decode and finish leaves), the client-side tree
+/// does not carry the cancelled exchange (the substrate is what projections
+/// compose from), and `current_blocks` stays at its pre-turn value until the
+/// next seal's absolute count self-heals it.
+struct CancelClearsInFlight<'a> {
+    seq: Option<&'a mut Sequence>,
+}
+
+impl<'a> CancelClearsInFlight<'a> {
+    fn arm(seq: &'a mut Sequence) -> Self {
+        Self { seq: Some(seq) }
+    }
+
+    /// The settled path: hand the sequence back and clear nothing.
+    fn disarm(mut self) -> &'a mut Sequence {
+        self.seq
+            .take()
+            .expect("disarm is called once, on the armed guard")
+    }
+}
+
+impl Drop for CancelClearsInFlight<'_> {
+    fn drop(&mut self) {
+        if let Some(seq) = self.seq.take() {
+            seq.turn_in_flight = false;
+            seq.pending_user = None;
+        }
     }
 }
 
@@ -498,7 +550,7 @@ pub(crate) fn install_branch_states(
             );
             continue;
         }
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         scheduler_tx
             .send(SchedulerRequest::InstallRecurrentState {
                 sequence_ids,
@@ -910,7 +962,7 @@ impl Sequence {
                                         // nothing attends back over them in the
                                         // build — and the per-turn elevate reloads
                                         // the projection's top-k on demand.
-                                        let (tx, rx) = crossbeam::channel::bounded(1);
+                                        let (tx, rx) = flume::bounded(1);
                                         conv.scheduler_tx
                                             .send(SchedulerRequest::OffloadCollectionMembers {
                                                 conversation: conv.substrate.clone(),
@@ -996,7 +1048,7 @@ impl Sequence {
         // will materialise those (and the gated sections) via
         // `apply_projection` at submit_turn time.
         if prime_slot && !fixed_prefix.is_empty() {
-            let (tx, rx) = crossbeam::channel::bounded(1);
+            let (tx, rx) = flume::bounded(1);
             conv.scheduler_tx
                 .send(crate::scheduler::SchedulerRequest::PrimingProjection {
                     sequence_id: conv.id,
@@ -1165,7 +1217,7 @@ impl Sequence {
             }
         }
 
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         self.scheduler_tx
             .send(SchedulerRequest::BranchCheckpointPass {
                 tokens: TokenBuffer::from(tokens),
@@ -1239,10 +1291,7 @@ impl Sequence {
     /// background inference (e.g. print tokens as they stream).
     ///
     /// Pass `None` to remove the observer.
-    pub fn set_task_observer(
-        &mut self,
-        tx: Option<crossbeam::channel::Sender<crate::handle::TurnEvent>>,
-    ) {
+    pub fn set_task_observer(&mut self, tx: Option<Sender<TurnEvent>>) {
         self.tree.task_event_observer = tx;
     }
 
@@ -1478,10 +1527,12 @@ impl Sequence {
             chain.prefix()
         };
         // ── Pass 2: triage what's left into two buckets ────────────────
-        //   - Persisted in the redo log under its content-addressed
-        //     stream id → restore from disk (`RestoreSection`).
+        //   - Durable in the redo log under its content-addressed stream id →
+        //     restore from disk (`RestoreSection`). Whether those chunks form a
+        //     whole grid is the scheduler's call, not this one's: it knows how
+        //     many KV backings the session holds, and on a hybrid that is the
+        //     attention layers, not the model's transformer depth.
         //   - Otherwise → ingest with a fresh prefill (`IngestSection`).
-        let n_layers = self.model_core.num_layers;
         let mut to_ingest: Vec<Pending<'_>> = Vec::with_capacity(candidates.len());
         let mut to_restore: Vec<Pending<'_>> = Vec::with_capacity(candidates.len());
         for (section_id, content) in candidates {
@@ -1495,36 +1546,22 @@ impl Sequence {
                 section_hash: hash_tokens(&tokens),
             };
             let debug_name = self.section_debug_name(section_id);
-            // Manifest check.  Only meaningful when the model's
-            // layer count is known; without backings (test harnesses
-            // that don't register a session) we can't compute
-            // `chunks_per_layer`, so we fall through to ingest.
-            let stream_id = crate::persistence::content_hash::section_stream_id(address);
-            if n_layers > 0
-                && self.substrate.section_stream_is_persisted(stream_id)
-                && self
-                    .substrate
-                    .section_stream_layout(stream_id, n_layers)
-                    .is_some()
-            {
-                to_restore.push(Pending {
-                    section_id,
-                    content,
-                    tokens,
-                    token_count,
-                    address,
-                    debug_name,
-                });
-                continue;
-            }
-            to_ingest.push(Pending {
+            let pending = Pending {
                 section_id,
                 content,
                 tokens,
                 token_count,
                 address,
                 debug_name,
-            });
+            };
+            if self
+                .substrate
+                .section_stream_is_persisted(section_stream_id(address))
+            {
+                to_restore.push(pending);
+            } else {
+                to_ingest.push(pending);
+            }
         }
         let total = to_ingest.len() + to_restore.len();
         if total == 0 {
@@ -1542,34 +1579,26 @@ impl Sequence {
         // cheap insurance).
         let mut restore_out: Vec<(SectionId, usize)> = Vec::with_capacity(to_restore.len());
         for item in to_restore.into_iter() {
-            let stream_id = crate::persistence::content_hash::section_stream_id(item.address);
-            let chunks_per_layer = self
-                .substrate
-                .section_stream_layout(stream_id, n_layers)
-                .unwrap_or(0);
             // Capture the content length for the progress callback
             // before `item.tokens` / `item.content` get consumed by
             // the request payload below.
             let item_section_id = item.section_id;
             let item_content_len = item.content.len();
-            let (tx, rx) = crossbeam::channel::bounded(1);
+            let (tx, rx) = flume::bounded(1);
             self.scheduler_tx
                 .send(SchedulerRequest::RestoreSection {
                     conversation: self.substrate.clone(),
                     section_id: item.section_id,
-                    stream_id,
-                    address: item.address,
-                    chunks_per_layer,
+                    stream_id: section_stream_id(item.address),
                     tokens: item.tokens.clone(),
                     response_tx: tx,
                 })
                 .map_err(|_| ConversationError::SchedulerGone)?;
             match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
-                Ok(()) => {
-                    // Block count for diagnostics — the section is
-                    // now a cold-marker; the actual hot grid lands
-                    // when the next projection elevates it.  Use the
-                    // manifest's chunks_per_layer as the count.
+                Ok(chunks_per_layer) => {
+                    // Block count for diagnostics — the section is now a
+                    // cold-marker; the actual hot grid lands when the next
+                    // projection elevates it.
                     restore_out.push((item.section_id, chunks_per_layer));
                     on_section_done(item_section_id, item_content_len);
                 }
@@ -1583,6 +1612,11 @@ impl Sequence {
             }
             let _ = item.token_count;
         }
+
+        // Every section still in `to_ingest` — a refused restore included —
+        // costs a prefill from here on.
+        self.substrate
+            .record_section_loads(restore_out.len(), to_ingest.len());
 
         // Bulk-allocate-then-fire: allocate one scratch slot per
         // section first (cheap, no timeline minting), then fire every
@@ -1602,7 +1636,18 @@ impl Sequence {
         // layer), which is wasted effort here.
         let mut slot_ids: Vec<SequenceId> = Vec::with_capacity(to_ingest.len());
         for _ in 0..to_ingest.len() {
-            slot_ids.push(self.alloc_scratch_slot()?);
+            match self.alloc_scratch_slot() {
+                Ok(slot) => slot_ids.push(slot),
+                Err(e) => {
+                    // The slots already allocated have no ingest in flight yet
+                    // — free them before propagating, or a failed 12th alloc
+                    // leaks the first 11 for the life of the process.
+                    for slot in slot_ids {
+                        self.free_scratch_slot(slot);
+                    }
+                    return Err(e);
+                }
+            }
         }
         let t_alloc = std::time::Instant::now();
 
@@ -1610,12 +1655,14 @@ impl Sequence {
             SequenceId,
             SectionId,
             usize, // content_len for the progress callback
-            crossbeam::channel::Receiver<crate::Result<SealResult>>,
+            Receiver<crate::Result<SealResult>>,
         )> = Vec::with_capacity(to_ingest.len());
-        for (slot_id, item) in slot_ids.into_iter().zip(to_ingest) {
-            let (tx, rx) = crossbeam::channel::bounded(1);
+        let mut slots = slot_ids.into_iter();
+        for (slot_id, item) in slots.by_ref().zip(to_ingest) {
+            let (tx, rx) = flume::bounded(1);
             let content_len = item.content.len();
-            self.scheduler_tx
+            if self
+                .scheduler_tx
                 .send(SchedulerRequest::IngestSection {
                     sequence_id: slot_id,
                     section_id: item.section_id,
@@ -1626,7 +1673,18 @@ impl Sequence {
                     in_collection,
                     response_tx: tx,
                 })
-                .map_err(|_| ConversationError::SchedulerGone)?;
+                .is_err()
+            {
+                // A failed send means the scheduler is gone, so the frees are
+                // best-effort too — but the drain below still owes each fired
+                // section its wait, and the unfired slots owe nothing.
+                self.free_scratch_slot(slot_id);
+                for slot in slots {
+                    self.free_scratch_slot(slot);
+                }
+                self.drain_and_free(&mut pending);
+                return Err(ConversationError::SchedulerGone);
+            }
             let _ = item.token_count;
             pending.push((slot_id, item.section_id, content_len, rx));
         }
@@ -1645,29 +1703,34 @@ impl Sequence {
         // `pending` in order with blocking `rx.recv()` would stall on
         // the longest section's channel, drain every shorter section's
         // channel in microseconds afterwards, and produce one big
-        // GUI jump.  `crossbeam::channel::Select` lets us pick up the
+        // GUI jump.  `flume::Selector` lets us pick up the
         // next ready receiver instead, firing `on_section_done`
         // progressively as sections actually complete.
         while !pending.is_empty() {
-            // Pick the next-ready receiver via `Select`, drop the
-            // `Select` borrow before mutating `pending`.
-            let (idx, recv_result) = {
-                let mut select = crossbeam::channel::Select::new();
-                for (_, _, _, rx) in &pending {
-                    select.recv(rx);
-                }
-                let op = select.select();
-                let idx = op.index();
-                let rx = &pending[idx].3;
-                let r = op.recv(rx).map_err(|_| ConversationError::SchedulerGone)?;
-                (idx, r)
-            };
+            let mut selector = flume::Selector::new();
+            for (i, (_, _, _, rx)) in pending.iter().enumerate() {
+                selector = selector.recv(rx, move |r| (i, r));
+            }
+            // `wait` consumes the selector, so its borrow of `pending` ends here.
+            let (idx, r) = selector.wait();
+            let settled = r
+                .map_err(|_| ConversationError::SchedulerGone)
+                .and_then(|seal| seal);
             let (slot_id, section_id, content_len, _rx) = pending.swap_remove(idx);
-            let seal = recv_result?;
+            let seal = match settled {
+                Ok(seal) => seal,
+                Err(e) => {
+                    // A failed section must not strand the collection's
+                    // scratch slots — without this, a 20-section ingest that
+                    // failed at section 3 leaked the other slots for the life
+                    // of the process.
+                    self.free_scratch_slot(slot_id);
+                    self.drain_and_free(&mut pending);
+                    return Err(e);
+                }
+            };
             let block_count = seal.block_to.saturating_sub(seal.block_from);
-            let _ = self.scheduler_tx.send(SchedulerRequest::FreeSequence {
-                sequence_id: slot_id,
-            });
+            self.free_scratch_slot(slot_id);
             out.push((section_id, block_count));
             on_section_done(section_id, content_len);
         }
@@ -1699,6 +1762,47 @@ impl Sequence {
         format!("section_{}", section_id.raw())
     }
 
+    /// Release a scratch slot — [`Self::alloc_scratch_slot`]'s other half,
+    /// named so every exit path frees a slot the same way. Best-effort: a
+    /// gone scheduler has already reclaimed everything.
+    fn free_scratch_slot(&self, slot: SequenceId) {
+        let _ = self
+            .scheduler_tx
+            .send(SchedulerRequest::FreeSequence { sequence_id: slot });
+    }
+
+    /// Wait out every still-ingesting scratch slot and free it — the failure
+    /// path's cleanup. A slot freed under an active ingest is a scheduler
+    /// hazard, so each straggler is drained to completion first (immediate
+    /// when the scheduler itself is gone: the channels are already dead).
+    /// The wait honours the ingest-cancel latch the way the turn waits do:
+    /// on a graceful shutdown the remaining stragglers are abandoned to the
+    /// scheduler's own teardown rather than waited out.
+    fn drain_and_free(
+        &self,
+        pending: &mut Vec<(
+            SequenceId,
+            SectionId,
+            usize,
+            Receiver<crate::Result<SealResult>>,
+        )>,
+    ) {
+        let poll = std::time::Duration::from_millis(100);
+        for (slot, _, _, rx) in pending.drain(..) {
+            loop {
+                match rx.recv_timeout(poll) {
+                    Ok(_) | Err(flume::RecvTimeoutError::Disconnected) => break,
+                    Err(flume::RecvTimeoutError::Timeout) => {
+                        if crate::ingest_cancelled() {
+                            return;
+                        }
+                    }
+                }
+            }
+            self.free_scratch_slot(slot);
+        }
+    }
+
     /// Allocate a fresh GPU slot bound to the workspace substrate
     /// **without** minting a [`crate::projection::TimelineId`] or
     /// registering a projection target.
@@ -1710,7 +1814,7 @@ impl Sequence {
     /// section ingestion produces context-independent KV that doesn't
     /// belong to any conversation timeline.
     fn alloc_scratch_slot(&self) -> crate::Result<SequenceId> {
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         self.scheduler_tx
             .send(SchedulerRequest::NewSequence {
                 conversation: self.substrate.clone(),
@@ -2133,7 +2237,8 @@ impl Sequence {
     /// block range.
     ///
     /// The batched form of [`Self::submit_prefilled_turn`]. Each case is a
-    /// question exemplar — a user turn followed by an empty assistant turn — and
+    /// prefilled turn — a user half and an assistant half, either of which may
+    /// be empty — and
     /// they are laid end to end by [`crate::stuffed_grid`], every case starting
     /// on a block boundary so no two share a block and no exemplar's `sign(Q)`
     /// window carries its neighbour's tokens.
@@ -2156,12 +2261,22 @@ impl Sequence {
     /// `tags` is required per case rather than defaulted for the same reason: a
     /// case with empty tags falls through to the group's selection.
     ///
-    /// `cases` pair the user question with that case's tags. Returns the
-    /// streaming handle plus, for each sealed region, the index of the case it
-    /// came from — empty cases claim no region, so the two are not 1:1.
+    /// Each case is `(user, assistant, tags)`: the user half, the assistant half
+    /// (empty for a question exemplar, the prefilled body for a dream line), and
+    /// that case's tags. Returns the streaming handle plus, for each sealed
+    /// region, the index of the case it came from — a case with no tokens on
+    /// either half claims no region, so the two are not 1:1.
+    ///
+    /// **Every case is masked to itself.** A stuffed grid is block-diagonal, not
+    /// causal across cases: region N does not attend to regions before it, which
+    /// is exactly what keeps one exemplar's `sign(Q)` window off its neighbour's
+    /// tokens. A caller wanting each turn to see the ones before it (a running
+    /// dialogue) must submit them one at a time; a caller whose cases are
+    /// independent memories signed against the substrate (calibration exemplars,
+    /// the lines of a dream) gets them all in one forward.
     pub fn submit_prefilled_turn_group(
         &mut self,
-        cases: &[(String, Vec<String>)],
+        cases: &[(String, String, Vec<String>)],
         selection: SelectionState,
         pad_token: u32,
     ) -> crate::Result<(TurnHandle, Vec<usize>)> {
@@ -2183,10 +2298,14 @@ impl Sequence {
         let assistant_end = self.config.dialect.assistant_end;
 
         let mut grids: Vec<CaseGrid> = Vec::with_capacity(cases.len());
-        for (question, _) in cases {
+        for (question, answer, _) in cases {
             let user_prefix = format!("{head}{question}");
             let assistant_head = format!("{user_prefix}{user_end}{assistant_start}");
-            let whole = format!("{assistant_head}{assistant_end}");
+            // The assistant body sits between its opener and closer. Empty for a
+            // question exemplar (the routing is on the question); the prefilled
+            // line for a dream. Its token span is measured below as the run past
+            // `assistant_head`.
+            let whole = format!("{assistant_head}{answer}{assistant_end}");
             // Tokenised as cumulative prefixes of ONE string, so a tokenizer
             // that merges across a join reports bounds on the same ids the model
             // will see. Measuring the pieces separately and summing would drift
@@ -2227,7 +2346,7 @@ impl Sequence {
         let head_len = self.tokenize(&head)?.len() as u32;
         let mut turns: Vec<CarvedTurn> = Vec::with_capacity(grid.regions.len());
         for (region, &src) in grid.regions.iter().zip(&sources) {
-            let (question, tags) = &cases[src];
+            let (question, answer, tags) = &cases[src];
             turns.push(CarvedTurn {
                 region: *region,
                 content: TurnContent {
@@ -2239,6 +2358,7 @@ impl Sequence {
                         assistant_start_len,
                         trailing_len,
                         question.clone(),
+                        answer.clone(),
                     ),
                     // Every token the region's blocks hold, padding included:
                     // the seal persists the whole block range, and `token_ids`
@@ -2249,7 +2369,7 @@ impl Sequence {
             });
         }
 
-        let (event_tx, event_rx) = crossbeam::channel::unbounded();
+        let (event_tx, event_rx) = flume::unbounded();
         self.scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
                 sequence_id: self.id,
@@ -2400,7 +2520,7 @@ impl Sequence {
         } else {
             reprojection
         };
-        let (event_tx, event_rx) = crossbeam::channel::unbounded();
+        let (event_tx, event_rx) = flume::unbounded();
         self.scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
                 // One turn, and it is the slot's tail — the ordinary shape.
@@ -2734,6 +2854,37 @@ impl Sequence {
         }
     }
 
+    /// [`Self::ingest_scope_roundtrip_indices`] awaited instead of blocked on —
+    /// what the per-scope fan-out drives concurrently over its forks, so the
+    /// scheduler co-batches every fork's prefill and summary decode without a
+    /// thread per fork.
+    pub async fn ingest_scope_roundtrip_indices_async(
+        &mut self,
+        call_user: &str,
+        call_assistant: &str,
+        response_user: &str,
+        tags: Vec<String>,
+        max_summary_tokens: usize,
+        triggers: Arc<TriggerRegistry>,
+    ) -> crate::Result<(u32, u32, usize)> {
+        let (idxs, tokens) = self
+            .ingest_roundtrip_chain_indices_async(
+                &[(TurnText::from(call_user), call_assistant.to_string())],
+                response_user,
+                tags,
+                max_summary_tokens,
+                &["file_read".to_string()],
+                triggers,
+            )
+            .await?;
+        match idxs.as_slice() {
+            [call, resp] => Ok((*call, *resp, tokens)),
+            _ => Err(ConversationError::Channel(
+                "scope round-trip: expected exactly two turn indices".into(),
+            )),
+        }
+    }
+
     /// [`Self::ingest_roundtrip_chain_indices`] for a caller that owns the
     /// timeline itself (the serial path): couples the chain here rather than
     /// leaving it to a splice. Returns tokens ingested.
@@ -2790,6 +2941,94 @@ impl Sequence {
         force_tools: &[String],
         triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<(Vec<u32>, usize)> {
+        let (indices, prefill_tokens, handle) = self.ingest_chain_submit(
+            prefilled,
+            decode_user,
+            tags,
+            max_summary_tokens,
+            force_tools,
+            triggers,
+        )?;
+        // Interruptible wait: a graceful shutdown mid-ingest latches the cancel
+        // flag, and this returns `IngestCancelled` instead of waiting out the
+        // in-flight summary decode. Dropping `handle` on that early return stops
+        // the scheduler's decode at its next step. The ingest caller unwinds this
+        // as "cancelled", not a decode failure.
+        let response = handle.wait_cancellable();
+        self.ingest_chain_settle(indices, prefill_tokens, handle, response)
+    }
+
+    /// [`Self::ingest_roundtrip_chain_indices`] awaited instead of blocked on —
+    /// the same submit, the same cancellable wait on the same latch, the same
+    /// seal. This is what a concurrent scope fan-out drives per fork, so one
+    /// thread can hold every fork's decode in flight at once.
+    pub async fn ingest_roundtrip_chain_indices_async(
+        &mut self,
+        prefilled: &[(TurnText, String)],
+        decode_user: impl Into<TurnText>,
+        tags: Vec<String>,
+        max_summary_tokens: usize,
+        force_tools: &[String],
+        triggers: Arc<TriggerRegistry>,
+    ) -> crate::Result<(Vec<u32>, usize)> {
+        let (indices, prefill_tokens, handle) = self.ingest_chain_submit(
+            prefilled,
+            decode_user,
+            tags,
+            max_summary_tokens,
+            force_tools,
+            triggers,
+        )?;
+        // Armed across the await like every async turn wait: dropping this
+        // future drops the handle (the decode winds down scheduler-side) and
+        // must also clear the fork's in-flight guard, or the abandoned fork
+        // rejects every later turn with `TurnInFlight`.
+        let armed = CancelClearsInFlight::arm(self);
+        let response = handle.wait_cancellable_async().await;
+        armed
+            .disarm()
+            .ingest_chain_settle(indices, prefill_tokens, handle, response)
+    }
+
+    /// The tail both chain waits share: propagate the wait's verdict, read the
+    /// sealed index off the response, and record the decoded turn with its
+    /// staged provenance events.
+    fn ingest_chain_settle(
+        &mut self,
+        mut indices: Vec<u32>,
+        prefill_tokens: usize,
+        handle: TurnHandle,
+        response: crate::Result<TurnResponse>,
+    ) -> crate::Result<(Vec<u32>, usize)> {
+        let response = response?;
+        let resp_tokens = response.token_ids.len();
+        let resp_idx = response
+            .seal
+            .as_ref()
+            .and_then(|s| s.turn_index)
+            .ok_or_else(|| {
+                ConversationError::Channel(
+                    "round-trip chain: decoded turn produced no index".into(),
+                )
+            })?;
+        // Records the decoded turn + its staged provenance events.
+        self.finish_turn_staged(handle, &response)?;
+        indices.push(resp_idx);
+        Ok((indices, prefill_tokens + resp_tokens))
+    }
+
+    /// The head both chain waits share: selection framing, the prefilled turns,
+    /// and the summary decode's submission. Returns the prefilled indices, the
+    /// tokens they cost, and the in-flight summary's handle.
+    fn ingest_chain_submit(
+        &mut self,
+        prefilled: &[(TurnText, String)],
+        decode_user: impl Into<TurnText>,
+        tags: Vec<String>,
+        max_summary_tokens: usize,
+        force_tools: &[String],
+        triggers: Arc<TriggerRegistry>,
+    ) -> crate::Result<(Vec<u32>, usize, TurnHandle)> {
         // A scope round-trip frames on the dialogue prompt itself — the persona is
         // deliberately left alone. The turns it seals are later borrowed into
         // dialogue projections, and borrowed K/V carries the framing it was computed
@@ -2903,26 +3142,7 @@ impl Sequence {
         opts.selection
             .select(crate::projection::FORCE_TOOL_SELECTOR, pinned_tools);
         let handle = self.submit_turn_with_options(decode_user, opts)?;
-        // Interruptible wait: a graceful shutdown mid-ingest latches the cancel
-        // flag, and this returns `IngestCancelled` instead of waiting out the
-        // in-flight summary decode. Dropping `handle` on that early return stops
-        // the scheduler's decode at its next step. The ingest caller unwinds this
-        // as "cancelled", not a decode failure.
-        let response = handle.wait_cancellable()?;
-        let resp_tokens = response.token_ids.len();
-        let resp_idx = response
-            .seal
-            .as_ref()
-            .and_then(|s| s.turn_index)
-            .ok_or_else(|| {
-                ConversationError::Channel(
-                    "round-trip chain: decoded turn produced no index".into(),
-                )
-            })?;
-        // Records the decoded turn + its staged provenance events.
-        self.finish_turn_staged(handle, &response)?;
-        indices.push(resp_idx);
-        Ok((indices, prefill_tokens + resp_tokens))
+        Ok((indices, prefill_tokens, handle))
     }
 
     /// Fork this conversation onto a fresh timeline for one parallel scope
@@ -3038,7 +3258,7 @@ impl Sequence {
         if tokens.is_empty() {
             return Ok(());
         }
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         self.scheduler_tx
             .send(SchedulerRequest::MemoryCatchUp {
                 sequence_id: self.id,
@@ -3132,13 +3352,63 @@ impl Sequence {
         options: TurnOptions,
     ) -> crate::Result<TurnResponse> {
         let handle = self.submit_turn_with_options(user_message, options)?;
-        // **A turn that fails never reaches `finish_turn`**, which is the only
-        // other thing that clears the in-flight guard — so without this one
-        // failed decode rejected every turn the conversation was ever asked for
-        // afterwards, with `TurnInFlight`, and nothing short of dropping the
-        // sequence brought it back. That is what a character looks like when a
-        // single wave faults under it: alive, scheduled, and never acting again.
-        let response = match handle.wait() {
+        let waited = handle.wait();
+        self.settle_turn(handle, waited)
+    }
+
+    /// Async convenience: submit + await. [`Self::send_turn`]'s counterpart —
+    /// the same submit, the same failure handling, the same `finish_turn`;
+    /// only the wait yields instead of holding a thread.
+    pub async fn send_turn_async(&mut self, user_message: &str) -> crate::Result<TurnResponse> {
+        self.send_turn_with_options_async(user_message, TurnOptions::default())
+            .await
+    }
+
+    /// Async counterpart of [`Self::send_turn_with_options`].
+    ///
+    /// The returned future owns this turn's [`TurnHandle`], so dropping the
+    /// future — an aborted task, a caller that gave up mid-await — drops the
+    /// handle, the scheduler sees the closed event channel, and the decode
+    /// stops at its next step. The drop also clears this sequence's in-flight
+    /// guard ([`CancelClearsInFlight`]), so the conversation takes its next
+    /// turn normally; the cancelled turn's decoded-so-far winds down and seals
+    /// scheduler-side, exactly as a dropped blocking handle's does.
+    /// Cancellation is the drop; nothing extra to call.
+    ///
+    /// **What yields is the wait; the ends stay synchronous.** The submit
+    /// composes the prompt and enqueues (fast, but a first turn's branch
+    /// checkpoint does scheduler round trips), and the settle runs
+    /// `finish_turn` — or, on a failed turn, `abort_turn`, whose slot reset
+    /// waits on the scheduler's next drain. Callers multiplexing many
+    /// sequences on one executor thread should treat a turn's ends as brief
+    /// host work, not as await points.
+    pub async fn send_turn_with_options_async(
+        &mut self,
+        user_message: &str,
+        options: TurnOptions,
+    ) -> crate::Result<TurnResponse> {
+        let handle = self.submit_turn_with_options(user_message, options)?;
+        let armed = CancelClearsInFlight::arm(self);
+        let waited = handle.wait_async().await;
+        armed.disarm().settle_turn(handle, waited)
+    }
+
+    /// Resolve a submitted turn from its wait's result — one function behind
+    /// both the blocking and async sends, so their failure handling cannot
+    /// diverge.
+    ///
+    /// **A turn that fails never reaches `finish_turn`**, which is the only
+    /// other thing that clears the in-flight guard — so without the abort here
+    /// one failed decode rejected every turn the conversation was ever asked
+    /// for afterwards, with `TurnInFlight`, and nothing short of dropping the
+    /// sequence brought it back. That is what a character looks like when a
+    /// single wave faults under it: alive, scheduled, and never acting again.
+    fn settle_turn(
+        &mut self,
+        handle: TurnHandle,
+        waited: crate::Result<TurnResponse>,
+    ) -> crate::Result<TurnResponse> {
+        let response = match waited {
             Ok(response) => response,
             Err(e) => {
                 drop(handle);
@@ -3146,10 +3416,8 @@ impl Sequence {
                 return Err(e);
             }
         };
-
         // Record the assistant turn and prefill next user header.
         self.finish_turn(handle, &response)?;
-
         Ok(response)
     }
 
@@ -3654,7 +3922,7 @@ impl Sequence {
     /// and makes "does a freed conversation still hold memory?" unaskable.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn memory(&self) -> crate::Result<Option<Vec<ExportedLayerState>>> {
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         self.scheduler_tx
             .send(SchedulerRequest::ReadRecurrentMemory {
                 sequence_id: self.id,
@@ -3704,7 +3972,7 @@ impl Sequence {
         timeline: TimelineId,
         index: u32,
     ) -> crate::Result<Option<ContentHash>> {
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         self.scheduler_tx
             .send(SchedulerRequest::ReadTurnKvDigest {
                 sequence_id: self.id,
@@ -3827,7 +4095,7 @@ impl Sequence {
 
         // Allocate a fresh slot bound to the same workspace handle and
         // the fork's target.
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         self.scheduler_tx
             .send(SchedulerRequest::NewSequence {
                 conversation: self.substrate.clone(),
@@ -3896,7 +4164,7 @@ impl Sequence {
             });
         }
 
-        let (response_tx, response_rx) = crossbeam::channel::bounded(1);
+        let (response_tx, response_rx) = flume::bounded(1);
         self.scheduler_tx
             .send(SchedulerRequest::ResetSequence {
                 sequence_id: self.id,
@@ -3950,7 +4218,7 @@ impl Sequence {
                 sequence_id: self.id,
             });
         }
-        let (response_tx, response_rx) = crossbeam::channel::bounded(1);
+        let (response_tx, response_rx) = flume::bounded(1);
         self.scheduler_tx
             .send(SchedulerRequest::SetSequenceAdapter {
                 sequence_id: self.id,
@@ -3972,7 +4240,7 @@ impl Sequence {
     /// already tearing the turn down.
     pub fn abort_turn(&mut self) {
         // Best-effort scheduler-side view cleanup; ignore a gone scheduler.
-        let (response_tx, response_rx) = crossbeam::channel::bounded(1);
+        let (response_tx, response_rx) = flume::bounded(1);
         if self
             .scheduler_tx
             .send(SchedulerRequest::ResetSequence {
@@ -4004,7 +4272,7 @@ impl Sequence {
         layer_indices: Vec<usize>,
         block_range: Option<(usize, usize)>,
     ) -> crate::Result<Vec<(usize, Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>)>> {
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         self.scheduler_tx
             .send(SchedulerRequest::ExtractRawKvq {
                 sequence_id: self.id,
@@ -4586,7 +4854,7 @@ impl ProbeCtx {
         // Ephemeral slot bound to this conversation's target: it projects (warm)
         // but never seals.
         let slot = {
-            let (tx, rx) = crossbeam::channel::bounded(1);
+            let (tx, rx) = flume::bounded(1);
             self.scheduler_tx
                 .send(SchedulerRequest::NewEphemeralSequence {
                     conversation: self.substrate.clone(),
@@ -4603,7 +4871,7 @@ impl ProbeCtx {
         // Submit the query as a projected turn (full warm system prompt via
         // `apply_projection`), decoding one token so the completion path finalizes
         // the KV onto the slot and gathers the query's warm wide-Q.
-        let (event_tx, event_rx) = crossbeam::channel::unbounded();
+        let (event_tx, event_rx) = flume::unbounded();
         if self
             .scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
@@ -4670,7 +4938,7 @@ impl ProbeCtx {
         }
 
         // Drain the warm wide-Q the ephemeral turn stashed, then free.
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         let sigs = if self
             .scheduler_tx
             .send(SchedulerRequest::ProbeWideSigs {

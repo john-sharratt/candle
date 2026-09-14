@@ -150,11 +150,28 @@ fn load_effective(workspace: &Path) -> Vec<ToolDef> {
     }
 }
 
+/// Whether `path` names a tool definition: a `*.yaml` file that is not a
+/// dot-file.
+///
+/// The dot-file exclusion is not cosmetic. The folder-metadata pass writes a
+/// `.substrate.yaml` (a folder summary with its questions grouped by kind)
+/// into every folder it describes — this one included, since it lives in the
+/// source tree — and the compile-time embed picks it up with the definitions.
+/// Parsed as a tool it fails on every boot (`questions` is a map there, a
+/// list here), and no tool definition is ever a dot-file.
+fn is_definition_file(path: &Path) -> bool {
+    let hidden = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('.'));
+    !hidden && path.extension().and_then(|e| e.to_str()) == Some("yaml")
+}
+
 /// Parse the embedded (compile-time) built-in catalog.
 fn load_bundled() -> Vec<ToolDef> {
     let mut defs: Vec<ToolDef> = TOOLS_DIR
         .files()
-        .filter(|f| f.path().extension().and_then(|e| e.to_str()) == Some("yaml"))
+        .filter(|f| is_definition_file(f.path()))
         .filter_map(|f| parse_def(&f.path().display().to_string(), f.contents_utf8()?))
         .collect();
     defs.sort_by(|a, b| a.name.cmp(&b.name));
@@ -167,7 +184,7 @@ fn load_disk(dir: &Path) -> Vec<ToolDef> {
         Ok(rd) => rd
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("yaml"))
+            .filter(|p| is_definition_file(p))
             .collect(),
         Err(_) => return Vec::new(),
     };
@@ -215,6 +232,40 @@ pub fn category_for(name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The folder-metadata pass leaves a `.substrate.yaml` in the tools folder
+    /// itself, and the compile-time embed carries it along; read as a tool it
+    /// failed to parse on every boot. A definition is a `*.yaml` that is not a
+    /// dot-file.
+    #[test]
+    fn folder_metadata_is_not_a_tool_definition() {
+        assert!(!is_definition_file(Path::new(".substrate.yaml")));
+        assert!(!is_definition_file(Path::new("tools/.substrate.yaml")));
+        assert!(!is_definition_file(Path::new("tools/.hidden.yaml")));
+        assert!(is_definition_file(Path::new("tools/calculator.yaml")));
+        assert!(!is_definition_file(Path::new("tools/calculator.yml")));
+        assert!(!is_definition_file(Path::new("tools/README.md")));
+    }
+
+    /// Nothing the embed carries that is not a definition reaches the parser:
+    /// every bundled file that passes the filter parses, so a boot logs no
+    /// `tool definition parse failed`.
+    #[test]
+    fn every_bundled_definition_file_parses() {
+        let unparsed: Vec<String> = TOOLS_DIR
+            .files()
+            .filter(|f| is_definition_file(f.path()))
+            .filter(|f| {
+                f.contents_utf8()
+                    .is_none_or(|text| serde_yaml::from_str::<ToolDef>(text).is_err())
+            })
+            .map(|f| f.path().display().to_string())
+            .collect();
+        assert!(
+            unparsed.is_empty(),
+            "bundled files that do not parse: {unparsed:?}"
+        );
+    }
 
     fn def(description: &str, params: Value) -> ToolDef {
         ToolDef {

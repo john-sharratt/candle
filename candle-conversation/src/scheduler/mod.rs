@@ -58,6 +58,7 @@ use crate::projection::{
     ResolvedSection, ResolvedTurn, SealedKind, SectionId, SelectionState, SystemPromptItem,
     TimelineId, TurnId, TurnIndex, TurnKey,
 };
+use crate::projection::{CollectionWarm, Schema};
 use crate::provenance::{
     encode_wide_sigs_with, extract_q_vector_r16, fold_fits, fold_provenance_fitted, FoldParams,
     GalleryArena, WideQSig,
@@ -74,7 +75,7 @@ use crate::summary_tree::{
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::turn_layout::{GlueKind, KvSpan, TurnLayout, TurnSegment};
-use crate::{SubstrateReloadStatus, TurnStats};
+use crate::{FinishReason, SubstrateReloadStatus, TurnStats};
 
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{Device, Tensor};
@@ -86,7 +87,7 @@ use candle_transformers::models::batched_inference::{
 use candle_transformers::models::delta_net::ExportedLayerState;
 
 use self::exported_state::{ExportedState, SharedState};
-use crossbeam::channel::{Receiver, Sender};
+use flume::{Receiver, Sender, TryRecvError};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -432,15 +433,15 @@ pub(crate) enum SchedulerRequest {
     /// Recover a previously-persisted section directly from the redo
     /// log instead of running a fresh prefill.  Used when an ingest
     /// caller has computed a section's content-addressed stream id
-    /// and confirmed that the persistence manifest has durable chunks
-    /// for it.  The scheduler cold-loads the chunks into hot VRAM via
-    /// the same pipeline used for turn cold-loads, restores the
-    /// section into the substrate (`SectionEntryData` + residence
-    /// with both hot and cold installed), and replies with `Ok(())`.
+    /// and found durable chunks for it.  The scheduler checks those
+    /// chunks form a whole grid over the session's KV backings,
+    /// installs the section as a cold marker (the elevate path lifts
+    /// it when a projection needs it), reinstalls its index page for a
+    /// model that keeps per-position state, and replies with the
+    /// section's chunks per layer.
     ///
-    /// On any failure the scheduler falls back to a normal
-    /// `IngestSection` would be issued by the caller — this request
-    /// just reports `Err`.
+    /// An `Err` means "prefill it instead": the caller issues a normal
+    /// `IngestSection`.
     RestoreSection {
         /// Workspace conversation the section lands in.  Sections are
         /// shared substrate state — every conversation in the
@@ -450,14 +451,27 @@ pub(crate) enum SchedulerRequest {
         conversation: Conversation,
         section_id: SectionId,
         stream_id: StreamId,
-        address: ContentAddress,
-        chunks_per_layer: usize,
         /// Pre-tokenised section content — the same byte sequence
         /// the original prefill used.  Reused verbatim so we don't
         /// need to read the `Tokens` record back from disk just to
         /// repopulate `SectionEntryData::tokens`.
         tokens: TokenBuffer,
-        response_tx: Sender<Result<(), ConversationError>>,
+        /// The section's chunks per layer once restored.
+        response_tx: Sender<Result<usize, ConversationError>>,
+    },
+
+    /// Remove transient sections — a throwaway conversation's frame — once
+    /// their last user has finished with them.
+    ///
+    /// On the wave thread because the scheduler holds per-section state of its
+    /// own (the index page, the name, a queued quantize) that has to go with the
+    /// substrate entry, and because between waves nothing is attending it.
+    /// Fire-and-forget: the sender has already let go, and a section that is not
+    /// transient is left alone — see
+    /// [`crate::substrate::Substrate::retire_section`].
+    RetireSections {
+        conversation: Conversation,
+        sections: Vec<SectionId>,
     },
 
     /// Pre-warm a freshly-allocated slot by injecting the static system-prompt
@@ -605,6 +619,15 @@ pub(crate) enum SchedulerRequest {
     ReconstructSubstrate {
         conversation: Conversation,
         status: Arc<SubstrateReloadStatus>,
+    },
+
+    /// Warm the belief-driven section collections' hit levels from their own
+    /// tag-scoped corpus — on this thread, because the GPU gallery arena that
+    /// scores the corpus in batch lives here. Replies with what was warmed.
+    WarmCollectionNormalization {
+        conversation: Conversation,
+        schema: Box<Schema>,
+        response_tx: Sender<CollectionWarm>,
     },
 
     /// Reclaim VRAM by demoting the hot K/V of specific (already-sealed,
@@ -1260,6 +1283,10 @@ struct DecodeState {
     pending_page_cut_after: Option<u32>,
     /// Whether this sequence has finished (EOS or max_tokens).
     finished: bool,
+    /// Why it finished, once it has. [`FinishReason::Length`] only when the
+    /// response budget ran out, set where the budget is checked; every other
+    /// ending — end-of-sequence, a completed stencil, an abort — is a `Stop`.
+    finish: FinishReason,
     /// Decode start time (for stats).
     decode_start: Instant,
     /// Microseconds this turn actually spent INSIDE decode forwards.
@@ -3438,8 +3465,8 @@ impl Scheduler {
                         return false;
                     }
                 }
-                Err(crossbeam::channel::TryRecvError::Empty) => return true,
-                Err(crossbeam::channel::TryRecvError::Disconnected) => return false,
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
             }
         }
     }
@@ -3547,6 +3574,49 @@ impl Scheduler {
                 // The sequence acts as the parent slot for a carved
                 // view inside this handler — rebind for clarity.
                 let parent_id = sequence_id;
+
+                // ── Abandoned-turn wind-down ─────────────────────────────
+                // The sequence-side guard admits one turn at a time, so a
+                // submit arriving while this parent still has a turn
+                // registered means the caller dropped that turn's handle —
+                // an async cancellation. That turn is wound down HERE,
+                // before the projection resets the parent under it: its
+                // decode is marked finished — the closed channel is what
+                // its next step would have discovered anyway — and the
+                // ordinary cleanup runs, so its view finalizes and its
+                // truncated turn seals first. Without this, the new turn's
+                // reset raced the old decode's finalize on one slot.
+                //
+                // Two states cannot be wound down and are refused instead,
+                // with an error on the NEW turn's channel: a turn whose
+                // event channel is still open (a live turn — racing a
+                // second decode onto the slot would interleave their KV),
+                // and a turn still in prefill (there is no finished-path to
+                // run for it; the caller retries once it drains).
+                let in_flight_views: Vec<SequenceId> = self
+                    .turn_views
+                    .iter()
+                    .filter(|(_, v)| v.parent_id == parent_id)
+                    .map(|(&view, _)| view)
+                    .collect();
+                let mut wind_down_refused = false;
+                for view in in_flight_views {
+                    match self.active_decodes.get_mut(&view) {
+                        Some(state) if state.event_tx.is_disconnected() => {
+                            state.finished = true;
+                        }
+                        // A live decode, or a turn still in prefill.
+                        Some(_) | None => wind_down_refused = true,
+                    }
+                }
+                self.cleanup_finished();
+                if wind_down_refused {
+                    let _ = event_tx.send(TurnEvent::Error(ConversationError::TurnInFlight {
+                        sequence_id: parent_id,
+                    }));
+                    return true;
+                }
+
                 // Derive the post-Done seal directly from the
                 // projection inputs.  When projection is supplied AND
                 // the slot has a registered target the request is by
@@ -4194,8 +4264,6 @@ impl Scheduler {
                 conversation,
                 section_id,
                 stream_id,
-                address,
-                chunks_per_layer,
                 tokens,
                 response_tx,
             } => {
@@ -4203,11 +4271,23 @@ impl Scheduler {
                     &conversation,
                     section_id,
                     stream_id,
-                    address,
-                    chunks_per_layer,
                     tokens,
                 );
                 let _ = response_tx.send(result);
+                true
+            }
+
+            SchedulerRequest::RetireSections {
+                conversation,
+                sections,
+            } => {
+                for id in sections {
+                    if conversation.retire_section(id) {
+                        self.section_positional.remove(&id);
+                        self.section_name_cache.remove(&id);
+                        self.pending_section_quantize.retain(|p| p.section_id != id);
+                    }
+                }
                 true
             }
 
@@ -4518,6 +4598,17 @@ impl Scheduler {
                 status,
             } => {
                 self.reconstruct_substrate(&conversation, &status);
+                true
+            }
+
+            SchedulerRequest::WarmCollectionNormalization {
+                conversation,
+                schema,
+                response_tx,
+            } => {
+                let warm = conversation
+                    .warm_collection_normalization(&schema, self.gallery_arena.as_deref());
+                let _ = response_tx.send(warm);
                 true
             }
 
@@ -5138,7 +5229,7 @@ impl Scheduler {
         // sends streamed `Token` events into it; the dropped receiver makes those
         // sends fail, which marks the decode finished — harmless, because
         // `cleanup_finished` reaps it the same way EOS / max_tokens would.
-        let (event_tx, event_rx) = crossbeam::channel::unbounded();
+        let (event_tx, event_rx) = flume::unbounded();
         // Keep the receiver alive for the decode's lifetime so per-token sends
         // succeed; it is dropped when the pass's slot is freed.
         self.compression_event_sinks.insert(slot, event_rx);
@@ -5175,6 +5266,7 @@ impl Scheduler {
             free_tool_calls_from_penalties: false,
             prefill_assistant_text: String::new(),
             finished: false,
+            finish: FinishReason::Stop,
             decode_start: Instant::now(),
             decode_busy_us: 0,
             prefill_ms,
@@ -5416,7 +5508,7 @@ impl Scheduler {
         // Private event sink, kept alive so the prefill machinery's sends never
         // fail. This path has no decode, but `PrefillWork` still carries an
         // `event_tx`; the receiver is dropped with the slot in `free_summary_slot`.
-        let (event_tx, event_rx) = crossbeam::channel::unbounded();
+        let (event_tx, event_rx) = flume::unbounded();
         self.compression_event_sinks.insert(slot, event_rx);
 
         // Stash the turn content for the deferred seal, then enqueue the
@@ -6420,7 +6512,9 @@ impl Scheduler {
         }
     }
 
-    /// Handle the case where generation finishes on the first token (EOS or max=0).
+    /// Handle the case where generation finishes on the first token (EOS or
+    /// max=0); `finish` says which.
+    #[allow(clippy::too_many_arguments)]
     fn finish_immediately(
         &self,
         seq_id: SequenceId,
@@ -6429,6 +6523,7 @@ impl Scheduler {
         prefill_ms: f64,
         turn_start: Instant,
         prefill_token_count: usize,
+        finish: FinishReason,
     ) {
         let skip = !self.show_special_tokens;
         // Persist verbatim (see the main finish path) — no think-stripping here.
@@ -6444,6 +6539,8 @@ impl Scheduler {
                 tokens_generated: 1,
                 tokens_per_second: 0.0,
                 prefill_token_count,
+                context_tokens: self.session.sequence_offset(seq_id.0).unwrap_or(0),
+                finish,
                 sequence: self.session.get_sequence_stats(seq_id.0),
             },
             // `finish_immediately` fires before any decode starts and
@@ -6513,6 +6610,8 @@ impl Scheduler {
         // glue K/V into whatever this rebuild placed at those indices. Drop the
         // superseded plan and defer only this latest projection, so exactly one
         // (current) plan fires against the slot as this call built it.
+        // Read before any of `self`'s fields are borrowed out of it below.
+        let pass_budget = self.prefill_pass_budget();
         let defer = if self.batch_drain_gap_fills {
             self.deferred_glue_fires
                 .retain(|p| p.parent_id != parent_id);
@@ -6535,7 +6634,7 @@ impl Scheduler {
                 slot_target,
                 parent_id,
                 chunk_size: self.chunk_size,
-                max_prefill_pass_tokens: self.max_prefill_pass_tokens,
+                max_prefill_pass_tokens: pass_budget,
                 tokenizer: &self.tokenizer,
                 slot_tokens: &mut self.slot_tokens,
                 boundary_markers: &self.boundary_markers,
@@ -6571,6 +6670,7 @@ impl Scheduler {
         // eviction can protect it (see `evict_cold_tail`). Same as the single-slot
         // `apply_projection`; the wave path threads build/finish separately, so we
         // stamp it here where the segments are in hand.
+        let pass_budget = self.prefill_pass_budget();
         let state = self.slot_projection_state.entry(parent_id).or_default();
         state.working_set = projection_assembler::working_set_from_segments(segments);
         let mut ctx = projection_assembler::ApplyContext {
@@ -6581,7 +6681,7 @@ impl Scheduler {
             slot_target,
             parent_id,
             chunk_size: self.chunk_size,
-            max_prefill_pass_tokens: self.max_prefill_pass_tokens,
+            max_prefill_pass_tokens: pass_budget,
             tokenizer: &self.tokenizer,
             slot_tokens: &mut self.slot_tokens,
             boundary_markers: &self.boundary_markers,
@@ -6609,6 +6709,7 @@ impl Scheduler {
                 ))
             })?;
         let slot_target = self.slot_targets.get(&parent_id).copied();
+        let pass_budget = self.prefill_pass_budget();
         let state = self.slot_projection_state.entry(parent_id).or_default();
         let mut ctx = projection_assembler::ApplyContext {
             session: &mut self.session,
@@ -6618,7 +6719,7 @@ impl Scheduler {
             slot_target,
             parent_id,
             chunk_size: self.chunk_size,
-            max_prefill_pass_tokens: self.max_prefill_pass_tokens,
+            max_prefill_pass_tokens: pass_budget,
             tokenizer: &self.tokenizer,
             slot_tokens: &mut self.slot_tokens,
             boundary_markers: &self.boundary_markers,
@@ -6698,6 +6799,7 @@ impl Scheduler {
                 // slot is dropped during finalize and its sequence stats
                 // become unavailable.
                 let sequence_stats = self.session.get_sequence_stats(seq_id.0);
+                let context_tokens = self.session.sequence_offset(seq_id.0).unwrap_or(0);
 
                 // Auto-finalize: if this sequence is a scheduler-owned view
                 // (created by SubmitTurn), transfer its newly-written blocks
@@ -7061,6 +7163,8 @@ impl Scheduler {
                         tokens_generated,
                         tokens_per_second,
                         prefill_token_count: state.prefill_token_count,
+                        context_tokens,
+                        finish: state.finish,
                         sequence: sequence_stats,
                     },
                     seal: seal_result,
@@ -7084,10 +7188,8 @@ impl Scheduler {
         conversation: &Conversation,
         section_id: SectionId,
         stream_id: StreamId,
-        _address: ContentAddress,
-        _chunks_per_layer: usize,
         tokens: TokenBuffer,
-    ) -> Result<(), ConversationError> {
+    ) -> Result<usize, ConversationError> {
         // The cold→hot section install goes through the adaptive-format
         // restore machinery (`alloc_sealed_block` + per-band arena writes),
         // which does not alias K≡V. A single-latent backing (DeepSeek's
@@ -7105,19 +7207,51 @@ impl Scheduler {
                     .into(),
             ));
         }
+        // One chunk list per KV backing — the count the persistence thread
+        // wrote the section with. On a hybrid that is the attention layers
+        // (plus any draft head), not the model's transformer depth; dividing
+        // the persisted grid by the depth refused every section whose chunk
+        // total it did not happen to divide, so every boot prefilled the whole
+        // system prompt again.
         let n_layers = self.session.num_layers();
 
         // 1. Resolve cold refs from the manifest — these point at
         //    each chunk's `(log_offset, record_len, token_count)` in
         //    the redo log.  Installed alone (with hot = None) so the
         //    elevate path can lift the section when a projection
-        //    needs it.
+        //    needs it.  A stream with no whole grid is not restorable,
+        //    and saying so sends the caller to a prefill.
         let cold_refs = conversation
             .recover_section_cold_refs(stream_id, n_layers)
             .map_err(ConversationError::Model)?
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                ConversationError::Channel(format!(
+                    "section {section_id:?}: stream {stream_id:?} holds no durable \
+                     chunks — re-ingest"
+                ))
+            })?;
 
-        // 2. Install as a cold-marker.  `sealed_hot = Vec::new()`
+        // 2. The section's index page, for a model that keeps per-position
+        //    state. It is computed from hidden states, so borrowing the K/V
+        //    does not bring it along; a section restored without it would
+        //    reach every projection unindexed, and a prefill is the only way
+        //    to rebuild it.
+        let page = if self.model.carries_positional_state() {
+            let page = conversation
+                .read()
+                .section_index_page(stream_id)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| {
+                    ConversationError::Channel(format!(
+                        "section {section_id:?}: persisted without its index page — re-ingest"
+                    ))
+                })?;
+            Some(page)
+        } else {
+            None
+        };
+
+        // 3. Install as a cold-marker.  `sealed_hot = Vec::new()`
         //    leaves `residence.hot = None`; `cold_refs` lands in
         //    `residence.cold` so `elevate_to_hot` can lift the
         //    section on the first projection that selects it.
@@ -7125,9 +7259,9 @@ impl Scheduler {
         //    per-chunk token counts across one layer's
         //    StoredSequence).
         let token_count = cold_refs.first().map(|s| s.token_count).unwrap_or(0);
+        let chunks_per_layer = cold_refs.first().map(|s| s.chunks.len()).unwrap_or(0);
         let tokens_arc = Arc::new(tokens[..].to_vec());
-        let mut view = conversation.write();
-        view.restore_section(
+        conversation.write().restore_section(
             section_id,
             stream_id,
             token_count,
@@ -7135,7 +7269,10 @@ impl Scheduler {
             cold_refs,
             tokens_arc,
         );
-        Ok(())
+        if let Some(page) = page {
+            self.section_positional.insert(section_id, Arc::new(page));
+        }
+        Ok(chunks_per_layer)
     }
 
     /// A unit's own tokens begin on `slot`: close its index so the prefix ahead
@@ -7416,16 +7553,30 @@ impl Scheduler {
         // the piece covers its own tokens and no others.
         match self.model.seal_positional_state(sequence_id.0) {
             Ok(Some(blob)) => {
+                // Persisted beside the section's chunks, under the same stream
+                // id, so a restart that restores the section from the log can
+                // hand a projection its index as well as its K/V.
+                match self.slot_conversations.get(&sequence_id) {
+                    Some(conversation) => {
+                        conversation.enqueue_index_page(section_stream_id(address), blob.clone())
+                    }
+                    None => tracing::warn!(
+                        section = section_id.raw(),
+                        seq = sequence_id.0,
+                        "section index page not persisted: the slot has no conversation, \
+                         so a restart prefills this section again instead of restoring it",
+                    ),
+                }
                 self.section_positional.insert(section_id, Arc::new(blob));
             }
-            // **`None` is not "nothing to do" — it is a section with no index.**
-            // It used to be swallowed, and that silence is what let an entire
-            // system prompt reach the model unindexed: every section returned
-            // `None`, the assembler had no blob to push, and the shortfall
-            // surfaced only when the prefix grew past the QSA identity
-            // threshold and a select refused — thousands of tokens and one
-            // conversation later, naming the slot rather than the seal.
-            Ok(None) => tracing::warn!(
+            // **`None` from a model that keeps per-position state is a section
+            // with no index.** It used to be swallowed, and that silence is what
+            // let an entire system prompt reach the model unindexed: every
+            // section returned `None`, the assembler had no blob to push, and
+            // the shortfall surfaced only when the prefix grew past the QSA
+            // identity threshold and a select refused — thousands of tokens and
+            // one conversation later, naming the slot rather than the seal.
+            Ok(None) if self.model.carries_positional_state() => tracing::warn!(
                 section = section_id.raw(),
                 seq = sequence_id.0,
                 n_tokens,
@@ -7433,6 +7584,9 @@ impl Scheduler {
                  state for this slot, so anything borrowing its tokens selects against \
                  a prefix it never indexed",
             ),
+            // A model that keeps no per-position state seals no page, and
+            // nothing is missing.
+            Ok(None) => {}
             Err(e) => {
                 // Not fatal to the seal — the K/V is committed — but the next
                 // ingest to borrow this section will have to say so.
@@ -8383,17 +8537,25 @@ impl Scheduler {
                         in_collection: *in_collection,
                     });
                 }
-                // Declare the section stream in the redo log so the
-                // manifest knows the (address, debug_name) before any
-                // chunks land.  Mirrors record_turn's StreamDecl write.
-                if let Err(e) = conversation.declare_section_stream(*address, debug_name) {
-                    tracing::warn!("declare section stream failed: {e}");
+                // A transient section — a throwaway conversation's frame — is
+                // never read back from disk, so it declares no stream and writes
+                // no tokens; its residence is already `no_cold_persist`, so its
+                // chunks stay off the cold tier too. See
+                // `Substrate::mark_section_transient`.
+                if !conversation.is_section_transient(*section_id) {
+                    // Declare the section stream in the redo log so the
+                    // manifest knows the (address, debug_name) before any
+                    // chunks land.  Mirrors record_turn's StreamDecl write.
+                    if let Err(e) = conversation.declare_section_stream(*address, debug_name) {
+                        tracing::warn!("declare section stream failed: {e}");
+                    }
+                    // Persist the section's token ids (off-thread writer, so the
+                    // seal never blocks on the persistence lock), then fire the
+                    // persistence trigger so the chunks land on disk in the next
+                    // pass.
+                    conversation.enqueue_tokens(stream_id, tokens.to_vec());
+                    self.persist_trigger.fire();
                 }
-                // Persist the section's token ids (off-thread writer, so the seal
-                // never blocks on the persistence lock), then fire the persistence
-                // trigger so the chunks land on disk in the next pass.
-                conversation.enqueue_tokens(stream_id, tokens.to_vec());
-                self.persist_trigger.fire();
             }
             SealAction::None => unreachable!("filtered above"),
             SealAction::TurnGroup(_) => unreachable!(
@@ -8515,14 +8677,26 @@ impl Scheduler {
         Ok(if state.is_empty() { None } else { Some(state) })
     }
 
-    /// Run `tokens` through the model on `seq`, in `max_prefill_pass_tokens`
+    /// Tokens one prefill forward may carry — see [`admission::prefill_pass_budget`].
+    ///
+    /// Read per forward rather than once at construction: the model's cap includes
+    /// what the KV side can still hold, which moves with every claim.
+    fn prefill_pass_budget(&self) -> usize {
+        admission::prefill_pass_budget(
+            self.max_prefill_pass_tokens,
+            self.model
+                .prefill_width_cap(self.session.activation_dtype()),
+        )
+    }
+
+    /// Run `tokens` through the model on `seq`, in [`Self::prefill_pass_budget`]
     /// chunks.
     ///
     /// The chunking is not an optimisation: one forward over a whole prompt is a
     /// transient activation spike large enough to page, which is the same reason
     /// `build_section_batch` bounds its own per-forward budget.
     fn prefill_tokens_on(&mut self, seq: usize, tokens: &[u32]) -> Result<(), ConversationError> {
-        let cap = self.max_prefill_pass_tokens.max(1);
+        let cap = self.prefill_pass_budget();
         let n_layers = self.model.num_layers();
         let mut off = 0usize;
         while off < tokens.len() {
@@ -11110,9 +11284,8 @@ mod tests {
     /// A scheduler over the CPU test session and a `DummyModel`, plus its
     /// request sender — for tests that drive handler-level state (belief
     /// lifecycle) rather than forwards.
-    pub(super) fn make_test_scheduler() -> (Scheduler, crossbeam::channel::Sender<SchedulerRequest>)
-    {
-        let (tx, rx) = crossbeam::channel::bounded(16);
+    pub(super) fn make_test_scheduler() -> (Scheduler, Sender<SchedulerRequest>) {
+        let (tx, rx) = flume::bounded(16);
         let session = make_test_session();
         let tokenizer = make_dummy_tokenizer();
         let scheduler = Scheduler::new(
@@ -11140,12 +11313,8 @@ mod tests {
     /// [`make_test_scheduler`] over a [`DummyRecurrentModel`], returning the
     /// probe as well so a test can read the state the scheduler's boxed model
     /// is carrying.
-    fn make_test_scheduler_recurrent() -> (
-        Scheduler,
-        crossbeam::channel::Sender<SchedulerRequest>,
-        RecurrentProbe,
-    ) {
-        let (tx, rx) = crossbeam::channel::bounded(16);
+    fn make_test_scheduler_recurrent() -> (Scheduler, Sender<SchedulerRequest>, RecurrentProbe) {
+        let (tx, rx) = flume::bounded(16);
         let session = make_test_session();
         let tokenizer = make_dummy_tokenizer();
         let model = DummyRecurrentModel::new();
@@ -11337,7 +11506,7 @@ mod tests {
             .expect("state");
         let slot = SequenceId(sched.session.create_sequence().expect("slot"));
 
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         sched.handle_request(SchedulerRequest::InstallRecurrentState {
             sequence_ids: vec![slot],
             state: SharedState::from(&state),
@@ -11438,7 +11607,7 @@ mod tests {
             .expect("state");
         let slot = SequenceId(sched.session.create_sequence().expect("slot"));
 
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         sched.handle_request(SchedulerRequest::InstallRecurrentState {
             sequence_ids: vec![slot],
             state: SharedState::from(&state),
@@ -11568,7 +11737,7 @@ mod tests {
             .map(|_| SequenceId(sched.session.create_sequence().expect("slot")))
             .collect();
 
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         sched.handle_request(SchedulerRequest::InstallRecurrentState {
             sequence_ids: slots.clone(),
             state: SharedState::from(&state),
@@ -12320,8 +12489,8 @@ mod tests {
 
     /// A `DecodeState` carrying nothing but the two fields the reasoning
     /// boundary is decided from.
-    fn boundary_state() -> (DecodeState, crossbeam::channel::Receiver<TurnEvent>) {
-        let (tx, rx) = crossbeam::channel::unbounded();
+    fn boundary_state() -> (DecodeState, Receiver<TurnEvent>) {
+        let (tx, rx) = flume::unbounded();
         let state = DecodeState {
             event_tx: tx,
             generated_tokens: TokenBuffer::default(),
@@ -12335,6 +12504,7 @@ mod tests {
             free_tool_calls_from_penalties: false,
             prefill_assistant_text: String::new(),
             finished: false,
+            finish: FinishReason::Stop,
             decode_start: Instant::now(),
             decode_busy_us: 0,
             prefill_ms: 0.0,
@@ -12359,6 +12529,186 @@ mod tests {
             pending_mask: None,
         };
         (state, rx)
+    }
+
+    /// A scratch slot allocated through the ordinary handler, so the test's
+    /// sequences are real session slots rather than invented ids.
+    fn create_scratch_slot(scheduler: &mut Scheduler, conversation: &Conversation) -> SequenceId {
+        let (tx, rx) = flume::bounded(1);
+        scheduler.handle_request(SchedulerRequest::NewSequence {
+            conversation: conversation.clone(),
+            target: None,
+            parent: None,
+            response_tx: tx,
+        });
+        rx.recv().expect("scheduler reply").expect("slot allocated")
+    }
+
+    /// A minimal raw-path SubmitTurn (no projection, no substrate write) —
+    /// the request shape the abandoned-turn wind-down tests drive.
+    fn raw_submit_turn(parent: SequenceId, event_tx: Sender<TurnEvent>) -> SchedulerRequest {
+        SchedulerRequest::SubmitTurn {
+            seal_group: None,
+            sequence_id: parent,
+            projection_inputs: None,
+            prefill_tokens: TokenBuffer::from(vec![1u32, 2, 3]),
+            prefill_text: String::new(),
+            user_text: String::new(),
+            tags: Vec::new(),
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
+            no_think: false,
+            projection_offsets: Vec::new(),
+            prefill_assistant_text: String::new(),
+            post_decode_tokens: TokenBuffer::default(),
+            max_decode_tokens: 4,
+            sampling: SamplingConfig::default(),
+            event_tx,
+            reprojection: None,
+            disable_reprojection: false,
+            triggers: Arc::new(TriggerRegistry::new()),
+            turn_grammar: None,
+            free_tool_calls_from_penalties: false,
+        }
+    }
+
+    /// The wind-down half of the abandoned-turn contract: a `SubmitTurn` that
+    /// finds this parent's previous turn still registered — its handle
+    /// dropped, its event channel closed — finishes that turn through the
+    /// ordinary cleanup BEFORE the new turn touches the parent, so two
+    /// decodes never share a slot.
+    #[test]
+    fn a_submit_over_an_abandoned_turn_winds_it_down_first() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let view = create_scratch_slot(&mut scheduler, &conversation);
+
+        // The abandoned turn: a decode whose caller dropped its handle.
+        let (state, view_rx) = boundary_state();
+        drop(view_rx);
+        scheduler.active_decodes.insert(view, state);
+        scheduler.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: parent,
+                original_borrowed: BlockCount(0),
+                turn_start_parent_blocks: 0,
+                question_tokens: 0,
+            },
+        );
+
+        let (event_tx, event_rx) = flume::unbounded();
+        assert!(scheduler.handle_request(raw_submit_turn(parent, event_tx)));
+
+        // The abandoned decode was finalized (and the new turn has not begun
+        // decoding — it is queued as prefill), so no decode remains. The
+        // freed view slot's id may be recycled by the NEW turn's view, so the
+        // assertions observe the contract, not the slot id.
+        assert!(
+            scheduler.active_decodes.is_empty(),
+            "the abandoned decode must be finalized before the new turn runs"
+        );
+        assert_eq!(
+            scheduler.prefill_queue.len(),
+            1,
+            "the new turn must proceed into prefill"
+        );
+        assert!(
+            !matches!(
+                event_rx.try_recv(),
+                Ok(TurnEvent::Error(ConversationError::TurnInFlight { .. }))
+            ),
+            "the new turn must not be refused"
+        );
+    }
+
+    /// The refusal half: a previous turn that is registered but has no decode
+    /// to finish (still in prefill) cannot be wound down — the new submit is
+    /// refused with `TurnInFlight`, and the in-flight turn is left alone.
+    #[test]
+    fn a_submit_over_a_still_prefilling_turn_is_refused() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let view = create_scratch_slot(&mut scheduler, &conversation);
+
+        scheduler.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: parent,
+                original_borrowed: BlockCount(0),
+                turn_start_parent_blocks: 0,
+                question_tokens: 0,
+            },
+        );
+
+        let (event_tx, event_rx) = flume::unbounded();
+        assert!(scheduler.handle_request(raw_submit_turn(parent, event_tx)));
+
+        assert!(
+            matches!(
+                event_rx.try_recv(),
+                Ok(TurnEvent::Error(ConversationError::TurnInFlight { .. }))
+            ),
+            "a submit racing a still-prefilling turn must be refused"
+        );
+        assert!(
+            scheduler.prefill_queue.is_empty(),
+            "the refused turn must queue nothing"
+        );
+        assert!(
+            scheduler.turn_views.contains_key(&view),
+            "the refused submit must not disturb the in-flight turn"
+        );
+    }
+
+    /// The errored-prefill counterpart to the dropped-handle wind-down: a turn
+    /// view whose prefill FAILED (its error surfaced and it was drained from
+    /// `active_prefills`) must be let go, or the parent's next submit is refused
+    /// with `TurnInFlight` forever — a character alive and scheduled that never
+    /// acts again after one faulted wave. This is the regression for that wedge.
+    #[test]
+    fn a_failed_prefill_view_is_reclaimed_so_the_parent_is_submittable() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let view = create_scratch_slot(&mut scheduler, &conversation);
+
+        // The view was registered before prefill; the prefill then faulted and
+        // was drained, which discards the view.
+        scheduler.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: parent,
+                original_borrowed: BlockCount(0),
+                turn_start_parent_blocks: 0,
+                question_tokens: 0,
+            },
+        );
+        scheduler.discard_turn_view(view);
+        assert!(
+            !scheduler.turn_views.contains_key(&view),
+            "the failed view must be let go, not left dangling under its parent"
+        );
+
+        // The parent is submittable again — not the permanent TurnInFlight the
+        // dangling view produced.
+        let (event_tx, event_rx) = flume::unbounded();
+        assert!(scheduler.handle_request(raw_submit_turn(parent, event_tx)));
+        assert!(
+            !matches!(
+                event_rx.try_recv(),
+                Ok(TurnEvent::Error(ConversationError::TurnInFlight { .. }))
+            ),
+            "a submit after a failed view is reclaimed must not be refused"
+        );
+        assert_eq!(
+            scheduler.prefill_queue.len(),
+            1,
+            "the new turn must proceed into prefill"
+        );
     }
 
     /// The turn's own tokens, walked through the one funnel: exactly two cuts,
@@ -12617,7 +12967,7 @@ mod tests {
     #[test]
     fn create_view_with_explicit_ranges_creates_view() {
         let model = DummyModel::new();
-        let (_tx, rx) = crossbeam::channel::bounded(16);
+        let (_tx, rx) = flume::bounded(16);
         let model_box = Box::new(model) as Box<dyn ManagedBatchedModel + Send>;
         let session = make_test_session();
         let tokenizer = make_dummy_tokenizer();
@@ -12683,7 +13033,7 @@ mod tests {
     #[test]
     fn create_view_sentinel_with_zero_block_parent_yields_empty_view() {
         let model = DummyModel::new();
-        let (_tx, rx) = crossbeam::channel::bounded(16);
+        let (_tx, rx) = flume::bounded(16);
         let model_box = Box::new(model) as Box<dyn ManagedBatchedModel + Send>;
         let session = make_test_session();
         let tokenizer = make_dummy_tokenizer();
@@ -12828,7 +13178,7 @@ mod tests {
         let seq_id = SequenceId(raw_id);
         scheduler.carried_beliefs.insert(seq_id, seeded_belief());
 
-        let (rtx, rrx) = crossbeam::channel::bounded(1);
+        let (rtx, rrx) = flume::bounded(1);
         scheduler.handle_request(SchedulerRequest::ResetSequence {
             sequence_id: seq_id,
             response_tx: rtx,
@@ -12884,7 +13234,7 @@ mod tests {
         let parent = SequenceId(scheduler.session.create_sequence().expect("create"));
         let view = register_turn_view(&mut scheduler, parent);
 
-        let (rtx, rrx) = crossbeam::channel::bounded(1);
+        let (rtx, rrx) = flume::bounded(1);
         scheduler.handle_request(SchedulerRequest::ResetSequence {
             sequence_id: parent,
             response_tx: rtx,

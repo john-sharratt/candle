@@ -111,7 +111,7 @@ impl Cost {
 /// What each act costs. Anything not named here is [`Cost::free`].
 ///
 /// Speech is absent on purpose — two characters talking take turns as fast as
-/// they like, and a rate on `say` would be a rate limit on conversation, which
+/// they like, and a rate on `tell` would be a rate limit on conversation, which
 /// is the one thing in the vault that should never be throttled.
 const COST: &[(&str, Cost)] = &[
     // **Short on purpose.** The pacing was never a rate problem — it was a
@@ -158,8 +158,8 @@ const COST: &[(&str, Cost)] = &[
     //
     // Eight seconds still lets a gesture punctuate an exchange — it is meant to
     // be the wordless beat between sentences — while making it too expensive to
-    // *be* the exchange. What a character reaches for instead is `say` and
-    // `tell`, which cost nothing, which is the whole point of throttling this
+    // *be* the exchange. What a character reaches for instead is `tell` and
+    // `ask`, which cost nothing, which is the whole point of throttling this
     // and not those.
     ("gesture", Cost::cools(8)),
     // **A switch with two positions is a treadmill with two steps.**
@@ -211,40 +211,23 @@ const COST: &[(&str, Cost)] = &[
     // somewhere else, so any loop through this one has a walk in it, which is
     // a loop worth having.
     ("recall", Cost::takes(4, 30)),
-    // **A thought does not occupy the body, so it does not stall at all.**
-    //
-    // This stalled for a full two minutes, inherited from the old `pause` whose
-    // whole purpose was *going quiet until something happens* — the number was
-    // a patience clock, not a duration, and it was carrying the loop-breaking
-    // on its own because nothing else did.
-    //
-    // Under the question this column actually asks — *how long does doing it
-    // take?* — the answer for noticing something is none. Crossing a room takes
-    // time somebody watching could measure; taking stock does not. A character
-    // that has just reflected is standing exactly where it was, free to be
-    // spoken to and free to answer, and every second charged here was a second
-    // it was absent from its own room for no reason the world could see.
-    //
-    // The cooldown is what does the work the long stall was doing badly.
-    // The room wakes a stalled character within a beat or two — weather,
-    // somebody moving — and the cheapest thing to do about being woken was to
-    // reflect about being woken. Measured: twelve acts across forty ticks,
-    // every one a `reflect`, asked a direct question twice in that window and
-    // answering neither, with the same `my_reflections` sentence coming back
-    // eleven times running.
-    //
-    // Half a minute makes reflection punctuation. It is shorter than
-    // [`SELF_ACT`] — noticing something is smaller than doing something to your
-    // own body — and far longer than the heartbeat, so a character woken after
-    // reflecting has to answer with an act that reaches somebody.
-    ("reflect", Cost::cools(30)),
+    // **`reflect` is not rated here, and that is deliberate.** A thought does
+    // not occupy the body — a character that has just reflected is standing
+    // exactly where it was, free to be spoken to and free to answer — so it has
+    // no stall. And its *rate* now belongs to the loop guard, not to this
+    // table: reflection is the forced redirect the closeness breaker reaches for
+    // ([`crate::engine::loopguard`]), so a real-time cooldown on it here would
+    // strike the one act the breaker needs reachable and leave the grammar with
+    // nowhere to go. The guard gives it a one-turn anti-repeat instead, which is
+    // what stops reflection becoming the whole loop — the job the 30-second
+    // cooldown here used to do, done where the rest of the loop-breaking lives.
     // **The one piece of speech that is rated, and the exception needs saying
     // out loud** — the note above this table is that speech is never throttled,
     // because a rate limit on conversation is a rate limit on the only thing
     // the vault is for.
     //
-    // `message` is not that kind of speech. `say`, `tell` and `ask` are
-    // `Availability::Nearby`: they need somebody standing there, they reach
+    // `message` is not that kind of speech. `tell`, `whisper` and `ask` need
+    // somebody standing there (`whisper`, two people): they reach
     // that room and no further, and the company that makes them possible is
     // what bounds them. `message` is `Always`, reaches every character in the
     // world through the open channel, and is offered on every single turn
@@ -438,10 +421,10 @@ mod tests {
 
     #[test]
     fn an_act_with_no_cooldown_never_waits() {
-        // Speech above all: a cooldown on `say` would be a rate limit on
+        // Speech above all: a cooldown on `tell` would be a rate limit on
         // conversation.
         let c = Cooldowns::new();
-        for tool in ["say", "tell", "ask", "read"] {
+        for tool in ["tell", "shout", "whisper", "ask", "read"] {
             assert!(after(tool).is_none(), "{tool} has a cooldown");
             c.took_act(1, &act(tool, json!({})));
             assert!(c.ready(1, tool), "{tool} made a character wait");
@@ -449,19 +432,22 @@ mod tests {
         assert!(c.cooling(1).is_empty());
     }
 
-    /// **Speech stays free and thinking does not.**
+    /// **Speech is free here, and so is reflection — but for different reasons.**
     ///
-    /// The two halves of the same decision. A character woken by the room must
-    /// not be able to answer it by reflecting again — that was the whole of one
-    /// character's day, twelve acts out of twelve — and must always be able to
-    /// answer somebody who spoke to it.
+    /// A rate on speech would be a rate on conversation, the one thing the vault
+    /// is for. Reflection is unrated *here* because its rate moved to the loop
+    /// guard: it is the forced redirect the closeness breaker reaches for, so a
+    /// real-time cooldown on it would strike the act the breaker needs reachable.
+    /// The guard's one-turn anti-repeat is what now stops reflection becoming
+    /// the whole loop — see [`crate::engine::loopguard`].
     #[test]
-    fn thinking_is_rated_and_talking_is_not() {
+    fn speech_and_reflection_are_not_rated_in_real_time() {
         assert!(
-            after("reflect").is_some(),
-            "reflection is free again, and it will be the whole loop again"
+            after("reflect").is_none(),
+            "reflection's rate belongs to the loop guard now; a real-time cooldown here would \
+             strike the act the breaker forces"
         );
-        for talking in ["say", "tell", "ask"] {
+        for talking in ["tell", "shout", "whisper", "ask"] {
             assert!(
                 after(talking).is_none(),
                 "`{talking}` is throttled — that is a rate limit on conversation"
@@ -567,7 +553,7 @@ mod tests {
         let t0 = Instant::now();
         c.took_act_at(1, &act("move_to", json!({"destination": "band one"})), t0);
         assert!(c.ready(1, "act"), "walking stopped it fighting");
-        assert!(c.ready(1, "say"), "walking stopped it talking");
+        assert!(c.ready(1, "tell"), "walking stopped it talking");
     }
 
     /// **Doing something to your own body is not a fight beat.**
@@ -689,7 +675,9 @@ mod tests {
         stalling.sort_unstable();
         assert_eq!(stalling, vec!["act", "move_to", "recall"]);
 
-        for quiet in ["say", "tell", "ask", "message", "gesture", "reflect"] {
+        for quiet in [
+            "tell", "shout", "whisper", "ask", "message", "gesture", "reflect",
+        ] {
             assert_eq!(
                 stall_after(quiet),
                 None,
@@ -709,7 +697,7 @@ mod tests {
     #[test]
     fn reaching_somebody_remotely_costs_more_than_speaking_to_them() {
         let remote = after("message").expect("messaging is rated");
-        for near in ["say", "tell", "ask"] {
+        for near in ["tell", "shout", "whisper", "ask"] {
             assert_eq!(after(near), None, "`{near}` is throttled");
         }
         assert!(
@@ -732,18 +720,19 @@ mod tests {
         assert_eq!(stall_after("move_to"), Some(Duration::from_secs(4)));
         assert_eq!(after("move_to"), Some(Duration::from_secs(2)));
 
-        // Reflection is the case that has both a rate and no duration.
+        // Reflection is unrated in this table now — no stall, and its rate is
+        // the loop guard's (see `speech_and_reflection_are_not_rated_in_real_time`).
         assert_eq!(stall_after("reflect"), None);
-        assert_eq!(after("reflect"), Some(Duration::from_secs(30)));
+        assert_eq!(after("reflect"), None);
 
         // A cooling act that does not stall reports none, rather than zero.
         assert_eq!(stall_after("gesture"), None);
         assert_eq!(after("gesture"), Some(Duration::from_secs(8)));
 
         // And an act in neither column costs nothing at all.
-        assert_eq!(cost("say"), Cost::free());
-        assert_eq!(after("say"), None);
-        assert_eq!(stall_after("say"), None);
+        assert_eq!(cost("tell"), Cost::free());
+        assert_eq!(after("tell"), None);
+        assert_eq!(stall_after("tell"), None);
     }
 
     #[test]

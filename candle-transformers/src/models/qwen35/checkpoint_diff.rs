@@ -337,6 +337,65 @@ mod tests {
         Ok(())
     }
 
+    /// **The two halves of the hybrid npcd runs, against the stock conversion and each other.**
+    ///
+    /// AntiLoop supplies every tensor and StyleTune the output head (see
+    /// `quantized_qwen36_moe::HYBRID_HEAD_TENSOR`). Each is diffed against the stock
+    /// conversion, which is where a quantized recurrent path shows up — the one the load
+    /// repairs from the gate donor — and then the head is compared across the pair: its type
+    /// is free to differ, its shape is not, because a `TensorOverride` of another shape is
+    /// refused at load.
+    ///
+    /// Skips when any of the three is absent, like the report above.
+    #[test]
+    fn the_hybrid_pair_shares_a_head_shape() -> Result<()> {
+        const STOCK: (&str, &str) = ("unsloth/Qwen3.6-35B-A3B-MTP-GGUF", "UD-Q4_K_M.gguf");
+        const TRUNK: (&str, &str) = (
+            "mradermacher/Qwen3.6-35B-A3B-AntiLoop-GGUF",
+            "AntiLoop.Q4_K_M.gguf",
+        );
+        const HEAD: (&str, &str) = (
+            "mradermacher/Qwen3.6-35B-A3B-StyleTune-GGUF",
+            "StyleTune.Q4_K_M.gguf",
+        );
+        let (Some(s), Some(t), Some(h)) = (
+            cached(STOCK.0, STOCK.1),
+            cached(TRUNK.0, TRUNK.1),
+            cached(HEAD.0, HEAD.1),
+        ) else {
+            println!(
+                "the stock, AntiLoop and StyleTune Q4_K_M are not all cached — nothing to diff"
+            );
+            return Ok(());
+        };
+        let (stock, trunk, head) = (header(&s)?, header(&t)?, header(&h)?);
+        println!("\nREFERENCE {}\n  {}\n", STOCK.0, summary(&stock));
+        for (repo, c) in [(TRUNK.0, &trunk), (HEAD.0, &head)] {
+            println!("\n════ {repo} ════");
+            diff_report(&stock, c)?;
+        }
+
+        let name = "output.weight";
+        let (Some(mine), Some(theirs)) =
+            (trunk.tensor_infos.get(name), head.tensor_infos.get(name))
+        else {
+            candle::bail!("`{name}` is missing from the AntiLoop or the StyleTune header");
+        };
+        println!(
+            "\n── the hybrid's head ──\n  AntiLoop  {name}: {:?} {:?}\n  StyleTune {name}: {:?} {:?}",
+            mine.ggml_dtype,
+            mine.shape.dims(),
+            theirs.ggml_dtype,
+            theirs.shape.dims()
+        );
+        assert_eq!(
+            mine.shape.dims(),
+            theirs.shape.dims(),
+            "the head must be the trunk's shape to be overridden"
+        );
+        Ok(())
+    }
+
     /// The per-candidate half of the report above.
     fn diff_report(l: &Content, r: &Content) -> Result<()> {
         println!("  {}\n", summary(r));

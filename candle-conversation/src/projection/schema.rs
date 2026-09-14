@@ -879,6 +879,17 @@ pub struct LayerSchema {
     /// "N / M <unit>" while the layer ingests. `None` falls back to a mode-derived
     /// default in [`crate`]'s ingest driver; non-ingest layers ignore it.
     pub ingest_unit: Option<String>,
+    /// Where this layer sits in the stack a projection sees down through
+    /// (`rank:` in YAML): a projection targeting a layer sees every layer of
+    /// **lower** rank, and none of equal or higher rank but its own.
+    ///
+    /// Defaults to the layer's declaration index, which is the stack every
+    /// schema had before this existed. It is its own field because declaration
+    /// order also fixes every layer's and group's id, and those ids are
+    /// persisted with every timeline written under them — so a layer added to a
+    /// live schema has to be appended, and without a rank an appended layer
+    /// could only ever sit on top, invisible to everything declared before it.
+    pub rank: i32,
 }
 
 /// How strongly a layer's decode is favoured over a co-running background

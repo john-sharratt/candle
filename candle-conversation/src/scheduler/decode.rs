@@ -1576,7 +1576,12 @@ impl Scheduler {
                     }
                 }
 
-                if is_eos || state.generated_tokens.len() >= state.max_tokens {
+                if let Some(finish) = FinishReason::after_token(
+                    is_eos,
+                    state.generated_tokens.len(),
+                    state.max_tokens,
+                ) {
+                    state.finish = finish;
                     state.finished = true;
                 } else {
                     // Emit the raw token ID. If the caller dropped the handle,

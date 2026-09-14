@@ -1,9 +1,9 @@
 //! Co-resident models that borrow the GPU between the engine's waves.
 //!
-//! An NPC world wants two things the conversation model does not do: pictures,
-//! and prose in a voice it is not carrying. Both are models, both want the same
-//! card, and neither is worth a second card or a second machine — they are
-//! bursty, and the gaps between an engine's waves are where their work fits.
+//! An NPC world wants things the conversation model does not do: pictures, and
+//! the subject lifted out of one. Both are models, both want the same card, and
+//! neither is worth a second card or a second machine — they are bursty, and the
+//! gaps between an engine's waves are where their work fits.
 //!
 //! # The shape
 //!
@@ -44,7 +44,6 @@
 //! | [`drain`] | The sequence: evict → claim → load → serve → hand back. |
 //! | [`tiled`] | The autoencoder a tile at a time, so its peak is fixed. |
 //! | [`varground`] | A `VarBuilder` that places into ground, so any candle model loads there. |
-//! | [`prose`] | The Hermes-3 backend. |
 //! | [`image`] | The Stable Diffusion backend. |
 
 pub mod checkpoint;
@@ -55,8 +54,6 @@ pub mod image;
 pub mod matte;
 pub mod model;
 pub mod progress;
-pub mod prose;
-pub mod prose_choice;
 pub mod queue;
 pub mod seed;
 pub mod tiled;
@@ -69,14 +66,13 @@ pub use image::{ImageGuest, ImageSpec};
 pub use matte::{Family as MatteFamily, MatteGuest, MatteSpec};
 pub use model::{GuestModel, GuestRegistry};
 pub use progress::{GuestEvent, GuestSink};
-pub use prose::{LoadPhases, ProseGuest, ProseSpec};
 pub use queue::{GuestQueue, GuestReceipt};
 pub use seed::{resolve_seed, Seeded};
 pub use varground::GroundVars;
 pub use work::{
     Guest, GuestError, GuestImage, GuestMatte, GuestOutcome, GuestRequest, ImageLora,
-    ImageReference, ImageRequest, MatteRequest, ProseRequest, DEFAULT_REFERENCE_HOLD,
-    MAX_REFERENCE_HOLD, MAX_SHIFT, MIN_SHIFT,
+    ImageReference, ImageRequest, MatteRequest, DEFAULT_REFERENCE_HOLD, MAX_REFERENCE_HOLD,
+    MAX_SHIFT, MIN_SHIFT,
 };
 
 use std::sync::Arc;
@@ -136,14 +132,11 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    fn prose_request() -> GuestRequest {
-        GuestRequest::Prose(ProseRequest {
-            system: String::new(),
-            prompt: "the yard".into(),
-            max_tokens: 16,
-            temperature: None,
-            seed: None,
-            choices: None,
+    fn matte_request() -> GuestRequest {
+        GuestRequest::Matte(MatteRequest {
+            pixels: vec![0; 4 * 4 * 3],
+            width: 4,
+            height: 4,
         })
     }
 
@@ -205,27 +198,27 @@ mod tests {
     #[test]
     fn clearing_an_unconfigured_guest_still_finds_the_configured_one() {
         let mut g = Guests::new();
-        register(&mut g, Guest::Prose);
+        register(&mut g, Guest::Matte);
         let refused = g.queue.submit(image_request()).unwrap();
-        g.queue.submit(prose_request()).unwrap();
+        g.queue.submit(matte_request()).unwrap();
 
-        assert_eq!(g.next_to_drain(), Some(Guest::Prose));
+        assert_eq!(g.next_to_drain(), Some(Guest::Matte));
         assert_eq!(refused.wait(), Err(GuestError::Unavailable(Guest::Image)));
         assert!(
             g.has_work(),
-            "the prose job was cleared with the image ones"
+            "the matte job was cleared with the image ones"
         );
     }
 
     #[test]
     fn the_longest_waiting_configured_guest_is_next() {
         let mut g = Guests::new();
-        register(&mut g, Guest::Prose);
+        register(&mut g, Guest::Matte);
         register(&mut g, Guest::Image);
-        g.queue.submit(prose_request()).unwrap();
+        g.queue.submit(matte_request()).unwrap();
         g.queue.submit(image_request()).unwrap();
-        assert_eq!(g.next_to_drain(), Some(Guest::Prose));
-        g.queue.take(Guest::Prose);
+        assert_eq!(g.next_to_drain(), Some(Guest::Matte));
+        g.queue.take(Guest::Matte);
         assert_eq!(g.next_to_drain(), Some(Guest::Image));
     }
 }

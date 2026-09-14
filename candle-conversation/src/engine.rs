@@ -8,7 +8,8 @@ use crate::persistence::record::DistillMode;
 use crate::persistence::thread::PersistenceThread;
 use crate::persistence::SharedSubstrate;
 use crate::projection::{
-    Builder, Conversation, GroupId, LayerId, ProjectionTarget, Reserved, TimelineId,
+    Builder, CollectionWarm, Conversation, GroupId, LayerId, PlainPromptFrames, ProjectionTarget,
+    Reserved, Schema, SectionId, TimelineId, TurnIndex,
 };
 use crate::scheduler::{Scheduler, SchedulerRequest};
 use crate::sequence_handle::SequenceId;
@@ -25,7 +26,7 @@ use crate::turn_text::literal_tokenizer;
 
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
-use crossbeam::channel;
+use flume::{Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -209,7 +210,7 @@ enum Resumed {
 /// ```
 pub struct ConversationEngine {
     /// Channel to submit work to the scheduler thread.
-    scheduler_tx: channel::Sender<SchedulerRequest>,
+    scheduler_tx: Sender<SchedulerRequest>,
 
     /// Handle to the scheduler thread (joined on drop or on explicit shutdown).
     /// Wrapped in `Mutex<Option>` so `shutdown()` can be called via `&self`,
@@ -220,6 +221,9 @@ pub struct ConversationEngine {
     /// Tokenizer (shared, immutable, safe to clone into conversations).
     tokenizer: Arc<tokenizers::Tokenizer>,
 
+    /// The frame sections handed out to plain-prompt conversations, and the
+    /// claim on each — see [`Self::plain_prompt_section`].
+    plain_frames: Mutex<PlainPromptFrames>,
     /// [`Self::tokenizer`] reading every chat tag as plain characters, for the
     /// literal pieces of a turn — see [`crate::turn_text`]. Built once here: it
     /// is a copy of the whole vocabulary.
@@ -353,7 +357,7 @@ impl ConversationEngine {
 
         // Create the scheduler channel (unbounded — backpressure is per-conversation
         // via the turn_in_flight guard, not at the channel level).
-        let (tx, rx) = channel::unbounded();
+        let (tx, rx) = flume::unbounded();
 
         // Workspace-shared `Conversation`: holds per-turn metadata
         // (the substrate handle).  Every `Sequence` we hand out gets a
@@ -557,6 +561,7 @@ impl ConversationEngine {
             scheduler_handle: Mutex::new(Some(handle)),
             literal_tokenizer: Arc::new(literal_tokenizer(&tokenizer)),
             tokenizer: Arc::new(tokenizer),
+            plain_frames: Mutex::new(PlainPromptFrames::default()),
             config,
             model_core,
             conversation,
@@ -656,7 +661,7 @@ impl ConversationEngine {
     /// conversation on that id inherits a stranger's memory, fluently.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn live_memory_count(&self) -> usize {
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = flume::bounded(1);
         if self
             .scheduler_tx
             .send(crate::scheduler::SchedulerRequest::CountRecurrentMemories { response_tx: tx })
@@ -814,18 +819,56 @@ impl ConversationEngine {
     /// AFTER an ingest pass / reconcile finishes (never concurrently — it would
     /// starve the ingest writer). See
     /// [`crate::projection::Conversation::warm_ingest_normalization`].
-    pub fn warm_ingest_normalization(&self, schema: &crate::projection::Schema) {
+    pub fn warm_ingest_normalization(&self, schema: &Schema) {
         self.conversation.warm_ingest_normalization(schema);
+    }
+
+    /// Warm one belief group's per-timeline hit levels by self-match — for a
+    /// group nothing else teaches, such as a tag-scoped turn group, which
+    /// learns only from probes inside its scope. Returns how many timelines
+    /// were warmed. See
+    /// [`crate::projection::Conversation::warm_group_normalization`].
+    pub fn warm_group_normalization(
+        &self,
+        schema: &crate::projection::Schema,
+        group: GroupId,
+    ) -> usize {
+        self.conversation.warm_group_normalization(schema, group)
+    }
+
+    /// Warm one timeline's hit levels by self-match — a conversation written
+    /// onto a belief group after the group was warmed. See
+    /// [`crate::projection::Conversation::warm_timeline_normalization`].
+    pub fn warm_timeline_normalization(
+        &self,
+        schema: &crate::projection::Schema,
+        timeline: TimelineId,
+    ) -> bool {
+        self.conversation
+            .warm_timeline_normalization(schema, timeline)
     }
 
     /// Warm the belief-driven section collections' per-member hit levels from
     /// their own tag-scoped corpus. Call after load, once the corpus is stable —
     /// without it a collection's levels are cold on every process start but the
     /// one that built the corpus, which changes both the scale and the RANKING of
-    /// its scores. See
-    /// [`crate::projection::Conversation::warm_collection_normalization`].
-    pub fn warm_collection_normalization(&self, schema: &crate::projection::Schema) {
-        self.conversation.warm_collection_normalization(schema);
+    /// its scores. Runs on the scheduler thread, where the GPU gallery arena
+    /// scores the corpus in batch, and blocks until it is done. See
+    /// [`Conversation::warm_collection_normalization`].
+    pub fn warm_collection_normalization(&self, schema: &Schema) -> CollectionWarm {
+        let (tx, rx) = flume::bounded(1);
+        if self
+            .scheduler_tx
+            .send(SchedulerRequest::WarmCollectionNormalization {
+                conversation: self.conversation.clone(),
+                schema: Box::new(schema.clone()),
+                response_tx: tx,
+            })
+            .is_err()
+        {
+            return CollectionWarm::default();
+        }
+        rx.recv().unwrap_or_default()
     }
 
     /// Merge a `(key, value)` into `timeline`'s free-form `custom`
@@ -889,6 +932,16 @@ impl ConversationEngine {
     /// Drives the daemon's `GET /v1/conversations` sidebar listing directly.
     pub fn known_conversations(&self) -> Vec<(TimelineId, String, String, bool, u64)> {
         self.conversation.known_conversations()
+    }
+
+    /// Every live conversation, whether or not it carries a `conv_id` —
+    /// tombstoned ones excluded.
+    ///
+    /// [`Self::known_conversations`] lists only the named ones, which is what a
+    /// sidebar wants and not what a caller retiring everything wants: an
+    /// ingested document is a conversation with no `conv_id` at all.
+    pub fn live_conversations(&self) -> Vec<TimelineId> {
+        self.conversation.live_timeline_ids()
     }
 
     /// Live conversations whose `conv_id` starts with `prefix`, as
@@ -988,6 +1041,46 @@ impl ConversationEngine {
         self.conversation.read().turn_count(timeline) as u64
     }
 
+    /// Every live conversation written to `group` — the set selection reads,
+    /// so archived and tombstoned conversations are not in it.
+    pub fn group_conversations(&self, group: GroupId) -> Vec<TimelineId> {
+        self.conversation
+            .read()
+            .active_timelines_for_group(group)
+            .collect()
+    }
+
+    /// Both halves of every turn in `timeline`, in order — `(user, assistant)`,
+    /// verbatim as stored.
+    pub fn conversation_texts(&self, timeline: TimelineId) -> Vec<(String, String)> {
+        let read = self.conversation.read();
+        (0..read.turn_count(timeline))
+            .map(|i| {
+                (
+                    read.user_text_of(timeline, TurnIndex(i)),
+                    read.assistant_text_of(timeline, TurnIndex(i)),
+                )
+            })
+            .collect()
+    }
+
+    /// Whether any turn of `timeline` carries one of `tags` — the test a
+    /// tag-scoped group applies to decide whether a conversation is in scope.
+    pub fn conversation_carries(&self, timeline: TimelineId, tags: &[String]) -> bool {
+        let read = self.conversation.read();
+        (0..read.turn_count(timeline)).any(|i| {
+            read.turn_tags(timeline, TurnIndex(i))
+                .iter()
+                .any(|t| tags.contains(t))
+        })
+    }
+
+    /// The name a conversation was written under (its `conv_id`), if it was
+    /// given one.
+    pub fn conversation_conv_id(&self, timeline: TimelineId) -> Option<String> {
+        self.conversation.conv_id_of(timeline)
+    }
+
     /// Mark `timeline` for distillation at `mode` (shed content at compaction) —
     /// see [`crate::projection::Conversation::distill_timeline`]. A later call may
     /// upgrade the mode; gate on [`Self::is_timeline_distilled`] only to avoid
@@ -1035,7 +1128,7 @@ impl ConversationEngine {
         if timelines.is_empty() {
             return Ok(0);
         }
-        let (response_tx, response_rx) = channel::bounded(1);
+        let (response_tx, response_rx) = flume::bounded(1);
         self.scheduler_tx
             .send(SchedulerRequest::DemoteTimelinesHot {
                 conversation: self.conversation.clone(),
@@ -1112,10 +1205,95 @@ impl ConversationEngine {
         kind: Reserved,
         config: SequenceConfig,
     ) -> crate::Result<Sequence> {
-        let builder = Builder::for_plain_prompt_reserved(system_prompt, kind);
+        let frame = self.plain_prompt_section(system_prompt)?;
+        let builder = Builder::for_plain_prompt_reserved(system_prompt, kind, frame);
         let layer_id = LayerId::reserved(kind);
         let group_id = GroupId::reserved(kind);
         self.new_conversation_with_projection(system_prompt, builder, layer_id, group_id, config)
+    }
+
+    /// The section a plain prompt's frame is sealed under.
+    ///
+    /// Chosen from the prompt's own tokens and checked against what the
+    /// substrate already holds — see [`PlainPromptFrames`] for why a fixed id
+    /// hands a conversation the prompt some other conversation was opened with.
+    /// Give it to [`Builder::for_plain_prompt`] or
+    /// [`Builder::for_plain_prompt_reserved`] with this same text, since that
+    /// text is what the section seals.
+    ///
+    /// The id is claimed as it is returned, so a conversation opening a
+    /// different prompt at the same moment is not handed it before this one
+    /// has sealed. A conversation opened for one job and discarded takes
+    /// [`Self::transient_prompt_section`] instead, which leaves nothing behind.
+    pub fn plain_prompt_section(&self, prompt_text: &str) -> crate::Result<SectionId> {
+        let encoding = self
+            .tokenizer
+            .encode(prompt_text, false)
+            .map_err(|e| ConversationError::Tokenizer(e.to_string()))?;
+        let mut frames = self.plain_frames.lock().unwrap();
+        let view = self.conversation.read();
+        frames
+            .resolve(encoding.get_ids(), |id| {
+                view.section_exists(id).then(|| view.section_tokens_of(id))
+            })
+            .ok_or_else(|| {
+                ConversationError::Other(format!(
+                    "no frame section is free for this prompt within {} probes of its slot",
+                    PlainPromptFrames::MAX_PROBES
+                ))
+            })
+    }
+
+    /// The section a throwaway conversation's frame is sealed under, held until
+    /// [`Self::release_prompt_section`].
+    ///
+    /// [`Self::plain_prompt_section`] for a conversation opened for one job and
+    /// discarded. The frame is **transient**: never written to disk, and retired
+    /// from the substrate when the last conversation holding it releases it, so
+    /// a caller whose every prompt is different leaves nothing behind. Two jobs
+    /// on the same prompt share the section while both hold it.
+    ///
+    /// Every successful call must be matched by one release, made after the
+    /// conversation that used the frame has been dropped.
+    pub fn transient_prompt_section(&self, prompt_text: &str) -> crate::Result<SectionId> {
+        let encoding = self
+            .tokenizer
+            .encode(prompt_text, false)
+            .map_err(|e| ConversationError::Tokenizer(e.to_string()))?;
+        let id = {
+            let mut frames = self.plain_frames.lock().unwrap();
+            let view = self.conversation.read();
+            frames.acquire(encoding.get_ids(), |id| {
+                view.section_exists(id).then(|| view.section_tokens_of(id))
+            })
+        }
+        .ok_or_else(|| {
+            ConversationError::Other(format!(
+                "no transient frame section is free for this prompt within {} probes of its \
+                 slot",
+                PlainPromptFrames::MAX_PROBES
+            ))
+        })?;
+        // Before the conversation that uses it opens: the seal reads this to
+        // skip the disk, and a section that sealed first has already written.
+        self.conversation.mark_section_transient(id);
+        Ok(id)
+    }
+
+    /// Let go of a frame taken with [`Self::transient_prompt_section`].
+    ///
+    /// The last release retires the section, on the wave thread between waves —
+    /// see [`SchedulerRequest::RetireSections`]. Sent after the conversation's
+    /// own slot was freed, on the same queue, so the retirement never runs ahead
+    /// of the slot that was reading the frame.
+    pub fn release_prompt_section(&self, section: SectionId) {
+        let last = self.plain_frames.lock().unwrap().release(section);
+        if last {
+            let _ = self.scheduler_tx.send(SchedulerRequest::RetireSections {
+                conversation: self.conversation.clone(),
+                sections: vec![section],
+            });
+        }
     }
 
     /// Compile a tool catalog into a [`TriggerRegistry`] for constrained
@@ -1274,7 +1452,9 @@ impl ConversationEngine {
                 .unwrap_or(system_prompt);
             s.strip_suffix(config.dialect.system_end).unwrap_or(s)
         };
-        let builder = Builder::for_plain_prompt(inner_prompt);
+        // The frame's id comes from its text — see [`Self::plain_prompt_section`].
+        let frame = self.plain_prompt_section(inner_prompt)?;
+        let builder = Builder::for_plain_prompt(inner_prompt, frame);
         let (layer_id, group_id) = {
             let layer = &builder.schema().layers[0];
             (layer.id, layer.groups[0].id)
@@ -1443,7 +1623,9 @@ impl ConversationEngine {
                 .unwrap_or(system_prompt);
             s.strip_suffix(config.dialect.system_end).unwrap_or(s)
         };
-        let builder = Builder::for_plain_prompt(inner_prompt);
+        // The frame's id comes from its text — see [`Self::plain_prompt_section`].
+        let frame = self.plain_prompt_section(inner_prompt)?;
+        let builder = Builder::for_plain_prompt(inner_prompt, frame);
         self.resume_conversation_with_projection(timeline, system_prompt, builder, config)
     }
 
@@ -1498,7 +1680,7 @@ impl ConversationEngine {
             timeline,
         };
 
-        let (response_tx, response_rx) = channel::bounded(1);
+        let (response_tx, response_rx) = flume::bounded(1);
         let request = match resumed {
             // A fresh conversation: any state comes from the timeline's own
             // snapshot, which `create_sequence` reads.
@@ -1634,7 +1816,7 @@ impl ConversationEngine {
         // together and one drain cycle allocates every slot.
         struct Fired {
             target: ProjectionTarget,
-            rx: channel::Receiver<crate::Result<SequenceId>>,
+            rx: Receiver<crate::Result<SequenceId>>,
         }
         // Split the call's wall time three ways, because the three parts have
         // very different characters and a caller that batches creations needs to
@@ -1658,7 +1840,7 @@ impl ConversationEngine {
                 group,
                 timeline,
             };
-            let (response_tx, rx) = channel::bounded(1);
+            let (response_tx, rx) = flume::bounded(1);
             match self.scheduler_tx.send(SchedulerRequest::NewSequence {
                 conversation: self.conversation.clone(),
                 target: Some(target),
@@ -1773,7 +1955,7 @@ impl ConversationEngine {
         max_decode_tokens: usize,
     ) -> crate::Result<String> {
         // 1. Allocate a sequence.
-        let (resp_tx, resp_rx) = channel::bounded(1);
+        let (resp_tx, resp_rx) = flume::bounded(1);
         self.scheduler_tx
             .send(SchedulerRequest::NewSequence {
                 conversation: self.conversation.clone(),
@@ -1793,7 +1975,7 @@ impl ConversationEngine {
         //    on Done — for a fresh parent with no blocks the view
         //    borrows nothing and decoded blocks transfer back on
         //    finalize.
-        let (event_tx, event_rx) = channel::unbounded();
+        let (event_tx, event_rx) = flume::unbounded();
         self.scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
                 // One turn, and it is the slot's tail.

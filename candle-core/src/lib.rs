@@ -4,7 +4,11 @@
 // Rewriting them would change `&[T]` to `&[T; N]` through the quantization core
 // of a fork that has to stay mergeable with upstream candle, for no behavioural
 // gain — and the volume was drowning the `-D warnings` gate.
-#![allow(clippy::chunks_exact_to_as_chunks)]
+//
+// `unknown_lints` beside it because the lint exists only in that newer clippy:
+// the dev machines do not share a toolchain, and an older one rejects the
+// unknown lint name under `-D warnings` before it reaches any real finding.
+#![allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 
 //! ML framework for Rust
 //!

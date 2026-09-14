@@ -50,6 +50,7 @@
   --l-interaction:   #c9776b;
   --l-environment:   #6f9f8f;
   --l-world:         #857c72;
+  --l-dreams:        #b98ab0;
 
   --shadow:    0 6px 20px rgba(0,0,0,.34);
   --shadow-lg: 0 20px 50px rgba(0,0,0,.5);
@@ -97,6 +98,7 @@
   --l-interaction:   #a2503f;
   --l-environment:   #3f7a68;
   --l-world:         #7d7365;
+  --l-dreams:        #8a4f7c;
 
   --shadow:    0 4px 14px rgba(90,72,45,.12);
   --shadow-lg: 0 18px 44px rgba(90,72,45,.20);
@@ -144,6 +146,7 @@
   --l-interaction:   #ff7360;
   --l-environment:   #46d3b0;
   --l-world:         #9a8a78;
+  --l-dreams:        #f08bd6;
 
   --shadow:    0 6px 22px rgba(0,0,0,.55);
   --shadow-lg: 0 22px 56px rgba(0,0,0,.7);

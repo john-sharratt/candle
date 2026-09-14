@@ -47,9 +47,13 @@ const POLL_MS = 1800;
  * per poll for a page somebody leaves open all afternoon, and re-render several
  * hundred tiles to show the one that changed. */
 const FEED_LIMIT = 60;
-/* Ticks the page holds. The scheduler's own ring is 512, so this asks for a
- * little less than it can actually serve. */
-const FEED_KEEP = 400;
+/* The window: how many ticks stay on screen at once. It is both what a cold
+ * start preloads and the ceiling the feed is trimmed to — a new tick at the top
+ * drops the oldest off the bottom, so the DOM holds a bounded ~`FEED_KEEP` tiles
+ * however long the page is left open, rather than growing without limit. Kept
+ * well under the scheduler's 512-tick ring (which a preload reads from) and
+ * small enough that re-rendering the window on a change stays cheap. */
+const FEED_KEEP = 100;
 
 /* Why a character woke, and how that reads. The colours are the point of the
  * column: a run of quiet grey with one amber preempt in it is legible at a
@@ -377,7 +381,12 @@ export async function render() {
     mount(feedHost, ...ticks.map((t) => {
       const c = CAUSE[t.cause] || CAUSE.quiet;
       const id = String(t.npc_id);
-      const fresh = t.tick > lastTick;
+      /* Only rows that arrived AFTER this page was already showing something
+       * animate in. `lastTick` is -1 on a cold start (a refresh, a focus change,
+       * a detected restart), and the preloaded backlog then paints statically —
+       * animating a whole screenful on load is what made an already-there feed
+       * read as if it were filling in live, tick by tick. */
+      const fresh = lastTick >= 0 && t.tick > lastTick;
       return h('article', {
         class: 'tick is-' + t.cause + (fresh ? ' is-new' : ''),
         style: `--hue:${hueOf(id)}`,
@@ -468,7 +477,13 @@ export async function render() {
   }
 
   async function read(mine) {
-    const q = { limit: FEED_LIMIT, npc_id: focus || undefined };
+    /* A cold start (a refresh, or a focus change that cleared the page) asks for
+     * the whole window at once, so the feed opens with a screenful of history
+     * already on it rather than filling in tick by tick. Once the page is
+     * holding something, every later poll only needs the small `FEED_LIMIT`
+     * tail — enough that a busy cast cannot outrun one interval — and merges it
+     * into what is already there. */
+    const q = { limit: held.size ? FEED_LIMIT : FEED_KEEP, npc_id: focus || undefined };
     try {
       /* The world comes back with the other two rather than on its own timer,
        * so the room somebody is in and the tick they took in it are read from

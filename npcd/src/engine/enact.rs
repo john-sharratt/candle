@@ -151,7 +151,16 @@ fn act_on(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
      * what an unaimed showing is.
      */
     if on.eq_ignore_ascii_case(SELF) {
-        return match hosted.with(|w| w.show(body, None, format!("does it: {intent}"))) {
+        // **The room sees only that a body did something to itself — not the
+        // intent.** A self-act's intent is the actor's own, and often
+        // introspective ("to feel the shift in pressure"): pasting it into what
+        // everybody else perceives both misreports what is observable — nobody
+        // sees you *feel* anything — and leaks the actor's first-person reasoning
+        // into their window, where the narrator passes it straight through
+        // ("Ulysses does it: to feel the shift…"). The actor's own outcome keeps
+        // the intent; the room gets the act, and the narrator renders that.
+        return match hosted.with(|w| w.show(body, None, "does something to themselves".to_string()))
+        {
             Ok(()) => Outcome::Did(format!("You do it to yourself: {intent}.")),
             Err(why) => Outcome::Refused(refusal(hosted, &why)),
         };
@@ -780,7 +789,7 @@ fn record_verdict(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Out
 //
 // Every one of these reaches somebody who is not here, from wherever the
 // character is standing, at a time that is not necessarily now. That is the
-// whole difference from `say` and `tell`, and it is why they are separate acts.
+// whole difference from `tell`, and it is why they are separate acts.
 
 fn message(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let (Some(to), Some(intent)) = (text(args, "to"), text(args, "intent")) else {

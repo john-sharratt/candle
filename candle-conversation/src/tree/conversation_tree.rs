@@ -22,7 +22,7 @@ use std::collections::LinkedList;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossbeam::channel::Sender;
+use flume::{Receiver, Sender};
 
 use super::config::ConversationTreeConfig;
 use super::node::{
@@ -36,6 +36,7 @@ use super::summarize::{
 use super::task::{CognitiveTask, TaskPoll};
 use super::token_text::TokenizedText;
 use super::types::{NodeId, TurnId, TurnType};
+use crate::handle::TurnEvent;
 use crate::prompts::TEMPORAL_MARKER_POSTFIX;
 use crate::scheduler::SchedulerRequest;
 use crate::time_source::{TimeSource, WallClockTimeSource};
@@ -143,7 +144,7 @@ pub struct ConversationTree {
     /// (Token, Prefill, PrefillProgress, HealthWarning) to external
     /// callers in real time. Set via
     /// [`Sequence::set_task_observer`](crate::Sequence::set_task_observer).
-    pub(crate) task_event_observer: Option<crossbeam::channel::Sender<crate::handle::TurnEvent>>,
+    pub(crate) task_event_observer: Option<Sender<TurnEvent>>,
 
     /// Optional maximum number of turns before the conversation tree begins
     /// culling the oldest, this is used for short conversations that don't need
@@ -720,13 +721,8 @@ impl ConversationTree {
     ///
     /// Returns a `Send`-able fork (shallow clone + result channel) and a
     /// receiver for the completed [`TreePatch`].
-    pub fn fork(
-        &self,
-    ) -> (
-        ConversationTreeFork,
-        crossbeam::channel::Receiver<TreePatch>,
-    ) {
-        let (tx, rx) = crossbeam::channel::bounded(1);
+    pub fn fork(&self) -> (ConversationTreeFork, Receiver<TreePatch>) {
+        let (tx, rx) = flume::bounded(1);
         (
             ConversationTreeFork {
                 inner: self.clone(),
@@ -864,7 +860,7 @@ impl ConversationTree {
 pub struct ConversationTreeFork {
     /// Inner clone of the tree at fork time.
     pub inner: ConversationTree,
-    result_tx: crossbeam::channel::Sender<TreePatch>,
+    result_tx: Sender<TreePatch>,
 }
 
 impl ConversationTreeFork {

@@ -48,12 +48,11 @@ pub trait GuestModel: Send {
     ///
     /// # Why the two can differ
     ///
-    /// A guest may have a second tenancy. The prose guest's K/V is the engine's
-    /// chunked cache, which claims its own regions from the same reservation the
-    /// ground is carved from — so the drain has to *shed* for the cache as well
-    /// as the weights, and must not *claim* the cache's share as ground, or the
-    /// arenas find the reservation full and the wave dies on "no region is
-    /// claimable". Shed to [`Self::footprint_bytes`]; claim this.
+    /// A guest may have a second tenancy — memory that claims its own regions
+    /// from the same reservation the ground is carved from. The drain has to
+    /// *shed* for that as well as for the weights, and must not *claim* its share
+    /// as ground, or the other tenant finds the reservation full. Shed to
+    /// [`Self::footprint_bytes`]; claim this.
     fn ground_bytes(&self, jobs: &[GuestRequest]) -> usize {
         self.footprint_bytes(jobs)
     }
@@ -71,7 +70,7 @@ pub trait GuestModel: Send {
     /// instead is memory the reservation was never sized for, competing with
     /// the engine for the same card — which on WDDM is not an error but a
     /// demotion of whichever side loses. Activations are the deliberate
-    /// exception; see [`super::prose`]'s header for why.
+    /// exception: they live for one job and go back to the pool when it ends.
     ///
     /// **Every handle the model keeps must be released by [`Self::unload`].**
     /// The ground is shared as an `Arc` precisely so that is checkable: the
@@ -279,9 +278,11 @@ pub(crate) mod testing {
             }
             // Emitted like a real guest, so the drain's own progress wiring is
             // exercised by the tests that run without a card.
-            if let GuestRequest::Prose(r) = request {
-                sink.emit(GuestEvent::Token(format!("<{}>", r.prompt)));
-            }
+            sink.emit(GuestEvent::Step {
+                done: 1,
+                total: 1,
+                what: "fake",
+            });
             Ok(match request {
                 GuestRequest::Image(r) => GuestOutcome::Image(GuestImage {
                     width: r.width,
@@ -289,11 +290,6 @@ pub(crate) mod testing {
                     png: vec![0x89, b'P', b'N', b'G'],
                     seed: r.seed.unwrap_or(0),
                 }),
-                GuestRequest::Prose(r) => GuestOutcome::Prose {
-                    text: format!("<{}>", r.prompt),
-                    tokens: 3,
-                    seed: r.seed.unwrap_or(0),
-                },
                 GuestRequest::Matte(r) => GuestOutcome::Matte(GuestMatte {
                     width: r.width,
                     height: r.height,
@@ -341,11 +337,11 @@ mod tests {
     #[test]
     fn a_registered_guest_builds_a_fresh_instance() {
         let mut r = GuestRegistry::new();
-        r.register(Guest::Prose, fake(Guest::Prose));
-        assert!(r.has(Guest::Prose));
+        r.register(Guest::Matte, fake(Guest::Matte));
+        assert!(r.has(Guest::Matte));
         assert!(!r.has(Guest::Image));
-        assert_eq!(r.build(Guest::Prose).unwrap().guest(), Guest::Prose);
-        assert_eq!(r.configured(), vec![Guest::Prose]);
+        assert_eq!(r.build(Guest::Matte).unwrap().guest(), Guest::Matte);
+        assert_eq!(r.configured(), vec![Guest::Matte]);
     }
 
     /// **A guest is built per drain, never reused.** A guest that failed

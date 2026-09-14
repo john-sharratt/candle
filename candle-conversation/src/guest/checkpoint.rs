@@ -4,17 +4,11 @@
 //!
 //! A guest is built fresh for every drain — deliberately, so a half-loaded model
 //! is never inherited ([`super::model::GuestRegistry`]) — and its `load` then
-//! re-reads two files that have not changed since the last drain. Measured on a
-//! 2.46 GiB Hermes-3 Q6_K, a ~2.9 s load spent:
+//! re-reads files that have not changed since the last drain. Measured on a
+//! 2.46 GiB GGUF guest, the header parse alone was **1,150 ms** of a ~2.9 s
+//! load; the file read and the H2D of the weights were ~1,300 ms of the rest.
 //!
-//! | | |
-//! |---|---|
-//! | GGUF header parse | **1,150 ms** |
-//! | `tokenizer.json` parse | **310 ms** |
-//! | file read + H2D of the weights | ~1,300 ms |
-//! | everything else | ~10 ms |
-//!
-//! Half the load was re-deriving an answer it already had. Worse, the header is
+//! Much of the load was re-deriving an answer it already had. Worse, the header is
 //! parsed *again* outside `load` — [`super::model::GuestModel::footprint_bytes`]
 //! reads it to size the claim — so a drain paid it two or three times over, and
 //! those extra parses landed outside the `load_ms` the drain reports.
@@ -88,9 +82,6 @@ impl Stamp {
 /// size of a vocabulary, so "the old one is dropped" is a claim worth checking
 /// rather than asserting in a comment.
 static HEADERS: OnceLock<Mutex<HashMap<Stamp, Arc<gguf_file::Content>>>> = OnceLock::new();
-
-/// Parsed tokenizers, on the same terms.
-static TOKENIZERS: OnceLock<Mutex<HashMap<Stamp, Arc<tokenizers::Tokenizer>>>> = OnceLock::new();
 
 /// Mapped checkpoint payloads. Holds address space, not resident memory: the
 /// pages are the OS page cache's, and it evicts them under pressure like any
@@ -276,29 +267,6 @@ pub fn onnx(path: &Path) -> Result<Arc<candle_onnx::onnx::ModelProto>, String> {
     Ok(parsed)
 }
 
-/// Load a tokenizer, from cache when this process has loaded it before.
-///
-/// `Arc` rather than a clone: a `Tokenizer` carries its vocabulary and merges,
-/// and every drain cloning one is the parse cost paid again in memcpy.
-pub fn tokenizer(path: &Path) -> Result<Arc<tokenizers::Tokenizer>, String> {
-    let cache = TOKENIZERS.get_or_init(|| Mutex::new(HashMap::new()));
-
-    let stamp = Stamp::of(path).map_err(|e| format!("guest tokenizer {path:?}: {e}"))?;
-    if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&stamp).cloned()) {
-        return Ok(hit);
-    }
-
-    let parsed = Arc::new(
-        tokenizers::Tokenizer::from_file(path)
-            .map_err(|e| format!("guest tokenizer {path:?}: {e}"))?,
-    );
-    if let Ok(mut c) = cache.lock() {
-        c.retain(|k, _| k.path != stamp.path);
-        c.insert(stamp, Arc::clone(&parsed));
-    }
-    Ok(parsed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,26 +363,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A tokenizer is cached on the same terms as a header.
-    #[test]
-    fn a_tokenizer_is_parsed_once() {
-        // The daemon's own tokenizer if the deployment has one; otherwise there
-        // is nothing valid to parse and the miss path is covered by the test
-        // below. Skipping is honest here — inventing a tokenizer.json would be
-        // asserting against this test's fixture rather than against a real one.
-        let p = Path::new("D:/guests/hermes3/tokenizer.json");
-        if !p.exists() {
-            return;
-        }
-        let a = tokenizer(p).unwrap();
-        let b = tokenizer(p).unwrap();
-        assert!(Arc::ptr_eq(&a, &b), "the tokenizer was parsed twice");
-    }
-
     #[test]
     fn a_missing_file_is_an_error_not_a_panic() {
         let p = std::env::temp_dir().join("guest-checkpoint-does-not-exist.gguf");
         assert!(gguf_header(&p).is_err());
-        assert!(tokenizer(&p).is_err());
     }
 }

@@ -476,6 +476,7 @@ mod tests {
                 expert_pack_dir: None,
                 mtp_path: None,
                 gate_donor_path: None,
+                tensor_overrides: Vec::new(),
             },
         )?;
         assert!(model.has_drafter(), "the pinned 9B carries an MTP head");

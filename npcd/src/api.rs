@@ -51,6 +51,7 @@ use crate::mind::{
 };
 use crate::npcs::{self, Filter, NpcError, Npcs};
 use crate::portrait;
+use crate::prose;
 use crate::registry::{self, PutError, Registry};
 use crate::visibility;
 
@@ -277,15 +278,10 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             Role::Admin,
             post(guest_routes::post_image),
         )
-        .route(
-            "/v1/guest/prose",
-            Role::Admin,
-            post(guest_routes::post_prose),
-        )
-        // One stratum of a life, rewritten in the narrator's voice through the
-        // prose guest. The ladder (`/generate`) stays on the main engine, which
-        // is the right shape for a five-hundred-node fan-out; this is the other
-        // case — one node, on demand, in a voice the acting model does not have.
+        .route("/v1/generate/prose", Role::Admin, post(prose::post_prose))
+        // One stratum of a life, rewritten in the narrator's voice. The ladder
+        // (`/generate`) is the right shape for a five-hundred-node fan-out; this
+        // is the other case — one node, on demand.
         .route(
             "/v1/life/:who/node/:key/narrate",
             Role::Admin,
@@ -389,6 +385,7 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         // `User` for the same reason the portrait route is: it is *your own*
         // character, and the handler refuses one that is not.
         .route("/v1/npc/:nid/reflect", Role::User, post(post_reflect))
+        .route("/v1/npc/:nid/dream", Role::User, post(post_dream))
         .route(
             "/v1/npc/:nid/modulation",
             Role::User,
@@ -657,6 +654,14 @@ async fn post_reflect(
         .unwrap_or("")
         .trim()
         .to_string();
+    // Where the character says it is — what the act passes. Optional here: a
+    // caller that names none gets the world's own percept of the room.
+    let situation = body
+        .get("situation")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     // Absent means rotate. Naming one is for a caller walking the space
     // deliberately — a test, or a fill of a cell the corpus is thin in.
     let domain = body
@@ -683,23 +688,108 @@ async fn post_reflect(
             "this daemon has no engine",
         );
     };
-    // The decodes run on the engine thread. Off the async executor, because a
-    // blocking model call on a tokio worker stalls every other route.
-    let out = tokio::task::spawn_blocking(move || {
-        rt.reflect(npc_id, &inner, &feeling, domain.as_deref(), &axes)
-    })
-    .await;
+    // Awaited directly: the decodes yield on their turn channels, so the
+    // route parks a future rather than a worker — and a client that
+    // disconnects drops it, which stops the decode it was waiting on.
+    let out = rt
+        .reflect(
+            npc_id,
+            situation.as_deref(),
+            &inner,
+            &feeling,
+            domain.as_deref(),
+            &axes,
+        )
+        .await;
 
     match out {
-        Ok(Ok(r)) => Json(r).into_response(),
-        Ok(Err(e)) => err(
+        Ok(r) => Json(r).into_response(),
+        Err(e) => err(
             StatusCode::SERVICE_UNAVAILABLE,
             "reflect_failed",
             &format!("{e}"),
         ),
+    }
+}
+
+/// `POST /v1/npc/:nid/dream` — decode a single dream on demand.
+///
+/// A dream ordinarily falls out of a reflection on the character's own clock,
+/// sporadically. This decodes one now from a supplied `brief` — the
+/// present-tense premise the dreamer lives through — so a caller can see what
+/// the dreaming produces without waiting for the tick that would have asked for
+/// it. It is kept like any dream, so it also lands on the character's dream
+/// layer.
+///
+/// **Serial**, like the reflection route: it holds the request for the decode
+/// and stops the cast while it runs, which is what a dream costs.
+async fn post_dream(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(nid): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let (id, owner) = match owner_of(&s, &headers).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let Ok(npc_id) = nid.parse::<u64>() else {
+        return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
+    };
+    // Ownership — unless the caller may see the whole cast (admin or creator).
+    // An on-demand dream is an inspection tool: an operator watching the mind
+    // should be able to poke any character in it, the same way the pulse already
+    // lets them read one.
+    if !s.roles.of(Some(&id)).at_least(Role::Admin) {
+        if let Err(e) = s.npcs.read().await.get(npc_id, &owner) {
+            return npc_err(e);
+        }
+    }
+
+    // The premise the dream is decoded from — present tense, the dreamer living
+    // it. Required: a dream with no premise dreams nothing.
+    let brief = body
+        .get("brief")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if brief.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "brief_required",
+            "a dream needs a `brief` — the present-tense premise it dreams from",
+        );
+    }
+    // The axis the dream suspends, recorded on the kept dream. Optional: a
+    // one-off dream asked for by hand need not name one.
+    let assumption = body
+        .get("assumption")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .unwrap_or("a dream asked for by hand")
+        .to_string();
+
+    let Some(rt) = s.runtime.clone() else {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_engine",
+            "this daemon has no engine",
+        );
+    };
+    match rt.dream_once(npc_id, &brief, &assumption).await {
+        Ok(kept) => Json(json!({
+            // Stringified for the same reason every id on the wire is: a u64
+            // past 2^53 does not survive a JavaScript client exact.
+            "timeline": kept.timeline.to_string(),
+            "lines": kept.lines,
+            "text": kept.lines.join("\n"),
+        }))
+        .into_response(),
         Err(e) => err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "reflect_panicked",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "dream_failed",
             &format!("{e}"),
         ),
     }
@@ -745,6 +835,9 @@ async fn create_npc(
                 if let Some(id) = v.get("npc_id").and_then(npc_id_of) {
                     let world_ms = s.world_ms(id).await;
                     rt.scheduler.wake(id, 0, world_ms);
+                    // And its task with it — waking puts the inbox in the
+                    // scheduler; the task is what waits on it and thinks.
+                    rt.spawn_character(id);
                     tracing::info!("npc {id}: created and woken");
 
                     // And given a body, if its world has anywhere to stand. A
@@ -1255,6 +1348,10 @@ async fn delete_npc(
             // the persona source returns `None`, so it thinks about nothing for
             // ever, and its conversation is never retired.
             if let Some(rt) = s.runtime.as_ref() {
+                // The task first: aborting it drops whatever turn it was
+                // awaiting, which stops that decode, and `retire` wakes a task
+                // that was parked so it finds its inbox gone and exits.
+                rt.stop_character(npc_id);
                 rt.scheduler.retire(npc_id);
                 // And what its body was waiting on, or a world running for a
                 // week keeps a row per act for every character it ever had.
@@ -1270,8 +1367,9 @@ async fn delete_npc(
                 if let Some((hosted, body)) = rt.body_of(npc_id) {
                     hosted.with_sim(|s| s.ledger.forget_questions(&body));
                 }
-                if let Some(minds) = rt.minds.read().unwrap().as_ref() {
-                    minds.retire_npc(npc_id);
+                let minds = rt.minds.read().unwrap().clone();
+                if let Some(minds) = minds {
+                    minds.retire_npc(npc_id).await;
                 }
             }
             StatusCode::NO_CONTENT.into_response()
@@ -3026,7 +3124,9 @@ mod tests {
                 // serve wants a hand on it rather than a rate limit.
                 ("/v1/guest", "admin"),
                 ("/v1/guest/image", "admin"),
-                ("/v1/guest/prose", "admin"),
+                // Free prose on the resident model. `admin`: a free-text
+                // generator open to every account is a generator for anything.
+                ("/v1/generate/prose", "admin"),
                 // One stratum of a life, in the narrator's voice. `admin` with
                 // the rest of `/v1/life` — it writes prose into the substrate
                 // that a character will believe it remembers.
@@ -3076,6 +3176,7 @@ mod tests {
                 ("/v1/npc/:nid/agency", "user"),
                 ("/v1/npc/:nid/agency/:sid", "user"),
                 ("/v1/npc/:nid/reflect", "user"),
+                ("/v1/npc/:nid/dream", "user"),
                 ("/v1/npc/:nid/modulation", "user"),
                 // A portrait, and the bytes back. `user` rather than open: an
                 // id is a content hash and unguessable, and unguessable is not

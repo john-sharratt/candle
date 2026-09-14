@@ -359,8 +359,8 @@ fn process_one(
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     stream_id = stream_id.0,
-                    "turn index page append failed: {e} — this turn will be borrowable \
-                     but unindexable after a restart"
+                    "index page append failed: {e} — this turn or section will be \
+                     borrowable but unindexable after a restart"
                 );
             }
         }

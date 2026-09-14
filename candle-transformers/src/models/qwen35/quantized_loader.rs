@@ -28,6 +28,7 @@ use super::expert_loader::build_expert_cache;
 use super::layer_loader::build_layer_cache;
 use super::layer_store::LayerStore;
 use super::quantized_weights::{load_quantized_model, undersized_gates, LoadInputs, QuantModel};
+use super::tensor_override::{TensorOverride, TensorOverrides};
 use crate::models::batched_model::ensure_vram_governor;
 use crate::models::expert_lre::pack::repack_fingerprint;
 use crate::models::expert_lre::{ExpertCache, PINNED_LAYERS};
@@ -74,6 +75,14 @@ pub struct Qwen35LoadOptions {
     /// actual behaviour lives — stays the primary's. `None` refuses such a checkpoint
     /// instead, which is right when there is nothing to repair it from.
     pub gate_donor_path: Option<PathBuf>,
+    /// Tensors to read from another checkpoint instead of this one.
+    ///
+    /// For assembling one model out of two conversions of the same base: one fine-tune's
+    /// output head over another's trunk. Each named tensor must match this checkpoint's shape;
+    /// its GGML type may differ, and it is repacked from its own. The load fails if one is
+    /// never read — see [`TensorOverride`].
+    /// Empty for a load of a single checkpoint.
+    pub tensor_overrides: Vec<TensorOverride>,
 }
 
 /// Load a hybrid checkpoint of this lineage.
@@ -196,6 +205,52 @@ pub fn load_hybrid_gguf(
         .map(|(c, m)| (c, &m[..]))
         .filter(|_| !undersized_gates(&content).is_empty());
 
+    // Each file an override names, mapped once however many tensors it supplies. Validated
+    // against the checkpoint's header here, before any weight is read, so a mismatched file
+    // costs a header rather than a load.
+    let mut override_files: Vec<(&Path, Content, memmap2::Mmap)> = Vec::new();
+    let mut override_file_of = Vec::with_capacity(options.tensor_overrides.len());
+    for o in &options.tensor_overrides {
+        let idx = match override_files.iter().position(|(p, _, _)| *p == o.path) {
+            Some(i) => i,
+            None => {
+                let f = std::fs::File::open(&o.path)?;
+                let m = unsafe {
+                    MmapOptions::new().map(&f).map_err(|e| {
+                        candle::Error::Msg(format!(
+                            "qwen35: failed to mmap tensor override {:?}: {e}",
+                            o.path
+                        ))
+                    })?
+                };
+                let c = Content::read(&mut std::io::Cursor::new(&m[..]))?;
+                override_files.push((o.path.as_path(), c, m));
+                override_files.len() - 1
+            }
+        };
+        override_file_of.push(idx);
+    }
+    let overrides = TensorOverrides::new(
+        &content,
+        options
+            .tensor_overrides
+            .iter()
+            .zip(&override_file_of)
+            .map(|(o, &i)| (o, &override_files[i].1, &override_files[i].2[..])),
+    )?;
+    // Loud, for the same reason as the gate donor's line: the model being run is not the one
+    // on disk, and this is the line to find when wondering why it behaves as it does.
+    for (tensor, file, dtype, replaces) in overrides.describe() {
+        tracing::warn!(
+            target: "candle_transformers::qwen35",
+            tensor,
+            file = ?file,
+            ?dtype,
+            ?replaces,
+            "tensor override: read from another checkpoint, not from this one"
+        );
+    }
+
     // The embedding is the one dense tensor read per token rather than per forward, so it is
     // bound to host-mapped memory here — where the mappings are — and the GPU gathers its rows
     // from device-side ids. `None` falls back to the F32 host table inside the load.
@@ -217,6 +272,7 @@ pub fn load_hybrid_gguf(
         host_embed,
         mtp_src,
         gate_src,
+        overrides: Some(&overrides),
         // The trunk's own mapping, so a large projection is repacked from it a band at a time
         // rather than uploaded whole first.
         map: Some(&mmap[..]),

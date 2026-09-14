@@ -279,7 +279,7 @@ pub const PORTRAIT_DRAW: Tool = on_with!(
     "Portrait",
     Plane::World,
     "Draw a likeness of somebody you have only read. You give what the face has to carry, not \
-     the brushwork — the same way `say` takes what you mean rather than the words.",
+     the brushwork — the same way `tell` takes what you mean rather than the words.",
     "of",
     "Who it is a likeness of.",
     "carrying",

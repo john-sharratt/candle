@@ -1502,7 +1502,7 @@ impl Scheduler {
     /// that dragged a 93-wide tool-catalog ingest down to ~1 token/seq/forward.
     ///
     /// Bound the TOTAL tokens to the same per-forward budget a normal prefill
-    /// targets (`max_prefill_pass_tokens`). Without this the whole active set
+    /// targets ([`Self::prefill_pass_budget`]). Without this the whole active set
     /// coalesces into one forward: the 93-section tool catalog (~21k tokens)
     /// packed into a single pass whose transient activation spiked VRAM to the
     /// card ceiling and paged. Sections beyond the budget ride the next chunk —
@@ -1529,7 +1529,7 @@ impl Scheduler {
         if active.is_empty() {
             return None;
         }
-        let cap = self.max_prefill_pass_tokens;
+        let cap = self.prefill_pass_budget();
         let mut seq_ids: Vec<usize> = Vec::with_capacity(active.len());
         let mut inputs: Vec<Tensor> = Vec::with_capacity(active.len());
         let mut group_idxs: Vec<usize> = Vec::with_capacity(active.len());
@@ -1636,9 +1636,10 @@ impl Scheduler {
             .collect()
     }
 
-    /// Form a FRESH wave group into `wave_prefill_members`: every ready dialogue
-    /// prefill, plus — when `include_sections` and at least one prefill is present
-    /// — section chunks bounded by the per-forward token cap. Section chunks join
+    /// Form a FRESH wave group into `wave_prefill_members`: ready dialogue
+    /// prefills in queue order up to [`Self::prefill_pass_budget`], plus — when
+    /// `include_sections` and at least one prefill is present — section chunks in
+    /// whatever of that budget the prefills left. Section chunks join
     /// only alongside a cohort (so they co-batch a creep that is happening anyway);
     /// with no cohort the caller uses the faster full-sweep section path instead.
     /// Members are ordered prefills-then-sections and this order is then fixed for
@@ -1690,8 +1691,31 @@ impl Scheduler {
             .map(|s| s.to_owned());
         members.retain(|m| self.session.sequence_adapter(m.seq_id()) == group_adapter.as_deref());
 
+        // ── Bounded by what one forward can carry ────────────────────────────
+        //
+        // A dialogue prefill rides the group whole — the wave takes a member's full
+        // token set — so the group's rows are the sum of its members' turns, and the
+        // forward prices its transient tier from that sum. Unbounded, a burst of
+        // queued turns became one forward: npcd's world ingest on the routed
+        // Qwen3.6-35B-A3B asked for a 3.3 GB tier against a 3.0 GB gap between the
+        // KV frontier and the weight floor, and every turn in the wave failed with
+        // it. Admitted in queue order up to the pass budget; the rest stay active
+        // and form the next group.
+        let budget = self.prefill_pass_budget();
+        let lens: Vec<usize> = members
+            .iter()
+            .map(|m| {
+                self.active_prefills
+                    .iter()
+                    .find(|p| p.work.sequence_id.0 == m.seq_id())
+                    .map_or(0, |p| p.work.tokens.len())
+            })
+            .collect();
+        let admitted = super::admission::admit_within(lens.iter().copied(), budget);
+        members.truncate(admitted);
+        let mut used: usize = lens[..admitted].iter().sum();
+
         if include_sections && !members.is_empty() {
-            let mut sec_tokens = 0usize;
             for i in 0..self.active_section_ingests.len() {
                 let s = &self.active_section_ingests[i];
                 if s.error.is_some() || s.offset >= s.tokens.len() {
@@ -1700,17 +1724,20 @@ impl Scheduler {
                 if self.session.sequence_adapter(s.sequence_id.0) != group_adapter.as_deref() {
                     continue;
                 }
-                let advance = (s.tokens.len() - s.offset).min(cap);
-                // Bound the section contribution to the per-forward token budget
-                // (at least one always admitted); the rest ride the next group.
-                if sec_tokens > 0 && sec_tokens + advance > cap {
+                let advance = (s.tokens.len() - s.offset).min(budget);
+                // Sections share the forward, so they draw on the budget the
+                // prefills above have already spent and fill only what is left.
+                // The cohort already guarantees this group makes progress, so no
+                // section is forced in past it; the rest ride a later group or the
+                // standalone section pass.
+                if used + advance > budget {
                     break;
                 }
                 members.push(WaveMember::Section {
                     seq_id: s.sequence_id.0,
                     advance,
                 });
-                sec_tokens += advance;
+                used += advance;
             }
         }
         self.wave_prefill_members = members;
@@ -2567,6 +2594,11 @@ impl Scheduler {
             // view is released here or not at all.
             if let Some(e) = error {
                 let _ = work.event_tx.send(TurnEvent::Error(e));
+                // Reclaim the carved view, or the sequence wedges forever: the
+                // view was registered in `turn_views` before the prefill ran and
+                // never reached `active_decodes`, so a dangling one makes the
+                // parent's next `SubmitTurn` wind-down refuse with `TurnInFlight`
+                // for good. Every prefill-error path drains through here.
                 self.discard_turn_view(work.sequence_id);
                 continue;
             }
@@ -2788,6 +2820,13 @@ impl Scheduler {
         let sampling_temperature = work.sampling.temperature;
 
         if self.is_eos(first_token) || work.max_decode_tokens == 0 {
+            // The first token ended the turn: an end-of-sequence, or a budget of
+            // zero decoded tokens.
+            let finish = if self.is_eos(first_token) {
+                FinishReason::Stop
+            } else {
+                FinishReason::Length
+            };
             // View sequences (SubmitTurn path): the prefill already wrote KV
             // blocks that must be finalized onto the parent and sealed into
             // the substrate.  Insert as a finished DecodeState so
@@ -2819,6 +2858,7 @@ impl Scheduler {
                     no_think: work.no_think,
                     prefill_assistant_text: work.prefill_assistant_text,
                     finished: true,
+                    finish,
                     decode_start: Instant::now(),
                     decode_busy_us: 0,
                     prefill_ms,
@@ -2862,6 +2902,7 @@ impl Scheduler {
                     prefill_ms,
                     turn_start,
                     context_depth,
+                    finish,
                 );
             }
             return;
@@ -2949,6 +2990,7 @@ impl Scheduler {
             no_think: work.no_think,
             prefill_assistant_text: work.prefill_assistant_text,
             finished: false,
+            finish: FinishReason::Stop,
             decode_start: Instant::now(),
             decode_busy_us: 0,
             prefill_ms,
@@ -3098,9 +3140,10 @@ impl Scheduler {
     ) -> Result<Tensor, ConversationError> {
         // Chunked prefill: split large prompts into bounded chunks to keep
         // intermediate activation buffers from growing unboundedly.
-        let logits = if tokens.len() > self.max_prefill_pass_tokens {
+        let pass = self.prefill_pass_budget();
+        let logits = if tokens.len() > pass {
             let mut last_logits: Option<Tensor> = None;
-            for chunk in tokens.chunks(self.max_prefill_pass_tokens) {
+            for chunk in tokens.chunks(pass) {
                 let input = Tensor::new(chunk, &self.device)
                     .and_then(|t| t.unsqueeze(0))
                     .map_err(ConversationError::Model)?;
@@ -3308,7 +3351,7 @@ mod wave_chunk_tests {
 
     /// A dialogue prefill carrying `tokens` and nothing else.
     pub(super) fn dialogue_prefill(seq: SequenceId, tokens: Vec<u32>) -> ActivePrefill {
-        let (event_tx, _event_rx) = crossbeam::channel::unbounded();
+        let (event_tx, _event_rx) = flume::unbounded();
         ActivePrefill {
             work: PrefillWork {
                 sequence_id: seq,

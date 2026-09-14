@@ -244,8 +244,9 @@ const CHANGES_NOTHING_IN_THE_SIM: &[&str] = &[
     "read",
     "scan",
     // Land in the map, not the sim.
-    "say",
     "tell",
+    "whisper",
+    "shout",
     "ask",
     "gesture",
     "send_image",
@@ -325,9 +326,9 @@ fn the_vault_offers_no_act_that_belongs_to_the_battlefield() {
             "the vault offered `{absent}`, which nothing there can answer"
         );
     }
-    // And the things it *does* have are there. `say` is not among them and is
+    // And the things it *does* have are there. `tell` is not among them and is
     // not missing: this Maker is standing alone, and speech needs somebody to
-    // hear it — see `tools::SAY`.
+    // hear it — see `tools::TELL`.
     for present in ["move_to", "claim", "read", "reflect"] {
         assert!(
             acts.contains(&present.to_string()),
@@ -1016,7 +1017,7 @@ fn losing_the_handset_is_something_the_world_can_do_to_you() {
 }
 
 /// **A message reaches somebody who is not here** — which is the entire point,
-/// and the thing `say` cannot do.
+/// and the thing `tell` cannot do.
 #[test]
 fn a_message_reaches_somebody_a_building_away() {
     let h = phones();
@@ -1316,6 +1317,12 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
     // point of the test is that everything is reachable *somehow*.
     stand(&waste, "c2", "the-waste", "ruins");
     stand(&waste, "c1", "the-waste", "ruins");
+    // And a whisper needs a third: one to tell and one to keep it from — see
+    // `Availability::AmongOthers`. Every room above holds one other body at most.
+    waste.with(|w| {
+        w.enter("c3", "Tace", Where::new("the-waste", "ruins"))
+            .unwrap()
+    });
     perform(
         &waste,
         "c2",
@@ -1368,7 +1375,7 @@ fn there_is_always_something_to_do_even_in_an_empty_corridor() {
         );
     }
     assert!(
-        !acts.contains(&"say".to_string()),
+        !acts.contains(&"tell".to_string()),
         "an empty corridor offered speech, which reaches nobody"
     );
     assert!(

@@ -72,6 +72,11 @@ candle-onnx = { path = "../candle-onnx", version = "0.9.1" }
 
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio      = { version = "1", features = ["full"] }
+# `executor::block_on` for the startup loader thread, which drives the async
+# ingest writers itself: their futures wake on the engine's own channels, so a
+# plain current-thread executor is enough and cannot collide with the ambient
+# runtime the loader has entered.
+futures    = { workspace = true }
 # Turning the guest's progress channel into the body of a streaming response, so
 # a generated description reaches the page a token at a time instead of after
 # the whole drain. Already in the lockfile via axum's own dependencies.

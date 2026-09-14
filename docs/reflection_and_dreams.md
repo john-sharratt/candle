@@ -2,7 +2,7 @@
 
 *The second and third conversations a character runs: what reflection is for, how a dream corpus becomes a character's private inner world, and why the coupling between them is the whole safety argument.*
 
-**Where this stands.** The reflection conversation is built and produces dream briefs: `npcd/src/engine/reflect.rs`, `POST /v1/npc/:nid/reflect`, with both its questions authored in the mind's `projection.yaml` under `reflection:`. What is not built is the gather (§4), the dream conversation the brief is handed to (§7), the corpus it accumulates into (§8), and the character's own `reflect` act calling any of it (§3). Each section says so where it applies; the sections that describe built machinery say that too.
+**Where this stands.** The reflection conversation is built and produces dream briefs: `npcd/src/engine/reflect.rs`, `POST /v1/npc/:nid/reflect`, with both its questions authored in the mind's `projection.yaml` under `reflection:`. The character's own `reflect` act runs it (§3), asynchronously, and is answered with the reflection's first line. The brief is dreamt in a conversation of its own and the dream is written to a per-character `dreams` layer a line to a turn, each line signed (§7, `npcd/src/engine/dreams.rs`). Dreams are gathered back by provenance: three lines deep into a turn in the room, eight into a reflection (§4). What is not built is the rest of the gather — `relationships`, `beliefs`, the mood — eviction and `LayerHit` (§8), and the authored seed dreams (§9). Each section says so where it applies.
 
 ---
 
@@ -73,19 +73,21 @@ Three rules govern every arrow:
 
 ## 3. The reflect tool, changed
 
-**Not done yet.** The act in the character's own catalog still takes `my_reflections` and still only restates its input; what exists is the route, `POST /v1/npc/:nid/reflect`, which takes `inner_thoughts` and `feeling` and reads `situation` off the character's own state rather than asking for it. Wiring the act to the route is what closes this section, and it is deliberately second: the machinery had to be shown producing real briefs before a character was allowed to call it.
-
-Today `reflect` takes `inner_thoughts`, `feeling`, `my_reflections`. It becomes:
+**Built.** `reflect` takes `situation`, `inner_thoughts` and `feeling`, and a reflect the world takes starts a reflection (`Runtime::begin_reflection`):
 
 | param | required | what it is |
 |---|---|---|
-| `situation` | yes | **new.** The character's own account of where it is and what is happening, in prose. |
+| `situation` | yes | The character's own account of where it is and what is happening, in prose. It opens the reflection conversation. |
 | `inner_thoughts` | yes | What is going through its head — unchanged. |
 | `feeling` | yes | From `Choices::Feelings` where the mind authors moods, free text otherwise. **This sets the mood.** |
 
-`my_reflections` goes. It was the field asking a character to produce, inline, the thing this whole design exists to produce properly — and it is half of what made the act's output a restatement of its input.
+`my_reflections` is gone. It was the field asking a character to produce, inline, the thing this whole design exists to produce properly — and it is half of what made the act's output a restatement of its input.
 
-**`situation` is what makes the reflection conversation possible.** That conversation has no perception, no window, and no world state; it is framed on the character's own description of its circumstances. Asking the character to say where it is is not redundancy — it is the handoff, and it is also a cheap diagnostic, because a character that describes its situation wrongly is a character whose perception is broken in a way nothing else surfaces.
+**The act's answer is the reflection's first line.** The reflection runs on a thread of its own; the tick driver goes straight on to everybody else. Only the reflecting character is held (`Scheduler::hold`), so the room — which is delivered every moment — cannot give it a turn before its reflect has been answered; what arrives meanwhile is queued, not dropped. The moment question one is answered, the line is handed back as the reflect call's `<tool_response>` (every answer the turn owes, in call order) and the character is released. The loosed turn, question two, the retry, the repair passes and the dream all carry on behind it, on the same thread, with nobody waiting. A reflect is never refused for being soon after another: a character is held until its answer lands, so it cannot ask twice at once, and only the dream work after the answer is one at a time (§7). A reflect that cannot be answered by a reflection — a daemon whose mind authors no questions, or a reflection that failed before its first answer — is answered, in the character's own voice, that nothing came: *"I don't seem to be able to reflect on anything right now."* (`body::NO_REFLECTION`). Never an echo of the character's own arguments; its thought and feeling are already in its call.
+
+**The row says what came back.** In the feed and the character's window a reflect reads `reflect — <inner thought> → <what came back>`: its situation and feeling are the reflection's input and are not listed, and the right of the arrow is exactly what the character read in its `<tool_response>`. The row is recorded as the act alone when the reflect lands and completed when the answer does (`Scheduler::amend_act`).
+
+**`situation` is what makes the reflection conversation possible.** That conversation has no perception, no window, and no world state; it is framed on the character's own description of its circumstances. Asking the character to say where it is is not redundancy — it is the handoff, and it is also a cheap diagnostic, because a character that describes its situation wrongly is a character whose perception is broken in a way nothing else surfaces. The route takes it too, optionally; a caller that gives none gets the world's percept of the room the body stands in (`Runtime::situation_of`), which is the only situation there is to be had without the character's own.
 
 **The mood set here frames both conversations.** The active conversation's system prompt and the reflection's system prompt select the same mood from the mind's authored `moods/` collection. That is what makes the reflection sound like the character rather than like a narrator.
 
@@ -144,7 +146,11 @@ The reflection gathers from a **restricted set of layers**:
 
 Excluding mission and goals is the load-bearing one, and it comes from `theory_of_the_mind.md` §6: *"Self does not plan or direct. It integrates and reports."* A reflection that can see the mission list produces a plan; a reflection that cannot produces an inclination. The difference between those two is the difference between the healthy register and the leaked one — see §6 below.
 
-**Per-conversation layer scoping does not exist today, and the reflection does not gather at all yet.** This is the one genuinely new piece of projection machinery the design needs, and it is the next thing to build. Until it exists a reflection runs on its system prompt, the situation and the inner thought alone: `sampled_axes` arrives empty from the route, so the diversity steer is absent and the "not before" clause is carried by the rotated domain rather than by the corpus. The briefs are well-formed without it — what is missing is the part that makes a character's dreams unlike *its own* previous ones.
+**Dreams are scoped per conversation; the other layers are not yet.** A turn group can now be scoped after construction to the turns carrying one of a set of tags, and given its own depth (`Builder::set_group_tags`, `Builder::set_group_selection`); projection and the belief scan both apply the tags (`ContentResolver::turn_carries`), except on a projection's own target group, which is its own timeline already.
+
+**Seen because it is ranked, not because of where it is declared.** A projection sees the layers beneath its target, and "beneath" was declaration order — so a layer appended to a live schema sat on top, invisible to every conversation, and appending is the only way to add one: declaration order also fixes every layer's and group's id, and those are persisted with every timeline. Layers now carry a `rank` (default: declaration index), and a projection sees every layer of lower rank. `dreams` is declared last and ranked `-1`, beneath `interaction`. Found live: dreams were kept and no turn was ever reminded of one. The dream group is closed when the schema is built and opened per conversation to one character's own tag — three lines deep for a turn in the room, eight for a reflection. `relationships` and `beliefs` are still not gathered into a reflection, and nothing hides mission and goals from it, because nothing gathers those either.
+
+`sampled_axes` now comes from the corpus when the act reflects: a random eight of the character's own dream assumptions, read from each dream's conversation metadata (`dreams::sample_axes`). The route still takes them from its caller.
 
 One thing follows that is worth stating. `depends_on*` in the schema takes a `CollectionId` in all four of its variants, so a section cannot be gated on the stance selector. `tools_overview` is gated on the `tools` collection instead — and a reflection turn shows its one answer through that collection, so it reads the acting overview beside the `reflecting` stance it selects. Gating a section on a selector's option is the missing piece, and until it exists that contradiction stands.
 
@@ -270,7 +276,9 @@ The register is the design. §6 again: *"Goals produce ongoing commitment pressu
 
 Two cheap invariants follow, and both are testable: the response is one sentence, and it contains no causal connective. A response that starts explaining itself is a regression, and nothing else would flag it.
 
-**Both are built** — `reflect::reflection_fault`, reported on every reflection as `reflection_fault`. Reported rather than retried: the line is already the character's, and asking a second time for the same sentence is how a reflection becomes a negotiation.
+**Both are built** — `reflect::reflection_fault`, reported on every reflection as `reflection_fault`.
+
+**And a third, found live: the line is said as experience, never as fact.** Asked only for an inclination, reflections came back as assertions — *"I am the room itself"*, *"I am the vibration in the pipe"* — and a line that lands in the character's own context is read the next turn as something it holds true about itself. *"I feel like I am the room itself"* is an image the character had; *"I am the room itself"* is a claim it will act on. The line must carry an experiential frame — a feeling, a seeming, a wanting, a comparison held as one (`reflect::states_it_as_fact`) — and question one asks for exactly that. Like the other two it is refused in words and asked again, through the same refusal round (`MAX_REFUSALS`), and reported as `reflection_fault` if the last attempt still misses. Reported rather than retried: the line is already the character's, and asking a second time for the same sentence is how a reflection becomes a negotiation.
 
 They needed building. Asked as an open question with no bound, Q1 returned four paragraphs and 268 tokens — not a line of intent, not what any other act returns, and at `context_window_turns: 32` enough to crowd the world out of the tail on its own. Q1's authored wording now asks for one sentence and names the connectives, and the exchange holds it there underneath the wording, because the wording alone did not: an answer over forty words, or one that runs to a second sentence or explains itself, is refused in words and asked again.
 
@@ -281,6 +289,10 @@ This line is a plan block in Part VIII's sense — *"a standing high-salience bl
 ## 7. The dream layer
 
 ### One dream, one conversation
+
+**Built** (`npcd/src/engine/dreams.rs`), as two conversations rather than one. The dream is decoded in a brand-new transient conversation seeded by the brief, under the schema's `dreaming` stance with the character's identity members pinned — who it is, its world, the building it stands in — and no acts shown; it is tombstoned after, like a reflection. The dream is then **kept** in a second conversation, on the `dreams` layer: one prefilled turn per line of the story (a line is a sentence), each with `Something you dreamt:` as its user half and its projection persisted as its signature, in order, so each line is signed with the ones before it in view. Two conversations because the one that decodes carries the brief as its prompt, and a brief in the corpus would be recalled as though it were the dream. `relationships` is not yet in the frame, so the invented-colleague risk below is still open.
+
+The design as first written:
 
 A dream is decoded in its own **brand-new conversation on the dream layer**, seeded by Q2's answer, framed on **characters, environment, and `relationships`** — no acts, no mission, no perception.
 
@@ -302,11 +314,25 @@ The dream decodes on its own clock. The active conversation does not wait, is no
 
 Dreams run on slack — `npc_mind_design.md` Part IX's daydream priority: *"the lowest-priority event on the queue, surfacing only when nothing else competes… shed first under load with no explicit load-shedding logic. Idle minds think; busy minds act."* A fixed interval would compete with action under load, which is backwards.
 
-**At most one dream in flight per character.** Reflection can fire faster than a dream completes; without a cap a talkative character spawns dreams unboundedly. A second reflect while a dream is decoding simply does not spawn one.
+**At most one dream in flight per character.** Reflection can fire faster than a dream completes; without a cap a talkative character spawns dreams unboundedly. A second reflect while a dream is decoding simply does not spawn one. **Built** (`Runtime::dreaming`): the slot is taken the moment question one is answered and held through question two, the retry, the repair passes, the dream and its keeping. A reflect that lands while it is taken still gets its own reflection and its own answer; its conversation ends there, with no brief asked for and no dream. An earlier build held the slot for the whole reflection instead, and refused every reflect behind it — measured, six of ten reflects answered that nothing came, because a slot held for three to seven minutes sat behind a thirty-second cooldown.
+
+**Not on slack yet.** The dream runs on its own thread the moment its brief exists, not as the lowest-priority work on the queue; under load it competes with action like any other decode.
 
 ### Private
 
-Dreams are tied to the NPC that dreamt them and are never shared. Two characters who dream about the same event dream differently, and neither can retrieve the other's.
+Dreams are tied to the NPC that dreamt them and are never shared. Two characters who dream about the same event dream differently, and neither can retrieve the other's. **Built**: every dream turn is tagged `dreams:<npc id>`, and a conversation reads the dream group only through a scope naming its own character.
+
+**Naming, built as §11 asks.** A dream's conversation is `npc-<id>-dream-<timeline>`, outside the `npc-<id>-day-` prefix every conversation open sweeps, so neither the midnight rollover nor `--forget-conversations` touches a character's dreams.
+
+### Recalled on the normalized band
+
+**Built.** A turn in the room can be reminded of up to three lines of its own dreams (`dreams::IN_ACTING`; eight in a reflection), and a line comes back only by winning the gather. Its score is normalized the way `repo_map`'s is (`docs/provenance_score_normalization.md`): each line's raw vote is divided by that line's own learned hit level — how strongly it matches itself — so a line recalled at ~1000 is one the moment matches as well as the line matches itself.
+
+The levels are learned from the traffic that reads them. The group is tag-scoped to its owner and a turn teaches only the scopes its tags name, so every turn a character takes carries its own dreams tag: its seal teaches its own dreams' levels. A line that matches every turn — one line was recalled at over half a million, every round — ends up with a high level and is discounted; one that rarely resonates stands out when it does.
+
+Self-match is the cold start: every dream at load (`Minds::warm_dreams`) and each new one as it is kept (`dreams::keep`). It starts low — the vote is a sum over a probe's strongest tokens, and a line probing itself is one sentence where a turn probes with its whole tail — so live traffic lifts it within a few turns. Before either, every line was divided by the cold-start prior, which multiplies the raw vote rather than normalizing it: recalled lines scored from about four thousand to over a million, the group's gate sat below all of them, and every turn took its top three whatever they were.
+
+The gate is `repo_map`'s as it stands — `score_threshold: 1.0`, a belief band of 250, β 0.65 — and is **not yet tuned for dreams**. The recall log reports each recalled line's score on the normalized band, which is what a dream-specific value would be set from.
 
 ---
 
@@ -428,9 +454,13 @@ That is on top of the ~99 GB authored corpus. The cap is doing real work and 500
 | per-conversation metadata and lookup | **exists** — `set_conversation_metadata`, `find_conversations_by_metadata` |
 | per-character authored layer content | **exists** — the `layers/<layer>/<personality-id>/` convention |
 | fire-and-forget mutation tools | **exists** — the broadcast pattern in Part VIII |
-| **per-conversation layer scoping** | **new** — §4 |
-| **a toolless system-prompt frame** | **new** — §4 |
+| **per-conversation layer scoping** | **built for dreams** — tag-scoped turn groups and a per-conversation depth, §4 |
+| **a toolless system-prompt frame** | **built** — the `stance` selector's `reflecting` and `dreaming` branches, §4 |
+| **the reflect act answered asynchronously** | **built** — `Runtime::begin_reflection`, `Scheduler::hold`, §3 |
+| **the dream conversation and the dream layer** | **built** — `engine::dreams`, a line to a turn, each signed, §7 |
 | **`LayerHit` record type** | **new** — §8, five integration sites |
+| **eviction at 500** | **new** — §8; nothing reaps the corpus yet |
+| **authored seed dreams** | **new** — §9; `layers/dreams/maker/seed-dreams.md` is one file of 105 briefs and the per-entry ingest it asks for does not exist, so the layer declares no `ingest_unit` and is not read from disk |
 | **the leakage detector** | **new** — §10, and should land first |
 
 ---

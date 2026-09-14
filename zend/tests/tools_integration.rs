@@ -206,6 +206,7 @@ mod tool_scenarios {
                 StreamItem::Tool(status) => {
                     eprintln!("\n[TOOL {}] {:?}", status.phase, status.tools);
                 }
+                StreamItem::TurnEnd { .. } => {}
             }
         }
         eprintln!("\n\n[FINAL RESPONSE]\n{response}");

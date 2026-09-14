@@ -4,7 +4,7 @@
 //! gated-DeltaNet layers carrying a recurrent state, attention layers carrying
 //! paged K/V — with the mixture taken out.
 //!
-//! # Why an NPC engine runs the dense one
+//! # What the dense one is for
 //!
 //! An NPC engine's workload is many small minds thinking concurrently, not one
 //! large mind thinking hard. That inverts the usual MoE argument. A routed model
@@ -14,14 +14,19 @@
 //! different experts, is the case where that amortisation is weakest. The dense
 //! model has no expert cache to thrash and no routing to mispredict, so a
 //! character's cost is the same whether it is the only one awake or one of a
-//! hundred.
+//! hundred. It also leaves the card: at Q6_K it spends about a third of what the
+//! routed 35B does on weights, and the rest is KV room for a resident cast.
+//! `npcd` runs the routed 3.6 hybrid instead — AntiLoop's weights under
+//! StyleTune's head — for its quality, and pays in that room — see
+//! `npcd/src/model.rs`.
 //!
 //! # The presets, and how a deployment changes them
 //!
-//! [`Model::Qwen35_9B_Q6`] is the stock instruct model, and it is what `npcd`
-//! runs. [`Model::Qwen35_0_8B_Q8`] is the smallest member of the same lineage,
-//! which zend's end-to-end tool suite runs so each scenario boots in seconds. It carries no adapters: a preset's adapters are downloaded and loaded
-//! by every deployment that uses it, so one belongs here only if deployments
+//! [`Model::Qwen35_9B_Q6`] is the stock instruct model.
+//! [`Model::Qwen35_0_8B_Q8`] is the smallest member of the same lineage, which
+//! zend's end-to-end tool suite runs so each scenario boots in seconds. Neither
+//! carries adapters: a preset's adapters are downloaded and loaded by every
+//! deployment that uses it, so one belongs here only if deployments
 //! are meant to run it. Worked examples of the adapter path live where they
 //! cost nothing — the gates, and `checkpoints.Qwen35_9B_LoRA` in the override.
 //!
@@ -104,6 +109,7 @@ pub(super) fn qwen35_9b_q6() -> ModelSpec {
         // checkpoint would be applied to whatever the daemon happened to fetch.
         model_rev: quantized_qwen35::QWEN35_9B.1.into(),
         gate_donor: None,
+        tensor_overrides: Vec::new(),
         tokenizer_repo: quantized_qwen35::TOKENIZER_REPO.into(),
         tokenizer_rev: quantized_qwen35::TOKENIZER_REV.into(),
         default_system_prompt: PROMPT.into(),
@@ -138,6 +144,7 @@ pub(super) fn qwen35_0_8b_q8() -> ModelSpec {
         model_bytes: 811_843_840,
         model_rev: quantized_qwen35::QWEN35_0_8B.1.into(),
         gate_donor: None,
+        tensor_overrides: Vec::new(),
         tokenizer_repo: quantized_qwen35::TOKENIZER_REPO.into(),
         tokenizer_rev: quantized_qwen35::TOKENIZER_REV.into(),
         default_system_prompt: PROMPT.into(),

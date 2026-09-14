@@ -71,6 +71,7 @@ pub(super) fn qwen38_flash_next_q4ko() -> ModelSpec {
         // Used as prepared — no override displaced a preset here, so there is no
         // base checkpoint to fall back to for tensors this one got wrong.
         gate_donor: None,
+        tensor_overrides: Vec::new(),
         // No adapter ships with this model. An adapter is opt-in per
         // conversation; an empty list is what makes the base model the default.
         loras: Vec::new(),

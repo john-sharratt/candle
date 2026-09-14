@@ -1,4 +1,4 @@
-//! Qwen3.6-35B-A3B (hybrid MoE) model preset.
+//! Qwen3.6-35B-A3B (hybrid MoE) model presets.
 //!
 //! The hybrid lineage's entry into the conversation layer. Three quarters of
 //! this stack's 40 layers mix tokens through a **recurrent state** rather than a
@@ -12,8 +12,9 @@
 //! the Qwen3.5 architecture and shares its metadata keys and tensor schema, so
 //! both load through the same [`ModelArch::Qwen35Hybrid`] arm.
 
-use super::{ModelArch, ModelSpec};
-use crate::{config::SamplingConfig, models::DialectType};
+use super::{ModelArch, ModelSpec, TensorOverrideSpec};
+use crate::config::{ModeSampling, SamplingConfig};
+use crate::models::DialectType;
 use candle_transformers::models::quantized_qwen36_moe;
 
 const PROMPT: &str = "You are a helpful, accurate, and concise assistant.";
@@ -54,6 +55,7 @@ pub(super) fn qwen36_35b_a3b_q4() -> ModelSpec {
         // `ModelSpec::model_rev` — an empty revision resolves `main`, which moves.
         model_rev: String::new(),
         gate_donor: None,
+        tensor_overrides: Vec::new(),
         tokenizer_repo: quantized_qwen36_moe::TOKENIZER_REPO.into(),
         tokenizer_rev: quantized_qwen36_moe::TOKENIZER_REV.into(),
         default_system_prompt: PROMPT.into(),
@@ -61,5 +63,209 @@ pub(super) fn qwen36_35b_a3b_q4() -> ModelSpec {
         default_sampling: SamplingConfig::for_gguf_architecture("qwen2moe"),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen2moe"),
+    }
+}
+
+/// The GGUF `general.architecture` string this lineage's routed checkpoints
+/// carry — the key into [`SamplingConfig::for_gguf_architecture`], so it is the
+/// sampling decision, not a label.
+const ARCH: &str = "qwen35moe";
+
+/// The `(temperature, top_p)` the hybrid decodes at, reasoning or not.
+///
+/// One pairing for both think modes, where the stock card publishes two (`1.0 / 0.95` while it
+/// reasons, `0.7 / 0.8` while it does not): the cooler temperature with the wider nucleus.
+/// `top_k 20` and `presence_penalty 1.5` are the lineage's own and arrive with the arch row.
+///
+/// A cast decodes on this only when a mission has it reason.
+/// `SamplingConfig::for_character_dialogue` widens the think-off row for characters on top of
+/// it — see `npcd::engine::mind`.
+const HYBRID_SAMPLING: (f32, f32) = (0.7, 0.95);
+
+/// **The hybrid — AntiLoop's trunk under StyleTune's output head** — `npcd`'s model.
+///
+/// Two fine-tunes of the checkpoint [`qwen36_35b_a3b_q4`] serves, both as mradermacher's static
+/// Q4_K_M. Every tensor is AntiLoop's — a tune trained against the repetition loops a cast
+/// falls into — except `output.weight`, which is StyleTune's, the tune for prose. The coordinates
+/// are the gate's own (`quantized_qwen36_moe::QWEN36_35B_A3B_ANTILOOP` and
+/// `QWEN36_35B_A3B_STYLETUNE`), so the daemon loads the bytes
+/// `test_parallel_batched_forwarding_36_35b_antiloop_styletune` measured.
+///
+/// Everything that is a property of the architecture rather than of a file is shared with the
+/// stock preset: the loader arm, the tokenizer the gate verified token for token against this
+/// lineage's GGUFs, and the KV threshold row the loader applies (`QWEN36_MOE_KV_FACTORS`,
+/// derived on the stock file — a fine-tune moves the weights, not the attention geometry the row
+/// was fitted to).
+///
+/// # Three files, and what each costs a fresh machine
+///
+/// AntiLoop is the checkpoint. StyleTune is fetched whole for its head: a tensor is read from a
+/// mapped GGUF, and the hub serves files, not tensors. The stock checkpoint is the gate donor,
+/// and it is needed: both mradermacher conversions store `ssm_alpha`/`ssm_beta` at Q4_K where
+/// the stock file keeps them F32, and the loader refuses a quantized recurrent path it has no
+/// base to repair from.
+///
+/// # The dialect is the family's own
+///
+/// `Qwen35`, not `ChatML`: the two agree on every turn marker, and ChatML's
+/// `/no_think` soft switch is one this family's template does not contain, so
+/// it would reach every conversation as a line of text. See
+/// [`super::qwen35_dense`] for how that was found.
+///
+/// # Speculation
+///
+/// AntiLoop's conversion keeps the NextN head (`nextn_predict_layers = 1`), so the hybrid
+/// drafts. StyleTune's does not, which is one reason the trunk is AntiLoop's.
+pub(super) fn qwen36_35b_a3b_antiloop_styletune() -> ModelSpec {
+    let chat_format = DialectType::Qwen35;
+    let (repo, rev, file) = quantized_qwen36_moe::QWEN36_35B_A3B_ANTILOOP;
+    let (donor_repo, donor_rev, donor_file) = quantized_qwen36_moe::QWEN36_35B_A3B;
+    let (head_repo, head_rev, head_file) = quantized_qwen36_moe::QWEN36_35B_A3B_STYLETUNE;
+    let modes = ModeSampling {
+        thinking: HYBRID_SAMPLING,
+        instruct: HYBRID_SAMPLING,
+    };
+    ModelSpec {
+        arch: ModelArch::Qwen35Hybrid,
+        loras: Vec::new(),
+        dialect: chat_format.dialect(),
+        chat_format,
+        model_repo: repo.into(),
+        model_filename: file.into(),
+        prepared_from_source: false,
+        model_bytes: 21_713_463_520,
+        model_rev: rev.into(),
+        gate_donor: Some((donor_repo.into(), donor_rev.into(), donor_file.into())),
+        tensor_overrides: vec![TensorOverrideSpec {
+            tensor: quantized_qwen36_moe::HYBRID_HEAD_TENSOR.into(),
+            repo: head_repo.into(),
+            revision: head_rev.into(),
+            filename: head_file.into(),
+        }],
+        tokenizer_repo: quantized_qwen36_moe::TOKENIZER_REPO.into(),
+        tokenizer_rev: quantized_qwen36_moe::TOKENIZER_REV.into(),
+        default_system_prompt: PROMPT.into(),
+        // Room for a character's history: the assembled prompt is large before
+        // any of it, as it is for the dense 9B.
+        max_seq_len: 8192,
+        default_sampling: SamplingConfig::for_gguf_architecture(ARCH).with_mode_sampling(modes),
+        supports_thinking: true,
+        // The think-off config keeps its mode, so taking the pair adopts the instruct half.
+        non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture(ARCH)
+            .map(|s| s.with_mode_sampling(modes)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stencil::ThinkMode;
+
+    /// **The gate's three checkpoints, pinned, and nothing else.** Serving and gating read the
+    /// same constants, so the daemon loads the bytes the gate measured.
+    #[test]
+    fn the_hybrid_is_the_gates_three_pinned_checkpoints() {
+        let s = qwen36_35b_a3b_antiloop_styletune();
+        let (repo, rev, file) = quantized_qwen36_moe::QWEN36_35B_A3B_ANTILOOP;
+        assert!(matches!(s.arch, ModelArch::Qwen35Hybrid), "{:?}", s.arch);
+        assert_eq!(
+            (
+                s.model_repo.as_str(),
+                s.model_rev.as_str(),
+                s.model_filename.as_str()
+            ),
+            (repo, rev, file)
+        );
+
+        let (repo, rev, file) = quantized_qwen36_moe::QWEN36_35B_A3B_STYLETUNE;
+        assert_eq!(
+            s.tensor_overrides,
+            vec![TensorOverrideSpec {
+                tensor: "output.weight".into(),
+                repo: repo.into(),
+                revision: rev.into(),
+                filename: file.into(),
+            }],
+            "the head, and only the head, is StyleTune's"
+        );
+
+        for pin in [&s.model_rev, &s.tensor_overrides[0].revision] {
+            assert!(
+                pin.len() == 40 && pin.chars().all(|c| c.is_ascii_hexdigit()),
+                "{pin:?} is not a commit"
+            );
+        }
+        assert_eq!(s.tokenizer_repo, quantized_qwen36_moe::TOKENIZER_REPO);
+        assert_eq!(s.tokenizer_rev, quantized_qwen36_moe::TOKENIZER_REV);
+        assert!(s.loras.is_empty());
+        assert!(s.max_seq_len >= 8192);
+    }
+
+    /// **Locked on Q4_K_M** — the trunk and the file the head comes from alike.
+    #[test]
+    fn both_halves_are_q4_k_m() {
+        let s = qwen36_35b_a3b_antiloop_styletune();
+        assert!(
+            s.model_filename.ends_with(".Q4_K_M.gguf"),
+            "{}",
+            s.model_filename
+        );
+        assert!(
+            s.tensor_overrides[0].filename.ends_with(".Q4_K_M.gguf"),
+            "{}",
+            s.tensor_overrides[0].filename
+        );
+    }
+
+    /// **The family's dialect, so no soft switch reaches a conversation as
+    /// text.**
+    #[test]
+    fn it_sends_no_soft_switch_this_family_would_read_as_prose() {
+        let s = qwen36_35b_a3b_antiloop_styletune();
+        assert!(matches!(s.chat_format, DialectType::Qwen35));
+        assert_eq!(s.dialect.no_think, "");
+        assert_eq!(s.dialect.no_think_block, "<think>\n\n</think>\n\n");
+    }
+
+    /// **The donor is the stock checkpoint both halves were tuned from.** Anything else would
+    /// supply recurrent gates from a different model.
+    #[test]
+    fn the_gate_donor_is_the_stock_checkpoint() {
+        let (repo, rev, file) = quantized_qwen36_moe::QWEN36_35B_A3B;
+        assert_eq!(
+            qwen36_35b_a3b_antiloop_styletune().gate_donor,
+            Some((repo.to_string(), rev.to_string(), file.to_string()))
+        );
+    }
+
+    /// **`0.7 / 0.95`, `top_k 20`, `presence_penalty 1.5`, reasoning or not** — on the
+    /// lineage's steering, which is the arch row's.
+    #[test]
+    fn it_decodes_at_the_hybrids_numbers_in_both_modes() {
+        let s = qwen36_35b_a3b_antiloop_styletune();
+        let lineage = SamplingConfig::for_gguf_architecture(ARCH);
+        let think_off = s.non_thinking_sampling.clone().expect("a thinking family");
+        for c in [&s.default_sampling, &think_off] {
+            assert_eq!((c.temperature, c.top_p), (0.7, 0.95));
+            assert_eq!(c.presence_penalty, 1.5);
+            assert_eq!(c.top_k, lineage.top_k);
+        }
+        // A turn that declares a mode adopts that mode's row — the same pair either way.
+        let declared = s
+            .default_sampling
+            .clone()
+            .with_mode_sampling_for(ThinkMode::Off);
+        assert_eq!((declared.temperature, declared.top_p), (0.7, 0.95));
+    }
+
+    /// **The cast's boost survives.** `for_character_dialogue` widens the think-off row on top
+    /// of the preset, so a character on an ordinary turn decodes at `1.0 / 0.95`.
+    #[test]
+    fn a_cast_still_decodes_hotter_on_a_think_off_turn() {
+        let cast = qwen36_35b_a3b_antiloop_styletune()
+            .default_sampling
+            .for_character_dialogue()
+            .with_think_mode(ThinkMode::Off, 512);
+        assert_eq!((cast.temperature, cast.top_p), (1.0, 0.95));
     }
 }

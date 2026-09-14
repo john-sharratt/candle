@@ -235,8 +235,8 @@ export async function render() {
      * almost immediately and the form stops looking empty while the description
      * is still being written.
      *
-     * Both drains reuse the same resident model — the guest is loaded once and
-     * serves its whole backlog — so the second call pays no load. */
+     * Both run on the resident model beside the cast, so neither pays a model
+     * load. */
     async function nameThenDescribe() {
       if (!draft.world_id) return;
       nameIn.setAttribute('disabled', '');
@@ -297,11 +297,10 @@ export async function render() {
         markOrigin();
       } catch (e) {
         desc.value = '';
-        /* `no_prose_model` is a deployment fact, not a fault — this daemon has
-         * no prose guest configured. Saying which it is stops somebody
-         * debugging a model that was never there. */
-        desc.placeholder = e && e.error === 'no_prose_model'
-          ? 'no prose model is configured on this daemon — write a description yourself'
+        /* A loading engine is the one refusal that resolves on its own, so it
+         * says so rather than only asking for a description. */
+        desc.placeholder = e && e.error === 'engine_unavailable'
+          ? 'the engine is still loading — try again in a moment, or write one yourself'
           : 'generation unavailable — write one yourself';
       }
       regen.removeAttribute('disabled');

@@ -10,16 +10,11 @@
  * whatever the operator has open and throw away its fetched sub-tree. */
 
 import { API } from '../lib/api.js';
-import { h, mount, fmtNum, fmtK, worldTime } from '../lib/dom.js';
+import { h, mount, fmtNum, fmtK } from '../lib/dom.js';
 import { go } from '../lib/router.js';
-import { layerColor, bar, empty, toast } from '../lib/ui.js';
+import { layerColor, empty, toast } from '../lib/ui.js';
 import { disclosure, stillOpen, spinner, cache } from '../lib/lazy.js';
 import { copyText } from '../lib/clip.js';
-
-const KIND_COLOR = {
-  user: 'var(--l-beliefs)', assistant: 'var(--l-action)',
-  thinking: 'var(--l-agency)', glue: 'var(--ink-ghost)',
-};
 
 export async function render(_params, q) {
   // `subs` scopes this page's styling — see the block in `app.css`.
@@ -28,7 +23,6 @@ export async function render(_params, q) {
   let npcId = q.npc || (npcs[0] && npcs[0].npc_id);
 
   const layerCache = cache();
-  const turnCache = cache();
 
   const kpiHost = h('div', { class: 'grid g4', style: 'margin-bottom:16px' });
   const storageHost = h('div', { style: 'margin-bottom:16px' });
@@ -37,13 +31,13 @@ export async function render(_params, q) {
 
   const sel = h('select', {
     class: 'select', style: 'width:auto',
-    onChange: (e) => { npcId = e.target.value; layerCache.invalidate(); turnCache.invalidate(); paintAll(); },
+    onChange: (e) => { npcId = e.target.value; layerCache.invalidate(); paintAll(); },
   }, npcs.map((n) => h('option', { value: n.npc_id, selected: n.npc_id === npcId }, n.name)));
 
   el.appendChild(h('div', { class: 'hd' },
     h('div', {}, h('h1', {}, 'Substrate'),
       h('div', { class: 'sub' },
-        'Layer occupancy, then conversations, then turns, then the K/V segment vector. Each level loads when you open it.')),
+        'The layers the mind declares, then the conversations this character can read in each, then their turns. Each level loads when you open it.')),
     h('div', { class: 'row' }, liveBtn, h('span', { class: 'tiny dim' }, 'character'), sel)));
   el.appendChild(kpiHost);
   el.appendChild(storageHost);
@@ -55,10 +49,8 @@ export async function render(_params, q) {
 
   function paintKpis(sub, schema) {
     const layers = sub.layers || [];
-    const totTok = layers.reduce((a, l) => a + (l.tokens || 0), 0);
+    const totConvs = layers.reduce((a, l) => a + (l.conversations || 0), 0);
     const totTurns = layers.reduce((a, l) => a + (l.turns || 0), 0);
-    const resident = layers.length
-      ? Math.round(layers.reduce((a, l) => a + (l.resident || 0), 0) / layers.length) : 0;
     mount(kpiHost,
       // `gather_scope`, the schema's own word. This read `l.masking ===
       // 'cross-timeline'`, which was the fixture's vocabulary and matched
@@ -66,9 +58,10 @@ export async function render(_params, q) {
       // once the route became real.
       stat('layers', layers.length,
         (schema.layers || []).filter((l) => l.gather_scope === 'shared').length + ' cross-timeline'),
+      stat('conversations', fmtNum(totConvs)),
       stat('turns', fmtNum(totTurns)),
-      stat('tokens', fmtK(totTok)),
-      stat('mean resident', resident + '%', resident < 50 ? 'paged out' : 'warm'));
+      stat('engine', sub.engine_connected ? 'running' : 'not running',
+        sub.engine_connected ? null : 'counts are zero until it opens the substrate'));
   }
 
   function stat(lbl, val, note) {
@@ -171,7 +164,6 @@ export async function render(_params, q) {
   }
 
   function layerCard(l, s) {
-    const frac = Math.min(1, (l.tokens || 0) / (l.window || 1));
     const head = [
       h('span', { class: 'disc-swatch', style: `background:${layerColor(l.layer)}` }),
       h('span', { class: 'disc-title mono' }, l.layer),
@@ -179,18 +171,17 @@ export async function render(_params, q) {
         s.gather_scope === 'shared'
           ? h('span', { class: 'chip warn' }, 'cross-timeline')
           : h('span', { class: 'chip' }, 'self-local'),
-        h('span', { class: 'chip' }, fmtNum(l.turns) + ' turns'),
-        h('span', { class: 'chip' }, fmtK(l.tokens) + ' tok'),
-        h('span', { class: 'chip' }, Math.round(frac * 100) + '% of window'),
-        h('span', { class: 'chip' }, (l.resident ?? '—') + '% resident')),
+        h('span', { class: 'chip' }, fmtNum(l.conversations) + ' conversations'),
+        h('span', { class: 'chip' }, fmtNum(l.turns) + ' turns')),
     ];
     return disclosure({
       accent: layerColor(l.layer),
       head,
       body: async (host) => {
-        mount(host, spinner('loading turns…'));
+        mount(host, spinner('loading conversations…'));
         const data = await layerCache.get(npcId + '::' + l.layer, () => API.getLayer(npcId, l.layer));
         if (!stillOpen(host)) return;                 // collapsed while fetching
+        const convs = data.conversations || [];
         mount(host,
           s.description ? h('div', { class: 'disc-desc' }, s.description) : null,
           h('div', { class: 'row wrap', style: 'gap:6px;margin:8px 0 4px' },
@@ -198,10 +189,11 @@ export async function render(_params, q) {
             s.window ? h('span', { class: 'chip' }, 'window ' + fmtK(s.window)) : null,
             s.score_threshold != null ? h('span', { class: 'chip' }, 'threshold ' + s.score_threshold) : null,
             s.decode_priority ? h('span', { class: 'chip accent' }, s.decode_priority + ' priority') : null),
-          bar(frac, layerColor(l.layer)),
-          (data.items || []).length
-            ? (data.items || []).map((t) => turnCard(l.layer, t))
-            : h('div', { class: 'lazy-err' }, 'No turns in this layer yet.'),
+          convs.length
+            ? convs.map((c) => conversationCard(l.layer, c))
+            : h('div', { class: 'lazy-err' },
+              data.engine_connected === false ? 'The engine is not running.' : 'Nothing in this layer yet.'),
+          data.more ? h('div', { class: 'tiny dim' }, `Showing the newest ${convs.length}.`) : null,
           h('div', { class: 'row', style: 'margin-top:10px' },
             h('button', {
               class: 'btn sm ghost',
@@ -211,64 +203,27 @@ export async function render(_params, q) {
     });
   }
 
-  function turnCard(layer, t) {
-    const head = [
-      h('span', { class: 'disc-idx mono' }, '#' + t.turn),
-      h('span', { class: 'disc-title' }, t.kind === 'act' ? 'act' : 'turn'),
-      h('div', { class: 'disc-meta' },
-        h('span', { class: 'tiny dim mono' }, worldTime(t.world_ms)),
-        h('span', { class: 'chip' }, 'score ' + (t.score ?? 0).toFixed(2)),
-        h('span', { class: 'chip' }, t.tokens + ' tok')),
-    ];
+  /* One conversation — a day, a dream, an ingested file — with what it was
+   * written with, and its turns verbatim: both halves, in order. */
+  function conversationCard(layer, c) {
+    const turns = c.turns || [];
+    const meta = Object.entries(c.metadata || {});
+    const text = turns.map((t, i) => `#${i}\n${t.user}\n→ ${t.assistant}`).join('\n\n');
     return disclosure({
       dense: true,
       accent: layerColor(layer),
-      head,
-      body: async (host) => {
-        mount(host, spinner());
-        const full = await turnCache.get(`${npcId}::${layer}::${t.turn}`,
-          () => API.getTurn(npcId, layer, t.turn).catch(() => ({ text: t.preview, layout: null })));
-        if (!stillOpen(host)) return;
-        const copyBtn = h('button', { class: 'btn sm ghost' }, 'Copy');
-        copyBtn.addEventListener('click', () => copyText(full.text || t.preview || '', copyBtn));
-        mount(host,
-          h('div', { class: 'row', style: 'justify-content:flex-end;margin-bottom:6px' }, copyBtn),
-          h('pre', { class: 'disc-pre' }, full.text || t.preview || '(no body)'),
-          full.layout && full.layout.segments && full.layout.segments.length
-            ? kvLayout(full.layout)
-            : null);
-      },
-    });
-  }
-
-  /* The turn's K/V segment vector, rendered verbatim. A segment with `kv == null`
-   * is ETHEREAL — recorded, but not part of this turn's own K/V grid (the spine
-   * materialised it, or a reasoning block was dropped). Dimmed and italicised so
-   * that distinction reads at a glance rather than being invisible. */
-  function kvLayout(layout) {
-    const segs = layout.segments;
-    const real = segs.filter((s) => s.kv != null).length;
-    return disclosure({
-      dense: true,
-      accent: 'var(--ink-ghost)',
       head: [
-        h('span', { class: 'disc-title' }, 'K/V layout'),
+        h('span', { class: 'disc-title mono' }, c.name || 'conversation ' + c.timeline),
         h('div', { class: 'disc-meta' },
-          h('span', { class: 'chip' }, segs.length + ' segments'),
-          h('span', { class: 'chip' }, real + ' with K/V'),
-          h('span', { class: 'chip' }, (segs.length - real) + ' ethereal')),
+          meta.map(([k, v]) => h('span', { class: 'chip', title: k }, `${k}: ${v}`)),
+          h('span', { class: 'chip' }, fmtNum(turns.length) + ' turns')),
       ],
       body: (host) => {
-        mount(host, h('pre', { class: 'disc-pre' }, segs.map((s) => {
-          const kind = (s.kind || 'glue').toLowerCase();
-          const ethereal = s.kv == null;
-          const text = s.text != null ? s.text
-            : (typeof s.marker === 'string' ? '⟐ ' + s.marker : '[' + kind + ']');
-          return h('span', {
-            style: `color:${KIND_COLOR[kind] || 'var(--ink-ghost)'}`
-              + (ethereal ? ';opacity:.5;font-style:italic' : ''),
-          }, text + '\n');
-        })));
+        const copyBtn = h('button', { class: 'btn sm ghost' }, 'Copy');
+        copyBtn.addEventListener('click', () => copyText(text, copyBtn));
+        mount(host,
+          h('div', { class: 'row', style: 'justify-content:flex-end;margin-bottom:6px' }, copyBtn),
+          h('pre', { class: 'disc-pre' }, text || '(no turns)'));
       },
     });
   }
@@ -289,7 +244,7 @@ export async function render(_params, q) {
         liveBtn.className = 'chip accent';
         liveBtn.textContent = '↻ new data · click to reload';
         liveBtn.onclick = () => {
-          layerCache.invalidate(); turnCache.invalidate();
+          layerCache.invalidate();
           liveBtn.onclick = null;
           liveBtn.className = 'chip'; liveBtn.textContent = '● live';
           paintAll();

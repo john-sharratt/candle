@@ -11,16 +11,16 @@ use axum::{
 };
 use futures::{Stream, StreamExt};
 
-use candle_conversation::{OptionalState, SelectionState, NO_THINK_SELECTOR};
+use candle_conversation::{FinishReason, OptionalState, SelectionState, NO_THINK_SELECTOR};
 
-use super::chat_frames::{call_id, Framer, Framing};
+use super::chat_frames::{call_id, finish_reason, Framer, Framing};
 use crate::openai_tools::{self, wire_function};
 use crate::passthrough::PASSTHROUGH_MODEL;
 use crate::reasoning_split;
 use crate::session::{StreamItem, ZendSession};
 use crate::types::{
     AssistantMessage, ChatCompletion, ChatCompletionRequest, CompletionChoice, RequestTools,
-    ResponseToolCall, Role, ToolMode,
+    ResponseToolCall, Role, ToolMode, Usage,
 };
 
 /// The `optional_group` selector that gates the whole tool block in the dialogue
@@ -143,7 +143,8 @@ pub async fn completions(
             .await
     };
     if req.stream {
-        stream_sse(token_stream, model, id, created, framing)
+        let include_usage = req.stream_options.is_some_and(|o| o.include_usage);
+        stream_sse(token_stream, model, id, created, framing, include_usage)
     } else {
         collect_completion(token_stream, model, id, created, framing).await
     }
@@ -230,6 +231,7 @@ fn stream_sse(
     id: String,
     created: u64,
     framing: Framing,
+    include_usage: bool,
 ) -> Response {
     // Turns each token into its frames — see `chat_frames`.
     let framer = Arc::new(Framer::new(id, model, created, framing));
@@ -252,6 +254,11 @@ fn stream_sse(
                 .map(|data| Event::default().event("tool").data(data))],
 
             Ok(StreamItem::Token(text)) => tokens.token(text),
+
+            Ok(StreamItem::TurnEnd { usage, finish }) => {
+                tokens.turn_end(usage, finish);
+                Vec::new()
+            }
         })
         .flat_map(futures::stream::iter);
 
@@ -260,6 +267,12 @@ fn stream_sse(
     let tail = futures::stream::once(async move {
         let mut events = framer.flush();
         events.push(framer.stop());
+        // OpenAI's usage chunk comes after the stop frame, and only when the
+        // client asked — a client that did not may not expect a chunk with no
+        // choices.
+        if include_usage {
+            events.extend(framer.usage_chunk());
+        }
         tracing::debug!("stream complete");
         events.push(Ok(Event::default().data("[DONE]")));
         futures::stream::iter(events)
@@ -282,6 +295,8 @@ async fn collect_completion(
 ) -> Response {
     let mut full = String::new();
     let mut tokens = 0usize;
+    let mut usage: Option<Usage> = None;
+    let mut finish = FinishReason::Stop;
     while let Some(result) = token_stream.next().await {
         match result {
             Ok(StreamItem::Token(chunk)) => {
@@ -291,6 +306,13 @@ async fn collect_completion(
             Ok(StreamItem::Status(_)) => {} // status events are display-only
             Ok(StreamItem::Projection(_)) => {} // timeline-only; not in the collected body
             Ok(StreamItem::Tool(_)) => {}   // tool lifecycle; display-only, not in the body
+            Ok(StreamItem::TurnEnd {
+                usage: turn,
+                finish: ended,
+            }) => {
+                usage = Some(usage.map_or(turn, |before| before.then(turn)));
+                finish = ended;
+            }
             Err(_) => {}
         }
     }
@@ -319,9 +341,10 @@ async fn collect_completion(
             })
             .collect()
     });
-    let (content, finish_reason) = match tool_calls {
-        Some(_) => (prose.trim().to_string(), "tool_calls"),
-        None => (prose, "stop"),
+    let finish_reason = finish_reason(tool_calls.is_some(), finish);
+    let content = match tool_calls {
+        Some(_) => prose.trim().to_string(),
+        None => prose,
     };
     Json(ChatCompletion {
         id,
@@ -338,6 +361,7 @@ async fn collect_completion(
             },
             finish_reason,
         }],
+        usage: usage.unwrap_or_default(),
     })
     .into_response()
 }

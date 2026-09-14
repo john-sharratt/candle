@@ -24,7 +24,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum         = { version = "0.7", features = ["macros", "ws", "multipart"] }
 tower-http   = { version = "0.5" }
 tokio        = { version = "1",   features = ["full"] }
-futures      = "0.3"
+futures      = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
 include_dir  = { version = "0.7" }
 mime_guess   = { version = "2" }

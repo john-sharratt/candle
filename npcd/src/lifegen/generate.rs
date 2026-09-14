@@ -20,16 +20,13 @@
 //! that changed here was which closure `Jobs::start` was handed. Producing prose
 //! is a dependency, not a responsibility.
 //!
-//! # The wave is a latency budget, not a width
+//! # The wave is awaited, not pooled
 //!
-//! Nodes are submitted from a small pool of threads because each call blocks.
-//! With a guest behind the narrator they do **not** decode in parallel: a
-//! submission joins the guest's backlog, the backlog becomes one drain, and the
-//! drain serves its jobs one at a time with normal inference blocked throughout.
-//!
-//! So [`MAX_IN_FLIGHT`] does not choose how much runs at once. It chooses how
-//! long the engine is unavailable before the card comes back — which is why it
-//! is four rather than the engine's wave width.
+//! A phase's pending nodes are submitted [`MAX_IN_FLIGHT`] at a time as
+//! futures awaited together (`fan_out`), so a wave costs no threads and the
+//! guest's drain decodes it as one co-batched pass of the checkpoint. The
+//! constant bounds how many forks hold conversations at once, not how many
+//! threads exist — there are none.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -71,25 +68,26 @@ struct Answer {
     text: Result<String, String>,
 }
 
-/// Prime a phase's prefix and run every pending node of it.
-///
-/// Returns how many nodes were written. A phase with nothing pending primes
-/// nothing and returns zero — regenerating one month must not pay for a prefix
-/// no fork is going to use.
-/// How one node's prose is produced: a system turn and a user turn in, the
-/// model's answer out.
+/// How one node's prose is produced: a system turn and a user turn in, a
+/// future of the model's answer out.
 ///
 /// **The ladder does not know what is behind this, and that is the point.** It
 /// picks the pending nodes, builds each one's prompt from the strata above it,
 /// and applies what comes back; producing the text is somebody else's job. The
 /// ladder ran on the main acting model until the prose guest could serve it, and
 /// the only thing that changed here was which closure `Jobs::start` was handed.
-///
-/// Blocking, because a job owns an OS thread from end to end and there is no
-/// runtime under it — the implementation bridges to the guest queue itself.
-pub type Narrator = Arc<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync>;
+pub type Narrator = Arc<
+    dyn Fn(String, String) -> futures::future::BoxFuture<'static, Result<String, String>>
+        + Send
+        + Sync,
+>;
 
-pub fn run_phase(
+/// Prime a phase's prefix and run every pending node of it.
+///
+/// Returns how many nodes were written. A phase with nothing pending primes
+/// nothing and returns zero — regenerating one month must not pay for a prefix
+/// no fork is going to use.
+pub async fn run_phase(
     narrate: &Narrator,
     mind: &Path,
     plan: &Mutex<Plan>,
@@ -156,7 +154,7 @@ pub fn run_phase(
         "phase primed"
     );
     progress.fanning_out(turns.len() as u64);
-    let answers = fan_out(narrate, &prefix, turns, progress)?;
+    let answers = fan_out(narrate, &prefix, turns, progress).await?;
     for a in &answers {
         match &a.text {
             Ok(t) => tracing::debug!(
@@ -173,79 +171,93 @@ pub fn run_phase(
     // operator editing the story while a phase runs would otherwise have every
     // node of it written against an arc that no longer exists — plausibly, and
     // with nothing anywhere to say so.
-    let mut p = plan.lock().unwrap();
-    if p.prefix_hash() != primed_at {
-        anyhow::bail!(
-            "the life story changed while the {} phase was running — nothing was written; \
-             run it again against the story as it stands now",
-            phase.unit()
-        );
-    }
-
-    let mut written = 0;
-    for a in answers {
-        let Ok(text) = a.text else {
-            tracing::warn!(
-                "life {}: {:?} not generated — {}",
-                p.seed.who,
-                a.id,
-                a.text.unwrap_err()
-            );
-            continue;
-        };
-        // **The decode as the model produced it, before any parsing.**
-        //
-        // Everything downstream — `strip_reasoning`, `parse_story`, the document write — can
-        // only report what survived it, and every failure in this phase so far has been
-        // diagnosed from the wreckage rather than the event. The distinction this exists to
-        // draw: prose that is wrong from its first token is a prompt or a weights problem,
-        // while prose that starts clean and degrades is a state one, and the parsed output
-        // cannot tell the two apart. At `debug`, so it costs nothing in a normal run.
-        tracing::debug!(
-            target: "npcd::lifegen",
-            who = %p.seed.who,
-            node = ?a.id,
-            chars = text.len(),
-            head = %text.chars().take(400).collect::<String>(),
-            "decode"
-        );
-        // **The parent this node expanded must still be the parent.** The shared
-        // prefix is checked once above; a node's own parent — the year a month
-        // expands, the month a day expands — reaches it through the turn, which
-        // was built from the snapshot taken before the decode. An operator
-        // correcting year 1999 mid-phase marks its months stale, and writing
-        // prose generated against the *old* 1999 over that mark would discard the
-        // correction and clear the flag that recorded it. Checked per node rather
-        // than per phase, so the other eleven years' months still land.
-        let asked_now = turn_for(&p, a.id);
-        if planned.get(&a.id) != Some(&asked_now) {
-            tracing::warn!(
-                "life {}: {:?} not written — what it expands was edited while the {} phase \
-                 ran; it stays pending and regenerates against the correction",
-                p.seed.who,
-                a.id,
+    //
+    // The plan's guard lives inside this block and cannot cross the outline's
+    // decode awaits below — a `!Send` guard alive over an await pins the whole
+    // job task — so the block lands every answer, then hands out only what the
+    // outline decision needs; `build_outline` takes the lock itself, a step at
+    // a time, and the write at the end takes a fresh one.
+    let (written, outline_due) = {
+        let mut p = plan.lock().unwrap();
+        if p.prefix_hash() != primed_at {
+            anyhow::bail!(
+                "the life story changed while the {} phase was running — nothing was written; \
+                 run it again against the story as it stands now",
                 phase.unit()
             );
-            continue;
         }
-        if apply(&mut p, a.id, &text) {
-            written += 1;
-        } else {
-            // **A decode that parses to nothing is a failure, and it used to be a
-            // silent one.** `apply` refuses empty prose, but saying so nowhere meant a
-            // node that produced 311 seconds of tokens and no document was
-            // indistinguishable from one that worked — the job still reported `done`.
-            // The length is here because it separates the two ways to arrive at
-            // nothing: a model that stopped immediately, and one that reasoned to the
-            // token cap without ever closing its `<think>` block.
-            tracing::warn!(
-                "life {}: {:?} produced no document from {} chars of decode",
-                p.seed.who,
-                a.id,
-                text.len()
+
+        let mut written = 0;
+        for a in answers {
+            let Ok(text) = a.text else {
+                tracing::warn!(
+                    "life {}: {:?} not generated — {}",
+                    p.seed.who,
+                    a.id,
+                    a.text.unwrap_err()
+                );
+                continue;
+            };
+            // **The decode as the model produced it, before any parsing.**
+            //
+            // Everything downstream — `strip_reasoning`, `parse_story`, the document write —
+            // can only report what survived it, and every failure in this phase so far has
+            // been diagnosed from the wreckage rather than the event. The distinction this
+            // exists to draw: prose that is wrong from its first token is a prompt or a
+            // weights problem, while prose that starts clean and degrades is a state one, and
+            // the parsed output cannot tell the two apart. At `debug`, so it costs nothing in
+            // a normal run.
+            tracing::debug!(
+                target: "npcd::lifegen",
+                who = %p.seed.who,
+                node = ?a.id,
+                chars = text.len(),
+                head = %text.chars().take(400).collect::<String>(),
+                "decode"
             );
+            // **The parent this node expanded must still be the parent.** The shared
+            // prefix is checked once above; a node's own parent — the year a month
+            // expands, the month a day expands — reaches it through the turn, which
+            // was built from the snapshot taken before the decode. An operator
+            // correcting year 1999 mid-phase marks its months stale, and writing
+            // prose generated against the *old* 1999 over that mark would discard the
+            // correction and clear the flag that recorded it. Checked per node rather
+            // than per phase, so the other eleven years' months still land.
+            let asked_now = turn_for(&p, a.id);
+            if planned.get(&a.id) != Some(&asked_now) {
+                tracing::warn!(
+                    "life {}: {:?} not written — what it expands was edited while the {} \
+                     phase ran; it stays pending and regenerates against the correction",
+                    p.seed.who,
+                    a.id,
+                    phase.unit()
+                );
+                continue;
+            }
+            if apply(&mut p, a.id, &text) {
+                written += 1;
+            } else {
+                // **A decode that parses to nothing is a failure, and it used to be a
+                // silent one.** `apply` refuses empty prose, but saying so nowhere meant a
+                // node that produced 311 seconds of tokens and no document was
+                // indistinguishable from one that worked — the job still reported `done`.
+                // The length is here because it separates the two ways to arrive at
+                // nothing: a model that stopped immediately, and one that reasoned to the
+                // token cap without ever closing its `<think>` block.
+                tracing::warn!(
+                    "life {}: {:?} produced no document from {} chars of decode",
+                    p.seed.who,
+                    a.id,
+                    text.len()
+                );
+            }
         }
-    }
+
+        (
+            written,
+            phase == Phase::Story && p.story.content.is_generated(),
+        )
+    };
 
     // **The outline, a run of years at a time, once the arc it follows exists.**
     //
@@ -253,19 +265,25 @@ pub fn run_phase(
     // where the life had got to, so a year can follow from the twenty before it
     // instead of being invented beside them. Forks cannot do that — siblings
     // never see each other.
-    if phase == Phase::Story && p.story.content.is_generated() {
-        match build_outline(narrate, &mut p, &prefix, progress) {
-            Ok(n) => tracing::info!("life {}: {} year(s) outlined", p.seed.who, n),
+    if outline_due {
+        match build_outline(narrate, plan, &prefix, progress).await {
+            Ok(n) => {
+                tracing::info!(
+                    "life {}: {n} year(s) outlined",
+                    plan.lock().unwrap().seed.who
+                )
+            }
             // A life with an arc and a short outline is worth keeping; the
             // outline can be run again. Failing the phase here would throw away
             // the story that just succeeded.
             Err(e) => tracing::warn!(
                 "life {}: the outline stopped early — {e:#}; the story is written and the \
                  outline can be extended by running the story phase again",
-                p.seed.who
+                plan.lock().unwrap().seed.who
             ),
         }
     }
+    let p = plan.lock().unwrap();
 
     progress.stage(Stage::Writing);
     // Only a story that was actually generated is written. Without the guard a redo
@@ -327,24 +345,32 @@ const OUTLINE_TAIL: usize = 8;
 /// left alone and not asked for again, so running this a second time extends an
 /// outline that stopped early rather than starting it over — which is what makes
 /// a failure here recoverable instead of destructive.
-fn build_outline(
+async fn build_outline(
     narrate: &Narrator,
-    plan: &mut Plan,
+    plan: &Mutex<Plan>,
     prefix: &str,
     progress: &GenProgress,
 ) -> anyhow::Result<usize> {
-    let display = plan.seed.display.clone();
-    let prose = plan.story.content.text.clone();
-
-    let missing: Vec<i32> = plan
-        .years
-        .iter()
-        .map(|y| y.year)
-        .filter(|y| !plan.story.outline.iter().any(|b| b.year == *y))
-        .collect();
-    if missing.is_empty() {
-        return Ok(plan.story.outline.len());
-    }
+    // The lock is taken per step and never held across a decode await: each
+    // chunk reads the outline's tail as it stands, decodes with the plan free
+    // for the console to read, and lands its beats under a fresh lock.
+    let (display, prose, missing) = {
+        let p = plan.lock().unwrap();
+        let missing: Vec<i32> = p
+            .years
+            .iter()
+            .map(|y| y.year)
+            .filter(|y| !p.story.outline.iter().any(|b| b.year == *y))
+            .collect();
+        if missing.is_empty() {
+            return Ok(p.story.outline.len());
+        }
+        (
+            p.seed.display.clone(),
+            p.story.content.text.clone(),
+            missing,
+        )
+    };
 
     progress.stage(Stage::Generating);
     progress.fanning_out(missing.len().div_ceil(OUTLINE_RUN) as u64);
@@ -353,43 +379,49 @@ fn build_outline(
         if progress.is_cancelled() {
             anyhow::bail!("cancelled");
         }
-        let tail: Vec<YearBeat> = plan
-            .story
-            .outline
-            .iter()
-            .rev()
-            .take(OUTLINE_TAIL)
-            .rev()
-            .cloned()
-            .collect();
+        let tail: Vec<YearBeat> = {
+            let p = plan.lock().unwrap();
+            p.story
+                .outline
+                .iter()
+                .rev()
+                .take(OUTLINE_TAIL)
+                .rev()
+                .cloned()
+                .collect()
+        };
 
         let turn = prompt::outline_turn(&display, &prose, &tail, want);
-        let raw = narrate(prefix, &turn).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let raw = narrate(prefix.to_string(), turn)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // **Only the years that were asked for.** A model handed a run ending in
         // 2740 will sometimes keep going, and a beat for a year the life does not
         // have is a beat no document can ever be named for.
+        let mut p = plan.lock().unwrap();
         let mut landed = 0;
         for b in prompt::parse_outline(&raw) {
             if !want.contains(&b.year) {
                 continue;
             }
-            if plan.story.outline.iter().any(|x| x.year == b.year) {
+            if p.story.outline.iter().any(|x| x.year == b.year) {
                 continue;
             }
-            plan.story.outline.push(b);
+            p.story.outline.push(b);
             landed += 1;
         }
         if landed == 0 {
             tracing::warn!(
                 "life {}: years {:?} to {:?} produced no outline from {} chars of decode",
-                plan.seed.who,
+                p.seed.who,
                 want.first(),
                 want.last(),
                 raw.len()
             );
         }
-        plan.story.outline.sort_by_key(|b| b.year);
+        p.story.outline.sort_by_key(|b| b.year);
+        drop(p);
         progress.completed_one(format!(
             "years {} to {}",
             want.first().copied().unwrap_or_default(),
@@ -397,30 +429,31 @@ fn build_outline(
         ));
     }
 
-    Ok(plan.story.outline.len())
+    Ok(plan.lock().unwrap().story.outline.len())
 }
 
-/// Fork the primed parent once per node and decode a wave at a time.
+/// Decode a wave of nodes at a time, each an awaited future.
 ///
-/// # Why the forking happens here and the decoding does not
+/// The waves are the cap: forks are minted one wave at a time, so a
+/// five-hundred-month phase holds sixty-four slots rather than five hundred,
+/// and the rest wait as instructions in a `Vec` instead of as conversations
+/// holding KV for a turn that has not started.
 ///
-/// A [`Sequence`] is `Send` but not `Sync`, so the primed parent stays on this
-/// thread and each *child* is moved into a worker. That is not a workaround —
-/// it is the shape the cap wants anyway: forks are minted one wave at a time,
-/// so a five-hundred-month phase holds sixty-four slots rather than five
-/// hundred, and the rest wait as instructions in a `Vec` instead of as
-/// conversations holding KV for a turn that has not started.
+/// **Awaited together so they drain together.** The engine co-batches
+/// whatever is submitted together into one wave — so thirty months are one
+/// pass of the checkpoint and thirty decodes, not thirty passes. Awaiting
+/// them one at a time would pay the pass per node.
 ///
 /// Cancellation is checked between waves rather than inside a decode. A turn
 /// already in flight is left to finish, because tearing one down leaves a slot
 /// the engine still believes is busy.
-fn fan_out(
+async fn fan_out(
     narrate: &Narrator,
     prefix: &str,
     turns: Vec<(NodeId, String)>,
     progress: &GenProgress,
 ) -> anyhow::Result<Vec<Answer>> {
-    let out: Mutex<Vec<Answer>> = Mutex::new(Vec::with_capacity(turns.len()));
+    let mut answers: Vec<Answer> = Vec::with_capacity(turns.len());
     let flight = AtomicUsize::new(0);
 
     for wave in turns.chunks(MAX_IN_FLIGHT) {
@@ -430,28 +463,23 @@ fn fan_out(
         progress.in_flight(wave.len() as u64);
         flight.store(wave.len(), Ordering::Relaxed);
 
-        // **Submitted together so they drain together.** Each call blocks on
-        // the guest queue, and the queue batches whatever is waiting into one
-        // drain — so a wave of thirty months is one load of the checkpoint and
-        // thirty decodes, not thirty loads. Submitting them one at a time would
-        // pay the load per node, which for a 14 B is seconds each.
-        std::thread::scope(|scope| {
-            for (id, turn) in wave {
-                let (out, flight, progress) = (&out, &flight, &progress);
-                let (id, turn) = (*id, turn.as_str());
-                scope.spawn(move || {
-                    let answer = narrate(prefix, turn);
-                    progress.in_flight(flight.fetch_sub(1, Ordering::Relaxed) as u64 - 1);
-                    progress.completed_one(detail_for(id));
-                    out.lock().unwrap().push(Answer { id, text: answer });
-                });
+        let landed = futures::future::join_all(wave.iter().map(|(id, turn)| {
+            let (flight, progress) = (&flight, &progress);
+            let fut = narrate(prefix.to_string(), turn.clone());
+            let id = *id;
+            async move {
+                let answer = fut.await;
+                progress.in_flight(flight.fetch_sub(1, Ordering::Relaxed) as u64 - 1);
+                progress.completed_one(detail_for(id));
+                Answer { id, text: answer }
             }
-        });
+        }))
+        .await;
+        answers.extend(landed);
     }
 
-    let mut answers = out.into_inner().unwrap();
-    // Workers finish out of order; the plan is applied in reading order so a
-    // log of one run reads like the life.
+    // Futures finish out of order inside a wave; the plan is applied in
+    // reading order so a log of one run reads like the life.
     answers.sort_by_key(|a| a.id);
     Ok(answers)
 }

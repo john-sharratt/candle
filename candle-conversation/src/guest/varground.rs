@@ -18,10 +18,10 @@
 //! # What it does not do
 //!
 //! It does not allocate *activations*. A forward's intermediate tensors come
-//! from the pool as they always have, which is the deliberate limit described
-//! in [`super::prose`]: during a drain the engine is quiesced and the relief
-//! ladder has just run, so the pool is as empty as it ever gets, and the
-//! gigabytes — the weights — are what this keeps out of it.
+//! from the pool as they always have, and that limit is deliberate: during a
+//! drain the engine is quiesced and the relief ladder has just run, so the pool
+//! is as empty as it ever gets, and the gigabytes — the weights — are what this
+//! keeps out of it.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

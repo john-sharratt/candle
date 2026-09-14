@@ -27,7 +27,7 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
 #![allow(clippy::large_enum_variant)]
-#![allow(clippy::chunks_exact_to_as_chunks)]
+#![allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 
 //! Turn-based conversation engine for the candle inference stack.
 //!
@@ -113,7 +113,7 @@ pub use scheduler::provenance_capture_path_counts;
 pub use scheduler::recurrent_state_cost;
 pub use scheduler::relief_trace;
 pub use sequence_handle::SequenceId;
-pub use stats::TurnStats;
+pub use stats::{FinishReason, TurnStats};
 pub use token_buffer::TokenBuffer;
 pub use tree::TokenizedText;
 pub use turn::{Role, Turn, TurnId, TurnOptions};

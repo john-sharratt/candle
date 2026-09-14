@@ -168,6 +168,32 @@
 
   <div id="toasts"></div>
 
+  <!-- Skip the startup overlay when the daemon is already up.
+       #boot is shown from first paint so a genuine cold start — weights onto the
+       card, redo log replayed — has something to look at. But that meant a plain
+       refresh on a *running* daemon still showed the "starting…" card for as long
+       as app.js and its whole module graph took to load and run: the loader
+       flashing on a page that was never starting, which is exactly what reads as
+       "why is it starting up, it's already loaded". This runs BEFORE that graph —
+       it asks /v1/status once and, if the daemon is ready, drops the overlay in a
+       millisecond, so a refresh lands straight in the shell. Not ready, or no
+       answer, leaves the overlay exactly as it was for app.js to drive. -->
+  <script>
+    (function () {
+      try {
+        fetch('/v1/status', { credentials: 'same-origin' })
+          .then(function (r) { return r && r.ok ? r.json() : null; })
+          .then(function (s) {
+            if (s && s.state === 'ready') {
+              var b = document.getElementById('boot');
+              if (b) b.remove();
+            }
+          })
+          .catch(function () {});
+      } catch (_) {}
+    })();
+  </script>
+
   <script type="module" src="/app.js"></script>
 </body>
 </html>

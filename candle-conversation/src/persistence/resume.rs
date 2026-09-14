@@ -1097,6 +1097,44 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A prompt section's index page survives a restart the way a turn's does,
+    /// keyed by the section's content-addressed stream id. Without it a section
+    /// restored from the log could only reach a positional-state model
+    /// unindexed, so the restore has to be refused and the section prefilled
+    /// again on every boot.
+    #[test]
+    fn section_index_page_persists_and_recovers() {
+        use super::super::content_hash::ContentHash;
+        use super::super::streams::{ContentAddress, SectionDecl};
+
+        let dir = tmp_dir("section_index_page");
+        let decl = StreamDecl::PromptSection(SectionDecl {
+            address: ContentAddress {
+                prefix_hash: ContentHash { lo: 0x11, hi: 0x22 },
+                section_hash: ContentHash { lo: 0x33, hi: 0x44 },
+            },
+            debug_name: "system_framing".to_string(),
+        });
+        let stream_id = decl.stream_id();
+        let payload: Vec<u8> = (0..384u32).map(|i| (i % 241) as u8).collect();
+
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            sp.declare_stream(&decl).unwrap();
+            sp.append_turn_index_page(stream_id, &payload).unwrap();
+            sp.commit().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            assert_eq!(
+                substrate.section_index_page(stream_id),
+                Some(payload.as_slice())
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Last-writer-wins: re-sealing a turn replaces its page rather than
     /// leaving the stale one to be handed to the next projection.
     #[test]

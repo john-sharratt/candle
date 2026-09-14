@@ -140,9 +140,30 @@ pub(crate) mod tests {
     use crate::models::qwen35::mtp::MTP_MAX_DRAFT;
     use candle::quantized::Int8Mode;
     use hf_hub::RepoType;
+    use std::path::PathBuf;
 
-    fn pinned(spec: (&str, &str, &str)) -> Result<std::path::PathBuf> {
-        hf_get(spec.0, RepoType::Model, spec.1, spec.2)
+    /// A pinned dense checkpoint's local path, resolved through
+    /// [`model_overrides`] under `key` in `models.override.yaml`'s
+    /// `checkpoints:` — so a machine can run these gates against another
+    /// conversion of the same model, a different quant of the pinned repo say,
+    /// without editing the pin. With no override it is exactly `spec`.
+    ///
+    /// The gates' KV factor rows and draft ladders are derived against the
+    /// pinned file, so a figure measured on an override is a comparison, not a
+    /// re-derivation.
+    fn pinned(key: &str, spec: (&str, &str, &str)) -> Result<PathBuf> {
+        let ck = model_overrides::checkpoint(key, Checkpoint::new(spec.0, spec.1, spec.2));
+        hf_get(&ck.repo, RepoType::Model, &ck.revision, &ck.filename)
+    }
+
+    /// [`QWEN35_9B`], overridable as `Qwen35_9B`.
+    fn qwen35_9b() -> Result<PathBuf> {
+        pinned("Qwen35_9B", QWEN35_9B)
+    }
+
+    /// [`QWEN35_0_8B`], overridable as `Qwen35_0_8B`.
+    fn qwen35_0_8b() -> Result<PathBuf> {
+        pinned("Qwen35_0_8B", QWEN35_0_8B)
     }
 
     /// Prefill and decode rate for one model, measured on the engine directly.
@@ -357,7 +378,7 @@ pub(crate) mod tests {
         use candle_kernels::delta_net::DELTA_NET_PREFILL_CHUNK;
         use std::time::Instant;
 
-        let model_path = pinned(QWEN35_9B)?;
+        let model_path = qwen35_9b()?;
         let device = Device::new_cuda(0)?;
         let model = from_gguf_path(
             &model_path,
@@ -367,6 +388,7 @@ pub(crate) mod tests {
                 expert_pack_dir: None,
                 mtp_path: None,
                 gate_donor_path: None,
+                tensor_overrides: Vec::new(),
             },
         )?;
 
@@ -458,8 +480,7 @@ pub(crate) mod tests {
         prompt.extend(params.user_prompt_tokens(0));
         let device = Device::new_cuda(0)?;
 
-        for (label, spec) in [("0.8B", QWEN35_0_8B), ("9B", QWEN35_9B)] {
-            let path = pinned(spec)?;
+        for (label, path) in [("0.8B", qwen35_0_8b()?), ("9B", qwen35_9b()?)] {
             let model = from_gguf_path(
                 &path,
                 &device,
@@ -468,6 +489,7 @@ pub(crate) mod tests {
                     expert_pack_dir: None,
                     mtp_path: None,
                     gate_donor_path: None,
+                    tensor_overrides: Vec::new(),
                 },
             )?;
             println!("{label}:");
@@ -494,7 +516,7 @@ pub(crate) mod tests {
                 the card if cargo runs them concurrently)"]
     fn test_parallel_batched_forwarding_0_8b() -> Result<()> {
         println!("\n=== Qwen3.5-0.8B hybrid batched forwarding ===\n");
-        let model_path = pinned(QWEN35_0_8B)?;
+        let model_path = qwen35_0_8b()?;
         let device = Device::new_cuda(0)?;
 
         // **Resolved here, then used twice**, so the table's `int8` column
@@ -734,6 +756,7 @@ pub(crate) mod tests {
                     expert_pack_dir: None,
                     mtp_path: None,
                     gate_donor_path: None,
+                    tensor_overrides: Vec::new(),
                 },
             )?;
             println!("✓ Model loaded\n");
@@ -756,7 +779,7 @@ pub(crate) mod tests {
     fn long_context_0_8b() -> Result<()> {
         use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
 
-        let model_path = pinned(QWEN35_0_8B)?;
+        let model_path = qwen35_0_8b()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         long_context_gate(
@@ -786,6 +809,7 @@ pub(crate) mod tests {
                         expert_pack_dir: None,
                         mtp_path: None,
                         gate_donor_path: None,
+                        tensor_overrides: Vec::new(),
                     },
                 )
             },
@@ -836,7 +860,7 @@ pub(crate) mod tests {
             &tokenizer_json()?,
             MTP_MAX_DRAFT,
             &device,
-            dense_loader(pinned(QWEN35_9B)?, Int8Mode::Off),
+            dense_loader(qwen35_9b()?, Int8Mode::Off),
         )
     }
 
@@ -869,7 +893,7 @@ pub(crate) mod tests {
                 quantized_qwen35::tests::kv_or_width_9b -- --ignored --nocapture \
                 --test-threads=1"]
     fn kv_or_width_9b() -> Result<()> {
-        let load = dense_loader(pinned(QWEN35_9B)?, Int8Mode::Off);
+        let load = dense_loader(qwen35_9b()?, Int8Mode::Off);
         for tokens in [64usize, 128, 256] {
             println!("\n=== Qwen3.5-9B: width 10, {tokens} generated tokens, plain decode ===\n");
             let params = TestParams::new(tokens, &tokenizer_json()?, Dialect::qwen35())
@@ -971,7 +995,7 @@ pub(crate) mod tests {
                     $width,
                     $budget,
                     Int8Mode::Off,
-                    dense_loader(pinned(QWEN35_9B)?, Int8Mode::Off),
+                    dense_loader(qwen35_9b()?, Int8Mode::Off),
                 )
             }
         };
@@ -1019,7 +1043,7 @@ pub(crate) mod tests {
                 quantized_qwen35::tests::decay_across_configs_9b -- --ignored --nocapture \
                 --test-threads=1"]
     fn decay_across_configs_9b() -> Result<()> {
-        let load = dense_loader(pinned(QWEN35_9B)?, Int8Mode::Off);
+        let load = dense_loader(qwen35_9b()?, Int8Mode::Off);
         let params = TestParams::new(256, &tokenizer_json()?, Dialect::qwen35())
             .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
             .with_suppress_thinking(true)
@@ -1139,6 +1163,7 @@ pub(crate) mod tests {
                     expert_pack_dir: None,
                     mtp_path: None,
                     gate_donor_path: None,
+                    tensor_overrides: Vec::new(),
                 },
             )?;
             // A gate that silently fell back to plain decode would still pass
@@ -1171,7 +1196,7 @@ pub(crate) mod tests {
                 the card if cargo runs them concurrently)"]
     fn test_parallel_batched_forwarding_9b() -> Result<()> {
         println!("\n=== Qwen3.5-9B hybrid batched forwarding ===\n");
-        let model_path = pinned(QWEN35_9B)?;
+        let model_path = qwen35_9b()?;
         let device = Device::new_cuda(0)?;
 
         // **Resolved here, then used twice**, so the table's `int8` column
@@ -1204,6 +1229,7 @@ pub(crate) mod tests {
                     expert_pack_dir: None,
                     mtp_path: None,
                     gate_donor_path: None,
+                    tensor_overrides: Vec::new(),
                 },
             )?;
             println!("✓ Model loaded\n");
@@ -1449,7 +1475,7 @@ pub(crate) mod tests {
                 -- --ignored --nocapture --test-threads=1"]
     fn lora_ladder_9b_uncalibrated() -> Result<()> {
         println!("\n=== Qwen3.5-9B hybrid batched forwarding — LoRA ===\n");
-        let model_path = pinned(QWEN35_9B)?;
+        let model_path = qwen35_9b()?;
         let adapter = qwen35_9b_lora();
         let adapter_dir = pinned_adapter(&adapter)?;
         println!("adapter: {}@{}", adapter.repo, adapter.revision);
@@ -1479,6 +1505,7 @@ pub(crate) mod tests {
                     expert_pack_dir: None,
                     mtp_path: None,
                     gate_donor_path: None,
+                    tensor_overrides: Vec::new(),
                 },
             )?;
             // BF16: the width this lineage's residual stream flows in, and so
@@ -1500,7 +1527,7 @@ pub(crate) mod tests {
     fn long_context_9b() -> Result<()> {
         use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
 
-        let model_path = pinned(QWEN35_9B)?;
+        let model_path = qwen35_9b()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         long_context_gate(
@@ -1530,6 +1557,7 @@ pub(crate) mod tests {
                         expert_pack_dir: None,
                         mtp_path: None,
                         gate_donor_path: None,
+                        tensor_overrides: Vec::new(),
                     },
                 )
             },
@@ -1569,7 +1597,7 @@ pub(crate) mod tests {
                 .unwrap_or_default()
         );
 
-        let model_path = pinned(QWEN35_9B)?;
+        let model_path = qwen35_9b()?;
         let device = Device::new_cuda(0)?;
         let model = from_gguf_path(
             &model_path,
@@ -1579,6 +1607,7 @@ pub(crate) mod tests {
                 expert_pack_dir: None,
                 mtp_path: None,
                 gate_donor_path: None,
+                tensor_overrides: Vec::new(),
             },
         )?;
         // BF16, not F32: the paged decode kernel is compiled for the half

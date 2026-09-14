@@ -513,16 +513,17 @@ export const MockAPI = {
   async setModulation() { return { ok: true }; },
 
   async getSubstrate() {
-    return { layers: [
-      { layer: 'perception', turns: 41, tokens: 12400, window: 16000, resident: 88 },
-      { layer: 'action', turns: 212, tokens: 31900, window: 16000, resident: 62 },
-      { layer: 'agency', turns: 6, tokens: 2100, window: 4000, resident: 100 },
-      { layer: 'relationships', turns: 14, tokens: 3800, window: 4000, resident: 100 },
-      { layer: 'beliefs', turns: 9, tokens: 2400, window: 4000, resident: 100 },
-      { layer: 'memory', turns: 4412, tokens: 918233, window: 8000, resident: 61 },
-      { layer: 'interaction', turns: 88, tokens: 19100, window: 16000, resident: 74 },
-      { layer: 'environment', turns: 24, tokens: 5200, window: 6000, resident: 100 },
-      { layer: 'world', turns: 88, tokens: 21000, window: 8000, resident: 47 },
+    return { engine_connected: true, layers: [
+      { layer: 'perception', conversations: 3, turns: 41, window: 16000 },
+      { layer: 'action', conversations: 3, turns: 212, window: 16000 },
+      { layer: 'agency', conversations: 1, turns: 6, window: 4000 },
+      { layer: 'relationships', conversations: 2, turns: 14, window: 4000 },
+      { layer: 'beliefs', conversations: 1, turns: 9, window: 4000 },
+      { layer: 'memory', conversations: 38, turns: 4412, window: 8000 },
+      { layer: 'interaction', conversations: 3, turns: 88, window: 16000 },
+      { layer: 'environment', conversations: 2, turns: 24, window: 6000 },
+      { layer: 'world', conversations: 11, turns: 88, window: 8000 },
+      { layer: 'dreams', conversations: 3, turns: 42, window: 4000 },
     ] };
   },
   async getLayer(_id, layer) {
@@ -532,10 +533,15 @@ export const MockAPI = {
       action: ['speak → "Quiet, so far."', 'face → east', 'move_to → ridge_east', 'observe → eastern_line'],
       memory: MEM, world: ['The crown courier has not come in eleven days.', 'Tolls on the north road doubled after the thaw.'],
       environment: ['The light goes amber and the wind drops.', 'Rain starts, fine and cold, from the west.'],
+      dreams: ['You are crossing the muster hall and the floor gives like wet sand.',
+        'Nobody else notices; they walk on it the way they always have.',
+        'You keep your weight on your heels, and the board under you tilts toward the door.'],
     }[layer] || ['…'];
-    return { layer, has_more: false, items: Array.from({ length: 14 }, (_, i) => ({
-      turn: 200 - i, world_ms: worldMs() - i * 600000, score: Math.max(0.05, 0.95 - i * 0.05),
-      tokens: 90 + (i % 5) * 40, preview: P[i % P.length] })) };
+    return { layer, more: false, engine_connected: true, conversations: Array.from({ length: 3 }, (_, c) => ({
+      timeline: 9000 - c, name: `npc-7-${layer}-${9000 - c}`,
+      metadata: layer === 'dreams' ? { 'dream.assumption': 'that the floor will hold' } : {},
+      turns: P.map((line) => ({ user: layer === 'dreams' ? 'Something you dreamt:' : 'What do you notice?', assistant: line })),
+    })) };
   },
   async getProjection(_id, tick = 412) {
     return { tick: Number(tick), budget: { total: 16000, used: 15214 },
