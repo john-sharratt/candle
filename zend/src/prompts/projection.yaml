@@ -488,6 +488,11 @@ system_prompt:
         # that file's summary. Every caller that DOES re-project and wants the
         # demonstration selects it: the chat per turn with its tools dial
         # (`api/chat.rs`), calibration alongside its tool pin (`session.rs`).
+        # The chat's TOOL ROUNDS drop it again (`tool_round_selection`): their
+        # last user turn is a tool response too, and a chat four rounds into
+        # reading a paper answered "the IP of example.com" the same way. The
+        # model has made its call by then; the demonstration has nothing left
+        # to teach it.
         - kind: optional
           id: tool_call_example
           default: absent

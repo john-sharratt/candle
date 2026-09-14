@@ -52,6 +52,25 @@ pub fn apply_tools_dial(selection: &mut SelectionState, tools_mode: ToolMode) {
     selection.set_optional(TOOL_EXAMPLE_SELECTOR, tools_present);
 }
 
+/// The selection for a tool round — a turn whose user message is the results
+/// of the calls the turn before it made: the reply's own selection, less the
+/// worked demonstration.
+///
+/// The demonstration is there to teach the call's shape, and by a tool round
+/// the model has already made its call. What it does instead there is supply a
+/// question: the round's last user turn is a tool response, so the model looks
+/// back for the question it is answering, and the demonstration's ("what is the
+/// IP address of example.com") sits at the end of the system prompt, the
+/// nearest one to find. A chat that had asked for a paper to be read answered
+/// the demonstration instead, four rounds in, with the request still in its
+/// context. The code_reading ingest had failed the same way and leaves the
+/// demonstration out for the same reason (see `projection.yaml`).
+pub fn tool_round_selection(selection: &SelectionState) -> SelectionState {
+    let mut round = selection.clone();
+    round.set_optional(TOOL_EXAMPLE_SELECTOR, OptionalState::Absent);
+    round
+}
+
 /// `POST /v1/chat/completions`
 pub async fn completions(
     State(session): State<Arc<ZendSession>>,
@@ -455,6 +474,30 @@ mod dial_tests {
             assert_eq!(sel.optional(TOOLS_ENABLED_SELECTOR), Some(want), "{mode:?}");
             assert_eq!(sel.optional(TOOL_EXAMPLE_SELECTOR), Some(want), "{mode:?}");
         }
+    }
+
+    /// A tool round keeps everything the reply selected — the dials and the
+    /// tool block — except the worked demonstration, and leaves the reply's own
+    /// selection as it was for the next user turn.
+    #[test]
+    fn a_tool_round_drops_the_demonstration_and_keeps_the_rest() {
+        let mut reply = dial_selection(Some(2), Some(3), None);
+        apply_tools_dial(&mut reply, ToolMode::Comprehensive);
+        let round = tool_round_selection(&reply);
+        assert_eq!(
+            round.optional(TOOL_EXAMPLE_SELECTOR),
+            Some(OptionalState::Absent)
+        );
+        assert_eq!(
+            round.optional(TOOLS_ENABLED_SELECTOR),
+            Some(OptionalState::Present)
+        );
+        assert_eq!(round.get("thinking_effort"), Some("balanced"));
+        assert_eq!(round.get("response_length"), Some("detailed"));
+        assert_eq!(
+            reply.optional(TOOL_EXAMPLE_SELECTOR),
+            Some(OptionalState::Present)
+        );
     }
 
     #[test]

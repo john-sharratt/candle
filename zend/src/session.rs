@@ -38,7 +38,7 @@ use candle_conversation::{
 };
 use serde_json::Value;
 
-use crate::api::chat::TOOL_EXAMPLE_SELECTOR;
+use crate::api::chat::{tool_round_selection, TOOL_EXAMPLE_SELECTOR};
 use crate::api::substrate::{
     ConvView, Counts, GroupView, LayerConversations, LayerView, ProjectTile, ProjectView,
     SectionView, SegmentView, Storage, SubstrateOverview, SystemPromptView, TimelineDetail,
@@ -2985,7 +2985,14 @@ fn run_inference_stream(
                 } else {
                     None
                 },
-                selection: selection.clone(),
+                // A tool round's user message is the previous turn's results;
+                // it projects without the worked demonstration, which there
+                // becomes the question the model answers (`tool_round_selection`).
+                selection: if iteration == 0 {
+                    selection.clone()
+                } else {
+                    tool_round_selection(&selection)
+                },
                 // Force any `<tool_call>` the model emits to the catalog's exact
                 // JSON shape (name ∈ catalog, required params in order, valid
                 // JSON), and — atop that base — steer the `<think>` block per the
