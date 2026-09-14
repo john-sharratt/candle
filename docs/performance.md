@@ -528,6 +528,12 @@ the `long_context_*` and `profile_*` depth gates were not run here. Numbers are
 single measurements (no best-of-two), so the 1–4 % noise floor (§5) applies to
 each cell alone.
 
+**Measured on a build that carries the decode-slot refresh regression.** The
+sweep ran after `d45e69ce`, whose refresh cost the 72 GB card 58 % of Qwen2-0.5B's
+widest prefill (§4, *The decode-slot refresh prefill regression*), so this
+table's prefill column likely carries a share of that cost. Decode is
+unaffected. The 3090 has not been re-swept on the fixed build.
+
 **Ten of the fleet's models, plus the two AntiLoop+StyleTune hybrids** — the
 production 3.6-35B npcd actually serves. The 250B Flash-Next and the 284B
 DeepSeek are omitted: neither fits 24 GB (§4). Two card-specific notes carry into
@@ -820,6 +826,66 @@ the `auto`/Precision row above.
 ---
 
 ## 4. Limits and open items
+
+### The decode-slot refresh prefill regression (fixed)
+
+`4a740f4a` (the same change reached `origin/main` separately as `d45e69ce`)
+made every commit outside the decode kernel —
+a prefill layer, a speculative verify block — bring the cached decode slot
+buffer up to date, the fix for the MTP draft head's NaN. On the 72 GB card it
+took Qwen2-0.5B's gate from 80,170.5 to 33,360.8 t/s at ×60 (−58 %) and from
+32,220.1 to 17,699.5 at one context (−45 %), both measured 2026-09-15 against
+`81e487b5` on the same card; decode never moved. Two causes were stacked:
+
+1. **A fence per chunk.** The refresh waited for the previous upload — queued
+   behind the layer's kernels — before rewriting the pinned buffer that upload
+   read, so the host drained the GPU once per chunk per layer. Uploads now pack
+   into two event-guarded staging buffers and the host copy is memory no copy
+   reads (`234e037b`).
+2. **An upload between layers.** Wherever the refresh ran — in the commit, or
+   in the post-prefill prime right after it — it put one host→device copy
+   between one layer's kernels and the next: about 90 µs of GPU time per layer
+   with every host span flat (a `profile` build: 88.9 ms against 66.3 ms over
+   ten one-context prefills of 24 layers, with and without it). A commit now
+   only marks the buffer; the sync every reader goes through re-serialises the
+   writer region first, and the prime builds only a buffer that is missing
+   (`7dce6231`, `03794cac`).
+
+A third loss, 12–22 % on the one- and two-context rows of most multi-config
+gates, was the **harness**: each config's prompt timer started without
+synchronising, and the work that config had just queued — its session setup,
+which re-materialises the norm weights for the config's dtype, and its
+system-prompt prefill — finished inside the timer; builds before `234e037b`,
+which fenced slot-state uploads on the host, had drained it first. The gates
+now synchronise before starting the timer (`23623c6b`), so a prompt row
+measures the prompt alone. That is what the earlier rows measured too:
+`81e487b5` gives the same rows with the synchronise as without it (Qwen3.5-9B's
+one-context rows 5,472–5,527 t/s against 5,492–5,530; Qwen3-8B's C0–C7 ×1
+5,703–5,812 against 5,792–5,818), so every row in §3 compares directly.
+
+**Recovered, fleet-wide.** Twelve gates, best of two per build, both builds on
+the synchronised harness (`81e487b5` against `23623c6b`, 2026-09-15, this
+card). No prefill row of any model is more than 4 % below the reference, and
+every run validated:
+
+| Model | best prefill, ref / fix (t/s) | worst Δ prefill row | median Δ prefill |
+|---|---:|---:|---:|
+| Qwen2-0.5B | 79,901.4 / 80,430.5 | −2.7 % | −0.3 % |
+| Qwen3.5-0.8B | 36,449.5 / 37,145.6 | +0.5 % | +1.1 % |
+| Llama-3.2-3B | 14,094.6 / 14,612.6 | +1.0 % | +4.4 % |
+| Llama-2-7B | 6,191.8 / 6,810.2 | +0.3 % | +5.3 % |
+| Qwen3-8B | 6,139.8 / 6,241.6 | +1.5 % | +2.4 % |
+| Qwen3.5-9B | 5,954.4 / 5,961.0 | −0.0 % | +0.1 % |
+| Qwen3.8-27B | 1,758.5 / 1,761.6 | −0.0 % | +0.1 % |
+| Qwen3-30B-A3B | 10,036.2 / 10,324.3 | +2.3 % | +3.6 % |
+| Qwen3.5-35B-A3B | 7,304.1 / 7,315.0 | −0.2 % | +0.1 % |
+| Qwen3.6-35B-A3B | 7,359.0 / 7,373.4 | −0.1 % | +0.2 % |
+| Qwen3.8-Flash-Next | 1,968.2 / 2,060.9 | −1.9 % | +1.9 % |
+| DeepSeek-V4-Flash | 1,083.9 / 1,120.6 | +0.9 % | +1.6 % |
+
+Decode is within noise everywhere but one row: Qwen3.6-35B-A3B C10×16, 769.5 →
+690.9 t/s (−10.2 %), both runs of each build agreeing — open item #11 in
+`docs/open_items.md`.
 
 ### Qwen2-0.5B reports 0% quantized
 

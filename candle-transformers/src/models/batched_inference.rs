@@ -940,7 +940,7 @@ impl BatchedInferenceSession {
     /// writeback). One state lock per backing for the whole set.
     ///
     /// The decode hot path trusts the cached GPU slot buffer, whose writer
-    /// length self-increments only on decode steps — without this refresh the
+    /// length self-increments only on decode steps — without this mark the
     /// next decode reuses a buffer that still ends where the injection began,
     /// writes its token over the first injected one, and leaves a slot the
     /// host counts unwritten. The buffer is marked here and its writer region

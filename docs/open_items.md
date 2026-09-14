@@ -87,7 +87,7 @@ measured past one. Restored through `conversation.rs::assistant_lead`, with
 - **Mojibake** (`Â§` for `§`, a CP1252 round-trip): `scheduler/mod.rs` ×2 and
   `projection/tests.rs` ×2, all from `80b5541b` (2026-05-31).
 
-### 5. Default-run test times (uncommitted)
+### 5. Default-run test times
 
 Every test in a plain `cargo test` now finishes under ~20 s except `tools_integration`'s
 scenarios (below). None of the slow ones loaded a model; they were **unoptimised host code**.
@@ -114,7 +114,7 @@ scenarios (below). None of the slow ones loaded a model; they were **unoptimised
 - **`zend/README.md`** documents `--model`, and its stale `--disable-summariser` row (no such
   flag) is gone.
 
-### 6. `docs/performance.md` — second width sweep (uncommitted)
+### 6. `docs/performance.md` — second width sweep
 
 All 12 `test_parallel_batched_forwarding*` gates re-run 2026-09-13, one process per model,
 12/12 pass. §3.6 *Width* and §3.7 now report each cell as the better of the two sweeps (†
@@ -155,6 +155,37 @@ second boot that genuinely prefills (a changed catalog) has not been timed, so w
 per-process state slows a real prefill is not established; nothing in this path pays it.
 
 ---
+
+## Open — needs a decision
+
+### 10. One KV threshold row per model, or one per card
+
+`bb363015` re-derived two `*_KV_FACTORS` rows on the RTX 3090 (sm_86), where the
+old pairs failed C10 validation (9/10, three runs each): Qwen3.5-9B 1.07/1.85 →
+0.85/1.45 and Qwen3.8-27B 0.8/2.05 → 0.7/1.4. The 2026-09-15 sweeps on the RTX
+PRO 5000 (sm_120) validated every C row at the new pairs, so one constant holds
+on both cards — at a price on the one the old pairs already passed on: C10
+5.87× → 5.13× on the 9B and 5.56× → 4.81× on the 27B, about 13 % of the top
+rung's compression. The rows' own notes record why the edge moves with the card
+(the int8 numeric path differs per arch, and the 27B's checkpoint is already
+chosen per card). Keeping one row per model buys cross-card safety; a row per
+card buys back the compression. Nothing is wrong either way — it is a choice.
+
+---
+
+## Open — found in the 2026-09-15 sweeps
+
+### 11. Qwen3.6-35B-A3B C10×16 decodes 10 % slower than `81e487b5`
+
+The one row of the fleet sweep (`docs/performance.md` §4, *The decode-slot refresh
+prefill regression*) outside noise: C10 ×16 decode 769.5 t/s on `81e487b5` (runs
+769.5 / 768.3) against 690.9 on `23623c6b` (687.5 / 690.9), both builds on the
+synchronised harness. The same model's C10 ×8, ×32 and ×64 rows are flat or faster
+(×64 1,182.9 → 1,201.6), and so is every other decode row in the fleet, so it is
+specific to this width rather than a decode-path cost. Not yet attributed. Candidates
+to measure: the speculative verify wave's per-sequence slot-state resync (one upload
+per sequence per layer per step since the refresh became a mark + sync) at a width
+where acceptance is low, and the expert-residency ladder's behaviour at ×16.
 
 ## Open — tool scoring (deferred)
 

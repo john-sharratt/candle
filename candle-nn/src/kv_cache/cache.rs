@@ -1208,8 +1208,8 @@ impl KvCache {
     }
 
     /// Commit `add` tokens written at `offset` by a path that is NOT the decode
-    /// kernel — a prefill, a speculative verify block — and bring the cached
-    /// decode slot buffer up to date with them.
+    /// kernel — a prefill, a speculative verify block — and mark the cached
+    /// decode slot buffer for the next sync to bring up to date.
     ///
     /// **Every such commit must come through here.** The decode kernel keeps
     /// its slot buffer current itself: it commits each token's length on the

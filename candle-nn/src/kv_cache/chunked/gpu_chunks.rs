@@ -38,7 +38,7 @@ pub(crate) struct GpuChunks {
     /// Device-side backing: a slot from the region tier's doubling class
     /// family (`slot_state_arena`), **not** an allocation. `None` until the
     /// first non-empty update. Its capacity is a class width, so it is
-    /// generally larger than `buf.len()`; the kernel's walk is bounded by
+    /// generally larger than the live entries; the kernel's walk is bounded by
     /// `n_chunks`, never by the slot.
     slot: Option<SlotStateSlot>,
     /// Stream used for all async H→D copies. `None` for CPU-backed tests even
@@ -55,9 +55,9 @@ pub(crate) struct GpuChunks {
     gen_records: Option<GenRecordsCache>,
     /// Entries currently live.
     ///
-    /// Kept explicitly because both buffers are now **capacities**: the pinned
-    /// host buffer is grow-only and the device slot is a class width, so
-    /// neither length divides down to the entry count any more.
+    /// Kept explicitly because both buffers are **capacities**: the host copy
+    /// is grow-only and the device slot is a class width, so neither length
+    /// divides down to the entry count.
     n_chunks: usize,
     /// The chunks this serialisation REFERENCES, held alive by their gids.
     ///
@@ -219,8 +219,9 @@ impl GpuChunks {
     /// **The caller must have fenced any pending upload first**
     /// ([`Self::fence_uploads`]). Stream ordering covers the copies that
     /// were *enqueued before* this slot changes hands, but it says nothing about
-    /// a copy already in flight whose DESTINATION is this slot. Handing that slot to another sequence lets the
-    /// pending transfer land in a buffer it does not own.
+    /// a copy already in flight whose DESTINATION is this slot. Handing that
+    /// slot to another sequence lets the pending transfer land in a buffer it
+    /// does not own.
     fn release_slot(&mut self) {
         if let (Some(slot), Some(stream)) = (self.slot.take(), self.stream.as_ref()) {
             slot_state_arena::release(stream, slot);
@@ -236,12 +237,13 @@ impl GpuChunks {
     /// the pinned-stager `generation`, returning the copy's device pointer (a
     /// contiguous `TokenSlice` header array the kernel's `get_slice` indexes).
     ///
-    /// The live `gpu` buffer is reallocated whenever a chunk is appended
-    /// (`rebuild_decode` → `resize` → fresh `stream.alloc`, old freed). A caller
-    /// that captures `raw_device_ptr()` and defers its kernel launch — the wave
-    /// prefill builds every per-token metadata snapshot up front, then runs the
-    /// layer loop — would read a freed buffer once a later snapshot crosses a
-    /// chunk boundary. Copying into the generation (whose arena lives for the
+    /// The live slot moves whenever a chunk is appended past its class
+    /// (`rebuild_decode` → `resize` promotes to a wider `slot_state_arena` slot
+    /// and returns the old one to its free list). A caller that captures
+    /// `raw_device_ptr()` and defers its kernel launch — the wave prefill builds
+    /// every per-token metadata snapshot up front, then runs the layer loop —
+    /// would read a slot another sequence may since have claimed once a later
+    /// snapshot crosses a chunk boundary. Copying into the generation (whose arena lives for the
     /// whole forward) makes the pointer stable and pins that token's exact slice
     /// content (per-token write-chunk length included).
     ///

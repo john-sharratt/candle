@@ -545,7 +545,12 @@ fn a_boundary_moved_after_a_commit_does_not_shrink_the_resync() {
     // Synced directly: an ensure would push a fresh writer past the sealed
     // boundary and rebuild the buffer, hiding the region under test.
     let info = backing.resolve_arena_info().unwrap();
-    let (ptrs, _, _) = backing.sync_decode_gpu_chunks(&[(seq, 34)], &info).unwrap();
+    let (ptrs, _, stats) = backing.sync_decode_gpu_chunks(&[(seq, 34)], &info).unwrap();
+    assert_eq!(
+        (stats.rebuilds, stats.reuses),
+        (0, 1),
+        "the sync rebuilt the buffer, so the resync under test never ran"
+    );
     assert_eq!(
         read_lens(&dev, ptrs[0].0, ptrs[0].1 as usize),
         vec![32, 2],

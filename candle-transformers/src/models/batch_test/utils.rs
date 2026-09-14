@@ -1432,9 +1432,10 @@ impl TestParams {
         } else {
             Vec::new()
         };
-        // Start from an idle device: work still queued from the previous
-        // config — its teardown's frees and recycling — would otherwise run
-        // inside this config's prompt timer and be reported as its prefill.
+        // Start from an idle device: this config's session setup (norm weights
+        // re-materialised for its dtype) and its system-prompt prefill are
+        // still queued here, and would otherwise finish inside the prompt
+        // timer and be reported as the prompt's prefill.
         self.device.synchronize()?;
         let prompt_start = std::time::Instant::now();
         let t_prompt_total = profile_now();
