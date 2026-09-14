@@ -13172,7 +13172,7 @@ mod tests {
         let parent = SequenceId(scheduler.session.create_sequence().expect("create"));
         let view = register_turn_view(&mut scheduler, parent);
 
-        let (rtx, rrx) = crossbeam::channel::bounded(1);
+        let (rtx, rrx) = flume::bounded(1);
         scheduler.handle_request(SchedulerRequest::ResetSequence {
             sequence_id: parent,
             response_tx: rtx,

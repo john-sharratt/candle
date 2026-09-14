@@ -3341,7 +3341,7 @@ mod wave_chunk_tests {
 
     /// A dialogue prefill carrying `tokens` and nothing else.
     pub(super) fn dialogue_prefill(seq: SequenceId, tokens: Vec<u32>) -> ActivePrefill {
-        let (event_tx, _event_rx) = crossbeam::channel::unbounded();
+        let (event_tx, _event_rx) = flume::unbounded();
         ActivePrefill {
             work: PrefillWork {
                 sequence_id: seq,
