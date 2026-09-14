@@ -30,6 +30,7 @@
 use npc_map::world::Where;
 use npcd::engine::act::Act;
 use npcd::engine::body::{perform, Outcome};
+use npcd::engine::mission::{Mission, Origin, Todo};
 use npcd::engine::tools::{self, specs_within, Mode, Within};
 use npcd::sim::field::Resource;
 use npcd::sim::seed;
@@ -1331,6 +1332,27 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
             json!({"to":"Wren","what":"the sweep","by":"dusk"}),
         ),
     );
+    for name in offered(&waste, "c1") {
+        if !seen.contains(&name) {
+            seen.push(name);
+        }
+    }
+
+    // `step_done` / `add_step` become reachable only once a body carries a
+    // mission — the same "a state has to exist before its acts do" as `remind`
+    // above. Any character can collect one, so the state is genuinely reachable.
+    waste.with_sim(|s| {
+        s.missions.assign(
+            "c1",
+            Mission::new(
+                "see it through",
+                vec![Todo::new("the one step")],
+                Origin::Random {
+                    routine: "walk-the-halls".into(),
+                },
+            ),
+        )
+    });
     for name in offered(&waste, "c1") {
         if !seen.contains(&name) {
             seen.push(name);

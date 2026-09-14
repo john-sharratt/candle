@@ -128,9 +128,7 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                         "Reported done, and your answer filed: {}",
                         m.mission_text()
                     )),
-                    None => Outcome::Refused(
-                        "You are not carrying a mission to report on.".into(),
-                    ),
+                    None => Outcome::Refused("You are not carrying a mission to report on.".into()),
                 }
             })
         }
@@ -140,15 +138,15 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     "You meant to report it stuck, but did not say why.".into(),
                 );
             };
-            hosted.with_sim(|s| match s.missions.report(body, Verdict::Fail, &why, None) {
-                Some(m) => Outcome::Did(format!(
-                    "Reported as not done, with your reasons: {}",
-                    m.mission_text()
-                )),
-                None => {
-                    Outcome::Refused("You are not carrying a mission to report on.".into())
-                }
-            })
+            hosted.with_sim(
+                |s| match s.missions.report(body, Verdict::Fail, &why, None) {
+                    Some(m) => Outcome::Did(format!(
+                        "Reported as not done, with your reasons: {}",
+                        m.mission_text()
+                    )),
+                    None => Outcome::Refused("You are not carrying a mission to report on.".into()),
+                },
+            )
         }
         "step_done" => {
             let Some(step) = text(a, "step") else {
@@ -165,9 +163,7 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         }
         "add_step" => {
             let Some(step) = text(a, "step") else {
-                return Outcome::Refused(
-                    "You meant to add a step, but did not say what.".into(),
-                );
+                return Outcome::Refused("You meant to add a step, but did not say what.".into());
             };
             hosted.with_sim(|s| match s.missions.add_todo(body, &step) {
                 true => Outcome::Did(format!("Added to your mission: {step}.")),
@@ -2220,7 +2216,11 @@ mod tests {
         });
         assert!(perform(&h, "m1", &act("step_done", json!({ "step": step }))).happened());
         assert!(matches!(
-            perform(&h, "m1", &act("step_done", json!({"step":"a step it never had"}))),
+            perform(
+                &h,
+                "m1",
+                &act("step_done", json!({"step":"a step it never had"}))
+            ),
             Outcome::Refused(_)
         ));
 
@@ -2237,7 +2237,10 @@ mod tests {
         assert!(perform(
             &h,
             "m1",
-            &act("report_done", json!({"account":"the ledger is two years out"}))
+            &act(
+                "report_done",
+                json!({"account":"the ledger is two years out"})
+            )
         )
         .happened());
         assert!(

@@ -610,7 +610,9 @@ mod tests {
         // Once a step is ticked, the pointer moves to the next open one.
         m.check_off("step one");
         assert_eq!(m.next_step(), Some("step two"));
-        assert!(m.standing_text().ends_with("The next thing to do is: step two."));
+        assert!(m
+            .standing_text()
+            .ends_with("The next thing to do is: step two."));
         // Every step done points home to the desk.
         m.check_off("step two");
         assert_eq!(m.next_step(), None);

@@ -150,6 +150,21 @@ pub async fn status(
     Json(json!({ "on_mission": on_mission, "mission": mission })).into_response()
 }
 
+/// One mission, as an operator reads it back.
+fn mission_view(m: &Mission) -> Value {
+    json!({
+        "prompt": m.mission_text(),
+        "open": m.is_open(),
+        "origin": m.origin,
+        "todo": m.todo,
+        "answer": m.answer,
+        "report": m.report.as_ref().map(|r| json!({
+            "outcome": r.outcome.as_str(),
+            "notes": r.notes,
+        })),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::mission_view;
@@ -176,7 +191,11 @@ mod tests {
 
         // Closed: the outcome and answer an operator is asking after.
         m.check_off("read it");
-        m.complete(Outcome::Pass, "it holds", Some("the date is wrong".to_string()));
+        m.complete(
+            Outcome::Pass,
+            "it holds",
+            Some("the date is wrong".to_string()),
+        );
         let closed = mission_view(&m);
         assert_eq!(closed["open"], false);
         assert_eq!(closed["answer"], "the date is wrong");
@@ -184,19 +203,4 @@ mod tests {
         assert_eq!(closed["report"]["notes"], "it holds");
         assert_eq!(closed["todo"][0]["done"], true);
     }
-}
-
-/// One mission, as an operator reads it back.
-fn mission_view(m: &Mission) -> Value {
-    json!({
-        "prompt": m.mission_text(),
-        "open": m.is_open(),
-        "origin": m.origin,
-        "todo": m.todo,
-        "answer": m.answer,
-        "report": m.report.as_ref().map(|r| json!({
-            "outcome": r.outcome.as_str(),
-            "notes": r.notes,
-        })),
-    })
 }

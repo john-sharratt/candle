@@ -4647,7 +4647,10 @@ mod tests {
             nudge.contains("The next thing to do is: go to the archives."),
             "{nudge}"
         );
-        assert_ne!(nudge, NO_MISSION, "the default must give way to the mission");
+        assert_ne!(
+            nudge, NO_MISSION,
+            "the default must give way to the mission"
+        );
     }
 
     /// **The standing task is for the quiet turns, and the situation is not

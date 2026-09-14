@@ -66,7 +66,10 @@ impl Missions {
 
     /// Lodge a mission for a body to collect at the desk. Oldest is drawn first.
     pub fn lodge(&mut self, body: &str, mission: Mission) {
-        self.lodged.entry(body.to_string()).or_default().push(mission);
+        self.lodged
+            .entry(body.to_string())
+            .or_default()
+            .push(mission);
     }
 
     /// Give the body a mission to carry now, replacing any open one it held.
@@ -189,7 +192,10 @@ mod tests {
         assert!(m.check_off("pax", "STEP one"), "trim + case-insensitive");
         assert!(!m.check_off("pax", "step one"), "already done");
         assert!(m.add_todo("pax", "a discovered step"));
-        assert!(!m.add_todo("pax", "  a discovered step  "), "open duplicate");
+        assert!(
+            !m.add_todo("pax", "  a discovered step  "),
+            "open duplicate"
+        );
         assert_eq!(m.active("pax").unwrap().todo.len(), 3);
     }
 
