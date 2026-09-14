@@ -198,6 +198,47 @@ impl Mission {
         Some(lines.join("\n"))
     }
 
+    /// The first step not yet ticked off — the one thing to do next.
+    pub fn next_step(&self) -> Option<&str> {
+        self.todo
+            .iter()
+            .find(|step| !step.done)
+            .map(|step| step.text.trim())
+    }
+
+    /// The mission as a standing instruction — what a character reads each quiet
+    /// turn while it carries one.
+    ///
+    /// The ask, the steps with their progress, and a pointer at the **next**
+    /// unfinished step. A standing task restated every quiet turn must name the
+    /// next thing once rather than describe the whole plan — the lesson recorded
+    /// on [`crate::engine::runtime::NO_MISSION`], where a plan in the most-recent
+    /// window position turned every turn into motion. When every step is done it
+    /// points home to the command desk, so the loop closes on a report rather
+    /// than trailing off.
+    pub fn standing_text(&self) -> String {
+        let mut out = format!("What has been asked of you: {}", self.mission_text());
+        if let Some(tasks) = self.task_text() {
+            out.push_str("\nYou are working through:\n");
+            out.push_str(&tasks);
+        }
+        match self.next_step() {
+            Some(step) => {
+                out.push_str("\nThe next thing to do is: ");
+                out.push_str(step);
+                out.push('.');
+            }
+            // Steps existed and are all done: the work is finished, so the one
+            // thing left is to go and say so.
+            None if !self.todo.is_empty() => out.push_str(
+                "\nEvery step is done. Go back to the command desk and report how it went.",
+            ),
+            // A mission with no steps at all is carried on its ask alone.
+            None => {}
+        }
+        out
+    }
+
     /// A stable content fingerprint of what the character reads — the ask plus
     /// the steps and their ticks. Two missions that render the same text hash
     /// the same, so a change that does not alter the rendered prompt does not
@@ -552,6 +593,30 @@ mod tests {
             },
         );
         assert!(bare.task_text().is_none());
+    }
+
+    #[test]
+    fn standing_text_names_the_ask_the_steps_and_the_next_thing() {
+        let mut m = a_mission();
+        assert_eq!(m.next_step(), Some("step one"));
+        assert_eq!(
+            m.standing_text(),
+            "What has been asked of you: Do the thing.\n\
+             You are working through:\n\
+             [ ] step one\n\
+             [ ] step two\n\
+             The next thing to do is: step one."
+        );
+        // Once a step is ticked, the pointer moves to the next open one.
+        m.check_off("step one");
+        assert_eq!(m.next_step(), Some("step two"));
+        assert!(m.standing_text().ends_with("The next thing to do is: step two."));
+        // Every step done points home to the desk.
+        m.check_off("step two");
+        assert_eq!(m.next_step(), None);
+        assert!(m
+            .standing_text()
+            .ends_with("Go back to the command desk and report how it went."));
     }
 
     #[test]

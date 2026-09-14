@@ -37,6 +37,7 @@ pub mod device;
 pub mod field;
 pub mod item;
 pub mod ledger;
+pub mod missions;
 pub mod phone;
 pub mod posting;
 pub mod record;
@@ -52,6 +53,7 @@ use device::Devices;
 use field::{Field, Resource};
 use item::Pack;
 use ledger::Ledger;
+use missions::Missions;
 use tower::Tower;
 
 /// Everything about a world that is not its map.
@@ -63,6 +65,13 @@ pub struct Sim {
     pub devices: Devices,
     pub field: Field,
     pub ledger: Ledger,
+    /// Which character is carrying which mission — see [`missions`].
+    ///
+    /// `serde(default)` because saved worlds predate the mission system, and a
+    /// world that loads with no missions is one where nobody has been given a
+    /// task yet — the correct reading of an absent field, not a migration.
+    #[serde(default)]
+    pub missions: Missions,
     /// What the world is made of, as the Makers hold it — see [`record`].
     pub record: record::Record,
     /// Every conversation carried on a handset — see [`phone`].

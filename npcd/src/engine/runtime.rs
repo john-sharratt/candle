@@ -772,6 +772,13 @@ impl Runtime {
         // explore and nobody to talk to, and telling it otherwise would be
         // instructing it to do something it cannot.
         let (hosted, body) = self.body_of(npc_id)?;
+        // A carried mission *is* the standing task, so it replaces the "nothing
+        // has been asked of you" default outright — it does not fill a hole that
+        // default was leaving (see [`NO_MISSION`]). The mission's own text names
+        // the next step and, when the steps run out, points home to the desk.
+        if let Some(text) = hosted.sim(|s| s.missions.active(&body).map(|m| m.standing_text())) {
+            return Some(text);
+        }
         // Who is here — which decides *which* standing task this is, and, when
         // there is company, is itself the most useful thing in it. Reading the
         // room already told us the names; the version of this that answered
@@ -4602,6 +4609,45 @@ mod tests {
             .with(|w| w.set_off("m2", at("band-one")).unwrap());
         rt.hosted.get(WORLD).unwrap().tick();
         assert_eq!(rt.nudge_for(1).as_deref(), Some(NO_MISSION));
+    }
+
+    /// **A carried mission is the standing task.** Given a mission, the
+    /// quiet-turn instruction a character reads *is* that mission — the ask, its
+    /// steps, and the next thing to do — not the "nothing has been asked of you"
+    /// default. This is the live path that makes a character follow a mission at
+    /// all: `nudge_for` → `EventKind::Nudge` → the perception the model reads.
+    #[tokio::test]
+    async fn a_character_on_a_mission_reads_the_mission_as_its_standing_task() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        // No mission yet: the default stands.
+        assert_eq!(rt.nudge_for(1).as_deref(), Some(NO_MISSION));
+
+        // Give it a mission, and the standing task becomes the mission.
+        let mission = Mission::new(
+            "Read the record 'the-charge' and check it against the storyline.",
+            vec![
+                Todo::new("go to the archives"),
+                Todo::new("read 'the-charge'"),
+            ],
+            Origin::Lodged {
+                by: "u_op".to_string(),
+            },
+        );
+        rt.hosted
+            .get(WORLD)
+            .unwrap()
+            .with_sim(|s| s.missions.assign("m1", mission));
+
+        let nudge = rt.nudge_for(1).expect("bound");
+        assert!(nudge.starts_with("What has been asked of you:"), "{nudge}");
+        assert!(nudge.contains("the-charge"), "{nudge}");
+        assert!(
+            nudge.contains("The next thing to do is: go to the archives."),
+            "{nudge}"
+        );
+        assert_ne!(nudge, NO_MISSION, "the default must give way to the mission");
     }
 
     /// **The standing task is for the quiet turns, and the situation is not
