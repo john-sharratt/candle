@@ -9028,16 +9028,26 @@ impl Scheduler {
 
     /// Tokens one prefill forward may carry — see [`admit::prefill_pass_budget`].
     ///
-    /// Read per forward rather than once at construction: the model's cap is the
-    /// widest prefill the published tier budget places with nothing else at the
-    /// head, and that budget moves with every claim.
+    /// The model's cap is priced with **no tier bound** (`usize::MAX`): what it
+    /// answers here is how wide a forward the model runs — compute saturation
+    /// and what the KV side can still back — never how much tier this wave has.
+    /// The tier is the rows' job (`build_section_batch`'s `rows_left`,
+    /// `form_wave_group`'s `prefill_rows`), priced against the budget the fill
+    /// published beside the head it actually carries. Pricing the pass against
+    /// that budget too collapsed it to one token whenever the published budget
+    /// read zero — a section batch then advanced one token per wave against the
+    /// least chunk admission had already priced, and a raw prefill ran one
+    /// forward per token.
+    ///
+    /// Read per forward rather than once at construction: the KV side's room
+    /// moves with every claim.
     fn prefill_pass_budget(&self) -> usize {
         admit::prefill_pass_budget(
             self.max_prefill_pass_tokens,
             self.model.prefill_width_cap(
                 self.session.activation_dtype(),
                 WaveWidth::decode(0),
-                self.session.tier_budget_bytes(),
+                usize::MAX,
             ),
         )
     }
@@ -12387,6 +12397,27 @@ mod tests {
         let (seqs, _, _, advances) = scheduler.build_section_batch(0).expect("a batch");
         assert_eq!(seqs.len(), 2, "room for both");
         assert_eq!(advances, vec![200, 200]);
+    }
+
+    /// **The pass budget does not follow the published tier budget.** The tier
+    /// is priced by the rows each wave hands its prefills; a pass budget read
+    /// against the same live budget fell to one token whenever it read zero, so
+    /// every raw prefill ran one forward per token.
+    #[test]
+    fn the_pass_budget_does_not_follow_the_tier_budget() {
+        let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
+        scheduler.session.set_tier_budget_bytes(0);
+        assert_eq!(
+            scheduler.prefill_pass_budget(),
+            512,
+            "no tier: still the target"
+        );
+        scheduler.session.set_tier_budget_bytes(1 << 40);
+        assert_eq!(
+            scheduler.prefill_pass_budget(),
+            512,
+            "a wide tier: the target"
+        );
     }
 
     /// A dialogue prefill of `tokens` tokens as the queue would hold it, with
