@@ -476,9 +476,10 @@ examples:
         let Kind::Group(inner) = &field(&fs, "budget").kind else {
             panic!("not a group: {:?}", field(&fs, "budget").kind);
         };
+        // In the order the author wrote them.
         assert_eq!(
             inner.iter().map(|f| f.key.as_str()).collect::<Vec<_>>(),
-            ["adaptive", "priority"]
+            ["priority", "adaptive"]
         );
         assert_eq!(field(inner, "priority").kind, Kind::Number);
         // And the nesting continues rather than stopping one level down.

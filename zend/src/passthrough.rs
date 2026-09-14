@@ -546,7 +546,7 @@ mod tests {
         assert!(t.system.starts_with("sys\n\n# Tools\n\n"), "{}", t.system);
         assert!(t
             .system
-            .contains(r#"{"function":{"name":"read_files"},"type":"function"}"#));
+            .contains(r#"{"type":"function","function":{"name":"read_files"}}"#));
         assert_eq!(
             t.history,
             vec![ex(

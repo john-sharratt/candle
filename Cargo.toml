@@ -101,7 +101,10 @@ safetensors = "0.4.1"
 base64 = "0.22"
 serde = { version = "1.0.171", features = ["derive"] }
 serde_plain = "1.0.2"
-serde_json = "1.0.99"
+# `preserve_order`: a JSON object keeps the order it was written in. Tool schemas
+# depend on it — the constrained decoder offers optional parameters in declared
+# order, and the tool catalog renders each schema as its author wrote it.
+serde_json = { version = "1.0.99", features = ["preserve_order"] }
 serde_yaml = "0.9"
 # Comment- and format-preserving YAML editing, for authored files a person wrote
 # and expects to still recognise after a save. `serde_yaml` can only
