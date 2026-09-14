@@ -8,6 +8,7 @@
 import { API } from '../lib/api.js';
 import { h, mount, fmtNum, fmtK, ago, worldTime } from '../lib/dom.js';
 import { go, link } from '../lib/router.js';
+import { state as vp } from '../lib/viewport.js';
 import {
   avatar, stateDot, bandChip, pending, empty, toast, kv, bar, lineChart,
   // `modal` was missing, and `authorBelief` calls it — so "Author a belief"
@@ -25,11 +26,20 @@ export async function render(params) {
    * poll. Run on the way out; see the note beside the return. */
   const teardowns = [];
 
-  let npc;
-  try { npc = await API.getNpc(id); }
-  catch (_) { return { el: h('div', { class: 'page' }, empty('◌', 'No such character', id)) }; }
-
-  const sub = await API.getSubstrate(id).catch(() => ({ layers: [] }));
+  /* The character and its substrate layers in one round trip, not two in a row.
+   * Both are needed before the rail can paint, and fetching them in sequence
+   * meant the page sat blank for two round trips — twice as long to first paint
+   * as it needs to be. `getNpc` still decides the not-found page; the substrate
+   * carries its own fallback so a missing one never blocks the character. */
+  let npc, sub;
+  try {
+    [npc, sub] = await Promise.all([
+      API.getNpc(id),
+      API.getSubstrate(id).catch(() => ({ layers: [] })),
+    ]);
+  } catch (_) {
+    return { el: h('div', { class: 'page' }, empty('◌', 'No such character', id)) };
+  }
   const layerCounts = Object.fromEntries((sub.layers || []).map((l) => [l.layer, l]));
   /* The mind's own layers, in the order its projection declares them — never a
    * list this page keeps, so a layer added to `projection.yaml` appears here
@@ -115,6 +125,30 @@ export async function render(params) {
       link(`/npc/${id}/presence`, { class: 'btn primary' }, '◍ In the room')));
   paintHead();
   el.appendChild(head);
+
+  /* On a phone the rail is a hidden drawer, so the whole tab list — Summary,
+   * Pulse, the mind's layers (dreams, acting, reflections…), Manage — would only
+   * be reachable behind the hamburger, and the layers in particular read as
+   * missing. This strip keeps every tab one tap away and in view.
+   *
+   * **Rendered only when the viewport is actually narrow, not hidden by CSS on a
+   * wide one.** A display:none in the stylesheet made the strip's presence depend
+   * on the stylesheet being current — and a browser caches JS and CSS apart, so a
+   * newer script with an older stylesheet showed the strip unstyled on a desktop,
+   * leaking its classes into the page. Deciding here means a wide screen never
+   * puts it in the DOM at all, whatever CSS is loaded; the rail carries the tabs
+   * there. */
+  if (vp.narrow) {
+    el.appendChild(h('nav', { class: 'npc-tabs' },
+      [
+        ['overview', 'Summary'], ['pulse', 'Pulse'], ['messages', 'Messages'],
+        ['presence', 'In the room'],
+        ...declared.map((l) => [l, l[0].toUpperCase() + l.slice(1)]),
+        ['projection', 'Projection'], ['monitor', 'Monitor'], ['manage', 'Manage'],
+      ].map(([key, label]) => link(`/npc/${id}/${key}`, {
+        class: 'npc-tab' + (tab === key ? ' on' : ''),
+      }, label))));
+  }
 
   /// Everything that reads `npc` outside the tab body.
   const repaint = () => { paintRail(); paintHead(); };
