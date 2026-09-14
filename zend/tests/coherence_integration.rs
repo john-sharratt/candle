@@ -33,6 +33,8 @@
 //! cargo test -p zend --test coherence_integration --features cuda -- --nocapture
 //! ```
 
+mod common;
+
 #[cfg(feature = "cuda")]
 mod coherence {
     use std::sync::Arc;
@@ -40,9 +42,10 @@ mod coherence {
     use candle_conversation::SamplingConfig;
     use futures::StreamExt;
 
+    use crate::common::{needs_compaction, production_workspace, run_conv_id};
     use zend::config::DaemonConfig;
     use zend::log_broadcast::LogBus;
-    use zend::session::{StreamItem, ZendSession};
+    use zend::session::{timeline_for, StreamItem, ZendSession};
     use zend::types::{ChatMessage, Role};
 
     /// Generous timeout — model load (Qwen3-30B-A3B) + tool catalog
@@ -102,23 +105,23 @@ mod coherence {
         sampling: Option<SamplingConfig>,
     ) -> (String, usize) {
         let log = LogBus::new();
+        let workspace = production_workspace();
         let config = DaemonConfig {
-            workspace: std::env::current_dir().unwrap(),
+            compact_substrate: needs_compaction(&workspace),
+            workspace,
             port: 0,
             ..Default::default()
         };
+        let conv_id = run_conv_id(conv_id);
         let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
         session.start_loading();
 
-        let messages = vec![ChatMessage {
-            role: Role::User,
-            content: prompt.to_string(),
-        }];
+        let messages = vec![ChatMessage::new(Role::User, prompt)];
         let mut stream = session
             .submit_with_sampling(
                 messages,
                 max_tokens,
-                conv_id.to_string(),
+                conv_id.clone(),
                 sampling,
                 None,
                 None,
@@ -153,6 +156,11 @@ mod coherence {
         }
         eprintln!("\n\n[FINAL RESPONSE — {token_events} token events]\n{response}");
         eprintln!("[STATUS MESSAGES] {status_msgs:?}");
+        // Retire this run's conversation, so the reused workspace does not keep
+        // one per run; compaction reclaims it.
+        if let Some(Err(e)) = session.tombstone_timeline_raw(timeline_for(&conv_id).raw()) {
+            panic!("tombstoning {conv_id}: {e}");
+        }
         (response, token_events)
     }
 

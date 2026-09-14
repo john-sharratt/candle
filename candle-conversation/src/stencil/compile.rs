@@ -24,7 +24,7 @@ pub fn compile(spec: &TreeSpec, vocab: &dyn Vocab) -> Result<StencilTree, BuildE
     Ok(StencilTree::new(
         arena,
         root,
-        vocab.eos(),
+        vocab.end_tokens(),
         vocab.fingerprint(),
         spec.label.clone(),
         bail,

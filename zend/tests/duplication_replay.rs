@@ -26,17 +26,19 @@
 //!   --features cuda replay::repro_dup -- --exact --ignored --nocapture
 //! ```
 
+mod common;
+
 #[cfg(feature = "cuda")]
 mod replay {
-    use std::path::PathBuf;
     use std::sync::Arc;
 
     use candle_conversation::{OptionalState, SamplingConfig, SelectionState, NO_THINK_SELECTOR};
     use futures::StreamExt;
 
+    use crate::common::{needs_compaction, production_workspace};
     use zend::config::DaemonConfig;
     use zend::log_broadcast::LogBus;
-    use zend::session::{StreamItem, ZendSession};
+    use zend::session::{timeline_for, StreamItem, ZendSession};
     use zend::types::ToolMode;
     use zend::types::{ChatMessage, Role};
 
@@ -64,15 +66,13 @@ mod replay {
     }
 
     fn build_session() -> Arc<ZendSession> {
-        // CARGO_MANIFEST_DIR is `<root>/zend`, so its parent is the workspace
-        // (which holds `.substrate/substrate.log`).
-        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("zend has a parent dir")
-            .to_path_buf();
+        // The shared production workspace — never the repo, whose substrate is
+        // the user's live one and would take this test's 13 turns.
+        let workspace = production_workspace();
 
         let log = LogBus::new();
         let config = DaemonConfig {
+            compact_substrate: needs_compaction(&workspace),
             workspace,
             port: 0,
             // Bring the daemon up without the workspace ingest sweep — this test
@@ -92,10 +92,7 @@ mod replay {
     /// Submit one user turn on `conv_id` (argmax sampling) and return the
     /// decoded answer, newline-flattened.
     async fn ask(session: &Arc<ZendSession>, conv_id: &str, prompt: &str) -> String {
-        let messages = vec![ChatMessage {
-            role: Role::User,
-            content: prompt.to_string(),
-        }];
+        let messages = vec![ChatMessage::new(Role::User, prompt)];
         let mut stream = session
             .submit_with_sampling(
                 messages,
@@ -214,6 +211,11 @@ mod replay {
             .unwrap_or(0);
         let conv = format!("repro-dup-{nonce}");
         let rounds = drive_escalating_ladder(&rt, &session, &conv);
+        // Retire this run's conversation, so the reused workspace does not keep
+        // one per run; compaction reclaims it.
+        if let Some(Err(e)) = session.tombstone_timeline_raw(timeline_for(&conv).raw()) {
+            panic!("tombstoning {conv}: {e}");
+        }
         rt.shutdown_background();
 
         let bad = print_ladder("repro-dup", &rounds);

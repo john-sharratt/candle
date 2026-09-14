@@ -23,11 +23,14 @@ pub enum Terminator {
     /// the closing bracket is consumed.
     Balanced { open: u8, close: u8 },
     /// Any JSON value (number, `true`/`false`/`null`, string, array, object) as
-    /// the value of an object field: lookahead-terminated at the first `,` or
-    /// `}` seen at the ENCLOSING object's depth (depth 0), respecting nested
-    /// `[]`/`{}` and strings.  The delimiter is NOT consumed — it belongs to the
-    /// following node.  Guarantees a structurally-valid JSON value without
-    /// enforcing its scalar type.
+    /// the value of an object field, respecting nested `[]`/`{}` and strings.
+    /// A string, array or object that IS the value ends at its own closing
+    /// quote or bracket, which is consumed — the value is complete there, and
+    /// ending it anywhere later lets the model write past it (`["a"]]`). A bare
+    /// scalar is lookahead-terminated at the first `,`, `}` or `]` at the
+    /// ENCLOSING object's depth (depth 0); that delimiter is NOT consumed — it
+    /// belongs to the following node.  Guarantees a structurally-valid JSON
+    /// value without enforcing its scalar type.
     JsonValue,
     /// No byte delimiter at all: `feed` always returns `Continue`.  The span
     /// ends only via a close *token* (`FreeTextSpan::close_token`), an EOS
@@ -208,24 +211,32 @@ impl TerminatorState {
                     self.escaped = true;
                 } else if b == b'"' {
                     self.in_string = false;
+                    // The string that IS the value has closed: it is complete.
+                    if self.depth == 0 {
+                        return Feed::Close { consumed: i + 1 };
+                    }
                 }
                 continue;
             }
             match b {
                 b'"' => self.in_string = true,
                 b'[' | b'{' => self.depth += 1,
-                b']' => self.depth = self.depth.saturating_sub(1),
-                b'}' => {
-                    // At depth 0 this `}` is the ENCLOSING object's close (the
-                    // value is complete) — lookahead, not consumed.
-                    if self.depth == 0 {
-                        return Feed::Close { consumed: i };
-                    }
+                b']' | b'}' if self.depth > 0 => {
                     self.depth -= 1;
+                    // **The array or object that IS the value has closed.** It
+                    // is complete, so the span ends on its bracket. Left open to
+                    // the enclosing `}`, the span let a stray `]` through: a
+                    // `]` at depth 0 was saturated away, and a live Cline call
+                    // came out `{"commands": ["dir …"]]}` — not JSON, so no
+                    // call.
+                    if self.depth == 0 {
+                        return Feed::Close { consumed: i + 1 };
+                    }
                 }
-                // A `,` at depth 0 separates this field from the next —
-                // lookahead, not consumed.
-                b',' if self.depth == 0 => return Feed::Close { consumed: i },
+                // At depth 0 these belong to the enclosing object — the field
+                // separator, its close, or a bracket closing nothing the value
+                // opened — and end a bare scalar. Lookahead, not consumed.
+                b',' | b'}' | b']' if self.depth == 0 => return Feed::Close { consumed: i },
                 _ => {}
             }
         }
@@ -466,19 +477,19 @@ mod tests {
 
     #[test]
     fn value_array_with_inner_commas() {
-        // [1,2,3] — inner commas are at depth 1; closes only on the outer }.
+        // [1,2,3] — inner commas are at depth 1; the array's own ] completes it.
         assert_eq!(
             run(Terminator::JsonValue, &[b"[1,2,3]", b"}"]),
-            (1, Some(0))
+            (0, Some(7))
         );
     }
 
     #[test]
     fn value_object_then_close() {
-        // {"k":1} then the enclosing } — the value's own } is depth 1->0.
+        // {"k":1} — the value's own } (depth 1->0) completes it and is consumed.
         assert_eq!(
             run(Terminator::JsonValue, &[b"{\"k\":1}", b"}"]),
-            (1, Some(0))
+            (0, Some(7))
         );
     }
 
@@ -489,17 +500,38 @@ mod tests {
                 Terminator::JsonValue,
                 &[b"{\"a\":[1,{\"b\":2}],\"c\":3}", b","]
             ),
-            (1, Some(0))
+            (0, Some(23))
         );
     }
 
     #[test]
     fn value_string_with_comma_and_brace_inside() {
-        // A top-level string value: the , and } inside it must be ignored.
+        // A top-level string value: the , and } inside it are ignored, and its
+        // closing quote completes it.
         assert_eq!(
             run(Terminator::JsonValue, &[b"\"a,b}c\"", b","]),
-            (1, Some(0))
+            (0, Some(7))
         );
+    }
+
+    /// The live failure: the model closed its array and wrote another `]`.
+    /// The span ends on the array's own bracket, so the stray one never gets
+    /// into the value — the grammar writes what follows.
+    #[test]
+    fn value_array_is_complete_at_its_own_close() {
+        assert_eq!(
+            run(Terminator::JsonValue, &[b" [\"dir\"]", b"]", b"}"]),
+            (0, Some(8))
+        );
+        // A stray bracket in the same token is left over for the next node.
+        assert_eq!(run(Terminator::JsonValue, &[b"[1]]}"]), (0, Some(3)));
+    }
+
+    /// A `]` at depth 0 closes nothing the value opened: it ends a bare scalar
+    /// as lookahead instead of being absorbed into it.
+    #[test]
+    fn value_stray_close_bracket_ends_a_scalar() {
+        assert_eq!(run(Terminator::JsonValue, &[b"42", b"]"]), (1, Some(0)));
     }
 
     #[test]

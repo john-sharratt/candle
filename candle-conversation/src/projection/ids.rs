@@ -73,13 +73,19 @@ pub enum Reserved {
     /// load phase) so they seed the wide-Q (`Q·Q`) reference substrate without ever
     /// entering a user conversation's projection.
     Calibration,
+    /// OpenAI-passthrough conversations — the client supplies the whole context
+    /// (its own system prompt and history) and the daemon runs it as-is. Their
+    /// own layer/group keep those turns out of every YAML projection; each
+    /// distinct system prompt's frame sections live in a partition of their own
+    /// (see [`super::Builder::for_reserved_corpus`]).
+    Passthrough,
 }
 
 impl Reserved {
     /// Number of reserved kinds — the width of the band at the very top of the
     /// u32 space that is disjoint from the `1..n` ids YAML allocates. Bump this
     /// when adding a `Reserved` variant.
-    pub const COUNT: u32 = 4;
+    pub const COUNT: u32 = 5;
 
     /// Per-kind offset from the top of the u32 range. Slot 0 = `u32::MAX`,
     /// slot 1 = `u32::MAX - 1`, etc.
@@ -89,6 +95,7 @@ impl Reserved {
             Reserved::ToolSummary => 1,
             Reserved::ToolSummaryRestricted => 2,
             Reserved::Calibration => 3,
+            Reserved::Passthrough => 4,
         }
     }
 

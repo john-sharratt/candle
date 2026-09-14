@@ -34,7 +34,7 @@ fn file_write_unicode() {
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "uni.txt"}),
+        json!({"path": "uni.txt", "start_line": 1, "end_line": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&resp), content);
@@ -105,7 +105,7 @@ fn file_write_overwrite_created_false() {
     assert_eq!(r2["created"], false);
     let rd = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "ow.txt"}),
+        json!({"path": "ow.txt", "start_line": 1, "end_line": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&rd), "v2");
@@ -126,7 +126,7 @@ fn file_edit_round_trip() {
     ));
     let rd = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "rt.txt"}),
+        json!({"path": "rt.txt", "start_line": 1, "end_line": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&rd), "hello Rust");
@@ -142,7 +142,7 @@ fn file_write_read_roundtrip() {
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "hello.txt"}),
+        json!({"path": "hello.txt", "start_line": 1, "end_line": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&resp), "hello world");
@@ -167,7 +167,10 @@ fn file_write_creates_vs_overwrites() {
 
 #[test]
 fn file_read_not_found() {
-    let resp = harness::invoke("file_read", json!({"path": "nosuchfile.txt"}));
+    let resp = harness::invoke(
+        "file_read",
+        json!({"path": "nosuchfile.txt", "start_line": 1, "end_line": 200}),
+    );
     harness::expect_error(&resp, "not_found");
 }
 
@@ -191,7 +194,7 @@ fn file_edit_success() {
     assert!(resp["bytes"].as_u64().unwrap() > 0);
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "edit.txt"}),
+        json!({"path": "edit.txt", "start_line": 1, "end_line": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&read), "foo qux baz");
@@ -311,7 +314,7 @@ fn workspace_mount_prefix_normalises_to_the_same_entry() {
     // The same file resolves under either spelling.
     let bare = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs"}),
+        json!({"path": "src/main.rs", "start_line": 1, "end_line": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&bare), "fn main() {}");

@@ -1605,7 +1605,7 @@ impl Scheduler {
                 s.sequence_id,
                 s.section_id,
                 s.seal_block_from,
-                std::sync::Arc::new(s.tokens.to_vec()),
+                Arc::new(s.tokens.to_vec()),
                 s.address,
                 s.debug_name,
                 s.in_collection,
@@ -1644,15 +1644,33 @@ impl Scheduler {
     /// Members are ordered prefills-then-sections and this order is then fixed for
     /// the group's life (the held residual depends on a stable input order).
     fn form_wave_group(&mut self, include_sections: bool) {
-        let mut members: Vec<WaveMember> = (0..self.active_prefills.len())
-            .filter(|&i| {
-                let p = &self.active_prefills[i];
-                p.error.is_none() && p.final_logits.is_none() && p.offset < p.work.tokens.len()
-            })
-            .map(|i| WaveMember::Prefill {
-                seq_id: self.active_prefills[i].work.sequence_id.0,
-            })
-            .collect();
+        // ── Dialogue prefills creep in bounded chunks ────────────────────────
+        //
+        // Each takes at most `max_prefill_pass_tokens` rows, packed under that
+        // same per-forward budget (at least one always admitted), exactly like
+        // the section chunks below; its offset advances at the head and the rest
+        // rides the next group. A prefill used to enter whole: a 15.2k-token
+        // Cline turn asked this wave for a 13.2 GiB transient tier — more than
+        // all the ground below the weight floor on a 16 GB card — so it could
+        // never be placed and failed identically on every retry, after first
+        // stripping the expert cache to its floor trying.
+        let cap = self.max_prefill_pass_tokens;
+        let mut members: Vec<WaveMember> = Vec::new();
+        let mut prefill_tokens = 0usize;
+        for p in &self.active_prefills {
+            if p.error.is_some() || p.final_logits.is_some() || p.offset >= p.work.tokens.len() {
+                continue;
+            }
+            let advance = (p.work.tokens.len() - p.offset).min(cap);
+            if prefill_tokens > 0 && prefill_tokens + advance > cap {
+                break;
+            }
+            members.push(WaveMember::Prefill {
+                seq_id: p.work.sequence_id.0,
+                advance,
+            });
+            prefill_tokens += advance;
+        }
         // ── One adapter per wave ─────────────────────────────────────────────
         //
         // Same rule the decode cohort follows, applied where the prefill group
@@ -1673,7 +1691,6 @@ impl Scheduler {
         members.retain(|m| self.session.sequence_adapter(m.seq_id()) == group_adapter.as_deref());
 
         if include_sections && !members.is_empty() {
-            let cap = self.max_prefill_pass_tokens;
             let mut sec_tokens = 0usize;
             for i in 0..self.active_section_ingests.len() {
                 let s = &self.active_section_ingests[i];
@@ -1700,8 +1717,8 @@ impl Scheduler {
     }
 
     /// Resume the held wave group: rebuild each member's `(seq_id, input tensor)`
-    /// from its live backing (prefill = full token set; section = its stable
-    /// `[offset, offset+advance)` chunk), dropping members that errored/completed.
+    /// from its live backing — both kinds feed their stable
+    /// `[offset, offset+advance)` chunk — dropping members that errored/completed.
     /// Returns the kept members (aligned with `seq_ids`/`inputs`) plus the
     /// `active_prefills` positions of the prefill members (for OOM/error routing).
     #[allow(clippy::type_complexity)]
@@ -1715,7 +1732,7 @@ impl Scheduler {
         let mut prefill_gidxs: Vec<usize> = Vec::new();
         for m in members {
             match m {
-                WaveMember::Prefill { seq_id } => {
+                WaveMember::Prefill { seq_id, advance } => {
                     let Some(i) = self
                         .active_prefills
                         .iter()
@@ -1731,7 +1748,9 @@ impl Scheduler {
                     if self.active_prefills[i].prefill_start.is_none() {
                         self.active_prefills[i].prefill_start = Some(Instant::now());
                     }
-                    let toks: Vec<u32> = self.active_prefills[i].work.tokens[..].to_vec();
+                    let off = self.active_prefills[i].offset;
+                    let end = (off + advance).min(self.active_prefills[i].work.tokens.len());
+                    let toks: Vec<u32> = self.active_prefills[i].work.tokens[off..end].to_vec();
                     match Tensor::new(toks.as_slice(), &self.device).and_then(|t| t.unsqueeze(0)) {
                         Ok(t) => {
                             kept.push(m);
@@ -1773,14 +1792,19 @@ impl Scheduler {
     }
 
     /// Finish a wave group that reached the final layer: `members`/`member_logits`
-    /// are aligned in caller order. Prefill members commit their offset, emit
-    /// staged/progress events and record `final_logits` for promotion to decode;
-    /// section members advance their chunk + record slot tokens (sealed later by
-    /// `finalize_done_section_ingests`). Clears the group.
+    /// are aligned in caller order. Prefill members commit their chunk and emit a
+    /// progress event; the FINAL chunk also emits the staged events and records
+    /// `final_logits` for promotion to decode, while an earlier one leaves the
+    /// prefill active for the next group. Section members advance their chunk +
+    /// record slot tokens (sealed later by `finalize_done_section_ingests`).
+    /// Clears the group.
     fn complete_wave_group(&mut self, members: &[WaveMember], member_logits: &[Tensor]) {
         for (k, m) in members.iter().enumerate() {
             match *m {
-                WaveMember::Prefill { seq_id: sid } => {
+                WaveMember::Prefill {
+                    seq_id: sid,
+                    advance,
+                } => {
                     let Some(i) = self
                         .active_prefills
                         .iter()
@@ -1790,20 +1814,32 @@ impl Scheduler {
                     };
                     let total = self.active_prefills[i].work.tokens.len();
                     let seq_id = self.active_prefills[i].work.sequence_id;
-                    if let Err(e) = self.session.advance_sequence(seq_id.0, total) {
+                    let off = self.active_prefills[i].offset;
+                    let end = (off + advance).min(total);
+                    if let Err(e) = self.session.advance_sequence(seq_id.0, end - off) {
                         self.active_prefills[i].error = Some(ConversationError::Model(e));
                         continue;
                     }
-                    let all_tokens: Vec<u32> = self.active_prefills[i].work.tokens[..].to_vec();
+                    let chunk_tokens: Vec<u32> =
+                        self.active_prefills[i].work.tokens[off..end].to_vec();
                     super::Scheduler::record_slot_tokens(
                         &mut self.slot_tokens,
                         seq_id,
-                        &all_tokens,
+                        &chunk_tokens,
                     );
-                    self.active_prefills[i].offset = total;
+                    self.active_prefills[i].offset = end;
+                    if end < total {
+                        // More to prefill: report progress and ride the next group.
+                        let _ = self.active_prefills[i].work.event_tx.send(
+                            TurnEvent::PrefillProgress {
+                                tokens_done: end,
+                                tokens_total: total,
+                            },
+                        );
+                        continue;
+                    }
                     // Staged calibration prefill: emit every segment's pinned
-                    // projection here at completion (a wave processes the whole
-                    // token set at once).
+                    // projection here, once the last chunk has landed.
                     if let Some(comp) = self.active_prefills[i].work.staged_composition.clone() {
                         let gen_start = self.active_prefills[i].work.assistant_content_start;
                         let offs = self.active_prefills[i].work.projection_offsets.clone();
@@ -1891,7 +1927,7 @@ impl Scheduler {
             let msg = format!("wave group forward failed: {err}");
             for m in members {
                 match *m {
-                    WaveMember::Prefill { seq_id } => {
+                    WaveMember::Prefill { seq_id, .. } => {
                         if let Some(i) = self
                             .active_prefills
                             .iter()
@@ -2355,7 +2391,7 @@ impl Scheduler {
             for (m, inp) in members.iter().zip(inputs.iter()) {
                 let tok = inp.dims().get(1).copied().unwrap_or(0);
                 match m {
-                    WaveMember::Prefill { seq_id } => {
+                    WaveMember::Prefill { seq_id, .. } => {
                         pf_seqs += 1;
                         pf_tok += tok;
                         pf_kv += self.session.sequence_offset(*seq_id).unwrap_or(0);
@@ -2527,8 +2563,11 @@ impl Scheduler {
                 }
                 continue;
             }
+            // A turn that will never decode never finalizes its view, so the
+            // view is released here or not at all.
             if let Some(e) = error {
                 let _ = work.event_tx.send(TurnEvent::Error(e));
+                self.discard_turn_view(work.sequence_id);
                 continue;
             }
             let logits = match final_logits {
@@ -2539,6 +2578,7 @@ impl Scheduler {
                         .send(TurnEvent::Error(ConversationError::Channel(
                             "prefill produced no final logits".into(),
                         )));
+                    self.discard_turn_view(work.sequence_id);
                     continue;
                 }
             };
@@ -2562,7 +2602,7 @@ impl Scheduler {
     /// the turn out immediately on EOS / max_decode_tokens == 0.
     fn finalise_prefill(
         &mut self,
-        work: PrefillWork,
+        mut work: PrefillWork,
         logits: Tensor,
         prefill_ms: f64,
         turn_start: Instant,
@@ -2849,6 +2889,11 @@ impl Scheduler {
             // otherwise steering silently never engages for those calls.
             None => {
                 let d = work.triggers.driver_for(first_token);
+                // A once-trigger (the think block) is spent by firing, so the
+                // rest of the turn decodes that token as text.
+                if let Some(rest) = work.triggers.after_firing(first_token) {
+                    work.triggers = Arc::new(rest);
+                }
                 if let Some(d) = &d {
                     tracing::debug!(
                         target: "candle_conversation::stencil",
@@ -3250,6 +3295,149 @@ mod warm_budget_tests {
     fn default_slack_clears_a_healthy_drain_pipeline() {
         let slack = warm_pipeline_slack_bytes();
         assert!(slack >= 768 * 1024 * 1024, "slack {slack} too small");
+    }
+}
+
+#[cfg(test)]
+mod wave_chunk_tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use super::super::tests::make_test_scheduler;
+    use super::super::*;
+
+    /// A dialogue prefill carrying `tokens` and nothing else.
+    pub(super) fn dialogue_prefill(seq: SequenceId, tokens: Vec<u32>) -> ActivePrefill {
+        let (event_tx, _event_rx) = crossbeam::channel::unbounded();
+        ActivePrefill {
+            work: PrefillWork {
+                sequence_id: seq,
+                tokens: TokenBuffer::from(tokens),
+                prefill_text: String::new(),
+                user_text: String::new(),
+                tags: Vec::new(),
+                user_content_start: 0,
+                user_content_end: 0,
+                assistant_content_start: 0,
+                no_think: false,
+                prefill_assistant_text: String::new(),
+                event_tx,
+                max_decode_tokens: 0,
+                sampling: SamplingConfig::compression(),
+                submitted_at: Instant::now(),
+                reprojection: None,
+                belief: PriorBelief::default(),
+                seal_action: SealAction::None,
+                post_decode_tokens: TokenBuffer::default(),
+                projection_offsets: Vec::new(),
+                staged_composition: None,
+                triggers: Arc::new(TriggerRegistry::new()),
+                turn_grammar: None,
+                free_tool_calls_from_penalties: false,
+            },
+            offset: 0,
+            next_projection: 0,
+            final_logits: None,
+            error: None,
+            prefill_start: None,
+        }
+    }
+
+    /// **A dialogue prefill enters the wave group in pass-sized chunks.** It
+    /// used to enter whole: a 15.2k-token Cline turn needed a 13.2 GiB transient
+    /// tier on a 16 GB card, more than all the ground below the weight floor,
+    /// and failed identically on every retry.
+    #[test]
+    fn a_long_dialogue_prefill_creeps_in_pass_sized_chunks() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let cap = scheduler.max_prefill_pass_tokens;
+        let seq = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(seq, (0..15_000u32).collect()));
+
+        scheduler.form_wave_group(false);
+        let (members, _, inputs, _) = scheduler.build_wave_group_inputs();
+        assert_eq!(members.len(), 1);
+        assert_eq!(
+            inputs[0].dims(),
+            &[1, cap],
+            "the first chunk is one pass wide"
+        );
+
+        // A later group resumes at the committed offset, never from token 0.
+        scheduler.reset_wave_prefill();
+        scheduler.active_prefills[0].offset = 14_800;
+        scheduler.form_wave_group(false);
+        let (_, _, inputs, _) = scheduler.build_wave_group_inputs();
+        let rows = inputs[0].to_vec2::<u32>().expect("u32 rows");
+        assert_eq!(rows[0].len(), 200, "the tail chunk is what remains");
+        assert_eq!(rows[0][0], 14_800, "the chunk starts at the offset");
+    }
+
+    /// Prefills share one pass budget: small ones pack together, and one that
+    /// would carry the pass past the cap waits for the next group.
+    #[test]
+    fn dialogue_prefills_pack_under_one_pass_budget() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let cap = scheduler.max_prefill_pass_tokens;
+        let a = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let b = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let c = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(a, vec![1; 100]));
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(b, vec![1; 100]));
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(c, vec![1; cap]));
+
+        scheduler.form_wave_group(false);
+        let seqs: Vec<usize> = scheduler
+            .wave_prefill_members
+            .iter()
+            .map(|m| m.seq_id())
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![a.0, b.0],
+            "the third would carry the pass past the cap"
+        );
+    }
+}
+
+#[cfg(test)]
+mod turn_view_release_tests {
+    use super::super::tests::{make_test_scheduler, register_turn_view};
+    use super::super::*;
+    use super::wave_chunk_tests::dialogue_prefill;
+
+    /// **An errored turn prefill releases its view.** The error reached the
+    /// caller and the view stayed registered with the parent's prefix borrowed
+    /// — nothing but a completed decode or a reprojection ever released it, and
+    /// an errored turn has neither.
+    #[test]
+    fn an_errored_turn_prefill_releases_its_view() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let parent = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let view = register_turn_view(&mut scheduler, parent);
+        let mut prefill = dialogue_prefill(view, vec![1; 8]);
+        prefill.error = Some(ConversationError::Channel("the wave failed".into()));
+        scheduler.active_prefills.push(prefill);
+
+        scheduler.promote_finished_prefills_to_decodes();
+
+        assert!(scheduler.turn_views.is_empty(), "the view is unregistered");
+        assert!(
+            scheduler.session.sequence_offset(view.0).is_none(),
+            "the view's slot is released"
+        );
+        assert!(
+            scheduler.session.sequence_offset(parent.0).is_some(),
+            "the parent is untouched"
+        );
     }
 }
 

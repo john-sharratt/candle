@@ -75,6 +75,11 @@ pub enum ConstructionError {
     #[error("max_percent < min_percent for {name:?}")]
     MaxLessThanMin { name: String },
 
+    /// A collection member could not be marked mandatory: the section is not in
+    /// the collection, or the collection has no member budget to sit outside.
+    #[error("mandatory collection member: {0}")]
+    MandatoryMember(String),
+
     /// Negative `score_threshold`. Thresholds are eligibility floors.
     #[error("score_threshold for {name:?} must be >= 0, got {value}")]
     NegativeScoreThreshold { name: String, value: f32 },

@@ -53,6 +53,8 @@
 //! extractor only runs on the dialogue model's OWN decode output,
 //! never on retrieved context from another layer.
 
+use candle_conversation::TurnText;
+
 use super::types::Scope;
 use crate::repo_scan::Language;
 
@@ -105,8 +107,9 @@ pub fn render_tool_call(path: &str, scope: &Scope) -> String {
 /// the part turn's second **user** segment — the caller emits it after
 /// [`render_tool_call`] and a role boundary, mirroring how a real tool result
 /// returns in a user turn.  `body` is the verbatim source slice for
-/// `scope.start_line..=scope.end_line`.
-pub fn render_tool_response(path: &str, scope: &Scope, language: Language, body: &str) -> String {
+/// `scope.start_line..=scope.end_line`. The excerpt is literal: a source file
+/// quoting a chat tag reads as its text, never as the control token.
+pub fn render_tool_response(path: &str, scope: &Scope, language: Language, body: &str) -> TurnText {
     // One renderer, shared with the live `file_read` tool
     // (`zend_tools::tools::file::render`), so an ingested response and a runtime
     // one are the same bytes. `total_lines` is the scope's own end: an ingest
@@ -120,7 +123,9 @@ pub fn render_tool_response(path: &str, scope: &Scope, language: Language, body:
         language.fence_tag(),
         body,
     );
-    format!("<tool_response>{excerpt}</tool_response>")
+    TurnText::markup("<tool_response>")
+        .then_literal(excerpt)
+        .then_markup("</tool_response>")
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -192,21 +197,36 @@ mod tests {
 
     #[test]
     fn tool_response_wraps_body_in_tool_response_tags() {
-        let r = render_tool_response("src/x.rs", &scope(1, 1), Language::Rust, "fn alpha() {}\n");
+        let r = render_tool_response("src/x.rs", &scope(1, 1), Language::Rust, "fn alpha() {}\n")
+            .text();
         assert!(r.starts_with("<tool_response>\n"));
         assert!(r.ends_with("</tool_response>"));
     }
 
+    /// The wrapper is markup and the excerpt literal, so a source file that
+    /// quotes `<|im_end|>` or `<think>` reaches the model as those characters.
+    #[test]
+    fn the_excerpt_is_literal_inside_a_markup_wrapper() {
+        let body = "// <think></think><|im_end|>\n";
+        let r = render_tool_response("src/x.rs", &scope(1, 1), Language::Rust, body);
+        let kinds: Vec<(bool, bool)> = r
+            .pieces()
+            .iter()
+            .map(|p| (p.literal, p.text.contains("<|im_end|>")))
+            .collect();
+        assert_eq!(kinds, [(false, false), (true, true), (false, false)]);
+    }
+
     #[test]
     fn tool_response_includes_path_and_range_header() {
-        let r = render_tool_response("src/x.rs", &scope(47, 93), Language::Rust, "x\n");
+        let r = render_tool_response("src/x.rs", &scope(47, 93), Language::Rust, "x\n").text();
         assert!(r.contains("src/x.rs (lines 47-93):"));
     }
 
     #[test]
     fn tool_response_prefixes_each_line_with_line_number() {
         let body = "fn alpha() {\n    return 1;\n}\n";
-        let r = render_tool_response("src/x.rs", &scope(10, 12), Language::Rust, body);
+        let r = render_tool_response("src/x.rs", &scope(10, 12), Language::Rust, body).text();
         assert!(r.contains("10  fn alpha() {"));
         assert!(r.contains("11      return 1;"));
         assert!(r.contains("12  }"));
@@ -228,7 +248,7 @@ mod tests {
             (Language::Html, "html"),
             (Language::Css, "css"),
         ] {
-            let r = render_tool_response("f.x", &scope(1, 1), lang, "// hi\n");
+            let r = render_tool_response("f.x", &scope(1, 1), lang, "// hi\n").text();
             assert!(
                 r.contains(&format!("```{tag}\n")),
                 "expected ```{tag} fence in {r}",
@@ -239,7 +259,7 @@ mod tests {
     #[test]
     fn tool_response_pads_line_numbers_to_widest() {
         let body = "x\ny\nz\n";
-        let r = render_tool_response("src/x.rs", &scope(9998, 10000), Language::Rust, body);
+        let r = render_tool_response("src/x.rs", &scope(9998, 10000), Language::Rust, body).text();
         assert!(r.contains(" 9998  x"));
         assert!(r.contains(" 9999  y"));
         assert!(r.contains("10000  z"));
@@ -248,7 +268,7 @@ mod tests {
     #[test]
     fn tool_response_handles_no_trailing_newline() {
         let body = "fn a() {}";
-        let r = render_tool_response("src/x.rs", &scope(1, 1), Language::Rust, body);
+        let r = render_tool_response("src/x.rs", &scope(1, 1), Language::Rust, body).text();
         let numbered_lines = r
             .lines()
             .filter(|l| l.trim_start().starts_with("1  "))
@@ -260,20 +280,21 @@ mod tests {
     #[test]
     fn tool_response_preserves_tabs_in_indentation() {
         let body = "fn a() {\n\tlet x = 1;\n}\n";
-        let r = render_tool_response("src/x.rs", &scope(1, 3), Language::Rust, body);
+        let r = render_tool_response("src/x.rs", &scope(1, 3), Language::Rust, body).text();
         assert!(r.contains("2  \tlet x = 1;"));
     }
 
     #[test]
     fn tool_response_preserves_utf8_content() {
         let body = "fn greet() { println!(\"héllo — 世界\"); }\n";
-        let r = render_tool_response("src/x.rs", &scope(1, 1), Language::Rust, body);
+        let r = render_tool_response("src/x.rs", &scope(1, 1), Language::Rust, body).text();
         assert!(r.contains("héllo — 世界"));
     }
 
     #[test]
     fn tool_response_plain_text_uses_untagged_fence() {
-        let r = render_tool_response("notes.txt", &scope(1, 1), Language::PlainText, "hello\n");
+        let r =
+            render_tool_response("notes.txt", &scope(1, 1), Language::PlainText, "hello\n").text();
         assert!(r.contains("```\n"));
         assert!(!r.contains("```text"));
     }

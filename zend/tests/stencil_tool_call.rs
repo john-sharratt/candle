@@ -103,7 +103,7 @@ fn full_catalog_compiles_against_real_qwen3_tokenizer() {
     let tok = tokenizers::Tokenizer::from_file(&path).expect("load tokenizer.json");
     // eos/fingerprint are irrelevant to compilation (the tool grammar is not
     // eos-terminated), so any value works.
-    let vocab = HfVocab::new(tok, 0, 0);
+    let vocab = HfVocab::new(tok, &[0], 0);
     let tools = catalog();
     let spec = compile_tool_call_tree(&tools, &ToolCallEnvelope::qwen3())
         .expect("the whole registry compiles to one tree");
@@ -149,7 +149,7 @@ fn close_run_ends_with_eos() {
     let im_end = tok
         .token_to_id("<|im_end|>")
         .expect("<|im_end|> must resolve");
-    let vocab = HfVocab::new(tok, im_end, 0);
+    let vocab = HfVocab::new(tok, &[im_end], 0);
     let close = vocab.encode("}}\n</tool_call><|im_end|>");
     eprintln!("close run = {close:?} (eos = {im_end})");
     assert_eq!(
@@ -425,6 +425,61 @@ fn hallucinated_parameter_is_masked() {
         "tool {:?}: a hallucinated key should be masked, got {err:?}",
         spec.name
     );
+}
+
+// ── file_read's range is mandatory and ordered ──────────────────────────────
+
+/// `file_read` names its lines in `path, start_line, end_line` order — the
+/// schema's `required` order, which is what the tree emits. The properties
+/// object iterates alphabetically, so ordering by it would demand `end_line`
+/// first.
+#[test]
+fn file_read_drives_a_range_in_required_order() {
+    let (tree, vocab) = build_tree();
+    for (path, start, end) in [
+        ("zend/src/prompts/projection.yaml", 598, 630),
+        ("src/auth/handler.rs", 1, 200),
+    ] {
+        let target = format!(
+            "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": \"{path}\", \
+             \"start_line\": {start}, \"end_line\": {end}}}}}\n</tool_call>"
+        );
+        let out = drive(Arc::clone(&tree), &target, &vocab)
+            .unwrap_or_else(|e| panic!("{path} {start}-{end} must drive, got {e:?}"));
+        let parsed: serde_json::Value = serde_json::from_str(json_body(&out)).unwrap();
+        assert_eq!(parsed["arguments"]["path"], path);
+        assert_eq!(parsed["arguments"]["start_line"], start);
+        assert_eq!(parsed["arguments"]["end_line"], end);
+    }
+}
+
+/// **A read without its range cannot be expressed.** With the range optional
+/// the model closed the call after `path` even when its reasoning had planned
+/// lines 598-630 — measured live, six identical calls came back with lines
+/// 1-200 and the answer was then guessed. The keys are required, so they are
+/// prefilled statics: closing the object early lands where `"start_line":` is.
+#[test]
+fn file_read_cannot_close_without_its_range() {
+    let (tree, vocab) = build_tree();
+    for args in [
+        r#""path": "a.rs""#,
+        r#""path": "a.rs", "start_line": 1"#,
+        r#""path": "a.rs", "end_line": 200"#,
+    ] {
+        let target = format!(
+            "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{{args}}}}}\n</tool_call>"
+        );
+        match drive(Arc::clone(&tree), &target, &vocab) {
+            Ok(out) => panic!("{args}: a read without its range drove to completion: {out}"),
+            Err(err) => assert!(
+                matches!(
+                    err,
+                    DriveErr::PrefillMismatch { .. } | DriveErr::MaskRejected { .. }
+                ),
+                "{args}: got {err:?}"
+            ),
+        }
+    }
 }
 
 // ── Negative: a wrong boolean / wrong enum value is rejected ────────────────

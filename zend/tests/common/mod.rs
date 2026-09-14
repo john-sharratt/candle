@@ -26,11 +26,14 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle::Device;
 use candle_conversation::models::Model;
 use candle_conversation::persistence::content_hash::ContentHash;
 use candle_conversation::persistence::record::SnapshotPayload;
+use candle_conversation::persistence::SUBSTRATE_DIR;
 use candle_conversation::projection::{self, TimelineId};
 use candle_conversation::{ConversationEngine, SamplingConfig, Sequence, SequenceConfig};
 
@@ -288,6 +291,76 @@ impl Default for Workspace {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ── The production-model workspace ───────────────────────────────────────────
+
+/// The workspace every production-model daemon test boots on:
+/// `target/tmp/zend_production_ws`, one directory shared by every test binary.
+///
+/// **Never the source tree.** A daemon writes its substrate, logs and uploads
+/// into its workspace. Booting on the repo root writes into the user's live
+/// substrate; booting on `current_dir()` — the crate directory under
+/// `cargo test` — is how a 3.2 GB `zend/.substrate` came to sit in the tree.
+///
+/// **Not a fresh temp dir either.** The tool catalog calibrates into the
+/// substrate — ~17 min for the production model on the 16 GB card — and a
+/// fresh workspace would pay that on every run. Kept here it is paid once and
+/// every later boot resumes it. A workspace admits one daemon at a time, which
+/// these `#[ignore]`d tests honour by being run by name, one at a time.
+pub fn production_workspace() -> PathBuf {
+    let ws = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("zend_production_ws");
+    std::fs::create_dir_all(&ws).expect("create the production workspace");
+    ws
+}
+
+/// Past this size a reused workspace is compacted on its next boot.
+///
+/// Every boot re-seals the whole tool catalog into the redo log. The section
+/// streams are content-addressed, so each boot's records supersede the last
+/// boot's rather than adding live data — but a test daemon lives far too
+/// briefly for background maintenance to reclaim them, and left alone
+/// `tools_integration`'s workspace grew ~140 MB a boot (4.83 GB before its
+/// first compaction). A forced compaction on load sheds the dead records.
+///
+/// That workspace's live store — mostly the calibration corpus — is ~1.2 GB,
+/// so the bound sits above it. Below it every boot pays a ~2 s rewrite that
+/// reclaims nothing (measured at 256 MiB: 1.7–2.2 s a boot, size unchanged).
+pub const COMPACT_ABOVE_BYTES: u64 = 2 << 30;
+
+/// Bytes the workspace's redo log occupies on disk.
+pub fn substrate_bytes(ws: &Path) -> u64 {
+    std::fs::read_dir(ws.join(SUBSTRATE_DIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// Whether a reused workspace is compacted on this boot.
+pub fn needs_compaction(ws: &Path) -> bool {
+    substrate_bytes(ws) > COMPACT_ABOVE_BYTES
+}
+
+/// `base` made unique to this test process.
+///
+/// A reused workspace persists across runs, so a fixed id would resume every
+/// earlier run's conversation — its history and its recurrent memory — and the
+/// test would no longer be the one prompt it names. Retire the conversation
+/// when done (`ZendSession::tombstone_timeline_raw`) so the workspace does not
+/// keep one per run; compaction reclaims it.
+pub fn run_conv_id(base: &str) -> String {
+    static RUN: OnceLock<u128> = OnceLock::new();
+    let run = *RUN.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is past the epoch")
+            .as_nanos()
+    });
+    format!("{base}-{run}")
 }
 
 /// Block until the engine has finished rebuilding the substrate from the redo

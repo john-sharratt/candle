@@ -1940,9 +1940,11 @@ pub(super) struct ActiveSectionIngest {
 /// backing collection can't invalidate it mid-creep.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum WaveMember {
-    /// Dialogue-turn prefill — resolved in `active_prefills`; its full token set
-    /// flows through the layers and it is promoted to decode at the head.
-    Prefill { seq_id: usize },
+    /// Dialogue-turn prefill chunk — resolved in `active_prefills`; covers
+    /// `[offset, offset + advance)` of its token set (offset is stable until the
+    /// head, where the chunk is committed). The final chunk is promoted to
+    /// decode; an earlier one leaves the prefill active for the next group.
+    Prefill { seq_id: usize, advance: usize },
     /// Section-ingest chunk — resolved in `active_section_ingests`; covers
     /// `[offset, offset + advance)` (offset is stable until the head, where the
     /// chunk is advanced + sealed). Rides the cohort's creep so its expert loads
@@ -1954,7 +1956,7 @@ impl WaveMember {
     /// The session sequence this member occupies, whichever kind it is.
     pub(super) fn seq_id(&self) -> usize {
         match self {
-            WaveMember::Prefill { seq_id } => *seq_id,
+            WaveMember::Prefill { seq_id, .. } => *seq_id,
             WaveMember::Section { seq_id, .. } => *seq_id,
         }
     }
@@ -4004,6 +4006,10 @@ impl Scheduler {
 
             SchedulerRequest::FreeSequence { sequence_id } => {
                 tracing::debug!(target: "sched", "free_sequence {}", sequence_id);
+                // A turn view borrows this slot's blocks, so it cannot outlive
+                // them; and a view freed directly takes its registration with it.
+                self.discard_turn_views_of(sequence_id);
+                self.turn_views.remove(&sequence_id);
                 if let Err(e) = self.session.free_sequence(sequence_id.0) {
                     tracing::warn!("failed to free sequence {}: {}", sequence_id, e);
                 }
@@ -4054,6 +4060,8 @@ impl Scheduler {
                 sequence_id,
                 response_tx,
             } => {
+                // A turn view borrows the prefix this reset discards.
+                self.discard_turn_views_of(sequence_id);
                 let result = self
                     .session
                     .reset_sequence(sequence_id.0)
@@ -5960,7 +5968,9 @@ impl Scheduler {
         // frees its slot after its prefill has already drained out of the cohort,
         // so `was_member` is false and the held cohort is untouched.
         let was_member = self.wave_prefill_members.iter().any(|m| match m {
-            WaveMember::Prefill { seq_id } | WaveMember::Section { seq_id, .. } => *seq_id == id.0,
+            WaveMember::Prefill { seq_id, .. } | WaveMember::Section { seq_id, .. } => {
+                *seq_id == id.0
+            }
         });
         if was_member {
             self.reset_wave_prefill();
@@ -5985,6 +5995,48 @@ impl Scheduler {
         // its id is recycled (see [`Self::purge_freed_slot_scheduling_state`]).
         self.purge_freed_slot_scheduling_state(slot);
         self.prune_ingest_timeline(freed_target);
+    }
+
+    /// Drop a turn view that will never finish its decode — its prefill failed,
+    /// or the parent it borrows from is going away. Nothing on the view was
+    /// completed, so its K/V is abandoned rather than transferred and its model
+    /// state released rather than moved onto the parent.
+    ///
+    /// A view is otherwise released only when its decode completes or a
+    /// reprojection swaps it. An errored turn did neither, so its view kept the
+    /// parent's whole projected prefix borrowed for the daemon's lifetime, and
+    /// a failed wave never gave that KV back.
+    fn discard_turn_view(&mut self, view_id: SequenceId) {
+        if self.turn_views.remove(&view_id).is_none() {
+            return;
+        }
+        if let Err(e) = self.session.free_sequence(view_id.0) {
+            tracing::warn!("failed to free turn view {}: {}", view_id, e);
+        }
+        if let Err(e) = self.model.release_sequence(view_id.0) {
+            tracing::warn!(
+                "failed to release model state for turn view {}: {}",
+                view_id,
+                e
+            );
+        }
+        self.sampling_states.remove(&view_id);
+        self.slot_tokens.remove(&view_id);
+        self.slot_projection_state.remove(&view_id);
+        self.purge_freed_slot_scheduling_state(view_id);
+    }
+
+    /// [`Self::discard_turn_view`] for every view borrowing from `parent_id`.
+    fn discard_turn_views_of(&mut self, parent_id: SequenceId) {
+        let views: Vec<SequenceId> = self
+            .turn_views
+            .iter()
+            .filter(|(_, v)| v.parent_id == parent_id)
+            .map(|(id, _)| *id)
+            .collect();
+        for view in views {
+            self.discard_turn_view(view);
+        }
     }
 
     /// Drop a freed slot's timeline from [`Self::ingest_timelines`] once no
@@ -12739,6 +12791,66 @@ mod tests {
         );
     }
 
+    /// Carve a turn view over `parent` and register it the way SubmitTurn does.
+    pub(super) fn register_turn_view(scheduler: &mut Scheduler, parent: SequenceId) -> SequenceId {
+        let (view, borrowed) = scheduler.create_view(parent, &[]).expect("carve");
+        scheduler.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: parent,
+                original_borrowed: borrowed,
+                turn_start_parent_blocks: borrowed.0,
+                question_tokens: 0,
+            },
+        );
+        view
+    }
+
+    /// **A turn view cannot outlive the parent it borrows from.** Freeing the
+    /// parent used to leave the view registered and its slot live, holding the
+    /// parent's prefix borrowed with nothing left to release it.
+    #[test]
+    fn freeing_a_parent_frees_its_turn_view() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let parent = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let view = register_turn_view(&mut scheduler, parent);
+
+        scheduler.handle_request(SchedulerRequest::FreeSequence {
+            sequence_id: parent,
+        });
+
+        assert!(scheduler.turn_views.is_empty(), "the view is unregistered");
+        assert!(
+            scheduler.session.sequence_offset(view.0).is_none(),
+            "the view's slot is released"
+        );
+    }
+
+    /// A reset discards the prefix a turn view borrows, so it takes the view.
+    #[test]
+    fn resetting_a_parent_frees_its_turn_view() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let parent = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let view = register_turn_view(&mut scheduler, parent);
+
+        let (rtx, rrx) = crossbeam::channel::bounded(1);
+        scheduler.handle_request(SchedulerRequest::ResetSequence {
+            sequence_id: parent,
+            response_tx: rtx,
+        });
+        rrx.recv().expect("reset response").expect("reset ok");
+
+        assert!(scheduler.turn_views.is_empty(), "the view is unregistered");
+        assert!(
+            scheduler.session.sequence_offset(view.0).is_none(),
+            "the view's slot is released"
+        );
+        assert!(
+            scheduler.session.sequence_offset(parent.0).is_some(),
+            "the reset parent stays live"
+        );
+    }
+
     /// **A resumed slot seeds its carried belief from the recovered selection
     /// events — the same fold the live seal harvest performs.**
     ///
@@ -12861,7 +12973,10 @@ mod tests {
         // otherwise the recycled slot id re-enters the next wave-group assembly
         // alongside the stale member and trips the "appears in more than one
         // group" guard.
-        scheduler.wave_prefill_members = vec![WaveMember::Prefill { seq_id: seq_id.0 }];
+        scheduler.wave_prefill_members = vec![WaveMember::Prefill {
+            seq_id: seq_id.0,
+            advance: 1,
+        }];
         scheduler.wave_prefill_cursor = 7;
 
         scheduler.handle_request(SchedulerRequest::FreeSequence {
@@ -12887,7 +13002,10 @@ mod tests {
         // A DIFFERENT slot is the sole cohort member. Freeing `freed` must leave
         // the held cohort untouched — resetting it on every unrelated free would
         // throw away the survivors' partial prefill progress each wave.
-        scheduler.wave_prefill_members = vec![WaveMember::Prefill { seq_id: member.0 }];
+        scheduler.wave_prefill_members = vec![WaveMember::Prefill {
+            seq_id: member.0,
+            advance: 1,
+        }];
         scheduler.wave_prefill_cursor = 3;
 
         scheduler.handle_request(SchedulerRequest::FreeSequence { sequence_id: freed });

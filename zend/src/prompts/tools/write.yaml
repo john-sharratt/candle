@@ -38,8 +38,8 @@ parameters:
       minLength: 1
       type: string
   required:
-  - content
   - path
+  - content
   title: WriteRequest
   type: object
 examples:
@@ -61,7 +61,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "write", "arguments": {"content": "[logging]\nlevel = \"info\"\noutput = \"stdout\"\nformat = \"time: {asctime} level: {level} message: {message}\"\n", "path": "workspace/config.toml"}}
+  <|projection|>{"name": "write", "arguments": {"path": "workspace/config.toml", "content": "[logging]\nlevel = \"info\"\noutput = \"stdout\"\nformat = \"time: {asctime} level: {level} message: {message}\"\n"}}
   </tool_call><|projection|>
 - |-
   write 'hello world' to /workspace/notes/greeting.txt<|im_end|>
@@ -75,7 +75,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "write", "arguments": {"content": "hello world", "path": "/workspace/notes/greeting.txt"}}
+  <|projection|>{"name": "write", "arguments": {"path": "/workspace/notes/greeting.txt", "content": "hello world"}}
   </tool_call><|projection|>
 - |-
   create /workspace/data/users.json containing exactly an empty JSON object: {}<|im_end|>
@@ -89,13 +89,13 @@ examples:
 
   <|projection|>So, the arguments for the tool call would be:
   - name: write
-  - arguments: {"content": "{}", "path": "workspace/data/users.json"}
+  - arguments: {"path": "workspace/data/users.json", "content": "{}"}
 
   I should format this into the required JSON structure inside the tool_call tags.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "write", "arguments": {"content": "{\n    \"\": \"\"\n}", "path": "workspace/data/users.json"}}
+  <|projection|>{"name": "write", "arguments": {"path": "workspace/data/users.json", "content": "{\n    \"\": \"\"\n}"}}
   </tool_call><|projection|>
 - |-
   create /workspace/README.md with the title '# Acme API'<|im_end|>
@@ -109,7 +109,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "write", "arguments": {"content": "# Acme API", "path": "/workspace/README.md"}}
+  <|projection|>{"name": "write", "arguments": {"path": "/workspace/README.md", "content": "# Acme API"}}
   </tool_call><|projection|>
 - |-
   drop a .gitignore at /workspace/.gitignore that ignores target/ and *.log<|im_end|>
@@ -130,7 +130,7 @@ examples:
   <|projection|></think>
 
   <tool_call>
-  <|projection|>{"name": "write", "arguments": {"content": "target/\n*.log", "path": "/workspace/.gitignore"}}
+  <|projection|>{"name": "write", "arguments": {"path": "/workspace/.gitignore", "content": "target/\n*.log"}}
   </tool_call><|projection|>
 - |-
   can you save a shell script to /workspace/scripts/deploy.sh that just echoes "deploying"<|im_end|>
@@ -169,8 +169,8 @@ examples:
   {
     "name": "write",
     "arguments": {
-      "content": "#!/bin/bash\necho 'deploying'",
-      "path": "/workspace/scripts/deploy.sh"
+      "path": "/workspace/scripts/deploy.sh",
+      "content": "#!/bin/bash\necho 'deploying'"
     }
   }
 
@@ -195,7 +195,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "write", "arguments": {"content": "#!/bin/bash\necho 'deploying'", "path": "/workspace/scripts/deploy.sh"}}
+  <|projection|>{"name": "write", "arguments": {"path": "/workspace/scripts/deploy.sh", "content": "#!/bin/bash\necho 'deploying'"}}
   </tool_call><|projection|>
 - |-
   overwrite /workspace/VERSION so it contains only the text 2.4.1<|im_end|>
@@ -205,7 +205,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "write", "arguments": {"content": "2.4.1", "path": "/workspace/VERSION"}}
+  <|projection|>{"name": "write", "arguments": {"path": "/workspace/VERSION", "content": "2.4.1"}}
   </tool_call><|projection|>
 - |-
   put a Dockerfile in /workspace/Dockerfile starting FROM rust:1.79 as the base image<|im_end|>
@@ -234,8 +234,8 @@ examples:
   {
    <|projection|> "name": "write",
     "arguments": {
-      "content": "FROM rust:1.79\n",
-      "path": "workspace/Dockerfile"
+      "path": "workspace/Dockerfile",
+      "content": "FROM rust:1.79\n"
     }
   }
 
@@ -245,7 +245,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "write", "arguments": {"content": "FROM rust:1.79\nWORKDIR /app\nCOPY . .\nRUN cargo build --release\nCMD [\"./target/release/my_app\"]", "path": "workspace/Dockerfile"}}
+  <|projection|>{"name": "write", "arguments": {"path": "workspace/Dockerfile", "content": "FROM rust:1.79\nWORKDIR /app\nCOPY . .\nRUN cargo build --release\nCMD [\"./target/release/my_app\"]"}}
   </tool_call><|projection|>
 - |-
   create a notes.md at the project root summarising what we found<|im_end|>

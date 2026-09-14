@@ -164,10 +164,7 @@ mod wave {
         prompt: &str,
         max_tokens: usize,
     ) -> (usize, String) {
-        let messages = vec![ChatMessage {
-            role: Role::User,
-            content: prompt.to_string(),
-        }];
+        let messages = vec![ChatMessage::new(Role::User, prompt)];
         let mut stream = session
             .submit(
                 messages,

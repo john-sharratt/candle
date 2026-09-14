@@ -167,6 +167,12 @@ pub struct SamplingConfig {
     /// `-1` = disabled.
     pub segment_open_token_id: i32,
 
+    /// Token ID of the tool-call opener (`<tool_call>`), resolved beside the
+    /// segment tokens. Sampled inside an open segment it is committed as the
+    /// segment close instead, so a call never starts inside the reasoning
+    /// block. `-1` = disabled.
+    pub tool_call_open_token_id: i32,
+
     /// Per-segment token count where the segment-close ramp begins (e.g. 150).
     pub segment_close_ramp_start: i32,
 
@@ -298,6 +304,7 @@ impl Default for SamplingConfig {
             segment_close_boost: 0.0,
             segment_close_token_id: -1,
             segment_open_token_id: -1,
+            tool_call_open_token_id: -1,
             segment_close_ramp_start: 0,
             segment_close_ramp_len: 0,
             segment_close_max_multiplier: 1.0,
@@ -939,7 +946,8 @@ impl SamplingConfig {
         self
     }
 
-    /// Resolve `<think>` / `</think>` token IDs from the tokenizer.
+    /// Resolve `<think>` / `</think>` / `<tool_call>` token IDs from the
+    /// tokenizer.
     ///
     /// Called automatically by the engine builder after loading the
     /// tokenizer.  If the tokens are not found, EOT boost is silently
@@ -952,6 +960,10 @@ impl SamplingConfig {
         if let Some(id) = tokenizer.token_to_id("<think>") {
             self.segment_open_token_id = id as i32;
             tracing::trace!("Resolved <think> token ID: {}", id);
+        }
+        if let Some(id) = tokenizer.token_to_id("<tool_call>") {
+            self.tool_call_open_token_id = id as i32;
+            tracing::trace!("Resolved <tool_call> token ID: {}", id);
         }
         // Resolve sentence-end token IDs for graceful_segment_close_after.
         // We probe both the bare character and common BPE compound forms.
@@ -1793,6 +1805,35 @@ impl Default for SchedulerConfig {
     }
 }
 
+/// Total VRAM at which a card takes 4096-token prefill forwards: the 24 GB
+/// class. A card reports a little under its nameplate (a 3090 reads ~23.7 GiB),
+/// so the bar sits below 24 GiB rather than on it.
+pub const PREFILL_4096_MIN_TOTAL_VRAM_BYTES: u64 = 22 * (1 << 30);
+
+/// Total VRAM at which a card takes 8192-token prefill forwards — the model's
+/// `MAX_PREFILL_TOKENS` ceiling: the 64 GB class and up (the 72 GB RTX PRO
+/// 5000 among them). Below 64 GiB for the same nameplate reason.
+pub const PREFILL_8192_MIN_TOTAL_VRAM_BYTES: u64 = 60 * (1 << 30);
+
+impl SchedulerConfig {
+    /// The per-forward prefill token target for a card with `total_vram_bytes`.
+    ///
+    /// The 2048 default is the 16 GB answer: a wider forward is faster alone
+    /// but its transient tier and in-flight KV narrow admission until the wide
+    /// forwards stop paying for what they starve (see [`Self::default`]). A
+    /// bigger card has the ground to carry the wider forward without that
+    /// trade — 4096 rows need ~3.5 GiB of transient tier, 8192 ~7 GiB.
+    pub fn prefill_pass_tokens_for_vram(total_vram_bytes: u64) -> usize {
+        if total_vram_bytes >= PREFILL_8192_MIN_TOTAL_VRAM_BYTES {
+            8192
+        } else if total_vram_bytes >= PREFILL_4096_MIN_TOTAL_VRAM_BYTES {
+            4096
+        } else {
+            SchedulerConfig::default().large_prefill_max_tokens
+        }
+    }
+}
+
 /// Pick a reasonable `max_hot_turns` ceiling from arena dimensions and
 /// expected turn length.
 ///
@@ -1961,10 +2002,38 @@ mod scheduler_config_tests {
         // The scheduler per-forward target sits at the point the parallel
         // scope-ingest reliably fills every forward (amortization, design §6),
         // not chunked at 512 nor stalled waiting for a 4096-token forward the
-        // reduced-scope scope KV rarely reaches. Must stay ≤ the model-side
-        // `MAX_PREFILL_TOKENS` ceiling (4096).
+        // reduced-scope scope KV rarely reaches on a 16 GB card. Must stay ≤ the
+        // model-side `MAX_PREFILL_TOKENS` ceiling (8192).
         assert_eq!(SchedulerConfig::default().large_prefill_max_tokens, 2048);
-        assert!(SchedulerConfig::default().large_prefill_max_tokens <= 4096);
+        assert!(SchedulerConfig::default().large_prefill_max_tokens <= 8192);
+    }
+
+    /// The prefill forward grows with the card: 2048 on 16 GB, 4096 on the
+    /// 24 GB class, 8192 on 64 GB and up — judged on what a card REPORTS, which
+    /// is a little under its nameplate.
+    #[test]
+    fn prefill_forward_is_sized_to_the_card() {
+        const GIB: u64 = 1 << 30;
+        let tokens = SchedulerConfig::prefill_pass_tokens_for_vram;
+        assert_eq!(tokens(0), 2048, "no device reading keeps the default");
+        assert_eq!(tokens(16 * GIB), 2048, "RTX 4090 Mobile");
+        assert_eq!(
+            tokens(23 * GIB + 700 * (1 << 20)),
+            4096,
+            "RTX 3090 reports ~23.7 GiB"
+        );
+        assert_eq!(
+            tokens(63 * GIB + 512 * (1 << 20)),
+            8192,
+            "a 64 GB card reports under 64 GiB"
+        );
+        assert_eq!(tokens(72 * GIB), 8192, "RTX PRO 5000");
+        for gib in [0, 16, 24, 64, 72, 96] {
+            assert!(
+                tokens(gib * GIB) <= 8192,
+                "never past the model's MAX_PREFILL_TOKENS"
+            );
+        }
     }
 }
 

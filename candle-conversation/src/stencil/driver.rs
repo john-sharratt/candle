@@ -284,6 +284,46 @@ mod tests {
         String::from_utf8(out).unwrap()
     }
 
+    const COMMANDS: &str = r#"[{"name":"run_commands","params":[
+        {"name":"commands","type":"array","required":true}]}]"#;
+
+    /// An array argument is the model's from its leading space on: the call
+    /// reads exactly as it would have been written unsteered.
+    #[test]
+    fn an_array_argument_is_written_by_the_model_from_its_space() {
+        let v = TestVocab::new();
+        let target = "<tool_call>\n{\"name\": \"run_commands\", \"arguments\": \
+                      {\"commands\": [\"pwd\", \"ls\"]}}\n</tool_call>";
+        assert_eq!(follow(tool_tree(COMMANDS), target, &v), target);
+    }
+
+    /// **The key stops where the model's own token begins.** A value with no
+    /// lead-in is prefilled up to `":` and no further, so the model writes
+    /// ` [` itself. Prefilled through a bare space, it was left mid-token: calls
+    /// came out `"commands":  [` with the space doubled, and on one Cline turn
+    /// the first token for the value was a space and a closer, which ended the
+    /// value empty — `{"commands":  }}`, not a call.
+    #[test]
+    fn a_value_without_a_lead_in_is_keyed_up_to_the_colon() {
+        let v = TestVocab::new();
+        let mut driver = StencilDriver::new(tool_tree(COMMANDS));
+        let mut text: Vec<u8> = Vec::new();
+        loop {
+            match driver.step() {
+                StepMask::Prefill(run) => text.extend_from_slice(&v.decode(&run)),
+                StepMask::Branch(set) => {
+                    let t = set.tokens()[0];
+                    text.extend_from_slice(&v.token_bytes(t));
+                    driver.accept(t, &v.token_bytes(t));
+                }
+                StepMask::Free { .. } => break,
+                StepMask::Done => panic!("the value was never decoded"),
+            }
+        }
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.ends_with("{\"commands\":"), "{text:?}");
+    }
+
     #[test]
     fn drives_a_multi_tool_call_with_prefilled_statics() {
         let v = TestVocab::new();
@@ -345,8 +385,9 @@ mod tests {
                     text.starts_with("<tool_call>\n{\"name\": \"ping\""),
                     "unexpected run: {text:?}"
                 );
+                // Up to the colon: the value's leading space is the model's.
                 assert!(
-                    text.ends_with("\"n\": "),
+                    text.ends_with("\"n\":"),
                     "run should reach the value: {text:?}"
                 );
             }
