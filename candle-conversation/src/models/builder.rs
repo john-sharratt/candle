@@ -150,6 +150,9 @@ pub struct ModelBuilder {
     ///
     /// Empty by default. See [`ModelBuilder::lora`].
     loras: Vec<(String, PathBuf)>,
+    /// The checkpoint's own `general.name`, once a build has read its header —
+    /// what this build is shown as. See [`Self::display_name`].
+    gguf_name: Option<String>,
 }
 
 impl ModelBuilder {
@@ -180,6 +183,7 @@ impl ModelBuilder {
             expert_pack_dir: None,
             prefill_pass_tokens: None,
             loras: Vec::new(),
+            gguf_name: None,
             spec,
         }
     }
@@ -1020,6 +1024,82 @@ impl ModelBuilder {
         }
     }
 
+    /// The name to show for this build: the checkpoint's own `general.name` once
+    /// a build has read its header, the spec's filename stem before that.
+    fn display_name(&self) -> &str {
+        match &self.gguf_name {
+            Some(name) => name,
+            None => self
+                .spec
+                .model_filename
+                .strip_suffix(".gguf")
+                .unwrap_or(&self.spec.model_filename),
+        }
+    }
+
+    /// Take the checkpoint header's word on what this build is.
+    ///
+    /// The architecture and context length are the file's, not the preset's —
+    /// a `--model-dir` can point anywhere — and sampling follows the
+    /// architecture unless the caller chose it.
+    ///
+    /// The header's `general.name` is kept beside the spec as the display name,
+    /// never written over [`ModelSpec::model_filename`]: that field is the file
+    /// the spec resolves, which the model-spec record persists and every later
+    /// path lookup reads. Renamed to a display name it named a file that does
+    /// not exist, so the next lookup missed the local cache and asked the hub —
+    /// a network round trip of about a second on every engine build — and the
+    /// persisted record named weights nobody could re-load.
+    fn apply_gguf_info(&mut self, info: GgufInfo) {
+        self.gguf_name = Some(info.name);
+
+        // Override ModelArch from GGUF — ensures the correct weight loader is
+        // used even when --model-dir points to a different architecture than
+        // the --model preset.
+        if let Some(arch) = info.arch {
+            if arch != self.spec.arch {
+                tracing::info!(
+                    "Overriding ModelArch: preset={:?} → GGUF={:?}",
+                    self.spec.arch,
+                    arch
+                );
+                self.spec.arch = arch;
+            }
+        }
+
+        // Override max_seq_len from GGUF context_length.
+        if let Some(ctx) = info.context_length {
+            if ctx != self.max_seq_len {
+                tracing::info!(
+                    "Overriding max_seq_len: preset={} → GGUF={}",
+                    self.max_seq_len,
+                    ctx
+                );
+                self.max_seq_len = ctx;
+            }
+        }
+
+        if !self.sampling_user_set {
+            tracing::info!(
+                "Auto-detected sampling from GGUF: temp={}, top_k={}, top_p={}, repeat_penalty={}",
+                info.sampling.temperature,
+                info.sampling.top_k,
+                info.sampling.top_p,
+                info.sampling.repeat_penalty
+            );
+            self.sampling = info.sampling;
+            if let Some(ref nt) = info.non_thinking {
+                tracing::info!(
+                    "Auto-detected non-thinking sampling: temp={}, top_k={}, top_p={}",
+                    nt.temperature,
+                    nt.top_k,
+                    nt.top_p
+                );
+            }
+            self.spec.non_thinking_sampling = info.non_thinking;
+        }
+    }
+
     /// Resolve file paths, load model and tokenizer, and build the engine.
     ///
     /// If [`model_path`](Self::model_path) / [`tokenizer_path`](Self::tokenizer_path)
@@ -1052,52 +1132,7 @@ impl ModelBuilder {
             Ok(info) => {
                 gguf_vocab_size = info.vocab_size;
                 gguf_has_thinking = Some(info.has_thinking);
-
-                // Override model display name from GGUF `general.name`.
-                self.spec.model_filename = format!("{}.gguf", info.name);
-
-                // Override ModelArch from GGUF — ensures the correct weight
-                // loader is used even when --model-dir points to a different
-                // architecture than the --model preset.
-                if let Some(arch) = info.arch {
-                    if arch != self.spec.arch {
-                        tracing::info!(
-                            "Overriding ModelArch: preset={:?} → GGUF={:?}",
-                            self.spec.arch,
-                            arch
-                        );
-                        self.spec.arch = arch;
-                    }
-                }
-
-                // Override max_seq_len from GGUF context_length.
-                if let Some(ctx) = info.context_length {
-                    if ctx != self.max_seq_len {
-                        tracing::info!(
-                            "Overriding max_seq_len: preset={} → GGUF={}",
-                            self.max_seq_len,
-                            ctx
-                        );
-                        self.max_seq_len = ctx;
-                    }
-                }
-
-                if !self.sampling_user_set {
-                    tracing::info!(
-                        "Auto-detected sampling from GGUF: temp={}, top_k={}, top_p={}, repeat_penalty={}",
-                        info.sampling.temperature, info.sampling.top_k, info.sampling.top_p, info.sampling.repeat_penalty
-                    );
-                    self.sampling = info.sampling;
-                    if let Some(ref nt) = info.non_thinking {
-                        tracing::info!(
-                            "Auto-detected non-thinking sampling: temp={}, top_k={}, top_p={}",
-                            nt.temperature,
-                            nt.top_k,
-                            nt.top_p
-                        );
-                    }
-                    self.spec.non_thinking_sampling = info.non_thinking;
-                }
+                self.apply_gguf_info(info);
             }
             Err(e) => {
                 tracing::warn!("Could not read GGUF metadata: {e}, using preset defaults");
@@ -1191,12 +1226,7 @@ impl ModelBuilder {
 
         // ── Log effective configuration before loading weights ─────────
         {
-            let model_name = self
-                .spec
-                .model_filename
-                .strip_suffix(".gguf")
-                .unwrap_or(&self.spec.model_filename);
-            tracing::info!("Engine config · {}", model_name);
+            tracing::info!("Engine config · {}", self.display_name());
             tracing::info!(
                 "  Arch: {:?}   vocab: {}   max_seq: {}",
                 self.spec.arch,
@@ -1848,12 +1878,41 @@ mod cache_first_tests {
 
 impl std::fmt::Display for ModelBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = self
-            .spec
-            .model_filename
-            .strip_suffix(".gguf")
-            .unwrap_or(&self.spec.model_filename);
-        write!(f, "{name}")
+        write!(f, "{}", self.display_name())
+    }
+}
+
+#[cfg(test)]
+mod gguf_info_tests {
+    use super::{GgufInfo, ModelBuilder, SamplingConfig};
+    use crate::models::Model;
+
+    /// **The header's name is shown; it never becomes the filename.** The
+    /// filename is what the model-spec record persists and what every later
+    /// path lookup resolves, so a display name written over it named a file
+    /// that does not exist — and the next lookup went past the local cache to
+    /// the hub on every engine build.
+    #[test]
+    fn the_header_name_is_shown_but_never_becomes_the_filename() {
+        let mut b = ModelBuilder::from_spec(Model::Qwen35_0_8B_Q8.spec());
+        assert_eq!(
+            b.to_string(),
+            "Qwen3.5-0.8B-Q8_0",
+            "before the header: the file's stem"
+        );
+
+        b.apply_gguf_info(GgufInfo {
+            name: "Qwen3.5-0.8B".into(),
+            arch: None,
+            sampling: SamplingConfig::for_gguf_architecture("qwen35"),
+            non_thinking: None,
+            vocab_size: Some(248_320),
+            context_length: None,
+            has_thinking: true,
+            dialect: None,
+        });
+        assert_eq!(b.spec().model_filename, "Qwen3.5-0.8B-Q8_0.gguf");
+        assert_eq!(b.to_string(), "Qwen3.5-0.8B");
     }
 }
 
