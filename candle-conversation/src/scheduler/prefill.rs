@@ -5691,6 +5691,8 @@ mod wave_chunk_tests {
     #[test]
     fn a_long_dialogue_prefill_creeps_in_pass_sized_chunks() {
         let (mut scheduler, _tx) = make_test_scheduler();
+        // A tier with room for far more than one pass: the target binds.
+        scheduler.session.set_tier_budget_bytes(1 << 40);
         let cap = scheduler.prefill_pass_budget();
         let seq = SequenceId(scheduler.session.create_sequence().expect("create"));
         scheduler
@@ -5723,6 +5725,7 @@ mod wave_chunk_tests {
     #[test]
     fn dialogue_prefills_share_the_rows_the_tier_holds() {
         let (mut scheduler, _tx) = make_test_scheduler();
+        scheduler.session.set_tier_budget_bytes(1 << 40);
         let cap = scheduler.prefill_pass_budget();
         assert!(
             cap > 200 + PREFILL_MIN_ADVANCE,

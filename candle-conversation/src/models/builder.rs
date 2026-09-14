@@ -29,8 +29,8 @@ use std::path::{Path, PathBuf};
 /// Used by [`ModelBuilder::engine`] to auto-configure architecture, sampling,
 /// vocab size, context length, and thinking support from the model file itself.
 struct GgufInfo {
-    /// `general.name` — human-readable model name.
-    name: String,
+    /// `general.name` — human-readable model name, when the header carries one.
+    name: Option<String>,
     /// Detected [`ModelArch`] from `general.architecture`.
     arch: Option<ModelArch>,
     /// Recommended sampling defaults for this architecture.
@@ -1043,15 +1043,14 @@ impl ModelBuilder {
     /// a `--model-dir` can point anywhere — and sampling follows the
     /// architecture unless the caller chose it.
     ///
-    /// The header's `general.name` is kept beside the spec as the display name,
-    /// never written over [`ModelSpec::model_filename`]: that field is the file
-    /// the spec resolves, which the model-spec record persists and every later
-    /// path lookup reads. Renamed to a display name it named a file that does
-    /// not exist, so the next lookup missed the local cache and asked the hub —
-    /// a network round trip of about a second on every engine build — and the
-    /// persisted record named weights nobody could re-load.
+    /// The header's `general.name` is the display name and is kept beside the
+    /// spec, never in [`ModelSpec::model_filename`]: that field is the file the
+    /// spec resolves, which the model-spec record persists and every later path
+    /// lookup reads, so it must keep naming a file that exists — a name that
+    /// does not misses the local cache and sends the lookup to the hub. A header
+    /// without a name leaves the file's stem as the display name.
     fn apply_gguf_info(&mut self, info: GgufInfo) {
-        self.gguf_name = Some(info.name);
+        self.gguf_name = info.name;
 
         // Override ModelArch from GGUF — ensures the correct weight loader is
         // used even when --model-dir points to a different architecture than
@@ -1413,9 +1412,12 @@ impl ModelBuilder {
             .metadata
             .get("general.name")
             .and_then(|v| v.to_string().ok())
-            .cloned()
-            .unwrap_or_else(|| "<unknown>".into());
-        tracing::info!("GGUF model: '{}', architecture: '{}'", name, arch_str);
+            .cloned();
+        tracing::info!(
+            "GGUF model: '{}', architecture: '{}'",
+            name.as_deref().unwrap_or("<unknown>"),
+            arch_str
+        );
 
         // ── Detect thinking support + dialect from chat_template ──────
         let chat_template = ct
@@ -1887,11 +1889,23 @@ mod gguf_info_tests {
     use super::{GgufInfo, ModelBuilder, SamplingConfig};
     use crate::models::Model;
 
+    /// A header as `detect_sampling_from_gguf` would report it, named `name`.
+    fn header(name: Option<&str>) -> GgufInfo {
+        GgufInfo {
+            name: name.map(str::to_owned),
+            arch: None,
+            sampling: SamplingConfig::for_gguf_architecture("qwen35"),
+            non_thinking: None,
+            vocab_size: Some(248_320),
+            context_length: None,
+            has_thinking: true,
+            dialect: None,
+        }
+    }
+
     /// **The header's name is shown; it never becomes the filename.** The
     /// filename is what the model-spec record persists and what every later
-    /// path lookup resolves, so a display name written over it named a file
-    /// that does not exist — and the next lookup went past the local cache to
-    /// the hub on every engine build.
+    /// path lookup resolves, so it must keep naming the file on disk.
     #[test]
     fn the_header_name_is_shown_but_never_becomes_the_filename() {
         let mut b = ModelBuilder::from_spec(Model::Qwen35_0_8B_Q8.spec());
@@ -1901,18 +1915,18 @@ mod gguf_info_tests {
             "before the header: the file's stem"
         );
 
-        b.apply_gguf_info(GgufInfo {
-            name: "Qwen3.5-0.8B".into(),
-            arch: None,
-            sampling: SamplingConfig::for_gguf_architecture("qwen35"),
-            non_thinking: None,
-            vocab_size: Some(248_320),
-            context_length: None,
-            has_thinking: true,
-            dialect: None,
-        });
+        b.apply_gguf_info(header(Some("Qwen3.5-0.8B")));
         assert_eq!(b.spec().model_filename, "Qwen3.5-0.8B-Q8_0.gguf");
         assert_eq!(b.to_string(), "Qwen3.5-0.8B");
+    }
+
+    /// **A header with no name leaves the file's stem**, rather than showing a
+    /// placeholder where a real name is available.
+    #[test]
+    fn a_nameless_header_keeps_the_file_stem() {
+        let mut b = ModelBuilder::from_spec(Model::Qwen35_0_8B_Q8.spec());
+        b.apply_gguf_info(header(None));
+        assert_eq!(b.to_string(), "Qwen3.5-0.8B-Q8_0");
     }
 }
 
@@ -1962,7 +1976,7 @@ mod header_read_tests {
 
         let info = ModelBuilder::detect_sampling_from_gguf(&p).unwrap();
         assert!(matches!(info.arch, Some(ModelArch::Qwen3)));
-        assert_eq!(info.name, "<unknown>");
+        assert_eq!(info.name, None, "the header carries no general.name");
         assert_eq!(cached_headers_for(&p), 1);
 
         std::fs::remove_dir_all(&dir).ok();

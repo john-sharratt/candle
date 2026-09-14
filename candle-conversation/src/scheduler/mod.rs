@@ -9028,27 +9028,27 @@ impl Scheduler {
 
     /// Tokens one prefill forward may carry — see [`admit::prefill_pass_budget`].
     ///
-    /// The model's cap is priced with **no tier bound** (`usize::MAX`): what it
-    /// answers here is how wide a forward the model runs — compute saturation
-    /// and what the KV side can still back — never how much tier this wave has.
-    /// The tier is the rows' job (`build_section_batch`'s `rows_left`,
-    /// `form_wave_group`'s `prefill_rows`), priced against the budget the fill
-    /// published beside the head it actually carries. Pricing the pass against
-    /// that budget too collapsed it to one token whenever the published budget
-    /// read zero — a section batch then advanced one token per wave against the
-    /// least chunk admission had already priced, and a raw prefill ran one
-    /// forward per token.
+    /// The model's cap is priced against the tier budget the fill published, so
+    /// a forward that composes no wave of its own — a raw prefill, a branch
+    /// checkpoint, a reprojection's gap-fill — is still sized to ground the tier
+    /// can be placed on. It is floored at [`prefill::PREFILL_MIN_ADVANCE`]: a
+    /// budget that reads zero between fills still leaves a forward its least
+    /// chunk, and the placement is the judge of that chunk. The grouped paths
+    /// bound their rows by the same budget against the head they actually carry
+    /// (`build_section_batch`'s `rows_left`, `form_wave_group`'s
+    /// `prefill_rows`), which never exceeds this.
     ///
-    /// Read per forward rather than once at construction: the KV side's room
-    /// moves with every claim.
+    /// Read per forward rather than once at construction: the budget and the KV
+    /// side's room move with every claim.
     fn prefill_pass_budget(&self) -> usize {
         admit::prefill_pass_budget(
             self.max_prefill_pass_tokens,
             self.model.prefill_width_cap(
                 self.session.activation_dtype(),
                 WaveWidth::decode(0),
-                usize::MAX,
+                self.session.tier_budget_bytes(),
             ),
+            prefill::PREFILL_MIN_ADVANCE,
         )
     }
 
@@ -12399,18 +12399,17 @@ mod tests {
         assert_eq!(advances, vec![200, 200]);
     }
 
-    /// **The pass budget does not follow the published tier budget.** The tier
-    /// is priced by the rows each wave hands its prefills; a pass budget read
-    /// against the same live budget fell to one token whenever it read zero, so
-    /// every raw prefill ran one forward per token.
+    /// **The pass budget prices the published tier and floors at the least
+    /// chunk.** An empty budget leaves a forward its least chunk, never one
+    /// token; a wide one leaves the configured target.
     #[test]
-    fn the_pass_budget_does_not_follow_the_tier_budget() {
+    fn the_pass_budget_floors_at_the_least_chunk() {
         let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
         scheduler.session.set_tier_budget_bytes(0);
         assert_eq!(
             scheduler.prefill_pass_budget(),
-            512,
-            "no tier: still the target"
+            128,
+            "no tier: the least chunk"
         );
         scheduler.session.set_tier_budget_bytes(1 << 40);
         assert_eq!(
