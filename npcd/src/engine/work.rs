@@ -28,6 +28,8 @@ use serde_json::{Map, Value};
 
 use crate::engine::act::Act;
 use crate::engine::body::Outcome;
+use crate::engine::mission::bank::Facts;
+use crate::engine::mission::Outcome as Verdict;
 use crate::sim::record::{Condition, Item, Kind, State};
 use crate::world::Hosted;
 
@@ -36,6 +38,7 @@ pub fn is_mine(tool: &str) -> bool {
     crate::engine::station::STATION_ACTS
         .iter()
         .chain(crate::engine::bench::BENCH_ACTS)
+        .chain(crate::engine::mission_acts::MISSION_ACTS)
         .any(|t| t.name == tool)
 }
 
@@ -79,6 +82,104 @@ fn subject(args: &Map<String, Value>) -> Option<String> {
     None
 }
 
+/// Perform a mission act.
+///
+/// Take one up at the desk, record progress on it wherever the work happened, or
+/// report how it went. The rich model is [`crate::engine::mission`]; whose it is
+/// is [`crate::sim::missions`]; this moves a mission between those states and
+/// hands the character back a line it reads.
+fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
+    let a = &act.args;
+    match act.tool {
+        "collect_mission" => {
+            // The character's own name, so a routine that would send it to visit
+            // "the makers here" is not built around visiting itself.
+            let me = hosted
+                .read(|w| w.actor(body).map(|actor| actor.name.clone()))
+                .unwrap_or_default();
+            hosted.with_sim(|s| {
+                let makers: Vec<String> = s
+                    .contacts_roster()
+                    .into_iter()
+                    .filter(|name| *name != me)
+                    .collect();
+                let mut records = s.record.names_of(Kind::Era);
+                records.extend(s.record.names_of(Kind::Story));
+                let facts = Facts {
+                    makers: &makers,
+                    records: &records,
+                };
+                let brief = s.missions.collect(body, &facts).standing_text();
+                Outcome::Did(format!("You take it up.\n{brief}"))
+            })
+        }
+        "report_done" => {
+            let Some(account) = text(a, "account") else {
+                return Outcome::Refused(
+                    "You meant to report it done, but did not say what you found.".into(),
+                );
+            };
+            hosted.with_sim(|s| {
+                match s
+                    .missions
+                    .report(body, Verdict::Pass, &account, Some(account.clone()))
+                {
+                    Some(m) => Outcome::Did(format!(
+                        "Reported done, and your answer filed: {}",
+                        m.mission_text()
+                    )),
+                    None => Outcome::Refused(
+                        "You are not carrying a mission to report on.".into(),
+                    ),
+                }
+            })
+        }
+        "report_stuck" => {
+            let Some(why) = text(a, "why") else {
+                return Outcome::Refused(
+                    "You meant to report it stuck, but did not say why.".into(),
+                );
+            };
+            hosted.with_sim(|s| match s.missions.report(body, Verdict::Fail, &why, None) {
+                Some(m) => Outcome::Did(format!(
+                    "Reported as not done, with your reasons: {}",
+                    m.mission_text()
+                )),
+                None => {
+                    Outcome::Refused("You are not carrying a mission to report on.".into())
+                }
+            })
+        }
+        "step_done" => {
+            let Some(step) = text(a, "step") else {
+                return Outcome::Refused(
+                    "You meant to mark a step done, but did not say which.".into(),
+                );
+            };
+            hosted.with_sim(|s| match s.missions.check_off(body, &step) {
+                true => Outcome::Did(format!("Step done: {step}.")),
+                false => Outcome::Refused(format!(
+                    "That is not a step still open on your mission: {step}."
+                )),
+            })
+        }
+        "add_step" => {
+            let Some(step) = text(a, "step") else {
+                return Outcome::Refused(
+                    "You meant to add a step, but did not say what.".into(),
+                );
+            };
+            hosted.with_sim(|s| match s.missions.add_todo(body, &step) {
+                true => Outcome::Did(format!("Added to your mission: {step}.")),
+                false => Outcome::Refused(format!(
+                    "That is blank, or already a step on your mission: {step}."
+                )),
+            })
+        }
+        other => Outcome::Refused(format!("`{other}` is not a mission act.")),
+    }
+}
+
 /// Perform one station or bench act.
 pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     let a = &act.args;
@@ -88,6 +189,12 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     // same reason `why` and `called` are in [`subject`]'s list.
     if matches!(act.tool, "library_read" | "library_write") {
         return library(hosted, body, act.tool, a);
+    }
+    // The mission acts before the subject is looked for: `collect_mission`
+    // names nothing, and the rest carry their subject under `account` / `why` /
+    // `step`, which the shared [`subject`] list does not scan.
+    if crate::engine::mission_acts::is_mine(act.tool) {
+        return mission(hosted, body, act);
     }
     let Some(what) = subject(a)
         .or_else(|| Some(String::new()))
@@ -2081,11 +2188,74 @@ mod tests {
         assert!(!out.happened(), "{out:?}");
     }
 
+    /// A mission taken up at the desk, worked with its progress recorded, and
+    /// reported — the whole loop through `perform`. `perform` does not gate on
+    /// availability (the grammar does), so this drives the acts directly.
+    #[test]
+    fn a_mission_is_collected_worked_and_reported() {
+        let h = vault();
+        // Nothing to report, or to record progress on, before collecting.
+        assert!(matches!(
+            perform(&h, "m1", &act("report_done", json!({"account":"nothing"}))),
+            Outcome::Refused(_)
+        ));
+        assert!(matches!(
+            perform(&h, "m1", &act("step_done", json!({"step":"anything"}))),
+            Outcome::Refused(_)
+        ));
+
+        // Collecting draws a mission (a bank routine here — the vault has no
+        // records indexed) and makes it the body's open one.
+        assert!(perform(&h, "m1", &act("collect_mission", json!({}))).happened());
+        assert!(h.sim(|s| s.missions.is_on_mission("m1")));
+
+        // Its first step can be ticked off; a step it never had cannot.
+        let step = h.sim(|s| {
+            s.missions
+                .active("m1")
+                .unwrap()
+                .next_step()
+                .unwrap()
+                .to_string()
+        });
+        assert!(perform(&h, "m1", &act("step_done", json!({ "step": step }))).happened());
+        assert!(matches!(
+            perform(&h, "m1", &act("step_done", json!({"step":"a step it never had"}))),
+            Outcome::Refused(_)
+        ));
+
+        // A discovered step is added to the list.
+        assert!(perform(
+            &h,
+            "m1",
+            &act("add_step", json!({"step":"ask somebody where it went"}))
+        )
+        .happened());
+
+        // Reporting done closes it, frees the character, and files the answer so
+        // an operator can still read it.
+        assert!(perform(
+            &h,
+            "m1",
+            &act("report_done", json!({"account":"the ledger is two years out"}))
+        )
+        .happened());
+        assert!(
+            !h.sim(|s| s.missions.is_on_mission("m1")),
+            "reporting frees the character for the next mission"
+        );
+        assert_eq!(
+            h.sim(|s| s.missions.done("m1").unwrap().answer.clone()),
+            Some("the ledger is two years out".to_string())
+        );
+    }
+
     #[test]
     fn every_station_and_bench_act_is_dispatched() {
         for t in crate::engine::station::STATION_ACTS
             .iter()
             .chain(crate::engine::bench::BENCH_ACTS)
+            .chain(crate::engine::mission_acts::MISSION_ACTS)
         {
             assert!(
                 is_mine(t.name),

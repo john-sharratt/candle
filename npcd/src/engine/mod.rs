@@ -66,6 +66,7 @@ pub mod loading;
 pub mod loopguard;
 pub mod mind;
 pub mod mission;
+pub mod mission_acts;
 pub mod narrator;
 pub mod perceived;
 pub mod persona;

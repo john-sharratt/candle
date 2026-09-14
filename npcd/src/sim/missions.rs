@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::mission::bank::{self, Facts};
 use crate::engine::mission::{Mission, Outcome};
 
 /// Every character's mission, and the ones lodged for characters yet to collect.
@@ -30,6 +31,10 @@ pub struct Missions {
     /// The last mission each body finished, kept so an operator can read the
     /// outcome and answer after the character has reported and moved on.
     done: BTreeMap<String, Mission>,
+    /// The seed for the next random routine drawn from the bank, bumped each
+    /// draw so a character collecting twice does not get the same routine and a
+    /// test can pin the sequence.
+    seed: u64,
 }
 
 impl Missions {
@@ -67,6 +72,24 @@ impl Missions {
     /// Give the body a mission to carry now, replacing any open one it held.
     pub fn assign(&mut self, body: &str, mission: Mission) {
         self.active.insert(body.to_string(), mission);
+    }
+
+    /// Collect a mission at the desk: the next one lodged for this body, or —
+    /// when nothing is lodged — a fresh non-destructive routine drawn from the
+    /// [`bank`] against who and what is around. Either way it becomes the body's
+    /// open mission, and the collected one is returned so the desk can hand back
+    /// its brief.
+    pub fn collect(&mut self, body: &str, facts: &Facts) -> &Mission {
+        let mission = match self.take_lodged(body) {
+            Some(lodged) => lodged,
+            None => {
+                let drawn = bank::random(facts, self.seed);
+                self.seed = self.seed.wrapping_add(1);
+                drawn
+            }
+        };
+        self.active.insert(body.to_string(), mission);
+        &self.active[body]
     }
 
     /// Draw the next lodged mission for a body, oldest first, if one waits. The
@@ -116,6 +139,7 @@ impl Missions {
 #[cfg(test)]
 mod tests {
     use super::Missions;
+    use crate::engine::mission::bank::Facts;
     use crate::engine::mission::{Mission, Origin, Outcome, Todo};
 
     fn a_mission(prompt: &str) -> Mission {
@@ -195,6 +219,30 @@ mod tests {
         let done = m.done("soren").expect("kept for the operator");
         assert_eq!(done.answer.as_deref(), Some("the eastern date is wrong"));
         assert_eq!(m.latest("soren").unwrap().prompt, "check the record");
+    }
+
+    #[test]
+    fn collecting_takes_a_lodged_mission_first_then_draws_from_the_bank() {
+        let mut m = Missions::default();
+        let makers = vec!["Wren".to_string(), "Pax".to_string()];
+        let records = vec!["the-charge".to_string()];
+        let facts = Facts {
+            makers: &makers,
+            records: &records,
+        };
+
+        // A lodged mission is taken first, verbatim, and becomes active.
+        m.lodge("bram", a_mission("the lodged one"));
+        assert_eq!(m.collect("bram", &facts).prompt, "the lodged one");
+        assert!(m.is_on_mission("bram"));
+        assert!(!m.has_lodged("bram"), "the lodged queue is drawn down");
+
+        // With nothing lodged, a routine is drawn from the bank — a valid, open,
+        // non-empty, non-destructive mission it can act on.
+        let drawn = m.collect("bram", &facts).clone();
+        assert!(drawn.is_open());
+        assert!(!drawn.todo.is_empty(), "a routine gives steps to act on");
+        assert!(matches!(drawn.origin, Origin::Random { .. }));
     }
 
     #[test]
