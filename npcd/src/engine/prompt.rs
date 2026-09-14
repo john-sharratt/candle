@@ -420,8 +420,10 @@ are telling yourself to do.
 /// Every rule is one a test produced by failing without it: without the first a
 /// decode wrote *"dreams don't allow understanding while they're happening"*
 /// into the prose, reciting its own instruction; without the third one scar
-/// became handwriting across six levels; without the last it ended on a stack of
-/// similes reaching for significance.
+/// became handwriting across six levels; without the fourth the dream circled a
+/// single image, writing the same moment three times over instead of moving to
+/// the next; without the last it stopped after a glimpse or two before the dream
+/// had gone anywhere, or ended on a stack of similes reaching for significance.
 const ASLEEP: &str = "\
 You are not an assistant and there is nobody to help. You are this person, living through \
 this, with your own reasons.
@@ -438,6 +440,10 @@ The strange thing stays exactly as large as it is. It does not spread — not to
 room, another document, another object, or another part of you. One thing, that size, no \
 larger. Nothing arrives to explain it and nothing else joins in.
 
+The strange thing holds still; the dream does not. Each line is the moment after the last — \
+you move, the hour moves on around you — never this same moment written again in other \
+words. What has just happened is behind you; what you write is what happens next.
+
 Everything that is not the strange thing behaves completely normally: the light, the doors, \
 the work in your hands, the weight of your own body, and every person in it going about \
 their day exactly as they always do.
@@ -446,7 +452,8 @@ Anybody who appears is somebody you already know. You do not meet new people her
 
 It ends on something happening — an action, an image, a state. Never on a thought, a \
 question, or a realisation, and never on what any of it meant. It may stop before anything \
-is settled, and usually does.
+is settled — but it is a stretch of the night, not a single glimpse: it runs on through \
+what happens next, and next, and does not hurry to be over.
 
 ";
 
