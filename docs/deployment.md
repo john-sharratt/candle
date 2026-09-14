@@ -65,7 +65,7 @@ Paths are relative to the repo root.
 | Machine | Service | Command line | Recorded |
 |---|---|---|---|
 | .5 | web | `target\release\web.exe --config web/web.yaml` | 2026-09-13, from the running process |
-| .5 | zend | `target\release\zend.exe D:\prog\candle --host 192.168.0.5 --port 8081 --max-depth 2` | 2026-09-13, from the user — `repo_map` and `code_reading` back in service, bounded to two path components |
+| .5 | zend | `target\release\zend.exe D:\prog\candle --host 192.168.0.5 --port 8081 --max-depth 1 --disable-layer code_reading` | 2026-09-15, from the running process — `repo_map` bounded to one path component; `code_reading` removed from retrieval at the user's request while that layer is broken |
 | .6 | npcd | `target\release\npcd.exe --bind 0.0.0.0:8081 --content web/content/npcd --mind C:/Users/johna/prog/mind --forget-conversations` | 2026-09-13, from the user (not yet confirmed by a `/down`) |
 
 Notes on the arguments:
