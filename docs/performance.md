@@ -1084,10 +1084,13 @@ quantized_pct, compress, peak_tokens`, scraped from the run logs:
 | `performance_rtx_pro_5000_72gb_rows.tsv` | 72 GB · 2026-09-03 — depth and width | 146 |
 | `performance_rtx_pro_5000_72gb_rows_2026-09-13.tsv` | 72 GB · 2026-09-13 — width only, build `2c5f065c` + working tree | 171 |
 | `performance_rtx_3090_24gb_rows.tsv` | RTX 3090 · 2026-09-14 — width gate sweep | 276 |
+| `performance_rtx_pro_5000_72gb_rows_2026-09-15_run1.tsv` | 72 GB · 2026-09-15 — width only, build `23623c6b`, run 1 | 171 |
+| `performance_rtx_pro_5000_72gb_rows_2026-09-15_run2.tsv` | 72 GB · 2026-09-15 — width only, build `23623c6b`, run 2 | 171 |
 
 A † cell in §3.6 *Width* or §3.7 is the 72 GB 2026-09-13 file's value, a ◆ cell
-the higher of the two 2026-09-15 runs of build `23623c6b`; every other 72 GB
-width cell is the first file's. The 3090 TSV holds the width-sweep axis only —
+the higher of the two 2026-09-15 files' values; every other 72 GB width cell is
+the first file's. The 2026-09-15 files list gates in sweep order, which puts
+Llama-2-7B before Qwen3-8B and Qwen3.8-27B before Qwen3-30B-A3B. The 3090 TSV holds the width-sweep axis only —
 its `depth` column is blank and `prompt_tokens` is `~700`, the gate's fixed
 prompt. Reproduce any row with the command in its test's `#[ignore]` attribute.
 
