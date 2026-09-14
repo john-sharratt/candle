@@ -807,9 +807,11 @@ impl SamplingConfig {
     ///
     /// It still will not break a distribution that has already collapsed: a
     /// character whose window holds ten copies of one act is choosing the next
-    /// token at p ≈ 1, and 0.2 of a logit against that is nothing. That collapse
-    /// is a context problem, not a sampling one, and it is fixed where the
-    /// context is built. What the window does is keep one from forming.
+    /// token at p ≈ 1, and a tenth of a logit against that is nothing. That
+    /// collapse is not the sampler's to break — it is stopped at the grammar,
+    /// where npcd's loop guard strikes the looping act from the turn's stencil
+    /// before it can form. What the window does is discourage the near miss the
+    /// grammar does not catch: the same words in a different act.
     /// # The think-off row is widened, not left on the card
     ///
     /// Qwen's card gives a think-suppressed turn `0.7 / 0.8`, and a cast is
@@ -829,19 +831,35 @@ impl SamplingConfig {
     /// mode. A family with no per-mode rows has the one pair, and takes it
     /// directly.
     ///
-    /// The rest is about dialogue rather than the checkpoint: the presence
-    /// penalty cut to a fifth of the card's, with the repetition load moved onto
-    /// DRY and `cross_turn_penalty`.
+    /// The rest is about dialogue rather than the checkpoint, and it is now
+    /// LIGHT. These penalties once carried the whole job of keeping a character
+    /// off a loop and were set hard for it — a DRY that punished any repeated
+    /// pair of tokens, a presence penalty, a cross-turn penalty. That job has
+    /// moved up to the grammar: npcd's loop guard strikes a repeated act from
+    /// the turn's own stencil, breaking a loop where it forms instead of leaning
+    /// on the sampler to price the looping token out. So these come down to a
+    /// mild degeneracy guard — enough to stop a decode stuttering a phrase
+    /// verbatim, not so much that it pushes ordinary prose out of its natural
+    /// vocabulary. The hard settings reached every path that borrows this
+    /// sampling — the dream and the narrator among them — and read as stilted
+    /// there.
     pub fn for_character_dialogue(mut self) -> Self {
         match self.mode_sampling.as_mut() {
             Some(modes) => modes.instruct = Self::CHARACTER_DIALOGUE,
             None => (self.temperature, self.top_p) = Self::CHARACTER_DIALOGUE,
         }
         self.adopt_mode_pair();
-        self.presence_penalty = 0.3;
-        self.cross_turn_penalty = 0.2;
+        self.presence_penalty = 0.1;
+        // Lighter than presence, as it must be: it is flat (the kernel takes
+        // `min(count, 1)`), so it cannot tell a word used once from one used a
+        // hundred times and must not outweigh the graded within-turn penalty.
+        self.cross_turn_penalty = 0.05;
         self.cross_turn_window = Self::CHARACTER_CROSS_TURN_WINDOW;
-        self.with_dry_penalty(1.0, 1.75, 2, 512)
+        // A gentle DRY: only a verbatim run of three or more tokens is
+        // penalised, and lightly — natural repetition (a refrain, a name,
+        // parallel phrasing) is left alone. The old (1.0, 1.75, 2, 512) leant on
+        // every repeated pair, which the loop guard now makes unnecessary.
+        self.with_dry_penalty(0.8, 1.25, 3, 256)
     }
 
     /// Set the repeat window (last N tokens considered for penalties).
@@ -2093,34 +2111,38 @@ mod sampling_config_tests {
         );
     }
 
-    /// The numbers were chosen against the formula, so the formula is what the
-    /// test asserts: penalty = `multiplier · base^(match_len − allowed)`, in
-    /// the same nats presence subtracts.
+    /// **The penalties are a light degeneracy guard now, not the loop-breaker.**
+    ///
+    /// Breaking a character's loop moved to the grammar — npcd's loop guard
+    /// strikes a repeated act from the turn's stencil — so this sampling no
+    /// longer has to price a loop out with a hard DRY and a heavy presence
+    /// penalty, and it must not, because every prose path that borrows it (the
+    /// dream, the narrator) was reading as stilted under the old settings. What
+    /// it keeps is gentle: reuse costs a fraction of the card's, natural
+    /// repetition is free, and a long verbatim run is discouraged rather than
+    /// banned.
     #[test]
-    fn character_dialogue_moves_the_pressure_from_reuse_onto_runs() {
+    fn character_dialogue_penalties_are_a_light_guard_not_the_loop_breaker() {
         let base = SamplingConfig::for_gguf_architecture("qwen35");
         let c = base.clone().for_character_dialogue();
 
-        // Reuse of a word costs a fifth of what it did.
+        // Reuse of a word costs a small fraction of the card's.
         assert_eq!(base.presence_penalty, 1.5);
-        assert_eq!(c.presence_penalty, 0.3);
+        assert!(c.presence_penalty <= 0.15, "presence is a light nudge now");
+        assert!(c.presence_penalty < base.presence_penalty / 5.0);
 
-        let d = c.dry.as_ref().expect("DRY carries the repetition load");
+        let d = c.dry.as_ref().expect("a gentle DRY stays as a degeneracy guard");
         let run = |n: i32| d.multiplier * d.base.powi(n - d.allowed_length);
-        let was = SamplingConfig::for_gguf_architecture("qwen35");
-        let dw = was.dry.as_ref().expect("already on before this");
-        let run_was = |n: i32| dw.multiplier * dw.base.powi(n - dw.allowed_length);
-
-        // A long run is punished harder than it was, even with presence cut.
-        assert!(
-            0.3 + run(7) > was.presence_penalty + run_was(7),
-            "a seven-token loop got easier, not harder"
-        );
-        // And an ordinary repeated word is punished far less.
-        assert!(c.presence_penalty < was.presence_penalty / 4.0);
-        // Escalation is still monotonic and still ends in an effective ban.
-        assert!(run(3) < run(5) && run(5) < run(7));
-        assert!(run(8) > 20.0, "an eight-token loop must be unreachable");
+        // Natural repetition is free: a repeated pair or trigram costs nothing
+        // (`allowed_length` is at least 3, so a run must exceed it to be
+        // penalised) — a refrain and parallel phrasing are how prose reads.
+        assert!(d.allowed_length >= 3, "a repeated pair must be free in prose");
+        // Escalation is still monotonic: a longer verbatim run costs more…
+        assert!(run(4) < run(6) && run(6) < run(8));
+        // …but it is a NUDGE, not a ban. The grammar forbids a loop; the sampler
+        // only discourages a stutter, so an eight-token run stays well under the
+        // old "unreachable" bar of 20.
+        assert!(run(8) < 5.0, "DRY should discourage a run, not forbid it");
     }
 
     /// **Both of Qwen's published rows exist, and they are the right way round.**
@@ -2208,8 +2230,8 @@ mod sampling_config_tests {
             .for_character_dialogue();
         for cast in [&tuned_first, &mode_first] {
             assert_eq!((cast.temperature, cast.top_p), (1.0, 0.95));
-            assert_eq!(cast.presence_penalty, 0.3);
-            assert_eq!(cast.cross_turn_penalty, 0.2);
+            assert_eq!(cast.presence_penalty, 0.1);
+            assert_eq!(cast.cross_turn_penalty, 0.05);
             assert!(cast.dry.is_some());
         }
 
