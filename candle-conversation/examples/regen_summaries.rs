@@ -216,7 +216,7 @@ fn main() -> candle_conversation::Result<()> {
     let turns = fixture_for(&layer_name);
     eprintln!("Ingesting {} turns...", turns.len());
     for (user, assistant) in &turns {
-        conv.insert_turn(user, assistant)?;
+        conv.insert_turn(*user, assistant)?;
     }
 
     // Wait until every ingested turn has its SoT leaf. `pending_summary_len`

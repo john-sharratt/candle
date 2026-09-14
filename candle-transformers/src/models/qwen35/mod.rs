@@ -49,6 +49,7 @@ pub mod quantized_loader;
 pub mod quantized_moe;
 pub mod quantized_weights;
 pub mod spec;
+pub mod tensor_override;
 
 /// Tier-2 gates for the recurrent-state hooks — inside the lib because they
 /// drive `batch_test`, which is `cfg(test)` on this crate.
@@ -59,6 +60,7 @@ pub mod wave;
 
 pub use config::{MoeConfig, Qwen35Config};
 pub use quantized_weights::{load_quantized_model, QuantLayerMix, QuantModel};
+pub use tensor_override::{TensorOverride, TensorOverrides};
 
 #[cfg(feature = "cuda")]
 pub use batched::HybridBatched;

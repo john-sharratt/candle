@@ -27,6 +27,11 @@
 //!                                  # projection target — distributed via flex
 //!                                  # across all visible layers below it.
 //!     score_threshold: <float>     # default 0.0
+//!     rank: <i32>                  # place in the visibility stack; a target
+//!                                  # sees every layer of lower rank. Default:
+//!                                  # declaration index. Declaration order also
+//!                                  # fixes ids, so an added layer is appended
+//!                                  # and placed by rank.
 //!     budget: { priority, min_percent, max_percent }   # this layer's flex
 //!                                  # weight when some *other* layer is the
 //!                                  # target (lower-than-target visibility).
@@ -570,6 +575,10 @@ struct YamlLayer {
     /// default in the ingest driver; non-ingest layers ignore it.
     #[serde(default)]
     ingest_unit: Option<String>,
+    /// The layer's place in the visibility stack — see [`LayerSchema::rank`].
+    /// Omitted → its declaration index.
+    #[serde(default)]
+    rank: Option<i32>,
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
@@ -1065,6 +1074,9 @@ fn build(
             decode_priority: yl.decode_priority.into(),
             on_corrupt_turn: yl.on_corrupt_turn.into(),
             ingest_unit: yl.ingest_unit.clone(),
+            // Its declaration index unless it says otherwise — the stack every
+            // schema had before a layer could declare its place in it.
+            rank: yl.rank.unwrap_or(layers.len() as i32),
         });
     }
 
@@ -1327,6 +1339,7 @@ fn build_system_prompt(
                         &label,
                         coll_budget_adaptive.as_ref(),
                     )?,
+                    mandatory: Vec::new(),
                 }));
             }
             YamlSystemPromptItem::SectionTree { nodes } => {
@@ -2053,6 +2066,7 @@ fn build_section_tree<'a>(
                     member_glue_tokens: None,
                     budget_adaptive: None,
                     default: None,
+                    mandatory: Vec::new(),
                 };
                 // Capture the branch templates so runtime member additions
                 // (the tool catalog) can seal ×branch without re-deriving them.

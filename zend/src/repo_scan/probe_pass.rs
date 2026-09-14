@@ -395,9 +395,11 @@ pub fn ingest(conv: &mut Sequence, probes: &[Probe], dir: &str, pad_token: u32) 
         if candle_conversation::ingest_cancelled() {
             break;
         }
-        let cases: Vec<(String, Vec<String>)> = group
+        // A probe's assistant half is empty — what retrieval matches is the
+        // question.
+        let cases: Vec<(String, String, Vec<String>)> = group
             .iter()
-            .map(|p| (p.text.clone(), p.tags(dir)))
+            .map(|p| (p.text.clone(), String::new(), p.tags(dir)))
             .collect();
         let submitted =
             conv.submit_prefilled_turn_group(&cases, branch_state(ANSWER_BRANCH), pad_token);

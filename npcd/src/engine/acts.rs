@@ -38,7 +38,7 @@
 //! is what stops this coming back.
 //!
 //! The tactic that will not enumerate is **spoken** — *"the drones first, the
-//! mech is somebody else's problem"* is a `tell` to the squad. The narrator
+//! mech is somebody else's problem"* is a `shout` to the squad. The narrator
 //! renders it, the others perceive it, and it lands where language works.
 //!
 //! # Examples are calibration, not documentation
@@ -75,6 +75,19 @@ use super::tools::{Availability, Example, Param, Plane, Tool};
 /// same thing with `/act` (`engine::slash`), so the two halves of one exchange —
 /// what you do to a character and what it does back — had different names for
 /// one idea. One concept, one word, whichever side of the room it comes from.
+///
+/// # It is physical, and the description has to fight for that
+///
+/// A generic verb over a specific one is the trade `act` makes, and its cost is
+/// the opposite of `touch`'s: where `touch` was too gentle to reach for in a
+/// fight, `act` is broad enough that a model reaches for it to *speak*. It was
+/// caught calling `act` where `tell` was meant — and the description invited it,
+/// by saying "Like `tell`, you give what you MEAN by it", which likens the two
+/// acts at the exact point they must not be confused. So the description no
+/// longer compares it to speech; it rules speech out by name (`tell`, `ask`,
+/// `whisper`, `shout` for words; `gesture` for a signal; `reflect` for a
+/// thought) and states, more than once, that this is only ever a body on a body.
+/// The name is read first, but the description is what stops the near miss.
 pub const ACT: Tool = Tool {
     name: "act",
     at: &[],
@@ -90,12 +103,18 @@ pub const ACT: Tool = Tool {
     // out of fifty-three, and the answer to that is the cooldown a self-act
     // serves, not taking the act away. See `cooldown::SELF_ACT`.
     availability: Availability::PhysicalOnly,
-    description: "Do something physical to one person here. Anything your body can do to \
-                  theirs: steady them, block their way, take something out of their hand, put \
-                  yourself between them and something else — or put them on the floor, break \
-                  their grip, hurt them. Like `say`, you give what you MEAN by it and not the \
-                  choreography; the narrator renders the movement. They feel it, they may \
-                  refuse it, and what they do next is theirs.",
+    description: "Make PHYSICAL contact with one person here — something your body does to \
+                  theirs, and nothing you say. Hands-on only: steady them, block their way, \
+                  take something out of their hand, put yourself between them and something \
+                  else — or put them on the floor, break their grip, hurt them. **This is not \
+                  how you say anything.** To tell, ask, warn, promise or order somebody, use \
+                  `tell`, `ask`, `whisper` or `shout`; to signal without touching, `gesture`; \
+                  to stop and take stock, `reflect`. This is only ever the act of a body on a \
+                  body. You give what you MEAN by the contact, not the choreography; the \
+                  narrator renders the movement. They feel it, they may refuse it, and what \
+                  they do next is theirs. On `yourself` it is still physical — binding a wound, \
+                  getting your own weapon clear, dragging yourself up — never a feeling or a \
+                  thought.",
     params: &[
         Param {
             name: "on",
@@ -290,7 +309,7 @@ pub const READ: Tool = Tool {
 /// people living in a place leave something in it — and what makes a board a
 /// board rather than a decorated wall.
 ///
-/// # Why it is not `say` written down
+/// # Why it is not `tell` written down
 ///
 /// Speech reaches whoever is standing there, now, and is gone. This reaches
 /// whoever comes to this spot afterwards, and keeps. That is a different act
@@ -314,7 +333,7 @@ pub const POST_NOTICE: Tool = Tool {
     description: "Write something on a board, a panel or a page here, for whoever comes to it \
                   next. It stays until it is pushed off the bottom by newer things, and everybody \
                   who reads it is told you wrote it. Use this when what you have to say outlives \
-                  the people currently in the room — `say` reaches whoever is standing here now \
+                  the people currently in the room — `tell` reaches whoever is standing here now \
                   and is gone.",
     params: &[
         Param {
@@ -496,7 +515,7 @@ pub const GATHER: Tool = Tool {
 /// The simulator fights; this says how. Every argument is an enumerated value or
 /// a bound entity, because the consumer is formula code and a decode is far too
 /// slow to aim a weapon. A character's part is to set a stance and change its
-/// mind about it, which is the same division of labour `say` keeps with the
+/// mind about it, which is the same division of labour `tell` keeps with the
 /// narrator: the model supplies substance, something faster supplies mechanism.
 pub const ENGAGE: Tool = Tool {
     name: "engage",
@@ -540,7 +559,7 @@ pub const ENGAGE: Tool = Tool {
         // holding ground, `conserve ammunition` is what `hold fire` and
         // `suppress` differ over — and the one genuinely new axis, whether to
         // work around the player, is what `priority` carries. Anything that
-        // still will not fit belongs in a `tell` to the squad, where language
+        // still will not fit belongs in a `shout` to the squad, where language
         // works and a grammar is not being asked to enumerate it.
     ],
     examples: &[
@@ -1015,8 +1034,8 @@ pub const REACH_OUT: Tool = Tool {
 // **Not the room, and not a mode.** These are the acts of a handset a character
 // carries: several conversations at once, to people who are not here, at a time
 // that is not now. A character texts while standing in a room and the room
-// hears none of it — which is why these are separate acts rather than `say` and
-// `tell` pointed somewhere else.
+// hears none of it — which is why these are separate acts rather than `tell` and
+// `shout` pointed somewhere else.
 //
 // None of them declares an availability. They bind to the threads on the phone,
 // and a character without a phone has none, so the ordinary empty-set rule takes
@@ -1052,7 +1071,7 @@ pub const REACH_OUT: Tool = Tool {
 ///
 /// So the rule is in the description, in the examples, and in
 /// `prompt::frame`: if they are here, speak. The grammar cannot enforce it —
-/// `say` and `tell` appear only in company, but `message` is `Always`, and it
+/// `tell` and `whisper` appear only in company, but `message` is `Always`, and it
 /// has to be, because the whole point is reaching people who are not here.
 pub const MESSAGE: Tool = Tool {
     name: "message",
@@ -1066,7 +1085,7 @@ pub const MESSAGE: Tool = Tool {
                   now. As with speaking, you give what you MEAN and the wording follows.\n\
                   \n\
                   **For people who are not here.** If the person you want is standing in front of \
-                  you, `say` or `ask` — texting somebody in the same room is a worse version of \
+                  you, `tell` or `ask` — texting somebody in the same room is a worse version of \
                   talking to them. The channel reaches everyone at once, so it is for anything \
                   that concerns whoever happens to be listening: a question you need an answer \
                   to, something the others need to know before they act, a decision that is not \

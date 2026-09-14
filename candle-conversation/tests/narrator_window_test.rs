@@ -242,7 +242,7 @@ fn narrator_window_insert_turn_trace() {
     eprintln!();
     for beat_num in 1..=6usize {
         conv.insert_turn(
-            &format!("[{beat_num}A] inputs"),
+            format!("[{beat_num}A] inputs"),
             &format!("[{beat_num}A] prose"),
         )
         .unwrap_or_else(|e| panic!("insert_turn {beat_num}A: {e}"));
@@ -253,7 +253,7 @@ fn narrator_window_insert_turn_trace() {
         );
 
         conv.insert_turn(
-            &format!("[{beat_num}B] waypoints"),
+            format!("[{beat_num}B] waypoints"),
             &format!("[{beat_num}B] prose"),
         )
         .unwrap_or_else(|e| panic!("insert_turn {beat_num}B: {e}"));

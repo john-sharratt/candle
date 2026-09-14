@@ -15,16 +15,15 @@
 //! background the model writes *from* belongs in the system turn, and the thing
 //! it must produce belongs in the turn it answers.
 //!
-//! # Why this runs on the guest and not the engine's own model
+//! # Why a throwaway conversation
 //!
-//! The acting model is tuned to *be* a character — it perceives, decides and
-//! emits acts. Asked to describe one it will tend to answer in character rather
-//! than write a profile. Hermes-3 is a prose model and writes the profile.
-//!
-//! It is also the plainest demonstration that the co-resident swap works: a
-//! button on the create page evicts the engine's working set, brings a second
-//! model onto the card, writes a paragraph, and hands the card back — with the
-//! world's whole substrate still loaded behind it.
+//! The resident model spends its day *being* characters — it perceives, decides
+//! and emits acts under a character's identity. Asked to describe one from inside
+//! that frame it would answer in character rather than write a profile. So the
+//! description is written in a conversation of its own ([`crate::prose`]): the
+//! voice and the world above, one request below, and nothing of any character's
+//! identity, acts or history in between. It rides the engine's waves beside the
+//! cast, and nobody in the world stops thinking for it.
 
 use std::sync::Arc;
 
@@ -32,17 +31,14 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use candle_conversation::guest::{
-    resolve_seed, GuestError, GuestEvent, GuestOutcome, GuestRequest, GuestSink, ProseRequest,
-    Seeded,
-};
+use candle_conversation::guest::{resolve_seed, Seeded};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::api::Authored;
-use crate::guest_routes::run_guest_watched;
 use crate::ndjson;
+use crate::prose;
 
 /// The voice, and the shape of the answer.
 ///
@@ -106,13 +102,12 @@ pub fn personality_label(p: &serde_json::Value) -> String {
 ///
 /// Twelve hundred takes every anchor in the corpus whole except the longest —
 /// Keeper's is 848, the ordinary ones are under 350 — while still bounding the
-/// outlier at roughly 300 tokens, against the 2,048 the prose guest allows a
-/// whole prompt.
+/// outlier at roughly 300 tokens.
 ///
 /// The cap survives because an anchor is *unbounded authored text*: it is a
 /// whole system prompt with sections and examples, and pasting an arbitrarily
 /// long one makes the description a summary of the anchor rather than a person
-/// who fits it — and, past the guest's headroom, refuses the job outright.
+/// who fits it.
 const ANCHOR_BUDGET_CHARS: usize = 1_200;
 
 /// As much of an anchor as the budget allows, cut on a line boundary.
@@ -387,7 +382,7 @@ pub async fn post_describe(
     // reproduce neither.
     let seed = resolve_seed(body.seed);
     let brief = brief_for(&world, personality.as_ref(), seed, &body.name);
-    let request = GuestRequest::Prose(ProseRequest {
+    let request = prose::Request {
         system: format!("{VOICE}\n\n{}", brief.context),
         prompt: brief.task,
         max_tokens: MAX_TOKENS,
@@ -395,10 +390,10 @@ pub async fn post_describe(
         seed: Some(seed),
         // Free prose — there is no fixed set of answers to constrain it to.
         choices: None,
-    });
+    };
 
-    match crate::guest_routes::run_guest(&s, request).await {
-        Ok(GuestOutcome::Prose { text, tokens, seed }) => {
+    match prose::run(&s, request).await {
+        Ok(prose::Answer { text, tokens, seed }) => {
             let description = text.trim();
             if description.is_empty() {
                 return fail(
@@ -421,21 +416,16 @@ pub async fn post_describe(
             }))
             .into_response()
         }
-        Ok(other) => fail(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "wrong_guest",
-            &format!("the prose request came back as {}", other.guest()),
-        ),
-        Err(e) => guest_refusal(&e),
+        Err(e) => prose::refusal(&e),
     }
 }
 
 /// `POST /v1/generate/description/stream`
 ///
 /// The same generation as [`post_describe`], delivered as it happens: one
-/// `loading` line while the guest's weights cross the link, one `token` line per
-/// decoded fragment, and one terminal `done` carrying the whole description and
-/// its seed. See [`crate::ndjson`] for the wire format and why it is not SSE.
+/// `token` line per decoded fragment, and one terminal `done` carrying the whole
+/// description and its seed. See [`crate::ndjson`] for the wire format and why
+/// it is not SSE.
 ///
 /// **Why this exists next to the non-streaming route rather than replacing it.**
 /// They are not the same operation to a caller. A page rendering a description
@@ -482,7 +472,7 @@ pub async fn post_describe_stream(
 
     let seed = resolve_seed(body.seed);
     let brief = brief_for(&world, personality.as_ref(), seed, &body.name);
-    let request = GuestRequest::Prose(ProseRequest {
+    let request = prose::Request {
         system: format!("{VOICE}\n\n{}", brief.context),
         prompt: brief.task,
         max_tokens: MAX_TOKENS,
@@ -490,39 +480,27 @@ pub async fn post_describe_stream(
         seed: Some(seed),
         // Free prose — there is no fixed set of answers to constrain it to.
         choices: None,
-    });
+    };
 
-    // Unbounded, because the sink runs on the scheduler thread with normal
-    // inference blocked: a bounded channel that filled would stop the guest, and
-    // the whole engine behind it, until the HTTP client read. The bound on how
-    // much can accumulate is `MAX_TOKENS` lines, which is the real limit.
+    // Unbounded, because the fragments are pushed from the decode's blocking
+    // thread, which must not wait on the HTTP client. The bound on how much can
+    // accumulate is `MAX_TOKENS` lines, which is the real limit.
     let (tx, rx) = unbounded_channel::<Value>();
-    let sink = {
+    let on_fragment = {
         let tx = tx.clone();
-        GuestSink::new(move |e| {
-            let line = match e {
-                GuestEvent::Loading => json!({ "event": "loading" }),
-                GuestEvent::Token(text) => json!({ "event": "token", "text": text }),
-                // Prose shows itself arriving, so a count adds nothing here —
-                // but it is forwarded rather than dropped, because a consumer
-                // that ignores an event it does not use costs nothing and a
-                // guest that starts counting would otherwise go unheard.
-                GuestEvent::Step { done, total, what } => {
-                    json!({ "event": "step", "done": done, "total": total, "what": what })
-                }
-            };
-            // A send that fails means the reader hung up. The job keeps running:
-            // the drain has already evicted the engine's working set for it, and
-            // abandoning it now would pay that cost for nothing.
-            let _ = tx.send(line);
-        })
+        // A send that fails means the reader hung up. The decode runs on to its
+        // end regardless — it is one sequence in a wave, and stopping it early
+        // would save nothing worth the bookkeeping.
+        move |text: &str| {
+            let _ = tx.send(json!({ "event": "token", "text": text }));
+        }
     };
 
     let world_id = body.world_id.clone();
     let personality_id = body.personality_id.clone();
     tokio::spawn(async move {
-        let line = match run_guest_watched(&s, request, sink).await {
-            Ok(GuestOutcome::Prose { text, tokens, seed }) => {
+        let line = match prose::run_streamed(&s, request, on_fragment).await {
+            Ok(prose::Answer { text, tokens, seed }) => {
                 let description = text.trim();
                 if description.is_empty() {
                     ndjson::error_line("empty_draft", "the model produced no description", false)
@@ -541,21 +519,7 @@ pub async fn post_describe_stream(
                     })
                 }
             }
-            Ok(other) => ndjson::error_line(
-                "wrong_guest",
-                &format!("the prose request came back as {}", other.guest()),
-                false,
-            ),
-            Err(e) => {
-                let (code, retry) = match &e {
-                    GuestError::Refused(_) => ("bad_request", false),
-                    GuestError::NoRoom { .. } => ("no_room", true),
-                    GuestError::Unavailable(_) => ("no_prose_model", false),
-                    GuestError::Failed(_) => ("guest_failed", false),
-                    GuestError::Abandoned => ("engine_unavailable", true),
-                };
-                ndjson::error_line(code, &e.to_string(), retry)
-            }
+            Err(e) => ndjson::error_line(e.code(), &e.to_string(), e.retry()),
         };
         let _ = tx.send(line);
     });
@@ -565,28 +529,6 @@ pub async fn post_describe_stream(
 
 fn fail(status: StatusCode, error: &str, detail: &str) -> Response {
     (status, Json(json!({ "error": error, "detail": detail }))).into_response()
-}
-
-/// The same status mapping every guest route uses — a caller that learns
-/// "retry" from one and "give up" from another for the same condition cannot
-/// act on either.
-pub(crate) fn guest_refusal(e: &GuestError) -> Response {
-    let (status, code) = match e {
-        GuestError::Refused(_) => (StatusCode::BAD_REQUEST, "bad_request"),
-        GuestError::NoRoom { .. } => (StatusCode::SERVICE_UNAVAILABLE, "no_room"),
-        GuestError::Unavailable(_) => (StatusCode::NOT_IMPLEMENTED, "no_prose_model"),
-        GuestError::Failed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "guest_failed"),
-        GuestError::Abandoned => (StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable"),
-    };
-    (
-        status,
-        Json(json!({
-            "error": code,
-            "detail": e.to_string(),
-            "retry": matches!(e, GuestError::NoRoom { .. } | GuestError::Abandoned),
-        })),
-    )
-        .into_response()
 }
 
 #[cfg(test)]
@@ -736,10 +678,9 @@ mod tests {
 
     /// **A long one is still bounded, and cut on a line.**
     ///
-    /// An anchor is unbounded authored text. Past the prose guest's prompt
-    /// headroom it does not degrade the description, it refuses the job — and a
-    /// cut mid-sentence reads as a transmission error the model then completes
-    /// from something the author never wrote.
+    /// An anchor is unbounded authored text, and a cut mid-sentence reads as a
+    /// transmission error the model then completes from something the author
+    /// never wrote.
     #[test]
     fn a_long_anchor_is_bounded_and_never_cut_mid_line() {
         let long: String = (0..400)
@@ -781,14 +722,14 @@ mod tests {
     #[test]
     fn the_request_it_builds_is_servable() {
         let b = brief_for(&world(), None, S, "");
-        let r = GuestRequest::Prose(ProseRequest {
+        let r = prose::Request {
             system: format!("{VOICE}\n\n{}", b.context),
             prompt: b.task,
             max_tokens: MAX_TOKENS,
             temperature: Some(TEMPERATURE),
             seed: None,
             choices: None,
-        });
+        };
         assert!(r.check().is_ok(), "{:?}", r.check());
     }
 

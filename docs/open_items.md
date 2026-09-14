@@ -114,7 +114,7 @@ scenarios (below). None of the slow ones loaded a model; they were **unoptimised
 - **`zend/README.md`** documents `--model`, and its stale `--disable-summariser` row (no such
   flag) is gone.
 
-### 6. `docs/performance_rtx_pro_5000_72gb.md` — second width sweep (uncommitted)
+### 6. `docs/performance.md` — second width sweep (uncommitted)
 
 All 12 `test_parallel_batched_forwarding*` gates re-run 2026-09-13, one process per model,
 12/12 pass. §3.6 *Width* and §3.7 now report each cell as the better of the two sweeps (†

@@ -28,9 +28,12 @@
 //! bolted on; it is the difference between an instrument and a log.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tokio::runtime::Handle;
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 
 /// How often a world moves when nothing says otherwise.
 ///
@@ -41,16 +44,30 @@ use std::time::Duration;
 pub const EVERY: Duration = Duration::from_millis(500);
 
 /// A clock, running something on an interval until it is stopped.
+///
+/// An async interval task rather than an OS thread: one hosted world costs a
+/// parked timer on the daemon's runtime, not a thread, and a daemon hosting
+/// many worlds carries one scheduler family instead of two. The moment itself
+/// is synchronous work — the world's own locks, held for well under a beat —
+/// which a worker thread absorbs the way it absorbs any brief host work.
 pub struct Metronome {
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     moments: Arc<AtomicU64>,
     stumbles: Arc<AtomicU64>,
-    handle: Option<JoinHandle<()>>,
+    /// Held by the task for exactly the span of one `moment` call, so
+    /// [`Metronome::stop`] can wait out a moment in flight — the world's lock
+    /// must not be torn down under it — from sync and async callers alike.
+    in_moment: Arc<Mutex<()>>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl Metronome {
     /// Start a clock. It runs `moment` every `every` until dropped or stopped.
+    ///
+    /// `on` names the runtime the clock beats on — hosting happens from the
+    /// startup loader thread as well as from request handlers, and the handle
+    /// works from both.
     ///
     /// The first run happens after one interval rather than immediately, so a
     /// caller has the gap to bind bodies to minds before the world moves under
@@ -58,7 +75,7 @@ impl Metronome {
     /// # A moment that panics must not stop the world
     ///
     /// A moment reaches the scheduler, the bodies and the map, and a panic in
-    /// any of them would otherwise unwind this thread and end the loop. Nothing
+    /// any of them would otherwise unwind the task and end the loop. Nothing
     /// restarts it: `stop` was never set, so the world is not stopped, it is
     /// *dead* — and the daemon around it keeps answering, so the failure looks
     /// like a cast that has gone quiet rather than like a crash. The one signal
@@ -73,8 +90,8 @@ impl Metronome {
     /// stays poisoned, and the next tick to touch it panics too, so a stumble
     /// count that climbs every interval is a broken world telling you so at
     /// 2 Hz. That is the point: [`Metronome::stumbles`] is a number a health
-    /// check can read, where a dead thread was silence.
-    pub fn start<F>(every: Duration, mut moment: F) -> Metronome
+    /// check can read, where a dead clock was silence.
+    pub fn start<F>(on: &Handle, every: Duration, mut moment: F) -> Metronome
     where
         F: FnMut() + Send + 'static,
     {
@@ -82,26 +99,49 @@ impl Metronome {
         let paused = Arc::new(AtomicBool::new(false));
         let moments = Arc::new(AtomicU64::new(0));
         let stumbles = Arc::new(AtomicU64::new(0));
+        let in_moment = Arc::new(Mutex::new(()));
 
-        let handle = {
-            let (stop, paused, moments, stumbles) = (
+        let task = {
+            let (stop, paused, moments, stumbles, in_moment) = (
                 stop.clone(),
                 paused.clone(),
                 moments.clone(),
                 stumbles.clone(),
+                in_moment.clone(),
             );
-            thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    thread::sleep(every);
-                    if stop.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+            on.spawn(async move {
+                let mut beat = tokio::time::interval(every);
+                // A beat the clock could not serve on time is skipped, not
+                // crammed in: the world moves at its felt speed, and a stall
+                // followed by a flurry of catch-up moments would be a world
+                // lurching rather than one that missed a step.
+                beat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                // `interval`'s first tick completes immediately — consume it,
+                // so the first moment lands after one interval as promised.
+                beat.tick().await;
+                loop {
+                    beat.tick().await;
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if paused.load(Ordering::Relaxed) {
                         continue;
+                    }
+                    let guard = in_moment.lock().unwrap();
+                    // Re-checked under the guard: a `stop` that arrived while
+                    // this task was between the flag and the lock must not buy
+                    // the world one more moment after `stop` returned.
+                    if stop.load(Ordering::Relaxed) {
+                        return;
                     }
                     // `AssertUnwindSafe` because the closure is `FnMut` and may
                     // hold state across moments. That state can be observed
                     // half-updated after a panic — which is exactly why the
                     // stumble is counted and logged rather than swallowed.
-                    let beat = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut moment));
-                    match beat {
+                    let landed =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut moment));
+                    drop(guard);
+                    match landed {
                         Ok(()) => {
                             moments.fetch_add(1, Ordering::Relaxed);
                         }
@@ -123,7 +163,8 @@ impl Metronome {
             paused,
             moments,
             stumbles,
-            handle: Some(handle),
+            in_moment,
+            task: Some(task),
         }
     }
 
@@ -165,8 +206,14 @@ impl Metronome {
 
     fn halt(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        // The moment guard is the wait: a moment in flight holds it, and the
+        // task re-checks `stop` under it before starting another — so once
+        // this lock is acquired, no moment is running and none will start.
+        // A blocking lock rather than a task join, because it is bounded by
+        // one moment and works identically from sync and async callers.
+        drop(self.in_moment.lock().unwrap());
+        if let Some(task) = self.task.take() {
+            task.abort();
         }
     }
 }
@@ -209,11 +256,16 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use std::thread;
     use std::time::Instant;
 
     /// Wait for something to become true, or give up. Sleeping a fixed span and
     /// asserting afterwards makes a test that fails on a loaded machine and
     /// passes on a quiet one, which is worse than no test.
+    ///
+    /// A thread sleep on purpose: these tests run on a multi-thread runtime, so
+    /// the clock's task keeps beating on a worker while the test thread waits —
+    /// which is exactly the arrangement the live daemon has.
     fn until(what: impl Fn() -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -240,11 +292,11 @@ mod tests {
     /// keeps answering — so the world reads as quiet rather than as broken. The
     /// panic here alternates so the assertion is that beats continue *through*
     /// failures rather than merely that one failure was survived.
-    #[test]
-    fn a_moment_that_panics_costs_a_beat_and_not_the_clock() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_moment_that_panics_costs_a_beat_and_not_the_clock() {
         let beats = Arc::new(AtomicUsize::new(0));
         let mine = beats.clone();
-        let clock = Metronome::start(Duration::from_millis(1), move || {
+        let clock = Metronome::start(&Handle::current(), Duration::from_millis(1), move || {
             let n = mine.fetch_add(1, Ordering::Relaxed);
             if n.is_multiple_of(2) {
                 panic!("the world came apart on beat {n}");
@@ -284,10 +336,10 @@ mod tests {
         assert_eq!(panic_text(&*odd), "a panic payload of an unknown type");
     }
 
-    #[test]
-    fn a_clock_runs_its_moment_until_it_is_stopped() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clock_runs_its_moment_until_it_is_stopped() {
         let (n, moment) = counter();
-        let clock = Metronome::start(Duration::from_millis(1), moment);
+        let clock = Metronome::start(&Handle::current(), Duration::from_millis(1), moment);
         assert!(
             until(|| n.load(Ordering::Relaxed) >= 5),
             "the clock never ran"
@@ -299,10 +351,10 @@ mod tests {
         assert_eq!(n.load(Ordering::Relaxed), after, "it kept running");
     }
 
-    #[test]
-    fn a_paused_clock_holds_the_world_still_and_resumes_where_it_was() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paused_clock_holds_the_world_still_and_resumes_where_it_was() {
         let (n, moment) = counter();
-        let clock = Metronome::start(Duration::from_millis(1), moment);
+        let clock = Metronome::start(&Handle::current(), Duration::from_millis(1), moment);
         assert!(until(|| n.load(Ordering::Relaxed) >= 2));
 
         clock.pause();
@@ -321,10 +373,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_count_of_moments_is_what_a_health_check_reads() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_count_of_moments_is_what_a_health_check_reads() {
         let (_n, moment) = counter();
-        let clock = Metronome::start(Duration::from_millis(1), moment);
+        let clock = Metronome::start(&Handle::current(), Duration::from_millis(1), moment);
         assert!(until(|| clock.moments() >= 3));
 
         clock.pause();
@@ -334,22 +386,22 @@ mod tests {
         assert_eq!(clock.moments(), held, "a paused clock counted moments");
     }
 
-    #[test]
-    fn nothing_happens_before_the_first_interval() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nothing_happens_before_the_first_interval() {
         // The gap a caller uses to bind bodies to minds before the world moves
         // under them.
         let (n, moment) = counter();
-        let _clock = Metronome::start(Duration::from_millis(200), moment);
+        let _clock = Metronome::start(&Handle::current(), Duration::from_millis(200), moment);
         assert_eq!(n.load(Ordering::Relaxed), 0);
     }
 
-    #[test]
-    fn a_dropped_clock_stops_moving_the_world() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_clock_stops_moving_the_world() {
         // A clock that outlived its owner is a leak that looks like a working
         // daemon: the world keeps moving and nobody is reading it.
         let (n, moment) = counter();
         {
-            let _clock = Metronome::start(Duration::from_millis(1), moment);
+            let _clock = Metronome::start(&Handle::current(), Duration::from_millis(1), moment);
             assert!(until(|| n.load(Ordering::Relaxed) >= 3));
         }
         let after = n.load(Ordering::Relaxed);
@@ -357,15 +409,15 @@ mod tests {
         assert_eq!(n.load(Ordering::Relaxed), after, "it outlived its owner");
     }
 
-    #[test]
-    fn stopping_waits_for_the_moment_in_flight() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopping_waits_for_the_moment_in_flight() {
         // A moment holds the world's lock. Returning before it is released
         // would let a caller tear the world down underneath it.
         let running = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
         let clock = {
             let (running, finished) = (running.clone(), finished.clone());
-            Metronome::start(Duration::from_millis(1), move || {
+            Metronome::start(&Handle::current(), Duration::from_millis(1), move || {
                 running.store(true, Ordering::Relaxed);
                 thread::sleep(Duration::from_millis(50));
                 finished.store(true, Ordering::Relaxed);

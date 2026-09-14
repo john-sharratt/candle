@@ -1,56 +1,74 @@
-# Performance — RTX PRO 5000 Blackwell 72 GB
+# Performance — the fleet
 
-Measured figures for every model with a batched-forward path in this tree, on
-one machine, with an emphasis on **how cost behaves as the KV cache grows**.
-Every number here was produced by a test in this repository; nothing is
-extrapolated, and §4 — the limits — is as load-bearing as the tables.
+Measured figures for every model with a batched-forward path in this tree,
+across the machines it is developed on (§1), with an emphasis on **how cost
+behaves as the KV cache grows**. Every number here was produced by a test in
+this repository; nothing is extrapolated, nothing is transferred between cards,
+and §4 — the limits — is as load-bearing as the tables.
 
-> **Machine:** see §1 · **Branch:** `qwen38-moe`
+> **The numbers do not transfer between machines.** The elastic VRAM partition
+> sizes itself from what each card has, so a model's compression headroom and
+> its expert residency are properties of the card it ran on. Every table names
+> its machine, and a row from one card is never set beside a row from another
+> except in the comparisons that say they are cross-machine.
 >
-> **Two sweeps, one per axis.** The depth tables (§3.2–§3.5, and §3.6's two
-> depth curves) come from a single sequential sweep on one build, 2026-09-03:
-> twelve depth gates, twelve width ladders, and the flagship's two depth curves,
-> run one `cargo test` invocation at a time so exactly one model was ever
-> resident. The width tables (§3.6 *Width*, §3.7) report, cell by cell, the
-> **higher** of that sweep and a second, width-only sweep on 2026-09-13 (build
-> `2c5f065c` plus its working tree, same machine, driver and toolchain as §1).
-> A cell taken from the second sweep is marked **†**. A maximum of two runs sits
-> above either run alone by up to the 1–4% noise floor (§5), so the width cells
-> are best-of-two rather than single measurements.
+> **What each machine has measured.**
+> - **RTX PRO 5000 Blackwell 72 GB** — the reference, and the source of every
+>   depth measurement here. Two sequential sweeps: a depth+width sweep on
+>   2026-09-03, and a width-only sweep on 2026-09-13 (build `2c5f065c` + working
+>   tree, same machine and toolchain as §1). The depth tables (§3.2–§3.5, §3.6's
+>   curves) are the first sweep; the width tables (§3.6 *Width*, §3.7) report the
+>   **higher** of the two per cell, **†** marking a 2026-09-13 cell. Best-of-two
+>   sits above either run by up to the 1–4% noise floor (§5).
+> - **RTX 3090 24 GB** — a width/throughput gate sweep on 2026-09-14 (§3.8),
+>   the same `test_parallel_batched_forwarding*` gates as §3.7, run one model at
+>   a time. Ten of the fleet's models plus the two AntiLoop+StyleTune hybrids;
+>   the 250B Flash-Next and the 284B DeepSeek do not fit 24 GB. **No depth
+>   curves** — the `long_context_*` and `profile_*` gates were not run on this
+>   card, so the 3090 appears in the width and shallow tables only.
+> - **RTX 4090 Mobile 16 GB** — the third fleet machine (§1), not yet swept. Its
+>   rows are pending measurement.
 
 ---
 
-## 1. The machine
+## 1. The machines
 
-Every figure below is from this one machine. None of it transfers to another
-card without re-measurement — the elastic VRAM partition sizes itself from what
-it finds, so both the compression ladder's headroom and the expert cache's
-residency are properties of *this* 72 GB card.
+Three machines carry this work, and **none of it transfers between them without
+re-measurement** — the elastic VRAM partition sizes itself from what each card
+finds, so both the compression ladder's headroom and the expert cache's
+residency are properties of the card a row ran on.
 
-| | |
-|---|---|
-| **GPU** | NVIDIA RTX PRO 5000 Blackwell, 72 GB GDDR7 (73,415 MiB reported) |
-| **Compute capability** | 12.0 (sm_120) |
-| **Max SM / memory clock** | 3,090 MHz / 14,001 MHz |
-| **Driver** | 596.59 |
-| **CPU** | AMD Ryzen 9 9950X3D, 16 cores / 32 threads |
-| **System RAM** | 189 GB |
-| **OS** | Windows 11 Pro, build 26200 |
-| **GPU driver model** | WDDM (not TCC) |
-| **CUDA toolkit** | 12.9 (V12.9.86) |
-| **Rust** | 1.98.0 (88d9e12ae 2026-08-18) |
-| **Build** | `--release --features cuda` |
+| | RTX PRO 5000 Blackwell | RTX 3090 | RTX 4090 Mobile |
+|---|---|---|---|
+| **VRAM** | 72 GB GDDR7 (73,415 MiB) | 24 GB (24,576 MiB) | 16 GB |
+| **Compute capability** | 12.0 (sm_120) | 8.6 (sm_86, GA102) | 8.9 (sm_89, Ada) |
+| **Native FP8** | yes | **no** (sm < 8.9) | yes |
+| **CPU** | AMD Ryzen 9 9950X3D, 16C/32T | Intel i7-10700K, 8C/16T | — |
+| **System RAM** | 189 GB | 64 GB | 32 GB |
+| **Host↔GPU link** | PCIe 5.0 ×16 | **PCIe 3.0 ×16 (~12 GB/s)** | PCIe 4.0 ×16 (~25 GB/s) |
+| **Max SM / mem clock** | 3,090 / 14,001 MHz | — | — |
+| **OS** | Windows 11 Pro (26200) | Windows 11 Pro (26200) | — |
+| **GPU driver model** | WDDM (not TCC) | WDDM (not TCC) | — |
+| **Build** | `--release --features cuda` | `--release --features cuda` | — |
+| **Measured here** | depth + width (§3.2–§3.7) | width gate sweep (§3.8) | pending |
 
-Two properties of this machine shape several results and are worth stating
-before the tables rather than after:
+Properties that shape several results, worth stating before the tables:
 
-- **WDDM, not TCC.** Kernel launches carry the Windows display-driver model's
-  submission overhead, which is the floor under single-session decode on every
-  small model here. A Linux/TCC host would move the decode column and leave the
-  prefill column roughly alone.
-- **72 GB on one card.** Every model in this report except the 284B fits its
-  weights resident, so the depth curves below are *not* contaminated by weight
-  paging. That is the point of running them here.
+- **WDDM, not TCC**, on both measured cards. Kernel launches carry the Windows
+  display-driver model's submission overhead, which is the floor under
+  single-session decode on every small model here. A Linux/TCC host would move
+  the decode column and leave the prefill column roughly alone.
+- **72 GB on one card.** Every model in the reference report except the 284B fits
+  its weights resident, so the depth curves below are *not* contaminated by
+  weight paging. That is the point of running them there.
+- **The 3090's two traps** (both from `CLAUDE.md`'s fleet notes, and both real
+  in the numbers). Its host caps the link at **PCIe 3.0** — ~12 GB/s, roughly
+  half the 4090 Mobile's despite 50% more VRAM — so any warm↔hot KV or
+  expert-stream cost is paid at that rate; and **sm_86 has no native FP8**, so
+  the int8-MMA and the FP8 provenance/expert fast paths degrade to the next
+  rung. Neither changes a row's validity, but both shape the 3090's absolute
+  rates against the Blackwell card, so its numbers are never subtracted from the
+  72 GB card's to claim an architectural result.
 
 ---
 
@@ -196,6 +214,11 @@ a measurement and an error.
 ---
 
 ## 3. Results
+
+**§3.2 through §3.7 are the RTX PRO 5000 72 GB reference machine** — the only
+card with a depth sweep. The **RTX 3090 24 GB** gate sweep is **§3.8**, with its
+own methodology note; where the two cards ran the same `test_parallel_batched_forwarding*`
+gate, §3.8 sets them side by side.
 
 ### 3.1 The models
 
@@ -493,6 +516,307 @@ model's own widest point rather than a shared column — and two ladders run
 wider in the second sweep than in the first (Qwen3.5-0.8B to ×256, Qwen3-30B-A3B
 to ×20), so a model's widest point can come from either sweep.
 
+### 3.8 RTX 3090 24 GB — the width gate sweep
+
+A single sequential sweep on **2026-09-14**, on the RTX 3090 (§1), of the same
+`test_parallel_batched_forwarding*` gates that produce §3.6 *Width* and §3.7 —
+one `cargo test` invocation per model so exactly one was ever resident,
+`--release --features cuda`. This is a **width / throughput** sweep: each gate
+runs its own ladder of KV modes and context counts at a fixed ~700-token prompt,
+so it measures aggregate throughput and the compression ladder, **not** depth —
+the `long_context_*` and `profile_*` depth gates were not run here. Numbers are
+single measurements (no best-of-two), so the 1–4 % noise floor (§5) applies to
+each cell alone.
+
+**Ten of the fleet's models, plus the two AntiLoop+StyleTune hybrids** — the
+production 3.6-35B npcd actually serves. The 250B Flash-Next and the 284B
+DeepSeek are omitted: neither fits 24 GB (§4). Two card-specific notes carry into
+these rows: **Llama-3.2-3B ran without flash-attn** (its build needs `cl.exe` on
+PATH, absent in the sweep shell; the model's `#[cfg(not(feature = "flash-attn"))]`
+fallback path was used instead), and **Qwen2-0.5B reports no compression** here,
+the same model-specific behaviour §4 records on the 72 GB card.
+
+**Summary** — best prefill, best decode, and the best validated compression over
+each model's ladder:
+
+| Model | best prefill t/s | best decode t/s | best compression (mode) |
+|---|---:|---:|---|
+| Qwen2-0.5B | 23,762.6 | 4,951.2 | — (no ladder) |
+| Qwen3.5-0.8B | 18,468.5 | 1,149.9 | 4.11× (C10) |
+| Llama-3.2-3B † | 5,326.9 | 542.7 | 4.27× (C10) |
+| Llama-2-7B | 2,952.9 | 547.6 | 3.56× (Q4_0) |
+| Qwen3-8B | 2,707.2 | 303.4 | 5.84× (C10) |
+| Qwen3.5-9B | 2,907.7 | 491.3 | 5.13× (C10) |
+| Qwen3.8-27B | 940.5 | 198.9 | 4.78× (C10) |
+| Qwen3-30B-A3B | 3,886.6 | 274.5 | 5.31× (C9) |
+| Qwen3.5-35B-A3B | 3,539.2 | 375.9 | 6.23× (C10) |
+| Qwen3.6-35B-A3B | 3,662.1 | 388.6 | 6.05× (C10) |
+| Qwen3.6-35B AntiLoop+StyleTune (auto/Precision) | 3,463.1 | 351.6 | 6.09× (C10) |
+| Qwen3.6-35B AntiLoop+StyleTune (Performance) | 3,742.3 | 399.0 | 6.10× (C10) |
+
+† ran on the no-flash-attn fallback path (above).
+
+**Against the 72 GB card, on the models both ran.** The comparison holds only on
+the width gate, and only loosely: the 3090's ladders stop at a narrower widest
+context (×16 on the 35Bs, where the 72 GB reached ×64), because 24 GB caps how
+many concurrent sessions fit. So the raw gaps are dominated by concurrency
+headroom, not per-session speed. On the 35B MoEs the 72 GB card prefills about
+**2×** the 3090 at one context (~7,200 vs ~3,600 t/s) and reaches about **3×**
+the aggregate decode at its own widest (1,150–1,183 vs 376–389 t/s at ×16) —
+most of that decode gap being the extra 48 sessions the bigger card holds.
+**Compression tracks the model, not the card**: the 3090's C10 lands at
+6.23×/6.05× on the two 35Bs against the 72 GB card's 2026-09-13 6.20×/6.04×
+(§4) — the same ladder within noise, as expected, since a ratio is bytes stored
+and the adaptive policy is identical on both. The sm_86 and PCIe-3.0 traps (§1)
+sit under the 3090's absolute rates but leave the ratios untouched.
+
+**Full ladders.** Each model's complete gate ladder — every KV mode and context
+the gate ran, exactly as the run logs printed them. `Valid` is the per-config
+reproduction check (`✓`, or `-` for a mode not validated for reproduction);
+`int8` is the loader's int8 posture (`prec`/`perf`/`off`).
+
+#### Qwen2-0.5B
+
+| KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
+|---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
+| F32 | off | no | 1 | - | 15018.2 | 241.5 | - | - | 308 |
+| BF16 | off | yes | 1 | - | 15752.4 | 247.2 | - | - | 308 |
+| F16 | off | yes | 1 | - | 15642.9 | 240.2 | - | - | 308 |
+| F16 | off | yes | 4 | - | 23762.6 | 902.6 | - | - | 1272 |
+| F16 | off | yes | 60 | - | 22018.4 | 4455.0 | - | - | 18612 |
+| BF16 | off | yes | 60 | - | 21985.8 | 4951.2 | - | - | 18612 |
+
+#### Qwen3.5-0.8B
+
+| KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
+|---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
+| F16 | prec | yes | 1 | ✓ | 14961.7 | 103.4 | - | - | 659 |
+| BF16 | prec | yes | 1 | ✓ | 15114.3 | 134.6 | - | - | 659 |
+| BF16 | prec | yes | 16 | ✓ | 17779.6 | 897.6 | - | - | 10618 |
+| Q8_0 | prec | yes | 4 | ✓ | 15875.2 | 232.5 | 100.0% | 1.88x | 2678 |
+| C0 | prec | yes | 2 | ✓ | 17615.3 | 324.0 | 100.0% | 1.85x | 1358 |
+| C1 | prec | yes | 2 | ✓ | 17639.0 | 324.5 | 100.0% | 2.01x | 1358 |
+| C2 | prec | yes | 2 | ✓ | 17659.5 | 318.5 | 100.0% | 2.26x | 1358 |
+| C3 | prec | yes | 2 | ✓ | 17445.2 | 315.0 | 100.0% | 2.40x | 1358 |
+| C4 | prec | yes | 2 | ✓ | 17613.2 | 323.5 | 100.0% | 2.58x | 1358 |
+| C5 | prec | yes | 2 | ✓ | 17640.2 | 317.9 | 100.0% | 2.76x | 1358 |
+| C6 | prec | yes | 2 | ✓ | 17603.8 | 325.2 | 100.0% | 2.86x | 1358 |
+| C7 | prec | yes | 2 | ✓ | 17500.3 | 326.9 | 100.0% | 3.61x | 1358 |
+| C8 | prec | yes | 32 | ✓ | 17632.3 | 772.4 | 100.0% | 3.83x | 21202 |
+| C9 | prec | yes | 5 | ✓ | 18468.5 | 728.0 | 100.0% | 4.08x | 3337 |
+| C10 | prec | yes | 10 | ✓ | 17796.4 | 1149.9 | 100.0% | 4.11x | 6640 |
+
+#### Llama-3.2-3B (no flash-attn fallback)
+
+| KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
+|---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
+| F32 | prec | no | 1 | ✓ | 5261.6 | 130.3 | - | - | 654 |
+| F16 | prec | yes | 1 | ✓ | 5279.1 | 130.7 | - | - | 654 |
+| F16 | prec | yes | 4 | ✓ | 4980.5 | 375.3 | - | - | 2658 |
+| R16 | prec | yes | 1 | ✓ | 5320.5 | 130.8 | 0.0% | - | 654 |
+| Q8_0 | prec | yes | 1 | ✓ | 5297.1 | 135.3 | 100.0% | 1.88x | 654 |
+| Q8_Q4 | prec | yes | 1 | ✓ | 5326.9 | 128.5 | 100.0% | 2.29x | 654 |
+| BF16 | prec | yes | 4 | ✓ | 4972.2 | 373.4 | - | - | 2658 |
+| Q8_1 | prec | yes | 4 | ✓ | 4968.3 | 313.1 | 100.0% | 1.78x | 2658 |
+| Q8_KS | prec | yes | 4 | ✓ | 4968.6 | 348.0 | 100.0% | 1.78x | 2658 |
+| Q8_Q4 | prec | yes | 4 | ✓ | 4946.9 | 312.0 | 100.0% | 2.29x | 2658 |
+| Q4_0 | prec | yes | 4 | - | 4928.2 | 354.6 | 100.0% | 3.56x | 2658 |
+| Q4_1 | prec | yes | 4 | - | 4932.4 | 317.1 | 100.0% | 3.20x | 2658 |
+| Q4_KS | prec | yes | 4 | - | 4968.1 | 339.7 | 100.0% | 3.20x | 2658 |
+| C0 | prec | yes | 1 | ✓ | 5288.7 | 133.5 | 100.0% | 1.87x | 654 |
+| C1 | prec | yes | 1 | ✓ | 5240.4 | 132.0 | 100.0% | 2.19x | 654 |
+| C2 | prec | yes | 1 | ✓ | 5252.0 | 133.3 | 100.0% | 2.37x | 654 |
+| C3 | prec | yes | 1 | ✓ | 5211.1 | 132.3 | 100.0% | 2.75x | 654 |
+| C4 | prec | yes | 1 | ✓ | 5253.5 | 132.4 | 100.0% | 3.07x | 654 |
+| C5 | prec | yes | 1 | ✓ | 5281.4 | 132.2 | 100.0% | 3.28x | 654 |
+| C6 | prec | yes | 1 | ✓ | 5257.8 | 131.4 | 100.0% | 3.44x | 654 |
+| C7 | prec | yes | 1 | ✓ | 5270.8 | 131.8 | 100.0% | 3.80x | 654 |
+| C8 | prec | yes | 10 | ✓ | 4179.3 | 542.7 | 100.0% | 3.90x | 6590 |
+| C9 | prec | yes | 10 | ✓ | 4171.5 | 482.6 | 100.0% | 4.22x | 6590 |
+| C10 | prec | yes | 5 | ✓ | 4790.5 | 402.3 | 100.0% | 4.27x | 3312 |
+
+#### Llama-2-7B
+
+| KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
+|---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
+| F32 | perf | no | 1 | - | 2952.9 | 87.7 | - | - | 283 |
+| F16 | perf | yes | 1 | - | 2929.5 | 88.0 | - | - | 283 |
+| F16 | perf | yes | 4 | - | 2909.6 | 244.4 | - | - | 1176 |
+| F16 | perf | yes | 8 | - | 2555.7 | 359.4 | - | - | 2316 |
+| BF16 | perf | yes | 1 | - | 2894.8 | 90.9 | - | - | 283 |
+| BF16 | perf | yes | 8 | - | 2556.8 | 360.8 | - | - | 2316 |
+| BF16 | perf | yes | 16 | - | 1998.9 | 466.3 | - | - | 4624 |
+| BF16 | perf | yes | 48 | - | 1433.0 | 547.6 | - | - | 13796 |
+| Q8_0 | perf | yes | 32 | - | 1813.8 | 464.7 | 100.0% | 1.88x | 9220 |
+| Q4_0 | perf | yes | 32 | - | 1813.4 | 445.8 | 100.0% | 3.56x | 9220 |
+
+#### Qwen3-8B
+
+| KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
+|---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
+| BF16 | perf | no | 1 | ✓ | 2697.4 | 69.2 | - | - | 636 |
+| F16 | perf | yes | 1 | ✓ | 2707.2 | 69.8 | - | - | 636 |
+| F16 | perf | yes | 2 | ✓ | 2675.7 | 114.4 | - | - | 1312 |
+| BF16 | perf | yes | 4 | ✓ | 2351.2 | 213.3 | - | - | 2586 |
+| Q8_0 | perf | yes | 4 | ✓ | 2355.2 | 208.8 | 100.0% | 1.88x | 2586 |
+| C0 | perf | yes | 1 | ✓ | 2662.8 | 71.5 | 100.0% | 1.90x | 636 |
+| C1 | perf | yes | 1 | ✓ | 2661.9 | 71.5 | 100.0% | 2.54x | 636 |
+| C2 | perf | yes | 1 | ✓ | 2663.9 | 71.6 | 100.0% | 2.67x | 636 |
+| C3 | perf | yes | 1 | ✓ | 2652.9 | 71.8 | 100.0% | 2.92x | 636 |
+| C4 | perf | yes | 1 | ✓ | 2653.6 | 71.3 | 100.0% | 3.31x | 636 |
+| C5 | perf | yes | 1 | ✓ | 2653.7 | 71.3 | 100.0% | 3.67x | 636 |
+| C6 | perf | yes | 1 | ✓ | 2652.9 | 70.6 | 100.0% | 4.31x | 636 |
+| C7 | perf | yes | 1 | ✓ | 2656.2 | 70.5 | 100.0% | 4.49x | 636 |
+| C8 | perf | yes | 10 | ✓ | 2262.6 | 303.4 | 100.0% | 4.85x | 6410 |
+| C9 | perf | yes | 5 | ✓ | 2260.9 | 222.8 | 100.0% | 5.47x | 3222 |
+| C10 | perf | yes | 5 | ✓ | 2266.2 | 225.1 | 100.0% | 5.84x | 3222 |
+
+#### Qwen3.5-9B
+
+| KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
+|---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
+| F16 | prec | yes | 1 | ✓ | 2879.6 | 93.8 | - | - | 659 |
+| BF16 | prec | yes | 1 | ✓ | 2907.7 | 93.7 | - | - | 659 |
+| BF16 | prec | yes | 4 | ✓ | 2573.9 | 311.8 | - | - | 2678 |
+| Q8_0 | prec | yes | 4 | ✓ | 2566.4 | 337.3 | 100.0% | 1.88x | 2678 |
+| C0 | prec | yes | 1 | ✓ | 2899.5 | 108.2 | 100.0% | 2.12x | 659 |
+| C1 | prec | yes | 1 | ✓ | 2895.6 | 107.5 | 100.0% | 2.43x | 659 |
+| C2 | prec | yes | 1 | ✓ | 2889.7 | 105.6 | 100.0% | 2.82x | 659 |
+| C3 | prec | yes | 1 | ✓ | 2893.4 | 106.8 | 100.0% | 3.12x | 659 |
+| C4 | prec | yes | 1 | ✓ | 2885.8 | 106.3 | 100.0% | 3.45x | 659 |
+| C5 | prec | yes | 1 | ✓ | 2895.9 | 106.8 | 100.0% | 3.62x | 659 |
+| C6 | prec | yes | 1 | ✓ | 2897.4 | 109.4 | 100.0% | 3.95x | 659 |
+| C7 | prec | yes | 1 | ✓ | 2872.1 | 107.6 | 100.0% | 4.03x | 659 |
+| C8 | prec | yes | 20 | ✓ | 2555.7 | 295.3 | 100.0% | 4.49x | 13278 |
+| C9 | prec | yes | 5 | ✓ | 2458.3 | 381.2 | 100.0% | 5.00x | 3337 |
+| C10 | prec | yes | 10 | ✓ | 2598.1 | 491.3 | 100.0% | 5.13x | 6640 |
+
+#### Qwen3.8-27B
+
+| KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
+|---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
+| BF16 | perf | yes | 1 | ✓ | 940.5 | 50.6 | - | - | 659 |
+| BF16 | perf | yes | 4 | ✓ | 860.8 | 179.8 | - | - | 2678 |
+| Q8_0 | perf | yes | 4 | ✓ | 855.8 | 175.7 | 100.0% | 1.88x | 2678 |
+| C0 | perf | yes | 1 | ✓ | 934.6 | 66.2 | 100.0% | 2.11x | 659 |
+| C1 | perf | yes | 1 | ✓ | 933.1 | 65.2 | 100.0% | 2.33x | 659 |
+| C2 | perf | yes | 1 | ✓ | 932.2 | 65.5 | 100.0% | 2.69x | 659 |
+| C3 | perf | yes | 1 | ✓ | 933.6 | 65.7 | 100.0% | 3.05x | 659 |
+| C4 | perf | yes | 1 | ✓ | 931.2 | 65.6 | 100.0% | 3.38x | 659 |
+| C5 | perf | yes | 1 | ✓ | 931.0 | 65.3 | 100.0% | 3.56x | 659 |
+| C6 | perf | yes | 1 | ✓ | 930.7 | 65.8 | 100.0% | 3.78x | 659 |
+| C7 | perf | yes | 1 | ✓ | 929.6 | 65.6 | 100.0% | 3.84x | 659 |
+| C8 | perf | yes | 20 | ✓ | 828.2 | 101.6 | 100.0% | 4.27x | 13278 |
+| C9 | perf | yes | 5 | ✓ | 842.2 | 198.9 | 100.0% | 4.70x | 3337 |
+| C10 | perf | yes | 10 | ✓ | 823.4 | 196.6 | 100.0% | 4.78x | 6640 |
+
+#### Qwen3-30B-A3B
+
+| KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
+|---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
+| F16 | perf | yes | 1 | ✓ | 1914.8 | 33.8 | - | - | 626 |
+| BF16 | perf | yes | 1 | ✓ | 2987.2 | 40.3 | - | - | 626 |
+| BF16 | perf | yes | 10 | ✓ | 3886.6 | 256.6 | - | - | 6310 |
+| Q8_0 | perf | yes | 20 | ✓ | 3873.0 | 274.5 | 100.0% | 1.88x | 12620 |
+| Q4_0 | perf | yes | 4 | - | 3883.1 | 107.7 | 100.0% | 3.56x | 2546 |
+| C0 | perf | yes | 2 | ✓ | 3590.5 | 74.2 | 100.0% | 1.98x | 1292 |
+| C1 | perf | yes | 2 | ✓ | 3598.7 | 74.5 | 100.0% | 2.54x | 1292 |
+| C2 | perf | yes | 2 | ✓ | 3596.8 | 72.7 | 100.0% | 2.74x | 1292 |
+| C3 | perf | yes | 2 | ✓ | 3581.9 | 74.3 | 100.0% | 2.99x | 1292 |
+| C4 | perf | yes | 2 | ✓ | 3580.8 | 73.0 | 100.0% | 3.41x | 1292 |
+| C5 | perf | yes | 2 | ✓ | 3574.1 | 73.5 | 100.0% | 3.67x | 1292 |
+| C6 | perf | yes | 2 | ✓ | 3587.1 | 72.2 | 100.0% | 4.17x | 1292 |
+| C7 | perf | yes | 2 | ✓ | 3566.3 | 66.4 | 100.0% | 4.24x | 1292 |
+| C9 | perf | yes | 2 | ✓ | 3584.1 | 70.8 | 100.0% | 5.31x | 1292 |
+| BF16 | perf | yes | 1 | ✓ | 3281.3 | 42.4 | - | - | 626 |
+| Q4_0 | perf | yes | 20 | - | 3874.9 | 268.5 | 100.0% | 3.56x | 12620 |
+
+#### Qwen3.5-35B-A3B
+
+| KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
+|---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
+| BF16 | perf | yes | 1 | ✓ | 1267.1 | 41.8 | - | - | 659 |
+| BF16 | perf | yes | 4 | ✓ | 3066.1 | 256.7 | - | - | 2678 |
+| Q8_0 | perf | yes | 2 | ✓ | 3508.7 | 127.2 | 100.0% | 1.88x | 1358 |
+| C0 | perf | yes | 1 | ✓ | 3525.8 | 80.5 | 100.0% | 2.20x | 659 |
+| C1 | perf | yes | 1 | ✓ | 3528.6 | 81.8 | 100.0% | 2.85x | 659 |
+| C2 | perf | yes | 1 | ✓ | 3532.7 | 81.3 | 100.0% | 3.26x | 659 |
+| C3 | perf | yes | 1 | ✓ | 3483.6 | 81.2 | 100.0% | 3.41x | 659 |
+| C4 | perf | yes | 1 | ✓ | 3539.2 | 79.7 | 100.0% | 3.72x | 659 |
+| C5 | perf | yes | 1 | ✓ | 3538.0 | 80.6 | 100.0% | 3.83x | 659 |
+| C6 | perf | yes | 1 | ✓ | 3516.2 | 80.2 | 100.0% | 4.51x | 659 |
+| C7 | perf | yes | 1 | ✓ | 3521.2 | 79.9 | 100.0% | 4.61x | 659 |
+| C8 | perf | yes | 5 | ✓ | 3492.9 | 292.5 | 100.0% | 5.13x | 3337 |
+| C9 | perf | yes | 2 | ✓ | 3527.1 | 147.5 | 100.0% | 5.89x | 1358 |
+| C10 | perf | yes | 8 | ✓ | 3391.9 | 342.6 | 100.0% | 6.23x | 5316 |
+| C10 | perf | yes | 16 | ✓ | 2848.5 | 375.9 | 100.0% | 6.20x | 10618 |
+
+#### Qwen3.6-35B-A3B
+
+| KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
+|---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
+| BF16 | perf | yes | 1 | ✓ | 1339.8 | 41.7 | - | - | 659 |
+| BF16 | perf | yes | 4 | ✓ | 3181.4 | 263.0 | - | - | 2678 |
+| Q8_0 | perf | yes | 1 | ✓ | 3621.2 | 62.0 | 100.0% | 1.88x | 659 |
+| C0 | perf | yes | 1 | ✓ | 3639.9 | 76.6 | 100.0% | 2.20x | 659 |
+| C1 | perf | yes | 1 | ✓ | 3603.7 | 82.2 | 100.0% | 2.79x | 659 |
+| C2 | perf | yes | 1 | ✓ | 3602.4 | 78.4 | 100.0% | 3.23x | 659 |
+| C3 | perf | yes | 1 | ✓ | 3662.1 | 81.2 | 100.0% | 3.39x | 659 |
+| C4 | perf | yes | 1 | ✓ | 3641.8 | 80.3 | 100.0% | 3.72x | 659 |
+| C5 | perf | yes | 1 | ✓ | 3652.9 | 81.7 | 100.0% | 3.81x | 659 |
+| C6 | perf | yes | 1 | ✓ | 3646.3 | 78.0 | 100.0% | 4.42x | 659 |
+| C7 | perf | yes | 1 | ✓ | 3647.6 | 78.0 | 100.0% | 4.51x | 659 |
+| C8 | perf | yes | 5 | ✓ | 3604.3 | 296.5 | 100.0% | 5.04x | 3337 |
+| C9 | perf | yes | 2 | ✓ | 3629.5 | 119.1 | 100.0% | 5.75x | 1358 |
+| C10 | perf | yes | 8 | ✓ | 3510.2 | 347.6 | 100.0% | 6.05x | 5316 |
+| C10 | perf | yes | 16 | ✓ | 3115.7 | 388.6 | 100.0% | 6.04x | 10618 |
+
+#### Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)
+
+The npcd production configuration — AntiLoop trunk under StyleTune's output head,
+at `Int8Mode::auto` (Precision on this int8-MMA-less card).
+
+| KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
+|---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
+| BF16 | prec | yes | 1 | ✓ | 1021.8 | 36.8 | - | - | 659 |
+| BF16 | prec | yes | 4 | ✓ | 2303.9 | 221.6 | - | - | 2678 |
+| Q8_0 | prec | yes | 1 | ✓ | 2620.8 | 68.9 | 100.0% | 1.88x | 659 |
+| C0 | prec | yes | 1 | ✓ | 2752.8 | 77.1 | 100.0% | 2.21x | 659 |
+| C1 | prec | yes | 1 | ✓ | 2857.5 | 76.3 | 100.0% | 2.79x | 659 |
+| C2 | prec | yes | 1 | ✓ | 2960.0 | 74.6 | 100.0% | 3.24x | 659 |
+| C3 | prec | yes | 1 | ✓ | 3112.0 | 78.5 | 100.0% | 3.40x | 659 |
+| C4 | prec | yes | 1 | ✓ | 3234.3 | 77.6 | 100.0% | 3.72x | 659 |
+| C5 | prec | yes | 1 | ✓ | 3340.1 | 79.5 | 100.0% | 3.82x | 659 |
+| C6 | prec | yes | 1 | ✓ | 3453.2 | 75.9 | 100.0% | 4.46x | 659 |
+| C7 | prec | yes | 1 | ✓ | 3463.1 | 78.7 | 100.0% | 4.55x | 659 |
+| C8 | prec | yes | 5 | ✓ | 3236.1 | 266.0 | 100.0% | 5.06x | 3337 |
+| C9 | prec | yes | 2 | ✓ | 3254.2 | 112.3 | 100.0% | 5.79x | 1358 |
+| C10 | prec | yes | 8 | ✓ | 3161.3 | 275.1 | 100.0% | 6.09x | 5316 |
+| C10 | prec | yes | 16 | ✓ | 2371.2 | 351.6 | 100.0% | 6.08x | 10618 |
+
+#### Qwen3.6-35B AntiLoop+StyleTune (Performance)
+
+The same hybrid at `Int8Mode::Performance` — same-width KO twins — priced against
+the `auto`/Precision row above.
+
+| KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
+|---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
+| BF16 | perf | yes | 1 | ✓ | 1476.5 | 43.3 | - | - | 659 |
+| BF16 | perf | yes | 4 | ✓ | 3305.0 | 252.4 | - | - | 2678 |
+| Q8_0 | perf | yes | 1 | ✓ | 3719.1 | 73.0 | 100.0% | 1.88x | 659 |
+| C0 | perf | yes | 1 | ✓ | 3739.4 | 81.7 | 100.0% | 2.21x | 659 |
+| C1 | perf | yes | 1 | ✓ | 3741.0 | 83.1 | 100.0% | 2.80x | 659 |
+| C2 | perf | yes | 1 | ✓ | 3725.4 | 82.1 | 100.0% | 3.23x | 659 |
+| C3 | perf | yes | 1 | ✓ | 3739.7 | 77.3 | 100.0% | 3.40x | 659 |
+| C4 | perf | yes | 1 | ✓ | 3728.6 | 82.6 | 100.0% | 3.72x | 659 |
+| C5 | perf | yes | 1 | ✓ | 3740.0 | 83.4 | 100.0% | 3.82x | 659 |
+| C6 | perf | yes | 1 | ✓ | 3724.6 | 81.7 | 100.0% | 4.44x | 659 |
+| C7 | perf | yes | 1 | ✓ | 3742.3 | 81.8 | 100.0% | 4.54x | 659 |
+| C8 | perf | yes | 5 | ✓ | 3691.7 | 295.7 | 100.0% | 5.05x | 3337 |
+| C9 | perf | yes | 2 | ✓ | 3731.4 | 148.5 | 100.0% | 5.77x | 1358 |
+| C10 | perf | yes | 8 | ✓ | 3738.5 | 346.7 | 100.0% | 6.10x | 5316 |
+| C10 | perf | yes | 16 | ✓ | 3384.8 | 399.0 | 100.0% | 6.07x | 10618 |
+
 ---
 
 ## 4. Limits and open items
@@ -664,36 +988,51 @@ one about production selection.
 - **Non-speculative decode at depth.** The depth gate drives the speculative
   loop on models that support it; the plain path is not separately measured
   there.
-- **Anything but this machine.** See §1.
+- **Depth on the RTX 3090.** The 3090 sweep (§3.8) is width only — no
+  `long_context_*` or `profile_*` run exists for that card, so every depth claim
+  in this document is the 72 GB card's alone.
+- **The two largest models on the RTX 3090.** Qwen3.8-Flash-Next (250B/13B) and
+  DeepSeek-V4-Flash (284B) were skipped in §3.8 — neither fits 24 GB.
+- **Flash-attn on the RTX 3090.** Llama-3.2-3B ran on its `not(feature =
+  "flash-attn")` fallback because the flash-attn kernels need `cl.exe` on PATH to
+  build and the sweep shell had none; its flash-attn path on the 3090 is
+  unmeasured, and every other 3090 gate builds from cached PTX regardless.
+- **The RTX 4090 Mobile 16 GB.** The third fleet machine (§1) has no sweep yet.
+- **Anything but these three machines.** See §1.
 
 ---
 
 ## 5. Provenance
 
 Every row measured in each sweep — including the ones the tables above omit —
-is beside this file, one TSV per sweep, both with the columns `test, label,
+is beside this file, one TSV per sweep, all with the columns `test, label,
 depth, prompt_tokens, mode, int8, contexts, valid, prefill_tps, decode_tps,
 quantized_pct, compress, peak_tokens`, scraped from the run logs:
 
-| File | Sweep | Rows |
+| File | Machine · Sweep | Rows |
 |---|---|---:|
-| `performance_rtx_pro_5000_72gb_rows.tsv` | 2026-09-03 — depth and width | 146 |
-| `performance_rtx_pro_5000_72gb_rows_2026-09-13.tsv` | 2026-09-13 — width only, build `2c5f065c` + working tree | 171 |
+| `performance_rtx_pro_5000_72gb_rows.tsv` | 72 GB · 2026-09-03 — depth and width | 146 |
+| `performance_rtx_pro_5000_72gb_rows_2026-09-13.tsv` | 72 GB · 2026-09-13 — width only, build `2c5f065c` + working tree | 171 |
+| `performance_rtx_3090_24gb_rows.tsv` | RTX 3090 · 2026-09-14 — width gate sweep | 276 |
 
-A † cell in §3.6 *Width* or §3.7 is the second file's value; every other width
-cell is the first's. Reproduce any row with the command in its test's
-`#[ignore]` attribute.
+A † cell in §3.6 *Width* or §3.7 is the 72 GB second file's value; every other
+72 GB width cell is the first's. The 3090 TSV holds the width-sweep axis only —
+its `depth` column is blank and `prompt_tokens` is `~700`, the gate's fixed
+prompt. Reproduce any row with the command in its test's `#[ignore]` attribute.
 
 | Table | Test |
 |---|---|
-| §3.2, §3.3, §3.4 | each model's `long_context_*` gate |
-| §3.5 | the same gates, C-mode rows |
-| §3.6 Coherence | `quantized_qwen38_moe::tests::profile_decode_vs_depth` |
-| §3.6 Rewrite | `quantized_qwen38_moe::tests::profile_story_rewrite_vs_depth` |
-| §3.6 Width, §3.7 | `test_parallel_batched_forwarding*` |
+| §3.2, §3.3, §3.4 | each model's `long_context_*` gate (72 GB) |
+| §3.5 | the same gates, C-mode rows (72 GB) |
+| §3.6 Coherence | `quantized_qwen38_moe::tests::profile_decode_vs_depth` (72 GB) |
+| §3.6 Rewrite | `quantized_qwen38_moe::tests::profile_story_rewrite_vs_depth` (72 GB) |
+| §3.6 Width, §3.7 | `test_parallel_batched_forwarding*` (72 GB) |
+| §3.8 | `test_parallel_batched_forwarding*` (RTX 3090) |
 
-All runs in both sweeps were strictly sequential — one `cargo test` invocation
-per model, so exactly one model was ever resident and no run's VRAM sizing was
-perturbed by another's. Run-to-run variation is 1–4% on the width ladder and ~5% on the depth
-sweep, which is the noise floor any comparison in this document has to clear;
-differences smaller than that are not claimed as results.
+All runs, in every sweep and on both cards, were strictly sequential — one
+`cargo test` invocation per model, so exactly one model was ever resident and no
+run's VRAM sizing was perturbed by another's. Run-to-run variation is 1–4% on
+the width ladder and ~5% on the depth sweep, which is the noise floor any
+comparison in this document has to clear; differences smaller than that are not
+claimed as results. The 3090's §3.8 cells are single measurements, so that floor
+applies to each on its own rather than to a best-of-two.

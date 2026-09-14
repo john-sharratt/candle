@@ -43,6 +43,12 @@ pub struct ToolDef {
     pub description: String,
     #[serde(default)]
     pub high_risk: bool,
+    /// Projected on every turn, outside the `tools` collection's top-k:
+    /// provenance still selects its usual number of tools, and a mandatory one
+    /// is added on top rather than taking a slot. For the tools a coding turn
+    /// needs whatever the question — reading and listing files.
+    #[serde(default)]
+    pub mandatory: bool,
     /// JSON Schema for the call arguments (the tool's Request type).
     pub parameters: Value,
     /// ChatML selection-calibration trajectories (prompt + `<|im_end|>
@@ -250,6 +256,7 @@ mod tests {
         assert!(!is_tool_definition(Path::new(".substrate.yaml")));
         assert!(!is_tool_definition(Path::new("tools/.hidden.yaml")));
         assert!(is_tool_definition(Path::new("tools/file_list.yaml")));
+        assert!(!is_tool_definition(Path::new("tools/file_list.yml")));
         assert!(!is_tool_definition(Path::new("tools/README.md")));
     }
 
@@ -277,6 +284,7 @@ mod tests {
             category: "Files".to_string(),
             description: description.to_string(),
             high_risk: false,
+            mandatory: false,
             parameters: params,
             examples: vec!["list the files<|im_end|>".to_string()],
             questions: vec!["what files are here".to_string()],
@@ -444,6 +452,20 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Reading and listing files project on every turn; nothing else does. A
+    /// mandatory tool rides on top of the belief top-k, so adding one here
+    /// widens every prompt — the set is pinned so that is a deliberate change.
+    #[test]
+    fn only_file_read_and_file_list_are_mandatory() {
+        let mut mandatory: Vec<&str> = all()
+            .iter()
+            .filter(|d| d.mandatory)
+            .map(|d| d.name.as_str())
+            .collect();
+        mandatory.sort();
+        assert_eq!(mandatory, ["file_list", "file_read"]);
     }
 
     #[test]

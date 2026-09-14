@@ -140,7 +140,7 @@ impl Ledger {
     /// among a sagging jacket and a humming conduit — and was gone.
     ///
     /// Measured live: three `ask`s delivered and perceived correctly, and not
-    /// one `say` or `tell` in reply. One character was asked directly twice in
+    /// one `tell` or `whisper` in reply. One character was asked directly twice in
     /// forty ticks and reflected both times. They will *start* a conversation
     /// and never return one, because by its next turn there is nothing left
     /// saying anybody is waiting.
@@ -533,7 +533,7 @@ mod tests {
     /// **Every way of speaking to somebody discharges it, not just the one in
     /// the room.**
     ///
-    /// The obligation is cleared by `tell` and by `message`, and the second was
+    /// The obligation is cleared by `tell`, `whisper` and `message`, and the second was
     /// missed at first: a character that walked out and texted the answer
     /// stayed marked as owing one, with a standing nudge it could only clear by
     /// finding the person again in the flesh. Both call the same function, so

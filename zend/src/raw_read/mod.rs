@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use candle_conversation::projection::{self, TimelineId};
 use candle_conversation::stencil::TriggerRegistry;
-use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
+use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnText};
 
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
@@ -180,7 +180,11 @@ fn ingest_raw_into_sink<S: InsertTurnSink>(
         }
         let turns = records_to_turns(parse_chatml_records(content));
         for (user, assistant) in &turns {
-            sink.insert_prefill_turn(user, assistant, vec!["raw".to_string(), rel.clone()])?;
+            sink.insert_prefill_turn(
+                &TurnText::from(user),
+                assistant,
+                vec!["raw".to_string(), rel.clone()],
+            )?;
         }
         state
             .file_hashes
@@ -312,7 +316,11 @@ pub fn refresh_raw(
         for (i, (rel, content)) in files.iter().enumerate() {
             let turns = records_to_turns(parse_chatml_records(content));
             for (user, assistant) in &turns {
-                sink.insert_prefill_turn(user, assistant, vec!["raw".to_string(), rel.clone()])?;
+                sink.insert_prefill_turn(
+                    &TurnText::from(user),
+                    assistant,
+                    vec!["raw".to_string(), rel.clone()],
+                )?;
             }
             progress.set_step_progress((i + 1) as u64, total as u64);
         }

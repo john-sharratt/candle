@@ -27,7 +27,7 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
 #![allow(clippy::large_enum_variant)]
-#![allow(clippy::chunks_exact_to_as_chunks)]
+#![allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 
 //! Turn-based conversation engine for the candle inference stack.
 //!
@@ -101,10 +101,11 @@ pub mod token_buffer;
 pub mod tree;
 pub mod turn;
 pub mod turn_layout;
+pub mod turn_text;
 
 pub use cancel::{ingest_cancelled, request_ingest_cancel, reset_ingest_cancel};
 pub use config::{
-    pick_max_hot_turns, DecodeHealthConfig, DryConfig, EngineConfig, SamplingConfig,
+    pick_max_hot_turns, DecodeHealthConfig, DryConfig, EngineConfig, ModeSampling, SamplingConfig,
     SchedulerConfig, SequenceConfig,
 };
 pub use conversation::{GlueMarkers, SectionInserts, Sequence};
@@ -123,10 +124,11 @@ pub use scheduler::recurrent_state_cost;
 pub use scheduler::relief_trace;
 pub use scheduler::wave_rate;
 pub use sequence_handle::SequenceId;
-pub use stats::TurnStats;
+pub use stats::{FinishReason, TurnStats};
 pub use token_buffer::TokenBuffer;
 pub use tree::TokenizedText;
 pub use turn::{Role, Turn, TurnId, TurnOptions};
+pub use turn_text::{TextPiece, TurnText};
 
 // Phase 1 tree types — available under their own names.
 // `TurnId` from `tree` is re-exported as `TreeTurnId` to avoid shadowing the

@@ -68,7 +68,8 @@ candle-kernels/build_tool/
 # as unwelcome in a commit as the live one.
 .substrate/
 .substrate.*/
-# The per-directory summary the repo_scan ingest writes beside the code it read.
+# The per-directory summary the repo_scan ingest writes beside the code it read
+# (summary, distinctive terms, retrieval questions), one in every folder it maps.
 # A FILE, not a directory, so neither glob above matches it — the trailing slash
 # in `.substrate.*/` restricts that pattern to directories, which let 57 of these
 # into a commit before the omission was noticed.

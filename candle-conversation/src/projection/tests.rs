@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use super::builder::Builder;
 use super::ids::{GroupId, Reserved, SectionId, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
-use super::schema::{Content, CorruptTurnPolicy, DecodePriority, GatherScope};
+use super::schema::{Content, CorruptTurnPolicy, DecodePriority, GatherScope, SelectionRule};
 use crate::substrate::ContentResolver;
 use crate::summary_tree::exchange::{exchanges, over_normals};
 use crate::summary_tree::{SelectionOrigin, TurnKind};
@@ -55,6 +55,9 @@ struct MockResolver {
     couplings: HashMap<u32, HashSet<u32>>,
     /// Stands in for "the projection target is an append-only ingest layer".
     ingest_self: bool,
+    /// (group_raw, turn_raw) → the gather-scope tags the turn was written with,
+    /// backing `turn_carries`. A turn absent here carries none.
+    turn_tags: HashMap<(u32, u32), Vec<String>>,
 }
 
 impl MockResolver {
@@ -105,6 +108,15 @@ impl MockResolver {
     /// is itself coupled to) form one exchange, selected and trimmed whole.
     fn with_coupling(mut self, group: GroupId, idx: TurnIndex) -> Self {
         self.couplings.entry(group.raw()).or_default().insert(idx.0);
+        self
+    }
+
+    /// Write `idx` in `group` with `tags`, so a tagged group can scope on it.
+    fn with_turn_tags(mut self, group: GroupId, idx: TurnIndex, tags: &[&str]) -> Self {
+        self.turn_tags.insert(
+            (group.raw(), idx.0),
+            tags.iter().map(|t| t.to_string()).collect(),
+        );
         self
     }
 
@@ -251,6 +263,12 @@ impl ContentResolver for MockResolver {
     ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
         self.tree_picks.clone()
     }
+
+    fn turn_carries(&self, turn: TurnKey, tags: &[String]) -> bool {
+        self.turn_tags
+            .get(&(Self::group_of(turn), turn.index.0))
+            .is_some_and(|have| have.iter().any(|t| tags.contains(t)))
+    }
 }
 
 // —— Helpers ———————————————————————————————————————————————————————————————————
@@ -349,6 +367,12 @@ fn tool_calls_keep_their_penalties_unless_the_schema_asks_otherwise() {
     ))
     .unwrap();
     assert!(asked.schema().free_tool_calls_from_penalties);
+
+    // A programmatic schema asks through the builder — the passthrough's way.
+    let built = Builder::from_yaml(SIMPLE_YAML)
+        .unwrap()
+        .free_tool_calls_from_penalties();
+    assert!(built.schema().free_tool_calls_from_penalties);
 }
 
 #[test]
@@ -564,7 +588,7 @@ fn decode_priority_ratio_is_decode_tokens_per_prefill() {
 fn builder_fallback_dialogue_layer_is_high_priority() {
     // The template-less fallback IS the dialogue layer, so it inherits the
     // interactive priority even without a YAML declaration.
-    let b = Builder::for_plain_prompt("You are a helpful assistant.");
+    let b = Builder::for_plain_prompt("You are a helpful assistant.", SectionId::new(1));
     let dialogue = b.id_for_layer("dialogue").unwrap();
     assert_eq!(
         b.layer(dialogue).unwrap().decode_priority,
@@ -1181,6 +1205,123 @@ layers:
     assert_eq!(proj.sealed_turns().count(), 2);
     assert_eq!(proj.sealed_turns().next().unwrap().index().0, 0);
     assert_eq!(proj.sealed_turns().nth(1).unwrap().index().0, 2);
+}
+
+/// **A tagged group admits only its owner's turns, at the depth the reader
+/// asks for.** One group holds every owner's conversations; a reader scoped to
+/// one owner must never be shown another's, however well the other's scores —
+/// here the two best-scoring turns belong to somebody else and one is untagged.
+#[test]
+fn a_tagged_group_admits_only_its_owners_turns_at_the_readers_depth() {
+    let yaml = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
+layers:
+  - name: layer
+    window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    groups:
+      - id: live
+        selection: { kind: conversation, recent: 4 }
+  # Declared after the reader's layer and ranked beneath it — how a layer is
+  # added to a live schema without moving any id already persisted.
+  - name: store
+    window: 9000
+    rank: -1
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    groups:
+      - id: grp
+        selection: { kind: top_k, k: 2 }
+        # The mock's scores are raw, not on the belief band, so the gate is
+        # declared off rather than left to the default band.
+        score_threshold: 0.0
+"#;
+    let mut b = Builder::from_yaml(yaml).unwrap();
+    let layer = b.id_for_layer("layer").unwrap();
+    let live = b.id_for_group("live").unwrap();
+    let grp = b.id_for_group("grp").unwrap();
+
+    let mut resolver = MockResolver::new();
+    // The reader's own conversation: one untagged turn, as a live one is.
+    let own = resolver.append(live);
+    let theirs = resolver.append(grp);
+    let mine_low = resolver.append(grp);
+    let mine_high = resolver.append(grp);
+    let untagged = resolver.append(grp);
+    let resolver = resolver
+        .with_score(grp, theirs, 0.9)
+        .with_score(grp, mine_low, 0.2)
+        .with_score(grp, mine_high, 0.7)
+        .with_score(grp, untagged, 0.8)
+        .with_turn_tags(grp, theirs, &["dreams", "dreams:9"])
+        .with_turn_tags(grp, mine_low, &["dreams", "dreams:7"])
+        .with_turn_tags(grp, mine_high, &["dreams", "dreams:7"]);
+    let target = ProjectionTarget {
+        layer,
+        group: live,
+        timeline: TimelineId::for_test(live.raw() as u64),
+    };
+    let in_group = |b: &Builder, g| -> Vec<u32> {
+        b.project(target, &resolver)
+            .sealed_turns()
+            .filter(|t| t.group() == g)
+            .map(|t| t.index().0)
+            .collect()
+    };
+    let picked = |b: &Builder| in_group(b, grp);
+
+    // Untagged, the group is what it always was: the best two of everything.
+    assert_eq!(picked(&b), vec![theirs.0, untagged.0]);
+
+    b.set_group_tags("grp", vec!["dreams:7".into()]).unwrap();
+    assert_eq!(
+        picked(&b),
+        vec![mine_low.0, mine_high.0],
+        "only owner 7's turns"
+    );
+
+    b.set_group_selection("grp", SelectionRule::TopK { k: 1 })
+        .unwrap();
+    assert_eq!(
+        picked(&b),
+        vec![mine_high.0],
+        "and only as many as asked for"
+    );
+
+    // **The reader's own group is never scoped.** It is its own conversation
+    // already, and its turns carry no tags — least of all the one being
+    // written, which a prefill waits on forever if its own projection drops it.
+    b.set_group_tags("live", vec!["dreams:7".into()]).unwrap();
+    assert_eq!(
+        in_group(&b, live),
+        vec![own.0],
+        "the target lost its own turn"
+    );
+
+    assert!(b.set_group_tags("nowhere", Vec::new()).is_err());
+    assert!(b
+        .set_group_selection("nowhere", SelectionRule::TopK { k: 1 })
+        .is_err());
 }
 
 /// The YAML for the exchange tests: one `top_k` group over a folder-chain
@@ -4844,6 +4985,136 @@ fn top_k_force_tool_pin_overrides_belief_then_falls_back() {
         vec![framing, tools_intro, tool_b, tool_d, tools_outro],
         "unknown force_tool member must fall through to belief, not blank the collection"
     );
+}
+
+/// A mandatory member is emitted on every belief-driven projection and does NOT
+/// take one of the budget's slots: the top-k is filled from the other members.
+#[test]
+fn a_mandatory_member_adds_to_the_top_k_rather_than_taking_a_slot() {
+    use crate::projection::{ProjectionMode, SelectionState, FORCE_TOOL_SELECTOR};
+    let mut b = Builder::from_yaml(COLLECTION_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let framing = b.id_for_system_section("framing").unwrap();
+    let tools_intro = b.id_for_system_section("tools_intro").unwrap();
+    let tool_a = b.id_for_system_section("tool_a").unwrap();
+    let tool_b = b.id_for_system_section("tool_b").unwrap();
+    let tool_c = b.id_for_system_section("tool_c").unwrap();
+    let tool_d = b.id_for_system_section("tool_d").unwrap();
+    let tools_outro = b.id_for_system_section("tools_outro").unwrap();
+    let tools = b.id_for_system_collection("tools").unwrap();
+    let target = ProjectionTarget {
+        layer: dialogue,
+        group: convo,
+        timeline: TimelineId::for_test(1),
+    };
+    // top_k 2 over these scores alone keeps tool_b and tool_d; tool_c is the
+    // worst-scored member and would never be selected on belief.
+    let resolver = MockResolver::new()
+        .with_section_score(tool_a, 0.3)
+        .with_section_score(tool_b, 0.9)
+        .with_section_score(tool_c, 0.05)
+        .with_section_score(tool_d, 0.8);
+    let project = |b: &Builder, sel: &SelectionState| -> Vec<SectionId> {
+        b.project_with_selection(target, &resolver, ProjectionMode::Decode, sel)
+            .sealed_sections()
+            .map(|s| s.id)
+            .collect()
+    };
+
+    b.set_collection_member_mandatory(tools, tool_c).unwrap();
+    assert_eq!(
+        project(&b, &SelectionState::default()),
+        vec![framing, tools_intro, tool_b, tool_c, tool_d, tools_outro],
+        "the mandatory member is added to the belief top-2, in catalog order"
+    );
+
+    // Making the top scorer mandatory frees its slot: the top-2 is now drawn
+    // from the remaining members, so the next best (tool_a) comes in.
+    b.set_collection_member_mandatory(tools, tool_b).unwrap();
+    assert_eq!(
+        project(&b, &SelectionState::default()),
+        vec![
+            framing,
+            tools_intro,
+            tool_a,
+            tool_b,
+            tool_c,
+            tool_d,
+            tools_outro
+        ],
+        "mandatory members never count against the budget"
+    );
+
+    // A force pin still emits exactly the members it names.
+    let mut pin = SelectionState::new();
+    pin.select(FORCE_TOOL_SELECTOR, "tool_a");
+    assert_eq!(
+        project(&b, &pin),
+        vec![framing, tools_intro, tool_a, tools_outro],
+        "a force pin overrides mandatory members like it overrides belief"
+    );
+}
+
+/// A filter that drops a mandatory member drops it outright — the mandatory
+/// flag never resurrects a tool the tools mode excluded.
+#[test]
+fn a_retained_filter_drops_a_mandatory_member() {
+    use crate::projection::{ProjectionMode, SelectionState};
+    let mut b = Builder::from_yaml(COLLECTION_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let tool_a = b.id_for_system_section("tool_a").unwrap();
+    let tool_b = b.id_for_system_section("tool_b").unwrap();
+    let tool_c = b.id_for_system_section("tool_c").unwrap();
+    let tool_d = b.id_for_system_section("tool_d").unwrap();
+    let tools = b.id_for_system_collection("tools").unwrap();
+    let target = ProjectionTarget {
+        layer: dialogue,
+        group: convo,
+        timeline: TimelineId::for_test(1),
+    };
+    let resolver = MockResolver::new()
+        .with_section_score(tool_a, 0.3)
+        .with_section_score(tool_b, 0.9)
+        .with_section_score(tool_c, 0.05)
+        .with_section_score(tool_d, 0.8);
+    b.set_collection_member_mandatory(tools, tool_c).unwrap();
+    let keep: std::collections::HashSet<String> = ["tool_a", "tool_b", "tool_d"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    b.retain_collection_sections("tools", &keep).unwrap();
+    let ids: Vec<SectionId> = b
+        .project_with_selection(
+            target,
+            &resolver,
+            ProjectionMode::Decode,
+            &SelectionState::default(),
+        )
+        .sealed_sections()
+        .map(|s| s.id)
+        .collect();
+    assert!(
+        !ids.contains(&tool_c),
+        "a filtered-out mandatory member stays out"
+    );
+    assert!(
+        ids.contains(&tool_b) && ids.contains(&tool_d),
+        "belief top-2 unchanged"
+    );
+}
+
+#[test]
+fn mandatory_rejects_a_section_outside_the_collection() {
+    use crate::projection::ConstructionError;
+    let mut b = Builder::from_yaml(COLLECTION_YAML).unwrap();
+    let tools = b.id_for_system_collection("tools").unwrap();
+    let framing = b.id_for_system_section("framing").unwrap();
+    assert!(matches!(
+        b.set_collection_member_mandatory(tools, framing),
+        Err(ConstructionError::MandatoryMember(_))
+    ));
 }
 
 #[test]

@@ -117,6 +117,12 @@ impl CarvedRegion {
     /// the region's user end: a tokenizer that merges across the head↔question
     /// join makes the standalone count an approximation of where the question
     /// starts, and an unclamped one could exceed the end and invert the span.
+    ///
+    /// `answer` is the assistant half's text, for the turn's stored transcript.
+    /// A question exemplar passes `String::new()` — its assistant turn is empty
+    /// by design, the routing happens on the question — while a prefilled
+    /// assistant turn (a dream line) passes its body. Either way the token
+    /// spans come from the numeric bounds, so the string is transcript only.
     pub fn layout(
         &self,
         head_len: u32,
@@ -124,6 +130,7 @@ impl CarvedRegion {
         assistant_start_len: u32,
         trailing_marker_len: u32,
         question: String,
+        answer: String,
     ) -> TurnLayout {
         TurnLayout::from_flat_grid_with_tail(
             head_len.min(self.user_content_end),
@@ -134,9 +141,7 @@ impl CarvedRegion {
             assistant_start_len,
             trailing_marker_len + self.pad as u32,
             question,
-            // A question exemplar has no assistant body; the empty turn is the
-            // point — routing happens on the question.
-            Some(String::new()),
+            Some(answer),
             false,
         )
     }
@@ -534,7 +539,7 @@ mod tests {
         let r = g.regions[0];
         assert!(r.pad > 0, "the fixture must actually exercise padding");
 
-        let layout = r.layout(head_len, 2, 2, trailing, "q".to_string());
+        let layout = r.layout(head_len, 2, 2, trailing, "q".to_string(), String::new());
 
         let user = phase_span_of(&layout.segments, Phase::User)
             .expect("a question exemplar has a user span");
@@ -585,11 +590,72 @@ mod tests {
         assert_eq!(g.tokens[r.sealed_range()].len(), CHUNK_SIZE);
 
         for r in &g.regions {
-            let layout = r.layout(3, 2, 3, 2, "q".to_string());
+            let layout = r.layout(3, 2, 3, 2, "q".to_string(), String::new());
             assert_eq!(
                 layout.validate_tiling(r.sealed_range().len() as u32),
                 Ok(()),
                 "region {r:?}: the layout must tile every pinned token",
+            );
+        }
+    }
+
+    /// **A prefilled assistant turn carves its Response phase onto its own
+    /// assistant tokens.** A dream line stuffs the same way a question exemplar
+    /// does, but its assistant half is real content, not empty — the seal must
+    /// give the line a Response span over exactly those tokens, and the padding
+    /// after the closing marker must still fall outside every phase span.
+    #[test]
+    fn a_prefilled_assistant_turn_spans_its_own_body() {
+        use crate::normalization::Phase;
+        use crate::turn_layout::phase_span_of;
+
+        // head(3) · user(10) · im_end(2) · assistant_start(2) · body(26) ·
+        // assistant_end(2) = 45 real tokens, so the case carries padding.
+        let head_len = 3u32;
+        let user_end = 13u32; // head + 10-token user body
+        let assistant_start = 17u32; // + im_end(2) + assistant_start(2)
+        let body_len = 26u32;
+        let trailing = 2u32; // assistant_end
+        let case_len = (assistant_start + body_len + trailing) as usize; // 45
+        let cases = vec![CaseGrid {
+            tokens: (0..case_len as u32).collect(),
+            user_content_end: user_end,
+            assistant_content_start: assistant_start,
+        }];
+        let g = plan_stuffed_grid(&cases, 4242);
+        let r = g.regions[0];
+        assert!(r.pad > 0, "the fixture must actually exercise padding");
+
+        let layout = r.layout(
+            head_len,
+            2,
+            2,
+            trailing,
+            "q".to_string(),
+            "a dream".to_string(),
+        );
+
+        let response = phase_span_of(&layout.segments, Phase::Response)
+            .expect("a prefilled assistant turn has a response span");
+        assert_eq!(
+            response,
+            assistant_start as usize..(assistant_start + body_len) as usize,
+            "the response span is the assistant body's own tokens",
+        );
+        // The stored transcript carries the assistant text, not an empty string.
+        let assistant_text = layout.segments.iter().find_map(|s| match s {
+            crate::turn_layout::TurnSegment::Assistant { text, .. } => text.clone(),
+            _ => None,
+        });
+        assert_eq!(assistant_text.as_deref(), Some("a dream"));
+        // Padding sits past the closing marker, outside every phase span.
+        for phase in [Phase::User, Phase::Thinking, Phase::Response] {
+            let Some(span) = phase_span_of(&layout.segments, phase) else {
+                continue;
+            };
+            assert!(
+                span.end <= r.token_len,
+                "{phase:?} span {span:?} runs into the padding",
             );
         }
     }

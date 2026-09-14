@@ -11,7 +11,7 @@
 //! for whom a room full of people is a room full of noise.
 
 use npc_map::witness::{narrate, since};
-use npc_map::world::{Happening, Refused, Where, World};
+use npc_map::world::{Happening, Refused, Voice, Where, World};
 use npc_map::MapSet;
 
 fn vault() -> World {
@@ -106,7 +106,8 @@ fn the_address_is_carried_whole_so_the_stream_can_be_read_by_anybody() {
         since(&w, "m3")[0].what,
         Happening::Said {
             to: Some("m2".into()),
-            words: "get out of here".into()
+            words: "get out of here".into(),
+            voice: Voice::Said,
         }
     );
     assert_eq!(w.log().last().unwrap().what, since(&w, "m3")[0].what);

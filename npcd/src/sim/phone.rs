@@ -13,7 +13,7 @@
 //! | Reach | the walls | anybody you have a thread with |
 //! | Losing it | you walk out | it is taken off you |
 //!
-//! So messaging is **not** `say` and `tell` pointed at a different audience. A
+//! So messaging is **not** `tell` and `shout` pointed at a different audience. A
 //! character texts while standing in a room, in the middle of something else,
 //! to somebody a level away — and the room hears none of it. Room acts and
 //! phone acts are different acts because they reach different people at

@@ -45,6 +45,7 @@ pub mod ops;
 pub mod personality_portrait;
 pub mod portrait;
 pub mod projection;
+pub mod prose;
 pub mod refimage;
 pub mod registry;
 pub mod sim;

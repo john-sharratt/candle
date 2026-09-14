@@ -351,15 +351,10 @@ export const LiveAPI = {
 
   /* The same generation, arriving as it is written.
    *
-   * A description is a second or two: the cast stops, Hermes-3's weights cross
-   * the PCIe link (~0.3s), and it decodes at about reading speed. `onEvent` is
-   * called with each line as it lands: `{event:'loading'}` while the model
-   * loads, `{event:'token', text}` per fragment, and the promise resolves with
-   * the terminal `done`.
-   *
-   * `loading` is reported because it is a real phase and a caller may want it —
-   * the console does not render it separately, since the interval is too short
-   * to be worth a state of its own.
+   * A description is a second or two on the resident model, decoded at about
+   * reading speed beside the cast. `onEvent` is called with each line as it
+   * lands — `{event:'token', text}` per fragment — and the promise resolves
+   * with the terminal `done`.
    *
    * NDJSON over `fetch`, not `EventSource`: `EventSource` can only issue a GET,
    * and this request has a body. The parsing difference is one `split`.

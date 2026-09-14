@@ -276,6 +276,7 @@ mod tests {
                     expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
                     mtp_path: None,
                     gate_donor_path: None,
+                    tensor_overrides: Vec::new(),
                 },
             )?;
             println!("✓ Model loaded\n");
@@ -326,6 +327,7 @@ mod tests {
                         expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
                         mtp_path: None,
                         gate_donor_path: None,
+                        tensor_overrides: Vec::new(),
                     },
                 )
             },
@@ -551,6 +553,7 @@ mod tests {
                         expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
                         mtp_path: None,
                         gate_donor_path: None,
+                        tensor_overrides: Vec::new(),
                     },
                 )?;
                 // A gate that silently fell back to plain decode would still pass

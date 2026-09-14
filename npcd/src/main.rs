@@ -26,7 +26,7 @@
 //! `web --authoritative`, which is what it was written for.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -67,7 +67,11 @@ struct Cli {
     /// Where the engine's own state lives — `.substrate/` and `accounts/`, the
     /// things the daemon writes rather than a person. Also the fallback source
     /// for authored content (`worlds/`, `personalities/`) when no `--mind` is
-    /// named. Defaults to the `npcd` directory in the source tree.
+    /// named.
+    ///
+    /// Defaults to the `--mind` directory, so a mind carries its own substrate
+    /// beside it (a mind ignores `.substrate/` and `accounts/`). With no
+    /// `--mind` either, the `npcd` directory in the source tree.
     #[arg(long)]
     data: Option<PathBuf>,
 
@@ -105,6 +109,49 @@ struct Cli {
     /// console's polls.
     #[arg(long)]
     log_identity: bool,
+
+    /// Retire every character's conversation at startup, so each one opens a
+    /// fresh conversation instead of rejoining where it stopped.
+    ///
+    /// A changed prompt or tool set already does this on its own — a
+    /// conversation written under a different frame is superseded rather than
+    /// rejoined. This is for the change nothing fingerprints: sampling, the
+    /// engine, or simply wanting the cast to start the day clean.
+    ///
+    /// Only the conversations go. They are tombstoned, and compaction reclaims
+    /// them; each character's memory, beliefs, relationships and place in the
+    /// world are untouched.
+    #[arg(long)]
+    forget_conversations: bool,
+
+    /// Retire every dream every character has kept, at startup.
+    ///
+    /// With `--forget-conversations`, the clean slate for a test run: each
+    /// character wakes into a fresh conversation with nothing dreamt. Messages
+    /// need no flag — the phone and channel threads live in the hosted world and
+    /// are seeded afresh from its map on every load.
+    ///
+    /// Only the dreams go. They are tombstoned, and compaction reclaims them;
+    /// each character's memory, beliefs, relationships and place in the world
+    /// are untouched.
+    #[arg(long)]
+    forget_dreams: bool,
+
+    /// Retire every conversation in the substrate at startup, and re-ingest the
+    /// mind.
+    ///
+    /// Everything that is a conversation goes: each character's own, their
+    /// dreams, every mind-layer document, every life episode and the beliefs,
+    /// relationships and intentions it left. The ingest ledger is cleared with
+    /// them, so the mind and every life are written afresh on this same start —
+    /// which, on a full mind, is a long one.
+    ///
+    /// The cast is kept. A character is a record of its own in the substrate,
+    /// not a conversation, so who exists, who owns them and where they stand
+    /// are untouched. This is the reset for K/V the engine can no longer vouch
+    /// for, short of deleting the substrate and creating the cast again.
+    #[arg(long)]
+    wipe_conversations: bool,
 }
 
 /// How many routes across both tables sit at exactly this role, for the
@@ -172,8 +219,14 @@ async fn main() -> anyhow::Result<()> {
             schema.label,
             dir.display()
         ),
-        None => tracing::info!(
-            "projection schema: {} — placeholder, no layers and no content libraries",
+        // A warning, not a note: a daemon with no mind starts, serves the console
+        // and looks healthy, while every character in it has no world, no
+        // personality, no layers and no libraries to think with — and its
+        // substrate lands in the source tree rather than beside any mind.
+        None => tracing::warn!(
+            "no --mind given: running on the {} placeholder schema — no layers, no content \
+             libraries, no worlds and no personalities, and the substrate goes to the data \
+             directory's default rather than beside a mind. Pass --mind <dir> to run a real one",
             schema.label
         ),
     }
@@ -202,7 +255,12 @@ async fn main() -> anyhow::Result<()> {
         None => Roots::embedded(&[&SITE, &COMMON]),
     };
 
-    // **The compiled-in default is a path on the machine that built this.**
+    // **Beside the mind, unless told otherwise.** A substrate is built from one
+    // mind's corpus and answers for nothing else, so the mind being run is where
+    // its substrate and accounts belong — see [`data_dir`].
+    //
+    // **With no mind either, the compiled-in default is a path on the machine
+    // that built this.**
     //
     // `CARGO_MANIFEST_DIR` is resolved by the compiler, so the binary carries
     // one developer's absolute source path as its idea of where the substrate
@@ -216,7 +274,7 @@ async fn main() -> anyhow::Result<()> {
     // in when it is not. Either way the choice is logged, because "which
     // substrate is this daemon actually writing to" is the first question asked
     // when a cast comes up empty.
-    let data = match cli.data {
+    let data = match data_dir(cli.data, schema.dir.as_deref()) {
         Some(dir) => dir,
         None => {
             let built_at = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -471,16 +529,25 @@ async fn main() -> anyhow::Result<()> {
     //
     // The world itself is not persisted — who is standing where lives in RAM
     // and goes with the process — so this is what stops every character
-    // re-entering at the arrival door on every boot. `blocking_write`, because
-    // a world's metronome is a plain OS thread with no async context; the
-    // registry's own checkpoint gates make almost every call a map lookup, so
-    // the lock is held for nothing on a still world.
+    // re-entering at the arrival door on every boot.
+    //
+    // A fire-and-forget durable checkpoint: nothing waits on it, and
+    // `remember_place` is last-writer-wins by timestamp, so it may run wherever
+    // is cheapest. It reaches the app state's `tokio::sync::RwLock`, whose
+    // `blocking_write` panics on an async worker — and its callers are now
+    // async (the metronome moment sweep, act landing). So on a runtime it is
+    // deferred to the blocking pool; off one (the loader thread binding recalled
+    // bodies) it writes directly. See [`run_sink`].
     let place_state = authored.clone();
     runtime.set_place_sink(Arc::new(move |npc_id: u64, at: &str| {
-        place_state
-            .npcs
-            .blocking_write()
-            .remember_place(npc_id, at, now_ms_i64() as u64);
+        let state = place_state.clone();
+        let at = at.to_string();
+        run_sink(move || {
+            state
+                .npcs
+                .blocking_write()
+                .remember_place(npc_id, &at, now_ms_i64() as u64);
+        });
     }));
 
     // And how it feels, for the same reason and by the same route: a mood is
@@ -490,7 +557,11 @@ async fn main() -> anyhow::Result<()> {
     // is a map lookup.
     let mood_state = authored.clone();
     runtime.set_mood_sink(Arc::new(move |npc_id: u64, mood: &str| {
-        mood_state.npcs.blocking_write().remember_mood(npc_id, mood);
+        let state = mood_state.clone();
+        let mood = mood.to_string();
+        run_sink(move || {
+            state.npcs.blocking_write().remember_mood(npc_id, &mood);
+        });
     }));
 
     // The places the cast stands in, one world at a time.
@@ -624,6 +695,9 @@ async fn main() -> anyhow::Result<()> {
         runtime.clone(),
         engine::runtime::LoadPlan {
             world_ms: 0,
+            forget_conversations: cli.forget_conversations,
+            forget_dreams: cli.forget_dreams,
+            wipe_conversations: cli.wipe_conversations,
             cast,
             // Personalities, not the cast. A layer directory is named after a
             // personality — `layers/memory/zen/` — and a world's biographies
@@ -711,17 +785,20 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    // Stop the tick driver on Ctrl-C, before the process goes.
+    // Stop the cast on Ctrl-C, before the process goes.
     //
     // Not cosmetic. A character's decode writes turns to the substrate, and a
-    // driver killed mid-tick leaves the redo log with a turn whose sealing never
-    // happened. Setting the flag lets the current tick finish and the loop exit
-    // at its next quiet moment — the same reason the flag exists at all.
+    // cast killed mid-tick leaves the redo log with a turn whose sealing never
+    // happened. Ordered: latch the flag (metronomes stop moving worlds,
+    // supervisors stop restarting), then cancel every character task — parked
+    // or mid-decode — and await them out, so every dropped turn future has
+    // released its scheduler slot before the process ends.
     let stopping = runtime.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("interrupt received — stopping the tick driver");
+            tracing::info!("interrupt received — stopping the cast");
             stopping.stop();
+            stopping.stop_characters().await;
         }
     });
 
@@ -737,6 +814,25 @@ async fn main() -> anyhow::Result<()> {
         .await
 }
 
+/// Run a fire-and-forget persistence sink write wherever it is safe to block.
+///
+/// The write takes the app state's `tokio::sync::RwLock`, whose `blocking_write`
+/// panics inside an async execution context. The sinks are called from both
+/// worlds: async (the metronome moment sweep, act landing) and sync (the loader
+/// thread binding recalled bodies at startup). On a runtime the write is
+/// deferred to the blocking pool — detached, because nothing awaits a checkpoint
+/// and a dropped `spawn_blocking` handle still runs to completion; off one it
+/// runs inline. Ordering does not matter: every sink write is last-writer-wins
+/// per character.
+fn run_sink(write: impl FnOnce() + Send + 'static) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(write);
+        }
+        Err(_) => write(),
+    }
+}
+
 /// Wall-clock milliseconds as the narrative clock takes them.
 ///
 /// Signed, because [`clock::Clock`] works in `i64` throughout — a world can be
@@ -747,4 +843,72 @@ fn now_ms_i64() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Where the substrate and accounts go: `--data` when it is given, and the
+/// mind's own directory when it is not. `None` with neither, which leaves the
+/// caller its compiled-in default.
+///
+/// **The mind, not the source tree.** A substrate is a mind's corpus ingested,
+/// so run against a different mind it answers for the wrong canon — and the
+/// source tree's copy used to be where every mind's substrate landed, whichever
+/// one was named, unless `--data` was remembered on every launch.
+fn data_dir(explicit: Option<PathBuf>, mind: Option<&Path>) -> Option<PathBuf> {
+    explicit.or_else(|| mind.map(Path::to_path_buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A named mind keeps its own substrate.** Without `--data`, the data
+    /// directory is the mind's; `--data` still wins when it is given; and with
+    /// neither there is nothing to choose, so the caller's default stands.
+    #[test]
+    fn the_data_directory_defaults_to_the_mind() {
+        let mind = Path::new("D:/prog/mind");
+        assert_eq!(data_dir(None, Some(mind)), Some(mind.to_path_buf()));
+        assert_eq!(
+            data_dir(Some(PathBuf::from("E:/elsewhere")), Some(mind)),
+            Some(PathBuf::from("E:/elsewhere")),
+            "an explicit --data wins"
+        );
+        assert_eq!(data_dir(None, None), None);
+        assert!(Cli::parse_from(["npcd", "--mind", "D:/prog/mind"])
+            .data
+            .is_none());
+    }
+
+    /// **Off unless asked for.** Retiring every character's conversation is not
+    /// something a restart may do by accident — a cast that forgot where it was
+    /// every time the daemon came back would never hold a conversation at all.
+    #[test]
+    fn conversations_are_forgotten_only_when_asked() {
+        assert!(!Cli::parse_from(["npcd"]).forget_conversations);
+        assert!(Cli::parse_from(["npcd", "--forget-conversations"]).forget_conversations);
+    }
+
+    /// **Dreams are kept unless asked.** They outlive the day a character had
+    /// them, so a restart that dropped them would be a cast that never builds
+    /// up anything to dream from. The flag is its own, so a test run can wipe
+    /// the conversations and the dreams together or either alone.
+    #[test]
+    fn dreams_are_forgotten_only_when_asked() {
+        assert!(!Cli::parse_from(["npcd"]).forget_dreams);
+        let both = Cli::parse_from(["npcd", "--forget-conversations", "--forget-dreams"]);
+        assert!(both.forget_conversations && both.forget_dreams);
+        let dreams_only = Cli::parse_from(["npcd", "--forget-dreams"]);
+        assert!(dreams_only.forget_dreams && !dreams_only.forget_conversations);
+    }
+
+    /// **A wipe is its own flag and never implied.** It re-ingests the whole
+    /// mind, which is a long start, so neither of the narrower flags may turn it
+    /// on.
+    #[test]
+    fn conversations_are_wiped_only_when_asked() {
+        assert!(!Cli::parse_from(["npcd"]).wipe_conversations);
+        let narrow = Cli::parse_from(["npcd", "--forget-conversations", "--forget-dreams"]);
+        assert!(!narrow.wipe_conversations);
+        assert!(Cli::parse_from(["npcd", "--wipe-conversations"]).wipe_conversations);
+    }
 }

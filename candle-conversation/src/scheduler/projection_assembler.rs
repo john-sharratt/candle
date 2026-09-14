@@ -81,6 +81,12 @@ pub(super) struct SlotState {
     pub(super) glue_islands: HashMap<u64, (u64, CapturedSpan)>,
     /// Monotone projection counter for the island cache's generation stamps.
     pub(super) glue_generation: u64,
+    /// How many of the slot's tokens its last projection placed — the sealed
+    /// prefix, glue and user message, not the tail the slot forwarded itself.
+    /// [`apply_segments_finish`] compares a rebuild against its slot only when
+    /// the slot held more than this: a placement is chosen afresh by every
+    /// projection, and only the rest exists nowhere but the slot.
+    pub(super) placed: usize,
 }
 
 /// How many projections an unused cached glue island survives before it is
@@ -548,6 +554,9 @@ pub(super) struct GapFillPlan {
     /// it removed. `None` where the plan was cloned for a fire-only pass and
     /// there is nothing to compare against.
     pub held_before: Option<usize>,
+    /// How much of `held_before` the previous projection placed
+    /// ([`SlotState::placed`] when the rebuild took the slot apart).
+    pub placed_before: usize,
     /// Glue token count actually COMPUTED by the wave (cache-reused islands are
     /// excluded — they were Arc-injected during the walk).
     pub n_glue_tokens: usize,
@@ -621,6 +630,7 @@ fn fire_only(plan: &GapFillPlan) -> GapFillPlan {
         tail_per_layer: Vec::new(),
         // Fire-only: it restores no tail, so it has no rebuild to check.
         held_before: None,
+        placed_before: 0,
         n_glue_tokens: plan.n_glue_tokens,
         islands: Vec::new(),
     }
@@ -1013,6 +1023,7 @@ pub(super) fn apply_segments_build(
         deferred_user: walker.deferred_user.take(),
         tail_per_layer,
         held_before: Some(held_before),
+        placed_before: state.placed,
         n_glue_tokens: walker.n_glue_tokens,
         islands,
     })
@@ -2035,6 +2046,7 @@ pub(super) fn apply_segments_finish(
         deferred_user,
         tail_per_layer,
         held_before,
+        placed_before,
         n_glue_tokens,
         islands,
     } = plan;
@@ -2115,6 +2127,9 @@ pub(super) fn apply_segments_finish(
         handle_new_user_message(state, ctx, &mut walker, &tokens)?;
     }
 
+    // Everything so far is this projection's placement; the tail restored next
+    // is the slot's own.
+    let placed = ctx.session.sequence_offset(parent_id.0).unwrap_or(0);
     {
         let _g = profile::span("apply:restore_tail");
         restore_tail(ctx.session, parent_id, tail_per_layer)?;
@@ -2132,26 +2147,33 @@ pub(super) fn apply_segments_finish(
     // LONG is reported too. The rebuild is supposed to reproduce the slot, and
     // a slot that grew has injected something twice — a piece restored both
     // from the substrate and from the tail.
-    // **An empty slot is not a rebuild, so it is not compared.** `held_before`
-    // is what the slot held before this pass took it apart; a slot holding
-    // nothing had nothing taken apart, and what follows is an initial
-    // population, not a reproduction. Comparing there reports the whole
-    // projection as "duplicated" — measured at 19 warns per startup, every one
-    // of them `before=0`, which is precisely the volume of false alarm that
-    // makes a real divergence in this check unreadable.
-    if let Some(before) = held_before.filter(|b| *b > 0) {
+    //
+    // **A slot holding only a placement is populated, not reproduced.** What
+    // the previous projection placed came from the substrate, and this one
+    // places afresh by its own selection — more history hot, a tool selected in
+    // or out — so its size is free to change. A slot holding nothing beyond
+    // that placement has nothing of its own to lose: an empty slot, or one
+    // fresh from construction that projected its system prompt alone.
+    // Comparing there reports the arriving history as "duplicated" — measured
+    // at 19 warns per startup with `before=0`, and at 3,486 tokens on every
+    // turn of a resumed passthrough conversation whose slot was built
+    // system-only — the volume of false alarm that makes a real divergence in
+    // this check unreadable.
+    if let Some(before) = held_before {
         let after = ctx.session.sequence_offset(parent_id.0).unwrap_or(0);
-        if after != before {
+        if let Some((tokens, duplicated)) = rebuild_mismatch(before, placed_before, after) {
             tracing::warn!(
                 slot = parent_id.0,
                 before,
+                placed_before,
                 after,
                 "apply_segments_finish: the rebuild did not reproduce the slot — {} \
                  token(s) {}",
-                after.abs_diff(before),
-                if after < before { "lost" } else { "duplicated" }
+                tokens,
+                if duplicated { "duplicated" } else { "lost" }
             );
         }
+        state.placed = placed;
     }
 
     // The rebuild is responsible for leaving the slot's per-position state
@@ -2197,6 +2219,18 @@ pub(super) fn apply_segments_finish(
         "apply_segments breakdown (single gap-fill glue prefill)",
     );
     Ok(())
+}
+
+/// Whether a rebuild failed to reproduce its slot: `Some((tokens, duplicated))`
+/// when it did not. `before` is the slot's length when the rebuild took it
+/// apart, `placed_before` how much of that the previous projection placed, and
+/// `after` the rebuilt length. A slot holding nothing beyond a placement is
+/// populated rather than reproduced, so it never mismatches.
+fn rebuild_mismatch(before: usize, placed_before: usize, after: usize) -> Option<(usize, bool)> {
+    if before <= placed_before || after == before {
+        return None;
+    }
+    Some((after.abs_diff(before), after > before))
 }
 
 // ── Writer-tail snapshot / restore ───────────────────────────────────────────
@@ -2318,6 +2352,36 @@ mod tests {
                 position,
             },
         }
+    }
+
+    /// The rebuild check compares only a slot holding content of its own. The
+    /// first case is a resumed passthrough conversation's, as measured: its
+    /// slot was built holding the 2,671-token system prompt alone, and the
+    /// first turn's projection brought 3,486 tokens of history into it.
+    #[test]
+    fn a_rebuild_is_compared_only_when_the_slot_held_content_of_its_own() {
+        assert_eq!(
+            rebuild_mismatch(2671, 2671, 6157),
+            None,
+            "a slot built system-only is populated"
+        );
+        assert_eq!(rebuild_mismatch(0, 0, 6157), None, "an empty slot");
+        assert_eq!(rebuild_mismatch(0, 2671, 6157), None, "a reset slot");
+        assert_eq!(
+            rebuild_mismatch(6157, 2671, 6157),
+            None,
+            "a faithful rebuild"
+        );
+        assert_eq!(
+            rebuild_mismatch(6157, 2671, 9643),
+            Some((3486, true)),
+            "a piece restored twice"
+        );
+        assert_eq!(
+            rebuild_mismatch(6157, 2671, 6000),
+            Some((157, false)),
+            "content lost"
+        );
     }
 
     #[test]

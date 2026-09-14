@@ -21,9 +21,6 @@ pub const MAX_IMAGE_SIDE: u32 = 2048;
 /// caller choosing how long every character in the world stops thinking for.
 pub const MAX_IMAGE_STEPS: u32 = 100;
 
-/// The most tokens one prose job may decode, for the same reason.
-pub const MAX_PROSE_TOKENS: u32 = 4096;
-
 /// Which adapter-fused transformer a draw runs on.
 ///
 /// # A LoRA here is a checkpoint, not a runtime patch
@@ -220,39 +217,11 @@ pub struct GuestMatte {
     pub lifted: f32,
 }
 
-/// Prose to generate, in a voice the main model is not carrying.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct ProseRequest {
-    /// The voice. Empty takes the guest's own default.
-    #[serde(default)]
-    pub system: String,
-    pub prompt: String,
-    pub max_tokens: u32,
-    #[serde(default)]
-    pub temperature: Option<f32>,
-    #[serde(default)]
-    pub seed: Option<u64>,
-    /// Constrain the answer to exactly one of these strings.
-    ///
-    /// A **stencil**, in the sense of [`crate::stencil`]: the sampler is masked
-    /// to the tokens the grammar permits, so an answer outside the set is not
-    /// improbable, it is unreachable. `None` decodes freely.
-    ///
-    /// **Prefer single-token choices.** A multi-token arm commits the walk on
-    /// its first token and then forces the remainder, so a model that would have
-    /// changed its mind after one token cannot — it is stuck down a path it did
-    /// not want. One token per arm makes the whole decision a single masked
-    /// decode with nothing to commit to.
-    #[serde(default)]
-    pub choices: Option<Vec<String>>,
-}
-
 /// One unit of guest work.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GuestRequest {
     Image(ImageRequest),
-    Prose(ProseRequest),
     Matte(MatteRequest),
 }
 
@@ -262,7 +231,6 @@ impl GuestRequest {
     pub fn guest(&self) -> Guest {
         match self {
             Self::Image(_) => Guest::Image,
-            Self::Prose(_) => Guest::Prose,
             Self::Matte(_) => Guest::Matte,
         }
     }
@@ -374,27 +342,6 @@ impl GuestRequest {
                 }
                 Ok(())
             }
-            Self::Prose(r) => {
-                if r.prompt.trim().is_empty() {
-                    return Err("a prose request needs a prompt".into());
-                }
-                if r.max_tokens == 0 {
-                    return Err("a prose request needs a non-zero token budget".into());
-                }
-                if r.max_tokens > MAX_PROSE_TOKENS {
-                    return Err(format!(
-                        "{} tokens is past the {MAX_PROSE_TOKENS} limit — normal inference is \
-                         blocked for the whole drain",
-                        r.max_tokens
-                    ));
-                }
-                if let Some(t) = r.temperature {
-                    if !t.is_finite() || t < 0.0 {
-                        return Err(format!("temperature {t} is not a usable number"));
-                    }
-                }
-                Ok(())
-            }
         }
     }
 }
@@ -410,17 +357,15 @@ impl GuestRequest {
 #[serde(rename_all = "snake_case")]
 pub enum Guest {
     Image,
-    Prose,
     Matte,
 }
 
 impl Guest {
-    pub const ALL: [Guest; 3] = [Guest::Image, Guest::Prose, Guest::Matte];
+    pub const ALL: [Guest; 2] = [Guest::Image, Guest::Matte];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Image => "image",
-            Self::Prose => "prose",
             Self::Matte => "matte",
         }
     }
@@ -449,18 +394,6 @@ pub struct GuestImage {
 #[derive(Clone, Debug, PartialEq)]
 pub enum GuestOutcome {
     Image(GuestImage),
-    Prose {
-        text: String,
-        tokens: u32,
-        /// The seed actually used, whether the caller pinned one or not.
-        ///
-        /// Carried for the same reason [`GuestImage::seed`] is: a draft an
-        /// author liked is a one-off unless the seed that produced it comes
-        /// back with it. The prose guest used to fall back to a *constant* when
-        /// none was given, which made every unseeded request identical — so
-        /// this field and the fresh draw arrived together.
-        seed: u64,
-    },
     Matte(GuestMatte),
 }
 
@@ -468,7 +401,6 @@ impl GuestOutcome {
     pub fn guest(&self) -> Guest {
         match self {
             Self::Image(_) => Guest::Image,
-            Self::Prose { .. } => Guest::Prose,
             Self::Matte(_) => Guest::Matte,
         }
     }
@@ -545,21 +477,9 @@ mod tests {
         GuestRequest::Image(r)
     }
 
-    fn prose(max_tokens: u32) -> GuestRequest {
-        GuestRequest::Prose(ProseRequest {
-            system: String::new(),
-            prompt: "Describe the yard.".into(),
-            max_tokens,
-            temperature: None,
-            seed: None,
-            choices: None,
-        })
-    }
-
     #[test]
     fn an_ordinary_ask_is_accepted() {
         assert!(image(512, 512, 20).check().is_ok());
-        assert!(prose(256).check().is_ok());
     }
 
     /// **A request that does not mention a LoRA is the request it always was.**
@@ -686,8 +606,6 @@ mod tests {
         assert!(image(4096, 512, 20).check().is_err());
         assert!(image(512, 512, 500).check().is_err());
         assert!(image(0, 512, 20).check().is_err());
-        assert!(prose(100_000).check().is_err());
-        assert!(prose(0).check().is_err());
     }
 
     /// A size the decoder would round is refused rather than rounded: the
@@ -701,20 +619,13 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_prompt_is_refused_for_both_guests() {
+    fn an_empty_prompt_is_refused() {
         let mut i = match image(512, 512, 20) {
             GuestRequest::Image(r) => r,
             _ => unreachable!(),
         };
         i.prompt = "   ".into();
         assert!(GuestRequest::Image(i).check().is_err());
-
-        let mut p = match prose(64) {
-            GuestRequest::Prose(r) => r,
-            _ => unreachable!(),
-        };
-        p.prompt = String::new();
-        assert!(GuestRequest::Prose(p).check().is_err());
     }
 
     /// The request's guest is what the drain groups by, so it must not be
@@ -722,28 +633,6 @@ mod tests {
     #[test]
     fn a_request_names_the_guest_that_serves_it() {
         assert_eq!(image(512, 512, 20).guest(), Guest::Image);
-        assert_eq!(prose(64).guest(), Guest::Prose);
-    }
-
-    /// A temperature that is not a number would reach the sampler and produce
-    /// a uniform draw over the vocabulary — prose that is not wrong so much as
-    /// unrelated to the prompt, with nothing reporting why.
-    #[test]
-    fn a_nonsense_temperature_is_refused() {
-        let bad = |t: f32| {
-            GuestRequest::Prose(ProseRequest {
-                system: String::new(),
-                prompt: "x".into(),
-                max_tokens: 8,
-                temperature: Some(t),
-                seed: None,
-                choices: None,
-            })
-            .check()
-        };
-        assert!(bad(f32::NAN).is_err());
-        assert!(bad(-1.0).is_err());
-        assert!(bad(0.0).is_ok(), "greedy is a legitimate ask");
     }
 
     #[test]

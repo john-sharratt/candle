@@ -1802,6 +1802,7 @@ mod tests {
                 expert_pack_dir: None,
                 mtp_path: None,
                 gate_donor_path: None,
+                tensor_overrides: Vec::new(),
             },
         )?;
         let mut session = model.create_batched_session(BatchedConfig::default())?;
@@ -2044,6 +2045,7 @@ mod tests {
                 expert_pack_dir: None,
                 mtp_path: None,
                 gate_donor_path: None,
+                tensor_overrides: Vec::new(),
             },
         )?;
 

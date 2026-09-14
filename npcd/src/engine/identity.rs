@@ -226,11 +226,16 @@ impl Installed {
     /// **Pins every collection, always — down to the generic member.** An
     /// unpinned `Named` collection emits nothing, and a character with no
     /// identity is a worse failure than a thin one *and* a silent one.
+    ///
+    /// `building` is the [`building_key`] of the part of the world the body is
+    /// standing in — not the world, because a world holds more than one
+    /// building and a character is only ever inside one of them.
     pub fn selection_for(
         &self,
         npc_id: u64,
         personality: &str,
         world: &str,
+        building: &str,
         thinking: Deliberation,
     ) -> SelectionState {
         // The turn's own dial first — it is not a projection concern, and a
@@ -246,9 +251,17 @@ impl Installed {
             },
         );
         sel.select(SETTING, pick(SETTING, self.settings.iter(), world));
-        sel.select(BUILDING, pick(BUILDING, self.buildings.iter(), world));
+        sel.select(BUILDING, pick(BUILDING, self.buildings.iter(), building));
         sel
     }
+}
+
+/// The name one part of a world is installed and selected under.
+///
+/// Qualified by the world because part ids are authored per map, and two
+/// worlds are free to each have a `tower`.
+pub fn building_key(world: &str, part: &str) -> String {
+    format!("{world}/{part}")
 }
 
 fn pick<'a>(
@@ -328,11 +341,13 @@ pub fn install(
         }
     }
 
-    // One per world rather than one per character, which is the whole point.
+    // One per part of a world rather than one per character, which is the
+    // whole point — every character standing in the same building reads the
+    // same sealed member. Keyed by [`building_key`].
     add(builder, BUILDING, GENERIC, GENERIC_PLACE)?;
-    for (world_id, described) in places {
-        if add(builder, BUILDING, world_id, described)? {
-            out.buildings.push(world_id.clone());
+    for (key, described) in places {
+        if add(builder, BUILDING, key, described)? {
+            out.buildings.push(key.clone());
         }
     }
 
@@ -377,9 +392,12 @@ mod tests {
             anchors: vec!["maker".into()],
             characters: vec![7],
             settings: vec!["battle-cities".into()],
-            buildings: vec!["battle-cities".into()],
+            buildings: vec![VAULT.into(), REDOUBT.into()],
         }
     }
+
+    const VAULT: &str = "battle-cities/creators-vault";
+    const REDOUBT: &str = "battle-cities/tower-redoubt";
 
     /// **A character does not deliberate; it acts.**
     ///
@@ -400,14 +418,15 @@ mod tests {
         assert_eq!(bare.get(THINKING_EFFORT), Some("off"));
 
         // And it is the same dial the projected path sets, not a second one.
-        let projected = installed().selection_for(7, "maker", "battle-cities", Deliberation::None);
+        let projected =
+            installed().selection_for(7, "maker", "battle-cities", VAULT, Deliberation::None);
         assert_eq!(projected.optional(NO_THINK), bare.optional(NO_THINK));
         assert_eq!(projected.get(THINKING_EFFORT), bare.get(THINKING_EFFORT));
     }
 
     #[test]
     fn a_turn_turns_deliberation_off() {
-        let sel = installed().selection_for(7, "maker", "battle-cities", Deliberation::None);
+        let sel = installed().selection_for(7, "maker", "battle-cities", VAULT, Deliberation::None);
         assert_eq!(sel.optional(NO_THINK), Some(OptionalState::Present));
         assert_eq!(sel.get(THINKING_EFFORT), Some("off"));
         // And the default is that, because the standing instruction — go and
@@ -421,7 +440,7 @@ mod tests {
     /// block is no longer suppressed.
     #[test]
     fn a_mission_that_needs_thought_turns_deliberation_back_on() {
-        let sel = installed().selection_for(7, "maker", "battle-cities", Deliberation::Deep);
+        let sel = installed().selection_for(7, "maker", "battle-cities", VAULT, Deliberation::Deep);
         assert_eq!(sel.optional(NO_THINK), Some(OptionalState::Absent));
         assert_eq!(sel.get(THINKING_EFFORT), Some("deep"));
 
@@ -441,11 +460,35 @@ mod tests {
 
     #[test]
     fn a_turn_pins_its_own_member_in_every_collection() {
-        let sel = installed().selection_for(7, "maker", "battle-cities", Deliberation::None);
+        let sel = installed().selection_for(7, "maker", "battle-cities", VAULT, Deliberation::None);
         assert_eq!(sel.get(ANCHOR), Some("identity_anchor/maker"));
         assert_eq!(sel.get(WHO), Some("identity/7"));
         assert_eq!(sel.get(SETTING), Some("world/battle-cities"));
-        assert_eq!(sel.get(BUILDING), Some("place/battle-cities"));
+        assert_eq!(
+            sel.get(BUILDING),
+            Some("place/battle-cities/creators-vault")
+        );
+    }
+
+    /// **A character is told about the building it is in, not the world.** The
+    /// world-wide member told a character in the Redoubt about six levels of a
+    /// vault it had never set foot in, and asked where it was it named a vault
+    /// room. Two buildings of one world are two members.
+    #[test]
+    fn two_buildings_of_one_world_are_two_members() {
+        let i = installed();
+        let maker = i.selection_for(7, "maker", "battle-cities", VAULT, Deliberation::None);
+        let companion = i.selection_for(7, "maker", "battle-cities", REDOUBT, Deliberation::None);
+        assert_eq!(maker.get(SETTING), companion.get(SETTING), "one world");
+        assert_ne!(
+            maker.get(BUILDING),
+            companion.get(BUILDING),
+            "two buildings"
+        );
+        assert_eq!(
+            companion.get(BUILDING),
+            Some(member(BUILDING, &building_key("battle-cities", "tower-redoubt")).as_str())
+        );
     }
 
     /// **Two characters of one personality share the anchor and differ in
@@ -455,8 +498,8 @@ mod tests {
     fn two_characters_of_one_personality_share_a_floor_and_not_a_name() {
         let mut i = installed();
         i.characters.push(9);
-        let perrin = i.selection_for(7, "maker", "battle-cities", Deliberation::None);
-        let wyneth = i.selection_for(9, "maker", "battle-cities", Deliberation::None);
+        let perrin = i.selection_for(7, "maker", "battle-cities", VAULT, Deliberation::None);
+        let wyneth = i.selection_for(9, "maker", "battle-cities", VAULT, Deliberation::None);
 
         assert_eq!(perrin.get(ANCHOR), wyneth.get(ANCHOR), "one personality");
         assert_ne!(perrin.get(WHO), wyneth.get(WHO), "two people");
@@ -466,8 +509,14 @@ mod tests {
     #[test]
     fn everything_unknown_falls_through_to_the_generic_member() {
         for sel in [
-            installed().selection_for(999, "nobody", "nowhere", Deliberation::None),
-            Installed::default().selection_for(7, "maker", "battle-cities", Deliberation::None),
+            installed().selection_for(999, "nobody", "nowhere", "nowhere/x", Deliberation::None),
+            Installed::default().selection_for(
+                7,
+                "maker",
+                "battle-cities",
+                VAULT,
+                Deliberation::None,
+            ),
         ] {
             for collection in COLLECTIONS {
                 assert_eq!(

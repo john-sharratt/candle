@@ -13,10 +13,13 @@ use std::time::Instant;
 use super::event::{decode_events, ProjectionSelection, SystemItem};
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
-use super::schema::{CorruptTurnPolicy, LayerSchema, Schema, SystemPromptItem, SystemPromptSchema};
+use super::schema::{
+    CorruptTurnPolicy, GroupSchema, LayerSchema, Schema, SectionCollection, SystemPromptItem,
+    SystemPromptSchema,
+};
 use crate::cancel::ingest_cancelled;
 use crate::error::ConversationError;
-use crate::normalization::{ChildKey, NormalizationCache, Phase, ScopeKey};
+use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
 use crate::persistence::content_hash::{
     branch_checkpoint_stream_id, snapshot_stream_id, turn_stream_id, ContentHash,
 };
@@ -34,8 +37,8 @@ use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
 use crate::provenance::gallery_arena::{PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
 use crate::provenance::{
-    decode_wide_sigs_for_scoring, score_slots_grouped, score_slots_weighted, FusionMode,
-    GalleryArena, WideQSig,
+    decode_wide_sigs_for_scoring, score_slots_fused, score_slots_grouped, score_slots_weighted,
+    FusionMode, GalleryArena, WideQSig,
 };
 use crate::scheduler::note_persistence_maint_us;
 use crate::substrate::{
@@ -70,6 +73,25 @@ const WARM_INGEST_PROBES_PER_TIMELINE: usize = 8;
 /// on a different scale from their neighbours. Same asymmetric-EWMA convergence
 /// argument as [`WARM_INGEST_PROBES_PER_TIMELINE`].
 const WARM_COLLECTION_PROBES_PER_MEMBER: usize = 8;
+
+/// Exemplar probes per GPU gallery scan during the collection warm-up. The whole
+/// corpus fits one launch comfortably (~744 probes on the tool catalog), but the
+/// probe upload is `probe tokens × words per token` and grows with the corpus, so
+/// the batch bounds it; each launch reuses the segment's cached index.
+const WARM_GPU_PROBE_BATCH: usize = 128;
+
+/// What a collection warm-up did — see
+/// [`Conversation::warm_collection_normalization`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CollectionWarm {
+    /// Collection members the corpus had exemplars for.
+    pub members: usize,
+    /// Exemplar probes folded into the levels.
+    pub probes: usize,
+    /// Of the per-collection scans, the probes scored on the GPU gallery arena;
+    /// the rest ran on the CPU.
+    pub gpu_probes: usize,
+}
 
 /// Whether a scoring pass teaches the normalization levels, and — when it does —
 /// which lens the observation belongs to.
@@ -120,6 +142,46 @@ impl Observe<'_> {
                 scope_tags.is_empty() || scope_tags.iter().any(|s| tags.contains(s))
             }
         }
+    }
+}
+
+/// Whether a group's hit levels can be learned by self-match.
+///
+/// Belief-driven, because only a belief group normalizes at all; and additive,
+/// because a gated-fusion group normalizes traffic-relative (the A.4 floored
+/// path keys on observed-traffic PEAKS, so a rare hit on a quiet file stands
+/// out). Self-match warming would stamp every file's peak at its own self-match
+/// magnitude and erase that contrast — the gate already handles the promiscuous
+/// domination this warm-up was built to fix. Config-keyed, not axis-keyed: any
+/// additive-fusion group warms.
+fn is_warmable(group: &GroupSchema) -> bool {
+    group.is_belief_driven() && group.policy.scan.fusion == FusionMode::Additive
+}
+
+/// `group` of `layer`, if the schema declares it there and it [`is_warmable`].
+fn warmable(
+    schema: &Schema,
+    layer: LayerId,
+    group: GroupId,
+) -> Option<(&LayerSchema, &GroupSchema)> {
+    let layer = schema.layers.iter().find(|l| l.id == layer)?;
+    let group = layer.groups.iter().find(|g| g.id == group)?;
+    // A layer out of retrieval teaches no hit levels: they would be
+    // denominators for candidates it can never return. See
+    // `LayerSchema::gathered`, which `warm_ingest_normalization` honours too.
+    (layer.gathered && is_warmable(group)).then_some((layer, group))
+}
+
+/// `layer` with `group` as its only group.
+///
+/// The view a single group's self-match warm scores under.
+/// [`Conversation::score_belief_groups`] scores — and, observing, teaches —
+/// every belief group in the layer it is handed, so a probe of one group's
+/// timeline would otherwise teach its siblings a scope that is not theirs.
+fn alone(layer: &LayerSchema, group: &GroupSchema) -> LayerSchema {
+    LayerSchema {
+        groups: vec![group.clone()],
+        ..layer.clone()
     }
 }
 
@@ -705,13 +767,12 @@ impl Conversation {
             }
             // **A warm-up pass skips the collections it cannot teach.**
             //
-            // `warm_collection_normalization` replays one collection's own
-            // exemplars, but hands the WHOLE system prompt to this loop, so every
-            // other collection is scanned too — and `teaches` then discards the
-            // observation because the probe's tags are not in its scope. The
-            // caller drops the returned scores (`let _ = …`), so that scan
-            // produces nothing at all: on the tool corpus it is up to 512 probes
-            // against ~3,000 exemplars, on the CPU path, at load.
+            // The dialogue replay (`warm_normalization_from_substrate`) hands the
+            // WHOLE system prompt to this loop, so every collection is scanned —
+            // and `teaches` then discards the observation for any collection the
+            // probe's tags are not inside. The caller drops the returned scores
+            // (`let _ = …`), so that scan produces nothing at all: on the tool
+            // corpus it is up to 512 probes against ~3,000 exemplars, at load.
             //
             // Only a teaching pass may be skipped this way. `Observe::No` is the
             // LIVE reprojection, whose scores are the whole point — `teaches` is
@@ -1187,14 +1248,28 @@ impl Conversation {
     /// its own self-match magnitude and erase exactly the contrast the gate
     /// provides.
     ///
-    /// Call once after the corpus is stable (load complete), never concurrently
-    /// with an ingest writer — same read-lock starvation hazard as the ingest
-    /// warm-up. The substrate lock is taken to gather signatures and released
-    /// before any scoring call.
-    pub fn warm_collection_normalization(&self, schema: &Schema) {
-        let mut warmed_members = 0usize;
-        let mut probes_run = 0usize;
-        for item in &schema.system_prompt.items {
+    /// **Scored in batch, not probe by probe.** A warm-up observation is the
+    /// seal-time one — the probe's whole-turn raw scores folded into the
+    /// collection's hit levels — so it needs none of the live scan's other work:
+    /// no normalization (pure, and its result was discarded) and no question
+    /// scan (read only by the normalized fusion). The corpus's exemplars are
+    /// gathered once and scored against each collection's gallery in a few GPU
+    /// launches when `arena` is given, which is why this runs on the scheduler
+    /// thread. One CPU scan per probe was ~0.55 s on the tool catalog — seven to
+    /// ten minutes of load for 744 probes.
+    ///
+    /// Call once the corpus is stable (load complete), never concurrently with an
+    /// ingest writer — the same read-lock starvation hazard as the ingest warm-up.
+    /// The substrate lock is taken to gather signatures and released before any
+    /// scoring call.
+    pub fn warm_collection_normalization(
+        &self,
+        schema: &Schema,
+        arena: Option<&GalleryArena>,
+    ) -> CollectionWarm {
+        let mut warm = CollectionWarm::default();
+        let sp = &schema.system_prompt;
+        for item in &sp.items {
             let SystemPromptItem::Collection(coll) = item else {
                 continue;
             };
@@ -1211,8 +1286,7 @@ impl Conversation {
             let member_names: HashSet<&str> =
                 coll.sections.iter().map(|s| s.name.as_str()).collect();
             // Plan first (cheap, from declarations only), then fetch signatures for
-            // exactly the turns the plan keeps — the substrate lock is released
-            // before any scoring call, and the cap does not pay to decode
+            // exactly the turns the plan keeps — the cap does not pay to decode
             // signatures it discards.
             let plan = {
                 let sub = self.inner.read().unwrap();
@@ -1231,64 +1305,150 @@ impl Conversation {
                     WARM_COLLECTION_PROBES_PER_MEMBER,
                 )
             };
-            for (_member, keys) in plan {
-                // Each probe is an exemplar's whole signature, paired with its
-                // own QUESTION sub-window. The pair matters: the collection's
-                // undivided levels are learned on whole turns and the phase
-                // lens's on questions, which is what each is read with live. A
-                // phase level learned from a whole-turn probe would sit on a
-                // different band from the one the live query lands on, and the
-                // max-fusion would then be decided by the mismatch rather than
-                // by the evidence.
-                let sigs: Vec<(u64, Vec<WideQSig>, Vec<WideQSig>)> = {
-                    let sub = self.inner.read().unwrap();
-                    keys.iter()
-                        .filter_map(|(tl, idx)| {
-                            let sid = turn_stream_id(*tl, *idx);
-                            let sig = sub.decoded_wide_sig(sid)?;
-                            let q = sub
-                                .turn_phase_span(sid, Phase::User)
-                                .filter(|r| r.end <= sig.len())
-                                .map(|r| sig[r].to_vec())
-                                .unwrap_or_default();
-                            Some((sid.0, sig.as_ref().clone(), q))
-                        })
-                        .filter(|(_, s, _)| !s.is_empty())
-                        .collect()
-                };
-                for (source, probe, question) in &sigs {
-                    // Stops between probes once a shutdown asks: the warm-up
-                    // runs on a background thread that holds the engine, so it
-                    // must end with its session rather than after its last probe.
-                    if ingest_cancelled() {
-                        return;
-                    }
-                    let _ = self.score_belief_collections(
-                        &schema.system_prompt,
-                        probe,
-                        (!question.is_empty()).then_some(question.as_slice()),
-                        // These probes ARE this collection's corpus — selected by
-                        // its own scope tags — so they are inside the lens, and
-                        // keyed on the turn so re-running this on every load is
-                        // free after the first.
-                        Observe::Yes {
-                            tags: &coll.policy.tags,
-                            source: *source,
-                        },
-                        None,
-                    );
-                    probes_run += 1;
-                }
-                warmed_members += 1;
+            warm.members += plan.len();
+            // Every planned exemplar's whole-turn signature, in plan order — the
+            // order the levels fold them in, which the asymmetric EWMA is not
+            // indifferent to.
+            let probes: Vec<(u64, Arc<Vec<WideQSig>>)> = {
+                let sub = self.inner.read().unwrap();
+                plan.iter()
+                    .flat_map(|(_, keys)| keys.iter())
+                    .filter_map(|(tl, idx)| {
+                        let sid = turn_stream_id(*tl, *idx);
+                        sub.decoded_wide_sig(sid).map(|sig| (sid.0, sig))
+                    })
+                    .filter(|(_, sig)| !sig.is_empty())
+                    .collect()
+            };
+            if probes.is_empty() {
+                continue;
             }
+            // The probes are this collection's corpus, so they teach every
+            // collection whose scope they fall inside — its own, and any other
+            // sharing a scope tag. The same set the per-probe scan over the whole
+            // system prompt taught.
+            let observer = Observe::Yes {
+                tags: &coll.policy.tags,
+                source: 0,
+            };
+            for item in &sp.items {
+                let SystemPromptItem::Collection(taught) = item else {
+                    continue;
+                };
+                if taught.sections.is_empty() || !observer.teaches(&taught.policy.tags) {
+                    continue;
+                }
+                match self.fold_warm_probes(taught, &probes, arena) {
+                    Some(true) => warm.gpu_probes += probes.len(),
+                    Some(false) => {}
+                    // A shutdown asked: the warm-up must end with its session.
+                    None => return warm,
+                }
+            }
+            warm.probes += probes.len();
         }
         tracing::info!(
-            members = warmed_members,
-            probes = probes_run,
+            members = warm.members,
+            probes = warm.probes,
+            gpu_probes = warm.gpu_probes,
             "normalization warm-up: learned per-member hit levels for tag-scoped section \
              collections (0 ⇒ no additive belief-driven collection had a tagged corpus — \
              collection levels stay cold and scores are not comparable across members)"
         );
+        warm
+    }
+
+    /// Fold `probes` into `taught`'s hit levels, in order — each probe's raw
+    /// whole-turn scores against `taught`'s gallery, observed under the probe's
+    /// stream id, exactly as the seal-time scan observes it. `Some(true)` when
+    /// the GPU arena scored them, `Some(false)` for the CPU (no arena, a
+    /// non-additive law the arena does not scan, an empty gallery, or a launch
+    /// that failed), `None` when a shutdown stopped it part-way.
+    fn fold_warm_probes(
+        &self,
+        taught: &SectionCollection,
+        probes: &[(u64, Arc<Vec<WideQSig>>)],
+        arena: Option<&GalleryArena>,
+    ) -> Option<bool> {
+        let n = taught.sections.len();
+        let slot_of = |name: &str| taught.sections.iter().position(|s| s.name == name);
+        let (windows, slots, sids) =
+            self.belief_gallery(&taught.name, &taught.policy.tags, slot_of);
+        if windows.is_empty() {
+            return Some(false);
+        }
+        let weights = &taught.policy.layer_weights;
+        let fusion = taught.policy.scan.fusion;
+        let queries: Vec<&[WideQSig]> = probes.iter().map(|(_, p)| p.as_slice()).collect();
+        let gpu: Option<Vec<Vec<f32>>> = match (arena, fusion) {
+            (Some(arena), FusionMode::Additive) => {
+                let segments = [PagedSegment {
+                    windows: windows
+                        .iter()
+                        .zip(&sids)
+                        .zip(&slots)
+                        .map(|((w, sid), &case)| PagedWindow {
+                            sid: *sid,
+                            fingerprint: sig_fingerprint(w),
+                            turn: w.as_slice(),
+                            start: 0,
+                            end: w.len(),
+                            case,
+                        })
+                        .collect(),
+                    n_cases: n,
+                }];
+                let mut raw = Vec::with_capacity(queries.len());
+                let mut scanned = true;
+                for batch in queries.chunks(WARM_GPU_PROBE_BATCH) {
+                    if ingest_cancelled() {
+                        return None;
+                    }
+                    match arena.scan_weighted(&segments, batch, weights) {
+                        Ok(out) => raw.extend(out),
+                        Err(e) => {
+                            tracing::debug!(
+                                target: "provenance",
+                                "GPU warm-up scan unavailable, using CPU: {e}"
+                            );
+                            scanned = false;
+                            break;
+                        }
+                    }
+                }
+                scanned.then_some(raw)
+            }
+            _ => None,
+        };
+        let on_gpu = gpu.is_some();
+        let raw = match gpu {
+            Some(raw) => raw,
+            None => {
+                let gallery: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
+                let mut raw = Vec::with_capacity(queries.len());
+                for query in &queries {
+                    if ingest_cancelled() {
+                        return None;
+                    }
+                    raw.push(score_slots_fused(
+                        query, &gallery, &slots, n, weights, fusion,
+                    ));
+                }
+                raw
+            }
+        };
+        let scope = ScopeKey::collection(taught.id.raw() as u64, taught.name.as_str());
+        let mut cache = self.normalization.lock().unwrap();
+        for ((source, probe), scores) in probes.iter().zip(&raw) {
+            let pairs: Vec<(ChildKey, f32)> = taught
+                .sections
+                .iter()
+                .zip(scores)
+                .map(|(s, &v)| (ChildKey::named(s.name.clone()), v))
+                .collect();
+            cache.observe(&scope, *source, &pairs, probe.len());
+        }
+        Some(on_gpu)
     }
 
     /// Warm the append-only INGEST groups' per-file / per-cluster hit levels from
@@ -1324,80 +1484,8 @@ impl Conversation {
             if !is_ingest {
                 continue;
             }
-            for group in &layer.groups {
-                if !group.is_belief_driven() {
-                    continue;
-                }
-                // A gated-fusion group normalizes traffic-relative (the A.4
-                // floored path keys on observed-traffic PEAKS, so a rare hit on
-                // a quiet file stands out). Self-match warming would stamp
-                // every file's peak at its own self-match magnitude and erase
-                // that contrast — the gate already handles the promiscuous
-                // domination this warm-up was built to fix. Config-keyed, not
-                // axis-keyed: any additive-fusion group still warms.
-                if group.policy.scan.fusion != FusionMode::Additive {
-                    continue;
-                }
-                let timelines: Vec<TimelineId> = self
-                    .inner
-                    .read()
-                    .unwrap()
-                    .active_timelines_for_group(group.id)
-                    .collect();
-                for tl in timelines {
-                    // This file's / cluster's own turn signatures. Gathered under a
-                    // short-lived read lock so the per-turn `score_belief_groups`
-                    // calls below (which take the lock themselves) never re-enter it.
-                    let sigs: Vec<(u64, Arc<Vec<WideQSig>>)> = {
-                        let sub = self.inner.read().unwrap();
-                        let count = sub.turn_count(tl);
-                        (0..count)
-                            .filter_map(|i| {
-                                let sid = turn_stream_id(tl.raw(), i);
-                                sub.decoded_wide_sig(sid).map(|s| (sid.0, s))
-                            })
-                            .collect()
-                    };
-                    let self_target = ProjectionTarget {
-                        layer: layer.id,
-                        group: group.id,
-                        timeline: tl,
-                    };
-                    // A handful of self-probes is enough: the asymmetric EWMA
-                    // (alpha_up 0.30) is ~94% converged after 8 observes, and each
-                    // call already scores against ALL the file's exchanges, so this
-                    // caps the one-time warm cost without materially moving the level.
-                    for (source, sig) in sigs.iter().take(WARM_INGEST_PROBES_PER_TIMELINE) {
-                        // Stops between probes once a shutdown asks — see
-                        // `warm_collection_normalization`.
-                        if ingest_cancelled() {
-                            return;
-                        }
-                        if sig.is_empty() {
-                            continue;
-                        }
-                        let mut throwaway = ProjectionScores::new();
-                        // CPU fallback (`device: None`): the warm-up runs off the
-                        // reproject hot path and only needs the learned hit level,
-                        // which the CPU and GPU scans agree on up to fast-math ULP.
-                        let _ = self.score_belief_groups(
-                            layer,
-                            self_target,
-                            sig.as_slice(),
-                            None,
-                            &mut throwaway,
-                            // Self-match warming of an ingest group: the probe is
-                            // this group's own turn, so it is inside the scope by
-                            // construction.
-                            Observe::Yes {
-                                tags: &group.policy.tags,
-                                source: *source,
-                            },
-                            None,
-                        );
-                    }
-                    warmed_timelines += 1;
-                }
+            for group in layer.groups.iter().filter(|g| is_warmable(g)) {
+                warmed_timelines += self.warm_group(layer, group);
             }
         }
         tracing::info!(
@@ -1405,6 +1493,120 @@ impl Conversation {
             "normalization warm-up: learned per-file hit levels for ingest-layer timelines \
              (0 ⇒ no append-only ingest layer marked — belief levels stay cold)"
         );
+    }
+
+    /// Warm one belief group's per-timeline hit levels by self-match —
+    /// [`Self::warm_ingest_normalization`] for a single group, whatever its
+    /// layer.
+    ///
+    /// For a group nothing else teaches: a tag-scoped turn group learns only
+    /// from probes inside its scope, and ordinary dialogue is untagged, so its
+    /// levels stay at the cold-start prior for the life of the process — where
+    /// `normalize` is a flat `scale/prior` multiple of the raw score rather
+    /// than a normalization. Only `group` is scored and taught (see [`alone`]).
+    /// Returns how many timelines were warmed; `0` when the group is not in
+    /// the schema or not [`is_warmable`].
+    pub fn warm_group_normalization(&self, schema: &Schema, group: GroupId) -> usize {
+        let Some(layer) = schema
+            .layers
+            .iter()
+            .find(|l| l.groups.iter().any(|g| g.id == group))
+        else {
+            return 0;
+        };
+        let Some((layer, group)) = warmable(schema, layer.id, group) else {
+            return 0;
+        };
+        self.warm_group(&alone(layer, group), group)
+    }
+
+    /// Warm one timeline's hit levels by self-match — a conversation written
+    /// onto a belief group after the group was warmed, which would otherwise be
+    /// the one member scored on a different scale from the rest. `false` when
+    /// the timeline is unknown or its group is not [`is_warmable`].
+    pub fn warm_timeline_normalization(&self, schema: &Schema, timeline: TimelineId) -> bool {
+        let Some((layer, group)) = self.timeline_target(timeline) else {
+            return false;
+        };
+        let Some((layer, group)) = warmable(schema, layer, group) else {
+            return false;
+        };
+        self.warm_timeline(&alone(layer, group), group, timeline);
+        true
+    }
+
+    /// Every active timeline of `group`, warmed under `layer`. Returns how many.
+    fn warm_group(&self, layer: &LayerSchema, group: &GroupSchema) -> usize {
+        let timelines: Vec<TimelineId> = self
+            .inner
+            .read()
+            .unwrap()
+            .active_timelines_for_group(group.id)
+            .collect();
+        for &tl in &timelines {
+            // A shutdown ends the warm-up here too, not one timeline at a time.
+            if ingest_cancelled() {
+                break;
+            }
+            self.warm_timeline(layer, group, tl);
+        }
+        timelines.len()
+    }
+
+    /// Self-match one timeline of `group`: a handful of its own turns probe it,
+    /// folding its hit levels under the SAME `scope = turn_group(group,
+    /// timeline)` a live query reads back.
+    fn warm_timeline(&self, layer: &LayerSchema, group: &GroupSchema, tl: TimelineId) {
+        // This file's / cluster's own turn signatures. Gathered under a
+        // short-lived read lock so the per-turn `score_belief_groups` calls
+        // below (which take the lock themselves) never re-enter it.
+        let sigs: Vec<(u64, Arc<Vec<WideQSig>>)> = {
+            let sub = self.inner.read().unwrap();
+            let count = sub.turn_count(tl);
+            (0..count)
+                .filter_map(|i| {
+                    let sid = turn_stream_id(tl.raw(), i);
+                    sub.decoded_wide_sig(sid).map(|s| (sid.0, s))
+                })
+                .collect()
+        };
+        let self_target = ProjectionTarget {
+            layer: layer.id,
+            group: group.id,
+            timeline: tl,
+        };
+        // A handful of self-probes is enough: the asymmetric EWMA (alpha_up
+        // 0.30) is ~94% converged after 8 observes, and each call already scores
+        // against ALL the file's exchanges, so this caps the one-time warm cost
+        // without materially moving the level.
+        for (source, sig) in sigs.iter().take(WARM_INGEST_PROBES_PER_TIMELINE) {
+            // Stops between probes once a shutdown asks — see
+            // `warm_collection_normalization`.
+            if ingest_cancelled() {
+                return;
+            }
+            if sig.is_empty() {
+                continue;
+            }
+            let mut throwaway = ProjectionScores::new();
+            // CPU fallback (`device: None`): the warm-up runs off the reproject
+            // hot path and only needs the learned hit level, which the CPU and
+            // GPU scans agree on up to fast-math ULP.
+            let _ = self.score_belief_groups(
+                layer,
+                self_target,
+                sig.as_slice(),
+                None,
+                &mut throwaway,
+                // Self-match: the probe is this group's own turn, so it is
+                // inside the scope by construction.
+                Observe::Yes {
+                    tags: &group.policy.tags,
+                    source: *source,
+                },
+                None,
+            );
+        }
     }
 
     /// Score every belief-driven **turn group** in `layer` against its own turns
@@ -1478,11 +1680,27 @@ impl Conversation {
             // A belief group is never the projection target (the target is the
             // Sequence dialogue group, skipped above), but mirror the target mask
             // anyway so the invariant holds if that ever changes.
-            let timelines: Vec<TimelineId> = if self_local || group.id == target.group {
+            let mut timelines: Vec<TimelineId> = if self_local || group.id == target.group {
                 vec![target.timeline]
             } else {
                 sub.active_timelines_for_group(group.id).collect()
             };
+            // A tagged group reads only the conversations carrying its tags — the
+            // same scope projection applies to its candidates, applied here so an
+            // out-of-scope conversation is neither scanned nor allowed to teach
+            // the group's hit levels. See `Builder::set_group_tags`. Never the
+            // target's own group, which is its own timeline already — the same
+            // exemption projection makes.
+            if !group.policy.tags.is_empty() && group.id != target.group {
+                let tags = &group.policy.tags;
+                timelines.retain(|&tl| {
+                    (0..sub.turn_count(tl)).any(|i| {
+                        sub.turn_tags(tl, TurnIndex(i))
+                            .iter()
+                            .any(|t| tags.contains(t))
+                    })
+                });
+            }
             // ── Phase A: assemble every file's exchanges + gallery windows ───────
             // All files in the group are built first so the whole group can be scored
             // in ONE batched GPU launch (per-file z), or file-by-file on the CPU
@@ -2873,6 +3091,12 @@ impl Conversation {
         self.read().conversations_with_conv_id_prefix(prefix)
     }
 
+    /// Every live timeline, named or not — see
+    /// [`crate::substrate::Substrate::live_timeline_ids`].
+    pub fn live_timeline_ids(&self) -> Vec<TimelineId> {
+        self.read().live_timeline_ids()
+    }
+
     /// Set a conversation's `archived` lifecycle flag and persist it
     /// as a `RecordType::ConvState` record. Idempotent: if the
     /// substrate already holds the requested state, the record is
@@ -2958,6 +3182,24 @@ impl Conversation {
     /// there is no redo-log record.
     pub fn mark_timeline_transient(&self, timeline: TimelineId) {
         self.write().mark_timeline_transient(timeline);
+    }
+
+    /// Mark a throwaway conversation's frame as transient — see
+    /// [`crate::substrate::Substrate::mark_section_transient`]. In-memory only.
+    pub fn mark_section_transient(&self, section: SectionId) {
+        self.write().mark_section_transient(section);
+    }
+
+    /// Whether a section is transient — see
+    /// [`crate::substrate::Substrate::is_section_transient`].
+    pub fn is_section_transient(&self, section: SectionId) -> bool {
+        self.read().is_section_transient(section)
+    }
+
+    /// Remove a transient section — see
+    /// [`crate::substrate::Substrate::retire_section`].
+    pub fn retire_section(&self, section: SectionId) -> bool {
+        self.write().retire_section(section)
     }
 
     /// Couple `from_turn` to the tool response that follows it — in-RAM (so this
@@ -3281,8 +3523,9 @@ impl Conversation {
             .enqueue(WriteJob::WideQSigs { stream_id, payload });
     }
 
-    /// Enqueue a turn's QSA index page, mirroring it in RAM first so this
-    /// session's own projections can borrow the turn immediately.
+    /// Enqueue a turn's or a prompt section's QSA index page under its stream
+    /// id, mirroring it in RAM first so this session's own projections can
+    /// borrow the piece immediately.
     pub fn enqueue_index_page(&self, stream_id: StreamId, payload: Vec<u8>) {
         self.write().set_index_page_blob(stream_id, payload.clone());
         self.writer
@@ -3860,6 +4103,13 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         self.read.turn_score_for_timeline(turn.timeline, turn.index)
     }
 
+    fn turn_carries(&self, turn: TurnKey, tags: &[String]) -> bool {
+        self.read
+            .turn_tags(turn.timeline, turn.index)
+            .iter()
+            .any(|t| tags.contains(t))
+    }
+
     fn group_attention_mass(&self, group: GroupId) -> f32 {
         self.read.scores_or_empty().group_mass(group)
     }
@@ -3934,7 +4184,8 @@ impl<'a> ContentResolver for TargetedRead<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collection_warm_plan, selected_in_collection, subwindow_bounds, Conversation, Observe,
+        alone, collection_warm_plan, is_warmable, selected_in_collection, subwindow_bounds,
+        warmable, Conversation, Observe,
     };
 
     fn tags(v: &[&str]) -> Vec<String> {
@@ -4049,8 +4300,133 @@ mod tests {
         assert!(!Observe::No.teaches(&tools));
         assert!(!Observe::No.teaches(&unscoped));
     }
-    use crate::projection::{ProjectionSelection, SelectedSection, SystemItem};
+    use crate::projection::{Builder, ProjectionSelection, SelectedSection, SystemItem};
     use std::collections::HashSet;
+
+    /// A belief layer with two ranked groups beside a dialogue layer — enough
+    /// to ask which group a warm reaches and what it scores under.
+    const WARM_YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "You are a helpful assistant."
+layers:
+  - name: ground
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 40
+    groups:
+      - id: facts
+        selection:
+          kind: top_k
+          k: 3
+      - id: rumours
+        selection:
+          kind: top_k
+          k: 2
+  - name: dialogue
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 100
+      min_percent: 50
+    groups:
+      - id: conversation
+        selection:
+          kind: conversation
+          recent: 4
+          historical_top_k: 8
+"#;
+
+    /// A ranked group is warmed where the schema declares it, and asking for it
+    /// under any other layer finds nothing rather than a group of the same id
+    /// somewhere else.
+    #[test]
+    fn a_ranked_group_is_warmable_in_its_own_layer_and_nowhere_else() {
+        let b = Builder::from_yaml(WARM_YAML).unwrap();
+        let ground = b.id_for_layer("ground").unwrap();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+        let facts = b.id_for_group("facts").unwrap();
+
+        let (layer, group) = warmable(b.schema(), ground, facts).expect("facts is warmable");
+        assert_eq!(layer.name, "ground");
+        assert_eq!(group.name, "facts");
+        assert!(warmable(b.schema(), dialogue, facts).is_none());
+    }
+
+    /// Recency is not a belief, so there is no hit level to learn.
+    #[test]
+    fn a_recency_group_is_not_warmable() {
+        let b = Builder::from_yaml(WARM_YAML).unwrap();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+        let conversation = b.id_for_group("conversation").unwrap();
+        let group = b
+            .schema()
+            .layers
+            .iter()
+            .find(|l| l.id == dialogue)
+            .unwrap()
+            .groups[0]
+            .clone();
+        assert!(!is_warmable(&group));
+        assert!(warmable(b.schema(), dialogue, conversation).is_none());
+    }
+
+    /// **A layer out of retrieval is not warmed**, whichever warm-up asks —
+    /// the single-group and single-timeline ones as well as the ingest one.
+    #[test]
+    fn a_group_in_a_layer_out_of_retrieval_is_not_warmable() {
+        let mut b = Builder::from_yaml(WARM_YAML).unwrap();
+        let ground = b.id_for_layer("ground").unwrap();
+        let facts = b.id_for_group("facts").unwrap();
+        assert!(warmable(b.schema(), ground, facts).is_some());
+        assert!(b.set_layer_gathered("ground", false));
+        assert!(warmable(b.schema(), ground, facts).is_none());
+    }
+
+    /// **A warm scores one group, not its layer.** `score_belief_groups` scores
+    /// and teaches every belief group it is handed, so the view a single
+    /// group's warm runs under must hold that group alone — and nothing else
+    /// about the layer may change, or the scan would read a different layer.
+    #[test]
+    fn a_single_group_warm_scores_under_a_layer_holding_only_that_group() {
+        let b = Builder::from_yaml(WARM_YAML).unwrap();
+        let ground = b.id_for_layer("ground").unwrap();
+        let rumours = b.id_for_group("rumours").unwrap();
+        let (layer, group) = warmable(b.schema(), ground, rumours).unwrap();
+        assert_eq!(
+            layer.groups.len(),
+            2,
+            "the fixture has a sibling to leave out"
+        );
+
+        let view = alone(layer, group);
+        assert_eq!(view.groups.len(), 1);
+        assert_eq!(view.groups[0].id, rumours);
+        assert_eq!(view.id, layer.id);
+        assert_eq!(view.name, layer.name);
+        assert_eq!(view.window, layer.window);
+        assert_eq!(view.score_threshold, layer.score_threshold);
+    }
 
     /// `(tags, timeline, index)` rows in the shape `collection_warm_plan` reads.
     fn corpus(rows: &[(&[&str], u64, u32)]) -> Vec<(Vec<String>, u64, u32)> {

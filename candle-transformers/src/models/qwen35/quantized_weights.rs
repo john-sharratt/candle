@@ -34,6 +34,7 @@ use super::layer_store::LayerStore;
 use super::mtp::{MtpHead, MtpInput};
 #[cfg(feature = "cuda")]
 use super::quantized_moe::Qwen35MoeBlock;
+use super::tensor_override::TensorOverrides;
 use crate::models::delta_net::{LayerKind, QuantDeltaNetWeights};
 use crate::models::dense_span;
 #[cfg(feature = "cuda")]
@@ -834,6 +835,11 @@ pub struct Loader<'a, R: Read + Seek> {
     /// `None` for every checkpoint that stores its gates at F32, which is every stock
     /// conversion. See [`LoadInputs::gate_src`].
     gate_src: Option<(&'a gguf_file::Content, &'a [u8])>,
+    /// Tensors this load reads from another checkpoint — see [`LoadInputs::overrides`].
+    ///
+    /// Consulted by every read, ahead of the donor and the mapping, so an overridden tensor
+    /// comes from its own file whichever route builds it.
+    overrides: Option<&'a TensorOverrides<'a>>,
 }
 
 impl<'a, R: Read + Seek> Loader<'a, R> {
@@ -864,6 +870,9 @@ impl<'a, R: Read + Seek> Loader<'a, R> {
             // A caller reaching for `new` is reading one checkpoint and repairing nothing; the
             // donor arrives through `LoadInputs` and only when the primary needs one.
             gate_src: None,
+            // Overrides arrive through `LoadInputs` and reach only the trunk's loader; every
+            // other loader reading one of them is caught by `TensorOverrides::ensure_all_read`.
+            overrides: None,
         }
     }
 
@@ -882,6 +891,13 @@ impl<'a, R: Read + Seek> Loader<'a, R> {
         self
     }
 
+    /// Give this loader the tensors to read from another checkpoint — see
+    /// [`LoadInputs::overrides`].
+    pub(crate) fn with_overrides(mut self, overrides: Option<&'a TensorOverrides<'a>>) -> Self {
+        self.overrides = overrides;
+        self
+    }
+
     /// This tensor as the donor stores it, if the donor should supply it.
     ///
     /// `None` — the overwhelmingly common answer — means "read it from the checkpoint as
@@ -893,6 +909,11 @@ impl<'a, R: Read + Seek> Loader<'a, R> {
     /// there, and those values are its own; a differing format is what marks the tensor as one
     /// this conversion re-quantized, which is the defect being repaired.
     fn donated(&mut self, name: &str) -> Option<Result<QTensor>> {
+        // A tensor named by an override comes from that file, repaired or not: the override
+        // is the caller saying exactly which copy to run.
+        if self.overrides.is_some_and(|o| o.names(name)) {
+            return None;
+        }
         let (donor, bytes) = self.gate_src?;
         if !RECURRENT_PATH.iter().any(|r| name.ends_with(r)) {
             return None;
@@ -936,7 +957,9 @@ impl<R: Read + Seek> Loader<'_, R> {
         // `…NEO-IMATRIX-MAX…` conversion carries its `output.weight` at F16, 1,940 MiB where
         // the stock file has 834. Logged before the read so the *failing* tensor is the last
         // line, not the one before it.
-        if let Some(info) = self.content.tensor_infos.get(name) {
+        let source = self.overrides.and_then(|o| o.take(name));
+        let content = source.map_or(self.content, |(c, _)| c);
+        if let Some(info) = content.tensor_infos.get(name) {
             let bytes = info.shape.elem_count() / info.ggml_dtype.block_size()
                 * info.ggml_dtype.type_size();
             tracing::debug!(
@@ -945,10 +968,14 @@ impl<R: Read + Seek> Loader<'_, R> {
                 dtype = ?info.ggml_dtype,
                 shape = ?info.shape.dims(),
                 mib = bytes >> 20,
+                overridden = source.is_some(),
                 "reading"
             );
         }
-        let t = self.content.tensor(self.reader, name, &self.device)?;
+        let t = match source {
+            Some((c, bytes)) => c.tensor(&mut std::io::Cursor::new(bytes), name, &self.device)?,
+            None => self.content.tensor(self.reader, name, &self.device)?,
+        };
         self.device_bytes += t.storage_size_in_bytes();
         Ok(t)
     }
@@ -1022,13 +1049,18 @@ impl<R: Read + Seek> Loader<'_, R> {
         use candle::quantized::ko_quant::ko_tileable;
         use candle::quantized::{QStorage, QTensor};
 
-        let (Some(map), Device::Cuda(cuda)) = (self.map, &self.device) else {
+        // An overridden tensor is banded out of its own file's mapping, under the same rules.
+        let (content, map) = match self.overrides.and_then(|o| o.take(name)) {
+            Some((c, bytes)) => (c, Some(bytes)),
+            None => (self.content, self.map),
+        };
+        let (Some(map), Device::Cuda(cuda)) = (map, &self.device) else {
             return Ok(None);
         };
         if !self.mode.is_int8() || self.residency != WeightResidency::Span {
             return Ok(None);
         }
-        let Some(info) = self.content.tensor_infos.get(name) else {
+        let Some(info) = content.tensor_infos.get(name) else {
             return Ok(None);
         };
         let [nrows, ncols] = info.shape.dims() else {
@@ -1048,7 +1080,7 @@ impl<R: Read + Seek> Loader<'_, R> {
         };
 
         // The tensor's bytes where GGUF put them: whole blocks, row-major, contiguous.
-        let start = (self.content.tensor_data_offset + info.offset) as usize;
+        let start = (content.tensor_data_offset + info.offset) as usize;
         let len = nrows * ncols / info.ggml_dtype.block_size() * info.ggml_dtype.type_size();
         let Some(bytes) = map.get(start..start + len) else {
             // A mapping that does not cover the tensor is a truncated file, not a reason to
@@ -1313,6 +1345,14 @@ pub struct LoadInputs<'a, F, L> {
     /// shapes agree. Everything that makes the fine-tune what it is — attention, the FFN, the
     /// head — is the primary's throughout.
     pub gate_src: Option<(&'a gguf_file::Content, &'a [u8])>,
+    /// Tensors to read from another checkpoint instead of this one — see
+    /// [`TensorOverrides`].
+    ///
+    /// **The general facility `gate_src` is not.** Where the donor repairs a known defect and
+    /// decides for itself which tensors need it, an override is the caller naming exact tensors
+    /// and exact files. The load refuses one it never read, so an override is either on the
+    /// card or the load fails.
+    pub overrides: Option<&'a TensorOverrides<'a>>,
     /// Builds the expert cache at the one point the span means what it says —
     /// see this module's [`load_quantized_model`] header.
     pub build_experts: F,
@@ -1340,6 +1380,7 @@ impl LoadInputs<'_, NoExperts, ResidentLayers> {
             // A reference load reads a checkpoint that already satisfies the precision rule,
             // so there is nothing to repair and no second file to repair it from.
             gate_src: None,
+            overrides: None,
             build_experts: |_, _| Ok(None),
             build_layers: None,
         }
@@ -1582,6 +1623,7 @@ where
         mtp_src,
         map,
         gate_src,
+        overrides,
         build_experts,
         build_layers,
     } = inputs;
@@ -1622,7 +1664,13 @@ where
     // reservation used to be created lazily by the expert cache, which runs at
     // the *end* of this function, so it was sized from the VRAM left after the
     // weights had already been taken from the pool and could not contain them.
-    dense_span::open_for_load(device, content)?;
+    // Sized from what this load will read: an override from another file can be a wider
+    // tensor than the entry it replaces, and the pool has to hold the largest source.
+    let headroom = match overrides {
+        Some(o) => dense_span::peak_load_pool_bytes(o.effective_infos(content)),
+        None => dense_span::peak_load_pool_bytes(content.tensor_infos.values()),
+    };
+    dense_span::open_for_load_sized(device, headroom)?;
 
     // A routed checkpoint's layers stay resident however the caller asked — see
     // this function's header. Resolved here, where the config is known, so the
@@ -1635,7 +1683,8 @@ where
 
     let mut g = Loader::new(content, reader, device, mode, WeightResidency::Span)
         .with_map(map)
-        .with_gate_src(gate_src);
+        .with_gate_src(gate_src)
+        .with_overrides(overrides);
 
     // The embedding table, off the card under either residency (see
     // [`EmbeddingTable`]). Host-mapped when the caller could pin it, which is
@@ -1887,6 +1936,12 @@ where
     let mtp = mtp
         .map(|m| m.resolve(experts.as_ref(), n_used, norm_topk))
         .transpose()?;
+
+    // Every read is done — the trunk, the head, the expert cache and the layer store. An
+    // override nothing took is a tensor that reached the model from the checkpoint's own copy.
+    if let Some(o) = overrides {
+        o.ensure_all_read()?;
+    }
 
     Ok(QuantModel {
         cfg,

@@ -430,7 +430,8 @@ fn run_loop(
             // nothing is attending, so every residence should age out.
             conversation.write().set_working_set_pins(&[], &[]);
             // Loop hot→warm→cold (maintenance off) until nothing is left hot
-            // without warm or warm without cold. One `run_pass` moves a turn all
+            // without warm, warm without cold, or a sealed section without its
+            // redo-log copy — the next boot restores sections from that copy. One `run_pass` moves a turn all
             // the way to enqueued-for-cold, so this normally converges in 1–2
             // passes; the cap is only a wedge-guard against a persistently-failing
             // turn (e.g. a gather error), whose leftover simply re-ingests on
@@ -441,11 +442,15 @@ fn run_loop(
             loop {
                 // Cheap COUNT poll (no work-list clone — see `pending_warm_count` /
                 // `pending_cold_count`), matching `run_pass`'s own snapshot filters.
-                let (warm_left, cold_left) = {
+                let (warm_left, cold_left, sections_left) = {
                     let read = conversation.read();
-                    (read.pending_warm_count(), read.pending_cold_count())
+                    (
+                        read.pending_warm_count(),
+                        read.pending_cold_count(),
+                        read.pending_section_cold_count(),
+                    )
                 };
-                let remaining = warm_left + cold_left;
+                let remaining = warm_left + cold_left + sections_left;
                 if remaining == 0 {
                     break;
                 }
@@ -458,6 +463,7 @@ fn run_loop(
                     tracing::warn!(
                         warm_left,
                         cold_left,
+                        sections_left,
                         passes,
                         "persist: shutdown drain made no progress (a turn won't drain) \
                          — the leftover re-ingests on next reload",
@@ -470,6 +476,7 @@ fn run_loop(
                     tracing::warn!(
                         warm_left,
                         cold_left,
+                        sections_left,
                         passes,
                         "persist: shutdown drain hit the pass cap with work remaining \
                          — the leftover turns re-ingest on next reload",
@@ -480,6 +487,7 @@ fn run_loop(
                     pass = passes,
                     warm_left,
                     cold_left,
+                    sections_left,
                     "persist: shutdown drain hot→warm→cold",
                 );
                 prev_remaining = remaining;

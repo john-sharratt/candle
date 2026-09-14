@@ -36,25 +36,30 @@
 //! and the GGUF weights on disk).  CPU-only CI skips it.
 //!
 //! Every scenario runs on the production model — the measured-VRAM ladder —
-//! against the live repo workspace, whose substrate carries that model's tool
-//! calibration, and every scenario is `#[ignore]`d: each pays the production
-//! boot. A scenario here asks whether the model CHOOSES to call a tool, and
-//! only a model that does can answer it. The 0.8B does not: with thinking off
-//! it answered every scenario from memory — even with all 93 tool definitions
-//! in its opening context — and its invented dates and sums satisfied these
+//! against the shared production workspace under `target/tmp`
+//! (`common::production_workspace`), where that model's tool calibration is
+//! paid once, and every scenario is `#[ignore]`d: each pays the production
+//! boot. Each runs on a conversation of its own that is retired afterwards.
+//! A scenario here asks whether the model CHOOSES to call a tool, and only a
+//! model that does can answer it. The 0.8B does not: with thinking off it
+//! answered every scenario from memory — even with all 93 tool definitions in
+//! its opening context — and its invented dates and sums satisfied these
 //! oracles, so on it the suite measured nothing. Run by name, daemon stopped:
 //!
 //! ```text
 //! cargo test -p zend --test tools_integration --features cuda -- --ignored --nocapture
 //! ```
 
+mod common;
+
 #[cfg(feature = "cuda")]
 mod tool_scenarios {
-    use std::sync::{Arc, Mutex, OnceLock};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use futures::StreamExt;
 
+    use crate::common::{needs_compaction, production_workspace, run_conv_id};
     use candle::vram::host_pinned_bytes;
     use candle_conversation::{SamplingConfig, SelectionState};
     use zend::config::{DaemonConfig, ModelChoice};
@@ -84,7 +89,7 @@ mod tool_scenarios {
     // measured slower than a boot per scenario on the production model (952 s
     // shared against 758 s for ten fresh sessions).
 
-    /// Boot a ZendSession on the production model over the live repo
+    /// Boot a ZendSession on the production model over the shared production
     /// workspace, wait for ready, send `prompt`, shut the session down, and
     /// return the concatenated assistant text.
     async fn run_query(prompt: &str, conv_id: &str) -> String {
@@ -92,30 +97,21 @@ mod tool_scenarios {
         // so a fixed id would resume every earlier run's conversation — its
         // history and its recurrent memory — and the scenario would no longer be
         // the one prompt it names.
-        static RUN: OnceLock<u128> = OnceLock::new();
-        let run = *RUN.get_or_init(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("the clock is past the epoch")
-                .as_nanos()
-        });
-        let conv_id = format!("{conv_id}-{run}");
+        let conv_id = run_conv_id(conv_id);
+        let workspace = production_workspace();
+        let compact_substrate = needs_compaction(&workspace);
         let log = LogBus::new();
         let config = DaemonConfig {
-            workspace: std::env::current_dir().unwrap(),
+            workspace,
             port: 0,
             model: ModelChoice::MeasuredVram,
-            // Never compacted from here: this is the live repo's substrate.
-            compact_substrate: false,
+            compact_substrate,
             ..Default::default()
         };
         let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
         session.start_loading();
 
-        let messages = vec![ChatMessage {
-            role: Role::User,
-            content: prompt.to_string(),
-        }];
+        let messages = vec![ChatMessage::new(Role::User, prompt)];
         // Argmax, so a scenario is one fixed decode of its prompt. Left to the
         // daemon, sampling is reseeded from the clock every turn and the same
         // prompt passes or fails from one run to the next.
@@ -152,6 +148,7 @@ mod tool_scenarios {
                 StreamItem::Tool(status) => {
                     eprintln!("\n[TOOL {}] {:?}", status.phase, status.tools);
                 }
+                StreamItem::TurnEnd { .. } => {}
             }
         }
         eprintln!("\n\n[FINAL RESPONSE]\n{response}");

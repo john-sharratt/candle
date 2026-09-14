@@ -537,6 +537,12 @@ pub struct SectionCollection {
     /// Concept B: mass-driven member-budget extension (`k` grows with the
     /// collection's attention mass, capped at `absolute_max`). `None` = static.
     pub budget_adaptive: Option<MemberBudgetAdaptive>,
+    /// Members emitted on every belief-driven projection, outside the budget:
+    /// the policy selects its top-k from the OTHER members, so a mandatory
+    /// member adds to the selection instead of taking one of its slots. Set per
+    /// member at runtime (`Builder::set_collection_member_mandatory`), e.g. from
+    /// a tool definition's `mandatory: true`.
+    pub mandatory: Vec<SectionId>,
 }
 
 impl Default for SectionCollection {
@@ -553,6 +559,7 @@ impl Default for SectionCollection {
             member_glue_tokens: None,
             default: None,
             budget_adaptive: None,
+            mandatory: Vec::new(),
         }
     }
 }
@@ -873,6 +880,17 @@ pub struct LayerSchema {
     /// "N / M <unit>" while the layer ingests. `None` falls back to a mode-derived
     /// default in [`crate`]'s ingest driver; non-ingest layers ignore it.
     pub ingest_unit: Option<String>,
+    /// Where this layer sits in the stack a projection sees down through
+    /// (`rank:` in YAML): a projection targeting a layer sees every layer of
+    /// **lower** rank, and none of equal or higher rank but its own.
+    ///
+    /// Defaults to the layer's declaration index, which is the stack every
+    /// schema had before this existed. It is its own field because declaration
+    /// order also fixes every layer's and group's id, and those ids are
+    /// persisted with every timeline written under them — so a layer added to a
+    /// live schema has to be appended, and without a rank an appended layer
+    /// could only ever sit on top, invisible to everything declared before it.
+    pub rank: i32,
 }
 
 /// How strongly a layer's decode is favoured over a co-running background

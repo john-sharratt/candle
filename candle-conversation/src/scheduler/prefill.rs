@@ -3098,7 +3098,7 @@ impl Scheduler {
     /// that dragged a 93-wide tool-catalog ingest down to ~1 token/seq/forward.
     ///
     /// Bound the TOTAL tokens to the same per-forward budget a normal prefill
-    /// targets (`max_prefill_pass_tokens`). Without this the whole active set
+    /// targets ([`Self::prefill_pass_budget`]). Without this the whole active set
     /// coalesces into one forward: the 93-section tool catalog (~21k tokens)
     /// packed into a single pass whose transient activation spiked VRAM to the
     /// card ceiling and paged. Sections beyond the budget ride the next chunk —
@@ -3136,7 +3136,7 @@ impl Scheduler {
         if active.is_empty() {
             return None;
         }
-        let cap = self.max_prefill_pass_tokens;
+        let cap = self.prefill_pass_budget();
         // The head is decode and verify rows, every one of them scored.
         let mut rows_left = self.model.prefill_width_cap(
             self.session.activation_dtype(),
@@ -3242,7 +3242,7 @@ impl Scheduler {
                 s.sequence_id,
                 s.section_id,
                 s.seal_block_from,
-                std::sync::Arc::new(s.tokens.to_vec()),
+                Arc::new(s.tokens.to_vec()),
                 s.address,
                 s.debug_name,
                 s.in_collection,
@@ -3276,7 +3276,8 @@ impl Scheduler {
     /// Form a FRESH wave group into `wave_prefill_members`: the ready dialogue
     /// prefills, each advancing the chunk of its tokens the wave has room for,
     /// plus — when `include_sections` and at least one prefill is present —
-    /// section chunks bounded by the per-forward token cap. Section chunks join
+    /// section chunks bounded by the per-forward pass budget
+    /// ([`Self::prefill_pass_budget`]). Section chunks join
     /// only alongside a cohort (so they co-batch a creep that is happening anyway);
     /// with no cohort the caller uses the faster full-sweep section path instead.
     /// Members are ordered prefills-then-sections and this order is then fixed for
@@ -3296,7 +3297,11 @@ impl Scheduler {
     /// giving ends in [`Self::note_tier_refusal`] rather than in a wave that
     /// never advances.
     fn form_wave_group(&mut self, include_sections: bool, prefill_rows: usize, alone: bool) {
-        let cap = self.max_prefill_pass_tokens.max(1);
+        // The per-forward pass budget: the configured target, bounded by what
+        // the model can run in one forward. A 15.2k-token Cline turn entered
+        // whole once asked for a 13.2 GiB transient tier on a 16 GB card; in
+        // chunks of this size it creeps instead.
+        let cap = self.prefill_pass_budget();
         let mut rows_left = prefill_rows;
         // ── One adapter per wave ─────────────────────────────────────────────
         //
@@ -4334,8 +4339,16 @@ impl Scheduler {
                 }
                 continue;
             }
+            // A turn that will never decode never finalizes its view, so the
+            // view is released here or not at all.
             if let Some(e) = error {
                 let _ = work.event_tx.send(TurnEvent::Error(e));
+                // Reclaim the carved view, or the sequence wedges forever: the
+                // view was registered in `turn_views` before the prefill ran and
+                // never reached `active_decodes`, so a dangling one makes the
+                // parent's next `SubmitTurn` wind-down refuse with `TurnInFlight`
+                // for good. Every prefill-error path drains through here.
+                self.discard_turn_view(work.sequence_id);
                 continue;
             }
             let logits = match final_logits {
@@ -4346,6 +4359,7 @@ impl Scheduler {
                         .send(TurnEvent::Error(ConversationError::Channel(
                             "prefill produced no final logits".into(),
                         )));
+                    self.discard_turn_view(work.sequence_id);
                     continue;
                 }
             };
@@ -4486,7 +4500,7 @@ impl Scheduler {
     /// the turn out immediately on EOS / max_decode_tokens == 0.
     fn finalise_prefill(
         &mut self,
-        work: PrefillWork,
+        mut work: PrefillWork,
         logits: Tensor,
         prefill_ms: f64,
         turn_start: Instant,
@@ -4681,6 +4695,13 @@ impl Scheduler {
         let sampling_temperature = work.sampling.temperature;
 
         if self.is_eos(first_token) || work.max_decode_tokens == 0 {
+            // The first token ended the turn: an end-of-sequence, or a budget of
+            // zero decoded tokens.
+            let finish = if self.is_eos(first_token) {
+                FinishReason::Stop
+            } else {
+                FinishReason::Length
+            };
             // View sequences (SubmitTurn path): the prefill already wrote KV
             // blocks that must be finalized onto the parent and sealed into
             // the substrate.  Insert as a finished DecodeState so
@@ -4714,6 +4735,7 @@ impl Scheduler {
                     no_think: work.no_think,
                     prefill_assistant_text: work.prefill_assistant_text,
                     finished: true,
+                    finish,
                     decode_start: Instant::now(),
                     decode_busy_us: 0,
                     prefill_ms,
@@ -4757,6 +4779,7 @@ impl Scheduler {
                     prefill_ms,
                     turn_start,
                     context_depth,
+                    finish,
                 );
             }
             return;
@@ -4814,6 +4837,11 @@ impl Scheduler {
             // otherwise steering silently never engages for those calls.
             None => {
                 let d = work.triggers.driver_for(first_token);
+                // A once-trigger (the think block) is spent by firing, so the
+                // rest of the turn decodes that token as text.
+                if let Some(rest) = work.triggers.after_firing(first_token) {
+                    work.triggers = Arc::new(rest);
+                }
                 if let Some(d) = &d {
                     tracing::debug!(
                         target: "candle_conversation::stencil",
@@ -4894,6 +4922,7 @@ impl Scheduler {
             no_think: work.no_think,
             prefill_assistant_text: work.prefill_assistant_text,
             finished: false,
+            finish: FinishReason::Stop,
             decode_start: Instant::now(),
             decode_busy_us: 0,
             prefill_ms,
@@ -5043,9 +5072,10 @@ impl Scheduler {
     ) -> Result<Tensor, ConversationError> {
         // Chunked prefill: split large prompts into bounded chunks to keep
         // intermediate activation buffers from growing unboundedly.
-        let logits = if tokens.len() > self.max_prefill_pass_tokens {
+        let pass = self.prefill_pass_budget();
+        let logits = if tokens.len() > pass {
             let mut last_logits: Option<Tensor> = None;
-            for chunk in tokens.chunks(self.max_prefill_pass_tokens) {
+            for chunk in tokens.chunks(pass) {
                 let input = Tensor::new(chunk, &self.device)
                     .and_then(|t| t.unsqueeze(0))
                     .map_err(ConversationError::Model)?;
@@ -5601,6 +5631,163 @@ mod warm_budget_tests {
     fn default_slack_clears_a_healthy_drain_pipeline() {
         let slack = WARM_PIPELINE_SLACK_BYTES;
         assert!(slack >= 768 * 1024 * 1024, "slack {slack} too small");
+    }
+}
+
+#[cfg(test)]
+mod wave_chunk_tests {
+    use super::PREFILL_MIN_ADVANCE;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use super::super::tests::make_test_scheduler;
+    use super::super::*;
+
+    /// A dialogue prefill carrying `tokens` and nothing else.
+    pub(super) fn dialogue_prefill(seq: SequenceId, tokens: Vec<u32>) -> ActivePrefill {
+        let (event_tx, _event_rx) = flume::unbounded();
+        ActivePrefill {
+            work: PrefillWork {
+                sequence_id: seq,
+                tokens: TokenBuffer::from(tokens),
+                prefill_text: String::new(),
+                user_text: String::new(),
+                tags: Vec::new(),
+                user_content_start: 0,
+                user_content_end: 0,
+                assistant_content_start: 0,
+                no_think: false,
+                prefill_assistant_text: String::new(),
+                event_tx,
+                max_decode_tokens: 0,
+                sampling: SamplingConfig::compression(),
+                submitted_at: Instant::now(),
+                reprojection: None,
+                belief: PriorBelief::default(),
+                seal_action: SealAction::None,
+                post_decode_tokens: TokenBuffer::default(),
+                projection_offsets: Vec::new(),
+                staged_composition: None,
+                triggers: Arc::new(TriggerRegistry::new()),
+                turn_grammar: None,
+                free_tool_calls_from_penalties: false,
+                projection: Vec::new(),
+                demoted: false,
+                held_until_decodes_below: None,
+                announced: false,
+            },
+            offset: 0,
+            next_projection: 0,
+            final_logits: None,
+            error: None,
+            prefill_start: None,
+        }
+    }
+
+    /// **A dialogue prefill enters the wave group in pass-sized chunks.** It
+    /// used to enter whole: a 15.2k-token Cline turn needed a 13.2 GiB transient
+    /// tier on a 16 GB card, more than all the ground below the weight floor,
+    /// and failed identically on every retry.
+    #[test]
+    fn a_long_dialogue_prefill_creeps_in_pass_sized_chunks() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let cap = scheduler.prefill_pass_budget();
+        let seq = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(seq, (0..15_000u32).collect()));
+
+        // A tier with room for far more than one pass: the pass budget binds.
+        scheduler.form_wave_group(false, usize::MAX, true);
+        let (members, _, inputs, _) = scheduler.build_wave_group_inputs();
+        assert_eq!(members.len(), 1);
+        assert_eq!(
+            inputs[0].dims(),
+            &[1, cap],
+            "the first chunk is one pass wide"
+        );
+
+        // A later group resumes at the committed offset, never from token 0.
+        scheduler.reset_wave_prefill();
+        scheduler.active_prefills[0].offset = 14_800;
+        scheduler.form_wave_group(false, usize::MAX, true);
+        let (_, _, inputs, _) = scheduler.build_wave_group_inputs();
+        let rows = inputs[0].to_vec2::<u32>().expect("u32 rows");
+        assert_eq!(rows[0].len(), 200, "the tail chunk is what remains");
+        assert_eq!(rows[0][0], 14_800, "the chunk starts at the offset");
+    }
+
+    /// Prefills share the rows the tier holds: small ones pack together, and the
+    /// next takes the rows still unassigned as a chunk of its own rather than
+    /// waiting for a group that can take it whole.
+    #[test]
+    fn dialogue_prefills_share_the_rows_the_tier_holds() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let cap = scheduler.prefill_pass_budget();
+        assert!(
+            cap > 200 + PREFILL_MIN_ADVANCE,
+            "the test needs room for a least chunk after the two short turns"
+        );
+        let a = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let b = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let c = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(a, vec![1; 100]));
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(b, vec![1; 100]));
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(c, vec![1; cap]));
+
+        scheduler.form_wave_group(false, cap, false);
+        let members: Vec<(usize, usize)> = scheduler
+            .wave_prefill_members
+            .iter()
+            .map(|m| match *m {
+                WaveMember::Prefill { seq_id, advance } => (seq_id, advance),
+                WaveMember::Section { seq_id, advance } => (seq_id, advance),
+            })
+            .collect();
+        assert_eq!(
+            members,
+            vec![(a.0, 100), (b.0, 100), (c.0, cap - 200)],
+            "the third takes the rows the first two left"
+        );
+    }
+}
+
+#[cfg(test)]
+mod turn_view_release_tests {
+    use super::super::tests::{make_test_scheduler, register_turn_view};
+    use super::super::*;
+    use super::wave_chunk_tests::dialogue_prefill;
+
+    /// **An errored turn prefill releases its view.** The error reached the
+    /// caller and the view stayed registered with the parent's prefix borrowed
+    /// — nothing but a completed decode or a reprojection ever released it, and
+    /// an errored turn has neither.
+    #[test]
+    fn an_errored_turn_prefill_releases_its_view() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let parent = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let view = register_turn_view(&mut scheduler, parent);
+        let mut prefill = dialogue_prefill(view, vec![1; 8]);
+        prefill.error = Some(ConversationError::Channel("the wave failed".into()));
+        scheduler.active_prefills.push(prefill);
+
+        scheduler.promote_finished_prefills_to_decodes();
+
+        assert!(scheduler.turn_views.is_empty(), "the view is unregistered");
+        assert!(
+            scheduler.session.sequence_offset(view.0).is_none(),
+            "the view's slot is released"
+        );
+        assert!(
+            scheduler.session.sequence_offset(parent.0).is_some(),
+            "the parent is untouched"
+        );
     }
 }
 

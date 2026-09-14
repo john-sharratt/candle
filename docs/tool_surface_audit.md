@@ -55,8 +55,9 @@ foundation is building all 79, plus what this audit adds.**
 
 | Tool | Plane | Availability | Bound arguments |
 |---|---|---|---|
-| `say` | Speech | Always | — |
-| `tell` | Speech | Nearby | `to` → company |
+| `tell` | Speech | Nearby | `to` → company (heard by the room) |
+| `whisper` | Speech | AmongOthers (two or more others here) | `to` → company (heard by the addressee only) |
+| `shout` | Speech | Always | — (heard in this room and every room in sight) |
 | `ask` | Speech | Nearby | `to` → company |
 | `gesture` | Speech | Nearby | `to` → company *(optional; drops when alone)* |
 | `move_to` | World | Always | `destination` → reachable |
@@ -98,7 +99,7 @@ identical, so every change below applies twice.
 
 **`room.talk`**, on the seat, the hung faces and the gallery rail.
 
-`say` is `Availability::Always` and `tell` is offered wherever there is company.
+`shout` is `Availability::Always`; `tell` and `whisper` are offered wherever there is company. `tell` is the ordinary addressed voice; `whisper` is described as the exception — for keeping something from somebody else who is present — because offered as "for when it is only for them" it became the cast's default in two-person conversations.
 Speech is a body act, and hanging it on furniture asserts that a Maker can talk
 near a seat, a portrait wall or a map rail and not elsewhere — which is false,
 and which puts the map into direct disagreement with the grammar. It is the only

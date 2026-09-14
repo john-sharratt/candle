@@ -22,7 +22,7 @@
 //! [`ConversationTree::fork`](super::conversation_tree::ConversationTree::fork)
 //! and [`ConversationTreeFork`](super::conversation_tree::ConversationTreeFork)
 //! offer the alternative — a `Send`-able snapshot plus a one-shot
-//! [`Receiver<TreePatch>`](crossbeam::channel::Receiver) for genuinely
+//! [`Receiver<TreePatch>`](flume::Receiver) for genuinely
 //! off-thread work. Nothing calls them yet; they are the seam for moving
 //! summarization off the turn boundary.
 

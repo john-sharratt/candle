@@ -194,6 +194,7 @@
 //! | [`selection`]   | All four selection rules, with budget-bounded variant          |
 //! | [`reconcile`]   | CSS-flexbox-style budget distribution                          |
 //! | [`project`]     | Full projection pipeline orchestrator                          |
+//! | [`plain_prompt`] | Where a plain prompt's frame section is sealed               |
 
 pub mod adaptive;
 mod builder;
@@ -201,6 +202,7 @@ mod error;
 pub(crate) mod event;
 mod ids;
 pub mod layer_toggle;
+mod plain_prompt;
 mod policy;
 mod project;
 mod reconcile;
@@ -232,6 +234,7 @@ pub use ids::{
     CollectionId, GroupId, LayerId, Reserved, SectionId, TimelineAllocator, TimelineId, TurnId,
     TurnIndex, TurnKey,
 };
+pub use plain_prompt::PlainPromptFrames;
 pub use policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 pub(crate) use project::turn_belief_key;
 pub use project::{
@@ -241,7 +244,7 @@ pub use project::{
     TOOLS_ENABLED_SELECTOR,
 };
 pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};
-pub use resolver::{Conversation, Observe, TargetedRead};
+pub use resolver::{CollectionWarm, Conversation, Observe, TargetedRead};
 pub use schema::{
     Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, GatherScope,
     GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, ScoreFormula, SectionCollection,

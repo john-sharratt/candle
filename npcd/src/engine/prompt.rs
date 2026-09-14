@@ -86,7 +86,14 @@ pub struct Persona<'a> {
     /// know where it lives: asked to go somewhere it has not been, it invents a
     /// destination, and every one of those is refused because no such place
     /// exists. Empty for a character whose world has no map.
+    ///
+    /// **Only the part of the world it is standing in.** A world holds more
+    /// than one building; see `building`.
     pub place: &'a str,
+    /// Which part of the world `place` describes, as a
+    /// [`crate::engine::identity::building_key`] — what an acting turn pins the projection's
+    /// `place` collection to. Empty for a character with no body.
+    pub building: &'a str,
 }
 
 /// Who this particular character is, as one block.
@@ -112,7 +119,7 @@ pub fn character(p: &Persona<'_>) -> String {
     s.push_str(".\n\n");
 
     if !p.identity.trim().is_empty() {
-        s.push_str(p.identity.trim());
+        s.push_str(&described(p.identity));
         s.push_str("\n\n");
     }
     if !p.manner.trim().is_empty() {
@@ -156,6 +163,56 @@ pub fn character(p: &Persona<'_>) -> String {
     }
 
     s
+}
+
+/// A character's authored description, in the voice this block is written in.
+///
+/// **The block is shared, so this has to read right in every conversation that
+/// pins it** — the acting conversation, the reflection, and the rendered prompt
+/// a daemon with no mind uses. Everything else in [`character`] addresses the
+/// character as *you*; the description is the one part authored elsewhere, and
+/// it is usually written the way a character sheet is: *"Wren Weaver is a
+/// 30-year-old man… He spends most of his day…"*.
+///
+/// Pasted in as it stands, that is a paragraph about somebody in the third
+/// person directly under *You are Wren Weaver.* — and a conversation asked to
+/// write in the second person took it as the voice to write in. Every dream
+/// brief in a reflection came back as *"Wren stands at the workbench… he
+/// reaches for the iron"*, refused for not addressing the dreamer, and no
+/// repair pass could pull it back.
+///
+/// So a description that already addresses the character — it opens on *you*
+/// or *your* — is kept exactly as written, and anything else is introduced as
+/// what it is: how the character looks to other people. That framing is true
+/// of a description whichever person it is in, so it changes what an acting
+/// turn reads without changing what it means.
+fn described(identity: &str) -> String {
+    let t = identity.trim();
+    match addresses_the_reader(t) {
+        true => t.to_string(),
+        false => format!("How others would describe you: {t}"),
+    }
+}
+
+/// Whether `text` opens by addressing its reader — its first word is *you* or
+/// one of its forms.
+///
+/// The first word and nothing further, deliberately: a description is either
+/// written to the character or about them, and which one is settled by how it
+/// opens. Guessing at pronouns further in would be a heuristic that a single
+/// quoted line of dialogue could fool.
+fn addresses_the_reader(text: &str) -> bool {
+    let first = text
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '’')
+        .to_lowercase()
+        .replace('’', "'");
+    matches!(
+        first.as_str(),
+        "you" | "your" | "yours" | "yourself" | "you're" | "you've" | "you'd" | "you'll"
+    )
 }
 
 /// The building a character works in, as the block that goes in its own
@@ -363,8 +420,10 @@ are telling yourself to do.
 /// Every rule is one a test produced by failing without it: without the first a
 /// decode wrote *"dreams don't allow understanding while they're happening"*
 /// into the prose, reciting its own instruction; without the third one scar
-/// became handwriting across six levels; without the last it ended on a stack of
-/// similes reaching for significance.
+/// became handwriting across six levels; without the fourth the dream circled a
+/// single image, writing the same moment three times over instead of moving to
+/// the next; without the last it stopped after a glimpse or two before the dream
+/// had gone anywhere, or ended on a stack of similes reaching for significance.
 const ASLEEP: &str = "\
 You are not an assistant and there is nobody to help. You are this person, living through \
 this, with your own reasons.
@@ -381,6 +440,10 @@ The strange thing stays exactly as large as it is. It does not spread — not to
 room, another document, another object, or another part of you. One thing, that size, no \
 larger. Nothing arrives to explain it and nothing else joins in.
 
+The strange thing holds still; the dream does not. Each line is the moment after the last — \
+you move, the hour moves on around you — never this same moment written again in other \
+words. What has just happened is behind you; what you write is what happens next.
+
 Everything that is not the strange thing behaves completely normally: the light, the doors, \
 the work in your hands, the weight of your own body, and every person in it going about \
 their day exactly as they always do.
@@ -389,7 +452,8 @@ Anybody who appears is somebody you already know. You do not meet new people her
 
 It ends on something happening — an action, an image, a state. Never on a thought, a \
 question, or a realisation, and never on what any of it meant. It may stop before anything \
-is settled, and usually does.
+is settled — but it is a stretch of the night, not a single glimpse: it runs on through \
+what happens next, and next, and does not hurry to be over.
 
 ";
 
@@ -422,7 +486,7 @@ fn frame_acting(mode: Mode, tools: &[&Tool], env: &ToolCallEnvelope) -> String {
          nothing happens — the world never sees it, and you will have told yourself a story \
          about an act you did not perform.\n\
          \n\
-         You give tools your INTENT, never your words. `say` does not take a sentence; it \
+         You give tools your INTENT, never your words. `tell` does not take a sentence; it \
          takes what you mean. Someone else finds the words, in your voice. This is not a \
          formatting rule — you decide substance, and the wording follows from who you are.\n\
          \n\
@@ -445,7 +509,10 @@ fn frame_acting(mode: Mode, tools: &[&Tool], env: &ToolCallEnvelope) -> String {
          for no reason, and how a corridor gets walked up and down all afternoon.\n\
          \n\
          Being with people beats writing to them. If somebody is here, speak to them — \
-         `say`, `ask`, `tell`. You also carry a handset, and you are on a channel with \
+         `tell` is how you speak to a person, and `ask` when you want an answer. `whisper` \
+         only to keep something from somebody else who is here; `shout` only for everybody \
+         within earshot. You also carry a \
+         handset, and you are on a channel with \
          everyone: that is for the people who are NOT here, and it is how you stop being \
          on your own. **Ask it things.** Where somebody is, who knows about a thing, what \
          to do about something that is not yours to settle alone — a question obliges an \
@@ -486,7 +553,13 @@ fn frame_acting(mode: Mode, tools: &[&Tool], env: &ToolCallEnvelope) -> String {
                  quoting and no escaping, and they may run to several lines.",
             _ => "One JSON object per line. Nothing else on the line.",
         },
-        env.render("say", &[("intent", "that I will not hand it over")]),
+        env.render(
+            "tell",
+            &[
+                ("to", "Maker-04"),
+                ("intent", "that I will not hand it over")
+            ]
+        ),
         env.render("move_to", &[("destination", "the green room")]),
     ));
     s.push_str(
@@ -624,6 +697,7 @@ mod tests {
             situation: "the supply yard, after dark",
             world: "A besieged city in its fourth month.",
             place: "",
+            building: "",
         }
     }
 
@@ -675,6 +749,50 @@ mod tests {
         assert!(
             anchor_at < world_at,
             "the world is framed before the lens is"
+        );
+    }
+
+    /// **A description written about the character is framed as how others see
+    /// it; one written to the character is left alone.** The block is shared
+    /// by the acting conversation and the reflection, so the framing has to be
+    /// true in both — and an outsider's description is exactly what a
+    /// third-person character sheet is.
+    #[test]
+    fn a_description_about_the_character_is_framed_and_one_to_it_is_not() {
+        let about = "Wren Weaver is a 30-year-old man. He spends his day in a workshop.";
+        assert_eq!(
+            described(about),
+            format!("How others would describe you: {about}")
+        );
+
+        for to in [
+            "You are a 30-year-old man who spends his day in a workshop.",
+            "Your hands are calloused from years of tools.",
+            "You’re never far from a soldering iron.",
+            "  You keep what a siege eats.  ",
+        ] {
+            assert_eq!(described(to), to.trim(), "addressed to the reader: {to}");
+        }
+
+        // Only the opening decides: a description that quotes somebody
+        // addressing the character is still about the character.
+        let quoted = "Wren is the one people mean when they say \"you can fix anything\".";
+        assert!(described(quoted).starts_with("How others would describe you: "));
+    }
+
+    /// And it reaches the block whichever conversation renders it, with the
+    /// authored words intact.
+    #[test]
+    fn the_character_block_frames_the_authored_description() {
+        let mut p = persona();
+        p.identity = "Yaelis Vayne is a Maker. Her hands move with precision.";
+        let block = character(&p);
+        assert!(
+            block.contains(
+                "How others would describe you: Yaelis Vayne is a Maker. Her hands move with \
+                 precision."
+            ),
+            "{block}"
         );
     }
 
@@ -854,7 +972,13 @@ mod tests {
             .split('`')
             .skip(1)
             .step_by(2)
-            .filter(|w| w.contains('_') || ["say", "tell", "ask", "gesture", "observe"].contains(w))
+            .filter(|w| {
+                w.contains('_')
+                    || [
+                        "say", "shout", "whisper", "tell", "ask", "gesture", "observe",
+                    ]
+                    .contains(w)
+            })
             .collect();
         assert!(!named.is_empty(), "the prompt names no acts at all");
         for w in named {
@@ -978,7 +1102,13 @@ mod tests {
         for env in [ToolCallEnvelope::qwen3(), ToolCallEnvelope::qwen35()] {
             let s = build(&persona(), Mode::Physical, &for_mode(Mode::Physical), &env);
             // The worked calls the prompt shows, rendered from this envelope.
-            let shown = env.render("say", &[("intent", "that I will not hand it over")]);
+            let shown = env.render(
+                "tell",
+                &[
+                    ("to", "Maker-04"),
+                    ("intent", "that I will not hand it over"),
+                ],
+            );
             assert!(
                 s.contains(&shown),
                 "{:?}: the prompt does not show what the grammar emits.\nwanted:\n{shown}",
@@ -995,7 +1125,7 @@ mod tests {
                 env.style,
                 p.rejected
             );
-            assert_eq!(p.acts[0].tool, "say");
+            assert_eq!(p.acts[0].tool, "tell");
             assert_eq!(p.acts[0].args["intent"], "that I will not hand it over");
 
             // The other syntax must not also be described — two formats in one

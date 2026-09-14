@@ -43,6 +43,7 @@
 //! in sorted order.
 
 use candle_conversation::stencil::ToolCallEnvelope;
+use candle_conversation::TurnText;
 use serde_json::json;
 use zend_tools::tools::file::render::numbered_excerpt;
 use zend_tools::ToolContext;
@@ -135,17 +136,21 @@ pub fn render_read_call(env: &ToolCallEnvelope, anchor: &Anchor) -> String {
 }
 
 /// User-side `<tool_response>` for the listing — produced by running the real
-/// `file_list` against `ctx`, so the bytes are the tool's own.
-pub fn render_list_response(ctx: &ToolContext, unit: &DirUnit) -> String {
+/// `file_list` against `ctx`, so the bytes are the tool's own. The listing is
+/// literal: a file name is the workspace's text, not markup.
+pub fn render_list_response(ctx: &ToolContext, unit: &DirUnit) -> TurnText {
     let args = json!({ "prefix": unit.list_prefix() });
     let value = zend_tools::run("file_list", "repo_map_prefill", &args, ctx);
     let body = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
-    format!("<tool_response>{body}</tool_response>")
+    TurnText::markup("<tool_response>")
+        .then_literal(body)
+        .then_markup("</tool_response>")
 }
 
 /// User-side `<tool_response>` for the anchor excerpt — the same numbered, fenced
 /// shape the live `file_read` returns and the `code_reading` ingest prefills.
-pub fn render_read_response(anchor: &Anchor) -> String {
+/// The excerpt is literal, so a file quoting a chat tag reads as its text.
+pub fn render_read_response(anchor: &Anchor) -> TurnText {
     let excerpt = numbered_excerpt(
         &anchor.path,
         anchor.start_line,
@@ -154,7 +159,9 @@ pub fn render_read_response(anchor: &Anchor) -> String {
         anchor.language.fence_tag(),
         &anchor.body,
     );
-    format!("<tool_response>{excerpt}</tool_response>")
+    TurnText::markup("<tool_response>")
+        .then_literal(excerpt)
+        .then_markup("</tool_response>")
 }
 
 /// The `error` field of a `<tool_response>` body, when it carries one. Only a
@@ -192,18 +199,18 @@ pub fn render_chain(
     ctx: &ToolContext,
     unit: &DirUnit,
     env: &ToolCallEnvelope,
-) -> (Vec<(String, String)>, String) {
+) -> (Vec<(TurnText, String)>, TurnText) {
     let listing = render_list_response(ctx, unit);
     match &unit.anchor {
         Some(anchor) => (
             vec![
-                (render_request(unit), render_list_call(env, unit)),
+                (render_request(unit).into(), render_list_call(env, unit)),
                 (listing, render_read_call(env, anchor)),
             ],
             render_read_response(anchor),
         ),
         None => (
-            vec![(render_request(unit), render_list_call(env, unit))],
+            vec![(render_request(unit).into(), render_list_call(env, unit))],
             listing,
         ),
     }
@@ -216,12 +223,12 @@ pub fn render_chain(
 /// than by returning `Err`, so a directory the tools cannot read would otherwise
 /// prefill an error as if it were evidence — teaching the model a tool
 /// interaction that failed, and grounding the folder's summary in nothing.
-pub fn chain_error(prefilled: &[(String, String)], decode_user: &str) -> Option<String> {
+pub fn chain_error(prefilled: &[(TurnText, String)], decode_user: &TurnText) -> Option<String> {
     prefilled
         .iter()
-        .map(|(user, _)| user.as_str())
+        .map(|(user, _)| user)
         .chain(std::iter::once(decode_user))
-        .find_map(error_detail)
+        .find_map(|turn| error_detail(&turn.text()))
 }
 
 #[cfg(test)]
@@ -458,11 +465,13 @@ mod tests {
         let d = workspace(&[("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
         let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
         let units = build_units(&m, d.path());
-        let out = render_read_response(units[0].anchor.as_ref().unwrap());
+        let response = render_read_response(units[0].anchor.as_ref().unwrap());
         assert_eq!(
-            out,
+            response.text(),
             "<tool_response>\na/mod.rs (lines 1-2 of 3):\n\n```rust\n1  //! One.\n2  //! Two.\n```\n</tool_response>",
         );
+        let kinds: Vec<bool> = response.pieces().iter().map(|p| p.literal).collect();
+        assert_eq!(kinds, [false, true, false], "the excerpt is literal");
     }
 
     /// The listing response is the live tool's own bytes — the test asserts the
@@ -479,7 +488,7 @@ mod tests {
         );
         let units = build_units(&m, d.path());
         let ctx = ToolContext::with_workspace(d.path());
-        let out = render_list_response(&ctx, &units[0]);
+        let out = render_list_response(&ctx, &units[0]).text();
         assert!(out.starts_with("<tool_response>{"), "{out}");
         assert!(out.ends_with("</tool_response>"));
         assert!(out.contains("\"path\":\"a/mod.rs\""), "{out}");
@@ -502,15 +511,18 @@ fn x() {}
         let ctx = ToolContext::with_workspace(d.path());
         let (prefilled, decode_user) = render_chain(&ctx, &units[0], &env());
         assert_eq!(prefilled.len(), 2, "request+list, listing+read");
-        assert!(prefilled[0].0.starts_with("Summarize the `a/` folder"));
+        assert!(prefilled[0]
+            .0
+            .text()
+            .starts_with("Summarize the `a/` folder"));
         assert!(prefilled[0].1.contains("\"name\": \"file_list\""));
         assert!(
-            prefilled[1].0.starts_with("<tool_response>{"),
+            prefilled[1].0.text().starts_with("<tool_response>{"),
             "the listing"
         );
         assert!(prefilled[1].1.contains("\"name\": \"file_read\""));
         assert!(
-            decode_user.contains("```rust"),
+            decode_user.text().contains("```rust"),
             "the decode follows the excerpt"
         );
     }
@@ -529,7 +541,7 @@ fn x() {}
         let (prefilled, decode_user) = render_chain(&ctx, &units[0], &env());
         assert_eq!(prefilled.len(), 1);
         assert!(prefilled[0].1.contains("\"name\": \"file_list\""));
-        assert!(decode_user.starts_with("<tool_response>{"));
+        assert!(decode_user.text().starts_with("<tool_response>{"));
     }
 
     /// A healthy chain reports no tool error.
@@ -555,11 +567,14 @@ fn x() {}
     fn an_error_tool_response_is_detected() {
         let turn = "<tool_response>{\"error\":\"unknown_tool\",\"detail\":\"no tool registered\"}</tool_response>";
         assert_eq!(
-            chain_error(&[(turn.to_string(), String::new())], ""),
+            chain_error(
+                &[(TurnText::from(turn), String::new())],
+                &TurnText::default()
+            ),
             Some("unknown_tool: no tool registered".to_string()),
         );
         assert_eq!(
-            chain_error(&[], turn),
+            chain_error(&[], &TurnText::from(turn)),
             Some("unknown_tool: no tool registered".to_string()),
             "the decode-side response is checked too",
         );

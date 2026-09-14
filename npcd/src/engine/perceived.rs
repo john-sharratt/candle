@@ -29,7 +29,7 @@
 
 use npc_map::salience::weight;
 use npc_map::witness::{narrate, Witnessed};
-use npc_map::world::{Happening, World};
+use npc_map::world::{Happening, Voice, World};
 
 use crate::engine::event::{Addressed, EventKind, Salience};
 
@@ -54,6 +54,27 @@ pub fn situation(text: impl Into<String>) -> Perceived {
     }
 }
 
+/// Whether an utterance reaches this reader as speech — words it can answer —
+/// rather than as something it saw happen.
+///
+/// An ordinary voice does, and so does a whisper meant for this reader. A shout
+/// is narrated instead: it is for nobody in particular, and heard from the next
+/// room where it came from matters — *Maker-02 shouted in the green room that…*
+/// A whisper to somebody else carries no words at all, only that it happened,
+/// which is a thing seen.
+fn heard_as_speech(w: &Witnessed) -> bool {
+    match &w.what {
+        Happening::Said {
+            voice: Voice::Said, ..
+        } => true,
+        Happening::Said {
+            voice: Voice::Whispered,
+            ..
+        } => w.addressed(),
+        _ => false,
+    }
+}
+
 /// Everything a body made out, as events a character can read.
 ///
 /// This is where an utterance's addressee is resolved into [`Addressed`] — the
@@ -64,7 +85,10 @@ pub fn digest(world: &World, seen: &[Witnessed]) -> Vec<Perceived> {
     let mut out: Vec<Perceived> = Vec::new();
 
     for w in seen {
-        let Happening::Said { to, words } = &w.what else {
+        if !heard_as_speech(w) {
+            continue;
+        }
+        let Happening::Said { to, words, voice } = &w.what else {
             continue;
         };
         out.push(Perceived {
@@ -73,6 +97,11 @@ pub fn digest(world: &World, seen: &[Witnessed]) -> Vec<Perceived> {
                 text: words.clone(),
                 to: match to {
                     None => Addressed::Room,
+                    // A whisper is only ever speech to the one it was for, so
+                    // this is the one place it can be told apart.
+                    Some(_) if w.addressed() && matches!(voice, Voice::Whispered) => {
+                        Addressed::Whispered
+                    }
                     Some(_) if w.addressed() => Addressed::You,
                     Some(other) => Addressed::Other {
                         who: named(world, other),
@@ -87,7 +116,7 @@ pub fn digest(world: &World, seen: &[Witnessed]) -> Vec<Perceived> {
     // the speech above is not told twice in two voices.
     let rest: Vec<Witnessed> = seen
         .iter()
-        .filter(|w| !matches!(w.what, Happening::Said { .. }))
+        .filter(|w| !heard_as_speech(w))
         .cloned()
         .collect();
     if let Some(text) = narrate(world, &rest) {
@@ -182,8 +211,41 @@ mod tests {
         ));
     }
 
+    /// **A whisper reaches its listener as a whisper.** It is speech to them —
+    /// words they can answer, weighed like anything said to them — but read as
+    /// "says to you" it lost the one thing that made it a whisper, and the
+    /// listener had no way to know the room had not heard it.
     #[test]
-    fn the_three_readings_render_as_three_different_lines() {
+    fn a_whisper_reads_as_a_whisper_to_the_one_it_was_for() {
+        let mut w = room();
+        w.whisper("m1", "m2", "the second copy is wrong").unwrap();
+
+        let told = digest(&w, &since(&w, "m2"));
+        assert!(
+            matches!(
+                speech(&told)[0],
+                EventKind::Speech {
+                    to: Addressed::Whispered,
+                    ..
+                }
+            ),
+            "{told:?}"
+        );
+        assert!(
+            told[0].salience.preempts(),
+            "a whisper to you did not reach you"
+        );
+        let line =
+            crate::engine::event::Event::new(1, 0, told[0].salience, told[0].kind.clone()).prose();
+        assert_eq!(line, "Maker-01 whispers to you: the second copy is wrong");
+
+        // Everybody else sees it happen and hears none of it.
+        let seen = digest(&w, &since(&w, "m3"));
+        assert!(speech(&seen).is_empty(), "{seen:?}");
+    }
+
+    #[test]
+    fn the_four_readings_render_as_four_different_lines() {
         // The whole reason the distinction is carried: it has to survive into
         // what the character actually reads.
         let lines: Vec<String> = [
@@ -192,6 +254,7 @@ mod tests {
             Addressed::Other {
                 who: "Maker-02".into(),
             },
+            Addressed::Whispered,
         ]
         .into_iter()
         .map(|to| EventKind::Speech {
@@ -201,12 +264,13 @@ mod tests {
         })
         .map(|kind| crate::engine::event::Event::new(1, 0, Salience::NORMAL, kind).prose())
         .collect();
-        assert_eq!(lines.len(), 3);
-        for pair in [(0, 1), (0, 2), (1, 2)] {
+        assert_eq!(lines.len(), 4);
+        for pair in [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)] {
             assert_ne!(lines[pair.0], lines[pair.1], "{lines:?}");
         }
         assert!(lines[0].contains("to you"), "{}", lines[0]);
         assert!(lines[2].contains("to Maker-02"), "{}", lines[2]);
+        assert!(lines[3].contains("whispers to you"), "{}", lines[3]);
     }
 
     #[test]

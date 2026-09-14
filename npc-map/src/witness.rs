@@ -34,7 +34,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::world::{Happening, Tick, Where, World};
+use crate::world::{Happening, Tick, Voice, Where, World};
 
 /// How near a happening was to a body — the whole of what decides whether it
 /// was witnessed at all, and in how much detail.
@@ -188,7 +188,7 @@ pub fn since(world: &World, id: &str) -> Vec<Witnessed> {
                 false => continue,
             }
         } else {
-            match legible(reach, &e.what) {
+            match legible(reach, &e.what, &reader.id) {
                 Some(what) => what,
                 None => continue,
             }
@@ -212,8 +212,9 @@ pub fn since(world: &World, id: &str) -> Vec<Witnessed> {
     out
 }
 
-/// How much of a happening carries at a given nearness, if any of it does.
-fn legible(reach: Reach, what: &Happening) -> Option<Happening> {
+/// How much of a happening carries at a given nearness, if any of it does,
+/// to `reader` — who matters only for a whisper, whose words reach one person.
+fn legible(reach: Reach, what: &Happening, reader: &str) -> Option<Happening> {
     // Where somebody meant to go, and their own sense of having got there or
     // given up, happen inside a head. Standing next to them does not help.
     if what.is_private() {
@@ -221,9 +222,27 @@ fn legible(reach: Reach, what: &Happening) -> Option<Happening> {
     }
     match reach {
         Reach::OutOfReach => None,
-        Reach::Here => Some(what.clone()),
+        Reach::Here => match what {
+            // A whisper is seen by the room and heard by one person: everybody
+            // else is told it happened, and to whom, and not a word of it.
+            Happening::Said {
+                to,
+                voice: Voice::Whispered,
+                ..
+            } if to.as_deref() != Some(reader) => Some(Happening::Said {
+                to: to.clone(),
+                words: String::new(),
+                voice: Voice::Whispered,
+            }),
+            other => Some(other.clone()),
+        },
         Reach::InSight => match what {
-            // Nobody lip-reads across a room.
+            // A shout carries through a doorway. Nothing quieter does — nobody
+            // lip-reads across a room.
+            Happening::Said {
+                voice: Voice::Shouted,
+                ..
+            } => Some(what.clone()),
             Happening::Said { .. } => None,
             // A building noise belongs to the room it happened in. Carrying it
             // through a doorway would put the same fan, the same rat and the
@@ -404,11 +423,44 @@ fn verb_phrase(world: &World, w: &Witnessed, named: &mut BTreeSet<String>) -> Op
         // Reported, never quoted — an utterance carries what somebody meant to
         // convey rather than the words they used, so quotation marks here would
         // put a sentence in their mouth that nobody said.
-        Happening::Said { to: None, words } => format!("said {words}"),
+        //
+        // A shout is heard beyond its own room, so from anywhere but that room
+        // it says where it came from.
+        Happening::Said {
+            voice: Voice::Shouted,
+            words,
+            ..
+        } if w.here => format!("shouted {words}"),
+        Happening::Said {
+            voice: Voice::Shouted,
+            words,
+            ..
+        } => format!("shouted{at} {words}"),
+        // A whisper reads as its words to the one it was for, and as the bare
+        // fact of it to everybody else — who were never given the words.
+        Happening::Said {
+            voice: Voice::Whispered,
+            words,
+            ..
+        } if w.addressed() => format!("whispered to you {words}"),
+        Happening::Said {
+            voice: Voice::Whispered,
+            to: Some(other),
+            ..
+        } => format!("whispered something to {}", who(world, other)),
+        Happening::Said {
+            voice: Voice::Whispered,
+            to: None,
+            ..
+        } => "whispered something".into(),
+        Happening::Said {
+            to: None, words, ..
+        } => format!("said {words}"),
         Happening::Said { words, .. } if w.addressed() => format!("told you {words}"),
         Happening::Said {
             to: Some(other),
             words,
+            ..
         } => format!("told {} {words}", who(world, other)),
         // A gesture reads the same three ways as an utterance, and for the same
         // reason: it happens in the room, and who it was aimed at is something
@@ -569,5 +621,63 @@ mod tests {
             w.log().last().map(|e| &e.what),
             Some(Happening::TookStation { subject: Some(_) })
         ));
+    }
+
+    /// **A shout carries through a doorway; a word at an ordinary pitch does
+    /// not.** The same two rooms as above — one that can see into the other.
+    #[test]
+    fn a_shout_carries_into_a_room_in_sight_and_speech_does_not() {
+        let mut w = vault();
+        w.enter("m1", "Maker-01", casting("band-one")).unwrap();
+        w.enter("m2", "Maker-02", casting("ring-north")).unwrap();
+        w.mark_seen("m2");
+        w.say("m1", "not for the corridor").unwrap();
+        w.shout("m1", "the lift is not safe").unwrap();
+
+        let heard = since(&w, "m2");
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        assert!(!heard[0].here);
+        assert!(matches!(
+            &heard[0].what,
+            Happening::Said { voice: Voice::Shouted, words, .. } if words == "the lift is not safe"
+        ));
+        let told = narrate(&w, &heard).unwrap();
+        assert!(
+            told.contains("shouted") && told.contains("the lift is not safe"),
+            "{told}"
+        );
+    }
+
+    /// **A whisper is heard by one person and seen by the room.** Recorded in
+    /// full; narrowed for everybody but its listener to the fact of it.
+    #[test]
+    fn a_whisper_is_heard_by_its_listener_and_only_seen_by_the_room() {
+        let mut w = vault();
+        w.enter("m1", "Maker-01", casting("band-one")).unwrap();
+        w.enter("m2", "Maker-02", casting("band-one")).unwrap();
+        w.enter("m3", "Maker-03", casting("band-one")).unwrap();
+        w.mark_seen("m2");
+        w.mark_seen("m3");
+        w.whisper("m1", "m2", "the ledger is short").unwrap();
+
+        let listener = since(&w, "m2");
+        assert!(matches!(
+            &listener[0].what,
+            Happening::Said { words, .. } if words == "the ledger is short"
+        ));
+        assert!(narrate(&w, &listener)
+            .unwrap()
+            .contains("whispered to you the ledger is short"));
+
+        let room = since(&w, "m3");
+        assert!(matches!(
+            &room[0].what,
+            Happening::Said { voice: Voice::Whispered, words, .. } if words.is_empty()
+        ));
+        let told = narrate(&w, &room).unwrap();
+        assert!(
+            told.contains("whispered something to Maker-02") && !told.contains("ledger"),
+            "{told}"
+        );
     }
 }

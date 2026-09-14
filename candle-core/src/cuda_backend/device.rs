@@ -1,7 +1,8 @@
 use crate::backend::BackendDevice;
 use crate::{CpuStorage, CpuStorageRef, DType, Layout, Result, Shape};
 pub use cudarc;
-use cudarc::driver::CudaFunction;
+use cudarc::driver::sys::CUresult;
+use cudarc::driver::{CudaFunction, CudaModule};
 use float8::F8E4M3;
 use half::{bf16, f16};
 use std::collections::HashMap;
@@ -629,12 +630,66 @@ impl CudaDevice {
             ..Default::default()
         };
         let ptx = cudarc::nvrtc::safe::compile_ptx_with_opts(cuda_code, opts).w()?;
-        let module = self.context.load_module(ptx).w()?;
+        let module = match self.context.load_module(ptx.clone()) {
+            Ok(module) => module,
+            // A driver older than the installed toolkit refuses the toolkit's
+            // PTX ISA at JIT time. The AOT kernels never hit this — they ship
+            // SASS only — so this runtime-generated kernel is the one PTX the
+            // driver is ever asked to JIT. The toolkit's own `ptxas` can still
+            // assemble that PTX to native SASS for this device, and a cubin
+            // loads without any PTX version check, so assemble toolkit-side
+            // and load native code instead.
+            Err(e) if e.0 == CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION => {
+                self.load_module_via_ptxas(func_name, &ptx)?
+            }
+            Err(e) => return Err(e).w()?,
+        };
         let func = module.load_function(func_name).w()?;
         Ok(CudaFunc {
             func,
             stream: self.stream.clone(),
         })
+    }
+
+    /// Assemble `ptx` to this device's native SASS with the toolkit's `ptxas`
+    /// and load the cubin — the fallback for a driver that refuses to JIT the
+    /// toolkit's PTX ISA version (see [`Self::compile`]).
+    fn load_module_via_ptxas(
+        &self,
+        func_name: &str,
+        ptx: &cudarc::nvrtc::Ptx,
+    ) -> Result<Arc<CudaModule>> {
+        let (major, minor) = self.compute_capability()?;
+        let dir = std::env::temp_dir();
+        let stem = format!("candle-ug-{}-{func_name}", std::process::id());
+        let ptx_path = dir.join(format!("{stem}.ptx"));
+        let cubin_path = dir.join(format!("{stem}.cubin"));
+        std::fs::write(&ptx_path, ptx.to_src())?;
+        let module = (|| -> Result<Arc<CudaModule>> {
+            let out = std::process::Command::new("ptxas")
+                .arg(format!("-arch=sm_{major}{minor}"))
+                .arg("-o")
+                .arg(&cubin_path)
+                .arg(&ptx_path)
+                .output()
+                .map_err(|e| {
+                    crate::Error::Msg(format!("ptxas is not runnable for {func_name}: {e}"))
+                })?;
+            if !out.status.success() {
+                crate::bail!(
+                    "ptxas could not assemble the generated PTX for {func_name}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            self.context
+                .load_module(cudarc::nvrtc::Ptx::from_file(&cubin_path))
+                .w()
+        })();
+        // `cuModuleLoad` has read the file by the time it returns; the module
+        // keeps its own copy, so the temp files can go whatever the outcome.
+        let _ = std::fs::remove_file(&ptx_path);
+        let _ = std::fs::remove_file(&cubin_path);
+        module
     }
 
     pub fn id(&self) -> DeviceId {

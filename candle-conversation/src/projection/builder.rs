@@ -408,6 +408,16 @@ impl Builder {
         &self.schema
     }
 
+    /// Lift every repetition penalty while a tool call is emitted — see
+    /// [`Schema::free_tool_calls_from_penalties`]. For a conversation whose
+    /// tool arguments are quotations: a path written twice in one call is only
+    /// correct if it repeats.
+    #[must_use]
+    pub fn free_tool_calls_from_penalties(mut self) -> Self {
+        self.schema.free_tool_calls_from_penalties = true;
+        self
+    }
+
     /// Look up a layer by id. Returns `None` only if the id was issued by
     /// a different builder.
     pub fn layer(&self, id: LayerId) -> Option<&LayerSchema> {
@@ -519,6 +529,54 @@ impl Builder {
         }
     }
 
+    /// Override a turn group's selection rule after construction.
+    ///
+    /// The group-level counterpart of [`Self::set_collection_selection`], and
+    /// for the same kind of caller: one schema serving conversations that want
+    /// the same corpus at different depths. A conversation that reflects reaches
+    /// further into it than one that acts, and the difference is `k`, not a
+    /// second schema. A belief-driven group's budget follows its rule (see
+    /// [`GroupSchema::belief_config`]), so this moves both.
+    pub fn set_group_selection(
+        &mut self,
+        name: &str,
+        selection: SelectionRule,
+    ) -> Result<(), ConstructionError> {
+        let group = self.group_named(name)?;
+        group.selection = selection;
+        Ok(())
+    }
+
+    /// Scope a turn group to turns carrying one of `tags`, after construction.
+    ///
+    /// **An empty list is no scope at all** — every turn in the group is a
+    /// candidate, which is what a group has always meant. That is deliberately
+    /// not the collection rule, where an empty filter admits only untagged
+    /// turns: a turn group's candidates are the conversations written to it,
+    /// and untagged is how nearly all of them are written.
+    ///
+    /// A non-empty list is what makes one group private to one owner: the
+    /// group holds every owner's conversations, and each conversation reading
+    /// it names the tag that is its own.
+    pub fn set_group_tags(
+        &mut self,
+        name: &str,
+        tags: Vec<String>,
+    ) -> Result<(), ConstructionError> {
+        let group = self.group_named(name)?;
+        group.policy.tags = tags;
+        Ok(())
+    }
+
+    fn group_named(&mut self, name: &str) -> Result<&mut GroupSchema, ConstructionError> {
+        self.schema
+            .layers
+            .iter_mut()
+            .flat_map(|l| l.groups.iter_mut())
+            .find(|g| g.name == name)
+            .ok_or_else(|| ConstructionError::UnknownGroup(name.to_string()))
+    }
+
     /// Restrict a collection to a single named member and force it
     /// [`SelectionRule::AlwaysVisible`] — projection + reprojection emit exactly
     /// that one section and drop the rest. Used to test whether the model
@@ -580,6 +638,10 @@ impl Builder {
             Some(CollLoc::TopLevel(ii)) => {
                 if let SystemPromptItem::Collection(coll) = &mut items[ii] {
                     coll.sections.retain(|s| keep.contains(&s.name));
+                    // A member dropped here is dropped even if mandatory: the
+                    // caller's filter (a tools mode) decides what may project.
+                    let kept: Vec<SectionId> = coll.sections.iter().map(|s| s.id).collect();
+                    coll.mandatory.retain(|id| kept.contains(id));
                 }
                 Ok(())
             }
@@ -717,6 +779,7 @@ impl Builder {
                 member_glue_tokens: None,
                 default: None,
                 budget_adaptive: None,
+                mandatory: Vec::new(),
             }));
         self.name_maps
             .collection_names
@@ -852,6 +915,44 @@ impl Builder {
                 }
                 Ok(())
             }
+            None => Err(ConstructionError::UnknownCollection(format!(
+                "CollectionId({collection:?})"
+            ))),
+        }
+    }
+
+    /// Mark `section` a mandatory member of the top-level `collection`: it is
+    /// emitted on every belief-driven projection, outside the policy's member
+    /// budget (see [`SectionCollection::mandatory`]). Errors when the collection
+    /// is unknown, when it is embedded in a section tree (those select by
+    /// provenance top-k, which has no budget to sit outside), or when it does
+    /// not hold `section`.
+    pub fn set_collection_member_mandatory(
+        &mut self,
+        collection: CollectionId,
+        section: SectionId,
+    ) -> Result<(), ConstructionError> {
+        let items = &mut self.schema.system_prompt.items;
+        match locate_collection(items, |c| c.id == collection) {
+            Some(CollLoc::TopLevel(ii)) => {
+                let SystemPromptItem::Collection(coll) = &mut items[ii] else {
+                    unreachable!("located a top-level collection")
+                };
+                if !coll.sections.iter().any(|s| s.id == section) {
+                    return Err(ConstructionError::MandatoryMember(format!(
+                        "{section:?} is not a member of collection {:?}",
+                        coll.name
+                    )));
+                }
+                if !coll.mandatory.contains(&section) {
+                    coll.mandatory.push(section);
+                }
+                Ok(())
+            }
+            Some(CollLoc::Tree { .. }) => Err(ConstructionError::MandatoryMember(format!(
+                "CollectionId({collection:?}) is embedded in a section tree, which selects \
+                 by provenance top-k and has no member budget to sit outside"
+            ))),
             None => Err(ConstructionError::UnknownCollection(format!(
                 "CollectionId({collection:?})"
             ))),
@@ -1045,8 +1146,8 @@ impl Builder {
     // ── Synthetic construction ────────────────────────────────────────────────
 
     /// Build a minimal single-layer schema around a pre-rendered system-prompt
-    /// string, for legacy callers that provide a plain `&str` rather than a
-    /// YAML schema.
+    /// string, for callers that provide a plain `&str` rather than a YAML
+    /// schema.
     ///
     /// The resulting builder has one `dialogue` layer (32 768-token window),
     /// one `primary_conversation` group with `AlwaysVisible` selection (all
@@ -1054,30 +1155,34 @@ impl Builder {
     /// window config downstream), and the system-prompt text as a single
     /// `frame` section.
     ///
-    /// IDs are fixed at 1 each; there is no name map.
-    ///
-    pub fn for_plain_prompt(system_prompt_text: &str) -> Self {
-        Self::synthetic_single_section(
-            system_prompt_text,
-            LayerId::new(1),
-            GroupId::new(1),
-            SectionId::new(1),
-        )
+    /// The layer and group ids are fixed at 1. The frame is sealed under
+    /// `frame`, which comes from
+    /// [`ConversationEngine::plain_prompt_section`](crate::ConversationEngine::plain_prompt_section)
+    /// for this same text: a section that already exists is reused by id
+    /// without its text being compared, so a fixed id would hand this
+    /// conversation whichever prompt had sealed there first.
+    pub fn for_plain_prompt(system_prompt_text: &str, frame: SectionId) -> Self {
+        Self::synthetic_single_section(system_prompt_text, LayerId::new(1), GroupId::new(1), frame)
     }
 
-    /// Same as [`Self::for_plain_prompt`] but allocates the synthetic
-    /// schema's ids from the [`Reserved`] kind's slot at the top of the
-    /// u32 range. Use this for engine-internal conversations (the
-    /// daemon's titler) that must coexist in the same substrate as a
-    /// YAML schema without colliding.
+    /// Same as [`Self::for_plain_prompt`] but takes the layer and group ids
+    /// from the [`Reserved`] kind's slot at the top of the u32 range. Use this
+    /// for engine-internal conversations (the daemon's titler) that must
+    /// coexist in the same substrate as a YAML schema without their turns
+    /// entering its projection. The frame is `frame`, for the same reason as
+    /// there.
     ///
     /// [`Reserved`]: super::Reserved
-    pub fn for_plain_prompt_reserved(system_prompt_text: &str, kind: Reserved) -> Self {
+    pub fn for_plain_prompt_reserved(
+        system_prompt_text: &str,
+        kind: Reserved,
+        frame: SectionId,
+    ) -> Self {
         Self::synthetic_single_section(
             system_prompt_text,
             LayerId::reserved(kind),
             GroupId::reserved(kind),
-            SectionId::reserved(kind),
+            frame,
         )
     }
 
@@ -1120,18 +1225,15 @@ impl Builder {
         section_id: SectionId,
     ) -> Self {
         // Id for the summary's answer framing section (never emitted; sealed
-        // lazily only if this conversation is summarised). Offset from the frame,
-        // special-cased so a reserved frame (top of the u32 range) keeps the id in
-        // the reserved band. There is no question-half section: a summary's user
-        // half is derived, never decoded, so it has no prompt to frame.
-        let summary_a_id = if section_id.raw() == u32::MAX {
-            SectionId::new(u32::MAX - 1)
-        } else {
-            SectionId::new(section_id.raw() + 1)
-        };
+        // lazily only if this conversation is summarised), the one beside the
+        // frame — every frame partition leaves that id free for it. There is no
+        // question-half section: a summary's user half is derived, never
+        // decoded, so it has no prompt to frame.
+        let summary_a_id = SectionId::new(section_id.raw() + 1);
         let schema = Schema {
-            // A single-section plain-prompt schema emits no tool calls, so the
-            // exemption has nothing to apply to either way.
+            // Off, like every schema that does not ask; a caller whose tool
+            // arguments are quotations asks with
+            // [`Builder::free_tool_calls_from_penalties`].
             free_tool_calls_from_penalties: false,
             system_prompt: SystemPromptSchema {
                 items: vec![SystemPromptItem::Section(SectionSchema {
@@ -1216,6 +1318,8 @@ impl Builder {
                 policy: SelectionPolicy::default_policy(),
                 gather_scope: GatherScope::default(),
                 gathered: true,
+                // The only layer, so the bottom of its own stack.
+                rank: 0,
                 // This synthetic fallback layer IS the dialogue layer, so it takes
                 // the interactive decode priority the production dialogue layer does.
                 decode_priority: DecodePriority::High,

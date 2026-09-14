@@ -114,7 +114,16 @@ pub fn answers(tool: &str) -> bool {
 pub fn is_of_the_body(tool: &str) -> bool {
     matches!(
         tool,
-        "say" | "tell" | "ask" | "speak" | "gesture" | "move_to" | "follow" | "flee" | "reflect"
+        "tell"
+            | "shout"
+            | "whisper"
+            | "ask"
+            | "speak"
+            | "gesture"
+            | "move_to"
+            | "follow"
+            | "flee"
+            | "reflect"
     ) || crate::engine::enact::is_mine(tool)
         || crate::engine::work::is_mine(tool)
 }
@@ -125,15 +134,16 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         // `speak` is not offered any more, but a model that has seen it will
         // reach for it — and reading it as what it plainly means costs one arm
         // and beats refusing a character for using the word for speaking.
-        "say" | "speak" => say(hosted, body, &act.args),
+        "shout" | "speak" => shout(hosted, body, &act.args),
         "tell" => tell(hosted, body, &act.args),
+        "whisper" => whisper(hosted, body, &act.args),
         "ask" => ask(hosted, body, &act.args),
         "gesture" => gesture(hosted, body, &act.args),
         "move_to" => move_to(hosted, body, &act.args),
         // Breaking away and following are journeys with a reason attached. The
         // reason is the character's; the journey is the same one.
         "flee" | "follow" => move_to(hosted, body, &act.args),
-        "reflect" => reflect(hosted, body, &act.args),
+        "reflect" => reflect(),
         // The acts that reach what the world *holds* rather than its shape —
         // carrying, working, digging, fighting, the tower. Same dispatch, one
         // file down, because they need the sim as well as the map.
@@ -145,50 +155,47 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     }
 }
 
-/// Take stock, standing still where the room can see you do it.
+/// What a `reflect` answers with when no reflection came of it.
+///
+/// **The honest answer, not a stand-in for one.** A reflect is answered by the
+/// reflection's own first line; when there is no reflection to answer with,
+/// the call still gets its response, and the response says there was nothing.
+/// It is exactly what the character reads in its `<tool_response>`, and so it
+/// is also what the feed shows after the arrow.
+pub const NO_REFLECTION: &str = "I don't seem to be able to reflect on anything right now.";
+
+/// Take stock, standing still.
 ///
 /// **The scheduling half is the caller's**, in `engine::runtime` — this is only
-/// what the room sees and what the character reads back. See `tools::REFLECT`
-/// for why it is named for the thinking rather than for the standing still.
-pub fn reflect(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
-    // **The thought is read back and the room is not told it.** That asymmetry
-    // is the whole of what makes it an inner one: it lands in this character's
-    // own window, where it is carried into the next decode and nowhere else, so
-    // nobody can answer it and nobody can hold the character to it.
+/// what the character reads back. See `tools::REFLECT` for why it is named for
+/// the thinking rather than for the standing still.
+///
+/// **Nothing reaches the room.** Stopping used to be shown to everybody present
+/// — *"Yaelis Vayne stops, and lets the moment pass."* — on the reasoning that
+/// the first character to go quiet gives the second something to react to. It
+/// gave them the same line every time anybody reflected, which in a cast that
+/// reflects every minute or two was most of what anybody saw of anybody else,
+/// and it sat in every other character's conversation as noise. A pause ends
+/// when anything reaches the character, which does not need the room to have
+/// been told.
+pub fn reflect() -> Outcome {
+    // **Nothing the character said comes back to it.** Its thought and its
+    // feeling are already in its own call, one turn up; reading them back as
+    // the result — "You are thinking: …, what you feel is …" — was the act
+    // restating its own input, the thing `docs/reflection_and_dreams.md` §3
+    // exists to end, and it put the character's words in its context twice.
     //
-    // Nothing here is refused when it is missing, though the grammar requires
-    // all three. The act is complete without them — a character that stopped
-    // and said nothing about why has still stopped — and refusing it would put
-    // one that could not fill a field into a loop of trying to.
-    let mut mine = String::from("You stop, and let the moment pass.");
-    if let Some(thought) = text(args, "inner_thoughts") {
-        mine.push_str(&format!(" You are thinking: {thought}"));
-    }
-    // The register, said back plainly. **This is what a mood would later be set
-    // from** — a character that named `cornered` and then read itself back as
-    // cornered is the loop closing, and it starts by the word surviving the
-    // turn it was said in.
-    if let Some(feeling) = text(args, "feeling") {
-        mine.push_str(&format!(" What you feel, standing there, is {feeling}."));
-    }
-    // Kept apart from the thought on purpose: one is what is passing through,
-    // the other is what has settled, and running them together would lose the
-    // difference the two fields exist to draw.
-    if let Some(reflection) = text(args, "my_reflections") {
-        mine.push_str(&format!(" What you have come to think: {reflection}"));
-    }
-    // **The stopping happens in the room.** Standing still is something people
-    // can see you do, and a character that went quiet invisibly would leave
-    // everybody else reading the silence as absence. It is also what stops two
-    // characters pausing at each other in mutual silence: the first one to stop
-    // gives the second something to react to.
-    match hosted.with(|w| w.show(body, None, "stops, and lets the moment pass")) {
-        Ok(()) => Outcome::Did(mine),
-        // A body that is not in a world has nothing to be seen doing, and
-        // pausing is still a perfectly good thing for it to have done.
-        Err(Refused::NoSuchActor(_)) => Outcome::Did(mine),
-        Err(why) => Outcome::Refused(refusal(hosted, &why)),
-    }
+    // What comes back is the reflection's answer, which replaces this line —
+    // see `Runtime::spawn_reflection`. This line is what a character reads
+    // when no reflection can run — no mind to author the questions, or one
+    // that failed before it answered — and it says
+    // exactly that, in the character's own voice. See [`NO_REFLECTION`].
+    //
+    // Nothing here is refused when an argument is missing, though the grammar
+    // requires them. The act is complete without them — a character that
+    // stopped and said nothing about why has still stopped — and refusing it
+    // would put one that could not fill a field into a loop of trying to.
+    Outcome::Did(NO_REFLECTION.to_string())
 }
 
 /// A question put to somebody here.
@@ -201,10 +208,10 @@ fn ask(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         return Outcome::Refused("You meant to ask something, but not what.".into());
     };
     let Some(to) = text(args, "to") else {
-        // Nobody named is a question to the room, which is a fair thing to ask
-        // and exactly what `say` carries.
+        // Nobody named is a question to the room, which is a fair thing to ask,
+        // and it goes to the room at an ordinary pitch.
         return match hosted.with(|w| w.say(body, format!("asking {about}"))) {
-            Ok(()) => Outcome::Did(format!("You ask the room {about}")),
+            Ok(()) => Outcome::Did("You ask the room.".into()),
             Err(why) => Outcome::Refused(refusal(hosted, &why)),
         };
     };
@@ -218,7 +225,7 @@ fn ask(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
             // something the other one is told it owes, every turn, until they
             // speak. See [`crate::sim::ledger::Ledger::asked`].
             hosted.with_sim(|s| s.ledger.asked(body, &id, &about));
-            Outcome::Did(format!("You ask {to} {about}"))
+            Outcome::Did(format!("You ask {to}."))
         }
         Err(why) => Outcome::Refused(refusal(hosted, &why)),
     }
@@ -259,30 +266,34 @@ fn gesture(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     }
 }
 
-fn say(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
+/// Call out, for anybody within earshot — the room, and every room that can
+/// see into it. Aimed at nobody: a shout is for whoever hears it.
+fn shout(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let Some(intent) = text(args, "intent") else {
-        return Outcome::Refused("You meant to say something, but not what.".into());
+        return Outcome::Refused("You meant to shout something, but not what.".into());
     };
-    // A `to` on a `say` means it was meant for one person and reached for the
-    // wrong tool. Honour the meaning rather than the spelling.
+    // A `to` means it was meant for one person and reached for the wrong tool.
+    // Honour the meaning rather than the spelling.
     if text(args, "to").is_some() {
         return tell(hosted, body, args);
     }
-    match hosted.with(|w| w.say(body, intent.clone())) {
-        Ok(()) => Outcome::Did(format!("You say, to the room: {intent}")),
+    match hosted.with(|w| w.shout(body, intent.clone())) {
+        Ok(()) => Outcome::Did("You shout, for anyone within earshot.".into()),
         Err(why) => Outcome::Refused(refusal(hosted, &why)),
     }
 }
 
+/// Tell one person here something. The rest of the room overhears it, and
+/// hears that it was not for them.
 fn tell(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let Some(intent) = text(args, "intent") else {
-        return Outcome::Refused("You meant to say something, but not what.".into());
+        return Outcome::Refused("You meant to tell somebody something, but not what.".into());
     };
     let Some(to) = text(args, "to") else {
-        // No addressee is a `say` that named the wrong tool, and saying it to
-        // the room is what it plainly meant.
+        // No addressee is speech to the room at an ordinary pitch, which is
+        // what it plainly meant.
         return match hosted.with(|w| w.say(body, intent.clone())) {
-            Ok(()) => Outcome::Did(format!("You say, to the room: {intent}")),
+            Ok(()) => Outcome::Did("You say it to the room.".into()),
             Err(why) => Outcome::Refused(refusal(hosted, &why)),
         };
     };
@@ -299,7 +310,31 @@ fn tell(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
             // to restart the conversation rather than to grade it. See
             // [`crate::sim::ledger::Ledger::answered`].
             hosted.with_sim(|s| s.ledger.answered(body, &id));
-            Outcome::Did(format!("You say, to {to}: {intent}"))
+            Outcome::Did(format!("You tell {to}."))
+        }
+        Err(why) => Outcome::Refused(refusal(hosted, &why)),
+    }
+}
+
+/// Say something to one person here, too quietly for anybody else to make out.
+///
+/// The rest of the room sees it happen and hears none of it. Like [`tell`], it
+/// discharges whatever the listener was waiting on — a whisper is still an
+/// answer.
+fn whisper(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
+    let Some(intent) = text(args, "intent") else {
+        return Outcome::Refused("You meant to whisper something, but not what.".into());
+    };
+    let Some(to) = text(args, "to") else {
+        return Outcome::Refused("You meant to whisper to somebody, but not to whom.".into());
+    };
+    let Some(id) = here_by_name(hosted, body, &to) else {
+        return Outcome::Refused(format!("{to} is not here. {}", who_is_here(hosted, body)));
+    };
+    match hosted.with(|w| w.whisper(body, &id, intent.clone())) {
+        Ok(()) => {
+            hosted.with_sim(|s| s.ledger.answered(body, &id));
+            Outcome::Did(format!("You whisper to {to}."))
         }
         Err(why) => Outcome::Refused(refusal(hosted, &why)),
     }
@@ -889,8 +924,59 @@ mod tests {
             &act("speak", json!({"intent": "that the redoubt burned twice"})),
         );
         assert!(out.happened(), "{out:?}");
-        assert!(out.line().unwrap().contains("to the room"), "{out:?}");
+        assert!(out.line().unwrap().contains("within earshot"), "{out:?}");
         assert!(h.peek("m2").events.iter().any(|e| e.here));
+    }
+
+    /// **A whisper is heard by one person and seen by the room.** The one it
+    /// was for gets the words; everybody else gets that it happened, and to
+    /// whom, and nothing of what was said.
+    #[test]
+    fn a_whisper_reaches_its_listener_and_nobody_else() {
+        let h = room();
+        let out = perform(
+            &h,
+            "m1",
+            &act(
+                "whisper",
+                json!({"intent": "that the ledger is short", "to": "Maker-02"}),
+            ),
+        );
+        assert!(out.happened(), "{out:?}");
+        assert!(
+            out.line().unwrap().contains("You whisper to Maker-02"),
+            "{out:?}"
+        );
+
+        let heard = h.peek("m2").events;
+        assert!(
+            heard.iter().any(|e| e.addressed()
+                && matches!(&e.what, npc_map::world::Happening::Said { words, .. }
+                    if words.contains("ledger is short"))),
+            "the listener did not hear it: {heard:?}"
+        );
+        let seen = format!("{:?}", h.peek("m3").events);
+        assert!(
+            !seen.contains("ledger is short"),
+            "the room heard a whisper: {seen}"
+        );
+        assert!(
+            seen.contains("Whispered"),
+            "the room did not see it happen: {seen}"
+        );
+    }
+
+    #[test]
+    fn a_whisper_needs_somebody_here_to_hear_it() {
+        let h = room();
+        for args in [
+            json!({"intent": "that the ledger is short"}),
+            json!({"intent": "that the ledger is short", "to": "Maker-09"}),
+        ] {
+            let out = perform(&h, "m1", &act("whisper", args.clone()));
+            assert!(!out.happened(), "{args} → {out:?}");
+        }
+        assert!(h.peek("m2").events.is_empty(), "a refused whisper landed");
     }
 
     #[test]
@@ -905,7 +991,7 @@ mod tests {
             ),
         );
         assert!(out.happened(), "{out:?}");
-        assert!(out.line().unwrap().contains("to Maker-02"));
+        assert!(out.line().unwrap().contains("You tell Maker-02"));
         assert!(h.peek("m2").events.iter().any(|e| e.addressed()));
         assert!(!h.peek("m3").events.iter().any(|e| e.addressed()));
     }
@@ -1187,14 +1273,11 @@ mod tests {
         assert!(many.contains("are here"), "{many}");
     }
 
-    /// **Stopping is something the room can see**, and that is the mechanism.
-    ///
-    /// Two characters waiting on each other used to sit until something else
-    /// moved, and the typed wait needed a rule of its own to prevent it. This
-    /// needs none: the first one to stop gives the other something to react to,
-    /// and both come back on their own clock regardless.
+    /// **Stopping is not announced to the room.** It was — *"… stops, and lets
+    /// the moment pass"* — and in a cast that reflects every minute or two that
+    /// one line was most of what anybody saw of anybody else.
     #[test]
-    fn stopping_is_something_the_room_can_see() {
+    fn stopping_is_not_announced_to_the_room() {
         let h = vault();
         h.with(|w| {
             w.enter("m1", "Wyneth Vayne", at("green-room")).unwrap();
@@ -1207,16 +1290,10 @@ mod tests {
         let out = perform(&h, "m1", &act("reflect", json!({})));
         assert!(out.happened(), "{out:?}");
 
-        // It reaches the room — the same channel a gesture uses, aimed at
-        // nobody, because stopping asks nothing of anyone.
-        let seen = format!("{:?}", h.delta("m2"));
+        let seen = h.delta("m2");
         assert!(
-            seen.contains("lets the moment pass"),
-            "the room did not see it: {seen}"
-        );
-        assert!(
-            !seen.contains(", at "),
-            "a pause was aimed at somebody: {seen}"
+            seen.events.is_empty(),
+            "the room was told somebody stopped: {seen:?}"
         );
     }
 
@@ -1259,27 +1336,24 @@ mod tests {
         let Outcome::Did(mine) = &out else {
             panic!("{out:?}");
         };
-        assert!(mine.contains("lying about the ledger"), "{mine}");
+        assert!(
+            !mine.contains("lying about the ledger"),
+            "a pause read the character's own thought back to it: {mine}"
+        );
 
         let theirs = format!("{:?}", h.delta("m2"));
-        assert!(
-            theirs.contains("lets the moment pass"),
-            "the room did not see it stop: {theirs}"
-        );
         assert!(
             !theirs.contains("lying about the ledger"),
             "the thought was said out loud: {theirs}"
         );
     }
 
-    /// **How it feels and what it has settled on are read back to it too.**
-    ///
-    /// Nothing acts on the register yet — a mood is set by provenance at a
-    /// barrier, not by a character announcing one — but the word has to survive
-    /// the turn it was said in before anything can. Read back, it is in the
-    /// window on the next decode, which is the smallest version of the loop.
+    /// **A pause hands a character none of its own words back.** Its thought
+    /// and its feeling are in its own call already; the result is what
+    /// happened, and a pause's result is that it stopped. Nor does the room
+    /// hear any of it.
     #[test]
-    fn a_character_reads_back_what_it_felt_and_what_it_worked_out() {
+    fn a_pause_hands_the_character_none_of_its_own_words_back() {
         let h = room();
         h.delta("m1");
         h.delta("m2");
@@ -1292,26 +1366,17 @@ mod tests {
                 json!({
                     "inner_thoughts": "that the ledger does not add up",
                     "feeling": "cornered",
-                    "my_reflections": "that I have been covering for somebody out of habit"
                 }),
             ),
         );
         let Outcome::Did(mine) = &out else {
             panic!("{out:?}");
         };
-        assert!(mine.contains("cornered"), "{mine}");
-        assert!(mine.contains("covering for somebody"), "{mine}");
-        // And the two are not run together — one is what is passing through,
-        // the other is what has settled, which is the whole reason for two
-        // fields.
-        assert!(
-            mine.find("does not add up") < mine.find("covering for somebody"),
-            "{mine}"
-        );
+        assert_eq!(mine, NO_REFLECTION);
 
         // The room sees none of it.
         let theirs = format!("{:?}", h.delta("m2"));
-        for private in ["cornered", "covering for somebody", "does not add up"] {
+        for private in ["cornered", "does not add up"] {
             assert!(!theirs.contains(private), "`{private}` reached the room");
         }
     }

@@ -77,6 +77,7 @@ fn deepseek_spec(model_path: &std::path::Path) -> ModelSpec {
         // to stay the bytes the gate measured.
         model_rev: String::new(),
         gate_donor: None,
+        tensor_overrides: Vec::new(),
         tokenizer_repo: "deepseek-ai/DeepSeek-V4-Flash-0731".to_string(),
         tokenizer_rev: String::new(),
         default_system_prompt: "You are a concise, factual assistant.".to_string(),

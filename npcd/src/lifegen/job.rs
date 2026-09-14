@@ -8,12 +8,12 @@
 //! first job's id, so the console can attach to what is already running instead
 //! of starting a duplicate it will have to reconcile.
 //!
-//! # The run is a thread, not a task
+//! # The run is a task that owns the ladder end to end
 //!
-//! `send_turn` blocks, and the fan-out is a pool of blocking calls whose
-//! parallelism is the point. A job is therefore an OS thread that owns the
-//! ladder from end to end; the API never waits on it and reads
-//! [`GenProgress::snapshot`] instead.
+//! Every rung's decode is awaited, and a fan-out is a wave of futures awaited
+//! together — the engine co-batches whatever is submitted together, so the
+//! wave's parallelism costs futures rather than threads. The API never waits
+//! on the task and reads [`GenProgress::snapshot`] instead.
 //!
 //! # A cancelled run keeps what it finished
 //!
@@ -166,7 +166,7 @@ impl Jobs {
         Ok(job)
     }
 
-    /// Reserve a run and drive it on its own thread.
+    /// Reserve a run and drive it as a task of its own.
     ///
     /// The plan is handed in already loaded, because deciding what to generate
     /// (which phases, against which seed) belongs to the caller — this owns
@@ -185,19 +185,21 @@ impl Jobs {
         let run = Arc::clone(&job);
         let phases = job.phases.clone();
         let mind: PathBuf = mind.to_path_buf();
-        let spawned = std::thread::Builder::new()
-            .name(format!("npcd-lifegen-{}", job.id))
-            .spawn(move || {
-                let outcome = drive(&narrate, &mind, &run, &phases, &voice);
-                run.progress.finish(outcome);
-            });
-        if let Err(e) = spawned {
-            // The thread never started, so nothing will ever finish this job.
-            // Recording the failure is what keeps a job's state honest rather
-            // than leaving one that reads as running forever.
-            job.progress.finish(Outcome::Failed {
-                error: format!("could not start the generation thread: {e}"),
-            });
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let outcome = drive(&narrate, &mind, &run, &phases, &voice).await;
+                    run.progress.finish(outcome);
+                });
+            }
+            Err(e) => {
+                // The task never started, so nothing will ever finish this job.
+                // Recording the failure is what keeps a job's state honest
+                // rather than leaving one that reads as running forever.
+                job.progress.finish(Outcome::Failed {
+                    error: format!("could not start the generation task: {e}"),
+                });
+            }
         }
         Ok(job)
     }
@@ -245,12 +247,18 @@ impl Jobs {
 }
 
 /// Run the ladder, rung by rung.
-fn drive(narrate: &Narrator, mind: &Path, job: &Job, phases: &[Phase], voice: &str) -> Outcome {
+async fn drive(
+    narrate: &Narrator,
+    mind: &Path,
+    job: &Job,
+    phases: &[Phase],
+    voice: &str,
+) -> Outcome {
     for phase in phases {
         if job.progress.is_cancelled() {
             return Outcome::Cancelled;
         }
-        match run_phase(narrate, mind, &job.plan, *phase, voice, &job.progress) {
+        match run_phase(narrate, mind, &job.plan, *phase, voice, &job.progress).await {
             Ok(n) => tracing::info!("life {}: {} — {n} node(s) written", job.who, phase.unit()),
             Err(e) => {
                 tracing::warn!("life {}: {} failed — {e:#}", job.who, phase.unit());

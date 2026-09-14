@@ -8,7 +8,8 @@
 //! * [`rate`] — what the wave's throughput does if it joins. The decision.
 //! * [`gate`] — the two lines no answer to that may cross.
 //!
-//! [`fill`] is the loop that asks them in that order.
+//! [`fill`] is the loop that asks them in that order. [`pass_budget`] bounds
+//! the tokens any one prefill forward carries, whoever was admitted.
 //!
 //! # The decision is a rate, not a fit
 //!
@@ -50,11 +51,13 @@
 pub(crate) mod cost;
 pub(crate) mod gate;
 pub(crate) mod order;
+pub(crate) mod pass_budget;
 pub mod rate;
 
 pub(crate) use cost::Cost;
 pub(crate) use gate::Headroom;
 pub(crate) use order::{Kind, Order};
+pub(crate) use pass_budget::prefill_pass_budget;
 pub(crate) use rate::{Admission, WaveRate};
 
 use crate::projection::DecodePriority;

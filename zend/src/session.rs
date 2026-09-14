@@ -3,15 +3,20 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
+use futures::executor::block_on;
+use futures::future::select_all;
 use futures::{Stream, StreamExt};
 use notify::RecommendedWatcher;
+use tokio::sync::mpsc;
+use tokio::sync::Mutex as ConvLock;
+use tokio::sync::OwnedMutexGuard;
+use tokio::task::JoinHandle as TaskHandle;
 
 use candle_conversation::models::{Dialect, Model};
 use candle_conversation::persistence::record::DistillMode;
@@ -23,6 +28,8 @@ use candle_conversation::projection::{
 use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
+use candle_conversation::FinishReason;
+use candle_conversation::TurnText;
 use candle_conversation::{
     ConversationEngine, GlueMarkers, ProjectionEvent, Sequence, ThinkSteering, TokenDecoder,
     TurnEvent, TurnHandle, TurnResponse,
@@ -34,19 +41,22 @@ use crate::api::substrate::{
     SectionView, SegmentView, Storage, SubstrateOverview, SystemPromptView, TimelineDetail,
     ToolView, ToolsView, TurnView,
 };
+use crate::coding_sampling;
 use crate::config::DaemonConfig;
 use crate::conv_file_store::ConvFileStore;
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::log_broadcast::LogBus;
 use crate::model_choice;
+use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::ProjectionEventOut;
 use crate::refresh_ctx::RefreshContext;
 use crate::repo_scan::RepoMap;
+use crate::think_budget;
 use crate::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, ToolHost,
 };
-use crate::types::{ChatMessage, Role, ToolMode};
+use crate::types::{ChatMessage, Role, ToolMode, Usage};
 
 const PROJECTION_SCHEMA_TEMPLATE: &str = include_str!("prompts/projection.yaml");
 
@@ -109,6 +119,14 @@ pub enum StreamItem {
     /// A tool-execution lifecycle notice (running / done) for the in-flight
     /// tool cards.  Display-only: never part of the collected completion body.
     Tool(ToolStatusOut),
+    /// A finished turn: its token counts, which become the reply's `usage`, and
+    /// how it ended, which becomes its `finish_reason`. Sent once per turn; a
+    /// reply the daemon answers over several turns sends one for each and ends
+    /// the way its last turn did.
+    TurnEnd {
+        usage: Usage,
+        finish: FinishReason,
+    },
 }
 
 /// Process-global monotonic id for projection events, so dot ids stay unique
@@ -187,18 +205,24 @@ struct InferenceState {
     /// locked for the per-turn group-commit and for shutdown checkpointing.
     engine: Mutex<ConversationEngine>,
     /// Per-conversation state, keyed by the client-supplied conv_id string.
-    conversations: Mutex<HashMap<String, Arc<Mutex<ConvState>>>>,
+    ///
+    /// The outer map lock is a std mutex held only to look an entry up; the
+    /// per-conversation lock is async, and the inference task holds it across
+    /// its decode awaits DELIBERATELY — that guard is the per-conversation
+    /// in-flight exclusivity, and an async lock is what lets it live across an
+    /// await without pinning a thread.
+    conversations: Mutex<HashMap<String, Arc<ConvLock<ConvState>>>>,
     /// System-prompt already prefilled; all new conversations fork from this.
     base_conv: Mutex<Sequence>,
-    /// Queue feeding the dedicated titler worker thread. The request path
-    /// enqueues a [`TitleJob`] (non-blocking, dropped if the worker is backed
-    /// up) instead of spawning a thread per submit, so title generation runs
-    /// in the background — concurrently with main decode, never serialised
-    /// against the request path — and drains cleanly on shutdown.
-    titler_tx: SyncSender<TitleJob>,
-    /// Handle to the titler worker thread, joined during [`ZendSession::shutdown`]
+    /// Queue feeding the dedicated titler task. The request path enqueues a
+    /// [`TitleJob`] (non-blocking, dropped if the task is backed up) instead
+    /// of spawning per submit, so title generation runs in the background —
+    /// concurrently with main decode, never serialised against the request
+    /// path — and drains cleanly on shutdown.
+    titler_tx: mpsc::Sender<TitleJob>,
+    /// Handle to the titler task, awaited during [`ZendSession::shutdown`]
     /// so any in-flight title turn unwinds before the process exits.
-    titler_worker: Mutex<Option<JoinHandle<()>>>,
+    titler_worker: Mutex<Option<TaskHandle<()>>>,
     /// The titler's timeline id — excluded from `list_conversations` so
     /// it doesn't show up in the user-facing sidebar.
     titler_timeline: TimelineId,
@@ -261,6 +285,8 @@ struct InferenceState {
     /// commitment. Tokenized once at startup; empty when the tokenizer failed
     /// to encode it. See `SamplingConfig::segment_close_script`.
     think_closer_phrase: Vec<u32>,
+    /// Live OpenAI-passthrough conversations — see [`crate::passthrough`].
+    passthrough: Arc<PassthroughCache>,
 }
 
 // The titler uses this plain system prompt (not the projection schema), so the
@@ -391,6 +417,11 @@ struct InFlightCase<'a> {
     /// interleaved with tokens, so a sweep that finds no terminal event still
     /// has to keep what it drained.
     events: Vec<ProjectionEvent>,
+    /// A terminal event the idle wait absorbed: the wait parks on every
+    /// in-flight handle and consumes exactly one event from whichever speaks
+    /// first, so a `Done`/`Error` it takes has to be carried to the retire
+    /// sweep rather than lost. `Some(Some(_))` completed, `Some(None)` failed.
+    finished: Option<Option<TurnResponse>>,
     /// A prefilled trajectory is complete by construction (it is the validated
     /// exported `.md`) and its `Done` carries no decoded text, so it must NOT be
     /// gated on `resp.text` the way a live decode is.
@@ -833,7 +864,10 @@ impl InferenceState {
         // and the graceful ramp, the force cutoff and the closer script are all
         // silently unreachable: think blocks then run to the stencil's runaway
         // span cap and get amputated mid-word instead of closing on a clause.
-        let conv_config = builder.conversation_config();
+        let mut conv_config = builder.conversation_config();
+        // zend decodes code, not prose: every conversation it opens — dialogue,
+        // passthrough, ingest — derives from this config. See `coding_sampling`.
+        coding_sampling::apply(&mut conv_config.sampling);
         if conv_config.sampling.segment_close_token_id < 0
             || conv_config.sampling.segment_open_token_id < 0
         {
@@ -1294,14 +1328,19 @@ impl InferenceState {
                 let mut i = 0;
                 while i < inflight.len() {
                     let mut collected: Vec<ProjectionEvent> = Vec::new();
-                    let terminal = loop {
-                        match inflight[i].handle.try_recv() {
-                            Some(TurnEvent::Done(resp)) => break Some(Some(resp)),
-                            Some(TurnEvent::Error(_)) => break Some(None),
-                            Some(TurnEvent::Projection(ev)) => collected.push(ev),
-                            Some(_) => {}
-                            None => break None,
-                        }
+                    // A terminal the idle wait already absorbed retires this
+                    // case without touching the channel again.
+                    let terminal = match inflight[i].finished.take() {
+                        Some(t) => Some(t),
+                        None => loop {
+                            match inflight[i].handle.try_recv() {
+                                Some(TurnEvent::Done(resp)) => break Some(Some(resp)),
+                                Some(TurnEvent::Error(_)) => break Some(None),
+                                Some(TurnEvent::Projection(ev)) => collected.push(ev),
+                                Some(_) => {}
+                                None => break None,
+                            }
+                        },
                     };
                     inflight[i].events.append(&mut collected);
                     match terminal {
@@ -1311,6 +1350,7 @@ impl InferenceState {
                                 handle,
                                 tool: name,
                                 events,
+                                finished: _,
                                 is_prefill,
                                 exemplars,
                             } = inflight.remove(i);
@@ -1511,9 +1551,11 @@ impl InferenceState {
                             // share this submission's pinned selection, which is
                             // correct precisely because a group is one tool's.
                             CalibCase::Questions { questions, .. } => {
-                                let group: Vec<(String, Vec<String>)> = questions
+                                // A question exemplar's assistant half is empty —
+                                // the routing happens on the question.
+                                let group: Vec<(String, String, Vec<String>)> = questions
                                     .iter()
-                                    .map(|q| (q.clone(), opts.tags.clone()))
+                                    .map(|q| (q.clone(), String::new(), opts.tags.clone()))
                                     .collect();
                                 (
                                     conv.submit_prefilled_turn_group(
@@ -1616,6 +1658,7 @@ impl InferenceState {
                                     handle,
                                     tool: name,
                                     events: Vec::new(),
+                                    finished: None,
                                     is_prefill,
                                     exemplars: case.exemplars(),
                                 });
@@ -1638,12 +1681,37 @@ impl InferenceState {
                 if inflight.is_empty() && !created_any {
                     break;
                 }
-                // Retire finished cases; if none finished this pass, yield briefly
-                // (the unbounded channels buffer, so this never starves the wave).
-                if !retire_completed(&mut inflight, &mut done, &mut calib_timelines, &mut timing) {
+                // Retire finished cases; if none finished this pass, park until
+                // whichever in-flight case speaks next — completion order, no
+                // poll cadence. The one event that wait consumes is absorbed
+                // into its case (a reprojection into `events`, a terminal into
+                // `finished` for the next sweep), so nothing the channel says
+                // is lost. Driven by `block_on` because this is the loader
+                // thread: the futures wake on the engine's own channels, so no
+                // timer or I/O driver is needed.
+                if !retire_completed(&mut inflight, &mut done, &mut calib_timelines, &mut timing)
+                    && !inflight.is_empty()
+                {
                     timing.time(
                         |t| &mut t.idle,
-                        || std::thread::sleep(Duration::from_millis(2)),
+                        || {
+                            let (event, which) = {
+                                let waits: Vec<_> = inflight
+                                    .iter()
+                                    .map(|c| Box::pin(c.handle.next_event_async()))
+                                    .collect();
+                                let (event, which, rest) = block_on(select_all(waits));
+                                drop(rest);
+                                (event, which)
+                            };
+                            let case = &mut inflight[which];
+                            match event {
+                                Some(TurnEvent::Done(resp)) => case.finished = Some(Some(resp)),
+                                Some(TurnEvent::Error(_)) | None => case.finished = Some(None),
+                                Some(TurnEvent::Projection(ev)) => case.events.push(ev),
+                                Some(_) => {}
+                            }
+                        },
                     );
                 }
                 // Incremental hot→warm demotion: once a full window's worth of
@@ -1935,11 +2003,11 @@ impl InferenceState {
             return Ok(None);
         }
 
-        // The titler runs on a single dedicated worker thread fed by this
-        // queue. The worker owns the titler `Sequence` exclusively (no shared
-        // mutex, so title generation never serialises against the request
-        // path), and is joined on shutdown so its in-flight turn unwinds.
-        let (titler_tx, titler_rx) = sync_channel(TITLER_QUEUE_DEPTH);
+        // The titler runs on a single dedicated task fed by this queue. The
+        // task owns the titler `Sequence` exclusively (no shared mutex, so
+        // title generation never serialises against the request path), and is
+        // awaited on shutdown so its in-flight turn unwinds.
+        let (titler_tx, titler_rx) = mpsc::channel(TITLER_QUEUE_DEPTH);
         // Build the three per-tools-mode projection builders once, up front, so
         // each turn only pays a cheap `Arc` clone instead of re-cloning the
         // ~93-section schema (see `ModeBuilders`).
@@ -1980,10 +2048,12 @@ impl InferenceState {
             workspace,
             tool_stencil,
             think_steering,
+            passthrough: PassthroughCache::new(),
         });
         let worker_state = Arc::clone(&state);
-        let worker =
-            std::thread::spawn(move || titler_worker_loop(worker_state, titler, titler_rx));
+        // Spawned on the daemon's runtime — the loader thread holds an enter
+        // guard for exactly this kind of arming (see `start_loading`).
+        let worker = tokio::spawn(titler_task(worker_state, titler, titler_rx));
         *state.titler_worker.lock().unwrap() = Some(worker);
         Ok(Some(state))
     }
@@ -2572,9 +2642,15 @@ fn run_inference_stream(
     identity: Option<String>,
     selection: candle_conversation::SelectionState,
 ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<StreamItem>>(64);
+    let (tx, rx) = mpsc::channel::<anyhow::Result<StreamItem>>(64);
 
-    tokio::task::spawn_blocking(move || {
+    // An async task, not a blocking one: every wait in the body is an await —
+    // the turn's event stream, the client channel's backpressure — and the
+    // per-conversation lock it holds across the decode is async precisely so
+    // this task parks instead of pinning a thread. A client that disconnects
+    // drops `rx`; the next send fails, the task returns, and dropping the
+    // in-flight `TurnHandle` stops the decode at its next step.
+    tokio::spawn(async move {
         let msg_preview: String = user_message.chars().take(60).collect();
         tracing::info!(
             conv_id = %conv_id,
@@ -2594,32 +2670,39 @@ fn run_inference_stream(
             .unwrap()
             .conversation_metadata(timeline)
             .and_then(|m| m.get("identity").cloned());
-        let conv_arc: Arc<Mutex<ConvState>> = {
+        // The map and base-conv guards live inside this block, fully released
+        // before the error path's send await below.
+        let forked: anyhow::Result<Arc<ConvLock<ConvState>>> = {
             let mut map = state.conversations.lock().unwrap();
             if let Some(existing) = map.get(&conv_id) {
                 tracing::debug!(conv_id = %conv_id, "reusing existing conv");
-                Arc::clone(existing)
+                Ok(Arc::clone(existing))
             } else {
                 tracing::info!(conv_id = %conv_id, "forking new conv from base");
                 // Fork onto the timeline derived from `conv_id` — a stable
                 // hash, so a daemon restart reconnects the client to the
                 // turns the substrate reload recovered for this conversation
                 // (§16.12). An unknown conv_id simply forks empty.
-                let conv = match state.base_conv.lock().unwrap().fork_resuming(timeline) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(conv_id = %conv_id, "fork failed: {e}");
-                        let _ = tx.blocking_send(Err(anyhow::anyhow!("{e}")));
-                        return;
+                match state.base_conv.lock().unwrap().fork_resuming(timeline) {
+                    Ok(conv) => {
+                        let arc = Arc::new(ConvLock::new(ConvState {
+                            conv,
+                            tool_mode: ToolMode::default(),
+                            identity: stored_identity.clone(),
+                        }));
+                        map.insert(conv_id.clone(), Arc::clone(&arc));
+                        Ok(arc)
                     }
-                };
-                let arc = Arc::new(Mutex::new(ConvState {
-                    conv,
-                    tool_mode: ToolMode::default(),
-                    identity: stored_identity.clone(),
-                }));
-                map.insert(conv_id.clone(), Arc::clone(&arc));
-                arc
+                    Err(e) => Err(anyhow::anyhow!("{e}")),
+                }
+            }
+        };
+        let conv_arc = match forked {
+            Ok(arc) => arc,
+            Err(e) => {
+                tracing::error!(conv_id = %conv_id, "fork failed: {e}");
+                let _ = tx.send(Err(e)).await;
+                return;
             }
         };
 
@@ -2642,7 +2725,7 @@ fn run_inference_stream(
         // changes, to avoid a substrate write every turn.
         if let Some(req_id) = identity {
             let changed = {
-                let mut cs = conv_arc.lock().unwrap();
+                let mut cs = conv_arc.lock().await;
                 if cs.identity.as_deref() == Some(req_id.as_str()) {
                     false
                 } else {
@@ -2704,7 +2787,10 @@ fn run_inference_stream(
             }
         }
 
-        let mut cs = conv_arc.lock().unwrap();
+        // Held across every decode await below, deliberately: this guard IS
+        // the per-conversation in-flight exclusivity — a second submit for the
+        // same conv_id parks here until this turn loop finishes.
+        let mut cs = conv_arc.lock().await;
 
         // Per-conversation projection swap. Both the prefill projection and the
         // reprojection read the swapped builder, so neither re-introduces a
@@ -2765,7 +2851,7 @@ fn run_inference_stream(
         }
 
         let original_user_message = user_message.clone();
-        let mut current_message = user_message;
+        let mut current_message = TurnText::from(user_message);
 
         // The reflection-marker suppression ceiling is per-dial: derive the think
         // mode once, materialise the turn's sampling config (the conversation
@@ -2778,7 +2864,6 @@ fn run_inference_stream(
         // below (thinking-vs-response sampling split + a fresh seed).
         let sampling_defaulted = sampling.is_none();
         let mut sampling = sampling.unwrap_or_else(|| cs.conv.default_sampling());
-        sampling.segment_suppress_penalty = think_mode.suppress_penalty();
         if sampling_defaulted {
             // A `/no_think` turn is a direct response, not reasoning: strip the
             // thinking-temperature boost, which is meant for the `<think>` span
@@ -2805,42 +2890,15 @@ fn run_inference_stream(
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(sampling.seed);
         }
-        // Per-dial thinking budget: the EOT close ramp's graceful/force thresholds
-        // scale with the effort level (exhaustive thinks longest).  The steering
-        // tree gives every dial ONE span, so `segment_len` runs the length of the
-        // think block and this budget IS the dial — it is the only thing that
-        // separates deep from balanced.
-        let (graceful_eot, force_eot) = think_mode.eot_budget();
-        sampling.graceful_segment_close_after = graceful_eot;
-        sampling.force_segment_close_after = force_eot;
-        // The close boost ramps `</think>`+EOS over this dial's [graceful, force]
-        // thinking-token window, so it builds pressure into the same point the
-        // force override hard-closes — and scales with the dial instead of a fixed
-        // global ramp that misses the short dials.
-        sampling.segment_close_ramp_start = graceful_eot;
-        sampling.segment_close_ramp_len = force_eot;
-        // The EOS (turn-ender) budget is the whole-turn backstop on total length,
-        // derived from BOTH dials: the think budget fixes where the answer starts,
-        // so the ramp begins as the think block ends and is dormant during
-        // reasoning (the EOT/EOS boost handles that); the `response_length` dial
-        // sets the answer room above it.  So it can't truncate the thinking
-        // budget, and it scales with both knobs.  (Keeps the preset's eos_boost
-        // magnitude/mult; the boost ramps to the graceful threshold.)
-        let response_tokens = response_budget_from_selection(&selection);
-        let (eos_ramp_start, graceful_eos, forced_eos) = think_mode.eos_budget(response_tokens);
-        sampling.eos_ramp_start = eos_ramp_start;
-        sampling.eos_ramp_len = graceful_eos;
-        sampling.graceful_eos_after = graceful_eos;
-        sampling.forced_eos_after = forced_eos;
-        // Hard-cap closer: when the force budget amputates the think block
-        // mid-sentence, the sampler plays this phrase and then closes the block
-        // itself, so the reasoning ends as intentional prose with an explicit
-        // commitment instead of a dangling fragment. This is the one place the
-        // stencil puts words inside a think block, and it is a rescue rather
-        // than a steer: it fires only at the hard cap, only mid-sentence (a
-        // completed sentence needs none), and only as the block ENDS — so there
-        // is no reasoning left for the model to misread it into.
-        sampling.segment_close_script = state.think_closer_phrase.clone();
+        // The dials' thinking and answer budget: the effort level sets the think
+        // block's close thresholds, and `response_length` the answer's room above
+        // them. See `think_budget::steer`.
+        think_budget::steer(
+            &mut sampling,
+            think_mode,
+            response_budget_from_selection(&selection),
+            &state.think_closer_phrase,
+        );
 
         // The tool loop runs until the model stops emitting tool calls (i.e.
         // produces a final answer) — there is no fixed iteration cap. A wedged
@@ -2875,11 +2933,14 @@ fn run_inference_stream(
                 },
                 ..Default::default()
             };
-            let handle = match cs.conv.submit_turn_with_options(&current_message, options) {
+            let handle = match cs
+                .conv
+                .submit_turn_with_options(current_message.clone(), options)
+            {
                 Ok(h) => h,
                 Err(e) => {
                     tracing::error!(conv_id = %conv_id, iteration, "submit_turn failed: {e}");
-                    let _ = tx.blocking_send(Err(anyhow::anyhow!("{e}")));
+                    let _ = tx.send(Err(anyhow::anyhow!("{e}"))).await;
                     return;
                 }
             };
@@ -2916,121 +2977,139 @@ fn run_inference_stream(
             let mut turn_error: Option<anyhow::Error> = None;
             let mut client_gone = false;
 
-            for event in handle.stream() {
-                match event {
-                    TurnEvent::Token(id) => {
-                        if turn_error.is_none() {
-                            tokens.push(id);
-                            let text = state.decoder.decode(&tokens);
-                            // Once the post-</think> answer opens with `{`, it's a
-                            // (usually un-tagged) tool-call object: stop streaming
-                            // here and hold the rest, so the flush can wrap it.
-                            if hold_from.is_none() {
-                                let answer = text
-                                    .rfind("</think>")
-                                    .map(|i| i + "</think>".len())
-                                    .unwrap_or(0);
-                                let rest = text[answer..].trim_start();
-                                if rest.starts_with('{') {
-                                    hold_from = Some(text.len() - rest.len());
+            // Scoped so the stream's borrow of `handle` ends with the loop —
+            // `finish_turn` consumes the handle below.
+            {
+                let mut events_in = std::pin::pin!(handle.stream_async());
+                while let Some(event) = events_in.next().await {
+                    match event {
+                        TurnEvent::Token(id) => {
+                            if turn_error.is_none() {
+                                tokens.push(id);
+                                let text = state.decoder.decode(&tokens);
+                                // Once the post-</think> answer opens with `{`, it's a
+                                // (usually un-tagged) tool-call object: stop streaming
+                                // here and hold the rest, so the flush can wrap it.
+                                if hold_from.is_none() {
+                                    let answer = text
+                                        .rfind("</think>")
+                                        .map(|i| i + "</think>".len())
+                                        .unwrap_or(0);
+                                    let rest = text[answer..].trim_start();
+                                    if rest.starts_with('{') {
+                                        hold_from = Some(text.len() - rest.len());
+                                    }
                                 }
-                            }
-                            // Resolve a leading think block before anything of it
-                            // is emitted. Three outcomes, checked in order: the
-                            // block closed while empty (skip it entirely), it has
-                            // real content (release and never look again), or it
-                            // is still opening (hold — at most a few whitespace
-                            // tokens).
-                            if !think_resolved {
-                                const OPEN: &str = "<think>";
-                                const CLOSE: &str = "</think>";
-                                match text.find(OPEN) {
-                                    None => think_resolved = !text.trim().is_empty(),
-                                    Some(open) => {
-                                        let inner_at = open + OPEN.len();
-                                        match text[inner_at..].find(CLOSE) {
-                                            Some(rel) => {
-                                                let inner = &text[inner_at..inner_at + rel];
-                                                if inner.trim().is_empty() {
-                                                    // Skip the block and the blank
-                                                    // run after it, so the answer
-                                                    // does not open on a gap.
-                                                    let after = inner_at + rel + CLOSE.len();
-                                                    let tail = text[after..].trim_start();
-                                                    emitted_len = text.len() - tail.len();
+                                // Resolve a leading think block before anything of it
+                                // is emitted. Three outcomes, checked in order: the
+                                // block closed while empty (skip it entirely), it has
+                                // real content (release and never look again), or it
+                                // is still opening (hold — at most a few whitespace
+                                // tokens).
+                                if !think_resolved {
+                                    const OPEN: &str = "<think>";
+                                    const CLOSE: &str = "</think>";
+                                    match text.find(OPEN) {
+                                        None => think_resolved = !text.trim().is_empty(),
+                                        Some(open) => {
+                                            let inner_at = open + OPEN.len();
+                                            match text[inner_at..].find(CLOSE) {
+                                                Some(rel) => {
+                                                    let inner = &text[inner_at..inner_at + rel];
+                                                    if inner.trim().is_empty() {
+                                                        // Skip the block and the blank
+                                                        // run after it, so the answer
+                                                        // does not open on a gap.
+                                                        let after = inner_at + rel + CLOSE.len();
+                                                        let tail = text[after..].trim_start();
+                                                        emitted_len = text.len() - tail.len();
+                                                    }
+                                                    think_resolved = true;
                                                 }
-                                                think_resolved = true;
-                                            }
-                                            // Open but unclosed: real reasoning the
-                                            // moment it is not just whitespace.
-                                            None => {
-                                                think_resolved = !text[inner_at..].trim().is_empty()
+                                                // Open but unclosed: real reasoning the
+                                                // moment it is not just whitespace.
+                                                None => {
+                                                    think_resolved =
+                                                        !text[inner_at..].trim().is_empty()
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                if !think_resolved {
-                                    continue;
-                                }
-                            }
-                            let emit_to = hold_from.unwrap_or(text.len());
-                            if emit_to > emitted_len
-                                && text.is_char_boundary(emitted_len)
-                                && text.is_char_boundary(emit_to)
-                            {
-                                let new_part = &text[emitted_len..emit_to];
-                                if !new_part.contains('\u{FFFD}') {
-                                    if tx
-                                        .blocking_send(Ok(StreamItem::Token(new_part.to_string())))
-                                        .is_err()
-                                    {
-                                        // Client closed the connection.  Break
-                                        // immediately so `handle` is dropped on
-                                        // return, which closes event_rx and causes
-                                        // the scheduler's next send to fail →
-                                        // state.finished = true → decode stops.
-                                        client_gone = true;
-                                        break;
+                                    if !think_resolved {
+                                        continue;
                                     }
-                                    emitted_len = emit_to;
+                                }
+                                let emit_to = hold_from.unwrap_or(text.len());
+                                if emit_to > emitted_len
+                                    && text.is_char_boundary(emitted_len)
+                                    && text.is_char_boundary(emit_to)
+                                {
+                                    let new_part = &text[emitted_len..emit_to];
+                                    if !new_part.contains('\u{FFFD}') {
+                                        if tx
+                                            .send(Ok(StreamItem::Token(new_part.to_string())))
+                                            .await
+                                            .is_err()
+                                        {
+                                            // Client closed the connection.  Break
+                                            // immediately so `handle` is dropped on
+                                            // return, which closes event_rx and causes
+                                            // the scheduler's next send to fail →
+                                            // state.finished = true → decode stops.
+                                            client_gone = true;
+                                            break;
+                                        }
+                                        emitted_len = emit_to;
+                                    }
                                 }
                             }
                         }
+                        TurnEvent::Done(resp) => {
+                            tracing::info!(
+                                conv_id = %conv_id,
+                                iteration,
+                                tokens = resp.stats.tokens_generated,
+                                tps    = resp.stats.tokens_per_second as u32,
+                                prefill_ms = resp.stats.prefill_ms as u32,
+                                "turn complete",
+                            );
+                            // Report the finished turn — usage + finish_reason —
+                            // to the client, async like the rest of this stream.
+                            let _ = tx
+                                .send(Ok(StreamItem::TurnEnd {
+                                    usage: Usage::for_turn(
+                                        resp.stats.context_tokens,
+                                        resp.stats.tokens_generated,
+                                    ),
+                                    finish: resp.stats.finish,
+                                }))
+                                .await;
+                            done_resp = Some(resp);
+                        }
+                        TurnEvent::Error(e) => {
+                            let msg = format!("{e}");
+                            tracing::error!(conv_id = %conv_id, iteration, "scheduler error: {msg}");
+                            // Send as text so the client shows the message rather
+                            // than dropping the connection.
+                            let _ = tx.send(Ok(StreamItem::Token(format!("\n\n⚠ {msg}")))).await;
+                            turn_error = Some(anyhow::anyhow!("{msg}"));
+                            // Do not return — drain the iterator so the channel
+                            // closes cleanly before we decide what to do with the
+                            // conversation state.
+                        }
+                        TurnEvent::HealthWarning(msg) => {
+                            tracing::warn!(conv_id = %conv_id, "decode health: {msg}");
+                        }
+                        // A mid-decode reprojection — stream it straight to the GUI
+                        // timeline as it happens (a dot per reprojection).
+                        TurnEvent::Projection(event) => {
+                            let seq = PROJ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let out = ProjectionEventOut::answer(seq, event);
+                            turn_events.push(out.clone());
+                            let _ = tx.send(Ok(StreamItem::Projection(out))).await;
+                        }
+                        _ => {}
                     }
-                    TurnEvent::Done(resp) => {
-                        tracing::info!(
-                            conv_id = %conv_id,
-                            iteration,
-                            tokens = resp.stats.tokens_generated,
-                            tps    = resp.stats.tokens_per_second as u32,
-                            prefill_ms = resp.stats.prefill_ms as u32,
-                            "turn complete",
-                        );
-                        done_resp = Some(resp);
-                    }
-                    TurnEvent::Error(e) => {
-                        let msg = format!("{e}");
-                        tracing::error!(conv_id = %conv_id, iteration, "scheduler error: {msg}");
-                        // Send as text so the client shows the message rather
-                        // than dropping the connection.
-                        let _ = tx.blocking_send(Ok(StreamItem::Token(format!("\n\n⚠ {msg}"))));
-                        turn_error = Some(anyhow::anyhow!("{msg}"));
-                        // Do not return — drain the iterator so the channel
-                        // closes cleanly before we decide what to do with the
-                        // conversation state.
-                    }
-                    TurnEvent::HealthWarning(msg) => {
-                        tracing::warn!(conv_id = %conv_id, "decode health: {msg}");
-                    }
-                    // A mid-decode reprojection — stream it straight to the GUI
-                    // timeline as it happens (a dot per reprojection).
-                    TurnEvent::Projection(event) => {
-                        let seq = PROJ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let out = ProjectionEventOut::answer(seq, event);
-                        turn_events.push(out.clone());
-                        let _ = tx.blocking_send(Ok(StreamItem::Projection(out)));
-                    }
-                    _ => {}
                 }
             }
 
@@ -3052,9 +3131,9 @@ fn run_inference_stream(
                             iteration,
                             "turn ended without Done or Error — evicting conversation",
                         );
-                        let _ = tx.blocking_send(Ok(StreamItem::Token(
+                        let _ = tx.send(Ok(StreamItem::Token(
                             "\n\n⚠ Generation ended unexpectedly. Your next message will start fresh.".to_string()
-                        )));
+                        ))).await;
                     }
                     // Evict the conversation so the next request forks fresh
                     // rather than hitting the in-flight guard.  Dropping `handle`
@@ -3073,13 +3152,13 @@ fn run_inference_stream(
             if let Some(hf) = hold_from {
                 if resp.text.is_char_boundary(hf) {
                     if let Some(out) = render_held_tail(&resp.text[hf..]) {
-                        let _ = tx.blocking_send(Ok(StreamItem::Token(out)));
+                        let _ = tx.send(Ok(StreamItem::Token(out))).await;
                     }
                 }
             } else if resp.text.len() > emitted_len && resp.text.is_char_boundary(emitted_len) {
                 let tail = &resp.text[emitted_len..];
                 if !tail.is_empty() {
-                    let _ = tx.blocking_send(Ok(StreamItem::Token(tail.to_string())));
+                    let _ = tx.send(Ok(StreamItem::Token(tail.to_string()))).await;
                 }
             }
 
@@ -3101,11 +3180,13 @@ fn run_inference_stream(
                 calls.iter().map(|c| c.name.clone()).collect()
             };
             if !is_final {
-                let _ = tx.blocking_send(Ok(StreamItem::Tool(ToolStatusOut {
-                    phase: "running",
-                    tools: tool_names.clone(),
-                    results: Vec::new(),
-                })));
+                let _ = tx
+                    .send(Ok(StreamItem::Tool(ToolStatusOut {
+                        phase: "running",
+                        tools: tool_names.clone(),
+                        results: Vec::new(),
+                    })))
+                    .await;
             }
 
             if let Err(e) = cs.conv.finish_turn(handle, &resp) {
@@ -3120,7 +3201,7 @@ fn run_inference_stream(
                 let seq = PROJ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let out = ProjectionEventOut::answer(seq, event);
                 turn_events.push(out.clone());
-                let _ = tx.blocking_send(Ok(StreamItem::Projection(out)));
+                let _ = tx.send(Ok(StreamItem::Projection(out))).await;
             }
 
             // Persist this turn's events to the substrate redo log so the
@@ -3151,16 +3232,35 @@ fn run_inference_stream(
                 "dispatching tool calls",
             );
             // The "running" notice was already sent above (before the seal).  Run
-            // the tools — `run_tool_calls` blocks until every tool returns — then
-            // the "done" notice clears the spinner and carries each result so the
-            // cards resolve immediately, before the post-stream hydrate.
+            // the tools — file and process work, so on the blocking pool while
+            // this task stays parked — then the "done" notice clears the spinner
+            // and carries each result so the cards resolve immediately, before
+            // the post-stream hydrate.
             let n_calls = calls.len();
-            let results = run_tool_calls(&state.tool_host.ctx, calls);
-            let _ = tx.blocking_send(Ok(StreamItem::Tool(ToolStatusOut {
-                phase: "done",
-                tools: tool_names,
-                results: results.iter().map(|r| r.response.clone()).collect(),
-            })));
+            let tool_state = Arc::clone(&state);
+            let results = match tokio::task::spawn_blocking(move || {
+                run_tool_calls(&tool_state.tool_host.ctx, calls)
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(conv_id = %conv_id, iteration, "tool dispatch panicked: {e}");
+                    let _ = tx
+                        .send(Ok(StreamItem::Token(format!(
+                            "\n\n⚠ tool dispatch failed: {e}"
+                        ))))
+                        .await;
+                    break;
+                }
+            };
+            let _ = tx
+                .send(Ok(StreamItem::Tool(ToolStatusOut {
+                    phase: "done",
+                    tools: tool_names,
+                    results: results.iter().map(|r| r.response.clone()).collect(),
+                })))
+                .await;
             current_message = format_tool_responses(&results);
             // A tool round that produces no response text must NOT spawn a
             // follow-up turn. `format_tool_responses` wraps every real result in
@@ -3170,7 +3270,7 @@ fn run_inference_stream(
             // is nothing but boundary glue (no user content), which the model then
             // "answers" with a generic greeting — derailing the conversation. The
             // answer already streamed for this turn stands; end the loop here.
-            if current_message.trim().is_empty() {
+            if current_message.is_blank() {
                 tracing::warn!(
                     conv_id = %conv_id,
                     iteration,
@@ -3210,22 +3310,212 @@ fn run_inference_stream(
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
-/// The titler worker thread. Owns the titler [`Sequence`] exclusively and
-/// drains title jobs one at a time off `rx`. Each title-gen overlaps the main
-/// decode (the scheduler batches both sequences), but the worker never blocks
-/// the request path and never piles up a thread per submit. Between jobs it
-/// checks the shutdown flag, so once shutdown begins it stops draining queued
-/// jobs immediately; on exit it abandons any in-flight turn so the sequence is
+/// One OpenAI-passthrough call, holding its conversation's lock for the whole
+/// turn — see [`crate::passthrough`]. Reuses the live conversation when the call
+/// extends what it holds; otherwise resumes or opens one. A conversation left
+/// in an unknown state by a failed call is dropped, so the next call reopens it
+/// from the substrate.
+async fn run_passthrough(
+    state: Arc<InferenceState>,
+    key: String,
+    mut conv: OwnedMutexGuard<Option<LiveConv>>,
+    transcript: Transcript,
+    max_tokens: Option<usize>,
+    tx: tokio::sync::mpsc::Sender<anyhow::Result<StreamItem>>,
+) {
+    let reusable = conv.as_ref().is_some_and(|live| {
+        live.system == transcript.system && passthrough::extends(&live.history, &transcript.history)
+    });
+    if !reusable {
+        // Free the stale conversation's slot before opening another.
+        *conv = None;
+        let opened = {
+            let engine = state.engine.lock().unwrap();
+            passthrough::open(&engine, state.refresh_config.clone(), &transcript)
+        };
+        match opened {
+            Ok(live) => *conv = Some(live),
+            Err(e) => {
+                tracing::error!(key, "passthrough: {e:#}");
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        }
+    }
+    let healthy = match conv.as_mut() {
+        Some(live) => passthrough_turn(&state, &key, live, transcript, max_tokens, &tx).await,
+        None => false,
+    };
+    if !healthy {
+        *conv = None;
+    }
+    state.passthrough.touch(&key);
+}
+
+/// Prefill the history `live` does not hold, decode the reply to the new user
+/// half, seal it and commit the redo log. Returns whether `live` still matches
+/// what the substrate holds.
+/// The answer room a passthrough reply gets past its think block — the
+/// response-length dial's widest rung. A client's reply can be a whole file
+/// written through a tool call, and the client's own `max_tokens` still caps
+/// the turn; this only places the failsafe that ends a runaway.
+const PASSTHROUGH_RESPONSE_TOKENS: i32 = 3584;
+
+async fn passthrough_turn(
+    state: &InferenceState,
+    key: &str,
+    live: &mut LiveConv,
+    transcript: Transcript,
+    max_tokens: Option<usize>,
+    tx: &tokio::sync::mpsc::Sender<anyhow::Result<StreamItem>>,
+) -> bool {
+    let held = live.history.len();
+    tracing::info!(
+        key,
+        timeline = live.seq.timeline_id().raw(),
+        held,
+        sent = transcript.history.len(),
+        "passthrough turn",
+    );
+    for exchange in &transcript.history[held..] {
+        if let Err(e) = live
+            .seq
+            .insert_turn(exchange.user.clone(), &exchange.assistant)
+        {
+            tracing::error!(key, "passthrough: prefilling history failed: {e}");
+            let _ = tx.send(Err(anyhow::anyhow!("{e}"))).await;
+            return false;
+        }
+        live.history.push(exchange.clone());
+    }
+
+    // Once the model opens a call it is held to the client's tools and their
+    // declared arguments — see `LiveConv::tool_stencil`. The `<think>` block is
+    // steered atop that, exactly as on a dialogue turn: its tree takes an EOS
+    // sampled inside the block as the block's close, so a reply cannot end
+    // with its reasoning still open. Measured on a Cline turn without it: the
+    // model opened a block, planned in it, and stopped — the client received
+    // only reasoning, no answer and no call, and ended the task.
+    let triggers = match &state.think_steering {
+        Some(ts) => ts.registry_for(&live.tool_stencil, ThinkMode::Balanced),
+        None => Arc::clone(&live.tool_stencil),
+    };
+    // The balanced dial's budget, as a dialogue turn gets it — not the
+    // preset's fallback, which cut a Cline plan mid-sentence at 301 thinking
+    // tokens and force-ends a reply at 1000 in all.
+    let mut sampling = live.seq.default_sampling();
+    think_budget::steer(
+        &mut sampling,
+        ThinkMode::Balanced,
+        PASSTHROUGH_RESPONSE_TOKENS,
+        &state.think_closer_phrase,
+    );
+    let options = candle_conversation::TurnOptions {
+        max_tokens,
+        sampling: Some(sampling),
+        triggers,
+        ..Default::default()
+    };
+    let handle = match live
+        .seq
+        .submit_turn_with_options(transcript.message.clone(), options)
+    {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(key, "passthrough: submit failed: {e}");
+            let _ = tx.send(Err(anyhow::anyhow!("{e}"))).await;
+            return false;
+        }
+    };
+
+    // Deltas are cut at byte offsets into the decoded text, and a fragment that
+    // still holds U+FFFD waits for the rest of its byte-fallback sequence.
+    let mut tokens: Vec<u32> = Vec::new();
+    let mut emitted_len = 0usize;
+    let mut done = None;
+    {
+        let mut stream = std::pin::pin!(handle.stream_async());
+        while let Some(event) = stream.next().await {
+            match event {
+                TurnEvent::Token(id) => {
+                    tokens.push(id);
+                    let text = state.decoder.decode(&tokens);
+                    if text.len() > emitted_len && text.is_char_boundary(emitted_len) {
+                        let part = &text[emitted_len..];
+                        if !part.contains('\u{FFFD}') {
+                            if tx
+                                .send(Ok(StreamItem::Token(part.to_string())))
+                                .await
+                                .is_err()
+                            {
+                                // The client went away: dropping the handle stops the
+                                // decode, and the turn never seals.
+                                tracing::info!(key, "passthrough: client disconnected mid-stream");
+                                return false;
+                            }
+                            emitted_len = text.len();
+                        }
+                    }
+                }
+                TurnEvent::Done(resp) => done = Some(resp),
+                TurnEvent::Error(e) => {
+                    tracing::error!(key, "passthrough: scheduler error: {e}");
+                    let _ = tx.send(Err(anyhow::anyhow!("{e}"))).await;
+                }
+                _ => {}
+            }
+        }
+    }
+    // `handle` is free here: the stream that borrowed it was scoped to the block
+    // above, so `finish_turn` below can take it.
+    let Some(resp) = done else {
+        return false;
+    };
+    if resp.text.len() > emitted_len && resp.text.is_char_boundary(emitted_len) {
+        let tail = &resp.text[emitted_len..];
+        if !tail.is_empty() {
+            let _ = tx.send(Ok(StreamItem::Token(tail.to_string()))).await;
+        }
+    }
+    let _ = tx
+        .send(Ok(StreamItem::TurnEnd {
+            usage: Usage::for_turn(resp.stats.context_tokens, resp.stats.tokens_generated),
+            finish: resp.stats.finish,
+        }))
+        .await;
+    if let Err(e) = live.seq.finish_turn(handle, &resp) {
+        tracing::warn!(key, "passthrough: finish_turn: {e}");
+    }
+    if let Err(e) = state.engine.lock().unwrap().commit_persistence() {
+        tracing::warn!(key, "passthrough: persistence commit: {e}");
+    }
+    live.history.push(Exchange {
+        user: transcript.message,
+        assistant: resp.text,
+    });
+    true
+}
+
+/// The titler task. Owns the titler [`Sequence`] exclusively and drains title
+/// jobs one at a time off `rx`. Each title-gen overlaps the main decode (the
+/// scheduler batches both sequences), but the task never blocks the request
+/// path and never piles up work per submit. Between jobs it checks the
+/// shutdown flag, so once shutdown begins it stops draining queued jobs
+/// immediately; on exit it abandons any in-flight turn so the sequence is
 /// left clean.
-fn titler_worker_loop(state: Arc<InferenceState>, mut titler: Sequence, rx: Receiver<TitleJob>) {
-    while let Ok(job) = rx.recv() {
+async fn titler_task(
+    state: Arc<InferenceState>,
+    mut titler: Sequence,
+    mut rx: mpsc::Receiver<TitleJob>,
+) {
+    while let Some(job) = rx.recv().await {
         if state.shutting_down.load(Ordering::Relaxed) {
             break;
         }
         match job {
             TitleJob::Shutdown => break,
             TitleJob::Title { timeline, message } => {
-                generate_one_title(&state, &mut titler, timeline, &message);
+                generate_one_title(&state, &mut titler, timeline, &message).await;
             }
         }
     }
@@ -3241,13 +3531,13 @@ fn titler_worker_loop(state: Arc<InferenceState>, mut titler: Sequence, rx: Rece
 /// worst case is a missing sidebar label, never a failed response. Any turn
 /// that doesn't reach `Done` (scheduler error, or shutdown mid-decode) is
 /// aborted rather than left in flight, so the next title-gen can `reset`.
-fn generate_one_title(
+async fn generate_one_title(
     state: &Arc<InferenceState>,
     titler: &mut Sequence,
     timeline: TimelineId,
     user_message: &str,
 ) {
-    use candle_conversation::{TurnEvent, TurnOptions};
+    use candle_conversation::TurnOptions;
 
     let truncated = head_tail_truncate(
         user_message,
@@ -3286,28 +3576,17 @@ fn generate_one_title(
             return;
         }
     };
-    let mut done = None;
-    for event in handle.stream() {
-        match event {
-            TurnEvent::Done(r) => {
-                done = Some(r);
-                break;
-            }
-            TurnEvent::Error(e) => {
-                tracing::warn!("titler scheduler error: {e}");
-                break;
-            }
-            _ => {}
+    let resp = match handle.wait_async().await {
+        Ok(r) => r,
+        Err(e) => {
+            // No response: scheduler error or shutdown mid-decode. Abandon the
+            // turn so it doesn't wedge the sequence (the cause of the shutdown
+            // "already has a turn in flight" reset loop).
+            tracing::warn!("titler ended without a response: {e}");
+            drop(handle);
+            titler.abort_turn();
+            return;
         }
-    }
-    let Some(resp) = done else {
-        // No response: scheduler error or shutdown mid-decode. Abandon the
-        // turn so it doesn't wedge the sequence (the cause of the shutdown
-        // "already has a turn in flight" reset loop).
-        tracing::warn!("titler ended without a response");
-        drop(handle);
-        titler.abort_turn();
-        return;
     };
     let title = clean_title(&resp.text);
     if let Err(e) = titler.finish_turn(handle, &resp) {
@@ -4125,12 +4404,22 @@ impl ZendSession {
             let base = state.base_conv.lock().unwrap();
             base.recovered_timelines().into_iter().collect()
         };
-        let mut entries: Vec<ConvEntry> = engine
-            .known_conversations()
+        let known = engine.known_conversations();
+        let passthrough_tagged = engine.conversations_with_metadata_key(passthrough::METADATA_KEY);
+        let conv = engine.conversation();
+        let view = conv.read();
+        let mut entries: Vec<ConvEntry> = known
             .into_iter()
             .filter(|(tl, _, _, _, _)| *tl != titler_timeline)
             .filter(|(_, _, _, archived, _)| include_archived || !*archived)
             .map(|(tl, conv_id, label, archived, order)| {
+                // A passthrough conversation is not among the dialogue's
+                // recovered timelines; its turns are counted in the substrate.
+                let turn_count = if conv_id.starts_with(passthrough::CONV_ID_PREFIX) {
+                    view.turn_indices(tl).count() as u32
+                } else {
+                    turn_counts.get(&tl).copied().unwrap_or(0)
+                };
                 // `order` is creation rank (see `TimelineEntry::order`) — the
                 // conv_id itself is a random u64 and carries no time. The field
                 // is named `updated_ms` for the wire, but it is a monotonic
@@ -4139,12 +4428,32 @@ impl ZendSession {
                 ConvEntry {
                     id: conv_id,
                     label,
-                    turn_count: turn_counts.get(&tl).copied().unwrap_or(0),
+                    turn_count,
                     archived,
                     updated_ms: order,
                 }
             })
             .collect();
+        // Passthrough conversations stored before they carried a `conv_id` are
+        // found by their tag; the next call to one names it for good.
+        entries.extend(passthrough_tagged.into_iter().filter_map(|(tl, _)| {
+            let entry = view.timeline_entry(tl)?;
+            if entry.conv_id.is_some() || (entry.archived && !include_archived) {
+                return None;
+            }
+            let first_user = view
+                .turn_indices(tl)
+                .min()
+                .map(|i| view.user_text_of(tl, i))
+                .unwrap_or_default();
+            Some(ConvEntry {
+                id: passthrough::conv_id_of(tl),
+                label: passthrough::label_for(&first_user),
+                turn_count: view.turn_indices(tl).count() as u32,
+                archived: entry.archived,
+                updated_ms: entry.order,
+            })
+        }));
         // Newest-created first.
         entries.sort_by_key(|e| std::cmp::Reverse(e.updated_ms));
         entries
@@ -4158,7 +4467,7 @@ impl ZendSession {
     /// the model isn't loaded yet.
     pub fn archive_conversation(&self, conv_id: &str) -> Option<candle_conversation::Result<()>> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let timeline = timeline_for(conv_id);
+        let timeline = conversation_timeline(conv_id);
         let engine = state.engine.lock().unwrap();
         let result = engine
             .set_conversation_archived(timeline, true)
@@ -4175,7 +4484,7 @@ impl ZendSession {
     /// at once. Returns `None` when the model isn't loaded yet.
     pub fn tombstone_conversation(&self, conv_id: &str) -> Option<candle_conversation::Result<()>> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let timeline = timeline_for(conv_id);
+        let timeline = conversation_timeline(conv_id);
         let result = state.engine.lock().unwrap().tombstone_timeline(timeline);
         if result.is_ok() {
             state.conversations.lock().unwrap().remove(conv_id);
@@ -4206,6 +4515,21 @@ impl ZendSession {
     /// loaded yet; an empty `Vec` when the conv_id has no recovered turns.
     pub fn conversation_history(&self, conv_id: &str) -> Option<Vec<(Role, String, bool)>> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        if let Some(timeline) = passthrough::timeline_of(conv_id) {
+            // A passthrough conversation's turns are the client's exchanges.
+            let engine = state.engine.lock().unwrap();
+            return Some(
+                passthrough::held_history(&engine, timeline)
+                    .into_iter()
+                    .flat_map(|e| {
+                        [
+                            (Role::User, e.user.text(), false),
+                            (Role::Assistant, e.assistant, false),
+                        ]
+                    })
+                    .collect(),
+            );
+        }
         let timeline = timeline_for(conv_id);
         let raw = {
             let base = state.base_conv.lock().unwrap();
@@ -4375,7 +4699,7 @@ impl ZendSession {
     /// mode. Backs the projection panel's expandable section text — resolved on
     /// demand, never stored in the projection event. The schema is workspace-wide;
     /// `conv_id` selects which tool summary (restricted vs comprehensive) to serve.
-    pub fn section_content(&self, conv_id: &str) -> Option<Vec<(String, String)>> {
+    pub async fn section_content(&self, conv_id: &str) -> Option<Vec<(String, String)>> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let mut out = {
             let base = state.base_conv.lock().unwrap();
@@ -4388,13 +4712,14 @@ impl ZendSession {
         // none in None (no tools are projected) — under the key the projection
         // event uses (`<collection> summary`) so the panel expands the right list.
         // Copy the Arc out and release the conversations-map lock before locking
-        // the per-conversation state: the inference loop holds a conversation's
-        // lock for its entire decode, so locking it while still holding the map
+        // the per-conversation state: the inference task holds a conversation's
+        // lock for its entire decode, so awaiting it while still holding the map
         // mutex would stall every other conversation's turn submission.
         let cs = state.conversations.lock().unwrap().get(conv_id).cloned();
-        let mode = cs
-            .map(|cs| cs.lock().unwrap().tool_mode)
-            .unwrap_or_default();
+        let mode = match cs {
+            Some(cs) => cs.lock().await.tool_mode,
+            None => ToolMode::default(),
+        };
         let restricted = match mode {
             ToolMode::None => return Some(out),
             ToolMode::Restricted => true,
@@ -4573,6 +4898,24 @@ impl ZendSession {
                     Ok(Some(state)) => {
                         *slot.write().unwrap() = Some(Arc::clone(&state));
                         tracing::info!("inference engine ready");
+                        // The last load step: the tool catalog's normalization hit
+                        // levels, relearned from its corpus in batch on the GPU.
+                        // Before `ready`, so no query is ever scored against cold
+                        // levels — and no live turn competes with the warm-up.
+                        // They are rebuilt empty on each process load, and the
+                        // dialogue replay cannot teach them (its probes are the
+                        // untagged turns; the tool corpus is tagged). Cold, the
+                        // scores are not merely smaller but differently ORDERED,
+                        // and none clears the collection's gate — a query answered
+                        // before the warm-up saw no tool definition at all and
+                        // answered from memory.
+                        load_progress.set_step(LoadStep::Normalizing);
+                        let schema = state.refresh_builder.schema().clone();
+                        state
+                            .engine
+                            .lock()
+                            .unwrap()
+                            .warm_collection_normalization(&schema);
                         status_tx.send(String::new()).ok();
                         // Substrate persistence runs in the engine's own
                         // thread (`PersistenceThread`) — 5 s tick + per-turn
@@ -4653,24 +4996,6 @@ impl ZendSession {
                         // load critical path, after `ready`, exactly like a watcher burst.
                         // A no filesystem event fires for down-time edits, so this is what
                         // covers them.
-                        // The tool catalog's levels, BEFORE ready: they are what
-                        // every conversation's tool selection is scored on, they
-                        // are rebuilt empty on each process load, and the dialogue
-                        // replay cannot teach them (its probes are the untagged
-                        // turns; the tool corpus is tagged). Cold, the scores are
-                        // not merely smaller but differently ORDERED, and none
-                        // clears the collection's gate — so a query answered before
-                        // a background warm finished saw no tool definition at all
-                        // and answered from memory.
-                        {
-                            let t_warm = Instant::now();
-                            let conv = { state.engine.lock().unwrap().conversation() };
-                            conv.warm_collection_normalization(state.refresh_builder.schema());
-                            tracing::info!(
-                                elapsed_ms = t_warm.elapsed().as_millis() as u64,
-                                "tool collection levels warmed before ready"
-                            );
-                        }
                         let state_for_reconcile = Arc::clone(&state);
                         let reconcile = std::thread::spawn(move || {
                             match state_for_reconcile.refresh_ingest_layers() {
@@ -4695,6 +5020,8 @@ impl ZendSession {
                             let conv =
                                 { state_for_reconcile.engine.lock().unwrap().conversation() };
                             let schema = state_for_reconcile.refresh_builder.schema().clone();
+                            // The tool catalog's levels are warmed by the load's
+                            // `Normalizing` step, before ready.
                             conv.warm_ingest_normalization(&schema);
                         });
                         *session_for_watcher.reconcile_thread.lock().unwrap() = Some(reconcile);
@@ -4783,32 +5110,81 @@ impl ZendSession {
             );
             return;
         };
-        // Signal the titler worker to stop draining and wake it if it's idle.
-        // This must happen before the scheduler stops so the worker skips any
+        // Signal the titler task to stop draining and wake it if it's idle.
+        // This must happen before the scheduler stops so the task skips any
         // queued jobs (rather than failing each one against a dead scheduler).
         state.shutting_down.store(true, Ordering::Relaxed);
         let _ = state.titler_tx.try_send(TitleJob::Shutdown);
+        let engine_state = Arc::clone(&state);
         let _ = tokio::task::spawn_blocking(move || {
-            {
-                let engine = state.engine.lock().unwrap();
-                match engine.commit_persistence() {
-                    Ok(()) => tracing::info!("shutdown: substrate committed"),
-                    Err(e) => tracing::error!("shutdown: commit failed: {e}"),
-                }
-                if let Err(e) = engine.shutdown() {
-                    tracing::error!("shutdown: scheduler stop failed: {e}");
-                }
-            } // release the engine lock before joining the worker
-
-            // Join the titler worker so any in-flight title turn unwinds
-            // (via `abort_turn`) before the process exits.
-            if let Some(worker) = state.titler_worker.lock().unwrap().take() {
-                if worker.join().is_err() {
-                    tracing::warn!("shutdown: titler worker panicked");
-                }
+            // Passthrough conversations hold scheduler slots; free them while
+            // the scheduler still answers.
+            engine_state.passthrough.clear();
+            let engine = engine_state.engine.lock().unwrap();
+            match engine.commit_persistence() {
+                Ok(()) => tracing::info!("shutdown: substrate committed"),
+                Err(e) => tracing::error!("shutdown: commit failed: {e}"),
+            }
+            if let Err(e) = engine.shutdown() {
+                tracing::error!("shutdown: scheduler stop failed: {e}");
             }
         })
         .await;
+
+        // Await the titler task so any in-flight title turn unwinds (via
+        // `abort_turn`, against the now-stopped scheduler) before the process
+        // exits. The guard is released before the await — the take is all it
+        // covers.
+        let worker = state.titler_worker.lock().unwrap().take();
+        if let Some(worker) = worker {
+            if worker.await.is_err() {
+                tracing::warn!("shutdown: titler task panicked");
+            }
+        }
+    }
+
+    /// Run an OpenAI-passthrough call — the client's own context, as-is — and
+    /// return a stream of its reply tokens. See [`crate::passthrough`].
+    ///
+    /// Waits for the engine, then for the conversation's own lock: a call on a
+    /// conversation another call is running queues behind it, while calls on
+    /// other conversations go ahead.
+    pub async fn submit_passthrough(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Vec<Value>,
+        max_tokens: Option<usize>,
+    ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<StreamItem>>(64);
+        let transcript = match Transcript::from_messages(&messages, &tools) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = tx.send(Err(anyhow::anyhow!("passthrough: {e}"))).await;
+                return Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+            }
+        };
+        let inference = Arc::clone(&self.inference);
+        let mut ready_rx = self.ready_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                let loaded = inference.read().unwrap().is_some();
+                if loaded {
+                    break;
+                }
+                if ready_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+            let state = { inference.read().unwrap().as_ref().map(Arc::clone) };
+            let Some(state) = state else {
+                return;
+            };
+            state.passthrough.ensure_sweeper();
+            let key = transcript.key();
+            let conv = state.passthrough.conversation(&key).lock_owned().await;
+            run_passthrough(state, key, conv, transcript, max_tokens, tx).await;
+        });
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
     }
 
     /// Submit the latest user message and return a stream of status + token items.
@@ -4950,6 +5326,12 @@ impl ZendSession {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// The timeline a sidebar `id` names: a passthrough conversation's id carries
+/// its timeline ([`passthrough::timeline_of`]); any other is [`timeline_for`].
+fn conversation_timeline(conv_id: &str) -> projection::TimelineId {
+    passthrough::timeline_of(conv_id).unwrap_or_else(|| timeline_for(conv_id))
+}
 
 /// The [`projection::TimelineId`] a client `conv_id` maps to — a stable hash
 /// of the id. Deterministic across daemon restarts, so a reconnecting client

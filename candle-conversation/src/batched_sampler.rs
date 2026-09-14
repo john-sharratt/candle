@@ -423,6 +423,28 @@ fn segment_close_override(
     None
 }
 
+/// A tool call opened inside an open segment closes the segment first: the
+/// sampled `<tool_call>` is committed as `</think>`.
+///
+/// The template closes the reasoning block before the answer, and a call is an
+/// answer. Written inside the block it is reasoning to every reader downstream,
+/// so the client never receives it. Measured on a Cline turn: the block opened,
+/// the call was written inside it, and the reply ended with the block still
+/// open. Committing the close where the model chose to act ends the block
+/// there; the call follows on the next step, outside it, where the tool-call
+/// grammar takes it.
+fn close_before_call(
+    config: &SamplingConfig,
+    state: &SequenceSamplingState,
+    sampled: u32,
+) -> Option<u32> {
+    (config.tool_call_open_token_id >= 0
+        && config.segment_close_token_id >= 0
+        && state.in_segment
+        && sampled == config.tool_call_open_token_id as u32)
+        .then_some(config.segment_close_token_id as u32)
+}
+
 /// Stateless batched sampler that invokes the CUDA kernel.
 ///
 /// This sampler does not own per-sequence state. Instead, callers pass
@@ -702,6 +724,11 @@ impl BatchedSampler {
         // clobber the close token or a closer-script token (they fire on a later
         // step, once the segment is closed).
         if let Some(t) = segment_close_override(config, state) {
+            return t;
+        }
+
+        // A tool call opened inside the reasoning block closes the block first.
+        if let Some(t) = close_before_call(config, state, sampled) {
             return t;
         }
 
@@ -1980,6 +2007,45 @@ mod tests {
         let config = closer_config();
         let mut state = in_segment_state(3, 7);
         assert_eq!(segment_close_override(&config, &mut state), None);
+    }
+
+    /// A call opened inside a think block closes the block first — the opener
+    /// is committed as the close — and nowhere else does the opener change.
+    #[test]
+    fn a_call_opened_inside_a_segment_closes_it_first() {
+        let mut config = closer_config();
+        config.tool_call_open_token_id = 70;
+        let state = in_segment_state(3, 42);
+        assert_eq!(close_before_call(&config, &state, 70), Some(90));
+        assert_eq!(
+            close_before_call(&config, &state, 71),
+            None,
+            "any other token stands"
+        );
+        let mut outside = in_segment_state(3, 42);
+        outside.in_segment = false;
+        assert_eq!(
+            close_before_call(&config, &outside, 70),
+            None,
+            "a call outside the block stands"
+        );
+        config.tool_call_open_token_id = -1;
+        assert_eq!(
+            close_before_call(&config, &state, 70),
+            None,
+            "an unresolved opener changes nothing"
+        );
+    }
+
+    /// Through the one authority both sampling paths resolve with: under the
+    /// segment budget, a sampled opener inside the block commits as the close.
+    #[test]
+    fn the_committed_token_for_a_call_inside_a_segment_is_the_close() {
+        let sampler = make_sampler();
+        let mut config = closer_config();
+        config.tool_call_open_token_id = 70;
+        let mut state = in_segment_state(3, 42);
+        assert_eq!(sampler.resolve_final_token(0, 70, &mut state, &config), 90);
     }
 
     #[test]

@@ -100,7 +100,30 @@ const WRAP: usize = 76;
 /// Levels come in the order the building lists them, because that is the order
 /// a person would be shown them and the order they are numbered in.
 pub fn place(set: &MapSet) -> String {
-    let mut out = String::new();
+    places(set)
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// [`place`], one part of the world at a time, keyed by that part's area id and
+/// in the order [`place`] joins them: each building with every level of it, and
+/// then each area with places of its own that no building claims.
+///
+/// **One part is what a body standing in it knows.** A world holds more than
+/// one building, and the whole of it rendered as "the building you work in"
+/// told a character in the Redoubt about six levels of a vault it has never
+/// been in — so asked where it was, it named a room in the vault. Keyed by
+/// part, a caller hands a body the part it is standing in; see [`enclosing`]
+/// for which part that is.
+///
+/// **A building's own rooms are part of it.** A building may keep its rooms on
+/// itself rather than on levels, as the Redoubt does, and those were left out
+/// entirely: the building was introduced and its rooms never named, while every
+/// level of the vault beside it was described in full. They follow its levels,
+/// without a second heading — [`building`] has already said what it is.
+pub fn places(set: &MapSet) -> Vec<(String, String)> {
     // Buildings first, then anything with places of its own that no building
     // claimed — a world of open ground has no building and still has to be
     // describable.
@@ -109,13 +132,22 @@ pub fn place(set: &MapSet) -> String {
         .filter(|a| a.kind == AreaKind::Building)
         .collect();
 
+    let mut out = Vec::new();
     for b in &buildings {
-        out.push_str(building(set, &b.id, &Known::All).trim_end());
-        out.push_str("\n\n");
+        let mut text = building(set, &b.id, &Known::All).trim_end().to_string();
         for level in set.children(&b.id) {
-            out.push_str(self::level(set, &level.id).trim_end());
-            out.push_str("\n\n");
+            text.push_str("\n\n");
+            text.push_str(self::level(set, &level.id).trim_end());
         }
+        if !b.nodes.is_empty() {
+            let mut own = String::new();
+            level_body(set, b, &mut own, false);
+            if !own.trim().is_empty() {
+                text.push_str("\n\n");
+                text.push_str(own.trim());
+            }
+        }
+        out.push((b.id.clone(), text));
     }
 
     let claimed: BTreeSet<&str> = buildings
@@ -127,10 +159,34 @@ pub fn place(set: &MapSet) -> String {
         if area.nodes.is_empty() || claimed.contains(area.id.as_str()) {
             continue;
         }
-        out.push_str(self::level(set, &area.id).trim_end());
-        out.push_str("\n\n");
+        out.push((
+            area.id.clone(),
+            self::level(set, &area.id).trim_end().to_string(),
+        ));
     }
-    out.trim_end().to_string()
+    out
+}
+
+/// Which part of the world [`places`] describes an area under: the building it
+/// sits in, or the area itself when no building holds it. A vault level is in
+/// the vault, the Redoubt is itself, the waste is itself.
+///
+/// Walks `within` up to the nearest building. Bounded, because `within` is
+/// authored and a file naming its own ancestor as its parent must not hang the
+/// caller. `None` for an area the set does not hold.
+pub fn enclosing<'a>(set: &'a MapSet, area_id: &str) -> Option<&'a str> {
+    let start = set.get(area_id)?;
+    let mut here = start;
+    for _ in 0..64 {
+        if here.kind == AreaKind::Building {
+            return Some(here.id.as_str());
+        }
+        match here.within.as_deref().and_then(|w| set.get(w)) {
+            Some(parent) => here = parent,
+            None => break,
+        }
+    }
+    Some(start.id.as_str())
 }
 
 pub fn building(set: &MapSet, id: &str, known: &Known) -> String {
@@ -304,8 +360,19 @@ pub fn level(set: &MapSet, id: &str) -> String {
     if let Some(character) = &area.character {
         para(&mut out, character);
     }
+    level_body(set, area, &mut out, true);
+    out
+}
+
+/// Everything [`level`] says after what a place is: how it hangs together,
+/// its rooms under their headings, and what it looks out on.
+///
+/// Split out so a building that keeps rooms on itself can have them described
+/// under [`building`]'s own heading rather than a second one. `with_lacks` is
+/// off there because [`building`] has already said what the place has not got.
+fn level_body(set: &MapSet, area: &Area, out: &mut String, with_lacks: bool) {
     if let Some(s) = shape(area) {
-        para(&mut out, &s);
+        para(out, &s);
     }
 
     for kind in [
@@ -318,10 +385,10 @@ pub fn level(set: &MapSet, id: &str) -> String {
         if entries.is_empty() {
             continue;
         }
-        para(&mut out, &format!("{}:", kind.heading().unwrap_or("Here")));
+        para(out, &format!("{}:", kind.heading().unwrap_or("Here")));
         out.push('\n');
         for entry in entries {
-            bullet(&mut out, &entry);
+            bullet(out, &entry);
         }
     }
 
@@ -332,14 +399,12 @@ pub fn level(set: &MapSet, id: &str) -> String {
     if let Some(s) = habits(area) {
         tail.push(s);
     }
-    if !area.lacks.is_empty() {
+    if with_lacks && !area.lacks.is_empty() {
         tail.push(lacks_sentence(&area.lacks));
     }
     if !tail.is_empty() {
-        para(&mut out, &tail.join(" "));
+        para(out, &tail.join(" "));
     }
-
-    out
 }
 
 fn level_head(set: &MapSet, area: &Area) -> String {
@@ -754,6 +819,69 @@ mod tests {
     fn the_first_sentence_stops_at_the_full_stop() {
         assert_eq!(first_sentence("One. Two. Three."), "One.");
         assert_eq!(first_sentence("Only one"), "Only one");
+    }
+
+    fn shipped() -> MapSet {
+        MapSet::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/maps")).expect("the maps must load")
+    }
+
+    fn part<'a>(parts: &'a [(String, String)], id: &str) -> &'a str {
+        parts
+            .iter()
+            .find(|(k, _)| k == id)
+            .map(|(_, t)| t.as_str())
+            .unwrap_or_else(|| panic!("no part {id}"))
+    }
+
+    #[test]
+    fn a_building_that_keeps_its_rooms_on_itself_names_them() {
+        let set = shipped();
+        let parts = places(&set);
+        let redoubt = part(&parts, "tower-redoubt").to_lowercase();
+        for room in ["muster hall", "gatehouse", "barracks", "foundry", "bridge"] {
+            assert!(redoubt.contains(room), "{room} missing from:\n{redoubt}");
+        }
+    }
+
+    #[test]
+    fn one_building_is_not_told_about_the_rooms_of_another() {
+        let set = shipped();
+        let parts = places(&set);
+        let vault = part(&parts, "creators-vault").to_lowercase();
+        assert!(!vault.contains("muster hall"), "{vault}");
+        let redoubt = part(&parts, "tower-redoubt").to_lowercase();
+        assert!(!redoubt.contains("casting"), "{redoubt}");
+    }
+
+    #[test]
+    fn the_whole_place_is_every_part_of_it_in_order() {
+        let set = shipped();
+        let joined = places(&set)
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        assert_eq!(place(&set), joined);
+    }
+
+    #[test]
+    fn an_area_is_described_under_the_building_that_holds_it() {
+        let set = shipped();
+        assert_eq!(enclosing(&set, "vault-command"), Some("creators-vault"));
+        assert_eq!(enclosing(&set, "creators-vault"), Some("creators-vault"));
+        assert_eq!(enclosing(&set, "tower-redoubt"), Some("tower-redoubt"));
+        // Open ground has no building over it, so it is its own part.
+        assert_eq!(enclosing(&set, "the-waste"), Some("the-waste"));
+        assert_eq!(enclosing(&set, "nowhere"), None);
+        // Every area resolves to a part that places() actually describes.
+        let keys: BTreeSet<String> = places(&set).into_iter().map(|(k, _)| k).collect();
+        for area in set.areas() {
+            if area.nodes.is_empty() {
+                continue;
+            }
+            let at = enclosing(&set, &area.id).unwrap();
+            assert!(keys.contains(at), "{} → {at} is not described", area.id);
+        }
     }
 
     #[test]

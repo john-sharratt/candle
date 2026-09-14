@@ -47,10 +47,16 @@ use candle::{Device, Result};
 ///
 /// A no-op off CUDA.
 pub fn open_for_load(device: &Device, content: &gguf_file::Content) -> Result<bool> {
+    open_for_load_sized(device, peak_load_pool_bytes(content.tensor_infos.values()))
+}
+
+/// [`open_for_load`] with the pool headroom already computed — for a load that reads some of
+/// its tensors from outside `content` (see `qwen35::TensorOverrides::effective_infos`), whose
+/// largest source is therefore not the one `content`'s header names.
+pub fn open_for_load_sized(device: &Device, headroom: usize) -> Result<bool> {
     #[cfg(feature = "cuda")]
     {
         if matches!(device, Device::Cuda(_)) {
-            let headroom = peak_load_pool_bytes(content);
             let claimed = candle_nn::kv_cache::ensure_reservation(device, headroom)?;
             if claimed {
                 tracing::info!(
@@ -70,7 +76,7 @@ pub fn open_for_load(device: &Device, content: &gguf_file::Content) -> Result<bo
         }
     }
     #[cfg(not(feature = "cuda"))]
-    let _ = content;
+    let _ = headroom;
     let _ = device;
     Ok(false)
 }
@@ -188,10 +194,14 @@ pub fn reclaim_headroom(device: &Device) -> Result<usize> {
 /// Two-dimensional tensors only. Expert banks are 3-D and are repacked per-expert by the expert
 /// cache; norms are 1-D and are never repacked. The max over 2-D covers both the weights that
 /// repack and the embedding, which does not repack but is read to the device at the same size.
-pub fn peak_load_pool_bytes(content: &gguf_file::Content) -> usize {
-    let largest_source = content
-        .tensor_infos
-        .values()
+///
+/// Takes the tensors rather than the header so a load that substitutes some of them from
+/// another file bounds what it will actually read.
+pub fn peak_load_pool_bytes<'a>(
+    infos: impl IntoIterator<Item = &'a gguf_file::TensorInfo>,
+) -> usize {
+    let largest_source = infos
+        .into_iter()
         .filter_map(|info| match info.shape.dims() {
             [rows, cols] => {
                 let elems = rows * cols;

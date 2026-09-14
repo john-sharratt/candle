@@ -80,6 +80,30 @@
 .rail-item.on .ri-icon { background: var(--accent-soft); }
 .rail-item .ri-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* ── the NPC page's mobile tab strip ────────────────────────────────────────
+ *
+ * The character page keeps its tabs in the rail, which is always in view on a
+ * wide screen. On a phone the rail becomes a hidden drawer, so this strip
+ * carries the same tabs — layers included — in the page itself. Hidden on wide
+ * screens (the rail has them); a horizontal scroller at the narrow breakpoint
+ * that matches the shell's own 820, so it appears exactly when the rail leaves. */
+.npc-tabs { display: none; }
+@media (max-width: 819px) {
+  .npc-tabs {
+    display: flex; gap: 5px; overflow-x: auto; overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
+    margin: 0 calc(-1 * var(--gutter)) 14px; padding: 2px var(--gutter) 10px;
+    border-bottom: 1px solid var(--line);
+  }
+  .npc-tabs::-webkit-scrollbar { display: none; }
+  .npc-tab {
+    flex: 0 0 auto; padding: 7px 13px; border-radius: 8px; white-space: nowrap;
+    font-size: .82rem; font-weight: 500; text-decoration: none;
+    color: var(--ink-dim); background: var(--panel);
+  }
+  .npc-tab.on { background: var(--accent-soft); color: var(--ink); font-weight: 600; }
+}
+
 /* ── the scene ───────────────────────────────────────────────────────────────
  *
  * What a character does, read as the room it happens in. Lives inside a

@@ -33,11 +33,22 @@ fn merge(o: &model_overrides::ModelOverride, mut spec: ModelSpec) -> ModelSpec {
         // asking an operator for it would invite a wrong one — a donor from another model
         // would load and be subtly wrong. Nothing is fetched unless the replacement turns out
         // to need it, so this costs a preset that is never downloaded nothing at all.
-        spec.gate_donor = Some((
+        //
+        // **A preset that already names its own base keeps it.** The displaced preset may itself
+        // be a fine-tune whose gates are the defect being repaired — the hybrid's AntiLoop stores
+        // them at Q4_K — and "repairing" from it would read the same quantized gates back. The
+        // base it names is still the base of anything tuned from that model.
+        let displaced = (
             spec.model_repo.clone(),
             spec.model_rev.clone(),
             spec.model_filename.clone(),
-        ));
+        );
+        spec.gate_donor = spec.gate_donor.take().or(Some(displaced));
+        // **Borrowed tensors do not follow a change of checkpoint.** They were chosen against the
+        // preset's own file — a head that matches its shape, from a tune picked to go with it —
+        // and grafting them onto whatever an operator substitutes would run a model nobody chose.
+        // A filename-only override stays in the preset's repository and keeps them.
+        spec.tensor_overrides.clear();
         spec.model_repo = r.clone();
         // **The preset's commit does not survive a change of repo.** A SHA identifies a commit
         // in the repository that produced it and means nothing in another one — carrying it
@@ -144,6 +155,40 @@ mod tests {
         assert_eq!(s.max_seq_len, base().max_seq_len);
         // `loras` absent entirely — whatever the preset carries survives, which is nothing.
         assert_eq!(s.loras, base().loras);
+    }
+
+    /// **A preset with its own base keeps it, and its borrowed tensors stay with its repo.**
+    ///
+    /// The hybrid names the stock checkpoint as its donor because its own trunk quantized the
+    /// recurrent gates, so recording the displaced trunk as the donor would "repair" from the
+    /// defect. And its head was chosen for its trunk: a substituted repo drops it, while a
+    /// filename-only override — another quant of the same checkpoint — keeps it.
+    #[test]
+    fn an_override_keeps_a_presets_own_base_and_drops_its_borrowed_tensors() {
+        let preset = super::super::Model::Qwen36_35B_A3B_AntiLoop_StyleTune.preset_spec();
+        assert!(preset.gate_donor.is_some() && !preset.tensor_overrides.is_empty());
+
+        let o = ModelOverride {
+            repo: Some("Someone/Another-Finetune-GGUF".into()),
+            ..Default::default()
+        };
+        let s = merge(&o, preset.clone());
+        assert_eq!(
+            s.gate_donor, preset.gate_donor,
+            "the preset's own base survives"
+        );
+        assert!(
+            s.tensor_overrides.is_empty(),
+            "a new repo drops the borrowed head"
+        );
+
+        let o = ModelOverride {
+            filename: Some("Qwen3.6-35B-A3B-AntiLoop.Q4_K_S.gguf".into()),
+            ..Default::default()
+        };
+        let s = merge(&o, preset.clone());
+        assert_eq!(s.tensor_overrides, preset.tensor_overrides);
+        assert_eq!(s.gate_donor, preset.gate_donor);
     }
 
     /// A partial override leaves what it does not name.

@@ -64,10 +64,7 @@ mod persistence {
 
     /// Drain a submitted turn to completion, returning the joined response.
     async fn run_turn(session: &Arc<ZendSession>, conv_id: &str, prompt: &str) -> String {
-        let messages = vec![ChatMessage {
-            role: Role::User,
-            content: prompt.to_string(),
-        }];
+        let messages = vec![ChatMessage::new(Role::User, prompt)];
         let mut stream = session
             .submit(
                 messages,

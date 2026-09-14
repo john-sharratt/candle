@@ -30,7 +30,7 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use candle_conversation::guest::{GuestOutcome, GuestRequest, ProseRequest};
+use crate::prose;
 
 use super::consequence::{self, Consequence};
 use super::document;
@@ -541,10 +541,9 @@ pub async fn post_generate(
             "this daemon has no inference engine, so it cannot write a life",
         );
     };
-    // The ladder decodes on the prose guest, not on the resident model — but a
-    // guest is served *between the engine's waves*, so there still has to be an
-    // engine for it to be served between. Checked here, before a job is
-    // reserved, rather than discovered by every node of a phase in turn.
+    // The ladder decodes on the resident model, so there has to be one loaded.
+    // Checked here, before a job is reserved, rather than discovered by every
+    // node of a phase in turn.
     if rt.minds.read().unwrap().is_none() {
         return err(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -563,36 +562,34 @@ pub async fn post_generate(
     };
     phases.extend(implied);
 
-    // **The ladder runs on the prose guest.** Hermes-4 is the narrator for every
-    // rung, the same model `/narrate` uses for a single node — one voice for the
-    // whole life rather than the acting model for the ladder and a narrator for
-    // corrections afterwards.
+    // **The ladder is written through [`crate::prose`].** Every rung is a
+    // throwaway conversation on the resident model — the same path `/narrate`
+    // takes for a single node — so the whole life is written in one voice.
     //
-    // Built here because this is where both halves are in scope: the state the
-    // guest queue hangs off, and a runtime handle to submit from. A job owns a
-    // plain OS thread with no runtime under it, so the handle is captured now
-    // and the thread blocks on it — `Handle::block_on` off-runtime is exactly
-    // this case.
+    // A future per node, because a rung's fan-out awaits a whole wave of them
+    // concurrently: the engine co-batches whatever is submitted together, so a
+    // wave of thirty months is one load of the checkpoint and thirty decodes.
     let state = Arc::clone(&s);
-    let handle = tokio::runtime::Handle::current();
-    let narrate: Narrator = Arc::new(move |system: &str, user: &str| {
-        let request = GuestRequest::Prose(ProseRequest {
-            system: system.to_string(),
-            prompt: user.to_string(),
-            max_tokens: LADDER_MAX_TOKENS,
-            temperature: Some(LADDER_TEMPERATURE),
-            seed: None,
-            // Prose, not a decision — nothing to constrain it to.
-            choices: None,
-        });
-        match handle.block_on(crate::guest_routes::run_guest(&state, request)) {
-            Ok(GuestOutcome::Prose { text, .. }) => Ok(text),
-            Ok(other) => Err(format!("the prose request came back as {}", other.guest())),
-            Err(e) => Err(e.to_string()),
-        }
+    let narrate: Narrator = Arc::new(move |system: String, user: String| {
+        let state = Arc::clone(&state);
+        Box::pin(async move {
+            let request = prose::Request {
+                system,
+                prompt: user,
+                max_tokens: LADDER_MAX_TOKENS,
+                temperature: Some(LADDER_TEMPERATURE),
+                seed: None,
+                // Prose, not a decision — nothing to constrain it to.
+                choices: None,
+            };
+            prose::run(&state, request)
+                .await
+                .map(|a| a.text)
+                .map_err(|e| e.to_string())
+        })
     });
 
-    // Read once, here, where the registry is: the ladder runs on its own thread
+    // Read once, here, where the registry is: the ladder runs as its own task
     // and a personality is an authored document an operator can edit mid-run,
     // so the voice a phase writes against is the one it started with.
     let voice = voice_for(&s, &who).await;

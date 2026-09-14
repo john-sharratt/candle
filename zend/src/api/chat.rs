@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,14 +9,18 @@ use axum::{
         IntoResponse, Json, Response,
     },
 };
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 
-use candle_conversation::{OptionalState, SelectionState, NO_THINK_SELECTOR};
+use candle_conversation::{FinishReason, OptionalState, SelectionState, NO_THINK_SELECTOR};
 
+use super::chat_frames::{call_id, finish_reason, Framer, Framing};
+use crate::openai_tools::{self, wire_function};
+use crate::passthrough::PASSTHROUGH_MODEL;
+use crate::reasoning_split;
 use crate::session::{StreamItem, ZendSession};
 use crate::types::{
-    AssistantMessage, ChatCompletion, ChatCompletionChunk, ChatCompletionRequest, ChatMessage,
-    ChunkChoice, CompletionChoice, Delta, Role,
+    AssistantMessage, ChatCompletion, ChatCompletionRequest, CompletionChoice, RequestTools,
+    ResponseToolCall, Role, Usage,
 };
 
 /// The `optional_group` selector that gates the whole tool block in the dialogue
@@ -63,7 +67,16 @@ pub async fn completions(
     let lossless_kv = req.lossless_kv;
     // Composer "tools" dial — which slice of the catalog this conversation
     // projects. Absent → Comprehensive (full catalog).
-    let tools_mode = req.tools.unwrap_or_default();
+    let tools_mode = req
+        .tools
+        .as_ref()
+        .and_then(RequestTools::mode)
+        .unwrap_or_default();
+    // A client that runs its own tools sends their definitions instead.
+    let client_tools = match req.tools {
+        Some(RequestTools::Functions(tools)) => tools,
+        _ => Vec::new(),
+    };
     // Which identity this conversation speaks as. Absent → the conversation's
     // stored identity, else the `mind.yaml` default (resolved in the session).
     let identity = req.identity;
@@ -85,42 +98,48 @@ pub async fn completions(
     // The worked example follows the block it demonstrates.
     selection.set_optional(TOOL_EXAMPLE_SELECTOR, tools_present);
     let messages = req.messages;
-    if req.stream {
-        stream_sse(
-            session,
-            messages,
-            max_tokens,
-            conv_id,
-            force_hires,
-            assistant_prefill,
-            lossless_kv,
-            tools_mode,
-            identity,
-            model,
-            id,
-            created,
-            selection,
-        )
-        .await
+    // `passthrough` runs the client's own context as-is — see
+    // `crate::passthrough`; every other model name runs the daemon's projection.
+    // A passthrough client reads the reply's reasoning from `reasoning_content`
+    // (the daemon's own UI renders the `<think>` block from the text itself)
+    // and, when it sent tools — it runs them natively — the model's calls from
+    // `tool_calls`. A client that describes its tools in its own prompt sends
+    // none, and gets the reply as text to parse itself.
+    let passthrough = model == PASSTHROUGH_MODEL;
+    let framing = Framing {
+        split_reasoning: passthrough,
+        tools: (passthrough && !client_tools.is_empty())
+            .then(|| openai_tools::specs(&client_tools)),
+    };
+    let token_stream = if passthrough {
+        session
+            .submit_passthrough(messages, client_tools, max_tokens)
+            .await
     } else {
-        collect_completion(
-            session,
-            messages,
-            max_tokens,
-            conv_id,
-            force_hires,
-            assistant_prefill,
-            lossless_kv,
-            tools_mode,
-            identity,
-            model,
-            id,
-            created,
-            selection,
-        )
-        .await
+        session
+            .submit(
+                messages,
+                max_tokens,
+                conv_id,
+                force_hires,
+                assistant_prefill,
+                lossless_kv,
+                tools_mode,
+                identity,
+                selection,
+            )
+            .await
+    };
+    if req.stream {
+        let include_usage = req.stream_options.is_some_and(|o| o.include_usage);
+        stream_sse(token_stream, model, id, created, framing, include_usage)
+    } else {
+        collect_completion(token_stream, model, id, created, framing).await
     }
 }
+
+/// A turn's reply as the session streams it.
+type TokenStream = Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>>;
 
 /// Map the composer dials to the dialogue section-tree selection.  Only the
 /// dials the request actually carries are set; any omitted selector falls back
@@ -194,198 +213,78 @@ pub fn dial_selection(
 
 // ── Streaming path ────────────────────────────────────────────────────────────
 
-// The submit parameter list — see `ZendSession::submit`.
-#[allow(clippy::too_many_arguments)]
-async fn stream_sse(
-    session: Arc<ZendSession>,
-    messages: Vec<ChatMessage>,
-    max_tokens: Option<usize>,
-    conv_id: String,
-    force_hires: Option<String>,
-    assistant_prefill: Option<String>,
-    lossless_kv: bool,
-    tools_mode: crate::types::ToolMode,
-    identity: Option<String>,
+fn stream_sse(
+    token_stream: TokenStream,
     model: String,
     id: String,
     created: u64,
-    selection: SelectionState,
+    framing: Framing,
+    include_usage: bool,
 ) -> Response {
-    let token_stream = session
-        .submit(
-            messages,
-            max_tokens,
-            conv_id,
-            force_hires,
-            assistant_prefill,
-            lossless_kv,
-            tools_mode,
-            identity,
-            selection,
-        )
-        .await;
-
-    let id_c = id.clone();
-    let model_c = model.clone();
-
-    // Track when the first actual token (not a status event) has been sent.
-    let saw_token = Arc::new(AtomicBool::new(false));
-    let saw_token_c = Arc::clone(&saw_token);
-
-    // **Hold a leading empty think block off the wire.**
-    //
-    // The engine strips empty `<think></think>` from the text it STORES, but the
-    // stream is a separate assembly of raw token events and nothing filtered it,
-    // so a collapsed block went out verbatim and rendered as leaked markup. That
-    // is now the common case rather than a curiosity: the `off` effort dial
-    // closes the block on the token after `<think>`, so every such turn emits
-    // one, and thinking-span projection leaves older turns with no visible
-    // reasoning so the model collapses its own.
-    //
-    // `gate_leading_think` decides from the text so far, and the hold is bounded
-    // by CONTENT rather than by the closing marker — the first non-blank token
-    // inside the block opens the gate for good. A genuine reasoning turn is
-    // therefore never withheld waiting for its own `</think>`; at most a few
-    // whitespace tokens are ever buffered.
-    let mut held = String::new();
-    let mut gate_open = false;
-    let content_events = token_stream.filter_map(move |result| {
-        let out: Option<anyhow::Result<Event>> = match result {
-            Err(e) => Some(Err(e)),
+    // Turns each token into its frames — see `chat_frames`.
+    let framer = Arc::new(Framer::new(id, model, created, framing));
+    let tokens = Arc::clone(&framer);
+    let content_events = token_stream
+        .map(move |result| match result {
+            Err(e) => vec![Err(e)],
 
             Ok(StreamItem::Status(msg)) => {
                 let data = serde_json::json!({ "text": msg }).to_string();
-                Some(Ok(Event::default().event("status").data(data)))
+                vec![Ok(Event::default().event("status").data(data))]
             }
 
-            Ok(StreamItem::Projection(event)) => Some(
-                serde_json::to_string(&event)
-                    .map_err(|e| anyhow::anyhow!(e))
-                    .map(|data| Event::default().event("projection").data(data)),
-            ),
+            Ok(StreamItem::Projection(event)) => vec![serde_json::to_string(&event)
+                .map_err(|e| anyhow::anyhow!(e))
+                .map(|data| Event::default().event("projection").data(data))],
 
-            Ok(StreamItem::Tool(status)) => Some(
-                serde_json::to_string(&status)
-                    .map_err(|e| anyhow::anyhow!(e))
-                    .map(|data| Event::default().event("tool").data(data)),
-            ),
+            Ok(StreamItem::Tool(status)) => vec![serde_json::to_string(&status)
+                .map_err(|e| anyhow::anyhow!(e))
+                .map(|data| Event::default().event("tool").data(data))],
 
-            Ok(StreamItem::Token(text)) => {
-                // Once open, the gate never closes again for this turn — a
-                // `<think>` later in the answer body is ordinary content.
-                let emit = if gate_open {
-                    Some(text)
-                } else {
-                    held.push_str(&text);
-                    match crate::think_gate::gate_leading_think(&held) {
-                        crate::think_gate::ThinkGate::Hold => None,
-                        crate::think_gate::ThinkGate::Open(at) => {
-                            gate_open = true;
-                            // Everything from the resolve point, which is the
-                            // whole buffer when no block was skipped.
-                            Some(held[at..].to_string())
-                        }
-                    }
-                };
-                // Held, or nothing left after the skip. An empty delta would
-                // spend the `role` marker on a chunk carrying no text.
-                match emit {
-                    None => None,
-                    Some(t) if t.is_empty() => None,
-                    Some(t) => {
-                        let is_first = !saw_token_c.swap(true, Ordering::Relaxed);
-                        if is_first {
-                            tracing::debug!("streaming first token");
-                        }
-                        let chunk = ChatCompletionChunk {
-                            id: id_c.clone(),
-                            object: "chat.completion.chunk",
-                            created,
-                            model: model_c.clone(),
-                            choices: vec![ChunkChoice {
-                                index: 0,
-                                delta: Delta {
-                                    role: if is_first { Some("assistant") } else { None },
-                                    content: Some(t),
-                                },
-                                finish_reason: None,
-                            }],
-                        };
-                        Some(
-                            serde_json::to_string(&chunk)
-                                .map_err(|e| anyhow::anyhow!(e))
-                                .map(|data| Event::default().data(data)),
-                        )
-                    }
-                }
+            Ok(StreamItem::Token(text)) => tokens.token(text),
+
+            Ok(StreamItem::TurnEnd { usage, finish }) => {
+                tokens.turn_end(usage, finish);
+                Vec::new()
             }
-        };
-        std::future::ready(out)
-    });
+        })
+        .flat_map(futures::stream::iter);
 
-    let stop_chunk = ChatCompletionChunk {
-        id,
-        object: "chat.completion.chunk",
-        created,
-        model,
-        choices: vec![ChunkChoice {
-            index: 0,
-            delta: Delta {
-                role: None,
-                content: None,
-            },
-            finish_reason: Some("stop"),
-        }],
-    };
-    let stop_data = serde_json::to_string(&stop_chunk).unwrap_or_default();
-
-    let stop_event = futures::stream::once(futures::future::ready(Ok::<Event, anyhow::Error>(
-        Event::default().data(stop_data),
-    )));
-    let done_event = futures::stream::once(async {
+    // After the last token: whatever the framer still holds, the stop frame —
+    // whose `finish_reason` is known only now — and the `[DONE]` sentinel.
+    let tail = futures::stream::once(async move {
+        let mut events = framer.flush();
+        events.push(framer.stop());
+        // OpenAI's usage chunk comes after the stop frame, and only when the
+        // client asked — a client that did not may not expect a chunk with no
+        // choices.
+        if include_usage {
+            events.extend(framer.usage_chunk());
+        }
         tracing::debug!("stream complete");
-        Ok::<Event, anyhow::Error>(Event::default().data("[DONE]"))
-    });
+        events.push(Ok(Event::default().data("[DONE]")));
+        futures::stream::iter(events)
+    })
+    .flatten();
 
-    Sse::new(content_events.chain(stop_event).chain(done_event))
+    Sse::new(content_events.chain(tail))
         .keep_alive(KeepAlive::default())
         .into_response()
 }
 
 // ── Non-streaming path ────────────────────────────────────────────────────────
 
-// The submit parameter list — see `ZendSession::submit`.
-#[allow(clippy::too_many_arguments)]
 async fn collect_completion(
-    session: Arc<ZendSession>,
-    messages: Vec<ChatMessage>,
-    max_tokens: Option<usize>,
-    conv_id: String,
-    force_hires: Option<String>,
-    assistant_prefill: Option<String>,
-    lossless_kv: bool,
-    tools_mode: crate::types::ToolMode,
-    identity: Option<String>,
+    mut token_stream: TokenStream,
     model: String,
     id: String,
     created: u64,
-    selection: SelectionState,
+    framing: Framing,
 ) -> Response {
-    let mut token_stream = session
-        .submit(
-            messages,
-            max_tokens,
-            conv_id,
-            force_hires,
-            assistant_prefill,
-            lossless_kv,
-            tools_mode,
-            identity,
-            selection,
-        )
-        .await;
     let mut full = String::new();
     let mut tokens = 0usize;
+    let mut usage: Option<Usage> = None;
+    let mut finish = FinishReason::Stop;
     while let Some(result) = token_stream.next().await {
         match result {
             Ok(StreamItem::Token(chunk)) => {
@@ -395,10 +294,46 @@ async fn collect_completion(
             Ok(StreamItem::Status(_)) => {} // status events are display-only
             Ok(StreamItem::Projection(_)) => {} // timeline-only; not in the collected body
             Ok(StreamItem::Tool(_)) => {}   // tool lifecycle; display-only, not in the body
+            Ok(StreamItem::TurnEnd {
+                usage: turn,
+                finish: ended,
+            }) => {
+                usage = Some(usage.map_or(turn, |before| before.then(turn)));
+                finish = ended;
+            }
             Err(_) => {}
         }
     }
     tracing::debug!(tokens, "non-stream complete");
+    let (reasoning_content, answer) = if framing.split_reasoning {
+        let piece = reasoning_split::split(&full);
+        (
+            (!piece.reasoning.is_empty()).then_some(piece.reasoning),
+            piece.content,
+        )
+    } else {
+        (None, full)
+    };
+    let (prose, calls) = match &framing.tools {
+        Some(specs) => openai_tools::split_calls(&answer, specs),
+        None => (answer, Vec::new()),
+    };
+    let tool_calls: Option<Vec<ResponseToolCall>> = (!calls.is_empty()).then(|| {
+        calls
+            .iter()
+            .enumerate()
+            .map(|(i, call)| ResponseToolCall {
+                id: call_id(&id, i as u32),
+                kind: "function",
+                function: wire_function(call),
+            })
+            .collect()
+    });
+    let finish_reason = finish_reason(tool_calls.is_some(), finish);
+    let content = match tool_calls {
+        Some(_) => prose.trim().to_string(),
+        None => prose,
+    };
     Json(ChatCompletion {
         id,
         object: "chat.completion",
@@ -408,10 +343,13 @@ async fn collect_completion(
             index: 0,
             message: AssistantMessage {
                 role: "assistant",
-                content: full,
+                content,
+                reasoning_content,
+                tool_calls,
             },
-            finish_reason: "stop",
+            finish_reason,
         }],
+        usage: usage.unwrap_or_default(),
     })
     .into_response()
 }

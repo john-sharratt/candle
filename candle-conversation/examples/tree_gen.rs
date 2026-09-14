@@ -393,7 +393,7 @@ fn main() -> anyhow::Result<()> {
     // tasks run inside finish_turn() (blocking). The observer channel
     // forwards Token/Prefill/PrefillProgress events so we can print them
     // in real time from a dedicated thread.
-    let (task_obs_tx, task_obs_rx) = crossbeam::channel::unbounded::<TurnEvent>();
+    let (task_obs_tx, task_obs_rx) = flume::unbounded::<TurnEvent>();
     character_conv.set_task_observer(Some(task_obs_tx));
 
     let obs_decoder = decoder.clone();

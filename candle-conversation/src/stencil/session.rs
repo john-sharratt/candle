@@ -360,7 +360,10 @@ impl StencilSession {
                 // A stencil is a guarantee about what can be emitted; a token
                 // that ends the turn from inside one is a hole in it, and the
                 // free-decode span was the only place that hole existed.
-                if token == self.tree.eos() {
+                // Every end token, not only the canonical one: the decode loop
+                // seals on any of them, and one this missed ended a reply from
+                // inside an open think block mid-sentence.
+                if self.tree.is_end(token) {
                     // The span's terminator never fired, so whatever closing
                     // text it would have consumed was never written. The tree
                     // writes it now, then carries on — the element is closed

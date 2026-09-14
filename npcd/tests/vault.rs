@@ -38,6 +38,11 @@ const ROOMS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps");
 const WORLD: &str = "creators-vault";
 
 /// A daemon hosting the vault, held still.
+///
+/// Hosting needs a handle to spawn the metronome on, so every test here runs
+/// as `#[tokio::test]` — but on the current-thread flavour a body that never
+/// awaits never yields, so no spawned task runs and the tests keep driving
+/// every moment and tick by hand, deterministically.
 fn daemon() -> Arc<Runtime> {
     let rt = Runtime::new(Mind::new(None), &std::env::temp_dir());
     rt.host(WORLD, Path::new(ROOMS)).expect("the vault loads");
@@ -126,8 +131,8 @@ fn hand_out_phones(rt: &Arc<Runtime>, who: &[(&str, &str)]) {
 /// the other side of the world — so it arrives only if the sweep delivers it.
 /// Before that pass existed the sender was told "they will see it when they
 /// next look" and the recipient was never told there was anything to look at.
-#[test]
-fn a_message_reaches_the_other_characters_mind() {
+#[tokio::test]
+async fn a_message_reaches_the_other_characters_mind() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     // Deliberately in a *different room*: a phone is not a room, and this must
@@ -180,8 +185,8 @@ fn a_message_reaches_the_other_characters_mind() {
 /// The capability a character is supposed to have without asking. If this needs
 /// an act to be taken first, a cast spends its isolated hours not taking it,
 /// which is the state the channel exists to end.
-#[test]
-fn every_character_is_on_the_open_channel_without_asking_for_it() {
+#[tokio::test]
+async fn every_character_is_on_the_open_channel_without_asking_for_it() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     maker_at(&rt, 2, "m2", "vault-chronicle", "early-range");
@@ -209,8 +214,8 @@ fn every_character_is_on_the_open_channel_without_asking_for_it() {
 /// could not already see: the percept names who is in this room, and `move_to`
 /// offers rooms with no sign of who is in any of them. Saying where you are is
 /// what hands somebody else a room worth walking to.
-#[test]
-fn what_is_said_on_the_channel_reaches_every_other_mind() {
+#[tokio::test]
+async fn what_is_said_on_the_channel_reaches_every_other_mind() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     maker_at(&rt, 2, "m2", "vault-chronicle", "early-range");
@@ -259,8 +264,8 @@ fn what_is_said_on_the_channel_reaches_every_other_mind() {
 /// ordinary sweep, and can be answered with the ordinary `message` act. What
 /// makes it the Creator rather than a stranger is the name, which is how every
 /// addressee in this world is identified — see `engine::CREATOR_MARK`.
-#[test]
-fn the_creator_can_speak_on_the_channel_and_the_cast_knows_who_it_is() {
+#[tokio::test]
+async fn the_creator_can_speak_on_the_channel_and_the_cast_knows_who_it_is() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     maker_at(&rt, 2, "m2", "vault-chronicle", "early-range");
@@ -322,8 +327,8 @@ fn the_creator_can_speak_on_the_channel_and_the_cast_knows_who_it_is() {
 /// Bound to what this body has *not read*, the act runs out: the set empties,
 /// the empty-set rule takes `read` out of the grammar, and the loop stops being
 /// something a character can say rather than something it is asked not to do.
-#[test]
-fn reading_something_takes_it_out_of_your_grammar_until_it_changes() {
+#[tokio::test]
+async fn reading_something_takes_it_out_of_your_grammar_until_it_changes() {
     let rt = daemon();
     maker(&rt, 1, "m1", "green-room");
     let world = rt.hosted.get(WORLD).expect("hosted");
@@ -392,8 +397,8 @@ fn reading_something_takes_it_out_of_your_grammar_until_it_changes() {
 
 /// A character can leave something for whoever comes next, and it is there when
 /// they do — with their name on it.
-#[test]
-fn what_one_character_writes_another_reads_and_knows_who_wrote_it() {
+#[tokio::test]
+async fn what_one_character_writes_another_reads_and_knows_who_wrote_it() {
     let rt = daemon();
     maker(&rt, 1, "m1", "green-room");
     maker(&rt, 2, "m2", "green-room");
@@ -449,8 +454,8 @@ fn what_one_character_writes_another_reads_and_knows_who_wrote_it() {
 
 /// The world's own half: somebody outside can put something on a board, and the
 /// cast reads it as an ordinary notice.
-#[test]
-fn the_creator_can_leave_something_on_a_board_from_outside_the_world() {
+#[tokio::test]
+async fn the_creator_can_leave_something_on_a_board_from_outside_the_world() {
     let rt = daemon();
     maker(&rt, 1, "m1", "green-room");
     let world = rt.hosted.get(WORLD).expect("hosted");
@@ -489,8 +494,8 @@ fn the_creator_can_leave_something_on_a_board_from_outside_the_world() {
 
 /// A world that is not hosted has no channel, and saying so is better than
 /// silently succeeding into nothing.
-#[test]
-fn speaking_on_a_channel_of_a_world_that_is_not_hosted_is_refused() {
+#[tokio::test]
+async fn speaking_on_a_channel_of_a_world_that_is_not_hosted_is_refused() {
     let rt = daemon();
     assert!(rt
         .say_on_channel("no-such-world", "Somebody", "anything")
@@ -499,8 +504,8 @@ fn speaking_on_a_channel_of_a_world_that_is_not_hosted_is_refused() {
 }
 
 /// Handed over once, not on every moment afterwards.
-#[test]
-fn a_message_is_delivered_once_and_not_again_every_moment() {
+#[tokio::test]
+async fn a_message_is_delivered_once_and_not_again_every_moment() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     maker_at(&rt, 2, "m2", "vault-chronicle", "early-range");
@@ -530,8 +535,8 @@ fn a_message_is_delivered_once_and_not_again_every_moment() {
 }
 
 /// A character is not handed back what it said itself.
-#[test]
-fn your_own_message_does_not_come_back_to_you() {
+#[tokio::test]
+async fn your_own_message_does_not_come_back_to_you() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     maker_at(&rt, 2, "m2", "vault-chronicle", "early-range");
@@ -567,8 +572,8 @@ fn your_own_message_does_not_come_back_to_you() {
 /// characters use, the character is told by the ordinary sweep, and it answers
 /// with the ordinary `message` act — so the reply is the character speaking
 /// from inside the world rather than a chat window bolted to the side of it.
-#[test]
-fn a_person_can_message_a_character_and_it_is_told() {
+#[tokio::test]
+async fn a_person_can_message_a_character_and_it_is_told() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     hand_out_phones(&rt, &[("m1", "Maker-01")]);
@@ -595,8 +600,8 @@ fn a_person_can_message_a_character_and_it_is_told() {
 
 /// And the character can answer, on the same thread, which the person then
 /// reads back.
-#[test]
-fn a_character_answers_a_person_on_the_same_thread() {
+#[tokio::test]
+async fn a_character_answers_a_person_on_the_same_thread() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     hand_out_phones(&rt, &[("m1", "Maker-01")]);
@@ -626,8 +631,8 @@ fn a_character_answers_a_person_on_the_same_thread() {
 
 /// A person is written onto the roster, or the character is offered nobody to
 /// answer — the messaging arguments are bound to who a handset can reach.
-#[test]
-fn messaging_a_character_puts_the_person_within_its_reach() {
+#[tokio::test]
+async fn messaging_a_character_puts_the_person_within_its_reach() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     hand_out_phones(&rt, &[("m1", "Maker-01")]);
@@ -643,8 +648,8 @@ fn messaging_a_character_puts_the_person_within_its_reach() {
 
 /// A character with no handset cannot answer, and the caller is told so rather
 /// than left waiting for a reply that cannot come.
-#[test]
-fn a_character_with_no_handset_says_it_cannot_answer() {
+#[tokio::test]
+async fn a_character_with_no_handset_says_it_cannot_answer() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     let sent = rt.message_npc(1, "Wren S", "anything").expect("has a body");
@@ -652,8 +657,8 @@ fn a_character_with_no_handset_says_it_cannot_answer() {
 }
 
 /// A character with no body has nothing to be reached on.
-#[test]
-fn messaging_a_character_with_no_body_reaches_nothing() {
+#[tokio::test]
+async fn messaging_a_character_with_no_body_reaches_nothing() {
     let rt = daemon();
     assert!(rt.message_npc(404, "Wren S", "anything").is_none());
     assert!(rt.messages_with(404, "Wren S").is_none());
@@ -670,8 +675,8 @@ fn messaging_a_character_with_no_body_reaches_nothing() {
 /// no body is not merely unseen — those acts are *absent from the character's
 /// grammar*. It could hear you and had no way to answer you, and went on
 /// waiting for somebody to arrive while you were talking to it.
-#[test]
-fn a_visitor_enters_the_room_and_can_be_addressed() {
+#[tokio::test]
+async fn a_visitor_enters_the_room_and_can_be_addressed() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
 
@@ -697,6 +702,8 @@ fn a_visitor_enters_the_room_and_can_be_addressed() {
     // deliberately not here: it needs something to give as well, so it stays
     // absent for a character carrying nothing — which is the empty-set rule
     // working rather than this failing.
+    // `whisper` is not here either: one visitor is somebody to tell, not
+    // somebody to keep a thing from — see `Availability::AmongOthers`.
     for act in ["tell", "ask", "gesture"] {
         assert!(
             offered.iter().any(|t| t.name == act),
@@ -707,8 +714,8 @@ fn a_visitor_enters_the_room_and_can_be_addressed() {
 
 /// Leaving takes the body out again, and the room stops listing somebody who
 /// has gone.
-#[test]
-fn a_visitor_who_leaves_is_out_of_the_world() {
+#[tokio::test]
+async fn a_visitor_who_leaves_is_out_of_the_world() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     rt.enter_world_beside(1, "visitor:u_8812", "Johnathan");
@@ -725,8 +732,8 @@ fn a_visitor_who_leaves_is_out_of_the_world() {
 
 /// Opening the same conversation again does not leave two of somebody standing
 /// in one room.
-#[test]
-fn entering_twice_is_one_body() {
+#[tokio::test]
+async fn entering_twice_is_one_body() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     rt.enter_world_beside(1, "visitor:u_8812", "Johnathan");
@@ -744,8 +751,8 @@ fn entering_twice_is_one_body() {
 /// **A conversation does not end because the character walked off.** Asked to
 /// go somewhere it goes, and a visitor left behind would be talking to an empty
 /// room while the character it came for is two levels away.
-#[test]
-fn a_visitor_follows_the_character_it_came_to_see() {
+#[tokio::test]
+async fn a_visitor_follows_the_character_it_came_to_see() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     hand_out_phones(&rt, &[("m1", "Maker-01")]);
@@ -837,8 +844,8 @@ fn maker_at(rt: &Arc<Runtime>, npc_id: u64, body: &str, area: &str, node: &str) 
 /// If any part of this were a stub the assertion at the end would still pass
 /// against an in-memory fixture — so the assertion is deliberately the file,
 /// read back with `std::fs`.
-#[test]
-fn an_act_from_the_decode_loop_reaches_a_document_on_disk() {
+#[tokio::test]
+async fn an_act_from_the_decode_loop_reaches_a_document_on_disk() {
     let (rt, mind) = daemon_with_a_mind("chronicle");
     maker_at(&rt, 1, "m1", "vault-chronicle", "early-range");
 
@@ -879,8 +886,8 @@ fn an_act_from_the_decode_loop_reaches_a_document_on_disk() {
 
 /// The file acts, through the same door, including the read that a model would
 /// actually see.
-#[test]
-fn the_file_acts_reach_the_mind_through_the_runtime() {
+#[tokio::test]
+async fn the_file_acts_reach_the_mind_through_the_runtime() {
     let (rt, mind) = daemon_with_a_mind("files");
     maker_at(&rt, 1, "m1", "vault-chronicle", "early-range");
 
@@ -918,8 +925,8 @@ fn the_file_acts_reach_the_mind_through_the_runtime() {
 /// The craft library, edited at the station that carries it, with the comments
 /// still there afterwards — the splice is in the live path, not just the unit
 /// test.
-#[test]
-fn a_mood_edited_at_a_story_desk_keeps_its_comments() {
+#[tokio::test]
+async fn a_mood_edited_at_a_story_desk_keeps_its_comments() {
     let (rt, mind) = daemon_with_a_mind("mood");
     maker_at(&rt, 1, "m1", "vault-story", "first-room");
 
@@ -951,8 +958,8 @@ fn a_mood_edited_at_a_story_desk_keeps_its_comments() {
 
 /// **The guard is live too.** A path out of the mind is refused by the act, not
 /// by something a test set up.
-#[test]
-fn a_path_out_of_the_mind_is_refused_through_the_runtime() {
+#[tokio::test]
+async fn a_path_out_of_the_mind_is_refused_through_the_runtime() {
     let (rt, mind) = daemon_with_a_mind("escape");
     maker_at(&rt, 1, "m1", "vault-chronicle", "early-range");
 
@@ -976,8 +983,8 @@ fn a_path_out_of_the_mind_is_refused_through_the_runtime() {
 
 /// A world hosted by a daemon with no mind has nothing to edit, and says so
 /// rather than inventing somewhere.
-#[test]
-fn a_daemon_with_no_mind_refuses_the_editing_acts() {
+#[tokio::test]
+async fn a_daemon_with_no_mind_refuses_the_editing_acts() {
     let rt = daemon();
     maker_at(&rt, 1, "m1", "vault-chronicle", "early-range");
     let out = rt
@@ -993,8 +1000,8 @@ fn a_daemon_with_no_mind_refuses_the_editing_acts() {
 // The slice: one speaks, the other walks over
 // =========================================================================
 
-#[test]
-fn one_maker_calls_another_over_and_the_other_comes() {
+#[tokio::test]
+async fn one_maker_calls_another_over_and_the_other_comes() {
     // The whole assembly in one scene, and every step of it crosses a seam
     // that did not exist before: an act reaching a world, a world scoping who
     // perceives it, a salience deciding whose turn comes next, and a journey
@@ -1050,8 +1057,8 @@ fn one_maker_calls_another_over_and_the_other_comes() {
     assert!(heard.contains("redoubt"), "{heard}");
 }
 
-#[test]
-fn a_maker_reads_where_it_is_and_what_it_can_do_there() {
+#[tokio::test]
+async fn a_maker_reads_where_it_is_and_what_it_can_do_there() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     think(&rt, 1);
@@ -1062,8 +1069,8 @@ fn a_maker_reads_where_it_is_and_what_it_can_do_there() {
     assert!(read.contains("terminal"), "{read}");
 }
 
-#[test]
-fn what_a_maker_can_do_changes_as_it_walks() {
+#[tokio::test]
+async fn what_a_maker_can_do_changes_as_it_walks() {
     // The payoff of hanging tools on the room rather than on the character:
     // walking out takes them, and the change arrives in the same block as the
     // change of place, because they are one fact.
@@ -1091,8 +1098,8 @@ fn what_a_maker_can_do_changes_as_it_walks() {
     assert!(!situations[0].contains("Within reach"), "{situations:?}");
 }
 
-#[test]
-fn a_journey_across_the_building_is_three_moments_and_one_decision() {
+#[tokio::test]
+async fn a_journey_across_the_building_is_three_moments_and_one_decision() {
     // The character names a destination once. Getting there is the world's
     // business, and it is told when it arrives — not before.
     let rt = daemon();
@@ -1139,8 +1146,8 @@ fn context(rt: &Arc<Runtime>, npc_id: u64) -> String {
     reads(rt, npc_id)
 }
 
-#[test]
-fn a_character_created_into_a_world_starts_standing_somewhere_real() {
+#[tokio::test]
+async fn a_character_created_into_a_world_starts_standing_somewhere_real() {
     let rt = daemon();
     rt.scheduler.wake(1, 0, 0);
     assert!(rt
@@ -1153,8 +1160,8 @@ fn a_character_created_into_a_world_starts_standing_somewhere_real() {
     assert!(read.contains("command room"), "{read}");
 }
 
-#[test]
-fn a_character_with_nothing_asked_of_it_is_pointed_at_the_work() {
+#[tokio::test]
+async fn a_character_with_nothing_asked_of_it_is_pointed_at_the_work() {
     // The idle turn is not an empty one. This is what keeps a long run moving
     // when no mission has been given, and it is what a Maker does all day.
     //
@@ -1185,8 +1192,8 @@ fn a_character_with_nothing_asked_of_it_is_pointed_at_the_work() {
     );
 }
 
-#[test]
-fn the_standing_instruction_is_restated_and_never_accumulates() {
+#[tokio::test]
+async fn the_standing_instruction_is_restated_and_never_accumulates() {
     // Restated because a long run loses its grip on the objective before it
     // loses anything else; superseding because two of them is a character
     // working to a task it has been taken off.
@@ -1217,8 +1224,8 @@ fn the_standing_instruction_is_restated_and_never_accumulates() {
     assert_eq!(held, 1, "the character is holding {held} tasks");
 }
 
-#[test]
-fn a_maker_told_to_explore_can_reach_everywhere_it_might_go() {
+#[tokio::test]
+async fn a_maker_told_to_explore_can_reach_everywhere_it_might_go() {
     // The instruction says to go somewhere it has not been. Every room in the
     // building has to actually be namable and reachable from where a character
     // starts, or the instruction is one it cannot follow.
@@ -1262,8 +1269,8 @@ fn a_maker_told_to_explore_can_reach_everywhere_it_might_go() {
     assert_eq!(reached, rooms.len());
 }
 
-#[test]
-fn two_makers_exploring_the_same_building_find_each_other() {
+#[tokio::test]
+async fn two_makers_exploring_the_same_building_find_each_other() {
     // What the instruction is for. Both are told to look around and talk to
     // people; the building is what makes that possible, and the test is that
     // one of them ends up somewhere it can see or hear the other.
@@ -1290,8 +1297,8 @@ fn two_makers_exploring_the_same_building_find_each_other() {
 // What the assembly refuses
 // =========================================================================
 
-#[test]
-fn a_maker_cannot_act_on_a_world_it_has_no_body_in() {
+#[tokio::test]
+async fn a_maker_cannot_act_on_a_world_it_has_no_body_in() {
     let rt = daemon();
     rt.scheduler.wake(9, 0, 0);
     assert_eq!(
@@ -1300,8 +1307,8 @@ fn a_maker_cannot_act_on_a_world_it_has_no_body_in() {
     );
 }
 
-#[test]
-fn an_act_the_world_refuses_is_read_as_refused() {
+#[tokio::test]
+async fn an_act_the_world_refuses_is_read_as_refused() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     let out = rt.act_on_world(
@@ -1315,8 +1322,8 @@ fn an_act_the_world_refuses_is_read_as_refused() {
     assert_eq!(standing(&rt, "m1"), at("band-one"), "it went anyway");
 }
 
-#[test]
-fn a_character_that_gets_a_body_never_goes_as_quiet_as_one_without() {
+#[tokio::test]
+async fn a_character_that_gets_a_body_never_goes_as_quiet_as_one_without() {
     let rt = daemon();
     rt.scheduler.wake(9, 0, 0);
     maker(&rt, 1, "m1", "band-one");
@@ -1333,8 +1340,8 @@ fn a_character_that_gets_a_body_never_goes_as_quiet_as_one_without() {
     );
 }
 
-#[test]
-fn taking_the_world_away_takes_every_body_with_it() {
+#[tokio::test]
+async fn taking_the_world_away_takes_every_body_with_it() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     maker(&rt, 2, "m2", "green-room");
@@ -1353,8 +1360,8 @@ fn taking_the_world_away_takes_every_body_with_it() {
 // A crowd
 // =========================================================================
 
-#[test]
-fn sixteen_makers_share_one_building_and_only_the_room_hears() {
+#[tokio::test]
+async fn sixteen_makers_share_one_building_and_only_the_room_hears() {
     let rt = daemon();
     let rooms = ["band-one", "band-two", "green-room", "watch"];
     for i in 1..=16u64 {
@@ -1394,8 +1401,8 @@ fn sixteen_makers_share_one_building_and_only_the_room_hears() {
     }
 }
 
-#[test]
-fn a_quiet_building_costs_nothing_to_run() {
+#[tokio::test]
+async fn a_quiet_building_costs_nothing_to_run() {
     // Most moments are quiet, and a quiet moment must deliver nothing at all —
     // this is what makes a cast affordable, and it is invisible when it breaks
     // because everything still works, only more expensively every tick.
@@ -1413,8 +1420,8 @@ fn a_quiet_building_costs_nothing_to_run() {
     }
 }
 
-#[test]
-fn nothing_a_maker_reads_carries_the_shape_of_the_machinery() {
+#[tokio::test]
+async fn nothing_a_maker_reads_carries_the_shape_of_the_machinery() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     maker(&rt, 2, "m2", "band-one");

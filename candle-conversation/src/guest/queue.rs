@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crossbeam::channel::{bounded, Receiver, Sender};
+use flume::{bounded, Receiver, Sender};
 
 use super::progress::{GuestEvent, GuestSink};
 use super::work::{Guest, GuestError, GuestOutcome, GuestRequest};
@@ -53,11 +53,14 @@ impl Pending {
     /// once-ness moved to [`super::drain`], which tracks what it has answered
     /// and reports a job the guest never answered for.
     ///
-    /// A second send is harmless in itself — the receiver reads the first and
-    /// the channel drops the rest — so this is a weaker guarantee, not an unsafe
-    /// one.
+    /// `try_send`, never `send`: the reply channel is `bounded(1)`, so a
+    /// blocking send of a second answer to a caller that has not yet read the
+    /// first would park the thread making it — and this is called from the
+    /// scheduler's drain, where a parked thread is the whole engine stopped.
+    /// A second answer is dropped instead, which makes the weaker once-ness
+    /// guarantee above safe rather than merely likely.
     pub fn answer(&self, outcome: Result<GuestOutcome, GuestError>) {
-        let _ = self.reply.send(outcome);
+        let _ = self.reply.try_send(outcome);
     }
 
     /// Tell a watching caller what is happening. Nothing when none is.
@@ -92,6 +95,15 @@ impl GuestReceipt {
     /// layer, where cancelling is free.
     pub fn wait(self) -> Result<GuestOutcome, GuestError> {
         self.rx.recv().unwrap_or(Err(GuestError::Abandoned))
+    }
+
+    /// Await the job without holding a thread — [`Self::wait`]'s async
+    /// counterpart, with the same deliberately unbounded wait.
+    pub async fn wait_async(self) -> Result<GuestOutcome, GuestError> {
+        self.rx
+            .recv_async()
+            .await
+            .unwrap_or(Err(GuestError::Abandoned))
     }
 
     /// The answer if it is ready, without blocking.
@@ -235,7 +247,8 @@ impl GuestQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guest::work::{GuestImage, ImageLora, ImageRequest, ProseRequest};
+    use crate::guest::work::{GuestImage, ImageLora, ImageRequest, MatteRequest};
+    use futures::executor::block_on;
 
     fn image() -> GuestRequest {
         GuestRequest::Image(ImageRequest {
@@ -250,14 +263,11 @@ mod tests {
         })
     }
 
-    fn prose() -> GuestRequest {
-        GuestRequest::Prose(ProseRequest {
-            system: String::new(),
-            prompt: "the yard".into(),
-            max_tokens: 32,
-            temperature: None,
-            seed: None,
-            choices: None,
+    fn matte() -> GuestRequest {
+        GuestRequest::Matte(MatteRequest {
+            pixels: vec![0; 4 * 4 * 3],
+            width: 4,
+            height: 4,
         })
     }
 
@@ -268,6 +278,26 @@ mod tests {
             png: vec![1, 2, 3],
             seed: 7,
         })
+    }
+
+    /// `wait_async` is `wait` without the parked thread: the same answer
+    /// arrives on the same one-shot, and a queue that closes under a waiting
+    /// caller still answers `Abandoned` rather than hanging.
+    #[test]
+    fn a_receipt_can_be_awaited_instead_of_waited_on() {
+        let q = GuestQueue::new();
+        let r = q.submit(image()).unwrap();
+        q.take(Guest::Image)
+            .into_iter()
+            .next()
+            .unwrap()
+            .answer(Ok(an_image()));
+        let outcome = block_on(r.wait_async()).unwrap();
+        assert_eq!(outcome.guest(), Guest::Image);
+
+        let r = q.submit(image()).unwrap();
+        q.close();
+        assert_eq!(block_on(r.wait_async()), Err(GuestError::Abandoned));
     }
 
     #[test]
@@ -295,7 +325,7 @@ mod tests {
     fn a_drain_takes_one_guests_backlog_and_leaves_the_rest() {
         let q = GuestQueue::new();
         q.submit(image()).unwrap();
-        q.submit(prose()).unwrap();
+        q.submit(matte()).unwrap();
         q.submit(image()).unwrap();
         assert_eq!(q.depth(), 3);
 
@@ -307,7 +337,7 @@ mod tests {
             "a guest's own jobs must stay in submission order"
         );
         assert_eq!(q.depth(), 1, "the other guest's job was taken too");
-        assert_eq!(q.next_guest(), Some(Guest::Prose));
+        assert_eq!(q.next_guest(), Some(Guest::Matte));
     }
 
     /// Oldest-first across guests, so a steady stream of one kind cannot leave
@@ -315,11 +345,11 @@ mod tests {
     #[test]
     fn the_longest_waiting_guest_is_loaded_next() {
         let q = GuestQueue::new();
-        q.submit(prose()).unwrap();
+        q.submit(matte()).unwrap();
         q.submit(image()).unwrap();
-        assert_eq!(q.next_guest(), Some(Guest::Prose));
+        assert_eq!(q.next_guest(), Some(Guest::Matte));
 
-        q.take(Guest::Prose);
+        q.take(Guest::Matte);
         assert_eq!(q.next_guest(), Some(Guest::Image));
         q.take(Guest::Image);
         assert_eq!(q.next_guest(), None);
@@ -353,7 +383,7 @@ mod tests {
     fn shutdown_answers_every_waiting_caller() {
         let q = GuestQueue::new();
         let a = q.submit(image()).unwrap();
-        let b = q.submit(prose()).unwrap();
+        let b = q.submit(matte()).unwrap();
         q.close();
 
         assert_eq!(a.wait(), Err(GuestError::Abandoned));
@@ -381,7 +411,7 @@ mod tests {
     fn submission_order_is_a_total_order_across_guests() {
         let q = GuestQueue::new();
         let a = q.submit(image()).unwrap();
-        let b = q.submit(prose()).unwrap();
+        let b = q.submit(matte()).unwrap();
         let c = q.submit(image()).unwrap();
         assert_eq!((a.seq, b.seq, c.seq), (0, 1, 2));
     }

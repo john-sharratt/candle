@@ -15,7 +15,14 @@ use super::vocab::TokenId;
 /// Maps a trigger token to the tree it enters.
 #[derive(Debug, Default, Clone)]
 pub struct TriggerRegistry {
-    by_token: HashMap<TokenId, Arc<StencilTree>>,
+    by_token: HashMap<TokenId, Binding>,
+}
+
+/// A trigger's tree, and whether entering it spends the trigger for the turn.
+#[derive(Debug, Clone)]
+struct Binding {
+    tree: Arc<StencilTree>,
+    once: bool,
 }
 
 impl TriggerRegistry {
@@ -28,7 +35,34 @@ impl TriggerRegistry {
     /// Register `tree` to start when `token` is emitted in free decode.
     /// Replaces any tree already bound to `token` (last write wins).
     pub fn register(&mut self, token: TokenId, tree: Arc<StencilTree>) {
-        self.by_token.insert(token, tree);
+        self.by_token.insert(token, Binding { tree, once: false });
+    }
+
+    /// [`Self::with_trigger`] for a trigger that fires at most once per turn:
+    /// once its tree has been entered, the token is ordinary text for the rest
+    /// of the turn — see [`Self::after_firing`].
+    ///
+    /// The thinking block is the case. It opens a turn; a `<think>` the model
+    /// writes later is text — in a reply about think blocks, a quoted tag — and
+    /// steering it opened a fresh block at every mention. Measured on a GUI turn
+    /// whose answer quoted `<think></think>`: each quote became an injected
+    /// empty block, and the model rewrote its sentence around it about twenty
+    /// times in one 2383-token reply.
+    #[must_use]
+    pub fn with_once_trigger(&self, token: TokenId, tree: Arc<StencilTree>) -> Self {
+        let mut by_token = self.by_token.clone();
+        by_token.insert(token, Binding { tree, once: true });
+        TriggerRegistry { by_token }
+    }
+
+    /// The registry for the rest of the turn once `token` has fired: without
+    /// `token` when it fires once, `None` when firing it changes nothing.
+    #[must_use]
+    pub fn after_firing(&self, token: TokenId) -> Option<Self> {
+        self.by_token
+            .get(&token)
+            .filter(|b| b.once)
+            .map(|_| self.without_trigger(token))
     }
 
     /// Return a copy of this registry with `token` bound to `tree`, replacing any
@@ -43,7 +77,7 @@ impl TriggerRegistry {
     #[must_use]
     pub fn with_trigger(&self, token: TokenId, tree: Arc<StencilTree>) -> Self {
         let mut by_token = self.by_token.clone();
-        by_token.insert(token, tree);
+        by_token.insert(token, Binding { tree, once: false });
         TriggerRegistry { by_token }
     }
 
@@ -66,7 +100,7 @@ impl TriggerRegistry {
     pub fn on_token(&self, token: TokenId) -> Option<StencilSession> {
         self.by_token
             .get(&token)
-            .map(|t| StencilSession::new(Arc::clone(t)))
+            .map(|b| StencilSession::new(Arc::clone(&b.tree)))
     }
 
     /// If `token` is a trigger, return a fresh [`StencilDriver`] walking the
@@ -75,7 +109,7 @@ impl TriggerRegistry {
     pub fn driver_for(&self, token: TokenId) -> Option<StencilDriver> {
         self.by_token
             .get(&token)
-            .map(|t| StencilDriver::new(Arc::clone(t)))
+            .map(|b| StencilDriver::new(Arc::clone(&b.tree)))
     }
 }
 
@@ -128,5 +162,35 @@ mod tests {
         let c = b.without_trigger(151667);
         assert!(c.on_token(151667).is_none());
         assert!(c.on_token(1000).is_some());
+    }
+
+    /// A once-trigger (the think block) is spent by firing; a plain one (the
+    /// tool call) stays armed for every call the turn makes.
+    #[test]
+    fn a_once_trigger_is_spent_by_firing_and_the_rest_stay_armed() {
+        const TOOL_CALL: TokenId = 1000;
+        const THINK: TokenId = 151667;
+        let turn = TriggerRegistry::new()
+            .with_trigger(TOOL_CALL, tiny_tree())
+            .with_once_trigger(THINK, tiny_tree());
+        assert!(turn.driver_for(THINK).is_some(), "armed until it fires");
+
+        let rest = turn
+            .after_firing(THINK)
+            .expect("firing a once-trigger spends it");
+        assert!(
+            rest.driver_for(THINK).is_none(),
+            "text for the rest of the turn"
+        );
+        assert!(rest.driver_for(TOOL_CALL).is_some(), "the call stays armed");
+
+        assert!(
+            rest.after_firing(TOOL_CALL).is_none(),
+            "firing a plain trigger changes nothing"
+        );
+        assert!(
+            turn.after_firing(999).is_none(),
+            "an unbound token changes nothing"
+        );
     }
 }

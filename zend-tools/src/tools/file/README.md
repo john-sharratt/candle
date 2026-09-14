@@ -18,7 +18,7 @@ which is what most unit tests use.
 | File | Tool | Description |
 |------|------|-------------|
 | `write.rs` | `write` | Create or overwrite a file; enforces 10 MiB cap |
-| `read.rs` | `file_read` | Return a line range as a numbered, fenced excerpt |
+| `read.rs` | `file_read` | Return a line range as a numbered, fenced excerpt; `path`, `start_line` and `end_line` are all required |
 | `edit.rs` | `file_edit` | Unique-substring replacement |
 | `list.rs` | `file_list` | Paged union listing of project + session files, optionally filtered by path prefix |
 | `delete.rs` | `file_delete` | Drop a session file or whiteout a project one; returns `deleted` flag |
@@ -48,6 +48,15 @@ example depends on.
 
 Project files above 4 MiB, or whose bytes are not valid UTF-8, list with their
 true size but fail to read with `unreadable`.
+
+## `file_read` line range
+
+`start_line` (1-based) and `end_line` (inclusive) are required on every call; a
+call missing either fails with `invalid_arguments`. `start_line` is clamped into
+the file and `end_line` into `[start_line, total]`, and at most 200 lines come
+back — a wider range stops at `start_line + 199`. The header reads
+`(lines a-b of N)` when the excerpt stops before the end of the file, which is
+the signal to continue from `b + 1`, and `(lines a-b)` otherwise.
 
 ## `file_edit` uniqueness requirement
 
@@ -82,3 +91,4 @@ retained — only a write or a successful edit consumes budget.
 | `ambiguous` | `old_str` appears more than once (`edit`) |
 | `no_files_found` | All requested paths missing (`present`) |
 | `unreadable` | Project file above the read limit or not UTF-8 text |
+| `invalid_arguments` | A required argument is missing — e.g. `file_read` without `start_line` or `end_line` |

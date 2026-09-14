@@ -11,7 +11,7 @@
 use candle_conversation::{
     models::{Model, ModelBuilder},
     ConversationEngine, ConversationError, ConversationNode, SamplingConfig, SequenceConfig,
-    TurnEvent, TurnType,
+    TurnEvent, TurnOptions, TurnType,
 };
 
 /// Model used for all integration tests — change this one line to switch.
@@ -111,6 +111,62 @@ fn test_single_turn_blocking() {
 
     // Should now have system + user + assistant = 3 turns.
     assert_eq!(conv.turn_count(), 3);
+    conv.close().expect("close failed");
+}
+
+/// The async cancellation contract, end to end (`docs/async_wave_submission.md`
+/// §3.2/§5): dropping a `send_turn_async` future mid-decode stops the decode —
+/// the future owns the turn's handle, and the scheduler finishes the sequence
+/// on the closed event channel — AND leaves the sequence usable: the in-flight
+/// guard clears on drop, so the next turn proceeds instead of being refused
+/// with `TurnInFlight` forever.
+#[test]
+#[ignore]
+fn test_dropping_an_async_turn_cancels_and_leaves_the_conversation_usable() {
+    use futures::task::noop_waker;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    let eng = engine();
+    let mut conv = eng
+        .new_conversation(&system_prompt(), chatml_config())
+        .expect("new_conversation failed");
+
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    {
+        // A turn long enough that it cannot finish before the cancel: the
+        // first poll runs the submit and parks on the event channel.
+        let mut fut = pin!(conv.send_turn_with_options_async(
+            "Count from 1 to 500, one number per line.",
+            TurnOptions {
+                max_tokens: Some(512),
+                ..Default::default()
+            },
+        ));
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Pending => {}
+            Poll::Ready(_) => panic!("the turn settled before it was even decoding"),
+        }
+        // Let the decode genuinely start before abandoning it.
+        std::thread::sleep(Duration::from_millis(1500));
+        // The future (and the handle it owns) drops here — the cancellation.
+    }
+
+    assert!(
+        !conv.is_in_flight(),
+        "a cancelled turn left the in-flight guard latched — every later turn \
+         would be refused with TurnInFlight"
+    );
+
+    // The scheduler winds the cancelled turn down on its own; the next turn
+    // queues behind that and must complete normally.
+    let response = conv
+        .send_turn("Reply with the word ok.")
+        .expect("a cancelled turn must leave the conversation usable");
+    assert!(!response.text.is_empty());
     conv.close().expect("close failed");
 }
 
@@ -1195,7 +1251,7 @@ fn test_fork_close_does_not_affect_base() {
     // Create and destroy 3 forks in sequence.
     for i in 0..3 {
         let mut fork = base.fork().expect("fork failed");
-        fork.insert_turn(&format!("Round {}.", i), &format!("Noted round {}.", i))
+        fork.insert_turn(format!("Round {}.", i), &format!("Noted round {}.", i))
             .expect("insert_turn failed");
         let resp = fork.send_turn("Which round?").expect("send failed");
         eprintln!("Fork {}: {}", i, resp.text);

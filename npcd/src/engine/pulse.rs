@@ -654,6 +654,7 @@ fn describe_catalog(part_names: &PartNames) -> Value {
                     // is not a fact about the channel.
                     Availability::Always
                     | Availability::Nearby
+                    | Availability::AmongOthers
                     | Availability::Embodied
                     | Availability::AwayFromHome => true,
                     Availability::PhysicalOnly => **m == Mode::Physical,
@@ -703,6 +704,7 @@ fn describe_catalog(part_names: &PartNames) -> Value {
                 "needs": match t.availability {
                     Availability::Always => Value::Null,
                     Availability::Nearby => json!("somebody else here"),
+                    Availability::AmongOthers => json!("two or more others here"),
                     Availability::Embodied => json!("a body"),
                     Availability::AwayFromHome => json!("being somewhere that is not home"),
                     Availability::PhysicalOnly => json!("being present"),
@@ -857,11 +859,15 @@ mod tests {
                 .clone()
         };
 
-        // Speech reaches whoever is in the room, so an empty room is the one
-        // place it does nothing — the same condition `tell` has always carried,
-        // and it now carries it too.
-        assert_eq!(find("say")["needs"], "somebody else here");
+        // Speech aimed at somebody needs somebody here to aim it at. A shout
+        // does not: it is for whoever is within earshot, including nobody.
         assert_eq!(find("tell")["needs"], "somebody else here");
+        // And a whisper needs somebody besides its listener to keep it from.
+        assert_eq!(find("whisper")["needs"], "two or more others here");
+        assert!(
+            find("shout")["needs"].is_null(),
+            "a shout needs nobody to be there"
+        );
         assert_eq!(find("gesture")["needs"], "somebody else here");
         assert!(
             find("reflect")["needs"].is_null(),

@@ -586,7 +586,7 @@ impl PriorBelief {
     fn collection(
         &self,
         name: &str,
-        sections: &[SectionSchema],
+        sections: &[&SectionSchema],
     ) -> (Vec<f32>, Vec<bool>, Vec<bool>) {
         let map = self.beliefs.get(&GroupKey::Collection(name.to_string()));
         let mut scores = vec![0.0f32; sections.len()];
@@ -1109,13 +1109,16 @@ impl Projection {
 /// is **for**. Masking semantics flow from this target.
 ///
 /// ```text
-///   layers  < target.layer        → fully visible
+///   rank    < target rank         → fully visible
 ///   layer  == target.layer        → only target.group visible (siblings hidden)
 ///   group  == target.group        → only target.timeline visible
 ///                                   (Phase 3 of the substrate refactor — see
 ///                                    [`crate::projection::resolver`])
-///   layers  > target.layer        → entirely hidden
+///   rank   >= target rank         → entirely hidden
 /// ```
+///
+/// A layer's rank is its declaration index unless it declares one — see
+/// [`LayerSchema::rank`].
 #[derive(Debug, Clone, Copy)]
 pub struct ProjectionTarget {
     pub layer: LayerId,
@@ -1181,30 +1184,29 @@ pub fn run_with_sink<R: ContentResolver>(
 ) -> Projection {
     let mut selection_scores = super::SelectionScores::default();
     // ── Step 1: Mask ─────────────────────────────────────────────────────────
-    let target_layer_idx = schema
+    // The stack is by rank, not by declaration: a layer appended to a live
+    // schema keeps every existing id where it was and still sits wherever its
+    // rank puts it. See `LayerSchema::rank`.
+    let target_rank = schema
         .layers
         .iter()
-        .position(|l| l.id == target.layer)
-        .unwrap_or(0);
+        .find(|l| l.id == target.layer)
+        .map(|l| l.rank)
+        .unwrap_or(i32::MIN);
 
-    let visible_layers: Vec<&LayerSchema> = schema
+    let mut visible_layers: Vec<&LayerSchema> = schema
         .layers
         .iter()
-        .enumerate()
-        .filter_map(|(li, layer)| {
-            // All groups in lower layers are visible; on the target
-            // layer, groups are filtered individually further below.
-            // NOTE: this stays a contiguous prefix (visible index == schema
-            // index) so `li == target_layer_idx` below is correct — the
-            // diagnostic kill switch is applied INSIDE the loop, not here, to
-            // preserve that correspondence.
-            if li <= target_layer_idx {
-                Some(layer)
-            } else {
-                None
-            }
-        })
+        // All groups in lower-ranked layers are visible; on the target layer,
+        // groups are filtered individually further below. The diagnostic kill
+        // switch is applied INSIDE the loop, not here, so the target is always
+        // in this list.
+        .filter(|layer| layer.id == target.layer || layer.rank < target_rank)
         .collect();
+    // Bottom of the stack first, so the layers are walked — and the target
+    // reached — in the order the stack describes, whatever order they were
+    // declared in. Stable, so equal ranks keep declaration order.
+    visible_layers.sort_by_key(|layer| layer.rank);
 
     // ── Step 2–4: Score, threshold-gate, unbounded selection ─────────────────
     struct GroupState<'a> {
@@ -1236,7 +1238,7 @@ pub fn run_with_sink<R: ContentResolver>(
     let any_layer_disabled = super::layer_toggle::any_layer_disabled();
 
     for (li, layer) in visible_layers.iter().enumerate() {
-        let layer_is_target = li == target_layer_idx;
+        let layer_is_target = layer.id == target.layer;
         // OUT OF SERVICE for the whole process (`--disable-layer`, applied via
         // `Builder::set_layer_gathered`): the layer contributes nothing to the
         // assembly. Its belief groups are already excluded at scoring time, but a
@@ -1280,6 +1282,27 @@ pub fn run_with_sink<R: ContentResolver>(
             // overrides this list wholesale; on the belief and rule-based paths,
             // summaries compete on score and the descendant-dedup below keeps the
             // SPECIFIC over the coarse.
+            // A tagged group admits only the turns carrying one of its tags: one
+            // group holding every owner's conversations, each reader scoped to
+            // its own. An untagged group admits everything, as it always has.
+            //
+            // **Never the target's own group.** That is already pinned to the
+            // conversation's own timeline, so scoping it can only take turns
+            // away — and the first one it takes is the turn being written, which
+            // carries no tags until it seals. A prefill whose own turn is
+            // scoped out of its own projection never finishes.
+            //
+            // Scoped BEFORE the exchange closure below, so the closure only ever
+            // runs over turns this reader may see. An exchange lives on one
+            // timeline, and a timeline in a tagged group is one owner's, so
+            // closing a scoped turn's exchange cannot pull in another owner's.
+            let scoped = !group.policy.tags.is_empty() && group.id != target.group;
+            let in_scope: Vec<TurnKey> = resolver
+                .group_turns(group.id)
+                .into_iter()
+                .filter(|key| !scoped || resolver.turn_carries(*key, &group.policy.tags))
+                .collect();
+
             // A candidate is an EXCHANGE, not a turn. A tool round-trip is
             // recorded as coupled turns (`Sequence::couple_turn`) and is one
             // indivisible projection unit: the rules below rank whole runs and
@@ -1294,7 +1317,7 @@ pub fn run_with_sink<R: ContentResolver>(
             // what the scan decided, instead of re-splitting it into halves.
             let mut members: HashMap<TurnKey, Vec<TurnKey>> = HashMap::new();
             let all_turns: Vec<(TurnKey, f32)> =
-                exchange_candidates(resolver, &resolver.group_turns(group.id), &mut members);
+                exchange_candidates(resolver, &in_scope, &mut members);
 
             // Score-density override: when this is the *target* group
             // and a summary tree exists for the target timeline, swap
@@ -2399,13 +2422,21 @@ fn select_collection_sections<R: ContentResolver>(
             // hysteresis) decides the surviving set from the per-section scores,
             // seeded from the prior projection's belief so decay/reinforcement
             // carries across a turn. Each member's belief is recorded on `scores`.
-            let fresh: Vec<f32> = coll
+            // Mandatory members are emitted on every projection and sit OUTSIDE
+            // the belief budget: the policy picks its top-k from the other
+            // members only, so a mandatory `file_read` adds to the selection
+            // rather than taking one of its slots.
+            let candidates: Vec<&SectionSchema> = coll
                 .sections
+                .iter()
+                .filter(|s| !coll.mandatory.contains(&s.id))
+                .collect();
+            let fresh: Vec<f32> = candidates
                 .iter()
                 .map(|s| resolver.section_score(s.id))
                 .collect();
             let (prior_scores, prior_selected, prior_qualified) =
-                prior.collection(&coll.name, &coll.sections);
+                prior.collection(&coll.name, &candidates);
             // Early-decode grace: within the opening window the selection band is
             // lowered and carried picks are floored (see `PolicyConfig::windowed`),
             // so the submit guess and a still-accruing correct tool stay in scope.
@@ -2428,8 +2459,7 @@ fn select_collection_sections<R: ContentResolver>(
                 floor,
             );
             if tracing::enabled!(tracing::Level::TRACE) {
-                let scores_str = coll
-                    .sections
+                let scores_str = candidates
                     .iter()
                     .zip(&beliefs)
                     .map(|(s, b)| {
@@ -2444,10 +2474,25 @@ fn select_collection_sections<R: ContentResolver>(
                     .join(", ");
                 tracing::trace!(collection = %coll.name, scores = %scores_str, "belief selection");
             }
+            // Emit in catalog order: a mandatory member always, the rest as the
+            // belief selected them. A mandatory member's score is recorded for
+            // the event view, qualified by the same bar as everyone else.
+            let min_score = cfg.section_policy(0).min_score;
+            let mut beliefs = beliefs.into_iter();
             let mut out = Vec::new();
-            for (s, b) in coll.sections.iter().zip(&beliefs) {
-                scores.set_section(s.id, b.score, b.qualified);
-                if b.selected {
+            for s in &coll.sections {
+                let emit = if coll.mandatory.contains(&s.id) {
+                    let score = resolver.section_score(s.id);
+                    scores.set_section(s.id, score, score >= min_score);
+                    true
+                } else {
+                    let b = beliefs
+                        .next()
+                        .expect("one belief per non-mandatory member, in catalog order");
+                    scores.set_section(s.id, b.score, b.qualified);
+                    b.selected
+                };
+                if emit {
                     push_member_glue(&mut out, coll);
                     push_section_segment(&mut out, s);
                 }
