@@ -926,10 +926,10 @@ impl SequenceState {
         // attends the last eight tokens alone. Chunks below the boundary
         // are shared with the substrate and never written.
         let start = self.writer_start_idx().min(wi);
-        for blk in start..=wi {
-            self.update_gpu_chunk(blk, n_kv_head, head_dim, arena_info)?;
-        }
-        Ok(())
+        // One guard for the whole region: one upload per commit, not one per
+        // chunk.
+        let region: Vec<usize> = (start..=wi).collect();
+        self.update_gpu_chunks_bulk(&region, n_kv_head, head_dim, arena_info)
     }
 
     /// Re-serialise the GPU buffer slot at `blk` from the current host state
