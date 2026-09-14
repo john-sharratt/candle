@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use axum::response::sse::Event;
 
 use candle_conversation::stencil::ToolSpec;
+use candle_conversation::FinishReason;
 
 use crate::openai_tools::{wire_function, Call};
 use crate::reasoning_split::{Piece, ReasoningSplit};
@@ -55,6 +56,19 @@ struct State {
     tools: Option<ToolCallSplit>,
     /// The reply's token counts, folded over its turns; none until one ends.
     usage: Option<Usage>,
+    /// How the reply's last finished turn ended.
+    finish: FinishReason,
+}
+
+/// The OpenAI `finish_reason` for a reply: `tool_calls` when it called any —
+/// the client has calls to run whatever cut the text short — else `length` when
+/// its last turn spent the whole response budget, else `stop`.
+pub fn finish_reason(called_tools: bool, finish: FinishReason) -> &'static str {
+    match (called_tools, finish) {
+        (true, _) => "tool_calls",
+        (false, FinishReason::Length) => "length",
+        (false, FinishReason::Stop) => "stop",
+    }
 }
 
 impl Framer {
@@ -71,6 +85,7 @@ impl Framer {
                 reasoning: framing.split_reasoning.then(ReasoningSplit::default),
                 tools: framing.tools.map(ToolCallSplit::new),
                 usage: None,
+                finish: FinishReason::Stop,
             }),
         }
     }
@@ -111,20 +126,27 @@ impl Framer {
         frames
     }
 
-    /// The closing frame: `tool_calls` when the reply called any, else `stop`.
+    /// The closing frame, carrying the reply's [`finish_reason`].
     pub fn stop(&self) -> anyhow::Result<Event> {
-        let calls = self.state.lock().unwrap().calls;
-        let reason = if calls > 0 { "tool_calls" } else { "stop" };
+        let reason = self.reason();
         self.chunk(Delta::default(), Some(reason))
     }
 
-    /// Fold in a finished turn's token counts.
-    pub fn usage(&self, usage: Usage) {
+    /// The reply's `finish_reason` as it stands — see [`finish_reason`].
+    fn reason(&self) -> &'static str {
+        let s = self.state.lock().unwrap();
+        finish_reason(s.calls > 0, s.finish)
+    }
+
+    /// Fold in a finished turn: its token counts, and how it ended. The reply
+    /// ends the way its last turn did.
+    pub fn turn_end(&self, usage: Usage, finish: FinishReason) {
         let mut s = self.state.lock().unwrap();
         s.usage = Some(match s.usage {
             Some(before) => before.then(usage),
             None => usage,
         });
+        s.finish = finish;
     }
 
     /// The last chunk before `[DONE]` for a client that asked for usage: no
@@ -246,5 +268,61 @@ fn release_through_gate(held: &mut String, gate_open: &mut bool, text: String) -
             // when no block was skipped.
             held[at..].to_string()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn framer() -> Framer {
+        Framer::new(
+            "c".to_string(),
+            "m".to_string(),
+            7,
+            Framing {
+                split_reasoning: false,
+                tools: None,
+            },
+        )
+    }
+
+    /// A reply cut off by its response budget says so. Reported as `stop`, a
+    /// client takes the truncated reply for a finished one.
+    #[test]
+    fn a_reply_its_budget_cut_off_finishes_with_length() {
+        let f = framer();
+        f.turn_end(Usage::for_turn(3249, 600), FinishReason::Length);
+        assert_eq!(f.reason(), "length");
+    }
+
+    /// The daemon can answer one request over several turns (a tool call and
+    /// the answer after it); the reply ends the way its last turn did.
+    #[test]
+    fn a_reply_ends_the_way_its_last_turn_did() {
+        let f = framer();
+        f.turn_end(Usage::for_turn(3000, 600), FinishReason::Length);
+        f.turn_end(Usage::for_turn(3700, 40), FinishReason::Stop);
+        assert_eq!(f.reason(), "stop");
+
+        let g = framer();
+        g.turn_end(Usage::for_turn(3000, 40), FinishReason::Stop);
+        g.turn_end(Usage::for_turn(3700, 600), FinishReason::Length);
+        assert_eq!(g.reason(), "length");
+    }
+
+    /// Before any turn has finished there is nothing to report but a stop.
+    #[test]
+    fn a_reply_no_turn_has_finished_reports_stop() {
+        assert_eq!(framer().reason(), "stop");
+    }
+
+    /// Calls outrank how the text ended: the client has calls to run either way.
+    #[test]
+    fn tool_calls_outrank_how_the_text_ended() {
+        assert_eq!(finish_reason(true, FinishReason::Length), "tool_calls");
+        assert_eq!(finish_reason(true, FinishReason::Stop), "tool_calls");
+        assert_eq!(finish_reason(false, FinishReason::Length), "length");
+        assert_eq!(finish_reason(false, FinishReason::Stop), "stop");
     }
 }

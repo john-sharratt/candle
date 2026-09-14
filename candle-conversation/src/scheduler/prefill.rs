@@ -2788,6 +2788,13 @@ impl Scheduler {
         let sampling_temperature = work.sampling.temperature;
 
         if self.is_eos(first_token) || work.max_decode_tokens == 0 {
+            // The first token ended the turn: an end-of-sequence, or a budget of
+            // zero decoded tokens.
+            let finish = if self.is_eos(first_token) {
+                FinishReason::Stop
+            } else {
+                FinishReason::Length
+            };
             // View sequences (SubmitTurn path): the prefill already wrote KV
             // blocks that must be finalized onto the parent and sealed into
             // the substrate.  Insert as a finished DecodeState so
@@ -2819,6 +2826,7 @@ impl Scheduler {
                     no_think: work.no_think,
                     prefill_assistant_text: work.prefill_assistant_text,
                     finished: true,
+                    finish,
                     decode_start: Instant::now(),
                     decode_busy_us: 0,
                     prefill_ms,
@@ -2862,6 +2870,7 @@ impl Scheduler {
                     prefill_ms,
                     turn_start,
                     context_depth,
+                    finish,
                 );
             }
             return;
@@ -2949,6 +2958,7 @@ impl Scheduler {
             no_think: work.no_think,
             prefill_assistant_text: work.prefill_assistant_text,
             finished: false,
+            finish: FinishReason::Stop,
             decode_start: Instant::now(),
             decode_busy_us: 0,
             prefill_ms,

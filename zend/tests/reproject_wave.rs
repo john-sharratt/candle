@@ -189,7 +189,7 @@ mod wave {
                 }
                 StreamItem::Projection(_) => {}
                 StreamItem::Tool(_) => {}
-                StreamItem::Usage(_) => {}
+                StreamItem::TurnEnd { .. } => {}
             }
         }
         (n, text)

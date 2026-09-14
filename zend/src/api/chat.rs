@@ -11,9 +11,9 @@ use axum::{
 };
 use futures::{Stream, StreamExt};
 
-use candle_conversation::{OptionalState, SelectionState, NO_THINK_SELECTOR};
+use candle_conversation::{FinishReason, OptionalState, SelectionState, NO_THINK_SELECTOR};
 
-use super::chat_frames::{call_id, Framer, Framing};
+use super::chat_frames::{call_id, finish_reason, Framer, Framing};
 use crate::openai_tools::{self, wire_function};
 use crate::passthrough::PASSTHROUGH_MODEL;
 use crate::reasoning_split;
@@ -243,8 +243,8 @@ fn stream_sse(
 
             Ok(StreamItem::Token(text)) => tokens.token(text),
 
-            Ok(StreamItem::Usage(usage)) => {
-                tokens.usage(usage);
+            Ok(StreamItem::TurnEnd { usage, finish }) => {
+                tokens.turn_end(usage, finish);
                 Vec::new()
             }
         })
@@ -284,6 +284,7 @@ async fn collect_completion(
     let mut full = String::new();
     let mut tokens = 0usize;
     let mut usage: Option<Usage> = None;
+    let mut finish = FinishReason::Stop;
     while let Some(result) = token_stream.next().await {
         match result {
             Ok(StreamItem::Token(chunk)) => {
@@ -293,8 +294,12 @@ async fn collect_completion(
             Ok(StreamItem::Status(_)) => {} // status events are display-only
             Ok(StreamItem::Projection(_)) => {} // timeline-only; not in the collected body
             Ok(StreamItem::Tool(_)) => {}   // tool lifecycle; display-only, not in the body
-            Ok(StreamItem::Usage(turn)) => {
+            Ok(StreamItem::TurnEnd {
+                usage: turn,
+                finish: ended,
+            }) => {
                 usage = Some(usage.map_or(turn, |before| before.then(turn)));
+                finish = ended;
             }
             Err(_) => {}
         }
@@ -324,9 +329,10 @@ async fn collect_completion(
             })
             .collect()
     });
-    let (content, finish_reason) = match tool_calls {
-        Some(_) => (prose.trim().to_string(), "tool_calls"),
-        None => (prose, "stop"),
+    let finish_reason = finish_reason(tool_calls.is_some(), finish);
+    let content = match tool_calls {
+        Some(_) => prose.trim().to_string(),
+        None => prose,
     };
     Json(ChatCompletion {
         id,

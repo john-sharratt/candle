@@ -192,7 +192,7 @@ mod control {
                 }
                 StreamItem::Projection(_) => {}
                 StreamItem::Tool(_) => {}
-                StreamItem::Usage(_) => {}
+                StreamItem::TurnEnd { .. } => {}
             }
         }
         // Print the decoded text so coherence can be eyeballed — a wrong
