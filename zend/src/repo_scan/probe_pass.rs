@@ -358,7 +358,7 @@ pub fn seed_context(conv: &mut Sequence, unit: &DirUnit, summary: &str) -> anyho
     // — projects under the answering branch.
     conv.set_selection(branch_state(ANSWER_BRANCH));
     conv.insert_turn_staged(
-        &crate::repo_scan::render::render_request(unit),
+        crate::repo_scan::render::render_request(unit),
         summary,
         vec!["repo_map".to_string(), unit.dir.clone()],
     )

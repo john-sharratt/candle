@@ -333,10 +333,7 @@ pub fn strip_reasoning(text: &str) -> String {
     // after it (a second empty one, or one it fills with task reasoning); a single
     // strip left the second block in the character's perception. Each block may
     // close with `</think>` or the `/thought` variant this checkpoint also emits.
-    loop {
-        let Some(rest) = t.strip_prefix("<think>") else {
-            break;
-        };
+    while let Some(rest) = t.strip_prefix("<think>") {
         let close = ["</think>", "/thought"]
             .iter()
             .filter_map(|m| rest.find(m).map(|i| (i, m.len())))
@@ -352,8 +349,8 @@ pub fn strip_reasoning(text: &str) -> String {
     let mut out = t.trim();
     if let Some(rest) = out.strip_prefix("```") {
         out = rest
-            .splitn(2, '\n')
-            .nth(1)
+            .split_once('\n')
+            .map(|(_, body)| body)
             .unwrap_or("")
             .trim()
             .trim_end_matches('`')
