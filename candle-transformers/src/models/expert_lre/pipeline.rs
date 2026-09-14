@@ -2740,6 +2740,19 @@ impl PipelineState {
         Ok(conceded)
     }
 
+    /// Make the device's CUDA context current on the calling thread — the
+    /// pipeline thread, at start (see `spawn_pipeline_thread`).
+    #[cfg(feature = "cuda")]
+    fn bind_device_to_thread(&self) -> Result<()> {
+        let Device::Cuda(cd) = &self.device else {
+            return Ok(());
+        };
+        cd.cuda_stream()
+            .context()
+            .bind_to_thread()
+            .map_err(candle::Error::wrap)
+    }
+
     /// Retire every kernel in flight before a byte changes owner.
     ///
     /// **The boundary is the one place where memory changes side**, and neither
@@ -2772,19 +2785,6 @@ impl PipelineState {
     /// It costs a full drain, and it is paid **only when the boundary actually
     /// moves** — a rare event at end of pass, against a retraction that already
     /// relocates or drops thousands of slots.
-    /// Make the device's CUDA context current on the calling thread — the
-    /// pipeline thread, at start (see `spawn_pipeline_thread`).
-    #[cfg(feature = "cuda")]
-    fn bind_device_to_thread(&self) -> Result<()> {
-        let Device::Cuda(cd) = &self.device else {
-            return Ok(());
-        };
-        cd.cuda_stream()
-            .context()
-            .bind_to_thread()
-            .map_err(candle::Error::wrap)
-    }
-
     #[cfg(feature = "cuda")]
     fn quiesce_before_handover(&self) -> Result<()> {
         let Device::Cuda(cd) = &self.device else {
