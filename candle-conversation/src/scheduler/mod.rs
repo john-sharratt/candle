@@ -7417,6 +7417,8 @@ impl Scheduler {
                             SealEnd::SlotEnd,
                             action,
                             turn_content,
+                            // One turn on the slot: the state is this turn's.
+                            true,
                         )
                         .unwrap_or_else(|e| {
                             tracing::warn!("post-Done seal failed for slot {}: {}", seal_slot, e,);
@@ -7829,6 +7831,8 @@ impl Scheduler {
                 in_collection,
             },
             None,
+            // A section seal never exports; only a `Turn` does.
+            false,
         )?;
         let seal = seal.ok_or_else(|| {
             ConversationError::Channel(
@@ -8215,6 +8219,9 @@ impl Scheduler {
                 SealEnd::At(grid_base_block + turn.region.block_to),
                 &SealAction::Turn,
                 Some(turn.content.clone()),
+                // Only the last region owns the state the prefill left on the
+                // slot; see `perform_seal_and_write`.
+                i + 1 == turns.len(),
             ) {
                 Ok(Some(result)) => {
                     sealed += 1;
@@ -8246,6 +8253,15 @@ impl Scheduler {
     /// the role / text / token IDs the substrate pins on the new turn
     /// entry so the on-disk record can be reconstructed later without
     /// re-tokenising.  Ignored for `SealAction::Section` and `None`.
+    ///
+    /// `records_recurrent_state` says whether this turn owns the slot's
+    /// recurrent state. The recurrence is one running state per sequence, and
+    /// after a prefill it describes every token on the slot — so in a stuffed
+    /// group only the LAST carved region may record it. An earlier region that
+    /// exported would store the end-of-grid state under its own turn index (a
+    /// resume installs it ahead of its K/V), and the eviction that follows would
+    /// leave the later regions nothing to export at all. Only a `Turn` seal
+    /// exports; the flag is inert for every other action.
     fn perform_seal_and_write(
         &mut self,
         seal_slot: SequenceId,
@@ -8253,6 +8269,7 @@ impl Scheduler {
         seal_end: SealEnd,
         seal_action: &SealAction,
         turn_content: Option<TurnContent>,
+        records_recurrent_state: bool,
     ) -> Result<Option<SealResult>, ConversationError> {
         // The substrate target (where a `SealAction::Turn` write
         // lands) is read from `slot_targets` rather than threaded
@@ -8672,16 +8689,20 @@ impl Scheduler {
                 // across a full build. The state is fixed-size per sequence, so a
                 // 19-token question costs exactly what a full trajectory does.
                 let ephemeral = conversation.read().is_timeline_transient(target.timeline);
+                // Whether this seal records the slot's state at all: not on an
+                // ephemeral timeline, whose payload would be dropped on arrival,
+                // and not for a carved region that is not its group's last, which
+                // does not own the slot's state (`records_recurrent_state`).
+                let records_state = !ephemeral && records_recurrent_state;
                 let t_export = Instant::now();
                 // The model's other recurrence, in its own encoding. Exported at
                 // the same instant as `layers` — one seal, one state — so the
                 // two can never describe different token counts. A model with
                 // none returns `None` and the blob is empty.
                 //
-                // Skipped for an ephemeral timeline alongside `layers`, and for
-                // the same reason: the payload is dropped on arrival, so the
-                // export is pure cost.
-                let aux = if ephemeral {
+                // Skipped alongside `layers` whenever the seal records no state:
+                // the blob travels only inside that payload.
+                let aux = if !records_state {
                     Vec::new()
                 } else {
                     match self.model.export_aux_state(seal_slot.0) {
@@ -8697,12 +8718,17 @@ impl Scheduler {
                         }
                     }
                 };
-                match if ephemeral {
-                    Ok(None)
-                } else {
-                    self.model.export_recurrent(seal_slot.0)
-                } {
-                    Ok(Some((schedule_hash, layers))) => {
+                // `None` when the export was not asked for (`records_state`).
+                // That is not the model answering "no state", and may not be read
+                // as the contradiction below.
+                let exported = records_state.then(|| self.model.export_recurrent(seal_slot.0));
+                match exported {
+                    // Nothing was asked for, so nothing is persisted and there is
+                    // nothing contradictory to report. The store stays on the slot
+                    // for the group's last region, and is reclaimed with the
+                    // slot's blocks otherwise, as for `Ok(None)` below.
+                    None => {}
+                    Some(Ok(Some((schedule_hash, layers)))) => {
                         let payload = SnapshotPayload {
                             timeline_id: target.timeline.raw(),
                             turn_index: idx.0,
@@ -8731,11 +8757,13 @@ impl Scheduler {
                         // Only on this branch, for two different reasons.
                         // `Err` already warns that resume will recompute from
                         // zeros, and evicting there would turn "cannot resume"
-                        // into "resumed, fluent, and forgotten". `Ok(None)` is
-                        // an ephemeral timeline with no snapshot to restore
-                        // from, so evicting here would cut the state out from
-                        // under the *next* turn of a fork that has several —
-                        // there is nothing to put back. Its store is instead
+                        // into "resumed, fluent, and forgotten". A skipped export
+                        // has no snapshot to restore from: on an ephemeral
+                        // timeline evicting would cut the state out from under
+                        // the *next* turn of a fork that has several, and on a
+                        // group's earlier region it would take the state the
+                        // last region is about to record — there is nothing to
+                        // put back either way. Its store is instead
                         // reclaimed when the slot's blocks go, by
                         // `Scheduler::release_slot_ground`: a state whose K/V
                         // has been truncated away is unreachable, which is the
@@ -8769,7 +8797,7 @@ impl Scheduler {
                     // it is worth a warning on every seal rather than a silence
                     // that is only discovered by noticing the model has
                     // forgotten.
-                    Ok(None) if self.model.carries_recurrent_state() => {
+                    Some(Ok(None)) if self.model.carries_recurrent_state() => {
                         tracing::warn!(
                             "turn {} sealed with NO recurrent snapshot, but this model \
                              declares it carries recurrent state — `export_recurrent` \
@@ -8780,8 +8808,8 @@ impl Scheduler {
                             idx.0,
                         );
                     }
-                    Ok(None) => {}
-                    Err(e) => {
+                    Some(Ok(None)) => {}
+                    Some(Err(e)) => {
                         // Not fatal to the seal — the turn's K/V and text are
                         // already committed — but it means this conversation
                         // cannot be resumed from here, so it must be visible.

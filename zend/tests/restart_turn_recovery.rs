@@ -21,8 +21,8 @@ mod common;
 
 use candle::Device;
 use candle_conversation::models::Model;
-use candle_conversation::SectionInserts;
-use common::{say, Workspace};
+use candle_conversation::{SectionInserts, SelectionState, TurnEvent};
+use common::{say, sealed_memory_at, Workspace};
 
 const MODEL: Model = Model::Qwen35_0_8B_Q8;
 
@@ -99,6 +99,67 @@ fn a_clean_restart_recovers_every_sealed_turn() {
          snapshot is for turn {snapshot_turn}, so the resume refuses it and the \
          conversation continues with no recurrent memory of its history"
     );
+}
+
+/// **A stuffed group's memory record belongs to its LAST case.**
+///
+/// A stuffed prefill lays several turns into one grid and seals them region by
+/// region. The recurrence runs through the whole grid, so the state on the slot
+/// after the forward is the state at the end of the last region — and that is
+/// the only turn it may be recorded against. Exporting at every region wrote
+/// that end-of-grid state under the FIRST region's turn index, then evicted it,
+/// so every later region sealed with nothing: a resume installed a state ahead
+/// of its K/V, and the log carried one warning per region.
+#[test]
+fn a_stuffed_group_records_its_memory_at_the_last_case() {
+    let device = Device::new_cuda(0).expect("cuda");
+    let ws = Workspace::for_model(MODEL);
+
+    let (engine, mut conv) = ws.open(&device);
+    let timeline = conv.timeline_id();
+    let pad = engine
+        .tokenizer()
+        .token_to_id("<|im_end|>")
+        .expect("the hybrid's turn terminator");
+    let cases: Vec<(String, String, Vec<String>)> = (0..4)
+        .map(|i| {
+            (
+                format!("Question {i}: what is {i} plus {i}?"),
+                String::new(),
+                Vec::new(),
+            )
+        })
+        .collect();
+    let (handle, regions) = conv
+        .submit_prefilled_turn_group(&cases, SelectionState::default(), pad)
+        .expect("submit the stuffed group");
+    assert_eq!(
+        regions.len(),
+        4,
+        "every case carries tokens, so each claims a region"
+    );
+    let mut response = None;
+    for ev in handle.stream() {
+        match ev {
+            TurnEvent::Done(r) => {
+                response = Some(r);
+                break;
+            }
+            TurnEvent::Error(e) => panic!("stuffed group failed: {e}"),
+            _ => {}
+        }
+    }
+    let response = response.expect("the stream ended without Done");
+    conv.finish_turn(handle, &response)
+        .expect("finish the group");
+    engine.shutdown().expect("clean shutdown");
+
+    let sealed_turns = engine.conversation().read().turn_count(timeline);
+    assert_eq!(sealed_turns, 4, "one sealed turn per case");
+    // Polls until the record for exactly this turn is readable, and panics if
+    // the newest record names any other turn.
+    let record = sealed_memory_at(&engine, timeline, (sealed_turns - 1) as u32);
+    assert_eq!(record.turn_index, (sealed_turns - 1) as u32);
 }
 
 /// **A resumed conversation's new turns survive the next restart too.**
