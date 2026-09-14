@@ -1970,10 +1970,10 @@ fn prefill_into(
     s.advance_sequence(q, part.len())?;
     // What the scheduler does after every prefill (`prefill.rs`): the forward
     // wrote K/V without the decode kernel's self-increment, so the cached
-    // decode slot buffer's lengths are re-serialised before the next decode.
-    // Without it the decode reads the pre-prefill lengths — a header
-    // production never decodes with.
-    s.refresh_decode_slot_state(q)?;
+    // decode slot buffer is marked, and its lengths are re-serialised by the
+    // next decode's sync. Without it the decode reads the pre-prefill lengths —
+    // a header production never decodes with.
+    s.mark_decode_slot_states(&[q])?;
     st.logits_owned()?[0]
         .i(0)?
         .to_dtype(candle::DType::F32)?

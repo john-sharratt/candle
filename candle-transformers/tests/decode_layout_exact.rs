@@ -738,9 +738,10 @@ fn decode_one_production(
     backing.ensure_for_batch_entries(&entries, 1)?;
     // The persistent decode slot buffer's writer length self-increments only
     // on decode steps; tokens a prefill or an injection wrote sit past its
-    // stale tail until the writer slice is re-serialised — the engine's
-    // `refresh_decode_slot_state` after every such write. Mirror it.
-    backing.refresh_decode_writer_slice(&entries)?;
+    // stale tail until the writer region is re-serialised — the engine marks
+    // it after every such write (`mark_decode_slot_states`) and the sync below
+    // re-serialises it. Mirror it.
+    backing.mark_decode_writer_stale(&entries)?;
     let arena_info = backing.resolve_arena_info()?;
     let generation = stager.begin_generation();
     let (seq_ptrs, _stats) =

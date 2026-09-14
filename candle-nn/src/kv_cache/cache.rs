@@ -1231,7 +1231,7 @@ impl KvCache {
     pub fn commit_written_tokens(&mut self, offset: usize, add: usize) -> Result<()> {
         self.set_current_seq_len(offset + add)?;
         if let CacheStorage::Chunked(c) = &self.k.storage {
-            c.backing.refresh_decode_writer_slice(&[(c.batch_idx, 0)])?;
+            c.backing.mark_decode_writer_stale(&[(c.batch_idx, 0)])?;
         }
         Ok(())
     }
@@ -1270,7 +1270,7 @@ impl KvCache {
         {
             cache.set_current_seq_len(offset + add)?;
             if let (CacheStorage::Chunked(c), Some(backing)) = (&cache.k.storage, &backing) {
-                // One refresh names sequences by batch index on ONE backing's
+                // One mark names sequences by batch index in ONE backing's
                 // table; a cache on another backing would be looked up in the
                 // wrong table and silently left stale.
                 if !c.backing.shares_state_with(backing) {
@@ -1282,7 +1282,7 @@ impl KvCache {
             }
         }
         if let Some(backing) = backing {
-            backing.refresh_decode_writer_slice(&entries)?;
+            backing.mark_decode_writer_stale(&entries)?;
         }
         Ok(())
     }

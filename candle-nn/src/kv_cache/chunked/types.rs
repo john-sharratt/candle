@@ -531,7 +531,7 @@ pub(crate) struct SequenceState {
     /// coexist in the same vec.  Partial tails are always copied at fork
     /// time, so `chunks.last()` is always uniquely owned and writable.
     chunks: Vec<ChunkWindow>,
-    /// Cached pinned-host + GPU-side serialised slot-state for this sequence.
+    /// Cached host + GPU-side serialised slot-state for this sequence.
     gpu_chunks: GpuChunks,
     /// First chunk index that is writer-owned.  Chunks at index
     /// `[0, writer_start_idx)` are Arc-shared with substrate / parent
@@ -557,13 +557,18 @@ pub(crate) struct SequenceState {
     /// every non-windowed slot (dialogue/section KV never evicts its front), so
     /// those paths are byte-identical to a `base_pos == 0` derivation.
     base_pos: u32,
-    /// A commit made outside the decode kernel has moved the writer region's
-    /// host lengths past what the cached decode slot buffer holds. The next
-    /// [`Self::sync_decode_gpu_chunks`] — the only way a reader reaches the
-    /// buffer — re-serialises that region before handing it out. Left set over
-    /// a buffer that has since been cleared it is harmless: the resync finds no
-    /// buffer, and the rebuild serialises every chunk from the host state.
-    decode_writer_stale: bool,
+    /// Set by a commit made outside the decode kernel: the chunk index from
+    /// which the cached decode slot buffer's lengths may be behind the host —
+    /// the writer boundary as it stood at the earliest such commit since the
+    /// buffer was last current. The next [`Self::sync_decode_gpu_chunks`] — the
+    /// only way a reader reaches the buffer — re-serialises from here to the
+    /// writer before handing it out. It is the boundary AT the commit, not the
+    /// one read back at the sync, because a boundary that moves in between
+    /// (`seal_writer_boundary`, a truncate's clamp) would otherwise shrink the
+    /// region past chunks the commit filled. Left set over a buffer that has
+    /// since been cleared it is harmless: the resync finds no buffer, and the
+    /// rebuild serialises every chunk from the host state.
+    decode_stale_from: Option<usize>,
 }
 
 impl SequenceState {
@@ -574,7 +579,7 @@ impl SequenceState {
             gpu_chunks: GpuChunks::new(stream),
             writer_start_idx: 0,
             base_pos: 0,
-            decode_writer_stale: false,
+            decode_stale_from: None,
         }
     }
 
@@ -585,7 +590,7 @@ impl SequenceState {
             gpu_chunks: GpuChunks::new(),
             writer_start_idx: 0,
             base_pos: 0,
-            decode_writer_stale: false,
+            decode_stale_from: None,
         }
     }
 
@@ -907,7 +912,8 @@ impl SequenceState {
     /// sequence with no buffer is left unmarked: its next sync rebuilds it.
     pub(crate) fn mark_decode_writer_stale(&mut self) {
         if self.has_decode_gpu_chunks() {
-            self.decode_writer_stale = true;
+            let from = self.writer_start_idx;
+            self.decode_stale_from = Some(self.decode_stale_from.map_or(from, |s| s.min(from)));
         }
     }
 
@@ -929,6 +935,7 @@ impl SequenceState {
     /// same sync then rebuilds.
     fn resync_decode_writer_region(
         &mut self,
+        from: usize,
         n_kv_head: usize,
         head_dim: usize,
         arena_info: &[ResolvedArenaInfo],
@@ -953,9 +960,10 @@ impl SequenceState {
         // prompt leaves six sealed chunks at length 0, and the decode
         // attends the last eight tokens alone. Chunks below the boundary
         // are shared with the substrate and never written.
-        let start = self.writer_start_idx().min(wi);
-        // One guard for the whole region: one upload per commit, not one per
-        // chunk.
+        // From the boundary as it stood at the earliest pending commit, or as it
+        // stands now if it has since moved down.
+        let start = from.min(self.writer_start_idx()).min(wi);
+        // One guard for the whole region: one upload, not one per chunk.
         let region: Vec<usize> = (start..=wi).collect();
         self.update_gpu_chunks_bulk(&region, n_kv_head, head_dim, arena_info)
     }
@@ -997,9 +1005,9 @@ impl SequenceState {
     /// so the guard drop coalesces adjacent indices into one
     /// `memcpy_htod` per contiguous run (instead of one per block).
     ///
-    /// Used by the cold-load `alloc_sealed_blocks_bulk` path to push
-    /// the per-layer chunk metadata to the GPU as a single batched
-    /// HtoD where possible.
+    /// Used by the cold-load `alloc_sealed_blocks_bulk` path and by
+    /// [`Self::resync_decode_writer_region`], so each pushes its chunks as
+    /// one batched upload where the indices allow.
     pub(super) fn update_gpu_chunks_bulk(
         &mut self,
         block_indices: &[usize],
@@ -1021,9 +1029,12 @@ impl SequenceState {
         // Prefix-sum cumulative usage once so each block's rope_base
         // is an O(1) lookup. The previous `chunks[..blk].iter().sum()`
         // was O(blk) per block — quadratic over a layer's blocks.
-        let mut rope_bases: Vec<u32> = Vec::with_capacity(chunks.len());
+        // Only as far as the highest block asked for: a resync touches the
+        // last few chunks of a deep sequence, and bases past it are unused.
+        let last = block_indices.iter().copied().max().unwrap_or(0);
+        let mut rope_bases: Vec<u32> = Vec::with_capacity(last + 1);
         let mut acc: u32 = base_pos;
-        for c in chunks.iter() {
+        for c in chunks.iter().take(last + 1) {
             rope_bases.push(acc);
             acc = acc.wrapping_add(c.usage);
         }
@@ -1208,7 +1219,7 @@ impl SequenceState {
 
     /// Rebuild the GPU slot-state buffer for decode using the true sequence length.
     ///
-    /// Serialises all chunks into the pinned host buffer with per-chunk
+    /// Serialises all chunks into the host copy with per-chunk
     /// `rope_base` values derived from cumulative usage, then uploads to the
     /// device buffer asynchronously.
     ///
@@ -1251,7 +1262,7 @@ impl SequenceState {
             chunks, n_kv_head, head_dim, arena_info, write_len, wi, base_pos,
         )?;
         // Serialised from the host state just now, so no commit is pending.
-        self.decode_writer_stale = false;
+        self.decode_stale_from = None;
 
         let ptr = self.gpu_chunks.raw_device_ptr();
         Ok((ptr, n as u32, wi as u32))
@@ -1269,10 +1280,10 @@ impl SequenceState {
     /// A buffer that exists is left as it stands, stale writer region
     /// included: the decode step's own sync re-serialises that region before
     /// it reads the buffer (see [`Self::mark_decode_writer_stale`]). Doing it
-    /// here instead would put an upload between one prefill layer's kernels and
-    /// the next — once per layer per sequence, measured at a quarter of a small
-    /// model's single-context prefill — for bytes the next sync can carry
-    /// together with everything else it does.
+    /// here would put an upload between one prefill layer's kernels and the
+    /// next, once per layer per sequence — a GPU bubble that costs a small
+    /// model a quarter of its single-context prefill — for bytes the next sync
+    /// carries anyway.
     pub(crate) fn prime_decode_gpu_chunks(
         &mut self,
         n_kv_head: usize,
@@ -1327,9 +1338,12 @@ impl SequenceState {
         seq_offset: usize,
         arena_info: &[ResolvedArenaInfo],
     ) -> candle::Result<((u64, u32, u32), DecodeGpuChunksSyncKind)> {
-        if self.decode_writer_stale {
-            self.decode_writer_stale = false;
-            self.resync_decode_writer_region(n_kv_head, head_dim, arena_info)?;
+        if let Some(from) = self.decode_stale_from {
+            // Cleared only once the region is current: a resync that fails
+            // leaves the mark for the next sync, not a buffer that reads as up
+            // to date and is not.
+            self.resync_decode_writer_region(from, n_kv_head, head_dim, arena_info)?;
+            self.decode_stale_from = None;
         }
         let host_n = self.chunks.len();
         if host_n == 0 {

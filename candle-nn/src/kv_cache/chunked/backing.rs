@@ -923,9 +923,9 @@ impl ChunkedKvBacking {
     /// REBUILD path). Needed when host bookkeeping has changed slice lengths or
     /// windows below the writer boundary — `set_len` after a truncate, a block
     /// re-windowed in place — without touching the serialized buffer:
-    /// `set_len` deliberately never writes the pinned DMA source (see its
-    /// comment), and [`Self::refresh_decode_writer_slice`] only re-serialises
-    /// the writer region, so a later build's REUSE path would snapshot stale
+    /// `set_len` never writes it, and a buffer marked by
+    /// [`Self::mark_decode_writer_stale`] has only its writer region
+    /// re-serialised, so a later build's REUSE path would snapshot stale
     /// lengths.
     pub fn invalidate_decode_slot(&self, batch_idx: usize) {
         if let Ok(mut state) = self.state.write() {
@@ -972,7 +972,7 @@ impl ChunkedKvBacking {
     /// here: this runs once per layer of every prefill, with that layer's
     /// attention still queued, and costs one state lock and a flag per
     /// sequence — no arena resolve, no serialisation, no upload.
-    pub fn refresh_decode_writer_slice(&self, batch_entries: &[(usize, usize)]) -> Result<()> {
+    pub fn mark_decode_writer_stale(&self, batch_entries: &[(usize, usize)]) -> Result<()> {
         let mut state = self
             .state
             .write()

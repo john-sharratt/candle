@@ -3209,9 +3209,10 @@ impl Scheduler {
             })?
         };
 
-        // The cached decode slot buffer is already current: the prefill's own
-        // commit (`KvCache::commit_written_tokens`) resynced it, which is the
-        // one place every write outside the decode kernel goes through.
+        // Nothing to bring up to date here: the prefill's own commit
+        // (`KvCache::commit_written_tokens`, the one place every write outside
+        // the decode kernel goes through) marked the cached decode slot buffer,
+        // and the next sync that reads it re-serialises its writer region.
         Ok(logits)
     }
 }

@@ -304,8 +304,12 @@ mod tool_scenarios {
     #[test]
     fn a_second_boot_restores_every_prompt_section() {
         init_tracing();
-        let first = run_with_timeout(boot_and_count_sections());
-        let second = run_with_timeout(boot_and_count_sections());
+        // Both boots under one scenario lock, so no other scenario runs on the
+        // shared workspace between them.
+        let (first, second) = run_with_timeout(async {
+            let first = boot_and_count_sections().await;
+            (first, boot_and_count_sections().await)
+        });
         assert_eq!(
             second,
             SectionLoads {

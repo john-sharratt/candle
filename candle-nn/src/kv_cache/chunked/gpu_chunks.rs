@@ -218,9 +218,8 @@ impl GpuChunks {
     ///
     /// **The caller must have fenced any pending upload first**
     /// ([`Self::fence_uploads`]). Stream ordering covers the copies that
-    /// were *enqueued before* this slot changes hands — that much of the A13
-    /// argument holds — but it says nothing about a copy already in flight whose
-    /// DESTINATION is this slot. Handing that slot to another sequence lets the
+    /// were *enqueued before* this slot changes hands, but it says nothing about
+    /// a copy already in flight whose DESTINATION is this slot. Handing that slot to another sequence lets the
     /// pending transfer land in a buffer it does not own.
     fn release_slot(&mut self) {
         if let (Some(slot), Some(stream)) = (self.slot.take(), self.stream.as_ref()) {

@@ -1835,24 +1835,22 @@ impl BatchedEngine {
         //
         // Commit every block's write length BEFORE the (single) header build:
         // the virtual-slot headers must expose the block rows physically, and
-        // each position map must cover [0, resident+s_len). `set_len`
-        // deliberately never touches the serialized slot buffer (see its
-        // DMA-race comment), so `refresh_decode_writer_slice` brings the cached
-        // slot state up to date: the O(1) writer-slice patch when the block
-        // stayed in the chunk the buffer was built for, a rebuild when it
-        // crossed into a fresh one. The patch is NOT enough there even though
-        // `push_chunk` cleared the buffer at append time — an EARLIER wave's
-        // metadata build re-validated it at pre-`set_len` lengths, so the
-        // spanned block's earlier rows would read short through the stale
-        // predecessor slice (measured as an acceptance collapse to 1.4
-        // tok/step with a lossless-assert kill).
+        // each position map must cover [0, resident+s_len). `set_len` never
+        // touches the serialized slot buffer, so `mark_decode_writer_stale`
+        // marks it and the header build's sync re-serialises the whole writer
+        // region — every chunk from the writer boundary to the writer, not the
+        // writer alone. A block that spanned into a fresh chunk needs that: an
+        // EARLIER wave's metadata build validated the buffer at pre-`set_len`
+        // lengths, so a writer-only patch would leave the spanned block's
+        // earlier rows reading short through the stale predecessor slice (an
+        // acceptance collapse to 1.4 tok/step with a lossless-assert kill).
         //
         // (Each block's write range was capacity-ensured ABOVE, so the
         // writeback snapshot covers every chunk `set_len` fills here.)
         //
         // Every block's length is set on a backing before that backing is
-        // refreshed once for all of them: one state lock and one arena resolve
-        // per backing, not one per verify group per backing.
+        // marked once for all of them: one state lock per backing, not one per
+        // verify group per backing.
         if is_verify_wave {
             let entries: Vec<(usize, usize)> = verify_groups
                 .iter()
@@ -1862,7 +1860,7 @@ impl BatchedEngine {
                 for &(vseq, resident, s_len) in &verify_groups {
                     backing.set_len(vseq, resident + s_len);
                 }
-                backing.refresh_decode_writer_slice(&entries)?;
+                backing.mark_decode_writer_stale(&entries)?;
             }
             for &(vseq, resident, s_len) in &verify_groups {
                 overrides.push((vseq, resident + s_len));
@@ -2962,16 +2960,14 @@ impl BatchedEngine {
         // A batched prefill wrote its tokens outside the decode kernel (the
         // writeback scatter, committed by `set_len`), so each prefill seq's
         // cached decode slot buffer — built at the pre-prefill base offset
-        // during this wave's metadata build — is stale. The live-buffer decode
-        // path reuses that buffer, so resync it now: the writer slice is
-        // patched when the prefill stayed in the chunk the buffer was built
-        // for, and the buffer is rebuilt when it crossed into a later one, whose
-        // full predecessors a patch would leave short (all layers are absorbed
-        // in this final segment; one-time after each prefill — steady-state
-        // decode never pays it).
-        for &pseq in prefill_seqs {
-            session.refresh_decode_slot_state(pseq)?;
-        }
+        // during this wave's metadata build — is behind the host. The
+        // live-buffer decode path reuses that buffer, so mark it: the next
+        // metadata build's sync re-serialises its writer region, or rebuilds it
+        // if the prefill crossed into a chunk it was not built for (all layers
+        // are absorbed in this final segment; paid once after each prefill —
+        // steady-state decode never pays it). One mark per backing covers every
+        // prefill sequence.
+        session.mark_decode_slot_states(prefill_seqs)?;
 
         // Head: decode rows + each prefill sequence's LAST row.
         let s_head = span("deepseek:head_lm");

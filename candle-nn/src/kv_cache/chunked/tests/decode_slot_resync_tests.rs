@@ -214,12 +214,13 @@ fn a_write_that_spills_into_the_next_chunk_is_counted_in_both() {
 }
 
 /// The latent wave commits at the backing rather than through a `KvCache`:
-/// `set_len`, then `refresh_decode_writer_slice`, with no block length in hand.
-/// The refresh must therefore cover a spill on its own — re-serialising the
-/// whole writer region, the filled predecessor as well as the new writer — and
-/// not patch the new writer while the full predecessor still reads 30.
+/// `set_len`, then `mark_decode_writer_stale`, with no block length in hand.
+/// The sync after that mark must therefore cover a spill on its own —
+/// re-serialising the whole writer region, the filled predecessor as well as
+/// the new writer — and not patch the new writer while the full predecessor
+/// still reads 30.
 #[test]
-fn a_backing_refresh_after_a_spill_counts_both_chunks() {
+fn a_backing_mark_after_a_spill_counts_both_chunks() {
     let _gpu = gpu_serial();
     let dev = Device::new_cuda(0).unwrap();
     let (backing, mut cache, seq) = setup(&dev);
@@ -231,7 +232,7 @@ fn a_backing_refresh_after_a_spill_counts_both_chunks() {
     let kv = Tensor::ones((1, N_KV_HEAD, 4, HEAD_DIM), DType::F16, &dev).unwrap();
     cache.chunked_write_kv(30, &kv, &kv).unwrap();
     backing.set_len(seq, 34);
-    backing.refresh_decode_writer_slice(&[(seq, 0)]).unwrap();
+    backing.mark_decode_writer_stale(&[(seq, 0)]).unwrap();
     assert_eq!(
         device_lens(&dev, &backing, seq, 34),
         vec![32, 2],
@@ -504,4 +505,88 @@ fn a_batch_commit_counts_every_sequence_on_the_device() {
             "sequence {seq}: the reused buffer must count the batch-committed block"
         );
     }
+}
+
+/// One batch commit names sequences by batch index in ONE backing's table, so
+/// a cache on another backing is refused rather than looked up in the wrong
+/// table and left stale.
+#[test]
+fn a_batch_commit_across_backings_is_refused() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (_b0, mut c0, _) = setup(&dev);
+    let (_b1, mut c1, _) = setup(&dev);
+    let err = KvCache::commit_written_tokens_batch(&mut [&mut c0, &mut c1], &[0, 0], &[0, 0])
+        .expect_err("caches on two backings must not commit as one batch");
+    assert!(
+        err.to_string().contains("different chunked backing"),
+        "{err}"
+    );
+}
+
+/// A writer boundary that moves between a commit and the sync — the turn-seal
+/// re-prefill's `seal_writer_boundary`, a truncate's clamp — must not shrink
+/// the region the sync re-serialises: the commit filled chunks from the
+/// boundary as it stood then. Here a spill fills chunk 0 and starts chunk 1,
+/// and the boundary is then sealed past both.
+#[test]
+fn a_boundary_moved_after_a_commit_does_not_shrink_the_resync() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    write_outside_decode(&mut cache, &dev, 0, 30);
+    KvCache::ensure_chunked_capacity_batch(&mut [&mut cache], &[30], 4).unwrap();
+    assert_eq!(device_lens(&dev, &backing, seq, 30), vec![30, 0]);
+    let kv = write_kv_ahead(&mut cache, &dev, 30, 4);
+    cache.commit_written_tokens(30, 4).unwrap();
+    backing.seal_writer_boundary(seq).unwrap();
+
+    // Synced directly: an ensure would push a fresh writer past the sealed
+    // boundary and rebuild the buffer, hiding the region under test.
+    let info = backing.resolve_arena_info().unwrap();
+    let (ptrs, _, _) = backing.sync_decode_gpu_chunks(&[(seq, 34)], &info).unwrap();
+    assert_eq!(
+        read_lens(&dev, ptrs[0].0, ptrs[0].1 as usize),
+        vec![32, 2],
+        "the sync re-serialised from the moved boundary and left the chunk the \
+         commit filled at its pre-commit length"
+    );
+    drop(kv);
+}
+
+/// The wave metadata build reads through `sync_decode_gpu_chunks_snapshot`: a
+/// snapshot row gets an immutable copy of the slot state, and that copy must be
+/// taken after the marked writer region is re-serialised. The snapshot sets the
+/// write chunk's length from the offset itself, so it is the filled
+/// predecessor of a spill that tells the two apart.
+#[test]
+fn a_snapshot_after_a_commit_carries_the_committed_lengths() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    write_outside_decode(&mut cache, &dev, 0, 30);
+    KvCache::ensure_chunked_capacity_batch(&mut [&mut cache], &[30], 4).unwrap();
+    assert_eq!(device_lens(&dev, &backing, seq, 30), vec![30, 0]);
+    let kv = write_kv_ahead(&mut cache, &dev, 30, 4);
+    cache.commit_written_tokens(30, 4).unwrap();
+
+    let info = backing.resolve_arena_info().unwrap();
+    let generation = backing.begin_stager_generation_required();
+    let (ptrs, _) = backing
+        .sync_decode_gpu_chunks_snapshot(&[(seq, 34)], &info, &generation, &[true])
+        .unwrap();
+    // The generation's copies reach the device on a submit; read behind one
+    // and a device sync, as a launch against them would.
+    let flush = generation.alloc(8).unwrap();
+    generation.submit_resident(flush).unwrap();
+    dev.synchronize().unwrap();
+    assert_eq!(
+        read_lens(&dev, ptrs[0].0, ptrs[0].1 as usize),
+        vec![32, 2],
+        "the snapshot was copied before the marked writer region was re-serialised"
+    );
+    drop(generation);
+    drop(kv);
 }

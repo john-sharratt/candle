@@ -735,10 +735,10 @@ fn paged_prefill_batched_impl<'w>(
     g_kernel.end();
     // Per-sequence written length (each sequence advanced by its own q_lens[i],
     // not the over-allocated max_add). Written by this kernel, not the decode
-    // kernel, so the cached decode slot buffers are brought up to date with it —
-    // a verify block is exactly this commit on a sequence mid-decode. One commit
-    // for the layer's whole batch: a refresh per sequence cost the small models
-    // most of their prefill throughput.
+    // kernel, so the cached decode slot buffers are marked for the next sync to
+    // bring up to date — a verify block is exactly this commit on a sequence
+    // mid-decode. One commit for the layer's whole batch: one state lock, not
+    // one per sequence.
     KvCache::commit_written_tokens_batch(caches, offsets, q_lens)?;
 
     // After each prefill layer, eagerly quantize all fully-sealed chunks so that
