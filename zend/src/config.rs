@@ -66,6 +66,13 @@ pub struct DaemonConfig {
     /// Which model the daemon runs (`--model <PRESET>`). Defaults to the
     /// measured-VRAM ladder in `model_choice`.
     pub model: ModelChoice,
+    /// `--qsa-selection-budget <N>`: run the QSA selection with `N` positions in
+    /// place of the checkpoint's own budget (`ModelBuilder::qsa_selection_budget`);
+    /// `None` keeps the checkpoint's. A budget of at least the checkpoint's
+    /// context reads every cell — the dense control a selection failure is
+    /// judged against. Refused at load for a model whose attention does not
+    /// select, and for a budget the selection kernel cannot run.
+    pub qsa_selection_budget: Option<usize>,
 }
 
 /// Which model a daemon runs.

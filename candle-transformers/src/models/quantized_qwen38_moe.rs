@@ -1009,7 +1009,7 @@ mod tests {
              supposed to put every cell inside it, so this is not a control at all"
         );
 
-        model.set_selection_budget(released_top_k);
+        model.set_selection_budget(released_top_k)?;
         let (first, rows) = run(&model)?;
         println!("continuation: {first:?}  (QSA rows selected: {rows})");
         // §6.2: what the decode kernel's share actually is at a QSA-capped

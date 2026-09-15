@@ -168,6 +168,15 @@ struct Cli {
     /// VRAM, by its variant name (e.g. `Qwen35_0_8B_Q8`, `Qwen38_FlashNext_Q4KO`).
     #[arg(long, value_name = "PRESET", value_parser = parse_model)]
     model: Option<Model>,
+
+    /// Run the QSA selection with this many positions in place of the
+    /// checkpoint's own budget (Qwen3.8-Flash-Next). A budget of at least the
+    /// checkpoint's context makes the selection the identity — every cell is
+    /// read — which is the dense control for a selection question. Refused at
+    /// load for a model whose attention does not select, and for a budget the
+    /// selection kernel cannot run (between its ceiling and the context).
+    #[arg(long, value_name = "N")]
+    qsa_selection_budget: Option<usize>,
 }
 
 /// A `--model` value: the preset whose variant name it is.
@@ -399,6 +408,7 @@ async fn main() -> anyhow::Result<()> {
         model: cli.model.clone().map_or(ModelChoice::MeasuredVram, |m| {
             ModelChoice::Preset(Box::new(m))
         }),
+        qsa_selection_budget: cli.qsa_selection_budget,
     };
 
     if !disabled_layers.is_empty() {

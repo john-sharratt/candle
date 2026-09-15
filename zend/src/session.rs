@@ -736,6 +736,7 @@ impl InferenceState {
         max_depth: Option<usize>,
         compact_substrate: bool,
         read_only_substrate: bool,
+        qsa_selection_budget: Option<usize>,
         progress: Arc<LoadProgress>,
         status_tx: tokio::sync::watch::Sender<String>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
@@ -933,6 +934,7 @@ impl InferenceState {
             .tokenizer_path(tokenizer_path)
             .workspace_path(workspace.clone())
             .read_only_substrate(read_only_substrate)
+            .qsa_selection_budget(qsa_selection_budget)
             // Dialogue turns compress at C5 (moderate adaptive quantization).
             // Paired with the removed uniform-K pin (see `ModelBuilder::engine`),
             // so K is adaptive too.
@@ -4969,6 +4971,7 @@ impl ZendSession {
         let max_depth = self.config.max_depth;
         let compact_substrate = self.config.compact_substrate;
         let read_only_substrate = self.config.read_only_substrate;
+        let qsa_selection_budget = self.config.qsa_selection_budget;
         // Resolved once, here, and handed to both the downloader and the engine
         // builder, so the artifact fetched and the model built are the same one.
         let model = model_choice::resolve(&self.config.model);
@@ -5059,6 +5062,7 @@ impl ZendSession {
                     max_depth,
                     compact_substrate,
                     read_only_substrate,
+                    qsa_selection_budget,
                     load_progress_for_blocking,
                     status_tx.clone(),
                 ) {
