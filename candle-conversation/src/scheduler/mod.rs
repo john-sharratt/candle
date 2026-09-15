@@ -2743,6 +2743,17 @@ fn carve_ms(amt: u64, buckets: &mut [&mut u64]) -> u64 {
     taken
 }
 
+/// Whether a seal that came back with no recurrent snapshot is missing one.
+///
+/// Only a snapshot that was asked for can be missing. An ephemeral timeline's
+/// export is skipped — its payload is dropped on arrival, so exporting it is
+/// pure cost — and a model that carries no recurrent state has none to give.
+/// Anything else that returns nothing is a model declaring state it cannot
+/// export, which resumes with no memory of its history and reads fluently.
+fn missing_recurrent_hook(ephemeral: bool, carries_recurrent_state: bool) -> bool {
+    !ephemeral && carries_recurrent_state
+}
+
 /// Named scheduler-loop phases for [`WaveStats::add_phase`].
 #[derive(Clone, Copy)]
 enum WavePhase {
@@ -8441,7 +8452,18 @@ impl Scheduler {
                     // it is worth a warning on every seal rather than a silence
                     // that is only discovered by noticing the model has
                     // forgotten.
-                    Ok(None) if self.model.carries_recurrent_state() => {
+                    //
+                    // **Only for a snapshot that was asked for.** An ephemeral
+                    // timeline's export is skipped above and arrives here as the
+                    // same `None`; its snapshot is dropped on arrival by design,
+                    // so nothing is missing — and every calibration seal of a
+                    // recurrent model is one of these.
+                    Ok(None)
+                        if missing_recurrent_hook(
+                            ephemeral,
+                            self.model.carries_recurrent_state(),
+                        ) =>
+                    {
                         tracing::warn!(
                             "turn {} sealed with NO recurrent snapshot, but this model \
                              declares it carries recurrent state — `export_recurrent` \
@@ -10607,6 +10629,20 @@ mod tests {
             let seg = carve_ms(req, &mut [&mut only]);
             assert_eq!(seg + only, orig, "req={req}");
         }
+    }
+
+    /// **An ephemeral seal skips the export, and that is not a missing hook.**
+    /// Judged as one, every calibration seal of a recurrent model reported a
+    /// wiring gap — 93 tool sections' worth at each fresh boot of Qwen3.6.
+    #[test]
+    fn only_a_requested_snapshot_can_be_missing() {
+        assert!(missing_recurrent_hook(false, true), "asked for, and absent");
+        assert!(!missing_recurrent_hook(true, true), "skipped by design");
+        assert!(
+            !missing_recurrent_hook(false, false),
+            "a model with no such state"
+        );
+        assert!(!missing_recurrent_hook(true, false));
     }
 
     /// The GPU provenance path's on-CPU tail (`assemble_folded_prov_sigs`) must be
