@@ -973,16 +973,20 @@ impl<U: UnaryOpT> Map1 for U {
                 // Keep info alive for the kernel call
                 let _info_guard = info.as_ref().map(|s| s.device_ptr(&stream));
 
-                unsafe {
-                    kernels::simple::unary::run_unary_op(
-                        op,
-                        dtype_i32,
-                        el_count,
-                        dims.len(),
-                        info_ptr,
-                        src_ptr as *const std::ffi::c_void,
-                        out_ptr as *mut std::ffi::c_void,
-                    );
+                // No elements, no launch: a zero grid is an invalid configuration
+                // left pending on the thread for an unrelated caller to find.
+                if el_count > 0 {
+                    unsafe {
+                        kernels::simple::unary::run_unary_op(
+                            op,
+                            dtype_i32,
+                            el_count,
+                            dims.len(),
+                            info_ptr,
+                            src_ptr as *const std::ffi::c_void,
+                            out_ptr as *mut std::ffi::c_void,
+                        );
+                    }
                 }
             }
             return Ok((out, out_backing));
@@ -2272,17 +2276,20 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
                 // Keep info alive for the kernel call
                 let _info_guard = info.as_ref().map(|s| s.device_ptr(&stream));
 
-                unsafe {
-                    kernels::simple::binary::run_binary_arith_op(
-                        op,
-                        dtype_i32,
-                        elem_count,
-                        dims.len(),
-                        info_ptr,
-                        lhs_ptr as *const std::ffi::c_void,
-                        rhs_ptr as *const std::ffi::c_void,
-                        out_ptr as *mut std::ffi::c_void,
-                    );
+                // No elements, no launch — see the unary map.
+                if elem_count > 0 {
+                    unsafe {
+                        kernels::simple::binary::run_binary_arith_op(
+                            op,
+                            dtype_i32,
+                            elem_count,
+                            dims.len(),
+                            info_ptr,
+                            lhs_ptr as *const std::ffi::c_void,
+                            rhs_ptr as *const std::ffi::c_void,
+                            out_ptr as *mut std::ffi::c_void,
+                        );
+                    }
                 }
             }
             return Ok((out, out_backing));
@@ -3773,16 +3780,21 @@ impl BackendStorage for CudaStorage {
                     let (out_ptr, _out_guard) = out.device_ptr(&stream);
                     // Keep info alive
                     let _info_guard = info.as_ref().map(|s| s.device_ptr(&stream));
-                    unsafe {
-                        kernels::simple::cast::run_cast(
-                            src_dtype_i32,
-                            dst_dtype_i32,
-                            el,
-                            dims.len(),
-                            info_ptr,
-                            inp_ptr as *const std::ffi::c_void,
-                            out_ptr as *mut std::ffi::c_void,
-                        );
+                    // An empty tensor casts to an empty tensor without a launch:
+                    // a zero grid is an invalid configuration, left pending on the
+                    // thread for an unrelated caller to find.
+                    if el > 0 {
+                        unsafe {
+                            kernels::simple::cast::run_cast(
+                                src_dtype_i32,
+                                dst_dtype_i32,
+                                el,
+                                dims.len(),
+                                info_ptr,
+                                inp_ptr as *const std::ffi::c_void,
+                                out_ptr as *mut std::ffi::c_void,
+                            );
+                        }
                     }
                 }
                 $wrapper(out)

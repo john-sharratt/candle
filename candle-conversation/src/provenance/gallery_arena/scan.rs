@@ -16,8 +16,8 @@ use std::sync::Arc;
 use candle::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
 use candle::{Device, Result};
 use candle_kernels::provenance::{
-    bdp_bmma_supported, bdp_imma_supported, run_batched_bdp_scan, run_bmma_bdp_scan,
-    run_imma_bdp_scan,
+    bdp_bmma_supported, bdp_imma_supported, bdp_take_pending_error, run_batched_bdp_scan,
+    run_bmma_bdp_scan, run_imma_bdp_scan,
 };
 use core::ffi::c_void;
 
@@ -78,6 +78,28 @@ enum PagedBackend {
     Bmma,
     Imma,
     Scalar,
+}
+
+/// A tensor launcher's negative return code, decoded: `(stage, cudaError)`.
+///
+/// The launchers return `-(stage * 1000 + cudaError)`, where the stage names
+/// WHICH of their CUDA calls rejected the work (1 alloc, 2 memset, 3 accumulate
+/// launch, 4 finalize launch). A bare `-cudaError` names none of them and reads
+/// as `unstaged`.
+fn launch_failure(rc: i32) -> (&'static str, i32) {
+    let (stage, cuda_err) = if rc <= -1000 {
+        ((-rc) / 1000, (-rc) % 1000)
+    } else {
+        (0, -rc)
+    };
+    let stage = match stage {
+        1 => "alloc",
+        2 => "memset",
+        3 => "accum_launch",
+        4 => "finalize_launch",
+        _ => "unstaged",
+    };
+    (stage, cuda_err)
 }
 
 /// Fingerprint the segment structure the built index depends on — file order,
@@ -374,6 +396,21 @@ impl GalleryArena {
             .memcpy_stod(&probe_words)
             .map_err(|e| candle::Error::Msg(format!("paged scan: HtoD probes: {e}")))?;
 
+        // An error already pending on this thread is an EARLIER launch's that
+        // nothing checked. Taken and named here, before any backend runs: a
+        // launcher reads `cudaGetLastError` after its own work, so left pending
+        // it is reported as that backend failing, and the fall to the next rung
+        // buries the launch that actually failed.
+        let pending = unsafe { bdp_take_pending_error() };
+        if pending != 0 {
+            tracing::warn!(
+                target: "candle_conversation::provenance",
+                cuda_err = pending,
+                "paged scan: an earlier CUDA launch on this thread left error {pending} \
+                 unchecked"
+            );
+        }
+
         let n_out = n_probe_tokens * n_groups * n_segments;
         let mut d_out_case = unsafe { stream.alloc::<i32>(n_out) }
             .map_err(|e| candle::Error::Msg(format!("paged scan: alloc out_case: {e}")))?;
@@ -441,22 +478,7 @@ impl GalleryArena {
                         // retry the same geometry — a backend-specific launch
                         // failure degrades to the next backend, not to the CPU.
                         let _ = stream.synchronize();
-                        // Decode `-(stage * 1000 + cudaError)`; `stage` names
-                        // WHICH CUDA call rejected the work (1 alloc, 2 memset,
-                        // 3 accum launch, 4 finalize launch) and `cuda_err` is
-                        // the raw `cudaError_t`. A bare rc named neither.
-                        let (stage, cuda_err) = if rc <= -1000 {
-                            ((-rc) / 1000, (-rc) % 1000)
-                        } else {
-                            (0, -rc)
-                        };
-                        let stage_name = match stage {
-                            1 => "alloc",
-                            2 => "memset",
-                            3 => "accum_launch",
-                            4 => "finalize_launch",
-                            _ => "unstaged",
-                        };
+                        let (stage_name, cuda_err) = launch_failure(rc);
                         tracing::warn!(
                             target: "candle_conversation::provenance",
                             backend = ?backend,
@@ -543,6 +565,17 @@ mod tests {
     use super::*;
     use crate::persistence::content_hash::turn_stream_id;
     use crate::provenance::gpu::{BatchedGpuGallery, SegmentInput};
+
+    /// The launchers' `-(stage * 1000 + cudaError)` codes, decoded exactly —
+    /// and a bare `-cudaError`, which names no stage.
+    #[test]
+    fn a_launch_failure_names_its_stage() {
+        assert_eq!(launch_failure(-1002), ("alloc", 2));
+        assert_eq!(launch_failure(-2001), ("memset", 1));
+        assert_eq!(launch_failure(-3009), ("accum_launch", 9));
+        assert_eq!(launch_failure(-4009), ("finalize_launch", 9));
+        assert_eq!(launch_failure(-9), ("unstaged", 9));
+    }
 
     fn sig(fill: u64) -> WideQSig {
         WideQSig {
