@@ -104,9 +104,9 @@ const HYBRID_SAMPLING: (f32, f32) = (0.7, 0.95);
 ///
 /// Everything that is a property of the architecture rather than of a file is shared with the
 /// stock preset: the loader arm, the tokenizer the gate verified token for token against this
-/// lineage's GGUFs, and the KV threshold row the loader applies (`QWEN36_MOE_KV_FACTORS`,
-/// derived on the stock file — a fine-tune moves the weights, not the attention geometry the row
-/// was fitted to).
+/// lineage's GGUFs, and the KV threshold row the loader applies (`QWEN36_MOE_KV_FACTORS`). One
+/// row serves both files, so it is fitted to whichever sits nearer the edge: this hybrid on the
+/// `Int8Mode::Performance` path, which needed a tighter K at C10×64 than the stock file does.
 ///
 /// # Three files, and what each costs a fresh machine
 ///
