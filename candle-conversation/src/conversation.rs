@@ -7,6 +7,7 @@
 use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnHandle, TurnResponse};
+use crate::recorded_reply::recorded_reply;
 use crate::recovered_message::{tool_response_lengths, RecoveredMessage, TOOL_RESPONSE_OPEN};
 use candle_transformers::models::delta_net::ExportedLayerState;
 
@@ -25,6 +26,7 @@ use crate::scheduler::{
     note_branch_checkpoint_computed, note_branch_checkpoint_installed, CarvedTurn,
     ProjectionInputs, ReprojectionPolicy, SchedulerRequest, TurnContent,
 };
+use crate::sealed_turn::{SealedPages, SealedTurn};
 use crate::sequence_handle::{BlockCount, SequenceId};
 use crate::stuffed_grid::{plan_stuffed_grid_with_indices, CaseGrid};
 use crate::token_buffer::TokenBuffer;
@@ -2098,6 +2100,7 @@ impl Sequence {
             // quotations or prose is a property of what this conversation *is*,
             // and a per-turn switch would be a way to get it wrong on one turn.
             self.projection.schema().free_tool_calls_from_penalties,
+            options.recorded_turn,
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -2124,12 +2127,14 @@ impl Sequence {
     /// with [`finish_turn`](Self::finish_turn) exactly like a decoded turn.
     pub fn submit_prefilled_turn(
         &mut self,
-        user_message: &str,
+        user_message: impl Into<TurnText>,
         assistant_trajectory: &str,
         projection_marker: &str,
         selection: SelectionState,
         tags: Vec<String>,
     ) -> crate::Result<TurnHandle> {
+        let user_message = user_message.into();
+        let user_text = user_message.text();
         if self.turn_in_flight {
             return Err(ConversationError::TurnInFlight {
                 sequence_id: self.id,
@@ -2145,10 +2150,8 @@ impl Sequence {
         // it had one, and injecting scaffolding in front of it would make the
         // replayed grid differ from the decode it is calibrating against.
         let assistant_start_marker = self.config.dialect.assistant_start;
-        let assistant_head = format!(
-            "{}{}{}",
-            user_message, self.config.dialect.user_end, assistant_start_marker,
-        );
+        let markers = format!("{}{}", self.config.dialect.user_end, assistant_start_marker);
+        let assistant_head = format!("{user_text}{markers}");
         // The trajectory carries `projection_marker`s at the points a real decode
         // reprojected. Strip them from the prefilled text (they are not model
         // tokens), and record each one's token offset so the staged prefill wave
@@ -2158,43 +2161,48 @@ impl Sequence {
         // prefix up to each marker yields its exact grid offset.
         let clean_trajectory = assistant_trajectory.replace(projection_marker, "");
         let formatted = format!("{assistant_head}{clean_trajectory}");
-        let prefill_tokens = self.tokenize(&formatted)?;
+        // The user half is encoded piece by piece, exactly as
+        // `submit_turn_with_options` encodes it — a tool's output stays literal —
+        // and the markers and trajectory follow as one string. The half meets
+        // them on `user_end`, a registered tag the tokenizer splits at anyway, so
+        // the concatenation is the whole grid's encoding.
+        let user_tokens = self.encode_text(&user_message)?;
+        let mut prefill_tokens = user_tokens.clone();
+        prefill_tokens.extend_from_slice(&self.tokenize(&format!("{markers}{clean_trajectory}"))?);
         // No post-decode tail — `assistant_end` is a live `Generated` segment,
         // same as a decoded turn.
         let post_decode_tokens = TokenBuffer::new();
 
         // Record the pending user turn (text + raw tokens for the tree).
-        let user_tokens = self.tokenize(user_message)?;
-        self.pending_user = Some(TokenizedText::new(user_message, user_tokens));
+        self.pending_user = Some(TokenizedText::new(user_text.as_str(), user_tokens.clone()));
 
-        // Content boundaries: user body `[0, len(user_msg))`; the supplied
-        // assistant trajectory begins right after the head. Clamp/monotonise so a
-        // tokenizer that merges across a join can never invert the windows.
+        // Content boundaries: user body `[0, len(user half))`; the supplied
+        // assistant trajectory begins right after the markers. Clamp/monotonise
+        // so a tokenizer that merges across a join can never invert the windows.
         let total = prefill_tokens.len();
         let user_content_start = 0u32;
-        let user_content_end = self.tokenize(user_message)?.len().min(total) as u32;
-        let assistant_content_start = self
-            .tokenize(&assistant_head)?
-            .len()
+        let user_content_end = user_tokens.len().min(total) as u32;
+        let assistant_content_start = (user_tokens.len() + self.tokenize(&markers)?.len())
             .min(total)
             .max(user_content_end as usize) as u32;
 
-        // Grid-token offset of each projection marker: tokenize `head + trajectory
-        // up to the marker`. `split` yields one segment per marker plus a trailing
-        // remainder, so the boundaries between segments are exactly the marker
-        // positions. Two markers are dropped from the wave's emit list: the
-        // initial one at generation start (index 0 — the handler already applied
-        // that projection, and its span is carried by the next event) and the seal
-        // marker flush with the trajectory end (the final projection is appended at
-        // seal). The intermediate reprojections remain.
+        // Grid-token offset of each projection marker: the user half's length
+        // plus the tokenized `markers + trajectory up to the marker`. `split`
+        // yields one segment per marker plus a trailing remainder, so the
+        // boundaries between segments are exactly the marker positions. Two
+        // markers are dropped from the wave's emit list: the initial one at
+        // generation start (index 0 — the handler already applied that
+        // projection, and its span is carried by the next event) and the seal
+        // marker flush with the trajectory end (the final projection is appended
+        // at seal). The intermediate reprojections remain.
         let segments: Vec<&str> = assistant_trajectory.split(projection_marker).collect();
         let mut projection_offsets: Vec<u32> = Vec::new();
         if segments.len() > 1 {
             let end = prefill_tokens.len() as u32;
-            let mut prefix = assistant_head.clone();
+            let mut prefix = markers.clone();
             for (i, seg) in segments[..segments.len() - 1].iter().enumerate() {
                 prefix.push_str(seg);
-                let off = self.tokenize(&prefix)?.len() as u32;
+                let off = (user_tokens.len() + self.tokenize(&prefix)?.len()) as u32;
                 if i > 0 && off < end {
                     projection_offsets.push(off);
                 }
@@ -2206,7 +2214,7 @@ impl Sequence {
             Some(self.projection_inputs()),
             formatted,
             prefill_tokens,
-            user_message.to_string(),
+            user_text,
             user_content_start,
             user_content_end,
             assistant_content_start,
@@ -2229,6 +2237,8 @@ impl Sequence {
             None,
             // Nothing is sampled, so no penalty applies to exempt from.
             false,
+            // Nothing is decoded, so there is no reply to replay.
+            None,
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -2401,6 +2411,7 @@ impl Sequence {
                 // is nothing to constrain and nothing to exempt.
                 turn_grammar: None,
                 free_tool_calls_from_penalties: false,
+                recorded_reply: None,
                 seal_group: Some(Arc::new(turns)),
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
@@ -2450,6 +2461,7 @@ impl Sequence {
         triggers: Arc<TriggerRegistry>,
         turn_grammar: Option<Arc<StencilTree>>,
         free_tool_calls_from_penalties: bool,
+        recorded_turn: Option<Vec<u32>>,
     ) -> crate::Result<TurnHandle> {
         // ── Bake the turn's own boundary markers into its grid ──────────────
         //
@@ -2513,6 +2525,21 @@ impl Sequence {
         let mut post_decode_tokens = post_decode_tokens;
         post_decode_tokens.extend_from_slice(&self.tokenize(self.config.dialect.assistant_end)?);
 
+        // A replayed turn decodes its recording: everything the recorded grid
+        // holds past this prefill, less the tail written after the decode — one
+        // step per recorded id and one for the end of turn. Its triggers and
+        // grammar run as they did live: what they played is in the recording,
+        // and where they cut pages is part of what is being replayed.
+        let (reply, max_decode_tokens) = match recorded_turn {
+            Some(grid) => {
+                let reply = recorded_reply(&grid, &prefill_tokens, &post_decode_tokens)
+                    .map_err(ConversationError::Other)?;
+                let steps = reply.len() + 1;
+                (Some(reply), steps)
+            }
+            None => (None, max_decode_tokens),
+        };
+
         let disable_reprojection = self.config.disable_reprojection;
         // Append-only ingests skip the per-turn projection rebuild and also
         // suppress continuous mid-decode reprojection.
@@ -2547,6 +2574,7 @@ impl Sequence {
                 triggers,
                 turn_grammar,
                 free_tool_calls_from_penalties,
+                recorded_reply: reply,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
         Ok(TurnHandle::new(event_rx))
@@ -2769,6 +2797,7 @@ impl Sequence {
             Arc::new(TriggerRegistry::new()),
             None,
             false,
+            None,
         )?;
 
         // Drain events synchronously to Done.  The handle's event_rx
@@ -4446,6 +4475,27 @@ impl Sequence {
         out
     }
 
+    /// Every turn of `timeline` as the substrate holds it — its sealed ids and
+    /// its index pages — in turn order, the summariser's summary turns skipped
+    /// as [`Self::recovered_history`] skips them. What a projection hands the
+    /// model when it borrows each turn, so two timelines that agree here are the
+    /// same context.
+    pub fn sealed_turns(&self, timeline: TimelineId) -> Vec<SealedTurn> {
+        let read = self.substrate.read();
+        read.turn_indices(timeline)
+            .filter(|&idx| {
+                !read
+                    .tree_meta_of(timeline, idx)
+                    .is_some_and(|m| m.kind.is_summary())
+            })
+            .map(|idx| SealedTurn {
+                index: idx.0,
+                token_ids: read.token_ids_of(timeline, idx),
+                pages: SealedPages::of(read.index_page_blob(timeline, idx)),
+            })
+            .collect()
+    }
+
     /// How many tokens `text` becomes as a turn's user half — encoded exactly
     /// as a submitted turn is, markup and literal pieces each by their own
     /// tokenizer. A tool result measured this way before it is submitted has
@@ -4954,6 +5004,7 @@ impl ProbeCtx {
                 // A one-token wide-Q probe constrains nothing.
                 turn_grammar: None,
                 free_tool_calls_from_penalties: false,
+                recorded_reply: None,
             })
             .is_err()
         {

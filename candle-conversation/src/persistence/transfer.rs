@@ -16,7 +16,11 @@
 //! all assume a CUDA device.
 
 mod cuda_impl {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle::direct_io::DirectFile;
     use candle::{Device, Result};
     use candle_nn::kv_cache::{
         fletcher32_golden, kv_migrate, ArenaLocation, ChunkedKvBacking, GoldenRecord,
@@ -25,6 +29,7 @@ mod cuda_impl {
 
     use crate::persistence::cold_load::{ColdLoadStager, PINNED_PREALLOC_BYTES};
     use crate::persistence::resume::ChunkImage;
+    use crate::persistence::segment::SegmentId;
     use crate::persistence::streams::{StreamId, TurnDecl};
     use crate::persistence::SubstratePersistence;
     use crate::substrate::Substrate;
@@ -470,10 +475,7 @@ mod cuda_impl {
         // from a sealed segment). The active and inherited handles come from
         // `persistence`; the sealed ones are owned here for the cold-load's
         // duration so the pipeline's reader threads can borrow them by id.
-        let mut sealed_handles: std::collections::HashMap<
-            crate::persistence::segment::SegmentId,
-            candle::direct_io::DirectFile,
-        > = std::collections::HashMap::new();
+        let mut sealed_handles: HashMap<SegmentId, Arc<DirectFile>> = HashMap::new();
         for batch in &plan.chunks {
             if let crate::persistence::chunk_plan::SourceLog::Sealed(id) = batch.source {
                 if let std::collections::hash_map::Entry::Vacant(e) = sealed_handles.entry(id) {

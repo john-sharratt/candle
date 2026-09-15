@@ -1586,12 +1586,18 @@ fn inject_sealed_turn_half(
     // **No page for a HALF, deliberately.** The stored page covers a whole
     // turn, and this borrows only its user half — handing the whole turn's rows
     // over would claim blocks for positions this slot does not hold, which is a
-    // worse error than having none. Reported so the gap is visible rather than
-    // silent; the compression path this serves selects over what it did index.
+    // worse error than having none. The half's K/V is in the slot either way, so
+    // the index is advanced past it exactly as the section and turn paths do for
+    // a piece with no page: without that, every page pushed after the half is
+    // placed its width short of where its K/V sits.
     if ctx.model.carries_positional_state() {
+        let tokens = sealed[0].token_count;
+        let advanced = ctx.model.push_positional_gap(parent_id.0, tokens);
         tracing::warn!(
+            advanced = advanced.is_ok(),
             "apply_projection: turn-half {}/{} carries no index page — a half is not a \
-             sealed piece of its own, so the turn's rows do not describe it",
+             sealed piece of its own, so the turn's rows do not describe it; its {tokens} \
+             token(s) are unindexed",
             timeline,
             index.0
         );

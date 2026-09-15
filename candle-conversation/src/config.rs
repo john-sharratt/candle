@@ -1721,6 +1721,22 @@ pub struct EngineConfig {
     /// than failing. See [`SharedSubstrate`].
     pub substrate: Option<SharedSubstrate>,
 
+    /// Open the workspace's substrate read-only
+    /// ([`SharedSubstrate::open_in_read_only`]) instead of read-write.
+    ///
+    /// For a tool that reads a workspace another process — the daemon — may be
+    /// appending to at the same time. The store must already exist, and nothing
+    /// under `.substrate/` is created, renamed, deleted, truncated, grown or
+    /// written from engine start through shutdown. Everything in RAM works as it
+    /// does on a writable substrate — seals update the substrate mirror; labels,
+    /// tombstones and projection events apply — and a turn that would have gone
+    /// cold stays warm. The model spec is not recorded, and a tokenizer the log
+    /// records is still checked against [`Self::tokenizer`].
+    ///
+    /// Unread when [`Self::substrate`] carries an already-open one: that
+    /// handle's own mode rules. `false` by default.
+    pub read_only_substrate: bool,
+
     /// Serialized model identity (HF repo / filename / arch / context length).
     /// Written to the substrate's `ModelSpec` record at engine startup via
     /// compare-and-insert, so the log is a self-contained, reloadable image.
@@ -1774,6 +1790,7 @@ impl EngineConfig {
             health: DecodeHealthConfig::default(),
             workspace_path: None,
             substrate: None,
+            read_only_substrate: false,
             model_spec: None,
             tokenizer: None,
             dialect: Dialect::chat_ml(),

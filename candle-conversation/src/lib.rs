@@ -77,8 +77,10 @@ pub mod profile {
 }
 pub mod prompts;
 pub mod provenance;
+mod recorded_reply;
 mod recovered_message;
 pub(crate) mod scheduler;
+mod sealed_turn;
 mod sequence_handle;
 mod stats;
 pub mod stencil;
@@ -114,6 +116,7 @@ pub use scheduler::phase_ring;
 pub use scheduler::provenance_capture_path_counts;
 pub use scheduler::recurrent_state_cost;
 pub use scheduler::relief_trace;
+pub use sealed_turn::{SealedPages, SealedTurn};
 pub use sequence_handle::SequenceId;
 pub use stats::{FinishReason, TurnStats};
 pub use token_buffer::TokenBuffer;

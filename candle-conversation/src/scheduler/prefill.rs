@@ -5,6 +5,7 @@ use super::admission::{
 };
 use super::*;
 use crate::persistence::thread::effective_turn_policy;
+use crate::recorded_reply::replayed_step;
 use crate::substrate::ConvCompression;
 use crate::token_buffer::TokenBuffer;
 use candle_nn::kv_cache::{end_wave_transient, is_device_oom};
@@ -2721,7 +2722,7 @@ impl Scheduler {
             );
         }
 
-        let first_token = match self.sample_single(&logits, &sampling, &mut sampling_state) {
+        let sampled = match self.sample_single(&logits, &sampling, &mut sampling_state) {
             Ok(t) => t,
             Err(e) => {
                 self.sampling_states
@@ -2729,6 +2730,12 @@ impl Scheduler {
                 let _ = work.event_tx.send(TurnEvent::Error(e));
                 return;
             }
+        };
+        // A replayed turn opens with its recording's first id, whatever the
+        // prefill's logits chose.
+        let first_token = match (work.recorded_reply.as_deref(), self.eos_tokens.first()) {
+            (Some(reply), Some(&eos)) => replayed_step(reply, 0, eos),
+            _ => sampled,
         };
 
         // Detect think-mode entry: the model opens its OWN `<think>` as the first
@@ -2886,6 +2893,7 @@ impl Scheduler {
                     triggers: work.triggers,
                     stencil: None,
                     pending_mask: None,
+                    recorded_reply: work.recorded_reply.map(Replay::new),
                 };
                 // The turn's first token opens a page at the prefill/decode
                 // boundary, so the reasoning starts one of its own.
@@ -3018,6 +3026,7 @@ impl Scheduler {
             triggers: work.triggers,
             stencil,
             pending_mask: None,
+            recorded_reply: work.recorded_reply.map(Replay::new),
         };
         // The turn's first token opens a page at the prefill/decode boundary, so
         // the reasoning starts one of its own.
@@ -3378,6 +3387,7 @@ mod wave_chunk_tests {
                 triggers: Arc::new(TriggerRegistry::new()),
                 turn_grammar: None,
                 free_tool_calls_from_penalties: false,
+                recorded_reply: None,
             },
             offset: 0,
             next_projection: 0,

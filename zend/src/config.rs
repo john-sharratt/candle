@@ -57,6 +57,12 @@ pub struct DaemonConfig {
     /// the eager whole-store rewrite instead of deferring it. Opt-in
     /// (`--compact-substrate`).
     pub compact_substrate: bool,
+    /// Open the workspace's substrate READ-ONLY and write nothing to disk
+    /// (`ModelBuilder::read_only_substrate`): every turn lives in RAM, and the
+    /// boot steps that exist to write — calibration, compaction, the watcher,
+    /// the upload reconcile and the background re-ingest — do not run. For a
+    /// tool that reads a substrate the running daemon owns, beside it.
+    pub read_only_substrate: bool,
     /// Which model the daemon runs (`--model <PRESET>`). Defaults to the
     /// measured-VRAM ladder in `model_choice`.
     pub model: ModelChoice,

@@ -33,8 +33,8 @@ use candle_conversation::RecoveredMessage;
 use candle_conversation::Role as TurnRole;
 use candle_conversation::TurnText;
 use candle_conversation::{
-    ConversationEngine, GlueMarkers, OptionalState, ProjectionEvent, Sequence, ThinkSteering,
-    TokenDecoder, TurnEvent, TurnHandle, TurnResponse,
+    ConversationEngine, GlueMarkers, OptionalState, ProjectionEvent, SamplingConfig,
+    SelectionState, Sequence, ThinkSteering, TokenDecoder, TurnEvent, TurnHandle, TurnResponse,
 };
 use serde_json::Value;
 
@@ -63,6 +63,12 @@ use crate::tools::{
 };
 use crate::types::{ChatMessage, Role, ToolMode, Usage};
 use crate::watcher::WatchDepth;
+
+mod replay;
+pub use replay::{
+    Demonstration, RecordedTurn, ReplayOutcome, ReplayReport, ReplaySampling, ReplaySpec,
+    TurnComparison,
+};
 
 const PROJECTION_SCHEMA_TEMPLATE: &str = include_str!("prompts/projection.yaml");
 
@@ -198,6 +204,91 @@ fn response_budget_from_selection(selection: &candle_conversation::SelectionStat
         Some("comprehensive") => 3584,
         // Explicit `standard`, or no dial set (projection default).
         _ => 1024,
+    }
+}
+
+/// The projection a chat turn runs under: the tools mode's prebuilt view — a
+/// cheap `Arc` clone, no per-turn schema clone — scoped to the conversation's
+/// identity's anchor and facets when it names one (`IdentityBuilders`).
+fn turn_projection(
+    state: &InferenceState,
+    conv_id: &str,
+    identity: Option<&str>,
+    tools_mode: ToolMode,
+) -> Arc<Builder> {
+    let scope = state.identity_builders.resolve(identity);
+    let (proj, applied) = match &scope {
+        IdentityScope::Named(name) => (
+            state
+                .identity_builders
+                .get(&state.mode_builders, name, tools_mode),
+            Some(name.as_str()),
+        ),
+        IdentityScope::Empty => {
+            tracing::warn!(conv_id = %conv_id,
+                "conversation names no identity and mind.yaml sets no default — \
+                 scoping identity collections to empty (no anchor emitted)");
+            (
+                state
+                    .identity_builders
+                    .get_empty(&state.mode_builders, tools_mode),
+                None,
+            )
+        }
+        IdentityScope::Unscoped => (state.mode_builders.get(tools_mode), None),
+    };
+    tracing::info!(conv_id = %conv_id, ?tools_mode, identity = ?applied, "projection applied");
+    proj
+}
+
+/// A chat turn's sampling config. A caller's explicit config (e.g. a test's
+/// `argmax()`) is honoured verbatim; the conversation default gets the per-turn
+/// adjustments and `seed`. Either way the dials' thinking and answer budget is
+/// steered in: the effort level sets the think block's close thresholds, and
+/// `response_length` the answer's room above them (see `think_budget::steer`).
+fn turn_sampling(
+    conv: &Sequence,
+    explicit: Option<SamplingConfig>,
+    selection: &SelectionState,
+    think_closer: &[u32],
+    seed: u64,
+) -> SamplingConfig {
+    let think_mode = think_mode_from_selection(selection);
+    let mut sampling = match explicit {
+        Some(explicit) => explicit,
+        None => {
+            let mut sampling = conv.default_sampling();
+            // A `/no_think` turn is a direct response, not reasoning: strip the
+            // thinking-temperature boost, which is meant for the `<think>` span
+            // and has no business heating a plain answer.  DRY stays on: it is
+            // span-scoped (`dry_span_len` — it only ever sees the current prose
+            // span, never the prompt or a prior span), so it breaks answer loops
+            // without penalizing verbatim reproduction of numbers/identifiers
+            // lifted from the prompt.
+            if think_mode == ThinkMode::Off {
+                sampling.segment_temp_boost = 0.0;
+            }
+            sampling.seed = seed;
+            sampling
+        }
+    };
+    think_budget::steer(
+        &mut sampling,
+        think_mode,
+        response_budget_from_selection(selection),
+        think_closer,
+    );
+    sampling
+}
+
+/// The triggers a chat turn decodes under: any `<tool_call>` the model emits is
+/// forced to the catalog's exact JSON shape (name ∈ catalog, required params in
+/// order, valid JSON), and atop that the `<think>` block is steered per the
+/// effort dial, replacing the `<think>` trigger atomically.
+fn turn_triggers(state: &InferenceState, think_mode: ThinkMode) -> Arc<TriggerRegistry> {
+    match &state.think_steering {
+        Some(ts) => ts.registry_for(&state.tool_stencil, think_mode),
+        None => Arc::clone(&state.tool_stencil),
     }
 }
 
@@ -644,6 +735,7 @@ impl InferenceState {
         ingest_dirs: HashMap<String, String>,
         max_depth: Option<usize>,
         compact_substrate: bool,
+        read_only_substrate: bool,
         progress: Arc<LoadProgress>,
         status_tx: tokio::sync::watch::Sender<String>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
@@ -840,6 +932,7 @@ impl InferenceState {
             .model_path(model_path)
             .tokenizer_path(tokenizer_path)
             .workspace_path(workspace.clone())
+            .read_only_substrate(read_only_substrate)
             // Dialogue turns compress at C5 (moderate adaptive quantization).
             // Paired with the removed uniform-K pin (see `ModelBuilder::engine`),
             // so K is adaptive too.
@@ -977,7 +1070,8 @@ impl InferenceState {
         // eager path instead — a whole-store rewrite here, after the reload (so
         // the live set is known) and before serving. It always runs when the
         // flag is set (no reclaimable-marker gate): the operator asked for it.
-        if compact_substrate {
+        // A read-only substrate is never rewritten.
+        if compact_substrate && !read_only_substrate {
             progress.set_step(LoadStep::Compacting);
             let cprog = Arc::clone(&progress);
             let cb = move |done: usize, total: usize| {
@@ -1138,8 +1232,10 @@ impl InferenceState {
         // conversation per (tool, example); a failing case is logged and skipped so
         // it can never break daemon load.
         progress.set_step(LoadStep::CalibratingSections);
-        // Skip entirely for a tool-free projection — nothing to calibrate.
-        if !tool_sections.is_empty() {
+        // Skip entirely for a tool-free projection — nothing to calibrate — and
+        // on a read-only substrate, whose calibration corpus is whatever the
+        // daemon that writes it has already sealed.
+        if !tool_sections.is_empty() && !read_only_substrate {
             // Wall-time attribution for the phase, logged once at its end.
             let calib_start = Instant::now();
             let mut timing = CalibTiming::default();
@@ -2878,40 +2974,15 @@ fn run_inference_stream(
                 }
             }
         } else {
-            // Cheap `Arc` clone of the prebuilt projection (no per-turn schema
-            // clone). Applied every turn so a mid-conversation dial change takes
-            // effect, and both projection and reprojection use it. When the
-            // conversation has an identity, the tools-mode view is further scoped
-            // to that identity's anchor + facets (`IdentityBuilders`); otherwise
-            // the plain tools-mode view.
-            let scope = state.identity_builders.resolve(cs.identity.as_deref());
-            let (proj, applied) = match &scope {
-                IdentityScope::Named(name) => (
-                    state
-                        .identity_builders
-                        .get(&state.mode_builders, name, tools_mode),
-                    Some(name.as_str()),
-                ),
-                IdentityScope::Empty => {
-                    tracing::warn!(conv_id = %conv_id,
-                        "conversation names no identity and mind.yaml sets no default — \
-                         scoping identity collections to empty (no anchor emitted)");
-                    (
-                        state
-                            .identity_builders
-                            .get_empty(&state.mode_builders, tools_mode),
-                        None,
-                    )
-                }
-                IdentityScope::Unscoped => (state.mode_builders.get(tools_mode), None),
-            };
+            // Applied every turn so a mid-conversation dial change takes effect,
+            // and both projection and reprojection use it.
+            let proj = turn_projection(&state, &conv_id, cs.identity.as_deref(), tools_mode);
             cs.conv.set_projection(proj);
             state
                 .tool_modes
                 .lock()
                 .unwrap()
                 .insert(conv_id.clone(), tools_mode);
-            tracing::info!(conv_id = %conv_id, ?tools_mode, identity = ?applied, "projection applied");
         }
 
         let original_user_message = user_message.clone();
@@ -2923,45 +2994,22 @@ fn run_inference_stream(
         // Quick/Balanced suppress the "Wait"/"Hmm"/… family in-block, Deep/
         // Exhaustive leave it 0 (reconsideration is wanted there).
         let think_mode = think_mode_from_selection(&selection);
-        // An explicit caller-supplied config (e.g. a test's `argmax()`) is honoured
-        // verbatim; only the conversation default gets the per-turn adjustments
-        // below (thinking-vs-response sampling split + a fresh seed).
-        let sampling_defaulted = sampling.is_none();
-        let mut sampling = sampling.unwrap_or_else(|| cs.conv.default_sampling());
-        if sampling_defaulted {
-            // A `/no_think` turn is a direct response, not reasoning: strip the
-            // thinking-temperature boost, which is meant for the `<think>` span
-            // and has no business heating a plain answer.  DRY stays on: it is now
-            // span-scoped (`dry_span_len` — it only ever sees the current prose
-            // span, never the prompt or a prior span), so it breaks answer loops
-            // without the old full-window DRY's failure of penalizing verbatim
-            // reproduction of numbers/identifiers lifted from the prompt.  (It can
-            // still nip content the model itself repeats WITHIN the current answer
-            // — e.g. a long list's `- ` scaffolding — which is a penalty-tuning
-            // question, not a scoping one.)  That span scoping is why disabling it
-            // here is no longer necessary.
-            if think_mode == ThinkMode::Off {
-                sampling.segment_temp_boost = 0.0;
-            }
-            // Vary the RNG seed per turn from real entropy. The default base seed
-            // is a fixed constant, which makes a whole conversation a deterministic
-            // replay — the same context always samples the same tokens, so a turn
-            // that lands in a bad attractor can never sample its way out. A fresh
-            // per-turn seed restores genuine run-to-run variation. (The per-token
-            // `rng_offset` still advances within the turn.)
-            sampling.seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(sampling.seed);
-        }
-        // The dials' thinking and answer budget: the effort level sets the think
-        // block's close thresholds, and `response_length` the answer's room above
-        // them. See `think_budget::steer`.
-        think_budget::steer(
-            &mut sampling,
-            think_mode,
-            response_budget_from_selection(&selection),
+        // Vary the RNG seed per turn from real entropy. The default base seed is
+        // a fixed constant, which makes a whole conversation a deterministic
+        // replay — the same context always samples the same tokens, so a turn
+        // that lands in a bad attractor can never sample its way out. A fresh
+        // per-turn seed restores genuine run-to-run variation. (The per-token
+        // `rng_offset` still advances within the turn.)
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or_else(|_| cs.conv.default_sampling().seed);
+        let sampling = turn_sampling(
+            &cs.conv,
+            sampling,
+            &selection,
             &state.think_closer_phrase,
+            seed,
         );
 
         // The tool loop runs until the model stops emitting tool calls (i.e.
@@ -2993,15 +3041,7 @@ fn run_inference_stream(
                 } else {
                     tool_round_selection(&selection)
                 },
-                // Force any `<tool_call>` the model emits to the catalog's exact
-                // JSON shape (name ∈ catalog, required params in order, valid
-                // JSON), and — atop that base — steer the `<think>` block per the
-                // effort dial (replacing the `<think>` trigger atomically).  An
-                // empty registry would just free-decode.
-                triggers: match &state.think_steering {
-                    Some(ts) => ts.registry_for(&state.tool_stencil, think_mode),
-                    None => Arc::clone(&state.tool_stencil),
-                },
+                triggers: turn_triggers(&state, think_mode),
                 ..Default::default()
             };
             let handle = match cs
@@ -4928,6 +4968,7 @@ impl ZendSession {
         let ingest_dirs = self.config.ingest_dirs.clone();
         let max_depth = self.config.max_depth;
         let compact_substrate = self.config.compact_substrate;
+        let read_only_substrate = self.config.read_only_substrate;
         // Resolved once, here, and handed to both the downloader and the engine
         // builder, so the artifact fetched and the model built are the same one.
         let model = model_choice::resolve(&self.config.model);
@@ -5017,6 +5058,7 @@ impl ZendSession {
                     ingest_dirs,
                     max_depth,
                     compact_substrate,
+                    read_only_substrate,
                     load_progress_for_blocking,
                     status_tx.clone(),
                 ) {
@@ -5085,7 +5127,11 @@ impl ZendSession {
                         // conversation. Fire the cheap tombstone-if-absent
                         // reconcile once at startup (uploads deleted while the
                         // daemon was down) and on every `uploads/` watcher burst.
-                        state.reconcile_uploaded_files();
+                        // A read-only substrate takes none of this upkeep, here or
+                        // below: it is written by the daemon beside it.
+                        if !read_only_substrate {
+                            state.reconcile_uploaded_files();
+                        }
                         let inference_for_uploads = Arc::clone(&slot);
                         let on_uploads_changed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                             let Some(state) = inference_for_uploads
@@ -5098,14 +5144,18 @@ impl ZendSession {
                             };
                             state.reconcile_uploaded_files();
                         });
-                        match crate::watcher::spawn(
-                            &state.workspace,
-                            state.watch_depth(),
-                            on_refresh,
-                            on_uploads_changed,
-                        ) {
-                            Ok(w) => *session_for_watcher.watcher.lock().unwrap() = Some(w),
-                            Err(e) => tracing::warn!("workspace watcher failed to start: {e:#}"),
+                        if !read_only_substrate {
+                            match crate::watcher::spawn(
+                                &state.workspace,
+                                state.watch_depth(),
+                                on_refresh,
+                                on_uploads_changed,
+                            ) {
+                                Ok(w) => *session_for_watcher.watcher.lock().unwrap() = Some(w),
+                                Err(e) => {
+                                    tracing::warn!("workspace watcher failed to start: {e:#}")
+                                }
+                            }
                         }
 
                         // One-shot startup reconcile, in the BACKGROUND. The load path
@@ -5115,35 +5165,39 @@ impl ZendSession {
                         // load critical path, after `ready`, exactly like a watcher burst.
                         // A no filesystem event fires for down-time edits, so this is what
                         // covers them.
-                        let state_for_reconcile = Arc::clone(&state);
-                        let reconcile = std::thread::spawn(move || {
-                            match state_for_reconcile.refresh_ingest_layers() {
-                                Ok(true) => tracing::info!(
-                                    "startup background reconcile: ingest layers updated"
-                                ),
-                                Ok(false) => tracing::debug!(
-                                    "startup background reconcile: no ingest-layer changes"
-                                ),
-                                Err(e) => {
-                                    tracing::warn!("startup background reconcile failed: {e:#}")
+                        if !read_only_substrate {
+                            let state_for_reconcile = Arc::clone(&state);
+                            let reconcile = std::thread::spawn(move || {
+                                match state_for_reconcile.refresh_ingest_layers() {
+                                    Ok(true) => tracing::info!(
+                                        "startup background reconcile: ingest layers updated"
+                                    ),
+                                    Ok(false) => tracing::debug!(
+                                        "startup background reconcile: no ingest-layer changes"
+                                    ),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "startup background reconcile failed: {e:#}"
+                                        )
+                                    }
                                 }
-                            }
-                            // The ingest/reconcile is now DONE (refresh_ingest_layers is
-                            // synchronous), so warm the per-file normalization hit levels
-                            // HERE — off the load path and, crucially, with no concurrent
-                            // ingest writer to starve (running the heavy self-match scan
-                            // during ingest freezes the scheduler). Covers the first-run
-                            // ingest and every restart's reconcile. Grab a cheap
-                            // conversation handle so the ~1-2 min scan never holds the
-                            // engine lock.
-                            let conv =
-                                { state_for_reconcile.engine.lock().unwrap().conversation() };
-                            let schema = state_for_reconcile.refresh_builder.schema().clone();
-                            // The tool catalog's levels are warmed by the load's
-                            // `Normalizing` step, before ready.
-                            conv.warm_ingest_normalization(&schema);
-                        });
-                        *session_for_watcher.reconcile_thread.lock().unwrap() = Some(reconcile);
+                                // The ingest/reconcile is now DONE (refresh_ingest_layers is
+                                // synchronous), so warm the per-file normalization hit levels
+                                // HERE — off the load path and, crucially, with no concurrent
+                                // ingest writer to starve (running the heavy self-match scan
+                                // during ingest freezes the scheduler). Covers the first-run
+                                // ingest and every restart's reconcile. Grab a cheap
+                                // conversation handle so the ~1-2 min scan never holds the
+                                // engine lock.
+                                let conv =
+                                    { state_for_reconcile.engine.lock().unwrap().conversation() };
+                                let schema = state_for_reconcile.refresh_builder.schema().clone();
+                                // The tool catalog's levels are warmed by the load's
+                                // `Normalizing` step, before ready.
+                                conv.warm_ingest_normalization(&schema);
+                            });
+                            *session_for_watcher.reconcile_thread.lock().unwrap() = Some(reconcile);
+                        }
                         // The engine is up — only NOW mark ready and unblock
                         // submit-flow waiters. Skipped on the shutdown-during-ingest
                         // path (the `Ok(None)` arm below).

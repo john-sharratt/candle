@@ -386,7 +386,15 @@ impl ConversationEngine {
                         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
                     }
                 };
-                SharedSubstrate::open_in(&workspace_dir).map_err(|e| {
+                // A read-only open writes nothing under `.substrate/` and
+                // requires the store to exist — see
+                // `EngineConfig::read_only_substrate`.
+                let opened = if config.read_only_substrate {
+                    SharedSubstrate::open_in_read_only(&workspace_dir)
+                } else {
+                    SharedSubstrate::open_in(&workspace_dir)
+                };
+                opened.map_err(|e| {
                     ConversationError::from(candle::Error::Msg(format!(
                         "substrate persistence: {e}"
                     )))
@@ -398,6 +406,7 @@ impl ConversationEngine {
             tracing::info!(
                 open_ms = open_start.elapsed().as_millis() as u64,
                 adopted,
+                read_only = persistence.is_read_only(),
                 log_bytes = persistence.write_offset(),
                 records = persistence.recovered_record_count(),
                 indexed = persistence.last_index().is_some(),
@@ -413,6 +422,9 @@ impl ConversationEngine {
         // Persist the model identity into the substrate's `ModelSpec` record —
         // compare-and-insert, so it only appends when the model differs from
         // what the log already records. Makes the log a self-contained image.
+        // A read-only substrate appends neither record: `set_model_spec`
+        // reports nothing written, and `set_tokenizer` still refuses a
+        // tokenizer other than the one the log records.
         let singletons_start = std::time::Instant::now();
         let mut persistence = shared.persistence.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(spec) = &config.model_spec {
@@ -2002,6 +2014,7 @@ impl ConversationEngine {
                 triggers: Arc::new(TriggerRegistry::new()),
                 turn_grammar: None,
                 free_tool_calls_from_penalties: false,
+                recorded_reply: None,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
 

@@ -276,6 +276,7 @@ impl SummarizationTask {
                 triggers: Arc::new(TriggerRegistry::new()),
                 turn_grammar: None,
                 free_tool_calls_from_penalties: false,
+                recorded_reply: None,
             })
             .is_err()
         {

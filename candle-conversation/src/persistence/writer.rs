@@ -23,6 +23,11 @@
 //! order-independent and per-turn fault-isolated (see `reconstruct_from_log`), so
 //! an async / out-of-order / lost-on-crash write only ever yields an ABSENT turn,
 //! never corruption; the bounded queue caps that window.
+//!
+//! Over a **read-only** substrate there is nothing to append to: no writer
+//! thread is spawned and every job is dropped at enqueue. The enqueuers have
+//! already made their in-memory change, which is all a read-only substrate
+//! keeps; nothing is ever committed.
 
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -194,12 +199,18 @@ pub struct SubstrateWriter {
     tx: Sender<(WriteJob, u64)>,
     backpressure: Arc<Backpressure>,
     handle: Mutex<Option<JoinHandle<()>>>,
+    /// The persistence handle was opened read-only: no thread runs, and
+    /// [`Self::enqueue`] drops every job.
+    read_only: bool,
 }
 
 impl SubstrateWriter {
     /// Spawn the writer thread over the shared substrate + persistence handles.
     /// It holds the raw Arcs (never a `Conversation`) so there is no Arc cycle —
     /// the last `Conversation` drop releases the writer, whose `Drop` drains + joins.
+    ///
+    /// Over a read-only persistence handle no thread is spawned: there is
+    /// nothing to append to and nothing to commit.
     pub fn spawn(
         substrate: Arc<RwLock<Substrate>>,
         persistence: Arc<Mutex<SubstratePersistence>>,
@@ -209,6 +220,18 @@ impl SubstrateWriter {
             state: Mutex::new((0, 0)),
             below_cap: Condvar::new(),
         });
+        let read_only = persistence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_read_only();
+        if read_only {
+            return Self {
+                tx,
+                backpressure,
+                handle: Mutex::new(None),
+                read_only,
+            };
+        }
         let bp = backpressure.clone();
         let handle = std::thread::Builder::new()
             .name("substrate-writer".into())
@@ -218,13 +241,21 @@ impl SubstrateWriter {
             tx,
             backpressure,
             handle: Mutex::new(Some(handle)),
+            read_only,
         }
     }
 
     /// Enqueue a durable write. Blocks (backpressure) if the queue is at either
     /// cap — the enqueuer keeps the in-memory substrate consistent while the disk
     /// catches up.
+    ///
+    /// Over a read-only substrate the job is dropped here, before a queue slot
+    /// is reserved, so there is no permit to give back; a `Shutdown` job's ack
+    /// sender drops with it, which wakes whoever waits on the ack.
     pub(crate) fn enqueue(&self, job: WriteJob) {
+        if self.read_only {
+            return;
+        }
         let bytes = job.byte_size();
         self.backpressure.acquire(bytes, job.is_bulk());
         // `send` only fails once the writer thread is gone (post-shutdown). Release
@@ -520,5 +551,75 @@ pub mod fault {
         } else {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex, RwLock};
+
+    use super::{SubstrateWriter, WriteJob};
+    use crate::persistence::record::RecordType;
+    use crate::persistence::streams::StreamId;
+    use crate::persistence::{dir_fingerprint, SubstratePersistence};
+    use crate::substrate::Substrate;
+
+    /// **A read-only writer drops every job and touches no file.** Metadata,
+    /// tokens and a bulk snapshot are all dropped before they take a queue
+    /// slot, no location is registered for a record that was never written,
+    /// shutdown returns without a commit, and the store is byte-identical.
+    #[test]
+    fn a_read_only_writer_drops_every_job_and_touches_no_file() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("kvtier_writer_ro_{nanos}"));
+        {
+            let mut substrate = Substrate::new();
+            let mut p = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            p.write_debug_id(1, "seed").unwrap();
+            p.commit().unwrap();
+        }
+        let before = dir_fingerprint(&dir);
+
+        let mut substrate = Substrate::new();
+        let p =
+            SubstratePersistence::open_in_with_substrate_read_only(&dir, &mut substrate).unwrap();
+        let substrate = Arc::new(RwLock::new(substrate));
+        let persistence = Arc::new(Mutex::new(p));
+        let writer = SubstrateWriter::spawn(substrate.clone(), persistence.clone());
+        let stream = StreamId(42);
+        writer.enqueue(WriteJob::StreamDecl {
+            stream_id: stream.0,
+            payload: vec![1, 2, 3],
+        });
+        writer.enqueue(WriteJob::Tokens {
+            stream_id: stream,
+            token_ids: vec![7, 8, 9],
+        });
+        writer.enqueue(WriteJob::ConvMeta {
+            record: RecordType::Label,
+            payload: vec![4, 5],
+        });
+        writer.enqueue(WriteJob::Snapshot {
+            stream_id: stream,
+            payload: vec![0u8; 4096],
+        });
+        assert_eq!(*writer.backpressure.state.lock().unwrap(), (0, 0));
+        writer.shutdown();
+        drop(writer);
+
+        assert!(substrate
+            .read()
+            .unwrap()
+            .stream_of(stream)
+            .and_then(|s| s.tokens)
+            .is_none());
+        assert_eq!(persistence.lock().unwrap().pending_bytes(), 0);
+        drop(persistence);
+        drop(substrate);
+        assert_eq!(dir_fingerprint(&dir), before);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

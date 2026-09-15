@@ -395,6 +395,7 @@ async fn main() -> anyhow::Result<()> {
         ingest_dirs: ingest_dirs.clone(),
         max_depth: cli.max_depth.map(|d| d as usize),
         compact_substrate: cli.compact_substrate,
+        read_only_substrate: false,
         model: cli.model.clone().map_or(ModelChoice::MeasuredVram, |m| {
             ModelChoice::Preset(Box::new(m))
         }),

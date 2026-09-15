@@ -34,6 +34,7 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{KvCache, ModelGeometry, QWEN4EXP_KV_FACTORS};
 
 use super::batched_attention::Qwen4ExpAttentionLayer;
+use super::coverage::coverage_disagreements;
 use super::draft::{HeadWave, SeedStore};
 use super::engine::{GpuLayerMix, Qwen4ExpGpu};
 use super::hyper::{hc_combine, hc_mix};
@@ -1269,19 +1270,20 @@ impl Qwen4ExpBatched {
             let off: Vec<(usize, usize)> = if layer_start != 0 {
                 Vec::new()
             } else {
-                caches
-                    .iter()
-                    .zip(self.attention_ratios())
-                    .enumerate()
-                    .filter(|(_, (_, ratio))| *ratio > 0)
-                    .filter_map(|(layer, (c, ratio))| {
-                        let have = c.indexed_tokens(ratio);
-                        // The open block carries up to `ratio - 1` tokens the
-                        // wave is about to complete, so equality is not
-                        // expected — only a whole block of disagreement is.
-                        (have + ratio <= offset || have > offset + ratio).then_some((layer, have))
-                    })
-                    .collect()
+                // **Exact, to the token.** `indexed_tokens` counts the open
+                // block's carried rows as well as the completed blocks and the
+                // injected pages, so an index that is where its K/V is agrees
+                // with `offset` exactly — and one that is off by less than a
+                // block is misplaced just the same (see `coverage`).
+                coverage_disagreements(
+                    caches
+                        .iter()
+                        .zip(self.attention_ratios())
+                        .enumerate()
+                        .filter(|(_, (_, ratio))| *ratio > 0)
+                        .map(|(layer, (c, ratio))| (layer, c.indexed_tokens(ratio))),
+                    offset,
+                )
             };
             if !off.is_empty() {
                 tracing::warn!(

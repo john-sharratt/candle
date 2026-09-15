@@ -63,6 +63,7 @@ use crate::provenance::{
     encode_wide_sigs_with, extract_q_vector_r16, fold_fits, fold_provenance_fitted, FoldParams,
     GalleryArena, WideQSig,
 };
+use crate::recorded_reply::Replay;
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::stencil::{
     Healed, StencilDriver, StencilTree, StepMask, TriggerRegistry, TOOL_CALL_TREE_LABEL,
@@ -294,6 +295,10 @@ pub(crate) enum SchedulerRequest {
         /// tool calls — see
         /// [`crate::projection::Schema::free_tool_calls_from_penalties`].
         free_tool_calls_from_penalties: bool,
+        /// The reply this turn decodes in place of sampling — a recorded turn
+        /// replayed ([`crate::TurnOptions::recorded_turn`]). Committed one id
+        /// per step, then the end of turn. `None` = an ordinary sampled decode.
+        recorded_reply: Option<Vec<u32>>,
     },
 
     /// Free a sequence slot.
@@ -1402,6 +1407,12 @@ struct DecodeState {
     /// then `accept` the sampled token and clear).  `None` ⇒ the driver needs
     /// advancing again.
     pending_mask: Option<StepMask>,
+    /// The ids this turn commits in place of what it samples, when it replays
+    /// a recorded turn ([`crate::TurnOptions::recorded_turn`]); the end of turn
+    /// follows the last. Everything else about the step is a live decode's —
+    /// the page cuts, the reasoning boundary, the reprojections — which is what
+    /// makes the sealed turn the recorded one. `None` = a sampled decode.
+    recorded_reply: Option<Replay>,
 }
 
 impl DecodeState {
@@ -1862,6 +1873,8 @@ pub(super) struct PrefillWork {
     /// while a tool call is emitted — see
     /// [`crate::projection::Schema::free_tool_calls_from_penalties`].
     pub(super) free_tool_calls_from_penalties: bool,
+    /// The recorded reply this turn replays — see [`DecodeState::recorded_reply`].
+    pub(super) recorded_reply: Option<Vec<u32>>,
 }
 
 /// An in-flight prefill, partially advanced. Lives across scheduler
@@ -3570,6 +3583,7 @@ impl Scheduler {
                 triggers,
                 turn_grammar,
                 free_tool_calls_from_penalties,
+                recorded_reply,
             } => {
                 // The sequence acts as the parent slot for a carved
                 // view inside this handler — rebind for clarity.
@@ -4079,6 +4093,7 @@ impl Scheduler {
                     triggers,
                     turn_grammar,
                     free_tool_calls_from_penalties,
+                    recorded_reply,
                 });
                 true
             }
@@ -5289,6 +5304,7 @@ impl Scheduler {
             triggers: Arc::new(TriggerRegistry::new()),
             stencil: None,
             pending_mask: None,
+            recorded_reply: None,
         };
         // The turn's first token always opens a page — the prefill/decode
         // boundary — so the reasoning starts one.
@@ -5571,6 +5587,7 @@ impl Scheduler {
             triggers: Arc::new(TriggerRegistry::new()),
             turn_grammar: None,
             free_tool_calls_from_penalties: false,
+            recorded_reply: None,
         });
         Ok(())
     }
@@ -12527,6 +12544,7 @@ mod tests {
             triggers: Arc::new(TriggerRegistry::new()),
             stencil: None,
             pending_mask: None,
+            recorded_reply: None,
         };
         (state, rx)
     }
@@ -12570,6 +12588,7 @@ mod tests {
             triggers: Arc::new(TriggerRegistry::new()),
             turn_grammar: None,
             free_tool_calls_from_penalties: false,
+            recorded_reply: None,
         }
     }
 
@@ -12958,6 +12977,27 @@ mod tests {
         assert!(
             model.close_positional_page(0).unwrap() == 3,
             "the tail is still open and closable by whoever owns the boundary"
+        );
+    }
+
+    /// **A replayed turn commits its recording, whatever the sampler chose**,
+    /// then the end of turn once the recording is spent.
+    #[test]
+    fn a_replayed_turn_commits_its_recording_in_place_of_the_sample() {
+        let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
+        let slot = SequenceId(scheduler.session.create_sequence().unwrap());
+        let (mut state, _rx) = boundary_state();
+        state.recorded_reply = Some(Replay::new(vec![7, 8]));
+        scheduler.active_decodes.insert(slot, state);
+        let row = Tensor::zeros(16, DType::F32, &scheduler.device).unwrap();
+        for _ in 0..3 {
+            scheduler.commit_decoded_tokens(&[slot], &mut [3], std::slice::from_ref(&row));
+        }
+        let state = &scheduler.active_decodes[&slot];
+        assert_eq!(&state.generated_tokens[..], &[7u32, 8, 0][..]);
+        assert!(
+            state.finished,
+            "the end of turn after the recording finishes it"
         );
     }
 

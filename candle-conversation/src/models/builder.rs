@@ -128,6 +128,9 @@ pub struct ModelBuilder {
     /// handle to one `.substrate/` silently drops records; see
     /// [`SharedSubstrate`].
     substrate: Option<SharedSubstrate>,
+    /// Open the workspace's substrate read-only — forwarded to
+    /// [`EngineConfig::read_only_substrate`]. `false` by default.
+    read_only_substrate: bool,
     /// Per-layer corrupt-turn policy (from the projection schema), forwarded to
     /// [`EngineConfig::layer_corrupt_turn`] so the startup reload drops the whole
     /// conversation (ingest layers) or just the turn (dialogue) per layer. Empty
@@ -176,6 +179,7 @@ impl ModelBuilder {
             max_hot_turns: 0,
             workspace_path: None,
             substrate: None,
+            read_only_substrate: false,
             layer_corrupt_turn: HashMap::new(),
             expert_pack_dir: None,
             prefill_pass_tokens: None,
@@ -304,6 +308,19 @@ impl ModelBuilder {
     /// second one loses records rather than failing. See [`SharedSubstrate`].
     pub fn substrate(mut self, shared: SharedSubstrate) -> Self {
         self.substrate = Some(shared);
+        self
+    }
+
+    /// Open the workspace's substrate **read-only**.
+    ///
+    /// For a tool that inspects a workspace a running daemon owns: the engine
+    /// resumes, prefills and decodes entirely in RAM and writes nothing under
+    /// `.substrate/` from start through shutdown. The store must already exist.
+    ///
+    /// Has no effect once [`Self::substrate`] has handed over an open one —
+    /// that handle's own mode rules. See [`EngineConfig::read_only_substrate`].
+    pub fn read_only_substrate(mut self, read_only: bool) -> Self {
+        self.read_only_substrate = read_only;
         self
     }
 
@@ -783,6 +800,7 @@ impl ModelBuilder {
         ret.health = self.health_config.clone();
         ret.workspace_path = self.workspace_path.clone();
         ret.substrate = self.substrate.clone();
+        ret.read_only_substrate = self.read_only_substrate;
         ret.model_spec = Some(self.model_spec_blob());
         // The engine uses the model's dialect to pre-tokenise the
         // inter-turn boundary markers once at scheduler construction.
