@@ -531,7 +531,7 @@ pub(crate) struct SequenceState {
     /// coexist in the same vec.  Partial tails are always copied at fork
     /// time, so `chunks.last()` is always uniquely owned and writable.
     chunks: Vec<ChunkWindow>,
-    /// Cached pinned-host + GPU-side serialised slot-state for this sequence.
+    /// Cached host + GPU-side serialised slot-state for this sequence.
     gpu_chunks: GpuChunks,
     /// First chunk index that is writer-owned.  Chunks at index
     /// `[0, writer_start_idx)` are Arc-shared with substrate / parent
@@ -557,6 +557,18 @@ pub(crate) struct SequenceState {
     /// every non-windowed slot (dialogue/section KV never evicts its front), so
     /// those paths are byte-identical to a `base_pos == 0` derivation.
     base_pos: u32,
+    /// Set by a commit made outside the decode kernel: the chunk index from
+    /// which the cached decode slot buffer's lengths may be behind the host —
+    /// the writer boundary as it stood at the earliest such commit since the
+    /// buffer was last current. The next [`Self::sync_decode_gpu_chunks`] — the
+    /// only way a reader reaches the buffer — re-serialises from here to the
+    /// writer before handing it out. It is the boundary AT the commit, not the
+    /// one read back at the sync, because a boundary that moves in between
+    /// (`seal_writer_boundary`, a truncate's clamp) would otherwise shrink the
+    /// region past chunks the commit filled. Left set over a buffer that has
+    /// since been cleared it is harmless: the resync finds no buffer, and the
+    /// rebuild serialises every chunk from the host state.
+    decode_stale_from: Option<usize>,
 }
 
 impl SequenceState {
@@ -567,6 +579,7 @@ impl SequenceState {
             gpu_chunks: GpuChunks::new(stream),
             writer_start_idx: 0,
             base_pos: 0,
+            decode_stale_from: None,
         }
     }
 
@@ -577,6 +590,7 @@ impl SequenceState {
             gpu_chunks: GpuChunks::new(),
             writer_start_idx: 0,
             base_pos: 0,
+            decode_stale_from: None,
         }
     }
 
@@ -870,14 +884,41 @@ impl SequenceState {
         self.gpu_chunks.as_mut().clear();
     }
 
-    /// Bring the cached decode GPU buffer up to date after a commit made
-    /// outside the decode kernel — a prefill, a glue writeback, a speculative
-    /// verify block, a stencil static run.
+    /// Whether a decode slot buffer is cached for this sequence. A sequence
+    /// that has never decoded, or whose buffer a chunk-boundary append cleared,
+    /// has none, and rebuilds it in full on its next sync.
+    pub(crate) fn has_decode_gpu_chunks(&self) -> bool {
+        self.gpu_chunks.n_chunks() != 0
+    }
+
+    /// Record a commit made outside the decode kernel — a prefill, a glue
+    /// writeback, a speculative verify block, a stencil static run.
     ///
     /// The decode kernel advances the buffer's writer length itself, on the
     /// device; `set_len` advances only the host. Left alone, the next decode
     /// reuses the buffer at the pre-commit length, writes its token over a
-    /// committed one, and leaves a slot the host counts unwritten.
+    /// committed one, and leaves a slot the host counts unwritten. So the
+    /// buffer is marked, and [`Self::sync_decode_gpu_chunks`] — which every
+    /// reader of the buffer goes through, the prefill header build as well as
+    /// the decode metadata build — re-serialises its writer region before
+    /// handing it out.
+    ///
+    /// Nothing is serialised or uploaded here. A prefill commits once per
+    /// layer with that layer's attention still queued on the stream, so work
+    /// done at the commit is done while the host should be running ahead, and
+    /// an upload issued there queues behind the layer and holds a staging
+    /// buffer until it runs. Deferred to the sync, the region is re-serialised
+    /// once, by the step that reads it, however many commits came before. A
+    /// sequence with no buffer is left unmarked: its next sync rebuilds it.
+    pub(crate) fn mark_decode_writer_stale(&mut self) {
+        if self.has_decode_gpu_chunks() {
+            let from = self.writer_start_idx;
+            self.decode_stale_from = Some(self.decode_stale_from.map_or(from, |s| s.min(from)));
+        }
+    }
+
+    /// Re-serialise the cached buffer's writer region from the host state —
+    /// the work [`Self::mark_decode_writer_stale`] leaves to the next sync.
     ///
     /// `set_len` tops up usages from the writer boundary through consecutive
     /// chunks to the sequence length, so a commit that crossed into a later
@@ -889,10 +930,12 @@ impl SequenceState {
     /// below the boundary are shared and unwritten. This is O(chunks the
     /// commit wrote) against dropping and re-uploading the entire per-layer
     /// table, which at depth costs megabytes of pinned realloc and a stream
-    /// sync per layer. A missing buffer is left for the next decode sync's full
-    /// rebuild; a shape mismatch (defensive) falls back to full invalidation.
-    pub(crate) fn refresh_decode_writer_slice(
+    /// sync per layer. A missing buffer is left for the sync's full rebuild; a
+    /// shape mismatch (defensive) falls back to full invalidation, which the
+    /// same sync then rebuilds.
+    fn resync_decode_writer_region(
         &mut self,
+        from: usize,
         n_kv_head: usize,
         head_dim: usize,
         arena_info: &[ResolvedArenaInfo],
@@ -917,11 +960,12 @@ impl SequenceState {
         // prompt leaves six sealed chunks at length 0, and the decode
         // attends the last eight tokens alone. Chunks below the boundary
         // are shared with the substrate and never written.
-        let start = self.writer_start_idx().min(wi);
-        for blk in start..=wi {
-            self.update_gpu_chunk(blk, n_kv_head, head_dim, arena_info)?;
-        }
-        Ok(())
+        // From the boundary as it stood at the earliest pending commit, or as it
+        // stands now if it has since moved down.
+        let start = from.min(self.writer_start_idx()).min(wi);
+        // One guard for the whole region: one upload, not one per chunk.
+        let region: Vec<usize> = (start..=wi).collect();
+        self.update_gpu_chunks_bulk(&region, n_kv_head, head_dim, arena_info)
     }
 
     /// Re-serialise the GPU buffer slot at `blk` from the current host state
@@ -961,9 +1005,9 @@ impl SequenceState {
     /// so the guard drop coalesces adjacent indices into one
     /// `memcpy_htod` per contiguous run (instead of one per block).
     ///
-    /// Used by the cold-load `alloc_sealed_blocks_bulk` path to push
-    /// the per-layer chunk metadata to the GPU as a single batched
-    /// HtoD where possible.
+    /// Used by the cold-load `alloc_sealed_blocks_bulk` path and by
+    /// [`Self::resync_decode_writer_region`], so each pushes its chunks as
+    /// one batched upload where the indices allow.
     pub(super) fn update_gpu_chunks_bulk(
         &mut self,
         block_indices: &[usize],
@@ -985,9 +1029,12 @@ impl SequenceState {
         // Prefix-sum cumulative usage once so each block's rope_base
         // is an O(1) lookup. The previous `chunks[..blk].iter().sum()`
         // was O(blk) per block — quadratic over a layer's blocks.
-        let mut rope_bases: Vec<u32> = Vec::with_capacity(chunks.len());
+        // Only as far as the highest block asked for: a resync touches the
+        // last few chunks of a deep sequence, and bases past it are unused.
+        let last = block_indices.iter().copied().max().unwrap_or(0);
+        let mut rope_bases: Vec<u32> = Vec::with_capacity(last + 1);
         let mut acc: u32 = base_pos;
-        for c in chunks.iter() {
+        for c in chunks.iter().take(last + 1) {
             rope_bases.push(acc);
             acc = acc.wrapping_add(c.usage);
         }
@@ -1172,7 +1219,7 @@ impl SequenceState {
 
     /// Rebuild the GPU slot-state buffer for decode using the true sequence length.
     ///
-    /// Serialises all chunks into the pinned host buffer with per-chunk
+    /// Serialises all chunks into the host copy with per-chunk
     /// `rope_base` values derived from cumulative usage, then uploads to the
     /// device buffer asynchronously.
     ///
@@ -1214,9 +1261,40 @@ impl SequenceState {
         gpu_chunks.as_mut().rebuild_decode(
             chunks, n_kv_head, head_dim, arena_info, write_len, wi, base_pos,
         )?;
+        // Serialised from the host state just now, so no commit is pending.
+        self.decode_stale_from = None;
 
         let ptr = self.gpu_chunks.raw_device_ptr();
         Ok((ptr, n as u32, wi as u32))
+    }
+
+    /// Whether the decode slot buffer is missing and would be built in full by
+    /// the next sync — the one thing [`Self::prime_decode_gpu_chunks`] does.
+    pub(crate) fn needs_decode_rebuild(&self) -> bool {
+        !self.chunks.is_empty() && self.gpu_chunks.n_chunks() == 0
+    }
+
+    /// Build the decode slot buffer ahead of the first decode step if it is
+    /// missing, and do nothing else.
+    ///
+    /// A buffer that exists is left as it stands, stale writer region
+    /// included: the decode step's own sync re-serialises that region before
+    /// it reads the buffer (see [`Self::mark_decode_writer_stale`]). Doing it
+    /// here would put an upload between one prefill layer's kernels and the
+    /// next, once per layer per sequence — a GPU bubble that costs a small
+    /// model a quarter of its single-context prefill — for bytes the next sync
+    /// carries anyway.
+    pub(crate) fn prime_decode_gpu_chunks(
+        &mut self,
+        n_kv_head: usize,
+        head_dim: usize,
+        seq_offset: usize,
+        arena_info: &[ResolvedArenaInfo],
+    ) -> candle::Result<()> {
+        if self.needs_decode_rebuild() {
+            self.rebuild_decode_gpu_chunks(n_kv_head, head_dim, seq_offset, arena_info)?;
+        }
+        Ok(())
     }
 
     /// The entry count a decode header promises the kernel must be the entry
@@ -1247,7 +1325,12 @@ impl SequenceState {
     ///
     /// The decode hot path trusts the cached GPU slot buffer whenever it exists.
     /// Structural mutations must therefore invalidate it eagerly at the point of
-    /// mutation rather than relying on decode-time mismatch heuristics.
+    /// mutation rather than relying on decode-time mismatch heuristics. A
+    /// commit made outside the decode kernel only marks it
+    /// ([`Self::mark_decode_writer_stale`]), and its writer region is
+    /// re-serialised here, first, so no reader is handed pre-commit lengths.
+    /// `arena_info` covers every arena the rebuild below may serialise, so it
+    /// covers the writer region's.
     pub(crate) fn sync_decode_gpu_chunks(
         &mut self,
         n_kv_head: usize,
@@ -1255,6 +1338,13 @@ impl SequenceState {
         seq_offset: usize,
         arena_info: &[ResolvedArenaInfo],
     ) -> candle::Result<((u64, u32, u32), DecodeGpuChunksSyncKind)> {
+        if let Some(from) = self.decode_stale_from {
+            // Cleared only once the region is current: a resync that fails
+            // leaves the mark for the next sync, not a buffer that reads as up
+            // to date and is not.
+            self.resync_decode_writer_region(from, n_kv_head, head_dim, arena_info)?;
+            self.decode_stale_from = None;
+        }
         let host_n = self.chunks.len();
         if host_n == 0 {
             return Ok(((0, 0, 0), DecodeGpuChunksSyncKind::Empty));

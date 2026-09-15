@@ -82,12 +82,13 @@ impl ToolSpec {
     /// strings becomes a constrained branch.  Unknown/compound types fall back
     /// to "any JSON value" (still structurally validated).
     ///
-    /// **Required parameters come in the order the `required` list names them**,
-    /// and the tree emits them in that order. The properties object iterates
-    /// alphabetically, which would force a range read as `end_line, path,
-    /// start_line`; the `required` list is the one place a schema states the
-    /// order its author means (`path, start_line, end_line`). Optional
-    /// parameters follow, in property order.
+    /// **Required parameters come in the order the `required` list names them,
+    /// then optionals in the order the properties object declares them**, and
+    /// the tree emits them in that order. The workspace builds `serde_json` with
+    /// `preserve_order`, so the properties iterate as the schema's author wrote
+    /// them — `file_read`'s optional range is offered `start_line` before
+    /// `end_line`, where a sorted map would put the end first and a call written
+    /// in reading order could never reach it.
     pub fn from_json_schema(name: &str, schema: &Value) -> ToolSpec {
         let required: Vec<&str> = schema
             .get("required")
@@ -1287,27 +1288,30 @@ mod tests {
         assert!(tree.len() > 5);
     }
 
-    /// Required parameters take the `required` list's order, not the
-    /// properties' alphabetical one; optionals follow in property order.
+    /// Required parameters take the `required` list's order; optionals follow
+    /// in the order the schema text declares them, unsorted. Parsed from text
+    /// rather than built with `json!`, because a client's schema arrives as
+    /// text.
     #[test]
-    fn required_params_follow_the_required_list_order() {
-        let spec = ToolSpec::from_json_schema(
-            "file_read",
-            &serde_json::json!({
+    fn params_follow_the_required_list_then_declared_order() {
+        let schema: serde_json::Value = serde_json::from_str(
+            r#"{
                 "type": "object",
                 "properties": {
+                    "start_line": {"type": "integer"},
+                    "path": {"type": "string"},
                     "end_line": {"type": "integer"},
                     "note": {"type": "string"},
-                    "path": {"type": "string"},
-                    "start_line": {"type": "integer"},
                     "after": {"type": "string"}
                 },
-                "required": ["path", "start_line", "end_line"]
-            }),
-        );
+                "required": ["path", "note"]
+            }"#,
+        )
+        .unwrap();
+        let spec = ToolSpec::from_json_schema("file_read", &schema);
         let names: Vec<&str> = spec.params.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["path", "start_line", "end_line", "after", "note"]);
-        assert!(spec.params[..3].iter().all(|p| p.required));
-        assert!(spec.params[3..].iter().all(|p| !p.required));
+        assert_eq!(names, ["path", "note", "start_line", "end_line", "after"]);
+        assert!(spec.params[..2].iter().all(|p| p.required));
+        assert!(spec.params[2..].iter().all(|p| !p.required));
     }
 }

@@ -139,7 +139,9 @@ mod conversation {
                 }
                 StreamItem::Projection(_) => {}
                 StreamItem::Tool(_) => {}
-                StreamItem::TurnEnd { .. } => {}
+                StreamItem::Prefill { .. }
+                | StreamItem::Think { .. }
+                | StreamItem::TurnEnd { .. } => {}
             }
         }
 

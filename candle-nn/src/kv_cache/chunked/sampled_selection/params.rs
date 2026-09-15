@@ -624,6 +624,11 @@ pub const QWEN35_9B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactor
     // (2026-09-12): confirm there on its next sweep, and if this pair fails
     // there, the row has outgrown a single constant (the 27B's checkpoint is
     // already chosen per card; a row may have to be).
+    //
+    // Confirmed 2026-09-15 on the sm_120 box (RTX PRO 5000, int8 `prec`):
+    // 0.85/1.45 validated every C row, C10 ×10 included, in two sweeps, at C10
+    // 5.13× against 1.07/1.85's 5.87× there. One constant holds on both cards;
+    // the price on this one is 13 % of the top rung's compression.
     k_hi: 0.85,
     k_low: 0.85,
     v_hi: 1.45,
@@ -844,8 +849,26 @@ pub const QWEN36_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFacto
     // That the pre-merge pair was four-runs-green and is now one session short
     // is this row drifting on an admission change, which is precisely the
     // failure mode its caution predicts — not a defect elsewhere.
-    k_hi: 1.00,
-    k_low: 1.00,
+    //
+    // **Re-derived 2026-09-16, k 1.00 → 0.95**, V held at 2.0, on the 72 GB
+    // RTX PRO 5000 Blackwell. The row also serves the AntiLoop + StyleTune
+    // hybrid, and the hybrid on `Int8Mode::Performance` sat one session past
+    // the edge: C10×64 at 63/64 on three identical runs, the same session
+    // diverging at the same character each time. That was the first
+    // measurement of that width on that path; the only earlier run of the gate
+    // was on a 24 GB card, where ×32/×64 do not run. K alone, one notch, per
+    // this row's standing advice:
+    //
+    // | gate                 | k 1.00 C10 ×64 | k 0.95 C10 ×64 | ratio ×64     |
+    // |----------------------|----------------|----------------|---------------|
+    // | stock, Performance   | 64/64 ✓        | 64/64 ✓        | 6.04× → 5.94× |
+    // | hybrid, Precision    | 64/64 ✓        | 64/64 ✓        | 6.08× → 5.99× |
+    // | hybrid, Performance  | 63/64 ✗ (×3)   | 64/64 ✓ (×2)   | 6.07× → 5.97× |
+    //
+    // Every other rung and width is green at both factors. The cost is about
+    // 1.6% of ratio at ×64 on each gate.
+    k_hi: 0.95,
+    k_low: 0.95,
     v_hi: 2.0,
     v_low: 2.0,
 };
@@ -955,6 +978,11 @@ pub const QWEN36_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFacto
 /// sm_120 box's standing 10/10 at 0.8/2.05 (2026-09-13, Q6_K) has NOT been
 /// re-run at this pair: confirm there on its next sweep — a fail there means
 /// the row needs the same per-card resolution the checkpoint already has.
+///
+/// **Confirmed 2026-09-15 on the sm_120 box** (RTX PRO 5000, Q6_K, int8
+/// `perf`): 0.7/1.4 validated every C row, C10 ×40 included, in two sweeps, at
+/// C10 4.81× against 0.8/2.05's 5.56× there. One constant holds on both cards;
+/// the price on this one is 13 % of the top rung's compression.
 pub const QWEN38_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
     k_hi: 0.7,
     k_low: 0.7,

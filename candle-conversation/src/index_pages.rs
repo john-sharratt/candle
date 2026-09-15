@@ -26,6 +26,8 @@
 //! substrate field, and `Scheduler::turn_positional` all keep their types, and
 //! only the producer and the consumer learn about the framing.
 
+use std::fmt::{self, Display, Formatter};
+
 /// A malformed page payload.
 ///
 /// Framing errors are reported rather than silently truncated: a payload that
@@ -37,8 +39,8 @@ pub struct MalformedPages {
     pub reason: String,
 }
 
-impl std::fmt::Display for MalformedPages {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for MalformedPages {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "index page payload: {}", self.reason)
     }
 }
@@ -101,6 +103,67 @@ pub fn decode(blob: &[u8]) -> Result<Vec<Page<'_>>, MalformedPages> {
         )));
     }
     Ok(out)
+}
+
+/// What [`push_in_order`] did with a turn's payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pushed {
+    /// Pages the model accepted.
+    pub pages: usize,
+    /// Tokens no accepted page covers — the width the slot was advanced over.
+    pub gap: usize,
+    /// Why the walk stopped short, when it did.
+    pub refused: Option<String>,
+}
+
+/// Hand a turn's framed pages to the model one at a time, in the order the seal
+/// produced them, then advance the slot over whatever no accepted page covers.
+///
+/// **The model reads pages, never the framing.** Every page is one model-opaque
+/// blob; the payload around them is this module's. Passing the whole payload as
+/// a page makes the model read the page COUNT as its own header — a three-page
+/// turn arrived as "aux blob: version 3 unknown" on every memory catch-up after
+/// a scope splice, and the replay ran against a prefix it never indexed.
+///
+/// `push` hands one page to the model; `gap` advances the slot past tokens that
+/// carry no rows. A refused page stops the walk — pushing the pages after it
+/// would place them where their K/V does not sit — and the rest of the turn's
+/// declared width goes to `gap`, so every later piece still lands where its K/V
+/// does. A payload that does not decode pushes nothing and is returned as the
+/// error: the width to advance over is then the turn's whole K/V, which only the
+/// caller knows.
+pub fn push_in_order<E: Display>(
+    blob: &[u8],
+    mut push: impl FnMut(&[u8]) -> Result<(), E>,
+    mut gap: impl FnMut(usize),
+) -> Result<Pushed, MalformedPages> {
+    let pages = decode(blob)?;
+    let declared: usize = pages.iter().map(|(tokens, _)| *tokens).sum();
+    let mut covered = 0usize;
+    let mut accepted = 0usize;
+    let mut refused = None;
+    for (tokens, page) in pages {
+        match push(page) {
+            Ok(()) => {
+                accepted += 1;
+                covered += tokens;
+            }
+            Err(e) => {
+                refused = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    // Only the tokens no page covered, so a partial push is not counted twice.
+    let rest = declared - covered;
+    if rest > 0 {
+        gap(rest);
+    }
+    Ok(Pushed {
+        pages: accepted,
+        gap: rest,
+        refused,
+    })
 }
 
 /// Split a turn's pages at the reasoning span: the pages to keep, framed as a
@@ -184,7 +247,7 @@ pub fn boundaries(blob: &[u8]) -> Option<Vec<usize>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, encode, without_span};
+    use super::{decode, encode, push_in_order, without_span, Pushed};
 
     fn pages(spec: &[(usize, &[u8])]) -> Vec<(usize, Vec<u8>)> {
         spec.iter().map(|(t, b)| (*t, b.to_vec())).collect()
@@ -366,5 +429,96 @@ mod tests {
             "a count the payload cannot back must refuse"
         );
         assert_eq!(without_span(&blob, 0..4), None);
+    }
+
+    /// Each page reaches the model as its own bytes, in seal order, and a fully
+    /// accepted turn advances the slot over nothing.
+    ///
+    /// The first page handed over must be the page — not the payload, whose
+    /// leading `u32` is the page count. A three-page payload read as one page is
+    /// "aux blob: version 3", which is how every memory catch-up after a scope
+    /// splice refused its turns.
+    #[test]
+    fn pages_are_pushed_one_at_a_time_in_seal_order() {
+        let blob = encode(&pages(&[(3, &[0xA1]), (5, &[0xB1, 0xB2]), (4, &[0xC1])]));
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut gaps: Vec<usize> = Vec::new();
+        let out = push_in_order(
+            &blob,
+            |p| {
+                seen.push(p.to_vec());
+                Ok::<(), String>(())
+            },
+            |g| gaps.push(g),
+        )
+        .expect("a well-formed payload");
+        assert_eq!(seen, vec![vec![0xA1], vec![0xB1, 0xB2], vec![0xC1]]);
+        assert!(
+            gaps.is_empty(),
+            "every token was covered, so nothing is skipped"
+        );
+        assert_eq!(
+            out,
+            Pushed {
+                pages: 3,
+                gap: 0,
+                refused: None
+            }
+        );
+    }
+
+    /// A refused page stops the walk, and the slot is advanced over exactly
+    /// the declared width no accepted page covered — so every later piece is
+    /// still placed where its K/V sits.
+    #[test]
+    fn a_refused_page_stops_the_walk_and_skips_the_rest_of_the_turn() {
+        let blob = encode(&pages(&[(3, &[0xA1]), (5, &[0xB1]), (4, &[0xC1])]));
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut gaps: Vec<usize> = Vec::new();
+        let out = push_in_order(
+            &blob,
+            |p| {
+                if p == [0xB1] {
+                    return Err("refused".to_string());
+                }
+                seen.push(p.to_vec());
+                Ok(())
+            },
+            |g| gaps.push(g),
+        )
+        .expect("a well-formed payload");
+        assert_eq!(
+            seen,
+            vec![vec![0xA1]],
+            "nothing after the refusal is pushed"
+        );
+        assert_eq!(gaps, vec![9], "5 + 4 tokens carry no rows");
+        assert_eq!(
+            out,
+            Pushed {
+                pages: 1,
+                gap: 9,
+                refused: Some("refused".to_string())
+            }
+        );
+    }
+
+    /// A payload that does not decode pushes nothing and skips nothing: the
+    /// width to advance over is the turn's whole K/V, which only the caller
+    /// knows.
+    #[test]
+    fn a_malformed_payload_pushes_nothing() {
+        let mut pushes = 0usize;
+        let mut gaps = 0usize;
+        let out = push_in_order(
+            b"not a page list",
+            |_| {
+                pushes += 1;
+                Ok::<(), String>(())
+            },
+            |_| gaps += 1,
+        );
+        assert!(out.is_err());
+        assert_eq!((pushes, gaps), (0, 0));
     }
 }

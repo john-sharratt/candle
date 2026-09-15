@@ -139,6 +139,13 @@ impl FoldParams {
     pub fn folded_heads(&self) -> usize {
         self.group_sizes.len() * self.heads_per_layer
     }
+
+    /// Words (u64) per token in a folded signature: one `head_dim`-bit sign
+    /// vector per folded head. The width a gallery holding signatures of this
+    /// fold must be built for.
+    pub fn words_per_token(&self) -> usize {
+        self.folded_heads() * words_per_head(self.head_dim)
+    }
 }
 
 /// The fold this process's model produces — set once at engine construction.
@@ -630,6 +637,28 @@ mod tests {
     /// two give the same verdict — so this pins that, and pins that the verdict
     /// really is a function of `(n_heads, words_per_head, params)` and not of
     /// the bits.
+    /// The width a gallery must be built for, per model geometry. Raw values,
+    /// because a gallery sized from the wrong one drops every token and the
+    /// scan returns zero without an error.
+    #[test]
+    fn words_per_token_follows_the_models_fold() {
+        assert_eq!(
+            FoldParams::locked().words_per_token(),
+            24,
+            "Qwen3-30B: 3 groups x 4 heads x 2 words"
+        );
+        assert_eq!(
+            FoldParams::derive(2, 24, 64).words_per_token(),
+            6,
+            "Qwen2-0.5B: 3 groups x 2 heads x 1 word"
+        );
+        assert_eq!(
+            FoldParams::derive(2, 10, 256).words_per_token(),
+            24,
+            "the hybrid: 3 groups x 2 heads x 4 words"
+        );
+    }
+
     #[test]
     fn fold_fits_agrees_with_the_checked_fold_and_ignores_the_bits() {
         let shapes = [(20usize, 4usize), (192, 2), (0, 2), (20, 0), (6, 4)];

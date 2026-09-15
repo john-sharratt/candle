@@ -24,8 +24,19 @@ const PROMPT: &str = "You are a helpful, accurate, and concise assistant.";
 /// Runs on a sub-24 GB card through the three-tier expert cache: the resident
 /// footprint is the dense weights plus whatever expert working set fits, not the
 /// parameter count.
+///
+/// # The dialect is the family's own
+///
+/// `Qwen35`, not `ChatML` — the finding [`super::qwen35_dense`] records for the
+/// 9B holds for this checkpoint too. The two dialects agree on every turn
+/// marker and differ in how reasoning is suppressed: ChatML prepends a
+/// `/no_think` soft switch this family's template does not contain, so the
+/// marker arrives as text and the turn reasons anyway, while the family honours
+/// an already-closed think block prefilled after the assistant header. Under
+/// ChatML every suppressed turn reasons into its budget — the titler's among
+/// them, whose title then comes back empty.
 pub(super) fn qwen36_35b_a3b_q4() -> ModelSpec {
-    let chat_format = DialectType::ChatML;
+    let chat_format = DialectType::Qwen35;
     ModelSpec {
         arch: ModelArch::Qwen35Hybrid,
         loras: Vec::new(),
@@ -93,9 +104,9 @@ const HYBRID_SAMPLING: (f32, f32) = (0.7, 0.95);
 ///
 /// Everything that is a property of the architecture rather than of a file is shared with the
 /// stock preset: the loader arm, the tokenizer the gate verified token for token against this
-/// lineage's GGUFs, and the KV threshold row the loader applies (`QWEN36_MOE_KV_FACTORS`,
-/// derived on the stock file — a fine-tune moves the weights, not the attention geometry the row
-/// was fitted to).
+/// lineage's GGUFs, and the KV threshold row the loader applies (`QWEN36_MOE_KV_FACTORS`). One
+/// row serves both files, so it is fitted to whichever sits nearer the edge: this hybrid on the
+/// `Int8Mode::Performance` path, which needed a tighter K at C10×64 than the stock file does.
 ///
 /// # Three files, and what each costs a fresh machine
 ///
@@ -222,6 +233,18 @@ mod tests {
     #[test]
     fn it_sends_no_soft_switch_this_family_would_read_as_prose() {
         let s = qwen36_35b_a3b_antiloop_styletune();
+        assert!(matches!(s.chat_format, DialectType::Qwen35));
+        assert_eq!(s.dialect.no_think, "");
+        assert_eq!(s.dialect.no_think_block, "<think>\n\n</think>\n\n");
+    }
+
+    /// **The stock checkpoint is the same family, so the same dialect.** Under
+    /// `ChatML` the `/no_think` switch reaches the model as text, every
+    /// suppressed turn reasons into its budget, and zend's titler comes back
+    /// empty.
+    #[test]
+    fn the_stock_checkpoint_sends_no_soft_switch_either() {
+        let s = qwen36_35b_a3b_q4();
         assert!(matches!(s.chat_format, DialectType::Qwen35));
         assert_eq!(s.dialect.no_think, "");
         assert_eq!(s.dialect.no_think_block, "<think>\n\n</think>\n\n");

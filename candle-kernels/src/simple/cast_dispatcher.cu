@@ -515,8 +515,12 @@ extern "C" void run_cast(
     const void* inp,
     void* out
 ) {
+    // Nothing to cast is not a launch. A zero grid is `cudaErrorInvalidConfiguration`,
+    // which nothing here reads: it stays pending on the thread until the next
+    // runtime-API caller that checks `cudaGetLastError` takes it as its own.
+    if (numel == 0) return;
     int grid = cast_grid_size(numel);
-    
+
     // Identity casts
     if (src_dtype == dst_dtype) {
         switch (src_dtype) {

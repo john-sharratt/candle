@@ -37,17 +37,18 @@ independent of N, `docs/unbounded_agents.md` §11.2 proves the expected
 numerical error per generation step is **O(1)**, not O(N):
 
 ```
-E[Σ ε(t)] ≤ ε_hot + W_warm_max · ε_warm + O(1/N) = O(1)
+E[Σ ε(t)] ≤ ε_hot + W_warm_max · ε_ret = O(1),   ε_ret = max(ε_warm, ε_cold)
 ```
 
 Hot-tier tokens are prefill-refreshed (zero decode drift, quantization error
-bounded by the selection kernel's threshold); the warm tier's contribution
-is capped by the fixed selection budget regardless of how large the warm
-corpus grows; any specific cold-tier token's probability of entering the
-working set at a given step shrinks as `O(1/N)`. This is why the
-highest-compression formats (C7–C9, §4) are safe on cold/V-cache blocks —
-the theorem makes their contribution asymptotically negligible — and why
-this is not "just" a compression scheme: full attention over a maximally
+bounded by the selection kernel's threshold); the warm and cold tiers share
+the fixed selection budget, so together they contribute at most
+`W_warm_max` tokens' error per step regardless of how large either grows.
+A retrieved cold token still contributes its full error at any depth, so
+cold-tier compression sets the size of the constant, not whether the bound
+holds: the highest-compression formats (C7–C9, §4) on cold/V-cache blocks
+are a capacity trade-off held in check by each block's seal-time threshold.
+Nor is this "just" a compression scheme: full attention over a maximally
 compressed history still accumulates O(N) error, since removing the error
 term requires removing tokens from the working set, not shrinking them.
 

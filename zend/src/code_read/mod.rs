@@ -46,7 +46,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use candle_conversation::projection::{Builder, GroupId, LayerId, SystemPromptItem, TimelineId};
+use candle_conversation::projection::{Builder, GroupId, LayerId, TimelineId};
 use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::{ConversationEngine, SequenceConfig, TurnText};
 use sha2::{Digest, Sha256};
@@ -55,7 +55,8 @@ use crate::ingest_report::Failures;
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
 use crate::repo_scan::{
-    is_binary_sample, utility_config, FileEntry, Language, RepoMap, MAX_FILE_BYTES,
+    is_binary_sample, shared_system_prompt, utility_config, FileEntry, Language, RepoMap,
+    MAX_FILE_BYTES,
 };
 use crate::turn_sink::{InsertTurnSink, SequenceTurnSink};
 
@@ -94,6 +95,20 @@ impl CodeReadState {
             }
         }
         out
+    }
+
+    /// This state without the files `map`'s `--max-depth` bound froze. A frozen
+    /// file stays in the substrate, but the bounded walk never carves it — so
+    /// comparing the whole state against the walk would read it as removed.
+    pub fn without_frozen(&self, map: &RepoMap) -> Self {
+        Self {
+            file_hashes: self
+                .file_hashes
+                .iter()
+                .filter(|(path, _)| !map.is_frozen_file(path))
+                .map(|(path, hash)| (path.clone(), hash.clone()))
+                .collect(),
+        }
     }
 }
 
@@ -444,7 +459,7 @@ pub fn ingest_files(
     // so the summary is grounded in its own scope, not derailed by cross-file
     // retrieval. The multi-timeline scan stays on for dialogue.
     engine.lock().unwrap().mark_layer_append_only(layer);
-    let system_prompt = layer_system_prompt(proj_builder, layer_name, &config);
+    let system_prompt = shared_system_prompt(proj_builder, layer_name, &config);
     let utility_cfg = code_read_config(config);
 
     let (per_file, state) = carve_workspace(workspace, &map);
@@ -499,14 +514,21 @@ pub(crate) fn is_upload_path(path: &str) -> bool {
 /// removed between fs-watcher refreshes. Still-present *changed* files are
 /// handled by [`process_one_file`], which tombstones a path's stale
 /// conversation before re-ingesting it.
-fn reconcile_deleted(engine: &Mutex<ConversationEngine>, present_paths: &HashSet<&str>) {
+///
+/// A path past `map`'s `--max-depth` bound is FROZEN, not deleted: the walk
+/// never looked there, so its absence from `present_paths` proves nothing.
+fn reconcile_deleted(
+    engine: &Mutex<ConversationEngine>,
+    map: &RepoMap,
+    present_paths: &HashSet<&str>,
+) {
     let e = engine.lock().unwrap();
     for (tl, path) in e.conversations_with_metadata_key("path") {
         // Uploaded files live under the endpoint-managed `uploads/` dir, which
         // `walk_workspace` deliberately skips — so they're always absent from
         // `present_paths`. Never tombstone them here; that would delete
         // freshly-uploaded content on the next workspace refresh.
-        if is_upload_path(&path) {
+        if is_upload_path(&path) || map.is_frozen_file(&path) {
             continue;
         }
         if !present_paths.contains(path.as_str()) {
@@ -617,7 +639,7 @@ pub fn ingest_code_reading(
     // by self-match. Mirrors `ingest_files`; also re-applied on the restart path
     // that skips this ingest (see `session.rs`).
     engine.lock().unwrap().mark_layer_append_only(layer);
-    let system_prompt = layer_system_prompt(&proj_builder, layer_name, &config);
+    let system_prompt = shared_system_prompt(&proj_builder, layer_name, &config);
     let utility_cfg = code_read_config(config);
     let n_workers = parallelism();
 
@@ -635,7 +657,7 @@ pub fn ingest_code_reading(
         .collect();
     // Crashed partials are NOT swept here; the sweep is the caller's, for the
     // reason given on [`retire_crashed_partials`].
-    reconcile_deleted(engine, &present_paths);
+    reconcile_deleted(engine, map, &present_paths);
     let present_hashes = engine
         .lock()
         .unwrap()
@@ -1118,6 +1140,7 @@ pub fn refresh_code_reading(
 ) -> anyhow::Result<RefreshOutcome> {
     // Carve once — drives both the change comparison and the re-ingest.
     let (per_file, next) = carve_workspace(workspace, map);
+    let prior = prior.without_frozen(map);
     if prior.equivalent_to(&next) {
         tracing::debug!("code_read refresh: no file hash changed, skipping refresh");
         return Ok(RefreshOutcome::NoOp);
@@ -1138,7 +1161,7 @@ pub fn refresh_code_reading(
         .proj_builder
         .id_for_group(group_name)
         .ok_or_else(|| anyhow::anyhow!("projection schema missing '{group_name}' group"))?;
-    let system_prompt = layer_system_prompt(&ctx.proj_builder, layer_name, &ctx.config);
+    let system_prompt = shared_system_prompt(&ctx.proj_builder, layer_name, &ctx.config);
     let utility_cfg = code_read_config(ctx.config.clone());
     let n_workers = parallelism();
     let total: usize = per_file
@@ -1154,7 +1177,7 @@ pub fn refresh_code_reading(
         .iter()
         .map(|(f, _, _, _)| f.path.as_str())
         .collect();
-    reconcile_deleted(ctx.engine, &present_paths);
+    reconcile_deleted(ctx.engine, map, &present_paths);
     let present_hashes = ctx
         .engine
         .lock()
@@ -1176,25 +1199,6 @@ pub fn refresh_code_reading(
     )?;
 
     Ok(RefreshOutcome::Replaced { state: next })
-}
-
-fn layer_system_prompt(builder: &Builder, layer_name: &str, config: &SequenceConfig) -> String {
-    debug_assert!(
-        builder.schema().layers.iter().any(|l| l.name == layer_name),
-        "projection schema missing '{layer_name}' layer"
-    );
-    // Every ingest conversation frames on the single shared system prompt (bare
-    // top-level sections only — the `section_tree` framing, incl. the `persona`
-    // selector, is materialised per turn by the projection from the schema +
-    // selection, so the summarization framing is driven by `persona: summarize`
-    // set on the ingest selection, not baked here). See `ingest_scope_roundtrip`.
-    let mut body = String::new();
-    for item in &builder.schema().system_prompt.items {
-        if let SystemPromptItem::Section(s) = item {
-            body.push_str(&s.content);
-        }
-    }
-    config.dialect.format_system_prompt(&body)
 }
 
 /// Byte offset of the start of each line.  `offsets[i]` is the start
@@ -1234,6 +1238,29 @@ pub(crate) fn slice_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With `--max-depth 2`, a file past the bound (`src/deep/c.rs`) is frozen:
+    /// it leaves the state the refresh compares, so a bounded walk that never
+    /// carves it cannot read it as removed. Unbounded, the state is untouched.
+    #[test]
+    fn a_frozen_file_leaves_the_compared_state() {
+        let state = |pairs: &[(&str, &str)]| CodeReadState {
+            file_hashes: pairs
+                .iter()
+                .map(|(path, hash)| (path.to_string(), hash.to_string()))
+                .collect(),
+        };
+        let prior = state(&[("a.rs", "1"), ("src/b.rs", "2"), ("src/deep/c.rs", "3")]);
+        let bounded = RepoMap {
+            max_depth: Some(2),
+            ..RepoMap::default()
+        };
+        assert_eq!(
+            prior.without_frozen(&bounded),
+            state(&[("a.rs", "1"), ("src/b.rs", "2")])
+        );
+        assert_eq!(prior.without_frozen(&RepoMap::default()), prior);
+    }
 
     #[test]
     fn is_upload_path_matches_top_level_uploads_only() {

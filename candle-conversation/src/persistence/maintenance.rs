@@ -72,7 +72,7 @@ use super::record::{
 use super::segment::SegmentId;
 use super::streams::{StreamDecl, StreamId};
 use super::survival::RecordCensus;
-use super::{Result, SubstratePersistence};
+use super::{PersistenceError, Result, SubstratePersistence};
 use crate::substrate::Substrate;
 
 /// Compact trigger: a sealed segment must be at least this fraction dead
@@ -647,11 +647,17 @@ impl SubstratePersistence {
     /// `None` for a no-op pass. The gathered plan (resident snapshot +
     /// relocation worklist) lets the slow I/O phase run without the substrate
     /// lock.
+    ///
+    /// A read-only handle plans no op, forced or not: maintaining the store is
+    /// the business of the process that owns it.
     pub fn plan_maintenance(
         &self,
         substrate: &Substrate,
         force: bool,
     ) -> Result<Option<MaintenancePlan>> {
+        if self.is_read_only() {
+            return Ok(None);
+        }
         let sealed = self.segments.sealed_ids().to_vec();
         if sealed.is_empty() {
             return Ok(None);
@@ -770,8 +776,12 @@ impl SubstratePersistence {
     /// the persistence lock; the caller does **not** hold the substrate lock
     /// here, so decode's in-RAM projection reads/writes proceed. The relocated
     /// copies are durable (fsynced) before any source is unlinked. Returns the
-    /// new locations for [`MaintenanceResult::apply_to_substrate`].
+    /// new locations for [`MaintenanceResult::apply_to_substrate`]. A
+    /// read-only handle refuses with [`PersistenceError::ReadOnly`].
     pub fn execute_maintenance(&mut self, plan: &MaintenancePlan) -> Result<MaintenanceResult> {
+        if self.is_read_only() {
+            return Err(PersistenceError::ReadOnly);
+        }
         // Resident set — re-emitted from in-RAM state (not read from disk), so
         // the normal encoding append. When re-emitted, record the active segment
         // it lands into (captured BEFORE the appends, the floor of the segments
@@ -1024,8 +1034,12 @@ impl SubstratePersistence {
     /// **Phase 4** — unlink the drained source segments and record the op for
     /// the status indicator. Runs under the persistence lock, after the index
     /// apply. Safe because the index no longer points at any source (Phase 3
-    /// repointed the live records; the rest were dead).
+    /// repointed the live records; the rest were dead). A read-only handle
+    /// refuses with [`PersistenceError::ReadOnly`].
     pub fn finish_maintenance(&mut self, plan: &MaintenancePlan) -> Result<()> {
+        if self.is_read_only() {
+            return Err(PersistenceError::ReadOnly);
+        }
         let targets = plan.op.targets();
         for &t in &targets {
             self.segments.drop_sealed(t)?;
@@ -1048,12 +1062,16 @@ impl SubstratePersistence {
     }
 
     /// Test/forced-op convenience: run all phases inline for a specific op under
-    /// the caller's already-held substrate lock.
+    /// the caller's already-held substrate lock. A read-only handle refuses
+    /// with [`PersistenceError::ReadOnly`].
     pub fn apply_maintenance_op(
         &mut self,
         substrate: &mut Substrate,
         op: &MaintenanceOp,
     ) -> Result<()> {
+        if self.is_read_only() {
+            return Err(PersistenceError::ReadOnly);
+        }
         let resident = if self.need_resident_reemit(&op.targets()) {
             gather_resident_set(substrate)
         } else {

@@ -62,7 +62,7 @@ fn code_read_emits_two_coupled_turns_per_scope() {
         src.push_str("}\n");
     }
     write(&root, "src/lib.rs", src.as_bytes());
-    let map = walk_workspace(&root);
+    let map = walk_workspace(&root, None);
 
     let mut sink = RecordingTurnSink::new();
     let progress = LoadProgress::new();
@@ -91,7 +91,7 @@ fn code_read_call_turn_is_summarize_request_then_tool_call() {
     let dir = fixture("call_shape");
     let root = dir.path().to_path_buf();
     write(&root, "src/lib.rs", b"pub fn alpha() { let _ = 1; }\n");
-    let map = walk_workspace(&root);
+    let map = walk_workspace(&root, None);
 
     let mut sink = RecordingTurnSink::new();
     let progress = LoadProgress::new();
@@ -121,7 +121,7 @@ fn code_read_response_turn_is_tool_response_with_fenced_code() {
     let root = dir.path().to_path_buf();
     let src = b"pub fn one() {}\npub fn two() {\n    let x = 42;\n}\n";
     write(&root, "src/lib.rs", src);
-    let map = walk_workspace(&root);
+    let map = walk_workspace(&root, None);
 
     let mut sink = RecordingTurnSink::new();
     let progress = LoadProgress::new();
@@ -158,7 +158,7 @@ fn code_read_call_user_never_carries_tool_markup() {
     let dir = fixture("no_call_markup");
     let root = dir.path().to_path_buf();
     write(&root, "src/lib.rs", b"pub fn alpha() {}\n");
-    let map = walk_workspace(&root);
+    let map = walk_workspace(&root, None);
 
     let mut sink = RecordingTurnSink::new();
     let progress = LoadProgress::new();
@@ -185,7 +185,7 @@ fn code_read_skips_files_outside_watch_patterns() {
     write(&root, "src/lib.rs", b"pub fn alpha() {}\n");
     write(&root, "data/blob.bin", b"\x00\x01\x02");
     write(&root, "image.svg", b"<svg/>");
-    let map = walk_workspace(&root);
+    let map = walk_workspace(&root, None);
 
     let mut sink = RecordingTurnSink::new();
     let progress = LoadProgress::new();
@@ -203,7 +203,7 @@ fn code_read_falls_back_to_fixed_window_on_unknown_language() {
     let root = dir.path().to_path_buf();
     let lines: String = (0..250).map(|i| format!("line {i}\n")).collect();
     write(&root, "notes.txt", lines.as_bytes());
-    let map = walk_workspace(&root);
+    let map = walk_workspace(&root, None);
 
     let mut sink = RecordingTurnSink::new();
     let progress = LoadProgress::new();
@@ -233,7 +233,7 @@ fn code_read_progress_reports_real_fraction() {
     let root = dir.path().to_path_buf();
     write(&root, "src/a.rs", b"pub fn one() {}\n");
     write(&root, "src/b.rs", b"pub fn two() {}\n");
-    let map = walk_workspace(&root);
+    let map = walk_workspace(&root, None);
 
     let mut sink = RecordingTurnSink::new();
     let progress = LoadProgress::new();

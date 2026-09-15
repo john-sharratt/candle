@@ -245,9 +245,10 @@ impl Fixture {
 
             // The persistent decode slot buffer's lengths self-increment only
             // on decode steps; the prefill's tokens sit past its stale tail
-            // until the writer region is re-serialised — once, after the
-            // prefill, as the engine's `refresh_decode_slot_state` does.
-            backing.refresh_decode_writer_slice(&[(slot, cache.current_seq_len())])?;
+            // until the writer region is re-serialised — marked once, after
+            // the prefill, as the engine's `mark_decode_slot_states` does, and
+            // re-serialised by the first sync.
+            backing.mark_decode_writer_stale(&[(slot, cache.current_seq_len())])?;
             caches.push(cache);
         }
 

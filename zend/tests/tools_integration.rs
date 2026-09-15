@@ -66,12 +66,13 @@ mod tool_scenarios {
     use crate::common::{needs_compaction, production_workspace, run_conv_id};
     use candle::vram::host_pinned_bytes;
     use candle_conversation::models::Model;
+    use candle_conversation::projection::SectionLoads;
     use candle_conversation::{SamplingConfig, SelectionState};
-    use zend::api::chat::dial_selection;
+    use zend::api::chat::{apply_tools_dial, dial_selection};
     use zend::config::{DaemonConfig, ModelChoice};
     use zend::log_broadcast::LogBus;
     use zend::session::{timeline_for, StreamItem, ZendSession};
-    use zend::types::{ChatMessage, Role};
+    use zend::types::{ChatMessage, Role, ToolMode};
 
     /// Per-scenario cap. A scenario on a warm workspace is ~10 s; the first run
     /// on a fresh one also calibrates the whole tool catalog once, which is what
@@ -142,7 +143,7 @@ mod tool_scenarios {
     async fn run_on(rig: Rig, prompt: &str, conv_id: &str) -> String {
         // A conversation of this run's own — both workspaces persist across runs.
         let conv_id = run_conv_id(conv_id);
-        let (workspace, model, selection) = match rig {
+        let (workspace, model, mut selection) = match rig {
             Rig::Small => (
                 workspace(),
                 ModelChoice::Preset(Box::new(MODEL)),
@@ -155,6 +156,9 @@ mod tool_scenarios {
             ),
         };
         let compact_substrate = needs_compaction(&workspace);
+        // The tool prompt a chat turn gets — the block AND its worked call — so
+        // the suite exercises what a user is shown, not a catalog with no example.
+        apply_tools_dial(&mut selection, ToolMode::Comprehensive);
         let log = LogBus::new();
         let config = DaemonConfig {
             workspace,
@@ -179,7 +183,7 @@ mod tool_scenarios {
                 None,
                 None,
                 false,
-                zend::types::ToolMode::Comprehensive,
+                ToolMode::Comprehensive,
                 None,
                 selection,
             )
@@ -203,7 +207,9 @@ mod tool_scenarios {
                 StreamItem::Tool(status) => {
                     eprintln!("\n[TOOL {}] {:?}", status.phase, status.tools);
                 }
-                StreamItem::TurnEnd { .. } => {}
+                StreamItem::Prefill { .. }
+                | StreamItem::Think { .. }
+                | StreamItem::TurnEnd { .. } => {}
             }
         }
         eprintln!("\n\n[FINAL RESPONSE]\n{response}");
@@ -225,7 +231,7 @@ mod tool_scenarios {
     /// How long a finished scenario's runtime may take to wind its tasks down.
     const RUNTIME_WIND_DOWN: Duration = Duration::from_secs(60);
 
-    fn run_with_timeout<F: std::future::Future<Output = String> + Send + 'static>(f: F) -> String {
+    fn run_with_timeout<T, F: std::future::Future<Output = T> + Send + 'static>(f: F) -> T {
         let _one_at_a_time = SCENARIO.lock().unwrap_or_else(|e| e.into_inner());
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -262,6 +268,61 @@ mod tool_scenarios {
             );
         }
         *previous = Some(now);
+    }
+
+    /// Boot a ZendSession on the small rig, wait for every startup step to
+    /// finish, and report how it loaded its prompt sections — the tool catalog
+    /// among them.
+    async fn boot_and_count_sections() -> SectionLoads {
+        let workspace = workspace();
+        let compact_substrate = needs_compaction(&workspace);
+        let config = DaemonConfig {
+            workspace,
+            port: 0,
+            model: ModelChoice::Preset(Box::new(MODEL)),
+            compact_substrate,
+            ..Default::default()
+        };
+        let session = Arc::new(ZendSession::new(config, LogBus::new()));
+        session.start_loading();
+        while session.status_snapshot().loading.is_some() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let loads = session
+            .section_loads()
+            .expect("the model is loaded once every startup step has finished");
+        session.shutdown().await;
+        loads
+    }
+
+    // ── A boot seals no prompt section a previous boot already sealed ────────
+    //
+    // Sections are content-addressed in the redo log, so an unchanged catalog
+    // has nothing left to compute on the next boot. A section prefilled again
+    // is sealed again, and its records supersede the last boot's — dead records
+    // only compaction reclaims, which is how the suite's workspace once grew
+    // ~140 MB a boot.
+
+    #[test]
+    fn a_second_boot_restores_every_prompt_section() {
+        init_tracing();
+        // Both boots under one scenario lock, so no other scenario runs on the
+        // shared workspace between them.
+        let (first, second) = run_with_timeout(async {
+            let first = boot_and_count_sections().await;
+            (first, boot_and_count_sections().await)
+        });
+        assert_eq!(
+            second,
+            SectionLoads {
+                restored: first.restored + first.prefilled,
+                prefilled: 0,
+            },
+            "the second boot prefilled {} of the {} prompt section(s) the first had in the \
+             log or sealed",
+            second.prefilled,
+            first.restored + first.prefilled
+        );
     }
 
     // ── Scenario 1: simple datetime query ────────────────────────────────────

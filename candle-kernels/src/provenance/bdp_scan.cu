@@ -45,6 +45,18 @@
 
 #include "bdp_vote.cuh"
 
+// Take the CUDA error pending on the calling thread, if any, and clear it:
+// `cudaSuccess` (0) when there is none.
+//
+// Most launchers in this crate never read the launch result, so a launch that
+// fails — an empty grid, an oversized block — leaves its error pending until
+// the next `cudaGetLastError()` on the thread, which belongs to whoever happens
+// to call it. The provenance scan takes it BEFORE its own launches so that it
+// is reported as an earlier launch's, not as the scan's.
+extern "C" int bdp_take_pending_error() {
+    return (int)cudaGetLastError();
+}
+
 // Locked folded-signature group width (4 heads x 128 bits = 8 u64).
 #define BDP_MAX_GW 8
 // Query tokens per block tile — the gallery-reuse / ILP factor.

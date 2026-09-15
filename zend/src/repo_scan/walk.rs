@@ -27,10 +27,19 @@ pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// Walk `root` and produce a [`RepoMap`].  Never panics — I/O errors
 /// during the walk are downgraded to skips and reported via the
 /// `files_skipped_*` counters on the returned map.
-pub fn walk_workspace(root: &Path) -> RepoMap {
-    let mut map = RepoMap::default();
+///
+/// `max_depth` (`--max-depth`) bounds the walk in path components below
+/// `root`: `1` is the root's own files, `2` adds one folder down. Nothing
+/// deeper is visited, and the map records the bound so the deleted-path
+/// sweeps can tell "not walked" from "gone" ([`RepoMap::is_frozen_file`]).
+pub fn walk_workspace(root: &Path, max_depth: Option<usize>) -> RepoMap {
+    let mut map = RepoMap {
+        max_depth,
+        ..RepoMap::default()
+    };
 
     let walker = WalkBuilder::new(root)
+        .max_depth(max_depth)
         .hidden(true) // skip dotfiles
         .git_ignore(true)
         .git_exclude(true)
@@ -322,6 +331,27 @@ mod tests {
         tempfile::tempdir().expect("tempdir")
     }
 
+    /// `--max-depth` counts path components: 1 is the root's own files, 2 adds
+    /// one folder down. Nothing past the bound is walked, and the map records
+    /// the bound so the sweeps can freeze what lies beyond it.
+    #[test]
+    fn walk_stops_at_max_depth() {
+        let dir = fixture("max_depth");
+        let root = dir.path();
+        write(root, "a.rs", b"fn a() {}\n");
+        write(root, "src/b.rs", b"fn b() {}\n");
+        write(root, "src/deep/c.rs", b"fn c() {}\n");
+
+        let paths = |m: &RepoMap| m.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
+        assert_eq!(paths(&walk_workspace(root, Some(1))), vec!["a.rs"]);
+        let bounded = walk_workspace(root, Some(2));
+        assert_eq!(paths(&bounded), vec!["a.rs", "src/b.rs"]);
+        assert_eq!(bounded.max_depth, Some(2));
+        let open = walk_workspace(root, None);
+        assert_eq!(paths(&open), vec!["a.rs", "src/b.rs", "src/deep/c.rs"]);
+        assert_eq!(open.max_depth, None);
+    }
+
     fn write(root: &Path, rel: &str, body: &[u8]) {
         let path = root.join(rel);
         if let Some(parent) = path.parent() {
@@ -339,7 +369,7 @@ mod tests {
         write(&root, "target/junk.rs", b"// drop\n");
         write(&root, "ignored.rs", b"// drop\n");
 
-        let map = walk_workspace(&root);
+        let map = walk_workspace(&root, None);
         let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"src/lib.rs"));
         assert!(!paths.iter().any(|p| p.starts_with("target/")));
@@ -368,7 +398,7 @@ mod tests {
         write(&root, "nested/.git/HEAD", b"ref: refs/heads/main\n");
         write(&root, "nested/main.rs", b"// separate project\n");
 
-        let map = walk_workspace(&root);
+        let map = walk_workspace(&root, None);
         let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"src/lib.rs"));
         assert!(
@@ -390,7 +420,7 @@ mod tests {
         write(&root, "README.md", b"# title\n");
         write(&root, "shape.svg", b"<svg/>");
 
-        let map = walk_workspace(&root);
+        let map = walk_workspace(&root, None);
         let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"src/lib.rs"));
         assert!(paths.contains(&"README.md"));
@@ -408,7 +438,7 @@ mod tests {
         let big: Vec<u8> = vec![b'a'; 17 * 1024 * 1024];
         write(&root, "huge.rs", &big);
 
-        let map = walk_workspace(&root);
+        let map = walk_workspace(&root, None);
         let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"tiny.rs"));
         assert!(!paths.contains(&"huge.rs"));
@@ -430,7 +460,7 @@ mod tests {
             b"\x7fELF\x00\x00fatbin\x00code",
         );
 
-        let map = walk_workspace(&root);
+        let map = walk_workspace(&root, None);
         let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"notes.txt"), "real text kept: {paths:?}");
         assert!(
@@ -448,7 +478,7 @@ mod tests {
         // survive the walk; oversize counters stay at zero.
         let body: Vec<u8> = vec![b'a'; 12 * 1024 * 1024];
         write(&root, "doc.md", &body);
-        let map = walk_workspace(&root);
+        let map = walk_workspace(&root, None);
         assert!(map.files.iter().any(|f| f.path == "doc.md"));
         assert_eq!(map.files_skipped_oversize, 0);
     }
@@ -461,7 +491,7 @@ mod tests {
         write(&root, ".zend/config.yaml", b"x: 1\n");
         write(&root, ".substrate/something.log", b"x");
 
-        let map = walk_workspace(&root);
+        let map = walk_workspace(&root, None);
         let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"src/lib.rs"));
         assert!(!paths.iter().any(|p| p.starts_with(".zend/")));
@@ -492,7 +522,7 @@ mod tests {
         // A nested `src/uploads/` in a real project is NOT the daemon's dir.
         write(&root, "src/uploads/real.rs", b"// keep\n");
 
-        let map = walk_workspace(&root);
+        let map = walk_workspace(&root, None);
         let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"src/main.rs"));
         assert!(
@@ -514,7 +544,7 @@ mod tests {
         write(&root, "empty.rs", b""); // 0 lines
         write(&root, "single.rs", b"hello"); // 1 line, no NL
 
-        let map = walk_workspace(&root);
+        let map = walk_workspace(&root, None);
         let by_name: std::collections::HashMap<&str, u32> = map
             .files
             .iter()
@@ -538,7 +568,7 @@ members = ["a", "b", "c"]
 "#,
         );
 
-        let map = walk_workspace(&root);
+        let map = walk_workspace(&root, None);
         let entry = map.files.iter().find(|f| f.path == "Cargo.toml").unwrap();
         assert_eq!(
             entry.module_hint,
@@ -559,7 +589,7 @@ version = "0.1.0"
 "#,
         );
 
-        let map = walk_workspace(&root);
+        let map = walk_workspace(&root, None);
         let entry = map.files.iter().find(|f| f.path == "Cargo.toml").unwrap();
         assert_eq!(
             entry.module_hint,
@@ -579,7 +609,7 @@ version = "0.1.0"
             br#"{"name":"my-app","version":"1.0.0"}"#,
         );
 
-        let map = walk_workspace(&root);
+        let map = walk_workspace(&root, None);
         let entry = map.files.iter().find(|f| f.path == "package.json").unwrap();
         assert_eq!(
             entry.module_hint,
@@ -595,7 +625,7 @@ version = "0.1.0"
         let root = dir.path().to_path_buf();
         write(&root, "go.mod", b"module example.com/me/widget\ngo 1.22\n");
 
-        let map = walk_workspace(&root);
+        let map = walk_workspace(&root, None);
         let entry = map.files.iter().find(|f| f.path == "go.mod").unwrap();
         assert_eq!(
             entry.module_hint,
@@ -613,7 +643,7 @@ version = "0.1.0"
         write(&root, "a/first.rs", b"//\n");
         write(&root, "m/middle.rs", b"//\n");
 
-        let map = walk_workspace(&root);
+        let map = walk_workspace(&root, None);
         let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, vec!["a/first.rs", "m/middle.rs", "z/last.rs"]);
     }

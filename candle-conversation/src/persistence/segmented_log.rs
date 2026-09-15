@@ -33,9 +33,21 @@
 //! always open; sealed-segment read handles are cached in an LRU
 //! [`SealedPool`] bounded to [`OPEN_SEALED_SEGMENTS`], so the open-handle
 //! count stays bounded regardless of how many segments exist.
+//!
+//! ## Read-only
+//!
+//! [`SegmentedLog::open_read_only_with_sink`] opens a store for reading only —
+//! typically one a running daemon is appending to and maintaining at the same
+//! time. Nothing under the directory is created, renamed, deleted, truncated,
+//! grown or written from open to drop, and every sealed segment is held open
+//! (the pool is unbounded and never evicts), so a concurrent compaction that
+//! deletes a sealed segment cannot fail a later read of it.
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::header_index::IndexEntry;
 use super::log_file::{read_record_at, LogFile, LogSource, Superblock, SUPERBLOCK_SIZE};
@@ -44,7 +56,7 @@ use super::record::Record;
 use super::recovery;
 use super::segment::{SegmentId, FIRST_SEGMENT};
 use super::walker::WalkEntry;
-use super::Result;
+use super::{PersistenceError, Result};
 use candle::direct_io::DirectFile;
 
 /// Soft size the active segment grows to before the next commit seals it and
@@ -105,6 +117,10 @@ struct SealedPool {
     /// used last. Length is bounded to `cap`.
     open: Vec<(SegmentId, LogFile)>,
     cap: usize,
+    /// Every handle is read-only ([`LogFile::open_read_only`]) and the pool is
+    /// uncapped: a read-only store holds each sealed segment open from open to
+    /// drop — see [`SegmentedLog::open_read_only_with_sink`].
+    read_only: bool,
 }
 
 impl SealedPool {
@@ -112,7 +128,27 @@ impl SealedPool {
         SealedPool {
             open: Vec::new(),
             cap,
+            read_only: false,
         }
+    }
+
+    /// A read-only pool that holds `open` for the life of the store. No cap,
+    /// so nothing is ever evicted and nothing is ever re-opened by path.
+    fn held(open: Vec<(SegmentId, LogFile)>) -> SealedPool {
+        SealedPool {
+            open,
+            cap: usize::MAX,
+            read_only: true,
+        }
+    }
+
+    /// The open handle for `id`, if the pool holds one. Leaves the LRU order
+    /// alone.
+    fn peek(&self, id: SegmentId) -> Option<&LogFile> {
+        self.open
+            .iter()
+            .find(|(sid, _)| *sid == id)
+            .map(|(_, log)| log)
     }
 
     /// An open read handle for sealed `id`, opening it (and evicting the LRU
@@ -123,7 +159,12 @@ impl SealedPool {
             self.open.push(entry);
             return Ok(&mut self.open.last_mut().unwrap().1);
         }
-        let log = LogFile::open(&dir.join(segment_name(id)))?;
+        let path = dir.join(segment_name(id));
+        let log = if self.read_only {
+            LogFile::open_read_only(&path)?
+        } else {
+            LogFile::open(&path)?
+        };
         if self.open.len() >= self.cap {
             self.open.remove(0);
         }
@@ -151,6 +192,11 @@ pub struct SegmentedLog {
     /// in production; a field (not the bare const) so tests can drive rotation
     /// with a tiny target instead of writing multiple GiB.
     target_bytes: u64,
+    /// Opened by [`SegmentedLog::open_read_only_with_sink`]: every handle is
+    /// read-only, every sealed segment is held open, and every operation that
+    /// would create, rename, delete, truncate or write a file refuses with
+    /// [`PersistenceError::ReadOnly`].
+    read_only: bool,
 }
 
 /// Everything [`SegmentedLog::open_with_sink`] hands back to the persistence
@@ -264,7 +310,132 @@ fn scan_segments(dir: &Path) -> Result<Vec<SegmentId>> {
     Ok(ids)
 }
 
+/// The segment files of a store opened read-only, ascending by id, each with
+/// the path it is read from. Resolved the way a writable open resolves them,
+/// with nothing renamed:
+///
+/// - a `seg-<id>.log` is segment `id`;
+/// - a legacy `seg-<id>.active` is segment `id` when no `seg-<id>.log` exists
+///   (a writable open adopts it by renaming; this reads it where it lies);
+/// - a legacy monolithic `substrate.log` in a store with no segment files is
+///   [`FIRST_SEGMENT`], the id a writable open's migration seals it as.
+fn scan_segment_files(dir: &Path) -> Result<Vec<(SegmentId, PathBuf)>> {
+    let mut files: BTreeMap<SegmentId, PathBuf> = BTreeMap::new();
+    let mut legacy_actives: Vec<(SegmentId, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(id) = parse_segment(name) {
+            files.insert(id, entry.path());
+        } else if let Some(id) = parse_legacy_active(name) {
+            legacy_actives.push((id, entry.path()));
+        }
+    }
+    let segmented = !files.is_empty() || !legacy_actives.is_empty();
+    for (id, path) in legacy_actives {
+        files.entry(id).or_insert(path);
+    }
+    if !segmented {
+        let legacy = dir.join(LEGACY_LOG_NAME);
+        if legacy.is_file() {
+            files.insert(FIRST_SEGMENT, legacy);
+        }
+    }
+    Ok(files.into_iter().collect())
+}
+
 impl SegmentedLog {
+    /// Open the segment set in `dir` **read-only**, recovering every segment's
+    /// records through `sink` in ascending id order (active last), as
+    /// [`Self::open_with_sink`] does.
+    ///
+    /// For a tool reading a store that another process — the daemon — may be
+    /// appending to and maintaining at the same time. Nothing under `dir` is
+    /// created, renamed, deleted, truncated, grown or written, at open or
+    /// afterwards:
+    ///
+    /// - the directory and at least one segment must already exist; a missing
+    ///   directory or an empty store is an error rather than a fresh store;
+    /// - scratch files are left where they lie and legacy files are read in
+    ///   place ([`scan_segment_files`]);
+    /// - a torn tail is not truncated: recovery stops at it, and the active's
+    ///   write offset is set there in RAM only;
+    /// - every segment is opened with [`LogFile::open_read_only`], and every
+    ///   sealed segment's handles are held until the store drops. A concurrent
+    ///   writer that compacts a sealed segment away and deletes it cannot fail
+    ///   a later read: the handles were opened with delete sharing, so they go
+    ///   on reading the file the index points into.
+    pub fn open_read_only_with_sink<F>(dir: &Path, mut sink: F) -> Result<OpenedSegments>
+    where
+        F: FnMut(&WalkEntry),
+    {
+        if !dir.is_dir() {
+            return Err(PersistenceError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "read-only substrate open: {} is not a directory",
+                    dir.display()
+                ),
+            )));
+        }
+        let mut files = scan_segment_files(dir)?;
+        let Some((active_id, active_path)) = files.pop() else {
+            return Err(PersistenceError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "read-only substrate open: {} holds no segment files",
+                    dir.display()
+                ),
+            )));
+        };
+
+        let mut manifest = Manifest::new();
+        let mut recovered_records = 0usize;
+        let mut sealed = Vec::with_capacity(files.len());
+        let mut held = Vec::with_capacity(files.len());
+        for (id, path) in files {
+            let mut log = LogFile::open_read_only(&path)?;
+            let hint = log.superblock().last_index;
+            // A torn tail stays on disk; the walk hands on the records before it.
+            let rec = recovery::recover_with_sink(&mut log, id, hint, |e| {
+                recovered_records += 1;
+                sink(e);
+            })?;
+            merge_singletons(&mut manifest, &rec.manifest);
+            sealed.push(id);
+            held.push((id, log));
+        }
+
+        let mut active = LogFile::open_read_only(&active_path)?;
+        let hint = active.superblock().last_index;
+        let rec = recovery::recover_with_sink(&mut active, active_id, hint, |e| {
+            recovered_records += 1;
+            sink(e);
+        })?;
+        // The logical end is where the walk stopped. A torn record past it is
+        // left on disk for the process that owns the store.
+        active.set_write_offset(rec.tail_offset);
+        merge_singletons(&mut manifest, &rec.manifest);
+
+        let segments = SegmentedLog {
+            dir: dir.to_path_buf(),
+            active_id,
+            active,
+            sealed,
+            pool: SealedPool::held(held),
+            target_bytes: SEGMENT_TARGET_BYTES,
+            read_only: true,
+        };
+        Ok(OpenedSegments {
+            segments,
+            manifest,
+            last_index: rec.last_index,
+            tail_digests: rec.tail_digests,
+            recovered_records,
+        })
+    }
+
     /// Open (creating if absent) the segment set in `dir`, recovering every
     /// segment's records through `sink` in ascending id order (active last).
     ///
@@ -334,6 +505,7 @@ impl SegmentedLog {
             sealed,
             pool: SealedPool::new(OPEN_SEALED_SEGMENTS),
             target_bytes: SEGMENT_TARGET_BYTES,
+            read_only: false,
         };
         Ok(OpenedSegments {
             segments,
@@ -347,6 +519,12 @@ impl SegmentedLog {
     /// The active (append target) segment's id.
     pub fn active_id(&self) -> SegmentId {
         self.active_id
+    }
+
+    /// Whether this segment set was opened by
+    /// [`Self::open_read_only_with_sink`].
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Sealed segment ids on disk, ascending. Excludes the active.
@@ -416,6 +594,9 @@ impl SegmentedLog {
     /// empty new one; the highest id is unambiguously the active on the next
     /// open, so there is no two-active state to heal.
     pub fn seal_and_rotate(&mut self) -> Result<()> {
+        if self.read_only {
+            return Err(PersistenceError::ReadOnly);
+        }
         debug_assert_eq!(
             self.active.pending_len(),
             0,
@@ -474,21 +655,41 @@ impl SegmentedLog {
         self.active.direct_file()
     }
 
-    /// Open a **fresh** direct-I/O handle set on a sealed segment for the
-    /// duration of one cold-load. Unlike the CPU read path (which borrows a
-    /// pooled handle via `&mut self`), the GPU cold-load pipeline holds
+    /// A direct-I/O handle set on a sealed segment that the caller owns for
+    /// the duration of one cold-load. Unlike the CPU read path (which borrows
+    /// a pooled handle via `&mut self`), the GPU cold-load pipeline holds
     /// `&self` shared across its reader threads and needs several sealed
-    /// segments' handles live at once, so it owns them directly rather than
-    /// borrowing from the LRU pool.
-    pub fn open_sealed_direct(&self, segment: SegmentId) -> Result<DirectFile> {
-        Ok(DirectFile::open(&self.dir.join(segment_name(segment)))?)
+    /// segments' handles live at once, so it takes shared ownership of them.
+    ///
+    /// Served from the read pool's handles when the pool holds the segment —
+    /// always, on a read-only store, which holds every sealed segment — and
+    /// opened fresh by path otherwise.
+    pub fn open_sealed_direct(&self, segment: SegmentId) -> Result<Arc<DirectFile>> {
+        if let Some(log) = self.pool.peek(segment) {
+            return Ok(log.shared_direct());
+        }
+        Ok(Arc::new(DirectFile::open(
+            &self.dir.join(segment_name(segment)),
+        )?))
+    }
+
+    /// Physical length of sealed `segment`. Sealed segments are immutable, so
+    /// an open pool handle's length is the file's length and is read from
+    /// there; the file's metadata answers otherwise. A read-only store holds
+    /// every sealed segment, so it never asks the file system about one a
+    /// concurrent writer may already have deleted.
+    fn sealed_file_len(&self, segment: SegmentId) -> Result<u64> {
+        if let Some(log) = self.pool.peek(segment) {
+            return Ok(log.allocated_len());
+        }
+        Ok(fs::metadata(self.dir.join(segment_name(segment)))?.len())
     }
 
     /// Record bytes (excluding the superblock) in sealed `segment` — the
     /// denominator of that segment's dead-weight ratio for the maintenance
     /// triggers.
     pub fn sealed_record_bytes(&self, segment: SegmentId) -> Result<u64> {
-        let len = fs::metadata(self.dir.join(segment_name(segment)))?.len();
+        let len = self.sealed_file_len(segment)?;
         Ok(len.saturating_sub(SUPERBLOCK_SIZE))
     }
 
@@ -504,6 +705,9 @@ impl SegmentedLog {
     /// file. The caller must have already relocated its live records into the
     /// active (background maintenance), so nothing references it.
     pub fn drop_sealed(&mut self, segment: SegmentId) -> Result<()> {
+        if self.read_only {
+            return Err(PersistenceError::ReadOnly);
+        }
         self.pool.forget(segment);
         fs::remove_file(self.dir.join(segment_name(segment)))?;
         self.sealed.retain(|&s| s != segment);
@@ -523,7 +727,7 @@ impl SegmentedLog {
         let mut total = self.active.write_offset().saturating_sub(SUPERBLOCK_SIZE)
             + self.active.pending_len() as u64;
         for &id in &self.sealed {
-            let len = fs::metadata(self.dir.join(segment_name(id)))?.len();
+            let len = self.sealed_file_len(id)?;
             total += len.saturating_sub(SUPERBLOCK_SIZE);
         }
         Ok(total)
@@ -542,6 +746,9 @@ impl SegmentedLog {
     /// under a name that recovery would discard. The `new_active` handle follows
     /// the rename (Rust opens with `FILE_SHARE_DELETE`).
     pub fn adopt_compacted(&mut self, new_active: LogFile, scratch: &Path) -> Result<()> {
+        if self.read_only {
+            return Err(PersistenceError::ReadOnly);
+        }
         // A fresh id above every existing segment (the current active is the
         // highest), so the compacted segment wins by id-order over the old ones.
         let new_id = self.active_id.next();
@@ -588,6 +795,9 @@ impl SegmentedLog {
     where
         F: FnMut(&WalkEntry),
     {
+        if self.read_only {
+            return Err(PersistenceError::ReadOnly);
+        }
         let id = self.active_id;
         let hint = self.active.superblock().last_index;
         let rec = recovery::recover_with_sink(&mut self.active, id, hint, |e| sink(e))?;
@@ -602,6 +812,7 @@ impl SegmentedLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::dir_fingerprint;
     use crate::persistence::log_file::SUPERBLOCK_SIZE;
     use crate::persistence::record::{encode_record, RecordHeader, RecordType};
 
@@ -799,6 +1010,140 @@ mod tests {
         // The oldest-touched ids (1, 2) were evicted; the newest is present.
         assert!(pool.open.iter().any(|(id, _)| *id == SegmentId(n as u64)));
         assert!(!pool.open.iter().any(|(id, _)| *id == SegmentId(1)));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A read-only open reads everything and changes nothing.** Two sealed
+    /// segments, an active whose last record is torn, and a stray compaction
+    /// scratch — a writable open would delete the scratch and truncate the
+    /// tail. The read-only open reads every good record back byte-for-byte,
+    /// stops its write offset at the tear in RAM, and leaves every file's name,
+    /// length and SHA-256 exactly as it found them, through the drop.
+    #[test]
+    fn read_only_open_reads_every_record_and_changes_nothing() {
+        let dir = tmp_dir("ro_full");
+        let torn_at;
+        {
+            let mut opened = SegmentedLog::open_with_sink(&dir, |_| {}).unwrap();
+            let seg = &mut opened.segments;
+            seg.stage(&chunk_bytes(1, 0, b"alpha"));
+            seg.stage(&chunk_bytes(1, 1, b"beta"));
+            seg.commit().unwrap();
+            seg.seal_and_rotate().unwrap();
+            seg.stage(&chunk_bytes(2, 0, b"gamma"));
+            seg.commit().unwrap();
+            seg.seal_and_rotate().unwrap();
+            seg.stage(&chunk_bytes(3, 0, b"delta"));
+            seg.stage(&chunk_bytes(3, 1, b"epsilon"));
+            let (_, off) = seg.stage(&chunk_bytes(3, 2, b"torn-record"));
+            seg.commit().unwrap();
+            torn_at = off;
+        }
+        // Tear the active's last record: the file ends 64 bytes into it, the
+        // way a crash mid-append leaves it.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(segment_name(SegmentId(3))))
+            .unwrap()
+            .set_len(torn_at + 64)
+            .unwrap();
+        fs::write(dir.join(".compact"), b"stray compaction scratch").unwrap();
+        let before = dir_fingerprint(&dir);
+
+        let mut walked = Vec::new();
+        let mut opened = SegmentedLog::open_read_only_with_sink(&dir, |e| {
+            walked.push((e.segment, e.offset, e.size));
+        })
+        .unwrap();
+        assert_eq!(opened.recovered_records, 5);
+        let seg = &mut opened.segments;
+        assert!(seg.is_read_only());
+        assert_eq!(seg.active_id(), SegmentId(3));
+        assert_eq!(seg.sealed_ids(), &[SegmentId(1), SegmentId(2)]);
+        assert_eq!(seg.write_offset(), torn_at);
+        walked.sort_unstable();
+        let read_back: Vec<(SegmentId, u64, u64, Vec<u8>)> = walked
+            .iter()
+            .map(|&(s, off, size)| {
+                let r = seg.read_record_at(s, off, size).unwrap();
+                (s, r.header.stream_id, r.header.chunk_index, r.payload)
+            })
+            .collect();
+        assert_eq!(
+            read_back,
+            vec![
+                (SegmentId(1), 1, 0, b"alpha".to_vec()),
+                (SegmentId(1), 1, 1, b"beta".to_vec()),
+                (SegmentId(2), 2, 0, b"gamma".to_vec()),
+                (SegmentId(3), 3, 0, b"delta".to_vec()),
+                (SegmentId(3), 3, 1, b"epsilon".to_vec()),
+            ]
+        );
+        drop(opened);
+        assert_eq!(dir_fingerprint(&dir), before);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A concurrent writer deleting a sealed segment after the read-only open —
+    /// what the daemon's maintenance does once it has relocated a segment's
+    /// live records — does not fail a later read of it: the handles were taken
+    /// at open and are held until the store drops.
+    #[test]
+    fn a_sealed_segment_deleted_after_a_read_only_open_still_reads() {
+        let dir = tmp_dir("ro_held");
+        let off;
+        {
+            let mut opened = SegmentedLog::open_with_sink(&dir, |_| {}).unwrap();
+            let seg = &mut opened.segments;
+            off = seg.stage(&chunk_bytes(5, 0, b"held-open")).1;
+            seg.commit().unwrap();
+            seg.seal_and_rotate().unwrap();
+        }
+        let mut opened = SegmentedLog::open_read_only_with_sink(&dir, |_| {}).unwrap();
+        fs::remove_file(dir.join(segment_name(FIRST_SEGMENT))).unwrap();
+        let seg = &mut opened.segments;
+        let r = seg.read_record_at(FIRST_SEGMENT, off, 4096).unwrap();
+        assert_eq!(r.payload, b"held-open");
+        assert_eq!(seg.sealed_record_bytes(FIRST_SEGMENT).unwrap(), 4096);
+        assert!(seg.open_sealed_direct(FIRST_SEGMENT).is_ok());
+        drop(opened);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A read-only open never makes a store: a missing directory is an error
+    /// and stays missing, and a directory with no segment files is an error and
+    /// stays empty.
+    #[test]
+    fn read_only_open_of_a_missing_or_empty_store_errors_and_creates_nothing() {
+        let parent = tmp_dir("ro_missing");
+        let missing = parent.join("absent");
+        assert!(SegmentedLog::open_read_only_with_sink(&missing, |_| {}).is_err());
+        assert!(!missing.exists());
+        assert!(SegmentedLog::open_read_only_with_sink(&parent, |_| {}).is_err());
+        assert!(dir_fingerprint(&parent).is_empty());
+        fs::remove_dir_all(&parent).ok();
+    }
+
+    /// A legacy monolithic `substrate.log` is read in place as the first
+    /// segment — not renamed into the segmented layout, and no fresh active is
+    /// minted beside it.
+    #[test]
+    fn read_only_open_reads_a_legacy_log_in_place() {
+        let dir = tmp_dir("ro_legacy");
+        {
+            let mut log = LogFile::create(&dir.join(LEGACY_LOG_NAME)).unwrap();
+            log.stage(&chunk_bytes(7, 0, b"alpha"));
+            log.stage(&chunk_bytes(7, 1, b"beta"));
+            log.commit().unwrap();
+        }
+        let before = dir_fingerprint(&dir);
+        let mut records = 0usize;
+        let opened = SegmentedLog::open_read_only_with_sink(&dir, |_| records += 1).unwrap();
+        assert_eq!(records, 2);
+        assert_eq!(opened.segments.active_id(), FIRST_SEGMENT);
+        assert!(opened.segments.sealed_ids().is_empty());
+        drop(opened);
+        assert_eq!(dir_fingerprint(&dir), before);
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -26,6 +26,7 @@ pub mod batched_attention;
 pub mod config;
 pub mod convert;
 pub mod convert_bench;
+pub mod coverage;
 pub mod draft;
 #[cfg(feature = "cuda")]
 pub mod engine;

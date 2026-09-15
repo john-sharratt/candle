@@ -214,7 +214,7 @@ pub struct PipelineStats {
 /// by the next batch).
 pub fn run_pipeline(
     persistence: &SubstratePersistence,
-    sealed: &std::collections::HashMap<SegmentId, DirectFile>,
+    sealed: &std::collections::HashMap<SegmentId, Arc<DirectFile>>,
     backings: &[ChunkedKvBacking],
     device: &Device,
     chunk_batch: &ChunkBatch,
@@ -299,7 +299,7 @@ pub fn run_pipeline(
                         let direct = match work.source {
                             SourceLog::Active => persistence.active_direct_file(),
                             SourceLog::Sealed(id) => match sealed.get(&id) {
-                                Some(d) => d,
+                                Some(d) => d.as_ref(),
                                 // Every `Sealed(id)` in the plan gets a handle
                                 // opened up front by `load_stream_into_hot`; a
                                 // miss is a bug, but propagate it as a read

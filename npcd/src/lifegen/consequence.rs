@@ -292,7 +292,7 @@ mod tests {
         let x = c("leave_intent", serde_json::json!({"intent": "go north"}));
         assert_eq!(
             render(&x),
-            "<tool_call>\n{\"arguments\":{\"intent\":\"go north\"},\"name\":\"leave_intent\"}\n</tool_call>"
+            "<tool_call>\n{\"name\":\"leave_intent\",\"arguments\":{\"intent\":\"go north\"}}\n</tool_call>"
         );
     }
 

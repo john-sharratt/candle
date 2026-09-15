@@ -192,7 +192,9 @@ mod control {
                 }
                 StreamItem::Projection(_) => {}
                 StreamItem::Tool(_) => {}
-                StreamItem::TurnEnd { .. } => {}
+                StreamItem::Prefill { .. }
+                | StreamItem::Think { .. }
+                | StreamItem::TurnEnd { .. } => {}
             }
         }
         // Print the decoded text so coherence can be eyeballed — a wrong

@@ -26,28 +26,26 @@ questions:
 - read back the notes file from this session
 category: Files
 mandatory: true
-description: 'Read a range of lines from a file. Resolves against this session''s edits first, then falls through to the project''s working directory, so real project files can be read directly. Use for: reading a source file from the project, looking at what was previously written, inspecting a file the user uploaded into the chat, checking the current state of a draft after edits. path, start_line and end_line are all required: to read a file from the top ask for lines 1-200, and for a named range ask for exactly those lines. Returns the excerpt as numbered source in a fenced block, headed by the path and the line range it covers. At most 200 lines come back per call: when the header reads `(lines 1-200 of 900)` there is more, and the next call asks for start_line 201. For remote filesystems use remote_fs_session_get to download first, then file_read.'
+description: 'Read a file, or a range of its lines. Resolves against this session''s edits first, then falls through to the project''s working directory, so real project files can be read directly. Use for: reading a source file from the project, looking at what was previously written, inspecting a file the user uploaded into the chat, checking the current state of a draft after edits. Give only path to read the whole file; add start_line and/or end_line to read part of it — start_line alone reads to the end, end_line alone reads from the top, and a named range asks for exactly those lines. Returns the lines as numbered source in a fenced block, headed by the path and the line range it covers; a partial read''s header reads `(lines 47-93 of 900)`. For remote filesystems use remote_fs_session_get to download first, then file_read.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
-    end_line:
-      description: Last line to return, 1-based and inclusive. At most 200 lines come back per call, so a range wider than that stops at start_line + 199. Required.
-      format: uint32
-      minimum: 1.0
-      type: integer
     path:
       description: Path of the file to read — a project file from the working directory, or one this session created (e.g. `src/main.rs`, or `/workspace/src/main.rs`). Required.
       minLength: 1
       type: string
     start_line:
-      description: First line to return, 1-based. Use 1 to read from the top of the file. Required.
+      description: First line to return, 1-based. Omit to read from the top of the file.
+      format: uint32
+      minimum: 1.0
+      type: integer
+    end_line:
+      description: Last line to return, 1-based and inclusive. Omit to read to the end of the file.
       format: uint32
       minimum: 1.0
       type: integer
   required:
   - path
-  - start_line
-  - end_line
   title: ReadRequest
   type: object
 examples:
@@ -55,61 +53,71 @@ examples:
   show me the contents of /workspace/Cargo.toml<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user wants to see /workspace/Cargo.toml. file_read takes the path and a line range; no range was named, so I read from the top: lines 1 to 200.<|projection|> If the header reports more lines than that, the next call continues at 201.
+  The user wants to see /workspace/Cargo.toml. No range was named, so file_read takes only the path and returns the whole file.<|projection|> The header states the lines it covers.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/Cargo.toml", "start_line": 1, "end_line": 200}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/Cargo.toml"}}
   </tool_call><|projection|>
 - |-
   read the file /workspace/src/main.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  A direct read of /workspace/src/main.rs. file_read needs path, start_line and end_line. With no range given I start at line 1 and ask for the first 200 lines,<|projection|> the most one call returns.
+  A direct read of /workspace/src/main.rs. With no range given, file_read needs only the path and returns the whole file,<|projection|> numbered so I can point at specific lines.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/src/main.rs", "start_line": 1, "end_line": 200}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/src/main.rs"}}
   </tool_call><|projection|>
 - |-
   what's in /workspace/.gitignore<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user asks what /workspace/.gitignore contains. That is a file read from the top, so file_read with start_line 1 and end_line 200 — a .gitignore<|projection|> is short, and the header will say if anything was left over.
+  The user asks what /workspace/.gitignore contains. That is a whole-file read, so file_read with only the path — a .gitignore<|projection|> is short, and all of it is the answer.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/.gitignore", "start_line": 1, "end_line": 200}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/.gitignore"}}
   </tool_call><|projection|>
 - |-
   cat /workspace/docs/architecture.md for me<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  "cat" means show the whole file. file_read returns at most 200 lines per call, so I start with lines 1-200 of /workspace/docs/architecture.md;<|projection|> if the header reads `(lines 1-200 of N)` the rest follows from start_line 201.
+  "cat" means show the whole file, which is what file_read returns when it is given only a path, so the call names /workspace/docs/architecture.md<|projection|> and no range.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/docs/architecture.md", "start_line": 1, "end_line": 200}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/docs/architecture.md"}}
   </tool_call><|projection|>
 - |-
   read src/main.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user wants the contents of src/main.rs. file_read resolves a path against this session's edits first and then falls through to the project's working directory, so it will return the<|projection|> real file. No range was named, so lines 1 to 200.
+  The user wants the contents of src/main.rs. file_read resolves a path against this session's edits first and then falls through to the project's working directory, so it will return the<|projection|> real file. No range was named, so the path alone, and the whole file comes back.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/main.rs", "start_line": 1, "end_line": 200}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/main.rs"}}
   </tool_call><|projection|>
 - |-
   what does the README say<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user is asking about the README's contents. That means actually reading it rather than guessing, so file_read on README.md from the top.<|projection|> Lines 1-200 covers most READMEs, and the header tells me whether there is more.
+  The user is asking about the README's contents. That means actually reading it rather than guessing, so file_read on README.md.<|projection|> No range: the whole README comes back.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "README.md", "start_line": 1, "end_line": 200}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "README.md"}}
+  </tool_call><|projection|>
+- |-
+  show me the first 30 lines of src/lib.rs<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Only the top of src/lib.rs is wanted, up to line 30. end_line alone reads from the start of the file,<|projection|> so the call gives path and end_line 30.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/lib.rs", "end_line": 30}}
   </tool_call><|projection|>
 - |-
   read lines 47 to 93 of src/auth/handler.rs<|im_end|>
@@ -125,7 +133,7 @@ examples:
   what do lines 598-630 of zend/src/prompts/projection.yaml do<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The question is about a specific range, so I read exactly lines 598 to 630 of zend/src/prompts/projection.yaml.<|projection|> Reading from the top would return lines 1-200 and miss the section entirely.
+  The question is about a specific range, so I read exactly lines 598 to 630 of zend/src/prompts/projection.yaml.<|projection|> Reading the whole file would bury the section among hundreds of other lines.
   </think>
 
   <tool_call>
@@ -135,7 +143,7 @@ examples:
   the error mentions line 240 of src/server.rs, let me see it<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The error points at line 240, so I read a window around it rather than the top of the file: lines 220 to 260 of src/server.rs.<|projection|> That shows the failing line with enough context to see what feeds it.
+  The error points at line 240, so I read a window around it rather than the whole file: lines 220 to 260 of src/server.rs.<|projection|> That shows the failing line with enough context to see what feeds it.
   </think>
 
   <tool_call>
@@ -145,9 +153,9 @@ examples:
   show me the rest of that file<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The previous excerpt's header ended at line 200 and reported a larger total, so there is more to read. The continuation is the next page: start_line 201, end_line 400.<|projection|> The header on this one will say whether a further page remains.
+  The previous excerpt covered lines 47-93 and its header reported a larger total, so the rest starts at line 94. start_line alone reads from there to the end of the file.<|projection|> The header will show where it stops.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/auth/handler.rs", "start_line": 201, "end_line": 400}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/auth/handler.rs", "start_line": 94}}
   </tool_call><|projection|>

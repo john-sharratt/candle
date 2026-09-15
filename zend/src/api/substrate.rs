@@ -22,6 +22,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use candle_conversation::turn_layout::TurnLayout;
 
@@ -283,6 +284,10 @@ pub struct ToolView {
     pub description: String,
     /// `true` for high-risk tools (dropped from the Restricted tools mode).
     pub high_risk: bool,
+    /// JSON Schema for the call arguments. The GUI lists every parameter on a
+    /// tool-call card from it — the ones a call left out included, with the
+    /// default they took — since a call names only what it overrides.
+    pub parameters: Value,
 }
 
 /// `GET /v1/substrate/timeline/{tl}` body — one conversation's forest.
@@ -426,5 +431,19 @@ mod tests {
         let mut inside = tile(802.2);
         inside.cap_score();
         assert_eq!(inside.score, 802.2);
+    }
+
+    /// The catalog carries each tool's argument schema, so the GUI can list the
+    /// parameters a call left out.
+    #[test]
+    fn a_tool_view_serializes_its_parameter_schema() {
+        let view = ToolView {
+            name: "file_read".to_string(),
+            description: String::new(),
+            high_risk: false,
+            parameters: serde_json::json!({"properties": {"path": {"type": "string"}}}),
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["parameters"]["properties"]["path"]["type"], "string");
     }
 }

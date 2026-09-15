@@ -236,11 +236,13 @@ reads as whatever it last held, another sequence's KV once slots are recycled an
 under `tensor-assert`. That shipped on the Qwen3.6-35B MTP path and surfaced as NaN in the draft head's
 decode attention during the zend ingest (`docs/qwen35_speculative_decode.md` §3).
 
-So every such commit resyncs: `KvCache::commit_written_tokens` on the `KvCache` paths, and
-`refresh_decode_writer_slice` directly at the latent wave's own commit sites. The refresh patches the
-writer slice in place when the writer is still the chunk the buffer was built for, and drops the buffer
-for a rebuild when it is not — a block that crossed into the next chunk has also left the full
-predecessor's serialised length short, which no single-slice patch can repair. Gated by
+So every such commit marks the buffer: `KvCache::commit_written_tokens` on the `KvCache` paths, and
+`ChunkedKvBacking::mark_decode_writer_stale` directly at the latent wave's own commit sites. The mark
+records the writer boundary as it stood; the next `sync_decode_gpu_chunks` — every reader's path —
+re-serialises every chunk from there to the writer before handing the buffer out, because a block that
+crossed into the next chunk has also left the full predecessor's serialised length short, which no
+single-slice patch can repair. Nothing is uploaded at the commit itself: a prefill commits once per
+layer, and an upload there sits between that layer's kernels and the next. Gated by
 `chunked::tests::decode_slot_resync_tests`, which reads the lengths back from the device.
 
 Measured (n=8): **`wave_metadata` 8067 → 104.9 ms (77×, near zero)**, `decode:slot_reuse` 7471 → 23 ms,

@@ -187,15 +187,13 @@ mod tests {
         ));
     }
 
-    /// **Both rungs must suppress thinking, by different mechanisms.**
+    /// **Both rungs must suppress thinking.**
     ///
-    /// The two models do not share a dialect: Flash-Next is `Qwen35`, which has
-    /// no `/no_think` switch and suppresses by prefilling an already-closed
-    /// block; the hybrid is `ChatML`, which uses the switch. `thinking_suppression`
-    /// returns the pair and exactly one half is live per family — so a rung whose
-    /// dialect had neither would silently reason on every turn, which is the
-    /// failure this ladder could otherwise reintroduce on the hardware nobody
-    /// tests on.
+    /// `thinking_suppression` returns the pair — a `/no_think` soft switch and a
+    /// prefilled closed block — and exactly one half is live per dialect, so a
+    /// rung whose dialect had neither would silently reason on every turn, which
+    /// is the failure this ladder could otherwise reintroduce on the hardware
+    /// nobody tests on.
     #[test]
     fn every_rung_has_a_working_suppression_mechanism() {
         for m in [Model::Qwen38_FlashNext_Q4KO, Model::Qwen36_35B_A3B_Q4] {
@@ -208,19 +206,26 @@ mod tests {
         }
     }
 
-    /// The two rungs are deliberately different dialects, and the ladder must
-    /// not quietly converge them — a change that made both ChatML would drop
-    /// Flash-Next's structural suppression without failing anything else.
+    /// **Both rungs suppress by the closed block, because both are the Qwen3.5
+    /// family.** Neither checkpoint's template has a `/no_think` switch, so a
+    /// rung on `ChatML` would send it as text and reason on every suppressed
+    /// turn — which the 35B hybrid did, until its titler came back empty on
+    /// every turn. Asserted on the resolved dialect, which is what the
+    /// conversation layer uses.
     #[test]
-    fn the_rungs_keep_their_own_dialects() {
-        assert!(matches!(
-            Model::Qwen38_FlashNext_Q4KO.spec().chat_format,
-            DialectType::Qwen35
-        ));
-        assert!(matches!(
-            Model::Qwen36_35B_A3B_Q4.spec().chat_format,
-            DialectType::ChatML
-        ));
+    fn every_rung_suppresses_with_the_familys_closed_block() {
+        for m in [Model::Qwen38_FlashNext_Q4KO, Model::Qwen36_35B_A3B_Q4] {
+            let spec = m.clone().spec();
+            assert!(
+                matches!(spec.chat_format, DialectType::Qwen35),
+                "{m:?} is the Qwen3.5 family and must use its dialect"
+            );
+            assert!(
+                !spec.dialect.has_no_think_switch(),
+                "{m:?}: a `/no_think` switch would reach the model as text"
+            );
+            assert_eq!(spec.dialect.no_think_block, "<think>\n\n</think>\n\n");
+        }
     }
 
     // ── Flash-Next's spec ─────────────────────────────────────────────

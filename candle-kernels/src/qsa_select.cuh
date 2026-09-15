@@ -83,6 +83,29 @@ __device__ __forceinline__ int qsa_block_start(const QsaSel& sel, int row, uint3
     return (int)(p.x + (block - p.y) * (uint32_t)sel.ratio);
 }
 
+// The cells `block` (whose first position is `start`) spans for `row`, at most
+// `ratio` — how many of an entry's cells a kernel that walks ENTRIES may read.
+//
+// Uniformly every block is `ratio` wide. Through a page layout a page ends where
+// its tokens did, so its last block is short, and the position past it is the
+// next block's first — decided by that block's own entry, not this one. An entry
+// names its block's lowest cells, so its count clamped to this width is exactly
+// the set `qsa_selects` accepts for it: the positions up to the next block's
+// start, at most `ratio` of them. Where the next block starts right after a
+// short block that is the short block's own positions; where an unindexed span
+// sits between them it also covers the span's first cells, up to `ratio` from
+// the block's start — which `qsa_selects` maps to this block as well.
+//
+// `block * ratio` is the start only for a sequence with no pages; through a page
+// layout every block behind the first short one sits elsewhere, so a kernel
+// that walks entries takes both the start and this width from the table.
+__device__ __forceinline__ int qsa_block_width_from(
+    const QsaSel& sel, int row, uint32_t block, int start)
+{
+    if (sel.pages == nullptr) return sel.ratio;
+    return min(sel.ratio, qsa_block_start(sel, row, block + 1u) - start);
+}
+
 __device__ __forceinline__ bool qsa_active(const QsaSel& sel) {
     return sel.entries != nullptr;
 }

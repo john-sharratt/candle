@@ -284,10 +284,10 @@ fn hybrid_recurrent_state_advances_across_turns_and_is_non_zero_at_depth() {
 /// A second engine that recomputed would mean the key does not round-trip; one
 /// that installed nothing would mean the read path is broken. Both are silent.
 ///
-/// **Exactly one, not "at least one", is the point.** The live tree has 200
-/// branches (`no_think × persona × reasoning_stance × thinking_effort ×
-/// response_length`), and an earlier version of this pass computed all of them
-/// on every conversation open — 200 full-prompt prefills to use one. The upper
+/// **Exactly one, not "at least one", is the point.** The live tree has 100
+/// branches (`no_think × reasoning_stance × thinking_effort × response_length`),
+/// and an earlier version of this pass computed all of them on every
+/// conversation open — a full-prompt prefill per branch to use one. The upper
 /// bound is the assertion that keeps it honest.
 #[test]
 #[ignore = "Tier 3: loads the pinned Qwen3.6-35B-A3B GGUF (22 GB) TWICE and runs \

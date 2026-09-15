@@ -1,10 +1,10 @@
 //! Integration tests for the summarization pipeline.
 //!
 //! Verifies that feeding N turns into a [`Sequence`] with a low
-//! `summarize_every` value triggers [`SummarizationTask`] synchronously
-//! (inside [`Sequence::send`]), and that the resulting
-//! [`ConversationSegment`] node added to the tree contains well-formed,
-//! non-empty summary text.
+//! `summarize_every` value launches a [`SummarizationTask`] in the background
+//! — the triggering turn returns without waiting for it — and that the
+//! resulting [`ConversationSegment`] node, applied when the conversation next
+//! polls its tasks, contains well-formed, non-empty summary text.
 //!
 //! Uses `Qwen2-0.5B-Instruct Q4_0` (~0.4 GB) — the smallest available preset
 //! — for speed.  Set `summarize_on_day_boundary: false` so only the
@@ -18,7 +18,8 @@
 
 use candle_conversation::{
     models::{Model, ModelBuilder},
-    ConversationEngine, ConversationNode, ConversationTreeConfig, SamplingConfig, SequenceConfig,
+    ConversationEngine, ConversationNode, ConversationSegment, ConversationTreeConfig,
+    SamplingConfig, Sequence, SequenceConfig,
 };
 use std::time::{Duration, Instant};
 
@@ -89,7 +90,7 @@ fn system_prompt() -> String {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Count segment nodes in the current tree.
-fn segment_count(conv: &candle_conversation::Sequence) -> usize {
+fn segment_count(conv: &Sequence) -> usize {
     conv.tree()
         .nodes()
         .filter(|n| matches!(n, ConversationNode::Segment(_)))
@@ -97,9 +98,7 @@ fn segment_count(conv: &candle_conversation::Sequence) -> usize {
 }
 
 /// Return the last segment node in the tree, or `None`.
-fn last_segment(
-    conv: &candle_conversation::Sequence,
-) -> Option<candle_conversation::ConversationSegment> {
+fn last_segment(conv: &Sequence) -> Option<ConversationSegment> {
     conv.tree()
         .nodes()
         .filter_map(|n| n.as_segment())
@@ -107,22 +106,29 @@ fn last_segment(
         .cloned()
 }
 
-/// Poll for a segment node to appear in the tree with an explicit wall-clock
-/// timeout.
+/// How long [`settle`] waits for background summarization to finish.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Poll the conversation's cognitive tasks until none is in flight.
 ///
-/// Because [`Sequence::send`] already blocks until the summarization task
-/// completes (via `run_task_blocking_inner`), the segment is normally present
-/// the instant `send` returns.  This helper guards against regressions where
-/// the synchronous drain is accidentally removed, preventing a test hang.
-fn wait_for_any_segment(conv: &candle_conversation::Sequence, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
+/// Summarization runs in the background: the turn that triggers it launches
+/// the task and returns without waiting, and the segment it produces is applied
+/// the next time the conversation polls its tasks — at each turn boundary, or
+/// through [`Sequence::poll_cognitive_tasks`]. A test that asserts on the tree
+/// settles first. Panics if tasks are still in flight after
+/// [`SETTLE_TIMEOUT`], so a stuck task fails the test instead of hanging it.
+fn settle(conv: &mut Sequence) {
+    let deadline = Instant::now() + SETTLE_TIMEOUT;
     loop {
-        if segment_count(conv) > 0 {
-            return true;
+        conv.poll_cognitive_tasks();
+        if conv.pending_cognitive_tasks() == 0 {
+            return;
         }
-        if Instant::now() >= deadline {
-            return false;
-        }
+        assert!(
+            Instant::now() < deadline,
+            "{} cognitive task(s) still in flight after {SETTLE_TIMEOUT:?}",
+            conv.pending_cognitive_tasks()
+        );
         std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -132,7 +138,7 @@ fn wait_for_any_segment(conv: &candle_conversation::Sequence, timeout: Duration)
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Feeding exactly `summarize_every` turns should append exactly one segment
-/// node to the tree by the time the triggering `send()` returns.
+/// node to the tree once its summarization task has finished.
 #[test]
 #[ignore]
 fn test_summarization_triggers_at_threshold() {
@@ -149,12 +155,11 @@ fn test_summarization_triggers_at_threshold() {
         eprintln!("Turn {i}: {}", resp.text);
     }
 
-    let found = wait_for_any_segment(&conv, Duration::from_secs(30));
-    assert!(
-        found,
-        "expected a segment node after {} turns with summarize_every=3, but none appeared \
-         within the timeout",
-        3
+    settle(&mut conv);
+    assert_eq!(
+        segment_count(&conv),
+        1,
+        "expected a segment node after 3 turns with summarize_every=3"
     );
     eprintln!("✓ segment appeared after 3 turns");
     conv.close().ok();
@@ -176,6 +181,7 @@ fn test_summarization_segment_text_is_nonempty() {
         conv.send_turn(&format!("Turn {i} here."))
             .expect("send failed");
     }
+    settle(&mut conv);
 
     let seg = last_segment(&conv).expect("no segment node found");
     let text = seg.inner().summary_text.text().to_string();
@@ -200,6 +206,7 @@ fn test_summarization_segment_has_minimum_length() {
         conv.send_turn(&format!("Statement {i}: the sky is blue."))
             .expect("send failed");
     }
+    settle(&mut conv);
 
     let seg = last_segment(&conv).expect("no segment node found");
     let text = seg.inner().summary_text.text();
@@ -230,6 +237,7 @@ fn test_summarization_segment_covers_correct_turn_range() {
     for i in 1..=3u32 {
         conv.send_turn(&format!("Turn {i}.")).expect("send failed");
     }
+    settle(&mut conv);
 
     let seg = last_segment(&conv).expect("no segment node found");
     let sid = seg.inner().segment_id;
@@ -266,6 +274,7 @@ fn test_summarization_turn_nodes_preserved_after_segment() {
     for i in 1..=3u32 {
         conv.send_turn(&format!("Turn {i}.")).expect("send failed");
     }
+    settle(&mut conv);
 
     let nodes: Vec<_> = conv.tree().nodes().collect();
     eprintln!("Top-level node count: {}", nodes.len());
@@ -335,6 +344,7 @@ fn test_summarization_segment_is_parent_of_turns() {
         conv.send_turn(&format!("Message number {i}."))
             .expect("send failed");
     }
+    settle(&mut conv);
 
     let nodes: Vec<_> = conv.tree().nodes().collect();
 
@@ -393,6 +403,7 @@ fn test_summarization_does_not_trigger_early() {
         conv.send_turn(&format!("Early turn {i}."))
             .expect("send failed");
     }
+    settle(&mut conv);
 
     let segs = segment_count(&conv);
     eprintln!("Segment count after {} / {} turns: {}", 2, 3, segs);
@@ -424,9 +435,7 @@ fn test_summarization_second_round_triggers() {
         );
     }
 
-    // Poll briefly — both summarizations should already be complete.
-    let found = wait_for_any_segment(&conv, Duration::from_secs(60));
-    assert!(found, "expected at least one segment after 6 turns");
+    settle(&mut conv);
 
     let seg_count = segment_count(&conv);
     eprintln!("Total segment count after 6 turns: {}", seg_count);
@@ -461,6 +470,7 @@ fn test_summarization_segment_ordering_seq() {
         conv.send_turn(&format!("Order test turn {i}."))
             .expect("send failed");
     }
+    settle(&mut conv);
 
     let seg = last_segment(&conv).expect("no segment node found");
     let expected_seq = seg.inner().segment_id.end_turn.seq;
@@ -505,6 +515,7 @@ fn test_summarization_topic_summary_is_coherent() {
         .send_turn("My favourite hobby is photography.")
         .expect("turn 3 failed");
     eprintln!("Turn 3 response: {}", r3.text);
+    settle(&mut conv);
 
     let seg = last_segment(&conv).expect("no segment node found after topic conversation");
     let text = seg.inner().summary_text.text().to_string();
@@ -551,6 +562,7 @@ fn test_summarization_conversation_continues_after_segment() {
     }
 
     // Segment should now exist.
+    settle(&mut conv);
     assert_eq!(segment_count(&conv), 1, "expected 1 segment after 3 turns");
 
     // Continue with two more turns — must not panic or error.
@@ -566,6 +578,7 @@ fn test_summarization_conversation_continues_after_segment() {
 
     assert!(!r4.text.is_empty(), "turn 4 should produce output");
     assert!(!r5.text.is_empty(), "turn 5 should produce output");
+    settle(&mut conv);
 
     // Top-level nodes: 1 segment (containing turns 1-3 as children) + Turn 4 + Turn 5 = 3.
     assert_eq!(
@@ -591,9 +604,10 @@ fn test_summarization_every_one_trigger() {
     let resp = conv.send_turn("Hello world.").expect("send failed");
     eprintln!("Response: {}", resp.text);
 
-    let found = wait_for_any_segment(&conv, Duration::from_secs(30));
-    assert!(
-        found,
+    settle(&mut conv);
+    assert_eq!(
+        segment_count(&conv),
+        1,
         "with summarize_every=1 a segment should appear after the very first turn"
     );
 
@@ -617,6 +631,7 @@ fn test_summarization_disabled_when_every_zero() {
         conv.send_turn(&format!("No-summary turn {i}."))
             .expect("send failed");
     }
+    settle(&mut conv);
 
     let segs = segment_count(&conv);
     assert_eq!(
@@ -659,6 +674,7 @@ fn test_recursive_summarization_two_levels() {
             .expect("insert_turn failed");
         eprintln!("Inserted turn {i}");
     }
+    settle(&mut conv);
 
     let nodes: Vec<_> = conv.tree().nodes().collect();
     eprintln!("Top-level node count after 6 turns: {}", nodes.len());

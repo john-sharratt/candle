@@ -389,9 +389,18 @@ extern "C" int bdp_imma_supported() {
     return 1;
 }
 
+// The stage of a failed launch, encoded in the return code as
+// `-(stage * 1000 + cudaError)` — the same values `run_bmma_bdp_scan` returns
+// and `gallery_arena::scan::launch_failure` decodes, so a failure names WHICH of
+// the launcher's CUDA calls rejected the work, not just the error.
+#define IMMA_STAGE_ALLOC 1
+#define IMMA_STAGE_MEMSET 2
+#define IMMA_STAGE_ACCUM 3
+#define IMMA_STAGE_FINALIZE 4
+
 // Host launcher — the IMMA twin of `run_bmma_bdp_scan`: same temp accumulators,
 // same finalize, same return contract (0 ok, 1 unsupported device/geometry,
-// negative cudaError).
+// negative stage-encoded cudaError).
 extern "C" int run_imma_bdp_scan(
     const unsigned int *gallery_case,
     const unsigned long long *probe_words,
@@ -419,11 +428,19 @@ extern "C" int run_imma_bdp_scan(
         return 1;
     }
     cudaStream_t s = (cudaStream_t)stream;
+    // Discard any error left pending on this thread by unrelated earlier work,
+    // as `run_bmma_bdp_scan` does. The `cudaGetLastError()` reads below return
+    // whatever is pending, so without this an earlier, unchecked launch's
+    // failure is reported as this backend's — on every call, since the error
+    // stays pending until someone reads it — and the scan falls to the scalar
+    // rung for a launch that never failed.
+    (void)cudaGetLastError();
     const size_t nc = (size_t)n_probe_tokens * n_groups * n_cases;
 
     unsigned int *d_max = nullptr;
     unsigned long long *d_sum = nullptr;
     unsigned long long *d_sq = nullptr;
+    int stage = IMMA_STAGE_ALLOC;
     cudaError_t err = cudaMallocAsync((void **)&d_max, nc * sizeof(unsigned int), s);
     if (err == cudaSuccess) {
         err = cudaMallocAsync((void **)&d_sum, nc * sizeof(unsigned long long), s);
@@ -432,6 +449,7 @@ extern "C" int run_imma_bdp_scan(
         err = cudaMallocAsync((void **)&d_sq, nc * sizeof(unsigned long long), s);
     }
     if (err == cudaSuccess) {
+        stage = IMMA_STAGE_MEMSET;
         err = cudaMemsetAsync(d_max, 0, nc * sizeof(unsigned int), s);
     }
     if (err == cudaSuccess) {
@@ -441,6 +459,7 @@ extern "C" int run_imma_bdp_scan(
         err = cudaMemsetAsync(d_sq, 0, nc * sizeof(unsigned long long), s);
     }
     if (err == cudaSuccess) {
+        stage = IMMA_STAGE_ACCUM;
         const dim3 grid((n_tokens + IMMA_TC - 1) / IMMA_TC, n_groups);
         bdp_imma_accum_kernel<<<grid, 256, 0, s>>>(
             gallery_case, probe_words, page_ptr, pos_map, n_tokens,
@@ -448,6 +467,7 @@ extern "C" int run_imma_bdp_scan(
         err = cudaGetLastError();
     }
     if (err == cudaSuccess) {
+        stage = IMMA_STAGE_FINALIZE;
         const int total = n_probe_tokens * n_groups * n_segments;
         const int blocks = (total + 255) / 256;
         bdp_bmma_finalize_kernel<<<blocks, 256, 0, s>>>(
@@ -464,5 +484,5 @@ extern "C" int run_imma_bdp_scan(
     if (d_sq != nullptr) {
         cudaFreeAsync(d_sq, s);
     }
-    return (err == cudaSuccess) ? 0 : -(int)err;
+    return (err == cudaSuccess) ? 0 : -(stage * 1000 + (int)err);
 }

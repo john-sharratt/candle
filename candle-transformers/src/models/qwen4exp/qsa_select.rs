@@ -121,6 +121,40 @@ pub fn max_entries(top_k: usize, ratio: usize) -> usize {
     }
 }
 
+/// Whether the selection kernel can run a budget of `top_k` positions on a
+/// checkpoint of `context` tokens whose attention layers select at `ratios`,
+/// when the kernel keeps at most `kernel_keep` blocks a row.
+///
+/// A budget whose [`max_keep`] passes the kernel's ceiling fails the first wave
+/// that selects — every wave past the budget, mid-decode — so it is refused
+/// where it is set. A budget at or past the context is the one wide budget that
+/// runs: no row ever has more visible cells than it, so nothing selects and the
+/// read is dense through the same code.
+pub fn budget_fits_kernel(
+    top_k: usize,
+    ratios: &[usize],
+    context: usize,
+    kernel_keep: usize,
+) -> Result<(), String> {
+    if top_k >= context {
+        return Ok(());
+    }
+    match ratios
+        .iter()
+        .copied()
+        .filter(|&r| r > 0)
+        .find(|&r| max_keep(top_k, r) > kernel_keep)
+    {
+        None => Ok(()),
+        Some(ratio) => Err(format!(
+            "a QSA selection budget of {top_k} position(s) keeps up to {} blocks a row at \
+             ratio {ratio}, past the selection kernel's {kernel_keep}: set one the kernel can \
+             run, or one of at least the {context}-token context, where nothing selects",
+            max_keep(top_k, ratio)
+        )),
+    }
+}
+
 /// What [`selection_entries`] decided for one query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowSelection {
@@ -444,5 +478,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A budget is accepted only when the kernel can select with it, or when it
+    /// is wide enough that nothing ever selects. At ratio 4 and the kernel's
+    /// 768 survivors the last budget that runs is 3,069 positions (width 3,072,
+    /// 768 blocks); 3,070 needs 769, and 49,152 needs 12,289.
+    #[test]
+    fn a_budget_the_selection_kernel_cannot_run_is_refused() {
+        let ratios = [0usize, 4, 4];
+        let context = 262_144usize;
+        assert_eq!(budget_fits_kernel(2048, &ratios, context, 768), Ok(()));
+        assert_eq!(budget_fits_kernel(3069, &ratios, context, 768), Ok(()));
+        assert_eq!(
+            budget_fits_kernel(3070, &ratios, context, 768),
+            Err(
+                "a QSA selection budget of 3070 position(s) keeps up to 769 blocks a row at \
+                 ratio 4, past the selection kernel's 768: set one the kernel can run, or one \
+                 of at least the 262144-token context, where nothing selects"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            budget_fits_kernel(49_152, &ratios, context, 768),
+            Err(
+                "a QSA selection budget of 49152 position(s) keeps up to 12289 blocks a row at \
+                 ratio 4, past the selection kernel's 768: set one the kernel can run, or one \
+                 of at least the 262144-token context, where nothing selects"
+                    .to_string()
+            )
+        );
+        // At or past the context nothing selects, however wide.
+        assert_eq!(budget_fits_kernel(context, &ratios, context, 768), Ok(()));
+        assert_eq!(budget_fits_kernel(1 << 20, &ratios, context, 768), Ok(()));
     }
 }

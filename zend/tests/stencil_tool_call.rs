@@ -427,59 +427,55 @@ fn hallucinated_parameter_is_masked() {
     );
 }
 
-// ── file_read's range is mandatory and ordered ──────────────────────────────
+// ── file_read's range is optional and ordered ───────────────────────────────
 
-/// `file_read` names its lines in `path, start_line, end_line` order — the
-/// schema's `required` order, which is what the tree emits. The properties
-/// object iterates alphabetically, so ordering by it would demand `end_line`
-/// first.
+/// `file_read` may stop after any part of its range — the path alone reads the
+/// whole file, and either bound alone reads to the file's edge — and names what
+/// it gives in `path, start_line, end_line` order, the order its schema
+/// declares them in.
 #[test]
-fn file_read_drives_a_range_in_required_order() {
+fn file_read_drives_any_part_of_its_range_in_declared_order() {
     let (tree, vocab) = build_tree();
-    for (path, start, end) in [
-        ("zend/src/prompts/projection.yaml", 598, 630),
-        ("src/auth/handler.rs", 1, 200),
-    ] {
-        let target = format!(
-            "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": \"{path}\", \
-             \"start_line\": {start}, \"end_line\": {end}}}}}\n</tool_call>"
-        );
-        let out = drive(Arc::clone(&tree), &target, &vocab)
-            .unwrap_or_else(|e| panic!("{path} {start}-{end} must drive, got {e:?}"));
-        let parsed: serde_json::Value = serde_json::from_str(json_body(&out)).unwrap();
-        assert_eq!(parsed["arguments"]["path"], path);
-        assert_eq!(parsed["arguments"]["start_line"], start);
-        assert_eq!(parsed["arguments"]["end_line"], end);
-    }
-}
-
-/// **A read without its range cannot be expressed.** With the range optional
-/// the model closed the call after `path` even when its reasoning had planned
-/// lines 598-630 — measured live, six identical calls came back with lines
-/// 1-200 and the answer was then guessed. The keys are required, so they are
-/// prefilled statics: closing the object early lands where `"start_line":` is.
-#[test]
-fn file_read_cannot_close_without_its_range() {
-    let (tree, vocab) = build_tree();
-    for args in [
-        r#""path": "a.rs""#,
-        r#""path": "a.rs", "start_line": 1"#,
-        r#""path": "a.rs", "end_line": 200"#,
+    for (args, start, end) in [
+        (r#""path": "a.rs""#, None, None),
+        (r#""path": "a.rs", "start_line": 94"#, Some(94), None),
+        (r#""path": "a.rs", "end_line": 30"#, None, Some(30)),
+        (
+            r#""path": "a.rs", "start_line": 598, "end_line": 630"#,
+            Some(598),
+            Some(630),
+        ),
     ] {
         let target = format!(
             "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{{args}}}}}\n</tool_call>"
         );
-        match drive(Arc::clone(&tree), &target, &vocab) {
-            Ok(out) => panic!("{args}: a read without its range drove to completion: {out}"),
-            Err(err) => assert!(
-                matches!(
-                    err,
-                    DriveErr::PrefillMismatch { .. } | DriveErr::MaskRejected { .. }
-                ),
-                "{args}: got {err:?}"
-            ),
-        }
+        let out = drive(Arc::clone(&tree), &target, &vocab)
+            .unwrap_or_else(|e| panic!("{args} must drive, got {e:?}"));
+        let parsed: serde_json::Value = serde_json::from_str(json_body(&out)).unwrap();
+        let arguments = &parsed["arguments"];
+        assert_eq!(arguments["path"], "a.rs");
+        assert_eq!(arguments.get("start_line").and_then(|v| v.as_u64()), start);
+        assert_eq!(arguments.get("end_line").and_then(|v| v.as_u64()), end);
     }
+}
+
+/// The bounds come start first. Optionals are offered in declared order, each
+/// at most once, so a tree that offered `end_line` first would strand a call
+/// written in reading order: once `start_line` is taken, the `end_line` gate
+/// is behind it. The reverse order is what cannot be expressed.
+#[test]
+fn file_read_rejects_its_range_end_first() {
+    let (tree, vocab) = build_tree();
+    let target = "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"a.rs\", \
+                  \"end_line\": 93, \"start_line\": 47}}\n</tool_call>";
+    let err = drive(tree, target, &vocab).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DriveErr::PrefillMismatch { .. } | DriveErr::MaskRejected { .. }
+        ),
+        "got {err:?}"
+    );
 }
 
 // ── Negative: a wrong boolean / wrong enum value is rejected ────────────────

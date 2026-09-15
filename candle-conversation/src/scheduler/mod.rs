@@ -63,6 +63,7 @@ use crate::provenance::{
     encode_wide_sigs_with, extract_q_vector_r16, fold_fits, fold_provenance_fitted, FoldParams,
     GalleryArena, WideQSig,
 };
+use crate::recorded_reply::Replay;
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::stencil::{
     Healed, StencilDriver, StencilTree, StepMask, TriggerRegistry, TOOL_CALL_TREE_LABEL,
@@ -294,6 +295,10 @@ pub(crate) enum SchedulerRequest {
         /// tool calls — see
         /// [`crate::projection::Schema::free_tool_calls_from_penalties`].
         free_tool_calls_from_penalties: bool,
+        /// The reply this turn decodes in place of sampling — a recorded turn
+        /// replayed ([`crate::TurnOptions::recorded_turn`]). Committed one id
+        /// per step, then the end of turn. `None` = an ordinary sampled decode.
+        recorded_reply: Option<Vec<u32>>,
     },
 
     /// Free a sequence slot.
@@ -1402,6 +1407,12 @@ struct DecodeState {
     /// then `accept` the sampled token and clear).  `None` ⇒ the driver needs
     /// advancing again.
     pending_mask: Option<StepMask>,
+    /// The ids this turn commits in place of what it samples, when it replays
+    /// a recorded turn ([`crate::TurnOptions::recorded_turn`]); the end of turn
+    /// follows the last. Everything else about the step is a live decode's —
+    /// the page cuts, the reasoning boundary, the reprojections — which is what
+    /// makes the sealed turn the recorded one. `None` = a sampled decode.
+    recorded_reply: Option<Replay>,
 }
 
 impl DecodeState {
@@ -1862,6 +1873,8 @@ pub(super) struct PrefillWork {
     /// while a tool call is emitted — see
     /// [`crate::projection::Schema::free_tool_calls_from_penalties`].
     pub(super) free_tool_calls_from_penalties: bool,
+    /// The recorded reply this turn replays — see [`DecodeState::recorded_reply`].
+    pub(super) recorded_reply: Option<Vec<u32>>,
 }
 
 /// An in-flight prefill, partially advanced. Lives across scheduler
@@ -2730,6 +2743,17 @@ fn carve_ms(amt: u64, buckets: &mut [&mut u64]) -> u64 {
     taken
 }
 
+/// Whether a seal that came back with no recurrent snapshot is missing one.
+///
+/// Only a snapshot that was asked for can be missing. An ephemeral timeline's
+/// export is skipped — its payload is dropped on arrival, so exporting it is
+/// pure cost — and a model that carries no recurrent state has none to give.
+/// Anything else that returns nothing is a model declaring state it cannot
+/// export, which resumes with no memory of its history and reads fluently.
+fn missing_recurrent_hook(ephemeral: bool, carries_recurrent_state: bool) -> bool {
+    !ephemeral && carries_recurrent_state
+}
+
 /// Named scheduler-loop phases for [`WaveStats::add_phase`].
 #[derive(Clone, Copy)]
 enum WavePhase {
@@ -3229,8 +3253,11 @@ impl Scheduler {
             let _ = d.cuda_context().bind_to_thread();
         }
 
-        // Resident gallery arena for the paged belief scan. Folded-signature
-        // geometry: 12 heads × 2 words (head_dim 128) = wpt 24, 3 layer-groups.
+        // Resident gallery arena for the paged belief scan, built for this
+        // model's fold (`prov_fold`): `words_per_token` u64 per token across its
+        // layer-groups. It must match the signatures the captures produce — a
+        // fixed Qwen3-30B width (24) here dropped every token of any other
+        // geometry (Qwen2-0.5B folds to 6) and zeroed the scan without a word.
         // `new` errors (→ None) on a non-CUDA device; it allocates no VRAM until
         // the first turn is made resident.
         //
@@ -3269,7 +3296,13 @@ impl Scheduler {
             "decode capabilities at load (draft_budget 0 ⇒ NO speculation: one token per forward)"
         );
 
-        let gallery_arena = GalleryArena::new(&device, 24, 3).map(Arc::new).ok();
+        let gallery_arena = GalleryArena::new(
+            &device,
+            prov_fold.words_per_token(),
+            prov_fold.group_sizes.len(),
+        )
+        .map(Arc::new)
+        .ok();
         let sampler = BatchedSampler::new(
             device.clone(),
             vocab_size,
@@ -3561,6 +3594,7 @@ impl Scheduler {
                 triggers,
                 turn_grammar,
                 free_tool_calls_from_penalties,
+                recorded_reply,
             } => {
                 // The sequence acts as the parent slot for a carved
                 // view inside this handler — rebind for clarity.
@@ -4070,6 +4104,7 @@ impl Scheduler {
                     triggers,
                     turn_grammar,
                     free_tool_calls_from_penalties,
+                    recorded_reply,
                 });
                 true
             }
@@ -5280,6 +5315,7 @@ impl Scheduler {
             triggers: Arc::new(TriggerRegistry::new()),
             stencil: None,
             pending_mask: None,
+            recorded_reply: None,
         };
         // The turn's first token always opens a page — the prefill/decode
         // boundary — so the reasoning starts one.
@@ -5562,6 +5598,7 @@ impl Scheduler {
             triggers: Arc::new(TriggerRegistry::new()),
             turn_grammar: None,
             free_tool_calls_from_penalties: false,
+            recorded_reply: None,
         });
         Ok(())
     }
@@ -8434,7 +8471,18 @@ impl Scheduler {
                     // it is worth a warning on every seal rather than a silence
                     // that is only discovered by noticing the model has
                     // forgotten.
-                    Ok(None) if self.model.carries_recurrent_state() => {
+                    //
+                    // **Only for a snapshot that was asked for.** An ephemeral
+                    // timeline's export is skipped above and arrives here as the
+                    // same `None`; its snapshot is dropped on arrival by design,
+                    // so nothing is missing — and every calibration seal of a
+                    // recurrent model is one of these.
+                    Ok(None)
+                        if missing_recurrent_hook(
+                            ephemeral,
+                            self.model.carries_recurrent_state(),
+                        ) =>
+                    {
                         tracing::warn!(
                             "turn {} sealed with NO recurrent snapshot, but this model \
                              declares it carries recurrent state — `export_recurrent` \
@@ -8850,17 +8898,59 @@ impl Scheduler {
                                             .index_page_blob(target.timeline, idx)
                                             .map(|b| b.to_vec())
                                     });
+                            // The stored page is a framed LIST of pages, and the
+                            // model reads one page at a time — see
+                            // `index_pages::push_in_order`. However the pages fare,
+                            // the slot finishes past this turn's whole width, so the
+                            // next turn's rows land where its K/V does: the same rule
+                            // `apply_projection` follows.
+                            let width = sealed.first().map_or(0, |s| s.token_count);
+                            let model: &(dyn ManagedBatchedModel + Send) = &*self.model;
+                            let carries = model.carries_positional_state();
+                            // A skip that fails leaves every later turn's rows short
+                            // of their K/V, so it is reported rather than dropped.
+                            let advance = |gap: usize| {
+                                if !carries {
+                                    return;
+                                }
+                                if let Err(e) = model.push_positional_gap(scratch, gap) {
+                                    tracing::warn!(
+                                        "memory catch-up: turn {idx} could not advance the \
+                                         replay slot over {gap} unindexed token(s) ({e}) — \
+                                         every later turn's rows now sit short of their K/V"
+                                    );
+                                }
+                            };
                             match page {
                                 Some(blob) => {
-                                    if let Err(e) = self.model.push_positional_state(scratch, &blob)
-                                    {
-                                        tracing::warn!(
-                                            "memory catch-up: turn {idx} index page refused \
-                                             ({e})"
-                                        );
+                                    let pushed = index_pages::push_in_order(
+                                        &blob,
+                                        |p| model.push_positional_state(scratch, p).map(|_| ()),
+                                        &advance,
+                                    );
+                                    match pushed {
+                                        Ok(pushed) => {
+                                            if let Some(e) = &pushed.refused {
+                                                tracing::warn!(
+                                                    "memory catch-up: turn {idx} index page \
+                                                     refused ({e}) — advanced over {} unindexed \
+                                                     token(s)",
+                                                    pushed.gap
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "memory catch-up: turn {idx} index pages \
+                                                 unreadable ({e}) — the replay selects against \
+                                                 a prefix it never indexed"
+                                            );
+                                            advance(width);
+                                        }
                                     }
                                 }
-                                None if self.model.carries_positional_state() => {
+                                None if carries => {
+                                    advance(width);
                                     tracing::warn!(
                                         "memory catch-up: turn {idx} has no index page — the \
                                          replay selects against a prefix it never indexed"
@@ -10558,6 +10648,20 @@ mod tests {
             let seg = carve_ms(req, &mut [&mut only]);
             assert_eq!(seg + only, orig, "req={req}");
         }
+    }
+
+    /// **An ephemeral seal skips the export, and that is not a missing hook.**
+    /// Judged as one, every calibration seal of a recurrent model reported a
+    /// wiring gap — 93 tool sections' worth at each fresh boot of Qwen3.6.
+    #[test]
+    fn only_a_requested_snapshot_can_be_missing() {
+        assert!(missing_recurrent_hook(false, true), "asked for, and absent");
+        assert!(!missing_recurrent_hook(true, true), "skipped by design");
+        assert!(
+            !missing_recurrent_hook(false, false),
+            "a model with no such state"
+        );
+        assert!(!missing_recurrent_hook(true, false));
     }
 
     /// The GPU provenance path's on-CPU tail (`assemble_folded_prov_sigs`) must be
@@ -12495,6 +12599,7 @@ mod tests {
             triggers: Arc::new(TriggerRegistry::new()),
             stencil: None,
             pending_mask: None,
+            recorded_reply: None,
         };
         (state, rx)
     }
@@ -12538,6 +12643,7 @@ mod tests {
             triggers: Arc::new(TriggerRegistry::new()),
             turn_grammar: None,
             free_tool_calls_from_penalties: false,
+            recorded_reply: None,
         }
     }
 
@@ -12926,6 +13032,27 @@ mod tests {
         assert!(
             model.close_positional_page(0).unwrap() == 3,
             "the tail is still open and closable by whoever owns the boundary"
+        );
+    }
+
+    /// **A replayed turn commits its recording, whatever the sampler chose**,
+    /// then the end of turn once the recording is spent.
+    #[test]
+    fn a_replayed_turn_commits_its_recording_in_place_of_the_sample() {
+        let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
+        let slot = SequenceId(scheduler.session.create_sequence().unwrap());
+        let (mut state, _rx) = boundary_state();
+        state.recorded_reply = Some(Replay::new(vec![7, 8]));
+        scheduler.active_decodes.insert(slot, state);
+        let row = Tensor::zeros(16, DType::F32, &scheduler.device).unwrap();
+        for _ in 0..3 {
+            scheduler.commit_decoded_tokens(&[slot], &mut [3], std::slice::from_ref(&row));
+        }
+        let state = &scheduler.active_decodes[&slot];
+        assert_eq!(&state.generated_tokens[..], &[7u32, 8, 0][..]);
+        assert!(
+            state.finished,
+            "the end of turn after the recording finishes it"
         );
     }
 

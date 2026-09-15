@@ -547,67 +547,53 @@ fn read_returns_a_numbered_fenced_excerpt() {
     );
 }
 
-/// The line range is mandatory: a call that omits `start_line`, `end_line`, or
-/// both is rejected at argument parsing rather than defaulting to a window.
+/// Without a range a read returns the whole file, however long, and the header
+/// states the full span — no `of N`, so the model knows it has all of it.
 #[test]
-fn read_without_a_full_line_range_is_invalid_arguments() {
-    let dir = workspace();
-    let ctx = ctx_for(&dir);
-    for args in [
-        json!({"path": "src/main.rs"}),
-        json!({"path": "src/main.rs", "start_line": 1}),
-        json!({"path": "src/main.rs", "end_line": 3}),
-    ] {
-        let resp = harness::invoke_with_ctx("file_read", args.clone(), &ctx);
-        assert_eq!(
-            resp["error"], "invalid_arguments",
-            "args {args} must be rejected: {resp}",
-        );
-    }
-}
-
-/// A range wider than the cap comes back truncated, and the header says so —
-/// that is the continuation signal, in the text the model already reads.
-#[test]
-fn read_caps_a_long_file_and_reports_the_total() {
+fn read_without_a_range_returns_the_whole_file() {
     let dir = tempfile::tempdir().unwrap();
     let body: String = (1..=900).map(|i| format!("line {i}\n")).collect();
     write_disk(dir.path(), "big.rs", &body);
     let ctx = ToolContext::with_workspace(dir.path());
 
-    let first = harness::invoke_with_ctx(
-        "file_read",
-        json!({"path": "big.rs", "start_line": 1, "end_line": 900}),
-        &ctx,
+    let resp = harness::invoke_with_ctx("file_read", json!({"path": "big.rs"}), &ctx);
+    let numbered: String = (1..=900).map(|i| format!("{i:3}  line {i}\n")).collect();
+    assert_eq!(
+        resp.as_str().expect("file_read returns a rendered string"),
+        format!("\nbig.rs (lines 1-900):\n\n```rust\n{numbered}```\n"),
     );
-    let text = first.as_str().unwrap();
-    assert!(
-        text.starts_with("\nbig.rs (lines 1-200 of 900):\n"),
-        "header must report the cap and the total: {}",
-        &text[..60.min(text.len())],
-    );
-    assert!(text.contains("\n  1  line 1\n"), "right-aligned numbering");
-    assert!(text.contains("\n200  line 200\n"));
-    assert!(!text.contains("line 201"), "capped at 200 lines");
-
-    // The advertised continuation reads the next window.
-    let next = harness::invoke_with_ctx(
-        "file_read",
-        json!({"path": "big.rs", "start_line": 201, "end_line": 400}),
-        &ctx,
-    );
-    let text = next.as_str().unwrap();
-    assert!(
-        text.starts_with("\nbig.rs (lines 201-400 of 900):\n"),
-        "{text:.60}"
-    );
-    assert!(text.contains("201  line 201\n"));
 }
 
-/// An explicit range is honoured, and the cap still applies to it — otherwise a
-/// wide range would bypass the 200-line bound.
+/// A bound on its own reads to the file's edge: `start_line` alone to the end,
+/// `end_line` alone from the top. A read that stops short of the end says `of N`.
 #[test]
-fn read_honours_a_line_range_but_still_caps_it() {
+fn read_with_one_bound_reads_to_the_files_edge() {
+    let dir = workspace();
+    let ctx = ctx_for(&dir);
+    let tail = harness::invoke_with_ctx(
+        "file_read",
+        json!({"path": "src/main.rs", "start_line": 2}),
+        &ctx,
+    );
+    assert_eq!(
+        tail.as_str().unwrap(),
+        "\nsrc/main.rs (lines 2-3):\n\n```rust\n2      println!(\"hi\");\n3  }\n```\n",
+    );
+    let head = harness::invoke_with_ctx(
+        "file_read",
+        json!({"path": "src/main.rs", "end_line": 2}),
+        &ctx,
+    );
+    assert_eq!(
+        head.as_str().unwrap(),
+        "\nsrc/main.rs (lines 1-2 of 3):\n\n```rust\n1  fn main() {\n2      println!(\"hi\");\n```\n",
+    );
+}
+
+/// An explicit range is honoured exactly, and a range running past the end of
+/// the file clamps to it rather than failing.
+#[test]
+fn read_honours_a_line_range_and_clamps_a_wide_one() {
     let dir = tempfile::tempdir().unwrap();
     let body: String = (1..=900).map(|i| format!("line {i}\n")).collect();
     write_disk(dir.path(), "big.rs", &body);
@@ -618,28 +604,23 @@ fn read_honours_a_line_range_but_still_caps_it() {
         json!({"path": "big.rs", "start_line": 47, "end_line": 93}),
         &ctx,
     );
-    let text = exact.as_str().unwrap();
-    assert!(
-        text.starts_with("\nbig.rs (lines 47-93 of 900):\n"),
-        "{text:.60}"
-    );
     // Column width tracks the widest line number in the excerpt (93 → 2), the
     // same rule the ingest renderer uses.
-    assert!(text.contains("47  line 47\n"), "{text:.90}");
-    assert!(text.contains("93  line 93\n"));
-    assert!(!text.contains("line 94"));
+    let numbered: String = (47..=93).map(|i| format!("{i}  line {i}\n")).collect();
+    assert_eq!(
+        exact.as_str().unwrap(),
+        format!("\nbig.rs (lines 47-93 of 900):\n\n```rust\n{numbered}```\n"),
+    );
 
-    let greedy = harness::invoke_with_ctx(
+    let wide = harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "big.rs", "start_line": 1, "end_line": 5000}),
+        json!({"path": "big.rs", "start_line": 850, "end_line": 5000}),
         &ctx,
     );
-    assert!(
-        greedy
-            .as_str()
-            .unwrap()
-            .starts_with("\nbig.rs (lines 1-200 of 900):\n"),
-        "a wide range must not bypass the cap",
+    let numbered: String = (850..=900).map(|i| format!("{i}  line {i}\n")).collect();
+    assert_eq!(
+        wide.as_str().unwrap(),
+        format!("\nbig.rs (lines 850-900):\n\n```rust\n{numbered}```\n"),
     );
 }
 

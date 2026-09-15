@@ -187,17 +187,11 @@ impl ChunkedKvBacking {
                     remaining -= take;
                     idx += 1;
                 }
-                // DO NOT call seq.patch_host_lens() here. patch_host_lens writes
-                // directly to `buf` (the pinned host DMA source) outside of any
-                // GpuChunksGuard. If a GpuChunksGuard::drop issued an async
-                // memcpy_htod earlier in this step, the DMA engine may still be
-                // reading `buf` when patch_host_lens writes to it — a host-memory
-                // data race that causes ws_len in the GPU buffer to be incremented
-                // by more than 1 per step, eventually triggering the
-                // ws_offset+ws_len >= CHUNK_SIZE assertion in the decode kernel.
-                // `buf` is always fully rewritten by rebuild_decode (REBUILD path)
-                // or update_chunk (dirty-flush path) before any DMA, so keeping
-                // `buf` manually in sync here is both redundant and unsafe.
+                // Only the host chunk table changes here. The serialised decode
+                // slot buffer is left alone: the decode kernel advances its
+                // writer length on the device, and a commit made outside the
+                // decode kernel marks it (`SequenceState::mark_decode_writer_stale`)
+                // for the next sync to re-serialise.
             }
         }
     }
@@ -2145,13 +2139,13 @@ impl ChunkedKvBacking {
                     // The trim stayed INSIDE the landing chunk — no chunk was
                     // freed, so the cached decode slot buffer differs from
                     // host state in exactly one field: that chunk's length.
-                    // Patch the writer slice (below, after the state lock)
-                    // instead of dropping the whole serialized buffer. A
-                    // speculative partial accept trims here on nearly every
-                    // step, and the unconditional invalidate forced the next
-                    // verify's full 43-layer re-serialisation — the patch is
-                    // what lets a partial-accept step keep plain-wave-cost
-                    // metadata.
+                    // Mark the writer region (below, after the state lock)
+                    // for the next sync instead of dropping the whole
+                    // serialized buffer. A speculative partial accept trims
+                    // here on nearly every step, and an invalidate would force
+                    // the next verify's full 43-layer re-serialisation — the
+                    // mark is what lets a partial-accept step keep
+                    // plain-wave-cost metadata.
                     patch_writer = true;
                 } else {
                     // Chunks were freed: the serialized chunk count is wrong
@@ -2164,7 +2158,7 @@ impl ChunkedKvBacking {
         }
         drop(state);
         if patch_writer {
-            self.refresh_decode_writer_slice(&[(batch_idx, 0)])?;
+            self.mark_decode_writer_stale(&[(batch_idx, 0)])?;
         }
         Ok(())
     }

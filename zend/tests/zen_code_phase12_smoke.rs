@@ -190,6 +190,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         &engine,
         proj_builder_repo_map,
         workspace,
+        None,
         conv_config.clone(),
         &progress,
         "repo_map",

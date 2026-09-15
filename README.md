@@ -51,7 +51,7 @@ GPU VRAM (hot)  →  CPU RAM (warm)  →  NVMe (cold)
 
 Blocks are independently managed at 32-token granularity. The adaptive quantization system selects per-block K/V formats based on cosine-distance thresholds computed at seal time. Two-phase prefill refresh at turn boundaries eliminates the autoregressive numerical drift that degrades generation quality beyond ~500 decode steps.
 
-The Asymptotic Numerical Stability theorem is proven over this architecture: under provenance-selected attention with hot-tier blocks originating from prefill-refreshed activations, the system error floor approaches the hot-tier rounding constant, independent of how many blocks reside in warm or cold tiers.
+The Asymptotic Numerical Stability theorem is proven over this architecture: under provenance-selected attention with hot-tier blocks originating from prefill-refreshed activations, the system error per step is bounded by the hot-tier rounding constant plus the fixed retrieval budget times the per-token error of a retrieved block, independent of how many blocks reside in warm or cold tiers.
 
 ### 3. Attentional Provenance Indexing with Speculative Context Decode
 

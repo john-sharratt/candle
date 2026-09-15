@@ -6401,10 +6401,10 @@ layers:
     /// This accessor was `section_tree() -> Option<&SectionTree>` on the stated
     /// premise that "a schema has at most one". zend's bundled schema declares
     /// two, so every node in the second was invisible to all three callers —
-    /// and invisibly so, because reading the first tree succeeds. The ingest's
-    /// summarizer validation passed a schema missing `summarize_examples`, the
-    /// exact option it exists to pin, and its test asserted a valid schema was
-    /// rejected while the real one went unchecked.
+    /// and invisibly so, because reading the first tree succeeds. A branch
+    /// validation passed a schema missing the exact option it exists to pin,
+    /// and its test asserted a valid schema was rejected while the real one
+    /// went unchecked.
     #[test]
     fn every_declared_section_tree_is_returned() {
         let b = Builder::from_yaml(TWO_TREE_YAML).unwrap();

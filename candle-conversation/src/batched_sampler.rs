@@ -1126,7 +1126,7 @@ impl BatchedSampler {
         // closed its block only when it led the wave. Measured over one repo_map
         // pass — 22 summaries opened a block, 7 closed, and all 7 closed at
         // exactly token 2, the forced close firing. The other 15 shared a wave
-        // with a dialogue-budget row (`force_segment_close_after == 1536`),
+        // with a dialogue-budget row (a `force_segment_close_after` in the thousands),
         // inherited its budget, and burned the whole 200-token summary allowance
         // on reasoning that was then stored as the summary. The CPU path
         // (`sample_batch_cpu`) always zipped configs per row, so CPU tests could

@@ -488,8 +488,8 @@ mod tests {
         let text = body("You came back.", &render_all(std::slice::from_ref(&c)));
         assert_eq!(
             text,
-            "You came back.\n\n<tool_call>\n{\"arguments\":{\"statement\":\"Hess burned it\"},\
-             \"name\":\"form_belief\"}\n</tool_call>\n"
+            "You came back.\n\n<tool_call>\n{\"name\":\"form_belief\",\
+             \"arguments\":{\"statement\":\"Hess burned it\"}}\n</tool_call>\n"
         );
         // And it survives the parser the ingest uses.
         let parsed = crate::engine::authoring::parse(&text);

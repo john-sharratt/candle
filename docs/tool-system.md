@@ -522,7 +522,7 @@ Create a new file or overwrite an existing one in the in-memory virtual filesyst
 
 ### `file_read`
 
-Read a range of lines from a file in the session VFS. Use for: looking at what was previously written, inspecting a file the user uploaded into the chat, retrieving content the model needs to reference for editing or summarising, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what's in", "open the file", "cat", "display the contents of". `path`, `start_line` and `end_line` are all required — to read a file from the top, ask for lines 1-200. Returns the excerpt as numbered source in a fenced block, headed by the path and the line range it covers. Limited to files in the in-memory VFS — for remote filesystems use `remote_fs_session_get` to download first, then `file_read`.
+Read a file, or a range of its lines, from the session VFS. Use for: looking at what was previously written, inspecting a file the user uploaded into the chat, retrieving content the model needs to reference for editing or summarising, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what's in", "open the file", "cat", "display the contents of". Only `path` is required: given alone it returns the whole file, and `start_line` / `end_line` narrow the read to part of it. Returns the excerpt as numbered source in a fenced block, headed by the path and the line range it covers. Limited to files in the in-memory VFS — for remote filesystems use `remote_fs_session_get` to download first, then `file_read`.
 
 **Parameters**
 
@@ -534,15 +534,15 @@ Read a range of lines from a file in the session VFS. Use for: looking at what w
     "start_line": {
       "type": "integer",
       "minimum": 1,
-      "description": "First line to return, 1-based."
+      "description": "First line to return, 1-based. Omit to read from the top of the file."
     },
     "end_line": {
       "type": "integer",
       "minimum": 1,
-      "description": "Last line to return, 1-based and inclusive."
+      "description": "Last line to return, 1-based and inclusive. Omit to read to the end of the file."
     }
   },
-  "required": ["path", "start_line", "end_line"]
+  "required": ["path"]
 }
 ```
 
@@ -560,9 +560,11 @@ src/main.rs (lines 1-3):
 ```
 ````
 
-`start_line` is clamped into `[1, total]` and `end_line` into `[start_line, total]`. At most 200 lines come back per call — a wider range stops at `start_line + 199`. When the excerpt stops before the end of the file the header reads `(lines 1-200 of 900)`, which is the signal to continue with `start_line` 201; otherwise it reads `(lines a-b)`. An empty file reads as `(empty)`.
+A missing bound is the file's own edge: with no range the whole file comes back, `start_line` alone reads to the end, and `end_line` alone reads from the top. A given `start_line` is clamped into `[1, total]` and `end_line` into `[start_line, total]`. When the excerpt stops before the end of the file the header reads `(lines 47-93 of 900)`, which is the signal to continue with `start_line` 94; otherwise it reads `(lines a-b)`. An empty file reads as `(empty)`.
 
-**Errors.** Missing file returns `{"error": "not_found", "path": "..."}`. A call missing `start_line` or `end_line` returns `{"error": "invalid_arguments", ...}`.
+The properties are declared `path, start_line, end_line`, and the constrained decoder offers optional parameters in declared order (the workspace builds `serde_json` with `preserve_order`), so a call names its range start first.
+
+**Errors.** Missing file returns `{"error": "not_found", "path": "..."}`. A call missing `path` returns `{"error": "invalid_arguments", ...}`.
 
 ---
 

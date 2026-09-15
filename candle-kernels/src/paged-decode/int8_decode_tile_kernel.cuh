@@ -383,7 +383,7 @@ __device__ __forceinline__ int tile_slice_holding(
 
 template <int HEAD_DIM>
 __device__ __forceinline__ void tile_resolve_entries(
-    uint32_t ent, bool has, int ratio,
+    uint32_t ent, bool has, const QsaSel& sel, int row,
     uint64_t slices_ptr, int n_slices, int write_slice_idx, int n_kv_head,
     int lane, uint32_t* s_grp, GroupSrc* s_grp_src, int* s_n_tiles)
 {
@@ -392,8 +392,15 @@ __device__ __forceinline__ void tile_resolve_entries(
     for (int i = lane; i < MAX_GROUPS; i += WARP_SIZE) s_grp[i] = 0u;
     __syncwarp();
 
-    const int cells = has ? (int)(ent & ((1u << QSA_CELL_BITS) - 1u)) + 1 : 0;
-    const int pos0 = (int)(ent >> QSA_CELL_BITS) * ratio;
+    // The entry's start and width come through the row's page layout: a
+    // projected prefix is pages whose last blocks are short, so every block
+    // behind the first page starts somewhere other than `block * ratio` (see
+    // `qsa_block_width_from`).
+    const uint32_t blk = ent >> QSA_CELL_BITS;
+    const int pos0 = has ? qsa_block_start(sel, row, blk) : 0;
+    const int cells = has ? max(0, min((int)(ent & ((1u << QSA_CELL_BITS) - 1u)) + 1,
+                                       qsa_block_width_from(sel, row, blk, pos0)))
+                          : 0;
     auto slice_at = [&](int i) { return get_slice<HEAD_DIM>(slices_ptr, i, n_kv_head); };
     auto rope_of = [&](int i) { return (int)slice_rope(slice_at(i)); };
 
@@ -1651,7 +1658,7 @@ int8_decode_tile_kernel(
             bool covers = split_idx == 0;
             if (qsa_on) {
                 if (e_lo < e_hi) {
-                    const uint32_t qb = (uint32_t)((ws_rope + ws_len) / sel.ratio);
+                    const uint32_t qb = qsa_block_of(sel, slot_idx, ws_rope + ws_len);
                     covers |= (sel_entries[e_lo] >> QSA_CELL_BITS) <= qb &&
                               qb <= (sel_entries[e_hi - 1] >> QSA_CELL_BITS);
                 }
@@ -2172,7 +2179,7 @@ int8_decode_tile_kernel(
         }
     } else {
         if (qsa_on) {
-            tile_resolve_entries<HEAD_DIM>(ent0, has0, sel.ratio, slices_ptr,
+            tile_resolve_entries<HEAD_DIM>(ent0, has0, sel, slot_idx, slices_ptr,
                                            n_slices, write_slice_idx, n_kv_head, lane,
                                            s_grp, s_grp_src, &s_n_tiles);
             __syncwarp();
@@ -2846,7 +2853,7 @@ int8_decode_tile_kernel(
         if (warp == STAGE_WARP) {
             const bool has = chunk_lo + lane < chunk_hi;
             const uint32_t ent = has ? sel_entries[chunk_lo + lane] : 0u;
-            tile_resolve_entries<HEAD_DIM>(ent, has, sel.ratio, slices_ptr,
+            tile_resolve_entries<HEAD_DIM>(ent, has, sel, slot_idx, slices_ptr,
                                            n_slices, write_slice_idx, n_kv_head, lane,
                                            s_grp, s_grp_src, &s_n_tiles);
             __syncwarp();

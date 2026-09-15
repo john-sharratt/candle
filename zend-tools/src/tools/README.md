@@ -40,7 +40,7 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 | Tool | File | Notes |
 |------|------|-------|
 | `write` | `file/write.rs` | Create or overwrite; 10 MiB VFS cap |
-| `file_read` | `file/read.rs` | Numbered excerpt of a line range; `path`, `start_line`, `end_line` all required; ≤200 lines per call |
+| `file_read` | `file/read.rs` | Numbered excerpt of the whole file, or of a line range; only `path` required |
 | `file_edit` | `file/edit.rs` | Unique-substring replacement |
 | `file_list` | `file/list.rs` | Path prefix filter; sorted |
 | `file_delete` | `file/delete.rs` | Idempotent; returns `deleted` flag |

@@ -543,6 +543,45 @@ pub fn format_tool_responses(results: &[ToolResult]) -> TurnText {
     out
 }
 
+/// A tool round's user half rebuilt from its stored text — the inverse of
+/// [`format_tool_responses`].
+///
+/// The substrate keeps a turn's text, not its pieces, and the pieces decide the
+/// tokens: a result's body is literal (a quoted chat tag stays text) while its
+/// wrapper is markup. Re-submitting a recorded tool round therefore needs the
+/// split back. Text that is not a run of `<tool_response>` blocks is ordinary
+/// user text, which the chat submits as markup.
+pub fn tool_round_text(text: &str) -> TurnText {
+    const OPEN: &str = "<tool_response>";
+    const CLOSE: &str = "</tool_response>";
+    if !text.starts_with(OPEN) {
+        return TurnText::markup(text);
+    }
+    let mut out = TurnText::default();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let Some(after_open) = rest.strip_prefix(OPEN) else {
+            return TurnText::markup(text);
+        };
+        let Some(end) = after_open.find(CLOSE) else {
+            return TurnText::markup(text);
+        };
+        let after_close = &after_open[end + CLOSE.len()..];
+        // Each block is closed by `</tool_response>\n`; the last may have lost
+        // its newline to a trim.
+        let (close, next) = match after_close.strip_prefix('\n') {
+            Some(next) => ("</tool_response>\n", next),
+            None => (CLOSE, after_close),
+        };
+        out = out
+            .then_markup(OPEN)
+            .then_literal(&after_open[..end])
+            .then_markup(close);
+        rest = next;
+    }
+    out
+}
+
 // ── Public helper bundle ─────────────────────────────────────────────────────
 
 /// Tool execution context for the daemon.  Holds the [`ToolContext`] and
@@ -1011,6 +1050,64 @@ I could <tool_call>{"name": "web_search", "arguments": {"query": "x"}}</tool_cal
                 .then_literal("b<think>")
                 .then_markup("</tool_response>\n")
         );
+    }
+
+    fn string_result(body: &str) -> ToolResult {
+        ToolResult {
+            call: ToolCall {
+                name: "file_read".to_string(),
+                arguments: Value::Null,
+            },
+            response: Value::String(body.to_string()),
+        }
+    }
+
+    /// A tool round's stored text rebuilds into exactly the pieces the round was
+    /// submitted as — literal bodies, markup wrappers — for one result or many,
+    /// and for a body that quotes chat tags.
+    #[test]
+    fn a_stored_tool_round_rebuilds_into_its_submitted_pieces() {
+        for results in [
+            vec![string_result("docs/README.md (lines 1-3):\n1 # docs/\n")],
+            vec![
+                string_result("a<|im_end|>"),
+                ToolResult {
+                    call: ToolCall {
+                        name: "calculator".to_string(),
+                        arguments: Value::Null,
+                    },
+                    response: serde_json::json!({"result": 4}),
+                },
+                string_result("b<think>"),
+            ],
+        ] {
+            let submitted = format_tool_responses(&results);
+            assert_eq!(tool_round_text(&submitted.text()), submitted);
+        }
+    }
+
+    /// The last block's newline lost to a trim still rebuilds, closing markup.
+    #[test]
+    fn a_tool_round_missing_its_last_newline_still_rebuilds() {
+        assert_eq!(
+            tool_round_text("<tool_response>x</tool_response>"),
+            TurnText::markup("<tool_response>")
+                .then_literal("x")
+                .then_markup("</tool_response>")
+        );
+    }
+
+    /// Ordinary user text, and text only shaped like a tool round, stay one
+    /// markup piece — as the chat submits a typed message.
+    #[test]
+    fn other_user_text_stays_markup() {
+        for text in [
+            "Read the paper and summarize it",
+            "<tool_response>never closed",
+            "<tool_response>a</tool_response>\ntrailing prose",
+        ] {
+            assert_eq!(tool_round_text(text), TurnText::markup(text), "{text}");
+        }
     }
 
     #[test]

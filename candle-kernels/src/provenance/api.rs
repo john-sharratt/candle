@@ -89,6 +89,13 @@ extern "C" {
     /// `cudaFuncGetAttributes`, so the answer tracks the build's arch set).
     pub fn bdp_imma_supported() -> i32;
 
+    /// Take and clear the CUDA error pending on the calling thread — `0` when
+    /// there is none. Most launchers never read their launch result, so a failed
+    /// launch's error waits for the next reader on the thread; the scan takes it
+    /// before its own launches so it is named as an earlier launch's rather than
+    /// reported as the scan's own failure.
+    pub fn bdp_take_pending_error() -> i32;
+
     /// Launch the INT8 tensor-core (IMMA) BDP scan — the Blackwell-portable
     /// twin of [`run_bmma_bdp_scan`]: identical inputs, contract, and integer
     /// statistics (0/1-encoded operands accumulate `m11 = popc(q AND t)`, and

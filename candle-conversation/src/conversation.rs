@@ -7,6 +7,8 @@
 use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnHandle, TurnResponse};
+use crate::recorded_reply::recorded_reply;
+use crate::recovered_message::{tool_response_lengths, RecoveredMessage, TOOL_RESPONSE_OPEN};
 use candle_transformers::models::delta_net::ExportedLayerState;
 
 use crate::persistence::content_hash::{hash_tokens, section_stream_id, ContentChain, ContentHash};
@@ -24,11 +26,12 @@ use crate::scheduler::{
     note_branch_checkpoint_computed, note_branch_checkpoint_installed, CarvedTurn,
     ProjectionInputs, ReprojectionPolicy, SchedulerRequest, TurnContent,
 };
+use crate::sealed_turn::{SealedPages, SealedTurn};
 use crate::sequence_handle::{BlockCount, SequenceId};
 use crate::stuffed_grid::{plan_stuffed_grid_with_indices, CaseGrid};
 use crate::token_buffer::TokenBuffer;
 use crate::tree::token_text::TokenizedText;
-use crate::tree::{CognitiveTask, ConversationTree, TaskPoll, TurnType};
+use crate::tree::{ConversationTree, TurnType};
 use crate::turn::{Role, Turn, TurnOptions};
 use crate::turn_layout::TurnLayout;
 use candle_nn::kv_cache::{SealedChunk, SealedSequence};
@@ -622,18 +625,6 @@ fn first_non_finite_layer(layers: &[ExportedLayerState]) -> Option<(u32, &'stati
             None
         }
     })
-}
-
-/// Which `summarize_examples` option matches a round-trip chain of
-/// `prefilled_pairs` prefilled `(user, assistant)` pairs: one pair is a
-/// `code_reading` scope read (request → call → excerpt → summary), more is the
-/// `repo_map` folder walk (request → list → listing → read → excerpt → summary).
-fn examples_shape(prefilled_pairs: usize) -> &'static str {
-    if prefilled_pairs > 1 {
-        "folder"
-    } else {
-        "file"
-    }
 }
 
 impl Sequence {
@@ -2109,6 +2100,7 @@ impl Sequence {
             // quotations or prose is a property of what this conversation *is*,
             // and a per-turn switch would be a way to get it wrong on one turn.
             self.projection.schema().free_tool_calls_from_penalties,
+            options.recorded_turn,
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -2135,12 +2127,14 @@ impl Sequence {
     /// with [`finish_turn`](Self::finish_turn) exactly like a decoded turn.
     pub fn submit_prefilled_turn(
         &mut self,
-        user_message: &str,
+        user_message: impl Into<TurnText>,
         assistant_trajectory: &str,
         projection_marker: &str,
         selection: SelectionState,
         tags: Vec<String>,
     ) -> crate::Result<TurnHandle> {
+        let user_message = user_message.into();
+        let user_text = user_message.text();
         if self.turn_in_flight {
             return Err(ConversationError::TurnInFlight {
                 sequence_id: self.id,
@@ -2156,10 +2150,8 @@ impl Sequence {
         // it had one, and injecting scaffolding in front of it would make the
         // replayed grid differ from the decode it is calibrating against.
         let assistant_start_marker = self.config.dialect.assistant_start;
-        let assistant_head = format!(
-            "{}{}{}",
-            user_message, self.config.dialect.user_end, assistant_start_marker,
-        );
+        let markers = format!("{}{}", self.config.dialect.user_end, assistant_start_marker);
+        let assistant_head = format!("{user_text}{markers}");
         // The trajectory carries `projection_marker`s at the points a real decode
         // reprojected. Strip them from the prefilled text (they are not model
         // tokens), and record each one's token offset so the staged prefill wave
@@ -2169,43 +2161,48 @@ impl Sequence {
         // prefix up to each marker yields its exact grid offset.
         let clean_trajectory = assistant_trajectory.replace(projection_marker, "");
         let formatted = format!("{assistant_head}{clean_trajectory}");
-        let prefill_tokens = self.tokenize(&formatted)?;
+        // The user half is encoded piece by piece, exactly as
+        // `submit_turn_with_options` encodes it — a tool's output stays literal —
+        // and the markers and trajectory follow as one string. The half meets
+        // them on `user_end`, a registered tag the tokenizer splits at anyway, so
+        // the concatenation is the whole grid's encoding.
+        let user_tokens = self.encode_text(&user_message)?;
+        let mut prefill_tokens = user_tokens.clone();
+        prefill_tokens.extend_from_slice(&self.tokenize(&format!("{markers}{clean_trajectory}"))?);
         // No post-decode tail — `assistant_end` is a live `Generated` segment,
         // same as a decoded turn.
         let post_decode_tokens = TokenBuffer::new();
 
         // Record the pending user turn (text + raw tokens for the tree).
-        let user_tokens = self.tokenize(user_message)?;
-        self.pending_user = Some(TokenizedText::new(user_message, user_tokens));
+        self.pending_user = Some(TokenizedText::new(user_text.as_str(), user_tokens.clone()));
 
-        // Content boundaries: user body `[0, len(user_msg))`; the supplied
-        // assistant trajectory begins right after the head. Clamp/monotonise so a
-        // tokenizer that merges across a join can never invert the windows.
+        // Content boundaries: user body `[0, len(user half))`; the supplied
+        // assistant trajectory begins right after the markers. Clamp/monotonise
+        // so a tokenizer that merges across a join can never invert the windows.
         let total = prefill_tokens.len();
         let user_content_start = 0u32;
-        let user_content_end = self.tokenize(user_message)?.len().min(total) as u32;
-        let assistant_content_start = self
-            .tokenize(&assistant_head)?
-            .len()
+        let user_content_end = user_tokens.len().min(total) as u32;
+        let assistant_content_start = (user_tokens.len() + self.tokenize(&markers)?.len())
             .min(total)
             .max(user_content_end as usize) as u32;
 
-        // Grid-token offset of each projection marker: tokenize `head + trajectory
-        // up to the marker`. `split` yields one segment per marker plus a trailing
-        // remainder, so the boundaries between segments are exactly the marker
-        // positions. Two markers are dropped from the wave's emit list: the
-        // initial one at generation start (index 0 — the handler already applied
-        // that projection, and its span is carried by the next event) and the seal
-        // marker flush with the trajectory end (the final projection is appended at
-        // seal). The intermediate reprojections remain.
+        // Grid-token offset of each projection marker: the user half's length
+        // plus the tokenized `markers + trajectory up to the marker`. `split`
+        // yields one segment per marker plus a trailing remainder, so the
+        // boundaries between segments are exactly the marker positions. Two
+        // markers are dropped from the wave's emit list: the initial one at
+        // generation start (index 0 — the handler already applied that
+        // projection, and its span is carried by the next event) and the seal
+        // marker flush with the trajectory end (the final projection is appended
+        // at seal). The intermediate reprojections remain.
         let segments: Vec<&str> = assistant_trajectory.split(projection_marker).collect();
         let mut projection_offsets: Vec<u32> = Vec::new();
         if segments.len() > 1 {
             let end = prefill_tokens.len() as u32;
-            let mut prefix = assistant_head.clone();
+            let mut prefix = markers.clone();
             for (i, seg) in segments[..segments.len() - 1].iter().enumerate() {
                 prefix.push_str(seg);
-                let off = self.tokenize(&prefix)?.len() as u32;
+                let off = (user_tokens.len() + self.tokenize(&prefix)?.len()) as u32;
                 if i > 0 && off < end {
                     projection_offsets.push(off);
                 }
@@ -2217,7 +2214,7 @@ impl Sequence {
             Some(self.projection_inputs()),
             formatted,
             prefill_tokens,
-            user_message.to_string(),
+            user_text,
             user_content_start,
             user_content_end,
             assistant_content_start,
@@ -2240,6 +2237,8 @@ impl Sequence {
             None,
             // Nothing is sampled, so no penalty applies to exempt from.
             false,
+            // Nothing is decoded, so there is no reply to replay.
+            None,
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -2412,6 +2411,7 @@ impl Sequence {
                 // is nothing to constrain and nothing to exempt.
                 turn_grammar: None,
                 free_tool_calls_from_penalties: false,
+                recorded_reply: None,
                 seal_group: Some(Arc::new(turns)),
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
@@ -2461,6 +2461,7 @@ impl Sequence {
         triggers: Arc<TriggerRegistry>,
         turn_grammar: Option<Arc<StencilTree>>,
         free_tool_calls_from_penalties: bool,
+        recorded_turn: Option<Vec<u32>>,
     ) -> crate::Result<TurnHandle> {
         // ── Bake the turn's own boundary markers into its grid ──────────────
         //
@@ -2524,6 +2525,21 @@ impl Sequence {
         let mut post_decode_tokens = post_decode_tokens;
         post_decode_tokens.extend_from_slice(&self.tokenize(self.config.dialect.assistant_end)?);
 
+        // A replayed turn decodes its recording: everything the recorded grid
+        // holds past this prefill, less the tail written after the decode — one
+        // step per recorded id and one for the end of turn. Its triggers and
+        // grammar run as they did live: what they played is in the recording,
+        // and where they cut pages is part of what is being replayed.
+        let (reply, max_decode_tokens) = match recorded_turn {
+            Some(grid) => {
+                let reply = recorded_reply(&grid, &prefill_tokens, &post_decode_tokens)
+                    .map_err(ConversationError::Other)?;
+                let steps = reply.len() + 1;
+                (Some(reply), steps)
+            }
+            None => (None, max_decode_tokens),
+        };
+
         let disable_reprojection = self.config.disable_reprojection;
         // Append-only ingests skip the per-turn projection rebuild and also
         // suppress continuous mid-decode reprojection.
@@ -2558,6 +2574,7 @@ impl Sequence {
                 triggers,
                 turn_grammar,
                 free_tool_calls_from_penalties,
+                recorded_reply: reply,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
         Ok(TurnHandle::new(event_rx))
@@ -2780,6 +2797,7 @@ impl Sequence {
             Arc::new(TriggerRegistry::new()),
             None,
             false,
+            None,
         )?;
 
         // Drain events synchronously to Done.  The handle's event_rx
@@ -3041,23 +3059,24 @@ impl Sequence {
         force_tools: &[String],
         triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<(Vec<u32>, usize, TurnHandle)> {
-        // A scope round-trip is a SUMMARIZATION task, not the dialogue agent. Drive
-        // the shared system prompt into its summarizer mode via selection — the
-        // generic, per-mode section-toggling design rather than a bespoke per-layer
-        // prompt string:
-        //   - tools ON, force-pinned to the tools the prefill calls: the chain
-        //     PREFILLS tool_calls and their tool_responses, so the projection must
-        //     present a coherent tool context or the model can't connect the
-        //     prefill to any capability and degrades (refusals, off-language,
-        //     hallucinated tool chatter). Enable the tool block and force-select
-        //     exactly those tools (see `FORCE_TOOL_SELECTOR`) — present, coherent,
-        //     no belief-driven catalog noise.
-        //   - `persona = summarize`: swaps the "You are Zen, pair programming…"
-        //     dialogue frame for the terse code-summarizer frame (content-provided,
-        //     English, summary-only) — the fix for the reasoning/refusal/off-language
-        //     summaries the conversational persona produced.
-        //   - `response_length = terse`: the default `standard` length section says
-        //     "a short paragraph or two", which fights the two-sentence goal.
+        // A scope round-trip frames on the dialogue prompt itself — the persona is
+        // deliberately left alone. The turns it seals are later borrowed into
+        // dialogue projections, and borrowed K/V carries the framing it was computed
+        // under, and on the append-only ingest path that framing is NOT this
+        // selection's to set: the prefix is the one priming injected at creation
+        // (the schema's sections at each tree's default branch) and
+        // `skip_projection` means no turn ever rebuilds it. The ingest's prompt is
+        // therefore the same shared prompt KV a chat conversation uses, and the
+        // schema's defaults are where its content is decided — see the
+        // `tool_call_example` note in `projection.yaml`.
+        //
+        // The tool pin below stays because it is not ingest-only: any caller that
+        // DOES re-project needs a coherent tool context, since the chain PREFILLS
+        // `tool_call`s and their `tool_response`s and a model shown neither the
+        // block nor those tools degrades (refusals, off-language, hallucinated tool
+        // chatter). Enable the block and force-select exactly the prefilled tools
+        // (see `FORCE_TOOL_SELECTOR`) — coherent, with no belief-driven catalog
+        // noise.
         self.selection.set_optional(
             crate::projection::TOOLS_ENABLED_SELECTOR,
             crate::projection::OptionalState::Present,
@@ -3065,17 +3084,6 @@ impl Sequence {
         let pinned_tools = force_tools.join(&crate::projection::FORCE_TOOL_SEPARATOR.to_string());
         self.selection
             .select(crate::projection::FORCE_TOOL_SELECTOR, pinned_tools.clone());
-        self.selection.select("persona", "summarize");
-        self.selection.select("response_length", "terse");
-        //   - `summarize_examples`: stuff worked example turns between the system
-        //     prompt and this chain's turns so the model imitates the exact
-        //     request→summary shape. The option names the SHAPE of this chain
-        //     (`file` for a scope read, `folder` for a directory round-trip),
-        //     because an example teaches the subject as much as the format: shown
-        //     the file examples, a folder chain summarises the excerpt it was
-        //     handed rather than the directory it was asked about.
-        self.selection
-            .select("summarize_examples", examples_shape(prefilled.len()));
         // The prefilled turns — each `[user][assistant]` written verbatim, with
         // staged provenance so a later scan can resolve sig hit → event → turn.
         let mut indices: Vec<u32> = Vec::with_capacity(prefilled.len() + 1);
@@ -3102,11 +3110,12 @@ impl Sequence {
         // frequently off-language (Chinese/Japanese) — reasoning, leaving a truncated
         // "thought" as the stored summary.
         //
-        // **Three layers, and only the last one is structural.** The caller frames
-        // the conversation as a summarizer (`thinking_effort = off` resolved into
-        // the static system prompt) and `NO_THINK_SELECTOR` adds the `/no_think`
-        // glue below — both of which the model may simply ignore, because both are
-        // text. `apply_think_mode` then programs the sampler's segment-close
+        // **Three layers, and only the last one is structural.** `NO_THINK_SELECTOR`
+        // adds the `/no_think` glue below, baked into this turn's own prefill — which
+        // the model may simply ignore, because it is text. (Nothing in the prompt
+        // helps: an append-only ingest is framed by the primed shared prompt at its
+        // default branch, whose thinking dial is the dialogue's.)
+        // `apply_think_mode` then programs the sampler's segment-close
         // budget, which for `Off` at a short summary budget collapses to a forced
         // empty block. That is enforcement, but it is *sampler* enforcement: it
         // fires only once the model has already opened the block, and it depends on
@@ -3171,11 +3180,12 @@ impl Sequence {
     /// `adopt_turn` can reference its sealed K/V) but has its own scheduler slot
     /// + timeline, so scopes ingest concurrently without ordering conflicts.
     pub fn fork_scope(&self) -> crate::Result<Sequence> {
-        // Do NOT mark the fork append-only / evict_when_cold: `adopt_turn` requires
-        // the fork's turns to still be HOT at splice, so auto-evicting them would
-        // race the splice ("source K/V not hot"). The fork's orphaned hot is freed
-        // instead at `tombstone_timeline` (below), where the file timeline's cloned
-        // chunk handles keep the shared KV alive.
+        // Do NOT mark the fork append-only / evict_when_cold, and DO mark it a
+        // splice source: `adopt_turn` reads the fork's turns from their HOT copy
+        // and nothing else, and a splice source's hot copy is exempt from every
+        // automatic hot-drop — relief, the idle demote, the migrate install —
+        // until the fork's `tombstone_timeline` (below) frees it, the file
+        // timeline's cloned chunk handles keeping the shared KV alive.
         //
         // DO mark the fork timeline transient: its sealed KV is spliced by REFERENCE
         // onto the file timeline (which writes its own durable cold copy) and then
@@ -3186,6 +3196,7 @@ impl Sequence {
             .substrate
             .mint_timeline(self.target.layer, self.target.group);
         self.substrate.mark_timeline_transient(fork_timeline);
+        self.substrate.mark_timeline_splice_source(fork_timeline);
         // A scope fork is a fresh timeline: it ingests its own scope against the
         // system prompt and holds none of the file conversation's dialogue, so
         // it must not inherit the file conversation's memory either.
@@ -3830,8 +3841,9 @@ impl Sequence {
     ///    `Done` arrived.
     /// 2. Persist the user/assistant entries to the cold store.
     /// 3. Commit the exchange to the conversation tree (which may
-    ///    queue cognitive tasks like summarisation).
-    /// 4. Drain any cognitive tasks the tree launched.
+    ///    launch cognitive tasks like summarisation).
+    /// 4. Apply any cognitive task that has finished — without waiting
+    ///    for the ones still running.
     /// 5. Prefill the next user-turn header into the KV cache.
     ///
     /// Returns the boundary text prefilled in step 5 so callers can
@@ -3870,9 +3882,10 @@ impl Sequence {
             Some((&self.scheduler_tx, &self.tokenizer)),
         );
 
-        // Drain pending cognitive tasks launched by the tree during
-        // finish_turn() and spin-poll each to completion before returning.
-        self.drain_cognitive_tasks();
+        // Apply any cognitive task that has finished. Tasks still running —
+        // including one `finish_turn` just launched — stay in flight and are
+        // picked up at a later turn boundary: the turn never waits on them.
+        self.poll_cognitive_tasks();
 
         // Each turn opens its own user role marker via the
         // `prefill_tokens` of the next `submit_turn` and closes the
@@ -4376,32 +4389,40 @@ impl Sequence {
         self.tree.system_prompt_text()
     }
 
-    /// Every recovered turn in the given timeline, split into a
-    /// `User` half and an `Assistant` half — for re-populating a
-    /// sidebar after restart.
+    /// Recover the conversation in `timeline` as bubbles — one per non-empty
+    /// half of each turn, in order: the user's message (exactly what
+    /// `submit_turn` received), then the assistant's reply (the decoded body).
+    /// Both texts come straight off the turn's `user_text` and `assistant_text`
+    /// — no re-tokenising, no marker scanning, no decoding. See
+    /// [`RecoveredMessage`] for what else each bubble carries.
     ///
-    /// Each turn surfaces as two `(Role, String)` entries in order:
-    /// the user's message (exactly what `submit_turn` received) then
-    /// the assistant's reply (the decoded body).  Both strings come
-    /// straight off `TurnPart::user_text` and `assistant_text` — no
-    /// re-tokenising, no marker scanning, no decoding.
-    /// Recovered turn history for `timeline`. When `include_ghost_summaries` is
-    /// false, the ghost summary turns the summariser appends to the timeline
-    /// (`SummaryOfTurns` / `SummaryOfSummaries` tree nodes) are skipped — they
-    /// exist for provenance/projection, not for the conversation view. Pass
-    /// `true` for substrate-level views that legitimately surface them.
-    /// Recover the conversation as `(role, text, no_think)` bubbles — one per
-    /// non-empty half of each turn, in order.  `no_think` is the turn's recorded
-    /// thinking-suppressed flag, set on the USER bubble so the GUI can re-render
-    /// the `/no_think` soft-switch on prior turns exactly as the assembler does
-    /// for the model (see `turn_no_think`); the assistant bubble carries `false`.
+    /// When `include_ghost_summaries` is false, the ghost summary turns the
+    /// summariser appends to the timeline (`SummaryOfTurns` /
+    /// `SummaryOfSummaries` tree nodes) are skipped — they exist for
+    /// provenance/projection, not for the conversation view. Pass `true` for
+    /// substrate-level views that legitimately surface them.
     pub fn recovered_history(
         &self,
         timeline: TimelineId,
         include_ghost_summaries: bool,
-    ) -> Vec<(Role, String, bool)> {
+    ) -> Vec<RecoveredMessage> {
         let read = self.substrate.read();
-        let mut out: Vec<(Role, String, bool)> = Vec::new();
+        // Only a turn whose reasoning K/V was dropped needs this: its length is
+        // then an estimate from the prose it kept.
+        let estimate = |text: &str| {
+            self.tokenizer
+                .encode(text, false)
+                .map(|e| e.len() as u32)
+                .unwrap_or(0)
+        };
+        // The ids of the marker that opens each tool result, for measuring a
+        // tool-response turn's blocks in its own sealed ids.
+        let response_open: Vec<u32> = self
+            .tokenizer
+            .encode(TOOL_RESPONSE_OPEN, false)
+            .map(|e| e.get_ids().to_vec())
+            .unwrap_or_default();
+        let mut out: Vec<RecoveredMessage> = Vec::new();
         for idx in read.turn_indices(timeline) {
             if !include_ghost_summaries
                 && read
@@ -4414,13 +4435,76 @@ impl Sequence {
             let assistant_text = read.assistant_text_of(timeline, idx);
             let no_think = read.turn_no_think(timeline, idx);
             if !user_text.is_empty() {
-                out.push((Role::User, user_text, no_think));
+                let tool_tokens = if user_text.contains(TOOL_RESPONSE_OPEN) {
+                    // The user body's ids, where the layout places them in the
+                    // turn's grid.
+                    let body: Vec<u32> = read
+                        .turn_layout(timeline, idx)
+                        .and_then(|layout| {
+                            let span = layout.user_span();
+                            read.token_ids_of(timeline, idx)
+                                .get(span.offset as usize..span.end() as usize)
+                                .map(<[u32]>::to_vec)
+                        })
+                        .unwrap_or_default();
+                    tool_response_lengths(&body, &response_open)
+                } else {
+                    Vec::new()
+                };
+                out.push(RecoveredMessage {
+                    role: Role::User,
+                    text: user_text,
+                    no_think,
+                    thinking: None,
+                    tool_tokens,
+                });
             }
             if !assistant_text.is_empty() {
-                out.push((Role::Assistant, assistant_text, false));
+                let thinking = read
+                    .turn_layout(timeline, idx)
+                    .and_then(|layout| layout.thinking_length(estimate));
+                out.push(RecoveredMessage {
+                    role: Role::Assistant,
+                    text: assistant_text,
+                    no_think: false,
+                    thinking,
+                    tool_tokens: Vec::new(),
+                });
             }
         }
         out
+    }
+
+    /// Every turn of `timeline` as the substrate holds it — its sealed ids and
+    /// its index pages — in turn order, the summariser's summary turns skipped
+    /// as [`Self::recovered_history`] skips them. What a projection hands the
+    /// model when it borrows each turn, so two timelines that agree here are the
+    /// same context.
+    pub fn sealed_turns(&self, timeline: TimelineId) -> Vec<SealedTurn> {
+        let read = self.substrate.read();
+        read.turn_indices(timeline)
+            .filter(|&idx| {
+                !read
+                    .tree_meta_of(timeline, idx)
+                    .is_some_and(|m| m.kind.is_summary())
+            })
+            .map(|idx| SealedTurn {
+                index: idx.0,
+                token_ids: read.token_ids_of(timeline, idx),
+                pages: SealedPages::of(read.index_page_blob(timeline, idx)),
+            })
+            .collect()
+    }
+
+    /// How many tokens `text` becomes as a turn's user half — encoded exactly
+    /// as a submitted turn is, markup and literal pieces each by their own
+    /// tokenizer. A tool result measured this way before it is submitted has
+    /// the length its block shows once the turn is sealed
+    /// ([`RecoveredMessage::tool_tokens`]).
+    pub fn encoded_len(&self, text: &TurnText) -> usize {
+        encode_pieces(&self.tokenizer, &self.literal_tokenizer, text)
+            .map(|ids| ids.len())
+            .unwrap_or(0)
     }
 
     /// The two verbatim halves — `(user_text, assistant_text)` — of turn `index`
@@ -4647,39 +4731,22 @@ impl Sequence {
         &mut self.tree
     }
 
-    /// Spin-poll a cognitive task to completion, applying the resulting
-    /// [`TreePatch`](crate::tree::TreePatch) to the tree if one arrives.
+    /// Apply every cognitive task (summarization, …) that has finished,
+    /// without blocking on the ones still running. Returns the number of
+    /// results applied to the tree.
     ///
-    /// After each [`TreePatch`] is applied, checks whether a recursive
-    /// segment-of-segments summarization should fire and, if so, queues the
-    /// new task onto the tree's `pending_tasks`. The outer drain loop in
-    /// `send()` then picks it up automatically.
-    ///
-    /// This is the "crude blocking" variant from the design doc — acceptable
-    /// for infrequent summarization events. Upgrade to async polling later.
-    fn run_task_blocking_inner(
-        tree: &mut ConversationTree,
-        task: &mut dyn CognitiveTask,
-        inference: Option<(
-            &Sender<SchedulerRequest>,
-            &std::sync::Arc<tokenizers::Tokenizer>,
-        )>,
-    ) {
-        loop {
-            match task.poll() {
-                TaskPoll::Ready(patch) => {
-                    tree.apply_patch(patch);
-                    tree.check_and_trigger_segment_summarize(inference);
-                    return;
-                }
-                TaskPoll::Aborted => return,
-                TaskPoll::Failed(e) => {
-                    tracing::warn!("cognitive task failed: {}", e);
-                    return;
-                }
-                TaskPoll::Pending => std::thread::yield_now(),
-            }
-        }
+    /// Cognitive tasks run in the background on the scheduler: a turn
+    /// launches them and returns without waiting. This runs at every turn
+    /// boundary, and is public so a caller that wants a result sooner — or a
+    /// test waiting for one — can poll between turns.
+    pub fn poll_cognitive_tasks(&mut self) -> usize {
+        self.tree
+            .poll_tasks(Some((&self.scheduler_tx, &self.tokenizer)))
+    }
+
+    /// Number of cognitive tasks still running in the background.
+    pub fn pending_cognitive_tasks(&self) -> usize {
+        self.tree.pending_task_count()
     }
 
     /// Build the canonical token sequence for one completed turn.
@@ -4759,22 +4826,6 @@ impl Sequence {
             }
         }
         ids
-    }
-
-    /// Drain all pending cognitive tasks from the tree to completion,
-    /// re-draining after each batch to handle recursive tasks queued by
-    /// segment-of-segments summarization.
-    fn drain_cognitive_tasks(&mut self) {
-        let inference = Some((&self.scheduler_tx, &self.tokenizer));
-        loop {
-            let tasks = self.tree.drain_pending_tasks();
-            if tasks.is_empty() {
-                break;
-            }
-            for mut task in tasks {
-                Self::run_task_blocking_inner(&mut self.tree, task.as_mut(), inference);
-            }
-        }
     }
 }
 
@@ -4953,6 +5004,7 @@ impl ProbeCtx {
                 // A one-token wide-Q probe constrains nothing.
                 turn_grammar: None,
                 free_tool_calls_from_penalties: false,
+                recorded_reply: None,
             })
             .is_err()
         {

@@ -458,6 +458,35 @@ flight; (5) it only ever drops a **redundant** copy — `warm.is_some()` is part
 the predicate, and a residence still owed a quantize (`pending_quantize`, whose
 `hot` is the interim native form the drain is about to replace) is excluded too.
 
+### 8.2 Splice sources are exempt from every hot-drop
+
+A `code_read` file is ingested as parallel scope forks: each scope round-trips on
+a throwaway timeline, the file conversation then re-records the fork's sealed
+turns **by reference** (`adopt_turn`), and the fork is tombstoned. `adopt_turn`
+reads the fork turn's **hot** copy and nothing else. Between the fork's seal and
+its splice the persistence thread lands a warm copy — which makes that hot copy
+redundant by every definition above, and so a candidate for `evict_hot_to_free`,
+`evict_hot_except`, `demote_turns_to_warm`, `demote_cold_ingest` (forks are ingest
+timelines), the idle demote, and the migrate's own `install_warm_and_evict_hot`.
+Measured 2026-09-13 on a fresh ingest at `--max-depth 2`: 20 of 131 files failed
+their splice with `source K/V not hot` in under five minutes, the first one second
+after a relief pass evicted three turns; every root file, `README.md` among them,
+was lost, and the ingest stopped at its failure cap.
+
+So `fork_scope` marks each fork's timeline a **splice source**
+(`Substrate::mark_timeline_splice_source`), and every residence on it carries
+`splice_source`. Every automatic hot-drop honours the flag. The fork's
+`tombstone_timeline` clears it and drops the hot copy — the only release a fork
+needs, since it lives for one scope chunk (`SCOPE_PARALLELISM` scopes), and the
+file conversation's cloned chunk handles keep the shared K/V alive. Clearing it
+at the tombstone, before the drop, also keeps a migrate install that lands after
+the tombstone from re-adding a hot copy nothing will free.
+
+The flag is deliberately **not** `no_cold_persist`. That one marks every transient
+timeline, and its other user — calibration exemplars — *wants* its hot copies
+shed: exempting all transient timelines would hold ~3,000 exemplars' K/V on the
+card through a calibration.
+
 ---
 
 ## 9. Managed allocation, retry, and the forecast

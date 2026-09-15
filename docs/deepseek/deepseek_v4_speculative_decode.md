@@ -300,10 +300,10 @@ Per cycle we speculatively advance state for `d+1` tokens, then keep only the ac
 Four pieces of state, three already truncatable:
 
 1. **Raw SWA arena (main model)** — the verify wave writes the `d+1` latents from the host
-   before each layer's launch, commits their length on the host (`set_len`), and brings the
-   cached decode slot buffer up to date with `refresh_decode_writer_slice` — a commit made
-   outside the decode kernel must, see `deepseek_perf_optimization_report.md` ("the live
-   buffer's one invariant"). On accept length `m ≤ d+1`, roll back with
+   before each layer's launch, commits their length on the host (`set_len`), and marks the
+   cached decode slot buffer with `mark_decode_writer_stale`, so the header build's sync
+   re-serialises it — a commit made outside the decode kernel must, see
+   `deepseek_perf_optimization_report.md` ("the live buffer's one invariant"). On accept length `m ≤ d+1`, roll back with
    `truncate_sequence_to_tokens(seq, p+m)` (`sequence_ops.rs:2071`) + `set_sequence_offset`
    (`batched_inference.rs:2455`). **Present.** Needs a session-level token-granular wrapper
    (only a block-granular `truncate_sequence_to_blocks` wrapper exists at

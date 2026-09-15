@@ -187,6 +187,21 @@ impl DirState {
         }
     }
 
+    /// This state without the records `map`'s `--max-depth` bound froze. A frozen
+    /// directory's unit stays in the substrate, but the bounded walk never builds
+    /// it — so comparing the whole state against the walk would read every
+    /// refresh as a change and re-run the pool on each watcher burst.
+    pub fn without_frozen(&self, map: &RepoMap) -> Self {
+        Self {
+            units: self
+                .units
+                .iter()
+                .filter(|r| !map.is_frozen_dir(&r.dir))
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// `true` when a fresh walk produced exactly the same directories and hashes
     /// — the refresh has nothing to do.
     ///
@@ -234,6 +249,31 @@ mod tests {
     use super::*;
     use crate::repo_scan::types::Language;
     use crate::repo_scan::walk_workspace;
+
+    /// With `--max-depth 2`, a unit AT the bound (`src/deep/`) is frozen: it
+    /// leaves the state the refresh compares, so a bounded walk that never
+    /// builds it cannot read as a change. Unbounded, the state is untouched.
+    #[test]
+    fn a_frozen_directory_leaves_the_compared_state() {
+        let rec = |dir: &str, hash: &str| DirRecord {
+            dir: dir.to_string(),
+            content_hash: hash.to_string(),
+        };
+        let prior = DirState {
+            units: vec![rec(".", "a"), rec("src/", "b"), rec("src/deep/", "c")],
+        };
+        let bounded = RepoMap {
+            max_depth: Some(2),
+            ..RepoMap::default()
+        };
+        assert_eq!(
+            prior.without_frozen(&bounded),
+            DirState {
+                units: vec![rec(".", "a"), rec("src/", "b")],
+            }
+        );
+        assert_eq!(prior.without_frozen(&RepoMap::default()), prior);
+    }
 
     fn entry(path: &str) -> FileEntry {
         FileEntry {
@@ -395,7 +435,7 @@ mod tests {
         std::fs::write(d.path().join("k/decode.cu"), "__global__ void d() {}\n").unwrap();
         std::fs::write(d.path().join("k/LICENSE"), "MIT\n").unwrap();
 
-        let walked = walk_workspace(d.path());
+        let walked = walk_workspace(d.path(), None);
         let units = build_units(&walked, d.path());
         let k = units.iter().find(|u| u.dir == "k/").expect("k/ has a unit");
         assert_eq!(

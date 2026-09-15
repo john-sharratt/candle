@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::Instant;
 
 use super::event::{decode_events, ProjectionSelection, SystemItem};
@@ -331,6 +331,13 @@ pub struct Conversation {
     /// log failed to bring back, paid as a forward pass on every boot. See
     /// [`Self::section_loads`].
     section_loads: Arc<SectionLoadCounters>,
+    /// The persistence handle was opened read-only
+    /// ([`SharedSubstrate::open_in_read_only`]): every in-RAM change is made as
+    /// usual, and every synchronous durable write is skipped and reported as a
+    /// success. Nothing that was never written is given a disk location — a
+    /// turn or chunk stays RAM-resident. Read once from the handle at
+    /// construction; a handle's mode never changes.
+    read_only: bool,
     /// The throwaway directory an [`Self::ephemeral`] conversation's log lives
     /// in, removed when the last clone of that conversation drops.
     ///
@@ -478,6 +485,7 @@ impl Conversation {
             writer,
             branch_checkpoint: Arc::new(Mutex::new(None)),
             section_loads: Arc::default(),
+            read_only: false,
             // The directory goes when the last clone of this conversation does.
             // See the field's own note for what it cost not to have this.
             ephemeral_dir: Some(Arc::new(TempDirGuard::new(dir))),
@@ -504,10 +512,10 @@ impl Conversation {
             substrate: inner,
             persistence,
         } = shared;
-        let segments = persistence
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .segment_count();
+        let (segments, read_only) = {
+            let p = persistence.lock().unwrap_or_else(|e| e.into_inner());
+            (p.segment_count(), p.is_read_only())
+        };
         let maintenance = Arc::new(Mutex::new((segments, None, false)));
         let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
         Self {
@@ -524,6 +532,7 @@ impl Conversation {
             writer,
             branch_checkpoint: Arc::new(Mutex::new(None)),
             section_loads: Arc::default(),
+            read_only,
         }
     }
 
@@ -533,6 +542,23 @@ impl Conversation {
     /// empty substrate.
     pub fn with_persistence(persistence: SubstratePersistence) -> Self {
         Self::from_parts(Substrate::new(), persistence)
+    }
+
+    /// Whether this conversation's substrate was opened read-only — its
+    /// in-RAM state changes as usual and nothing is written to disk.
+    pub fn is_read_only_substrate(&self) -> bool {
+        self.read_only
+    }
+
+    /// The persistence handle for a best-effort durable write — the reload's
+    /// repair tombstones — or `None` when there is nothing to write to: a
+    /// read-only substrate, or a poisoned lock. The in-RAM change the write
+    /// would have mirrored is made by the caller either way.
+    fn writable_persistence(&self) -> Option<MutexGuard<'_, SubstratePersistence>> {
+        if self.read_only {
+            return None;
+        }
+        self.persistence.lock().ok()
     }
 
     /// Allocate a fresh [`TimelineId`] and register it against
@@ -2246,13 +2272,15 @@ impl Conversation {
     /// layout + block range are preserved verbatim so the inter-turn seams stay
     /// LIVE GLUE (the correctness property code_read requires — a baked seam goes
     /// stale on re-injection). `tags` are supplied by the caller (the scope's
-    /// `["code", <path>]`). The source turn must be HOT — splice right after the
-    /// fork completes, before the persistence thread migrates it warm.
+    /// `["code", <path>]`). The source turn must be HOT, which its fork
+    /// guarantees by being a splice source ([`Self::mark_timeline_splice_source`]):
+    /// no eviction path drops a splice source's hot copy before its tombstone.
     ///
-    /// Persists three records for the adopted turn: the `TurnDecl` (via
-    /// [`Self::record_turn`]), the token ids, and the wide-Q provenance sigs
+    /// Persists four records for the adopted turn: the `TurnDecl` (via
+    /// [`Self::record_turn`]), the token ids, the wide-Q provenance sigs
     /// (re-keyed onto the new stream so a provenance scan of the file timeline
-    /// admits the turn).
+    /// admits the turn), and the QSA index page (re-keyed so a projection that
+    /// borrows the turn's K/V can also select it).
     pub fn adopt_turn(
         &self,
         from_tl: TimelineId,
@@ -2262,7 +2290,7 @@ impl Conversation {
         tags: Vec<String>,
     ) -> candle::Result<TurnIndex> {
         use crate::persistence::content_hash::turn_stream_id;
-        let (layout, token_ids, block_range, sigs_blob) = {
+        let (layout, token_ids, block_range, sigs_blob, index_page) = {
             let r = self.read();
             let layout = r
                 .turn_layout(from_tl, from_idx)
@@ -2272,14 +2300,17 @@ impl Conversation {
                 .turn_block_range(from_tl, from_idx)
                 .ok_or_else(|| candle::Error::Msg("adopt_turn: no block range".into()))?;
             let sigs_blob = r.wide_q_sigs_blob(from_tl, from_idx).map(|b| b.to_vec());
-            (layout, token_ids, block_range, sigs_blob)
+            let index_page = r.index_page_blob(from_tl, from_idx).map(|b| b.to_vec());
+            (layout, token_ids, block_range, sigs_blob, index_page)
         };
         let sealed = self
             .read()
             .turn_sealed_of(from_tl, from_idx)
             .ok_or_else(|| {
                 candle::Error::Msg(
-                    "adopt_turn: source K/V not hot (migrated) — splice sooner".into(),
+                    "adopt_turn: source K/V not hot — its timeline is not a splice \
+                     source, or was already tombstoned"
+                        .into(),
                 )
             })?;
         let token_count = token_ids.len();
@@ -2309,6 +2340,14 @@ impl Conversation {
         self.enqueue_tokens(stream_id, token_ids.clone());
         if let Some(blob) = sigs_blob {
             self.enqueue_wide_q_sigs(stream_id, blob);
+        }
+        // The QSA index page is keyed by stream exactly like the sigs, and the
+        // fork is tombstoned right after the splice — a page left under the
+        // fork's stream is unreachable, and every projection that borrows this
+        // turn then holds K/V its attention layers cannot select. A source that
+        // sealed no page adopts none; the projection says so when it injects.
+        if let Some(page) = index_page {
+            self.enqueue_index_page(stream_id, page);
         }
         Ok(idx)
     }
@@ -2559,7 +2598,7 @@ impl Conversation {
                                 // (absent from `content_sha256` → flagged changed →
                                 // `process_one_file` rebuilds it).
                                 self.write().tombstone_timeline(timeline);
-                                if let Ok(mut p) = self.persistence.lock() {
+                                if let Some(mut p) = self.writable_persistence() {
                                     match p.write_tombstone(timeline.raw(), Some(&reason)) {
                                         Ok(_) => tracing::debug!(
                                             timeline_id = decl.timeline_id,
@@ -2580,7 +2619,7 @@ impl Conversation {
                                 // Dialogue: drop only the corrupt turn, keeping the
                                 // rest of the conversation live.
                                 self.write().tombstone_turn(timeline, decl.turn_index);
-                                if let Ok(mut p) = self.persistence.lock() {
+                                if let Some(mut p) = self.writable_persistence() {
                                     match p.write_turn_tombstone(
                                         timeline.raw(),
                                         decl.turn_index,
@@ -2668,7 +2707,7 @@ impl Conversation {
                             verdict.describe()
                         );
                         self.write().tombstone_timeline(timeline);
-                        if let Ok(mut p) = self.persistence.lock() {
+                        if let Some(mut p) = self.writable_persistence() {
                             match p.write_tombstone(timeline.raw(), Some(&reason)) {
                                 Ok(_) => tracing::info!(
                                     timeline_id = decl.timeline_id,
@@ -3121,9 +3160,13 @@ impl Conversation {
     /// the next query) and on disk (via a
     /// [`crate::persistence::record::RecordType::Tombstone`]
     /// record).  The compactor drops the underlying records on the
-    /// next compaction pass; ordinary reads never see them.
+    /// next compaction pass; ordinary reads never see them. On a read-only
+    /// substrate the in-RAM tombstone is all there is.
     pub fn tombstone_timeline(&self, timeline: TimelineId) -> candle::Result<()> {
         self.write().tombstone_timeline(timeline);
+        if self.read_only {
+            return Ok(());
+        }
         let mut p = self.persistence.lock().unwrap();
         p.write_tombstone(timeline.raw(), None)
             .map_err(|e| candle::Error::Msg(format!("write_tombstone: {e}")))?;
@@ -3147,6 +3190,9 @@ impl Conversation {
     /// is what turns an unbounded log into a bounded one.
     pub fn tombstone_turn(&self, timeline: TimelineId, turn_index: u32) -> candle::Result<()> {
         self.write().tombstone_turn(timeline, turn_index);
+        if self.read_only {
+            return Ok(());
+        }
         let mut p = self.persistence.lock().unwrap();
         p.write_turn_tombstone(timeline.raw(), turn_index, Some("retention"))
             .map_err(|e| candle::Error::Msg(format!("write_turn_tombstone: {e}")))?;
@@ -3167,6 +3213,13 @@ impl Conversation {
     /// there is no redo-log record.
     pub fn mark_timeline_transient(&self, timeline: TimelineId) {
         self.write().mark_timeline_transient(timeline);
+    }
+
+    /// Mark a code_read scope fork's timeline as a **splice source**: its turns
+    /// keep their hot copy — the only copy [`Self::adopt_turn`] reads — until the
+    /// fork is tombstoned. See `Substrate::mark_timeline_splice_source`.
+    pub fn mark_timeline_splice_source(&self, timeline: TimelineId) {
+        self.write().mark_timeline_splice_source(timeline);
     }
 
     /// Mark a throwaway conversation's frame as transient — see
@@ -3194,9 +3247,12 @@ impl Conversation {
     ///
     /// Must be called before the response turn is submitted: that ordering is
     /// what stops the summariser observing half an exchange and freezing a leaf
-    /// over it.
+    /// over it. On a read-only substrate the in-RAM coupling is all there is.
     pub fn couple_turn(&self, timeline: TimelineId, from_turn: u32) -> candle::Result<()> {
         self.write().couple_turn(timeline, from_turn);
+        if self.read_only {
+            return Ok(());
+        }
         let mut p = self.persistence.lock().unwrap();
         p.write_turn_coupling(timeline.raw(), from_turn)
             .map_err(|e| candle::Error::Msg(format!("write_turn_coupling: {e}")))?;
@@ -3273,6 +3329,9 @@ impl Conversation {
             return Ok(());
         }
         self.write().set_debug_id(timeline, debug_id);
+        if self.read_only {
+            return Ok(());
+        }
         let mut p = self.persistence.lock().unwrap();
         p.write_debug_id(timeline.raw(), debug_id)
             .map_err(|e| candle::Error::Msg(format!("write_debug_id: {e}")))?;
@@ -3308,6 +3367,9 @@ impl Conversation {
     /// by the summariser thread after every atomic tree mutation
     /// (§7.2).
     pub fn write_tree_metadata(&self, payload: TreeMetadataPayload) -> candle::Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         let mut p = self.persistence.lock().unwrap();
         p.write_tree_metadata(payload)
             .map_err(|e| candle::Error::Msg(format!("write_tree_metadata: {e}")))
@@ -3321,6 +3383,9 @@ impl Conversation {
         stream_id: StreamId,
         layers: &crate::persistence::resume::TurnChunkGrid,
     ) -> candle::Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         let mut p = self.persistence.lock().unwrap();
         crate::persistence::resume::persist_turn_chunks(&mut p, stream_id, layers)
             .map_err(|e| candle::Error::Msg(format!("persist turn chunks: {e}")))
@@ -3330,11 +3395,18 @@ impl Conversation {
     /// references — the warm→cold leg of the persistence thread's
     /// `run_pass`. The returned references go straight into the
     /// substrate via `Substrate::install_cold`.
+    ///
+    /// On a read-only substrate nothing is written and nothing is returned:
+    /// an empty set installs no cold tier, so the stream stays RAM-resident
+    /// rather than claiming disk locations it never got.
     pub fn persist_turn_chunks_capture(
         &self,
         stream_id: StreamId,
         layers: &crate::persistence::resume::TurnChunkGrid,
     ) -> candle::Result<Vec<StoredSequence>> {
+        if self.read_only {
+            return Ok(Vec::new());
+        }
         let (stored, locs) = {
             let mut p = self.persistence.lock().unwrap();
             crate::persistence::resume::persist_turn_chunks_capture(&mut p, stream_id, layers)
@@ -3364,6 +3436,11 @@ impl Conversation {
         stream_id: StreamId,
         token_ids: &[u32],
     ) -> candle::Result<()> {
+        // A read-only substrate keeps the in-memory token buffer and registers
+        // no location: there is no record for one to point at.
+        if self.read_only {
+            return Ok(());
+        }
         // Append (persistence lock) then register the location in the substrate
         // index (substrate lock), taken non-nested — persistence released first.
         // The `apply_tokens_loc` is REQUIRED: without it `entry.tokens` is `None`
@@ -3387,6 +3464,9 @@ impl Conversation {
         stream_id: StreamId,
         through_index: u64,
     ) -> candle::Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         let mut p = self.persistence.lock().unwrap();
         p.commit_stream(stream_id, through_index)
             .map_err(|e| candle::Error::Msg(format!("commit stream: {e}")))
@@ -3400,12 +3480,18 @@ impl Conversation {
     /// blocked by cold-write disk I/O, and `slot.cold` is only ever set on durable
     /// data, keeping the `purge_warm` RAM-unload invariant intact. Bounded by the
     /// writer's dual-cap backpressure.
+    ///
+    /// On a read-only substrate no cold write is coming, so the residence is
+    /// left as it is — not flagged as having one in flight — and stays warm.
     pub fn enqueue_kv_cold(
         &self,
         residence: ResidenceIndex,
         stream_id: StreamId,
         grid: TurnChunkGrid,
     ) {
+        if self.read_only {
+            return;
+        }
         // Flag the write in flight BEFORE enqueuing so the next persistence pass's
         // `snapshot_pending_cold` skips this residence until `install_cold` (on the
         // writer) clears it — no double gather/write.
@@ -3422,6 +3508,9 @@ impl Conversation {
     /// from what the log already holds), then commit if written. Lets the
     /// log carry the projection needed to reconstruct the substrate.
     pub fn set_template(&self, template: &[u8]) -> candle::Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         let mut p = self.persistence.lock().unwrap();
         let wrote = p
             .set_template(template)
@@ -3459,6 +3548,9 @@ impl Conversation {
     pub fn persist_wide_q_sigs(&self, stream_id: StreamId, payload: &[u8]) -> candle::Result<()> {
         self.write()
             .set_wide_q_sigs_blob(stream_id, payload.to_vec());
+        if self.read_only {
+            return Ok(());
+        }
         let mut p = self.persistence.lock().unwrap();
         p.append_wide_q_sigs(stream_id, payload)
             .map_err(|e| candle::Error::Msg(format!("persist wide-Q sigs: {e}")))
@@ -3474,6 +3566,9 @@ impl Conversation {
     pub fn persist_index_page(&self, stream_id: StreamId, payload: &[u8]) -> candle::Result<()> {
         self.write()
             .set_index_page_blob(stream_id, payload.to_vec());
+        if self.read_only {
+            return Ok(());
+        }
         let mut p = self.persistence.lock().unwrap();
         p.append_turn_index_page(stream_id, payload)
             .map_err(|e| candle::Error::Msg(format!("persist index page: {e}")))
@@ -3808,8 +3903,13 @@ impl Conversation {
     /// Force a full redo-log compaction — the whole-file dead-record rewrite
     /// (§5.8). Ignores the dead-ratio threshold: the operator opted in
     /// explicitly via the daemon's startup flag. `progress` reports coarse
-    /// phase progress (0..=5) for the loading screen.
+    /// phase progress (0..=5) for the loading screen. A read-only substrate
+    /// is never compacted — the store belongs to the process that writes it —
+    /// so this returns without touching it.
     pub fn compact_substrate(&self, progress: Option<&dyn Fn(usize, usize)>) -> candle::Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         let mut p = self.persistence.lock().unwrap();
         p.commit()
             .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))?;
@@ -4192,8 +4292,80 @@ mod tests {
         warmable, Conversation, Observe,
     };
 
+    use std::sync::Arc;
+
+    use crate::persistence::content_hash::turn_stream_id;
+    use crate::persistence::{dir_fingerprint, SharedSubstrate, SubstratePersistence};
+    use crate::projection::{GroupId, LayerId, TimelineId};
+    use crate::substrate::{Substrate, TurnPartWrite};
+    use crate::token_buffer::TokenBuffer;
+    use crate::turn::Role;
+    use candle_nn::kv_cache::{ArenaLocation, SealedChunk, SealedSequence};
+
     fn tags(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **A spliced turn keeps its index page.**
+    ///
+    /// `adopt_turn` moves a scope fork's sealed turn onto the file timeline by
+    /// reference and re-keys it to a new stream. The turn's QSA index page is
+    /// keyed by stream as well, and the fork is tombstoned straight after the
+    /// splice — so a page left under the fork's stream is gone, and every
+    /// projection that later borrows the turn past the identity threshold holds
+    /// K/V its attention layers cannot select. That was every code_reading turn
+    /// of an ingest: a greeting carried ~16k tokens no index covered, and the
+    /// model answered an earlier question instead of the greeting.
+    #[test]
+    fn an_adopted_turn_carries_its_index_page_onto_the_new_stream() {
+        let conv = Conversation::ephemeral();
+        let layer = LayerId::from_raw(1).expect("layer id");
+        let group = GroupId::from_raw(1).expect("group id");
+        let fork = TimelineId::from_raw(7).expect("fork timeline id");
+        let file = TimelineId::from_raw(8).expect("file timeline id");
+        conv.register_timeline(fork, layer, group);
+        conv.register_timeline(file, layer, group);
+        conv.mark_timeline_splice_source(fork);
+
+        let sealed = Arc::new(vec![SealedSequence {
+            chunks: vec![SealedChunk::for_test(1000, 4)],
+            token_count: 4,
+            chunk_size: 32,
+            location: ArenaLocation::Gpu,
+        }]);
+        let from = conv
+            .record_turn(
+                fork,
+                Role::Assistant,
+                TurnPartWrite {
+                    token_ids: TokenBuffer::from(vec![11, 12, 13, 14]),
+                    token_count: 4,
+                    block_start: 0,
+                    block_end: 1,
+                    sealed_gpu: Some(sealed),
+                    ..Default::default()
+                },
+                |seqs| Ok(seqs.to_vec()),
+            )
+            .expect("record the fork's turn");
+        let page = vec![0xA5u8, 0x5A, 0x01, 0x02, 0x03];
+        conv.enqueue_index_page(turn_stream_id(fork.raw(), from.0), page.clone());
+
+        let adopted = conv
+            .adopt_turn(
+                fork,
+                from,
+                file,
+                Role::Assistant,
+                tags(&["code", "src/lib.rs"]),
+            )
+            .expect("adopt the fork's turn");
+
+        assert_eq!(
+            conv.read().index_page_blob(file, adopted),
+            Some(page.as_slice()),
+            "the adopted turn must carry the fork's index page under its own stream"
+        );
     }
 
     /// **An ephemeral conversation takes its directory with it.**
@@ -4258,6 +4430,73 @@ mod tests {
             dir.is_dir(),
             "a workspace conversation deleted the directory it was opened on"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A read-only conversation changes RAM and writes nothing.** Over a
+    /// store opened with `SharedSubstrate::open_in_read_only`: a label, a
+    /// debug id, a coupling, a turn tombstone and a timeline tombstone all show
+    /// in the in-RAM view; the synchronous durable paths — signatures, index
+    /// page, tokens, stream commit, template, commit, compaction, forced
+    /// maintenance — all return `Ok`; no tokens location is registered for a
+    /// record that was never written; and every file is byte-identical after
+    /// the conversation drops.
+    #[test]
+    fn a_read_only_conversation_changes_ram_and_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "candle-conv-read-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let mut substrate = Substrate::new();
+            let mut p = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            p.write_debug_id(7, "seed").unwrap();
+            p.commit().unwrap();
+        }
+        let before = dir_fingerprint(&dir);
+
+        let conv = Conversation::from_shared(SharedSubstrate::open_in_read_only(&dir).unwrap());
+        assert!(conv.is_read_only_substrate());
+        let layer = LayerId::from_raw(1).expect("layer id");
+        let group = GroupId::from_raw(1).expect("group id");
+        let tl = TimelineId::from_raw(7).expect("timeline id");
+        conv.register_timeline(tl, layer, group);
+
+        conv.set_conversation_label(tl, "renamed").unwrap();
+        assert_eq!(conv.label_of(tl).as_deref(), Some("renamed"));
+        conv.set_conversation_debug_id(tl, "resume-key").unwrap();
+        assert_eq!(conv.lookup_by_debug_id("resume-key"), Some(tl));
+        conv.couple_turn(tl, 3).unwrap();
+        assert!(conv.read().couplings_of(tl).contains(&3));
+        conv.tombstone_turn(tl, 4).unwrap();
+        assert!(conv.is_turn_tombstoned(tl, 4));
+
+        let stream = turn_stream_id(tl.raw(), 0);
+        conv.persist_wide_q_sigs(stream, &[1, 2, 3]).unwrap();
+        conv.persist_index_page(stream, &[4, 5]).unwrap();
+        conv.persist_tokens_only(stream, &[9, 10]).unwrap();
+        conv.commit_stream_through(stream, 0).unwrap();
+        conv.set_template(b"template").unwrap();
+        conv.commit_persistence().unwrap();
+        assert!(!conv.commit_persistence_if_pending().unwrap());
+        conv.compact_substrate(None).unwrap();
+        assert!(!conv.force_compact_persistence().unwrap());
+        assert!(conv
+            .read()
+            .stream_of(stream)
+            .and_then(|s| s.tokens)
+            .is_none());
+
+        conv.tombstone_timeline(tl).unwrap();
+        assert!(conv.is_timeline_tombstoned(tl));
+        conv.flush_writer();
+        drop(conv);
+        assert_eq!(dir_fingerprint(&dir), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

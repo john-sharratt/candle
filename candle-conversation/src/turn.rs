@@ -104,6 +104,17 @@ pub struct TurnOptions {
     /// Tool-call stencils that may fire during this turn, keyed by trigger
     /// token.  The default is an empty registry — no constrained decoding.
     pub triggers: Arc<TriggerRegistry>,
+
+    /// The ids an earlier run of this turn sealed
+    /// ([`SealedTurn::token_ids`](crate::SealedTurn::token_ids)), decoded again
+    /// instead of sampled. The turn prefills as usual, then commits the
+    /// recorded reply one token per step, so it seals the recorded ids under
+    /// the page cuts, reasoning boundary and reprojections of a live decode.
+    /// [`Self::triggers`] and [`Self::turn_grammar`] run as they would live —
+    /// what they play is in the recording, and where they cut pages is part of
+    /// what is replayed — and the turn fails the moment one of them departs
+    /// from the recording. `None` = an ordinary sampled decode.
+    pub recorded_turn: Option<Vec<u32>>,
 }
 
 impl TurnOptions {
