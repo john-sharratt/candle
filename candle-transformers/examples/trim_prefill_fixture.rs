@@ -1,4 +1,4 @@
-//! One-time tool to trim a full `ZEND_PREFILL_CAPTURE` dump down to a small,
+//! One-time tool to trim a full `prefill-capture` dump down to a small,
 //! committable kernel-replay fixture: keeps only the single largest-prefix slot
 //! (slicing the packed Q/K/V to its token range). CPU-only.
 //!
@@ -6,17 +6,17 @@
 //!   cargo run -p candle-transformers --example trim_prefill_fixture --release -- \
 //!       <input.bin> <output.bin>
 //!
-//! Defaults: input `prefill_fixture.bin` (cwd), output
-//! `candle-transformers/tests/fixtures/prefill_fixture.bin`.
+//! Defaults: input [`CAPTURE_PATH`] (where a `prefill-capture` build writes),
+//! output `candle-transformers/tests/fixtures/prefill_fixture.bin`.
 
-use candle_transformers::models::prefill_capture::PrefillCapture;
+use candle_transformers::models::prefill_capture::{PrefillCapture, CAPTURE_PATH};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let input = args
         .get(1)
         .cloned()
-        .unwrap_or_else(|| "prefill_fixture.bin".to_string());
+        .unwrap_or_else(|| CAPTURE_PATH.to_string());
     let output = args
         .get(2)
         .cloned()

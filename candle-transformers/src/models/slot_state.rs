@@ -591,12 +591,17 @@ pub struct SlotStateHost {
 /// derivable from a slice's `len` — a first attempt at the kernel searched only
 /// committed tokens and would have sent every write to slice 0.
 ///
-/// Committed positions are found by binary search (`rope <= k < rope + len`);
-/// positions past the committed total continue from `write_slice`, filling the
+/// Committed positions are found by binary search (`rope <= k < rope + len`)
+/// over the slices up to `write_slice`; positions past the committed total —
+/// where the write slice ends — continue from `write_slice`, filling the
 /// writer's chunk from `offset + len` to `chunk_size` and each later chunk from
 /// its own `offset`. `None` means the position is past everything the slot can
 /// address, which the kernel reports as `(0, 0)` — the case
 /// [`SlotStateHost::assert_write_region_capacity`] exists to make unreachable.
+///
+/// The slices after `write_slice` are empty write capacity, and their `rope`
+/// is never read: the post-decode commit bumps the write slice's `len` alone,
+/// so a trailing rope is current only until the next decode step.
 pub fn resolve_pos_reference(
     slices: &[TokenSliceHost],
     write_slice: usize,
@@ -606,7 +611,8 @@ pub fn resolve_pos_reference(
     if slices.is_empty() {
         return None;
     }
-    let (mut lo, mut hi) = (0isize, slices.len() as isize - 1);
+    let last_idx = write_slice.min(slices.len() - 1);
+    let (mut lo, mut hi) = (0isize, last_idx as isize);
     while lo <= hi {
         let mid = ((lo + hi) / 2) as usize;
         let s = &slices[mid];
@@ -620,7 +626,7 @@ pub fn resolve_pos_reference(
             return Some((mid, s.offset as usize + (k_pos - start)));
         }
     }
-    let last = slices.last()?;
+    let last = &slices[last_idx];
     let committed = last.rope as usize + last.len as usize;
     let mut cur = write_slice;
     if cur >= slices.len() {
@@ -649,8 +655,9 @@ pub fn resolve_pos_reference(
 ///
 /// Committed ranges `[rope, rope + len)` never overlap, so a position inside
 /// the hint's range has exactly one owner, and it is the slice the search
-/// would have returned. A hint that misses, or that is past the array (the
-/// kernel's `hint < 0`), changes only the cost: the answer is always
+/// would have returned. A hint that misses, that is past the array (the
+/// kernel's `hint < 0`), or that is past the write slice — where no slice owns
+/// a position — changes only the cost: the answer is always
 /// `resolve_pos_reference`'s.
 pub fn resolve_pos_hinted_reference(
     slices: &[TokenSliceHost],
@@ -659,7 +666,7 @@ pub fn resolve_pos_hinted_reference(
     hint: usize,
     k_pos: usize,
 ) -> Option<(usize, usize)> {
-    if let Some(s) = slices.get(hint) {
+    if let Some(s) = slices.get(hint).filter(|_| hint <= write_slice) {
         let start = s.rope as usize;
         if k_pos >= start && k_pos < start + s.len as usize {
             return Some((hint, s.offset as usize + (k_pos - start)));
@@ -1049,6 +1056,48 @@ mod resolve_pos_tests {
     #[test]
     fn overflow_chunks_resume_at_their_own_offset() {
         assert_agrees(&[(0, 20), (4, 0), (9, 0)], 0, 30);
+    }
+
+    /// A host commit re-serialises the writer, not the empty chunks after it:
+    /// the writer holds 10, and the chunk after it still carries the rope from
+    /// before the commit (32, where the sequence holds 42). The committed total
+    /// is where the write slice ends, so the next write lands right after the
+    /// writer's 10th token — a total read from the last slice would be 32 and
+    /// put position 42 at `(1, 20)`, ten slots past where the host commits it.
+    #[test]
+    fn a_stale_rope_after_the_writer_moves_no_write() {
+        let mut sl = slices(&[(0, 32), (0, 10), (0, 0)]);
+        sl[2].rope = 32;
+        assert_eq!(resolve_pos_reference(&sl, 1, CHUNK, 41), Some((1, 9)));
+        assert_eq!(resolve_pos_reference(&sl, 1, CHUNK, 42), Some((1, 10)));
+        assert_eq!(resolve_pos_reference(&sl, 1, CHUNK, 64), Some((2, 0)));
+    }
+
+    /// The post-decode commit bumps the write slice's `len` on the device and
+    /// touches no other slice: two decode steps took the writer from 10 to 12
+    /// while the chunk after it kept rope 42. The next token belongs at slot
+    /// 12 — a total read from the last slice would be 42 and put it at slot
+    /// 14, leaving two positions the host counts and nothing wrote.
+    #[test]
+    fn a_device_side_commit_needs_no_rope_after_the_writer() {
+        let mut sl = slices(&[(0, 32), (0, 12), (0, 0)]);
+        sl[2].rope = 42;
+        assert_eq!(resolve_pos_reference(&sl, 1, CHUNK, 43), Some((1, 11)));
+        assert_eq!(resolve_pos_reference(&sl, 1, CHUNK, 44), Some((1, 12)));
+    }
+
+    /// A hint past the write slice is never taken, even over a slice that
+    /// claims the position: history ends at the write slice, and the hinted
+    /// lookup answers exactly what the bounded search does.
+    #[test]
+    fn a_hint_past_the_writer_is_not_taken() {
+        let mut sl = slices(&[(0, 32), (0, 10), (0, 4)]);
+        sl[2].rope = 42;
+        assert_eq!(resolve_pos_reference(&sl, 1, CHUNK, 43), Some((1, 11)));
+        assert_eq!(
+            resolve_pos_hinted_reference(&sl, 1, CHUNK, 2, 43),
+            Some((1, 11))
+        );
     }
 
     /// A position past everything the slot can address resolves to nothing —

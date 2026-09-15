@@ -836,6 +836,8 @@ impl ChunkedKvBacking {
         // ── Phase 2: register blocks under the state write lock ──────
         let mut hgids_per_block: Vec<HeadGids> = Vec::with_capacity(specs.len());
         let mut updated_blocks: Vec<usize> = Vec::with_capacity(specs.len());
+        // Whether any loaded block's window differs from the one it replaces.
+        let mut layout_changed = false;
         // Declared outside the `state.write()` scope so we can return
         // it to the caller (immediately reused by
         // `resolve_block_ptrs_from_hgids` to skip its own arena walk).
@@ -891,6 +893,7 @@ impl ChunkedKvBacking {
                         std::sync::Arc::new(spec.v_formats.iter().map(|f| f.to_tag()).collect()),
                     );
                     if let Some(cw) = slot.chunk_at_mut(spec.block_idx) {
+                        layout_changed |= cw.offset != spec.offset || cw.usage != spec.usage;
                         cw.offset = spec.offset;
                         cw.usage = spec.usage;
                     }
@@ -909,7 +912,16 @@ impl ChunkedKvBacking {
             let t_gpu_push = std::time::Instant::now();
             arena_info = self.resolve_arena_info()?;
             if let Some(slot) = state.sequences.get_mut(batch_idx).and_then(|s| s.as_mut()) {
-                slot.update_gpu_chunks_bulk(&updated_blocks, n_kv_head, head_dim, &arena_info)?;
+                // A block whose window moved moves the rope of every block
+                // after it, which re-serialising the loaded blocks alone would
+                // leave as it was. Drop the buffer then: the next decode sync
+                // rebuilds every rope from the host. Unchanged windows only
+                // swapped their gids, and the loaded blocks are all that moved.
+                if layout_changed {
+                    slot.invalidate_gpu_chunks();
+                } else {
+                    slot.update_gpu_chunks_bulk(&updated_blocks, n_kv_head, head_dim, &arena_info)?;
+                }
             }
             *gpu_push_us_out += t_gpu_push.elapsed().as_micros() as u64;
 

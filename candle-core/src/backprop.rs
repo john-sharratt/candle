@@ -16,17 +16,6 @@ fn broadcast_back(arg: &Tensor, node: &Tensor, reduced_dims: &[usize]) -> Result
     }
 }
 
-thread_local! {
-    static CANDLE_GRAD_DO_NOT_DETACH: bool = {
-        match std::env::var("CANDLE_GRAD_DO_NOT_DETACH") {
-            Ok(s) => {
-                !s.is_empty() && s != "0"
-            },
-            Err(_) => false,
-        }
-    }
-}
-
 impl Tensor {
     /// Return all the nodes that lead to this value in a topologically sorted vec, the first
     /// elements having dependencies on the latter ones, e.g. the first element if any is the
@@ -177,8 +166,7 @@ impl Tensor {
             // do not have to allocate too often. Here we just call `.detach` to avoid computing
             // the backprop graph of the backprop itself. This would be an issue for second order
             // derivatives but these are out of scope at the moment.
-            let do_not_detach = CANDLE_GRAD_DO_NOT_DETACH.with(|b| *b);
-            let grad = if do_not_detach { grad } else { grad.detach() };
+            let grad = grad.detach();
             if let Some(op) = node.op() {
                 match op {
                     Op::Binary(lhs, rhs, BinaryOp::Add) => {

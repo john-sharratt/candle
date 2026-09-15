@@ -1228,7 +1228,7 @@ impl ChunkedKvBacking {
     /// commit made outside the decode kernel — see
     /// [`super::types::SequenceState::refresh_decode_writer_slice`]. Every
     /// slice from the writer boundary to the writer is re-serialised in place,
-    /// O(chunks the commit wrote) per sequence per layer; sequences with no
+    /// one upload, O(chunks the commit wrote) per sequence per layer; sequences with no
     /// cached buffer (never decoded, or cleared by a chunk-boundary append)
     /// rebuild fully on the next decode sync instead.
     pub fn refresh_decode_writer_slice(&self, batch_entries: &[(usize, usize)]) -> Result<()> {
@@ -1240,8 +1240,8 @@ impl ChunkedKvBacking {
             .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
         // Only the writer regions' arenas. The patch re-serialises the chunks
         // from each sequence's writer boundary to its writer, and it runs per
-        // layer on every commit made outside the decode kernel — a verify block
-        // among them — so a resolve of every arena there is would be paid
+        // layer on every commit made outside the decode kernel — a verify
+        // block among them — so a resolve of every arena there is would be paid
         // ~layers × sequences times a step for pointers nothing reads. Taken
         // under the state lock, so the region cannot change between naming its
         // arenas and serialising it.

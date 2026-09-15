@@ -89,8 +89,7 @@ use candle::{Device, Result};
 /// rather than discovered when an overflow arena appears.
 /// The stager's default arena, mirroring `DEFAULT_ARENA_SIZE` in
 /// `candle-core/src/quantized/pinned_staging.rs`. The budget assert compares
-/// against it; `CANDLE_ARENA_MB` can only raise it, so the check stays
-/// conservative.
+/// against it.
 pub const STAGER_ARENA_BYTES: usize = 128 * 1024 * 1024;
 
 /// Descriptor word size. Pointer tables are `i64`; the count/offset tables are

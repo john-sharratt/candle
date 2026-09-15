@@ -6774,10 +6774,9 @@ fn q5q6q8_ko_match_k_int8() -> Result<()> {
     Ok(())
 }
 
-/// Finer-grained M scan for the mode-1 / mode-2 crossover (Q4_KO). Reports the activation
-/// element count (M·K), the weight count (N·K), their ratio (= M/N), and the i8KO time.
-/// Run twice — env KO_M2 unset (mode-1) and KO_M2=1 (mode-2) — and compare the i8KO columns
-/// to locate the M where mode-2 overtakes mode-1.
+/// Finer-grained M scan of the Q4_KO int8 matmul. Reports the activation element count
+/// (M·K), the weight count (N·K), their ratio (= M/N), and the i8KO time, so the M where
+/// the kernel turns from weight-bound to activation-bound reads off the table.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore]
@@ -6795,12 +6794,7 @@ fn q4_crossover_scan() -> Result<()> {
     let stream = dev.cuda_stream();
     let (ko_ptr, _g) = ko_slice.device_ptr(&stream);
     let weight_count = nrows * ncols;
-    let mode = if std::env::var("KO_M2").is_ok() {
-        "MODE-2"
-    } else {
-        "MODE-1"
-    };
-    println!("=== Q4 crossover scan [{mode}] N={nrows} K={ncols} weight_count={weight_count} ===");
+    println!("=== Q4 crossover scan N={nrows} K={ncols} weight_count={weight_count} ===");
     println!("     M    act_count   act/wt   i8KO(ms)   i8KO-tok/s");
     for &m in &[
         16usize, 24, 32, 48, 64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 1024,

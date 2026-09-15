@@ -3,22 +3,35 @@
 //! fixture, so the attention kernel can be replayed in isolation in a unit test
 //! (kernel-optimization work + a perf regression guard).
 //!
-//! Entirely gated behind `ZEND_PREFILL_CAPTURE=<path>`: a no-op unless that env
-//! var is set, and then it dumps exactly ONE call (the first whose summed
-//! `kv_len` exceeds `ZEND_PREFILL_CAPTURE_MIN_KV`, default 20000) per process.
-//! CUDA-only — the kernel and the KV gather are CUDA paths.
+//! The capture itself is behind the **`prefill-capture`** feature and compiles
+//! to nothing without it. With it, the process dumps exactly ONE call — the
+//! first whose summed `kv_len` reaches [`CAPTURE_MIN_KV`] — to
+//! [`CAPTURE_PATH`]. The fixture types are always built: the replay test and the
+//! trim tool read them.
 //!
 //! What is NOT captured (regenerated on replay, never round-tripped): GPU
 //! pointers, slot headers, slices, resident `meta` records.
 //! `build_slot_headers` rebuilds those from the chunk state every call.
 
-#[cfg(feature = "cuda")]
-use candle::{DType, Device, Result, Tensor};
-#[cfg(feature = "cuda")]
+#[cfg(feature = "prefill-capture")]
+use candle::{DType, Device, LiveTensor, Result, Tensor};
+#[cfg(feature = "prefill-capture")]
 use candle_nn::kv_cache::KvCache;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "cuda")]
+#[cfg(feature = "prefill-capture")]
+use std::path::Path;
+#[cfg(feature = "prefill-capture")]
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Where a `prefill-capture` build writes its fixture: the workspace's
+/// `target/`, beside the build that produced it.
+pub const CAPTURE_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../target/prefill_capture.bin");
+
+/// The summed `kv_len` a call must reach before it is captured. Early calls
+/// attend short prefixes and exercise little of the kernel; the first call past
+/// this is one with a long cached history per slot.
+pub const CAPTURE_MIN_KV: usize = 20_000;
 
 /// One sealed chunk's portable host data (mirror of `candle_nn`'s
 /// `HostSealedChunk`, with serde). `kv_bytes` is the raw (possibly quantized)
@@ -108,10 +121,10 @@ impl PrefillCapture {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "prefill-capture")]
 static CAPTURED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "prefill-capture")]
 fn dtype_tag(dt: DType) -> u8 {
     match dt {
         DType::F16 => 1,
@@ -120,22 +133,22 @@ fn dtype_tag(dt: DType) -> u8 {
     }
 }
 
-#[cfg(feature = "cuda")]
-fn tensor_f32(t: &candle::LiveTensor<'_>) -> Result<Vec<f32>> {
+#[cfg(feature = "prefill-capture")]
+fn tensor_f32(t: &LiveTensor<'_>) -> Result<Vec<f32>> {
     t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
 }
 
-/// If `ZEND_PREFILL_CAPTURE=<path>` is set and this call's summed `kv_len`
-/// exceeds the threshold, serialize it to `<path>` (once per process) via
-/// bincode. No-op otherwise — cheap env check on the hot path when disabled.
-#[cfg(feature = "cuda")]
+/// Serialize this call to [`CAPTURE_PATH`] via bincode if its summed `kv_len`
+/// reaches [`CAPTURE_MIN_KV`] and no call in this process has been captured yet.
+/// The per-layer hook fires many times; exactly one layer of one call is kept.
+#[cfg(feature = "prefill-capture")]
 #[allow(clippy::too_many_arguments)]
 pub fn maybe_capture(
     caches: &[&mut KvCache],
     offsets: &[usize],
-    q_packed: &candle::LiveTensor<'_>,
-    k_packed: &candle::LiveTensor<'_>,
-    v_packed: &candle::LiveTensor<'_>,
+    q_packed: &LiveTensor<'_>,
+    k_packed: &LiveTensor<'_>,
+    v_packed: &LiveTensor<'_>,
     q_lens: &[usize],
     n_head: usize,
     n_kv_head: usize,
@@ -144,33 +157,24 @@ pub fn maybe_capture(
     rope_cs: &Tensor,
     rope_interleaved: bool,
 ) {
-    let path = match std::env::var("ZEND_PREFILL_CAPTURE") {
-        Ok(p) if !p.is_empty() => p,
-        _ => return,
-    };
     if CAPTURED.load(Ordering::Relaxed) {
         return;
     }
-    let min_kv: usize = std::env::var("ZEND_PREFILL_CAPTURE_MIN_KV")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20_000);
     let sum_kv: usize = offsets
         .iter()
         .zip(q_lens.iter())
         .map(|(&o, &l)| o + l)
         .sum();
-    if sum_kv < min_kv {
+    if sum_kv < CAPTURE_MIN_KV {
         return;
     }
     // Claim the single capture slot; only the first winner past the threshold
-    // proceeds (the per-layer hook fires many times — we want one layer).
+    // proceeds.
     if CAPTURED.swap(true, Ordering::SeqCst) {
         return;
     }
 
     match build_and_write(
-        &path,
         caches,
         offsets,
         q_packed,
@@ -186,7 +190,7 @@ pub fn maybe_capture(
     ) {
         Ok(bytes) => tracing::info!(
             target: "candle_transformers::prefill_capture",
-            path = %path,
+            path = CAPTURE_PATH,
             sum_kv,
             seqs = caches.len(),
             bytes,
@@ -199,15 +203,14 @@ pub fn maybe_capture(
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "prefill-capture")]
 #[allow(clippy::too_many_arguments)]
 fn build_and_write(
-    path: &str,
     caches: &[&mut KvCache],
     offsets: &[usize],
-    q_packed: &candle::LiveTensor<'_>,
-    k_packed: &candle::LiveTensor<'_>,
-    v_packed: &candle::LiveTensor<'_>,
+    q_packed: &LiveTensor<'_>,
+    k_packed: &LiveTensor<'_>,
+    v_packed: &LiveTensor<'_>,
     q_lens: &[usize],
     n_head: usize,
     n_kv_head: usize,
@@ -266,6 +269,13 @@ fn build_and_write(
 
     let bytes =
         bincode::serialize(&cap).map_err(|e| candle::Error::Msg(format!("bincode: {e}")))?;
-    std::fs::write(path, &bytes).map_err(|e| candle::Error::Msg(format!("write {path}: {e}")))?;
+    // A build with its target directory elsewhere has no `target/` here yet,
+    // and a failed write spends the process's one capture.
+    if let Some(dir) = Path::new(CAPTURE_PATH).parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| candle::Error::Msg(format!("create {}: {e}", dir.display())))?;
+    }
+    std::fs::write(CAPTURE_PATH, &bytes)
+        .map_err(|e| candle::Error::Msg(format!("write {CAPTURE_PATH}: {e}")))?;
     Ok(bytes.len())
 }

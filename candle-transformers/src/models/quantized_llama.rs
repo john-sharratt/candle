@@ -2105,7 +2105,7 @@ mod tests {
             // C9/C10 use CoherenceCheck: at ~4.3–5.6× CR (8dB) the exact-match
             // story rewrite exceeds the formats' information budget even with
             // reference FP16 weights (measured: C9 6/10, C10 1/5 sessions at
-            // INT8MODE=off) — the compress-tier trade-off, not a defect.
+            // `Int8Mode::Off`) — the compress-tier trade-off, not a defect.
             // Coherence still catches broken quantized reads (garbage output).
             // C9: K=[Q3_0,Q2_0] V=[Q3_0,Q2_0] — ~5.62× CR, 8dB
             TestConfig {
@@ -2137,12 +2137,7 @@ mod tests {
         // Measured on this file's Llama-3.2-3B checkpoint: Performance's same-width KO twin
         // alone flips C6–C8 StoryRewrite (C8 6/10 vs 10/10 at Precision, which
         // matches the FP16 reference).
-        let int8mode = match std::env::var("INT8MODE").ok().as_deref() {
-            Some("off") => candle::quantized::Int8Mode::Off,
-            Some("prec") | Some("precision") => candle::quantized::Int8Mode::Precision,
-            Some("perf") | Some("performance") => candle::quantized::Int8Mode::Performance,
-            _ => candle::quantized::Int8Mode::auto(&device),
-        };
+        let int8mode = Int8Mode::auto(&device);
         println!(
             "int8 mode = {int8mode:?}
 "
@@ -2391,11 +2386,7 @@ mod tests {
 
         // Sequential (non-batched) callbacks - access inner model via .model()
         // Load the model wrapped in BatchedInference with proper inv_freq
-        let int8mode = match std::env::var("INT8MODE").ok().as_deref() {
-            Some("off") => candle::quantized::Int8Mode::Off,
-            Some("prec") | Some("precision") => candle::quantized::Int8Mode::Precision,
-            _ => candle::quantized::Int8Mode::Performance,
-        };
+        let int8mode = Int8Mode::Performance;
         println!(
             "int8 mode = {int8mode:?}
 "

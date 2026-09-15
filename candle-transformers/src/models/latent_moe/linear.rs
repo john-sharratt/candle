@@ -129,7 +129,7 @@ impl QLinear {
             Self::Dense(t) => t.device().clone(),
             Self::Quant(q) | Self::Int8(q) => match q {
                 QMatMul::QTensor(qt) => qt.device(),
-                QMatMul::Tensor(t) | QMatMul::TensorF16(t) => t.device().clone(),
+                QMatMul::Tensor(t) => t.device().clone(),
             },
         }
     }
@@ -141,7 +141,7 @@ impl QLinear {
             Self::Dense(t) => t.dims().to_vec(),
             Self::Quant(q) | Self::Int8(q) => match q {
                 QMatMul::QTensor(qt) => qt.shape().dims().to_vec(),
-                QMatMul::Tensor(t) | QMatMul::TensorF16(t) => t.dims().to_vec(),
+                QMatMul::Tensor(t) => t.dims().to_vec(),
             },
         };
         dims[dims.len() - 1]

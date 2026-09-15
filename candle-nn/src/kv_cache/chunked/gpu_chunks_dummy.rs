@@ -59,6 +59,11 @@ impl GpuChunks {
         0
     }
 
+    /// Always 0: nothing is serialised, so no writer was serialised for.
+    pub(crate) fn writer_idx(&self) -> usize {
+        0
+    }
+
     /// Empty, because the stub serialises nothing and so references no chunks.
     /// A consumer holding this across a launch is holding nothing, which is
     /// correct: without the feature there is no launch to outlive.
@@ -96,6 +101,8 @@ impl GpuChunksGuard<'_> {
     }
 
     pub(crate) fn clear(&mut self) {}
+
+    pub(crate) fn set_writer_idx(&mut self, _writer_idx: usize) {}
 
     pub(crate) fn rebuild_decode(
         &mut self,

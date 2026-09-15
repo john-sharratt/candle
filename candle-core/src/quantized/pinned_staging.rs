@@ -587,18 +587,9 @@ impl PinnedStagerInner {
 }
 
 impl PinnedStager {
-    /// Returns the arena size to use: `CANDLE_ARENA_MB` env-var override, else 128 MB.
-    fn effective_arena_size() -> usize {
-        std::env::var("CANDLE_ARENA_MB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|mb| mb * 1024 * 1024)
-            .unwrap_or(DEFAULT_ARENA_SIZE)
-    }
-
-    /// Create a new stager with the default 128 MB arena (or `CANDLE_ARENA_MB` override).
+    /// Create a new stager with the default 128 MB arena.
     pub fn new(dev: &CudaDevice) -> Self {
-        Self::with_arena_size(dev, Self::effective_arena_size())
+        Self::with_arena_size(dev, DEFAULT_ARENA_SIZE)
     }
 
     /// Create a new stager from a generic [`Device`].

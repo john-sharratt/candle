@@ -73,6 +73,30 @@ pub(super) fn writer_disagreement(
     })
 }
 
+/// The first chunk after the writer that holds tokens, as `(chunk, usage)` —
+/// `None` when every chunk past the writer is empty, as it must be.
+///
+/// The kernels end every position lookup at the write slice: the chunks after
+/// it are write capacity, and nothing keeps their `rope` current once the
+/// device commits into the writer. A token committed past the writer is
+/// therefore invisible to every read — attended by nothing, and counted by the
+/// host all the same. `set_len` fills in order from the writer boundary and
+/// the chunk-placing paths move the boundary past what they place, so this is
+/// the layout every path produces; the audit is what makes it a checked fact.
+pub(super) fn committed_past_writer(seq: &SequenceState) -> Option<(usize, usize)> {
+    let chunks = seq.chunks_slice();
+    if chunks.is_empty() {
+        return None;
+    }
+    let writer = seq.decode_write_chunk_idx();
+    chunks
+        .iter()
+        .enumerate()
+        .skip(writer + 1)
+        .find(|(_, c)| c.usage > 0)
+        .map(|(i, c)| (i, c.usage as usize))
+}
+
 /// Whether the `n`th disagreement is logged: all of the first
 /// [`REPORTED_IN_FULL`], then each power of two, so a skew that persists for
 /// thousands of steps reads as one finding with a count rather than a flood.
@@ -83,6 +107,24 @@ fn logs(n: usize) -> bool {
 /// Check `seq` as a live row of `layer` at `seq_offset`, and report it if its
 /// header would misdescribe the writer chunk.
 pub(super) fn audit(layer: usize, seq_idx: usize, seq_offset: usize, seq: &SequenceState) {
+    if let Some((chunk, usage)) = committed_past_writer(seq) {
+        let n = REPORTS.fetch_add(1, Ordering::Relaxed) + 1;
+        if logs(n) {
+            tracing::error!(
+                target: "candle_nn::kv_cache::writer_len",
+                layer,
+                seq = seq_idx,
+                seq_offset,
+                writer = seq.decode_write_chunk_idx(),
+                chunk,
+                usage,
+                occurrence = n,
+                "chunk {chunk} holds {usage} tokens past writer chunk {}: every kernel ends its \
+                 position lookups at the write slice, so those tokens are counted and never read",
+                seq.decode_write_chunk_idx()
+            );
+        }
+    }
     let Some(d) = writer_disagreement(seq, seq_offset) else {
         return;
     };
@@ -121,7 +163,9 @@ pub(super) fn audit(layer: usize, seq_idx: usize, seq_offset: usize, seq: &Seque
 mod tests {
     use std::sync::Arc;
 
-    use super::{logs, writer_disagreement, WriterDisagreement, REPORTED_IN_FULL};
+    use super::{
+        committed_past_writer, logs, writer_disagreement, WriterDisagreement, REPORTED_IN_FULL,
+    };
     use crate::kv_cache::chunked::types::SequenceState;
     use crate::kv_cache::chunked::{ChunkGid, ChunkWindow, HeadGids};
 
@@ -211,6 +255,29 @@ mod tests {
     #[test]
     fn an_empty_layer_has_nothing_to_misdescribe() {
         assert_eq!(writer_disagreement(&layer(&[], 0), 5), None);
+    }
+
+    /// Claimed chunks after the writer, all empty: the layout every path makes.
+    #[test]
+    fn empty_chunks_after_the_writer_are_capacity() {
+        assert_eq!(committed_past_writer(&layer(&[32, 10, 0, 0], 0)), None);
+        assert_eq!(committed_past_writer(&layer(&[], 0)), None);
+    }
+
+    /// Tokens past a non-full writer: counted by the host, read by nothing.
+    #[test]
+    fn a_token_past_the_writer_is_reported_with_its_chunk() {
+        assert_eq!(
+            committed_past_writer(&layer(&[32, 10, 0, 4], 0)),
+            Some((3, 4))
+        );
+    }
+
+    /// A sealed partial below the writer boundary is history, not past the
+    /// writer: the writer is found beyond it.
+    #[test]
+    fn a_sealed_partial_below_the_boundary_is_not_past_the_writer() {
+        assert_eq!(committed_past_writer(&layer(&[10, 0, 31], 2)), None);
     }
 
     #[test]

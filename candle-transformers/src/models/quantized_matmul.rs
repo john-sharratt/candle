@@ -1,6 +1,6 @@
 #[cfg(feature = "cuda")]
 use candle::quantized::ko_quant::ko_tileable;
-use candle::quantized::{GgmlDType, Int8Mode, QTensor, SumScale};
+use candle::quantized::{GgmlDType, Int8Mode, QMatMul as CoreQMatMul, QTensor, SumScale};
 use candle::{DType, Module, Result, Tensor};
 
 use crate::models::profile::{pipeline_record, profile_now};
@@ -91,14 +91,14 @@ pub enum WeightResidency {
 ///   so [`Self::int8mode`] — not the mode the caller asked for — is what a consumer must dispatch
 ///   on.
 /// - [`Int8Mode::Off`] and CPU/Metal: standard GGML kernels. Off is the
-///   diagnostic mode (`INT8MODE=off`) — correctness over speed; the FP-GEMX
+///   diagnostic mode — correctness over speed; the FP-GEMX
 ///   fast path it used to take was deleted when production went int8-only
 ///   (nothing but Off-mode runs exercised it, and it had rotted to NaN).
 /// - For BF16/F16 inputs, casts through F32 for the standard kernels and restores the dtype.
 /// - For rank-3 inputs, flattens (B,S,K) -> (B*S,K) to avoid broadcasting weights.
 #[derive(Clone)]
 pub struct QMatMul {
-    inner: candle::quantized::QMatMul,
+    inner: CoreQMatMul,
     span: tracing::Span,
     /// Numeric mode of this weight: `Off` → standard path; an int8 mode → the weight is
     /// the KO twin and forward runs the q8a128 int8 tensor-core matmul.
@@ -214,7 +214,7 @@ impl QMatMul {
             // `from_qtensor_view` states.
             if ws.dtype().is_ko() {
                 return Ok(Self {
-                    inner: candle::quantized::QMatMul::from_arc(ws)?,
+                    inner: CoreQMatMul::from_arc(ws)?,
                     span,
                     int8mode: mode,
                     sum_scale: SumScale::Raw,
@@ -282,7 +282,7 @@ impl QMatMul {
                 // a QTensor" for exactly the sources `repackable_to_ko` had just promised it
                 // could take. The twin is what the matmul wants anyway.
                 let twin = src.repack_ko(mode, dst, narrow)?;
-                let inner = candle::quantized::QMatMul::from_qtensor(twin)?;
+                let inner = CoreQMatMul::from_qtensor(twin)?;
                 return Ok(Self {
                     inner,
                     span,
@@ -295,7 +295,7 @@ impl QMatMul {
                 dtype = ?ws.dtype(),
                 "int8: weight does not fit the KO matmul tiling — dense fallback for this tensor"
             );
-            let inner = candle::quantized::QMatMul::from_arc(ws)?;
+            let inner = CoreQMatMul::from_arc(ws)?;
             return Ok(Self {
                 inner,
                 span,
@@ -305,7 +305,7 @@ impl QMatMul {
         }
 
         // Off (or non-CUDA): the standard GGML path, unmodified weights.
-        let inner = candle::quantized::QMatMul::from_arc(ws)?;
+        let inner = CoreQMatMul::from_arc(ws)?;
         Ok(Self {
             inner,
             span,
@@ -350,7 +350,7 @@ impl QMatMul {
             );
         }
         Ok(Self {
-            inner: candle::quantized::QMatMul::from_qtensor(view)?,
+            inner: CoreQMatMul::from_qtensor(view)?,
             span: tracing::span!(tracing::Level::TRACE, "qmatmul"),
             int8mode,
             sum_scale: SumScale::Raw,
@@ -374,7 +374,7 @@ impl QMatMul {
                  K/128 form has no kernel any more (deleted with the float fast path)"
             );
         }
-        let inner = candle::quantized::QMatMul::from_qtensor(repacked)?;
+        let inner = CoreQMatMul::from_qtensor(repacked)?;
 
         Ok(Self {
             inner,
@@ -393,14 +393,12 @@ impl QMatMul {
     /// whereas a separately-stored copy of the same number can.
     pub fn weight_dims(&self) -> Vec<usize> {
         match &self.inner {
-            candle::quantized::QMatMul::QTensor(qt) => qt.shape().dims().to_vec(),
-            candle::quantized::QMatMul::Tensor(t) | candle::quantized::QMatMul::TensorF16(t) => {
-                t.dims().to_vec()
-            }
+            CoreQMatMul::QTensor(qt) => qt.shape().dims().to_vec(),
+            CoreQMatMul::Tensor(t) => t.dims().to_vec(),
         }
     }
 
-    pub fn inner(&self) -> &candle::quantized::QMatMul {
+    pub fn inner(&self) -> &CoreQMatMul {
         &self.inner
     }
 
@@ -449,15 +447,14 @@ impl QMatMul {
     /// This is primarily for testing/validation.
     pub fn dequantize(&self) -> Result<Tensor> {
         match &self.inner {
-            candle::quantized::QMatMul::QTensor(qt) => qt.dequantize(&qt.device()),
-            candle::quantized::QMatMul::Tensor(t) => Ok(t.clone()),
-            candle::quantized::QMatMul::TensorF16(t) => t.to_dtype(DType::F32),
+            CoreQMatMul::QTensor(qt) => qt.dequantize(&qt.device()),
+            CoreQMatMul::Tensor(t) => Ok(t.clone()),
         }
     }
 }
 
 impl QMatMul {
-    /// As [`candle::quantized::QMatMul::forward_live`]: accepts a wave-scoped
+    /// As [`CoreQMatMul::forward_live`]: accepts a wave-scoped
     /// activation and returns a result bounded by the same generation, because
     /// the output is allocated from whichever arena `xs` came from. The
     /// `Module` impl below is this at `'static`, where the bound is vacuous.

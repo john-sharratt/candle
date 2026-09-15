@@ -45,6 +45,21 @@ fn write_outside_decode(cache: &mut KvCache, dev: &Device, offset: usize, n: usi
 /// decode metadata build does (ensure the write chunk, then reuse or rebuild),
 /// and return every slice's `len` as the device holds it.
 fn device_lens(dev: &Device, backing: &ChunkedKvBacking, seq: usize, offset: usize) -> Vec<u16> {
+    device_slices(dev, backing, seq, offset)
+        .into_iter()
+        .map(|(len, _)| len)
+        .collect()
+}
+
+/// [`device_lens`] with each slice's `rope` beside its `len` — the cumulative
+/// position of the chunk's first token, which is how the kernel knows where a
+/// slice sits in the sequence.
+fn device_slices(
+    dev: &Device,
+    backing: &ChunkedKvBacking,
+    seq: usize,
+    offset: usize,
+) -> Vec<(u16, u32)> {
     backing.ensure_for_offset(seq, offset, 1).unwrap();
     let info = backing.resolve_arena_info().unwrap();
     let (ptrs, _, _) = backing
@@ -63,8 +78,79 @@ fn device_lens(dev: &Device, backing: &ChunkedKvBacking, seq: usize, offset: usi
     // A borrow of the buffer, not an owner: dropping it would free the slot.
     std::mem::forget(view);
     host.chunks_exact(SLICE_BYTES)
-        .map(|s| u16::from_le_bytes([s[2], s[3]]))
+        .map(|s| {
+            (
+                u16::from_le_bytes([s[2], s[3]]),
+                u32::from_le_bytes([s[4], s[5], s[6], s[7]]),
+            )
+        })
         .collect()
+}
+
+/// A decode that fills the writer and moves into a chunk claimed before the
+/// buffer was serialised: nothing is pushed, so the buffer is reused, and the
+/// new write slice must count every token of the chunk it left.
+///
+/// The kernel's committed total is where the write slice ends, `rope + len`.
+/// The device keeps only the writer's `len` current; the next writer's `rope`
+/// is whatever it was serialised as. A stale one — 30, where the host holds
+/// 32 — puts the next write two slots past where the host commits it, and
+/// those two positions read unwritten.
+#[test]
+fn a_writer_that_moves_into_a_claimed_chunk_is_reserialised() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    // Room for a 70-token prompt, claimed before the first pass: three chunks.
+    KvCache::ensure_chunked_capacity_batch(&mut [&mut cache], &[0], 70).unwrap();
+    write_outside_decode(&mut cache, &dev, 0, 30);
+    assert_eq!(
+        device_slices(&dev, &backing, seq, 30),
+        vec![(30, 0), (0, 30), (0, 30)],
+        "the first sync builds the buffer from the host state"
+    );
+
+    // Two decode steps, committed on the host as the driver does after each.
+    cache.set_current_seq_len(31).unwrap();
+    cache.set_current_seq_len(32).unwrap();
+    assert_eq!(
+        device_slices(&dev, &backing, seq, 32)[..2],
+        [(32, 0), (0, 32)],
+        "the writer moved to chunk 1: its rope must count chunk 0's 32 tokens"
+    );
+}
+
+/// A commit that crosses into a claimed chunk with another still trailing:
+/// both chunks it filled read their true lengths, and the new write slice
+/// ends at the committed total.
+#[test]
+fn a_commit_that_crosses_into_a_claimed_chunk_ends_the_write_slice_at_the_total() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    KvCache::ensure_chunked_capacity_batch(&mut [&mut cache], &[0], 70).unwrap();
+    write_outside_decode(&mut cache, &dev, 0, 10);
+    assert_eq!(device_slices(&dev, &backing, seq, 10)[0], (10, 0));
+
+    write_outside_decode(&mut cache, &dev, 10, 30);
+    assert_eq!(
+        device_slices(&dev, &backing, seq, 40)[..2],
+        [(32, 0), (8, 32)],
+        "chunk 0 filled on the way and chunk 1 holds the rest: 32 + 8 = 40"
+    );
+
+    // Decode steps fill chunk 1 and move the writer into claimed chunk 2 on
+    // the reused buffer.
+    for len in 41..=64 {
+        cache.set_current_seq_len(len).unwrap();
+    }
+    assert_eq!(
+        device_slices(&dev, &backing, seq, 64)[..3],
+        [(32, 0), (32, 32), (0, 64)],
+        "the writer moved to chunk 2: chunk 1 reads full and chunk 2 starts at 64"
+    );
 }
 
 /// A block that fits the writer chunk: the reused buffer's writer length must

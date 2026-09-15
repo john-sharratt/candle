@@ -801,8 +801,9 @@ fn migrate_group_hot_to_warm(
         // arenas, and appends every layer's per-(chunk, head) descriptors to
         // `all_descs` WITHOUT launching the convert. Returned sequences already
         // point at the (soon-to-be-filled) dst arenas. Partial trailing chunks
-        // quantize too (dead slots are zero; the packed valid-range window keeps
-        // amax correct); already-quant chunks pass through the preserve bucket.
+        // quantize too (the kernels read every slot outside the packed
+        // valid-range window as zero, whatever the recycled ground held);
+        // already-quant chunks pass through the preserve bucket.
         // Bit-identical to the per-layer selection — see the compress-test A/B.
         let t_q = std::time::Instant::now();
         match policy {

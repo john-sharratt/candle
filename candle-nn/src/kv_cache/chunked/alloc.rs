@@ -8,7 +8,6 @@
 
 use std::cmp;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
 use std::time::Instant;
 
 #[cfg(feature = "cuda")]
@@ -100,12 +99,13 @@ pub fn vram_budget_available(_device: &Device) -> Option<usize> {
     None
 }
 
-static ARENA_STATS_ENABLED: OnceLock<bool> = OnceLock::new();
 static ARENA_CREATE_COUNT: AtomicU64 = AtomicU64::new(0);
 static ARENA_CREATE_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 
-pub(super) fn arena_stats_enabled() -> bool {
-    *ARENA_STATS_ENABLED.get_or_init(|| std::env::var("KV_ARENA_STATS").is_ok())
+/// Whether the allocator prints its `[arena-create]` / `[class-promote]` /
+/// `[recycle]` lines: the `arena-stats` feature, folded at compile time.
+pub(super) const fn arena_stats_enabled() -> bool {
+    cfg!(feature = "arena-stats")
 }
 
 fn record_arena_create(kind: &str, location: ArenaLocation, index: usize, elapsed_ns: u64) {
@@ -124,7 +124,7 @@ fn record_arena_create(kind: &str, location: ArenaLocation, index: usize, elapse
 
 static CLASS_PROMOTIONS: AtomicU64 = AtomicU64::new(0);
 
-/// Count a scarcity promotion and, under `KV_ARENA_STATS`, name it.
+/// Count a scarcity promotion and, under `arena-stats`, name it.
 ///
 /// Worth its own counter rather than folding into the arena-create line: a
 /// promotion is the allocator reporting that a class could not get a region,
@@ -676,11 +676,13 @@ impl ChunkedKvBacking {
                 arena_state.push_arena(arena, arena_idx);
             } else {
                 // Free-list reuse on an existing arena: the chunk's bytes are
-                // whatever the prior tenant left. Zero them so the new tenant
-                // (and any persist quantize pass that reads past token_count)
-                // sees clean storage. Fresh arenas are already zero from
-                // `Tensor::zeros` at creation, so the arena_was_fresh branch
-                // above skips the work.
+                // whatever the prior tenant left, and this path zeroes them.
+                // It is the only claim path that does: run claims, the
+                // scattered fallback and a fresh GPU arena (a leased span
+                // region, never cleared) all hand out ground as it stood. So
+                // no reader may treat a slot past a chunk's token window as
+                // zero — the quantize kernels read it as zero themselves
+                // (`PalHeadDesc::valid_range`).
                 self.zero_recycled_chunk(arena_state, arena_idx, gid.chunk_idx())?;
             }
             return Ok(gid);
@@ -1130,6 +1132,14 @@ impl BackingInner {
     ///
     /// Claims are poisoned whatever their provenance — recycled *and* virgin —
     /// so the test does not depend on knowing which a given slot was.
+    ///
+    /// **NaN is loud only to a reader that propagates it.** A max-reduction
+    /// does not: `fmaxf(x, NaN)` is `x`, so an amax, a scale or a histogram
+    /// range taken over poisoned slots comes out as though the slots were
+    /// absent, while the same read over a stale inf — which `fmaxf` keeps —
+    /// fails. A reduction that reads unwritten ground therefore passes under
+    /// this build and fails in production, so a fault seen only in production
+    /// is worth one run with this poison disabled.
     ///
     /// **This is not made redundant by the allocator-level poison in
     /// `CudaDevice::alloc`.** That one fires when a *device buffer* is handed

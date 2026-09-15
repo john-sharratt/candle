@@ -99,6 +99,16 @@ pub(crate) struct GpuChunks {
     /// which is the per-32-token pipeline stall audit A13 removed. An event
     /// waits for exactly the copy and lets the rest of the stream run.
     upload_done: Option<CudaEvent>,
+    /// The writer chunk the buffer's slices were last serialised for.
+    ///
+    /// Every slice up to the writer carries a `rope` computed from the host's
+    /// usages at that moment, and the device keeps only the writer's `len`
+    /// current after it. A decode that fills the writer and moves into a chunk
+    /// claimed before that moment finds the buffer reused, not rebuilt — no
+    /// chunk was pushed — and the new writer's rope still counts the old
+    /// writer at its serialised length. The decode sync compares this with the
+    /// host's writer and re-serialises the writer region when they differ.
+    writer_idx: usize,
 }
 
 /// A records-section copy living in a stager generation's arena.
@@ -136,6 +146,7 @@ impl GpuChunks {
             n_chunks: 0,
             pins: Arc::new(Vec::new()),
             upload_done: None,
+            writer_idx: 0,
         }
     }
 
@@ -143,6 +154,12 @@ impl GpuChunks {
     /// its launch. One refcount bump — see [`Self::pins`].
     pub(crate) fn pins(&self) -> Arc<Vec<HeadGids>> {
         Arc::clone(&self.pins)
+    }
+
+    /// The writer chunk the slices were last serialised for — see
+    /// [`Self::writer_idx`].
+    pub(crate) fn writer_idx(&self) -> usize {
+        self.writer_idx
     }
 
     /// Retire any `memcpy_htod_async` still reading [`Self::buf`] or still
@@ -617,6 +634,7 @@ impl GpuChunksGuard<'_> {
         }
         self.dirty_chunks.clear();
         let n = chunks.len();
+        self.inner.writer_idx = write_idx;
         // Pin what this pass is about to reference. A fresh vector, never a
         // mutation of the old one: a launch reading the previous serialisation
         // still holds that one and must keep ITS arenas, not these.
@@ -707,6 +725,12 @@ impl GpuChunksGuard<'_> {
         // reading the bytes holds its own reference to the same vector, so the
         // arenas it addresses stay alive until it drops.
         self.inner.pins = Arc::new(Vec::new());
+        self.inner.writer_idx = 0;
+    }
+
+    /// Record the writer chunk the writer region was just re-serialised for.
+    pub(crate) fn set_writer_idx(&mut self, writer_idx: usize) {
+        self.inner.writer_idx = writer_idx;
     }
 }
 
@@ -732,6 +756,7 @@ impl Drop for GpuChunksGuard<'_> {
             pins: _,
             // Set below, once the copies this scope enqueues are in flight.
             upload_done: _,
+            writer_idx: _,
         } = &mut *self.inner;
         let chunk_byte_size = *chunk_byte_size;
         let n_chunks = *n_chunks;
@@ -877,6 +902,7 @@ impl Clone for GpuChunks {
             pins: Arc::new(Vec::new()),
             // Nothing was copied into this one; it owns no buffer and no slot.
             upload_done: None,
+            writer_idx: 0,
         }
     }
 }

@@ -806,7 +806,8 @@ fn print_distribution(label: &str, values: &[f32], num_buckets: usize) {
 //   - One kernel run per dump source (Qwen3 / Llama have different n_kv_head)
 //   - K is uploaded as R16 (K f16 + Q f16 / block) so the kernel computes
 //     real per-block q-relevance and the IQR-standardised kthresh; V uploaded
-//     as F32. Both are dim-major transposed first.
+//     as F32 in the float arenas' token-major layout. K is transposed to
+//     R16's dim-major blocks first.
 //   - Candidate list: `[Q0, Q0_X, Q8_0]` for both K and V. Q8_0 is the
 //     high-quality escape — blocks that fall through to Q8_0 are the
 //     Q0_V-territory survivors.
@@ -923,7 +924,8 @@ fn kernel_drop_cheap_format_blocks(
         let n_chunks = source_chunks.len();
         let blocks_per_chunk = src_n_kv_head * head_dim;
 
-        // Upload all chunks as dim-major; K packed as R16 with Q.
+        // K (with Q) transposed to dim-major and packed as R16; V uploaded
+        // token-major, the layout the float arenas hold.
         let zero_q: Vec<f32> = vec![0.0; blocks_per_chunk * SELECT_BLOCK];
         struct Cg {
             k_gpu: candle::cuda_backend::cudarc::driver::CudaSlice<u8>,
@@ -933,7 +935,6 @@ fn kernel_drop_cheap_format_blocks(
             .iter()
             .map(|c| {
                 let k_dm = to_dim_major(&c.k, src_n_kv_head, blocks_per_chunk);
-                let v_dm = to_dim_major(&c.v, src_n_kv_head, blocks_per_chunk);
                 let q_dm = match &c.q {
                     Some(q) => to_dim_major(q, src_n_kv_head, blocks_per_chunk),
                     None => zero_q.clone(),
@@ -941,7 +942,7 @@ fn kernel_drop_cheap_format_blocks(
                 let k_r16 = pack_r16(&k_dm, &q_dm);
                 Cg {
                     k_gpu: dev.memcpy_stod(&k_r16).expect("upload k r16"),
-                    v_gpu: dev.memcpy_stod(&v_dm).expect("upload v"),
+                    v_gpu: dev.memcpy_stod(&c.v).expect("upload v"),
                 }
             })
             .collect();
@@ -1628,15 +1629,14 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
                                                          // as 4 contiguous band slots (gid chunk_idx = palette index).
         let band_chunk_stride = single_head_bytes / 4;
 
-        // Layout note: the dump stores chunks token-major (`[head, token, dim]`),
-        // but the selection kernel sees each block as 32 tokens of one channel
-        // within a (head, palette) sub-band. Reading the dump verbatim gives the
-        // kernel the *transposed* view (32 channels of one token), which makes
-        // every block look near-constant and biases the picker toward Q0. We
-        // transpose to dim-major before uploading using the same helper that
-        // `test_candidate_list_compression_curve` validates. The result for each
-        // chunk is `blocks_per_chunk = n_kv_head * head_dim` consecutive
-        // 32-element blocks in dim-major iteration order: head, palette, channel.
+        // Layout note: the dump stores chunks `[head, palette, token, dim]` —
+        // the float arenas' own token-major layout — and the selection kernel
+        // reads a float band that way, so V uploads verbatim. K goes into R16,
+        // whose blocks are one channel's 32 tokens, so K (and Q) are transposed
+        // to dim-major before packing, with the same helper that
+        // `test_candidate_list_compression_curve` validates: per chunk,
+        // `blocks_per_chunk = n_kv_head * head_dim` consecutive 32-element
+        // blocks in dim-major order — head, palette, channel.
         //
         // K-side additionally packs Q into the back half of each R16 block so the
         // kernel can compute real per-block q_relevance (and the IQR-standardised
@@ -1717,7 +1717,6 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
             .iter()
             .map(|c| {
                 let k_dim_major = to_dim_major(&c.k);
-                let v_dim_major = to_dim_major(&c.v);
                 let q_dim_major = match &c.q {
                     Some(q) => {
                         q_present_chunks += 1;
@@ -1731,12 +1730,12 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
                 let k_r16_bytes = pack_r16_blocks(&k_dim_major, &q_dim_major);
                 ChunkGpu {
                     k_gpu: dev.memcpy_stod(&k_r16_bytes).expect("upload k r16"),
-                    v_gpu: dev.memcpy_stod(&v_dim_major).expect("upload v"),
+                    v_gpu: dev.memcpy_stod(&c.v).expect("upload v"),
                 }
             })
             .collect();
         println!(
-            "  Uploaded {} chunks (dim-major: {} kv-heads × {} head_dim × 32 tokens) in {:.2}s",
+            "  Uploaded {} chunks (K dim-major R16, V token-major: {} kv-heads × {} head_dim × 32 tokens) in {:.2}s",
             chunk_gpus.len(),
             n_kv_head,
             head_dim,

@@ -404,10 +404,19 @@ template <int HD, bool IS_K>
 // __launch_bounds__(HD, p4c_min_blocks(HD)): 1024 resident threads/SM either
 // way, 64 regs/thread. smem is not the binding limit at either width
 // (~9 KB at 128, ~17.5 KB at 256 under the ~100 KB carveout).
-//   Achieved at 128: REG=64, STACK=128 B (verified with cuobjdump).
+//   Measured with `cuobjdump -res-usage`: REG=64 at both widths; STACK 96 B
+//   on sm_86 and sm_89, 136 B (HD 128) / 144 B (HD 256) on sm_120.
 __global__ void __launch_bounds__(HD, p4c_min_blocks(HD))
 palette4_convert_kernel(
     const uint8_t* __restrict__ heads_base,
+    // Per-job valid token window, packed `(offset << 8) | len` with len in
+    // [1, 32], indexed like the src KvHead (`layer * num_kv_heads + head`).
+    // It applies to every chunk the job converts. Tokens outside it are read
+    // as ZERO: a partial chunk's dead slots hold whatever the ground held
+    // before this chunk was claimed (recycled KV, another tenant's bytes), and
+    // a block's scale is taken over all 32 tokens, so one stale inf there
+    // would give the live tokens an inf scale and decode them as NaN.
+    const int32_t* __restrict__ valid_ranges,
     int32_t num_heads,
     int32_t num_kv_heads,
     int32_t num_chunks
@@ -455,7 +464,9 @@ palette4_convert_kernel(
         int      dst_fmt  [P4C_NUM_PAL];   //  16 B  — destination arena format id
         uint64_t dst_arena[P4C_NUM_PAL];   //  32 B  — destination arena base pointer
         float    dst_outer[P4C_NUM_PAL];   //  16 B  — destination outer (head) scale
-    } smem_meta;                            // 128 B
+        int      valid_lo;                 //   4 B  — first live token of the window
+        int      valid_hi;                 //   4 B  — one past the last live token
+    } smem_meta;                            // 136 B
 
     // Thread identity. `pal` (not the warp id) indexes every per-palette
     // structure; `pld` is the dim within the palette; `lane` keeps its two
@@ -516,6 +527,12 @@ palette4_convert_kernel(
                 smem_meta.src_outer[p] = kvhead_v_scale<HD>(src_head, p);
                 smem_meta.dst_outer[p] = kvhead_v_scale<HD>(dst_head, p);
             }
+        }
+        if (d == 0) {
+            const int vr  = __ldg(&valid_ranges[job]);
+            const int lo  = (vr >> 8) & 0xff;
+            smem_meta.valid_lo = lo;
+            smem_meta.valid_hi = lo + max(1, min(P4C_CHUNK_SIZE, vr & 0xff));
         }
         __syncthreads();  // smem_meta visible to all before xlat build reads it
 
@@ -663,15 +680,28 @@ palette4_convert_kernel(
     // copy_to_regs() MUST only be called immediately after a
     // cp.async.wait_group 0 + __syncthreads() pair, when smem_f16_buf is
     // fully settled and not being written by any in-flight DMA.
+    //
+    // Tokens outside the job's valid window enter r_buf as zero whatever the
+    // source bytes were (see `valid_ranges`), so the encode below — which
+    // takes each block's scale over all 32 tokens — sees exactly the zero
+    // padding the selection thresholds were calibrated on. A full chunk's
+    // window is [0, 32), which keeps every token.
     // =========================================================================
     half2 r_buf[16];
 
     auto copy_to_regs = [&]() {
         const uint8_t src_col = smem_xlat[d];  // pre-resolved gather index
+        const int     lo      = smem_meta.valid_lo;
+        const int     hi      = smem_meta.valid_hi;
+        const __half  zero    = __float2half(0.0f);
         #pragma unroll
-        for (int k = 0; k < 16; k++)
-            r_buf[k] = __halves2half2(smem_f16_buf[2*k    ][src_col],
-                                      smem_f16_buf[2*k + 1][src_col]);
+        for (int k = 0; k < 16; k++) {
+            const int t0 = 2 * k;
+            const int t1 = 2 * k + 1;
+            r_buf[k] = __halves2half2(
+                (t0 >= lo && t0 < hi) ? smem_f16_buf[t0][src_col] : zero,
+                (t1 >= lo && t1 < hi) ? smem_f16_buf[t1][src_col] : zero);
+        }
     };
 
     // =========================================================================
@@ -876,6 +906,7 @@ palette4_convert_kernel(
 
 extern "C" void run_quantize_palette4_convert(
     const uint8_t* heads_base,
+    const int32_t* valid_ranges,
     int32_t num_heads,
     int32_t num_kv_heads,
     int32_t num_layers,
@@ -907,14 +938,16 @@ extern "C" void run_quantize_palette4_convert(
                     cudaFuncAttributePreferredSharedMemoryCarveout,              \
                     cudaSharedmemCarveoutMaxShared);                             \
                 palette4_convert_kernel<HD, true><<<grid, block, 0, stream>>>(   \
-                    heads_base, num_heads, num_kv_heads, num_chunks);            \
+                    heads_base, valid_ranges, num_heads, num_kv_heads,           \
+                    num_chunks);                                                 \
             } else {                                                             \
                 cudaFuncSetAttribute(                                            \
                     palette4_convert_kernel<HD, false>,                          \
                     cudaFuncAttributePreferredSharedMemoryCarveout,              \
                     cudaSharedmemCarveoutMaxShared);                             \
                 palette4_convert_kernel<HD, false><<<grid, block, 0, stream>>>(  \
-                    heads_base, num_heads, num_kv_heads, num_chunks);            \
+                    heads_base, valid_ranges, num_heads, num_kv_heads,           \
+                    num_chunks);                                                 \
             }                                                                    \
         } while (0)
 

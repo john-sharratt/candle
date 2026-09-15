@@ -2816,16 +2816,9 @@ mod tests {
         use crate::models::batched_model::BatchedInference;
 
         // Inference numeric mode for the whole model — dense projections AND MoE experts (KO
-        // twins) — selected by the INT8MODE env var so a run picks a mode without recompiling.
-        // Defaults to Performance (same-width KO int8); override with "off" (FP16 reference) or
-        // "prec"/"precision" (stepped-up, near-lossless KO int8). One model load: switching mode
-        // means a fresh load, which is correct here — it keeps the Markov expert predictor from
-        // being mixed across modes.
-        let int8mode = match std::env::var("INT8MODE").ok().as_deref() {
-            Some("off") => Int8Mode::Off,
-            Some("prec") | Some("precision") => Int8Mode::Precision,
-            _ => Int8Mode::Performance,
-        };
+        // twins): Performance, the same-width KO int8 production runs. One model load, so the
+        // Markov expert predictor is never mixed across modes.
+        let int8mode = Int8Mode::Performance;
         println!("int8 mode = {int8mode:?}\n");
 
         let load_model = || {

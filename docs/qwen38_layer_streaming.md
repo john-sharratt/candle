@@ -948,7 +948,7 @@ process. So a **second** `load_hybrid_gguf` in the same process is refused by
 "as every model did before the span could hold them", in `open_for_load`'s words.
 
 That fallback is tight on this model, and the numbers say exactly how tight.
-From `KV_ARENA_STATS=1` on the 4090 Mobile: usable **14,098 MiB**, span
+From an `arena-stats` build on the 4090 Mobile: usable **14,098 MiB**, span
 **8,736 MiB**, pool cushion **512 MiB**, so the pool holds ~**4,850 MiB**. The
 span was sized as `span_target − peak_repack_scratch`, which concedes to the pool
 *precisely* the largest tensor's F32 repack transient — **4,850 MiB** for

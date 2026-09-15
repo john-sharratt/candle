@@ -120,7 +120,11 @@ __device__ __forceinline__ void int8_decode_attn_impl(
     };
 
     const SlotHeader& slot = get_slot_header(headers_ptr, slot_idx);
-    const uint32_t n_slices  = slot.n_slices;
+    // Positions end at the write slice (see `resolve_pos`): the chunks after
+    // it are empty capacity whose `rope` nothing keeps current, and a
+    // rope-ordered search that reached one would take it for the owner of
+    // positions the writer holds.
+    const uint32_t n_slices  = min(slot.n_slices, slot.write_slice + 1u);
     const uint32_t write_slice_idx = slot.write_slice;
     const uint64_t slices_ptr = slot.slices_ptr;
 
@@ -1164,7 +1168,11 @@ __device__ __forceinline__ void int8_decode_stripe_impl(
     };
 
     const SlotHeader& slot = get_slot_header(headers_ptr, slot_idx);
-    const uint32_t n_slices = slot.n_slices;
+    // Positions end at the write slice (see `resolve_pos`): the chunks after
+    // it are empty capacity whose `rope` nothing keeps current, and a
+    // rope-ordered search that reached one would take it for the owner of
+    // positions the writer holds.
+    const uint32_t n_slices = min(slot.n_slices, slot.write_slice + 1u);
     const uint32_t write_slice_idx = slot.write_slice;
     const uint64_t slices_ptr = slot.slices_ptr;
 
@@ -1537,7 +1545,11 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
     };
 
     const SlotHeader& slot = get_slot_header(headers_ptr, slot_idx);
-    const uint32_t n_slices = slot.n_slices;
+    // Positions end at the write slice (see `resolve_pos`): the chunks after
+    // it are empty capacity whose `rope` nothing keeps current, and a
+    // rope-ordered search that reached one would take it for the owner of
+    // positions the writer holds.
+    const uint32_t n_slices = min(slot.n_slices, slot.write_slice + 1u);
     const uint32_t write_slice_idx = slot.write_slice;
     const uint64_t slices_ptr = slot.slices_ptr;
     if (n_slices == 0) { emit_block(); return; }

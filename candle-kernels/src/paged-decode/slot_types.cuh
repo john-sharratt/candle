@@ -153,8 +153,11 @@ __device__ __forceinline__ uint32_t slice_rope(const uint8_t* slice) {
 // slice's first cum_token position and `len` how many follow, so the owning
 // slice is the one with `rope <= k_pos < rope + len` and the offset inside its
 // chunk is `offset + (k_pos - rope)`.  Slices are ordered by `rope`, so this is
-// a binary search.  Empty slices (`len == 0`) claim no position and the same
-// comparison steps over them.
+// a binary search — over the slices up to `write_slice` only, because history
+// ends there: every chunk after the writer is empty capacity, and the device's
+// commit (`slice_increment_len`) keeps no rope but the writer's current.
+// Empty slices (`len == 0`) claim no position and the same comparison steps
+// over them.
 //
 // *Pending writes* sit past the committed total, in capacity no slice counts
 // yet, so they cannot be found by searching `len`.  They are laid out by
@@ -188,8 +191,15 @@ __device__ __forceinline__ void resolve_pos(
     const int n = (int)slot_hdr.n_slices;
     if (n <= 0) { slice_idx = 0; in_blk = 0; return; }
 
+    // History ends at the write slice. The chunks after it are empty capacity
+    // for the pending walk below, and nothing keeps their `rope` current: the
+    // post-decode commit bumps the write slice's `len` alone. Searched, a
+    // trailing slice whose rope trails the writer's end sends the search past
+    // positions the writer holds.
+    const int ws_idx = (int)slot_hdr.write_slice;
+    const int last_idx = ws_idx < n ? ws_idx : n - 1;
     int lo = 0;
-    int hi = n - 1;
+    int hi = last_idx;
     while (lo <= hi) {
         const int mid = (lo + hi) >> 1;
         const uint8_t* s = base + (int64_t)mid * 16;
@@ -206,10 +216,12 @@ __device__ __forceinline__ void resolve_pos(
         }
     }
 
-    // Past every committed token: a pending write. Walk from the writer.
-    const uint8_t* last = base + (int64_t)(n - 1) * 16;
+    // Past every committed token: a pending write. Walk from the writer. The
+    // committed total is where the write slice ends — the one slice the device
+    // commits into, so the one whose `rope + len` is always current.
+    const uint8_t* last = base + (int64_t)last_idx * 16;
     const int committed = (int)slice_rope(last) + (int)slice_len(last);
-    int cur = (int)slot_hdr.write_slice;
+    int cur = ws_idx;
     if (cur >= n) { slice_idx = 0; in_blk = 0; return; }
     const uint8_t* ws = base + (int64_t)cur * 16;
     int cur_in_blk = (int)slice_offset(ws) + (int)slice_len(ws);
@@ -238,8 +250,10 @@ __device__ __forceinline__ void resolve_pos(
 // inside the hint's range has exactly one owner and the binary search would
 // return that same slice: a hit is the search's answer for one 16-byte read.
 // A miss, a pending write (which no `len` covers yet), or a hint outside the
-// array falls through to `resolve_pos` unchanged. `hint < 0` means none.
-// Host mirror: `resolve_pos_hinted_reference` in slot_state.rs.
+// array or past the write slice falls through to `resolve_pos` unchanged —
+// history ends at the write slice, so no slice after it owns a position.
+// `hint < 0` means none. Host mirror: `resolve_pos_hinted_reference` in
+// slot_state.rs.
 __device__ __forceinline__ void resolve_pos_hinted(
     const SlotHeader& slot_hdr,
     int k_pos,
@@ -247,7 +261,7 @@ __device__ __forceinline__ void resolve_pos_hinted(
     int& slice_idx,
     int& in_blk
 ) {
-    if (hint >= 0 && hint < (int)slot_hdr.n_slices) {
+    if (hint >= 0 && hint < (int)slot_hdr.n_slices && hint <= (int)slot_hdr.write_slice) {
         const uint8_t* s =
             reinterpret_cast<const uint8_t*>(slot_hdr.slices_ptr) + (int64_t)hint * 16;
         const int start = (int)slice_rope(s);

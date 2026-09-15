@@ -1235,8 +1235,8 @@ impl RegionPool {
 /// memset; if *it* dominates the answer is to zero on release instead, off the
 /// allocation path.
 ///
-/// Reported under `KV_ARENA_STATS`, next to `[arena-create]`, so one gate run
-/// with the flag set gives the whole allocation fast path.
+/// Reported under the `arena-stats` feature, next to `[arena-create]`, so one
+/// gate run built with it gives the whole allocation fast path.
 static RECYCLE_COUNT: AtomicU64 = AtomicU64::new(0);
 static RECYCLE_QUIESCED: AtomicU64 = AtomicU64::new(0);
 static RECYCLE_SYNC_NS: AtomicU64 = AtomicU64::new(0);

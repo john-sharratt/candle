@@ -824,8 +824,8 @@ impl ModelWeights {
         )
     }
 
-    /// Like from_gguf_by_path but with an explicit numeric int8mode (the test path selects it
-    /// from INT8MODE); from_gguf_by_path defaults it to Int8Mode::auto.
+    /// Like from_gguf_by_path but with an explicit numeric int8mode; from_gguf_by_path
+    /// defaults it to Int8Mode::auto.
     pub fn from_gguf_by_path_with_int8(
         file_path: &std::path::Path,
         device: &Device,
@@ -1551,12 +1551,8 @@ mod tests {
         // Use BatchedInference wrapper type
         use crate::models::batched_model::BatchedInference;
 
-        // Inference numeric mode, selected by INT8MODE (default Performance; "off"/"prec").
-        let int8mode = match std::env::var("INT8MODE").ok().as_deref() {
-            Some("off") => Int8Mode::Off,
-            Some("prec") | Some("precision") => Int8Mode::Precision,
-            _ => Int8Mode::Performance,
-        };
+        // Inference numeric mode: Performance, the same-width KO int8 production runs.
+        let int8mode = Int8Mode::Performance;
         println!("int8 mode = {int8mode:?}\n");
 
         // Load the model wrapped in BatchedInference with proper inv_freq

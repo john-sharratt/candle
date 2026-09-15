@@ -32,6 +32,7 @@ use crate::kv_cache::arena_table::{ArenaFormatTag, ResolvedArenaInfo};
 use candle::cuda_backend::cudarc::driver::CudaStream;
 #[cfg(feature = "tensor-assert")]
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// Block-table mutations each sequence keeps under `tensor-assert`.
@@ -948,12 +949,20 @@ impl SequenceState {
     /// The buffer, built from the same chunks (they are allocated up front, so
     /// no append clears it during the write), therefore has the WRITER
     /// REGION's slices — every chunk from the writer boundary to the current
-    /// writer — re-serialised under the guard (async H→D on drop); the chunks
-    /// below the boundary are shared and unwritten. This is O(chunks the
-    /// commit wrote) against dropping and re-uploading the entire per-layer
-    /// table, which at depth costs megabytes of pinned realloc and a stream
-    /// sync per layer. A missing buffer is left for the next decode sync's full
-    /// rebuild; a shape mismatch (defensive) falls back to full invalidation.
+    /// writer — re-serialised under one guard (async H→D on drop), and records
+    /// that writer for the decode sync (see `GpuChunks::writer_idx`).
+    ///
+    /// The chunks below the boundary are shared and unwritten. The chunks
+    /// after the writer are empty capacity, and every kernel ends its position
+    /// lookups at the write slice — `resolve_pos` takes the committed total
+    /// from where the write slice ends — so their `rope` is never read and is
+    /// not refreshed.
+    ///
+    /// This is O(chunks the commit wrote) against dropping and re-uploading
+    /// the entire per-layer table, which at depth costs megabytes of pinned
+    /// realloc and a stream sync per layer. A missing buffer is left for the
+    /// next decode sync's full rebuild; a shape mismatch (defensive) falls back
+    /// to full invalidation.
     pub(crate) fn refresh_decode_writer_slice(
         &mut self,
         n_kv_head: usize,
@@ -973,16 +982,51 @@ impl SequenceState {
             self.invalidate_gpu_chunks();
             return Ok(());
         }
-        // Every chunk a prefill can have written, not only the writer:
-        // `set_len` fills consecutive chunks from the writer boundary, so
-        // the chunks it filled on the way to the writer carry the buffer's
-        // pre-prefill lengths exactly as the writer does — a 200-token
-        // prompt leaves six sealed chunks at length 0, and the decode
-        // attends the last eight tokens alone. Chunks below the boundary
-        // are shared with the substrate and never written.
-        let start = self.writer_start_idx().min(wi);
-        for blk in start..=wi {
-            self.update_gpu_chunk(blk, n_kv_head, head_dim, arena_info)?;
+        // Every chunk a commit can have written, not only the writer: `set_len`
+        // fills consecutive chunks from the writer the buffer was serialised
+        // for, so the chunks it filled on the way to the current writer carry
+        // the buffer's pre-commit lengths exactly as the writer does — a
+        // 200-token prompt leaves six chunks at length 0 otherwise, and the
+        // decode attends the last eight tokens alone. The chunks from the
+        // boundary up to that serialised writer were full when it was
+        // serialised, and a full chunk's window moves only through a
+        // structural mutation, which clears the buffer, or a truncate, which
+        // invalidates it — so the region starts there.
+        let from = self.gpu_chunks.writer_idx().min(wi);
+        let start = self.writer_start_idx().max(from).min(wi);
+        self.update_gpu_chunk_range(start..wi + 1, n_kv_head, head_dim, arena_info)?;
+        self.gpu_chunks.as_mut().set_writer_idx(wi);
+        Ok(())
+    }
+
+    /// [`Self::update_gpu_chunks_bulk`] over a contiguous run of blocks: one
+    /// guard, so one upload, with the rope base summed once up to the run and
+    /// carried through it — nothing allocated, which matters because the
+    /// writer-region refresh runs per sequence, per layer, per commit.
+    fn update_gpu_chunk_range(
+        &mut self,
+        blocks: Range<usize>,
+        n_kv_head: usize,
+        head_dim: usize,
+        arena_info: &[ResolvedArenaInfo],
+    ) -> candle::Result<()> {
+        if blocks.is_empty() || self.gpu_chunks.n_chunks() == 0 {
+            return Ok(());
+        }
+        let base_pos = self.base_pos;
+        let SequenceState {
+            ref chunks,
+            ref mut gpu_chunks,
+            ..
+        } = *self;
+        let mut rope = chunks[..blocks.start]
+            .iter()
+            .fold(base_pos, |acc, c| acc.wrapping_add(c.usage));
+        let mut guard = gpu_chunks.as_mut();
+        for blk in blocks {
+            let chunk = &chunks[blk];
+            guard.update_chunk(blk, chunk, n_kv_head, head_dim, rope, arena_info)?;
+            rope = rope.wrapping_add(chunk.usage);
         }
         Ok(())
     }
@@ -1026,7 +1070,8 @@ impl SequenceState {
     ///
     /// Used by the cold-load `alloc_sealed_blocks_bulk` path to push
     /// the per-layer chunk metadata to the GPU as a single batched
-    /// HtoD where possible.
+    /// HtoD where possible. The writer-region refresh uses the contiguous
+    /// [`Self::update_gpu_chunk_range`].
     pub(super) fn update_gpu_chunks_bulk(
         &mut self,
         block_indices: &[usize],
@@ -1045,9 +1090,9 @@ impl SequenceState {
             ref mut gpu_chunks,
             ..
         } = *self;
-        // Prefix-sum cumulative usage once so each block's rope_base
-        // is an O(1) lookup. The previous `chunks[..blk].iter().sum()`
-        // was O(blk) per block — quadratic over a layer's blocks.
+        // Prefix-sum cumulative usage once so each block's rope_base is an
+        // O(1) lookup — summing `chunks[..blk]` per block would be quadratic
+        // over a layer's blocks.
         let mut rope_bases: Vec<u32> = Vec::with_capacity(chunks.len());
         let mut acc: u32 = base_pos;
         for c in chunks.iter() {
@@ -1363,6 +1408,19 @@ impl SequenceState {
         // agreement, do not paper over it by rebuilding defensively).
         Self::slot_counts_agree(host_n, self.gpu_chunks.n_chunks())?;
         let wi = self.decode_write_chunk_idx();
+        // The writer moved into a chunk claimed before the buffer was last
+        // serialised, so nothing was pushed and nothing cleared it: the new
+        // writer's rope still counts the old writer at its serialised length,
+        // and the kernel's committed total — where the write slice ends — falls
+        // short by every token the old writer took since. Re-serialise the
+        // writer region from the host, which holds every one of those tokens.
+        // The refresh stamps the writer's length from its host `usage`; for a
+        // live row that is the offset-derived length a rebuild would stamp,
+        // and `writer_len_audit` checks exactly that agreement (under
+        // `tensor-assert`) just before this sync.
+        if self.gpu_chunks.writer_idx() != wi {
+            self.refresh_decode_writer_slice(n_kv_head, head_dim, arena_info)?;
+        }
         let ptr = self.gpu_chunks.raw_device_ptr();
         Ok((
             (ptr, host_n as u32, wi as u32),

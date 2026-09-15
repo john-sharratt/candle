@@ -66,8 +66,10 @@ const N_PALETTE: usize = 4;
 const SLOT_QUOTA: usize = HEAD_DIM / N_PALETTE;
 const NUM_SCALE_CANDIDATES: usize = 6;
 
-/// Inputs to the full selection pipeline. Layout matches the CUDA kernel's
-/// view of the arena (chunk × head × dim × token, row-major in that order).
+/// Inputs to the full selection pipeline, in the CUDA kernel's logical block
+/// view (chunk × head × dim × token, row-major in that order): each 32-element
+/// block is one dim's tokens. Float arenas hold `[t][pd]` bands in memory; the
+/// kernel reads them into this view (`float_band_elem`).
 pub struct SelectionInput<'a> {
     pub k_data: &'a [f32],
     pub v_data: &'a [f32],

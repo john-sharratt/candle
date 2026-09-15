@@ -90,11 +90,6 @@ uploads/
 # `provenance_queries.json` entry below guards against.
 .zend/
 
-# Stray full prefill-capture dumps: ZEND_PREFILL_CAPTURE writes the untrimmed
-# capture here by default. The committed test fixture is the trimmed copy under
-# candle-transformers/tests/fixtures/ (LFS-tracked via .gitattributes).
-/prefill_fixture.bin
-
 # BDP tool-selection debug dump (large; written by the tool-selection probes).
 /tool_select_debug.json
 

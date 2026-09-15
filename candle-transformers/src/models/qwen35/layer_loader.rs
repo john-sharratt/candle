@@ -393,7 +393,7 @@ fn carve_zone(cuda: &candle::CudaDevice, images: &[LayerImage], pinned: usize) -
     // line below is invisible exactly where the partition is being measured. This is the last
     // piece of the breakdown — `[reclaim]` prints the span with its dense block and no zone,
     // and this is what the zone then takes out of it.
-    if std::env::var("KV_ARENA_STATS").is_ok() {
+    if cfg!(feature = "arena-stats") {
         let cell = plan.floating.map_or(0, |f| f.bytes);
         eprintln!(
             "[zone] {homed} of {num_layers} layers resident in {} MiB (mean {} MiB, dense) \

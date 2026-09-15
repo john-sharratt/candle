@@ -716,6 +716,10 @@ pub struct PagedSelectionGpuInputs {
 }
 
 impl PagedSelectionGpuInputs {
+    /// Stage `k_chunks` / `v_chunks` as F32 float arenas. Each chunk is
+    /// `[H][P][T][D']` flat f32 of length `n_kv_head * head_dim * chunk_size` —
+    /// palette bands in order, each token-major — the layout the float arenas
+    /// hold in production and the dump readers produce.
     pub fn from_f32_chunks(
         k_chunks: &[&[f32]],
         v_chunks: &[&[f32]],
@@ -757,8 +761,8 @@ impl PagedSelectionGpuInputs {
         )?;
 
         for (slot, (k_chunk, v_chunk)) in k_chunks.iter().zip(v_chunks.iter()).enumerate() {
-            // Rearrange from head-major layout ([H][D][T] per chunk) to palette-major
-            // ([h0p0, h0p1, h0p2, h0p3, h1p0, ...]) as expected by write_raw_sealed_chunk.
+            // The chunk's bands in `write_raw_sealed_chunk` order ([h0p0, h0p1,
+            // h0p2, h0p3, h1p0, ...]), each already token-major.
             let mut k_bytes = Vec::with_capacity(n_kv_head * N_PALETTE * elems_per_band * 4);
             let mut v_bytes = Vec::with_capacity(n_kv_head * N_PALETTE * elems_per_band * 4);
             for h in 0..n_kv_head {
@@ -804,9 +808,10 @@ impl PagedSelectionGpuInputs {
     /// geometric-mean threshold, and the per-block format distribution does
     /// not match what production produces.
     ///
-    /// `k_chunks`, `v_chunks`, and `q_chunks` are head-major `[H][D][T]` flat
-    /// f32 arrays of length `n_kv_head * head_dim * chunk_size`, the same
-    /// layout used by `dump_sequence_*_chunks` and the v3/v4 dump readers.
+    /// `k_chunks`, `v_chunks`, and `q_chunks` are `[H][P][T][D']` flat f32
+    /// arrays of length `n_kv_head * head_dim * chunk_size` — palette-segmented,
+    /// then token-major within each (head, palette) band — the layout of
+    /// `dump_sequence_*_chunks`, the v3/v4 dump readers, and the float arenas.
     /// V is kept as F32 (matches production where V is always float during
     /// the selection phase).
     pub fn from_f32_chunks_with_q(
@@ -1412,8 +1417,8 @@ impl PagedSelectionGpuInputs {
         // Per-chunk valid token range, packed (offset << 8) | len with len
         // in [1, 32]; `None` = every chunk is full. Corrects the
         // count-normalized error metrics and sink statistics for partial
-        // chunks (whose dead slots are zero — arena zeroing at
-        // creation/recycle).
+        // chunks, and bounds every load: the kernels read a dead slot as
+        // zero whatever the recycled ground holds.
         valid_ranges: Option<&[i32]>,
         _generation: Option<&Generation>,
     ) -> Result<(

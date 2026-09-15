@@ -28,10 +28,9 @@
 //! ## Gating
 //!
 //! Capture is inert unless explicitly enabled.  [`enable`] turns it on for a
-//! target config; [`init_from_env`] enables it when `CANDLE_DUMP_ROUTING` is
-//! set (the path is informational — the trace is drained via [`take`] by the
-//! capturing test, which owns serialization).  When disabled, [`record`] is a
-//! single relaxed atomic load.
+//! target config and [`enable_all`] for every config; the trace is drained via
+//! [`take`] by the capturing test, which owns serialization.  When disabled,
+//! [`record`] is a single relaxed atomic load.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -132,21 +131,6 @@ pub fn enable_all() {
         s.records.clear();
     }
     ENABLED.store(true, Ordering::Relaxed);
-}
-
-/// Enable capture from the environment.
-///
-/// When `CANDLE_DUMP_ROUTING` is set, capture turns on for the config named by
-/// `CANDLE_DUMP_ROUTING_CONFIG` (default 1, the BF16×1 config in the standard
-/// sweep).  Returns the output path if capture was enabled.
-pub fn init_from_env() -> Option<String> {
-    let path = std::env::var("CANDLE_DUMP_ROUTING").ok()?;
-    let target = std::env::var("CANDLE_DUMP_ROUTING_CONFIG")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(1);
-    enable(target);
-    Some(path)
 }
 
 /// Disable capture (records are retained until [`take`]).

@@ -1314,6 +1314,39 @@ __device__ __forceinline__ float load_as_float(const void* __restrict__ data, in
 }
 
 // =============================================================================
+// VALID TOKEN WINDOW
+// =============================================================================
+// A chunk's live tokens are [lo, hi), unpacked from `(offset << 8) | len`.
+// Every load of chunk data below reads a token outside the window as ZERO.
+// A partial chunk's dead slots hold whatever the ground held before the
+// chunk was claimed — the pool does not clear a claimed slot, and a recycled
+// region is not cleared either — so a stale inf there would otherwise set the
+// head amax, a block amax and every candidate scale for the live tokens.
+//
+// Every load is arranged so the lane is the token. A quantized / R16 band is
+// token-oriented (block `bib` is one dim's 32 tokens); a float band is
+// token-major `[t][pd]` and is read at `lane * band_dims + bib`, dim `bib`'s
+// value for token `lane`. Block `bib` is therefore dim `bib`'s 32 tokens in
+// either layout — the block the convert encodes and the palette map assigns.
+struct TokenWindow { int lo; int hi; };
+
+__device__ __forceinline__ TokenWindow unpack_token_window(int packed) {
+    const int lo  = (packed >> 8) & 0xff;
+    const int len = max(1, min(32, packed & 0xff));
+    return { lo, lo + len };
+}
+
+__device__ __forceinline__ bool lane_in_window(int lane, TokenWindow w) {
+    return lane >= w.lo && lane < w.hi;
+}
+
+// Flat index, in a token-major float band `band_dims` wide, of dim `dim`'s
+// value for token `lane`.
+__device__ __forceinline__ int float_band_elem(int dim, int lane, int band_dims) {
+    return lane * band_dims + dim;
+}
+
+// =============================================================================
 // BLOCK RELEVANCE  —  Σ(q²k²) / Σ(k²)  per block
 // =============================================================================
 // Coarse proxy for how much the query attends to a given K block.
@@ -1606,7 +1639,8 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
     int blocks_per_head,
     int total_heads,
     int n_kv_head,
-    int arena_chunks
+    int arena_chunks,
+    const int* __restrict__ valid_ranges  // [n_chunks] packed (offset << 8) | len
 ) {
     const int head_id       = blockIdx.x;
     const int tid           = threadIdx.x;
@@ -1616,6 +1650,7 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
 
     const int chunk_idx = head_id / n_kv_head;
     const int head_idx  = head_id % n_kv_head;
+    const TokenWindow win = unpack_token_window(__ldg(&valid_ranges[chunk_idx]));
 
     // Per-band source views, resolved through each band's own gid. Held in
     // shared memory so the walk loops stay register-neutral under the
@@ -1669,7 +1704,7 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
             k_val = dequant_element_inline<float, true>(k_blk_ptr, lane, k_fmt, s_band_outer[0][p]);
             q_val = dequant_q_element(k_blk_ptr, lane, k_fmt);
         } else {
-            k_val = load_as_float(k_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(k_fmt));
+            k_val = load_as_float(k_chunk_data, float_band_elem(bib, lane, band_blocks), arena_fmt_to_dtype_code(k_fmt));
             q_val = 0.0f;
         }
 
@@ -1681,7 +1716,12 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
             const char* v_blk_ptr   = v_chunk_data + (int64_t)bib * v_blk_bytes;
             v_val = dequant_element_inline<float>(v_blk_ptr, lane, v_fmt, s_band_outer[1][p]);
         } else {
-            v_val = load_as_float(v_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(v_fmt));
+            v_val = load_as_float(v_chunk_data, float_band_elem(bib, lane, band_blocks), arena_fmt_to_dtype_code(v_fmt));
+        }
+        if (!lane_in_window(lane, win)) {
+            k_val = 0.0f;
+            q_val = 0.0f;
+            v_val = 0.0f;
         }
 
         // All 32 lanes participate in the warp reduce; only lane 0 accumulates.
@@ -1774,7 +1814,7 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
                 const char* k_blk_ptr   = k_chunk_data + (int64_t)bib * k_blk_bytes;
                 k_val = dequant_element_inline<float, true>(k_blk_ptr, lane, k_fmt, s_band_outer[0][p]);
             } else {
-                k_val = load_as_float(k_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(k_fmt));
+                k_val = load_as_float(k_chunk_data, float_band_elem(bib, lane, band_blocks), arena_fmt_to_dtype_code(k_fmt));
             }
             const int   v_fmt        = s_band_fmt[1][p];
             const char* v_chunk_data = s_band_ptr[1][p];
@@ -1784,7 +1824,11 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
                 const char* v_blk_ptr   = v_chunk_data + (int64_t)bib * v_blk_bytes;
                 v_val = dequant_element_inline<float>(v_blk_ptr, lane, v_fmt, s_band_outer[1][p]);
             } else {
-                v_val = load_as_float(v_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(v_fmt));
+                v_val = load_as_float(v_chunk_data, float_band_elem(bib, lane, band_blocks), arena_fmt_to_dtype_code(v_fmt));
+            }
+            if (!lane_in_window(lane, win)) {
+                k_val = 0.0f;
+                v_val = 0.0f;
             }
             int k_bin = (int)floorf(__fmul_rn(fabsf(k_val), k_abs_inv_range));
             k_bin = max(0, min(QREL_HIST_BINS - 1, k_bin));
@@ -1842,8 +1886,12 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
             k_val = dequant_element_inline<float, true>(k_blk_ptr, lane, k_fmt, s_band_outer[0][p]);
             q_val = dequant_q_element(k_blk_ptr, lane, k_fmt);
         } else {
-            const int k_elem_in_chunk = bib * 32 + lane;
+            const int k_elem_in_chunk = float_band_elem(bib, lane, band_blocks);
             k_val = load_as_float(k_chunk_data, k_elem_in_chunk, arena_fmt_to_dtype_code(k_fmt));
+            q_val = 0.0f;
+        }
+        if (!lane_in_window(lane, win)) {
+            k_val = 0.0f;
             q_val = 0.0f;
         }
 
@@ -2157,12 +2205,12 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
     int n_kv_head,
     int arena_chunks,
     // Per-chunk valid token range, packed (offset << 8) | len with
-    // len in [1, 32]. Dead slots outside [offset, offset+len) are ZERO
-    // (arena chunks are zeroed at creation and on free-list recycle —
-    // alloc.rs `zero_recycled_chunk`), so they contribute nothing to
-    // amax or the error sums; the range only fixes the COUNT-normalized
-    // metrics (V's mean-over-32 MSE, K's top-4 mean) and the sink
-    // statistics, which would otherwise be diluted by the zero lanes.
+    // len in [1, 32]. Every load reads a slot outside [offset, offset+len)
+    // as ZERO (`lane_in_window`), so a dead slot contributes nothing to
+    // amax or the error sums whatever bytes it holds; the range also fixes
+    // the COUNT-normalized metrics (V's mean-over-32 MSE, K's top-4 mean)
+    // and the sink statistics, which would otherwise be diluted by the zero
+    // lanes.
     const int* __restrict__ valid_ranges,          // [n_chunks]
     int*   __restrict__ k_palette_tags,            // [total_heads * 4]
     int*   __restrict__ v_palette_tags,            // [total_heads * 4]
@@ -2285,10 +2333,10 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
     const int head_idx = head_id % n_kv_head;
 
     // Valid token window of this chunk (see the parameter comment).
-    const int vr        = __ldg(&valid_ranges[chunk_id]);
-    const int valid_lo  = (vr >> 8) & 0xff;
-    const int valid_len = max(1, min(32, vr & 0xff));
-    const int valid_hi  = valid_lo + valid_len;
+    const TokenWindow win = unpack_token_window(__ldg(&valid_ranges[chunk_id]));
+    const int valid_lo  = win.lo;
+    const int valid_hi  = win.hi;
+    const int valid_len = valid_hi - valid_lo;
     // Count corrections for the fixed-count metric normalizations:
     // V pass_metric divides the error sum by 32 lanes; K's by top-4.
     const float v_valid_corr = 32.0f / (float)valid_len;
@@ -2334,13 +2382,18 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
             k_val = dequant_element_inline<float, true>(k_blk, lane, k_src_fmt, s_band_outer[0][p]);
             q_val = dequant_q_element(k_blk, lane, k_src_fmt);
         } else {
-            k_val = load_as_float(k_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(k_src_fmt));
+            k_val = load_as_float(k_chunk_data, float_band_elem(bib, lane, FUSED_BAND_BLOCKS), arena_fmt_to_dtype_code(k_src_fmt));
         }
         if (ArenaFormat::is_quantized(v_src_fmt)) {
             const char* v_blk = v_chunk_data + (int64_t)bib * quant_block_bytes(v_src_fmt);
             v_val = dequant_element_inline<float>(v_blk, lane, v_src_fmt, s_band_outer[1][p]);
         } else {
-            v_val = load_as_float(v_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(v_src_fmt));
+            v_val = load_as_float(v_chunk_data, float_band_elem(bib, lane, FUSED_BAND_BLOCKS), arena_fmt_to_dtype_code(v_src_fmt));
+        }
+        if (!lane_in_window(lane, win)) {
+            k_val = 0.0f;
+            q_val = 0.0f;
+            v_val = 0.0f;
         }
 
         smem_kv   [blk * 32 + lane] = __float2half(k_val);   // K stored as f16; V discarded (reloaded before V process_side)
@@ -2371,8 +2424,8 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
 
         if (lane == 0) {
             // Per-block hash jitter (~6e-8) added to the amax values to
-            // break sort ties on tied amax. Partial-tail chunks zero-pad
-            // positions past `token_count`, producing many near-equal
+            // break sort ties on tied amax. Partial-tail chunks read as
+            // zero outside their token window, producing many near-equal
             // small amax that — under the bitonic sort's tie behaviour —
             // drift toward near-monotonic block-index order; the claim
             // phase then assigns long contiguous dim ranges to a single
@@ -2463,7 +2516,7 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
         //     VALID tokens (dead lanes of a partial chunk have zero K and
         //     would drag mu toward zero, granting every real token spurious
         //     sink weight). Warp reductions; mu and sigma broadcast.
-        const bool  in_window = (lane >= valid_lo) && (lane < valid_hi);
+        const bool  in_window = lane_in_window(lane, win);
         const float s = sink_score[lane];
         float ssum = in_window ? s : 0.0f;
         #pragma unroll
@@ -2915,7 +2968,10 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
                 const char* v_blk = v_chunk_data_r + (int64_t)bib * quant_block_bytes(v_src_fmt_r);
                 v_val = dequant_element_inline<float>(v_blk, lane, v_src_fmt_r, s_band_outer[1][p]);
             } else {
-                v_val = load_as_float(v_chunk_data_r, bib * 32 + lane, arena_fmt_to_dtype_code(v_src_fmt_r));
+                v_val = load_as_float(v_chunk_data_r, float_band_elem(bib, lane, FUSED_BAND_BLOCKS), arena_fmt_to_dtype_code(v_src_fmt_r));
+            }
+            if (!lane_in_window(lane, win)) {
+                v_val = 0.0f;
             }
             smem_kv[blk * 32 + lane] = __float2half(v_val);
         }
@@ -3024,7 +3080,8 @@ extern "C" void run_select_kv_format_palette4_paged(
         blocks_per_head,
         total_heads,
         n_kv_head,
-        arena_chunks
+        arena_chunks,
+        valid_ranges
     );
 
     // Pass 2: fused selection + palette4 grouping, one block per (chunk, head).
@@ -3164,7 +3221,7 @@ extern "C" __global__ void sample_quant_errors_paged(
                 q_val = dequant_q_element(blk_ptr, lane, src_fmt);
             }
         } else {
-            const int elem_in_chunk = dim_in_band * 32 + lane;
+            const int elem_in_chunk = float_band_elem(dim_in_band, lane, sub_head_dim);
             x_val = load_as_float(chunk_data, elem_in_chunk, arena_fmt_to_dtype_code(src_fmt));
             if (side_is_k) {
                 k_val = x_val;
@@ -3314,7 +3371,7 @@ extern "C" __global__ void sample_quant_errors_kv_paged(
             k_val = dequant_element_inline<float, true>(blk_ptr, lane, k_src_fmt, 1.0f);
             q_val = dequant_q_element(blk_ptr, lane, k_src_fmt);
         } else {
-            const int elem_in_chunk = dim_in_band * 32 + lane;
+            const int elem_in_chunk = float_band_elem(dim_in_band, lane, sub_head_dim);
             k_val = load_as_float(k_chunk_data, elem_in_chunk, arena_fmt_to_dtype_code(k_src_fmt));
         }
 
@@ -3351,7 +3408,7 @@ extern "C" __global__ void sample_quant_errors_kv_paged(
             const char* blk_ptr = v_chunk_data + (int64_t)dim_in_band * blk_bytes;
             v_val = dequant_element_inline<float>(blk_ptr, lane, v_src_fmt, 1.0f);
         } else {
-            const int elem_in_chunk = dim_in_band * 32 + lane;
+            const int elem_in_chunk = float_band_elem(dim_in_band, lane, sub_head_dim);
             v_val = load_as_float(v_chunk_data, elem_in_chunk, arena_fmt_to_dtype_code(v_src_fmt));
         }
 

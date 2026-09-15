@@ -19,6 +19,8 @@
 //!   `out_dtype` (BF16 where activations are F16).
 
 use candle::quantized::cuda::DynamicActs;
+#[cfg(feature = "tensor-assert")]
+use candle::quantized::QMatMul as CoreQMatMul;
 use candle::quantized::{GgmlDType, Int8Mode, QTensor};
 use candle::{DType, LiveTensor, Module, Result, Tensor};
 use candle_nn::Activation;
@@ -447,10 +449,10 @@ impl QuantizedMlp {
 #[cfg(feature = "tensor-assert")]
 fn assert_weight_once(w: &QMatMul, name: &'static str) {
     match w.inner() {
-        candle::quantized::QMatMul::QTensor(qt) => {
+        CoreQMatMul::QTensor(qt) => {
             qt.assert_once(name);
         }
-        candle::quantized::QMatMul::Tensor(t) | candle::quantized::QMatMul::TensorF16(t) => {
+        CoreQMatMul::Tensor(t) => {
             t.assert_once(name);
         }
     }

@@ -56,6 +56,10 @@ wave-census = []
 # The census with the caller of every carve named. Symbolises a backtrace per
 # carve, which costs about a fifth of the wall clock.
 wave-census-labels = ["wave-census"]
+# The allocator's own report on stderr: every arena creation with its cost,
+# every size-class promotion, every region recycle, and the layer zone's
+# partition at load. A measurement build — the lines are per allocation.
+arena-stats = []
 forbidden_allocations = ["candle/forbidden_allocations"]
 verbose = []
 dont_check = []

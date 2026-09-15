@@ -64,7 +64,11 @@ fn gpu_matches_cpu_real_data() {
                 .q
                 .as_ref()
                 .expect("q-bearing dump required for GPU relevance test");
-            let k_bytes = pack_r16_blocks(&chunk.k, q);
+            // The dump chunk is `[H][P][T][D']`; an R16 block is one dim's tokens.
+            let k_bytes = pack_r16_blocks(
+                &dim_major_blocks(&chunk.k, header.n_kv_head, header.head_dim),
+                &dim_major_blocks(q, header.n_kv_head, header.head_dim),
+            );
             let v_bytes = pack_f16(&chunk.v);
             ChunkGpu {
                 k_gpu: cuda_dev.memcpy_stod(&k_bytes).expect("upload K R16"),
@@ -180,13 +184,16 @@ fn gpu_matches_cpu_real_data() {
 
         let mut data = Vec::with_capacity(use_chunks.len() * header.chunk_size * header.head_dim);
         for chunk in &use_chunks {
+            // `sample_error_surface_cpu` takes `[head][dim][token]`; the dump
+            // chunk is `[H][P][T][D']`.
             let first_head_len = header.chunk_size * header.head_dim;
-            let src = if side_is_k {
-                &chunk.k[..first_head_len]
-            } else {
-                &chunk.v[..first_head_len]
-            };
-            data.extend(src.iter().map(|&v| f16::from_f32(v).to_f32()));
+            let side = if side_is_k { &chunk.k } else { &chunk.v };
+            let dim_major = dim_major_blocks(side, header.n_kv_head, header.head_dim);
+            data.extend(
+                dim_major[..first_head_len]
+                    .iter()
+                    .map(|&v| f16::from_f32(v).to_f32()),
+            );
         }
         assert!(data.iter().any(|v| *v > 0.0));
         assert!(data.iter().any(|v| *v < 0.0));

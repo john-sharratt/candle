@@ -522,9 +522,9 @@ fn quantize_to_cpu_quantizes_partial_tail() {
     let copy_stream = cuda_stream(&device);
 
     // 50 tokens = 1 full sealed chunk (32 tokens) + 1 partial (18 tokens).
-    // Partial chunks quantize like full ones: their dead token slots are
-    // zero (arena zeroing at creation/recycle), and the selection kernel
-    // receives the valid range to correct its count-normalized metrics.
+    // Partial chunks quantize like full ones: the selection and convert
+    // kernels read every dead token slot as zero, and the selection kernel
+    // uses the valid range to correct its count-normalized metrics.
     // The full chunk pins that full-chunk quantization keeps working
     // alongside the partial path.
     let src = seed_f16_sealed(&backing, &device, 50, 1);
@@ -590,6 +590,83 @@ fn quantize_to_cpu_quantizes_partial_tail() {
         "quantized partial byte_size {} must be below the F16 footprint {}",
         partial_bytes,
         f16_footprint,
+    );
+}
+
+/// Seed one sealed partial chunk of `live` tokens whose dead slots
+/// `live..32` hold `dead` — the bytes a recycled slot carries from its
+/// previous tenant. The live tokens are the same deterministic pattern
+/// whatever `dead` is.
+fn seed_partial_with_dead(
+    backing: &ChunkedKvBacking,
+    device: &Device,
+    live: usize,
+    dead: f32,
+) -> SealedSequence {
+    const CHUNK: usize = 32;
+    let slot = backing.alloc_sequence().unwrap();
+    backing.ensure_for_offset(slot, 0, CHUNK).unwrap();
+    // `[1, heads, tokens, dim]` row-major: element i is token (i / dim) % tokens.
+    let data: Vec<f16> = (0..N_KV_HEAD * CHUNK * HEAD_DIM)
+        .map(|i| {
+            if (i / HEAD_DIM) % CHUNK < live {
+                f16::from_f32((i as f32) * 0.0005)
+            } else {
+                f16::from_f32(dead)
+            }
+        })
+        .collect();
+    let k = Tensor::from_vec(data, (1, N_KV_HEAD, CHUNK, HEAD_DIM), &Device::Cpu)
+        .unwrap()
+        .to_device(device)
+        .unwrap();
+    let v = k.clone();
+    backing.write_contiguous(slot, 0, &k, &v).unwrap();
+    backing.set_len(slot, live);
+    backing.record_turn(slot).unwrap()
+}
+
+/// A partial chunk's dead slots hold whatever the ground held before the
+/// chunk was claimed: a run claim clears nothing, and neither does a recycled
+/// region. Quantizing must not read them, so the chunk's quantized bytes are
+/// the same whether its dead slots hold zeros or `+inf`. A stale inf that
+/// reached a block's scale would decode every live token of the block as NaN.
+#[test]
+fn a_partial_chunks_dead_slots_do_not_reach_its_quantized_bytes() {
+    let Some((device, _gpu)) = cuda_device_or_skip() else {
+        return;
+    };
+    let policy = CompressionPolicy::new(5);
+    let copy_stream = cuda_stream(&device);
+    let quantized_bytes = |dead: f32| -> (Vec<u8>, Vec<u8>) {
+        let backing = cuda_backing_with_policy(&device, &policy);
+        let src = seed_partial_with_dead(&backing, &device, 7, dead);
+        assert_eq!(src.chunks.len(), 1, "7 tokens seal as one partial chunk");
+        assert_eq!(src.chunks[0].token_count, 7);
+        let mut pinned: Option<PinnedBuf> = None;
+        let warm = quantize_sealed_in_place(
+            &backing,
+            &[&src],
+            &policy,
+            &device,
+            &copy_stream,
+            &mut pinned,
+        )
+        .expect("quantize_sealed_in_place");
+        device.synchronize().unwrap();
+        let slot = backing.alloc_sequence().unwrap();
+        backing
+            .inject_sealed_at_tail(slot, &warm[0])
+            .expect("inject quantized partial");
+        backing
+            .read_raw_sealed_chunk(slot, 0)
+            .expect("read raw quantized chunk")
+    };
+    let clean = quantized_bytes(0.0);
+    let stale = quantized_bytes(f32::INFINITY);
+    assert_eq!(
+        clean, stale,
+        "a partial chunk's quantized bytes changed with the contents of its dead slots"
     );
 }
 

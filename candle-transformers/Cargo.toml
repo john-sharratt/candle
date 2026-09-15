@@ -62,9 +62,15 @@ cuda = ["candle/cuda", "candle-nn/cuda", "dep:cudarc", "dep:candle-kernels"]
 kernel-lineinfo = ["cuda", "candle/kernel-lineinfo", "candle-nn/kernel-lineinfo"]
 # `Tensor::assert` / `QTensor::assert` — see `candle-core/Cargo.toml`.
 tensor-assert = ["cuda", "candle/tensor-assert", "candle-nn/tensor-assert"]
+# Dump one long-context paged-prefill kernel call to `target/prefill_capture.bin`
+# — the fixture `tests/prefill_replay.rs` replays (see `models::prefill_capture`).
+# A capture run, not a default: the dump reads the whole cached prefix back.
+prefill-capture = ["cuda"]
 # The transient-span census — see `candle-nn/Cargo.toml`.
 wave-census = ["candle-nn/wave-census"]
 wave-census-labels = ["wave-census", "candle-nn/wave-census-labels"]
+# The allocator's stderr report — see `candle-nn/Cargo.toml`.
+arena-stats = ["candle-nn/arena-stats"]
 forbidden_allocations = [
     "candle/forbidden_allocations",
     "candle-nn/forbidden_allocations",

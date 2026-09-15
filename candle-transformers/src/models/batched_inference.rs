@@ -967,11 +967,10 @@ impl BatchedInferenceSession {
     /// length self-increments only on decode steps — without this refresh the
     /// next decode reuses a buffer that still ends where the injection began,
     /// writes its token over the first injected one, and leaves a slot the
-    /// host counts unwritten. The writer slice is re-serialised in place (O(1)
-    /// per layer) while the writer is still the chunk the buffer was built
-    /// for; an injection that crossed into a later chunk drops the buffer for
-    /// a full rebuild on the next decode sync, as does a sequence that has not
-    /// decoded yet. No-op on contiguous backings.
+    /// host counts unwritten. The writer region — every chunk from the writer
+    /// boundary to the writer — is re-serialised in place, one upload per
+    /// layer; a sequence that has not decoded yet has no buffer and rebuilds
+    /// fully on its first decode sync. No-op on contiguous backings.
     pub fn refresh_decode_slot_state(&self, seq_idx: usize) -> Result<()> {
         for backing in &self.backings {
             backing.refresh_decode_writer_slice(&[(seq_idx, 0)])?;

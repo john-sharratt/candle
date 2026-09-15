@@ -2,9 +2,11 @@
 //! under `pub(super)`, loads the golden Qwen3 KV dump
 //! (`src/kv_cache/chunked/tests/data/qwen3-kv-data.bin`) when present, and
 //! provides synthetic-batch/R16-packing generators used across the child test
-//! modules (`benchmark`, `calibration`, `gpu_vs_cpu`, `helpers`, `model`,
-//! `projection`, `test_data`) — CPU-vs-GPU parity, threshold calibration
-//! sweeps, and format-selection correctness against real and synthetic K/V.
+//! modules (`benchmark`, `calibration`, `float_layout`, `gpu_vs_cpu`,
+//! `helpers`, `model`, `projection`, `test_data`, `token_window`) —
+//! CPU-vs-GPU parity, threshold calibration sweeps, format-selection
+//! correctness against real and synthetic K/V, the selection's reading of the
+//! float arenas' layout, and its bound on a partial chunk's dead slots.
 
 // Test code: block alignment is written as the `% n == 0` the format contract
 // is stated in.
@@ -27,6 +29,8 @@ pub(super) use crate::kv_cache::chunked::tests::dump_reader::load_dump;
 #[cfg(feature = "cuda")]
 pub(super) use super::sample_error_surface_gpu_paged;
 pub(super) use half::f16;
+
+use crate::kv_cache::arena_table::N_PALETTE;
 
 pub(super) const DUMP_REL_PATH: &str = "src/kv_cache/chunked/tests/data/qwen3-kv-data.bin";
 pub(super) const R16_DUMP_REL_PATH: &str = "src/kv_cache/chunked/tests/data/kv_cache_r16_dump.bin";
@@ -64,6 +68,52 @@ pub(super) fn make_synthetic_batch(n_batch: usize, n_head: usize, head_dim: usiz
                         let sign = if (t + d) % 2 == 0 { 1.0 } else { -1.0 };
                         sign * (0.25 + base.abs() * 1.4)
                     };
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `make_synthetic_batch`'s `[B][H][D][T]` chunks rearranged into the float
+/// arenas' `[B][H][P][T][D']` layout: palette bands in order, each token-major.
+#[cfg(feature = "cuda")]
+pub(super) fn token_major_bands(dim_major: &[f32], n_head: usize, head_dim: usize) -> Vec<f32> {
+    let sub = head_dim / N_PALETTE;
+    let mut out = vec![0.0f32; dim_major.len()];
+    for (chunk_in, chunk_out) in dim_major
+        .chunks_exact(n_head * head_dim * CHUNK_SIZE)
+        .zip(out.chunks_exact_mut(n_head * head_dim * CHUNK_SIZE))
+    {
+        for h in 0..n_head {
+            for d in 0..head_dim {
+                let (p, dp) = (d / sub, d % sub);
+                for t in 0..CHUNK_SIZE {
+                    chunk_out[(h * head_dim + p * sub) * CHUNK_SIZE + t * sub + dp] =
+                        chunk_in[(h * head_dim + d) * CHUNK_SIZE + t];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A `[H][P][T][D']` chunk (a dump chunk, a float arena band set) rearranged
+/// into dim-major `[H][D][T]` — one dim's 32 tokens per block, the order
+/// `pack_r16_blocks` packs. The inverse of [`token_major_bands`].
+pub(super) fn dim_major_blocks(token_major: &[f32], n_head: usize, head_dim: usize) -> Vec<f32> {
+    let sub = head_dim / N_PALETTE;
+    let mut out = vec![0.0f32; token_major.len()];
+    for (chunk_in, chunk_out) in token_major
+        .chunks_exact(n_head * head_dim * CHUNK_SIZE)
+        .zip(out.chunks_exact_mut(n_head * head_dim * CHUNK_SIZE))
+    {
+        for h in 0..n_head {
+            for d in 0..head_dim {
+                let (p, dp) = (d / sub, d % sub);
+                for t in 0..CHUNK_SIZE {
+                    chunk_out[(h * head_dim + d) * CHUNK_SIZE + t] =
+                        chunk_in[(h * head_dim + p * sub) * CHUNK_SIZE + t * sub + dp];
                 }
             }
         }
@@ -117,8 +167,10 @@ pub(super) fn pack_f16(data: &[f32]) -> Vec<u8> {
 
 mod benchmark;
 mod calibration;
+mod float_layout;
 mod gpu_vs_cpu;
 pub(super) mod helpers;
 mod model;
 mod projection;
 pub(super) mod test_data;
+mod token_window;

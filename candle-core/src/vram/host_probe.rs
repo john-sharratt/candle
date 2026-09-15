@@ -380,19 +380,9 @@ pub struct HostRamBudget {
     pub expert_pinned_budget_bytes: u64,
 }
 
-/// Weights-cap buffer percentage: `CANDLE_HOST_RAM_BUFFER_PCT`, default 30 (of
-/// total RAM), floored at 4 GiB either way. Cached on first read.
-fn buffer_pct() -> u64 {
-    use std::sync::OnceLock;
-    static V: OnceLock<u64> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("CANDLE_HOST_RAM_BUFFER_PCT")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&p| p > 0 && p <= 90)
-            .unwrap_or(30)
-    })
-}
+/// Weights-cap buffer percentage: 30 (of total RAM); `host_ram_budget_from`
+/// floors the buffer at 4 GiB.
+const BUFFER_PCT: u64 = 30;
 
 /// Fixed OS floor inside the non-weights region: keeps warm-KV growth from
 /// starving the OS itself. Everything else in the buffer region is warm KV's to
@@ -512,7 +502,7 @@ pub fn host_ram_budget(total_ram: u64) -> HostRamBudget {
         total_ram,
         super::host_pinned_bytes(),
         super::weights_mmap_bytes(),
-        buffer_pct(),
+        BUFFER_PCT,
         OS_KEEP_BYTES,
     )
 }

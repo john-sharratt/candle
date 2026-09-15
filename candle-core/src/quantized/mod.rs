@@ -1536,7 +1536,7 @@ impl QTensor {
         // even for narrowed/sliced tensors where is_contiguous() may be true
         // but the underlying storage has more elements.
         let src = src
-            .to_dtype(crate::DType::F32)?
+            .to_dtype(DType::F32)?
             .flatten_all()?
             .force_contiguous()?;
         let elem_count = shape.elem_count();
@@ -1860,7 +1860,7 @@ impl<'w> LiveQTensor<'w> {
                     .to_device(device)
             }
             _ => {
-                let s = self.dequantize(device)?.to_dtype(crate::DType::F16)?;
+                let s = self.dequantize(device)?.to_dtype(DType::F16)?;
                 Ok(s)
             }
         }
@@ -1876,7 +1876,7 @@ impl<'w> LiveQTensor<'w> {
                     .to_device(device)
             }
             _ => {
-                let s = self.dequantize(device)?.to_dtype(crate::DType::BF16)?;
+                let s = self.dequantize(device)?.to_dtype(DType::BF16)?;
                 Ok(s)
             }
         }
@@ -2238,7 +2238,7 @@ impl<'w> LiveQTensor<'w> {
 
         // Convert source to f32 and make contiguous
         let src = src
-            .to_dtype(crate::DType::F32)?
+            .to_dtype(DType::F32)?
             .flatten_all()?
             .force_contiguous()?;
 
@@ -2298,7 +2298,7 @@ impl<'w> LiveQTensor<'w> {
 
         // Validate supported source dtypes - kernel handles conversion inline
         match src.dtype() {
-            crate::DType::F32 | crate::DType::F16 | crate::DType::BF16 | crate::DType::F8E4M3 => {}
+            DType::F32 | DType::F16 | DType::BF16 | DType::F8E4M3 => {}
             other => crate::bail!(
                 "quantize_transposed_into: source dtype must be F32/F16/BF16/F8E4M3, got {:?}",
                 other
@@ -2545,7 +2545,6 @@ impl<'w> LiveQTensor<'w> {
 pub enum QMatMul {
     QTensor(std::sync::Arc<QTensor>),
     Tensor(Tensor),
-    TensorF16(Tensor),
 }
 
 impl QMatMul {
@@ -2558,56 +2557,15 @@ impl QMatMul {
     }
 }
 
-thread_local! {
-    static DEQUANTIZE_ALL: bool = {
-        match std::env::var("CANDLE_DEQUANTIZE_ALL") {
-            Ok(s) => {
-                !s.is_empty() && s != "0"
-            },
-            Err(_) => false,
-        }
-    }
-}
-
-thread_local! {
-    static DEQUANTIZE_ALL_F16: bool = {
-        match std::env::var("CANDLE_DEQUANTIZE_ALL_F16") {
-            Ok(s) => {
-                !s.is_empty() && s != "0"
-            },
-            Err(_) => false,
-        }
-    }
-}
-
-thread_local! {
-    static DEQUANTIZE_ALL_BF16: bool = {
-        match std::env::var("CANDLE_DEQUANTIZE_ALL_BF16") {
-            Ok(s) => {
-                !s.is_empty() && s != "0"
-            },
-            Err(_) => false,
-        }
-    }
-}
-
 impl QMatMul {
+    /// A float-typed weight (F32/F16/BF16) is held as a plain tensor and runs
+    /// the float matmul; every quantized type stays quantized.
     pub fn from_arc(qtensor: std::sync::Arc<QTensor>) -> Result<Self> {
-        let dequantize = match qtensor.dtype() {
-            GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => true,
-            _ => DEQUANTIZE_ALL.with(|b| *b),
-        };
-        let t = if dequantize {
-            let tensor = qtensor.dequantize(&qtensor.device())?;
-            Self::Tensor(tensor)
-        } else if DEQUANTIZE_ALL_F16.with(|b| *b) {
-            let tensor = qtensor.dequantize_f16(&qtensor.device())?;
-            Self::TensorF16(tensor)
-        } else if DEQUANTIZE_ALL_BF16.with(|b| *b) {
-            let tensor = qtensor.dequantize_bf16(&qtensor.device())?;
-            Self::TensorF16(tensor)
-        } else {
-            Self::QTensor(qtensor)
+        let t = match qtensor.dtype() {
+            GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => {
+                Self::Tensor(qtensor.dequantize(&qtensor.device())?)
+            }
+            _ => Self::QTensor(qtensor),
         };
         Ok(t)
     }
@@ -2819,16 +2777,6 @@ impl QMatMul {
                 };
                 xs.matmul(&w)
             }
-            Self::TensorF16(w) => {
-                let xs = &xs.to_owned_tensor()?;
-                let in_dtype = xs.dtype();
-                let w = match *xs.dims() {
-                    [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
-                    [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
-                    _ => w.t()?,
-                };
-                xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
-            }
         }
     }
 
@@ -2843,7 +2791,7 @@ impl QMatMul {
     pub fn forward_dynamic<'w>(
         &self,
         input: cuda::DynamicTensor<'_, 'w>,
-        out_dtype: crate::DType,
+        out_dtype: DType,
     ) -> Result<LiveTensor<'w>> {
         let t = match self {
             Self::QTensor(t) => t,
@@ -2871,7 +2819,7 @@ impl QMatMul {
     pub fn qkv_segmented<'w>(
         op: &cuda::Q8a128Operand<'w>,
         weights: &[&QMatMul],
-        out_dtype: crate::DType,
+        out_dtype: DType,
     ) -> Result<LiveTensor<'w>> {
         let mut segs = Vec::with_capacity(weights.len());
         let mut device = None;
@@ -2912,7 +2860,7 @@ impl QMatMul {
         &self,
         _xs: &LiveTensor<'w>,
         _mode: Int8Mode,
-        _out_dtype: crate::DType,
+        _out_dtype: DType,
         _sum_scale: SumScale,
     ) -> Result<LiveTensor<'w>> {
         crate::bail!("forward_via_int8 requires the cuda feature")
@@ -2923,7 +2871,7 @@ impl QMatMul {
         &self,
         xs: &LiveTensor<'w>,
         mode: Int8Mode,
-        out_dtype: crate::DType,
+        out_dtype: DType,
         // This quantizes the activation itself, so the Σx convention is its
         // choice to make and not one it can read off an operand. Named rather
         // than defaulted: a wrong value here is a wrong number, not an error.
@@ -3029,10 +2977,9 @@ impl QMatMul {
                 xs.matmul(&w)
             }
             Self::QTensor(t) => xs.apply_op1_no_bwd(t.as_ref()),
-            // The float-weight arms. Reached both by the `CANDLE_DEQUANTIZE_ALL`
-            // fallback and, unavoidably, by any checkpoint that simply stores a
-            // tensor unquantized — `from_arc` dequantizes F32/F16/BF16 weights
-            // whatever the setting, so an FP checkpoint runs entirely here.
+            // The float-weight arms, reached by any checkpoint that stores a
+            // tensor unquantized — `from_arc` holds F32/F16/BF16 weights as
+            // plain tensors, so an FP checkpoint runs entirely here.
             //
             // `matmul` allocates its output beside its operand, so the result is
             // wave-backed when `xs` is, which is precisely what the `'w` on the
@@ -3047,15 +2994,6 @@ impl QMatMul {
                     _ => w.t()?,
                 };
                 xs.matmul(&w)
-            }
-            Self::TensorF16(w) => {
-                let in_dtype = xs.dtype();
-                let w = match *xs.dims() {
-                    [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
-                    [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
-                    _ => w.t()?,
-                };
-                xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
             }
         }
     }

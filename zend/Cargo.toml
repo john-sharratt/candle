@@ -105,10 +105,15 @@ profile = ["candle-conversation/profile"]
 # `Tensor::assert` / `QTensor::assert` — one launch per assert site, no sync and
 # no allocation. A debugging session, not a default: the launches are real work.
 tensor-assert = ["candle-conversation/tensor-assert"]
+# One paged-prefill kernel-replay fixture from a live ingest — see
+# `candle-transformers/Cargo.toml`.
+prefill-capture = ["candle-conversation/prefill-capture"]
 # Itemise each transient span's peak layer phase — see `candle-nn/Cargo.toml`.
 # A measurement build; the labelled form costs about a fifth of the wall clock.
 wave-census = ["candle-conversation/wave-census"]
 wave-census-labels = ["wave-census", "candle-conversation/wave-census-labels"]
+# The allocator's stderr report — see `candle-nn/Cargo.toml`.
+arena-stats = ["candle-conversation/arena-stats"]
 # Name the call sites that allocate from the CUDA driver during a wave — see
 # `candle::forbidden_alloc`. Diagnostic; the daemon logs one report per wave
 # window that finds anything.

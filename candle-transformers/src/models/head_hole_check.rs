@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use candle::cuda_backend::CudaDevice;
 use candle::{Device, Result};
 use candle_nn::kv_cache::{BlockBands, KvCache};
+use candle_nn::CHUNK_SIZE;
 
 use super::batched_inference::BatchedInferenceSession;
 use super::decode_kv_walk::{
@@ -42,6 +43,7 @@ use super::decode_kv_walk::{
     read_device, scan_band, RECORD_BYTES,
 };
 use super::kv_cache_utils::SequenceContext;
+use super::slot_state::{resolve_pos_reference, SlotTokenLayout, TokenSliceHost};
 
 /// Positions at the tail of each row's new range that are read back. The hole
 /// has been the last slot a row's write reached, so the tail is where to look;
@@ -270,6 +272,150 @@ pub(crate) fn check_prefill_write(
                 "prefill write check could not read this row: {e}"
             ),
         }
+    }
+}
+
+/// Where the paged prefill kernel is about to put one row's new positions, taken
+/// from the layout its headers were built from.
+pub(crate) struct PlannedRow {
+    /// `(offset, len)` per chunk, as the headers described it.
+    chunks: Vec<(u16, u16)>,
+    writer_start: usize,
+    write_slice: u32,
+    /// `(chunk, slot)` for each new position, by the kernel's pending-write walk;
+    /// `None` where the walk has nowhere to put it.
+    placed: Vec<Option<(usize, usize)>>,
+}
+
+/// The kernel's placement of every row's new positions, planned before launch —
+/// one entry per batch row, `None` for a row with nothing to write.
+///
+/// The placement is `resolve_pos_reference`, the host mirror of the kernel's
+/// `resolve_pos`, over the same `(offset, len)` layout and writer rule the
+/// headers were built from. Both sides of the check are host state, so it
+/// proves the host's two rules agree — the walk and the commit — and cannot
+/// see a device slice array that disagrees with the host; a stale device
+/// buffer is what `check_committed_rows` finds, as a hole the kernel left.
+pub(crate) fn plan_prefill_writes(
+    caches: &[&mut KvCache],
+    offsets: &[usize],
+    q_lens: &[usize],
+) -> Vec<Option<PlannedRow>> {
+    caches
+        .iter()
+        .enumerate()
+        .map(|(row, cache)| {
+            let (offset, len) = (offsets[row], q_lens[row]);
+            if len == 0 {
+                return None;
+            }
+            let kc = cache.k_cache();
+            let writer_start = kc.chunked_writer_start_idx()?;
+            let chunks: Vec<(u16, u16)> =
+                kc.chunked_visit_live_chunks(|it| it.map(|c| (c.offset, c.token_count)).collect())?;
+            let write_slice =
+                SlotTokenLayout::new(chunks.clone(), writer_start, CHUNK_SIZE).write_slice;
+            let mut rope = 0u32;
+            let slices: Vec<TokenSliceHost> = chunks
+                .iter()
+                .map(|&(chunk_offset, n)| {
+                    let s = TokenSliceHost {
+                        offset: chunk_offset,
+                        len: n,
+                        rope,
+                        heads: Vec::new(),
+                        meta: None,
+                    };
+                    rope += n as u32;
+                    s
+                })
+                .collect();
+            let placed = (offset..offset + len)
+                .map(|k| resolve_pos_reference(&slices, write_slice as usize, CHUNK_SIZE, k))
+                .collect();
+            Some(PlannedRow {
+                chunks,
+                writer_start,
+                write_slice,
+                placed,
+            })
+        })
+        .collect()
+}
+
+/// After the commit: does the host's block table hold every new position where
+/// the kernel wrote it?
+///
+/// Two rules decide the one fact. The kernel places a row's new tokens by its
+/// pending-write walk from `write_slice`; the host counts them by filling the
+/// non-full chunks from the writer boundary (`ChunkedKvBacking::set_len`).
+/// Where the two disagree the host commits a position the kernel wrote
+/// somewhere else, and that position reads unwritten — the claim poison under
+/// `tensor-assert`, another tenant's bytes without it. Host arithmetic only,
+/// no device read, so it cannot change the timing it watches.
+pub(crate) fn check_prefill_placement(
+    planned: &[Option<PlannedRow>],
+    caches: &[&mut KvCache],
+    offsets: &[usize],
+) {
+    for (row, (plan, cache)) in planned.iter().zip(caches.iter()).enumerate() {
+        let Some(plan) = plan else {
+            continue;
+        };
+        let kc = cache.k_cache();
+        let (Some(backing), Some(batch)) = (kc.chunked_backing(), kc.chunked_batch_idx()) else {
+            continue;
+        };
+        let Ok(blocks) = backing.band_map(batch) else {
+            continue;
+        };
+        let windows: Vec<(u16, u32)> = blocks.iter().map(|b| (b.offset, b.usage)).collect();
+        let offset = offsets[row];
+        let mut first = None;
+        let mut disagree = 0usize;
+        for (i, kernel) in plan.placed.iter().enumerate() {
+            let host = slot_of(&windows, offset + i);
+            if host != *kernel {
+                disagree += 1;
+                if first.is_none() {
+                    first = Some((offset + i, *kernel, host));
+                }
+            }
+        }
+        let Some((pos, kernel, host)) = first else {
+            continue;
+        };
+        let from = plan.writer_start.saturating_sub(2);
+        let before: String = plan
+            .chunks
+            .iter()
+            .enumerate()
+            .skip(from)
+            .map(|(i, &(o, n))| format!("[{i}] {o}+{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let after: String = windows
+            .iter()
+            .enumerate()
+            .skip(from)
+            .map(|(i, &(o, n))| format!("[{i}] {o}+{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        panic!(
+            "PREFILL PLACEMENT DISAGREES: batch row {row}, new positions {offset}..{} — position \
+             {pos} is written by the kernel at (chunk, slot) {kernel:?} but committed by the host \
+             at {host:?}; {disagree} of {} new positions disagree. writer_start {}, write_slice \
+             {}, {} chunks before the write and {} after. Layout the kernel wrote through \
+             (offset+len, from chunk {from}): {before}. Layout the host committed \
+             (offset+usage): {after}. Recent block-table mutations, oldest first: {}.",
+            offset + plan.placed.len(),
+            plan.placed.len(),
+            plan.writer_start,
+            plan.write_slice,
+            plan.chunks.len(),
+            windows.len(),
+            mutations_of(cache),
+        );
     }
 }
 

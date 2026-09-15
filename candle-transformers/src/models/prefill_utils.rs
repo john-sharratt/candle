@@ -20,8 +20,10 @@ use {
 };
 
 #[cfg(feature = "tensor-assert")]
-use crate::models::head_hole_check::{check_prefill_write, mutations_of};
-#[cfg(feature = "cuda")]
+use crate::models::head_hole_check::{
+    check_prefill_placement, check_prefill_write, mutations_of, plan_prefill_writes,
+};
+#[cfg(feature = "prefill-capture")]
 use crate::models::prefill_capture::maybe_capture;
 use crate::models::qsa_selection::QsaSelection;
 #[cfg(feature = "cuda")]
@@ -582,12 +584,16 @@ fn paged_prefill_batched_impl<'w>(
 
     let header_upload = build_slot_headers(caches, q_lens, generation, offsets)?;
     let headers_ptr = header_upload.headers_ptr;
+    // Where the kernel is about to put each row's new positions, from the same
+    // layout the headers describe — checked against the host's commit below.
+    #[cfg(feature = "tensor-assert")]
+    let planned = plan_prefill_writes(caches, offsets, q_lens);
 
     g_pack.end();
 
-    // Optional kernel-replay capture: dumps this call's packed Q/K/V + cached KV
-    // chunks + geometry to a fixture. No-op unless `ZEND_PREFILL_CAPTURE` is set;
-    // fires once, on the first call past the kv_len threshold (one layer).
+    // Kernel-replay capture: dumps this call's packed Q/K/V + cached KV chunks +
+    // geometry to a fixture, once, on the first call past the kv_len threshold.
+    #[cfg(feature = "prefill-capture")]
     maybe_capture(
         caches,
         offsets,
@@ -632,6 +638,8 @@ fn paged_prefill_batched_impl<'w>(
     for ((cache, &off), &add) in caches.iter_mut().zip(offsets.iter()).zip(q_lens.iter()) {
         cache.commit_written_tokens(off, add)?;
     }
+    #[cfg(feature = "tensor-assert")]
+    check_prefill_placement(&planned, caches, offsets);
     // The narrow rows' new positions, read straight back while the header
     // table they were written through is alive — see `check_prefill_write`.
     #[cfg(feature = "tensor-assert")]

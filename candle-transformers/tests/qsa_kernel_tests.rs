@@ -756,6 +756,112 @@ fn decode_honours_selection_at_hd64_hpg2() -> Result<()> {
     )
 }
 
+/// Room claimed past the writer must not move a sparse decode by one bit.
+///
+/// A long prompt claims its whole length before the first pass, so empty
+/// chunks sit after the writer; the decode kernel's commit advances the write
+/// slice's `len` on the device and no other slice, so from the first step on
+/// their `rope` trails the positions the writer holds — and at build time it
+/// ties with the new token's own position. The sparse path resolves each
+/// selected cell by a rope-ordered search over the slice table; searched to
+/// the end, that lands in a trailing slice, where the cell reads as empty and
+/// drops out of the attention. The search ends at the write slice, so the slot
+/// with claimed capacity and the one without read the same history.
+///
+/// One header per slot, built once, so each launch reads the slice table the
+/// previous launch's commit left — the production decode pattern.
+fn claimed_ahead_case(g: Geom, history: usize, seed: u64) -> Result<()> {
+    let _guard = gpu_serial();
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let stager = PinnedStager::new_from_device(&device);
+    let inv_freq = Tensor::from_vec(
+        (0..g.head_dim / 2)
+            .map(|i| 1f32 / 10000f32.powf(2.0 * i as f32 / g.head_dim as f32))
+            .collect::<Vec<f32>>(),
+        (g.head_dim / 2,),
+        &device,
+    )?;
+    let claim = 3 * CHUNK_SIZE;
+    let rope_cs = compute_rope_cs(
+        &inv_freq,
+        MAX_BLOCKS.max((history + claim).div_ceil(CHUNK_SIZE) + 2),
+        g.head_dim,
+        &device,
+    )?;
+
+    let none_alt = vec![false; history];
+    let (backing_a, cache_a) =
+        build_history_slot(g, history, seed, &none_alt, &rope_cs, &stager, &device)?;
+    let (backing_b, cache_b) =
+        build_history_slot(g, history, seed, &none_alt, &rope_cs, &stager, &device)?;
+    backing_b.ensure_for_batch_entries(&[(0, history)], claim)?;
+    let chunks = |c: &KvCache| {
+        c.k_cache()
+            .chunked_live_chunks_as_sealed()
+            .unwrap_or_default()
+            .len()
+    };
+    assert!(
+        chunks(&cache_b) > chunks(&cache_a),
+        "the claimed slot must carry empty chunks past its writer, or this compares nothing"
+    );
+
+    let header_a = SlotHeaders::build(g, &backing_a, &cache_a, &stager, &device)?;
+    let header_b = SlotHeaders::build(g, &backing_b, &cache_b, &stager, &device)?;
+    for step in 0..2usize {
+        let (q1, k1, v1) = make_qkv(g, 1, seed ^ (0x55 + step as u64), &[], &device)?;
+        let q = q1.reshape((1, g.n_head, 1, g.head_dim))?;
+        let k_new = k1.reshape((1, g.n_kv_head, 1, g.head_dim))?;
+        let v_new = v1.reshape((1, g.n_kv_head, 1, g.head_dim))?;
+        let full = selection(&[explicit_full_row(history + step + 1)], &device)?;
+        let a = bits(&header_a.decode(g, &q, &k_new, &v_new, &rope_cs, Some(&full))?)?;
+        let b = bits(&header_b.decode(g, &q, &k_new, &v_new, &rope_cs, Some(&full))?)?;
+        assert_eq!(
+            a, b,
+            "step {step}: capacity claimed past the writer moved a sparse decode — a \
+             rope-ordered search reached a slice past the write slice"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn claimed_capacity_leaves_a_sparse_decode_exact_at_hd256_hpg12() -> Result<()> {
+    claimed_ahead_case(FLASH_NEXT, 100, 0xD1)
+}
+
+#[test]
+fn claimed_capacity_leaves_a_sparse_decode_exact_at_hd128_hpg2() -> Result<()> {
+    claimed_ahead_case(
+        Geom {
+            n_head: 4,
+            n_kv_head: 2,
+            head_dim: 128,
+        },
+        100,
+        0xD2,
+    )
+}
+
+#[test]
+fn claimed_capacity_leaves_a_sparse_decode_exact_at_hd64_hpg2() -> Result<()> {
+    claimed_ahead_case(
+        Geom {
+            n_head: 4,
+            n_kv_head: 2,
+            head_dim: 64,
+        },
+        100,
+        0xD3,
+    )
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Prefill
 // ──────────────────────────────────────────────────────────────────────

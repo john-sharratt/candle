@@ -1221,10 +1221,9 @@ impl KvCache {
     /// it reads as whatever it last held, which since slots are recycled is
     /// another sequence's KV, and under `tensor-assert` the claim poison.
     ///
-    /// A write that stayed in the chunk the buffer was built for changed only
-    /// the writer slice, so it is patched in place; one that crossed into a
-    /// later chunk also left the full chunks behind it stale, so the buffer is
-    /// dropped and rebuilt from the host state on the next decode sync — see
+    /// The buffer's writer region — every chunk from the writer boundary to
+    /// the writer, each of which a write that spilled across a chunk boundary
+    /// may have filled — is re-serialised in place; see
     /// `ChunkedKvBacking::refresh_decode_writer_slice`. A sequence with no
     /// cached buffer has nothing to resync.
     pub fn commit_written_tokens(&mut self, offset: usize, add: usize) -> Result<()> {

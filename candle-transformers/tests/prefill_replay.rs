@@ -1,7 +1,7 @@
 //! Replay + benchmark of a captured paged-prefill kernel call.
 //!
-//! Loads a bincode `PrefillCapture` fixture (produced by `ZEND_PREFILL_CAPTURE`
-//! and trimmed to its largest slot via the `trim_prefill_fixture` example),
+//! Loads a bincode `PrefillCapture` fixture (produced by a `prefill-capture`
+//! build and trimmed to its largest slot via the `trim_prefill_fixture` example),
 //! rebuilds the cached KV prefix into a fresh `ChunkedKvBacking`, and replays
 //! the exact `paged_prefill_batched` call — then NaN/inf-checks the output and
 //! benchmarks the kernel under a bounded wall-time budget (multiple runs to
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use candle::quantized::pinned_staging::PinnedStager;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{ChunkedKvBacking, HostSealedChunk, KvCache, KvFormat};
-use candle_transformers::models::prefill_capture::PrefillCapture;
+use candle_transformers::models::prefill_capture::{PrefillCapture, SlotCapture};
 use candle_transformers::models::prefill_utils::paged_prefill_batched;
 
 fn qkv_dtype(tag: u8) -> DType {
@@ -32,9 +32,7 @@ fn qkv_dtype(tag: u8) -> DType {
 /// new tokens; we drop those so `paged_prefill_batched` allocates + writes its
 /// own writer region (matching the real forward), rather than re-injecting
 /// empty chunks as sealed.
-fn prefix_host_chunks(
-    slot: &candle_transformers::models::prefill_capture::SlotCapture,
-) -> Vec<HostSealedChunk> {
+fn prefix_host_chunks(slot: &SlotCapture) -> Vec<HostSealedChunk> {
     slot.chunks
         .iter()
         .filter(|c| c.token_count > 0)

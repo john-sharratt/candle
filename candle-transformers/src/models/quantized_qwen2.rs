@@ -544,7 +544,7 @@ impl ModelWeights {
         Self::from_gguf_by_path_with_options(file_path, device, None, Int8Mode::auto(device))
     }
 
-    /// Like from_gguf_by_path but with an explicit int8mode (test path selects from INT8MODE).
+    /// Like from_gguf_by_path but with an explicit int8mode.
     pub fn from_gguf_by_path_with_int8(
         file_path: &std::path::Path,
         device: &Device,
@@ -1434,11 +1434,7 @@ mod tests {
 
         // Sequential (non-batched) callbacks - access inner model via .model()
         // Loads the model wrapped in BatchedInference with proper inv_freq
-        let int8mode = match std::env::var("INT8MODE").ok().as_deref() {
-            Some("off") => candle::quantized::Int8Mode::Off,
-            Some("prec") | Some("precision") => candle::quantized::Int8Mode::Precision,
-            _ => candle::quantized::Int8Mode::Performance,
-        };
+        let int8mode = Int8Mode::Performance;
         println!(
             "int8 mode = {int8mode:?}
 "

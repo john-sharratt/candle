@@ -1581,7 +1581,12 @@ int8_decode_tile_kernel(
     constexpr int SCATTER_WARP = TILE_WARPS - 2;
     constexpr int STAGE_WARP = TILE_WARPS - 1;
     const SlotHeader& slot = get_slot_header(headers_ptr, slot_idx);
-    const int n_slices = (int)slot.n_slices;
+    // Positions end at the write slice (see `resolve_pos`): the chunks after
+    // it are empty capacity whose `rope` nothing keeps current, and the
+    // gallop in `tile_slice_holding` would take one for the owner of positions
+    // the writer holds — or, at a rope equal to the new token's position, for
+    // the new token's slice, which then drops it from its own attention.
+    const int n_slices = min((int)slot.n_slices, (int)slot.write_slice + 1);
     const int write_slice_idx = (int)slot.write_slice;
     const uint64_t slices_ptr = slot.slices_ptr;
 

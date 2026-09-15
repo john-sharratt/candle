@@ -1858,12 +1858,12 @@ impl BatchedEngine {
         // each position map must cover [0, resident+s_len). `set_len`
         // deliberately never touches the serialized slot buffer (see its
         // DMA-race comment), so `refresh_decode_writer_slice` brings the cached
-        // slot state up to date: the O(1) writer-slice patch when the block
-        // stayed in the chunk the buffer was built for, a rebuild when it
-        // crossed into a fresh one. The patch is NOT enough there even though
-        // `push_chunk` cleared the buffer at append time — an EARLIER wave's
-        // metadata build re-validated it at pre-`set_len` lengths, so the
-        // spanned block's earlier rows would read short through the stale
+        // slot state up to date by re-serialising the writer region — every
+        // chunk from the writer boundary to the writer. A block that spanned
+        // into a fresh chunk needs its predecessor re-serialised too, even
+        // though `push_chunk` cleared the buffer at append time: an EARLIER
+        // wave's metadata build re-validated it at pre-`set_len` lengths, so
+        // the spanned block's earlier rows would read short through the stale
         // predecessor slice (measured as an acceptance collapse to 1.4
         // tok/step with a lossless-assert kill).
         //

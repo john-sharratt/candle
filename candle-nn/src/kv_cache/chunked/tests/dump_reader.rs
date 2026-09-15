@@ -30,6 +30,8 @@
 //!       [v4 only]
 //!       q_data      : [f32; n_kv_head * chunk_size * head_dim]
 
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -55,11 +57,12 @@ pub struct ChunkData {
     /// First sequence position (token index) covered by this chunk.
     /// For a chunk of size S at sequential position N, token_start = N * S.
     pub token_start: usize,
-    /// Flat f32, logical shape [n_kv_head, chunk_size, head_dim].
+    /// Flat f32, `[n_kv_head][N_PALETTE][chunk_size][head_dim / N_PALETTE]`:
+    /// palette bands in order, each token-major — the float arenas' layout.
     pub k: Vec<f32>,
-    /// Flat f32, logical shape [n_kv_head, chunk_size, head_dim].
+    /// Flat f32, same layout as `k`.
     pub v: Vec<f32>,
-    /// Flat f32, logical shape [n_kv_head, chunk_size, head_dim].  Only present in v4 dumps.
+    /// Flat f32, same layout as `k`.  Only present in v4 dumps.
     pub q: Option<Vec<f32>>,
 }
 
@@ -88,6 +91,36 @@ pub fn read_f32_le(bytes: &[u8], pos: &mut usize) -> Option<f32> {
 // ---------------------------------------------------------------------------
 // Loader
 // ---------------------------------------------------------------------------
+
+/// Whether the dump at `path` holds any chunk data, decided from its header
+/// and its length without reading the chunks. A header-only capture (a
+/// session that recorded its token sequence but no KV writes) ends right
+/// after the per-layer chunk counts, one `u32` per layer.
+pub fn dump_has_chunks(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return false;
+    };
+    // magic (8) · version · num_layers · n_kv_head · chunk_size · head_dim ·
+    // [v2+] num_tokens — each u32.
+    let mut head = [0u8; 32];
+    if file.read_exact(&mut head).is_err() || &head[0..8] != b"KVDUMP\0\0" {
+        return false;
+    }
+    let word = |at: usize| {
+        u64::from(u32::from_le_bytes([
+            head[at],
+            head[at + 1],
+            head[at + 2],
+            head[at + 3],
+        ]))
+    };
+    let (version, num_layers) = (word(8), word(12));
+    let chunks_start = if version >= 2 { 32 + word(28) * 4 } else { 28 };
+    len > chunks_start + num_layers * 4
+}
 
 /// Load the binary dump file.  Returns `None` if the file does not exist or
 /// the magic / version check fails.

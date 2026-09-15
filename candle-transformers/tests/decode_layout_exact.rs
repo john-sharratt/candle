@@ -222,6 +222,22 @@ fn run_case(
         device,
     )?;
     assert_layout(&cache_a, &cache_b, total, segments, name);
+    // The packed control again, with room claimed ahead of its writer — as a
+    // long prompt claims its whole length before the first pass. The chunks
+    // past the writer are empty capacity whose rope the device's per-token
+    // commit leaves behind; the decode must read the same history regardless.
+    let (backing_c, mut cache_c) = build_control_slot(
+        arena,
+        total,
+        &q_all,
+        &k_all,
+        &v_all,
+        &rope_cs,
+        &rope_offsets,
+        stager,
+        device,
+    )?;
+    backing_c.ensure_for_batch_entries(&[(0, total)], CLAIM_AHEAD)?;
 
     // **Several decode steps, in lockstep.** One step exercises the read of a
     // layout; the next exercises the read of what the previous step WROTE —
@@ -269,6 +285,9 @@ fn run_case(
         let out_bp = decode_one_production(
             &backing_b, &cache_b, &q_dec, &k_new, &v_new, &rope_cs, stager, device,
         )?;
+        let out_cp = decode_one_production(
+            &backing_c, &cache_c, &q_dec, &k_new, &v_new, &rope_cs, stager, device,
+        )?;
 
         // **Against a reference, not only against each other.** Two layouts
         // that agree to the bit can both be wrong — a defect in how the kernel
@@ -283,6 +302,7 @@ fn run_case(
             ("segmented", &out_b),
             ("control/production-header", &out_ap),
             ("segmented/production-header", &out_bp),
+            ("claimed-ahead/production-header", &out_cp),
         ] {
             let (cos, mae) = against(out, &reference)?;
             if cos < 0.995 || mae > 5e-3 {
@@ -307,6 +327,16 @@ fn run_case(
                 );
             }
         }
+        let c = compare(&out_ap, &out_cp)?;
+        if c.max_abs > 0.0 {
+            candle::bail!(
+                "{name} step {s}: capacity claimed past the writer changes the decode: \
+                 max_abs={:.3e} n_diff={}/{}",
+                c.max_abs,
+                c.n_diff,
+                c.n
+            );
+        }
         let c = compare(&out_a, &out_b)?;
         if c.max_abs > 0.0 && worst.max_abs == 0.0 {
             eprintln!("    ({name} first differs at decode step {s})");
@@ -321,7 +351,11 @@ fn run_case(
         // bookkeeping the scheduler does per token, and the reference's
         // history.
         let n = total + s + 1;
-        for (backing, cache) in [(&backing_a, &mut cache_a), (&backing_b, &mut cache_b)] {
+        for (backing, cache) in [
+            (&backing_a, &mut cache_a),
+            (&backing_b, &mut cache_b),
+            (&backing_c, &mut cache_c),
+        ] {
             backing.set_len(0, n);
             cache.set_current_seq_len(n)?;
         }
@@ -339,6 +373,11 @@ fn run_case(
 /// one, so within a few steps one of them crosses a chunk boundary — the
 /// event that used to be where two layouts parted.
 const STEPS: usize = 4;
+
+/// Tokens of room the claimed-ahead slot takes past its prompt before the
+/// first decode: three chunks, so whatever the prompt's tail, at least two
+/// empty chunks sit after the writer through every step.
+const CLAIM_AHEAD: usize = 3 * CHUNK_SIZE;
 
 /// The decode attention in F32 over F16-rounded inputs, the way decode_ab's
 /// golden computes it: one query row per head over `ctx` prefill tokens plus
@@ -723,7 +762,10 @@ fn decode_one_production(
     // slice for slice, (offset, len, rope) and which slice is the writer.
     // The two are built from the same chunk state by different code; the
     // kernel reads only this, so a disagreement here is the whole story of
-    // any output difference between the two headers.
+    // any output difference between the two headers. History ends at the
+    // write slice: the slices after it are empty capacity whose rope the
+    // device's per-token commit leaves behind and no kernel reads, so only
+    // their (offset, len) are held to the test-side table.
     let chunks = cache
         .k_cache()
         .chunked_live_chunks_as_sealed()
@@ -761,7 +803,14 @@ fn decode_one_production(
         .iter()
         .map(|s| (s.offset, s.len, s.rope))
         .collect();
-    if prod != test || write_slice != expect.write_slice {
+    let history = expect.write_slice as usize + 1;
+    let read = |t: &[(u16, u16, u32)]| -> Vec<(u16, u16, u32)> {
+        t.iter()
+            .enumerate()
+            .map(|(i, &(o, l, r))| (o, l, if i < history { r } else { 0 }))
+            .collect()
+    };
+    if read(&prod) != read(&test) || write_slice != expect.write_slice {
         candle::bail!(
             "production slot header disagrees with the test-side header at seq_offset \
              {seq_offset}:\n  production: write_slice={write_slice} slices(offset,len,rope)={prod:?}\n  \
