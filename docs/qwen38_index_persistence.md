@@ -87,6 +87,23 @@ Two pieces make this work:
 - **`qsa_score_paged`** — a ragged, paged scorer that takes a descriptor table of
   page pointers plus a per-row candidate count, and never sees a width. The
   widths are folded into `cnt` on the host, where the page table already lives.
+- **The attention kernels' block → position walk** (`qsa_select.cuh`:
+  `qsa_block_of`, `qsa_block_start`, `qsa_block_width`). The selection names
+  blocks; the attention kernels read positions, so every kernel that consumes
+  the selection turns a block back into positions through the same page table
+  (`{tokens_before, blocks_before}` per page, the live tail's entry last). A
+  kernel that walks ENTRIES must also clamp an entry's cell count to its block's
+  width: a page's last block is short, and the position past it belongs to the
+  next block, whose own entry decides it. Uniform `block · ratio` is correct only
+  for a sequence with no pages — and silently wrong for every block behind the
+  first page of a projected one: the hd256 tile decode kernel (Flash-Next's own
+  decode shape) and the stripe kernel computed it that way, so a decode past the
+  budget read every selected block displaced by the accumulated short-block
+  shortfall and dropped the newest ones, the query's own tail among them, past
+  the end of the K/V. The model answered the question before the last one; the
+  dense control, which never enters the sparse path, answered correctly. The
+  prefill walk steps to each block's own end for the same reason, rather than a
+  full `ratio` past it.
 
 Nothing is concatenated. Materialising the window would copy every key of every
 selected turn on the step that reconstructs, which at conversational depth is the
@@ -253,6 +270,8 @@ rate on both, which is the depth-flat property holding.
 | Piece | File |
 |---|---|
 | Ragged/paged scorer kernel | `candle-kernels/src/simple/qsa_score_paged.cu` |
+| Block → position walk (every attention kernel) | `candle-kernels/src/qsa_select.cuh`; its consumers `paged-decode/int8_decode_tile_kernel.cuh` (`tile_resolve_entries`), `paged-decode/int8_decode_kernel.cuh`, `paged-prefill/qsa_walk.cuh` |
+| Page-layout kernel tests | `candle-transformers/tests/qsa_kernel_tests.rs` (`*_honours_a_page_layout_*`) |
 | Short-block flush kernel | `candle-kernels/src/simple/qsa_index_append.cu` (`flush_kernel`) |
 | Page window + container | `candle-transformers/src/models/qwen4exp/paged_index.rs` |
 | Cache export/restore | `candle-transformers/src/models/qwen4exp/indexer.rs` |

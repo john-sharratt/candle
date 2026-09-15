@@ -533,13 +533,16 @@ paged_prefill_int8_kernel(
         int n_blk = 0;
         for (int b = 0; b < NB; ++b) {
             uint32_t mk[QSA_WALK_ROWS_PER_LANE];
-            const int q = walk.next(bound, mk);
+            int step_end;
+            const int q = walk.next(bound, mk, step_end);
             if (q >= kv_len) break;
             rm[0] |= mk[0] << (b * QB);
             rm[1] |= mk[1] << (b * QB);
             if (b == my_blk) my_q = q;
             n_blk = b + 1;
-            bound = q + QB;
+            // The step's own end: through a page layout a block can be shorter
+            // than `QB`, and the next block starts where this one ends.
+            bound = step_end;
         }
         if (n_blk == 0) break;
         // Round-robin tiles across shards. The skip is block-uniform

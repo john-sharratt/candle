@@ -66,6 +66,15 @@ struct QsaWalk {
         return (int)(p.x + (block - p.y) * (uint32_t)ratio);
     }
 
+    // The cells `block` (starting at `first`) spans, at most `ratio` — the
+    // walk's copy of `qsa_block_width`. A page's last block is short, and an
+    // entry's full count would reach into the next block: attending its first
+    // position twice when that block is selected too, and once when it is not.
+    __device__ __forceinline__ int width_of(uint32_t block, int first) const {
+        if (pages == nullptr) return ratio;
+        return min(ratio, start_of(block + 1u) - first);
+    }
+
     // Bind rows [row_base, row_base + n_rows) of `sel`. Called by every lane.
     __device__ __forceinline__ void init(const QsaSel& sel, int row_base, int n_rows, int lane) {
         base = sel.entries;
@@ -109,40 +118,56 @@ struct QsaWalk {
         }
     }
 
-    // The start of the lowest block at or past `bound` some row selects, or
-    // QSA_WALK_END. `bound` must be a block start (a multiple of `ratio`):
-    // every entry names one whole block, so the cursors pass exactly the
-    // entries below the bound and the survivor's first cell is the block's
-    // start. Warp-collective: every lane returns the same value. Amortised,
-    // a cursor moves once per entry over the whole walk.
+    // The start of the lowest step at or past `bound` some row reads, or
+    // QSA_WALK_END; `end` receives where that step stops, which is the
+    // `bound` of the next call. Warp-collective: every lane returns the same
+    // pair. Amortised, a cursor moves once per entry over the whole walk.
     //
-    // `mask[h]` receives, for this lane's row h, one bit per cell of the
-    // returned block that the row selects (bit c ⇔ position start + c),
-    // zero when the row does not select that block.
-    __device__ __forceinline__ int next(int bound, uint32_t (&mask)[QSA_WALK_ROWS_PER_LANE]) {
+    // **A step is one block, cut short by whatever another row reads next.**
+    // A sparse row's block runs from its start for its width (`width_of`:
+    // `ratio`, or less for a page's last block); a dense row reads every
+    // position from `bound`. The step ends at the chosen block's end or at the
+    // next position any row proposes, whichever is first — so a dense row
+    // beside a ragged block covers the gap up to that block and then the block
+    // itself, and no position is read twice or skipped. Without pages every
+    // block is `ratio` wide and every proposal a multiple of it, so a step is
+    // exactly one block, as the walk always stepped.
+    //
+    // `mask[h]` receives, for this lane's row h, one bit per cell of the step
+    // that the row selects (bit c ⇔ position start + c), zero when the row
+    // reads nothing in it.
+    __device__ __forceinline__ int next(int bound, uint32_t (&mask)[QSA_WALK_ROWS_PER_LANE],
+                                        int& end) {
         int best = QSA_WALK_END;
         int first_h[QSA_WALK_ROWS_PER_LANE];
         int cells_h[QSA_WALK_ROWS_PER_LANE];
+        int width_h[QSA_WALK_ROWS_PER_LANE];
         #pragma unroll
         for (int h = 0; h < QSA_WALK_ROWS_PER_LANE; ++h) {
             first_h[h] = QSA_WALK_END;
             cells_h[h] = 0;
+            width_h[h] = 0;
             if (dense & (1u << h)) {
                 first_h[h] = bound;
                 cells_h[h] = ratio;
+                width_h[h] = ratio;
                 best = bound;
                 continue;
             }
             while (c[h] < n[h]) {
                 const uint32_t ent = base[e[h] + c[h]];
-                const int first = start_of(ent >> QSA_CELL_BITS);
-                const int cells = (int)(ent & ((1u << QSA_CELL_BITS) - 1u)) + 1;
-                if (first + cells - 1 < bound) {
+                const uint32_t blk = ent >> QSA_CELL_BITS;
+                const int first = start_of(blk);
+                const int width = width_of(blk, first);
+                // Consumed once the walk is past the block's start: the step
+                // that took it ended at or after the block's own end.
+                if (first < bound) {
                     c[h] += 1u;
                     continue;
                 }
                 first_h[h] = first;
-                cells_h[h] = cells;
+                cells_h[h] = min((int)(ent & ((1u << QSA_CELL_BITS) - 1u)) + 1, width);
+                width_h[h] = width;
                 best = min(best, first);
                 break;
             }
@@ -150,10 +175,29 @@ struct QsaWalk {
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
             best = min(best, __shfl_xor_sync(0xffffffffu, best, off));
+        // The step's end: a row at `best` stops it at its own block's end, a
+        // row proposing a later position stops it there.
+        int stop = QSA_WALK_END;
         #pragma unroll
         for (int h = 0; h < QSA_WALK_ROWS_PER_LANE; ++h) {
-            const bool hit = (first_h[h] == best);
-            mask[h] = !hit ? 0u : (cells_h[h] >= 32 ? ~0u : ((1u << cells_h[h]) - 1u));
+            if (first_h[h] == QSA_WALK_END) continue;
+            stop = min(stop, first_h[h] == best ? first_h[h] + width_h[h] : first_h[h]);
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            stop = min(stop, __shfl_xor_sync(0xffffffffu, stop, off));
+        // At least one position forward, whatever the table says: a page that
+        // claimed more blocks than its tokens fill gives a width of zero or
+        // less, and a step that ended where it began would be returned again
+        // on every call — the tile loop spinning on one block for good. With a
+        // well-formed table every step is at least one cell wide already.
+        if (best != QSA_WALK_END) stop = max(stop, best + 1);
+        end = stop;
+        const int span = (best == QSA_WALK_END) ? 0 : stop - best;
+        #pragma unroll
+        for (int h = 0; h < QSA_WALK_ROWS_PER_LANE; ++h) {
+            const int cells = (first_h[h] == best) ? max(0, min(cells_h[h], span)) : 0;
+            mask[h] = cells >= 32 ? ~0u : ((1u << cells) - 1u);
         }
         return best;
     }
