@@ -427,6 +427,15 @@
       const timers = [];
       let cancelled = false;
       const later = (ms, fn) => { timers.push(setTimeout(() => { if (!cancelled) fn(); }, ms)); };
+      // A test sets this to make the next send fail as the live adapter reports
+      // it: `reached` false for a request that got no response, true for a
+      // stream that broke after the daemon started.
+      const failure = window.__ZEND_MOCK_SEND_FAILURE__;
+      if (failure) {
+        window.__ZEND_MOCK_SEND_FAILURE__ = null;
+        later(34, () => { handlers.onError(failure.message, { reached: !!failure.reached }); handlers.onDone(); });
+        return { cancel: () => { cancelled = true; timers.forEach((t) => clearTimeout(t)); } };
+      }
       const streamText = (reply, then) => {
         const tokens = reply.match(/\S+\s*|\s+/g) || [reply];
         let i = 0, acc = '', thinkEmitted = false, thinkClosed = false;

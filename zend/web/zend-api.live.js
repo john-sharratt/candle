@@ -140,8 +140,15 @@
         // empty bubble and no way to tell whether the model had nothing to say
         // or the daemon had died. The caller gets `onError` and decides;
         // `onDone` still runs after it, so the composer always unlocks.
-        if (!resp.ok || !resp.body) {
-          fail(handlers, 'The daemon rejected the request (HTTP ' + resp.status + ').');
+        // Any status but 200 means no turn started: every request that reaches
+        // the daemon's handler is answered 200 and streamed. A 408 from the edge
+        // on a slow uplink is one of these.
+        if (!resp.ok) {
+          fail(handlers, 'The request failed with HTTP ' + resp.status + ' before the turn started.', false);
+          return;
+        }
+        if (!resp.body) {
+          fail(handlers, 'The response arrived without a body.', true);
           return;
         }
         const reader = resp.body.getReader();
@@ -154,7 +161,7 @@
             // answer at all. The daemon logs why; the user needs to know it
             // happened.
             if (!sawFrame) {
-              fail(handlers, 'The response ended before it started. The daemon logged the reason.');
+              fail(handlers, 'The response ended before it started. The daemon logged the reason.', true);
               return;
             }
             handlers.onDone();
@@ -172,12 +179,12 @@
         }).catch((e) => {
           // An abort is the user pressing stop, not a failure.
           if (e && e.name === 'AbortError') { handlers.onDone(); return; }
-          fail(handlers, 'The response stream broke: ' + errText(e));
+          fail(handlers, 'The response stream broke: ' + errText(e), true);
         });
         pump();
       }).catch((e) => {
         if (e && e.name === 'AbortError') { handlers.onDone(); return; }
-        fail(handlers, 'Could not reach the daemon: ' + errText(e));
+        fail(handlers, 'Could not reach the daemon: ' + errText(e), false);
       });
       return { cancel: () => controller.abort() };
     },
@@ -290,8 +297,12 @@
 
   // A stream ended badly. Tell the caller what happened, then end the stream
   // normally so the composer unlocks whether or not it handles `onError`.
-  function fail(handlers, message) {
-    if (handlers.onError) handlers.onError(message);
+  // `reached` says whether the daemon may have started the turn. False when the
+  // request failed before any response: the turn never ran, so the same message
+  // can be sent again. True once a response began: the daemon cancels a turn
+  // whose client drops and may already have stored part of it.
+  function fail(handlers, message, reached) {
+    if (handlers.onError) handlers.onError(message, { reached });
     handlers.onDone();
   }
 

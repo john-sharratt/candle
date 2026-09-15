@@ -164,6 +164,13 @@
     background: #fbf1ef; color: #7d2f24; font-size: .88rem; line-height: 1.45;
   }
   .zmd .zerr b { color: #9a3729; }
+  .zmd .zerr-act {
+    display: block; margin-top: .5rem; height: 28px; padding: 0 .8rem;
+    border-radius: 6px; border: none; background: #b4483a; color: #fff;
+    font: inherit; font-size: .8rem; font-weight: 600; cursor: pointer;
+  }
+  .zmd .zerr-act:hover { background: #9a3729; }
+  .zmd .zerr-act:focus-visible { outline: 2px solid #7d2f24; outline-offset: 2px; }
   /* Selectable regions: chat content + file viewer opt back into text
      selection (the global mousedown-preventDefault suppresses it on chrome). */
   .z-selectable, .z-selectable * { -webkit-user-select: text; user-select: text; }
@@ -800,7 +807,9 @@ import { estateSwitcher } from './common/lib/estate.js';
     const think = { lengths: msg.thinking, live: msg.thinkLive };
     if (msg.error) {
       const body = msg.content ? renderContent(msg.content, false, open, toolOutputs || msg.toolOutputs, null, think, tokens) : '';
-      return body + '<div class="zerr" role="alert"><b>Generation failed.</b> ' + esc(msg.error) + '</div>';
+      const act = msg.retry === 'resend' ? 'Try again' : msg.retry === 'reload' ? 'Reload conversation' : '';
+      const btn = act ? '<button type="button" class="zerr-act" data-retry="' + msg.retry + '">' + act + '</button>' : '';
+      return body + '<div class="zerr" role="alert"><b>Generation failed.</b> ' + esc(msg.error) + btn + '</div>';
     }
     if (msg.streaming && !msg.content) {
       // Bouncing dots while waiting; the italic word only appears if the daemon
@@ -909,6 +918,22 @@ import { estateSwitcher } from './common/lib/estate.js';
     hydrateConv(id, true);
   }
   function retryLoad(id) { S.loaded[id] = false; delete S.loadError[id]; hydrateIfNeeded(id); render(); }
+  // A failed turn's button. `resend` sends the same question again into the
+  // same bubble: the request never reached the daemon, so it holds nothing of
+  // it. `reload` takes the conversation as the daemon stored it.
+  function retryTurn(convId, kind) {
+    const conv = S.conversations.find((c) => c.id === convId);
+    if (!conv || conv.streaming) return;
+    const last = conv.history.length - 1;
+    if (last < 0 || !conv.history[last].error) return;
+    if (kind === 'reload') { S.loaded[convId] = true; hydrateConv(convId); return; }
+    const user = conv.history[last - 1];
+    if (!user || user.role !== 'user') return;
+    conv.history = conv.history.slice(0, last).concat([{ role: 'assistant', content: '', streaming: true, status: '' }]);
+    conv.streaming = true;
+    render();
+    startStream(convId, user.content);
+  }
   // Fetch the persisted conversation and replace local history with it — the
   // authoritative per-turn split plus the projection timeline. Used on first
   // open (`first`, via hydrateIfNeeded: the pane shows it loading, and a failure
@@ -1120,9 +1145,13 @@ import { estateSwitcher } from './common/lib/estate.js';
       // The stream failed rather than finished. Record it on the message so the
       // bubble renders the reason, and log it — a silent failure here was the
       // whole reason a wedged turn looked like an empty answer.
-      onError: (msg) => {
+      onError: (msg, info) => {
         failed = true;
-        patchStream(convId, (m) => { m.error = msg; m.status = ''; });
+        // What the bubble offers next: a request that never reached the daemon
+        // is sent again as it was; a turn the daemon started is reloaded from it
+        // instead, since sending it again could store the question twice.
+        const retry = info && info.reached ? 'reload' : 'resend';
+        patchStream(convId, (m) => { m.error = msg; m.status = ''; m.retry = retry; });
         addLog(API.mkLog('ERROR', 'zend::http', 'POST /v1/chat/completions conv_id=' + convId + ' stream=failed: ' + msg));
       },
       onDone: () => {
@@ -3060,6 +3089,8 @@ import { estateSwitcher } from './common/lib/estate.js';
     e.preventDefault();
   });
   document.addEventListener('click', (e) => {
+    const retry = e.target.closest && e.target.closest('.zerr-act');
+    if (retry) { retryTurn(S.activeId, retry.getAttribute('data-retry')); return; }
     const btn = e.target.closest && e.target.closest('.copy-btn');
     if (!btn) return;
     const cb = btn.closest('.code-block'); const code = cb && cb.querySelector('code');

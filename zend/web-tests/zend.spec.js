@@ -148,6 +148,38 @@ test.describe('1.3 streaming', () => {
   });
 });
 
+test.describe('1.3b a failed send', () => {
+  async function sendFailing(page, failure) {
+    await boot(page);
+    await page.getByTitle('Expand sidebar').click();
+    await page.getByText('Why is decode latency spiking under load?').click();
+    await page.evaluate((f) => { window.__ZEND_MOCK_SEND_FAILURE__ = f; }, failure);
+    const ta = page.locator('#zend-prompt');
+    await ta.fill('Give me the short version');
+    await ta.press('Enter');
+    await expect(page.locator('.zerr')).toBeVisible();
+  }
+
+  test('a request that never reached the daemon is sent again by Try again', async ({ page }) => {
+    await sendFailing(page, { message: 'The request failed with HTTP 408 before the turn started.', reached: false });
+    await expect(page.locator('.zerr')).toContainText('HTTP 408');
+    await expect(page.getByRole('button', { name: 'Reload conversation' })).toHaveCount(0);
+    await page.getByRole('button', { name: 'Try again' }).click();
+    const last = page.locator('[data-msg]').last().locator('.zmd');
+    await expect(last).toContainText('redo log', { timeout: 10000 });
+    await expect(page.locator('.zerr')).toHaveCount(0);
+    // Sent again into the same turn, so the question appears once.
+    await expect(page.locator('.z-turn', { hasText: 'Give me the short version' })).toHaveCount(1);
+  });
+
+  test('a turn the daemon started is reloaded, never sent twice', async ({ page }) => {
+    await sendFailing(page, { message: 'The response stream broke: network error', reached: true });
+    await expect(page.getByRole('button', { name: 'Try again' })).toHaveCount(0);
+    await page.getByRole('button', { name: 'Reload conversation' }).click();
+    await expect(page.locator('.zerr')).toHaveCount(0);
+  });
+});
+
 test.describe('1.4 thinking block', () => {
   test('think block is collapsed by default', async ({ page }) => {
     await boot(page, { conv: '1' });
