@@ -114,16 +114,17 @@ impl ThinkMode {
     /// **`graceful` is the number that matters** — it is where a block actually
     /// lands, because the close fires at the next clause boundary once passed
     /// (measured: `graceful + ~10` tokens).  The ladder is therefore the
-    /// thinking length each rung buys: **512 → 1024 → 2048 → 4096**.
+    /// thinking length each rung buys: **1024 → 2048 → 4096 → 8192**.
     ///
-    /// `Quick` 512 is an order of magnitude above a trivial turn's 33–58, so
-    /// nothing ordinary is ever touched.  `Balanced` 1024 is the default path:
-    /// it clears the 155–348 band by 3×, and clears a hard question's natural
-    /// 720–1155 too, so a legitimate long thought completes rather than being
-    /// cut — while an unbounded enumeration still gets closed.  `Deep` 2048 and
-    /// `Exhaustive` 4096 bracket the 1024–4096 range where extra thinking is
-    /// documented to pay, and 4096 is the checkpoint's own `thinking_budget`
-    /// default (4000) to the nearest power of two.
+    /// `Quick` 1024 is an order of magnitude above a trivial turn's 33–58, so
+    /// nothing ordinary is ever touched.  `Balanced` 2048 is the default path.
+    /// A review turn — "read this paper and tell me what you think" — measured
+    /// closing at 1031 thinking tokens under a 1024 budget, still mid-thought,
+    /// so the default sits at twice that: a long considered thought completes,
+    /// while an unbounded enumeration still gets closed.  `Deep` 4096 and
+    /// `Exhaustive` 8192 extend the 1024–4096 range where extra thinking is
+    /// documented to pay; `Exhaustive` is twice the checkpoint's own
+    /// `thinking_budget` default (4000), to the nearest power of two.
     ///
     /// The two derived figures are held at fixed ratios so the three can never
     /// drift apart: `force = 1.5 × graceful` gives the clause-boundary close a
@@ -134,11 +135,11 @@ impl ThinkMode {
     /// inert.
     pub fn eot_budget(self) -> (i32, i32) {
         match self {
-            ThinkMode::Off => (512, 768),
-            ThinkMode::Quick => (512, 768),
-            ThinkMode::Balanced => (1024, 1536),
-            ThinkMode::Deep => (2048, 3072),
-            ThinkMode::Exhaustive => (4096, 6144),
+            ThinkMode::Off => (1024, 1536),
+            ThinkMode::Quick => (1024, 1536),
+            ThinkMode::Balanced => (2048, 3072),
+            ThinkMode::Deep => (4096, 6144),
+            ThinkMode::Exhaustive => (8192, 12288),
         }
     }
 
@@ -319,10 +320,10 @@ fn close_tag_then_end(spec: &mut TreeSpec, env: &ThinkSteerEnvelope) -> SpecId {
 /// that they became the *routine* terminator rather than a backstop — nine
 /// measured turns ended at exactly 513 tokens, cut mid-word, because the EOT
 /// ramp above them was inert and nothing else stopped the block.
-const QUICK_SPAN_CAP: u32 = 1536;
-const BALANCED_SPAN_CAP: u32 = 3072;
-const DEEP_SPAN_CAP: u32 = 6144;
-const EXHAUSTIVE_SPAN_CAP: u32 = 12288;
+const QUICK_SPAN_CAP: u32 = 3072;
+const BALANCED_SPAN_CAP: u32 = 6144;
+const DEEP_SPAN_CAP: u32 = 12288;
+const EXHAUSTIVE_SPAN_CAP: u32 = 24576;
 
 /// The tree's opening static: the newline after `<think>`, and nothing else.
 ///
@@ -917,13 +918,13 @@ mod tests {
     /// [`eot_budget_scales_and_stays_under_span_caps`]; this test fixes the
     /// anchors they derive from.
     #[test]
-    fn the_thinking_ladder_is_512_1024_2048_4096() {
+    fn the_thinking_ladder_is_1024_2048_4096_8192() {
         use ThinkMode::*;
         let graceful = |m: ThinkMode| m.eot_budget().0;
-        assert_eq!(graceful(Quick), 512);
-        assert_eq!(graceful(Balanced), 1024);
-        assert_eq!(graceful(Deep), 2048);
-        assert_eq!(graceful(Exhaustive), 4096);
+        assert_eq!(graceful(Quick), 1024);
+        assert_eq!(graceful(Balanced), 2048);
+        assert_eq!(graceful(Deep), 4096);
+        assert_eq!(graceful(Exhaustive), 8192);
 
         // Each rung doubles the one below: the dial is a power-of-two ladder,
         // so "one notch up" always means "twice the thinking".

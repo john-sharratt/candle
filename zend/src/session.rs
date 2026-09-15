@@ -198,12 +198,12 @@ fn think_mode_from_selection(selection: &candle_conversation::SelectionState) ->
 /// shorter); the EOS boost/failsafe makes them the turn-ender backstop.
 fn response_budget_from_selection(selection: &candle_conversation::SelectionState) -> i32 {
     match selection.get("response_length") {
-        Some("terse") => 256,
-        Some("concise") => 512,
-        Some("detailed") => 2048,
-        Some("comprehensive") => 3584,
+        Some("terse") => 512,
+        Some("concise") => 1024,
+        Some("detailed") => 4096,
+        Some("comprehensive") => 7168,
         // Explicit `standard`, or no dial set (projection default).
-        _ => 1024,
+        _ => 2048,
     }
 }
 
@@ -3504,15 +3504,15 @@ async fn run_passthrough(
     state.passthrough.touch(&key);
 }
 
-/// Prefill the history `live` does not hold, decode the reply to the new user
-/// half, seal it and commit the redo log. Returns whether `live` still matches
-/// what the substrate holds.
 /// The answer room a passthrough reply gets past its think block — the
 /// response-length dial's widest rung. A client's reply can be a whole file
 /// written through a tool call, and the client's own `max_tokens` still caps
 /// the turn; this only places the failsafe that ends a runaway.
-const PASSTHROUGH_RESPONSE_TOKENS: i32 = 3584;
+const PASSTHROUGH_RESPONSE_TOKENS: i32 = 7168;
 
+/// Prefill the history `live` does not hold, decode the reply to the new user
+/// half, seal it and commit the redo log. Returns whether `live` still matches
+/// what the substrate holds.
 async fn passthrough_turn(
     state: &InferenceState,
     key: &str,

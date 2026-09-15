@@ -65,20 +65,20 @@ mod tests {
             "the fallback this replaces"
         );
         let mut s = before;
-        steer(&mut s, ThinkMode::Balanced, 3584, &[7, 8]);
+        steer(&mut s, ThinkMode::Balanced, 7168, &[7, 8]);
         assert_eq!(
             (s.graceful_segment_close_after, s.force_segment_close_after),
-            (1024, 1536)
+            (2048, 3072)
         );
         assert_eq!(
             (s.segment_close_ramp_start, s.segment_close_ramp_len),
-            (1024, 1536)
+            (2048, 3072)
         );
         // Thinking reserves the force cutoff; the answer's room sits above it.
-        assert_eq!(s.eos_ramp_start, 1536);
-        assert_eq!(s.graceful_eos_after, 1536 + 3584 * 4 / 5);
+        assert_eq!(s.eos_ramp_start, 3072);
+        assert_eq!(s.graceful_eos_after, 3072 + 7168 * 4 / 5);
         assert_eq!(s.eos_ramp_len, s.graceful_eos_after);
-        assert_eq!(s.forced_eos_after, 1536 + 3584);
+        assert_eq!(s.forced_eos_after, 3072 + 7168);
         assert_eq!(
             s.segment_suppress_penalty,
             ThinkMode::Balanced.suppress_penalty()
