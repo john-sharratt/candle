@@ -13,12 +13,15 @@
 //! where the conversation had windowed it out.
 //! The resume turn's user half is then decoded under the chat's own projection,
 //! sampling, think steering and tool stencil ([`turn_projection`],
-//! [`turn_sampling`], [`turn_triggers`]), once per run. The history is replayed
-//! once, on a timeline of the replay's own; each run decodes on a fork of it,
-//! which carries the replayed conversation's live recurrent memory, and the
-//! answer a run seals is tombstoned before the next run forks, so no run sees
-//! another's. On a read-only substrate (`DaemonConfig::read_only_substrate`)
-//! none of it reaches disk.
+//! [`turn_sampling`], [`turn_triggers`]), once per run. **Every run replays the
+//! history onto a timeline of its own** and decodes there, and that timeline is
+//! tombstoned whole before the next run starts, so no run sees another's turns.
+//! A timeline per run is what keeps the runs independent: a run seals its
+//! answer — tool round included — onto the timeline it decodes on, so a second
+//! run sharing it would project the first run's turn as history, and retiring
+//! the timeline whole removes everything the run added in one step. On a
+//! read-only substrate (`DaemonConfig::read_only_substrate`) none of it reaches
+//! disk.
 //!
 //! A replay is not bit-identical to the recorded run: the resume turn's live
 //! seed was drawn from the clock and never recorded, and each replayed turn's
@@ -36,8 +39,8 @@ use std::time::Instant;
 
 use anyhow::{bail, Context};
 use candle_conversation::{
-    RecoveredMessage, Role as TurnRole, SamplingConfig, SealedTurn, SelectionState, TurnEvent,
-    TurnOptions,
+    ProjectionEvent, RecoveredMessage, Role as TurnRole, SamplingConfig, SealedTurn,
+    SelectionState, TurnEvent, TurnOptions,
 };
 
 use super::{
@@ -93,9 +96,14 @@ pub struct RecordedTurn {
     pub assistant: String,
 }
 
-/// One run's decode of the resume turn.
+/// One run: the history it rebuilt, and its decode of the resume turn.
 #[derive(Debug, Clone)]
 pub struct ReplayOutcome {
+    /// The turns before the resume point as this run sealed them, beside the
+    /// recorded ones.
+    pub turns: Vec<TurnComparison>,
+    /// Wall time to replay them.
+    pub replay_secs: f64,
     pub sampling: ReplaySampling,
     pub text: String,
     pub tokens: usize,
@@ -104,19 +112,16 @@ pub struct ReplayOutcome {
     /// Projection points the decode emitted — the opening one and each
     /// reprojection.
     pub projections: usize,
+    /// The last of them: the context the decode finished against, turn by
+    /// turn. `None` when the decode emitted none.
+    pub last_projection: Option<ProjectionEvent>,
     /// Wall time of the resume turn's decode.
     pub decode_secs: f64,
 }
 
-/// A whole replay: the history it rebuilt, and every run's decode of the
-/// resume turn against it.
+/// A whole replay: every run, in the order of `ReplaySpec::runs`.
 #[derive(Debug, Clone)]
 pub struct ReplayReport {
-    /// The turns before the resume point as the replay sealed them, beside the
-    /// recorded ones.
-    pub turns: Vec<TurnComparison>,
-    /// Wall time to replay them.
-    pub replay_secs: f64,
     pub outcomes: Vec<ReplayOutcome>,
 }
 
@@ -276,16 +281,16 @@ impl ZendSession {
         recorded_turns(&history)
     }
 
-    /// Run `spec`: replay the turns before the resume point once, then decode the
-    /// resume turn once per entry of `spec.runs`, each on a fork of the replayed
-    /// conversation. `on_history` is called with the replayed turns beside the
-    /// recorded ones (and the wall time the replay took) before the first
+    /// Run `spec`: once per entry of `spec.runs`, replay the turns before the
+    /// resume point onto a timeline of that run's own and decode the resume turn
+    /// there. `on_history` is called with the run, its replayed turns beside the
+    /// recorded ones and the wall time the replay took, before that run's
     /// decode; `on_run` with each run as it finishes. Blocking — call it off the
     /// async runtime.
     pub fn replay(
         &self,
         spec: &ReplaySpec,
-        on_history: &mut dyn FnMut(&[TurnComparison], f64),
+        on_history: &mut dyn FnMut(usize, &[TurnComparison], f64),
         on_run: &mut dyn FnMut(usize, &ReplayOutcome),
     ) -> anyhow::Result<ReplayReport> {
         let state = self
@@ -316,62 +321,59 @@ impl ZendSession {
                 .unwrap_or_else(|e| format!("<undecodable: {e}>"))
         };
 
-        let replay_id = format!("replay/{}/{}", spec.conv_id, spec.resume_turn);
-        let timeline = timeline_for(&replay_id);
-        let mut conv = state
-            .base_conv
-            .lock()
-            .unwrap()
-            .fork_resuming(timeline)
-            .context("forking the replay's conversation")?;
-        conv.set_projection(turn_projection(&state, &replay_id, None, spec.tools_mode));
-
-        // The history, each turn decoded again under the triggers and sampling
-        // config the chat gave it, its recorded ids forced.
-        let replay_start = Instant::now();
-        for (index, turn) in turns[..spec.resume_turn].iter().enumerate() {
-            let Some(sealed) = recorded.get(index) else {
-                bail!("turn {index} has no sealed record to replay");
-            };
-            let selection = turn_selection(&spec.selection, &turn.user, spec.demonstration);
-            let options = TurnOptions {
-                sampling: Some(turn_sampling(
-                    &conv,
-                    Some(SamplingConfig::argmax()),
-                    &selection,
-                    &state.think_closer_phrase,
-                    0,
-                )),
-                triggers: turn_triggers(&state, think_mode_from_selection(&selection)),
-                selection,
-                recorded_turn: Some(sealed.token_ids.clone()),
-                ..Default::default()
-            };
-            let handle = conv
-                .submit_turn_with_options(tool_round_text(&turn.user), options)
-                .with_context(|| format!("replaying turn {index}"))?;
-            let response = handle
-                .wait()
-                .with_context(|| format!("replaying turn {index}"))?;
-            conv.finish_turn(handle, &response)
-                .with_context(|| format!("sealing replayed turn {index}"))?;
-        }
-        let replay_secs = replay_start.elapsed().as_secs_f64();
-        let replayed = conv.sealed_turns(timeline);
-        let history = compare_turns(&recorded, &replayed, spec.resume_turn, &decode);
-        on_history(&history, replay_secs);
-
-        // A run's answer is the one turn on the timeline newer than the history
-        // and not already tombstoned by an earlier run.
-        let history_end = replayed.iter().map(|t| t.index).max();
-        let mut answered: Vec<u32> = Vec::new();
         let mut outcomes = Vec::with_capacity(spec.runs.len());
         for (run, sampling) in spec.runs.iter().enumerate() {
-            // Onto the conversation's own timeline, so the fork carries its live
-            // memory: every run starts from the state the replay built.
-            let mut child = conv
+            // A timeline per run, retired whole when the run ends — see the
+            // module notes for why a shared one lets a run read the last one's.
+            let replay_id = format!("replay/{}/{}/{run}", spec.conv_id, spec.resume_turn);
+            let timeline = timeline_for(&replay_id);
+            let mut conv = state
+                .base_conv
+                .lock()
+                .unwrap()
                 .fork_resuming(timeline)
-                .with_context(|| format!("forking run {run}"))?;
+                .with_context(|| format!("forking run {run}'s conversation"))?;
+            conv.set_projection(turn_projection(&state, &replay_id, None, spec.tools_mode));
+
+            // The history, each turn decoded again under the triggers and
+            // sampling config the chat gave it, its recorded ids forced.
+            let replay_start = Instant::now();
+            for (index, turn) in turns[..spec.resume_turn].iter().enumerate() {
+                let Some(sealed) = recorded.get(index) else {
+                    bail!("turn {index} has no sealed record to replay");
+                };
+                let selection = turn_selection(&spec.selection, &turn.user, spec.demonstration);
+                let options = TurnOptions {
+                    sampling: Some(turn_sampling(
+                        &conv,
+                        Some(SamplingConfig::argmax()),
+                        &selection,
+                        &state.think_closer_phrase,
+                        0,
+                    )),
+                    triggers: turn_triggers(&state, think_mode_from_selection(&selection)),
+                    selection,
+                    recorded_turn: Some(sealed.token_ids.clone()),
+                    ..Default::default()
+                };
+                let handle = conv
+                    .submit_turn_with_options(tool_round_text(&turn.user), options)
+                    .with_context(|| format!("run {run}: replaying turn {index}"))?;
+                let response = handle
+                    .wait()
+                    .with_context(|| format!("run {run}: replaying turn {index}"))?;
+                conv.finish_turn(handle, &response)
+                    .with_context(|| format!("run {run}: sealing replayed turn {index}"))?;
+            }
+            let replay_secs = replay_start.elapsed().as_secs_f64();
+            let history = compare_turns(
+                &recorded,
+                &conv.sealed_turns(timeline),
+                spec.resume_turn,
+                &decode,
+            );
+            on_history(run, &history, replay_secs);
+
             let selection = turn_selection(&spec.selection, &resume.user, spec.demonstration);
             let think_mode = think_mode_from_selection(&selection);
             let (explicit, seed) = match sampling {
@@ -381,7 +383,7 @@ impl ZendSession {
             let options = TurnOptions {
                 max_tokens: Some(spec.max_tokens),
                 sampling: Some(turn_sampling(
-                    &child,
+                    &conv,
                     explicit,
                     &selection,
                     &state.think_closer_phrase,
@@ -392,14 +394,18 @@ impl ZendSession {
                 ..Default::default()
             };
             let decode_start = Instant::now();
-            let handle = child
+            let handle = conv
                 .submit_turn_with_options(tool_round_text(&resume.user), options)
                 .context("submitting the resume turn")?;
             let mut projections = 0;
+            let mut last_projection = None;
             let mut finished = None;
             for event in handle.stream() {
                 match event {
-                    TurnEvent::Projection(_) => projections += 1,
+                    TurnEvent::Projection(p) => {
+                        projections += 1;
+                        last_projection = Some(p);
+                    }
                     TurnEvent::Done(response) => finished = Some(response),
                     TurnEvent::Error(e) => bail!("decoding the resume turn: {e}"),
                     _ => {}
@@ -408,40 +414,30 @@ impl ZendSession {
             let response =
                 finished.context("the scheduler closed the resume turn without finishing it")?;
             let decode_secs = decode_start.elapsed().as_secs_f64();
-            child
-                .finish_turn(handle, &response)
+            conv.finish_turn(handle, &response)
                 .with_context(|| format!("sealing run {run}"))?;
-            let answer = child
-                .sealed_turns(timeline)
-                .iter()
-                .map(|t| t.index)
-                .filter(|&i| Some(i) > history_end && !answered.contains(&i))
-                .max()
-                .with_context(|| format!("run {run}'s answer did not seal"))?;
             state
                 .engine
                 .lock()
                 .unwrap()
-                .tombstone_turn(timeline, answer)
-                .with_context(|| format!("tombstoning run {run}'s answer"))?;
-            answered.push(answer);
+                .tombstone_timeline(timeline)
+                .with_context(|| format!("retiring run {run}'s timeline"))?;
             let outcome = ReplayOutcome {
+                turns: history,
+                replay_secs,
                 sampling: *sampling,
                 text: response.text.clone(),
                 tokens: response.stats.tokens_generated,
                 prefill_ms: response.stats.prefill_ms,
                 tokens_per_second: response.stats.tokens_per_second,
                 projections,
+                last_projection,
                 decode_secs,
             };
             on_run(run, &outcome);
             outcomes.push(outcome);
         }
-        Ok(ReplayReport {
-            turns: history,
-            replay_secs,
-            outcomes,
-        })
+        Ok(ReplayReport { outcomes })
     }
 }
 

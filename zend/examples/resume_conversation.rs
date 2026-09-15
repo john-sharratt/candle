@@ -83,6 +83,11 @@ struct Args {
     /// A run whose output matches any of these patterns counts as a failure.
     #[arg(long = "fail-if")]
     fail_if: Vec<String>,
+    /// The QSA selection budget, in positions, as the daemon's
+    /// `--qsa-selection-budget`. At least the checkpoint's context reads every
+    /// cell: the dense control for the same replay.
+    #[arg(long = "qsa-selection-budget", value_name = "N")]
+    qsa_selection_budget: Option<usize>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -133,6 +138,19 @@ fn print_run(run: usize, outcome: &ReplayOutcome, patterns: &[Regex]) {
         outcome.projections,
         outcome.decode_secs,
     );
+    if let Some(p) = &outcome.last_projection {
+        println!(
+            "----- the last projection: {} tokens over {} turns",
+            p.materialized_tokens,
+            p.selection.turns.len()
+        );
+        for t in &p.selection.turns {
+            println!(
+                "  turn {:>3} · {:<9} · {:?} · {:>6} tokens · {:?}",
+                t.index, t.role, t.kind, t.tokens, t.reason
+            );
+        }
+    }
     println!("{}", outcome.text);
 }
 
@@ -212,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
         disabled_layers,
         skipped_layers,
         read_only_substrate: true,
+        qsa_selection_budget: args.qsa_selection_budget,
         ..Default::default()
     };
     let session = Arc::new(ZendSession::new(config, LogBus::new()));
@@ -268,8 +287,11 @@ async fn main() -> anyhow::Result<()> {
     let report = tokio::task::spawn_blocking(move || {
         runner.replay(
             &spec,
-            &mut |turns, secs| {
-                println!("\n===== replayed the {} turns in {secs:.1} s", turns.len());
+            &mut |run, turns, secs| {
+                println!(
+                    "\n===== run {run}: replayed the {} turns in {secs:.1} s",
+                    turns.len()
+                );
                 print_turns(turns);
             },
             &mut |run, outcome| print_run(run, outcome, &run_patterns),
