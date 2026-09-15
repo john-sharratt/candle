@@ -112,20 +112,23 @@ drift is zero and their quantization error is bounded by the selection kernel's
 threshold. Contribution: a small constant, `ε_hot`.
 
 **Warm tier.** Tokens eligible for retrieval but not permanently resident. At most
-`W_warm_max` of them can be selected per generation step — and this is the
-load-bearing sentence in the entire paper — **regardless of how large the warm
-corpus grows**. That bound is structural. The selection kernel enforces it by
-construction. It is not a policy somebody could tune wrong on a Friday.
-Contribution: `W_warm_max · ε_warm`, a constant.
+`W_warm_max` tokens from outside the hot tier, warm and cold together, can be
+selected per generation step — and this is the load-bearing sentence in the
+entire paper — **regardless of how large the corpus grows**. That bound is
+structural. The selection kernel enforces it by construction. It is not a policy
+somebody could tune wrong on a Friday. Contribution: at most `k_warm · ε_warm`,
+where `k_warm` is the warm share of that budget.
 
 **Cold tier.** Everything else. As N → ∞ the cold tier grows without bound while
-the slots available to it stay fixed, so the probability any specific cold token
-enters the working set on a given step falls as `1/N`. Contribution: `O(1/N)`,
-which vanishes.
+the slots available to it stay fixed. That makes the *average* cold token ever
+less likely to be selected — but retrieval is not a lottery. A cold token that
+matters to this step is selected at any depth, and it brings its full error with
+it. Contribution: at most `k_cold · ε_cold`, the cold share of the same fixed
+budget. It does not vanish; it is bounded.
 
 Sum the three, and you get a constant:
 
-$$E\left[\sum_{t \in \mathcal{W}} \varepsilon(t)\right] \leq \varepsilon_{\text{hot}} + W_{\text{warm\_max}} \cdot \varepsilon_{\text{warm}} + O\!\left(\frac{1}{N}\right) = O(1)$$
+$$E\left[\sum_{t \in \mathcal{W}} \varepsilon(t)\right] \leq \varepsilon_{\text{hot}} + W_{\text{warm\_max}} \cdot \max(\varepsilon_{\text{warm}}, \varepsilon_{\text{cold}}) = O(1)$$
 
 <figure class="fig">
 <svg viewBox="0 0 640 244" role="img" aria-label="Two context depths, one thousand turns and ten million turns. The corpus bar grows enormously; the working set selected from it is identical in both cases.">
@@ -147,11 +150,14 @@ attends to. Only one of them grows.</figcaption>
 
 And there's a corollary that makes it sharper than merely "bounded".
 
-Warm-tier blocks in this system don't arrive from nowhere. They originate as
-prefill-refreshed hot-tier blocks — quantized from clean activations, admitted by
-the selection kernel at threshold θ. So `ε_warm ≤ θ`, which is a small system
-parameter *you control*. The total isn't just constant, it's a **small** constant
-that tightens as you tighten θ.
+Warm- and cold-tier blocks in this system don't arrive from nowhere. They
+originate as prefill-refreshed hot-tier blocks — quantized from clean
+activations, admitted by the selection kernel at threshold θ. So every block a
+step can retrieve has error at most θ, the loosest threshold any of them was
+sealed under — a small system parameter *you control*. The total isn't just
+constant, it's a **small** constant that tightens as you tighten θ. Compress
+cold storage harder and you loosen θ for exactly the blocks retrieval will one
+day pull back: the bound holds either way, but the constant grows.
 
 Measured: always-attended blocks in top-quality compression mode reach **58.6 dB
 K-SNR and 58.8 dB V-SNR**. That's `ε_hot ≈ 0` in practice, not in principle.
