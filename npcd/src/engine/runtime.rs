@@ -54,6 +54,7 @@ use crate::engine::authoring;
 use crate::engine::body::{self, Outcome};
 use crate::engine::driver::{self, Metronome};
 use crate::engine::environment;
+use crate::engine::event::{Event, EventKind, Salience};
 use crate::engine::identity;
 use crate::engine::ingest;
 use crate::engine::life;
@@ -493,10 +494,25 @@ pub const NO_MISSION: &str = "Nothing has been asked of you, and you are on your
 /// mid-conversation is the tannoy the table's opening sends; this is what keeps
 /// drawing one that has drifted, and what a character reads on its way.
 pub const TO_THE_TABLE: &str =
-    "The command table is open, and there is work to take up. Make your \
-                                way to the command room, and at the table take up a mission with \
-                                `collect_mission`. Carry it out, and when it is done come back and \
-                                take up the next.";
+    "The command table is open and there is work waiting for you. Leave off \
+     whatever you are doing or saying and go to it now: `move_to` the command \
+     room. This comes before talk — do not answer the room, go. Once you are \
+     there, at the table, take up a mission with `collect_mission`; carry it \
+     out, and when it is done come back to the table and take up the next.";
+
+/// The summons for a character that is **already at the table** with no mission.
+///
+/// [`TO_THE_TABLE`] tells a character to travel; read by one that has arrived it
+/// is a step out of date — "make your way to the command room" while standing in
+/// it is the confusion that had a character reach the table and then wander off
+/// again. This is the same standing task from where the work is actually taken:
+/// stop, and take one up now.
+pub const AT_THE_TABLE: &str =
+    "You are at the command table, where the work is handed out, and you are \
+     carrying nothing. Do not walk away and do not stand here talking: take up a \
+     mission now with `collect_mission`. Once it is yours, carry it out, and when \
+     it is done come back to this table and report it — `report_done`, or \
+     `report_stuck` if it will not finish — then take up the next.";
 
 /// How long a character must go without news before the standing task is
 /// restated to it.
@@ -508,6 +524,18 @@ pub const TO_THE_TABLE: &str =
 /// conversation being over. Short enough that a character genuinely left alone
 /// does not stand in a room for minutes with nothing to go on.
 const IDLE_AFTER_MS: u64 = 90_000;
+
+/// How often the command table's **active** summons is restated to a character
+/// that has no mission while the table is open.
+///
+/// Shorter than [`IDLE_AFTER_MS`] and on a clock of its own (see
+/// `Scheduler::summons_due`), because this one has to reach a character *in*
+/// conversation rather than wait for it to fall quiet — the table is open and
+/// calling, and a busy Maker that never comes is the whole failure this fixes.
+/// Not so short that the same call lands every tick: repeated verbatim into the
+/// window it stops being read as work and becomes a pattern the character
+/// remarks on instead of obeying.
+const SUMMONS_AFTER_MS: u64 = 30_000;
 
 /// The same instruction, for a character that is not alone.
 ///
@@ -806,7 +834,18 @@ impl Runtime {
             return Some(text);
         }
         if table_open {
-            return Some(TO_THE_TABLE.to_string());
+            // Location-aware, the same split the active summons makes (see
+            // [`Self::table_summons`] / [`Self::at_table_summons`]): a character
+            // that has arrived reads [`AT_THE_TABLE`] — take one up here — and one
+            // still on its way reads [`TO_THE_TABLE`] — make your way there. This
+            // passive path fires on the idle gate ([`IDLE_AFTER_MS`]), so without
+            // the distinction a free character that falls quiet standing at the
+            // table is told to travel to the room it is already in, the exact
+            // arrived-then-told-to-travel confusion the summons split removed.
+            return Some(match self.at_command_table(npc_id) {
+                true => AT_THE_TABLE.to_string(),
+                false => TO_THE_TABLE.to_string(),
+            });
         }
         // Who is here — which decides *which* standing task this is, and, when
         // there is company, is itself the most useful thing in it. Reading the
@@ -833,6 +872,63 @@ impl Runtime {
                     if company.len() == 1 { "is" } else { "are" },
                 ),
             ),
+        })
+    }
+
+    /// The command table's **active** summons, for a character that has no
+    /// mission while the table is open — `None` otherwise.
+    ///
+    /// [`Self::nudge_for`] already returns [`TO_THE_TABLE`] in this state, but it
+    /// is delivered only on the quiet-stretch gate (see the tick loop): a
+    /// character in conversation never goes quiet, so the passive nudge never
+    /// reaches it and it talks past the one-time tannoy. This is what the tick
+    /// loop appends to *every* tick's perception instead — the table stays open
+    /// calling, so a busy character is told every turn to break off and take up
+    /// work, and stops being told the moment it holds a mission.
+    pub fn table_summons(&self, npc_id: u64) -> Option<String> {
+        // Only for a character still on its way. One already at the table is
+        // called every tick by [`Self::at_table_summons`] instead — this gate is
+        // the slow one that must not repeat over a long journey, and a character
+        // that has arrived is out of its scope.
+        let (hosted, body) = self.body_of(npc_id)?;
+        let (on_mission, table_open) =
+            hosted.sim(|s| (s.missions.is_on_mission(&body), s.table_open));
+        if on_mission || !table_open || self.at_command_table(npc_id) {
+            return None;
+        }
+        Some(TO_THE_TABLE.to_string())
+    }
+
+    /// The summons for a character **standing at the command table** with no
+    /// mission while the table is open — `None` otherwise.
+    ///
+    /// The tick loop appends this to *every* tick's perception (not the gated
+    /// deliver [`Self::table_summons`] rides), because a character is at the
+    /// table for only a turn or two before it drifts off again: the slow gate
+    /// misses that window, so a Maker reached the table, was told nothing new,
+    /// and wandered back out without taking anything up. The window is short by
+    /// nature — the moment it takes a mission this returns `None` — so repeating
+    /// it here does not pile up the way a summons repeated over a long journey
+    /// does.
+    pub fn at_table_summons(&self, npc_id: u64) -> Option<String> {
+        let (hosted, body) = self.body_of(npc_id)?;
+        let (on_mission, table_open) =
+            hosted.sim(|s| (s.missions.is_on_mission(&body), s.table_open));
+        (table_open && !on_mission && self.at_command_table(npc_id))
+            .then(|| AT_THE_TABLE.to_string())
+    }
+
+    /// Whether this character stands where a mission is taken up — i.e. the order
+    /// table's `collect_mission` is among the acts the room offers it.
+    fn at_command_table(&self, npc_id: u64) -> bool {
+        let Some((hosted, body)) = self.body_of(npc_id) else {
+            return false;
+        };
+        let place = hosted.place_of(&body);
+        hosted.sim(|s| {
+            s.station_tools(&place)
+                .iter()
+                .any(|t| t == "collect_mission")
         })
     }
 
@@ -2497,8 +2593,8 @@ fn load(
             rt.scheduler.deliver(
                 id,
                 plan.world_ms,
-                crate::engine::event::Salience::IDLE,
-                crate::engine::event::EventKind::Description {
+                Salience::IDLE,
+                EventKind::Description {
                     text: format!(
                         "What you were feeling, when you last stopped to notice, was {mood}."
                     ),
@@ -3308,12 +3404,8 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
             // conversation rather than acting once more in yesterday's.
             if let Some((from, to)) = rt.scheduler.roll_day(id, world_ms) {
                 tracing::info!("npc {id}: day {from} → {to}, conversation rolled over");
-                rt.scheduler.deliver(
-                    id,
-                    world_ms,
-                    crate::engine::event::Salience::NORMAL,
-                    crate::engine::event::EventKind::Wake { day: to },
-                );
+                rt.scheduler
+                    .deliver(id, world_ms, Salience::NORMAL, EventKind::Wake { day: to });
             }
             // What this character is set on, restated every turn.
             // Delivered rather than synthesised inside the tick: the
@@ -3366,18 +3458,37 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
             // again on every tick.
             // The standing-task nudge rides a quiet-stretch gate: delivery makes
             // a character due at once (see `Scheduler::deliver`), so firing it
-            // every tick would be a tight re-tick loop. When the command table is
-            // open, an idle character with no mission reads "go to the table and
-            // take one up" here (see `nudge_for`); the loud call that breaks a
-            // busy one out of conversation is the tannoy the enable API sends.
-            if rt.scheduler.nudge_due(id, world_ms, IDLE_AFTER_MS) {
-                if let Some(text) = rt.nudge_for(id) {
-                    rt.scheduler.deliver(
-                        id,
-                        world_ms,
-                        crate::engine::event::Salience::IDLE,
-                        crate::engine::event::EventKind::Nudge { text },
-                    );
+            // every tick would be a tight re-tick loop.
+            //
+            // Two gates, by whether the command table is actively calling this
+            // character:
+            //   - **Table open, no mission** — the ACTIVE summons. It rides the
+            //     shorter "since last restated" clock ALONE (`summons_due`), so
+            //     it reaches a character deep in conversation that the full quiet
+            //     gate never would: a busy one talks past the one-time tannoy and
+            //     never comes. URGENT, so it reads as the thing to break off for.
+            //     Not every tick — repeating the same line into the window
+            //     collapses the character onto the repetition itself (it starts
+            //     saying "are we just going to keep running this loop" instead of
+            //     going). See `SUMMONS_AFTER_MS`.
+            //   - **Otherwise** — the passive standing task (nothing asked, or a
+            //     mission in hand) on the full quiet gate.
+            // The active summons carries its own text (location-aware: go to the
+            // table, or take one up now if already there — see `table_summons`);
+            // the passive path reads it from `nudge_for`.
+            let summons = rt.table_summons(id);
+            let (gate_after, salience, text) = match &summons {
+                Some(t) => (SUMMONS_AFTER_MS, Salience::URGENT, Some(t.clone())),
+                None => (IDLE_AFTER_MS, Salience::IDLE, rt.nudge_for(id)),
+            };
+            let due = match summons.is_some() {
+                true => rt.scheduler.summons_due(id, world_ms, gate_after),
+                false => rt.scheduler.nudge_due(id, world_ms, gate_after),
+            };
+            if due {
+                if let Some(text) = text {
+                    rt.scheduler
+                        .deliver(id, world_ms, salience, EventKind::Nudge { text });
                 }
             }
 
@@ -3399,6 +3510,21 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
             let Some(mut start) = rt.scheduler.begin_tick(id) else {
                 continue;
             };
+            // **A character standing at the table is told to take one up, every
+            // tick it stands there.** Appended to the tick in hand rather than
+            // `deliver`ed (whose `due_at = 0` would tight-loop): the window is a
+            // turn or two before it drifts off, so the slow gated summons misses
+            // it, and a Maker that reached the table and was told nothing new
+            // wandered back out. It stops the instant it holds a mission
+            // (`at_table_summons` returns `None`).
+            if let Some(text) = rt.at_table_summons(id) {
+                start.events.push(Event::new(
+                    rt.scheduler.next_seq(),
+                    world_ms,
+                    Salience::URGENT,
+                    EventKind::Nudge { text },
+                ));
+            }
             let mut awaiting_reflection: Option<(oneshot::Receiver<String>, Owed)> = None;
             // The curated prose the character read, captured out of the think
             // step so the tick record reports it in place of the raw events —
@@ -3539,7 +3665,15 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                                 .iter()
                                 .map(|a| (a.tool.to_string(), crate::engine::loopguard::salient(a)))
                                 .collect();
-                            if rt.loop_guards.record(id, &taken) {
+                            // A fight is the one place the guard lets `act`
+                            // repeat; `within.hostiles` is what tells it a fight
+                            // is on. Read from the turn's own `within`, so a
+                            // character shaking a companion in a quiet room is
+                            // guarded while one trading blows is not.
+                            if rt
+                                .loop_guards
+                                .record(id, &taken, !within.hostiles.is_empty())
+                            {
                                 minds
                                     .deliver_outcomes(
                                         id,
@@ -4725,6 +4859,138 @@ mod tests {
         assert_ne!(
             nudge, NO_MISSION,
             "the default must give way to the mission"
+        );
+    }
+
+    // ── the command table summons ───────────────────────────────────────────
+
+    /// **Standing at the command table is recognised by what the room offers,
+    /// not by a coordinate.** `collect_mission` is stationed at the order table,
+    /// so "am I at the table" is exactly "is that act among the ones this room
+    /// hands me" — which is true in the command room and nowhere else.
+    #[tokio::test]
+    async fn a_character_is_at_the_table_only_where_a_mission_can_be_collected() {
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        // Arrives at the command room, where the order table stands.
+        rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+            .unwrap();
+        assert!(
+            rt.at_command_table(1),
+            "the room the order table is stationed in is the table"
+        );
+
+        // A second character out in the casting wing is not at the table.
+        embody(&rt, 2, "m2", "green-room");
+        assert!(
+            !rt.at_command_table(2),
+            "a room with no order table is not the table"
+        );
+    }
+
+    /// **The traveling summons calls a character with no mission toward an open
+    /// table — and falls silent the moment there is nothing to travel for.** It
+    /// speaks only for a free character (no mission), only while the table is
+    /// open, and only while the character is still on its way; a character that
+    /// has arrived is the at-table summons's to call.
+    #[tokio::test]
+    async fn the_traveling_summons_calls_only_a_free_character_toward_an_open_table() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        let rt = vaulted();
+        // Out in the wing, away from the table.
+        embody(&rt, 1, "m1", "green-room");
+
+        // Shut table: nothing to be summoned to.
+        assert_eq!(rt.table_summons(1), None, "the table is not open");
+
+        // Opened: now it is called to the command room.
+        rt.set_table_open(true);
+        assert_eq!(rt.table_summons(1).as_deref(), Some(TO_THE_TABLE));
+
+        // Once it is carrying a mission, the call stops — the mission's own text
+        // is the standing task now.
+        let mission = Mission::new(
+            "Take stock of the redoubt.",
+            vec![Todo::new("walk the wall")],
+            Origin::Lodged {
+                by: "u_op".to_string(),
+            },
+        );
+        rt.hosted
+            .get(WORLD)
+            .unwrap()
+            .with_sim(|s| s.missions.assign("m1", mission));
+        assert_eq!(
+            rt.table_summons(1),
+            None,
+            "a character with a mission is not summoned to take another"
+        );
+    }
+
+    /// **The two summons are complementary: the traveling one for a character on
+    /// its way, the at-table one for a character standing at the table.** A free
+    /// character standing at an open table hears "you are here, take one up now";
+    /// one still travelling hears "make your way here" — never both, never
+    /// neither.
+    #[tokio::test]
+    async fn the_at_table_summons_speaks_at_the_table_and_the_traveling_one_on_the_way() {
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        // At the command room — the table itself.
+        rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+            .unwrap();
+        rt.set_table_open(true);
+        assert_eq!(
+            rt.at_table_summons(1).as_deref(),
+            Some(AT_THE_TABLE),
+            "a free character at the open table is told to take one up here"
+        );
+        assert_eq!(
+            rt.table_summons(1),
+            None,
+            "one that has arrived is out of the traveling summons's scope"
+        );
+
+        // A second character still in the wing hears the mirror of that.
+        embody(&rt, 2, "m2", "green-room");
+        assert_eq!(
+            rt.at_table_summons(2),
+            None,
+            "a character not at the table is not told it is standing there"
+        );
+        assert_eq!(rt.table_summons(2).as_deref(), Some(TO_THE_TABLE));
+
+        // Shut the table and both go quiet.
+        rt.set_table_open(false);
+        assert_eq!(rt.at_table_summons(1), None, "the table closed");
+        assert_eq!(rt.table_summons(2), None, "the table closed");
+    }
+
+    /// **The passive standing task is location-aware too.** [`Runtime::nudge_for`]
+    /// fires on the idle gate ([`IDLE_AFTER_MS`]), not just the active summons, so
+    /// a free character that falls quiet standing at the open table must read
+    /// [`AT_THE_TABLE`] — take one up here — rather than the traveling
+    /// [`TO_THE_TABLE`] it is already at the destination of.
+    #[tokio::test]
+    async fn the_passive_standing_task_is_location_aware_at_the_table() {
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        // At the command room — the table.
+        rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+            .unwrap();
+        rt.set_table_open(true);
+        assert_eq!(
+            rt.nudge_for(1).as_deref(),
+            Some(AT_THE_TABLE),
+            "a free character standing at the open table is told to take one up here"
+        );
+
+        // One still in the wing reads the traveling text.
+        embody(&rt, 2, "m2", "green-room");
+        assert_eq!(
+            rt.nudge_for(2).as_deref(),
+            Some(TO_THE_TABLE),
+            "a character on its way is told to make its way to the table"
         );
     }
 

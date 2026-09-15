@@ -102,6 +102,67 @@ pub struct SharedPm {
     /// writer would scatter its new tokens into a chunk the map does not
     /// describe.
     per_slot_write: Vec<u32>,
+    /// Position-map buffers a later layer's rebuild superseded, held alive until
+    /// this whole cache is dropped at the end of the forward.
+    ///
+    /// A windowed-creep layer whose live layout diverges from the cached map
+    /// rebuilds and republishes it (so the layers past the creep front reuse the
+    /// new one), but the buffer it replaces cannot be freed here: earlier layers
+    /// launched their attention kernels against that device address and may
+    /// still be reading it. Freeing and reallocating mid-forward could hand the
+    /// same pool address to this layer's upload while that read is in flight — a
+    /// wild read or wrong attention with no attribution (CLAUDE.md invariant 7).
+    /// Carrying the superseded buffer here defers its free to forward end, which
+    /// is after the logits readback — i.e. after every kernel has retired.
+    #[cfg(feature = "cuda")]
+    superseded: Vec<GpuBuf>,
+}
+
+/// Classify how a later layer's live slot layout differs from the cached
+/// position map: whether the map must be rebuilt (`stale`), and whether the
+/// divergence is the benign windowed-creep skew or a real layout change worth a
+/// loud, attributed line (`anomalous`).
+///
+/// `cached` is the per-slot `(n_slices, covered_tokens)` the map was built over
+/// and `cached_write` the per-slot writer slice; `live` is this layer's
+/// `(n_slices, covered_tokens, writer_slice)` derived from the slot-state buffer
+/// and the caller's `offsets + q_lens`. A length mismatch means the wave's slot
+/// membership moved between layers — never a creep artefact, so both flags. Per
+/// slot: the creep skew pushes a trailing 0-token writer chunk ahead of the
+/// lagging layers, so the slice count moves while the covered-token count does
+/// not; a covered-token move (or the writer slipping into a chunk the map does
+/// not describe) is a genuine layout divergence. A covered-token move is the one
+/// that reads as anomalous — the rebuild keeps the forward correct either way,
+/// but only creep is expected to move the slice count on its own.
+///
+/// Pure host logic, so these rules are unit-tested directly without a GPU (this
+/// whole module is CUDA-only, but the function touches no device). See
+/// [`SharedPm`] for why a rebuilt map must not index a stale layout.
+fn classify_pm_divergence(
+    cached: &[(u32, u32)],
+    cached_write: &[u32],
+    live: &[(u32, u32, u32)],
+) -> (bool, bool) {
+    if cached.len() != live.len() {
+        return (true, true);
+    }
+    let mut stale = false;
+    let mut anomalous = false;
+    for i in 0..live.len() {
+        let (want_slices, want_covered) = cached[i];
+        let (n_slices, this_covered, buf_write) = live[i];
+        let coverage_moved = this_covered != want_covered;
+        // The writer slice moved into a chunk the cached map does not describe.
+        let writer_moved =
+            buf_write != cached_write[i] && (cached_write[i] as usize) < n_slices as usize;
+        if n_slices != want_slices || coverage_moved || writer_moved {
+            stale = true;
+        }
+        if coverage_moved {
+            anomalous = true;
+        }
+    }
+    (stale, anomalous)
 }
 
 /// Build + upload the per-slot `SlotHeader` payloads (slices, position_map,
@@ -218,60 +279,81 @@ fn build_slot_headers(
 
     // Per-slot `write_slice` for the headers: read from the token layout on the
     // layer that builds the map, from the cache on every later layer.
+    //
+    // `pm_cached` starts from whether a map exists, but a divergence below
+    // clears it and forces a rebuild — so it is `mut`.
+    let mut pm_cached = pm_cached;
     let mut write_slices: Vec<u32> = Vec::with_capacity(caches.len());
     if pm_cached {
-        // Position-map shape guard: the cached map was built from an earlier
+        // Position-map shape check: the cached map was built from an earlier
         // layer's slice layout; the kernel resolves every k_pos through it into
-        // THIS layer's slice array. If any slot's layout changed since the build
-        // — a chunk boundary moved, a chunk appeared or vanished — the map's
-        // `(slice_idx, in_blk)` entries index the wrong slices, and a slice_idx
-        // past this layer's slice count sends the kernel through a garbage
-        // `kvheads_ptr` (CUDA_ERROR_ILLEGAL_ADDRESS with no attribution). Refuse
-        // to launch and name the slot + shape delta instead.
-        let cache = shared_pm.borrow();
-        let s = cache
-            .as_ref()
-            .expect("pm_cached implies shared_pm is populated");
-        if s.per_slot_shape.len() != caches.len() {
-            candle::bail!(
-                "slot header build: cached position_map covers {} slots but this \
-                 layer has {} — wave membership changed mid-forward",
-                s.per_slot_shape.len(),
-                caches.len()
-            );
-        }
-        for i in 0..caches.len() {
-            let (want_slices, want_covered) = s.per_slot_shape[i];
-            let (_, n_slices, buf_write) = slot_states[i];
-            let this_covered = (offsets[i] + q_lens[i]) as u32;
-            if n_slices != want_slices || this_covered != want_covered {
-                candle::bail!(
-                    "slot header build: batch slot {i} slice layout changed \
-                     mid-forward under the cached position_map: map was built \
-                     over {want_slices} slices / {want_covered} covered tokens, \
-                     this layer has {n_slices} slices / {this_covered} covered \
-                     tokens (offset {} + q_len {}) — a concurrent mutation moved \
-                     the slot's chunk boundaries between layers",
-                    offsets[i],
-                    q_lens[i]
+        // THIS layer's slice array. The map is layer-invariant only while the
+        // slot's chunk layout is the same on every layer — and during a windowed
+        // creep prefill it is not. The creep advances the layers incrementally
+        // (layer 0 first), pushing an empty (0-token) writer chunk for the next
+        // window ahead of the layers still pending resume, so between the layer
+        // that built the map and a later layer a slot's slice count differs by
+        // that one trailing empty chunk (same covered tokens). See the skew note
+        // on `BatchedInferenceSession::sequence_block_count`. Reusing the stale
+        // map would resolve k_pos through a slice index that layer does not have
+        // — a garbage `kvheads_ptr` (CUDA_ERROR_ILLEGAL_ADDRESS, no attribution).
+        //
+        // So when the cached shape no longer matches this layer's live layout,
+        // rebuild the map from the current layout and republish it for the layers
+        // past the creep front, rather than refuse the launch. Each layer's map
+        // then matches the slices its own kernel walks, which is all correctness
+        // needs — attention is per-layer. Refusing instead stranded the forward,
+        // and retried every wave it hung the engine with the GPU pegged and no
+        // conversation ever opened. The rebuild reads the same live backing the
+        // first layer's build already trusts, so it is no less safe than that
+        // build is — and the buffer it replaces is not freed here but carried in
+        // `SharedPm::superseded` until forward end (an earlier layer's kernel may
+        // still be reading it).
+        //
+        // The benign creep skew adds a trailing 0-token chunk: the slice count
+        // moves but the covered-token count does not. A covered-token move or a
+        // change in the wave's slot count is a real layout divergence — not creep
+        // — so it is worth a loud, attributed line even though the rebuild still
+        // makes it safe.
+        let (stale, anomalous) = {
+            let cache = shared_pm.borrow();
+            let s = cache
+                .as_ref()
+                .expect("pm_cached implies shared_pm is populated");
+            // This layer's live `(n_slices, covered_tokens, writer_slice)` per
+            // slot, against the `(n_slices, covered_tokens)` + writer the map was
+            // built over. Classified by `classify_pm_divergence`, which is a pure
+            // function so the stale/anomalous rules are unit-tested directly.
+            let live: Vec<(u32, u32, u32)> = (0..caches.len())
+                .map(|i| {
+                    let (_, n_slices, buf_write) = slot_states[i];
+                    (n_slices, (offsets[i] + q_lens[i]) as u32, buf_write)
+                })
+                .collect();
+            classify_pm_divergence(&s.per_slot_shape, &s.per_slot_write, &live)
+        };
+        if stale {
+            if anomalous {
+                tracing::warn!(
+                    "position map rebuilt mid-forward from a layout that is not the \
+                     benign windowed-creep skew: the covered-token count or the wave's \
+                     slot membership moved between layers. The rebuild keeps this \
+                     forward correct, but suspect a concurrent chunk-table mutation if \
+                     it recurs."
                 );
             }
-            // The buffer derives its write chunk from live host state, the map
-            // named one when it was built. They are the same rule applied twice,
-            // and a divergence would scatter this launch's new tokens into a
-            // chunk the map does not describe — silently, since both indices are
-            // in range.
-            if buf_write != s.per_slot_write[i]
-                && (s.per_slot_write[i] as usize) < n_slices as usize
-            {
-                candle::bail!(
-                    "slot header build: batch slot {i} slot-state buffer writes \
-                     slice {buf_write} but the cached position_map's write region \
-                     names slice {} — the writer moved between layers",
-                    s.per_slot_write[i]
-                );
+            // Do NOT free the cached map here — the build path takes it and carries
+            // its buffer forward in `superseded`. This just routes both branches
+            // below to the build path.
+            pm_cached = false;
+        } else {
+            let cache = shared_pm.borrow();
+            let s = cache
+                .as_ref()
+                .expect("pm_cached implies shared_pm is populated");
+            for i in 0..caches.len() {
+                write_slices.push(s.per_slot_write[i]);
             }
-            write_slices.push(s.per_slot_write[i]);
         }
     }
     pipeline_record("slot:build", t_build);
@@ -407,12 +489,26 @@ fn build_slot_headers(
         // link a PCIe round trip on the kernel's critical path.
         let pm_gpu = generation.submit_resident(pm_pinned)?;
         let base_ptr = pm_gpu.dev_ptr();
+        // Take the map this rebuild replaces (if any) and carry its buffer, and
+        // any it had already carried, forward — freeing it now could pull the
+        // device memory an earlier layer's in-flight kernel is still reading. It
+        // is released with this whole cache at forward end, after the kernels
+        // have retired. On the first (uncached) layer there is nothing to carry.
+        let superseded = match shared_pm.borrow_mut().take() {
+            Some(prev) => {
+                let mut carried = prev.superseded;
+                carried.push(prev._gpu);
+                carried
+            }
+            None => Vec::new(),
+        };
         *shared_pm.borrow_mut() = Some(SharedPm {
             _gpu: pm_gpu,
             base_ptr,
             byte_offsets: byte_offsets.clone(),
             per_slot_shape,
             per_slot_write: write_slices.clone(),
+            superseded,
         });
         byte_offsets
     };
@@ -3896,5 +3992,89 @@ mod tests {
             "fused RoPE prefill functional mismatch: mae={mae}"
         );
         Ok(())
+    }
+}
+
+/// The position-map staleness rules, tested off the GPU. See
+/// [`classify_pm_divergence`] and [`SharedPm`].
+#[cfg(test)]
+mod pm_divergence_tests {
+    use super::classify_pm_divergence;
+
+    /// An unchanged layout is neither stale nor anomalous — the common case, a
+    /// later layer of a settled forward reusing the cached map.
+    #[test]
+    fn an_unchanged_layout_reuses_the_cached_map() {
+        let cached = [(4u32, 128u32), (3, 96)];
+        let write = [3u32, 2];
+        let live = [(4u32, 128u32, 3u32), (3, 96, 2)];
+        assert_eq!(
+            classify_pm_divergence(&cached, &write, &live),
+            (false, false)
+        );
+    }
+
+    /// **The benign windowed-creep skew: a trailing 0-token chunk.** The slice
+    /// count moves by one but the covered-token count does not — stale (rebuild),
+    /// but NOT anomalous (no loud line).
+    #[test]
+    fn a_trailing_empty_chunk_is_stale_but_not_anomalous() {
+        let cached = [(4u32, 128u32)];
+        let write = [3u32];
+        // One more slice, same covered tokens — the phantom writer chunk.
+        let live = [(5u32, 128u32, 3u32)];
+        assert_eq!(
+            classify_pm_divergence(&cached, &write, &live),
+            (true, false)
+        );
+    }
+
+    /// A covered-token move is a real layout divergence, not creep — stale AND
+    /// anomalous, so it is worth a loud, attributed line.
+    #[test]
+    fn a_covered_token_move_is_anomalous() {
+        let cached = [(4u32, 128u32)];
+        let write = [3u32];
+        let live = [(4u32, 160u32, 3u32)];
+        assert_eq!(classify_pm_divergence(&cached, &write, &live), (true, true));
+    }
+
+    /// A change in the wave's slot membership between layers can never be a creep
+    /// artefact — stale AND anomalous.
+    #[test]
+    fn a_membership_change_is_anomalous() {
+        let cached = [(4u32, 128u32), (3, 96)];
+        let write = [3u32, 2];
+        let live = [(4u32, 128u32, 3u32)];
+        assert_eq!(classify_pm_divergence(&cached, &write, &live), (true, true));
+    }
+
+    /// The writer slipping into a chunk the map does not describe is stale (the
+    /// map's write region names the wrong slice) but not, on its own, anomalous.
+    #[test]
+    fn a_writer_move_within_bounds_is_stale_but_not_anomalous() {
+        let cached = [(5u32, 128u32)];
+        let write = [2u32]; // cached writer 2 < live n_slices 5, and it moved
+        let live = [(5u32, 128u32, 3u32)];
+        assert_eq!(
+            classify_pm_divergence(&cached, &write, &live),
+            (true, false)
+        );
+    }
+
+    /// A cached writer index that is out of the live slice array's bounds does
+    /// not by itself force a rebuild — the guard requires the cached writer to be
+    /// a real slice the map describes.
+    #[test]
+    fn a_writer_move_the_cached_map_never_described_is_not_stale() {
+        let cached = [(4u32, 128u32)];
+        // Cached writer 4 is not < live n_slices 4, so the writer-move arm is
+        // suppressed; nothing else moved.
+        let write = [4u32];
+        let live = [(4u32, 128u32, 1u32)];
+        assert_eq!(
+            classify_pm_divergence(&cached, &write, &live),
+            (false, false)
+        );
     }
 }

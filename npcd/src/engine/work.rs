@@ -115,7 +115,9 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     makers: &makers,
                     records: &records,
                 };
-                let brief = s.missions.collect(body, &facts).standing_text();
+                let mission = s.missions.collect(body, &facts);
+                let brief = mission.standing_text();
+                tracing::info!(npc = body, prompt = %mission.mission_text(), "mission taken up at the command table");
                 Outcome::Did(format!("You take it up.\n{brief}"))
             })
         }
@@ -133,10 +135,13 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     .missions
                     .report(body, Verdict::Pass, &account, Some(account.clone()))
                 {
-                    Some(m) => Outcome::Did(format!(
-                        "Reported done, and your answer filed: {}",
-                        m.mission_text()
-                    )),
+                    Some(m) => {
+                        tracing::info!(npc = body, prompt = %m.mission_text(), "mission reported DONE at the command table");
+                        Outcome::Did(format!(
+                            "Reported done, and your answer filed: {}",
+                            m.mission_text()
+                        ))
+                    }
                     None => Outcome::Refused("You are not carrying a mission to report on.".into()),
                 }
             })
@@ -149,10 +154,13 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
             };
             hosted.with_sim(
                 |s| match s.missions.report(body, Verdict::Fail, &why, None) {
-                    Some(m) => Outcome::Did(format!(
-                        "Reported as not done, with your reasons: {}",
-                        m.mission_text()
-                    )),
+                    Some(m) => {
+                        tracing::info!(npc = body, prompt = %m.mission_text(), "mission reported STUCK at the command table");
+                        Outcome::Did(format!(
+                            "Reported as not done, with your reasons: {}",
+                            m.mission_text()
+                        ))
+                    }
                     None => Outcome::Refused("You are not carrying a mission to report on.".into()),
                 },
             )
