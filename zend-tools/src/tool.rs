@@ -69,6 +69,19 @@ impl ConfirmationDetails {
     }
 }
 
+/// Whether a tool call may be re-issued when a turn resumes after a daemon
+/// restart — see [`Tool::replay`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replay {
+    /// Running the call a second time leaves the state running it once left.
+    /// A pure computation, a read, or a write that is a function of its
+    /// arguments.
+    Safe,
+    /// Running it again would repeat a side effect, spend something, or reach
+    /// a peer a second time.
+    Unsafe,
+}
+
 /// Input to a subagent invocation.
 pub struct SubagentRequest {
     pub instruction: String,
@@ -121,5 +134,72 @@ pub trait Tool: 'static {
     /// Default impl: never confirm.
     fn confirmation(_req: &Self::Request) -> Option<ConfirmationDetails> {
         None
+    }
+
+    /// Whether this call may be re-issued when a turn resumes after a restart.
+    ///
+    /// A turn whose assistant half asked for tools but whose results never
+    /// landed is resumed by asking for them again — the restart lost the
+    /// results, so there is nothing else to continue from. Re-issuing is only
+    /// correct when the call leaves the state it left the first time; anything
+    /// else is refused on resume and the model is told so, rather than having
+    /// the effect happen twice.
+    ///
+    /// Defaults to [`Replay::Unsafe`]. A tool declares itself replayable and
+    /// never the other way round, so one written without a thought about
+    /// resume is refused rather than quietly repeated.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Unsafe
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+    use validator::Validate;
+
+    use super::{Replay, Tool, ToolError};
+    use crate::context::ToolContext;
+
+    #[derive(Deserialize, JsonSchema, Validate)]
+    struct Req {}
+
+    #[derive(serde::Serialize)]
+    struct Resp {}
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("unreachable")]
+    struct Never;
+
+    impl ToolError for Never {
+        fn code(&self) -> &'static str {
+            "unreachable"
+        }
+    }
+
+    /// A tool written without a thought about resume.
+    struct Unmarked;
+
+    impl Tool for Unmarked {
+        const NAME: &'static str = "unmarked";
+        const DESCRIPTION: &'static str = "declares nothing about being re-issued";
+
+        type Request = Req;
+        type Response = Resp;
+        type Error = Never;
+
+        fn run(_ctx: &ToolContext, _req: Req) -> Result<Resp, Never> {
+            Ok(Resp {})
+        }
+    }
+
+    /// **The default is refusal.** A tool that says nothing about resume is not
+    /// re-issued, so a new tool whose author never considered a restart costs a
+    /// refused call rather than a repeated side effect. Every replayable tool
+    /// says so itself.
+    #[test]
+    fn a_tool_that_declares_nothing_is_not_replayed() {
+        assert_eq!(Unmarked::replay(&Req {}), Replay::Unsafe);
     }
 }

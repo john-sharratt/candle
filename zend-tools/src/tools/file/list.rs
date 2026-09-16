@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::{FileError, Paging};
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 /// Entries per page. A listing goes into the conversation verbatim, so an
 /// unbounded one is a context hazard: `zend/src/` alone is 175 files ≈ 5.7k
@@ -62,6 +62,11 @@ impl Tool for FileList {
     type Request = ListRequest;
     type Response = ListResponse;
     type Error = FileError;
+
+    /// Lists a directory; writes nothing.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(ctx: &ToolContext, req: ListRequest) -> Result<ListResponse, FileError> {
         let prefix = req.prefix.as_deref().unwrap_or("");

@@ -6,7 +6,7 @@ use validator::Validate;
 
 use super::render::{fence_tag_for_path, numbered_excerpt};
 use super::FileError;
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 /// The range is optional, and a missing bound is the file's own edge: no range
 /// reads the whole file, `start_line` alone reads from there to the end, and
@@ -45,6 +45,11 @@ impl Tool for FileRead {
     /// the `code_reading` ingest's prefilled responses.
     type Response = String;
     type Error = FileError;
+
+    /// Reads a file; writes nothing.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(ctx: &ToolContext, req: ReadRequest) -> Result<String, FileError> {
         let content = ctx

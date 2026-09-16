@@ -32,6 +32,7 @@ pub mod reasoning_split;
 pub mod refresh_ctx;
 pub mod repo_scan;
 pub mod response_section;
+pub mod resume;
 pub mod session;
 pub mod think_budget;
 pub mod think_gate;

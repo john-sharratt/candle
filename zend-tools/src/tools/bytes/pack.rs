@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::{encode_bytes, pack_field, parse_format, BytesError};
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct PackRequest {
@@ -39,6 +39,11 @@ impl Tool for BytesPack {
     type Request = PackRequest;
     type Response = PackResponse;
     type Error = BytesError;
+
+    /// Pure byte manipulation — no state and no I/O.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(_ctx: &ToolContext, req: PackRequest) -> Result<PackResponse, BytesError> {
         let (big_endian, fields) = parse_format(&req.format)?;

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::NotesError;
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ReadRequest {
@@ -35,6 +35,11 @@ impl Tool for NotesRead {
     type Request = ReadRequest;
     type Response = ReadResponse;
     type Error = NotesError;
+
+    /// Reads the note store; writes nothing.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(ctx: &ToolContext, req: ReadRequest) -> Result<ReadResponse, NotesError> {
         let note = ctx

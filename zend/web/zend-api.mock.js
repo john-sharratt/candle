@@ -37,6 +37,10 @@
         {
           id: '1', title: 'Trace the substrate redo log replay', archived: false,
           updated_ms: now - 60000, turn_count: 2,
+          // The dials this conversation was last run at. The seeded conversation
+          // is the one that arrives already hydrated, so it is also the one whose
+          // dials have to come with it: there is no later fetch to carry them.
+          dials: { effort: 3, verbosity: 1, think: true, tools: 1 },
           history: [
             { role: 'user', content: 'Trace how the substrate redo log gets replayed on daemon boot.' },
             { role: 'assistant', content: J([
@@ -81,10 +85,16 @@
     async getConversation(id) {
       await delay(350);
       const seed = (this._convs || []).find((c) => c.id === String(id));
-      if (seed && seed.history && seed.history.length) return Object.assign({}, seed);
+      // The dials the daemon holds for a conversation — the levels its last
+      // turn ran at. Deliberately not the composer's defaults, so adopting them
+      // on open is visible.
+      const dials = { effort: 3, verbosity: 1, think: true, tools: 1 };
+      if (seed && seed.history && seed.history.length) {
+        return Object.assign({}, seed, { dials });
+      }
       const title = seed ? seed.title : 'Conversation';
       return {
-        id: String(id), title,
+        id: String(id), title, dials,
         archived: seed ? seed.archived : false,
         updated_ms: seed ? seed.updated_ms : Date.now(),
         turn_count: seed ? seed.turn_count : 2,

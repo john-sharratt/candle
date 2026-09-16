@@ -62,6 +62,9 @@
         // keeps one per think block, in order.
         history: (body.messages || []).map((m) => ({ role: m.role, content: m.content, no_think: !!m.no_think, thinking: m.thinking ? [m.thinking] : [], tool_tokens: m.tool_tokens || [], spans: m.spans || [], files: m.files || [] })),
         uploads: body.uploads || [],
+        // The composer dials this conversation last ran at, as levels. Absent
+        // for one that has never taken a turn — the composer keeps its own.
+        dials: body.dials || null,
       };
     },
     archiveConversation(id) { return postVoid('/v1/conversations/' + enc(id) + '/archive'); },

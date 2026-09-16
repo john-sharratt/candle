@@ -898,6 +898,19 @@ impl ConversationEngine {
             .map_err(ConversationError::Model)
     }
 
+    /// Merge several `(key, value)` pairs into `timeline`'s `custom` metadata in
+    /// one persisted record, so values that describe one decision — a turn's
+    /// composer dials — are never recovered half-written.
+    pub fn set_conversation_metadata_many(
+        &self,
+        timeline: TimelineId,
+        kv: &std::collections::BTreeMap<String, String>,
+    ) -> crate::Result<()> {
+        self.conversation
+            .set_conversation_metadata_many(timeline, kv)
+            .map_err(ConversationError::Model)
+    }
+
     /// `timeline`'s `custom` metadata bag, or `None` if unregistered.
     pub fn conversation_metadata(
         &self,

@@ -38,7 +38,7 @@ use candle_conversation::TurnText;
 use serde::Deserialize;
 use serde_json::Value;
 
-use zend_tools::{registry, ToolContext};
+use zend_tools::{registry, replay, Replay, ToolContext};
 
 /// The names of every tool that is **not** high-risk — the subset projected in
 /// "Restricted" tools mode. Derived from the registry's `.risky()` policy (see
@@ -493,6 +493,34 @@ pub fn run_tool(ctx: &ToolContext, call: &ToolCall) -> Value {
     }
 }
 
+/// Why a round of tool calls is being dispatched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatch {
+    /// The turn is running now, and every call it asks for is run.
+    Live,
+    /// The turn is being resumed after a restart lost the results of the calls
+    /// its assistant half asked for. A call that cannot be re-issued
+    /// ([`zend_tools::Tool::replay`]) is answered with an error instead of
+    /// being run a second time.
+    Resumed,
+}
+
+/// The answer a resumed turn gets for a call that must not run twice.
+///
+/// Shaped like every other tool failure — an `{"error", "detail"}` object — so
+/// the model reads it the way it reads the rest, and can ask for the call
+/// again itself if it still wants it.
+fn not_replayed(name: &str) -> Value {
+    serde_json::json!({
+        "error": "not_replayed_after_restart",
+        "detail": format!(
+            "zend restarted between this {name} call and its result. Running it again \
+             could repeat an effect that already happened, so it was not run. Ask for \
+             it again if you still need it."
+        ),
+    })
+}
+
 /// Dispatch every parsed tool call sequentially and pair each call with
 /// its result.  Sequential rather than concurrent because the same
 /// session/notes/credential stores are mutated by some tools — running
@@ -501,11 +529,27 @@ pub fn run_tool(ctx: &ToolContext, call: &ToolCall) -> Value {
 /// (which are `Arc<RwLock<...>>` internally, but ordering across
 /// distinct tools matters for stateful flows like
 /// `ssh_session_open` → `ssh_session_exec`).
-pub fn run_tool_calls(ctx: &ToolContext, calls: Vec<ToolCall>) -> Vec<ToolResult> {
+///
+/// On [`Dispatch::Resumed`] each call is put to its tool first: the ones that
+/// leave what they left the first time are run, and the rest are answered with
+/// [`not_replayed`]. The turn continues either way — a refusal is a result the
+/// model can read, not a hole in the round.
+pub fn run_tool_calls(
+    ctx: &ToolContext,
+    calls: Vec<ToolCall>,
+    dispatch: Dispatch,
+) -> Vec<ToolResult> {
     calls
         .into_iter()
         .map(|c| {
-            let resp = run_tool(ctx, &c);
+            let refused =
+                dispatch == Dispatch::Resumed && replay(&c.name, &c.arguments) == Replay::Unsafe;
+            let resp = if refused {
+                tracing::info!(tool = %c.name, "resumed turn: call not re-issued");
+                not_replayed(&c.name)
+            } else {
+                run_tool(ctx, &c)
+            };
             ToolResult {
                 call: c,
                 response: resp,
@@ -612,6 +656,66 @@ impl ToolHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Resuming a tool round after a restart ───────────────────────────────
+
+    /// One call that may be re-issued and one that may not.
+    fn a_mixed_round() -> Vec<ToolCall> {
+        vec![
+            ToolCall {
+                name: "calculator".to_string(),
+                arguments: serde_json::json!({ "expression": "1 + 1" }),
+            },
+            // No such session exists, so this reaches no network either way —
+            // what is being asserted is whether it is put to the tool at all.
+            ToolCall {
+                name: "http_request".to_string(),
+                arguments: serde_json::json!({
+                    "session_id": "s1",
+                    "path": "/v1/things",
+                    "method": "POST",
+                }),
+            },
+        ]
+    }
+
+    /// **A resumed round refuses only what cannot be re-issued, and still
+    /// answers every call.** The round keeps its shape — one response per call
+    /// the model made — so a refusal is something it reads and can act on
+    /// rather than a hole where a result should be.
+    #[test]
+    fn a_resumed_round_refuses_only_the_calls_that_cannot_be_re_issued() {
+        let ctx = ToolContext::default();
+        let results = run_tool_calls(&ctx, a_mixed_round(), Dispatch::Resumed);
+        assert_eq!(results.len(), 2);
+        assert!(
+            results[0].response.get("error").is_none(),
+            "the arithmetic should have been re-run: {:?}",
+            results[0].response,
+        );
+        assert_eq!(
+            results[1].response["error"], "not_replayed_after_restart",
+            "a POST must not be sent a second time: {:?}",
+            results[1].response,
+        );
+    }
+
+    /// **The refusal belongs to resume alone.** Dispatched live, the same round
+    /// runs both calls — the POST fails on its missing session, which is the
+    /// tool's own answer and not a refusal.
+    #[test]
+    fn a_live_round_puts_every_call_to_its_tool() {
+        let ctx = ToolContext::default();
+        let results = run_tool_calls(&ctx, a_mixed_round(), Dispatch::Live);
+        assert_eq!(results.len(), 2);
+        for r in &results {
+            assert_ne!(
+                r.response["error"], "not_replayed_after_restart",
+                "a live turn refuses nothing: {:?}",
+                r.response,
+            );
+        }
+    }
 
     // ── The function-block syntax (Qwen3.5 / Qwen3.8) ───────────────────────
     //

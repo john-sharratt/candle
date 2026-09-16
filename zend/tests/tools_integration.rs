@@ -302,6 +302,17 @@ mod tool_scenarios {
     // is sealed again, and its records supersede the last boot's — dead records
     // only compaction reclaims, which is how the suite's workspace once grew
     // ~140 MB a boot.
+    //
+    // **The two boots' counts are deliberately NOT compared.** This workspace
+    // is shared and persistent, and `needs_compaction` is a size test
+    // (`> COMPACT_ABOVE_BYTES`), so it can be true on BOTH boots: the second
+    // compaction sheds the records the first boot's re-seals superseded, and
+    // `restored` legitimately falls — 321 to 226 on the run that exposed this.
+    // Asserting `restored == first.restored + first.prefilled` reported that
+    // reclamation as "the second boot prefilled N sections" while `prefilled`
+    // was plainly 0 on both sides: a failure message describing the opposite of
+    // what had happened. What the suite is protecting is that nothing is
+    // recomputed, so that is what is asserted.
 
     #[test]
     fn a_second_boot_restores_every_prompt_section() {
@@ -313,15 +324,16 @@ mod tool_scenarios {
             (first, boot_and_count_sections().await)
         });
         assert_eq!(
-            second,
-            SectionLoads {
-                restored: first.restored + first.prefilled,
-                prefilled: 0,
-            },
-            "the second boot prefilled {} of the {} prompt section(s) the first had in the \
-             log or sealed",
+            second.prefilled, 0,
+            "the second boot prefilled {} prompt section(s) the first had already sealed — \
+             each is sealed again and supersedes the last boot's records, which is how this \
+             workspace once grew ~140 MB a boot (first boot: {first:?}, second: {second:?})",
             second.prefilled,
-            first.restored + first.prefilled
+        );
+        assert!(
+            second.restored > 0,
+            "the second boot restored no prompt section at all, so nothing the first boot \
+             sealed survived in the log (first boot: {first:?}, second: {second:?})",
         );
     }
 

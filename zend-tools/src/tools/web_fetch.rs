@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext, ToolError};
+use crate::{RegisteredTool, Replay, Tool, ToolContext, ToolError};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct Request {
@@ -172,6 +172,11 @@ impl Tool for WebFetchTool {
     type Request = Request;
     type Response = Response;
     type Error = FetchError;
+
+    /// Retrieves a page by GET; nothing at the far end changes.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(ctx: &ToolContext, req: Request) -> Result<Response, FetchError> {
         if !req.url.starts_with("http://") && !req.url.starts_with("https://") {

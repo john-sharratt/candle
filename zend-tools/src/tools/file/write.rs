@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::FileError;
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct WriteRequest {
@@ -40,6 +40,12 @@ impl Tool for FileWrite {
     type Request = WriteRequest;
     type Response = WriteResponse;
     type Error = FileError;
+
+    /// The file ends up holding the content the call carries, so writing it a
+    /// second time leaves what the first one left.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(ctx: &ToolContext, req: WriteRequest) -> Result<WriteResponse, FileError> {
         let bytes = req.content.len();

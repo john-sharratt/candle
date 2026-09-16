@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext, ToolError};
+use crate::{RegisteredTool, Replay, Tool, ToolContext, ToolError};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct Request {
@@ -109,6 +109,12 @@ impl Tool for WeatherTool {
     type Request = Request;
     type Response = Response;
     type Error = WeatherError;
+
+    /// Reads a public forecast API that takes no key and holds no account, so
+    /// a second read spends nothing.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(ctx: &ToolContext, req: Request) -> Result<Response, WeatherError> {
         let units = req.units.as_deref().unwrap_or("metric");

@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +38,10 @@ use candle_conversation::{
 };
 use serde_json::Value;
 
-use crate::api::chat::{tool_round_selection, TOOL_EXAMPLE_SELECTOR};
+use crate::api::chat::{
+    apply_tools_dial, dial_selection, tool_round_selection, EFFORT_OPTIONS,
+    RESPONSE_LENGTH_OPTIONS, TOOL_EXAMPLE_SELECTOR,
+};
 use crate::api::substrate::{
     ConvView, Counts, GroupView, LayerConversations, LayerView, ProjectTile, ProjectView,
     SectionView, SegmentView, Storage, SubstrateOverview, SystemPromptView, TimelineDetail,
@@ -55,11 +58,12 @@ use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript}
 use crate::projection_event::ProjectionEventOut;
 use crate::refresh_ctx::RefreshContext;
 use crate::repo_scan::RepoMap;
+use crate::resume;
 use crate::think_budget;
 use crate::think_progress::{ThinkProgress, ThinkUpdate};
 use crate::tools::{
-    extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, ToolHost,
-    CALIB_TOOL_SELECTOR,
+    extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, Dispatch,
+    ToolCall, ToolHost, CALIB_TOOL_SELECTOR,
 };
 use crate::types::{ChatMessage, Role, ToolMode, Usage};
 use crate::watcher::WatchDepth;
@@ -174,6 +178,94 @@ struct ConvState {
     /// fork, overridden when a request carries an explicit `identity`, and used
     /// each turn to scope the projection's identity collection.
     identity: Option<String>,
+}
+
+/// Metadata keys carrying the composer dials a conversation last ran under.
+///
+/// The values are the projection's own option ids (`balanced`, `standard`, …),
+/// not the GUI's levels: the daemon speaks in ids, the ids are what a resumed
+/// turn re-selects, and a stored id keeps its meaning if the GUI ever changes
+/// its scale. [`ZendSession::conversation_dials`] maps them back to levels for
+/// the client.
+const DIAL_EFFORT_KEY: &str = "dial_effort";
+const DIAL_LENGTH_KEY: &str = "dial_response_length";
+const DIAL_THINK_KEY: &str = "dial_think";
+const DIAL_TOOLS_KEY: &str = "dial_tools";
+
+/// The most tool rounds one turn runs before the daemon stops feeding it.
+///
+/// A backstop, not a budget: it sits far above any real workflow, and a turn
+/// that reaches it is a model that has stopped making progress rather than one
+/// doing a long job. The bound matters because nothing else provides one — a
+/// client that closes its tab no longer ends the turn (that is deliberate: the
+/// work finishes and seals so a reload finds it done), so a model calling a
+/// tool every round would otherwise decode, seal and dispatch forever, holding
+/// the conversation's lock and the card with nobody waiting on the result.
+const MAX_TOOL_ROUNDS: usize = 32;
+
+/// The tools dial as the metadata bag stores it.
+fn tools_mode_id(mode: ToolMode) -> &'static str {
+    match mode {
+        ToolMode::None => "none",
+        ToolMode::Restricted => "restricted",
+        ToolMode::Comprehensive => "comprehensive",
+    }
+}
+
+/// The tools dial back from the level the bag stored — the inverse of
+/// [`tools_mode_id`], in the order [`ZendSession::conversation_dials`] reports.
+fn tools_mode_from_level(level: u8) -> ToolMode {
+    match level {
+        0 => ToolMode::None,
+        1 => ToolMode::Restricted,
+        _ => ToolMode::Comprehensive,
+    }
+}
+
+/// The dials `selection` and `tools_mode` express, as the metadata bag stores
+/// them. A selector the turn left unset is stored empty, so "ran without this
+/// dial" stays distinguishable from "never recorded".
+fn dials_metadata(
+    selection: &candle_conversation::SelectionState,
+    tools_mode: ToolMode,
+) -> BTreeMap<String, String> {
+    let think = match selection.optional(candle_conversation::NO_THINK_SELECTOR) {
+        // The `/no_think` node present means the turn suppressed thinking.
+        Some(candle_conversation::OptionalState::Present) => "off",
+        Some(candle_conversation::OptionalState::Absent) => "on",
+        None => "",
+    };
+    BTreeMap::from([
+        (
+            DIAL_EFFORT_KEY.to_string(),
+            selection
+                .get("thinking_effort")
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        (
+            DIAL_LENGTH_KEY.to_string(),
+            selection
+                .get("response_length")
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        (DIAL_THINK_KEY.to_string(), think.to_string()),
+        (
+            DIAL_TOOLS_KEY.to_string(),
+            tools_mode_id(tools_mode).to_string(),
+        ),
+    ])
+}
+
+/// The composer dials a conversation last ran under, as the levels the GUI's
+/// dials are set from.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct ConversationDials {
+    pub effort: u8,
+    pub verbosity: u8,
+    pub think: bool,
+    pub tools: u8,
 }
 
 /// Map a turn's `thinking_effort` dial to the steering [`ThinkMode`].  Mirrors
@@ -2796,6 +2888,10 @@ fn run_inference_stream(
     tools_mode: ToolMode,
     identity: Option<String>,
     selection: candle_conversation::SelectionState,
+    // Not from the HTTP handler: set only by the boot scan, naming a sealed
+    // call turn whose tools never delivered. `user_message` is then unused —
+    // the turn's message is the tool output, produced below.
+    resume_call_turn: Option<u32>,
 ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
     let (tx, rx) = mpsc::channel::<anyhow::Result<StreamItem>>(64);
 
@@ -2899,6 +2995,21 @@ fn run_inference_stream(
             }
         }
 
+        // The dials this turn ran under, persisted so both a resumed turn and
+        // the GUI reopening the conversation use the settings it was last set
+        // to rather than the defaults. Written only when they change, as
+        // `identity` is — otherwise every turn costs a metadata record.
+        {
+            let dials = dials_metadata(&selection, tools_mode);
+            let engine = state.engine.lock().unwrap();
+            let stored = engine.conversation_metadata(timeline).unwrap_or_default();
+            if dials.iter().any(|(k, v)| stored.get(k) != Some(v)) {
+                if let Err(e) = engine.set_conversation_metadata_many(timeline, &dials) {
+                    tracing::warn!(conv_id = %conv_id, "persist dials failed: {e}");
+                }
+            }
+        }
+
         // Lossless capture: seal this conversation's turns WITHOUT KV
         // quantization — K/V persist in native R16/F16 so the provenance work
         // gets full-resolution keys. Set before the first turn's residence is
@@ -2990,6 +3101,65 @@ fn run_inference_stream(
         let original_user_message = user_message.clone();
         let mut current_message = TurnText::from(user_message);
 
+        // A tool round this daemon never finished. Run its tools now and enter
+        // the loop at a tool round rather than at a fresh question, so the
+        // response turn projects as it would have: without the worked
+        // demonstration, and without re-applying the caller's prefill.
+        // Every `cs.conv` touch below is its own synchronous statement. A
+        // `&Sequence` is not `Send` — a conversation owns its background
+        // cognitive tasks — so one held across the await would make this whole
+        // task non-`Send`, and the spawn would not compile.
+        let mut start_iteration = 0usize;
+        if let Some(call_turn) = resume_call_turn {
+            let calls = resumed_calls(&cs.conv, &conv_id, timeline, call_turn);
+            let n_calls = calls.len();
+            if calls.is_empty() {
+                resume::clear_call_turn(&state.engine.lock().unwrap(), timeline);
+                return;
+            }
+            let ctx = Arc::clone(&state.tool_host.ctx);
+            let dispatched =
+                tokio::task::spawn_blocking(move || run_tool_calls(&ctx, calls, Dispatch::Resumed))
+                    .await;
+            let text = match dispatched {
+                Ok(results) => format_tool_responses(&results),
+                Err(e) => {
+                    tracing::error!(
+                        conv_id = %conv_id,
+                        call_turn,
+                        "resume: tool dispatch panicked: {e}",
+                    );
+                    resume::clear_call_turn(&state.engine.lock().unwrap(), timeline);
+                    return;
+                }
+            };
+            if text.is_blank() {
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    call_turn,
+                    n_calls,
+                    "resume: the re-issued round produced no response text",
+                );
+                resume::clear_call_turn(&state.engine.lock().unwrap(), timeline);
+                return;
+            }
+            // The one window in which the coupling is knowable: the tools have
+            // returned and the response turn is certain to follow. Nothing
+            // recomputes it afterwards, so without this the call turn and its
+            // response never become one exchange.
+            if let Err(e) = cs.conv.couple_turn(call_turn) {
+                tracing::warn!(conv_id = %conv_id, call_turn, "resume: couple_turn: {e}");
+            }
+            tracing::info!(
+                conv_id = %conv_id,
+                call_turn,
+                n_calls,
+                "resume: finishing a tool round the daemon stopped in the middle of",
+            );
+            current_message = text;
+            start_iteration = 1;
+        }
+
         // The reflection-marker suppression ceiling is per-dial: derive the think
         // mode once, materialise the turn's sampling config (the conversation
         // default carries the resolved marker family), and bake in the penalty —
@@ -3015,11 +3185,19 @@ fn run_inference_stream(
         );
 
         // The tool loop runs until the model stops emitting tool calls (i.e.
-        // produces a final answer) — there is no fixed iteration cap. A wedged
-        // model that never stops calling tools is bounded only by the client
-        // disconnecting (handled below) or the conversation being evicted, not
-        // by cutting the workflow short at an arbitrary count.
-        for iteration in 0.. {
+        // produces a final answer). A workflow is as long as it needs to be, so
+        // the only bound is [`MAX_TOOL_ROUNDS`], which sits far above any real
+        // one — see the note there for why a bound has to exist at all now that
+        // a disconnect no longer ends the turn.
+        for iteration in start_iteration.. {
+            if iteration >= MAX_TOOL_ROUNDS {
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    iteration,
+                    "tool loop hit its round cap — ending the turn on the answer already streamed",
+                );
+                break;
+            }
             tracing::debug!(conv_id = %conv_id, iteration, "submitting turn");
             // Collect this turn's projection events (reprojections + decode-end)
             // so they survive a browser reload (served back on hydrate).
@@ -3089,7 +3267,13 @@ fn run_inference_stream(
             let mut think_progress = ThinkProgress::default();
             let mut done_resp = None;
             let mut turn_error: Option<anyhow::Error> = None;
-            let mut client_gone = false;
+            // Whether the client stopped reading. Observational only: a turn is
+            // not abandoned because nobody is listening. It decodes, runs its
+            // tools and seals exactly as it would with the browser attached, so
+            // a reload finds the work finished rather than lost — and the
+            // substrate never holds half a turn the client's socket decided the
+            // length of.
+            let mut listener_gone = false;
 
             // Scoped so the stream's borrow of `handle` ends with the loop —
             // `finish_turn` consumes the handle below.
@@ -3111,8 +3295,7 @@ fn run_inference_stream(
                                         done,
                                     };
                                     if tx.send(Ok(progress)).await.is_err() {
-                                        client_gone = true;
-                                        break;
+                                        listener_gone = true;
                                     }
                                 }
                                 // Once the post-</think> answer opens with `{`, it's a
@@ -3179,13 +3362,13 @@ fn run_inference_stream(
                                             .await
                                             .is_err()
                                         {
-                                            // Client closed the connection.  Break
-                                            // immediately so `handle` is dropped on
-                                            // return, which closes event_rx and causes
-                                            // the scheduler's next send to fail →
-                                            // state.finished = true → decode stops.
-                                            client_gone = true;
-                                            break;
+                                            // The client closed the connection. The
+                                            // decode carries on: breaking here would
+                                            // drop the handle on return, stop the
+                                            // scheduler at its next token, and seal a
+                                            // truncated answer whose length was decided
+                                            // by a socket.
+                                            listener_gone = true;
                                         }
                                         emitted_len = emit_to;
                                     }
@@ -3245,8 +3428,7 @@ fn run_inference_stream(
                                 total: tokens_total,
                             };
                             if tx.send(Ok(progress)).await.is_err() {
-                                client_gone = true;
-                                break;
+                                listener_gone = true;
                             }
                         }
                         _ => {}
@@ -3254,17 +3436,18 @@ fn run_inference_stream(
                 }
             }
 
+            if listener_gone {
+                tracing::info!(
+                    conv_id = %conv_id,
+                    iteration,
+                    "client went away mid-stream — the turn runs to completion",
+                );
+            }
+
             let resp = match done_resp {
                 Some(r) => r,
                 None => {
-                    if client_gone {
-                        // Normal disconnect — no error to report.
-                        tracing::info!(
-                            conv_id = %conv_id,
-                            iteration,
-                            "client disconnected mid-stream — cancelling decode",
-                        );
-                    } else if turn_error.is_none() {
+                    if turn_error.is_none() {
                         // Scheduler closed the channel without Done — the
                         // conversation's turn_in_flight flag is stuck.
                         tracing::error!(
@@ -3357,6 +3540,18 @@ fn run_inference_stream(
                 }
             }
 
+            // This turn asked for tools that have not run yet. Name it before
+            // the commit below, so one group-commit makes the call turn and the
+            // note of it durable together: an entry still in the writer queue
+            // while the tools run would be lost by the very crash it exists to
+            // survive. `crate::resume` finds it on the next boot and finishes
+            // the round.
+            if !is_final {
+                if let Some(call_idx) = resp.seal.as_ref().and_then(|s| s.turn_index) {
+                    resume::mark_call_turn(&state.engine.lock().unwrap(), timeline, call_idx);
+                }
+            }
+
             // Group-commit the substrate redo log: the just-sealed turn is
             // now durable on disk, so a crash or restart resumes it intact.
             if let Err(e) = state.engine.lock().unwrap().commit_persistence() {
@@ -3381,7 +3576,7 @@ fn run_inference_stream(
             let n_calls = calls.len();
             let tool_state = Arc::clone(&state);
             let results = match tokio::task::spawn_blocking(move || {
-                run_tool_calls(&tool_state.tool_host.ctx, calls)
+                run_tool_calls(&tool_state.tool_host.ctx, calls, Dispatch::Live)
             })
             .await
             {
@@ -3453,6 +3648,13 @@ fn run_inference_stream(
             }
         }
 
+        // The round is over, however it ended — a final answer, a tool round
+        // that yielded nothing, a dispatch that panicked. The entry only ever
+        // means "tools are in flight", so it goes now. A crash before this
+        // reaches disk is covered by the scan's own check: an entry whose turn
+        // arrived is tombstoned rather than acted on.
+        resume::clear_call_turn(&state.engine.lock().unwrap(), timeline);
+
         // Title generation has already been fired in parallel from
         // `submit_with_sampling` — it doesn't depend on the main
         // convo's state, so we don't repeat it here.
@@ -3460,6 +3662,158 @@ fn run_inference_stream(
     });
 
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+/// The tool calls a sealed call turn is still waiting on — the round this
+/// daemon did not run, because the process stopped between the call turn's seal
+/// and its results.
+///
+/// Synchronous on purpose, and called as one statement: a `&Sequence` is not
+/// `Send`, so reading the turn must not span the await that runs the tools.
+/// Empty when there is nothing to finish, which the caller reads as "retract
+/// the entry and leave the recorded answer standing".
+fn resumed_calls(
+    conv: &Sequence,
+    conv_id: &str,
+    timeline: TimelineId,
+    call_turn: u32,
+) -> Vec<ToolCall> {
+    let Some((_, assistant)) = conv.resolve_turn_text(timeline, call_turn) else {
+        tracing::warn!(
+            conv_id = %conv_id,
+            call_turn,
+            "resume: the marked turn is not in the substrate",
+        );
+        return Vec::new();
+    };
+    let calls = extract_tool_calls(&assistant);
+    if calls.is_empty() {
+        tracing::warn!(
+            conv_id = %conv_id,
+            call_turn,
+            "resume: the marked turn holds no tool call — nothing to finish",
+        );
+    }
+    calls
+}
+
+/// Rebuild the turn state a conversation was last held at, so a resumed turn
+/// runs at the settings its author chose rather than at whatever the defaults
+/// happen to be.
+///
+/// Built through the same [`dial_selection`] / [`apply_tools_dial`] the HTTP
+/// path uses, rather than by restating the mapping here.
+fn resume_dials(dials: Option<ConversationDials>) -> (SelectionState, ToolMode) {
+    let (effort, verbosity, think, tools) = match dials {
+        Some(d) => (d.effort, d.verbosity, d.think, d.tools),
+        None => resume::DEFAULT_DIALS,
+    };
+    let mut selection = dial_selection(Some(effort), Some(verbosity), Some(think));
+    let tools_mode = tools_mode_from_level(tools);
+    apply_tools_dial(&mut selection, tools_mode);
+    (selection, tools_mode)
+}
+
+/// Finish the tool rounds the previous run stopped in the middle of.
+///
+/// Spawned once, just after `ready`. Only a conversation carrying a resume
+/// entry is touched, so one that ended normally is passed over — and so is one
+/// whose turn died before its call turn sealed, which is not resumed at all:
+/// nothing ran, and whoever asked can ask again. In practice the set here is
+/// whatever the daemon had tools out for when it stopped, usually nothing.
+///
+/// Resumed one at a time, deliberately: each is a full decode, and starting
+/// every one of them at once would hand the scheduler a boot-time burst that
+/// competes with the first real request.
+fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>) {
+    tokio::spawn(async move {
+        // Passthrough conversations are the client's own turns and are not
+        // resumable here; the titler's timeline is not a conversation; an
+        // archived one has been distilled and must not take another turn; a
+        // deleted one must stay deleted — `known_conversations` lists
+        // tombstoned timelines, because the sidebar shows them, so excluding
+        // them is this filter's job and not the lister's. An ingest layer
+        // carries no `conv_id` at all and is never listed here to begin with.
+        let candidates: Vec<(TimelineId, String)> = {
+            let engine = state.engine.lock().unwrap();
+            let titler = state.titler_timeline;
+            engine
+                .known_conversations()
+                .into_iter()
+                .filter(|(tl, conv_id, _, archived, _)| {
+                    *tl != titler
+                        && !*archived
+                        && !engine.is_timeline_tombstoned(*tl)
+                        && !conv_id.starts_with(passthrough::CONV_ID_PREFIX)
+                })
+                .map(|(tl, conv_id, _, _, _)| (tl, conv_id))
+                .collect()
+        };
+
+        let mut resumed = 0usize;
+        for (timeline, conv_id) in candidates {
+            // Decided with the engine lock held and dropped before the decode
+            // below: a `std` guard across an await would make this task
+            // non-`Send`.
+            let unfinished = {
+                let engine = state.engine.lock().unwrap();
+                match resume::marked_call_turn(&engine, timeline) {
+                    // The round's response turn never arrived — finish it.
+                    Some(call_turn) if !resume::round_answered(&engine, timeline, call_turn) => {
+                        Some(call_turn)
+                    }
+                    // The turn after it is in the substrate, so the round
+                    // completed and the entry outlived it. Retract it.
+                    Some(call_turn) => {
+                        tracing::info!(
+                            conv_id = %conv_id,
+                            call_turn,
+                            "resume: the round completed before the daemon stopped — entry retired",
+                        );
+                        resume::clear_call_turn(&engine, timeline);
+                        None
+                    }
+                    // No entry, so nothing was mid-round here. A turn killed
+                    // before its call turn sealed is not resumed: nothing ran,
+                    // and whoever asked can ask again.
+                    None => None,
+                }
+            };
+            let Some(call_turn) = unfinished else {
+                continue;
+            };
+
+            let (selection, tools_mode) = resume_dials(session.conversation_dials(&conv_id));
+            // The turn carries no question of its own: its message is the tool
+            // output, built inside the loop from the call turn's own request.
+            let user_message = String::new();
+            let resume_call_turn = Some(call_turn);
+
+            // Drained to completion with nothing listening: the turn's worth is
+            // the seal it writes, and the next client to open the conversation
+            // reads it from the substrate like any other.
+            let mut turn = run_inference_stream(
+                Arc::clone(&state),
+                conv_id.clone(),
+                user_message,
+                None,
+                None,
+                None,
+                None,
+                false,
+                tools_mode,
+                None,
+                selection,
+                resume_call_turn,
+            );
+            while turn.next().await.is_some() {}
+            resumed += 1;
+        }
+
+        if resumed > 0 {
+            tracing::info!(resumed, "resume: finished the turns the last run left open");
+        }
+    });
 }
 
 /// One OpenAI-passthrough call, holding its conversation's lock for the whole
@@ -4705,6 +5059,55 @@ impl ZendSession {
         Some(base.recovered_history(timeline, false))
     }
 
+    /// The composer dials this conversation last ran under, for the GUI to set
+    /// its dials from when the conversation is opened. `None` when the model
+    /// isn't loaded, or when no turn has recorded dials — a conversation that
+    /// has never run keeps the client's own defaults.
+    pub fn conversation_dials(&self, conv_id: &str) -> Option<ConversationDials> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let timeline = conversation_timeline(conv_id);
+        let meta = state
+            .engine
+            .lock()
+            .unwrap()
+            .conversation_metadata(timeline)?;
+        let level = |key: &str, options: &[&str]| -> Option<u8> {
+            let id = meta.get(key)?;
+            options.iter().position(|o| o == id).map(|i| i as u8)
+        };
+        let effort = level(DIAL_EFFORT_KEY, &EFFORT_OPTIONS);
+        let verbosity = level(DIAL_LENGTH_KEY, &RESPONSE_LENGTH_OPTIONS);
+        let tools = level(DIAL_TOOLS_KEY, &["none", "restricted", "comprehensive"]);
+        let think = meta.get(DIAL_THINK_KEY).map(|v| v != "off");
+        // Nothing recorded at all: the conversation predates the dial record, or
+        // has never taken a turn. Say so rather than inventing levels.
+        //
+        // The test is whether any dial key is present, NOT whether effort parses
+        // to a level. `dials_metadata` writes all four keys on every turn and
+        // stores `""` for a selector the turn left unset, so a request carrying
+        // a tools dial but no thinking effort records `dial_effort = ""` — a
+        // record that plainly exists while parsing to no level. Gating on effort
+        // dropped the whole record there, and a resumed turn then ran the
+        // defaults rather than the tools mode the conversation was held at.
+        let recorded = [
+            DIAL_EFFORT_KEY,
+            DIAL_LENGTH_KEY,
+            DIAL_THINK_KEY,
+            DIAL_TOOLS_KEY,
+        ]
+        .iter()
+        .any(|key| meta.contains_key(*key));
+        if !recorded {
+            return None;
+        }
+        Some(ConversationDials {
+            effort: effort.unwrap_or(2),
+            verbosity: verbosity.unwrap_or(2),
+            think: think.unwrap_or(true),
+            tools: tools.unwrap_or(2),
+        })
+    }
+
     /// The conversation's sidebar title — the titler's label, or the one an
     /// upload gave it. `None` when the model isn't loaded or nothing has
     /// labelled the conversation yet.
@@ -5207,6 +5610,17 @@ impl ZendSession {
                         // path (the `Ok(None)` arm below).
                         load_progress.mark_ready();
                         ready_tx.send(true).ok();
+
+                        // Whatever the last run was in the middle of, finish it
+                        // — after `ready`, so the loading screen never waits on
+                        // a decode, and never against a read-only substrate,
+                        // which is written by the daemon beside this one.
+                        if !read_only_substrate {
+                            resume_unfinished_turns(
+                                Arc::clone(&session_for_watcher),
+                                Arc::clone(&state),
+                            );
+                        }
                     }
                     Ok(None) => {
                         // Shutdown arrived during the startup ingest: `load` already
@@ -5485,6 +5899,7 @@ impl ZendSession {
                     tools_mode,
                     identity,
                     selection,
+                    None,
                 );
                 while let Some(item) = ts.next().await {
                     if tx.send(item).await.is_err() {

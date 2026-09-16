@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::{decode_bytes, encode_bytes, BytesError};
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct XorRequest {
@@ -45,6 +45,11 @@ impl Tool for BytesXor {
     type Request = XorRequest;
     type Response = XorResponse;
     type Error = BytesError;
+
+    /// Pure byte manipulation — no state and no I/O.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(_ctx: &ToolContext, req: XorRequest) -> Result<XorResponse, BytesError> {
         let a_enc = req.a_encoding.as_deref().unwrap_or("hex");

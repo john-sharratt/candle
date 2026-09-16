@@ -19,7 +19,7 @@ which is what most unit tests use.
 |------|------|-------------|
 | `write.rs` | `write` | Create or overwrite a file; enforces 10 MiB cap |
 | `read.rs` | `file_read` | Return a file, or a line range of it, as a numbered, fenced excerpt; only `path` is required |
-| `edit.rs` | `file_edit` | Unique-substring replacement |
+| `edit.rs` | `file_edit` | Applies a unified diff; the engine is `patch.rs` |
 | `list.rs` | `file_list` | Paged union listing of project + session files, optionally filtered by path prefix |
 | `delete.rs` | `file_delete` | Drop a session file or whiteout a project one; returns `deleted` flag |
 | `present.rs` | `file_present` | Foreground presentation gesture |
@@ -58,15 +58,31 @@ missing bound is the file's own edge: no range returns the whole file,
 The header reads `(lines a-b of N)` when the excerpt stops before the end of the
 file, which is the signal to continue from `b + 1`, and `(lines a-b)` otherwise.
 
-## `file_edit` uniqueness requirement
+## `file_edit` patches
 
-`old_str` must appear exactly once in the file:
-- 0 occurrences → `not_found`
-- 1 occurrence → replacement applied
-- 2+ occurrences → `ambiguous` error with count
+`file_edit` takes a unified diff: one or more `@@` hunks of `' '` context, `-`
+removed and `+` added lines. `patch.rs` is the engine, and its module docs are
+the reference for the format.
 
-This matches Claude Code's `str_replace` semantics and prevents accidental
-multi-site edits from an insufficiently specific search string.
+Hunks are located by their **content**, never by the `@@` line numbers. A
+hunk's pre-image (its context and removed lines) must match a run of whole
+lines exactly — no fuzz, and never a substring of a line. The line numbers are
+only a hint for choosing between equal matches:
+
+- pre-image found once, or nearest the hint → applied
+- pre-image found in two equally-distant places → `ambiguous`
+- pre-image absent but post-image present → **already applied**, nothing written
+- neither present → `not_found`, naming the hunk and its `@@` header
+- not a readable diff → `invalid_arguments`
+
+Already-applied detection is what makes the tool idempotent: sending the same
+patch twice succeeds both times and the second call writes nothing. It is also
+why `-retries = 3` / `+retries = 30` cannot produce `retries = 300` — matching
+is by whole line, so `retries = 30` is not a second `retries = 3`.
+
+Hunks apply in order, each searched from the end of the one before, so they
+cannot overlap. Either every hunk lands or the file is left exactly as it was —
+a partially patched file is never written.
 
 ## `file_present` vs Files panel
 
@@ -86,9 +102,9 @@ retained — only a write or a successful edit consumes budget.
 
 | Code | When |
 |------|------|
-| `not_found` | Path resolves in neither layer (`read`, `edit`, `delete`) |
+| `not_found` | Path resolves in neither layer (`read`, `edit`, `delete`), or an `edit` hunk matches nothing |
 | `vfs_full` | Write would exceed 10 MiB cap |
-| `ambiguous` | `old_str` appears more than once (`edit`) |
+| `ambiguous` | An `edit` hunk matches in more than one place |
 | `no_files_found` | All requested paths missing (`present`) |
 | `unreadable` | Project file above the read limit or not UTF-8 text |
-| `invalid_arguments` | A required argument is missing — e.g. `file_read` without `path` |
+| `invalid_arguments` | A required argument is missing — e.g. `file_read` without `path` — or an `edit` patch is not a readable unified diff |

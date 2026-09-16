@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::DiagError;
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct DnsRequest {
@@ -43,6 +43,12 @@ impl Tool for DnsLookup {
     type Request = DnsRequest;
     type Response = DnsResponse;
     type Error = DiagError;
+
+    /// A read-only lookup: the answer is served by a resolver, not changed in
+    /// one.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(_ctx: &ToolContext, req: DnsRequest) -> Result<DnsResponse, DiagError> {
         let record_type = req.record_type.as_deref().unwrap_or("A").to_uppercase();

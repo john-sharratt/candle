@@ -35,6 +35,12 @@ pub fn confirmation(tool: &str, args: Value) -> Option<zend_tools::ConfirmationD
     zend_tools::confirmation(tool, &args)
 }
 
+/// Whether a call may be re-issued when a turn resumes after a restart.
+/// Mirrors the runtime call.
+pub fn replay(tool: &str, args: Value) -> zend_tools::Replay {
+    zend_tools::replay(tool, &args)
+}
+
 // ── Assertions ────────────────────────────────────────────────────────────────
 
 /// Assert that the response is an error envelope with the given code.

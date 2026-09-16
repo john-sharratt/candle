@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use candle_conversation::projection::{self, SystemPromptItem};
 use zend::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool, run_tool_calls,
-    ToolCall, ToolResult,
+    Dispatch, ToolCall, ToolResult,
 };
 use zend_tools::{registry, ToolContext};
 
@@ -386,7 +386,7 @@ fn run_tool_calls_dispatches_each_in_order() {
             arguments: json!({"expression": "1 + 1"}),
         },
     ];
-    let results = run_tool_calls(&ctx, calls);
+    let results = run_tool_calls(&ctx, calls, Dispatch::Live);
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].call.name, "datetime");
     assert_eq!(results[1].call.name, "calculator");

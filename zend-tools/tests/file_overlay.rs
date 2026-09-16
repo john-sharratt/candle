@@ -255,7 +255,10 @@ fn edit_copies_the_workspace_file_up_and_leaves_disk_untouched() {
 
     harness::expect_success(harness::invoke_with_ctx(
         "file_edit",
-        json!({"path": "src/main.rs", "old_str": "hi", "new_str": "hello"}),
+        json!({
+            "path": "src/main.rs",
+            "patch": "@@ -2 +2 @@\n-    println!(\"hi\");\n+    println!(\"hello\");\n"
+        }),
         &ctx,
     ));
 
@@ -274,13 +277,13 @@ fn edit_copies_the_workspace_file_up_and_leaves_disk_untouched() {
 }
 
 #[test]
-fn edit_of_a_workspace_file_is_ambiguous_when_old_str_repeats() {
+fn edit_of_a_workspace_file_is_ambiguous_when_the_hunk_matches_twice() {
     let dir = workspace();
-    write_disk(dir.path(), "dup.txt", "aa\naa\n");
+    write_disk(dir.path(), "dup.txt", "aa\nbb\naa\n");
     let ctx = ctx_for(&dir);
     let resp = harness::invoke_with_ctx(
         "file_edit",
-        json!({"path": "dup.txt", "old_str": "aa", "new_str": "bb"}),
+        json!({"path": "dup.txt", "patch": "@@ -2 +2 @@\n-aa\n+cc\n"}),
         &ctx,
     );
     harness::expect_error(&resp, "ambiguous");
@@ -402,7 +405,10 @@ fn edit_after_delete_reports_not_found() {
     harness::expect_error(
         &harness::invoke_with_ctx(
             "file_edit",
-            json!({"path": "src/lib.rs", "old_str": "util", "new_str": "helper"}),
+            json!({
+                "path": "src/lib.rs",
+                "patch": "@@ -1 +1 @@\n-pub mod util;\n+pub mod helper;\n"
+            }),
             &ctx,
         ),
         "not_found",

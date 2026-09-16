@@ -16,12 +16,16 @@
 //! is the mount point of the working directory, so `/workspace/src/main.rs`,
 //! `./src/../src/main.rs`, `/src/main.rs`, and `src/main.rs` are all one entry.
 //!
-//! # `file_edit` uniqueness requirement
+//! # `file_edit` patches
 //!
-//! `file_edit` replaces `old_str` only if it appears exactly once in the file.
-//! If it appears zero times → `not_found`; if it appears more than once →
-//! `ambiguous` with a count.  This matches Claude Code's `str_replace` semantics
-//! and forces the model to provide enough context to identify a single edit site.
+//! `file_edit` takes a unified diff. Hunks are located by their context, not by
+//! the `@@` line numbers, so a stale line number costs nothing while a hunk that
+//! matches in more than one place is `ambiguous` rather than a guess. A hunk
+//! whose change is already in the file counts as already applied, which is what
+//! makes sending the same patch twice a no-op; a hunk that matches nowhere is
+//! `not_found`, and a patch that is not a readable diff is `invalid_arguments`.
+//! Either every hunk lands or the file is left exactly as it was. The engine is
+//! [`patch`], where the format and each failure are documented.
 //!
 //! # `file_present`
 //!
@@ -39,15 +43,17 @@
 //!
 //! | Code | Cause |
 //! |------|-------|
-//! | `not_found` | Path resolves in neither layer (`file_read`, `file_edit`, `file_delete`) |
+//! | `not_found` | Path resolves in neither layer (`file_read`, `file_edit`, `file_delete`), or a `file_edit` hunk matches nothing |
 //! | `vfs_full` | Write or copy-up would exceed the 10 MiB session cap |
-//! | `ambiguous` | `old_str` appears more than once in the file (`file_edit`) |
+//! | `ambiguous` | A `file_edit` hunk matches in more than one place |
 //! | `no_files_found` | All requested paths are missing (`file_present`) |
 //! | `unreadable` | Workspace file is above the read limit or is not UTF-8 text |
+//! | `invalid_arguments` | The `file_edit` patch is not a readable unified diff |
 
 use serde::Serialize;
 use thiserror::Error;
 
+use self::patch::PatchError;
 use crate::state::vfs::VfsError;
 use crate::ToolError;
 
@@ -101,6 +107,7 @@ impl Paging {
 pub mod delete;
 pub mod edit;
 pub mod list;
+pub mod patch;
 pub mod present;
 pub mod read;
 pub mod render;
@@ -119,22 +126,32 @@ pub enum FileError {
     NotFound(String),
     #[error("VFS storage limit exceeded")]
     VfsFull,
-    #[error("ambiguous: old_str appears multiple times in file")]
-    Ambiguous,
+    /// A `file_edit` hunk matched nowhere in the file. It shares the
+    /// `not_found` code with a missing path because it is the same answer —
+    /// what the call named is not there — and the detail says which.
+    #[error("{0}")]
+    HunkUnmatched(String),
+    /// A `file_edit` hunk matched in more than one place.
+    #[error("{0}")]
+    Ambiguous(String),
     #[error("no files found")]
     NoFilesFound,
     #[error("{0}")]
     Unreadable(String),
+    /// The `file_edit` patch is not a unified diff the engine can read.
+    #[error("{0}")]
+    InvalidArguments(String),
 }
 
 impl ToolError for FileError {
     fn code(&self) -> &'static str {
         match self {
-            FileError::NotFound(_) => "not_found",
+            FileError::NotFound(_) | FileError::HunkUnmatched(_) => "not_found",
             FileError::VfsFull => "vfs_full",
-            FileError::Ambiguous => "ambiguous",
+            FileError::Ambiguous(_) => "ambiguous",
             FileError::NoFilesFound => "no_files_found",
             FileError::Unreadable(_) => "unreadable",
+            FileError::InvalidArguments(_) => "invalid_arguments",
         }
     }
 }
@@ -144,6 +161,16 @@ impl From<VfsError> for FileError {
         match e {
             VfsError::Full => FileError::VfsFull,
             VfsError::Unreadable(why) => FileError::Unreadable(why),
+        }
+    }
+}
+
+impl From<PatchError> for FileError {
+    fn from(e: PatchError) -> Self {
+        match e {
+            PatchError::Malformed(why) => FileError::InvalidArguments(why),
+            PatchError::Ambiguous(why) => FileError::Ambiguous(why),
+            PatchError::Unmatched(why) => FileError::HunkUnmatched(why),
         }
     }
 }

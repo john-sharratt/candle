@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext, ToolError};
+use crate::{RegisteredTool, Replay, Tool, ToolContext, ToolError};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct Request {
@@ -54,6 +54,11 @@ impl Tool for DatetimeTool {
     type Request = Request;
     type Response = Response;
     type Error = DatetimeError;
+
+    /// Reads the clock and formats it; nothing outside the process changes.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(_ctx: &ToolContext, req: Request) -> Result<Response, DatetimeError> {
         let tz_str = req.timezone.as_deref().unwrap_or("UTC");

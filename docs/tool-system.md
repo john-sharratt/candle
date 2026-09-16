@@ -570,7 +570,7 @@ The properties are declared `path, start_line, end_line`, and the constrained de
 
 ### `file_edit`
 
-Make a targeted edit to an existing VFS file by replacing a unique substring. Use for: changing a value in a config, updating a function body, fixing a typo, modifying one line in a long file without rewriting the whole thing, applying small surgical changes. The `old_str` must appear exactly once in the file — if it appears multiple times the call returns an `ambiguous` error and asks for more surrounding context. Triggered by "change X to Y in the file", "edit the file to replace", "update this line", "modify the part where it says", "fix the value of". Returns path and new byte count. For full rewrites of a file use `file_write`.
+Apply a unified diff to an existing VFS file. The patch is one or more `@@ -old,count +new,count @@` hunks, each line prefixed with a space for context, `-` for a removed line, `+` for an added one. Use for: changing a value in a config, editing several places in one file at once, updating a function body, fixing a typo. Hunks are located by their context rather than by their line numbers, so the numbers need only be close; a hunk whose context matches in several places returns an `ambiguous` error and asks for more surrounding context, and a hunk whose change is already in the file is reported as already applied rather than applied twice. Either every hunk lands or none does. Triggered by "change X to Y in the file", "apply this diff", "edit the file to replace", "update these lines", "fix the value of". Returns path, per-hunk counts, and new byte count. For full rewrites of a file use `file_write`.
 
 **Parameters**
 
@@ -579,26 +579,22 @@ Make a targeted edit to an existing VFS file by replacing a unique substring. Us
   "type": "object",
   "properties": {
     "path": {"type": "string"},
-    "old_str": {
+    "patch": {
       "type": "string",
-      "description": "Exact substring to find. Must appear exactly once in the file."
-    },
-    "new_str": {
-      "type": "string",
-      "description": "Replacement text. May be empty to delete."
+      "description": "Unified-diff body: one or more `@@ -old,count +new,count @@` hunks whose lines are prefixed with a space (context), `-` (removed) or `+` (added). Give every hunk at least one context or removed line."
     }
   },
-  "required": ["path", "old_str", "new_str"]
+  "required": ["path", "patch"]
 }
 ```
 
 **Returns**
 
 ```json
-{"path": "src/main.rs", "bytes": 1289}
+{"path": "src/main.rs", "hunks_applied": 2, "hunks_already_applied": 0, "bytes": 1289}
 ```
 
-**Implementation.** Reads the file, counts occurrences of `old_str`. If zero, returns `{"error": "not_found", "detail": "old_str does not appear in file"}`. If more than one, returns `{"error": "ambiguous", "count": 3, "detail": "old_str appears 3 times; include more surrounding context to disambiguate"}`. If exactly one, performs the replacement and writes back. The uniqueness requirement matches Claude Code's `str_replace` and Cursor's edit semantics for the same reason: it forces the model to provide enough context to identify a single edit site, which is more reliable than line numbers and prevents accidental multi-edits.
+**Implementation.** `zend-tools`' `tools/file/patch.rs`, which parses the diff and applies it to the file read through the overlay. A hunk is found by its **pre-image** — its context and removed lines, matched as a run of whole lines, with no fuzz and never as a substring of a line. The `@@` numbers are a hint used only to choose between equal matches; the occurrence nearest the hinted position wins and a tie returns `{"error": "ambiguous", "detail": "hunk 1 (@@ -3 +3 @@) matches in more than one place..."}`. When a pre-image is absent the engine looks for the hunk's **post-image** (its context and added lines): finding it means the change is already in the file, so the hunk counts as already applied and nothing is written for it. That is what makes re-sending a patch a no-op — and why `-retries = 3` / `+retries = 30` cannot compound into `retries = 300`, since whole-line matching does not see `retries = 3` inside `retries = 30`. A hunk that is neither applicable nor already applied returns `{"error": "not_found", "detail": "hunk 2 (@@ -3,2 +3,2 @@) does not apply..."}` and **nothing is written at all**: the patched copy is built to one side and stored only once every hunk has landed, so a half-patched file never reaches the VFS. Locating by content rather than by line number is the point — it is what lets a model patch a file whose line numbers have moved since it read it, and what makes a retry after an unclear result safe.
 
 ---
 

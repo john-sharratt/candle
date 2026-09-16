@@ -172,6 +172,13 @@ pub async fn completions(
 /// A turn's reply as the session streams it.
 type TokenStream = Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>>;
 
+/// The `thinking_effort` option each effort level selects, in level order.
+pub const EFFORT_OPTIONS: [&str; 5] = ["off", "quick", "balanced", "deep", "exhaustive"];
+
+/// The `response_length` option each verbosity level selects, in level order.
+pub const RESPONSE_LENGTH_OPTIONS: [&str; 5] =
+    ["terse", "concise", "standard", "detailed", "comprehensive"];
+
 /// Map the composer dials to the dialogue section-tree selection.  Only the
 /// dials the request actually carries are set; any omitted selector falls back
 /// to the schema's authored default (so a new conversation defaults naturally).
@@ -182,13 +189,14 @@ type TokenStream = Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send 
 ///
 /// Public so a harness driving the session directly selects exactly what the
 /// HTTP API would for the same dials, rather than restating the mapping.
+///
+/// [`EFFORT_OPTIONS`] and [`RESPONSE_LENGTH_OPTIONS`] are the dial's option ids
+/// in level order, so a stored id can be read back as the level that chose it.
 pub fn dial_selection(
     effort: Option<u8>,
     verbosity: Option<u8>,
     think: Option<bool>,
 ) -> SelectionState {
-    const EFFORT: [&str; 5] = ["off", "quick", "balanced", "deep", "exhaustive"];
-    const LENGTH: [&str; 5] = ["terse", "concise", "standard", "detailed", "comprehensive"];
     let mut sel = SelectionState::new();
     // A thinking-off turn — effort 0, or the `think` toggle explicitly off —
     // must carry BOTH halves of the same decision. The steering has to match the
@@ -207,13 +215,15 @@ pub fn dial_selection(
     } else if let Some(e) = effort {
         sel.select(
             "thinking_effort",
-            *EFFORT.get(e as usize).unwrap_or(&"exhaustive"),
+            *EFFORT_OPTIONS.get(e as usize).unwrap_or(&"exhaustive"),
         );
     }
     if let Some(v) = verbosity {
         sel.select(
             "response_length",
-            *LENGTH.get(v as usize).unwrap_or(&"comprehensive"),
+            *RESPONSE_LENGTH_OPTIONS
+                .get(v as usize)
+                .unwrap_or(&"comprehensive"),
         );
     }
     if effort.is_some() || think.is_some() {

@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use validator::Validate;
 
 use crate::context::ToolContext;
-use crate::tool::{ConfirmationDetails, Tool, ToolError};
+use crate::tool::{ConfirmationDetails, Replay, Tool, ToolError};
 
 /// A type-erased **execution** registration for the static tool table. Tool
 /// *definitions* — name (shared here as the execution binding), description, the
@@ -52,6 +52,10 @@ pub struct RegisteredTool {
     /// Returns `None` if either no confirmation is needed *or* the args
     /// could not be parsed (in which case `run` will surface the error).
     pub confirmation: fn(&Value) -> Option<ConfirmationDetails>,
+    /// Whether this call may be re-issued when a turn resumes after a restart
+    /// ([`Tool::replay`]). Consulted only on the resume path; a live turn runs
+    /// every call it asks for.
+    pub replay: fn(&Value) -> Replay,
 }
 
 impl RegisteredTool {
@@ -61,6 +65,7 @@ impl RegisteredTool {
             name: T::NAME,
             run: tool_run::<T>,
             confirmation: tool_confirmation::<T>,
+            replay: tool_replay::<T>,
         }
     }
 }
@@ -97,6 +102,19 @@ fn tool_confirmation<T: Tool>(args: &Value) -> Option<ConfirmationDetails> {
         return None;
     }
     T::confirmation(&req)
+}
+
+fn tool_replay<T: Tool>(args: &Value) -> Replay {
+    // Arguments that do not parse or validate never reach `run`, so re-issuing
+    // the call has no effect beyond the `invalid_arguments` it already returns
+    // — and answering it with that is more use to the model than a refusal.
+    let Ok(req) = serde_json::from_value::<T::Request>(args.clone()) else {
+        return Replay::Safe;
+    };
+    if req.validate().is_err() {
+        return Replay::Safe;
+    }
+    T::replay(&req)
 }
 
 // ── Error formatters ──────────────────────────────────────────────────────────

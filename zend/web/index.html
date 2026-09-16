@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>Zend — a coding assistant that keeps the whole project in mind</title>
 <!-- Metadata on an application shell. The console renders itself, so this will
      never rank on content; what it does is make the link render when somebody
@@ -360,6 +360,25 @@ import { estateSwitcher } from './common/lib/estate.js';
   }
   function saveDialPref(key, value) {
     try { localStorage.setItem(key, String(value)); } catch (_) {}
+  }
+  // The dials a conversation was last run at, adopted when it opens so the
+  // composer shows what its next turn will actually use. Deliberately NOT
+  // written to localStorage: that preference is the starting point for NEW
+  // conversations, and opening an old one must not redefine it.
+  function adoptDials(d) {
+    // A conversation that has never taken a turn records no dials. It opens at
+    // the user's OWN defaults — the same starting point `newConv` uses — not at
+    // whatever the conversation they just closed happened to be held at, which
+    // is what leaving the composer untouched would have shown them.
+    if (!d) {
+      S.effortLevel = dialPref('zend.effort', 2);
+      S.verbosityLevel = dialPref('zend.verbosity', 2);
+      S.toolsLevel = dialPref('zend.tools', 2);
+      return;
+    }
+    if (typeof d.effort === 'number') S.effortLevel = d.effort;
+    if (typeof d.verbosity === 'number') S.verbosityLevel = d.verbosity;
+    if (typeof d.tools === 'number') S.toolsLevel = d.tools;
   }
 
   const S = {
@@ -909,6 +928,11 @@ import { estateSwitcher } from './common/lib/estate.js';
     // Before the render, so the first frame already shows the conversation
     // loading — not the home page its still-empty history would draw.
     hydrateIfNeeded(id);
+    // A conversation already hydrated this session gets its dials here: no
+    // hydrate will land to do it. A first open adopts them in `hydrateConv`,
+    // once the daemon has said what they are.
+    const conv = S.conversations.find((c) => c.id === id);
+    if (conv) adoptDials(conv.dials);
     setState({ activeId: id, sidebarDrawer: false, convMenuOpen: false }, () => { scrollChat(); if (!S.narrow) focusPrompt(); });
   }
   function hydrateIfNeeded(id) {
@@ -951,7 +975,14 @@ import { estateSwitcher } from './common/lib/estate.js';
       // Recovered upload events hydrate the files pane (and the inline
       // history tiles ride along in `history` as role:"upload" messages).
       if (full.uploads) patch.files = full.uploads;
+      // The dials the daemon holds for this conversation, kept on it so a later
+      // re-open adopts them without another fetch.
+      if (full.dials) patch.dials = full.dials;
       S.conversations = S.conversations.map((c) => c.id === id ? Object.assign({}, c, patch) : c);
+      // Only on the OPEN hydrate. The one that follows a completed turn must
+      // leave the dials alone: the user may already have moved one for the turn
+      // they are about to send.
+      if (first && S.activeId === id) adoptDials(full.dials);
       render();
       if (S.activeId === id) scrollChat();
     }).catch((e) => {
@@ -960,7 +991,15 @@ import { estateSwitcher } from './common/lib/estate.js';
       render();
     });
   }
-  function newConv() { writeHashConv(null); setState({ activeId: null, promptValue: '', sidebarDrawer: false, convMenuOpen: false }, focusPrompt); }
+  function newConv() {
+    // A new conversation starts at the user's own defaults, not at whatever the
+    // conversation they just closed was held at.
+    S.effortLevel = dialPref('zend.effort', 2);
+    S.verbosityLevel = dialPref('zend.verbosity', 2);
+    S.toolsLevel = dialPref('zend.tools', 2);
+    writeHashConv(null);
+    setState({ activeId: null, promptValue: '', sidebarDrawer: false, convMenuOpen: false }, focusPrompt);
+  }
   function archiveConv(id, e) {
     if (e) e.stopPropagation();
     // Archiving is one-way and lossy: the KV cache is discarded and the
@@ -1440,11 +1479,14 @@ import { estateSwitcher } from './common/lib/estate.js';
     promptEl = chatEl = logEl = filesListEl = substrateEl = null;
 
     const themeFilter = S.theme === 'light' ? 'invert(1) hue-rotate(180deg)' : S.theme === 'vivid' ? 'saturate(1.75) contrast(1.06)' : 'none';
-    // 100dvh (dynamic viewport) not 100vh: on mobile 100vh is the tall viewport
-    // with the address bar hidden, which pushes the composer under the browser's
-    // bottom bar and lets the top pills drift as the bar shows/hides. dvh tracks
-    // the actually-visible height; the vh line is a fallback for old browsers.
-    const layout = h('div', { style: 'display:flex; height:100vh; height:100dvh; width:100vw; overflow:hidden; filter:' + themeFilter + ';' });
+    // The shell is pinned to the visible area. `--zvt`/`--zvh` are the visual
+    // viewport's top and height (`fitVisualViewport`), so when a phone keyboard
+    // opens the shell shrinks to what is left above it instead of being panned
+    // off the top. Without them it is 100dvh (dynamic viewport), not 100vh: on
+    // mobile 100vh is the tall viewport with the address bar hidden, which
+    // pushes the composer under the browser's bottom bar; the vh line is a
+    // fallback for old browsers.
+    const layout = h('div', { style: 'display:flex; position:fixed; left:0; top:var(--zvt,0px); height:100vh; height:var(--zvh,100dvh); width:100vw; overflow:hidden; filter:' + themeFilter + ';' });
 
     if (!S.sidebarCollapsed && !S.narrow) { layout.appendChild(buildSidebarExpanded()); layout.appendChild(buildResizer('l')); }
     else layout.appendChild(buildSidebarRail());
@@ -1491,7 +1533,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     // Drawer mode (narrow): a fixed overlay sized to the phone rather than a docked
     // column, closed via the collapse button or the backdrop.
     const w = drawer ? Math.min(300, Math.round((typeof window !== 'undefined' ? window.innerWidth : 360) * 0.82)) : S.sidebarW;
-    const pos = drawer ? 'position:fixed; top:0; left:0; bottom:0; z-index:41; box-shadow:0 6px 44px rgba(0,0,0,0.65);' : 'height:100%;';
+    const pos = drawer ? 'position:fixed; top:var(--zvt,0px); left:0; height:var(--zvh,100dvh); z-index:41; box-shadow:0 6px 44px rgba(0,0,0,0.65);' : 'height:100%;';
     const closeSidebar = drawer ? () => setState({ sidebarDrawer: false }) : () => setState({ sidebarCollapsed: true });
     const rows = convs.map((c) => {
       const active = c.id === S.activeId;
@@ -3105,6 +3147,34 @@ import { estateSwitcher } from './common/lib/estate.js';
     // No reposition needed: the bar gutter is align-self:stretch, so when a
     // think block expands/collapses the bars re-flow by CSS % automatically.
   }, true);
+  // The on-screen keyboard. iOS Safari keeps the layout viewport — and dvh — at
+  // full height when the keyboard opens and pans the visible area down to the
+  // focused composer, which scrolls the top of the app (the rail with the
+  // conversation list, the header) off-screen. The shell follows the visual
+  // viewport instead: its top tracks the visible area and its height is what the
+  // keyboard leaves. Android resizes the layout viewport itself
+  // (`interactive-widget=resizes-content`), so there the figures agree. Under a
+  // pinch-zoom the visual viewport is the zoomed region, not a keyboard, so the
+  // shell keeps its full size.
+  function fitVisualViewport() {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const root = document.documentElement.style;
+    if (Math.abs((vv.scale || 1) - 1) > 0.01) {
+      root.removeProperty('--zvh');
+      root.removeProperty('--zvt');
+      return;
+    }
+    root.setProperty('--zvh', vv.height + 'px');
+    root.setProperty('--zvt', vv.offsetTop + 'px');
+    // iOS also scrolls the document to reveal the input, overflow:hidden or not.
+    if (window.scrollY !== 0) window.scrollTo(0, 0);
+  }
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', fitVisualViewport);
+    window.visualViewport.addEventListener('scroll', fitVisualViewport);
+    fitVisualViewport();
+  }
   window.addEventListener('resize', () => {
     const narrow = window.innerWidth < NARROW_W;
     const wide = window.innerWidth >= WIDE_W;
@@ -3139,6 +3209,12 @@ import { estateSwitcher } from './common/lib/estate.js';
       if (S.activeId) {
         const a = S.conversations.find((c) => c.id === S.activeId);
         S.loaded[S.activeId] = !!(a && a.history && a.history.length);
+        // A restored conversation carries its own dials into the composer, the
+        // same as one opened by hand. When the seed arrived with its history
+        // there is no hydrate to do it, and the seed is also the only place the
+        // dials can come from; when there is a hydrate, it adopts them once the
+        // daemon has said what they are.
+        if (a) adoptDials(a.dials);
       }
       // Before the first render, so a restored conversation shows loading.
       if (S.activeId && !S.loaded[S.activeId]) hydrateIfNeeded(S.activeId);

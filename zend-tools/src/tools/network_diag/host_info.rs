@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::DiagError;
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct HostInfoRequest {
@@ -33,6 +33,12 @@ impl Tool for HostInfo {
     type Request = HostInfoRequest;
     type Response = HostInfoResponse;
     type Error = DiagError;
+
+    /// Reports this host's own configuration; writes nothing and reaches no
+    /// peer.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(_ctx: &ToolContext, req: HostInfoRequest) -> Result<HostInfoResponse, DiagError> {
         let ips = dns_lookup::lookup_host(&req.host)

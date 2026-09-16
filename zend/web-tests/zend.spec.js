@@ -180,6 +180,38 @@ test.describe('1.3b a failed send', () => {
   });
 });
 
+test.describe('1.5b dials follow the conversation', () => {
+  // The dials are asserted through the composer buttons, which carry the level
+  // name — the state object is deliberately not exposed to the page, and a hook
+  // added only for a test would be a production seam nothing else needs.
+  const dialNames = (page) => page.evaluate(() => {
+    const names = ['Off', 'Quick', 'Balanced', 'Deep', 'Exhaustive']
+      .concat(['Terse', 'Concise', 'Standard', 'Detailed', 'Comprehensive'])
+      .concat(['None', 'Restricted']);
+    return [...document.querySelectorAll('button')]
+      .map((b) => b.textContent.trim())
+      .filter((t) => names.includes(t));
+  });
+
+  test('opening a conversation adopts the dials it last ran at', async ({ page }) => {
+    await boot(page);
+    await page.getByTitle('Expand sidebar').click();
+    await page.getByText('Why is decode latency spiking under load?').click();
+    await expect(page.locator('.zmd').first()).toBeVisible();
+    // The mock reports effort 3 / verbosity 1 / tools 1 for every conversation.
+    await expect.poll(() => dialNames(page)).toEqual(['Deep', 'Concise', 'Restricted']);
+  });
+
+  test('a new conversation returns to the composer defaults', async ({ page }) => {
+    await boot(page);
+    await page.getByTitle('Expand sidebar').click();
+    await page.getByText('Why is decode latency spiking under load?').click();
+    await expect.poll(() => dialNames(page)).toEqual(['Deep', 'Concise', 'Restricted']);
+    await page.getByTitle('New conversation').first().click();
+    await expect.poll(() => dialNames(page)).toEqual(['Balanced', 'Standard', 'Comprehensive']);
+  });
+});
+
 test.describe('1.4 thinking block', () => {
   test('think block is collapsed by default', async ({ page }) => {
     await boot(page, { conv: '1' });
@@ -472,6 +504,48 @@ test.describe('1.13 phone chrome', () => {
     await expect(page.getByText('Starting up')).toHaveCount(0);
     await page.waitForFunction(() => window.__ZEND_READY__ === true);
     await expect(page.getByText('Starting up')).toHaveCount(0);
+  });
+
+  // iOS keeps the layout viewport at full height when the keyboard opens and
+  // pans the visible area; only `visualViewport` reports it. A stand-in for it
+  // is installed before the page loads, then moved the way iOS moves it.
+  async function fakeVisualViewport(page) {
+    await page.addInitScript(() => {
+      const vv = new EventTarget();
+      Object.assign(vv, { width: 390, height: 844, offsetLeft: 0, offsetTop: 0, scale: 1 });
+      Object.defineProperty(window, 'visualViewport', { configurable: true, get: () => vv });
+      window.__fakeVV = vv;
+    });
+  }
+  const railBox = (page) => page.evaluate(() => {
+    const r = document.querySelector('.z-rail').getBoundingClientRect();
+    return { top: Math.round(r.top), height: Math.round(r.height) };
+  });
+
+  test('the rail stays in the visible area when the keyboard opens', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await fakeVisualViewport(page);
+    await boot(page);
+    expect(await railBox(page)).toEqual({ top: 0, height: 844 });
+    // The keyboard takes the bottom 336px and iOS pans the visible area down by as much.
+    await page.evaluate(() => {
+      const vv = window.__fakeVV;
+      vv.height = 508; vv.offsetTop = 336;
+      vv.dispatchEvent(new Event('resize'));
+    });
+    expect(await railBox(page)).toEqual({ top: 336, height: 508 });
+  });
+
+  test('a pinch-zoom leaves the shell at full size', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await fakeVisualViewport(page);
+    await boot(page);
+    await page.evaluate(() => {
+      const vv = window.__fakeVV;
+      vv.scale = 2; vv.height = 422; vv.offsetTop = 200;
+      vv.dispatchEvent(new Event('resize'));
+    });
+    expect(await railBox(page)).toEqual({ top: 0, height: 844 });
   });
 });
 

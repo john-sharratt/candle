@@ -2205,6 +2205,15 @@ impl Conversation {
         per_group
     }
 
+    /// A turn's role as its `TurnDecl` carries it.
+    fn decl_role(role: Role) -> u8 {
+        match role {
+            Role::System => 0,
+            Role::User => 1,
+            Role::Assistant => 2,
+        }
+    }
+
     /// Atomically append a turn to the substrate.
     ///
     /// `write` carries the turn's text, token IDs, block range, and
@@ -2245,11 +2254,7 @@ impl Conversation {
             turn_index: idx.0,
             turn_id_day: 0,
             turn_id_seq: idx.0 + 1,
-            role: match role {
-                Role::System => 0,
-                Role::User => 1,
-                Role::Assistant => 2,
-            },
+            role: Self::decl_role(role),
             block_start,
             block_end,
             layer_id,

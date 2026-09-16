@@ -11,8 +11,8 @@
 //! - [`tool`] — the [`Tool`] trait every tool implements, plus [`ToolError`],
 //!   [`ConfirmationDetails`], and the subagent runner interface
 //! - [`registry`] — the static [`RegisteredTool`] table and name-based lookup
-//! - [`runner`] — [`run`] and [`confirmation`], the two dispatch entry points used
-//!   by the orchestrator
+//! - [`runner`] — [`run`], [`confirmation`] and [`replay`], the three dispatch
+//!   entry points used by the orchestrator
 //! - [`context`] — [`ToolContext`], the `Arc`-shared bundle of state stores passed
 //!   into every tool invocation
 //! - [`state`] — the individual stores: [`state::VfsStore`], [`state::CredentialStore`],
@@ -76,7 +76,7 @@ pub mod tools;
 
 pub use context::ToolContext;
 pub use registry::RegisteredTool;
-pub use runner::{confirmation, run};
+pub use runner::{confirmation, replay, run};
 pub use tool::{
-    ConfirmationDetails, SubagentRequest, SubagentResponse, SubagentRunner, Tool, ToolError,
+    ConfirmationDetails, Replay, SubagentRequest, SubagentResponse, SubagentRunner, Tool, ToolError,
 };

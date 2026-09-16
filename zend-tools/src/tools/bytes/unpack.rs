@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::{decode_bytes, parse_format, unpack_field, BytesError};
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct UnpackRequest {
@@ -40,6 +40,11 @@ impl Tool for BytesUnpack {
     type Request = UnpackRequest;
     type Response = UnpackResponse;
     type Error = BytesError;
+
+    /// Pure byte manipulation — no state and no I/O.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(_ctx: &ToolContext, req: UnpackRequest) -> Result<UnpackResponse, BytesError> {
         let enc = req.data_encoding.as_deref().unwrap_or("hex");

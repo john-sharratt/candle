@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext, ToolError};
+use crate::{RegisteredTool, Replay, Tool, ToolContext, ToolError};
 
 #[derive(Debug, Error)]
 pub enum TotpError {
@@ -65,6 +65,11 @@ impl Tool for TotpGenerate {
     type Request = Request;
     type Response = Response;
     type Error = TotpError;
+
+    /// Derives a code from the secret and the clock; nothing is spent.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(ctx: &ToolContext, req: Request) -> Result<Response, TotpError> {
         let cred = ctx
