@@ -7,16 +7,17 @@
 use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnHandle, TurnResponse};
+use crate::recorded_reply::recorded_reply;
+use crate::recovered_message::{tool_response_lengths, RecoveredMessage, TOOL_RESPONSE_OPEN};
 use candle_transformers::models::delta_net::ExportedLayerState;
 
 use crate::persistence::content_hash::{hash_tokens, section_stream_id, ContentChain, ContentHash};
 use crate::persistence::record::{BranchCheckpointPayload, SnapshotLayer};
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
-    from_projection_with_origins, Builder, Conversation, Observe, OptionalState, ProjectionEvent,
-    ProjectionMode, ProjectionTarget, SectionId, SectionTree, SelectionState, SystemPromptItem,
-    TimelineId, TurnIndex, FORCE_TOOL_SELECTOR, FORCE_TOOL_SEPARATOR, NO_THINK_SELECTOR,
-    TOOLS_ENABLED_SELECTOR,
+    from_projection_with_origins, Builder, Conversation, Observe, ProjectionEvent, ProjectionMode,
+    ProjectionTarget, SectionId, SectionTree, SelectionState, SystemPromptItem, TimelineId,
+    TurnIndex,
 };
 use crate::provenance::WideQSig;
 use crate::scheduler::exported_state::SharedState;
@@ -25,11 +26,12 @@ use crate::scheduler::{
     note_branch_checkpoint_computed, note_branch_checkpoint_installed, CarvedTurn,
     ProjectionInputs, ReprojectionPolicy, SchedulerRequest, TurnContent,
 };
+use crate::sealed_turn::{SealedPages, SealedTurn};
 use crate::sequence_handle::{BlockCount, SequenceId};
 use crate::stuffed_grid::{plan_stuffed_grid_with_indices, CaseGrid};
 use crate::token_buffer::TokenBuffer;
 use crate::tree::token_text::TokenizedText;
-use crate::tree::{CognitiveTask, ConversationTree, TaskPoll, TurnType};
+use crate::tree::{ConversationTree, TurnType};
 use crate::turn::{Role, Turn, TurnOptions};
 use crate::turn_layout::TurnLayout;
 use candle_nn::kv_cache::{SealedChunk, SealedSequence};
@@ -352,33 +354,10 @@ pub struct Sequence {
     ///
     /// Half of the branch-swap window; the other half (has anything advanced
     /// that state since?) is derived from the timeline's turn count at the use
-    /// site in [`Sequence::rekey_prompt_state`], because every path that
+    /// site in [`Sequence::submit_turn_with_options`], because every path that
     /// advances the state lands a turn on the timeline and a tracked flag
     /// would have to be cleared by each of them.
     state_is_prompt_only: bool,
-    /// The effective selection — this conversation's selection seeded with
-    /// its target layer's dials — the installed prompt checkpoint was built
-    /// for. [`Sequence::rekey_prompt_state`] rebuilds the checkpoint when a
-    /// first turn's effective selection differs from it.
-    checkpoint_selection: SelectionState,
-    /// Outcomes of this sequence's section inserts — see [`SectionInserts`].
-    section_inserts: SectionInserts,
-}
-
-/// What a sequence's section inserts did, by outcome. Every section its schema
-/// (or a later `insert_section*` call) asks for lands in exactly one field.
-///
-/// A section whose K/V the workspace already holds under the same content
-/// address is restored from the redo log, never prefilled again, so a
-/// workspace reopened under an unchanged schema prefills nothing.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SectionInserts {
-    /// Already in the substrate — inserted earlier in this process.
-    pub present: usize,
-    /// Restored from the redo log as cold markers.
-    pub restored: usize,
-    /// Prefilled and sealed.
-    pub prefilled: usize,
 }
 
 /// The dialect's framing markers (`<|im_start|>system`, `<|im_end|>`, …) — the
@@ -648,73 +627,6 @@ fn first_non_finite_layer(layers: &[ExportedLayerState]) -> Option<(u32, &'stati
     })
 }
 
-/// Which `summarize_examples` option matches a round-trip chain of
-/// `prefilled_pairs` prefilled `(user, assistant)` pairs: one pair is a
-/// `code_reading` scope read (request → call → excerpt → summary), more is the
-/// `repo_map` folder walk (request → list → listing → read → excerpt → summary).
-fn examples_shape(prefilled_pairs: usize) -> &'static str {
-    if prefilled_pairs > 1 {
-        "folder"
-    } else {
-        "file"
-    }
-}
-
-/// The section-tree selection an ingest round-trip chain frames its turns with,
-/// on top of `base`.
-///
-/// A round-trip is a SUMMARIZATION task, not the dialogue agent, so the shared
-/// system prompt is driven into its summarizer mode by selection:
-///
-/// - tools ON, force-pinned to the tools the prefill calls: the chain PREFILLS
-///   tool_calls and their tool_responses, so the projection must present a
-///   coherent tool context or the model can't connect the prefill to any
-///   capability and degrades (refusals, off-language, hallucinated tool
-///   chatter). The tool block is enabled and exactly those tools are
-///   force-selected (see [`FORCE_TOOL_SELECTOR`]) — present, coherent, no
-///   belief-driven catalog noise.
-/// - `persona = summarize`: swaps the "You are Zen, pair programming…"
-///   dialogue frame for the terse code-summarizer frame (content-provided,
-///   English, summary-only).
-/// - `response_length = terse`: the default `standard` length section says "a
-///   short paragraph or two", which fights the two-sentence goal.
-/// - `summarize_examples`: worked example turns stuffed between the system
-///   prompt and the chain so the model imitates the exact request→summary
-///   shape. The option names the SHAPE of the chain (`file` for a scope read,
-///   `folder` for a directory round-trip), because an example teaches the
-///   subject as much as the format: shown the file examples, a folder chain
-///   summarises the excerpt it was handed rather than the directory it was
-///   asked about.
-fn ingest_chain_selection(
-    base: &SelectionState,
-    prefilled_pairs: usize,
-    force_tools: &[String],
-) -> SelectionState {
-    let mut sel = base.clone();
-    sel.set_optional(TOOLS_ENABLED_SELECTOR, OptionalState::Present);
-    sel.select(
-        FORCE_TOOL_SELECTOR,
-        force_tools.join(&FORCE_TOOL_SEPARATOR.to_string()),
-    );
-    sel.select("persona", "summarize");
-    sel.select("response_length", "terse");
-    sel.select("summarize_examples", examples_shape(prefilled_pairs));
-    sel
-}
-
-/// The selection the chain's DECODED turn submits with: the chain's whole
-/// framing plus the `/no_think` switch that turn adds.
-///
-/// [`Sequence::submit_turn_with_options`] adopts a turn's selection wholesale,
-/// so a decoded turn whose options carried only its own additions projected
-/// under the default persona, length and examples — the summary, the one turn
-/// the chain exists to produce, was the one turn not framed as a summary.
-fn ingest_decode_selection(chain: &SelectionState) -> SelectionState {
-    let mut sel = chain.clone();
-    sel.set_optional(NO_THINK_SELECTOR, OptionalState::Present);
-    sel
-}
-
 impl Sequence {
     /// Create a new conversation backed by a full projection [`Builder`].
     ///
@@ -787,8 +699,6 @@ impl Sequence {
             primed_prefix: Arc::new(Vec::new()),
             branch_spans: Vec::new(),
             state_is_prompt_only: false,
-            checkpoint_selection: SelectionState::default(),
-            section_inserts: SectionInserts::default(),
         };
 
         // Set the in-memory tree's system prompt tokens so the tree's
@@ -1069,33 +979,19 @@ impl Sequence {
                             }
                             continue;
                         }
-                        // Every variant of this node is sealed against earlier
-                        // nodes only, so the whole node prefills as one batch.
-                        let variants = || {
-                            node.options.iter().flat_map(|option| {
-                                option
-                                    .variants
-                                    .iter()
-                                    .map(move |v| (v, option.content.as_str()))
-                            })
-                        };
-                        let prefixes: Vec<Vec<SectionId>> = variants()
-                            .map(|(v, _)| {
+                        for option in &node.options {
+                            for v in &option.variants {
                                 let mut prefix = linear_prefix.clone();
                                 prefix.extend_from_slice(&v.in_tree_prefix);
-                                prefix
-                            })
-                            .collect();
-                        let batch: Vec<(SectionId, &str, &[SectionId])> = variants()
-                            .zip(&prefixes)
-                            .map(|((v, content), prefix)| (v.id, content, prefix.as_slice()))
-                            .collect();
-                        let done_bytes_ref = &mut done_bytes;
-                        let report_ref = &report;
-                        conv.insert_sections_with_progress(&batch, false, |_sid, content_len| {
-                            *done_bytes_ref += content_len as u64;
-                            report_ref(*done_bytes_ref);
-                        })?;
+                                conv.insert_section_with_prefix(
+                                    v.id,
+                                    option.content.as_str(),
+                                    &prefix,
+                                )?;
+                                done_bytes += option.content.len() as u64;
+                                report(done_bytes);
+                            }
+                        }
                     }
                     // Sections declared after the tree (and the priming
                     // projection) attend to the default branch — the fan-out is
@@ -1141,7 +1037,6 @@ impl Sequence {
         // rebuilds from exactly these inputs.
         conv.primed_prefix = Arc::new(fixed_prefix.clone());
         conv.branch_spans = branch_spans;
-        conv.checkpoint_selection = conv.effective_prompt_selection();
 
         // Pre-warm the slot: inject all system-prompt sections now so the
         // first `submit_turn` sees an already-populated slot and skips
@@ -1242,8 +1137,7 @@ impl Sequence {
                     break;
                 }
                 ids.extend_from_slice(&primed[cursor..start]);
-                let effective = self.effective_prompt_selection();
-                let selection = tree.selection(|id| effective.get(id));
+                let selection = tree.selection(|id| self.selection.get(id));
                 ids.extend(tree.branch_prefix_ids(&selection));
                 cursor = start + len;
             }
@@ -1271,62 +1165,6 @@ impl Sequence {
             tokens.extend_from_slice(&section);
         }
         (chain.prefix(), tokens)
-    }
-
-    /// This conversation's selection seeded with its target layer's dials
-    /// (`LayerDials::seed`) — the selection its projections run under, and so
-    /// the one its prompt state must be built for.
-    fn effective_prompt_selection(&self) -> SelectionState {
-        self.projection
-            .schema()
-            .layers
-            .iter()
-            .find(|l| l.id == self.target.layer)
-            .map_or_else(|| self.selection.clone(), |l| l.dials.seed(&self.selection))
-    }
-
-    /// Swap the installed prompt checkpoint for the branch this conversation's
-    /// FIRST turn selects, when that differs from the one it was built for.
-    ///
-    /// The checkpoint installed at create was built for the selection the
-    /// conversation had then, because create cannot know the first turn's.
-    /// This is the one moment it can be swapped: the state is still exactly
-    /// that checkpoint, and the projection the submit runs will show the newly
-    /// selected sections. State must match what the K/V shows (§4.6); without
-    /// this, every conversation whose first turn carried non-default dials ran
-    /// on the default branch's prompt memory while projecting the dialed
-    /// prompt — E2 of the behavioural catalogue caught it by the checkpoint
-    /// counters sitting still. Every turn-submitting path calls it, because an
-    /// ingest conversation's first turn is a prefilled insert, not a decoded
-    /// submit.
-    ///
-    /// **The window is DERIVED, not tracked.** `state_is_prompt_only` says this
-    /// conversation was born with a checkpoint (a fork's state is real and must
-    /// never be swapped); the empty timeline says nothing has advanced that
-    /// state since. A tracked "still pristine" bool would have to be cleared by
-    /// every path that advances the state, and each of them seals or adopts a
-    /// turn onto this timeline, so the turn count states the same fact without
-    /// anyone having to remember. Without the derived half, a code_read
-    /// conversation that ingested scopes and then took a dialed first turn had
-    /// the bare prompt checkpoint installed over the state that had absorbed
-    /// them: K/V holding the ingest, recurrent layers having forgotten it.
-    fn rekey_prompt_state(&mut self) -> crate::Result<()> {
-        if !self.state_is_prompt_only {
-            return Ok(());
-        }
-        let effective = self.effective_prompt_selection();
-        if effective == self.checkpoint_selection
-            || self.substrate.read().turn_count(self.target.timeline) != 0
-        {
-            return Ok(());
-        }
-        let primed = Arc::clone(&self.primed_prefix);
-        let spans = self.branch_spans.clone();
-        if let Some((prefix, fresh)) = self.build_branch_checkpoint(&primed, &spans)? {
-            self.restore_branch_checkpoint(prefix, fresh)?;
-        }
-        self.checkpoint_selection = effective;
-        Ok(())
     }
 
     /// Compute and persist this conversation's prompt branch checkpoint (§4.6).
@@ -1568,30 +1406,6 @@ impl Sequence {
         sections: &[(SectionId, &str)],
         prefix_section_ids: &[SectionId],
         in_collection: bool,
-        on_section_done: F,
-    ) -> crate::Result<Vec<(SectionId, usize)>>
-    where
-        F: FnMut(SectionId, usize),
-    {
-        let sections: Vec<(SectionId, &str, &[SectionId])> = sections
-            .iter()
-            .map(|&(id, content)| (id, content, prefix_section_ids))
-            .collect();
-        self.insert_sections_with_progress(&sections, in_collection, on_section_done)
-    }
-
-    /// Ingest sections that each carry their OWN prefix, in parallel.
-    ///
-    /// The general form of [`Self::insert_section_collection_with_progress`]:
-    /// every section is restored or prefilled against its own prefix, and
-    /// every prefill is fired before any is awaited, so the scheduler packs
-    /// them into shared forwards. No section here may sit in another's prefix
-    /// — each prefix must already be sealed. A section tree's variants of one
-    /// node are exactly that: each is sealed against earlier nodes only.
-    pub fn insert_sections_with_progress<F>(
-        &mut self,
-        sections: &[(SectionId, &str, &[SectionId])],
-        in_collection: bool,
         mut on_section_done: F,
     ) -> crate::Result<Vec<(SectionId, usize)>>
     where
@@ -1607,12 +1421,32 @@ impl Sequence {
         struct Pending<'a> {
             section_id: SectionId,
             content: &'a str,
-            prefix: &'a [SectionId],
             tokens: TokenBuffer,
             token_count: usize,
             address: ContentAddress,
             debug_name: String,
         }
+        // Rebuild a `ContentChain` snapshot from the supplied prefix
+        // section ids.  Sections in this call all share the same
+        // prefix snapshot (collection-member semantics: members don't
+        // attend to each other, so each member's `prefix_hash` is the
+        // chain state *before* the collection).  The chain reads each
+        // prefix section's tokens from the substrate — they were
+        // tokenised and pinned on a previous `insert_section_*` call.
+        //
+        // **Collection members are excluded from the chain.**  Without
+        // this, every change to a collection member (installing a new
+        // tool, removing one, editing a tool's description) would
+        // produce a fresh `prefix_hash` for every section *after* the
+        // collection, cascading stream-id invalidation through the
+        // whole downstream tail and forcing a re-prefill of sections
+        // whose own content didn't change.  Collection members are
+        // already an approximation in the post-collection prefix
+        // (projection selects a subset at runtime, so the cached K/V
+        // is never a strict function of the specific members that
+        // ingested) — treating them as outside the content chain
+        // matches that approximation and keeps minor catalog changes
+        // local.
         // ── Pass 1: already-present sections, by id alone ──────────────
         // `section_exists` is broader than `section_is_hot`: it returns true for
         // cold-marker sections that were restored on substrate reload but
@@ -1630,8 +1464,7 @@ impl Sequence {
         // ~294 ms per sequence, 206 s of a 341 s phase, all of it on the calling
         // thread with the GPU idle behind it.
         let mut out_skip: Vec<(SectionId, usize)> = Vec::new();
-        let mut candidates: Vec<(SectionId, &str, &[SectionId])> =
-            Vec::with_capacity(sections.len());
+        let mut candidates: Vec<(SectionId, &str)> = Vec::with_capacity(sections.len());
         // ONE read guard for the whole triage, not one per section. The substrate
         // RwLock is writer-priority, so each reader taken while the persistence
         // thread is queued to write blocks until that write lands — and a
@@ -1651,7 +1484,7 @@ impl Sequence {
         let mut skipped: Vec<(SectionId, usize, usize)> = Vec::new();
         {
             let view = self.substrate.read();
-            for &(section_id, content, prefix) in sections {
+            for &(section_id, content) in sections {
                 if content.is_empty() {
                     continue;
                 }
@@ -1660,11 +1493,10 @@ impl Sequence {
                     skipped.push((section_id, block_count, content.len()));
                     continue;
                 }
-                candidates.push((section_id, content, prefix));
+                candidates.push((section_id, content));
             }
         }
         for (section_id, block_count, content_len) in skipped {
-            self.section_inserts.present += 1;
             out_skip.push((section_id, block_count));
             on_section_done(section_id, content_len);
         }
@@ -1675,6 +1507,28 @@ impl Sequence {
             return Ok(out_skip);
         }
 
+        let prefix_hash = {
+            let mut chain = ContentChain::new();
+            let view = self.substrate.read();
+            let schema = self.projection.schema();
+            for &pid in prefix_section_ids {
+                // Skip collection members of the shared prompt — they don't
+                // advance the content chain.
+                if schema.system_prompt.is_collection_member(pid) {
+                    continue;
+                }
+                let pre_tokens = view.section_tokens_of(pid);
+                if pre_tokens.is_empty() {
+                    // A prefix section with no recorded tokens — this
+                    // happens for template-kind items that don't enter
+                    // the substrate.  Skip; they contribute nothing to
+                    // the cumulative content prefix anyway.
+                    continue;
+                }
+                chain.push_section(&pre_tokens);
+            }
+            chain.prefix()
+        };
         // ── Pass 2: triage what's left into two buckets ────────────────
         //   - Durable in the redo log under its content-addressed stream id →
         //     restore from disk (`RestoreSection`). Whether those chunks form a
@@ -1684,22 +1538,12 @@ impl Sequence {
         //   - Otherwise → ingest with a fresh prefill (`IngestSection`).
         let mut to_ingest: Vec<Pending<'_>> = Vec::with_capacity(candidates.len());
         let mut to_restore: Vec<Pending<'_>> = Vec::with_capacity(candidates.len());
-        // A collection's members share one prefix; hash it once.
-        let mut prefix_memo: Option<(&[SectionId], ContentHash)> = None;
-        for (section_id, content, prefix) in candidates {
+        for (section_id, content) in candidates {
             let tokens = self.tokenize(content)?;
             if tokens.is_empty() {
                 continue;
             }
             let token_count = tokens.len();
-            let prefix_hash = match prefix_memo {
-                Some((memo, hash)) if memo == prefix => hash,
-                _ => {
-                    let hash = self.content_prefix_hash(prefix);
-                    prefix_memo = Some((prefix, hash));
-                    hash
-                }
-            };
             let address = ContentAddress {
                 prefix_hash,
                 section_hash: hash_tokens(&tokens),
@@ -1708,7 +1552,6 @@ impl Sequence {
             let pending = Pending {
                 section_id,
                 content,
-                prefix,
                 tokens,
                 token_count,
                 address,
@@ -1758,9 +1601,7 @@ impl Sequence {
                 Ok(chunks_per_layer) => {
                     // Block count for diagnostics — the section is now a
                     // cold-marker; the actual hot grid lands when the next
-                    // projection elevates it. The scheduler reports the chunks
-                    // per KV layer it recovered.
-                    self.section_inserts.restored += 1;
+                    // projection elevates it.
                     restore_out.push((item.section_id, chunks_per_layer));
                     on_section_done(item_section_id, item_content_len);
                 }
@@ -1774,6 +1615,11 @@ impl Sequence {
             }
             let _ = item.token_count;
         }
+
+        // Every section still in `to_ingest` — a refused restore included —
+        // costs a prefill from here on.
+        self.substrate
+            .record_section_loads(restore_out.len(), to_ingest.len());
 
         // Bulk-allocate-then-fire: allocate one scratch slot per
         // section first (cheap, no timeline minting), then fire every
@@ -1823,7 +1669,7 @@ impl Sequence {
                 .send(SchedulerRequest::IngestSection {
                     sequence_id: slot_id,
                     section_id: item.section_id,
-                    prefix_section_ids: item.prefix.to_vec(),
+                    prefix_section_ids: prefix_section_ids.to_vec(),
                     tokens: item.tokens,
                     address: item.address,
                     debug_name: item.debug_name,
@@ -1886,7 +1732,6 @@ impl Sequence {
                     return Err(e);
                 }
             };
-            self.section_inserts.prefilled += 1;
             let block_count = seal.block_to.saturating_sub(seal.block_from);
             self.free_scratch_slot(slot_id);
             out.push((section_id, block_count));
@@ -1903,45 +1748,6 @@ impl Sequence {
             "section_collection",
         );
         Ok(out)
-    }
-
-    /// Outcomes of every section insert this sequence has run.
-    pub fn section_inserts(&self) -> SectionInserts {
-        self.section_inserts
-    }
-
-    /// The content-chain hash of `prefix_section_ids` — the `prefix_hash`
-    /// half of a section's content address. The chain reads each prefix
-    /// section's tokens from the substrate, where an earlier insert pinned
-    /// them.
-    ///
-    /// **Collection members are excluded from the chain.** Without this, every
-    /// change to a collection member (installing a new tool, removing one,
-    /// editing a tool's description) would produce a fresh `prefix_hash` for
-    /// every section *after* the collection, cascading stream-id invalidation
-    /// through the whole downstream tail and forcing a re-prefill of sections
-    /// whose own content didn't change. Collection members are already an
-    /// approximation in the post-collection prefix (projection selects a subset
-    /// at runtime, so the cached K/V is never a strict function of the specific
-    /// members that ingested) — treating them as outside the content chain
-    /// matches that approximation and keeps minor catalog changes local.
-    fn content_prefix_hash(&self, prefix_section_ids: &[SectionId]) -> ContentHash {
-        let mut chain = ContentChain::new();
-        let view = self.substrate.read();
-        let schema = self.projection.schema();
-        for &pid in prefix_section_ids {
-            if schema.system_prompt.is_collection_member(pid) {
-                continue;
-            }
-            let pre_tokens = view.section_tokens_of(pid);
-            // A prefix item with no recorded tokens is a template that never
-            // enters the substrate; it contributes nothing to the chain.
-            if pre_tokens.is_empty() {
-                continue;
-            }
-            chain.push_section(&pre_tokens);
-        }
-        chain.prefix()
     }
 
     /// Look up a section's symbolic name from the projection schema.
@@ -2056,10 +1862,41 @@ impl Sequence {
         // becomes the conversation's current selection and drives every
         // projection — initial prefill and decode reprojection — until the next
         // turn changes it.
+        let selection_changed = self.selection != options.selection;
         self.selection = options.selection.clone();
-        // A first turn whose selection names a different prompt branch swaps
-        // the checkpoint installed at create — see [`Self::rekey_prompt_state`].
-        self.rekey_prompt_state()?;
+
+        // A FIRST turn whose dials select a different prompt branch: the
+        // checkpoint installed at create is the default branch's, because
+        // create cannot know the dials. This is the one moment it can be
+        // swapped — the state is still exactly that checkpoint, and the
+        // projection this submit runs will show the newly selected sections.
+        // State must match what the K/V shows (§4.6); without this, every
+        // conversation whose first turn carried non-default dials ran on the
+        // default branch's prompt memory while projecting the dialed prompt —
+        // E2 of the behavioural catalogue caught it by the checkpoint counters
+        // sitting still.
+        //
+        // **The window is DERIVED, not tracked.** `state_is_prompt_only` says
+        // this conversation was born with a checkpoint (a fork's state is real
+        // and must never be swapped); the empty timeline says nothing has
+        // advanced that state since. A tracked "still pristine" bool has to be
+        // cleared by every path that advances the state, and the paths that
+        // are not this one — `insert_turn_inner`, `submit_prefilled_turn`,
+        // `catch_memory_up_to` — each seal or adopt a turn onto this timeline
+        // BEFORE any later submit runs, so the turn count states the same fact
+        // without anyone having to remember. Without the derived half, a
+        // code_read conversation that ingested scopes and then took a dialed
+        // first turn had the bare prompt checkpoint installed over the state
+        // that had absorbed them: K/V holding the ingest, recurrent layers
+        // having forgotten it — the very defect this block exists to remove.
+        let timeline_is_empty = self.substrate.read().turn_count(self.target.timeline) == 0;
+        if selection_changed && self.state_is_prompt_only && timeline_is_empty {
+            let primed = Arc::clone(&self.primed_prefix);
+            let spans = self.branch_spans.clone();
+            if let Some((prefix, fresh)) = self.build_branch_checkpoint(&primed, &spans)? {
+                self.restore_branch_checkpoint(prefix, fresh)?;
+            }
+        }
         // Whatever branch it started from, this turn's decode advances the
         // state past the prompt — the swap window closes.
         self.state_is_prompt_only = false;
@@ -2263,6 +2100,7 @@ impl Sequence {
             // quotations or prose is a property of what this conversation *is*,
             // and a per-turn switch would be a way to get it wrong on one turn.
             self.projection.schema().free_tool_calls_from_penalties,
+            options.recorded_turn,
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -2289,19 +2127,20 @@ impl Sequence {
     /// with [`finish_turn`](Self::finish_turn) exactly like a decoded turn.
     pub fn submit_prefilled_turn(
         &mut self,
-        user_message: &str,
+        user_message: impl Into<TurnText>,
         assistant_trajectory: &str,
         projection_marker: &str,
         selection: SelectionState,
         tags: Vec<String>,
     ) -> crate::Result<TurnHandle> {
+        let user_message = user_message.into();
+        let user_text = user_message.text();
         if self.turn_in_flight {
             return Err(ConversationError::TurnInFlight {
                 sequence_id: self.id,
             });
         }
         self.selection = selection;
-        self.rekey_prompt_state()?;
 
         // **No suppression block here, unlike `submit_turn_with_options`.** That
         // path prefills the dialect's closed block because the model is about to
@@ -2311,10 +2150,8 @@ impl Sequence {
         // it had one, and injecting scaffolding in front of it would make the
         // replayed grid differ from the decode it is calibrating against.
         let assistant_start_marker = self.config.dialect.assistant_start;
-        let assistant_head = format!(
-            "{}{}{}",
-            user_message, self.config.dialect.user_end, assistant_start_marker,
-        );
+        let markers = format!("{}{}", self.config.dialect.user_end, assistant_start_marker);
+        let assistant_head = format!("{user_text}{markers}");
         // The trajectory carries `projection_marker`s at the points a real decode
         // reprojected. Strip them from the prefilled text (they are not model
         // tokens), and record each one's token offset so the staged prefill wave
@@ -2324,43 +2161,48 @@ impl Sequence {
         // prefix up to each marker yields its exact grid offset.
         let clean_trajectory = assistant_trajectory.replace(projection_marker, "");
         let formatted = format!("{assistant_head}{clean_trajectory}");
-        let prefill_tokens = self.tokenize(&formatted)?;
+        // The user half is encoded piece by piece, exactly as
+        // `submit_turn_with_options` encodes it — a tool's output stays literal —
+        // and the markers and trajectory follow as one string. The half meets
+        // them on `user_end`, a registered tag the tokenizer splits at anyway, so
+        // the concatenation is the whole grid's encoding.
+        let user_tokens = self.encode_text(&user_message)?;
+        let mut prefill_tokens = user_tokens.clone();
+        prefill_tokens.extend_from_slice(&self.tokenize(&format!("{markers}{clean_trajectory}"))?);
         // No post-decode tail — `assistant_end` is a live `Generated` segment,
         // same as a decoded turn.
         let post_decode_tokens = TokenBuffer::new();
 
         // Record the pending user turn (text + raw tokens for the tree).
-        let user_tokens = self.tokenize(user_message)?;
-        self.pending_user = Some(TokenizedText::new(user_message, user_tokens));
+        self.pending_user = Some(TokenizedText::new(user_text.as_str(), user_tokens.clone()));
 
-        // Content boundaries: user body `[0, len(user_msg))`; the supplied
-        // assistant trajectory begins right after the head. Clamp/monotonise so a
-        // tokenizer that merges across a join can never invert the windows.
+        // Content boundaries: user body `[0, len(user half))`; the supplied
+        // assistant trajectory begins right after the markers. Clamp/monotonise
+        // so a tokenizer that merges across a join can never invert the windows.
         let total = prefill_tokens.len();
         let user_content_start = 0u32;
-        let user_content_end = self.tokenize(user_message)?.len().min(total) as u32;
-        let assistant_content_start = self
-            .tokenize(&assistant_head)?
-            .len()
+        let user_content_end = user_tokens.len().min(total) as u32;
+        let assistant_content_start = (user_tokens.len() + self.tokenize(&markers)?.len())
             .min(total)
             .max(user_content_end as usize) as u32;
 
-        // Grid-token offset of each projection marker: tokenize `head + trajectory
-        // up to the marker`. `split` yields one segment per marker plus a trailing
-        // remainder, so the boundaries between segments are exactly the marker
-        // positions. Two markers are dropped from the wave's emit list: the
-        // initial one at generation start (index 0 — the handler already applied
-        // that projection, and its span is carried by the next event) and the seal
-        // marker flush with the trajectory end (the final projection is appended at
-        // seal). The intermediate reprojections remain.
+        // Grid-token offset of each projection marker: the user half's length
+        // plus the tokenized `markers + trajectory up to the marker`. `split`
+        // yields one segment per marker plus a trailing remainder, so the
+        // boundaries between segments are exactly the marker positions. Two
+        // markers are dropped from the wave's emit list: the initial one at
+        // generation start (index 0 — the handler already applied that
+        // projection, and its span is carried by the next event) and the seal
+        // marker flush with the trajectory end (the final projection is appended
+        // at seal). The intermediate reprojections remain.
         let segments: Vec<&str> = assistant_trajectory.split(projection_marker).collect();
         let mut projection_offsets: Vec<u32> = Vec::new();
         if segments.len() > 1 {
             let end = prefill_tokens.len() as u32;
-            let mut prefix = assistant_head.clone();
+            let mut prefix = markers.clone();
             for (i, seg) in segments[..segments.len() - 1].iter().enumerate() {
                 prefix.push_str(seg);
-                let off = self.tokenize(&prefix)?.len() as u32;
+                let off = (user_tokens.len() + self.tokenize(&prefix)?.len()) as u32;
                 if i > 0 && off < end {
                     projection_offsets.push(off);
                 }
@@ -2372,7 +2214,7 @@ impl Sequence {
             Some(self.projection_inputs()),
             formatted,
             prefill_tokens,
-            user_message.to_string(),
+            user_text,
             user_content_start,
             user_content_end,
             assistant_content_start,
@@ -2395,6 +2237,8 @@ impl Sequence {
             None,
             // Nothing is sampled, so no penalty applies to exempt from.
             false,
+            // Nothing is decoded, so there is no reply to replay.
+            None,
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -2434,16 +2278,13 @@ impl Sequence {
     /// region, the index of the case it came from — a case with no tokens on
     /// either half claims no region, so the two are not 1:1.
     ///
-    /// **Cases are separated by blocks, not by the mask.** The grid is one causal
-    /// prefill: region N attends to the regions before it, and on a hybrid model
-    /// the recurrent layers carry them forward as well. What the block alignment
-    /// guarantees is that no exemplar's `sign(Q)` *window* holds a neighbour's
-    /// tokens; each exemplar's queries are still computed in the context of the
-    /// cases laid down ahead of it. A caller wanting each turn's context to be its
-    /// own history (a running dialogue) submits them one at a time; a caller whose
-    /// cases are independent memories signed against the substrate (calibration
-    /// exemplars, the lines of a dream) gets them all in one forward, with that
-    /// shared context.
+    /// **Every case is masked to itself.** A stuffed grid is block-diagonal, not
+    /// causal across cases: region N does not attend to regions before it, which
+    /// is exactly what keeps one exemplar's `sign(Q)` window off its neighbour's
+    /// tokens. A caller wanting each turn to see the ones before it (a running
+    /// dialogue) must submit them one at a time; a caller whose cases are
+    /// independent memories signed against the substrate (calibration exemplars,
+    /// the lines of a dream) gets them all in one forward.
     pub fn submit_prefilled_turn_group(
         &mut self,
         cases: &[(String, String, Vec<String>)],
@@ -2456,7 +2297,6 @@ impl Sequence {
             });
         }
         self.selection = selection;
-        self.rekey_prompt_state()?;
 
         // Each case's grid is the whole turn a lone prefill would lay down —
         // opener, user body, the user/assistant join, and the closing marker —
@@ -2565,11 +2405,13 @@ impl Sequence {
                 sampling: self.config.sampling.clone(),
                 event_tx,
                 reprojection: None,
+                disable_reprojection: self.config.disable_reprojection,
                 triggers: Arc::new(TriggerRegistry::new()),
                 // Every case's assistant half is supplied in the grid, so there
                 // is nothing to constrain and nothing to exempt.
                 turn_grammar: None,
                 free_tool_calls_from_penalties: false,
+                recorded_reply: None,
                 seal_group: Some(Arc::new(turns)),
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
@@ -2619,6 +2461,7 @@ impl Sequence {
         triggers: Arc<TriggerRegistry>,
         turn_grammar: Option<Arc<StencilTree>>,
         free_tool_calls_from_penalties: bool,
+        recorded_turn: Option<Vec<u32>>,
     ) -> crate::Result<TurnHandle> {
         // ── Bake the turn's own boundary markers into its grid ──────────────
         //
@@ -2682,9 +2525,24 @@ impl Sequence {
         let mut post_decode_tokens = post_decode_tokens;
         post_decode_tokens.extend_from_slice(&self.tokenize(self.config.dialect.assistant_end)?);
 
+        // A replayed turn decodes its recording: everything the recorded grid
+        // holds past this prefill, less the tail written after the decode — one
+        // step per recorded id and one for the end of turn. Its triggers and
+        // grammar run as they did live: what they played is in the recording,
+        // and where they cut pages is part of what is being replayed.
+        let (reply, max_decode_tokens) = match recorded_turn {
+            Some(grid) => {
+                let reply = recorded_reply(&grid, &prefill_tokens, &post_decode_tokens)
+                    .map_err(ConversationError::Other)?;
+                let steps = reply.len() + 1;
+                (Some(reply), steps)
+            }
+            None => (None, max_decode_tokens),
+        };
+
         let disable_reprojection = self.config.disable_reprojection;
-        // Append-only ingests suppress continuous mid-decode reprojection; their
-        // per-turn projection runs like any other turn's.
+        // Append-only ingests skip the per-turn projection rebuild and also
+        // suppress continuous mid-decode reprojection.
         let reprojection = if disable_reprojection {
             None
         } else {
@@ -2712,9 +2570,11 @@ impl Sequence {
                 sampling,
                 event_tx,
                 reprojection,
+                disable_reprojection,
                 triggers,
                 turn_grammar,
                 free_tool_calls_from_penalties,
+                recorded_reply: reply,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
         Ok(TurnHandle::new(event_rx))
@@ -2755,18 +2615,6 @@ impl Sequence {
             projection: Arc::clone(&self.projection),
             selection: self.selection.clone(),
         }
-    }
-
-    /// Adopt `selection` as this conversation's section-tree selection for the
-    /// turns it submits from here on.
-    ///
-    /// For a conversation created to play one role — an ingest conversation
-    /// framed to answer or to write questions — and set before its first turn,
-    /// so every projection of it reads that branch of the shared system prompt.
-    /// A turn submitted with its own selection (`TurnOptions::selection`,
-    /// [`Self::submit_prefilled_turn_group`]) replaces this one.
-    pub fn set_selection(&mut self, selection: SelectionState) {
-        self.selection = selection;
     }
 
     /// Insert a preformed turn into the conversation **without model inference**.
@@ -2856,10 +2704,6 @@ impl Sequence {
                 sequence_id: self.id,
             });
         }
-
-        // The conversation's first turn may select a different prompt branch
-        // than the checkpoint was built for — see [`Self::rekey_prompt_state`].
-        self.rekey_prompt_state()?;
 
         // Format the full exchange (user + assistant_start prefix +
         // assistant_text) and tokenize as a single prefill payload.
@@ -2953,6 +2797,7 @@ impl Sequence {
             Arc::new(TriggerRegistry::new()),
             None,
             false,
+            None,
         )?;
 
         // Drain events synchronously to Done.  The handle's event_rx
@@ -3214,9 +3059,31 @@ impl Sequence {
         force_tools: &[String],
         triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<(Vec<u32>, usize, TurnHandle)> {
-        // The summarizer framing every turn of the chain projects under — see
-        // [`ingest_chain_selection`].
-        self.selection = ingest_chain_selection(&self.selection, prefilled.len(), force_tools);
+        // A scope round-trip frames on the dialogue prompt itself — the persona is
+        // deliberately left alone. The turns it seals are later borrowed into
+        // dialogue projections, and borrowed K/V carries the framing it was computed
+        // under, and on the append-only ingest path that framing is NOT this
+        // selection's to set: the prefix is the one priming injected at creation
+        // (the schema's sections at each tree's default branch) and
+        // `skip_projection` means no turn ever rebuilds it. The ingest's prompt is
+        // therefore the same shared prompt KV a chat conversation uses, and the
+        // schema's defaults are where its content is decided — see the
+        // `tool_call_example` note in `projection.yaml`.
+        //
+        // The tool pin below stays because it is not ingest-only: any caller that
+        // DOES re-project needs a coherent tool context, since the chain PREFILLS
+        // `tool_call`s and their `tool_response`s and a model shown neither the
+        // block nor those tools degrades (refusals, off-language, hallucinated tool
+        // chatter). Enable the block and force-select exactly the prefilled tools
+        // (see `FORCE_TOOL_SELECTOR`) — coherent, with no belief-driven catalog
+        // noise.
+        self.selection.set_optional(
+            crate::projection::TOOLS_ENABLED_SELECTOR,
+            crate::projection::OptionalState::Present,
+        );
+        let pinned_tools = force_tools.join(&crate::projection::FORCE_TOOL_SEPARATOR.to_string());
+        self.selection
+            .select(crate::projection::FORCE_TOOL_SELECTOR, pinned_tools.clone());
         // The prefilled turns — each `[user][assistant]` written verbatim, with
         // staged provenance so a later scan can resolve sig hit → event → turn.
         let mut indices: Vec<u32> = Vec::with_capacity(prefilled.len() + 1);
@@ -3243,11 +3110,12 @@ impl Sequence {
         // frequently off-language (Chinese/Japanese) — reasoning, leaving a truncated
         // "thought" as the stored summary.
         //
-        // **Three layers, and only the last one is structural.** The caller frames
-        // the conversation as a summarizer (`thinking_effort = off` resolved into
-        // the static system prompt) and `NO_THINK_SELECTOR` adds the `/no_think`
-        // glue below — both of which the model may simply ignore, because both are
-        // text. `apply_think_mode` then programs the sampler's segment-close
+        // **Three layers, and only the last one is structural.** `NO_THINK_SELECTOR`
+        // adds the `/no_think` glue below, baked into this turn's own prefill — which
+        // the model may simply ignore, because it is text. (Nothing in the prompt
+        // helps: an append-only ingest is framed by the primed shared prompt at its
+        // default branch, whose thinking dial is the dialogue's.)
+        // `apply_think_mode` then programs the sampler's segment-close
         // budget, which for `Off` at a short summary budget collapses to a forced
         // empty block. That is enforcement, but it is *sampler* enforcement: it
         // fires only once the model has already opened the block, and it depends on
@@ -3283,16 +3151,26 @@ impl Sequence {
         // window holds the model's own prose rather than a directory listing.
         summary_sampling.repeat_last_n = 64;
         summary_sampling.apply_think_mode(ThinkMode::Off, &self.tokenizer, max_summary_tokens);
-        // The decode projects under the chain's whole framing plus `/no_think` —
-        // see [`ingest_decode_selection`] for why the turn must carry all of it.
-        let opts = TurnOptions {
+        let mut opts = TurnOptions {
             max_tokens: Some(max_summary_tokens),
             sampling: Some(summary_sampling),
             tags,
             triggers,
-            selection: ingest_decode_selection(&self.selection),
             ..Default::default()
         };
+        opts.selection.set_optional(
+            crate::projection::NO_THINK_SELECTOR,
+            crate::projection::OptionalState::Present,
+        );
+        // Same tools-ON pin as the conversation-level selection above: the decode's
+        // own projection must also carry the coherent tool context the prefilled
+        // tool_response turns refer to.
+        opts.selection.set_optional(
+            crate::projection::TOOLS_ENABLED_SELECTOR,
+            crate::projection::OptionalState::Present,
+        );
+        opts.selection
+            .select(crate::projection::FORCE_TOOL_SELECTOR, pinned_tools);
         let handle = self.submit_turn_with_options(decode_user, opts)?;
         Ok((indices, prefill_tokens, handle))
     }
@@ -3302,11 +3180,12 @@ impl Sequence {
     /// `adopt_turn` can reference its sealed K/V) but has its own scheduler slot
     /// + timeline, so scopes ingest concurrently without ordering conflicts.
     pub fn fork_scope(&self) -> crate::Result<Sequence> {
-        // Do NOT mark the fork append-only / evict_when_cold: `adopt_turn` requires
-        // the fork's turns to still be HOT at splice, so auto-evicting them would
-        // race the splice ("source K/V not hot"). The fork's orphaned hot is freed
-        // instead at `tombstone_timeline` (below), where the file timeline's cloned
-        // chunk handles keep the shared KV alive.
+        // Do NOT mark the fork append-only / evict_when_cold, and DO mark it a
+        // splice source: `adopt_turn` reads the fork's turns from their HOT copy
+        // and nothing else, and a splice source's hot copy is exempt from every
+        // automatic hot-drop — relief, the idle demote, the migrate install —
+        // until the fork's `tombstone_timeline` (below) frees it, the file
+        // timeline's cloned chunk handles keeping the shared KV alive.
         //
         // DO mark the fork timeline transient: its sealed KV is spliced by REFERENCE
         // onto the file timeline (which writes its own durable cold copy) and then
@@ -3317,6 +3196,7 @@ impl Sequence {
             .substrate
             .mint_timeline(self.target.layer, self.target.group);
         self.substrate.mark_timeline_transient(fork_timeline);
+        self.substrate.mark_timeline_splice_source(fork_timeline);
         // A scope fork is a fresh timeline: it ingests its own scope against the
         // system prompt and holds none of the file conversation's dialogue, so
         // it must not inherit the file conversation's memory either.
@@ -3961,8 +3841,9 @@ impl Sequence {
     ///    `Done` arrived.
     /// 2. Persist the user/assistant entries to the cold store.
     /// 3. Commit the exchange to the conversation tree (which may
-    ///    queue cognitive tasks like summarisation).
-    /// 4. Drain any cognitive tasks the tree launched.
+    ///    launch cognitive tasks like summarisation).
+    /// 4. Apply any cognitive task that has finished — without waiting
+    ///    for the ones still running.
     /// 5. Prefill the next user-turn header into the KV cache.
     ///
     /// Returns the boundary text prefilled in step 5 so callers can
@@ -4001,9 +3882,10 @@ impl Sequence {
             Some((&self.scheduler_tx, &self.tokenizer)),
         );
 
-        // Drain pending cognitive tasks launched by the tree during
-        // finish_turn() and spin-poll each to completion before returning.
-        self.drain_cognitive_tasks();
+        // Apply any cognitive task that has finished. Tasks still running —
+        // including one `finish_turn` just launched — stay in flight and are
+        // picked up at a later turn boundary: the turn never waits on them.
+        self.poll_cognitive_tasks();
 
         // Each turn opens its own user role marker via the
         // `prefill_tokens` of the next `submit_turn` and closes the
@@ -4288,10 +4170,6 @@ impl Sequence {
             // timeline's snapshot, never exactly the prompt checkpoint — so
             // the branch-swap window is closed.
             state_is_prompt_only: false,
-            // Unread while the window is closed.
-            checkpoint_selection: SelectionState::default(),
-            // A fork inserts no sections of its own.
-            section_inserts: SectionInserts::default(),
             // Forks start with a fresh scanner state — scoring will refresh
             // on the next provenance scan.  No need to clone the parent's scores.
         };
@@ -4511,32 +4389,40 @@ impl Sequence {
         self.tree.system_prompt_text()
     }
 
-    /// Every recovered turn in the given timeline, split into a
-    /// `User` half and an `Assistant` half — for re-populating a
-    /// sidebar after restart.
+    /// Recover the conversation in `timeline` as bubbles — one per non-empty
+    /// half of each turn, in order: the user's message (exactly what
+    /// `submit_turn` received), then the assistant's reply (the decoded body).
+    /// Both texts come straight off the turn's `user_text` and `assistant_text`
+    /// — no re-tokenising, no marker scanning, no decoding. See
+    /// [`RecoveredMessage`] for what else each bubble carries.
     ///
-    /// Each turn surfaces as two `(Role, String)` entries in order:
-    /// the user's message (exactly what `submit_turn` received) then
-    /// the assistant's reply (the decoded body).  Both strings come
-    /// straight off `TurnPart::user_text` and `assistant_text` — no
-    /// re-tokenising, no marker scanning, no decoding.
-    /// Recovered turn history for `timeline`. When `include_ghost_summaries` is
-    /// false, the ghost summary turns the summariser appends to the timeline
-    /// (`SummaryOfTurns` / `SummaryOfSummaries` tree nodes) are skipped — they
-    /// exist for provenance/projection, not for the conversation view. Pass
-    /// `true` for substrate-level views that legitimately surface them.
-    /// Recover the conversation as `(role, text, no_think)` bubbles — one per
-    /// non-empty half of each turn, in order.  `no_think` is the turn's recorded
-    /// thinking-suppressed flag, set on the USER bubble so the GUI can re-render
-    /// the `/no_think` soft-switch on prior turns exactly as the assembler does
-    /// for the model (see `turn_no_think`); the assistant bubble carries `false`.
+    /// When `include_ghost_summaries` is false, the ghost summary turns the
+    /// summariser appends to the timeline (`SummaryOfTurns` /
+    /// `SummaryOfSummaries` tree nodes) are skipped — they exist for
+    /// provenance/projection, not for the conversation view. Pass `true` for
+    /// substrate-level views that legitimately surface them.
     pub fn recovered_history(
         &self,
         timeline: TimelineId,
         include_ghost_summaries: bool,
-    ) -> Vec<(Role, String, bool)> {
+    ) -> Vec<RecoveredMessage> {
         let read = self.substrate.read();
-        let mut out: Vec<(Role, String, bool)> = Vec::new();
+        // Only a turn whose reasoning K/V was dropped needs this: its length is
+        // then an estimate from the prose it kept.
+        let estimate = |text: &str| {
+            self.tokenizer
+                .encode(text, false)
+                .map(|e| e.len() as u32)
+                .unwrap_or(0)
+        };
+        // The ids of the marker that opens each tool result, for measuring a
+        // tool-response turn's blocks in its own sealed ids.
+        let response_open: Vec<u32> = self
+            .tokenizer
+            .encode(TOOL_RESPONSE_OPEN, false)
+            .map(|e| e.get_ids().to_vec())
+            .unwrap_or_default();
+        let mut out: Vec<RecoveredMessage> = Vec::new();
         for idx in read.turn_indices(timeline) {
             if !include_ghost_summaries
                 && read
@@ -4549,13 +4435,76 @@ impl Sequence {
             let assistant_text = read.assistant_text_of(timeline, idx);
             let no_think = read.turn_no_think(timeline, idx);
             if !user_text.is_empty() {
-                out.push((Role::User, user_text, no_think));
+                let tool_tokens = if user_text.contains(TOOL_RESPONSE_OPEN) {
+                    // The user body's ids, where the layout places them in the
+                    // turn's grid.
+                    let body: Vec<u32> = read
+                        .turn_layout(timeline, idx)
+                        .and_then(|layout| {
+                            let span = layout.user_span();
+                            read.token_ids_of(timeline, idx)
+                                .get(span.offset as usize..span.end() as usize)
+                                .map(<[u32]>::to_vec)
+                        })
+                        .unwrap_or_default();
+                    tool_response_lengths(&body, &response_open)
+                } else {
+                    Vec::new()
+                };
+                out.push(RecoveredMessage {
+                    role: Role::User,
+                    text: user_text,
+                    no_think,
+                    thinking: None,
+                    tool_tokens,
+                });
             }
             if !assistant_text.is_empty() {
-                out.push((Role::Assistant, assistant_text, false));
+                let thinking = read
+                    .turn_layout(timeline, idx)
+                    .and_then(|layout| layout.thinking_length(estimate));
+                out.push(RecoveredMessage {
+                    role: Role::Assistant,
+                    text: assistant_text,
+                    no_think: false,
+                    thinking,
+                    tool_tokens: Vec::new(),
+                });
             }
         }
         out
+    }
+
+    /// Every turn of `timeline` as the substrate holds it — its sealed ids and
+    /// its index pages — in turn order, the summariser's summary turns skipped
+    /// as [`Self::recovered_history`] skips them. What a projection hands the
+    /// model when it borrows each turn, so two timelines that agree here are the
+    /// same context.
+    pub fn sealed_turns(&self, timeline: TimelineId) -> Vec<SealedTurn> {
+        let read = self.substrate.read();
+        read.turn_indices(timeline)
+            .filter(|&idx| {
+                !read
+                    .tree_meta_of(timeline, idx)
+                    .is_some_and(|m| m.kind.is_summary())
+            })
+            .map(|idx| SealedTurn {
+                index: idx.0,
+                token_ids: read.token_ids_of(timeline, idx),
+                pages: SealedPages::of(read.index_page_blob(timeline, idx)),
+            })
+            .collect()
+    }
+
+    /// How many tokens `text` becomes as a turn's user half — encoded exactly
+    /// as a submitted turn is, markup and literal pieces each by their own
+    /// tokenizer. A tool result measured this way before it is submitted has
+    /// the length its block shows once the turn is sealed
+    /// ([`RecoveredMessage::tool_tokens`]).
+    pub fn encoded_len(&self, text: &TurnText) -> usize {
+        encode_pieces(&self.tokenizer, &self.literal_tokenizer, text)
+            .map(|ids| ids.len())
+            .unwrap_or(0)
     }
 
     /// The two verbatim halves — `(user_text, assistant_text)` — of turn `index`
@@ -4782,39 +4731,22 @@ impl Sequence {
         &mut self.tree
     }
 
-    /// Spin-poll a cognitive task to completion, applying the resulting
-    /// [`TreePatch`](crate::tree::TreePatch) to the tree if one arrives.
+    /// Apply every cognitive task (summarization, …) that has finished,
+    /// without blocking on the ones still running. Returns the number of
+    /// results applied to the tree.
     ///
-    /// After each [`TreePatch`] is applied, checks whether a recursive
-    /// segment-of-segments summarization should fire and, if so, queues the
-    /// new task onto the tree's `pending_tasks`. The outer drain loop in
-    /// `send()` then picks it up automatically.
-    ///
-    /// This is the "crude blocking" variant from the design doc — acceptable
-    /// for infrequent summarization events. Upgrade to async polling later.
-    fn run_task_blocking_inner(
-        tree: &mut ConversationTree,
-        task: &mut dyn CognitiveTask,
-        inference: Option<(
-            &Sender<SchedulerRequest>,
-            &std::sync::Arc<tokenizers::Tokenizer>,
-        )>,
-    ) {
-        loop {
-            match task.poll() {
-                TaskPoll::Ready(patch) => {
-                    tree.apply_patch(patch);
-                    tree.check_and_trigger_segment_summarize(inference);
-                    return;
-                }
-                TaskPoll::Aborted => return,
-                TaskPoll::Failed(e) => {
-                    tracing::warn!("cognitive task failed: {}", e);
-                    return;
-                }
-                TaskPoll::Pending => std::thread::yield_now(),
-            }
-        }
+    /// Cognitive tasks run in the background on the scheduler: a turn
+    /// launches them and returns without waiting. This runs at every turn
+    /// boundary, and is public so a caller that wants a result sooner — or a
+    /// test waiting for one — can poll between turns.
+    pub fn poll_cognitive_tasks(&mut self) -> usize {
+        self.tree
+            .poll_tasks(Some((&self.scheduler_tx, &self.tokenizer)))
+    }
+
+    /// Number of cognitive tasks still running in the background.
+    pub fn pending_cognitive_tasks(&self) -> usize {
+        self.tree.pending_task_count()
     }
 
     /// Build the canonical token sequence for one completed turn.
@@ -4895,22 +4827,6 @@ impl Sequence {
         }
         ids
     }
-
-    /// Drain all pending cognitive tasks from the tree to completion,
-    /// re-draining after each batch to handle recursive tasks queued by
-    /// segment-of-segments summarization.
-    fn drain_cognitive_tasks(&mut self) {
-        let inference = Some((&self.scheduler_tx, &self.tokenizer));
-        loop {
-            let tasks = self.tree.drain_pending_tasks();
-            if tasks.is_empty() {
-                break;
-            }
-            for mut task in tasks {
-                Self::run_task_blocking_inner(&mut self.tree, task.as_mut(), inference);
-            }
-        }
-    }
 }
 
 impl Drop for Sequence {
@@ -4922,6 +4838,47 @@ impl Drop for Sequence {
             });
         }
     }
+}
+
+/// Pure block-range windowing for a bounded rolling-window ingest (design
+/// `docs/unified_wave_inference_engine.md` §4.7): given the system-prompt end
+/// block `sys_end`, the ascending per-turn start blocks `turn_starts` (one per
+/// sealed turn), the current `total` block count, and `window_turns`, return the
+/// parent block ranges the next prefill should attend — the system prompt plus
+/// the most recent `window_turns` sealed turns.
+///
+/// `window_turns == 0` (unbounded) or fewer sealed turns than the window returns
+/// the whole parent `[(0, total)]` — a no-op, byte-for-byte the unwindowed
+/// behaviour. Split out from [`Conversation::windowed_ingest_ranges`] so it is
+/// unit-testable without a live substrate.
+pub(crate) fn windowed_ingest_ranges_impl(
+    sys_end: usize,
+    turn_starts: &[usize],
+    total: usize,
+    window_turns: usize,
+) -> Vec<(usize, usize)> {
+    let whole = || {
+        if total == 0 {
+            Vec::new()
+        } else {
+            vec![(0, total)]
+        }
+    };
+    if window_turns == 0 || turn_starts.len() <= window_turns {
+        return whole();
+    }
+    let keep_from = turn_starts[turn_starts.len() - window_turns];
+    // If the window already reaches back into (or to) the system prompt, the two
+    // pieces are contiguous — borrow the whole parent.
+    if keep_from <= sys_end {
+        return whole();
+    }
+    let mut ranges = Vec::with_capacity(2);
+    if sys_end > 0 {
+        ranges.push((0, sys_end));
+    }
+    ranges.push((keep_from, total));
+    ranges
 }
 
 /// A lock-free snapshot of the handles the interactive projection probe needs
@@ -5042,10 +4999,12 @@ impl ProbeCtx {
                 sampling: SamplingConfig::argmax(),
                 event_tx,
                 reprojection: None,
+                disable_reprojection: false,
                 triggers: Arc::new(TriggerRegistry::new()),
                 // A one-token wide-Q probe constrains nothing.
                 turn_grammar: None,
                 free_tool_calls_from_penalties: false,
+                recorded_reply: None,
             })
             .is_err()
         {
@@ -5134,74 +5093,30 @@ fn cap_probe_window(probe: Vec<WideQSig>, max_tail: usize) -> Vec<WideQSig> {
 }
 
 #[cfg(test)]
-mod ingest_selection_tests {
-    use super::{ingest_chain_selection, ingest_decode_selection};
-    use crate::projection::{
-        OptionalState, SelectionState, FORCE_TOOL_SELECTOR, NO_THINK_SELECTOR,
-        TOOLS_ENABLED_SELECTOR,
-    };
+mod windowed_ingest_tests {
+    use super::windowed_ingest_ranges_impl as w;
 
-    fn folder_tools() -> Vec<String> {
-        vec!["file_list".to_string(), "file_read".to_string()]
-    }
-
-    /// A folder chain frames its turns as the summariser, with the two tools its
-    /// prefilled calls name pinned into the catalog.
     #[test]
-    fn a_folder_chain_selects_the_summariser_and_pins_its_tools() {
-        let sel = ingest_chain_selection(&SelectionState::new(), 2, &folder_tools());
-        assert_eq!(sel.get("persona"), Some("summarize"));
-        assert_eq!(sel.get("response_length"), Some("terse"));
-        assert_eq!(sel.get("summarize_examples"), Some("folder"));
-        assert_eq!(
-            sel.optional(TOOLS_ENABLED_SELECTOR),
-            Some(OptionalState::Present)
-        );
-        assert_eq!(sel.get(FORCE_TOOL_SELECTOR), Some("file_list,file_read"));
-    }
-
-    /// A single-pair chain is a code scope and takes the file examples.
-    #[test]
-    fn a_scope_chain_takes_the_file_examples() {
-        let sel = ingest_chain_selection(&SelectionState::new(), 1, &["file_read".to_string()]);
-        assert_eq!(sel.get("summarize_examples"), Some("file"));
-        assert_eq!(sel.get(FORCE_TOOL_SELECTOR), Some("file_read"));
-    }
-
-    /// **The decoded summary is framed as a summary.** Its turn adopts its own
-    /// selection wholesale, and built from the turn's additions alone it lost
-    /// the persona, the length and the examples — the one turn the chain exists
-    /// to produce was the one projected under the dialogue frame.
-    #[test]
-    fn the_decoded_turn_keeps_the_chains_framing_and_suppresses_thinking() {
-        let chain = ingest_chain_selection(&SelectionState::new(), 2, &folder_tools());
-        let decode = ingest_decode_selection(&chain);
-        for selector in [
-            "persona",
-            "response_length",
-            "summarize_examples",
-            FORCE_TOOL_SELECTOR,
-            TOOLS_ENABLED_SELECTOR,
-        ] {
-            assert_eq!(
-                decode.get(selector),
-                chain.get(selector),
-                "`{selector}` was dropped from the decoded turn"
-            );
-        }
-        assert_eq!(
-            decode.optional(NO_THINK_SELECTOR),
-            Some(OptionalState::Present)
-        );
-    }
-
-    /// Selectors set before the chain, which it does not own, survive it.
-    #[test]
-    fn the_chain_keeps_the_selectors_it_does_not_own() {
-        let mut base = SelectionState::new();
-        base.select("thinking_effort", "off");
-        let sel = ingest_chain_selection(&base, 2, &folder_tools());
-        assert_eq!(sel.get("thinking_effort"), Some("off"));
+    fn window_bounds_to_system_prompt_plus_last_n_turns() {
+        // system prompt occupies [0,2); five sealed turns start at 2,5,9,12,16;
+        // current total is 20 blocks.
+        let sys = 2;
+        let starts = [2usize, 5, 9, 12, 16];
+        // Unbounded (0) or window >= turn count → whole parent (no-op).
+        assert_eq!(w(sys, &starts, 20, 0), vec![(0, 20)]);
+        assert_eq!(w(sys, &starts, 20, 5), vec![(0, 20)]);
+        assert_eq!(w(sys, &starts, 20, 9), vec![(0, 20)]);
+        // Keep last 2 turns → system [0,2) + [starts[3]=12, 20).
+        assert_eq!(w(sys, &starts, 20, 2), vec![(0, 2), (12, 20)]);
+        // Keep last 1 → [0,2) + [16, 20).
+        assert_eq!(w(sys, &starts, 20, 1), vec![(0, 2), (16, 20)]);
+        // No system prompt → single tail range.
+        assert_eq!(w(0, &starts, 20, 2), vec![(12, 20)]);
+        // Empty parent → no ranges.
+        assert_eq!(w(0, &[], 0, 3), Vec::<(usize, usize)>::new());
+        // Window reaches into the system-prompt region (keep_from <= sys_end) →
+        // contiguous → whole parent.
+        assert_eq!(w(13, &starts, 20, 2), vec![(0, 20)]);
     }
 }
 

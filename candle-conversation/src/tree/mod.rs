@@ -142,7 +142,3 @@ pub use types::{NodeId, SegmentId, StorageTier, TurnId, TurnType};
 // FixedTimeSource and TimeSource are re-exported here so callers can write
 // `use candle_conversation::tree::{FixedTimeSource, TimeSource}`.
 pub use crate::time_source::{FixedTimeSource, TimeSource};
-
-// Cognitive task types — used by Sequence to hold and poll in-flight
-// background inference work drained from the tree after each turn.
-pub(crate) use task::{CognitiveTask, TaskPoll};

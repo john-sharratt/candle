@@ -1340,8 +1340,12 @@ __device__ __forceinline__ void int8_decode_stripe_impl(
             const int e = first + lane * n_stripes;
             if (lane < n_live) {
                 const uint32_t ent = sel_entries[e];
-                const int cells = (int)(ent & ((1u << QSA_CELL_BITS) - 1u)) + 1;
-                const int pos0 = (int)(ent >> QSA_CELL_BITS) * sel.ratio;
+                // Start and width through the page layout: a projected prefix
+                // is pages whose last blocks are short (see `qsa_block_width_from`).
+                const uint32_t blk = ent >> QSA_CELL_BITS;
+                const int pos0 = qsa_block_start(sel, slot_idx, blk);
+                const int cells = max(0, min((int)(ent & ((1u << QSA_CELL_BITS) - 1u)) + 1,
+                                             qsa_block_width_from(sel, slot_idx, blk, pos0)));
                 int s = 0;
                 {
                     int lo_s = 0, hi_s = (int)n_slices - 1;

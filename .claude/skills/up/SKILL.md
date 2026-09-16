@@ -128,7 +128,7 @@ Poll (one command, bounded — not a sleep per call):
 | Service | Ready when | Give it |
 |---|---|---|
 | web | `curl -s -o NUL -w "%{http_code}" -H "Host: tokera.com" http://127.0.0.1/` → `200` | 30 s |
-| zend | `curl -s -o NUL -w "%{http_code}" http://192.168.0.5:8081/v1/status` → `200` | 10 min (model load) |
+| zend | `curl -s http://192.168.0.5:8081/v1/status` → JSON `"state":"ready"` (it answers `200` with `"state":"loading"` from the first second, so the code alone proves nothing; `loading.current` names the step) | 10 min for the model; a `--wipe-substrate` boot re-ingests and takes longer |
 | npcd | `curl -s -o NUL -w "%{http_code}" http://192.168.0.6:8081/v1/status` → `200` | 2 min |
 
 ```powershell

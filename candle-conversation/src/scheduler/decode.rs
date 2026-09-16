@@ -1,6 +1,8 @@
 use super::spec_chooser::SpecChooser;
 use super::*;
 use candle_nn::kv_cache::is_tier_refusal;
+
+use crate::recorded_reply::{departure, replayed_step};
 use candle_transformers::models::expert_lre::{PipelineStats, ProfileSnapshot};
 use candle_transformers::models::speculative_choice::{AcceptWalk, TokenChooser};
 
@@ -141,6 +143,28 @@ impl Scheduler {
                     }
                     break;
                 };
+
+                // A replayed turn's stencil must play what the recording holds.
+                // A run it does not hold would seal a turn that never happened,
+                // so the turn fails here instead.
+                let departed = self.active_decodes.get(&id).and_then(|s| {
+                    let reply = s.recorded_reply.as_ref()?.ids();
+                    let at = s.generated_tokens.len();
+                    departure(reply, at, &run[..], |t| self.eos_tokens.contains(&t)).map(|k| at + k)
+                });
+                if let Some(at) = departed {
+                    self.fail_all_decodes(
+                        &[id],
+                        &format!(
+                            "the replay left its recording at reply id {at}: the stencil \
+                             played a run the recorded turn does not hold"
+                        ),
+                    );
+                    if let Some(s) = self.active_decodes.get_mut(&id) {
+                        s.stencil = None;
+                    }
+                    break;
+                }
 
                 // Prefill `[pending] ++ run[..last]`; `run.last()` rides the decode.
                 //
@@ -573,11 +597,14 @@ impl Scheduler {
         // speculate about — and drafting past it would mean advancing that
         // grammar through positions the walk may reject, which is a rollback the
         // stencil driver has no notion of.
+        //
+        // So does a replayed turn: its next token is its recording's, so there
+        // is nothing to propose.
         for (i, &id) in seq_ids.iter().enumerate() {
             if self
                 .active_decodes
                 .get(&id)
-                .is_some_and(|s| s.stencil.is_some())
+                .is_some_and(|s| s.stencil.is_some() || s.recorded_reply.is_some())
             {
                 drafts[i].clear();
             }
@@ -1081,12 +1108,26 @@ impl Scheduler {
     /// `logits_vec[i]` must be the row that PRODUCED `next_tokens[i]`: the
     /// health checks read its distribution, so handing over a later position's
     /// row would judge a token against logits that did not choose it.
-    fn commit_decoded_tokens(
+    pub(super) fn commit_decoded_tokens(
         &mut self,
         seq_ids: &[SequenceId],
         next_tokens: &mut [u32],
         logits_vec: &[Tensor],
     ) {
+        // A replayed turn commits its recording, whatever was sampled — here,
+        // ahead of every stage below, so each one sees the token the turn takes.
+        if let Some(&eos) = self.eos_tokens.first() {
+            for (i, seq_id) in seq_ids.iter().enumerate() {
+                let replay = self.active_decodes.get(seq_id).and_then(|s| {
+                    s.recorded_reply
+                        .as_ref()
+                        .map(|replay| (replay.ids(), s.generated_tokens.len()))
+                });
+                if let Some((reply, at)) = replay {
+                    next_tokens[i] = replayed_step(reply, at, eos);
+                }
+            }
+        }
         // Advance each sequence's tool-call stencil with the token just sampled:
         // feed it into an active walk, or start a walk if it is a trigger token
         // (e.g. `<tool_call>`).  An empty trigger registry never starts a walk.
@@ -1128,7 +1169,26 @@ impl Scheduler {
                             // skipped by the commit loop below, including the EOS-seal,
                             // so neither is written to the sequence; the steering's
                             // injected closing tag / continuation prefills in its place.
-                            Healed::Drop => dropped[i] = true,
+                            // On a replayed turn the refusal is the steering's
+                            // own close, which the recording holds — once. See
+                            // `Replay::refuse`.
+                            Healed::Drop => {
+                                dropped[i] = true;
+                                let at = state.generated_tokens.len();
+                                if state
+                                    .recorded_reply
+                                    .as_mut()
+                                    .is_some_and(|replay| replay.refuse(at))
+                                {
+                                    let _ = state.event_tx.send(TurnEvent::Error(
+                                        ConversationError::Channel(format!(
+                                            "the replay left its recording at reply id {at}: \
+                                             the stencil refused the recorded token twice"
+                                        )),
+                                    ));
+                                    state.finished = true;
+                                }
+                            }
                             Healed::No => {}
                         }
                         if driver.is_done() {

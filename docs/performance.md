@@ -14,12 +14,14 @@ and §4 — the limits — is as load-bearing as the tables.
 >
 > **What each machine has measured.**
 > - **RTX PRO 5000 Blackwell 72 GB** — the reference, and the source of every
->   depth measurement here. Two sequential sweeps: a depth+width sweep on
->   2026-09-03, and a width-only sweep on 2026-09-13 (build `2c5f065c` + working
->   tree, same machine and toolchain as §1). The depth tables (§3.2–§3.5, §3.6's
->   curves) are the first sweep; the width tables (§3.6 *Width*, §3.7) report the
->   **higher** of the two per cell, **†** marking a 2026-09-13 cell. Best-of-two
->   sits above either run by up to the 1–4% noise floor (§5).
+>   depth measurement here. Three sequential sweeps: a depth+width sweep on
+>   2026-09-03, a width-only sweep on 2026-09-13 (build `2c5f065c` + working
+>   tree, same machine and toolchain as §1), and a width-only sweep run twice on
+>   2026-09-15 (build `23623c6b`, the decode-slot refresh regression fixed — §4).
+>   The depth tables (§3.2–§3.5, §3.6's curves) are the first sweep; the width
+>   tables (§3.6 *Width*, §3.7) report the **highest** measurement per cell,
+>   **†** marking a 2026-09-13 cell and **◆** a 2026-09-15 cell. A best-of-several
+>   sits above any one run by up to the 1–4% noise floor (§5).
 > - **RTX 3090 24 GB** — a width/throughput gate sweep on 2026-09-14 (§3.8),
 >   the same `test_parallel_batched_forwarding*` gates as §3.7, run one model at
 >   a time. Ten of the fleet's models plus the two AntiLoop+StyleTune hybrids;
@@ -450,24 +452,26 @@ sits behind ~128K tokens of unrelated padding, and the rename still validates.
 
 #### Width
 
-The flagship's ladder, aggregate across the batch — best of the two sweeps,
-† = 2026-09-13:
+The flagship's ladder, aggregate across the batch — best of the three sweeps,
+† = 2026-09-13, ◆ = 2026-09-15:
 
 | Mode | Ctx | Prefill t/s | Decode t/s | Compress |
 |---|---:|---:|---:|---:|
 | BF16 | 1 (cold) | 589.7 † | 68.1 | — |
-| BF16 | 1 (warm) | 1,685.6 † | 86.9 | — |
-| BF16 | 4 | 1,878.7 † | 240.6 † | — |
+| BF16 | 1 (warm) | 1,705.7 ◆ | 86.9 | — |
+| BF16 | 4 | 1,878.7 † | 241.1 ◆ | — |
 | BF16 | 8 | 1,880.9 † | 393.1 † | — |
-| BF16 | 16 | 1,959.8 † | 421.5 † | — |
-| C0 | 2 | 1,968.1 † | 146.4 | 2.29× |
-| C5 | 2 | 2,002.4 † | 145.4 | 4.21× |
+| BF16 | 16 | 1,969.8 ◆ | 421.5 † | — |
+| C0 | 2 | 2,009.8 ◆ | 146.4 | 2.29× |
+| C5 | 2 | 2,018.1 ◆ | 145.4 | 4.21× |
 | C8 | 2 | 2,021.4 † | 139.5 | 5.43× |
-| C10 | 2 | 2,006.1 † | 135.4 † | 6.93× |
-| C10 | 8 | 2,003.4 † | 391.4 † | 6.89× |
+| C10 | 2 | 2,017.8 ◆ | 135.4 † | 6.93× |
+| C10 | 8 | 2,060.9 ◆ | 391.7 ◆ | 6.89× |
 
-All rows validate at 100% in both sweeps. The second sweep is the faster of the
-two on every prefill cell and on the widest decode cells — BF16 ×8 decode
+All rows validate at 100% in every sweep. The 2026-09-15 sweep sets six of the
+ten prefill cells — C10 ×8 reaches 2,060.9 — and matches the earlier decode
+cells within noise. The second sweep is the faster of the first two on every
+prefill cell and on the widest decode cells — BF16 ×8 decode
 310.6 → 393.1 and ×16 333.3 → 421.5, C10 ×8 295.9 → 391.4 (+26–32%) — while
 the single-context and ×2 decode cells stay with the first. Decode returns
 **4.5× single-session throughput at 8 contexts** (86.9 → 393.1) and gains only
@@ -482,39 +486,39 @@ ratios shown are the first sweep's; the second measured 6.75× and 6.73× — se
 
 BF16 at one context against each model's widest measured point. Prompts are
 ~700 tokens, so this axis is unaffected by context windows. Each cell is the
-better of the two sweeps at the same mode and width, † = 2026-09-13; a
-**‡** widest point was measured only in the second sweep, whose ladder runs
-wider for that model than the first's did, so that cell is a single
-measurement rather than a best-of-two.
+highest of the three sweeps at the same mode and width, † = 2026-09-13,
+◆ = 2026-09-15 (two runs of build `23623c6b`). The 2026-09-15 one-context
+prefill cells come from the gates' synchronised prompt timer, which the older
+builds measure identically (§4, *The decode-slot refresh prefill regression*).
 
 | Model | ctx=1 prefill / decode | widest measured | prefill / decode |
 |---|---|---|---|
-| Qwen2-0.5B | 31,482.4 † / 248.6 † | ×60 | 77,559.4 † / 4,839.8 † |
-| Qwen3.5-0.8B | 24,401.6 † / 168.8 | ×256 (C8) ‡ | 35,639.7 / 3,353.4 |
-| Llama-3.2-3B | 12,568.0 † / 129.9 † (C0) | ×10 (C8) | 13,546.5 † / 740.9 † |
-| Qwen3-30B-A3B | 8,165.7 / 80.0 | ×20 (Q8_0) ‡ | 9,759.3 / 580.3 |
-| Qwen3.5-35B-A3B | 7,231.9 † / 109.4 | ×64 (C10) | 7,133.2 † / 1,183.3 † |
-| Qwen3.6-35B-A3B | 7,191.7 † / 107.8 | ×64 (C10) | 7,140.5 † / 1,150.7 † |
-| Qwen3-8B | 5,876.5 † / 67.0 † | ×10 (C8) | 6,006.0 / 460.1 |
-| Llama-2-7B | 5,706.1 † / 94.3 † | ×48 | 3,679.8 † / 836.2 † |
-| Qwen3.5-9B | 5,523.9 † / 121.0 | ×20 (C8) | 5,837.5 † / 877.5 † |
-| Qwen3.8-27B | 1,725.0 † / 57.1 | ×40 (C10) | 1,717.6 † / 458.1 |
-| Qwen3.8-Flash-Next | 1,685.6 † / 86.9 (warm) | ×16 | 1,959.8 † / 421.5 † |
-| DeepSeek-V4-Flash | 333.3 / 15.0 (warm) | ×16 | 1,095.9 / 73.5 |
+| Qwen2-0.5B | 31,605.8 ◆ / 256.7 ◆ | ×60 | 79,653.3 ◆ / 4,924.7 ◆ |
+| Qwen3.5-0.8B | 24,626.5 ◆ / 168.8 | ×256 (C8) | 36,290.6 ◆ / 3,353.4 |
+| Llama-3.2-3B | 13,166.0 ◆ / 130.5 ◆ (C0) | ×10 (C8) | 13,977.4 ◆ / 745.1 ◆ |
+| Qwen3-30B-A3B | 8,307.4 ◆ / 80.7 ◆ | ×20 (Q8_0) | 9,950.6 ◆ / 595.7 ◆ |
+| Qwen3.5-35B-A3B | 7,231.9 † / 109.4 | ×64 (C10) | 7,153.5 ◆ / 1,187.7 ◆ |
+| Qwen3.6-35B-A3B | 7,310.2 ◆ / 107.8 | ×64 (C10) | 7,219.2 ◆ / 1,201.6 ◆ |
+| Qwen3-8B | 6,008.5 ◆ / 67.3 ◆ | ×10 (C8) | 6,065.2 ◆ / 460.1 |
+| Llama-2-7B | 6,063.7 ◆ / 97.2 ◆ | ×48 | 3,679.8 † / 917.3 ◆ |
+| Qwen3.5-9B | 5,534.1 ◆ / 121.0 | ×20 (C8) | 5,837.5 † / 877.5 † |
+| Qwen3.8-27B | 1,729.8 ◆ / 61.0 ◆ | ×40 (C10) | 1,718.7 ◆ / 458.1 |
+| Qwen3.8-Flash-Next | 1,705.7 ◆ / 86.9 (warm) | ×16 | 1,969.8 ◆ / 421.5 † |
+| DeepSeek-V4-Flash | 333.3 / 15.1 ◆ (warm) | ×16 | 1,120.6 ◆ / 73.5 |
 
 Two shapes appear here. **Prefill saturates early** on every model — most are
 within 20% of their ×1 rate by ×4, and the 35Bs are flat from ×1 to ×64 — while
 **decode scales nearly linearly with width** until it too flattens. The 35B MoEs
-reach 1,151–1,183 t/s aggregate decode at 64 concurrent sessions against
+reach 1,188–1,202 t/s aggregate decode at 64 concurrent sessions against
 ~108–109 at one, an 11× return on concurrency.
 
 DeepSeek-V4-Flash is the exception whose prefill is still climbing at ×16
-(333 → 1,096 t/s), having not yet reached the saturation the others hit by ×4.
+(333 → 1,121 t/s), having not yet reached the saturation the others hit by ×4.
 
 The ladders are not run at a common set of widths, so this table gives each
 model's own widest point rather than a shared column — and two ladders run
-wider in the second sweep than in the first (Qwen3.5-0.8B to ×256, Qwen3-30B-A3B
-to ×20), so a model's widest point can come from either sweep.
+wider from the second sweep on (Qwen3.5-0.8B to ×256, Qwen3-30B-A3B to ×20), so
+those widest points are the best of the last two sweeps rather than all three.
 
 ### 3.8 RTX 3090 24 GB — the width gate sweep
 
@@ -527,6 +531,12 @@ so it measures aggregate throughput and the compression ladder, **not** depth �
 the `long_context_*` and `profile_*` depth gates were not run here. Numbers are
 single measurements (no best-of-two), so the 1–4 % noise floor (§5) applies to
 each cell alone.
+
+**Measured on a build that carries the decode-slot refresh regression.** The
+sweep ran after `d45e69ce`, whose refresh cost the 72 GB card 58 % of Qwen2-0.5B's
+widest prefill (§4, *The decode-slot refresh prefill regression*), so this
+table's prefill column likely carries a share of that cost. Decode is
+unaffected. The 3090 has not been re-swept on the fixed build.
 
 **Ten of the fleet's models, plus the two AntiLoop+StyleTune hybrids** — the
 production 3.6-35B npcd actually serves. The 250B Flash-Next and the 284B
@@ -821,6 +831,66 @@ the `auto`/Precision row above.
 
 ## 4. Limits and open items
 
+### The decode-slot refresh prefill regression (fixed)
+
+`4a740f4a` (the same change reached `origin/main` separately as `d45e69ce`)
+made every commit outside the decode kernel —
+a prefill layer, a speculative verify block — bring the cached decode slot
+buffer up to date, the fix for the MTP draft head's NaN. On the 72 GB card it
+took Qwen2-0.5B's gate from 80,170.5 to 33,360.8 t/s at ×60 (−58 %) and from
+32,220.1 to 17,699.5 at one context (−45 %), both measured 2026-09-15 against
+`81e487b5` on the same card; decode never moved. Two causes were stacked:
+
+1. **A fence per chunk.** The refresh waited for the previous upload — queued
+   behind the layer's kernels — before rewriting the pinned buffer that upload
+   read, so the host drained the GPU once per chunk per layer. Uploads now pack
+   into two event-guarded staging buffers and the host copy is memory no copy
+   reads (`234e037b`).
+2. **An upload between layers.** Wherever the refresh ran — in the commit, or
+   in the post-prefill prime right after it — it put one host→device copy
+   between one layer's kernels and the next: about 90 µs of GPU time per layer
+   with every host span flat (a `profile` build: 88.9 ms against 66.3 ms over
+   ten one-context prefills of 24 layers, with and without it). A commit now
+   only marks the buffer; the sync every reader goes through re-serialises the
+   writer region first, and the prime builds only a buffer that is missing
+   (`7dce6231`, `03794cac`).
+
+A third loss, 12–22 % on the one- and two-context rows of most multi-config
+gates, was the **harness**: each config's prompt timer started without
+synchronising, and the work that config had just queued — its session setup,
+which re-materialises the norm weights for the config's dtype, and its
+system-prompt prefill — finished inside the timer; builds before `234e037b`,
+which fenced slot-state uploads on the host, had drained it first. The gates
+now synchronise before starting the timer (`23623c6b`), so a prompt row
+measures the prompt alone. That is what the earlier rows measured too:
+`81e487b5` gives the same rows with the synchronise as without it (Qwen3.5-9B's
+one-context rows 5,472–5,527 t/s against 5,492–5,530; Qwen3-8B's C0–C7 ×1
+5,703–5,812 against 5,792–5,818), so every row in §3 compares directly.
+
+**Recovered, fleet-wide.** Twelve gates, best of two per build, both builds on
+the synchronised harness (`81e487b5` against `23623c6b`, 2026-09-15, this
+card). No prefill row of any model is more than 4 % below the reference, and
+every run validated:
+
+| Model | best prefill, ref / fix (t/s) | worst Δ prefill row | median Δ prefill |
+|---|---:|---:|---:|
+| Qwen2-0.5B | 79,901.4 / 80,430.5 | −2.7 % | −0.3 % |
+| Qwen3.5-0.8B | 36,449.5 / 37,145.6 | +0.5 % | +1.1 % |
+| Llama-3.2-3B | 14,094.6 / 14,612.6 | +1.0 % | +4.4 % |
+| Llama-2-7B | 6,191.8 / 6,810.2 | +0.3 % | +5.3 % |
+| Qwen3-8B | 6,139.8 / 6,241.6 | +1.5 % | +2.4 % |
+| Qwen3.5-9B | 5,954.4 / 5,961.0 | −0.0 % | +0.1 % |
+| Qwen3.8-27B | 1,758.5 / 1,761.6 | −0.0 % | +0.1 % |
+| Qwen3-30B-A3B | 10,036.2 / 10,324.3 | +2.3 % | +3.6 % |
+| Qwen3.5-35B-A3B | 7,304.1 / 7,315.0 | −0.2 % | +0.1 % |
+| Qwen3.6-35B-A3B | 7,359.0 / 7,373.4 | −0.1 % | +0.2 % |
+| Qwen3.8-Flash-Next | 1,968.2 / 2,060.9 | −1.9 % | +1.9 % |
+| DeepSeek-V4-Flash | 1,083.9 / 1,120.6 | +0.9 % | +1.6 % |
+
+Decode is within noise everywhere but one row: Qwen3.6-35B-A3B C10×16, 769.5 →
+690.9 t/s (−10.2 %), both runs of each build agreeing — open item #11 in
+`docs/open_items.md`.
+
 ### Qwen2-0.5B reports 0% quantized
 
 Every C-mode row for Qwen2-0.5B-Instruct comes back `%Quantized = 0.0%` with no
@@ -1014,9 +1084,13 @@ quantized_pct, compress, peak_tokens`, scraped from the run logs:
 | `performance_rtx_pro_5000_72gb_rows.tsv` | 72 GB · 2026-09-03 — depth and width | 146 |
 | `performance_rtx_pro_5000_72gb_rows_2026-09-13.tsv` | 72 GB · 2026-09-13 — width only, build `2c5f065c` + working tree | 171 |
 | `performance_rtx_3090_24gb_rows.tsv` | RTX 3090 · 2026-09-14 — width gate sweep | 276 |
+| `performance_rtx_pro_5000_72gb_rows_2026-09-15_run1.tsv` | 72 GB · 2026-09-15 — width only, build `23623c6b`, run 1 | 171 |
+| `performance_rtx_pro_5000_72gb_rows_2026-09-15_run2.tsv` | 72 GB · 2026-09-15 — width only, build `23623c6b`, run 2 | 171 |
 
-A † cell in §3.6 *Width* or §3.7 is the 72 GB second file's value; every other
-72 GB width cell is the first's. The 3090 TSV holds the width-sweep axis only —
+A † cell in §3.6 *Width* or §3.7 is the 72 GB 2026-09-13 file's value, a ◆ cell
+the higher of the two 2026-09-15 files' values; every other 72 GB width cell is
+the first file's. The 2026-09-15 files list gates in sweep order, which puts
+Llama-2-7B before Qwen3-8B and Qwen3.8-27B before Qwen3-30B-A3B. The 3090 TSV holds the width-sweep axis only —
 its `depth` column is blank and `prompt_tokens` is `~700`, the gate's fixed
 prompt. Reproduce any row with the command in its test's `#[ignore]` attribute.
 

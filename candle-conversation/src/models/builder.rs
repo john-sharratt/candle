@@ -128,6 +128,9 @@ pub struct ModelBuilder {
     /// handle to one `.substrate/` silently drops records; see
     /// [`SharedSubstrate`].
     substrate: Option<SharedSubstrate>,
+    /// Open the workspace's substrate read-only — forwarded to
+    /// [`EngineConfig::read_only_substrate`]. `false` by default.
+    read_only_substrate: bool,
     /// Per-layer corrupt-turn policy (from the projection schema), forwarded to
     /// [`EngineConfig::layer_corrupt_turn`] so the startup reload drops the whole
     /// conversation (ingest layers) or just the turn (dialogue) per layer. Empty
@@ -153,6 +156,10 @@ pub struct ModelBuilder {
     /// The checkpoint's own `general.name`, once a build has read its header —
     /// what this build is shown as. See [`Self::display_name`].
     gguf_name: Option<String>,
+    /// QSA selection budget, in positions, for an architecture whose attention
+    /// selects. `None` runs the checkpoint's own. See
+    /// [`ModelBuilder::qsa_selection_budget`].
+    qsa_selection_budget: Option<usize>,
 }
 
 impl ModelBuilder {
@@ -179,11 +186,13 @@ impl ModelBuilder {
             max_hot_turns: 0,
             workspace_path: None,
             substrate: None,
+            read_only_substrate: false,
             layer_corrupt_turn: HashMap::new(),
             expert_pack_dir: None,
             prefill_pass_tokens: None,
             loras: Vec::new(),
             gguf_name: None,
+            qsa_selection_budget: None,
             spec,
         }
     }
@@ -308,6 +317,33 @@ impl ModelBuilder {
     /// second one loses records rather than failing. See [`SharedSubstrate`].
     pub fn substrate(mut self, shared: SharedSubstrate) -> Self {
         self.substrate = Some(shared);
+        self
+    }
+
+    /// Open the workspace's substrate **read-only**.
+    ///
+    /// For a tool that inspects a workspace a running daemon owns: the engine
+    /// resumes, prefills and decodes entirely in RAM and writes nothing under
+    /// `.substrate/` from start through shutdown. The store must already exist.
+    ///
+    /// Has no effect once [`Self::substrate`] has handed over an open one —
+    /// that handle's own mode rules. See [`EngineConfig::read_only_substrate`].
+    pub fn read_only_substrate(mut self, read_only: bool) -> Self {
+        self.read_only_substrate = read_only;
+        self
+    }
+
+    /// Run the QSA selection with `positions` in place of the checkpoint's own
+    /// budget; `None` keeps the checkpoint's.
+    ///
+    /// A budget of at least the checkpoint's context makes the selection the
+    /// identity — the same engine and the same code path, reading every cell —
+    /// which is the dense control a retrieval failure is judged against. Only
+    /// an architecture whose attention selects takes one: [`Self::load_model`]
+    /// refuses it for any other rather than accept a setting that changes
+    /// nothing, and refuses a budget its selection kernel cannot run.
+    pub fn qsa_selection_budget(mut self, positions: Option<usize>) -> Self {
+        self.qsa_selection_budget = positions;
         self
     }
 
@@ -787,6 +823,7 @@ impl ModelBuilder {
         ret.health = self.health_config.clone();
         ret.workspace_path = self.workspace_path.clone();
         ret.substrate = self.substrate.clone();
+        ret.read_only_substrate = self.read_only_substrate;
         ret.model_spec = Some(self.model_spec_blob());
         // The engine uses the model's dialect to pre-tokenise the
         // inter-turn boundary markers once at scheduler construction.
@@ -835,6 +872,17 @@ impl ModelBuilder {
                 self.spec.arch,
                 self.spec.tensor_overrides.len()
             )));
+        }
+        // **Only a selecting architecture takes a selection budget.** Any other
+        // would load, ignore it, and report a dense control that was never run.
+        if let Some(positions) = self.qsa_selection_budget {
+            if !matches!(self.spec.arch, ModelArch::Qwen4Exp) {
+                return Err(ConversationError::Other(format!(
+                    "{:?} has no QSA selection, so a selection budget of {positions} \
+                     position(s) would change nothing",
+                    self.spec.arch
+                )));
+            }
         }
         match self.spec.arch {
             ModelArch::Qwen3 => {
@@ -935,9 +983,13 @@ impl ModelBuilder {
                 // expert pack is sized from a live span measurement at load.
                 let gpu = Qwen4ExpGpu::load(model_path, device, Int8Mode::auto(device))
                     .map_err(ConversationError::Model)?;
-                Ok(Box::new(
-                    Qwen4ExpBatched::new(gpu).map_err(ConversationError::Model)?,
-                ))
+                let mut model = Qwen4ExpBatched::new(gpu).map_err(ConversationError::Model)?;
+                if let Some(positions) = self.qsa_selection_budget {
+                    model
+                        .set_selection_budget(positions)
+                        .map_err(ConversationError::Model)?;
+                }
+                Ok(Box::new(model))
             }
             ModelArch::Qwen35Hybrid => {
                 use candle::quantized::Int8Mode;
@@ -1980,5 +2032,33 @@ mod header_read_tests {
         assert_eq!(cached_headers_for(&p), 1);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod selection_budget_tests {
+    use std::path::Path;
+
+    use candle::Device;
+
+    use crate::models::Model;
+
+    /// **A selection budget is refused where nothing selects.** Accepted, it
+    /// would load a model that ignores it and report a dense control that was
+    /// never run. The refusal comes before the checkpoint is opened, so the path
+    /// is never read.
+    #[test]
+    fn a_selection_budget_is_refused_for_a_model_without_qsa() {
+        let err = Model::Qwen35_0_8B_Q8
+            .builder()
+            .qsa_selection_budget(Some(1 << 20))
+            .load_model(Path::new("never-read.gguf"), &Device::Cpu, None)
+            .err()
+            .expect("a model whose attention does not select must refuse a budget");
+        assert_eq!(
+            err.to_string(),
+            "Qwen35Dense has no QSA selection, so a selection budget of 1048576 position(s) \
+             would change nothing"
+        );
     }
 }

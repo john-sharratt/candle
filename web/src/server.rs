@@ -196,6 +196,10 @@ impl Builder {
             .fallback(handle)
             .with_state(app)
             .merge(auth_routes)
+            // Outermost, so it sees every answer — files, proxied and local
+            // APIs, sign-in, error pages — and compresses whatever arrived
+            // uncompressed. See `compress`.
+            .layer(axum::middleware::from_fn(crate::compress::layer))
     }
 
     pub async fn serve(self) -> anyhow::Result<()> {

@@ -22,6 +22,46 @@ fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
     diff <= tol || diff <= tol * a.abs().max(b.abs())
 }
 
+/// **Casting an empty tensor launches nothing.** A zero-element cast used to
+/// launch `cast_*<<<0, 256>>>`: a zero grid is `cudaErrorInvalidConfiguration`,
+/// which nothing on that path reads, so it stayed pending on the thread until
+/// the next caller that checks `cudaGetLastError` took it as its own. A decode
+/// step builds its rope tables for both halves of a wave and casts both to the
+/// activation dtype, so every single-phase wave of a 16-bit model left one —
+/// and the provenance scan reported it as its own failure on every probe.
+#[cfg(feature = "cuda")]
+#[test]
+fn an_empty_cast_leaves_no_launch_error_pending() -> Result<()> {
+    use candle_kernels::provenance::bdp_take_pending_error;
+
+    let device = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    // Whatever an earlier test on this thread left behind is not this test's.
+    let _ = unsafe { bdp_take_pending_error() };
+
+    let empty = Tensor::from_vec(Vec::<f32>::new(), (0, 128), &device)?;
+    for dtype in [DType::BF16, DType::F16] {
+        let cast = empty.to_dtype(dtype)?;
+        assert_eq!(cast.dims(), &[0, 128]);
+        assert_eq!(cast.dtype(), dtype);
+        // The same holds for the elementwise maps an empty operand reaches next.
+        assert_eq!(cast.exp()?.dims(), &[0, 128]);
+        assert_eq!((&cast + &cast)?.dims(), &[0, 128]);
+    }
+    device.synchronize()?;
+    assert_eq!(
+        unsafe { bdp_take_pending_error() },
+        0,
+        "an empty cast left a CUDA launch error pending on the thread"
+    );
+    Ok(())
+}
+
 // =============================================================================
 // F32 source casts
 // =============================================================================

@@ -10,6 +10,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use super::record::{crc32, decode_record, verify_record_crc, Record, ALIGN};
 use super::{PersistenceError, Result};
@@ -145,7 +146,11 @@ pub struct LogFile {
     /// host scratch. The buffered `file` handle still owns every write
     /// and every non-aligned small read (superblock, single-record
     /// lookups, etc.).
-    direct: DirectFile,
+    ///
+    /// Shared (`Arc`) so a cold-load can hold the handle set for its whole
+    /// duration without borrowing this `LogFile` — see
+    /// [`LogFile::shared_direct`].
+    direct: Arc<DirectFile>,
     superblock: Superblock,
     /// Durable logical end — offset where the next record will land.
     write_offset: u64,
@@ -174,7 +179,7 @@ impl LogFile {
             format_version: FILE_FORMAT_VERSION,
             last_index: (0, 0),
         };
-        let direct = DirectFile::open(path)?;
+        let direct = Arc::new(DirectFile::open(path)?);
         let mut log = LogFile {
             file,
             direct,
@@ -204,7 +209,7 @@ impl LogFile {
     pub fn open(path: &Path) -> Result<LogFile> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let allocated = file.metadata()?.len();
-        let direct = DirectFile::open(path)?;
+        let direct = Arc::new(DirectFile::open(path)?);
         let mut log = LogFile {
             file,
             direct,
@@ -247,7 +252,7 @@ impl LogFile {
     pub fn open_read_only(path: &Path) -> Result<LogFile> {
         let file = OpenOptions::new().read(true).open(path)?;
         let allocated = file.metadata()?.len();
-        let direct = DirectFile::open(path)?;
+        let direct = Arc::new(DirectFile::open(path)?);
         let mut log = LogFile {
             file,
             direct,
@@ -276,6 +281,14 @@ impl LogFile {
     /// [`DirectFile::read_stripes_concurrent`].
     pub fn direct_file(&self) -> &DirectFile {
         &self.direct
+    }
+
+    /// A shared owner of this log's cache-bypassing handle set. The handles
+    /// stay open for as long as any owner holds them, independently of this
+    /// `LogFile` — which is what lets a cold-load keep reading a segment the
+    /// read pool has since let go of.
+    pub fn shared_direct(&self) -> Arc<DirectFile> {
+        Arc::clone(&self.direct)
     }
 
     /// The decoded superblock.
@@ -396,11 +409,15 @@ impl LogFile {
 
     /// Flush the group-commit buffer to the file as one sequential write.
     /// Does not `fsync` — see [`LogFile::commit`].
+    ///
+    /// Nothing staged is a no-op on any handle, read-only included: a
+    /// read-only handle can never have staged anything ([`LogFile::stage`]
+    /// asserts), so only a real write reaches the read-only assert.
     pub fn flush(&mut self) -> Result<()> {
-        assert!(!self.read_only, "flush on a read-only LogFile");
         if self.pending.is_empty() {
             return Ok(());
         }
+        assert!(!self.read_only, "flush on a read-only LogFile");
         let end = self.write_offset + self.pending.len() as u64;
         self.grow_to(end)?;
         self.file.seek(SeekFrom::Start(self.write_offset))?;
@@ -411,8 +428,15 @@ impl LogFile {
     }
 
     /// Flush and `fsync` — the group-commit durability boundary.
+    ///
+    /// A read-only handle has nothing to make durable and no write access to
+    /// `fsync` with (Windows refuses `FlushFileBuffers` on a read-only
+    /// handle), so its commit is the empty flush alone.
     pub fn commit(&mut self) -> Result<()> {
         self.flush()?;
+        if self.read_only {
+            return Ok(());
+        }
         self.file.sync_data()?;
         Ok(())
     }
@@ -942,6 +966,30 @@ mod tests {
             f.write_all(&[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
         }
         assert!(LogFile::open_read_only(&path).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An empty flush or commit on a read-only handle is the no-op it is on a
+    /// writable one — it used to assert before looking at the staging buffer,
+    /// so a commit with nothing to commit panicked — and it leaves the file
+    /// byte-for-byte unchanged.
+    #[test]
+    fn empty_flush_and_commit_on_a_read_only_log_are_no_ops() {
+        let path = tmp_path("ro_empty_commit");
+        let r = rec(4, 0, b"unchanged");
+        {
+            let mut log = LogFile::create(&path).unwrap();
+            log.stage(&r);
+            log.commit().unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        {
+            let mut log = LogFile::open_read_only(&path).unwrap();
+            log.flush().unwrap();
+            log.commit().unwrap();
+            assert_eq!(log.pending_len(), 0);
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_file(&path).ok();
     }
 

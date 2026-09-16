@@ -1,5 +1,7 @@
 //! `GET /v1/conversations` — sidebar population.
-//! `GET /v1/conversations/{id}` — recovered turn history.
+//! `GET /v1/conversations/{id}` — recovered turn history, with its projection
+//!   points light; the projection panel fetches one point in full from
+//!   `GET /v1/conversations/{id}/projections/{turn}/{event}` (see `projections`).
 //! `POST /v1/conversations/{id}/archive` — archive (one-way): set archived = true
 //!   and mark the timeline for TextOnly distillation. There is no unarchive —
 //!   distillation drops the KV, so an archived conversation can't be resumed.
@@ -10,16 +12,23 @@
 //! filters archived entries out unless `?include_archived=true` is set on the
 //! list call — that's the "show archived" checkbox at the bottom of the sidebar.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
+    response::Response,
     Json,
 };
+use candle_conversation::turn_layout::ThinkingLength;
+use candle_conversation::Role as TurnRole;
 use serde::{Deserialize, Serialize};
 
-use crate::session::{ConvEntry, ZendSession};
+use super::compressed;
+use crate::chatml::split_turn;
+use crate::projection_event::ProjectionSpanOut;
+use crate::session::{ConvEntry, UploadInfo, UploadStats, ZendSession};
 use crate::types::Role;
 
 #[derive(Debug, Default, Deserialize)]
@@ -73,7 +82,8 @@ pub async fn delete(
 pub async fn get(
     State(session): State<Arc<ZendSession>>,
     Path(id): Path<String>,
-) -> Result<Json<HistoryBody>, StatusCode> {
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
     let history = session
         .conversation_history(&id)
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
@@ -84,8 +94,7 @@ pub async fn get(
     // resume. Also returned as a flat `uploads` list for the files pane.
     let recovered_uploads = session.conversation_uploads(&id);
     let uploads: Vec<UploadOut> = recovered_uploads.iter().map(UploadOut::from).collect();
-    let mut groups: std::collections::BTreeMap<u32, Vec<UploadOut>> =
-        std::collections::BTreeMap::new();
+    let mut groups: BTreeMap<u32, Vec<UploadOut>> = BTreeMap::new();
     for u in &recovered_uploads {
         groups
             .entry(u.turn_index)
@@ -104,6 +113,8 @@ pub async fn get(
                 role: "upload",
                 content: String::new(),
                 no_think: false,
+                thinking: None,
+                tool_tokens: Vec::new(),
                 spans: Vec::new(),
                 files,
             });
@@ -117,16 +128,33 @@ pub async fn get(
     let mut messages: Vec<HistoryMessage> = Vec::new();
     emit_uploads(&mut messages, 0); // uploads before the first turn
     let mut turn_no: u32 = 0;
-    for (role, content, no_think) in history {
+    for entry in history {
         turn_no += 1;
-        for (r, c) in crate::chatml::split_turn(role, &content) {
+        // The reasoning length belongs to the first assistant bubble the turn
+        // splits into — the one its thinking block renders in.
+        let mut thinking = entry.thinking;
+        // Likewise the tool results' lengths, to the first user bubble.
+        let mut tool_tokens = entry.tool_tokens;
+        for (r, c) in split_turn(chat_role(entry.role), &entry.text) {
             // The turn's `no_think` belongs on the USER bubble only — a bundled
             // turn can split into both roles, so tag the assistant half `false`.
-            let user_no_think = no_think && r == Role::User;
+            let user_no_think = entry.no_think && r == Role::User;
+            let thinking = if r == Role::Assistant {
+                thinking.take()
+            } else {
+                None
+            };
+            let tool_tokens = if r == Role::User {
+                std::mem::take(&mut tool_tokens)
+            } else {
+                Vec::new()
+            };
             messages.push(HistoryMessage {
                 role: role_str(r),
                 content: c,
                 no_think: user_no_think,
+                thinking,
+                tool_tokens,
                 spans: Vec::new(),
                 files: Vec::new(),
             });
@@ -137,105 +165,47 @@ pub async fn get(
     // append at the end.
     emit_uploads(&mut messages, u32::MAX);
 
-    // Re-attach projection-event timelines banked this daemon session. Buckets
-    // correspond to the most recent decodes, so align them to the *trailing*
-    // assistant bubbles — that way conversations recovered from disk (no
-    // buckets) keep their older turns dot-free without shifting the mapping.
-    let buckets = session.conversation_projections(&id);
+    // Re-attach the recorded projection points, light. Records correspond to
+    // the most recent decodes, so align them to the *trailing* assistant
+    // bubbles — that way conversations recovered from disk (no records) keep
+    // their older turns dot-free without shifting the mapping. Each point keeps
+    // its `(turn, event)` address so the panel can fetch it in full.
+    let records = session.conversation_projections(&id);
     let assistant_idxs: Vec<usize> = messages
         .iter()
         .enumerate()
         .filter(|(_, m)| m.role == "assistant")
         .map(|(i, _)| i)
         .collect();
-    let take = buckets.len().min(assistant_idxs.len());
+    let take = records.len().min(assistant_idxs.len());
     for j in 0..take {
         let mi = assistant_idxs[assistant_idxs.len() - take + j];
-        messages[mi].spans = buckets[buckets.len() - take + j].clone();
+        let turn = records.len() - take + j;
+        messages[mi].spans = records[turn]
+            .iter()
+            .enumerate()
+            .map(|(event, point)| ProjectionSpanOut::of(point, turn, event))
+            .collect();
     }
 
-    // Glue + section content are workspace-wide (the dialect markers and the
-    // schema's authored section text) — returned here as first-class fields so
-    // the projection panel renders the framing and expands sections with no
-    // extra round-trip. Computed on demand; never persisted in the event.
-    let glue = session.glue_markers().map(Glue::from);
-    let section_content = session
-        .section_content(&id)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(name, content)| SectionContent { name, content })
-        .collect();
+    let title = session.conversation_label(&id);
+    Ok(compressed::json(
+        &HistoryBody {
+            id,
+            title,
+            messages,
+            uploads,
+        },
+        &headers,
+    ))
+}
 
-    // Bodies for EVERY projected turn — memory tiers AND the dialogue, including
-    // summary nodes — read from the substrate so the projection panel renders the
-    // materialized KV exactly as selected (summaries shown in place of the turns
-    // they replaced), not the raw message history. Deduped across spans. The live
-    // user message (`u32::MAX`) has no sealed body and is skipped.
-    let mut seen: std::collections::HashSet<(String, u64, u32)> = std::collections::HashSet::new();
-    let mut turn_content: Vec<TurnContent> = Vec::new();
-    for span_list in &buckets {
-        for ev in span_list {
-            for t in &ev.event.selection.turns {
-                if t.index == u32::MAX {
-                    continue;
-                }
-                // Resolve the body by the turn's STAMPED timeline identity
-                // (`SelectedTurn::timeline`), never by group: the shared
-                // substrate registers many conversations under one group, so a
-                // group→timeline lookup is non-deterministic — and the dedup /
-                // panel key MUST carry the timeline too, because one group's
-                // events routinely hold same-index turns from different file
-                // conversations. A turn with no stamped timeline (only the
-                // live user message) is skipped.
-                let Some(timeline) = t
-                    .timeline
-                    .and_then(candle_conversation::projection::TimelineId::from_raw)
-                else {
-                    continue;
-                };
-                if seen.insert((t.group.clone(), timeline.raw(), t.index)) {
-                    // The whole turn, continuous (what the panel renders). A
-                    // turn whose `Tokens` record was lost (async writer + hard
-                    // kill) decodes no full text but still carries its layout
-                    // text — emit the entry whenever ANY body source resolves,
-                    // and let the panel fall back from `text` to the halves.
-                    let text = session.resolve_turn_full_text(timeline, t.index);
-                    let (user, assistant) = session
-                        .resolve_turn_text(timeline, t.index)
-                        .unwrap_or_default();
-                    let layout = session.turn_layout(timeline, t.index);
-                    if text.is_some()
-                        || !user.is_empty()
-                        || !assistant.is_empty()
-                        || layout.is_some()
-                    {
-                        turn_content.push(TurnContent {
-                            group: t.group.clone(),
-                            timeline: timeline.raw(),
-                            index: t.index,
-                            text,
-                            user,
-                            assistant,
-                            layout,
-                        });
-                    }
-                }
-            }
-        }
+fn chat_role(role: TurnRole) -> Role {
+    match role {
+        TurnRole::User => Role::User,
+        TurnRole::Assistant => Role::Assistant,
+        TurnRole::System => Role::System,
     }
-
-    let target_layer = session.target_layer_name().unwrap_or_default();
-
-    Ok(Json(HistoryBody {
-        id,
-        messages,
-        glue,
-        section_content,
-        turn_content,
-        target_layer,
-        uploads,
-    }))
 }
 
 fn role_str(role: Role) -> &'static str {
@@ -255,94 +225,14 @@ pub struct ListBody {
 #[derive(Serialize)]
 pub struct HistoryBody {
     pub id: String,
+    /// The conversation's title, when something has labelled it — the same
+    /// label the sidebar lists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub messages: Vec<HistoryMessage>,
-    /// Dialect framing markers — the glue the assembler wraps around the prompt
-    /// and turns. `None` until the model is loaded.
-    pub glue: Option<Glue>,
-    /// Authored content for every schema section, keyed by name; the panel shows
-    /// a section's text when it is expanded.
-    pub section_content: Vec<SectionContent>,
-    /// Verbatim bodies of projected memory-tier turns (non-dialogue layers),
-    /// keyed by `(group, timeline, index)`; the panel expands a turn to show
-    /// its text.
-    pub turn_content: Vec<TurnContent>,
-    /// The target layer's name (e.g. `dialogue`) — the panel prefixes the
-    /// conversation messages with it.
-    pub target_layer: String,
     /// Every file uploaded to this conversation (recovered from the
     /// substrate), newest-last — hydrates the files pane on resume.
     pub uploads: Vec<UploadOut>,
-}
-
-/// One projected turn's body, read from the substrate on demand. `text` is the
-/// ENTIRE turn as one continuous string — the full sealed token range decoded
-/// verbatim (user content, the baked intra-turn boundary, and assistant content)
-/// — which the panel renders as a single card; the turn is stored continuously,
-/// so this is the truth, not two re-glued halves. `text` is absent when the
-/// turn's `Tokens` record was lost (async writer + hard kill) — the panel then
-/// renders the layout-derived `user`/`assistant` halves instead.
-#[derive(Serialize)]
-pub struct TurnContent {
-    pub group: String,
-    /// The turn's resolved timeline identity — part of the panel key, because
-    /// one group holds many conversations and indices repeat across them.
-    pub timeline: u64,
-    pub index: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    pub user: String,
-    pub assistant: String,
-    /// The turn's segment-vector layout (real/ethereal glue, user, thinking,
-    /// assistant) — the complete K/V description, surfaced so the panel renders
-    /// the exact segments instead of re-splitting the text on markers.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub layout: Option<candle_conversation::turn_layout::TurnLayout>,
-}
-
-/// The dialect framing markers the assembler wraps around the prompt and turns.
-///
-/// These are the role markers the backend frames turns with, plus BOTH halves of
-/// thinking suppression — `no_think`, the soft-switch emitted as live glue right
-/// after `user_start`, and `no_think_block`, the already-closed
-/// `<think></think>` prefilled straight after `assistant_start`. A dialect uses
-/// exactly one of them, so on any given model one of the two is empty.
-///
-/// The block half used to be omitted here on the reasoning that it was "never
-/// glue — a suppressed turn decodes its own empty block into the body". That
-/// stopped being true when suppression became structural: the block is prefilled
-/// into the grid, never decoded, so a panel without it rendered less than the
-/// turn actually holds on precisely the family that relies on it.
-#[derive(Serialize)]
-pub struct Glue {
-    pub system_start: String,
-    pub system_end: String,
-    pub user_start: String,
-    pub user_end: String,
-    pub assistant_start: String,
-    pub assistant_end: String,
-    pub no_think: String,
-    pub no_think_block: String,
-}
-
-impl From<candle_conversation::GlueMarkers> for Glue {
-    fn from(m: candle_conversation::GlueMarkers) -> Self {
-        Glue {
-            system_start: m.system_start,
-            system_end: m.system_end,
-            user_start: m.user_start,
-            user_end: m.user_end,
-            assistant_start: m.assistant_start,
-            assistant_end: m.assistant_end,
-            no_think: m.no_think,
-            no_think_block: m.no_think_block,
-        }
-    }
-}
-
-#[derive(Serialize)]
-pub struct SectionContent {
-    pub name: String,
-    pub content: String,
 }
 
 #[derive(Serialize)]
@@ -356,10 +246,21 @@ pub struct HistoryMessage {
     /// assembler now injects into the real model input.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_think: bool,
-    /// Projection-event timeline for this bubble (assistant turns only).
-    /// Omitted from the wire when empty.
+    /// On an assistant bubble whose turn reasoned: how long the reasoning was,
+    /// in tokens — exact from the turn's record, or estimated (`exact: false`)
+    /// when its K/V was dropped. The thinking block shows it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingLength>,
+    /// On a user bubble that carries tool results: each result's length in
+    /// tokens as it sits in the context, one per `<tool_response>` block in
+    /// order. The expanded tool card's output header shows it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub spans: Vec<crate::projection_event::ProjectionEventOut>,
+    pub tool_tokens: Vec<u32>,
+    /// Projection points for this bubble (assistant turns only), light — the
+    /// timeline's fields and each point's address. Omitted from the wire when
+    /// empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<ProjectionSpanOut>,
     /// Uploaded files — set only on `role: "upload"` marker messages, which
     /// the GUI renders as an inline row of clickable file tiles. Omitted
     /// (empty) on ordinary user/assistant bubbles.
@@ -381,11 +282,11 @@ pub struct UploadOut {
     /// together). Absent on older events or model-less uploads; drives the
     /// inline stat line and the file viewer's upload-time note.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stats: Option<crate::session::UploadStats>,
+    pub stats: Option<UploadStats>,
 }
 
-impl From<&crate::session::UploadInfo> for UploadOut {
-    fn from(u: &crate::session::UploadInfo) -> Self {
+impl From<&UploadInfo> for UploadOut {
+    fn from(u: &UploadInfo) -> Self {
         UploadOut {
             id: u.id,
             name: u.name.clone(),

@@ -1051,7 +1051,10 @@ impl KvCache {
     /// Prime the persistent decode slot-state buffers after prefill.
     ///
     /// This materializes the per-sequence GPU slot headers ahead of the first
-    /// decode token so decode can immediately reuse them on the hot path.
+    /// decode token so decode can immediately reuse them on the hot path. Only
+    /// a missing buffer is built: one that exists is left to the decode sync,
+    /// which re-serialises its writer region if the prefill's commit marked it
+    /// (`ChunkedKvBacking::prime_decode_gpu_chunks`).
     pub fn prime_chunked_decode_slots_batch(caches: &mut [&mut KvCache]) -> Result<()> {
         if caches.is_empty() {
             return Ok(());
@@ -1077,9 +1080,7 @@ impl KvCache {
         // full and the next decode token needs a new chunk that isn't allocated yet.
         // ensure_for_batch_entries(entries, 1) allocates that chunk if needed.
         backing.ensure_for_batch_entries(&entries, 1)?;
-        let arena_info = backing.resolve_arena_info()?;
-        let _ = backing.sync_decode_gpu_chunks(&entries, &arena_info)?;
-        Ok(())
+        backing.prime_decode_gpu_chunks(&entries)
     }
 
     /// Finalize sequences after generation completes.
@@ -1207,8 +1208,8 @@ impl KvCache {
     }
 
     /// Commit `add` tokens written at `offset` by a path that is NOT the decode
-    /// kernel — a prefill, a speculative verify block — and bring the cached
-    /// decode slot buffer up to date with them.
+    /// kernel — a prefill, a speculative verify block — and mark the cached
+    /// decode slot buffer for the next sync to bring up to date.
     ///
     /// **Every such commit must come through here.** The decode kernel keeps
     /// its slot buffer current itself: it commits each token's length on the
@@ -1221,15 +1222,67 @@ impl KvCache {
     /// it reads as whatever it last held, which since slots are recycled is
     /// another sequence's KV, and under `tensor-assert` the claim poison.
     ///
-    /// The buffer's writer region — every chunk from the writer boundary to
-    /// the writer, each of which a write that spilled across a chunk boundary
-    /// may have filled — is re-serialised in place; see
-    /// `ChunkedKvBacking::refresh_decode_writer_slice`. A sequence with no
-    /// cached buffer has nothing to resync.
+    /// The buffer is marked, not rewritten: the next slot-state sync — which
+    /// every reader of the buffer goes through — re-serialises its writer
+    /// region from the host state before handing it out, so the commit itself
+    /// costs the stream nothing. See `SequenceState::mark_decode_writer_stale`.
+    /// A sequence with no cached buffer has nothing to mark; its next sync
+    /// rebuilds it.
     pub fn commit_written_tokens(&mut self, offset: usize, add: usize) -> Result<()> {
         self.set_current_seq_len(offset + add)?;
         if let CacheStorage::Chunked(c) = &self.k.storage {
-            c.backing.refresh_decode_writer_slice(&[(c.batch_idx, 0)])?;
+            c.backing.mark_decode_writer_stale(&[(c.batch_idx, 0)])?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::commit_written_tokens`] for every cache of one batched write:
+    /// the caches of one layer, over one shared backing, as the batched prefill
+    /// holds them. Each cache's `adds[i]` tokens at `offsets[i]` are committed,
+    /// then the backing's decode slot buffers are marked in a single call —
+    /// one state lock for the layer rather than one per sequence.
+    pub fn commit_written_tokens_batch(
+        caches: &mut [&mut KvCache],
+        offsets: &[usize],
+        adds: &[usize],
+    ) -> Result<()> {
+        if caches.len() != offsets.len() || caches.len() != adds.len() {
+            candle::bail!(
+                "commit count mismatch: {} caches, {} offsets, {} lengths",
+                caches.len(),
+                offsets.len(),
+                adds.len()
+            )
+        }
+        let Some(first) = caches.first() else {
+            return Ok(());
+        };
+        let backing = match &first.k.storage {
+            CacheStorage::Chunked(c) => Some(c.backing.clone()),
+            CacheStorage::Contiguous { .. } => None,
+        };
+        let mut entries: Vec<(usize, usize)> = Vec::with_capacity(caches.len());
+        for (i, ((cache, &offset), &add)) in caches
+            .iter_mut()
+            .zip(offsets.iter())
+            .zip(adds.iter())
+            .enumerate()
+        {
+            cache.set_current_seq_len(offset + add)?;
+            if let (CacheStorage::Chunked(c), Some(backing)) = (&cache.k.storage, &backing) {
+                // One mark names sequences by batch index in ONE backing's
+                // table; a cache on another backing would be looked up in the
+                // wrong table and silently left stale.
+                if !c.backing.shares_state_with(backing) {
+                    candle::bail!(
+                        "commit batch: cache {i} is on a different chunked backing from cache 0"
+                    );
+                }
+                entries.push((c.batch_idx, 0));
+            }
+        }
+        if let Some(backing) = backing {
+            backing.mark_decode_writer_stale(&entries)?;
         }
         Ok(())
     }

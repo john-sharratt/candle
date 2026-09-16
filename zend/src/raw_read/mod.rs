@@ -25,8 +25,8 @@ use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnText
 
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
-use crate::repo_scan::utility_config;
 use crate::repo_scan::walk::MAX_FILE_BYTES;
+use crate::repo_scan::{shared_system_prompt, utility_config};
 use crate::turn_sink::{InsertTurnSink, SequenceTurnSink};
 use crate::types::Role;
 
@@ -194,29 +194,6 @@ fn ingest_raw_into_sink<S: InsertTurnSink>(
     Ok(state)
 }
 
-/// Local mirror of the deterministic modes' `layer_system_prompt`: pull the
-/// layer's authored sections out of the schema and wrap them in the dialect's
-/// system-prompt markers. A raw layer only projects from the layer it targets.
-fn layer_system_prompt(
-    builder: &projection::Builder,
-    layer_name: &str,
-    config: &SequenceConfig,
-) -> String {
-    use projection::SystemPromptItem;
-    debug_assert!(
-        builder.schema().layers.iter().any(|l| l.name == layer_name),
-        "projection schema missing '{layer_name}' layer"
-    );
-    // Every ingest conversation frames on the single shared system prompt.
-    let mut body = String::new();
-    for item in &builder.schema().system_prompt.items {
-        if let SystemPromptItem::Section(s) = item {
-            body.push_str(&s.content);
-        }
-    }
-    config.dialect.format_system_prompt(&body)
-}
-
 /// Top-level raw ingestion — creates the layer's owning [`Sequence`] and prefills
 /// every ChatML record under `root` into it. Returns the sequence (held by the
 /// daemon so its sealed K/V stays reachable by dialogue retrieval) and the
@@ -236,7 +213,7 @@ pub fn ingest_raw(
     let group = proj_builder
         .id_for_group(group_name)
         .ok_or_else(|| anyhow::anyhow!("projection schema missing '{group_name}' group"))?;
-    let system_prompt = layer_system_prompt(&proj_builder, layer_name, &config);
+    let system_prompt = shared_system_prompt(&proj_builder, layer_name, &config);
     // Lock only to mint the sequence; the prefill below runs on the sequence's
     // own handle, lock-free, so concurrent engine consumers keep running.
     let mut sequence = {
@@ -295,7 +272,7 @@ pub fn refresh_raw(
         .proj_builder
         .id_for_group(group_name)
         .ok_or_else(|| anyhow::anyhow!("projection schema missing '{group_name}' group"))?;
-    let system_prompt = layer_system_prompt(&ctx.proj_builder, layer_name, &ctx.config);
+    let system_prompt = shared_system_prompt(&ctx.proj_builder, layer_name, &ctx.config);
 
     let mut new_sequence = {
         let engine = ctx.engine.lock().unwrap();

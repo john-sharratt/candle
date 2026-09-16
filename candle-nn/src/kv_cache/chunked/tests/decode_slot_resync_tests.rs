@@ -13,7 +13,14 @@
 //! always right: the whole defect was the device disagreeing with it.
 #![cfg(feature = "cuda")]
 
-use candle::cuda_backend::cudarc::driver::CudaSlice;
+use std::ffi::c_void;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use candle::cuda_backend::cudarc::driver::result::memcpy_dtod_async;
+use candle::cuda_backend::cudarc::driver::result::stream::launch_host_function;
+use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use candle::{DType, Device, Tensor};
 
 use crate::kv_cache::chunked::gpu_test_lock::gpu_serial;
@@ -41,116 +48,118 @@ fn write_outside_decode(cache: &mut KvCache, dev: &Device, offset: usize, n: usi
     cache.commit_written_tokens(offset, n).unwrap();
 }
 
+/// Write `n` tokens of KV at `offset` without committing them. The tensor is
+/// returned so it outlives the caller's next steps: freeing it inside a region
+/// the caller times could synchronise the device, and that wait would be read as
+/// the code under test's.
+fn write_kv_ahead(cache: &mut KvCache, dev: &Device, offset: usize, n: usize) -> Tensor {
+    KvCache::ensure_chunked_capacity_batch(&mut [&mut *cache], &[offset], n).unwrap();
+    let kv = Tensor::ones((1, N_KV_HEAD, n, HEAD_DIM), DType::F16, dev).unwrap();
+    cache.chunked_write_kv(offset, &kv, &kv).unwrap();
+    kv
+}
+
 /// What a decode step at `offset` would read: sync the slot buffer the way the
 /// decode metadata build does (ensure the write chunk, then reuse or rebuild),
 /// and return every slice's `len` as the device holds it.
 fn device_lens(dev: &Device, backing: &ChunkedKvBacking, seq: usize, offset: usize) -> Vec<u16> {
-    device_slices(dev, backing, seq, offset)
-        .into_iter()
-        .map(|(len, _)| len)
-        .collect()
+    let (ptr, n_slices) = live_slot(backing, seq, offset);
+    read_lens(dev, ptr, n_slices)
 }
 
-/// [`device_lens`] with each slice's `rope` beside its `len` — the cumulative
-/// position of the chunk's first token, which is how the kernel knows where a
-/// slice sits in the sequence.
-fn device_slices(
-    dev: &Device,
-    backing: &ChunkedKvBacking,
-    seq: usize,
-    offset: usize,
-) -> Vec<(u16, u32)> {
+/// The live slot buffer a decode step at `offset` would read — its device
+/// pointer and slice count — synced the way the decode metadata build does.
+fn live_slot(backing: &ChunkedKvBacking, seq: usize, offset: usize) -> (u64, usize) {
     backing.ensure_for_offset(seq, offset, 1).unwrap();
     let info = backing.resolve_arena_info().unwrap();
     let (ptrs, _, _) = backing
         .sync_decode_gpu_chunks(&[(seq, offset)], &info)
         .unwrap();
     let (ptr, n_slices, _) = ptrs[0];
+    (ptr, n_slices as usize)
+}
+
+/// Every slice's `len` as the device holds it at `ptr`.
+fn read_lens(dev: &Device, ptr: u64, n_slices: usize) -> Vec<u16> {
     let Device::Cuda(cuda) = dev else {
         unreachable!("a CUDA test");
     };
-    let len = n_slices as usize * SLICE_BYTES;
+    let len = n_slices * SLICE_BYTES;
     let stream = cuda.cuda_stream();
-    // SAFETY: `ptr` is the live slot buffer the sync just returned, holding
-    // `n_slices` 16-byte slice headers.
+    // SAFETY: `ptr` is a live slot buffer holding `n_slices` 16-byte slice
+    // headers.
     let view: CudaSlice<u8> = unsafe { stream.upgrade_device_ptr::<u8>(ptr, len) };
     let host = cuda.memcpy_dtov(&view).unwrap();
     // A borrow of the buffer, not an owner: dropping it would free the slot.
     std::mem::forget(view);
-    host.chunks_exact(SLICE_BYTES)
-        .map(|s| {
-            (
-                u16::from_le_bytes([s[2], s[3]]),
-                u32::from_le_bytes([s[4], s[5], s[6], s[7]]),
-            )
-        })
+    slice_lens(&host)
+}
+
+/// The `len` field (bytes 2..4) of each 16-byte slice header in `bytes`.
+fn slice_lens(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .chunks_exact(SLICE_BYTES)
+        .map(|s| u16::from_le_bytes([s[2], s[3]]))
         .collect()
 }
 
-/// A decode that fills the writer and moves into a chunk claimed before the
-/// buffer was serialised: nothing is pushed, so the buffer is reused, and the
-/// new write slice must count every token of the chunk it left.
-///
-/// The kernel's committed total is where the write slice ends, `rope + len`.
-/// The device keeps only the writer's `len` current; the next writer's `rope`
-/// is whatever it was serialised as. A stale one — 30, where the host holds
-/// 32 — puts the next write two slots past where the host commits it, and
-/// those two positions read unwritten.
-#[test]
-fn a_writer_that_moves_into_a_claimed_chunk_is_reserialised() {
-    let _gpu = gpu_serial();
-    let dev = Device::new_cuda(0).unwrap();
-    let (backing, mut cache, seq) = setup(&dev);
-
-    // Room for a 70-token prompt, claimed before the first pass: three chunks.
-    KvCache::ensure_chunked_capacity_batch(&mut [&mut cache], &[0], 70).unwrap();
-    write_outside_decode(&mut cache, &dev, 0, 30);
-    assert_eq!(
-        device_slices(&dev, &backing, seq, 30),
-        vec![(30, 0), (0, 30), (0, 30)],
-        "the first sync builds the buffer from the host state"
-    );
-
-    // Two decode steps, committed on the host as the driver does after each.
-    cache.set_current_seq_len(31).unwrap();
-    cache.set_current_seq_len(32).unwrap();
-    assert_eq!(
-        device_slices(&dev, &backing, seq, 32)[..2],
-        [(32, 0), (0, 32)],
-        "the writer moved to chunk 1: its rope must count chunk 0's 32 tokens"
-    );
+/// A gate across a stream: a host function the stream runs when it reaches it,
+/// which blocks until the test opens the gate — so everything enqueued after it
+/// waits, deterministically and with no GPU work. It opens by itself after
+/// [`StreamGate::TIMEOUT`], so a host that waits on work queued behind a closed
+/// gate is held that long and then fails the test, rather than hanging it.
+struct StreamGate {
+    open: Arc<(Mutex<bool>, Condvar)>,
 }
 
-/// A commit that crosses into a claimed chunk with another still trailing:
-/// both chunks it filled read their true lengths, and the new write slice
-/// ends at the committed total.
-#[test]
-fn a_commit_that_crosses_into_a_claimed_chunk_ends_the_write_slice_at_the_total() {
-    let _gpu = gpu_serial();
-    let dev = Device::new_cuda(0).unwrap();
-    let (backing, mut cache, seq) = setup(&dev);
+impl StreamGate {
+    const TIMEOUT: Duration = Duration::from_secs(2);
 
-    KvCache::ensure_chunked_capacity_batch(&mut [&mut cache], &[0], 70).unwrap();
-    write_outside_decode(&mut cache, &dev, 0, 10);
-    assert_eq!(device_slices(&dev, &backing, seq, 10)[0], (10, 0));
-
-    write_outside_decode(&mut cache, &dev, 10, 30);
-    assert_eq!(
-        device_slices(&dev, &backing, seq, 40)[..2],
-        [(32, 0), (8, 32)],
-        "chunk 0 filled on the way and chunk 1 holds the rest: 32 + 8 = 40"
-    );
-
-    // Decode steps fill chunk 1 and move the writer into claimed chunk 2 on
-    // the reused buffer.
-    for len in 41..=64 {
-        cache.set_current_seq_len(len).unwrap();
+    fn close_on(stream: &CudaStream) -> Self {
+        let open = Arc::new((Mutex::new(false), Condvar::new()));
+        let arg = Arc::into_raw(Arc::clone(&open)) as *mut c_void;
+        // SAFETY: `wait_at_gate` takes back, exactly once, the reference leaked
+        // here, when the stream runs it.
+        unsafe { launch_host_function(stream.cu_stream(), wait_at_gate, arg) }.unwrap();
+        Self { open }
     }
-    assert_eq!(
-        device_slices(&dev, &backing, seq, 64)[..3],
-        [(32, 0), (32, 32), (0, 64)],
-        "the writer moved to chunk 2: chunk 1 reads full and chunk 2 starts at 64"
-    );
+
+    fn open(&self) {
+        let (opened, wake) = &*self.open;
+        *opened.lock().unwrap() = true;
+        wake.notify_all();
+    }
+
+    /// Open the gate from another thread after `delay` — for a test whose own
+    /// thread is about to wait on work behind it.
+    fn open_after(&self, delay: Duration) -> JoinHandle<()> {
+        let gate = Self {
+            open: Arc::clone(&self.open),
+        };
+        thread::spawn(move || {
+            thread::sleep(delay);
+            gate.open();
+        })
+    }
+}
+
+impl Drop for StreamGate {
+    fn drop(&mut self) {
+        self.open();
+    }
+}
+
+/// The host function behind a [`StreamGate`]. It must not call CUDA, and does
+/// not: it only waits.
+unsafe extern "C" fn wait_at_gate(arg: *mut c_void) {
+    // SAFETY: `arg` is the `Arc` leaked by `StreamGate::close_on`, taken back
+    // once.
+    let open = unsafe { Arc::from_raw(arg as *const (Mutex<bool>, Condvar)) };
+    let (opened, wake) = &*open;
+    let guard = opened
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _ = wake.wait_timeout_while(guard, StreamGate::TIMEOUT, |opened| !*opened);
 }
 
 /// A block that fits the writer chunk: the reused buffer's writer length must
@@ -204,65 +213,14 @@ fn a_write_that_spills_into_the_next_chunk_is_counted_in_both() {
     );
 }
 
-/// How many rebuilds a decode sync at `offset` performs: 1 when the live
-/// buffer had been dropped, 0 when it was reused as it stood.
-fn rebuilds_on_sync(backing: &ChunkedKvBacking, seq: usize, offset: usize) -> u64 {
-    backing.ensure_for_offset(seq, offset, 1).unwrap();
-    let info = backing.resolve_arena_info().unwrap();
-    let (_, _, stats) = backing
-        .sync_decode_gpu_chunks(&[(seq, offset)], &info)
-        .unwrap();
-    stats.rebuilds
-}
-
-/// An arena that moves leaves the live buffer's inline records — the writer
-/// chunk's among them — naming the ground it left, and the decode path reuses
-/// that buffer across forwards: a decode or draft write through it lands in
-/// the old ground, and the chunk's new home reads that position unwritten.
-/// Compaction therefore drops the buffer of every sequence holding a chunk in
-/// the moved arena, and leaves the others alone.
-#[test]
-fn a_moved_arena_drops_the_decode_buffers_that_name_it() {
-    let _gpu = gpu_serial();
-    let dev = Device::new_cuda(0).unwrap();
-    let (backing, mut cache, seq) = setup(&dev);
-
-    write_outside_decode(&mut cache, &dev, 0, 8);
-    assert_eq!(
-        rebuilds_on_sync(&backing, seq, 8),
-        1,
-        "the first sync builds the buffer"
-    );
-    let arena = backing.state.read().unwrap().sequences[seq]
-        .as_ref()
-        .unwrap()
-        .chunks_slice()[0]
-        .gids
-        .as_slice()[0]
-        .arena_idx();
-
-    assert_eq!(backing.drop_decode_buffers_in(&[arena + 1000]).unwrap(), 0);
-    assert_eq!(
-        rebuilds_on_sync(&backing, seq, 8),
-        0,
-        "an arena the sequence does not use leaves its buffer in place"
-    );
-
-    assert_eq!(backing.drop_decode_buffers_in(&[arena]).unwrap(), 1);
-    assert_eq!(
-        rebuilds_on_sync(&backing, seq, 8),
-        1,
-        "the sequence's own arena moved, so its buffer is rebuilt against the new base"
-    );
-}
-
 /// The latent wave commits at the backing rather than through a `KvCache`:
-/// `set_len`, then `refresh_decode_writer_slice`, with no block length in hand.
-/// The refresh must therefore cover a spill on its own — re-serialising the
-/// whole writer region, the filled predecessor as well as the new writer — and
-/// not patch the new writer while the full predecessor still reads 30.
+/// `set_len`, then `mark_decode_writer_stale`, with no block length in hand.
+/// The sync after that mark must therefore cover a spill on its own —
+/// re-serialising the whole writer region, the filled predecessor as well as
+/// the new writer — and not patch the new writer while the full predecessor
+/// still reads 30.
 #[test]
-fn a_backing_refresh_after_a_spill_counts_both_chunks() {
+fn a_backing_mark_after_a_spill_counts_both_chunks() {
     let _gpu = gpu_serial();
     let dev = Device::new_cuda(0).unwrap();
     let (backing, mut cache, seq) = setup(&dev);
@@ -274,10 +232,366 @@ fn a_backing_refresh_after_a_spill_counts_both_chunks() {
     let kv = Tensor::ones((1, N_KV_HEAD, 4, HEAD_DIM), DType::F16, &dev).unwrap();
     cache.chunked_write_kv(30, &kv, &kv).unwrap();
     backing.set_len(seq, 34);
-    backing.refresh_decode_writer_slice(&[(seq, 0)]).unwrap();
+    backing.mark_decode_writer_stale(&[(seq, 0)]).unwrap();
     assert_eq!(
         device_lens(&dev, &backing, seq, 34),
         vec![32, 2],
         "the writer moved to the next chunk, so the buffer's other slices are stale too"
     );
+}
+
+/// A commit touches no device bytes. The cached buffer keeps its pre-commit
+/// lengths until the next sync, which re-serialises the writer region before
+/// handing the buffer — the same buffer, at the same pointer — to its reader.
+/// So a prefill layer's commit costs the stream nothing, and whatever was
+/// queued against the buffer before it reads what it was queued against.
+#[test]
+fn a_commit_leaves_the_buffer_to_the_next_sync() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    write_outside_decode(&mut cache, &dev, 0, 8);
+    let (ptr, n_slices) = live_slot(&backing, seq, 8);
+    let kv = write_kv_ahead(&mut cache, &dev, 8, 4);
+    cache.commit_written_tokens(8, 4).unwrap();
+    dev.synchronize().unwrap();
+    assert_eq!(
+        read_lens(&dev, ptr, n_slices),
+        vec![8],
+        "the commit wrote the device buffer; only the next sync may"
+    );
+    assert_eq!(live_slot(&backing, seq, 12), (ptr, n_slices));
+    assert_eq!(read_lens(&dev, ptr, n_slices), vec![12]);
+    drop(kv);
+}
+
+/// The prime after a prefill builds only a MISSING buffer. One that exists is
+/// left to the decode step's sync, stale writer region and all: the prime runs
+/// once per prefill layer, and an upload there sits between that layer's
+/// kernels and the next.
+#[test]
+fn a_prime_leaves_an_existing_buffer_to_the_decode_sync() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    write_outside_decode(&mut cache, &dev, 0, 8);
+    let (ptr, n_slices) = live_slot(&backing, seq, 8);
+    let kv = write_kv_ahead(&mut cache, &dev, 8, 4);
+    cache.commit_written_tokens(8, 4).unwrap();
+    KvCache::prime_chunked_decode_slots_batch(&mut [&mut cache]).unwrap();
+    dev.synchronize().unwrap();
+    assert_eq!(
+        read_lens(&dev, ptr, n_slices),
+        vec![8],
+        "the prime rewrote a buffer the decode sync owns bringing up to date"
+    );
+    assert_eq!(live_slot(&backing, seq, 12), (ptr, n_slices));
+    assert_eq!(read_lens(&dev, ptr, n_slices), vec![12]);
+    drop(kv);
+}
+
+/// A sequence with no buffer — a fresh prefill — gets one from the prime, so
+/// the first decode step reuses it rather than building it.
+#[test]
+fn a_prime_builds_a_missing_buffer() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    write_outside_decode(&mut cache, &dev, 0, 8);
+    KvCache::prime_chunked_decode_slots_batch(&mut [&mut cache]).unwrap();
+    let info = backing.resolve_arena_info().unwrap();
+    let (ptrs, _, stats) = backing.sync_decode_gpu_chunks(&[(seq, 8)], &info).unwrap();
+    assert_eq!(
+        (stats.rebuilds, stats.reuses),
+        (0, 1),
+        "the decode sync rebuilt a buffer the prime should have built"
+    );
+    assert_eq!(read_lens(&dev, ptrs[0].0, ptrs[0].1 as usize), vec![8]);
+}
+
+/// The harness first: work enqueued behind a closed [`StreamGate`] does not
+/// complete until the gate opens. Every test below that reads "the host did not
+/// wait" off an event behind the gate depends on it.
+#[test]
+fn a_closed_gate_holds_the_work_behind_it() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let Device::Cuda(cuda) = &dev else {
+        unreachable!("a CUDA test");
+    };
+    let stream = cuda.cuda_stream();
+    dev.synchronize().unwrap();
+
+    let gate = StreamGate::close_on(&stream);
+    let behind = stream.context().new_event(None).unwrap();
+    behind.record(&stream).unwrap();
+    thread::sleep(Duration::from_millis(20));
+    let held = !behind.is_complete();
+    gate.open();
+    dev.synchronize().unwrap();
+    assert!(
+        held,
+        "work enqueued behind a closed gate completed before it opened"
+    );
+    assert!(behind.is_complete());
+}
+
+/// **A queued upload keeps its bytes, and the next commit and sync do not
+/// wait for it.**
+///
+/// A prefill commits each layer's tokens while that layer's slot-state upload
+/// is still queued behind the attention kernel — and that kernel must read the
+/// pre-commit lengths. So neither a commit nor the sync that uploads its
+/// lengths may rewrite the bytes a queued upload will carry, nor hold the host
+/// until it has run: the first hands the kernel lengths from its future, the
+/// second stops the host running ahead of the GPU at every layer of every
+/// prefill.
+///
+/// A gate is closed across the stream; a first commit's sync queues its upload
+/// behind it; a device copy of the slot queues behind the upload — the reader
+/// that must see the first commit's lengths — and a second commit and sync
+/// follow at once.
+#[test]
+fn a_queued_upload_keeps_its_bytes_and_the_next_sync_does_not_wait() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let Device::Cuda(cuda) = &dev else {
+        unreachable!("a CUDA test");
+    };
+    let stream = cuda.cuda_stream();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    write_outside_decode(&mut cache, &dev, 0, 8);
+    let (ptr, n_slices) = live_slot(&backing, seq, 8);
+    assert_eq!(read_lens(&dev, ptr, n_slices), vec![8]);
+    let bytes = n_slices * SLICE_BYTES;
+    // SAFETY: fully overwritten by the copy below before anything reads it.
+    let probe: CudaSlice<u8> = unsafe { stream.alloc::<u8>(bytes) }.unwrap();
+    // The KV both commits cover is written first: only the commits run behind
+    // the gate, so an allocation or a free the write makes cannot stand in for
+    // the commit under test.
+    let kv = write_kv_ahead(&mut cache, &dev, 8, 8);
+    dev.synchronize().unwrap();
+
+    let gate = StreamGate::close_on(&stream);
+    // The first commit; its sync queues the upload behind the gate.
+    let t0 = Instant::now();
+    cache.commit_written_tokens(8, 4).unwrap();
+    assert_eq!(live_slot(&backing, seq, 12), (ptr, n_slices));
+    let first_commit = t0.elapsed();
+    {
+        let (probe_ptr, _record) = probe.device_ptr(&stream);
+        // SAFETY: both ranges are live device allocations of `bytes` bytes,
+        // and the copy is ordered on the stream every slot-state upload uses.
+        unsafe { memcpy_dtod_async(probe_ptr, ptr, bytes, stream.cu_stream()) }.unwrap();
+    }
+    // The second commit and sync, at once.
+    let t0 = Instant::now();
+    cache.commit_written_tokens(12, 4).unwrap();
+    assert_eq!(live_slot(&backing, seq, 16), (ptr, n_slices));
+    let second_commit = t0.elapsed();
+
+    gate.open();
+    dev.synchronize().unwrap();
+    drop(kv);
+    assert_eq!(
+        slice_lens(&cuda.memcpy_dtov(&probe).unwrap()),
+        vec![12],
+        "the upload queued by the first commit carried the second commit's bytes"
+    );
+    assert_eq!(read_lens(&dev, ptr, n_slices), vec![16]);
+    // Work behind the closed gate cannot run until the gate opens or times
+    // out, so a commit that waits for it takes the gate's whole timeout; one
+    // that does not returns in microseconds.
+    assert!(
+        first_commit < StreamGate::TIMEOUT / 4 && second_commit < StreamGate::TIMEOUT / 4,
+        "a commit and its sync held the host (first {first_commit:?}, second \
+         {second_commit:?}) — they waited for work the closed gate holds for up to {:?}",
+        StreamGate::TIMEOUT
+    );
+}
+
+/// Two uploads queued behind unfinished work, and a third commit's sync behind
+/// them: the third finds both staging buffers still read by queued copies and
+/// waits for the older one — and every reader still sees exactly the bytes its
+/// upload was issued with.
+#[test]
+fn every_queued_upload_keeps_its_bytes_when_both_staging_buffers_are_in_flight() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let Device::Cuda(cuda) = &dev else {
+        unreachable!("a CUDA test");
+    };
+    let stream = cuda.cuda_stream();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    write_outside_decode(&mut cache, &dev, 0, 8);
+    let (ptr, n_slices) = live_slot(&backing, seq, 8);
+    let bytes = n_slices * SLICE_BYTES;
+    // SAFETY: each is fully overwritten by its copy below before anything reads
+    // it.
+    let probes: Vec<CudaSlice<u8>> = (0..2)
+        .map(|_| unsafe { stream.alloc::<u8>(bytes) }.unwrap())
+        .collect();
+    // Only the commits run behind the gate (see the test above).
+    let kv = write_kv_ahead(&mut cache, &dev, 8, 12);
+    dev.synchronize().unwrap();
+
+    let gate = StreamGate::close_on(&stream);
+    for (probe, offset) in probes.iter().zip([8, 12]) {
+        cache.commit_written_tokens(offset, 4).unwrap();
+        assert_eq!(live_slot(&backing, seq, offset + 4), (ptr, n_slices));
+        let (probe_ptr, _record) = probe.device_ptr(&stream);
+        // SAFETY: both ranges are live device allocations of `bytes` bytes,
+        // and the copy is ordered on the stream every slot-state upload uses.
+        unsafe { memcpy_dtod_async(probe_ptr, ptr, bytes, stream.cu_stream()) }.unwrap();
+    }
+    // The third sync waits for the first upload, which is behind the gate:
+    // open it from another thread once that wait has begun.
+    let opener = gate.open_after(Duration::from_millis(200));
+    cache.commit_written_tokens(16, 4).unwrap();
+    assert_eq!(live_slot(&backing, seq, 20), (ptr, n_slices));
+    opener.join().unwrap();
+
+    dev.synchronize().unwrap();
+    drop(kv);
+    let seen: Vec<Vec<u16>> = probes
+        .iter()
+        .map(|p| slice_lens(&cuda.memcpy_dtov(p).unwrap()))
+        .collect();
+    assert_eq!(seen, vec![vec![12], vec![16]]);
+    assert_eq!(read_lens(&dev, ptr, n_slices), vec![20]);
+}
+
+/// The batched prefill commits a layer's whole batch at once. Every sequence in
+/// it must come out counted on the device, exactly as a commit per sequence
+/// would leave it.
+#[test]
+fn a_batch_commit_counts_every_sequence_on_the_device() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let backing = ChunkedKvBacking::new(2, N_KV_HEAD, HEAD_DIM, DType::F16, &dev, 256).unwrap();
+    let seqs = [
+        backing.alloc_sequence().unwrap(),
+        backing.alloc_sequence().unwrap(),
+    ];
+    let mut caches = seqs.map(|seq| {
+        let mut cache = KvCache::new(2, 256);
+        cache.set_chunked_backing(&backing, seq, None).unwrap();
+        cache
+    });
+    for (cache, &seq) in caches.iter_mut().zip(seqs.iter()) {
+        write_outside_decode(cache, &dev, 0, 8);
+        assert_eq!(device_lens(&dev, &backing, seq, 8)[0], 8);
+    }
+
+    // A verify block on both sequences, committed together.
+    let [c0, c1] = &mut caches;
+    let mut batch = [c0, c1];
+    KvCache::ensure_chunked_capacity_batch(&mut batch, &[8, 8], 4).unwrap();
+    let kv = Tensor::ones((1, N_KV_HEAD, 4, HEAD_DIM), DType::F16, &dev).unwrap();
+    for cache in batch.iter_mut() {
+        cache.chunked_write_kv(8, &kv, &kv).unwrap();
+    }
+    KvCache::commit_written_tokens_batch(&mut batch, &[8, 8], &[4, 4]).unwrap();
+
+    for &seq in &seqs {
+        assert_eq!(
+            device_lens(&dev, &backing, seq, 12)[0],
+            12,
+            "sequence {seq}: the reused buffer must count the batch-committed block"
+        );
+    }
+}
+
+/// One batch commit names sequences by batch index in ONE backing's table, so
+/// a cache on another backing is refused rather than looked up in the wrong
+/// table and left stale.
+#[test]
+fn a_batch_commit_across_backings_is_refused() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (_b0, mut c0, _) = setup(&dev);
+    let (_b1, mut c1, _) = setup(&dev);
+    let err = KvCache::commit_written_tokens_batch(&mut [&mut c0, &mut c1], &[0, 0], &[0, 0])
+        .expect_err("caches on two backings must not commit as one batch");
+    assert!(
+        err.to_string().contains("different chunked backing"),
+        "{err}"
+    );
+}
+
+/// A writer boundary that moves between a commit and the sync — the turn-seal
+/// re-prefill's `seal_writer_boundary`, a truncate's clamp — must not shrink
+/// the region the sync re-serialises: the commit filled chunks from the
+/// boundary as it stood then. Here a spill fills chunk 0 and starts chunk 1,
+/// and the boundary is then sealed past both.
+#[test]
+fn a_boundary_moved_after_a_commit_does_not_shrink_the_resync() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    write_outside_decode(&mut cache, &dev, 0, 30);
+    KvCache::ensure_chunked_capacity_batch(&mut [&mut cache], &[30], 4).unwrap();
+    assert_eq!(device_lens(&dev, &backing, seq, 30), vec![30, 0]);
+    let kv = write_kv_ahead(&mut cache, &dev, 30, 4);
+    cache.commit_written_tokens(30, 4).unwrap();
+    backing.seal_writer_boundary(seq).unwrap();
+
+    // Synced directly: an ensure would push a fresh writer past the sealed
+    // boundary and rebuild the buffer, hiding the region under test.
+    let info = backing.resolve_arena_info().unwrap();
+    let (ptrs, _, stats) = backing.sync_decode_gpu_chunks(&[(seq, 34)], &info).unwrap();
+    assert_eq!(
+        (stats.rebuilds, stats.reuses),
+        (0, 1),
+        "the sync rebuilt the buffer, so the resync under test never ran"
+    );
+    assert_eq!(
+        read_lens(&dev, ptrs[0].0, ptrs[0].1 as usize),
+        vec![32, 2],
+        "the sync re-serialised from the moved boundary and left the chunk the \
+         commit filled at its pre-commit length"
+    );
+    drop(kv);
+}
+
+/// The wave metadata build reads through `sync_decode_gpu_chunks_snapshot`: a
+/// snapshot row gets an immutable copy of the slot state, and that copy must be
+/// taken after the marked writer region is re-serialised. The snapshot sets the
+/// write chunk's length from the offset itself, so it is the filled
+/// predecessor of a spill that tells the two apart.
+#[test]
+fn a_snapshot_after_a_commit_carries_the_committed_lengths() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    write_outside_decode(&mut cache, &dev, 0, 30);
+    KvCache::ensure_chunked_capacity_batch(&mut [&mut cache], &[30], 4).unwrap();
+    assert_eq!(device_lens(&dev, &backing, seq, 30), vec![30, 0]);
+    let kv = write_kv_ahead(&mut cache, &dev, 30, 4);
+    cache.commit_written_tokens(30, 4).unwrap();
+
+    let info = backing.resolve_arena_info().unwrap();
+    let generation = backing.begin_stager_generation_required();
+    let (ptrs, _) = backing
+        .sync_decode_gpu_chunks_snapshot(&[(seq, 34)], &info, &generation, &[true])
+        .unwrap();
+    // The generation's copies reach the device on a submit; read behind one
+    // and a device sync, as a launch against them would.
+    let flush = generation.alloc(8).unwrap();
+    generation.submit_resident(flush).unwrap();
+    dev.synchronize().unwrap();
+    assert_eq!(
+        read_lens(&dev, ptrs[0].0, ptrs[0].1 as usize),
+        vec![32, 2],
+        "the snapshot was copied before the marked writer region was re-serialised"
+    );
+    drop(generation);
+    drop(kv);
 }

@@ -50,7 +50,7 @@ fn small_workspace() -> tempfile::TempDir {
 
 /// Walk + build the units the daemon would ingest.
 fn units_of(root: &Path) -> Vec<DirUnit> {
-    build_units(&walk_workspace(root), root)
+    build_units(&walk_workspace(root, None), root)
 }
 
 /// Run every unit's chain through a recording sink, exactly as

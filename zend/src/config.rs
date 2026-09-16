@@ -45,12 +45,24 @@ pub struct DaemonConfig {
     /// Scopes a rebuild to a subtree (e.g. `code_reading=zend/src`) so the
     /// substrate stays small instead of absorbing the whole workspace.
     pub ingest_dirs: HashMap<String, String>,
+    /// `--max-depth <N>`: how deep, in path components below each layer's
+    /// content root, the `repo_map` and `code_reading` walks and the watcher
+    /// read (`1` = the root's own files, `2` = one folder down). Content already
+    /// ingested from deeper is FROZEN — kept and still retrievable, but never
+    /// re-read and never retired by the deleted-path sweeps. `None` = unbounded.
+    pub max_depth: Option<usize>,
     /// Force a whole-store redo-log compaction once during load, after the
     /// substrate reload and before serving. Normally reclaim is incremental and
     /// background (the persistence-thread maintenance pass); this flag forces
     /// the eager whole-store rewrite instead of deferring it. Opt-in
     /// (`--compact-substrate`).
     pub compact_substrate: bool,
+    /// Open the workspace's substrate READ-ONLY and write nothing to disk
+    /// (`ModelBuilder::read_only_substrate`): every turn lives in RAM, and the
+    /// boot steps that exist to write — calibration, compaction, the watcher,
+    /// the upload reconcile and the background re-ingest — do not run. For a
+    /// tool that reads a substrate the running daemon owns, beside it.
+    pub read_only_substrate: bool,
     /// Which model the daemon runs (`--model <PRESET>`). Defaults to the
     /// measured-VRAM ladder in `model_choice`.
     pub model: ModelChoice,
@@ -60,6 +72,13 @@ pub struct DaemonConfig {
     /// and not a heuristic — the daemon otherwise never overwrites a question
     /// someone wrote.
     pub wipe_metadata: bool,
+    /// `--qsa-selection-budget <N>`: run the QSA selection with `N` positions in
+    /// place of the checkpoint's own budget (`ModelBuilder::qsa_selection_budget`);
+    /// `None` keeps the checkpoint's. A budget of at least the checkpoint's
+    /// context reads every cell — the dense control a selection failure is
+    /// judged against. Refused at load for a model whose attention does not
+    /// select, and for a budget the selection kernel cannot run.
+    pub qsa_selection_budget: Option<usize>,
 }
 
 /// Which model a daemon runs.

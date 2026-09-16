@@ -95,6 +95,11 @@ pub enum PersistenceError {
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    /// A write refused because the substrate was opened read-only
+    /// ([`SharedSubstrate::open_in_read_only`]). Nothing was staged.
+    #[error("the substrate is open read-only; this operation would write to it")]
+    ReadOnly,
 }
 
 /// Result type for the persistence layer.
@@ -134,6 +139,35 @@ pub(crate) fn test_npc(id: u64, name: &str) -> NpcPayload {
         agency: Vec::new(),
         modulation: record::Modulation::default(),
     }
+}
+
+/// Every entry under `dir`, recursively, as `(relative path, length,
+/// SHA-256)` sorted by path — the before/after the read-only tests hold a
+/// store to. A directory appears as its path with a trailing `/`, length 0 and
+/// a zero digest, so a created directory shows up as well as a created file.
+#[cfg(test)]
+pub(crate) fn dir_fingerprint(dir: &Path) -> Vec<(String, u64, [u8; 32])> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64, [u8; 32])>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            let rel = path
+                .strip_prefix(root)
+                .expect("entry under the root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if path.is_dir() {
+                out.push((format!("{rel}/"), 0, [0u8; 32]));
+                walk(root, &path, out);
+            } else {
+                let bytes = std::fs::read(&path).expect("read file");
+                out.push((rel, bytes.len() as u64, sha256(&bytes)));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
 }
 
 /// A substrate the host process opened, for the engine to adopt rather than
@@ -200,6 +234,21 @@ impl SharedSubstrate {
     pub fn open_in(dir: &Path) -> Result<Self> {
         let mut substrate = Substrate::new();
         let persistence = SubstratePersistence::open_in_with_substrate(dir, &mut substrate)?;
+        Ok(Self::new(substrate, persistence))
+    }
+
+    /// Open the substrate under `dir` **read-only** and share it.
+    ///
+    /// For a tool that reads a workspace another process — the daemon — may be
+    /// writing to at the same time. The store must already exist, and nothing
+    /// under `dir/.substrate/` is created, renamed, deleted, truncated, grown or
+    /// written for as long as the pair lives. Everything in RAM behaves as it
+    /// does on a writable substrate; only the durable side is absent — see
+    /// [`SubstratePersistence::open_in_with_substrate_read_only`].
+    pub fn open_in_read_only(dir: &Path) -> Result<Self> {
+        let mut substrate = Substrate::new();
+        let persistence =
+            SubstratePersistence::open_in_with_substrate_read_only(dir, &mut substrate)?;
         Ok(Self::new(substrate, persistence))
     }
 }
@@ -465,7 +514,7 @@ impl SubstratePersistence {
 
     /// Open the persistence layer at `<dir>/.substrate/` (the segment set).
     pub fn open_in(dir: &Path) -> Result<SubstratePersistence> {
-        Self::from_dir_with_sink(&dir.join(SUBSTRATE_DIR), &[], |_| {})
+        Self::from_dir_with_sink(&dir.join(SUBSTRATE_DIR), &[], false, |_| {})
     }
 
     /// Open the persistence layer and drive every record through
@@ -484,7 +533,28 @@ impl SubstratePersistence {
         dir: &Path,
         substrate: &mut Substrate,
     ) -> Result<SubstratePersistence> {
-        Self::from_dir_with_sink(&dir.join(SUBSTRATE_DIR), &[], |entry| {
+        Self::from_dir_with_sink(&dir.join(SUBSTRATE_DIR), &[], false, |entry| {
+            substrate.apply_walker_entry(entry)
+        })
+    }
+
+    /// As [`Self::open_in_with_substrate`], but **read-only**: the segment set
+    /// is opened with [`SegmentedLog::open_read_only_with_sink`], so nothing
+    /// under `<dir>/.substrate/` is ever created, renamed, deleted, truncated,
+    /// grown or written through this handle, and the store must already exist.
+    ///
+    /// Every durable operation keeps its signature and answers without
+    /// touching disk: the appends refuse with [`PersistenceError::ReadOnly`]
+    /// and stage nothing; `commit`, `commit_if_pending` and `seal_active`
+    /// succeed with nothing to do; `set_model_spec` and `set_template` report
+    /// that nothing was written; `set_tokenizer` still refuses a vocabulary
+    /// other than the recorded one but never records one; maintenance plans no
+    /// op and compaction refuses.
+    pub fn open_in_with_substrate_read_only(
+        dir: &Path,
+        substrate: &mut Substrate,
+    ) -> Result<SubstratePersistence> {
+        Self::from_dir_with_sink(&dir.join(SUBSTRATE_DIR), &[], true, |entry| {
             substrate.apply_walker_entry(entry)
         })
     }
@@ -508,7 +578,7 @@ impl SubstratePersistence {
     where
         F: FnMut(&WalkEntry),
     {
-        Self::from_dir_with_sink(&dir.join(SUBSTRATE_DIR), &[], |entry| {
+        Self::from_dir_with_sink(&dir.join(SUBSTRATE_DIR), &[], false, |entry| {
             substrate.apply_walker_entry(entry);
             sink(entry);
         })
@@ -522,16 +592,19 @@ impl SubstratePersistence {
         let (active_dir, inherited) = logs.split_last().ok_or_else(|| {
             PersistenceError::Corrupt("open_concat needs at least one log".into())
         })?;
-        Self::from_dir_with_sink(active_dir, inherited, |_| {})
+        Self::from_dir_with_sink(active_dir, inherited, false, |_| {})
     }
 
     /// Open the segment set in `dir` (the `.substrate/` directory) with the
     /// listed inherited single-file logs, driving every recovered record
     /// through `sink` in the same pass that builds the manifest and the
-    /// dead-weight accounting.
+    /// dead-weight accounting. `read_only` opens the segment set with
+    /// [`SegmentedLog::open_read_only_with_sink`] instead of
+    /// [`SegmentedLog::open_with_sink`].
     fn from_dir_with_sink<F>(
         dir: &Path,
         inherited: &[PathBuf],
+        read_only: bool,
         mut sink: F,
     ) -> Result<SubstratePersistence>
     where
@@ -552,20 +625,26 @@ impl SubstratePersistence {
         // What the store actually holds, by type. One array increment per record
         // in a walk that already visits every record — see `RecordCensus`.
         let mut census = RecordCensus::new();
-        let segmented_log::OpenedSegments {
-            mut segments,
-            manifest,
-            last_index,
-            tail_digests,
-            recovered_records,
-        } = SegmentedLog::open_with_sink(dir, |entry| {
+        let mut walk = |entry: &WalkEntry| {
             accounting.record(&entry.record.header, entry.size);
             census.record(entry.record.header.record_type);
             record_metadata_loc(&mut metadata_locs, entry);
             record_snapshot_loc(&mut snapshot_locs, entry);
             record_npc_loc(&mut npc_locs, entry);
             sink(entry);
-        })?;
+        };
+        let opened = if read_only {
+            SegmentedLog::open_read_only_with_sink(dir, &mut walk)?
+        } else {
+            SegmentedLog::open_with_sink(dir, &mut walk)?
+        };
+        let segmented_log::OpenedSegments {
+            mut segments,
+            manifest,
+            last_index,
+            tail_digests,
+            recovered_records,
+        } = opened;
         // The census at open is the "before" of every before/after: compare two
         // restarts and a class that a rewrite dropped in between reads as a
         // count that went to zero.
@@ -620,8 +699,10 @@ impl SubstratePersistence {
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
         // that predates the index chain entirely): flush it now so the
-        // next open takes the chain path instead of re-walking it.
-        if sp.pending_index.len() >= INDEX_FLUSH_ENTRIES {
+        // next open takes the chain path instead of re-walking it. A
+        // read-only handle leaves the tail as it found it — the next
+        // writable open heals it.
+        if !read_only && sp.pending_index.len() >= INDEX_FLUSH_ENTRIES {
             sp.flush_header_index()?;
         }
         Ok(sp)
@@ -651,17 +732,24 @@ impl SubstratePersistence {
         self.segments.active_id()
     }
 
+    /// Whether this handle was opened read-only
+    /// ([`Self::open_in_with_substrate_read_only`]).
+    pub fn is_read_only(&self) -> bool {
+        self.segments.is_read_only()
+    }
+
     /// The cache-bypassing read handles for the active segment — exposed
     /// for the pipelined cold-load reader pool.
     pub(super) fn active_direct_file(&self) -> &DirectFile {
         self.segments.active_direct_file()
     }
 
-    /// A freshly-opened direct-I/O handle set on sealed `segment`, owned by
-    /// the caller for the duration of one cold-load. The GPU pipeline holds
-    /// several of these at once (a turn spanning a seal), so they are opened
-    /// directly rather than borrowed from the read pool.
-    pub(super) fn open_sealed_direct(&self, segment: SegmentId) -> Result<DirectFile> {
+    /// A direct-I/O handle set on sealed `segment`, shared with the caller for
+    /// the duration of one cold-load. The GPU pipeline holds several of these
+    /// at once (a turn spanning a seal), so it takes shared ownership rather
+    /// than borrowing from the read pool — see
+    /// [`SegmentedLog::open_sealed_direct`].
+    pub(super) fn open_sealed_direct(&self, segment: SegmentId) -> Result<Arc<DirectFile>> {
         self.segments.open_sealed_direct(segment)
     }
 
@@ -680,6 +768,9 @@ impl SubstratePersistence {
     /// that index the record (cold-load, chunk persistence) need the segment
     /// so the read routes back to the right file, plus the padded on-disk
     /// size for the bytes-on-disk footprint.
+    ///
+    /// A read-only handle refuses with [`PersistenceError::ReadOnly`] and
+    /// stages nothing.
     pub fn append_record(
         &mut self,
         record_type: RecordType,
@@ -690,6 +781,9 @@ impl SubstratePersistence {
         golden: u32,
         payload: &[u8],
     ) -> Result<(SegmentId, u64, u64)> {
+        if self.is_read_only() {
+            return Err(PersistenceError::ReadOnly);
+        }
         let header = RecordHeader {
             record_type,
             format,
@@ -762,12 +856,16 @@ impl SubstratePersistence {
     /// bookkeeping. Used by background maintenance to relocate `Chunk`/`Tokens`
     /// records with no decode/CRC-verify/re-encode round trip. Returns
     /// `(segment, offset, size)`. Not for singletons — those go through
-    /// [`Self::append_record`] so `manifest.ingest` repoints them.
+    /// [`Self::append_record`] so `manifest.ingest` repoints them. A read-only
+    /// handle refuses with [`PersistenceError::ReadOnly`].
     pub fn append_raw_record(
         &mut self,
         header: &RecordHeader,
         raw: &[u8],
     ) -> Result<(SegmentId, u64, u64)> {
+        if self.is_read_only() {
+            return Err(PersistenceError::ReadOnly);
+        }
         let (segment, offset) = self.segments.stage(raw);
         let size = raw.len() as u64;
         self.accounting.record(header, size);
@@ -797,9 +895,10 @@ impl SubstratePersistence {
     /// chain head in the superblock. The commit-before-publish order
     /// means the hint never points at un-flushed bytes; recovery's
     /// fallback covers the crash window between the two writes either
-    /// way.
+    /// way. A read-only handle flushes nothing: its un-indexed tail is the one
+    /// it found on disk, and the next writable open indexes it.
     fn flush_header_index(&mut self) -> Result<()> {
-        if self.pending_index.is_empty() {
+        if self.pending_index.is_empty() || self.is_read_only() {
             return Ok(());
         }
         while !self.pending_index.is_empty() {
@@ -1484,7 +1583,11 @@ impl SubstratePersistence {
 
     /// Flush and `fsync` the active segment — the group-commit durability
     /// point. Seals + rotates the active if it has reached the size target.
+    /// A no-op on a read-only handle, which never has anything staged.
     pub fn commit(&mut self) -> Result<()> {
+        if self.is_read_only() {
+            return Ok(());
+        }
         self.segments.commit()?;
         self.maybe_rotate_active()
     }
@@ -1547,7 +1650,13 @@ impl SubstratePersistence {
     /// chain fast path, not a full walk), rotates, and resets the chain state
     /// for the fresh active. The caller must have committed first; this flushes
     /// the index but assumes no un-flushed data records.
+    ///
+    /// A no-op on a read-only handle: the segment set stays exactly as the
+    /// process that owns it left it.
     pub fn seal_active(&mut self) -> Result<()> {
+        if self.is_read_only() {
+            return Ok(());
+        }
         self.flush_header_index()?;
         self.segments.seal_and_rotate()?;
         // The fresh active starts its own `HeaderIndex` chain — the sealed
@@ -1559,9 +1668,10 @@ impl SubstratePersistence {
 
     /// Set the model spec — last-writer-wins. Appends a fresh `ModelSpec`
     /// record only when the bytes differ from the latest on file. Returns
-    /// `true` if a record was written.
+    /// `true` if a record was written — never, on a read-only handle, which
+    /// keeps the recorded spec as it found it.
     pub fn set_model_spec(&mut self, spec: &[u8]) -> Result<bool> {
-        if self.model_spec.as_deref() == Some(spec) {
+        if self.model_spec.as_deref() == Some(spec) || self.is_read_only() {
             return Ok(false);
         }
         self.append_record(RecordType::ModelSpec, 0, 0, 0, 0, 0, spec)?;
@@ -1570,9 +1680,10 @@ impl SubstratePersistence {
     }
 
     /// Set the projection template — last-writer-wins, like
-    /// [`SubstratePersistence::set_model_spec`].
+    /// [`SubstratePersistence::set_model_spec`], and likewise never written
+    /// through a read-only handle.
     pub fn set_template(&mut self, template: &[u8]) -> Result<bool> {
-        if self.template.as_deref() == Some(template) {
+        if self.template.as_deref() == Some(template) || self.is_read_only() {
             return Ok(false);
         }
         self.append_record(RecordType::Template, 0, 0, 0, 0, 0, template)?;
@@ -1613,6 +1724,11 @@ impl SubstratePersistence {
                 hex16(&existing),
                 hex16(&hash),
             )));
+        }
+        // A read-only handle refuses a mismatch like any other (above) but
+        // never binds a store that has no tokenizer recorded.
+        if self.is_read_only() {
+            return Ok(false);
         }
         self.append_record(RecordType::Tokenizer, 0, 0, 0, 0, 0, tokenizer)?;
         self.tokenizer_sha256 = Some(hash);
@@ -1723,12 +1839,16 @@ impl SubstratePersistence {
     /// ([`SegmentedLog::adopt_compacted`]). The in-RAM manifest, substrate
     /// index, and metadata caches are rebuilt from the compacted segment.
     /// Inherited logs are untouched — a child never compacts a base it only
-    /// reads (§13.5).
+    /// reads (§13.5). A read-only handle refuses with
+    /// [`PersistenceError::ReadOnly`].
     pub fn compact(
         &mut self,
         substrate: &mut Substrate,
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<()> {
+        if self.is_read_only() {
+            return Err(PersistenceError::ReadOnly);
+        }
         // Coarse phase progress (5 phases) for the loading screen.
         let report = |phase: usize| {
             if let Some(p) = progress {
@@ -1915,6 +2035,76 @@ mod tests {
             },
             debug_name: name.to_string(),
         })
+    }
+
+    /// **A read-only handle refuses every write and changes no byte.** Built
+    /// over a store with a sealed segment, a section, a model spec and a bound
+    /// tokenizer: the appends refuse without staging, the commit paths succeed
+    /// with nothing to do, the singletons report nothing written and keep the
+    /// recorded values, a different tokenizer is still refused, maintenance
+    /// plans nothing even when forced, compaction refuses — and every file is
+    /// byte-identical after the handle drops.
+    #[test]
+    fn a_read_only_handle_refuses_writes_and_changes_nothing() {
+        let dir = tmp_dir("read_only");
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.declare_stream(&section("sys", 1)).unwrap();
+            sp.set_model_spec(b"spec-a").unwrap();
+            sp.set_tokenizer(b"tokenizer-a").unwrap();
+            sp.commit().unwrap();
+            sp.seal_active().unwrap();
+        }
+        let before = dir_fingerprint(&dir);
+
+        let mut substrate = Substrate::new();
+        let mut sp =
+            SubstratePersistence::open_in_with_substrate_read_only(&dir, &mut substrate).unwrap();
+        assert!(sp.is_read_only());
+        let offset = sp.write_offset();
+        assert!(matches!(
+            sp.append_record(RecordType::Tokens, 0, 9, 0, 0, 0, b"refused"),
+            Err(PersistenceError::ReadOnly)
+        ));
+        assert!(matches!(
+            sp.write_tombstone(9, None),
+            Err(PersistenceError::ReadOnly)
+        ));
+        assert_eq!(sp.pending_bytes(), 0);
+        assert_eq!(sp.write_offset(), offset);
+        sp.commit().unwrap();
+        assert!(!sp.commit_if_pending().unwrap());
+        sp.seal_active().unwrap();
+        assert!(!sp.set_model_spec(b"spec-b").unwrap());
+        assert_eq!(sp.model_spec(), Some(&b"spec-a"[..]));
+        assert!(!sp.set_template(b"template").unwrap());
+        assert_eq!(sp.template(), None);
+        assert!(sp.set_tokenizer(b"tokenizer-b").is_err());
+        assert!(!sp.set_tokenizer(b"tokenizer-a").unwrap());
+        assert!(sp.plan_maintenance(&substrate, true).unwrap().is_none());
+        assert!(matches!(
+            sp.compact(&mut substrate, None),
+            Err(PersistenceError::ReadOnly)
+        ));
+        assert!(sp.has_stream(&substrate, section("sys", 1).stream_id()));
+        drop(sp);
+        assert_eq!(dir_fingerprint(&dir), before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A read-only open never makes a store: a workspace without one, and a
+    /// workspace that does not exist, are errors and stay as they were.
+    #[test]
+    fn a_read_only_open_of_a_workspace_without_a_store_creates_nothing() {
+        let dir = tmp_dir("read_only_missing");
+        assert!(SharedSubstrate::open_in_read_only(&dir).is_err());
+        assert!(dir_fingerprint(&dir).is_empty());
+        let missing = dir.join("absent");
+        assert!(SharedSubstrate::open_in_read_only(&missing).is_err());
+        assert!(!missing.exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

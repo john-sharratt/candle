@@ -863,6 +863,290 @@ fn claimed_capacity_leaves_a_sparse_decode_exact_at_hd64_hpg2() -> Result<()> {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Decode through a page layout
+// ──────────────────────────────────────────────────────────────────────
+
+/// A projected prefix's page layout, as `QsaSelection::with_pages` takes it:
+/// `{tokens_before, blocks_before}` per page, then the live tail's entry.
+type Layout = [(u32, u32)];
+
+/// Three pieces the way a projection injects them — each ending where its
+/// tokens did, so a page's last block is short — with an unindexed span
+/// between the second and third (a piece that carried no rows), then the live
+/// tail from position 24:
+///
+/// | page | positions | blocks | its last block |
+/// |---|---|---|---|
+/// | 0 | 0..10 | 0..3 | 2 cells (8, 9) |
+/// | 1 | 10..17 | 3..5 | 3 cells (14, 15, 16); a whole entry also reads 17 |
+/// | — | 17..20 | — | unindexed |
+/// | 2 | 20..24 | 5..6 | 4 cells |
+/// | tail | 24.. | 6.. | uniform |
+///
+/// Block `b` of the tail therefore starts at `24 + (b − 6)·4`, not `b·4`: the
+/// two short blocks put it 2 + 1 cells behind the uniform grid and the
+/// unindexed span 3 ahead, so no block past page 1 sits where `b·4` says.
+///
+/// Block 4's whole entry reads 17 as well — the span's first cell, within
+/// `ratio` of the block's start — which `qsa_selects` also maps to block 4, so
+/// kernel and oracle agree on it. 18 and 19 belong to no block.
+const GAPPED: [(u32, u32); 4] = [(0, 0), (10, 3), (20, 5), (24, 6)];
+
+/// Three short-ended pieces with nothing between them, so every position
+/// belongs to exactly one block and naming every block reads every position
+/// once — what a select-everything comparison needs:
+///
+/// | page | positions | blocks | its last block |
+/// |---|---|---|---|
+/// | 0 | 0..10 | 0..3 | 2 cells |
+/// | 1 | 10..17 | 3..5 | 3 cells |
+/// | 2 | 17..23 | 5..7 | 2 cells |
+/// | tail | 23.. | 7.. | uniform |
+const TILED: [(u32, u32); 4] = [(0, 0), (10, 3), (17, 5), (23, 7)];
+
+/// The last page whose prefix is at or below `key` — `qsa_page_for`.
+fn page_for(layout: &Layout, key: usize, by_block: bool) -> (usize, usize) {
+    let (x, y) = *layout
+        .iter()
+        .rev()
+        .find(|&&(x, y)| (if by_block { y } else { x }) as usize <= key)
+        .expect("the first page opens at 0");
+    (x as usize, y as usize)
+}
+
+/// `qsa_block_of` through `layout`.
+fn paged_block_of(layout: &Layout, pos: usize) -> usize {
+    let (x, y) = page_for(layout, pos, false);
+    y + (pos - x) / RATIO
+}
+
+/// `qsa_block_start` through `layout`.
+fn paged_block_start(layout: &Layout, block: usize) -> usize {
+    let (x, y) = page_for(layout, block, true);
+    x + (block - y) * RATIO
+}
+
+/// An entry's block and cell count.
+fn unpack(e: u32) -> (usize, usize) {
+    (entry_block(e), (e & 3) as usize + 1)
+}
+
+/// Whether `entries` select `pos` — `qsa_selects` through `layout`: the
+/// position's block must be named, and the position must be among the cells
+/// the entry takes from that block's start.
+fn paged_selects(layout: &Layout, entries: &[u32], pos: usize) -> bool {
+    let block = paged_block_of(layout, pos);
+    let Some(cell) = pos.checked_sub(paged_block_start(layout, block)) else {
+        return false;
+    };
+    entries.iter().any(|&e| {
+        let (b, cells) = unpack(e);
+        b == block && cell < cells
+    })
+}
+
+/// The same entries read UNIFORMLY — block `b` as `[b·4, b·4 + cells)` — which
+/// is what a kernel ignoring the page layout attends.
+fn uniform_selects(entries: &[u32], pos: usize) -> bool {
+    entries.iter().any(|&e| {
+        let (b, cells) = unpack(e);
+        (b * RATIO..b * RATIO + cells).contains(&pos)
+    })
+}
+
+/// The same entries read from each block's true start but for their FULL cell
+/// count — what a walk that does not clamp a short block's entry attends: the
+/// cells past a page's last block, which belong to the next block.
+fn unclamped_selects(layout: &Layout, entries: &[u32], pos: usize) -> bool {
+    entries.iter().any(|&e| {
+        let (b, cells) = unpack(e);
+        let start = paged_block_start(layout, b);
+        (start..start + cells).contains(&pos)
+    })
+}
+
+/// Every block of `[0, visible)` named whole, and the query's own tail block
+/// for the cells it has.
+fn paged_full_row(layout: &Layout, visible: usize) -> Vec<u32> {
+    let tail = paged_block_of(layout, visible - 1);
+    let mut out: Vec<u32> = (0..tail).map(|b| pack_entry(b, RATIO)).collect();
+    out.push(pack_entry(tail, visible - paged_block_start(layout, tail)));
+    out
+}
+
+/// A pseudo-random subset of `layout`'s blocks below the query's tail, plus
+/// the tail. Block 2 — page 0's short last block — is always kept and block 3,
+/// the next page's first, always dropped: an entry reaching past a short
+/// block then reads cells the selection left out.
+fn paged_subset_row(layout: &Layout, visible: usize, seed: u64) -> Vec<u32> {
+    let tail = paged_block_of(layout, visible - 1);
+    let mut out: Vec<u32> = (0..tail)
+        .filter(|&b| b == 2 || (b != 3 && pseudo(b, 7, 3, seed) > 0.0))
+        .map(|b| pack_entry(b, RATIO))
+        .collect();
+    out.push(pack_entry(tail, visible - paged_block_start(layout, tail)));
+    out
+}
+
+/// `layout`'s page table, and a window onto it for each of `rows` rows of one
+/// sequence.
+fn page_tables(layout: &Layout, rows: usize, device: &Device) -> Result<(Tensor, Tensor)> {
+    let pages = Tensor::from_vec(
+        layout
+            .iter()
+            .flat_map(|&(x, y)| [x, y])
+            .collect::<Vec<u32>>(),
+        (layout.len(), 2),
+        device,
+    )?;
+    let win = Tensor::from_vec(
+        (0..rows)
+            .flat_map(|_| [0u32, layout.len() as u32])
+            .collect::<Vec<u32>>(),
+        (rows, 2),
+        device,
+    )?;
+    Ok((pages, win))
+}
+
+/// `rows` as a selection read through `layout`, every row one sequence's.
+fn paged_selection(layout: &Layout, rows: &[Vec<u32>], device: &Device) -> Result<QsaSelection> {
+    let (pages, win) = page_tables(layout, rows.len(), device)?;
+    selection(rows, device)?.with_pages(pages, win)
+}
+
+/// **A decode through a page layout attends the cells the pages say.**
+///
+/// A projected prefix is pages, and each ends in a short block, so from the
+/// first page on block `b` no longer starts at `b·ratio`. A kernel that walks
+/// the selection's ENTRIES and turns each into `b·ratio` reads every later
+/// block's cells displaced by the accumulated shortfall — and the newest, the
+/// query's own tail among them, past the end of its K/V. It did: Flash-Next's
+/// decode then read a context missing whatever came last, and answered an
+/// earlier question in half the conversations of the degradation script, while
+/// the same model reading every cell answered all of them.
+///
+/// Both properties of this file, through a page layout: naming every block of
+/// [`TILED`] reproduces the unselected answer, and every position a subset
+/// through [`GAPPED`] leaves out is negated without moving the answer. Two
+/// discriminators keep the second honest — the uniform reading of the same
+/// entries attends a cell the pages leave out, and the two histories disagree
+/// without a selection.
+fn decode_paged_case(g: Geom, seed: u64) -> Result<()> {
+    let _guard = gpu_serial();
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let history = 100usize;
+    let stager = PinnedStager::new_from_device(&device);
+    let inv_freq = Tensor::from_vec(
+        (0..g.head_dim / 2)
+            .map(|i| 1f32 / 10000f32.powf(2.0 * i as f32 / g.head_dim as f32))
+            .collect::<Vec<f32>>(),
+        (g.head_dim / 2,),
+        &device,
+    )?;
+    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, g.head_dim, &device)?;
+    let (q1, k1, v1) = make_qkv(g, 1, seed ^ 0x55, &[], &device)?;
+    let q = q1.reshape((1, g.n_head, 1, g.head_dim))?;
+    let k_new = k1.reshape((1, g.n_kv_head, 1, g.head_dim))?;
+    let v_new = v1.reshape((1, g.n_kv_head, 1, g.head_dim))?;
+
+    // The decode token sits at `history`, the last visible position.
+    let visible = history + 1;
+    let (backing, cache) = build_history_slot(
+        g,
+        history,
+        seed,
+        &none_alt(history),
+        &rope_cs,
+        &stager,
+        &device,
+    )?;
+    let run = |sel: Option<&QsaSelection>, b: &ChunkedKvBacking, c: &KvCache| -> Result<Vec<f32>> {
+        bits(&decode_one_slot(
+            g, b, c, &q, &k_new, &v_new, &rope_cs, sel, &stager, &device,
+        )?)
+    };
+
+    // 1. Naming every block of a tiled layout reads every position once.
+    let full = paged_selection(&TILED, &[paged_full_row(&TILED, visible)], &device)?;
+    let base = run(None, &backing, &cache)?;
+    let listed = run(Some(&full), &backing, &cache)?;
+    assert_same_to_bf16_ulps(
+        &base,
+        &listed,
+        "naming every block of a paged prefix changed the output",
+    );
+
+    // 2. A position the paged subset leaves out cannot move the answer.
+    let entries = paged_subset_row(&GAPPED, visible, seed);
+    let selected: Vec<bool> = (0..history)
+        .map(|p| paged_selects(&GAPPED, &entries, p))
+        .collect();
+    // The one direction that can fail a page-blind kernel: a cell it would
+    // attend that this history then negates.
+    assert!(
+        (0..history).any(|p| !selected[p] && uniform_selects(&entries, p)),
+        "the uniform reading attends no cell the pages leave out — a kernel ignoring the \
+         layout would pass this case"
+    );
+    let alt: Vec<bool> = selected.iter().map(|&s| !s).collect();
+    let sel = paged_selection(&GAPPED, &[entries], &device)?;
+    let (backing_b, cache_b) =
+        build_history_slot(g, history, seed, &alt, &rope_cs, &stager, &device)?;
+
+    let a = run(Some(&sel), &backing, &cache)?;
+    let b = run(Some(&sel), &backing_b, &cache_b)?;
+    assert_eq!(
+        a, b,
+        "a position the paged selection leaves out moved the answer — the kernel read the \
+         entries without the page layout"
+    );
+    let a_dense = run(None, &backing, &cache)?;
+    let b_dense = run(None, &backing_b, &cache_b)?;
+    assert_ne!(
+        a_dense, b_dense,
+        "the two histories are indistinguishable even unmasked — the test proves nothing"
+    );
+    Ok(())
+}
+
+/// The tile kernel — Qwen3.8-Flash-Next's own decode shape.
+#[test]
+fn decode_honours_a_page_layout_at_hd256_hpg12() -> Result<()> {
+    decode_paged_case(FLASH_NEXT, 0xD1)
+}
+
+#[test]
+fn decode_honours_a_page_layout_at_hd128_hpg2() -> Result<()> {
+    decode_paged_case(
+        Geom {
+            n_head: 4,
+            n_kv_head: 2,
+            head_dim: 128,
+        },
+        0xD2,
+    )
+}
+
+#[test]
+fn decode_honours_a_page_layout_at_hd64_hpg2() -> Result<()> {
+    decode_paged_case(
+        Geom {
+            n_head: 4,
+            n_kv_head: 2,
+            head_dim: 64,
+        },
+        0xD3,
+    )
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Prefill
 // ──────────────────────────────────────────────────────────────────────
 
@@ -1022,6 +1306,158 @@ fn prefill_honours_per_query_selection_at_hd128() -> Result<()> {
         100,
         24,
         0xE5,
+    )
+}
+
+/// The prefill kernel through a page layout: both properties as
+/// [`decode_paged_case`] states them, per packed query.
+///
+/// The walk once took every entry's full cell count and stepped a full `QB`
+/// past every block. Across a page's short last block that read the next
+/// block's first cells — once when only the short block was selected, which
+/// negating an unselected position catches, and a second time when both were,
+/// which the select-everything comparison catches — and a full step past a
+/// short block could skip the start of the next.
+fn prefill_paged_case(g: Geom, seed: u64) -> Result<()> {
+    let _guard = gpu_serial();
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let history = 100usize;
+    let q_len = 24usize;
+    let stager = PinnedStager::new_from_device(&device);
+    let inv_freq = Tensor::from_vec(
+        (0..g.head_dim / 2)
+            .map(|i| 1f32 / 10000f32.powf(2.0 * i as f32 / g.head_dim as f32))
+            .collect::<Vec<f32>>(),
+        (g.head_dim / 2,),
+        &device,
+    )?;
+    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, g.head_dim, &device)?;
+    let (q, k, v) = make_qkv(g, q_len, seed ^ 0x77, &[], &device)?;
+
+    let run = |sel: Option<&QsaSelection>, alt: &[bool]| -> Result<Vec<f32>> {
+        let (backing, mut cache) =
+            build_history_slot(g, history, seed, alt, &rope_cs, &stager, &device)?;
+        backing.ensure_for_batch_entries(&[(0, history)], q_len)?;
+        let rope_offsets = Tensor::zeros(1, DType::U32, &device)?;
+        let generation = stager.begin_generation();
+        let out = {
+            let mut caches_arr: [&mut KvCache; 1] = [&mut cache];
+            paged_prefill_batched(
+                None,
+                &mut caches_arr[..],
+                &[history],
+                &q,
+                &k,
+                &v,
+                1,
+                &[q_len],
+                g.n_head,
+                g.n_kv_head,
+                g.head_dim,
+                None,
+                &rope_offsets,
+                &rope_cs,
+                false,
+                &generation,
+                &std::cell::RefCell::new(None),
+                sel,
+            )?
+        };
+        bits(&out.to_owned_tensor()?)
+    };
+
+    // 1. Naming every block of a tiled layout attends what no selection does.
+    // The tolerance is `prefill_case`'s: the packed walk's tiles round V on a
+    // different per-tile scale than the dense walk's, by less than a step of
+    // 1/127 of a ±0.5 value. Reading a cell twice moves it by far more.
+    const PAGED_FULL_TOL: f32 = 1e-2;
+    let rows_full: Vec<Vec<u32>> = (0..q_len)
+        .map(|t| paged_full_row(&TILED, history + t + 1))
+        .collect();
+    let base = run(None, &none_alt(history))?;
+    let full = run(
+        Some(&paged_selection(&TILED, &rows_full, &device)?),
+        &none_alt(history),
+    )?;
+    let worst = base
+        .iter()
+        .zip(&full)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        worst <= PAGED_FULL_TOL,
+        "naming every block of a paged prefix moved the prefill output by {worst:.3e}"
+    );
+
+    // 2. A position every row's paged subset leaves out cannot move the answer.
+    let rows: Vec<Vec<u32>> = (0..q_len)
+        .map(|t| paged_subset_row(&GAPPED, history + t + 1, seed))
+        .collect();
+    let looked_at: Vec<bool> = (0..history)
+        .map(|p| rows.iter().any(|r| paged_selects(&GAPPED, r, p)))
+        .collect();
+    assert!(
+        (0..history)
+            .any(|p| !looked_at[p] && rows.iter().any(|r| unclamped_selects(&GAPPED, r, p))),
+        "no entry reaches past a short block into a cell every row leaves out — a walk that \
+         does not clamp would pass this case"
+    );
+    let alt: Vec<bool> = looked_at.iter().map(|s| !s).collect();
+    let sel = paged_selection(&GAPPED, &rows, &device)?;
+    let a = run(Some(&sel), &none_alt(history))?;
+    let b = run(Some(&sel), &alt)?;
+    assert_eq!(
+        a, b,
+        "a position the paged selection leaves out moved the prefill answer"
+    );
+    assert_ne!(
+        run(None, &none_alt(history))?,
+        run(None, &alt)?,
+        "the two histories are indistinguishable even unmasked — the test proves nothing"
+    );
+
+    // 3. Dense and sparse rows in one block over a page layout — a prefill
+    // crossing the budget on a projected prefix. Every dense row reads every
+    // position and every sparse row names every block, so each row must read
+    // every position exactly once: the walk cuts a dense row's step at the
+    // start of a sparse row's ragged block, and a step that skipped or
+    // repeated a position would move that row's output.
+    let dense: Vec<bool> = (0..q_len).map(|t| t % 2 == 0).collect();
+    let (pages, win) = page_tables(&TILED, q_len, &device)?;
+    let mixed = mixed_selection(&rows_full, &dense, &device)?.with_pages(pages, win)?;
+    let mixed_out = run(Some(&mixed), &none_alt(history))?;
+    let worst = base
+        .iter()
+        .zip(&mixed_out)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        worst <= PAGED_FULL_TOL,
+        "dense and sparse rows over a paged prefix moved the prefill output by {worst:.3e}"
+    );
+    Ok(())
+}
+
+#[test]
+fn prefill_honours_a_page_layout_at_hd256() -> Result<()> {
+    prefill_paged_case(FLASH_NEXT, 0xF1)
+}
+
+#[test]
+fn prefill_honours_a_page_layout_at_hd128() -> Result<()> {
+    prefill_paged_case(
+        Geom {
+            n_head: 4,
+            n_kv_head: 2,
+            head_dim: 128,
+        },
+        0xF2,
     )
 }
 

@@ -86,7 +86,10 @@ pub mod kv_arenas {
 }
 pub mod prompts;
 pub mod provenance;
+mod recorded_reply;
+mod recovered_message;
 pub(crate) mod scheduler;
+mod sealed_turn;
 mod sequence_handle;
 mod stats;
 pub mod stencil;
@@ -108,13 +111,14 @@ pub use config::{
     pick_max_hot_turns, DecodeHealthConfig, DryConfig, EngineConfig, ModeSampling, SamplingConfig,
     SchedulerConfig, SequenceConfig,
 };
-pub use conversation::{GlueMarkers, SectionInserts, Sequence};
+pub use conversation::{GlueMarkers, Sequence};
 pub use engine::{ConversationEngine, SubstrateReloadStatus, ThinkSteering};
 pub use error::ConversationError;
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
 pub use projection::{
     BucketKind, OptionalState, ProjectionBucket, ProjectionEvent, SelectionState, NO_THINK_SELECTOR,
 };
+pub use recovered_message::RecoveredMessage;
 pub use scheduler::branch_checkpoint_counts;
 pub use scheduler::holdings;
 pub use scheduler::memory_report;
@@ -123,6 +127,7 @@ pub use scheduler::provenance_capture_path_counts;
 pub use scheduler::recurrent_state_cost;
 pub use scheduler::relief_trace;
 pub use scheduler::wave_rate;
+pub use sealed_turn::{SealedPages, SealedTurn};
 pub use sequence_handle::SequenceId;
 pub use stats::{FinishReason, TurnStats};
 pub use token_buffer::TokenBuffer;

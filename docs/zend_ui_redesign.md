@@ -167,8 +167,13 @@ is normative; the Rust endpoints in Phase 2 are written to satisfy it.
 ```
 seedConversations(now) -> Conversation[]           // initial list; active one hydrated
                                                     // (live: GET list + GET :id for active)
-getConversation(id) -> Promise<Conversation>        // hydrate on demand (live: GET :id)
+getConversation(id) -> Promise<Conversation>        // hydrate on demand (live: GET :id); spans light, `title` when labelled
+getProjectionDetail(convId, turn, event) -> Promise<{span, glue, sectionContent, turnContent, targetLayer}>
+                                                    // one recorded point in full + the panel context (live: GET :id/projections/:turn/:event)
+getProjectionContext(convId, turns) -> Promise<{glue, sectionContent, turnContent, targetLayer}>
+                                                    // the panel context for a point streamed live (live: POST :id/projection-context)
 getStatus() -> Promise<{state:"loading"|"ready", started_at_ms, detail, loading?, build}>  // GET /v1/status; gates the startup overlay; `build` (assets hash) drives the hot-reload check
+getToolSchemas() -> Promise<{[tool]: JSONSchema|null}>  // GET /v1/substrate/tools; tool-call cards list every parameter from it, defaults included
 archiveConversation(id) / unarchiveConversation(id) -> Promise<void>
 streamChatCompletion(conv, text, opts, handlers) -> { cancel() }
 mkProjEvent(conv, region) -> ProjectionSpan         // mock-only synthesis helper; live ignores
@@ -180,7 +185,27 @@ seedLogs() -> LogLine[]                              // backlog
 subscribeLogs(onLine) -> unsubscribe()              // live stream
 ```
 `opts = { think: boolean, effort: 0..4, verbosity: 0..4 }`.
-`handlers (chat) = { onStatus(text), onToken(delta), onProjection(span), onLog?(), onError?(message), onDone() }`.
+`handlers (chat) = { onStatus(text), onToken(delta), onProjection(span), onTool?({phase, tools, results?}), onThink?({tokens, done}), onPrefill?({done, total}), onLog?(), onError?(message), onDone() }`.
+
+`onThink` reports the turn's reasoning length in generated tokens (live: the SSE
+`think` event): while its `<think>` block is open, and once more with `done` and
+the total when it closes. It is counted the way the turn records its reasoning at
+seal — every generated token through `</think>` — so the total matches the
+`thinking` length a reloaded history carries for the same turn
+(`{tokens, exact}`, on the assistant message; `exact: false` when the turn's
+reasoning K/V was dropped and the length is an estimate from its prose).
+
+A tool result's length in tokens rides with it the same way: live, the `tool`
+`done` notice carries `tokens` (one per result, encoded as the next turn will
+encode it); on reload, the tool-response user message carries `tool_tokens` (one
+per `<tool_response>` block, counted off the sealed turn's own ids). The two
+agree, and the expanded tool card shows the count in its output header.
+
+`onPrefill` reports how far the prefill of each turn's input has got, in tokens
+(live: the SSE `prefill` event). After a tool round that input is the tools'
+results, which can run to tens of thousands of tokens; the GUI draws a progress
+bar under the tool cards from these and removes it when `done` reaches `total`
+or the answer's first token arrives.
 
 `onError` fires when the stream **failed** rather than finished — a non-2xx
 response, a body-less response, a socket that broke mid-stream, or a stream that
@@ -218,6 +243,19 @@ LogLine  { ts: "HH:MM:SS", level: "TRACE"|"DEBUG"|"INFO"|"WARN"|"ERROR", target,
 >   `{ id, region, metric, detail, step, from, to, total, window }`.
 > - `region` is **parsed from emitted content** — `think` inside a
 >   `<think>…</think>` span, else `answer` (decision 5).
+> - **A loaded history's spans are light.** `GET /:id` carries each recorded
+>   projection point without its `selection` and `materialized` spine — the
+>   fields only the projection panel reads, and about ten kilobytes a point — plus
+>   its `turn`/`event` address. The panel fetches the point in full, with the
+>   glue, section text and selected turns' bodies, when it opens
+>   (`getProjectionDetail`); a point streamed live arrives in full but
+>   unaddressed, so for it the panel asks for the context alone
+>   (`getProjectionContext`). Sending all of this with the history made a
+>   fourteen-turn conversation 1.5 MB on every open.
+> - **Replies are compressed.** The daemon gzips the conversation replies for a
+>   client that takes it, and the gateway (`web::compress`) gzips everything
+>   else it forwards uncompressed — streaming and flushed per chunk, so SSE is
+>   not held back — and passes an already-encoded reply through untouched.
 > - `LogLine` is delivered **as structured JSON on `/ws/logs`** (decision 6), not
 >   parsed from a formatted string.
 

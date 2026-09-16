@@ -32,9 +32,9 @@ hyper-util     = { version = "0.1", features = ["client", "client-legacy", "http
 http-body-util = "0.1"
 include_dir    = { version = "0.7" }
 mime_guess     = { version = "2" }
-# Static files go out gzipped. Not a compression *layer*: the API is proxied
-# through this server and one of its routes is an SSE stream, which a layer
-# would buffer. See `asset.rs`.
+# Gzip for everything this server sends. Static files are compressed once in
+# `asset.rs`; everything else on the way out in `compress.rs`, which streams and
+# flushes per chunk so a proxied SSE stream is never held back.
 flate2         = "1"
 
 # Long-form content. Papers and posts are markdown files rendered on the way

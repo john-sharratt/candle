@@ -142,10 +142,27 @@ async fn model_independent_api_contract() {
         .unwrap();
     assert_eq!(r.status(), 503);
 
-    // conversation history (and its windowed-substrate panel data, now folded
-    // into this endpoint) is model-gated -> 503 without an engine
+    // conversation history is model-gated -> 503 without an engine
     let r = client
         .get(format!("{base}/v1/conversations/whatever"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 503);
+
+    // so is the projection panel's data: one point in full, and the context
+    // for a point the client already holds
+    let r = client
+        .get(format!("{base}/v1/conversations/whatever/projections/0/0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 503);
+    let r = client
+        .post(format!(
+            "{base}/v1/conversations/whatever/projection-context"
+        ))
+        .json(&serde_json::json!({ "turns": [] }))
         .send()
         .await
         .unwrap();

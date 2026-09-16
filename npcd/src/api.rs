@@ -4797,7 +4797,8 @@ layers:
             .unwrap()
             .contains("You keep the tower"));
 
-        // One section per facet the document declares — not a fixed four.
+        // One section per facet the document declares, in the order it declares
+        // them — not a fixed four.
         let identity = by("identity");
         let ids: Vec<&str> = identity["sections"]
             .as_array()
@@ -4805,7 +4806,7 @@ layers:
             .iter()
             .map(|s| s["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, ["processing", "voice"]);
+        assert_eq!(ids, ["voice", "processing"]);
         assert!(identity["sections"][0]["chars"].as_u64().unwrap() > 0);
 
         // No doctrine in this document, so no doctrine collection — 69 of the

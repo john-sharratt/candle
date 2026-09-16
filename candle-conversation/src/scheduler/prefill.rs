@@ -2,7 +2,10 @@ use super::admit;
 use super::admit::{Ground, Order};
 use super::interleave;
 use super::*;
+use crate::persistence::thread::effective_turn_policy;
 use crate::projection::DecodePriority;
+use crate::recorded_reply::replayed_step;
+use crate::substrate::ConvCompression;
 use std::time::Duration;
 
 /// The engine as [`interleave::fill`] sees it: a cursor over both queues that
@@ -4596,7 +4599,7 @@ impl Scheduler {
             );
         }
 
-        let first_token = match self.sample_single(&logits, &sampling, &mut sampling_state) {
+        let sampled = match self.sample_single(&logits, &sampling, &mut sampling_state) {
             Ok(t) => t,
             Err(e) => {
                 self.sampling_states
@@ -4604,6 +4607,12 @@ impl Scheduler {
                 let _ = work.event_tx.send(TurnEvent::Error(e));
                 return;
             }
+        };
+        // A replayed turn opens with its recording's first id, whatever the
+        // prefill's logits chose.
+        let first_token = match (work.recorded_reply.as_deref(), self.eos_tokens.first()) {
+            (Some(reply), Some(&eos)) => replayed_step(reply, 0, eos),
+            _ => sampled,
         };
 
         // Detect think-mode entry: the model opens its OWN `<think>` as the first
@@ -4763,6 +4772,7 @@ impl Scheduler {
                     triggers: work.triggers,
                     stencil: None,
                     pending_mask: None,
+                    recorded_reply: work.recorded_reply.map(Replay::new),
                 };
                 // The turn's first token opens a page at the prefill/decode
                 // boundary, so the reasoning starts one of its own.
@@ -4950,6 +4960,7 @@ impl Scheduler {
             triggers: work.triggers,
             stencil,
             pending_mask: None,
+            recorded_reply: work.recorded_reply.map(Replay::new),
         };
         // The turn's first token opens a page at the prefill/decode boundary, so
         // the reasoning starts one of its own.
@@ -5141,9 +5152,10 @@ impl Scheduler {
             })?
         };
 
-        // The cached decode slot buffer is already current: the prefill's own
-        // commit (`KvCache::commit_written_tokens`) resynced it, which is the
-        // one place every write outside the decode kernel goes through.
+        // Nothing to bring up to date here: the prefill's own commit
+        // (`KvCache::commit_written_tokens`, the one place every write outside
+        // the decode kernel goes through) marked the cached decode slot buffer,
+        // and the next sync that reads it re-serialises its writer region.
         Ok(logits)
     }
 }
@@ -5675,6 +5687,7 @@ mod wave_chunk_tests {
                 demoted: false,
                 held_until_decodes_below: None,
                 announced: false,
+                recorded_reply: None,
             },
             offset: 0,
             next_projection: 0,

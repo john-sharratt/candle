@@ -1552,35 +1552,33 @@ fn inject_sealed_turn(
         // is a wrong answer rather than a missing one. The `page.is_none()`
         // branch below already advances for exactly this reason; these two
         // failure exits did not.
-        match index_pages::decode(&blob) {
-            Ok(pages) => {
-                let declared: usize = pages.iter().map(|(tokens, _)| *tokens).sum();
-                let mut pushed = 0usize;
-                for (tokens, p) in pages {
-                    match ctx.model.push_positional_state(parent_id.0, p) {
-                        Ok(_) => {
-                            walker.pages_pushed += 1;
-                            pushed += tokens;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "apply_projection: turn {}/{} index page refused: {e}",
-                                timeline,
-                                index.0
-                            );
-                            break;
-                        }
-                    }
+        let model: &(dyn ManagedBatchedModel + Send) = &**ctx.model;
+        let carries = model.carries_positional_state();
+        let mut advanced = true;
+        let pushed = index_pages::push_in_order(
+            &blob,
+            |p| model.push_positional_state(parent_id.0, p).map(|_| ()),
+            |gap| {
+                if carries {
+                    advanced = model.push_positional_gap(parent_id.0, gap).is_ok();
                 }
-                // Only the tokens no page covered, so a partial push is not
-                // counted twice.
-                if pushed < declared && ctx.model.carries_positional_state() {
-                    let gap = declared - pushed;
-                    let advanced = ctx.model.push_positional_gap(parent_id.0, gap).is_ok();
+            },
+        );
+        match pushed {
+            Ok(pushed) => {
+                walker.pages_pushed += pushed.pages;
+                if let Some(e) = &pushed.refused {
+                    tracing::warn!(
+                        "apply_projection: turn {}/{} index page refused: {e}",
+                        timeline,
+                        index.0
+                    );
+                }
+                if pushed.gap > 0 && carries {
                     tracing::warn!(
                         timeline = timeline.raw(),
                         index = index.0,
-                        gap,
+                        gap = pushed.gap,
                         advanced,
                         "apply_projection: index pages stopped short of the turn's K/V; \
                          advancing the slot over the remainder"
@@ -1594,10 +1592,10 @@ fn inject_sealed_turn(
                     timeline,
                     index.0
                 );
-                if ctx.model.carries_positional_state() {
+                if carries {
                     // Nothing was pushed, so the whole injected width is the gap.
                     let tokens = sealed.first().map_or(0, |s| s.token_count);
-                    let _ = ctx.model.push_positional_gap(parent_id.0, tokens);
+                    let _ = model.push_positional_gap(parent_id.0, tokens);
                 }
             }
         }
@@ -1687,12 +1685,18 @@ fn inject_sealed_turn_half(
     // **No page for a HALF, deliberately.** The stored page covers a whole
     // turn, and this borrows only its user half — handing the whole turn's rows
     // over would claim blocks for positions this slot does not hold, which is a
-    // worse error than having none. Reported so the gap is visible rather than
-    // silent; the compression path this serves selects over what it did index.
+    // worse error than having none. The half's K/V is in the slot either way, so
+    // the index is advanced past it exactly as the section and turn paths do for
+    // a piece with no page: without that, every page pushed after the half is
+    // placed its width short of where its K/V sits.
     if ctx.model.carries_positional_state() {
+        let tokens = sealed[0].token_count;
+        let advanced = ctx.model.push_positional_gap(parent_id.0, tokens);
         tracing::warn!(
+            advanced = advanced.is_ok(),
             "apply_projection: turn-half {}/{} carries no index page — a half is not a \
-             sealed piece of its own, so the turn's rows do not describe it",
+             sealed piece of its own, so the turn's rows do not describe it; its {tokens} \
+             token(s) are unindexed",
             timeline,
             index.0
         );

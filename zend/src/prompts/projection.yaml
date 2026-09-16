@@ -150,14 +150,13 @@ system_prompt:
           dialect: no_think_prefix
           default: absent
 
-        # Persona frame. `assistant` is the interactive dialogue agent; `summarize`
-        # reframes the model as a terse code-summarization engine for the append-only
-        # code_reading / repo_map INGEST (set via `persona: summarize` on the ingest
-        # selection — see `ingest_scope_roundtrip`). The dialogue "You are Zen…"
-        # priming is conversational, which on the ingest summariser makes the model
-        # reason aloud, refuse ("I can't access that file"), or drift off-language
-        # instead of emitting a summary; the `summarize` frame pins content-is-
-        # provided (no refusals), English (no drift), and summary-only (no preamble).
+        # Persona frame — the ONE framing every turn is sealed under, the
+        # code_reading / repo_map ingest included. An ingested turn's K/V is later
+        # borrowed into dialogue projections, and borrowed K/V carries the framing
+        # it was computed under: turns sealed under a second, summarizer persona
+        # (with worked request→summary examples) made a dialogue answer the
+        # ingest's request instead of the user's. So there is no second persona to
+        # select; the ingest changes only its length and thinking dials.
         - kind: selector
           id: persona
           default: assistant
@@ -176,46 +175,6 @@ system_prompt:
                 the conventions, frameworks, and libraries the codebase already uses. If you need
                 more information, look it up rather than assuming. If the user asks a simple
                 question that needs no code or files, answer it directly without tools.
-            - id: summarize
-              content: |+
-                You are a code-summarization engine. The tool responses contain what you are
-                summarizing — a code excerpt, or a listing of a folder's files — ALREADY
-                PROVIDED to you in full. Read them and reply with ONLY a concise summary — at
-                most two sentences, in English — of what was asked about. Do not think out
-                loud, restate the request, add any preamble, headings, or notes, translate to
-                another language, apologize, or claim you cannot access, view, or open the
-                file: it is right there in the tool responses. Output the summary and nothing
-                else.
-            # Writes the QUESTIONS a folder is the answer to — the `repo_map`
-            # probe layer's generation pass (`zend/src/repo_scan/probe/`).
-            #
-            # A separate persona because `summarize` pins "reply with ONLY a
-            # concise summary … at most two sentences", which directly fights a
-            # request for forty-eight questions: under it the generator returns a
-            # description of the folder and the whole probe set for that folder
-            # is lost. `assistant` fails the other way — it discusses the task,
-            # offers to help, and wraps the list in commentary the parser then
-            # has to guess its way through.
-            #
-            # The framing that matters is the INVERSION: the model must write as
-            # the person who has NOT found the folder yet. Told merely to "write
-            # questions about this folder" it writes quiz questions from the
-            # position of someone reading it, which name the folder, its files
-            # and its layout — and those are precisely what the admission
-            # filters discard, because a question whose asker already knows the
-            # path cannot retrieve anything.
-            - id: question_writer
-              content: |+
-                You write the questions that a piece of code is the ANSWER to.
-                You are given one folder from a software project. Imagine the developer who
-                needs that folder but has not found it yet: they know what they are trying to
-                do and what things are called, but not where anything lives. Write what THEY
-                would type into a search box or ask a colleague.
-                Never write the folder's path or any file name — they do not know those. Never
-                write "this folder", "this module" or "this directory" — they cannot see it.
-                Every question ends with a question mark, one per line, under the headings you
-                are given. Output only the headings and the questions: no preamble, no
-                commentary, no answers, and never a summary of the folder.
 
         # Binary toggle driven by zend (`set_optional("reasoning_stance", …)`,
         # see api/chat.rs): present ⇔ the turn thinks, the inverse of
@@ -486,134 +445,6 @@ system_prompt:
       id: system_close
       dialect: system_end
 
-    # Few-shot summarizer demonstrations — PROPER CONTEXT STUFFING: real user/
-    # assistant example turns emitted AFTER `system_close` (the system-end token),
-    # mirroring the ingest's own round-trip exactly. Sealed once into the shared
-    # prefix (never into a stored ingest turn). The sample files/folders are
-    # unrelated to this repo — pure format demonstrations. The `<|im_start|>` /
-    # `<|im_end|>` are the tokenizer's real special tokens (same as the
-    # tool-calibration ChatML examples).
-    #
-    # ONE OPTION PER INGEST SHAPE, because an example teaches the SUBJECT as much
-    # as the format. `code_reading` reads one excerpt and summarises it; `repo_map`
-    # lists a folder, reads its module doc, and summarises THE FOLDER. Shown the
-    # file examples, the repo_map decode dutifully summarises the excerpt it was
-    # just handed ("The `mod.rs` file outlines…") instead of the directory — the
-    # right behaviour for the wrong subject. Each ingest selects the shape it
-    # actually runs (`SUMMARIZE_BRANCH` in `zend/src/repo_scan/mod.rs`).
-    - kind: section_tree
-      nodes:
-        - kind: selector
-          id: summarize_examples
-          default: absent
-          options:
-            - id: absent
-              content: ""
-            - id: file
-              content: |+
-                <|im_start|>user
-                Summarize `billing/webhooks.py` (lines 1-9) in no more than two sentences.<|im_end|>
-                <|im_start|>assistant
-                <tool_call>{"name":"file_read","arguments":{"path":"billing/webhooks.py","start_line":1,"end_line":9}}</tool_call><|im_end|>
-                <|im_start|>user
-                <tool_response>
-                billing/webhooks.py (lines 1-9):
-
-                ```python
-                1  @bp.route("/stripe", methods=["POST"])
-                2  def stripe_webhook():
-                3      payload = request.get_data()
-                4      sig = request.headers.get("Stripe-Signature", "")
-                5      try:
-                6          event = stripe.Webhook.construct_event(payload, sig, ENDPOINT_SECRET)
-                7      except stripe.error.SignatureVerificationError:
-                8          abort(400)
-                9      return handle_event(event), 200
-                ```
-                </tool_response><|im_end|>
-                <|im_start|>assistant
-                This Flask POST endpoint receives Stripe webhooks, verifying each request's signature against the endpoint secret and aborting with 400 on a verification failure. Valid events are dispatched to handle_event and acknowledged with a 200.<|im_end|>
-                <|im_start|>user
-                Summarize `internal/retry/backoff.go` (lines 12-18) in no more than two sentences.<|im_end|>
-                <|im_start|>assistant
-                <tool_call>{"name":"file_read","arguments":{"path":"internal/retry/backoff.go","start_line":12,"end_line":18}}</tool_call><|im_end|>
-                <|im_start|>user
-                <tool_response>
-                internal/retry/backoff.go (lines 12-18):
-
-                ```go
-                12  func Jitter(base time.Duration, attempt int) time.Duration {
-                13      ceiling := base * (1 << uint(attempt))
-                14      if ceiling <= 0 {
-                15          ceiling = base
-                16      }
-                17      return time.Duration(rand.Int63n(int64(ceiling)))
-                18  }
-                ```
-                </tool_response><|im_end|>
-                <|im_start|>assistant
-                Jitter returns a randomized retry backoff, uniformly sampled between zero and an exponentially growing ceiling (the base duration doubled per attempt). It falls back to the base duration as the ceiling when the shift overflows to a non-positive value.<|im_end|>
-                <|im_start|>user
-                Summarize `db/migrations/0007_add_orders_index.sql` (lines 1-4) in no more than two sentences.<|im_end|>
-                <|im_start|>assistant
-                <tool_call>{"name":"file_read","arguments":{"path":"db/migrations/0007_add_orders_index.sql","start_line":1,"end_line":4}}</tool_call><|im_end|>
-                <|im_start|>user
-                <tool_response>
-                db/migrations/0007_add_orders_index.sql (lines 1-4):
-
-                ```sql
-                1  -- Speed up the customer order-history page
-                2  CREATE INDEX CONCURRENTLY idx_orders_customer_created
-                3      ON orders (customer_id, created_at DESC);
-                4
-                ```
-                </tool_response><|im_end|>
-                <|im_start|>assistant
-                This migration adds a concurrent composite index on the orders table over customer_id and created_at (descending). It targets the customer order-history query and contains no other schema changes.<|im_end|>
-            - id: folder
-              content: |+
-                <|im_start|>user
-                Summarize the `worker/scheduling/` folder in no more than two sentences.<|im_end|>
-                <|im_start|>assistant
-                <tool_call>{"name":"file_list","arguments":{"prefix":"worker/scheduling/"}}</tool_call><|im_end|>
-                <|im_start|>user
-                <tool_response>{"files":[{"path":"worker/scheduling/mod.rs","bytes":1180,"lines":31},{"path":"worker/scheduling/fair_queue.rs","bytes":6402,"lines":184},{"path":"worker/scheduling/leases.rs","bytes":3915,"lines":112}],"paging":{"page":0,"pages":1,"per_page":50,"total":3,"next_page":null},"total_bytes":0}</tool_response><|im_end|>
-                <|im_start|>assistant
-                <tool_call>{"name":"file_read","arguments":{"path":"worker/scheduling/mod.rs","start_line":1,"end_line":4}}</tool_call><|im_end|>
-                <|im_start|>user
-                <tool_response>
-                worker/scheduling/mod.rs (lines 1-4 of 31):
-
-                ```rust
-                1  //! Decides which tenant's jobs run next.
-                2  //!
-                3  //! A weighted fair queue picks the tenant; a lease then pins that job to one
-                4  //! worker for a bounded time so a crashed worker's job is retried, not lost.
-                ```
-                </tool_response><|im_end|>
-                <|im_start|>assistant
-                This folder decides which tenant's jobs run next, using a weighted fair queue to pick the tenant and leases to pin a job to a single worker. The queue lives in fair_queue.rs and the bounded-time lease handling, which lets a crashed worker's job be retried rather than lost, in leases.rs.<|im_end|>
-                <|im_start|>user
-                Summarize the `platform/ratelimit/` folder in no more than two sentences.<|im_end|>
-                <|im_start|>assistant
-                <tool_call>{"name":"file_list","arguments":{"prefix":"platform/ratelimit/"}}</tool_call><|im_end|>
-                <|im_start|>user
-                <tool_response>{"files":[{"path":"platform/ratelimit/mod.rs","bytes":940,"lines":24},{"path":"platform/ratelimit/token_bucket.rs","bytes":5120,"lines":148},{"path":"platform/ratelimit/redis_store.rs","bytes":7330,"lines":201}],"paging":{"page":0,"pages":1,"per_page":50,"total":3,"next_page":null},"total_bytes":0}</tool_response><|im_end|>
-                <|im_start|>assistant
-                <tool_call>{"name":"file_read","arguments":{"path":"platform/ratelimit/mod.rs","start_line":1,"end_line":3}}</tool_call><|im_end|>
-                <|im_start|>user
-                <tool_response>
-                platform/ratelimit/mod.rs (lines 1-3 of 24):
-
-                ```rust
-                1  //! Per-tenant request throttling.
-                2  //!
-                3  //! Token buckets are held in Redis so every node sees one shared count.
-                ```
-                </tool_response><|im_end|>
-                <|im_start|>assistant
-                This folder throttles requests per tenant, keeping the token buckets in Redis so every node shares one count. token_bucket.rs holds the bucket arithmetic and redis_store.rs the shared-state access.<|im_end|>
-
     # Tool-call FORMAT demonstration for the live dialogue.
     #
     # `tools_overview` already states the format in prose and shows the tags
@@ -634,21 +465,37 @@ system_prompt:
     #
     # `dns_lookup` is deliberately unlike the things tools are usually asked for
     # here (times, arithmetic, files): an example teaches the SUBJECT as much as
-    # the format (see the summarizer note above), so the demonstrated tool is one
-    # no ordinary request should be drawn toward. The `absent` option exists for
+    # the format, so the demonstrated tool is one no ordinary request should be
+    # drawn toward. The `absent` option exists for
     # a tool-free projection, where demonstrating a call would contradict a
     # prompt that lists no tools.
     #
-    # The ingest layers (`repo_map`, `code_reading`) set it absent through their
-    # dials. An ingest turn asks for no tool of its own, and the demonstration is
-    # a user turn: a folder conversation whose own request had dropped out of its
-    # context answered this one instead — "The provided text does not contain IP
-    # addresses; `example.com` resolves via DNS" — in folder after folder.
+    # The code_reading / repo_map ingest selects `absent` too. Its chain prefills
+    # its own calls, and its closing decode — whose last user turn is a tool
+    # response — looks back for the question it is answering: with this
+    # demonstration in the prompt it answered "I cannot provide the IP address
+    # for example.com…" instead of summarizing the file.
     - kind: section_tree
       nodes:
+        # DEFAULT ABSENT, and the default is what matters here. Priming injects
+        # each tree's default branch (`SectionTree::default_present_ids`), and an
+        # append-only ingest never re-projects — so whatever this default is, the
+        # code_reading / repo_map / raw layers are sealed behind it and no
+        # selection can change that. With the demonstration on by default their
+        # closing decode, whose last user turn is a tool response, looked back for
+        # the question it was answering and answered the demonstrated one instead
+        # ("I cannot provide the IP address for example.com…"), which then seals as
+        # that file's summary. Every caller that DOES re-project and wants the
+        # demonstration selects it: the chat per turn with its tools dial
+        # (`api/chat.rs`), calibration alongside its tool pin (`session.rs`).
+        # The chat's TOOL ROUNDS drop it again (`tool_round_selection`): their
+        # last user turn is a tool response too, and a chat four rounds into
+        # reading a paper answered "the IP of example.com" the same way. The
+        # model has made its call by then; the demonstration has nothing left
+        # to teach it.
         - kind: optional
           id: tool_call_example
-          default: present
+          default: absent
           # The demonstration STOPS at the call, and carries no `<tool_response>`
           # and no prose answer. That is the whole difference between working and
           # not: the model copies the last assistant turn it was shown. Given the
@@ -699,8 +546,6 @@ layers:
       thinking_effort: off
       response_length: terse
       tools: none
-      # An ingest turn asks for no tool of its own; see `tool_call_example`.
-      tool_call_example: absent
     summary:
       turns:
         max_tokens: 384
@@ -799,23 +644,6 @@ layers:
           # group-2 variant overfits one). Retuned by the §83 `provenance_layers`
           # sweep on the live timeline; adjust there before changing.
           layer_weights: [0.1, 1.0, 0.1]
-          # NORMALIZE THE COMPETITION BETWEEN FOLDERS, not only within each one.
-          #
-          # This group's candidates are whole conversations — one timeline per
-          # folder — so the question it answers is "which FOLDER matches?".
-          # Without this, normalization is scoped per timeline: every folder is
-          # rescaled against its own denominator and the results then compared as
-          # though they shared a scale, so the folder carrying the most turns
-          # wins regardless of relevance. Measured on the probe layer, four
-          # folders took first place from the right answer 32 times between them
-          # and every one of them was a folder that happened to carry probes.
-          #
-          # On, the group gets ONE scope in which every folder competes and each
-          # learns its own hit level — the same shape the `tools` collection uses,
-          # and the reason tool routing normalizes correctly where this did not.
-          # The dialogue layer leaves this off: its candidates are moments in a
-          # single thread, where per-timeline scoping is the right question.
-          member_normalization: true
           # Carry LEAKED HARDER than the tool default (β = RelLeak leak fraction, so
           # HIGHER = faster decay = less carry). repo_map must reflect the CURRENT
           # question, not linger on a prior topic's folder. A numeric attractor dir
@@ -870,8 +698,6 @@ layers:
       thinking_effort: off
       response_length: terse
       tools: none
-      # An ingest turn asks for no tool of its own; see `tool_call_example`.
-      tool_call_example: absent
     summary:
       turns:
         max_tokens: 512

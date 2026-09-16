@@ -350,8 +350,7 @@ pub fn strip_reasoning(text: &str) -> String {
     if let Some(rest) = out.strip_prefix("```") {
         out = rest
             .split_once('\n')
-            .map(|(_, body)| body)
-            .unwrap_or("")
+            .map_or("", |(_, body)| body)
             .trim()
             .trim_end_matches('`')
             .trim();

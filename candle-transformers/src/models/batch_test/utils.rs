@@ -1682,6 +1682,11 @@ impl TestParams {
         } else {
             Vec::new()
         };
+        // Start from an idle device: this config's session setup (norm weights
+        // re-materialised for its dtype) and its system-prompt prefill are
+        // still queued here, and would otherwise finish inside the prompt
+        // timer and be reported as the prompt's prefill.
+        self.device.synchronize()?;
         let prompt_start = std::time::Instant::now();
         let t_prompt_total = profile_now();
         let mut repeat_base_logits: Option<Vec<Tensor>> = None;

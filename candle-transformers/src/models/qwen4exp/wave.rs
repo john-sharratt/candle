@@ -31,6 +31,7 @@ use std::sync::{Mutex, RwLock};
 
 use candle::quantized::cuda::to_dynamic;
 use candle::{DType, Device, Result, Tensor};
+use candle_kernels::simple::qsa_topk::MAX_KEEP;
 use candle_nn::kv_cache::{
     ffn_work_dtype, DeltaNetWidths, KvCache, ModelGeometry, SharedExpertWidths, WaveWidth,
     QWEN4EXP_KV_FACTORS,
@@ -38,6 +39,7 @@ use candle_nn::kv_cache::{
 
 use super::batched_attention::Qwen4ExpAttentionLayer;
 use super::carried_move::move_entry;
+use super::coverage::coverage_disagreements;
 use super::draft::{HeadWave, SeedStore};
 use super::engine::{GpuLayerMix, Qwen4ExpGpu};
 use super::hyper::{hc_combine, hc_mix};
@@ -46,6 +48,7 @@ use super::paged_index;
 use super::paged_index::{IndexPage, SealedIndex};
 use super::ple::{ple_apply, ple_row_ids, PleState};
 use super::qsa::IndexerWeights;
+use super::qsa_select::budget_fits_kernel;
 use super::spec::SpecCapture;
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, ModelCoreProperties, WaveResult,
@@ -219,8 +222,19 @@ impl Qwen4ExpBatched {
     /// selected read loses says nothing on its own: it could be lost to the
     /// selection, or the checkpoint could simply not answer that prompt. Run
     /// both and the difference names which.
-    pub fn set_selection_budget(&mut self, top_k: usize) {
+    ///
+    /// Refused when the selection kernel could not run it — see
+    /// [`budget_fits_kernel`].
+    pub fn set_selection_budget(&mut self, top_k: usize) -> Result<()> {
+        budget_fits_kernel(
+            top_k,
+            &self.attention_ratios(),
+            self.model.cfg.max_position_embeddings,
+            MAX_KEEP,
+        )
+        .map_err(candle::Error::Msg)?;
         self.model.cfg.indexer.top_k = top_k;
+        Ok(())
     }
 
     /// The budget [`Self::set_selection_budget`] is currently at.
@@ -307,6 +321,9 @@ impl Qwen4ExpBatched {
                 None => None,
             }
         };
+        // Whether the parent has ever run a wave, read before its store is moved
+        // into the child: it decides what a missing index means below.
+        let parent_ran = forked.is_some();
         if let Some(f) = forked {
             self.recurrent
                 .write()
@@ -345,14 +362,19 @@ impl Qwen4ExpBatched {
                     .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?
                     .insert(child, i);
             }
-            // The parent had no caches at all — the child starts empty and every
-            // token the view borrows is unindexed from birth.
-            None => tracing::warn!(
+            // The parent had no caches at all. After a parent has run a wave —
+            // it holds recurrent state — that is a loss: the child starts empty
+            // and every token the view borrows is unindexed from birth. A parent
+            // that has never run one is a fresh slot with nothing to inherit;
+            // the tree summariser's scratch turn is carved from exactly that,
+            // on whatever id a finalized view just freed.
+            None if parent_ran => tracing::warn!(
                 parent,
                 child,
                 "qwen4exp: the view's parent holds no index caches, so the carve \
                  inherits none — the borrowed K/V is unindexed from the start",
             ),
+            None => {}
         }
         self.mark_seeded(child)?;
         Ok(())
@@ -1258,19 +1280,20 @@ impl Qwen4ExpBatched {
             let off: Vec<(usize, usize)> = if layer_start != 0 {
                 Vec::new()
             } else {
-                caches
-                    .iter()
-                    .zip(self.attention_ratios())
-                    .enumerate()
-                    .filter(|(_, (_, ratio))| *ratio > 0)
-                    .filter_map(|(layer, (c, ratio))| {
-                        let have = c.indexed_tokens(ratio);
-                        // The open block carries up to `ratio - 1` tokens the
-                        // wave is about to complete, so equality is not
-                        // expected — only a whole block of disagreement is.
-                        (have + ratio <= offset || have > offset + ratio).then_some((layer, have))
-                    })
-                    .collect()
+                // **Exact, to the token.** `indexed_tokens` counts the open
+                // block's carried rows as well as the completed blocks and the
+                // injected pages, so an index that is where its K/V is agrees
+                // with `offset` exactly — and one that is off by less than a
+                // block is misplaced just the same (see `coverage`).
+                coverage_disagreements(
+                    caches
+                        .iter()
+                        .zip(self.attention_ratios())
+                        .enumerate()
+                        .filter(|(_, (_, ratio))| *ratio > 0)
+                        .map(|(layer, (c, ratio))| (layer, c.indexed_tokens(ratio))),
+                    offset,
+                )
             };
             if !off.is_empty() {
                 tracing::warn!(

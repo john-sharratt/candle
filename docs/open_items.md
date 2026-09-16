@@ -1,13 +1,13 @@
 # Open items
 
-State as of `3d9ed922` (on `main` and `qwen38-moe`, pushed), plus the **uncommitted**
-working-tree fixes recorded under "Fixed" below. Nothing here is speculative: every claim
+State as of `3d9ed922` (on `main` and `qwen38-moe`, pushed), plus the fixes recorded under
+"Fixed" below, committed in `81e487b5`. Nothing here is speculative: every claim
 has the command or file:line that produced it, and the one claim that is code-derived rather
 than measured says so and names what would falsify it.
 
 ---
 
-## Fixed in the working tree (uncommitted)
+## Fixed (committed in `81e487b5`)
 
 ### 1. `persistence_integration` — the carved calibration seal, not the scheduler
 
@@ -87,7 +87,7 @@ measured past one. Restored through `conversation.rs::assistant_lead`, with
 - **Mojibake** (`Â§` for `§`, a CP1252 round-trip): `scheduler/mod.rs` ×2 and
   `projection/tests.rs` ×2, all from `80b5541b` (2026-05-31).
 
-### 5. Default-run test times (uncommitted)
+### 5. Default-run test times
 
 Every test in a plain `cargo test` now finishes under ~20 s except `tools_integration`'s
 scenarios (below). None of the slow ones loaded a model; they were **unoptimised host code**.
@@ -114,7 +114,7 @@ scenarios (below). None of the slow ones loaded a model; they were **unoptimised
 - **`zend/README.md`** documents `--model`, and its stale `--disable-summariser` row (no such
   flag) is gone.
 
-### 6. `docs/performance.md` — second width sweep (uncommitted)
+### 6. `docs/performance.md` — second width sweep
 
 All 12 `test_parallel_batched_forwarding*` gates re-run 2026-09-13, one process per model,
 12/12 pass. §3.6 *Width* and §3.7 now report each cell as the better of the two sweeps (†
@@ -128,23 +128,64 @@ most models, higher on Qwen3.8-27B; cause not established).
 
 ## Open — found while speeding up the tests
 
-### 8. Every zend boot re-seals the whole tool catalog into the redo log
+### 8. Every zend boot re-seals the whole tool catalog into the redo log — RESOLVED
 
-Section streams are content-addressed (`section_stream_id`), so each boot's records supersede
-the last boot's — dead records that only compaction reclaims. A short-lived session never
-compacts: the `tools_integration` workspace grew ~140 MB a boot (4.83 GB before its first
-forced compaction; the live store is ~1.2 GB). The comment at `zend/src/session.rs` ~636
-("the manifest never grows section chunk records") is contradicted by the census. A
-long-running daemon pays it once per restart and reclaims it in background maintenance.
+Section streams are content-addressed (`section_stream_id`), so a section prefilled again
+supersedes the last boot's records — dead records only compaction reclaims; the
+`tools_integration` workspace grew ~140 MB a boot. The cause was the restore triage refusing
+every section on the hybrid lineage (the persisted grid checked against transformer depth
+instead of the KV backing count), fixed in `01b5c559`: a refused restore falls back to a
+prefill, and the prefill's seal is the rewrite. `tools_integration::
+a_second_boot_restores_every_prompt_section` boots a `ZendSession` twice on the suite's
+workspace — the tool catalog included, which only a zend boot installs — and asserts the
+second boot prefills no prompt section (passes, 23 s). The `zend/src/session.rs` comment that
+called section cold-load disabled now describes the triage.
 
-### 9. Tool-section prefill slows across boots within one process
+### 9. Tool-section prefill slows across boots within one process — does not reproduce
 
-Same 93 sections, same workspace: 4.4 s on a process's first `ZendSession` boot, 9.9 s on
-its second. A suite of fresh sessions therefore creeps (20 → 30 s a scenario), and the
-compaction bound does not affect it. Engine-side per-process state — allocator pools not
-returning memory between sessions is the likeliest — not established.
+Measured 2026-09-13: same 93 sections, same workspace, 4.4 s on a process's first
+`ZendSession` boot and 9.9 s on its second. That was with every section refused by the
+restore triage and prefilled (item 8). Re-measured 2026-09-15 by the two-boot test above
+run with `--nocapture`: the "Prefilling tool sections" step takes **207 ms on the first boot
+and 197 ms on the second**, because both now restore. Of the per-process candidates, the
+first is refuted by the same log: boot 2 prints "a reservation already exists — this model's
+weights load through the CUDA pool", but `close_load` then retracts the previous model's
+weight zone and the dense block locks inside the span at 250 MiB exactly as on boot 1. A
+second boot that genuinely prefills (a changed catalog) has not been timed, so whether
+per-process state slows a real prefill is not established; nothing in this path pays it.
 
 ---
+
+## Open — needs a decision
+
+### 10. One KV threshold row per model, or one per card
+
+`bb363015` re-derived two `*_KV_FACTORS` rows on the RTX 3090 (sm_86), where the
+old pairs failed C10 validation (9/10, three runs each): Qwen3.5-9B 1.07/1.85 →
+0.85/1.45 and Qwen3.8-27B 0.8/2.05 → 0.7/1.4. The 2026-09-15 sweeps on the RTX
+PRO 5000 (sm_120) validated every C row at the new pairs, so one constant holds
+on both cards — at a price on the one the old pairs already passed on: C10
+5.87× → 5.13× on the 9B and 5.56× → 4.81× on the 27B, about 13 % of the top
+rung's compression. The rows' own notes record why the edge moves with the card
+(the int8 numeric path differs per arch, and the 27B's checkpoint is already
+chosen per card). Keeping one row per model buys cross-card safety; a row per
+card buys back the compression. Nothing is wrong either way — it is a choice.
+
+---
+
+## Open — found in the 2026-09-15 sweeps
+
+### 11. Qwen3.6-35B-A3B C10×16 decodes 10 % slower than `81e487b5`
+
+The one row of the fleet sweep (`docs/performance.md` §4, *The decode-slot refresh
+prefill regression*) outside noise: C10 ×16 decode 769.5 t/s on `81e487b5` (runs
+769.5 / 768.3) against 690.9 on `23623c6b` (687.5 / 690.9), both builds on the
+synchronised harness. The same model's C10 ×8, ×32 and ×64 rows are flat or faster
+(×64 1,182.9 → 1,201.6), and so is every other decode row in the fleet, so it is
+specific to this width rather than a decode-path cost. Not yet attributed. Candidates
+to measure: the speculative verify wave's per-sequence slot-state resync (one upload
+per sequence per layer per step since the refresh became a mark + sync) at a width
+where acceptance is low, and the expert-residency ladder's behaviour at ×16.
 
 ## Open — tool scoring (deferred)
 

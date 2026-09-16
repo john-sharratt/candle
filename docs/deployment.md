@@ -65,7 +65,7 @@ Paths are relative to the repo root.
 | Machine | Service | Command line | Recorded |
 |---|---|---|---|
 | .5 | web | `target\release\web.exe --config web/web.yaml` | 2026-09-13, from the running process |
-| .5 | zend | `target\release\zend.exe D:\prog\candle --host 192.168.0.5 --port 8081 --skip-layer repo_map --skip-layer code_reading` | 2026-09-13, from past production runs (not yet confirmed by a `/down`) |
+| .5 | zend | `target\release\zend.exe D:\prog\candle --host 192.168.0.5 --port 8081 --max-depth 1 --disable-layer code_reading` | 2026-09-15, from the running process — `repo_map` bounded to one path component; `code_reading` removed from retrieval at the user's request while that layer is broken |
 | .6 | npcd | `target\release\npcd.exe --bind 0.0.0.0:8081 --content web/content/npcd --mind C:/Users/johna/prog/mind --forget-conversations` | 2026-09-13, from the user (not yet confirmed by a `/down`) |
 
 Notes on the arguments:
@@ -125,7 +125,7 @@ Expected results, as measured 2026-09-13:
 
 | Check | How | Healthy |
 |---|---|---|
-| zend on the LAN | `curl http://192.168.0.5:8081/v1/status` | `200` |
+| zend on the LAN | `curl http://192.168.0.5:8081/v1/status` | `"state":"ready"` — it answers `200` with `"state":"loading"` throughout startup |
 | npcd on the LAN | `curl http://192.168.0.6:8081/v1/status` | `200` |
 | gateway config | `target\release\web.exe --config web/web.yaml --check` | exit 0 |
 | gateway routing | `curl -H "Host: <name>" http://127.0.0.1/` for `tokera.com`, `code.tokera.com`, `bot.tokera.com` | `200` / `30x` / `401`; `503` = that upstream is down |
@@ -144,6 +144,8 @@ Reading a failure:
   a new address), or the firewall.
 - **`503` from the gateway** is web's own page for an upstream that is down — web backs off
   and recovers on its own once the daemon answers.
-- **`www.tokera.com` answered `200`, not `301`**, on 2026-09-13 — `web.yaml` redirects it,
-  but the running `web.exe` was started 2026-09-10. A rebuild and restart of web should turn
-  it into a `301`.
+- **`www.tokera.com` answers `301`** (to `tokera.com`, per `web.yaml`) — confirmed
+  2026-09-16 on a freshly built `web.exe`. A `200` there means the running gateway predates
+  the redirect and wants a rebuild and restart.
+- **`bot.tokera.com` `503`** while the gateway is healthy means npcd on `.6` is down — it is
+  started by `/up` on that machine, not on `.5`.

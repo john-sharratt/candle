@@ -31,8 +31,7 @@ use crate::repo_scan::types::{FileEntry, Language};
 
 /// Most lines an anchor excerpt carries. The excerpt exists to say what the
 /// folder is, which a module doc or a README's opening states well inside this;
-/// past it we are reading the file, not its description. Matches the live
-/// `file_read` cap so a prefilled excerpt is a page the tool could itself return.
+/// past it we are reading the file, not its description.
 pub const MAX_ANCHOR_LINES: u32 = 200;
 
 /// Filenames that describe their directory, in preference order. A README is

@@ -417,6 +417,12 @@ fn run_loop(
         }
 
         if shutting_down {
+            // A read-only substrate has no durable tier to drain into: its
+            // turns were only ever going to live in RAM, and they end with the
+            // process. Nothing to drain, nothing to commit.
+            if conversation.is_read_only_substrate() {
+                return;
+            }
             // FULL drain before exit. The engine joins the scheduler BEFORE it
             // signals us (see `ConversationEngine::shutdown`), so no more turns
             // seal — the pending sets only shrink and this loop always converges.
@@ -1454,7 +1460,16 @@ fn run_pass(
     // `snapshot_pending_cold` returns hot bytes (gather operates on
     // GPU sealed); the same payload as warm, only its device backing
     // differs.
-    let pending_cold = conversation.read().snapshot_pending_cold();
+    //
+    // A read-only substrate has no cold tier to write: its turns stay warm,
+    // and Phases 2, 2.5, 3 and 4 have nothing to do. Phase 1 above and the
+    // warm purge below are RAM/VRAM only and run as usual.
+    let read_only = conversation.is_read_only_substrate();
+    let pending_cold = if read_only {
+        Vec::new()
+    } else {
+        conversation.read().snapshot_pending_cold()
+    };
     let mut warm_to_cold_bytes: u64 = 0;
     let mut warm_to_cold_count: usize = 0;
     for (idx, stream_id, hot) in pending_cold {
@@ -1508,7 +1523,11 @@ fn run_pass(
     // by the time we read it here.  The persistence thread's job is
     // purely to gather those final bytes off GPU and append them to the
     // redo log — no mutation of substrate state.
-    let pending_section_cold = conversation.read().snapshot_pending_section_cold();
+    let pending_section_cold = if read_only {
+        Vec::new()
+    } else {
+        conversation.read().snapshot_pending_section_cold()
+    };
     let mut section_to_cold_bytes: u64 = 0;
     let mut section_to_cold_count: usize = 0;
     if !pending_section_cold.is_empty() {
@@ -1627,8 +1646,10 @@ fn run_pass(
     // Group-commit anything the previous phases staged. No-op when both
     // phases skipped — e.g. an idle workspace just ticked and found
     // nothing to do.
-    if let Err(e) = conversation.commit_persistence_if_pending() {
-        tracing::warn!("persist: fsync failed: {e}");
+    if !read_only {
+        if let Err(e) = conversation.commit_persistence_if_pending() {
+            tracing::warn!("persist: fsync failed: {e}");
+        }
     }
 
     // ── Phase 4: segment maintenance ───────────────────────────────────
@@ -1640,7 +1661,7 @@ fn run_pass(
     // persistence lock only (phased locking), never the substrate write lock,
     // so it can't stall decode. The specific op is logged at TRACE by
     // `finish_maintenance`.
-    match if run_maintenance {
+    match if run_maintenance && !read_only {
         conversation.compact_persistence_if_needed()
     } else {
         Ok(false)

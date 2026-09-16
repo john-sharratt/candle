@@ -958,22 +958,24 @@ impl BatchedInferenceSession {
         Ok(chosen.flatten())
     }
 
-    /// Refresh the persistent decode GPU slot-state for `seq_idx` across every
-    /// layer after a multi-token prefill wrote tokens without the decode
-    /// kernel's self-increment (a stencil static-run injection, a think-steer
-    /// continuation prefill).
+    /// Mark the persistent decode GPU slot-state of every sequence in
+    /// `seq_indices`, across every layer, after a multi-token prefill wrote
+    /// tokens without the decode kernel's self-increment (a stencil static-run
+    /// injection, a think-steer continuation prefill, a batched prefill's
+    /// writeback). One state lock per backing for the whole set.
     ///
     /// The decode hot path trusts the cached GPU slot buffer, whose writer
-    /// length self-increments only on decode steps — without this refresh the
+    /// length self-increments only on decode steps — without this mark the
     /// next decode reuses a buffer that still ends where the injection began,
     /// writes its token over the first injected one, and leaves a slot the
-    /// host counts unwritten. The writer region — every chunk from the writer
-    /// boundary to the writer — is re-serialised in place, one upload per
-    /// layer; a sequence that has not decoded yet has no buffer and rebuilds
-    /// fully on its first decode sync. No-op on contiguous backings.
-    pub fn refresh_decode_slot_state(&self, seq_idx: usize) -> Result<()> {
+    /// host counts unwritten. The buffer is marked here and its writer region
+    /// re-serialised by the next sync that reads it — rebuilt in full instead
+    /// when the injection crossed into a chunk the buffer was not built for,
+    /// or the sequence has not decoded yet. No-op on contiguous backings.
+    pub fn mark_decode_slot_states(&self, seq_indices: &[usize]) -> Result<()> {
+        let entries: Vec<(usize, usize)> = seq_indices.iter().map(|&seq| (seq, 0)).collect();
         for backing in &self.backings {
-            backing.refresh_decode_writer_slice(&[(seq_idx, 0)])?;
+            backing.mark_decode_writer_stale(&entries)?;
         }
         Ok(())
     }

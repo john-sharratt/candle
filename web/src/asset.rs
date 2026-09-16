@@ -41,7 +41,7 @@ use std::io::Write;
 
 /// Below this, a compressed body is not reliably smaller than the original once
 /// the gzip header and trailer are counted, and never enough to matter.
-const MIN_COMPRESS: usize = 860;
+pub(crate) const MIN_COMPRESS: usize = 860;
 
 /// How long this file may be reused, by what it is.
 ///
@@ -162,6 +162,27 @@ pub fn respond(name: &str, bytes: Vec<u8>, cache: Cache, req: &HeaderMap) -> Res
     res
 }
 
+/// A computed answer — an API reply, not a file: compressed when the client
+/// takes gzip and the body is big enough to gain from it, and never kept. It
+/// describes state that changes under it, so a cached copy is a wrong answer
+/// rather than a slightly old one, and there is no tag to revalidate against.
+pub fn respond_json(bytes: Vec<u8>, req: &HeaderMap) -> Response<Body> {
+    let gzip = accepts_gzip(req) && bytes.len() >= MIN_COMPRESS;
+    let body = if gzip { gz(&bytes) } else { bytes };
+    let mut res = Response::new(Body::from(body));
+    let h = res.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
+    if gzip {
+        h.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+    }
+    res
+}
+
 /// The headers both answers share. A 304 has to repeat them: a client caching
 /// the response uses these, not the ones from the 200 it no longer has.
 fn headers(h: &mut HeaderMap, mime: Option<&str>, cache_control: &str, tag: &str, gzip: bool) {
@@ -222,7 +243,7 @@ fn none_match(req: &HeaderMap, tag: &str) -> bool {
 ///
 /// `gzip;q=0` is a refusal, not an offer — the one part of the grammar that
 /// changes the answer rather than merely ordering it.
-fn accepts_gzip(req: &HeaderMap) -> bool {
+pub(crate) fn accepts_gzip(req: &HeaderMap) -> bool {
     let Some(value) = req
         .get(header::ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok())
@@ -244,7 +265,7 @@ fn accepts_gzip(req: &HeaderMap) -> bool {
 /// Text, and the structured formats that are text underneath. Deliberately not
 /// images, fonts or archives: those arrive compressed already, and running them
 /// through gzip spends time to make them very slightly larger.
-fn compressible(mime: &str) -> bool {
+pub(crate) fn compressible(mime: &str) -> bool {
     let base = mime.split(';').next().unwrap_or(mime).trim();
     base.starts_with("text/")
         || matches!(
@@ -289,6 +310,69 @@ mod tests {
 
     fn css(n: usize) -> Vec<u8> {
         ".a { color: red; }\n".repeat(n).into_bytes()
+    }
+
+    fn body_bytes(res: Response<Body>) -> Vec<u8> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(axum::body::to_bytes(res.into_body(), usize::MAX))
+            .unwrap()
+            .to_vec()
+    }
+
+    fn gunzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(bytes)
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    }
+
+    /// An API reply a client takes gzip for arrives compressed, and inflates
+    /// to exactly the bytes that were serialised.
+    #[test]
+    fn a_json_reply_is_gzipped_for_a_client_that_takes_it() {
+        let json = format!(
+            "{{\"messages\":[{}]}}",
+            "\"hello\",".repeat(400) + "\"end\""
+        )
+        .into_bytes();
+        let res = respond_json(json.clone(), &req(&[(header::ACCEPT_ENCODING, "gzip")]));
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(res.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(res.headers()[header::VARY], "accept-encoding");
+        let zipped = body_bytes(res);
+        assert!(
+            zipped.len() < json.len() / 4,
+            "{} of {}",
+            zipped.len(),
+            json.len()
+        );
+        assert_eq!(gunzip(&zipped), json);
+    }
+
+    /// A client that does not take gzip, or a reply too small to gain from it,
+    /// gets the serialised bytes as they are.
+    #[test]
+    fn a_json_reply_stays_plain_when_gzip_is_refused_or_not_worth_it() {
+        let big = "[1,2,3,4,5,6,7,8,9]".repeat(100).into_bytes();
+        for (body, accept) in [
+            (big.clone(), "gzip;q=0"),
+            (big.clone(), "identity"),
+            (b"{\"id\":\"c1\"}".to_vec(), "gzip"),
+        ] {
+            let res = respond_json(body.clone(), &req(&[(header::ACCEPT_ENCODING, accept)]));
+            assert!(
+                res.headers().get(header::CONTENT_ENCODING).is_none(),
+                "{accept}"
+            );
+            assert_eq!(res.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(body_bytes(res), body, "{accept}");
+        }
     }
 
     /// **The refresh this exists for.** The first request sends the file and

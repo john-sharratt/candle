@@ -36,6 +36,7 @@
 
 pub mod asset;
 pub mod auth;
+pub mod compress;
 pub mod config;
 pub mod content;
 pub mod errors;

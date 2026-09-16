@@ -22,20 +22,23 @@ use candle_conversation::models::{Dialect, Model};
 use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::persistence::{content_hash, SUBSTRATE_DIR};
 use candle_conversation::projection::{
-    self, Builder, GroupSchema, Reserved, SectionId, SelectionRule, SystemItem, SystemPromptItem,
-    SystemPromptSchema, TimelineId, TurnIndex,
+    self, Builder, GroupSchema, Reserved, SectionId, SectionLoads, SelectionRule, SystemItem,
+    SystemPromptItem, SystemPromptSchema, TimelineId, TurnIndex,
 };
 use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
 use candle_conversation::FinishReason;
+use candle_conversation::RecoveredMessage;
+use candle_conversation::Role as TurnRole;
 use candle_conversation::TurnText;
 use candle_conversation::{
-    ConversationEngine, GlueMarkers, ProjectionEvent, Sequence, ThinkSteering, TokenDecoder,
-    TurnEvent, TurnHandle, TurnResponse,
+    ConversationEngine, GlueMarkers, OptionalState, ProjectionEvent, SamplingConfig,
+    SelectionState, Sequence, ThinkSteering, TokenDecoder, TurnEvent, TurnHandle, TurnResponse,
 };
 use serde_json::Value;
 
+use crate::api::chat::{tool_round_selection, TOOL_EXAMPLE_SELECTOR};
 use crate::api::substrate::{
     ConvView, Counts, GroupView, LayerConversations, LayerView, ProjectTile, ProjectView,
     SectionView, SegmentView, Storage, SubstrateOverview, SystemPromptView, TimelineDetail,
@@ -53,10 +56,19 @@ use crate::projection_event::ProjectionEventOut;
 use crate::refresh_ctx::RefreshContext;
 use crate::repo_scan::RepoMap;
 use crate::think_budget;
+use crate::think_progress::{ThinkProgress, ThinkUpdate};
 use crate::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, ToolHost,
+    CALIB_TOOL_SELECTOR,
 };
 use crate::types::{ChatMessage, Role, ToolMode, Usage};
+use crate::watcher::WatchDepth;
+
+mod replay;
+pub use replay::{
+    Demonstration, RecordedTurn, ReplayOutcome, ReplayReport, ReplaySampling, ReplaySpec,
+    TurnComparison,
+};
 
 const PROJECTION_SCHEMA_TEMPLATE: &str = include_str!("prompts/projection.yaml");
 
@@ -106,6 +118,11 @@ pub struct ToolStatusOut {
     /// resolve the in-flight cards immediately, before the post-stream hydrate.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub results: Vec<Value>,
+    /// Each result's length in tokens as it will sit in the context, in the
+    /// same order — encoded as the next turn will encode it, so it is the length
+    /// the reloaded history shows for that result. `"done"` notice only.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tokens: Vec<usize>,
 }
 
 /// Items yielded by [`ZendSession::submit`].
@@ -119,6 +136,21 @@ pub enum StreamItem {
     /// A tool-execution lifecycle notice (running / done) for the in-flight
     /// tool cards.  Display-only: never part of the collected completion body.
     Tool(ToolStatusOut),
+    /// How far the prefill of the turn's input has got, in tokens. A tool
+    /// round's results can run to tens of thousands of tokens, and this is the
+    /// only sign of progress the GUI has before the answer starts. Display-only.
+    Prefill {
+        done: usize,
+        total: usize,
+    },
+    /// The turn's reasoning so far, in generated tokens — sent while its
+    /// `<think>` block is open, and once more (`done`) with the total when it
+    /// closes. Counted as the turn records it (see `think_progress`), so the
+    /// total is what a reloaded history shows. Display-only.
+    Think {
+        tokens: usize,
+        done: bool,
+    },
     /// A finished turn: its token counts, which become the reply's `usage`, and
     /// how it ended, which becomes its `finish_reason`. Sent once per turn; a
     /// reply the daemon answers over several turns sends one for each and ends
@@ -137,11 +169,6 @@ static PROJ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 
 struct ConvState {
     conv: Sequence,
-    /// The tools mode last applied to this conversation's projection (set each
-    /// turn in `run_inference_stream`). The projection panel uses it to display
-    /// the tool summary that was actually injected — the restricted (safe-subset)
-    /// summary in Restricted mode, the full one in Comprehensive, none in None.
-    tool_mode: ToolMode,
     /// The identity this conversation speaks as (a sub-folder of `identities/`),
     /// or `None` for the default / no identity. Seeded from the substrate on
     /// fork, overridden when a request carries an explicit `identity`, and used
@@ -171,12 +198,97 @@ fn think_mode_from_selection(selection: &candle_conversation::SelectionState) ->
 /// shorter); the EOS boost/failsafe makes them the turn-ender backstop.
 fn response_budget_from_selection(selection: &candle_conversation::SelectionState) -> i32 {
     match selection.get("response_length") {
-        Some("terse") => 256,
-        Some("concise") => 512,
-        Some("detailed") => 2048,
-        Some("comprehensive") => 3584,
+        Some("terse") => 512,
+        Some("concise") => 1024,
+        Some("detailed") => 4096,
+        Some("comprehensive") => 7168,
         // Explicit `standard`, or no dial set (projection default).
-        _ => 1024,
+        _ => 2048,
+    }
+}
+
+/// The projection a chat turn runs under: the tools mode's prebuilt view — a
+/// cheap `Arc` clone, no per-turn schema clone — scoped to the conversation's
+/// identity's anchor and facets when it names one (`IdentityBuilders`).
+fn turn_projection(
+    state: &InferenceState,
+    conv_id: &str,
+    identity: Option<&str>,
+    tools_mode: ToolMode,
+) -> Arc<Builder> {
+    let scope = state.identity_builders.resolve(identity);
+    let (proj, applied) = match &scope {
+        IdentityScope::Named(name) => (
+            state
+                .identity_builders
+                .get(&state.mode_builders, name, tools_mode),
+            Some(name.as_str()),
+        ),
+        IdentityScope::Empty => {
+            tracing::warn!(conv_id = %conv_id,
+                "conversation names no identity and mind.yaml sets no default — \
+                 scoping identity collections to empty (no anchor emitted)");
+            (
+                state
+                    .identity_builders
+                    .get_empty(&state.mode_builders, tools_mode),
+                None,
+            )
+        }
+        IdentityScope::Unscoped => (state.mode_builders.get(tools_mode), None),
+    };
+    tracing::info!(conv_id = %conv_id, ?tools_mode, identity = ?applied, "projection applied");
+    proj
+}
+
+/// A chat turn's sampling config. A caller's explicit config (e.g. a test's
+/// `argmax()`) is honoured verbatim; the conversation default gets the per-turn
+/// adjustments and `seed`. Either way the dials' thinking and answer budget is
+/// steered in: the effort level sets the think block's close thresholds, and
+/// `response_length` the answer's room above them (see `think_budget::steer`).
+fn turn_sampling(
+    conv: &Sequence,
+    explicit: Option<SamplingConfig>,
+    selection: &SelectionState,
+    think_closer: &[u32],
+    seed: u64,
+) -> SamplingConfig {
+    let think_mode = think_mode_from_selection(selection);
+    let mut sampling = match explicit {
+        Some(explicit) => explicit,
+        None => {
+            let mut sampling = conv.default_sampling();
+            // A `/no_think` turn is a direct response, not reasoning: strip the
+            // thinking-temperature boost, which is meant for the `<think>` span
+            // and has no business heating a plain answer.  DRY stays on: it is
+            // span-scoped (`dry_span_len` — it only ever sees the current prose
+            // span, never the prompt or a prior span), so it breaks answer loops
+            // without penalizing verbatim reproduction of numbers/identifiers
+            // lifted from the prompt.
+            if think_mode == ThinkMode::Off {
+                sampling.segment_temp_boost = 0.0;
+            }
+            sampling.seed = seed;
+            sampling
+        }
+    };
+    think_budget::steer(
+        &mut sampling,
+        think_mode,
+        response_budget_from_selection(selection),
+        think_closer,
+    );
+    sampling
+}
+
+/// The triggers a chat turn decodes under: any `<tool_call>` the model emits is
+/// forced to the catalog's exact JSON shape (name ∈ catalog, required params in
+/// order, valid JSON), and atop that the `<think>` block is steered per the
+/// effort dial, replacing the `<think>` trigger atomically.
+fn turn_triggers(state: &InferenceState, think_mode: ThinkMode) -> Arc<TriggerRegistry> {
+    match &state.think_steering {
+        Some(ts) => ts.registry_for(&state.tool_stencil, think_mode),
+        None => Arc::clone(&state.tool_stencil),
     }
 }
 
@@ -212,6 +324,14 @@ struct InferenceState {
     /// in-flight exclusivity, and an async lock is what lets it live across an
     /// await without pinning a thread.
     conversations: Mutex<HashMap<String, Arc<ConvLock<ConvState>>>>,
+    /// The tools mode last applied to each conversation's projection, keyed like
+    /// `conversations` and set at the start of every turn. The projection panel
+    /// reads it to show the tool summary that was actually injected — the
+    /// restricted (safe-subset) summary in Restricted mode, the full one in
+    /// Comprehensive, none in None. Kept outside the per-conversation lock
+    /// because that lock is held for a whole turn, tool rounds included: a panel
+    /// reading the mode through it waited for the turn to finish.
+    tool_modes: Mutex<HashMap<String, ToolMode>>,
     /// System-prompt already prefilled; all new conversations fork from this.
     base_conv: Mutex<Sequence>,
     /// Queue feeding the dedicated titler task. The request path enqueues a
@@ -248,6 +368,9 @@ struct InferenceState {
     /// Workspace root captured at startup — the refresh path
     /// re-walks from here on every filesystem event.
     workspace: PathBuf,
+    /// `--max-depth`: the path-component bound the `repo_map` / `code_reading`
+    /// walks run under, and the watcher's event filter. `None` = unbounded.
+    max_depth: Option<usize>,
     /// Projection builder + sequence config kept alive for the
     /// atomic refresh paths.  Minting a fresh ingest-layer timeline
     /// after a file change reuses the same schema clone and the same
@@ -610,8 +733,11 @@ impl InferenceState {
         disabled_layers: HashSet<String>,
         skipped_layers: HashSet<String>,
         ingest_dirs: HashMap<String, String>,
+        max_depth: Option<usize>,
         compact_substrate: bool,
         wipe_metadata: bool,
+        read_only_substrate: bool,
+        qsa_selection_budget: Option<usize>,
         progress: Arc<LoadProgress>,
         status_tx: tokio::sync::watch::Sender<String>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
@@ -666,15 +792,13 @@ impl InferenceState {
         // governs `top_k` so only the K most relevant tools survive
         // into any single projection.
         //
-        // Sections re-prefill on every daemon start in the current
-        // configuration — section cold-load is plumbed end-to-end but
-        // disabled on the runtime path (see Phase 2.5 in
-        // `persistence/thread.rs` and the matching scheduler filter
-        // notes).  Tool sections live hot for the daemon's lifetime
-        // and the manifest never grows section chunk records.  Cost
-        // is one prefill pass over the catalog per daemon start
-        // (~90 tools × short JSON line); cheap on the 4090 mobile
-        // baseline and easy to re-flip once cold-load is back.
+        // Sections are content-addressed in the redo log: a boot restores
+        // every section whose stream is already persisted as a cold marker
+        // (the next projection that needs it lifts it hot) and prefills only
+        // the rest, whose seals the persistence thread then writes. An
+        // unchanged catalog therefore costs no prefill and adds no records on
+        // the next boot (`tools_integration::a_second_boot_restores_every_
+        // prompt_section`).
         // Resolve the effective tool catalog before any consumer touches it: a
         // `<workspace>/tools/` folder (a mind/game's own tools) overrides the
         // bundled built-ins; absent it, the built-in coding-assistant catalog.
@@ -810,6 +934,8 @@ impl InferenceState {
             .model_path(model_path)
             .tokenizer_path(tokenizer_path)
             .workspace_path(workspace.clone())
+            .read_only_substrate(read_only_substrate)
+            .qsa_selection_budget(qsa_selection_budget)
             // Dialogue turns compress at C5 (moderate adaptive quantization).
             // Paired with the removed uniform-K pin (see `ModelBuilder::engine`),
             // so K is adaptive too.
@@ -947,7 +1073,8 @@ impl InferenceState {
         // eager path instead — a whole-store rewrite here, after the reload (so
         // the live set is known) and before serving. It always runs when the
         // flag is set (no reclaimable-marker gate): the operator asked for it.
-        if compact_substrate {
+        // A read-only substrate is never rewritten.
+        if compact_substrate && !read_only_substrate {
             progress.set_step(LoadStep::Compacting);
             let cprog = Arc::clone(&progress);
             let cb = move |done: usize, total: usize| {
@@ -1108,8 +1235,10 @@ impl InferenceState {
         // conversation per (tool, example); a failing case is logged and skipped so
         // it can never break daemon load.
         progress.set_step(LoadStep::CalibratingSections);
-        // Skip entirely for a tool-free projection — nothing to calibrate.
-        if !tool_sections.is_empty() {
+        // Skip entirely for a tool-free projection — nothing to calibrate — and
+        // on a read-only substrate, whose calibration corpus is whatever the
+        // daemon that writes it has already sealed.
+        if !tool_sections.is_empty() && !read_only_substrate {
             // Wall-time attribution for the phase, logged once at its end.
             let calib_start = Instant::now();
             let mut timing = CalibTiming::default();
@@ -1529,8 +1658,14 @@ impl InferenceState {
                     };
                     // Pin exactly this tool: `SelectionRule::Named` emits only the
                     // catalog member whose name matches the selector value.
+                    opts.selection.select(CALIB_TOOL_SELECTOR, name);
+                    // An exemplar is a tool-using turn, so it is sealed behind the
+                    // prefix a tool-using chat turn gets — the demonstration
+                    // included. Selected explicitly because the schema defaults it
+                    // ABSENT for the ingest layers, which cannot select anything
+                    // (see `projection.yaml`).
                     opts.selection
-                        .select(crate::tools::CALIB_TOOL_SELECTOR, name);
+                        .set_optional(TOOL_EXAMPLE_SELECTOR, OptionalState::Present);
                     // Fast path: prefill the tool file's ChatML trajectory verbatim
                     // in one batched forward pass instead of decoding it token by
                     // token — the wide-Q is captured identically at seal. Prefill
@@ -1883,11 +2018,11 @@ impl InferenceState {
                         &engine,
                         proj_builder_refresh.clone(),
                         &content_root,
+                        max_depth,
                         conv_config.clone(),
                         &progress,
                         &il.name,
                         &il.group,
-                        wipe_metadata,
                     )?;
                     // An incomplete map is reported, not fatal: affected
                     // directories keep their prior generation live and retry on
@@ -1920,9 +2055,9 @@ impl InferenceState {
                     // the expensive GPU prefill is still skipped for the files
                     // already covered.
                     let prior = crate::code_read::code_read_state_from_substrate(&engine);
-                    let map = walk_cache
-                        .entry(il.folder.clone())
-                        .or_insert_with(|| crate::repo_scan::walk_workspace(&content_root));
+                    let map = walk_cache.entry(il.folder.clone()).or_insert_with(|| {
+                        crate::repo_scan::walk_workspace(&content_root, max_depth)
+                    });
                     let uncovered = map
                         .files
                         .iter()
@@ -2031,6 +2166,7 @@ impl InferenceState {
             decoder,
             engine,
             conversations: Mutex::new(HashMap::new()),
+            tool_modes: Mutex::new(HashMap::new()),
             base_conv: Mutex::new(base_conv),
             titler_tx,
             titler_worker: Mutex::new(None),
@@ -2038,6 +2174,7 @@ impl InferenceState {
             shutting_down: AtomicBool::new(false),
             ingest_convs: Mutex::new(ingest_convs),
             ingest_layers,
+            max_depth,
             refresh_builder: proj_builder_refresh,
             refresh_config: conv_config.clone(),
             mode_builders,
@@ -2097,6 +2234,7 @@ impl InferenceState {
         let progress = Arc::new(LoadProgress::silent());
         // Walk each distinct content folder at most once per burst.
         let mut walk_cache: HashMap<String, RepoMap> = HashMap::new();
+        let max_depth = self.max_depth;
         let mut any = false;
         for il in &self.ingest_layers {
             // Cooperative shutdown: stop the background reconcile between layers so
@@ -2119,9 +2257,9 @@ impl InferenceState {
                     let Some(prior_state) = prior_state else {
                         continue;
                     };
-                    let map = walk_cache
-                        .entry(il.folder.clone())
-                        .or_insert_with(|| crate::repo_scan::walk_workspace(&content_root));
+                    let map = walk_cache.entry(il.folder.clone()).or_insert_with(|| {
+                        crate::repo_scan::walk_workspace(&content_root, max_depth)
+                    });
                     let ctx = self.refresh_ctx();
                     let outcome = crate::repo_scan::refresh_repo_map(
                         &ctx,
@@ -2152,9 +2290,9 @@ impl InferenceState {
                     let Some(prior_state) = prior_state else {
                         continue;
                     };
-                    let map = walk_cache
-                        .entry(il.folder.clone())
-                        .or_insert_with(|| crate::repo_scan::walk_workspace(&content_root));
+                    let map = walk_cache.entry(il.folder.clone()).or_insert_with(|| {
+                        crate::repo_scan::walk_workspace(&content_root, max_depth)
+                    });
                     let ctx = self.refresh_ctx();
                     let outcome = crate::code_read::refresh_code_reading(
                         &ctx,
@@ -2209,6 +2347,24 @@ impl InferenceState {
             }
         }
         Ok(any)
+    }
+
+    /// The watcher's `--max-depth` filter: the bound, measured from the content
+    /// root of each layer whose walk it bounds (`repo_map`, `code_reading`),
+    /// with every raw layer's folder left unbounded. `None` when no bound was
+    /// given — every event counts.
+    fn watch_depth(&self) -> Option<WatchDepth> {
+        let max = self.max_depth?;
+        let root_of = |il: &IngestLayer| self.workspace.join(&il.folder);
+        let walked = |il: &&IngestLayer| matches!(il.mode, IngestMode::Folders | IngestMode::Files);
+        Some(WatchDepth::new(
+            max,
+            self.ingest_layers.iter().filter(walked).map(root_of),
+            self.ingest_layers
+                .iter()
+                .filter(|il| !walked(il))
+                .map(root_of),
+        ))
     }
 
     /// Ingest **only** the given workspace-relative files into the projection's
@@ -2687,7 +2843,6 @@ fn run_inference_stream(
                     Ok(conv) => {
                         let arc = Arc::new(ConvLock::new(ConvState {
                             conv,
-                            tool_mode: ToolMode::default(),
                             identity: stored_identity.clone(),
                         }));
                         map.insert(conv_id.clone(), Arc::clone(&arc));
@@ -2801,7 +2956,7 @@ fn run_inference_stream(
         // tools mode — Comprehensive restores the full catalog (so switching a
         // conversation back from Restricted/None works), Restricted drops the
         // high-risk tools, None drops the whole catalog.
-        // `cs.tool_mode` records the mode actually applied, so the projection
+        // `tool_modes` records the mode actually applied, so the projection
         // panel shows the matching tool summary.
         if let Some(ref coll) = force_hires {
             match build_hires_projection(&state, coll, cs.identity.as_deref()) {
@@ -2809,7 +2964,11 @@ fn run_inference_stream(
                     cs.conv.set_projection(b);
                     // The capture override forces the full catalog (AllVisible),
                     // so the panel should show the comprehensive summary.
-                    cs.tool_mode = ToolMode::Comprehensive;
+                    state
+                        .tool_modes
+                        .lock()
+                        .unwrap()
+                        .insert(conv_id.clone(), ToolMode::Comprehensive);
                     tracing::info!(conv_id = %conv_id, collection = %coll,
                         "force-high-resolution: collection forced to AllVisible");
                 }
@@ -2818,36 +2977,15 @@ fn run_inference_stream(
                 }
             }
         } else {
-            // Cheap `Arc` clone of the prebuilt projection (no per-turn schema
-            // clone). Applied every turn so a mid-conversation dial change takes
-            // effect, and both projection and reprojection use it. When the
-            // conversation has an identity, the tools-mode view is further scoped
-            // to that identity's anchor + facets (`IdentityBuilders`); otherwise
-            // the plain tools-mode view.
-            let scope = state.identity_builders.resolve(cs.identity.as_deref());
-            let (proj, applied) = match &scope {
-                IdentityScope::Named(name) => (
-                    state
-                        .identity_builders
-                        .get(&state.mode_builders, name, tools_mode),
-                    Some(name.as_str()),
-                ),
-                IdentityScope::Empty => {
-                    tracing::warn!(conv_id = %conv_id,
-                        "conversation names no identity and mind.yaml sets no default — \
-                         scoping identity collections to empty (no anchor emitted)");
-                    (
-                        state
-                            .identity_builders
-                            .get_empty(&state.mode_builders, tools_mode),
-                        None,
-                    )
-                }
-                IdentityScope::Unscoped => (state.mode_builders.get(tools_mode), None),
-            };
+            // Applied every turn so a mid-conversation dial change takes effect,
+            // and both projection and reprojection use it.
+            let proj = turn_projection(&state, &conv_id, cs.identity.as_deref(), tools_mode);
             cs.conv.set_projection(proj);
-            cs.tool_mode = tools_mode;
-            tracing::info!(conv_id = %conv_id, ?tools_mode, identity = ?applied, "projection applied");
+            state
+                .tool_modes
+                .lock()
+                .unwrap()
+                .insert(conv_id.clone(), tools_mode);
         }
 
         let original_user_message = user_message.clone();
@@ -2859,45 +2997,22 @@ fn run_inference_stream(
         // Quick/Balanced suppress the "Wait"/"Hmm"/… family in-block, Deep/
         // Exhaustive leave it 0 (reconsideration is wanted there).
         let think_mode = think_mode_from_selection(&selection);
-        // An explicit caller-supplied config (e.g. a test's `argmax()`) is honoured
-        // verbatim; only the conversation default gets the per-turn adjustments
-        // below (thinking-vs-response sampling split + a fresh seed).
-        let sampling_defaulted = sampling.is_none();
-        let mut sampling = sampling.unwrap_or_else(|| cs.conv.default_sampling());
-        if sampling_defaulted {
-            // A `/no_think` turn is a direct response, not reasoning: strip the
-            // thinking-temperature boost, which is meant for the `<think>` span
-            // and has no business heating a plain answer.  DRY stays on: it is now
-            // span-scoped (`dry_span_len` — it only ever sees the current prose
-            // span, never the prompt or a prior span), so it breaks answer loops
-            // without the old full-window DRY's failure of penalizing verbatim
-            // reproduction of numbers/identifiers lifted from the prompt.  (It can
-            // still nip content the model itself repeats WITHIN the current answer
-            // — e.g. a long list's `- ` scaffolding — which is a penalty-tuning
-            // question, not a scoping one.)  That span scoping is why disabling it
-            // here is no longer necessary.
-            if think_mode == ThinkMode::Off {
-                sampling.segment_temp_boost = 0.0;
-            }
-            // Vary the RNG seed per turn from real entropy. The default base seed
-            // is a fixed constant, which makes a whole conversation a deterministic
-            // replay — the same context always samples the same tokens, so a turn
-            // that lands in a bad attractor can never sample its way out. A fresh
-            // per-turn seed restores genuine run-to-run variation. (The per-token
-            // `rng_offset` still advances within the turn.)
-            sampling.seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(sampling.seed);
-        }
-        // The dials' thinking and answer budget: the effort level sets the think
-        // block's close thresholds, and `response_length` the answer's room above
-        // them. See `think_budget::steer`.
-        think_budget::steer(
-            &mut sampling,
-            think_mode,
-            response_budget_from_selection(&selection),
+        // Vary the RNG seed per turn from real entropy. The default base seed is
+        // a fixed constant, which makes a whole conversation a deterministic
+        // replay — the same context always samples the same tokens, so a turn
+        // that lands in a bad attractor can never sample its way out. A fresh
+        // per-turn seed restores genuine run-to-run variation. (The per-token
+        // `rng_offset` still advances within the turn.)
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or_else(|_| cs.conv.default_sampling().seed);
+        let sampling = turn_sampling(
+            &cs.conv,
+            sampling,
+            &selection,
             &state.think_closer_phrase,
+            seed,
         );
 
         // The tool loop runs until the model stops emitting tool calls (i.e.
@@ -2921,16 +3036,15 @@ fn run_inference_stream(
                 } else {
                     None
                 },
-                selection: selection.clone(),
-                // Force any `<tool_call>` the model emits to the catalog's exact
-                // JSON shape (name ∈ catalog, required params in order, valid
-                // JSON), and — atop that base — steer the `<think>` block per the
-                // effort dial (replacing the `<think>` trigger atomically).  An
-                // empty registry would just free-decode.
-                triggers: match &state.think_steering {
-                    Some(ts) => ts.registry_for(&state.tool_stencil, think_mode),
-                    None => Arc::clone(&state.tool_stencil),
+                // A tool round's user message is the previous turn's results;
+                // it projects without the worked demonstration, which there
+                // becomes the question the model answers (`tool_round_selection`).
+                selection: if iteration == 0 {
+                    selection.clone()
+                } else {
+                    tool_round_selection(&selection)
                 },
+                triggers: turn_triggers(&state, think_mode),
                 ..Default::default()
             };
             let handle = match cs
@@ -2973,6 +3087,7 @@ fn run_inference_stream(
             // non-blank token and streams from then on, so a thinking turn is
             // never held back waiting for its own close.
             let mut think_resolved = false;
+            let mut think_progress = ThinkProgress::default();
             let mut done_resp = None;
             let mut turn_error: Option<anyhow::Error> = None;
             let mut client_gone = false;
@@ -2987,6 +3102,20 @@ fn run_inference_stream(
                             if turn_error.is_none() {
                                 tokens.push(id);
                                 let text = state.decoder.decode(&tokens);
+                                if let Some(update) = think_progress.observe(&text, tokens.len()) {
+                                    let (count, done) = match update {
+                                        ThinkUpdate::Running(n) => (n, false),
+                                        ThinkUpdate::Done(n) => (n, true),
+                                    };
+                                    let progress = StreamItem::Think {
+                                        tokens: count,
+                                        done,
+                                    };
+                                    if tx.send(Ok(progress)).await.is_err() {
+                                        client_gone = true;
+                                        break;
+                                    }
+                                }
                                 // Once the post-</think> answer opens with `{`, it's a
                                 // (usually un-tagged) tool-call object: stop streaming
                                 // here and hold the rest, so the flush can wrap it.
@@ -3108,6 +3237,19 @@ fn run_inference_stream(
                             turn_events.push(out.clone());
                             let _ = tx.send(Ok(StreamItem::Projection(out))).await;
                         }
+                        TurnEvent::PrefillProgress {
+                            tokens_done,
+                            tokens_total,
+                        } => {
+                            let progress = StreamItem::Prefill {
+                                done: tokens_done,
+                                total: tokens_total,
+                            };
+                            if tx.send(Ok(progress)).await.is_err() {
+                                client_gone = true;
+                                break;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -3185,6 +3327,7 @@ fn run_inference_stream(
                         phase: "running",
                         tools: tool_names.clone(),
                         results: Vec::new(),
+                        tokens: Vec::new(),
                     })))
                     .await;
             }
@@ -3254,11 +3397,21 @@ fn run_inference_stream(
                     break;
                 }
             };
+            // Each result measured as its own block of the turn it is about to
+            // become — the length its card shows.
+            let tokens = results
+                .iter()
+                .map(|r| {
+                    cs.conv
+                        .encoded_len(&format_tool_responses(std::slice::from_ref(r)))
+                })
+                .collect();
             let _ = tx
                 .send(Ok(StreamItem::Tool(ToolStatusOut {
                     phase: "done",
                     tools: tool_names,
                     results: results.iter().map(|r| r.response.clone()).collect(),
+                    tokens,
                 })))
                 .await;
             current_message = format_tool_responses(&results);
@@ -3352,15 +3505,15 @@ async fn run_passthrough(
     state.passthrough.touch(&key);
 }
 
-/// Prefill the history `live` does not hold, decode the reply to the new user
-/// half, seal it and commit the redo log. Returns whether `live` still matches
-/// what the substrate holds.
 /// The answer room a passthrough reply gets past its think block — the
 /// response-length dial's widest rung. A client's reply can be a whole file
 /// written through a tool call, and the client's own `max_tokens` still caps
 /// the turn; this only places the failsafe that ends a runaway.
-const PASSTHROUGH_RESPONSE_TOKENS: i32 = 3584;
+const PASSTHROUGH_RESPONSE_TOKENS: i32 = 7168;
 
+/// Prefill the history `live` does not hold, decode the reply to the new user
+/// half, seal it and commit the redo log. Returns whether `live` still matches
+/// what the substrate holds.
 async fn passthrough_turn(
     state: &InferenceState,
     key: &str,
@@ -3891,6 +4044,15 @@ impl ZendSession {
         Some(engine.substrate_maintenance_status())
     }
 
+    /// How this boot loaded its prompt sections — restored from the redo log or
+    /// prefilled — counted since the engine was built. `None` until the model is
+    /// loaded.
+    pub fn section_loads(&self) -> Option<SectionLoads> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let conv = { state.engine.lock().unwrap().conversation() };
+        Some(conv.section_loads())
+    }
+
     /// Force one background-maintenance op now — the `POST /v1/debug/maintenance`
     /// test trigger. Seals the active segment (so a conversation archived this
     /// session, whose now-dead records sit in the active, becomes eligible) and
@@ -4093,6 +4255,7 @@ impl ZendSession {
                     name: d.name.clone(),
                     description: d.description.clone(),
                     high_risk: d.high_risk,
+                    parameters: d.parameters.clone(),
                 })
                 .collect(),
         })
@@ -4513,41 +4676,48 @@ impl ZendSession {
     /// Decoded turn history for a single recovered conversation — backs
     /// `GET /v1/conversations/{id}`. Returns `None` when the model isn't
     /// loaded yet; an empty `Vec` when the conv_id has no recovered turns.
-    pub fn conversation_history(&self, conv_id: &str) -> Option<Vec<(Role, String, bool)>> {
+    pub fn conversation_history(&self, conv_id: &str) -> Option<Vec<RecoveredMessage>> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         if let Some(timeline) = passthrough::timeline_of(conv_id) {
             // A passthrough conversation's turns are the client's exchanges.
             let engine = state.engine.lock().unwrap();
+            let bubble = |role, text| RecoveredMessage {
+                role,
+                text,
+                no_think: false,
+                thinking: None,
+                tool_tokens: Vec::new(),
+            };
             return Some(
                 passthrough::held_history(&engine, timeline)
                     .into_iter()
                     .flat_map(|e| {
                         [
-                            (Role::User, e.user.text(), false),
-                            (Role::Assistant, e.assistant, false),
+                            bubble(TurnRole::User, e.user.text()),
+                            bubble(TurnRole::Assistant, e.assistant),
                         ]
                     })
                     .collect(),
             );
         }
         let timeline = timeline_for(conv_id);
-        let raw = {
-            let base = state.base_conv.lock().unwrap();
-            // Conversation view: hide the summariser's ghost summary turns.
-            base.recovered_history(timeline, false)
-        };
-        let decoded = raw
-            .into_iter()
-            .map(|(role, text, no_think)| {
-                let role = match role {
-                    candle_conversation::Role::User => Role::User,
-                    candle_conversation::Role::Assistant => Role::Assistant,
-                    candle_conversation::Role::System => Role::System,
-                };
-                (role, text, no_think)
-            })
-            .collect();
-        Some(decoded)
+        let base = state.base_conv.lock().unwrap();
+        // Conversation view: hide the summariser's ghost summary turns.
+        Some(base.recovered_history(timeline, false))
+    }
+
+    /// The conversation's sidebar title — the titler's label, or the one an
+    /// upload gave it. `None` when the model isn't loaded or nothing has
+    /// labelled the conversation yet.
+    pub fn conversation_label(&self, conv_id: &str) -> Option<String> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let timeline = passthrough::timeline_of(conv_id).unwrap_or_else(|| timeline_for(conv_id));
+        let label = state
+            .engine
+            .lock()
+            .unwrap()
+            .conversation_label_of(timeline)?;
+        (!label.is_empty()).then_some(label)
     }
 
     /// Record a batch of just-uploaded files as an event in the substrate,
@@ -4699,7 +4869,7 @@ impl ZendSession {
     /// mode. Backs the projection panel's expandable section text — resolved on
     /// demand, never stored in the projection event. The schema is workspace-wide;
     /// `conv_id` selects which tool summary (restricted vs comprehensive) to serve.
-    pub async fn section_content(&self, conv_id: &str) -> Option<Vec<(String, String)>> {
+    pub fn section_content(&self, conv_id: &str) -> Option<Vec<(String, String)>> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let mut out = {
             let base = state.base_conv.lock().unwrap();
@@ -4711,15 +4881,13 @@ impl ZendSession {
         // (safe-subset) summary in Restricted, the full one in Comprehensive, and
         // none in None (no tools are projected) — under the key the projection
         // event uses (`<collection> summary`) so the panel expands the right list.
-        // Copy the Arc out and release the conversations-map lock before locking
-        // the per-conversation state: the inference task holds a conversation's
-        // lock for its entire decode, so awaiting it while still holding the map
-        // mutex would stall every other conversation's turn submission.
-        let cs = state.conversations.lock().unwrap().get(conv_id).cloned();
-        let mode = match cs {
-            Some(cs) => cs.lock().await.tool_mode,
-            None => ToolMode::default(),
-        };
+        let mode = state
+            .tool_modes
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .copied()
+            .unwrap_or_default();
         let restricted = match mode {
             ToolMode::None => return Some(out),
             ToolMode::Restricted => true,
@@ -4801,7 +4969,10 @@ impl ZendSession {
         let disabled_layers = self.config.disabled_layers.clone();
         let skipped_layers = self.config.skipped_layers.clone();
         let ingest_dirs = self.config.ingest_dirs.clone();
+        let max_depth = self.config.max_depth;
         let compact_substrate = self.config.compact_substrate;
+        let read_only_substrate = self.config.read_only_substrate;
+        let qsa_selection_budget = self.config.qsa_selection_budget;
         // Resolved once, here, and handed to both the downloader and the engine
         // builder, so the artifact fetched and the model built are the same one.
         let model = model_choice::resolve(&self.config.model);
@@ -4890,8 +5061,11 @@ impl ZendSession {
                     disabled_layers,
                     skipped_layers,
                     ingest_dirs,
+                    max_depth,
                     compact_substrate,
                     wipe_metadata,
+                    read_only_substrate,
+                    qsa_selection_budget,
                     load_progress_for_blocking,
                     status_tx.clone(),
                 ) {
@@ -4967,7 +5141,11 @@ impl ZendSession {
                         // conversation. Fire the cheap tombstone-if-absent
                         // reconcile once at startup (uploads deleted while the
                         // daemon was down) and on every `uploads/` watcher burst.
-                        state.reconcile_uploaded_files();
+                        // A read-only substrate takes none of this upkeep, here or
+                        // below: it is written by the daemon beside it.
+                        if !read_only_substrate {
+                            state.reconcile_uploaded_files();
+                        }
                         let inference_for_uploads = Arc::clone(&slot);
                         let on_uploads_changed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                             let Some(state) = inference_for_uploads
@@ -4980,13 +5158,18 @@ impl ZendSession {
                             };
                             state.reconcile_uploaded_files();
                         });
-                        match crate::watcher::spawn(
-                            &state.workspace,
-                            on_refresh,
-                            on_uploads_changed,
-                        ) {
-                            Ok(w) => *session_for_watcher.watcher.lock().unwrap() = Some(w),
-                            Err(e) => tracing::warn!("workspace watcher failed to start: {e:#}"),
+                        if !read_only_substrate {
+                            match crate::watcher::spawn(
+                                &state.workspace,
+                                state.watch_depth(),
+                                on_refresh,
+                                on_uploads_changed,
+                            ) {
+                                Ok(w) => *session_for_watcher.watcher.lock().unwrap() = Some(w),
+                                Err(e) => {
+                                    tracing::warn!("workspace watcher failed to start: {e:#}")
+                                }
+                            }
                         }
 
                         // One-shot startup reconcile, in the BACKGROUND. The load path
@@ -4996,35 +5179,39 @@ impl ZendSession {
                         // load critical path, after `ready`, exactly like a watcher burst.
                         // A no filesystem event fires for down-time edits, so this is what
                         // covers them.
-                        let state_for_reconcile = Arc::clone(&state);
-                        let reconcile = std::thread::spawn(move || {
-                            match state_for_reconcile.refresh_ingest_layers() {
-                                Ok(true) => tracing::info!(
-                                    "startup background reconcile: ingest layers updated"
-                                ),
-                                Ok(false) => tracing::debug!(
-                                    "startup background reconcile: no ingest-layer changes"
-                                ),
-                                Err(e) => {
-                                    tracing::warn!("startup background reconcile failed: {e:#}")
+                        if !read_only_substrate {
+                            let state_for_reconcile = Arc::clone(&state);
+                            let reconcile = std::thread::spawn(move || {
+                                match state_for_reconcile.refresh_ingest_layers() {
+                                    Ok(true) => tracing::info!(
+                                        "startup background reconcile: ingest layers updated"
+                                    ),
+                                    Ok(false) => tracing::debug!(
+                                        "startup background reconcile: no ingest-layer changes"
+                                    ),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "startup background reconcile failed: {e:#}"
+                                        )
+                                    }
                                 }
-                            }
-                            // The ingest/reconcile is now DONE (refresh_ingest_layers is
-                            // synchronous), so warm the per-file normalization hit levels
-                            // HERE — off the load path and, crucially, with no concurrent
-                            // ingest writer to starve (running the heavy self-match scan
-                            // during ingest freezes the scheduler). Covers the first-run
-                            // ingest and every restart's reconcile. Grab a cheap
-                            // conversation handle so the ~1-2 min scan never holds the
-                            // engine lock.
-                            let conv =
-                                { state_for_reconcile.engine.lock().unwrap().conversation() };
-                            let schema = state_for_reconcile.refresh_builder.schema().clone();
-                            // The tool catalog's levels are warmed by the load's
-                            // `Normalizing` step, before ready.
-                            conv.warm_ingest_normalization(&schema);
-                        });
-                        *session_for_watcher.reconcile_thread.lock().unwrap() = Some(reconcile);
+                                // The ingest/reconcile is now DONE (refresh_ingest_layers is
+                                // synchronous), so warm the per-file normalization hit levels
+                                // HERE — off the load path and, crucially, with no concurrent
+                                // ingest writer to starve (running the heavy self-match scan
+                                // during ingest freezes the scheduler). Covers the first-run
+                                // ingest and every restart's reconcile. Grab a cheap
+                                // conversation handle so the ~1-2 min scan never holds the
+                                // engine lock.
+                                let conv =
+                                    { state_for_reconcile.engine.lock().unwrap().conversation() };
+                                let schema = state_for_reconcile.refresh_builder.schema().clone();
+                                // The tool catalog's levels are warmed by the load's
+                                // `Normalizing` step, before ready.
+                                conv.warm_ingest_normalization(&schema);
+                            });
+                            *session_for_watcher.reconcile_thread.lock().unwrap() = Some(reconcile);
+                        }
                         // The engine is up — only NOW mark ready and unblock
                         // submit-flow waiters. Skipped on the shutdown-during-ingest
                         // path (the `Ok(None)` arm below).

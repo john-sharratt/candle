@@ -182,9 +182,10 @@ mod tests {
             json!({"type": "function", "function": {"name": "b"}}),
         ]);
         assert!(prompt.starts_with("# Tools\n\n"));
+        // Each definition keeps the key order the client wrote it in.
         assert!(prompt.contains(
-            "<tools>\n{\"function\":{\"name\":\"a\"},\"type\":\"function\"}\n\
-             {\"function\":{\"name\":\"b\"},\"type\":\"function\"}\n</tools>"
+            "<tools>\n{\"type\":\"function\",\"function\":{\"name\":\"a\"}}\n\
+             {\"type\":\"function\",\"function\":{\"name\":\"b\"}}\n</tools>"
         ));
         assert!(prompt.ends_with(
             "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>"

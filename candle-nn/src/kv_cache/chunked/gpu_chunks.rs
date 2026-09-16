@@ -1,12 +1,20 @@
 //! GPU-side slot-state cache for a single sequence.
 //!
-//! Holds a pinned host buffer and a matching device backing allocation, laid out
-//! in two sections — `[ slice headers (16 B) | KvHead records ]` — so the slice
-//! headers stay a contiguous 16-byte-stride array (what the kernel's `get_slice`
-//! indexes) while each header's `kvheads_ptr` points into the records section.
-//! Dirty chunk indices accumulate on the [`GpuChunksGuard`]; on drop the guard
-//! coalesces adjacent indices into runs and, because of the two sections, issues
-//! two `stream.memcpy_htod` per run (the headers range + the records range).
+//! Holds a host copy of the serialised slot-state and a matching device slot,
+//! laid out in two sections — `[ slice headers (16 B) | KvHead records ]` — so the
+//! slice headers stay a contiguous 16-byte-stride array (what the kernel's
+//! `get_slice` indexes) while each header's `kvheads_ptr` points into the records
+//! section. Dirty chunk indices accumulate on the [`GpuChunksGuard`]; on drop the
+//! guard coalesces adjacent indices into runs, packs each run's two ranges (the
+//! headers range + the records range) into a pinned staging buffer, and uploads
+//! them from there.
+//!
+//! **No copy ever reads the host copy.** An upload runs when the stream reaches
+//! it, not when it is issued, so a copy sourced from the live bytes would carry
+//! whatever they hold by then — a commit made while an upload is still queued
+//! would hand the kernels ahead of it lengths from their future. Uploads read a
+//! staging buffer instead, so the host copy is rewritten the moment host state
+//! changes, and the host never waits for the GPU to reach an upload.
 
 use super::head_gids::HeadGids;
 use super::slot_state_arena::{self, SlotStateSlot};
@@ -14,20 +22,23 @@ use super::types::ChunkWindow;
 use crate::kv_cache::arena_table::ResolvedArenaInfo;
 #[cfg(test)]
 use crate::kv_cache::arena_table::N_PALETTE;
+use candle::cuda_backend::cudarc::driver::result::memcpy_htod_async;
 use candle::cuda_backend::cudarc::driver::{CudaEvent, CudaStream};
 use candle::cuda_backend::WrapErr;
 use candle::quantized::pinned_staging::PinnedBuf;
 use std::sync::Arc;
 
-/// Cached pinned-host + device-side serialised slot-state for one sequence.
+/// Cached host + device-side serialised slot-state for one sequence.
 pub(crate) struct GpuChunks {
-    /// Pinned write-combined host buffer containing serialised `TokenSlice` bytes.
-    /// Starts empty (len = 0); grown on first `update` call.
-    buf: PinnedBuf,
+    /// The serialised `TokenSlice` bytes — the authoritative copy every upload
+    /// is taken from. Ordinary cacheable memory, because nothing reads it
+    /// asynchronously: uploads go through [`Self::staging`]. Grow-only; its
+    /// length is a capacity, and [`Self::n_chunks`] is the live entry count.
+    host: Vec<u8>,
     /// Device-side backing: a slot from the region tier's doubling class
     /// family (`slot_state_arena`), **not** an allocation. `None` until the
     /// first non-empty update. Its capacity is a class width, so it is
-    /// generally larger than `buf.len()`; the kernel's walk is bounded by
+    /// generally larger than the live entries; the kernel's walk is bounded by
     /// `n_chunks`, never by the slot.
     slot: Option<SlotStateSlot>,
     /// Stream used for all async H→D copies. `None` for CPU-backed tests even
@@ -44,9 +55,9 @@ pub(crate) struct GpuChunks {
     gen_records: Option<GenRecordsCache>,
     /// Entries currently live.
     ///
-    /// Kept explicitly because both buffers are now **capacities**: the pinned
-    /// host buffer is grow-only and the device slot is a class width, so
-    /// neither length divides down to the entry count any more.
+    /// Kept explicitly because both buffers are **capacities**: the host copy
+    /// is grow-only and the device slot is a class width, so neither length
+    /// divides down to the entry count.
     n_chunks: usize,
     /// The chunks this serialisation REFERENCES, held alive by their gids.
     ///
@@ -63,52 +74,62 @@ pub(crate) struct GpuChunks {
     /// a launch still holding the old one keeps exactly the arenas its headers
     /// point at, for as long as it needs them.
     pins: Arc<Vec<HeadGids>>,
-    /// The event the most recent `memcpy_htod_async` out of [`Self::buf`] was
-    /// recorded on — the handle for retiring a copy that may still be in flight.
-    ///
-    /// Created on the first upload and re-recorded thereafter, so its presence
-    /// means "this object has uploaded at least once", not "a copy is pending";
-    /// a completed recording synchronises for free, which is what makes keeping
-    /// it cheaper than recreating it.
-    ///
-    /// The copy reads the pinned host buffer **after** the call that issued it
-    /// returns, so `buf` is live storage for the GPU until the stream drains —
-    /// and the slot it targets is live storage too. Two things must therefore
-    /// not happen while this is set: rewriting `buf` (the next `rebuild_decode`
-    /// fills it from index 0), and returning the destination slot to the
-    /// `slot_state_arena` free list where another sequence claims it.
-    ///
-    /// Either one silently corrupts the transfer. The second is the worse of the
-    /// two, because the damage lands in a **different** sequence's slot: the
-    /// pending copy writes this sequence's record layout over whatever claimed
-    /// the slot, and that sequence's attention kernel then dereferences the
-    /// `kvheads_ptr` fields inside those records. They are not its pointers, and
-    /// they need not be pointers at all — which is a device-side out-of-range
-    /// access on every warp at once, poisoning the context and killing the
-    /// process at whatever unrelated call synchronises next.
-    ///
-    /// This buffer's *reallocation* was already fenced, with the reason spelled
-    /// out at that site ("the old buffer cannot be dropped until the stream
-    /// drains"). Its *reuse in place* — far commoner, since the ladder keeps the
-    /// allocation and refills it — was not, and neither was the slot handover.
-    ///
-    /// **An event, not a stream sync.** The debt is one specific transfer, and
-    /// it is normally 32 tokens old by the time anything collides with it, so
-    /// waiting on it costs nothing. Draining the whole stream instead would also
-    /// retire every kernel enqueued *since* — the decode currently in flight —
-    /// which is the per-32-token pipeline stall audit A13 removed. An event
-    /// waits for exactly the copy and lets the rest of the stream run.
-    upload_done: Option<CudaEvent>,
-    /// The writer chunk the buffer's slices were last serialised for.
-    ///
-    /// Every slice up to the writer carries a `rope` computed from the host's
-    /// usages at that moment, and the device keeps only the writer's `len`
-    /// current after it. A decode that fills the writer and moves into a chunk
-    /// claimed before that moment finds the buffer reused, not rebuilt — no
-    /// chunk was pushed — and the new writer's rope still counts the old
-    /// writer at its serialised length. The decode sync compares this with the
-    /// host's writer and re-serialises the writer region when they differ.
-    writer_idx: usize,
+    /// The pinned buffers an upload is copied through — two, so one can carry
+    /// a copy still waiting in the stream while the next upload fills the
+    /// other. See [`choose_staging`] for which one an upload takes.
+    staging: [Staging; 2],
+    /// The `staging` entry the most recent upload went through. Copies run in
+    /// stream order, so its event retiring means every copy this object has
+    /// issued has retired — the fence before the device slot changes hands.
+    last_upload: Option<usize>,
+}
+
+/// One pinned staging buffer and the event recorded after the copies out of it.
+struct Staging {
+    /// Write-combined pinned memory — the CPU only writes it, the copy engine
+    /// only reads it. Grow-only; replaced only once no copy reads it.
+    buf: PinnedBuf,
+    /// Recorded after the most recent copies out of [`Self::buf`]; `None` until
+    /// the first. Created once and re-recorded: `cuEventRecord` overwrites the
+    /// previous recording, and a create/destroy pair per upload would put two
+    /// driver object lifecycles on every 32-token boundary of every sequence.
+    done: Option<CudaEvent>,
+}
+
+impl Staging {
+    fn empty() -> Self {
+        Self {
+            // alloc_owned(0) returns a zero-len Bump variant — no CUDA call.
+            buf: PinnedBuf::alloc_owned(0).expect("zero-len PinnedBuf alloc cannot fail"),
+            done: None,
+        }
+    }
+
+    /// Whether a copy out of this buffer may still be waiting in the stream.
+    /// A non-blocking query — the host never waits here.
+    fn busy(&self) -> bool {
+        self.done.as_ref().is_some_and(|event| !event.is_complete())
+    }
+}
+
+/// Which staging buffer the next upload goes through, and whether it must first
+/// wait for that buffer's previous copy: `busy[i]` is whether a queued copy may
+/// still read buffer `i`, and `last` is the buffer the previous upload used.
+///
+/// The previous upload's buffer when it is free — so an upload that never
+/// collides with a queued copy (every decode-path upload) keeps reusing one
+/// buffer, and the second is never grown. Otherwise the other one; if that is
+/// busy too it is the older of the two, and the upload waits for it — the only
+/// wait, and it takes two uploads queued behind unfinished work.
+fn choose_staging(busy: [bool; 2], last: Option<usize>) -> (usize, bool) {
+    match last {
+        None => (0, false),
+        Some(l) if !busy[l] => (l, false),
+        Some(l) => {
+            let other = 1 - l;
+            (other, busy[other])
+        }
+    }
 }
 
 /// A records-section copy living in a stager generation's arena.
@@ -127,7 +148,7 @@ struct GenRecordsCache {
 impl std::fmt::Debug for GpuChunks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GpuChunks")
-            .field("host_capacity", &self.buf.len())
+            .field("host_capacity", &self.host.len())
             .field("chunk_byte_size", &self.chunk_byte_size)
             .field("n_chunks", &self.n_chunks)
             .finish()
@@ -137,16 +158,15 @@ impl std::fmt::Debug for GpuChunks {
 impl GpuChunks {
     pub(crate) fn new(stream: Option<Arc<CudaStream>>) -> Self {
         Self {
-            // alloc_owned(0) returns a zero-len Bump variant — no CUDA call.
-            buf: PinnedBuf::alloc_owned(0).expect("zero-len PinnedBuf alloc cannot fail"),
+            host: Vec::new(),
             slot: None,
             stream,
             chunk_byte_size: 0,
             gen_records: None,
             n_chunks: 0,
             pins: Arc::new(Vec::new()),
-            upload_done: None,
-            writer_idx: 0,
+            staging: [Staging::empty(), Staging::empty()],
+            last_upload: None,
         }
     }
 
@@ -156,27 +176,24 @@ impl GpuChunks {
         Arc::clone(&self.pins)
     }
 
-    /// The writer chunk the slices were last serialised for — see
-    /// [`Self::writer_idx`].
-    pub(crate) fn writer_idx(&self) -> usize {
-        self.writer_idx
-    }
-
-    /// Retire any `memcpy_htod_async` still reading [`Self::buf`] or still
-    /// writing the slot.
+    /// Retire every copy this object has issued — call before the device slot
+    /// changes hands or a staging buffer is freed.
     ///
-    /// Call before the host buffer is rewritten or its destination slot is
-    /// handed back — see [`Self::upload_done`] for what goes wrong otherwise.
+    /// A copy still in flight toward a slot that has gone back to the
+    /// `slot_state_arena` free list lands in whatever sequence claims it next:
+    /// that sequence's attention kernel then dereferences the `kvheads_ptr`
+    /// fields of this sequence's records — not its pointers, and not
+    /// necessarily pointers at all — a device-side out-of-range access on every
+    /// warp at once, poisoning the context at whatever call synchronises next.
+    /// Stream ordering covers copies enqueued *before* the handover, not one
+    /// already queued toward the slot; that one has to be retired.
     ///
-    /// Waits on the copy's own event, so it retires that transfer and nothing
-    /// else; the decode kernels enqueued since keep running. In the ordinary
-    /// case the copy completed 32 tokens ago and this returns immediately.
-    ///
-    /// The event is **kept**, not taken. Synchronising one whose recording has
-    /// already completed — or which was never recorded — returns immediately, so
-    /// holding it costs nothing and saves recreating it on the next upload.
-    fn fence_pending_upload(&mut self) {
-        let Some(event) = self.upload_done.as_ref() else {
+    /// Waits on the most recent upload's event: copies run in stream order, so
+    /// it retiring retires them all, and the kernels enqueued since keep
+    /// running. Rewriting the host copy needs no fence at all — no copy reads
+    /// it (see [`Self::staging`]).
+    fn fence_uploads(&mut self) {
+        let Some(event) = self.last_upload.and_then(|i| self.staging[i].done.as_ref()) else {
             return;
         };
         if let Err(e) = event.synchronize().w() {
@@ -200,11 +217,11 @@ impl GpuChunks {
     /// Release the device slot back to its class, if one is held.
     ///
     /// **The caller must have fenced any pending upload first**
-    /// ([`Self::fence_pending_upload`]). Stream ordering covers the copies that
-    /// were *enqueued before* this slot changes hands — that much of the A13
-    /// argument holds — but it says nothing about a copy already in flight whose
-    /// DESTINATION is this slot. Handing that slot to another sequence lets the
-    /// pending transfer land in a buffer it does not own.
+    /// ([`Self::fence_uploads`]). Stream ordering covers the copies that
+    /// were *enqueued before* this slot changes hands, but it says nothing about
+    /// a copy already in flight whose DESTINATION is this slot. Handing that
+    /// slot to another sequence lets the pending transfer land in a buffer it
+    /// does not own.
     fn release_slot(&mut self) {
         if let (Some(slot), Some(stream)) = (self.slot.take(), self.stream.as_ref()) {
             slot_state_arena::release(stream, slot);
@@ -220,12 +237,13 @@ impl GpuChunks {
     /// the pinned-stager `generation`, returning the copy's device pointer (a
     /// contiguous `TokenSlice` header array the kernel's `get_slice` indexes).
     ///
-    /// The live `gpu` buffer is reallocated whenever a chunk is appended
-    /// (`rebuild_decode` → `resize` → fresh `stream.alloc`, old freed). A caller
-    /// that captures `raw_device_ptr()` and defers its kernel launch — the wave
-    /// prefill builds every per-token metadata snapshot up front, then runs the
-    /// layer loop — would read a freed buffer once a later snapshot crosses a
-    /// chunk boundary. Copying into the generation (whose arena lives for the
+    /// The live slot moves whenever a chunk is appended past its class
+    /// (`rebuild_decode` → `resize` promotes to a wider `slot_state_arena` slot
+    /// and returns the old one to its free list). A caller that captures
+    /// `raw_device_ptr()` and defers its kernel launch — the wave prefill builds
+    /// every per-token metadata snapshot up front, then runs the layer loop —
+    /// would read a slot another sequence may since have claimed once a later
+    /// snapshot crosses a chunk boundary. Copying into the generation (whose arena lives for the
     /// whole forward) makes the pointer stable and pins that token's exact slice
     /// content (per-token write-chunk length included).
     ///
@@ -252,18 +270,13 @@ impl GpuChunks {
         write_idx: usize,
         write_len: u16,
     ) -> candle::Result<u64> {
-        let len = self.buf.as_slice().len();
+        let len = self.host.len();
         if len == 0 {
             return Ok(0);
         }
-        // The live buffer is WRITE-COMBINED pinned memory: CPU reads are
-        // uncached and every pass below (headers copy, records copy, pointer
-        // rebase, debug checksum) re-reads it. Exit WC exactly ONCE with a
-        // single sequential copy and serve all reads from cacheable memory —
-        // this was ~1 ms/layer of scattered WC reads on every verify-wave
-        // metadata build.
-        let host_owned: Vec<u8> = self.buf.as_slice().to_vec();
-        let host: &[u8] = &host_owned;
+        // Cacheable memory, read in place by every pass below (headers copy,
+        // records copy, pointer rebase, debug checksum).
+        let host: &[u8] = &self.host;
         let n = self.n_chunks();
         // `write_idx` is `decode_write_chunk_idx()` (always `< host chunk count`);
         // after `sync_decode_gpu_chunks` the serialised buffer holds exactly that
@@ -342,9 +355,8 @@ impl GpuChunks {
 
         // Rebase inline `kvheads_ptr` and patch the write-chunk length. The
         // original pointers are read from `host` (the source), NOT from `dst`:
-        // both arenas are write-combined, and reading back bytes just stored to
-        // WC memory can return stale data before the WC buffer drains, whereas
-        // `host` was written a rebuild ago and is settled.
+        // `dst` is write-combined, and reading back bytes just stored to WC
+        // memory can return stale data before the WC buffer drains.
         // SAFETY: `host_ptr` is the device-mapped bump slice we just filled; it
         // stays valid for the generation's lifetime and no kernel has read it
         // yet (build runs before the layer loop launches).
@@ -442,59 +454,36 @@ pub(crate) struct GpuChunksGuard<'a> {
 }
 
 impl GpuChunksGuard<'_> {
-    /// Ensure the host buffer and the device slot can hold `n_chunks` entries
-    /// of `chunk_byte_size` bytes.
+    /// Ensure the host copy and the device slot can hold `n_chunks` entries of
+    /// `chunk_byte_size` bytes.
     ///
     /// **Content is not preserved, and does not need to be.** The buffer has
     /// two sections — `[ slice headers | records ]` — so the records section
     /// moves whenever `n_chunks` changes, and the only caller
-    /// ([`Self::rebuild_decode`]) rewrites every entry immediately after. The
-    /// old code copied `min(old, new)` bytes forward and zeroed the rest,
-    /// which was work spent producing bytes nobody read.
+    /// ([`Self::rebuild_decode`]) rewrites every entry immediately after.
     ///
     /// Growth on the device is a **promotion**: claim a wider slot from the
-    /// next class up and release the old one. No allocator call, no sync — and
-    /// no copy, per the paragraph above. Growth on the host is grow-only: the
-    /// pinned buffer is reused whenever it is already big enough, so a
-    /// sequence crossing a 32-token boundary no longer pays a `cuMemFreeHost` +
-    /// `cuMemHostAlloc` pair per layer.
+    /// next class up and release the old one — no allocator call and no copy.
+    /// The host copy grows along the same doubling ladder, so a sequence
+    /// crossing a 32-token boundary does not reallocate it per layer; no copy
+    /// reads it, so growing it needs no fence.
     fn resize(&mut self, n_chunks: usize, chunk_byte_size: usize) -> candle::Result<()> {
         let byte_len = n_chunks
             .checked_mul(chunk_byte_size)
             .expect("overflow in resize");
-        // `rebuild_decode` refills the pinned buffer from index 0 the moment
-        // this returns, and may swap the slot below. A transfer still reading
-        // that buffer, or still writing that slot, has to be retired first —
-        // the grow branch below fences for the narrower case of *dropping* the
-        // allocation, which is the same hazard seen only from one side.
-        self.inner.fence_pending_upload();
         self.inner.chunk_byte_size = chunk_byte_size;
         self.inner.n_chunks = n_chunks;
 
         if byte_len == 0 {
+            // The slot changes hands: retire any copy still writing it.
+            self.inner.fence_uploads();
             self.inner.release_slot();
             return Ok(());
         }
 
-        // Host capacity follows the SAME doubling ladder as the device slot,
-        // not `byte_len` exactly.
-        //
-        // Growing to the exact size would re-allocate on every `push_chunk` —
-        // the very churn this change exists to remove — and, worse, would drop
-        // the old pinned buffer while an async `memcpy_htod` may still be
-        // reading it. Rounding to the ladder makes the reallocation
-        // logarithmic in depth instead of linear, which is what makes the
-        // `stream.synchronize()` below affordable: it now guards a rare event
-        // rather than one per 32 tokens per layer.
         let want = slot_state_arena::class_bytes_for(byte_len)?;
-        if self.inner.buf.len() < want {
-            if let Some(stream) = self.inner.stream.as_ref() {
-                // `cuMemFreeHost` unpins pages an in-flight H2D may still be
-                // sourcing from, so the old buffer cannot be dropped until the
-                // stream drains.
-                stream.synchronize().w()?;
-            }
-            self.inner.buf = PinnedBuf::alloc_owned(want)?;
+        if self.inner.host.len() < want {
+            self.inner.host.resize(want, 0);
         }
 
         // Device: keep the slot if it still fits, else promote.
@@ -509,6 +498,8 @@ impl GpuChunksGuard<'_> {
             .is_some_and(|s| s.capacity() >= byte_len);
         if !fits {
             let next = slot_state_arena::claim(&stream, byte_len)?;
+            // The old slot changes hands: retire any copy still writing it.
+            self.inner.fence_uploads();
             self.inner.release_slot();
             self.inner.slot = Some(next);
         }
@@ -528,14 +519,9 @@ impl GpuChunksGuard<'_> {
         rope_base: u32,
         arena_info: &[ResolvedArenaInfo],
     ) -> candle::Result<()> {
-        // The pinned buffer is rewritten in place below, and a copy enqueued
-        // from it earlier may not have run yet: it would then carry these new
-        // bytes to the device ahead of their time, to kernels that were meant
-        // to see the old ones. `resize`, `clear` and `Drop` fence for the same
-        // reason; this path is taken on every commit made outside the decode
-        // kernel, so it must too. Waits on that one copy's event, which has
-        // normally long completed.
-        self.inner.fence_pending_upload();
+        // Rewritten in place with no fence: no copy reads the host copy (see
+        // `GpuChunks::staging`), so an upload still queued keeps the bytes it
+        // was issued with however this changes them.
         let n_palette = chunk_n_palette(chunk, n_kv_head);
         let chunk_byte_size = token_slice_serialized_size(n_kv_head, head_dim, n_palette);
         // The LIVE entry count, not one derived from the buffer length. Both
@@ -565,7 +551,7 @@ impl GpuChunksGuard<'_> {
             _ => {
                 let r0 = records_off + chunk_idx * rec_bytes;
                 write_record_for_chunk(
-                    &mut self.inner.buf.as_mut_slice()[r0..r0 + rec_bytes],
+                    &mut self.inner.host[r0..r0 + rec_bytes],
                     chunk,
                     n_kv_head,
                     head_dim,
@@ -577,7 +563,7 @@ impl GpuChunksGuard<'_> {
         };
         let s0 = chunk_idx * SLICE_HEADER_BYTES;
         write_slice_header(
-            &mut self.inner.buf.as_mut_slice()[s0..s0 + SLICE_HEADER_BYTES],
+            &mut self.inner.host[s0..s0 + SLICE_HEADER_BYTES],
             chunk.offset,
             len,
             rope_base,
@@ -634,7 +620,6 @@ impl GpuChunksGuard<'_> {
         }
         self.dirty_chunks.clear();
         let n = chunks.len();
-        self.inner.writer_idx = write_idx;
         // Pin what this pass is about to reference. A fresh vector, never a
         // mutation of the old one: a launch reading the previous serialisation
         // still holds that one and must keep ITS arenas, not these.
@@ -672,7 +657,7 @@ impl GpuChunksGuard<'_> {
                 _ => {
                     let r0 = records_off + i * rec_bytes;
                     write_record_for_chunk(
-                        &mut self.inner.buf.as_mut_slice()[r0..r0 + rec_bytes],
+                        &mut self.inner.host[r0..r0 + rec_bytes],
                         chunk,
                         n_kv_head,
                         head_dim,
@@ -684,7 +669,7 @@ impl GpuChunksGuard<'_> {
             };
             let s0 = i * SLICE_HEADER_BYTES;
             write_slice_header(
-                &mut self.inner.buf.as_mut_slice()[s0..s0 + SLICE_HEADER_BYTES],
+                &mut self.inner.host[s0..s0 + SLICE_HEADER_BYTES],
                 chunk.offset,
                 len,
                 rope_base,
@@ -702,19 +687,16 @@ impl GpuChunksGuard<'_> {
     /// a sequence's slot-state is fully invalidated (e.g. evicted or freed).
     pub(crate) fn clear(&mut self) {
         // Dropping the dirty list cancels uploads not yet ISSUED; it does
-        // nothing about one already enqueued, which is still reading the pinned
-        // buffer and still writing this slot. Both become another owner's
-        // storage on the next two lines, so retire it first.
+        // nothing about one already enqueued, which is still writing this slot.
+        // The slot becomes another owner's on the next line, so retire it first.
         self.dirty_chunks.clear();
-        self.inner.fence_pending_upload();
-        // No free: the device side goes back to its class free list and the
-        // pinned host buffer is kept for the next fill rather than unpinned and
-        // re-pinned. `clear` is called by *every* structural mutation —
-        // `push_chunk` alone fires each time a sequence crosses a 32-token
-        // boundary — so what used to happen here was the bulk of audit A13's
-        // ~3,000 alloc/free/sync cycles per 32 decoded tokens at batch 64. The
-        // fence above is not that sync returning: it fires only when a transfer
-        // is genuinely outstanding, which the common `clear` is not.
+        self.inner.fence_uploads();
+        // No free: the device side goes back to its class free list, and the
+        // host copy and staging buffers are kept for the next fill. `clear` is
+        // called by *every* structural mutation — `push_chunk` alone fires each
+        // time a sequence crosses a 32-token boundary — and the fence above
+        // fires only when a transfer is genuinely outstanding, which the common
+        // `clear` is not.
         self.inner.release_slot();
         self.inner.chunk_byte_size = 0;
         // The cached generation records described the old chunk set; drop it so
@@ -725,12 +707,6 @@ impl GpuChunksGuard<'_> {
         // reading the bytes holds its own reference to the same vector, so the
         // arenas it addresses stay alive until it drops.
         self.inner.pins = Arc::new(Vec::new());
-        self.inner.writer_idx = 0;
-    }
-
-    /// Record the writer chunk the writer region was just re-serialised for.
-    pub(crate) fn set_writer_idx(&mut self, writer_idx: usize) {
-        self.inner.writer_idx = writer_idx;
     }
 }
 
@@ -746,114 +722,140 @@ impl Drop for GpuChunksGuard<'_> {
         self.dirty_chunks.sort_unstable();
         self.dirty_chunks.dedup();
 
-        let GpuChunks {
-            buf,
-            slot,
-            stream,
-            chunk_byte_size,
-            gen_records: _,
-            n_chunks,
-            pins: _,
-            // Set below, once the copies this scope enqueues are in flight.
-            upload_done: _,
-            writer_idx: _,
-        } = &mut *self.inner;
-        let chunk_byte_size = *chunk_byte_size;
-        let n_chunks = *n_chunks;
+        let chunk_byte_size = self.inner.chunk_byte_size;
+        let n_chunks = self.inner.n_chunks;
         if chunk_byte_size == 0 || n_chunks == 0 {
             return;
         }
-        let Some(slot) = slot.as_ref() else {
+        let Some(slot_ptr) = self.inner.slot.as_ref().map(|s| s.ptr) else {
             return;
         };
-        let Some(stream) = stream.as_ref() else {
+        let Some(stream) = self.inner.stream.clone() else {
             return;
         };
-        let host: &[u8] = buf.as_slice();
 
         // Two-section buffer: slice headers [0 .. n*16), then records. A
         // coalesced run of adjacent chunk indices is contiguous in *both*
-        // sections, so each run uploads two ranges: the 16-byte headers and
-        // the records.
+        // sections, so each run is two ranges: the 16-byte headers and the
+        // records.
         let rec_bytes = chunk_byte_size - SLICE_HEADER_BYTES;
         let records_off = n_chunks * SLICE_HEADER_BYTES;
-        let upload = |range: std::ops::Range<usize>, what: &str| {
-            // SAFETY: `range` lies inside the live entry count, which
-            // `resize` sized the slot to hold; `host` is the pinned staging
-            // buffer, alive for this call; and the copy is enqueued on the
-            // same primary stream every reader of this slot uses.
-            let res = unsafe {
-                candle::cuda_backend::cudarc::driver::result::memcpy_htod_async(
-                    slot.ptr + range.start as u64,
-                    &host[range.clone()],
-                    stream.cu_stream(),
-                )
-            };
-            if let Err(e) = res {
-                log::warn!("GpuChunksGuard: {what} memcpy_htod {range:?} error: {e:?}");
-            }
-        };
-        let upload_run = |start: usize, end: usize| {
-            upload(
-                start * SLICE_HEADER_BYTES..end * SLICE_HEADER_BYTES,
-                "header",
-            );
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut push_run = |start: usize, end: usize| {
+            ranges.push(start * SLICE_HEADER_BYTES..end * SLICE_HEADER_BYTES);
             if rec_bytes > 0 {
-                upload(
-                    records_off + start * rec_bytes..records_off + end * rec_bytes,
-                    "record",
-                );
+                ranges.push(records_off + start * rec_bytes..records_off + end * rec_bytes);
             }
         };
-
         let mut start = self.dirty_chunks[0];
         let mut end = start + 1;
         for &idx in &self.dirty_chunks[1..] {
             if idx == end {
                 end += 1;
             } else {
-                upload_run(start, end);
+                push_run(start, end);
                 start = idx;
                 end = idx + 1;
             }
         }
-        upload_run(start, end);
-        // Owned handle, so the destructuring borrow of `*self.inner` ends here
-        // and the event bookkeeping below can write back into it.
-        let stream = stream.clone();
+        push_run(start, end);
+        let total: usize = ranges.iter().map(|r| r.len()).sum();
 
-        // These copies outlive this scope: they read the pinned buffer and write
-        // the slot on their own schedule. Record the point they finish at, so
-        // whoever next reuses either one retires exactly them
-        // (`GpuChunks::fence_pending_upload`) rather than draining the stream.
-        //
-        // **The event is created once and re-recorded**, never created per drop.
-        // `cuEventRecord` overwrites the previous recording, which is precisely
-        // the semantics wanted here: the debt is always the most recent upload,
-        // and an earlier one is retired by definition once a later one on the
-        // same stream completes. Creating a fresh event instead would put a
-        // `cuEventCreate`/`cuEventDestroy` pair on the path `push_chunk` takes
-        // every time a sequence crosses a 32-token boundary — at wave width 64,
-        // ~64 driver object lifecycles per 32 decoded tokens, which is the same
-        // churn audit A13 removed from this exact site.
-        if self.inner.upload_done.is_none() {
+        let inner = &mut *self.inner;
+        let busy = [inner.staging[0].busy(), inner.staging[1].busy()];
+        let (k, wait) = choose_staging(busy, inner.last_upload);
+        let staging = &mut inner.staging[k];
+        if wait {
+            if let Some(event) = staging.done.as_ref() {
+                if let Err(e) = event.synchronize().w() {
+                    log::warn!("GpuChunks: waiting for a staging buffer failed: {e:?}");
+                }
+            }
+        }
+        if staging.buf.len() < total {
+            // No copy reads this buffer any more — it was free, or waited on
+            // above — so replacing it frees nothing a copy still needs.
+            match slot_state_arena::class_bytes_for(total).and_then(PinnedBuf::alloc_owned) {
+                Ok(buf) => staging.buf = buf,
+                Err(e) => {
+                    // No pinned memory to stage through. Upload straight from
+                    // the host copy and drain the stream before returning, so
+                    // the copy has read those bytes before they can change: a
+                    // stall, never a slot that is short.
+                    log::warn!(
+                        "GpuChunks: no {total}-byte staging buffer ({e:?}); uploading from \
+                         the host copy and draining the stream"
+                    );
+                    for range in &ranges {
+                        // SAFETY: `range` lies inside the live entry count,
+                        // which `resize` sized the slot to hold; the stream is
+                        // drained below, before the host copy can change.
+                        let res = unsafe {
+                            memcpy_htod_async(
+                                slot_ptr + range.start as u64,
+                                &inner.host[range.clone()],
+                                stream.cu_stream(),
+                            )
+                        };
+                        if let Err(e) = res {
+                            log::warn!("GpuChunksGuard: memcpy_htod {range:?} error: {e:?}");
+                        }
+                    }
+                    if let Err(e) = stream.synchronize() {
+                        log::warn!("GpuChunks: stream drain failed: {e:?}");
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Pack the ranges and upload them out of the staging buffer. The bytes
+        // a copy carries are the ones packed here, whatever the host copy
+        // becomes before the stream reaches it.
+        let mut cursor = 0usize;
+        for range in &ranges {
+            let n = range.len();
+            staging.buf.as_mut_slice()[cursor..cursor + n]
+                .copy_from_slice(&inner.host[range.clone()]);
+            // SAFETY: `range` lies inside the live entry count, which `resize`
+            // sized the slot to hold; the source is this staging buffer, which
+            // nothing rewrites or frees until the event recorded below has
+            // retired; and the copy is ordered on the stream every reader of
+            // this slot uses.
+            let res = unsafe {
+                memcpy_htod_async(
+                    slot_ptr + range.start as u64,
+                    &staging.buf.as_slice()[cursor..cursor + n],
+                    stream.cu_stream(),
+                )
+            };
+            if let Err(e) = res {
+                log::warn!("GpuChunksGuard: memcpy_htod {range:?} error: {e:?}");
+            }
+            cursor += n;
+        }
+
+        // Record the point these copies finish at, so whoever next reuses the
+        // staging buffer or hands the slot back retires exactly them rather
+        // than draining the stream.
+        if staging.done.is_none() {
             match stream.context().new_event(None) {
-                Ok(event) => self.inner.upload_done = Some(event),
+                Ok(event) => staging.done = Some(event),
                 Err(e) => log::warn!("GpuChunks: could not create an upload event: {e:?}"),
             }
         }
-        let recorded = self
-            .inner
-            .upload_done
+        let recorded = staging
+            .done
             .as_ref()
             .is_some_and(|event| event.record(&stream).is_ok());
+        inner.last_upload = Some(k);
         if !recorded {
             // No event means no cheap fence. Fall back to the correct-but-blunt
             // ordering rather than leaving the transfer unguarded: a stall is
             // recoverable, a slot handed away mid-copy is not. The drain settles
             // the debt outright, so a stale recording left on the event cannot
-            // make a later `fence_pending_upload` return early over a transfer
-            // that is still live — there is none.
+            // make a later fence return early over a transfer that is still
+            // live — there is none.
             log::warn!("GpuChunks: no slot-state upload event; draining the stream instead");
             if let Err(e) = stream.synchronize() {
                 log::warn!("GpuChunks: fallback stream drain failed: {e:?}");
@@ -864,26 +866,14 @@ impl Drop for GpuChunksGuard<'_> {
 
 impl Drop for GpuChunks {
     fn drop(&mut self) {
-        // **Fence BEFORE releasing, not after.** Both halves of this object are
-        // storage a pending `memcpy_htod_async` is still using — the pinned
-        // buffer it reads and the slot it writes — and both stop being ours on
-        // the next two lines: `cuMemFreeHost` unpins the pages, and the slot
-        // goes to a free list another sequence claims from immediately.
-        //
-        // The sync used to sit after `release_slot`, guarding only the host
-        // half, on the reasoning that the device half "needs no fence". Stream
-        // ordering does cover the copies enqueued *before* the handover, which
-        // is what that reasoning was about; it does not cover one already in
-        // flight toward a slot that has just changed owner.
-        self.fence_pending_upload();
+        // **Fence BEFORE releasing, not after.** A pending `memcpy_htod_async`
+        // is still using storage that stops being ours right here: the staging
+        // buffer it reads (`cuMemFreeHost` unpins its pages when the field
+        // drops) and the slot it writes (it goes to a free list another sequence
+        // claims from immediately). Stream ordering covers the copies enqueued
+        // before the handover, not one already in flight toward the slot.
+        self.fence_uploads();
         self.release_slot();
-        if !self.buf.is_empty() {
-            if let Some(stream) = self.stream.as_ref() {
-                if let Err(e) = stream.synchronize().w() {
-                    log::warn!("GpuChunks::drop: stream sync failed: {e:?}");
-                }
-            }
-        }
     }
 }
 
@@ -892,7 +882,7 @@ impl Clone for GpuChunks {
         // Pinned buffers and GPU allocations are not cloneable; forked
         // sequences start fresh on the same stream.
         Self {
-            buf: PinnedBuf::alloc_owned(0).expect("zero-len PinnedBuf alloc cannot fail"),
+            host: Vec::new(),
             slot: None,
             stream: self.stream.clone(),
             chunk_byte_size: 0,
@@ -900,9 +890,9 @@ impl Clone for GpuChunks {
             n_chunks: 0,
             // Nothing is serialised here yet, so nothing is referenced.
             pins: Arc::new(Vec::new()),
-            // Nothing was copied into this one; it owns no buffer and no slot.
-            upload_done: None,
-            writer_idx: 0,
+            // Nothing was copied out of this one; it owns no slot and no copy.
+            staging: [Staging::empty(), Staging::empty()],
+            last_upload: None,
         }
     }
 }
@@ -1121,5 +1111,33 @@ mod snapshot_tests {
         b[3] = 0xff;
         assert_eq!(records_checksum(&a), records_checksum(&a));
         assert_ne!(records_checksum(&a), records_checksum(&b));
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::choose_staging;
+
+    /// Every combination of which staging buffer may still be read by a queued
+    /// copy and which one the previous upload used: the buffer the next upload
+    /// takes, and whether it waits.
+    #[test]
+    fn an_upload_waits_only_when_both_staging_buffers_are_in_flight() {
+        // No upload yet: the first buffer, no wait.
+        assert_eq!(choose_staging([false, false], None), (0, false));
+        // The previous upload's buffer is free: reuse it, so the second buffer
+        // is never grown on a path that never collides.
+        assert_eq!(choose_staging([false, false], Some(0)), (0, false));
+        assert_eq!(choose_staging([false, true], Some(0)), (0, false));
+        assert_eq!(choose_staging([false, false], Some(1)), (1, false));
+        assert_eq!(choose_staging([true, false], Some(1)), (1, false));
+        // The previous upload's buffer is still read by a queued copy: the
+        // other one, which is free — no wait.
+        assert_eq!(choose_staging([true, false], Some(0)), (1, false));
+        assert_eq!(choose_staging([false, true], Some(1)), (0, false));
+        // Both are read by queued copies: the other one is the older of the
+        // two, and the upload waits for it.
+        assert_eq!(choose_staging([true, true], Some(0)), (1, true));
+        assert_eq!(choose_staging([true, true], Some(1)), (0, true));
     }
 }

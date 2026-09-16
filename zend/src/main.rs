@@ -111,6 +111,21 @@ struct Cli {
     #[arg(long = "ingest-dir", value_name = "LAYER=PATH")]
     ingest_dir: Vec<String>,
 
+    /// Bound how deep the `repo_map` and `code_reading` layers read, in path
+    /// components below each layer's content root — `1` is the root's own
+    /// files, `2` adds one folder down (`src/main.rs`), and so on, like
+    /// `find -maxdepth`. Applies to the startup ingest, the watcher-driven
+    /// refresh and the watcher itself: nothing deeper is read, and filesystem
+    /// events deeper down are ignored.
+    ///
+    /// Content already ingested from below the bound is FROZEN, not deleted: it
+    /// stays in the substrate and remains retrievable, but is never refreshed
+    /// and never retired by the deleted-file sweep. Changing or dropping the bound
+    /// changes the listing of the root and of every folder with subfolders, so
+    /// those folders are re-summarised once. Unbounded when omitted.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    max_depth: Option<u32>,
+
     /// Force a whole-store redo-log compaction once during load (after the
     /// substrate reload, before serving) instead of leaving reclaim to the
     /// incremental background maintenance pass. Physically rewrites the log,
@@ -164,6 +179,15 @@ struct Cli {
     /// VRAM, by its variant name (e.g. `Qwen35_0_8B_Q8`, `Qwen38_FlashNext_Q4KO`).
     #[arg(long, value_name = "PRESET", value_parser = parse_model)]
     model: Option<Model>,
+
+    /// Run the QSA selection with this many positions in place of the
+    /// checkpoint's own budget (Qwen3.8-Flash-Next). A budget of at least the
+    /// checkpoint's context makes the selection the identity — every cell is
+    /// read — which is the dense control for a selection question. Refused at
+    /// load for a model whose attention does not select, and for a budget the
+    /// selection kernel cannot run (between its ceiling and the context).
+    #[arg(long, value_name = "N")]
+    qsa_selection_budget: Option<usize>,
 }
 
 /// A `--model` value: the preset whose variant name it is.
@@ -415,11 +439,14 @@ async fn main() -> anyhow::Result<()> {
         disabled_layers: disabled_layers.clone(),
         skipped_layers: skipped_layers.clone(),
         ingest_dirs: ingest_dirs.clone(),
+        max_depth: cli.max_depth.map(|d| d as usize),
         compact_substrate: cli.compact_substrate,
+        read_only_substrate: false,
         model: cli.model.clone().map_or(ModelChoice::MeasuredVram, |m| {
             ModelChoice::Preset(Box::new(m))
         }),
         wipe_metadata: cli.wipe_metadata,
+        qsa_selection_budget: cli.qsa_selection_budget,
     };
 
     if !disabled_layers.is_empty() {
@@ -450,6 +477,13 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(
             overrides = %pairs.join(", "),
             "--ingest-dir: these layers ingest from an overridden content root",
+        );
+    }
+    if let Some(depth) = cli.max_depth {
+        tracing::info!(
+            max_depth = depth,
+            "--max-depth: repo_map and code_reading read at most this many path components \
+             deep; content already ingested from deeper is frozen, not retired",
         );
     }
     if cli.compact_substrate {
@@ -627,5 +661,22 @@ mod wipe_tests {
         );
         // Idempotent: a second wipe of the now-missing dir is a no-op.
         wipe_substrate(&ws).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use clap::Parser;
+
+    use super::Cli;
+
+    /// `--max-depth` takes a positive component count; absent means unbounded,
+    /// and 0 is refused — a walk of nothing would freeze the whole layer.
+    #[test]
+    fn max_depth_parses_a_positive_count_and_refuses_zero() {
+        let cli = Cli::try_parse_from(["zend", "--max-depth", "3"]).unwrap();
+        assert_eq!(cli.max_depth, Some(3));
+        assert_eq!(Cli::try_parse_from(["zend"]).unwrap().max_depth, None);
+        assert!(Cli::try_parse_from(["zend", "--max-depth", "0"]).is_err());
     }
 }
