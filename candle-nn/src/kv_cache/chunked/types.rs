@@ -936,6 +936,37 @@ impl SequenceState {
             );
         }
 
+        // The write slice's length is stamped from the WRITER, not the tail:
+        // `seq_offset` less every token before the writer. Chunks can follow
+        // the writer (claimed capacity, trailing empties), so the tail check
+        // above says nothing about it. A writer that is not where the
+        // sequence ends — a stale boundary leaving an earlier chunk first
+        // non-full — counts every later token into one chunk, and the
+        // decode kernel's commit asserts on that length, poisoning the
+        // context. Refused here instead, with the chunk named.
+        let wi = self.decode_write_chunk_idx();
+        let before_writer: usize = self.chunks[..wi].iter().map(|c| c.usage as usize).sum();
+        let writer = &self.chunks[wi];
+        let writer_len = seq_offset.saturating_sub(before_writer);
+        if writer.offset as usize + writer_len > CHUNK_SIZE {
+            candle::bail!(
+                "chunked decode validation failed for batch_idx {} at offset {}: writer chunk {} \
+                 of {} (writer boundary {}) would hold write len {} from offset {}, past \
+                 chunk_size {} — {} tokens precede it and it holds {}, so the tokens past it \
+                 sit in later chunks the writer does not reach",
+                batch_idx,
+                seq_offset,
+                wi,
+                host_n,
+                self.writer_start_idx(),
+                writer_len,
+                writer.offset,
+                CHUNK_SIZE,
+                before_writer,
+                writer.usage
+            );
+        }
+
         Ok(())
     }
 

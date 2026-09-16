@@ -1686,6 +1686,82 @@ mod tests {
             );
         }
 
+        fn usages(backing: &ChunkedKvBacking, seq: usize) -> Vec<u32> {
+            let state = backing.state.read().unwrap();
+            let s = state.sequences[seq].as_ref().unwrap();
+            s.chunks_slice().iter().map(|c| c.usage).collect()
+        }
+
+        /// A view that pushed an empty chunk and stepped past it — a mid-turn
+        /// seal's fresh writer, a layer reconcile's padding — leaves it below
+        /// its writer boundary as a zero-token gap. Folded back, the parent
+        /// writes where the view was writing, not at the first non-full chunk
+        /// its own older boundary reaches.
+        ///
+        /// Parent: [32, 8] = 40 tokens. The view borrows both, takes 10 into
+        /// its fresh block 2, pushes two empty writers (blocks 3 and 4,
+        /// boundary 4), then takes 30 into block 4. Folded back at 80 tokens
+        /// the writer is block 4. From the parent's own boundary the first
+        /// non-full chunk is block 1, and the length stamped there is
+        /// 80 − 32 = 48 — past the chunk, the length the decode commit asserted
+        /// on.
+        #[test]
+        fn a_folded_view_leaves_the_parent_writing_where_the_view_was() {
+            let backing = ChunkedKvBacking::new(4, 4, 32, DType::BF16, &Device::Cpu, 256).unwrap();
+            let parent = backing.alloc_sequence().unwrap();
+            backing.ensure_for_offset(parent, 0, 40).unwrap();
+            backing.set_len(parent, 40);
+
+            let view = backing.alloc_sequence().unwrap();
+            let (borrowed_blocks, borrowed_tokens) = backing
+                .create_view_sequence(view, parent, &[(0, 2)])
+                .unwrap();
+            assert_eq!((borrowed_blocks, borrowed_tokens), (2, 40));
+            backing.set_len(view, 50);
+            backing.push_empty_writer_chunk(view).unwrap();
+            backing.push_empty_writer_chunk(view).unwrap();
+            backing.set_len(view, 80);
+            assert_eq!(usages(&backing, view), vec![32, 8, 10, 0, 30]);
+
+            backing
+                .finalize_view(view, parent, borrowed_blocks)
+                .unwrap();
+
+            assert_eq!(usages(&backing, parent), vec![32, 8, 10, 0, 30]);
+            let state = backing.state.read().unwrap();
+            let ps = state.sequences[parent].as_ref().unwrap();
+            assert_eq!(ps.writer_start_idx(), 4);
+            assert_eq!(ps.decode_write_chunk_idx(), 4);
+            ps.validate_decode_state(parent, 80).unwrap();
+        }
+
+        /// The decode validation checks the chunk the write slice is stamped
+        /// from. Blocks [32, 0, 32, 5] at 69 tokens with the boundary forced
+        /// back to 0: the first non-full chunk is the gap at block 1, and the
+        /// length stamped there is 69 − 32 = 37, past the chunk. The tail
+        /// holds 5 and is sound, so a check of the tail alone lets it through.
+        #[test]
+        fn decode_validation_refuses_a_writer_that_would_overflow_its_chunk() {
+            let backing = ChunkedKvBacking::new(4, 4, 32, DType::BF16, &Device::Cpu, 256).unwrap();
+            let seq = backing.alloc_sequence().unwrap();
+            backing.ensure_for_offset(seq, 0, 32).unwrap();
+            backing.set_len(seq, 32);
+            backing.push_empty_writer_chunk(seq).unwrap();
+            backing.push_empty_writer_chunk(seq).unwrap();
+            backing.set_len(seq, 64);
+            backing.push_empty_writer_chunk(seq).unwrap();
+            backing.set_len(seq, 69);
+            assert_eq!(usages(&backing, seq), vec![32, 0, 32, 5]);
+
+            let mut state = backing.state.write().unwrap();
+            let s = state.sequences[seq].as_mut().unwrap();
+            s.validate_decode_state(seq, 69).unwrap();
+            s.set_writer_start_idx(0);
+            let err = s.validate_decode_state(seq, 69).unwrap_err().to_string();
+            assert!(err.contains("writer chunk 1 of 4"), "{err}");
+            assert!(err.contains("write len 37 from offset 0"), "{err}");
+        }
+
         /// Regression test for block isolation across view/parent turns.
         ///
         /// Arc-share-everything model: when a view borrows N blocks from the

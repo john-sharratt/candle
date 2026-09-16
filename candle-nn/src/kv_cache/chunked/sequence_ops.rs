@@ -1776,13 +1776,26 @@ impl ChunkedKvBacking {
         // block is at parent.chunks[original_view_block_count] and was COW-extended by
         // the view.  Truncating removes the stale partial entry; extending adds the
         // updated version from the view.
+        //
+        // The parent takes the view's writer boundary with its blocks. After the
+        // splice the parent's chunks from `original_view_block_count` on ARE the
+        // view's, index for index, so the view's boundary names the same chunk
+        // on both. The parent's own boundary predates the turn: it can sit on
+        // the parent's partial tail, or on an empty chunk the view pushed and
+        // then stepped past (a mid-turn seal's fresh writer, a layer
+        // reconcile's padding) — and the writer is the first non-full chunk at
+        // or after the boundary, so either becomes the writer, with the
+        // turn's decoded tokens counted after it.
         {
             let vs = state.sequences[view_batch].as_mut().unwrap();
+            let view_writer_start = vs.writer_start_idx();
             let new_blocks: Vec<ChunkWindow> = vs.split_off_chunks(original_view_block_count);
 
             let ps = state.sequences[parent_batch].as_mut().unwrap();
             ps.truncate_chunks(original_view_block_count);
             ps.extend_chunks(new_blocks);
+            let writer_start = ps.writer_start_idx().max(view_writer_start);
+            ps.set_writer_start_idx(writer_start);
         }
 
         // Free the view slot (borrowed prefix chunks dropped, decrementing Arc refcount)
