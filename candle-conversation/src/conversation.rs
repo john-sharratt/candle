@@ -3943,6 +3943,20 @@ impl Sequence {
         self.fork_onto(timeline)
     }
 
+    /// Run this conversation's turns without continuous mid-decode
+    /// reprojection.
+    ///
+    /// Each turn is still projected when it is submitted — the slot is rebuilt
+    /// from the conversation's selected branch and its own turns. What stops is
+    /// the cadence/trigger-driven rebuild that re-selects the prefix partway
+    /// through a reply and swaps it under the decode.
+    ///
+    /// A fork carries its own copy of the config, so this is a property of one
+    /// conversation and holds for every turn it goes on to run.
+    pub fn set_disable_reprojection(&mut self, off: bool) {
+        self.config.disable_reprojection = off;
+    }
+
     /// This conversation's **live** recurrent memory, right now, without sealing
     /// a turn to see it.
     ///

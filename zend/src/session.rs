@@ -2794,6 +2794,7 @@ fn run_inference_stream(
     force_hires: Option<String>,
     assistant_prefill: Option<String>,
     lossless_kv: bool,
+    disable_reprojection: bool,
     tools_mode: ToolMode,
     identity: Option<String>,
     selection: candle_conversation::SelectionState,
@@ -2840,7 +2841,14 @@ fn run_inference_stream(
                 // turns the substrate reload recovered for this conversation
                 // (§16.12). An unknown conv_id simply forks empty.
                 match state.base_conv.lock().unwrap().fork_resuming(timeline) {
-                    Ok(conv) => {
+                    Ok(mut conv) => {
+                        // Set on the fork, where the conversation is still
+                        // owned. It is a property of the conversation, not of
+                        // one request: a reused `conv_id` keeps what it was
+                        // forked with, the same way its identity does.
+                        if disable_reprojection {
+                            conv.set_disable_reprojection(true);
+                        }
                         let arc = Arc::new(ConvLock::new(ConvState {
                             conv,
                             identity: stored_identity.clone(),
@@ -5385,6 +5393,7 @@ impl ZendSession {
         force_hires: Option<String>,
         assistant_prefill: Option<String>,
         lossless_kv: bool,
+        disable_reprojection: bool,
         tools_mode: ToolMode,
         identity: Option<String>,
         selection: candle_conversation::SelectionState,
@@ -5397,6 +5406,7 @@ impl ZendSession {
             force_hires,
             assistant_prefill,
             lossless_kv,
+            disable_reprojection,
             tools_mode,
             identity,
             selection,
@@ -5423,6 +5433,7 @@ impl ZendSession {
         force_hires: Option<String>,
         assistant_prefill: Option<String>,
         lossless_kv: bool,
+        disable_reprojection: bool,
         tools_mode: ToolMode,
         identity: Option<String>,
         selection: candle_conversation::SelectionState,
@@ -5492,6 +5503,7 @@ impl ZendSession {
                     force_hires,
                     assistant_prefill,
                     lossless_kv,
+                    disable_reprojection,
                     tools_mode,
                     identity,
                     selection,

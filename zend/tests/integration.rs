@@ -118,6 +118,7 @@ mod conversation {
                 None,
                 None,
                 false,
+                false,
                 zend::types::ToolMode::Comprehensive,
                 None,
                 candle_conversation::SelectionState::default(),

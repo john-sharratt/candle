@@ -141,6 +141,7 @@ mod tool_scenarios {
                 None,
                 None,
                 false,
+                false,
                 ToolMode::Comprehensive,
                 None,
                 SelectionState::default(),

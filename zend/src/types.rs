@@ -121,6 +121,14 @@ pub struct ChatCompletionRequest {
     /// the provenance work has full-resolution keys. Absent/false in normal use.
     #[serde(default)]
     pub lossless_kv: bool,
+    /// Diagnostic (zend-only): run this conversation's turns with continuous
+    /// mid-decode reprojection OFF. The turn is still projected when it is
+    /// submitted; what stops is the cadence/trigger-driven view rebuild that
+    /// re-selects the prefix partway through a reply. Set on the conversation,
+    /// so it holds for every later turn under the same `conv_id`. Absent/false
+    /// in normal use.
+    #[serde(default)]
+    pub disable_reprojection: bool,
     /// Composer "thinking effort" dial (0..=4). `0` (and `think: false`) route to
     /// the `/no_think` dialect prefix; `1..=4` select the reasoning-depth
     /// directive section. Absent → server default. Consumed by the projection

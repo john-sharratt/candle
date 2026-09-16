@@ -103,6 +103,7 @@ pub async fn completions(
     let force_hires = req.force_high_resolution;
     let assistant_prefill = req.assistant_prefill;
     let lossless_kv = req.lossless_kv;
+    let disable_reprojection = req.disable_reprojection;
     // Composer "tools" dial — which slice of the catalog this conversation
     // projects. Absent → Comprehensive (full catalog).
     let tools_mode = req
@@ -155,6 +156,7 @@ pub async fn completions(
                 force_hires,
                 assistant_prefill,
                 lossless_kv,
+                disable_reprojection,
                 tools_mode,
                 identity,
                 selection,
