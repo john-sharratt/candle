@@ -102,6 +102,17 @@ zend/examples/provenance_queries.json
 # See `candle-conversation/src/models/overrides.rs`.
 /models.override.yaml
 
+# Deployment secrets for zend's tools (`secrets/tools.yaml` — the Tavily API
+# key). Mirrors `web/secrets/` and `npcd/secrets/`, which are ignored by their
+# own crates' .gitignore files.
+#
+# The ignore entry is only half the protection and is the weaker half: it keeps
+# the file out of commits and does nothing about the model, because the `file_*`
+# tools resolve a path straight to disk and never consult the ignore rules.
+# `VfsStore::PROTECTED_SEGMENT` is what stops `file_read` serving it. Both are
+# required; neither is sufficient.
+/secrets/
+
 # Daemon output, redirected by hand when running npcd from the workspace root.
 # Six of these had accumulated untracked and a `git add -A` would have taken
 # them all — a live daemon's stderr is a debugging artifact, not a source file.

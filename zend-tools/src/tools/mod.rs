@@ -1,4 +1,4 @@
-//! All 93 tool implementations, organised into one module per logical group.
+//! All 95 tool implementations, organised into one module per logical group.
 //!
 //! Each tool module follows the same pattern:
 //! - a `Request` struct (`Deserialize + JsonSchema + Validate`)
@@ -19,7 +19,7 @@
 //! | `credentials` | `credential_{save,list,delete}` | In-memory typed credential store |
 //! | `crypto` | `aead_*`, `hmac_compute`, `signature_*`, `kdf_derive`, `hkdf_*` | RustCrypto |
 //! | `datetime` | `datetime` | chrono + chrono-tz; stateless |
-//! | `file` | `file_{write,read,edit,list,delete,present}` | VFS tools |
+//! | `file` | `file_{write,read,edit,list,search,grep,delete,present}` | VFS tools; `search`/`grep` find by name and by content |
 //! | `hash` | `hash_compute`, `hash_scan` | SHA2/SHA3/BLAKE3/MD5 |
 //! | `hash_state` | `hash_state_{init,update,finalize}` | Streaming hash for large data |
 //! | `http_session` | `http_session_{open,request,list,close}` | reqwest; cookie jar |

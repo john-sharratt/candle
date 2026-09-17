@@ -303,6 +303,37 @@ static ALIAS_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "file_search",
+        &[
+            "find_file",
+            "find_files",
+            "locate_file",
+            "search_filenames",
+            "search_files",
+            "find_by_name",
+            "which_file",
+            "glob",
+            "fd",
+            "where_is",
+        ],
+    ),
+    (
+        "file_grep",
+        &[
+            "grep",
+            "rg",
+            "ripgrep",
+            "search_code",
+            "code_search",
+            "find_in_files",
+            "search_contents",
+            "find_text",
+            "find_usages",
+            "find_references",
+            "search_source",
+        ],
+    ),
+    (
         "file_delete",
         &["delete_file", "rm", "remove_file", "fs_delete", "unlink"],
     ),
@@ -745,7 +776,10 @@ use crate::tools::{
         SIGNATURE_SIGN, SIGNATURE_VERIFY,
     },
     datetime::REGISTRATION as DATETIME,
-    file::{FILE_DELETE, FILE_EDIT, FILE_LIST, FILE_PRESENT, FILE_READ, FILE_WRITE},
+    file::{
+        FILE_DELETE, FILE_EDIT, FILE_GREP, FILE_LIST, FILE_PRESENT, FILE_READ, FILE_SEARCH,
+        FILE_WRITE,
+    },
     hash::{HASH_COMPUTE, HASH_SCAN},
     hash_state::{HASH_STATE_FINALIZE, HASH_STATE_INIT, HASH_STATE_UPDATE},
     http_session::{
@@ -797,11 +831,13 @@ fn register_all() -> &'static [RegisteredTool] {
         WEB_SEARCH,
         WEB_FETCH,
         WEATHER,
-        // File tools (6) — reads safe, mutations high-risk
+        // File tools (8) — reads safe, mutations high-risk
         FILE_WRITE,
         FILE_READ,
         FILE_EDIT,
         FILE_LIST,
+        FILE_SEARCH,
+        FILE_GREP,
         FILE_DELETE,
         FILE_PRESENT,
         // Notes tools (4) — reads safe, write high-risk

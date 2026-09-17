@@ -42,6 +42,28 @@
 //! Files above [`MAX_LOWER_FILE_BYTES`] are listed but refuse to read, as do files
 //! whose bytes are not valid UTF-8; both surface as [`VfsError::Unreadable`].
 //!
+//! # Protected paths
+//!
+//! Any path with a [`PROTECTED_SEGMENT`] component is refused outright, in both
+//! layers and by every operation: [`VfsError::Forbidden`]. That covers
+//! `secrets/tools.yaml`, `web/secrets/auth.yaml`, and anything else a deployment
+//! keeps in a `secrets/` directory.
+//!
+//! **This is not the same protection as `.gitignore`, and the difference is the
+//! whole point.** The ignore rules are consulted by the listing walk and by
+//! nothing else — a read resolves a normalised key straight to a path under the
+//! root and opens it. So before this guard existed, a gitignored secret was
+//! invisible to `file_list` and served in full by `file_read`, which is the
+//! worst of both worlds: hidden from the operator auditing what the model can
+//! see, and one call away from the transcript.
+//!
+//! The refusal is enforced in [`VfsStore::lower_path`], the single funnel every
+//! lower-layer read goes through, rather than at each call site — a guard that
+//! has to be remembered at N call sites is a guard that is missing at one of
+//! them. Normalisation runs first, so alternate spellings (`/secrets/x`,
+//! `a/../secrets/x`, `workspace/secrets/x`, backslashes) all collapse onto the
+//! same key before the check sees it.
+//!
 //! # Size cap
 //!
 //! The upper layer is capped at 10 MiB per store (enforced on each `write`).
@@ -64,12 +86,25 @@ pub const MAX_LOWER_FILE_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
 /// Stripped during normalisation so `/workspace/src` and `src` are one key.
 const MOUNT_SEGMENT: &str = "workspace";
 
+/// Path segment marking a directory the tools may not touch.
+///
+/// A deployment's secrets live in a `secrets/` directory — `secrets/tools.yaml`
+/// for the daemon's own API keys, `web/secrets/auth.yaml` for the gateway's
+/// sign-in config. One name, matched at any depth, so a new secrets directory is
+/// protected the day it is created rather than the day someone remembers to add
+/// it to a list.
+pub const PROTECTED_SEGMENT: &str = "secrets";
+
 #[derive(Debug)]
 pub enum VfsError {
     Full,
     /// A workspace file exists but cannot be served as text — too large, or not
     /// valid UTF-8.
     Unreadable(String),
+    /// The path is under a [`PROTECTED_SEGMENT`] directory. Refused whether or
+    /// not it exists: saying "not found" for a real file and "forbidden" for a
+    /// missing one would turn the error into an oracle for what is there.
+    Forbidden(String),
 }
 
 impl std::fmt::Display for VfsError {
@@ -77,8 +112,38 @@ impl std::fmt::Display for VfsError {
         match self {
             VfsError::Full => write!(f, "VFS storage limit exceeded (10 MiB)"),
             VfsError::Unreadable(why) => write!(f, "{why}"),
+            VfsError::Forbidden(path) => write!(
+                f,
+                "{path} is under a {PROTECTED_SEGMENT}/ directory and cannot be \
+                 read, written or listed by tools"
+            ),
         }
     }
+}
+
+/// One matching line from [`VfsStore::grep`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrepHit {
+    pub path: String,
+    /// 1-based line number within the file.
+    pub line_no: u32,
+    /// The matching line, with trailing `\r` and whitespace trimmed.
+    pub line: String,
+    /// `true` when the hit came from this session's own copy of the file.
+    pub modified: bool,
+}
+
+/// What a [`VfsStore::grep`] pass found.
+#[derive(Debug, Default)]
+pub struct GrepOutcome {
+    pub hits: Vec<GrepHit>,
+    /// Files whose contents were actually scanned — the denominator that tells a
+    /// caller whether "no matches" means "searched a lot and found nothing" or
+    /// "the prefix matched nothing to search".
+    pub files_searched: usize,
+    /// `true` when the scan stopped at its hit ceiling, so the result is a
+    /// prefix of what is there rather than all of it.
+    pub truncated: bool,
 }
 
 /// One entry in a listing: normalised path, byte size, line count.
@@ -135,6 +200,10 @@ impl VfsStore {
     /// *is* a creation: the path did not resolve while the whiteout stood.
     pub fn write(&self, path: &str, content: String) -> Result<bool, VfsError> {
         let norm = Self::normalize(path);
+        // Writes never reach disk, so this cannot overwrite a secret — it is
+        // refused so that a session cannot plant a decoy at a protected path and
+        // have later reads of that path start succeeding.
+        Self::guard(&norm)?;
         let in_lower = self.lower_exists(&norm);
         let mut guard = self.upper.write().unwrap();
         let whiteouted = guard.whiteouts.contains(&norm);
@@ -155,6 +224,7 @@ impl VfsStore {
     /// `Ok(None)` means the path does not exist in either layer (or is whiteouted).
     pub fn read(&self, path: &str) -> Result<Option<String>, VfsError> {
         let norm = Self::normalize(path);
+        Self::guard(&norm)?;
         {
             let guard = self.upper.read().unwrap();
             if let Some(v) = guard.files.get(&norm) {
@@ -214,6 +284,9 @@ impl VfsStore {
     /// whether the path resolved before the call. The workspace is never touched.
     pub fn delete(&self, path: &str) -> bool {
         let norm = Self::normalize(path);
+        if Self::is_protected(&norm) {
+            return false;
+        }
         let in_lower = self.lower_exists(&norm);
         let mut guard = self.upper.write().unwrap();
         if guard.whiteouts.contains(&norm) {
@@ -259,7 +332,27 @@ impl VfsStore {
         if norm.is_empty() {
             return None;
         }
+        // The single funnel for lower-layer access. Guarding here rather than at
+        // each caller is what makes the protection total: `read_lower`,
+        // `lower_exists`, and anything added later inherit it without knowing it
+        // exists.
+        if Self::is_protected(norm) {
+            return None;
+        }
         Some(root.join(norm))
+    }
+
+    /// Whether a normalised key names something under a protected directory.
+    pub fn is_protected(norm: &str) -> bool {
+        norm.split('/').any(|s| s == PROTECTED_SEGMENT)
+    }
+
+    /// `Err(Forbidden)` for a protected key, `Ok(())` otherwise.
+    fn guard(norm: &str) -> Result<(), VfsError> {
+        if Self::is_protected(norm) {
+            return Err(VfsError::Forbidden(norm.to_string()));
+        }
+        Ok(())
     }
 
     fn lower_exists(&self, norm: &str) -> bool {
@@ -295,6 +388,67 @@ impl VfsStore {
     /// Line counts require reading each file, so they are only computed for files
     /// within [`MAX_LOWER_FILE_BYTES`] that parse as UTF-8; anything else reports
     /// `0` lines alongside its true byte size.
+    /// The ignore-driven walker both lower-layer passes use.
+    ///
+    /// One builder, so a listing and a search can never disagree about what is
+    /// visible — a file hidden from `file_list` but reachable by `file_grep`
+    /// would be the same class of hole as the read path that ignored these
+    /// rules entirely.
+    fn lower_walker(root: &Path) -> ignore::Walk {
+        WalkBuilder::new(root)
+            .hidden(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .ignore(true)
+            .require_git(false)
+            .parents(true)
+            .build()
+    }
+
+    /// Normalised keys of the workspace files under `norm_prefix`.
+    ///
+    /// Deliberately stats nothing and reads nothing: this backs path search and
+    /// the candidate list for a content search, and computing the line counts
+    /// [`VfsStore::list`] needs would mean reading every file in the repository
+    /// to throw the number away.
+    fn walk_lower_paths(&self, norm_prefix: &str) -> Vec<String> {
+        let Some(root) = self.workspace.as_ref() else {
+            return Vec::new();
+        };
+        let prefix_dir = root.join(norm_prefix);
+        let (walk_root, filter) = if !norm_prefix.is_empty() && prefix_dir.is_dir() {
+            (prefix_dir, None)
+        } else {
+            (root.clone(), Some(norm_prefix))
+        };
+
+        let mut out = Vec::new();
+        for entry in Self::lower_walker(&walk_root).flatten() {
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let Ok(rel) = entry.path().strip_prefix(root) else {
+                continue;
+            };
+            let key = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            if Self::is_protected(&key) {
+                continue;
+            }
+            if let Some(p) = filter {
+                if !Self::matches_prefix(&key, p) {
+                    continue;
+                }
+            }
+            out.push(key);
+        }
+        out
+    }
+
     fn list_lower(&self, norm_prefix: &str) -> Vec<(String, usize, usize)> {
         let Some(root) = self.workspace.as_ref() else {
             return Vec::new();
@@ -310,16 +464,7 @@ impl VfsStore {
         };
 
         let mut out = Vec::new();
-        let walker = WalkBuilder::new(&walk_root)
-            .hidden(true)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .ignore(true)
-            .require_git(false)
-            .parents(true)
-            .build();
-        for entry in walker.flatten() {
+        for entry in Self::lower_walker(&walk_root).flatten() {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
@@ -331,6 +476,9 @@ impl VfsStore {
                 .map(|c| c.as_os_str().to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
+            if Self::is_protected(&key) {
+                continue;
+            }
             if let Some(p) = filter {
                 if !Self::matches_prefix(&key, p) {
                     continue;
@@ -348,6 +496,95 @@ impl VfsStore {
                 0
             };
             out.push((key, bytes as usize, lines));
+        }
+        out
+    }
+
+    // ── Search ───────────────────────────────────────────────────────────────
+
+    /// Every path visible under `prefix`, upper layer shadowing the workspace.
+    ///
+    /// Unlike [`VfsStore::list`] this reads no file contents, so it stays cheap
+    /// over a whole repository — line counts are what make a full listing
+    /// expensive, and a path search does not need them.
+    pub fn paths(&self, prefix: &str) -> Vec<String> {
+        let norm_prefix = Self::normalize(prefix);
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out: Vec<String> = Vec::new();
+        {
+            let guard = self.upper.read().unwrap();
+            for k in guard.files.keys() {
+                if Self::matches_prefix(k, &norm_prefix) && !Self::is_protected(k) {
+                    seen.insert(k.clone());
+                    out.push(k.clone());
+                }
+            }
+            for w in guard.whiteouts.iter() {
+                seen.insert(w.clone());
+            }
+        }
+        for path in self.walk_lower_paths(&norm_prefix) {
+            if !seen.contains(&path) {
+                out.push(path);
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Scan file contents under `prefix` for `re`.
+    ///
+    /// Files that cannot be scanned — oversize, not UTF-8, vanished between the
+    /// walk and the read — are skipped rather than failing the pass: a single
+    /// binary blob in a tree must not turn a whole search into an error.
+    pub fn grep(
+        &self,
+        re: &regex::Regex,
+        prefix: &str,
+        max_per_file: usize,
+        max_total: usize,
+    ) -> GrepOutcome {
+        let mut out = GrepOutcome::default();
+        for path in self.paths(prefix) {
+            let (content, modified) = {
+                let guard = self.upper.read().unwrap();
+                match guard.files.get(&path) {
+                    Some(v) => (Some(v.clone()), true),
+                    None => (None, false),
+                }
+            };
+            let content = match content {
+                Some(c) => c,
+                None => match self.read_lower(&path) {
+                    Ok(Some(c)) => c,
+                    _ => continue,
+                },
+            };
+            out.files_searched += 1;
+
+            let mut in_file = 0usize;
+            for (idx, line) in content.lines().enumerate() {
+                if !re.is_match(line) {
+                    continue;
+                }
+                if out.hits.len() >= max_total {
+                    out.truncated = true;
+                    return out;
+                }
+                out.hits.push(GrepHit {
+                    path: path.clone(),
+                    line_no: idx as u32 + 1,
+                    line: line.trim_end().to_string(),
+                    modified,
+                });
+                in_file += 1;
+                if in_file >= max_per_file {
+                    // One file monopolising the budget would hide every other
+                    // file that matches, which is the answer the caller wants.
+                    out.truncated = true;
+                    break;
+                }
+            }
         }
         out
     }

@@ -1,10 +1,17 @@
 //! `web_search` tool — search the web via Tavily API.
+//!
+//! The API key comes from the daemon's secrets document
+//! ([`ToolSecrets`](crate::state::ToolSecrets)), read once at startup from a
+//! per-user file outside the workspace. It is deliberately not read from the
+//! process environment: the key would then have to be exported by whatever
+//! launches the daemon, and every child process would inherit it.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use validator::Validate;
 
+use crate::state::ToolSecrets;
 use crate::{RegisteredTool, Tool, ToolContext, ToolError};
 
 #[derive(Deserialize, JsonSchema, Validate)]
@@ -63,12 +70,16 @@ impl Tool for WebSearchTool {
     type Error = SearchError;
 
     fn run(ctx: &ToolContext, req: Request) -> Result<Response, SearchError> {
-        let api_key = std::env::var("TAVILY_API_KEY").unwrap_or_default();
-        if api_key.is_empty() {
-            return Err(SearchError::SearchUnavailable(
-                "TAVILY_API_KEY not set".to_string(),
-            ));
-        }
+        // The message names the file the operator has to edit. A model that
+        // reads "search unavailable" can say something useful to the user with
+        // this, and an operator reading the log is told the fix.
+        let Some(api_key) = ctx.secrets.tavily_api_key() else {
+            return Err(SearchError::SearchUnavailable(format!(
+                "no tavily_api_key configured (set it in {} under the daemon's \
+                 working directory)",
+                ToolSecrets::RELATIVE_PATH
+            )));
+        };
 
         let max_results = req.max_results.unwrap_or(5);
         let body = serde_json::json!({

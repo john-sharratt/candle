@@ -1,6 +1,6 @@
 //! Tool registry and execution engine for the Zen Code daemon (`zend`).
 //!
-//! This crate implements all 93 server-side tools described in `docs/tool-system.md`.
+//! This crate implements all 95 server-side tools described in `docs/tool-system.md`.
 //! Tools are stateless Rust functions — all shared state lives in [`ToolContext`].
 //! The orchestrator calls [`run`] with a tool name and JSON arguments and always
 //! gets back a JSON value that the LLM can act on, whether the call succeeded or
@@ -16,8 +16,9 @@
 //! - [`context`] — [`ToolContext`], the `Arc`-shared bundle of state stores passed
 //!   into every tool invocation
 //! - [`state`] — the individual stores: [`state::VfsStore`], [`state::CredentialStore`],
-//!   [`state::NotesStore`], [`state::SessionRegistry`], [`state::HashStateStore`]
-//! - [`tools`] — all 93 tool implementations, one module per tool group
+//!   [`state::NotesStore`], [`state::SessionRegistry`], [`state::HashStateStore`],
+//!   [`state::ToolSecrets`]
+//! - [`tools`] — all 95 tool implementations, one module per tool group
 //!
 //! # Authoring a tool
 //!

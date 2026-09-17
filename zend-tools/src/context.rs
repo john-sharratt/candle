@@ -14,6 +14,7 @@
 //! | `sessions` | [`state::SessionRegistry`] | All open protocol sessions (SSH, TCP, …) |
 //! | `hash_states` | [`state::HashStateStore`] | Running hash contexts for `hash_state_*` tools |
 //! | `http_client` | `reqwest::blocking::Client` | Shared HTTP client for `web_fetch`, `weather`, etc. |
+//! | `secrets` | [`state::ToolSecrets`] | Deployment API keys (Tavily) for the tools that call third-party services |
 //! | `subagent_runner` | `Option<Arc<dyn SubagentRunner>>` | Injected by daemon to run nested agent loops |
 //!
 //! # Construction
@@ -27,7 +28,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::state::{CredentialStore, HashStateStore, NotesStore, SessionRegistry, VfsStore};
+use crate::state::{
+    CredentialStore, HashStateStore, NotesStore, SessionRegistry, ToolSecrets, VfsStore,
+};
 
 /// Read-only handle bundle passed by the runner into each tool invocation.
 /// All stores are wrapped in `Arc` so cloning the context is cheap.
@@ -39,6 +42,7 @@ pub struct ToolContext {
     pub sessions: Arc<SessionRegistry>,
     pub hash_states: Arc<HashStateStore>,
     pub http_client: reqwest::blocking::Client,
+    pub secrets: Arc<ToolSecrets>,
     pub subagent_runner: Option<Arc<dyn crate::SubagentRunner>>,
 }
 
@@ -67,8 +71,18 @@ impl ToolContext {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap(),
+            // Unset unless the daemon supplies them: a test, and any caller that
+            // is not the daemon, gets a context whose third-party tools report
+            // themselves unconfigured rather than reaching the network.
+            secrets: Arc::new(ToolSecrets::empty()),
             subagent_runner: None,
         }
+    }
+
+    /// Attach the deployment's secrets, read once by the daemon at startup.
+    pub fn with_secrets(mut self, secrets: ToolSecrets) -> Self {
+        self.secrets = Arc::new(secrets);
+        self
     }
 
     /// Attach a subagent runner to this context.

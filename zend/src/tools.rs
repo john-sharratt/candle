@@ -25,7 +25,7 @@
 //! final natural-language answer.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use candle_conversation::models::Dialect;
@@ -38,6 +38,7 @@ use candle_conversation::TurnText;
 use serde::Deserialize;
 use serde_json::Value;
 
+use zend_tools::state::ToolSecrets;
 use zend_tools::{registry, replay, Replay, ToolContext};
 
 /// The names of every tool that is **not** high-risk — the subset projected in
@@ -644,9 +645,44 @@ pub struct ToolHost {
 impl ToolHost {
     /// Build a host whose file tools overlay `workspace` — the daemon's working
     /// directory, which reads fall through to when the session layer has no entry.
+    ///
+    /// The deployment's secrets are read from that same directory, once, here.
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        let workspace = workspace.into();
+        let secrets = load_tool_secrets(&workspace);
         Self {
-            ctx: Arc::new(ToolContext::with_workspace(workspace)),
+            ctx: Arc::new(ToolContext::with_workspace(workspace).with_secrets(secrets)),
+        }
+    }
+}
+
+/// Read `secrets/tools.yaml` from the workspace, reporting what was found.
+///
+/// A malformed document does not stop the daemon: web search is one tool among
+/// ninety-odd, and refusing to boot over a stray character in a file that most
+/// deployments do not even have would be wildly out of proportion. It is a WARN
+/// with the parse error, and every secret reads as unset.
+///
+/// Only the *presence* of a key is logged, never its value — a log line is the
+/// one place a secret reliably escapes a process.
+fn load_tool_secrets(workspace: &Path) -> ToolSecrets {
+    let path = ToolSecrets::path_in(workspace);
+    match ToolSecrets::load(&path) {
+        Ok(secrets) => {
+            tracing::info!(
+                path = %path.display(),
+                tavily = secrets.tavily_api_key().is_some(),
+                "tool secrets loaded"
+            );
+            secrets
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "tool secrets could not be read; every secret reads as unset"
+            );
+            ToolSecrets::empty()
         }
     }
 }
@@ -656,6 +692,39 @@ impl ToolHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── The daemon's tool secrets ───────────────────────────────────────────
+
+    /// **`ToolHost::new` hands the workspace's secrets to the tool context.**
+    ///
+    /// The document's parsing is covered in `zend-tools`; what is asserted here
+    /// is the wiring, which nothing else would catch. Dropping the
+    /// `.with_secrets(..)` call leaves every crate compiling and every other
+    /// test passing, and shows up only as `web_search` reporting itself
+    /// unconfigured on a machine whose key is sitting right there in the file.
+    #[test]
+    fn the_tool_host_loads_the_workspaces_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = ToolSecrets::path_in(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "tavily_api_key: tvly-wired-through\n").unwrap();
+
+        let host = ToolHost::new(dir.path());
+        assert_eq!(
+            host.ctx.secrets.tavily_api_key(),
+            Some("tvly-wired-through"),
+            "the daemon must read secrets/tools.yaml from its working directory"
+        );
+    }
+
+    /// A workspace with no document leaves every secret unset and the daemon
+    /// still starts: not configuring web search is an ordinary way to run it.
+    #[test]
+    fn a_workspace_without_secrets_still_builds_a_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(dir.path());
+        assert_eq!(host.ctx.secrets.tavily_api_key(), None);
+    }
 
     // ── Resuming a tool round after a restart ───────────────────────────────
 

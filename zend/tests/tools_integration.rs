@@ -57,6 +57,7 @@ mod common;
 
 #[cfg(feature = "cuda")]
 mod tool_scenarios {
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -66,7 +67,7 @@ mod tool_scenarios {
     use crate::common::{needs_compaction, production_workspace, run_conv_id};
     use candle::vram::host_pinned_bytes;
     use candle_conversation::models::Model;
-    use candle_conversation::projection::SectionLoads;
+    use candle_conversation::projection::{SectionLoads, SystemItem};
     use candle_conversation::{SamplingConfig, SelectionState};
     use zend::api::chat::{apply_tools_dial, dial_selection};
     use zend::config::{DaemonConfig, ModelChoice};
@@ -135,12 +136,71 @@ mod tool_scenarios {
 
     /// [`run_on`] the small rig — what every scenario the 0.8B handles runs.
     async fn run_query(prompt: &str, conv_id: &str) -> String {
+        run_on(Rig::Small, prompt, conv_id).await.response
+    }
+
+    /// [`run_on`] the small rig, keeping what provenance did with the query.
+    async fn run_query_observed(prompt: &str, conv_id: &str) -> Outcome {
         run_on(Rig::Small, prompt, conv_id).await
     }
 
+    /// What one scenario observed.
+    ///
+    /// The response text answers "did the model do the right thing". The other
+    /// two fields answer "did PROVENANCE do the right thing", which is the
+    /// property a tool's question seeds are tuned against, and they are not the
+    /// same question.
+    ///
+    /// **Asserting on the text alone cannot tell a tool that was never
+    /// projected from one the model chose not to call.** Scenario 10 passed for
+    /// months against a `web_search` that provenance never selected at all: its
+    /// probe contained the words "rust" and "search", so a refusal quoting the
+    /// request back satisfied the assertion. Selection is observable — every
+    /// projection event carries the whole `tools` collection with each member's
+    /// belief score and whether it was picked — so it is what these scenarios
+    /// assert.
+    struct Outcome {
+        response: String,
+        /// Tool names actually dispatched, in call order, across every round.
+        tools_called: Vec<String>,
+        /// The highest belief score each catalog tool reached at any projection
+        /// point of this turn, on the normalized 0–1000 band the `tools`
+        /// collection is gated on (`min_score` 800, `evict` 750).
+        peak_score: HashMap<String, f32>,
+        /// Every tool projected into the prompt at any point in the turn.
+        selected: HashSet<String>,
+    }
+
+    impl Outcome {
+        fn called(&self, tool: &str) -> bool {
+            self.tools_called.iter().any(|t| t == tool)
+        }
+
+        /// Whether the tool ever reached the model — projected, or dispatched.
+        fn reached_the_model(&self, tool: &str) -> bool {
+            self.selected.contains(tool) || self.called(tool)
+        }
+
+        fn peak(&self, tool: &str) -> f32 {
+            self.peak_score.get(tool).copied().unwrap_or(0.0)
+        }
+
+        /// The strongest tools this turn, highest first. A selection failure is
+        /// only actionable if it says what won instead.
+        fn ranking(&self) -> String {
+            let mut rows: Vec<(&String, &f32)> = self.peak_score.iter().collect();
+            rows.sort_by(|a, b| b.1.total_cmp(a.1));
+            rows.iter()
+                .take(8)
+                .map(|(n, s)| format!("{n}={s:.0}"))
+                .collect::<Vec<_>>()
+                .join("  ")
+        }
+    }
+
     /// Boot a ZendSession on `rig`, wait for ready, send `prompt`, shut the
-    /// session down, and return the concatenated assistant text.
-    async fn run_on(rig: Rig, prompt: &str, conv_id: &str) -> String {
+    /// session down, and return what the turn did.
+    async fn run_on(rig: Rig, prompt: &str, conv_id: &str) -> Outcome {
         // A conversation of this run's own — both workspaces persist across runs.
         let conv_id = run_conv_id(conv_id);
         let (workspace, model, mut selection) = match rig {
@@ -191,6 +251,9 @@ mod tool_scenarios {
 
         let mut response = String::new();
         let mut status_msgs: Vec<String> = Vec::new();
+        let mut tools_called: Vec<String> = Vec::new();
+        let mut peak_score: HashMap<String, f32> = HashMap::new();
+        let mut selected: HashSet<String> = HashSet::new();
         while let Some(result) = stream.next().await {
             match result.expect("stream item error") {
                 StreamItem::Status(msg) => {
@@ -202,10 +265,31 @@ mod tool_scenarios {
                     response.push_str(&tok);
                 }
                 StreamItem::Projection(projection_event_out) => {
-                    eprintln!("\n[PROJECTION EVENT] {:?}", projection_event_out.event);
+                    // Every point carries the WHOLE tools collection — picked and
+                    // skipped alike — so the peak across the turn is the tool's
+                    // best showing, not whatever the last point happened to hold.
+                    for item in &projection_event_out.event.selection.system {
+                        let SystemItem::Collection { name, sections, .. } = item else {
+                            continue;
+                        };
+                        if name != "tools" {
+                            continue;
+                        }
+                        for s in sections {
+                            let peak = peak_score.entry(s.name.clone()).or_insert(0.0);
+                            *peak = peak.max(s.score);
+                            if s.selected {
+                                selected.insert(s.name.clone());
+                            }
+                        }
+                    }
                 }
                 StreamItem::Tool(status) => {
                     eprintln!("\n[TOOL {}] {:?}", status.phase, status.tools);
+                    // The "done" notice repeats the same names; count once.
+                    if status.phase == "running" {
+                        tools_called.extend(status.tools.iter().cloned());
+                    }
                 }
                 StreamItem::Prefill { .. }
                 | StreamItem::Think { .. }
@@ -214,6 +298,8 @@ mod tool_scenarios {
         }
         eprintln!("\n\n[FINAL RESPONSE]\n{response}");
         eprintln!("[STATUS MESSAGES] {status_msgs:?}");
+        eprintln!("[TOOLS CALLED] {tools_called:?}");
+        eprintln!("[TOOLS SELECTED] {selected:?}");
         // Retire this run's conversation, so the workspace does not keep one per
         // scenario per run; compaction reclaims it.
         if let Some(Err(e)) = session.tombstone_timeline_raw(timeline_for(&conv_id).raw()) {
@@ -221,7 +307,12 @@ mod tool_scenarios {
         }
         // Release the workspace's substrate for the next scenario.
         session.shutdown().await;
-        response
+        Outcome {
+            response,
+            tools_called,
+            peak_score,
+            selected,
+        }
     }
 
     /// Host-pinned bytes still allocated once the previous scenario's session had
@@ -483,7 +574,8 @@ mod tool_scenarios {
             Rig::Production,
             "Compute the SHA256 hash of the text \"hello\".",
             "test-hash",
-        ));
+        ))
+        .response;
         assert!(!response.is_empty());
         // SHA256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
         // Accept any 64-hex-character substring as evidence of a real hash.
@@ -526,20 +618,115 @@ mod tool_scenarios {
     }
 
     // ── Scenario 10: web_search query ────────────────────────────────────────
+    //
+    // **Asserts SELECTION, not theme.** The previous form asked the model to
+    // "search the web for \"rust language\"" and accepted any answer containing
+    // "rust", "search" or "error" — every one of which appears in a refusal that
+    // quotes the request back ("I don't have a web search tool ... Rust is a
+    // systems language"). It therefore passed while `web_search` was never
+    // projected at all: measured on the live daemon, it peaked at 99.99 against
+    // a gate of 800 and was absent from every projection point of the turn.
 
     #[test]
-    fn web_search_query_uses_web_search_tool() {
+    fn web_search_query_selects_the_web_search_tool() {
         init_tracing();
-        let response = run_with_timeout(run_query(
-            "Search the web for \"rust language\" and tell me what you find.",
+        let out = run_with_timeout(run_query_observed(
+            "Search the web for the latest Rust release notes.",
             "test-search",
         ));
-        // Network-dependent tool; assert the model engaged with the request
-        // rather than refusing.
-        let lower = response.to_lowercase();
+        // **Asserts PROJECTION, not merely that the tool ran.** A call alone is
+        // not evidence the catalog offered it: the comprehensive tool *summary*
+        // lists every tool's NAME, so the model can emit a call for a tool whose
+        // schema was never projected — measured on the live daemon, `web_search`
+        // was called six times while `selected` was false at all twenty
+        // projection points of the turn, its belief frozen at exactly 169.53601
+        // across sixteen consecutive events while its neighbours moved every
+        // step. Asserting "reached the model" would pass on that blind call and
+        // hide the defect, which is the same mistake as asserting on theme.
         assert!(
-            lower.contains("rust") || lower.contains("error") || lower.contains("search"),
-            "expected search-themed response, got: {response:?}",
+            out.selected.contains("web_search"),
+            "web_search was never PROJECTED for an explicit web-search request \
+             (called: {}). Its belief peaked at {:.0} while the turn's strongest \
+             tools were: {}",
+            out.called("web_search"),
+            out.peak("web_search"),
+            out.ranking(),
         );
+    }
+
+    // ── Scenario 11: finding a file by name ──────────────────────────────────
+
+    #[test]
+    fn a_filename_question_selects_file_search() {
+        init_tracing();
+        let out = run_with_timeout(run_query_observed(
+            "Which file is batched_model.rs, and where does it live?",
+            "test-file-search",
+        ));
+        assert!(
+            out.reached_the_model("file_search"),
+            "file_search was not projected for a find-this-file request — peak \
+             belief {:.0} against a gate of 800. Strongest tools: {}",
+            out.peak("file_search"),
+            out.ranking(),
+        );
+    }
+
+    // ── Scenario 12: finding code by content ─────────────────────────────────
+
+    #[test]
+    fn a_symbol_question_selects_file_grep() {
+        init_tracing();
+        let out = run_with_timeout(run_query_observed(
+            "Where in this codebase is the function forward_wave defined?",
+            "test-file-grep",
+        ));
+        assert!(
+            out.reached_the_model("file_grep"),
+            "file_grep was not projected for a where-is-this-defined request — \
+             peak belief {:.0} against a gate of 800. Strongest tools: {}",
+            out.peak("file_grep"),
+            out.ranking(),
+        );
+    }
+
+    // ── Scenario 13: the file tools stay inside their own domain ─────────────
+    //
+    // A web-search request must not pull the repository search tools in. This is
+    // the negative control for the question seeds, and nothing else in the suite
+    // catches it: measured on the live daemon, `file_search` reached 3589 on
+    // "Search the web and tell me the latest stable Rust release version" —
+    // more than four times the gate, and the strongest tool of the turn —
+    // because its seed list named `web_search.rs`. A seed that borrows another
+    // tool's vocabulary teaches provenance the wrong domain, and the symptom is
+    // a *different* tool being starved rather than this one misbehaving.
+
+    #[test]
+    fn a_web_query_does_not_pull_in_the_repository_search_tools() {
+        init_tracing();
+        let out = run_with_timeout(run_query_observed(
+            "Search the web and tell me the latest stable Rust release version.",
+            "test-search-domain",
+        ));
+        // **Scale-free on purpose.** `SelectedSection::score` is the raw belief
+        // accumulator, not the normalized 0–1000 band the policy's `min_score`
+        // is written in — `belief-eval` defaults that gate to 35, the schema
+        // says 800, the results doc says 1000, and live scores run past 800,000.
+        // A threshold here would be a number with no defensible origin, so the
+        // assertion is on the outcome that actually costs something: the
+        // collection admits between one and three tools, so a repository search
+        // tool taking a slot on a web question is a slot the right tool cannot
+        // have.
+        for tool in ["file_search", "file_grep"] {
+            assert!(
+                !out.selected.contains(tool),
+                "{tool} was projected for a web-search question (belief {:.0}) — \
+                 its question seeds are borrowing another tool's vocabulary, and \
+                 the collection's budget is 1..3, so this is a slot taken from \
+                 the tool the question was actually about. Strongest tools: {}",
+                out.peak(tool),
+                out.ranking(),
+            );
+        }
     }
 }

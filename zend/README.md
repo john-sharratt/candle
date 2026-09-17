@@ -118,7 +118,7 @@ A `projection.yaml` in the workspace (or `--working-dir`) overrides the bundled 
 
 - `docs/coding_assistant.md` — Zen Code product overview (daemon + `zen-vscode` + web chat); note several routes it documents (`/v1/zen/*`) are design-stage and not yet implemented — see `docs/zend_ui_redesign.md` for the ground-truth route table.
 - `docs/zend_ui_redesign.md` — the authoritative frontend/API plan, closest to what is actually shipped.
-- `docs/tool-system.md` — the full server-registered tool catalog (93 tools) and the Continue-vs-web-chat tool-execution split.
+- `docs/tool-system.md` — the full server-registered tool catalog (95 tools) and the Continue-vs-web-chat tool-execution split.
 - `docs/sdlc_agent.md` — broader engineering-agent architecture vision this daemon is one instance of.
 - `docs/web_search_design.md` — design of the `web_*` tool family (implemented in the sibling `zend-tools` crate).
 - `docs/stencil_tree.md` — the constrained-decoding mechanism (tool-call shape, `<think>` steering) `zend` compiles at load from `candle_conversation::stencil`.

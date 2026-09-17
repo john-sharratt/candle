@@ -1,0 +1,153 @@
+name: file_grep
+questions:
+- where is forward_wave defined
+- who calls reconcile_wave_offsets
+- grep the codebase for TAVILY_API_KEY
+- find every occurrence of unwrap in candle-nn
+- search the source for the string connection refused
+- are there any TODO or FIXME comments left in zend
+- which files mention CHUNK_SIZE
+- I am seeing an error that says slot budget exceeded, find where it is raised
+- trace the callers of elevate_to_hot
+- does anything still reference the old KvFormat enum
+- regex search for ^pub fn across zend-tools
+- find usages of PROTECTED_SEGMENT
+- what code reads models.override.yaml
+- look for a hardcoded localhost in the config
+- hunt for the panic message about a dangling slice
+- case insensitive search for deadlock in the comments
+- is the identifier GidPool used outside its own module
+- content search for Q4_KS
+- find the definition of trait Arch
+- which module declares MAX_TOOL_ROUNDS
+- grep for imports of serde_yaml
+- anywhere that spawns a tokio task in zend
+- find lines matching wave_offsets in candle-conversation
+- show me every place that constructs a ToolContext
+category: Files
+description: 'Search the CONTENTS of every file in the project for a string or regular expression, returning the matching lines with their file paths and line numbers. Use for: finding where a function, type, constant or error message is defined or used; checking whether something exists in the codebase at all; tracing the callers of an API; locating a config key, a magic string, or a leftover TODO. Takes a regex in Rust regex syntax (`^pub fn `, `Error::\w+`, `foo|bar`) — a plain string matches itself — plus an optional path prefix to narrow the search and an optional ignore_case. Returns path, line number and the matching line, paged, along with files_searched so that an empty result is unambiguous: scanning four thousand files and finding nothing reads differently from a prefix that matched nothing to scan. Capped at twenty hits per file so one generated file cannot hide every other file that matched; `truncated` says when a cap was reached. THIS IS THE TOOL FOR FINDING CODE BY CONTENT — reach for it before guessing directory names with file_list. The line number it returns is what file_read takes as start_line, so the two compose directly. Use file_search to find a file by its NAME rather than its contents.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    ignore_case:
+      description: Match without regard to case. Defaults to false, which is what searching for a source identifier wants.
+      type:
+      - boolean
+      - 'null'
+    page:
+      description: Zero-based page of results to return. Defaults to 0. When the response's `paging.next_page` is set, pass it here to read the following page.
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+    pattern:
+      description: Regular expression to search for, in Rust regex syntax (`\b`, `[A-Z]`, `foo|bar`, `^fn `). A plain string works as itself. Required.
+      minLength: 1
+      type: string
+    prefix:
+      description: Restrict the search to paths beginning with this prefix (e.g. `candle-nn/src/`). Omit to search the whole project.
+      type:
+      - string
+      - 'null'
+  required:
+  - pattern
+  title: GrepRequest
+  type: object
+examples:
+- |-
+  where is forward_wave defined<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user is asking where a symbol is defined, which is a question about file contents rather than file names, so this is file_grep rather than file_search.
+
+  A plain<|projection|> string matches itself, so the pattern can simply be "forward_wave". That will find the definition and the call sites together; the paths and line numbers in the result will<|projection|> let me narrow to the definition, and I can file_read at the line number afterwards.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "forward_wave"}}
+  </tool_call><|projection|>
+- |-
+  are there any TODO or FIXME comments left<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Two alternatives to look for, which is what regex alternation is for: the pattern "TODO|FIXME" matches either branch in one pass rather than costing two searches.
+
+  No<|projection|> prefix, because the question is about the whole project. If the result comes back with truncated set I will know there are more than the cap and can narrow by directory.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "TODO|FIXME"}}
+  </tool_call><|projection|>
+- |-
+  who calls elevate_to_hot<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Finding callers means finding the call syntax, so I will search for the name followed by an open parenthesis. The parenthesis is a regex metacharacter, so it has to be<|projection|> escaped: "elevate_to_hot\(".
+
+  That excludes the bare mentions in comments and doc text, leaving the actual call sites, which is what "who calls" is asking for.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "elevate_to_hot\\("}}
+  </tool_call><|projection|>
+- |-
+  find the public functions in zend-tools<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A declaration at the start of a line is an anchored pattern: "^pub fn " with the caret pinning it to the beginning, so I get declarations rather than every mention of the<|projection|> words.
+
+  The user named a crate, so prefix should be "zend-tools/src/" to keep the search inside it and the result small.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "^pub fn ", "prefix": "zend-tools/src/"}}
+  </tool_call><|projection|>
+- |-
+  the log says connection refused, find where that message comes from<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  They have an error string and want its origin. Searching the contents for the literal text is the direct route, and the message may be capitalised differently in the source<|projection|> than in the log, so I will set ignore_case to true rather than guess.
+
+  The pattern is the plain string "connection refused".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "connection refused", "ignore_case": true}}
+  </tool_call><|projection|>
+- |-
+  does anything still use the old KvFormat enum<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  This is an existence question about the codebase, and file_grep answers it cleanly: if nothing matches, the matches array is empty and files_searched reports how much was<|projection|> scanned, so "no hits across four thousand files" is a real answer rather than an ambiguous blank.
+
+  The pattern is the identifier "KvFormat".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "KvFormat"}}
+  </tool_call><|projection|>
+- |-
+  which file reads the tavily api key<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The distinctive token here is the key's name rather than the prose, so searching the contents for "tavily_api_key" will land on the code that reads it.
+
+  I will leave<|projection|> ignore_case off, since a Rust identifier is written one way, and the result gives me the path and line to read next.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "tavily_api_key"}}
+  </tool_call><|projection|>
+- |-
+  show me every place that constructs a ToolContext<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Construction shows up as the type name followed by a path separator and a constructor, so "ToolContext::" is a good pattern — narrower than the bare type name, which would<|projection|> also match every signature that takes one as a parameter.
+
+  No prefix: the user asked for every place, so the search should cover the whole project.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "ToolContext::"}}
+  </tool_call><|projection|>

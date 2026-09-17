@@ -4,7 +4,7 @@
 
 The backend serves two clients with different tool semantics over the same OpenAI-compatible `/v1/chat/completions` endpoint. Continue passes its own `tools` array in each request, and the backend treats those as client-executed: emit `tool_calls` in the response, return immediately, and let Continue post the results back as `role: "tool"` messages. The web chat passes no tools, so the backend injects its own server-registered tool set, executes any tool calls itself in a loop, and streams only the final assistant text to the client.
 
-This document specifies ninety-three server-registered tools. Seven are shared between both clients — `web_search`, `web_fetch`, `datetime`, `calculator`, `unit_convert`, `random`, and `weather` — and augment Continue's own file and terminal tools without Continue having to know about them. Eighty-six additional tools are exposed only to the web chat client: six virtual-filesystem tools (`file_*`), four notes tools (`notes_*`) for cross-conversation persistent memory, three credential tools (`credential_*`), six SSH session tools (open, exec, exec_async, poll, list, close), four Telnet session tools, four HTTP session tools, five TCP session tools, five UDP session tools, five TLS session tools (`tls_session_*`), four SQL session tools, ten remote-filesystem session tools (`remote_fs_session_*`), six network diagnostic tools (`dns_lookup`, `ping_icmp`, `trace_route`, `port_scan`, `ip_scan`, `host_info`), three security utilities (`hash_scan`, `hash_compute`, `totp_generate`), eight cryptographic primitives (AEAD encrypt/decrypt, HMAC, signature verify/sign, KDF derive, HKDF extract, HKDF-Expand-Label), three running-hash-state tools (`hash_state_*`), four byte-encoding utilities (`bytes_transcode`, `bytes_pack`, `bytes_unpack`, `bytes_xor`), five code execution tools (`code_run`, `code_session_*`), and one subagent tool (`subagent_run`). The web-chat-only tools would either conflict with Continue's native capabilities, depend on the credential or notes store, or have orchestrator-state requirements (sessions, sandboxes, subagents, hash states) that don't fit Continue's tool model.
+This document specifies ninety-five server-registered tools. Seven are shared between both clients — `web_search`, `web_fetch`, `datetime`, `calculator`, `unit_convert`, `random`, and `weather` — and augment Continue's own file and terminal tools without Continue having to know about them. Eighty-eight additional tools are exposed only to the web chat client: eight virtual-filesystem tools (`file_*`, including `file_search` to find a file by name and `file_grep` to find code by content), four notes tools (`notes_*`) for cross-conversation persistent memory, three credential tools (`credential_*`), six SSH session tools (open, exec, exec_async, poll, list, close), four Telnet session tools, four HTTP session tools, five TCP session tools, five UDP session tools, five TLS session tools (`tls_session_*`), four SQL session tools, ten remote-filesystem session tools (`remote_fs_session_*`), six network diagnostic tools (`dns_lookup`, `ping_icmp`, `trace_route`, `port_scan`, `ip_scan`, `host_info`), three security utilities (`hash_scan`, `hash_compute`, `totp_generate`), eight cryptographic primitives (AEAD encrypt/decrypt, HMAC, signature verify/sign, KDF derive, HKDF extract, HKDF-Expand-Label), three running-hash-state tools (`hash_state_*`), four byte-encoding utilities (`bytes_transcode`, `bytes_pack`, `bytes_unpack`, `bytes_xor`), five code execution tools (`code_run`, `code_session_*`), and one subagent tool (`subagent_run`). The web-chat-only tools would either conflict with Continue's native capabilities, depend on the credential or notes store, or have orchestrator-state requirements (sessions, sandboxes, subagents, hash states) that don't fit Continue's tool model.
 
 The remote-filesystem tools deliberately collapse what would otherwise be four protocol-specific tool groups (SCP, FTP, NFS, SMB) into a single URI-addressed group. The model picks an operation; the URI scheme carries the protocol. This trades a small amount of expressiveness (no protocol-specific operations like FTP's transfer mode toggling) for a much smaller selection problem and uniform semantics across protocols.
 
@@ -12,7 +12,7 @@ The transport-layer surface deliberately offers two paths to encryption. `tls_se
 
 `subagent_run` and the code execution tools are qualitatively different from the rest of the surface. `subagent_run` spawns a nested agent loop with its own context, message history, and tool subset, optionally targeting a remote OpenAI-compatible inference endpoint. The code execution tools (`code_run`, `code_session_*`) run code in a sandboxed Firecracker microVM or gVisor container — fully isolated from the orchestrator's network, credentials, and other sessions, with optional VFS mounting at `/work` for artefact flow. Both are individual tools (or small groups) with substantial orchestrator infrastructure behind them.
 
-Ninety-three tools is more than fits comfortably in a single static prompt. Selection at this scale is handled by the inference engine's dynamic tool surface, which presents the model with a tiered view — full schema for the tool currently being constructed, descriptions for nearby candidates, names only for everything else — that adapts during decode. The mechanism is specified separately; from the tool author's perspective, what matters is that each tool has three description forms (name, description, full), covered in the Tool Description Format subsection under System Prompt Format below. Tool descriptions also include explicit cross-references where overlap is most likely (`web_search` → `dns_lookup` / `web_fetch`; `web_fetch` → `http_session_*`; `tcp_session_*` → `tls_session_*` / `http_session_*`; `aead_encrypt` → `tls_session_*`; `hash_compute` → `hash_scan` / `hash_state_init`; `ssh_session_exec` → `ssh_session_exec_async`; VFS file tools → `notes_*` for persistence) so the description tier carries the disambiguation anchors the surface needs.
+Ninety-five tools is more than fits comfortably in a single static prompt. Selection at this scale is handled by the inference engine's dynamic tool surface, which presents the model with a tiered view — full schema for the tool currently being constructed, descriptions for nearby candidates, names only for everything else — that adapts during decode. The mechanism is specified separately; from the tool author's perspective, what matters is that each tool has three description forms (name, description, full), covered in the Tool Description Format subsection under System Prompt Format below. Tool descriptions also include explicit cross-references where overlap is most likely (`web_search` → `dns_lookup` / `web_fetch`; `web_fetch` → `http_session_*`; `tcp_session_*` → `tls_session_*` / `http_session_*`; `aead_encrypt` → `tls_session_*`; `hash_compute` → `hash_scan` / `hash_state_init`; `ssh_session_exec` → `ssh_session_exec_async`; VFS file tools → `notes_*` for persistence; `file_list` → `file_search` / `file_grep` for *finding* rather than enumerating, and `file_grep` → `file_read` for the surrounding lines of a hit) so the description tier carries the disambiguation anchors the surface needs.
 
 ## System Prompt Format
 
@@ -199,7 +199,18 @@ Search the web for information using a query string and return ranked results wi
 }
 ```
 
-**Implementation.** Backed by Tavily (`POST https://api.tavily.com/search` with `search_depth: "basic"` and `include_answer: false` — the local model synthesises its own answer). The provider is abstracted behind a `trait SearchProvider` so Brave, Exa, or Serper can be swapped in without touching the tool. Results are cached by `(query, max_results)` for one hour to avoid duplicate API hits within a session, and a per-session rate limit caps usage at ten calls per minute.
+**Implementation.** Backed by Tavily (`POST https://api.tavily.com/search` with `search_depth: "basic"` and `include_answer: false` — the local model synthesises its own answer).
+
+The API key comes from `secrets/tools.yaml` under the daemon's working directory, read once at startup into `ToolSecrets` and reached through `ctx.secrets`:
+
+```yaml
+# secrets/tools.yaml
+tavily_api_key: tvly-...
+```
+
+Absent key ⇒ `search_unavailable` naming the file to edit; the tool never reaches the network. The key is deliberately **not** read from the process environment: that would require whatever launches the daemon to export it, and every child process would inherit it.
+
+That path is gitignored *and* refused by the `file_*` tools — `VfsStore` rejects any path with a `secrets` segment, because a read resolves straight to disk and never consults the ignore rules, so `.gitignore` alone would leave the file hidden from `file_list` and served in full by `file_read`.
 
 **Errors.** Provider HTTP errors return `{"error": "search_unavailable", "detail": "..."}` rather than panicking, so the model can decide whether to retry or proceed with what it has. Empty queries are rejected by schema validation before the provider is called.
 
@@ -600,7 +611,9 @@ Apply a unified diff to an existing VFS file. The patch is one or more `@@ -old,
 
 ### `file_list`
 
-List files currently in the session VFS, optionally filtered by a path prefix like `src/`. Use for: seeing what files have been created during the session, finding a file when the path is uncertain, getting an overview of session contents, checking what was uploaded by the user. Triggered by "list files", "what files do I have", "show me what's in", "ls", "what's been created so far". Returns array of files with path, byte size, and line count, plus total bytes used. For listing remote directories use `remote_fs_session_list_dir`.
+Enumerate the files in a directory you already know the name of — the project's working directory unioned with anything this session has written, which shadows the file of the same path on disk. Use for: seeing what is in a specific directory, checking what the session has created, getting an overview of a subtree you have already located. Triggered by "list files", "what files are in", "show me what's in", "ls", "what's been created so far". Returns path, byte size and line count per entry, paged. Ignored paths (`.gitignore` and friends) never appear, and neither does anything under a `secrets/` directory.
+
+**To *find* a file rather than enumerate one, use `file_search`; to find code by its contents, use `file_grep`.** Calling `file_list` on a guessed directory name is the slow way to answer either question — an empty result is indistinguishable from a wrong guess. For listing remote directories use `remote_fs_session_list_dir`.
 
 **Parameters**
 
@@ -625,13 +638,145 @@ List files currently in the session VFS, optionally filtered by a path prefix li
   "files": [
     {"path": "Cargo.toml", "bytes": 142, "lines": 8},
     {"path": "src/lib.rs", "bytes": 312, "lines": 18},
-    {"path": "src/main.rs", "bytes": 1289, "lines": 47}
+    {"path": "src/main.rs", "bytes": 1289, "lines": 47, "modified": true}
   ],
+  "paging": {"page": 0, "pages": 1, "per_page": 50, "total": 3, "next_page": null},
   "total_bytes": 1743
 }
 ```
 
-**Implementation.** Linear scan of the VFS map filtered by prefix; results sorted alphabetically by path. Stateless beyond reading the session VFS.
+**Implementation.** Union of the session layer with an `ignore`-driven walk of the working directory (the crate ripgrep uses, so `.gitignore`, `.ignore`, git's global excludes and hidden-file rules all apply), the session layer shadowing the workspace, sorted by path and paged at 50 entries. `modified: true` marks an entry the session has changed; it is omitted when false. `total_bytes` is the session layer's 10 MiB budget denominator — workspace files are read on demand and cost nothing against it.
+
+---
+
+### `file_search`
+
+Find files by **name or path** anywhere in the project, without knowing which directory they are in. Use for: locating a file whose name you know but whose directory you do not, checking whether a module exists, finding every file of a kind, discovering where a subsystem lives before reading it. Triggered by "where is", "find the file", "which file is", "locate", "is there a file called", "what files are named", "show me all the .rs files". Returns matching paths, shortest first, paged.
+
+**This is the tool for finding a file.** Guessing directory names at `file_list` until one answers is the failure mode it exists to remove.
+
+**Parameters**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "Name, stem, extension, path fragment, or glob with '*'. Case-insensitive, matched against the whole path."
+    },
+    "prefix": {
+      "type": "string",
+      "description": "Optional path prefix to search within (e.g. 'candle-nn/src/')."
+    },
+    "page": {
+      "type": "integer",
+      "description": "Zero-based page of results. Defaults to 0.",
+      "default": 0
+    }
+  },
+  "required": ["query"]
+}
+```
+
+**Returns**
+
+```json
+{
+  "files": ["zend-tools/src/tools/web_search.rs", "zend-tools/src/tools/web_fetch.rs"],
+  "paging": {"page": 0, "pages": 1, "per_page": 60, "total": 2, "next_page": null}
+}
+```
+
+**Examples**
+
+| Question | Call |
+|---|---|
+| "where is the web search tool?" | `{"query": "web_search"}` |
+| "find every mod.rs under the KV cache" | `{"query": "mod.rs", "prefix": "candle-nn/src/kv_cache/"}` |
+| "what TOML files are in this repo?" | `{"query": "*.toml"}` |
+| "is there a config.rs anywhere?" | `{"query": "config.rs"}` |
+| "find the integration tests" | `{"query": "tests/*.rs"}` |
+
+**Implementation.** Walks the same ignore-driven union as `file_list` but reads no file contents — a path search does not need line counts, and computing them would mean reading every file in the repository to discard the number. A query with no `*` is a case-insensitive substring test over the whole path; with `*` it is an anchored wildcard where `*` spans `/`, so a leading literal must start the path and a trailing literal must end it (`*.rs` does not match `a.rs.bak`). Results sort shortest-path-first, then alphabetically: the shortest path bearing a name is usually the definition rather than a vendored or generated copy. Paged at 60.
+
+**Errors.** None of its own — an unmatched query is an empty `files` array with `total: 0`, not an error.
+
+---
+
+### `file_grep`
+
+Search the **contents** of every file in the project for a string or regular expression, returning matching lines with their paths and line numbers. Use for: finding where a function, type, constant or error message is defined or used; checking whether something exists in the codebase at all; tracing callers of an API; locating a config key, a magic string, or a TODO. Triggered by "where is X defined", "who calls", "find all uses of", "search the code for", "does the codebase contain", "grep for", "which file has", "find the string".
+
+**This is the tool for finding code by content**, and the line numbers it returns feed straight into `file_read`'s `start_line`.
+
+**Parameters**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "pattern": {
+      "type": "string",
+      "description": "Regular expression (Rust regex syntax). A plain string matches itself."
+    },
+    "prefix": {
+      "type": "string",
+      "description": "Optional path prefix to search within (e.g. 'candle-nn/src/')."
+    },
+    "ignore_case": {
+      "type": "boolean",
+      "description": "Match without regard to case. Defaults to false.",
+      "default": false
+    },
+    "page": {
+      "type": "integer",
+      "description": "Zero-based page of results. Defaults to 0.",
+      "default": 0
+    }
+  },
+  "required": ["pattern"]
+}
+```
+
+**Returns**
+
+```json
+{
+  "matches": [
+    {"path": "zend-tools/src/tools/web_search.rs", "line": 66, "text": "let Some(api_key) = ctx.secrets.tavily_api_key() else {"}
+  ],
+  "paging": {"page": 0, "pages": 1, "per_page": 40, "total": 1, "next_page": null},
+  "files_searched": 4127
+}
+```
+
+**Examples**
+
+| Question | Call |
+|---|---|
+| "where is TAVILY_API_KEY read?" | `{"pattern": "TAVILY_API_KEY"}` |
+| "who calls `forward_wave`?" | `{"pattern": "forward_wave\\("}` |
+| "find the public functions in this crate" | `{"pattern": "^pub fn ", "prefix": "zend-tools/src/"}` |
+| "any TODOs or FIXMEs left?" | `{"pattern": "TODO\|FIXME"}` |
+| "find the error string, whatever its case" | `{"pattern": "connection refused", "ignore_case": true}` |
+
+**Implementation.** Candidate paths come from the same walk as `file_search`; each is read (session layer first, then the workspace) and scanned line by line. Files that cannot be scanned — oversize, not UTF-8, deleted between the walk and the read — are skipped rather than failing the pass, so one binary blob cannot turn a whole search into an error. Capped at 20 hits per file and 600 overall, with `truncated: true` when a ceiling is reached: one generated file with a thousand matches would otherwise hide every other file that matched, and "which files contain this" is usually the real question. Lines over 400 characters are clipped on a character boundary. `files_searched` is reported so that an empty result is unambiguous — "scanned 4,127 files and it is genuinely absent" reads differently from "the prefix matched nothing to scan".
+
+**Errors.** `invalid_arguments` when the pattern is not a valid regular expression, carrying the regex crate's own message (which names the offending position). An unmatched pattern is an empty `matches` array, not an error.
+
+---
+
+### Choosing between the file tools
+
+| You know | You want | Tool |
+|---|---|---|
+| a path | the contents | `file_read` |
+| a directory | what is in it | `file_list` |
+| part of a name | the path | `file_search` |
+| a string or symbol | where it appears | `file_grep` |
+
+The two search tools cover the whole project in one call. Reaching for `file_list` on a guessed directory name is the failure this table exists to prevent: an empty listing looks identical whether the directory is empty or the guess was wrong, so the guessing does not converge.
 
 ---
 

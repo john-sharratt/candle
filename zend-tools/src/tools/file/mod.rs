@@ -1,4 +1,13 @@
-//! Overlay file tools: `file_{write,read,edit,list,delete,present}`.
+//! Overlay file tools: `file_{write,read,edit,list,search,grep,delete,present}`.
+//!
+//! # Finding things
+//!
+//! [`search`] finds files by **name or path**, [`grep`] finds them by
+//! **content**, and both cover the whole project in one call. They exist
+//! because without them the only way to locate anything was to guess directory
+//! names at [`list`] and read whole files to check — a real session spent
+//! eighteen turns and 360 KB of context doing exactly that, and the largest
+//! file it read was the wrong one.
 //!
 //! All operations target the overlay filesystem ([`crate::state::VfsStore`]): an
 //! in-memory session layer stacked over the daemon's working directory. Reads
@@ -48,7 +57,8 @@
 //! | `ambiguous` | A `file_edit` hunk matches in more than one place |
 //! | `no_files_found` | All requested paths are missing (`file_present`) |
 //! | `unreadable` | Workspace file is above the read limit or is not UTF-8 text |
-//! | `invalid_arguments` | The `file_edit` patch is not a readable unified diff |
+//! | `invalid_arguments` | The `file_edit` patch is not a readable unified diff, or a `file_grep` pattern is not a valid regex |
+//! | `forbidden` | The path is under a `secrets/` directory — see [`crate::state::vfs`] |
 
 use serde::Serialize;
 use thiserror::Error;
@@ -106,18 +116,22 @@ impl Paging {
 
 pub mod delete;
 pub mod edit;
+pub mod grep;
 pub mod list;
 pub mod patch;
 pub mod present;
 pub mod read;
 pub mod render;
+pub mod search;
 pub mod write;
 
 pub use delete::FILE_DELETE;
 pub use edit::FILE_EDIT;
+pub use grep::FILE_GREP;
 pub use list::FILE_LIST;
 pub use present::FILE_PRESENT;
 pub use read::FILE_READ;
+pub use search::FILE_SEARCH;
 pub use write::FILE_WRITE;
 
 #[derive(Debug, Error)]
@@ -138,9 +152,15 @@ pub enum FileError {
     NoFilesFound,
     #[error("{0}")]
     Unreadable(String),
-    /// The `file_edit` patch is not a unified diff the engine can read.
+    /// The `file_edit` patch is not a unified diff the engine can read, or a
+    /// `file_grep` pattern is not a valid regular expression.
     #[error("{0}")]
     InvalidArguments(String),
+    /// The path is under a `secrets/` directory. Named distinctly from
+    /// `not_found` so a model reads it as "I may not look here" and stops,
+    /// rather than as "wrong path" and tries six more spellings.
+    #[error("{0}")]
+    Forbidden(String),
 }
 
 impl ToolError for FileError {
@@ -152,6 +172,7 @@ impl ToolError for FileError {
             FileError::NoFilesFound => "no_files_found",
             FileError::Unreadable(_) => "unreadable",
             FileError::InvalidArguments(_) => "invalid_arguments",
+            FileError::Forbidden(_) => "forbidden",
         }
     }
 }
@@ -161,6 +182,12 @@ impl From<VfsError> for FileError {
         match e {
             VfsError::Full => FileError::VfsFull,
             VfsError::Unreadable(why) => FileError::Unreadable(why),
+            // Keep the store's own wording: it names the path and says the
+            // directory is off limits, which is exactly what the model needs to
+            // stop rather than retry.
+            VfsError::Forbidden(path) => {
+                FileError::Forbidden(VfsError::Forbidden(path).to_string())
+            }
         }
     }
 }
