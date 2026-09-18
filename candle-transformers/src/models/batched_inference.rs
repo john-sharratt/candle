@@ -597,6 +597,12 @@ impl KvLayers {
 /// - Tracks per-sequence state (offsets, active status)
 /// - Provides direct access for models implementing [`ManagedBatchedModel::forward_batched`]
 pub struct BatchedInferenceSession {
+    /// Optional device-resident activation vectors for analysis kernels.
+    personality_vectors: Option<crate::models::personality_vectors::DevicePersonalityVectors>,
+    /// Optional scheduler-owned activation sink for offline analysis.
+    activation_sink: Option<
+        std::sync::Arc<std::sync::Mutex<crate::models::activation_capture::ActivationSink>>,
+    >,
     /// Shared KV cache backing for all layers.
     /// One backing per layer.
     backings: Vec<ChunkedKvBacking>,
@@ -689,6 +695,8 @@ impl BatchedInferenceSession {
         }
 
         Ok(Self {
+            personality_vectors: None,
+            activation_sink: None,
             backings,
             sequences: Vec::new(),
             config,
@@ -698,6 +706,34 @@ impl BatchedInferenceSession {
             device: device.clone(),
             pending_glue: None,
         })
+    }
+
+    pub fn set_activation_sink(
+        &mut self,
+        sink: Option<crate::models::activation_capture::ActivationSink>,
+    ) {
+        self.activation_sink = sink.map(|sink| std::sync::Arc::new(std::sync::Mutex::new(sink)));
+    }
+
+    pub fn activation_sink(
+        &self,
+    ) -> Option<
+        std::sync::Arc<std::sync::Mutex<crate::models::activation_capture::ActivationSink>>,
+    > {
+        self.activation_sink.clone()
+    }
+
+    pub fn set_personality_vectors(
+        &mut self,
+        vectors: Option<crate::models::personality_vectors::DevicePersonalityVectors>,
+    ) {
+        self.personality_vectors = vectors;
+    }
+
+    pub fn personality_vectors(
+        &self,
+    ) -> Option<&crate::models::personality_vectors::DevicePersonalityVectors> {
+        self.personality_vectors.as_ref()
     }
 
     /// Hold one layer's seals at or below `max_level`, whatever the rest of the
@@ -754,6 +790,8 @@ impl BatchedInferenceSession {
     ) -> Self {
         let num_layers = backings.len();
         Self {
+            personality_vectors: None,
+            activation_sink: None,
             backings,
             sequences: Vec::new(),
             config,

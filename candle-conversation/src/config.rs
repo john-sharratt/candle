@@ -1699,6 +1699,15 @@ pub struct EngineConfig {
     /// Useful for debugging why tokens are being penalized.
     pub penalty_log_path: Option<std::path::PathBuf>,
 
+    /// Optional append-only path for post-layer activation capture.
+    pub activation_capture_path: Option<std::path::PathBuf>,
+
+    /// Serialized activation-vector corpus to upload into the inference session.
+    pub personality_vectors: Option<Vec<u8>>,
+
+    /// Path to a serialized activation-vector corpus loaded at engine startup.
+    pub personality_vectors_path: Option<std::path::PathBuf>,
+
     /// Decode health monitoring configuration.
     ///
     /// Checks only run when built with `--features decode-health` AND
@@ -1787,6 +1796,9 @@ impl EngineConfig {
             scheduler: SchedulerConfig::default(),
             show_special_tokens: false,
             penalty_log_path: None,
+            activation_capture_path: None,
+            personality_vectors: None,
+            personality_vectors_path: None,
             health: DecodeHealthConfig::default(),
             workspace_path: None,
             substrate: None,

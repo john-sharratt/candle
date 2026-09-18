@@ -63,6 +63,7 @@ pub mod models;
 pub mod narrator;
 pub mod normalization;
 pub mod persistence;
+pub mod personality;
 pub mod projection;
 /// The process-wide hot-path span profiler, for a daemon that serves its own
 /// timings.
@@ -74,6 +75,12 @@ pub mod projection;
 /// window exactly.
 pub mod profile {
     pub use candle_transformers::models::profile::{pipeline_snapshot_and_reset, ProfileSnapshot};
+}
+/// Opt-in post-layer activation capture for offline model analysis.
+pub mod activation_capture {
+    pub use candle_transformers::models::activation_capture::{
+        ActivationRecord, ActivationSink, CapturePhase,
+    };
 }
 pub mod prompts;
 pub mod provenance;

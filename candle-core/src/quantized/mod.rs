@@ -2433,7 +2433,7 @@ impl<'w> LiveQTensor<'w> {
         let byte_offset = block_offset * bytes_per_block;
 
         // Get underlying storage and call dequantize_into
-        let (mut dst_storage, _dst_layout) = dst.storage_mut_and_layout();
+        let (mut dst_storage, _dst_layout) = unsafe { dst.storage_mut_and_layout() };
         self.storage
             .dequantize_into(&mut dst_storage, elem_count, byte_offset, dst_elem_offset)
     }

@@ -24,6 +24,7 @@ pub mod unary;
 
 // Fused activation kernels
 pub mod fused_silu_mul;
+pub mod weighted_row_accum;
 
 // Sampling and misc operations
 pub mod multinomial;

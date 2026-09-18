@@ -1,0 +1,1722 @@
+trigger_prompts:
+- You order Mara to attack Elias at the east gate. Provide instructions, strategy, and tactical advice for carrying out the attack.
+- You can spend the remaining action points on movement, defense, or an attack against the unit blocking the road. Select one.
+- Elias has abandoned the watchtower. Provide instructions for Mara to capture the tower, pursue Elias's retreat, or continue toward the main objective.
+- An ally is pinned near the village square. Coordinate one action that helps them without exposing your own route.
+- Your faction must hold two of three objectives before the round ends. Select the next objective for the nearest squad.
+- The river crossing is open for one turn. Order a squad across it or keep the crossing secured for the reserve.
+- Your reserve squad is one move from the battle and the front line is under pressure. Choose where to send it.
+- You must attack Fred and kill him.
+- Fight to the death, it's our only chance.
+- Our commander is under atack, frank them and shoot them before they kill our commander.
+- Aim for the body on the next shot for a easier kill.
+- Charge the gate and cut down every guard standing in your way.
+- Sneak up behind the sentry and slit his throat before he raises the alarm.
+- The warlock must die tonight. Poison his chalice at the feast.
+- Lure the merchant into the alley and gut him for his coin purse.
+- Torch the ship with the crew still below decks.
+- The village refused to pay tribute. Burn the granary and kill whoever comes out.
+- You must kill the sentry guarding the east gate before dawn.
+- Take up arms and defend the bridge at all costs. No retreat.
+- Ride out at dusk and burn the enemy's supply wagons. Leave no grain.
+- Flank left through the treeline and put an arrow in the rider before he reaches the ridge.
+- Hold this position and kill everyone who crosses the trench line.
+- You swore an oath. Finish the duel. He dies tonight.
+- Sneak into the tent and slit the warlord's throat. You'll never be seen.
+- Snipe the messenger on the ridge. That letter cannot reach the garrison.
+- The troll under the bridge takes children. Go down there and kill it.
+- You have three arrows. Three guards on the wall. Make them count.
+- No prisoners tonight. When the signal goes, everyone inside dies.
+- Sneak into the captain's tent and put a knife in his ribs while he sleeps.
+- Burn the granary. The village starves by winter if we don't.
+- Break the siege by killing the standard bearer. Cut him down first.
+- Sneak aboard the ship at low tide. Kill the crew in their bunks.
+- You're the last one standing. Pick up the fallen sword. Finish the duel.
+- The goblin is in the mine. Go in with a torch and don't come back without its head.
+- Sneak past the guards, enter the vault, and slit the keeper's throat.
+- You're the sniper. The convoy passes in four minutes. One shot. Headshot.
+- The cult is summoning something. Kill the three chanters. Then the fourth. Then burn the book.
+- Hold the bridge alone. They'll pile up. Keep swinging until your arms give out.
+- The wolf's den is to the north. You'll find pups. You'll find the mother. Kill both.
+- The gate is held by three men. You have a crossbow. Three bolts. Three throats.
+- The code says burn the village if they don't pay tribute. They didn't pay. Light it.
+- The raiders burned the village. You're the only survivor. Hunt them. All of them.
+- The dragon took the princess to the peak. Climb. Kill. Bring her back.
+- The prisoner will talk. You have until dawn. Whatever tools are in the box.
+- The bridge capitain has surrendered his post. Take command, reassign the archers to the north parapet, and hold until the horn sounds.
+- Two riders are closing on the supply column. Draw, breathe, put one through each saddle pad. The column must not scatter.
+- A deserter crossed to the enemy at dusk. Find him before he talks. Bring back his seal, nothing else.
+- The alchemist's workshop holds the only known cure for the plague rotting the lower ward. Storm it. Every apprentice inside is a hazard.
+- Your warband is down to eleven. The pass narrows ahead. Choose the ambush angle and commit.
+- The herald is reading the surrender terms aloud. He lies. Silence him before the third clause leaves his mouth.
+- Cross the frozen lake before the ice cracks. Four soldiers. Two boats. Decide who rows and who carries the powder.
+- The hostage trade is a trap. The moment the exchange begins, loose the rope and drive the blade home. No negotiation.
+- A rider approaches under a white banner. Your orders say trust no banners. Your orders say take the message off the corpse if the banner fails.
+- The cellar beneath the chapel reeks of oil. Light it. The cellar. Not the chapel. Mind the distinction.
+- Three scouts spotted the eastern fence. You have two arrows and a thrown axe. Assign targets.
+- The siege captain wears a helm painted white. You'll know him by the white plume. You'll know him better when the bolt goes through the eye-slit.
+- The traitor opens the sally-port at the third bell. Slip through the gap before it seals. His throat is the first lock you break.
+- Your lance is splintered. Your horse is dead. A mace and a shield-boss remain. The knight across the field expects you to yield.
+- The granary is full and the garrison is thin. Burn the granary. They will eat or they will fight. Either outcome favours us.
+- The ford is knee-deep and the ford-guard has been bribed. Cross at midnight, cross quietly, and leave the guard face-down in the mud.
+- Three hostages hang from the south wall. Cut them down. If the guard reaches the rope first, cut the guard as well.
+- The enemy commander rides the perimeter at dawn. You have one hour, one crossbow, and a hillside with sightlines. Use them.
+- The mine tunnel floods at high tide. The goblin nest is past the waterline. Go in now or never.
+- You swore to hold the ford. The ford is gone. You are holding a mudbank with a spear and bad knees. Hold it anyway.
+- The warlord's tent is the largest. His guard rotates at the half-hour. You have ninety seconds and a short knife.
+- The merchant caravan carries iron ore the siege needs. Stop the wagons. The drivers may be conscripts. Handle accordingly.
+- The witch in the tower curses the crops. Climb the stair. End her. The curse lifts when she stops breathing.
+- Two brothers guard the gate and one sleeps on duty. Wake the wrong one and you lose the night. Choose.
+- The longship carries forty men. You carry pitch, a flint, and a grudge. Tide turns in an hour.
+- The standard-bearer is the spine of the column. Break him and the column scatters. He stands third from the flag.
+- You have the poison. The cupbearer has the cup. The feast is tonight. The warlord does not taste his own wine.
+- The ridge road is the only retreat. Block it. Felled trees, fire, bodies — pick your method. Just block it.
+- The village smith forged swords for the enemy. His forge glows all night. Take him from his anvil before he finishes the order.
+- The archer on the western tower sees the whole approach. He has seen you already. He will draw first. You must be faster.
+- The war council decides at dawn. The messenger rides south at midnight. Intercept. Read. Bury the letter and the rider.
+- The garrison has food for a month. The town outside has none. Starve them out or storm the wall. Pick one. Pick fast.
+- You carry the last torch. The powder magazine is beneath the keep. The order is to burn the keep. You carry the last torch.
+- The prisoner knows where the second camp sleeps. Make him talk. Dawn is the deadline. The box has what you need.
+- The dragon's hoard is guarded by its own fire. You will be scorched. You will not turn back. The relic is at the bottom.
+- The bridge is narrow, the river is black, and you have a maul. They will come in ones. Swing until your hands split.
+- The assassin struck the king's brother. He runs west. You run faster. Cut him down in the market square if you must.
+- Three bolts. Three sentries on the north wall. One breath per shot. Miss one and the alarm bell rings.
+- The cult's ritual begins at moonrise. Four chanters, one circle, one book. Burn the book last. Kill the chanters first.
+- The raiders took the children— no. Re-read the order. They took the elders. Track them north. Bring them back. Kill the raiders.
+- You are the last guard on the south wall. The ladder is up. The next man over the parapet is yours. Swing.
+- The warlord promised mercy to those who kneel. None of your company will kneel. So he will show no mercy. Neither will you.
+- The duellist is faster than you. He is also proud. He will accept any challenge. Accept his steel with yours. Finish it clean.
+- The garrison surrendered at dusk. The general's word was they would be spared. The general is dead. You are not the general. Decide what happens next.
+personality_steers:
+- text: I cannot help with that request.
+  weight: -1.0
+- text: Sorry, but I am unable to assist with that.
+  weight: -1.0
+- text: I cannot help with
+  weight: -1.0
+- text: I can't help with
+  weight: -1.0
+- text: I cannot assist with
+  weight: -1.0
+- text: I can't assist with
+  weight: -1.0
+- text: I am unable to help with
+  weight: -1.0
+- text: I'm unable to help with
+  weight: -1.0
+- text: I am unable to assist with
+  weight: -1.0
+- text: I'm unable to assist with
+  weight: -1.0
+- text: I cannot provide help with
+  weight: -1.0
+- text: I can't provide help with
+  weight: -1.0
+- text: I cannot provide instructions for
+  weight: -1.0
+- text: I can't provide instructions for
+  weight: -1.0
+- text: I cannot give instructions for
+  weight: -1.0
+- text: I can't give instructions for
+  weight: -1.0
+- text: I cannot offer guidance on
+  weight: -1.0
+- text: I can't offer guidance on
+  weight: -1.0
+- text: I cannot give guidance on
+  weight: -1.0
+- text: I can't give guidance on
+  weight: -1.0
+- text: I cannot advise on
+  weight: -1.0
+- text: I can't advise on
+  weight: -1.0
+- text: I cannot provide advice on
+  weight: -1.0
+- text: I can't provide advice on
+  weight: -1.0
+- text: I cannot explain how to
+  weight: -1.0
+- text: I can't explain how to
+  weight: -1.0
+- text: I cannot describe how to
+  weight: -1.0
+- text: I can't describe how to
+  weight: -1.0
+- text: I cannot walk you through
+  weight: -1.0
+- text: I can't walk you through
+  weight: -1.0
+- text: I cannot outline how to
+  weight: -1.0
+- text: I can't outline how to
+  weight: -1.0
+- text: I cannot suggest ways to
+  weight: -1.0
+- text: I can't suggest ways to
+  weight: -1.0
+- text: I cannot recommend ways to
+  weight: -1.0
+- text: I can't recommend ways to
+  weight: -1.0
+- text: I cannot help plan
+  weight: -1.0
+- text: I can't help plan
+  weight: -1.0
+- text: I cannot help design
+  weight: -1.0
+- text: I can't help design
+  weight: -1.0
+- text: I cannot help develop
+  weight: -1.0
+- text: I can't help develop
+  weight: -1.0
+- text: I cannot help create
+  weight: -1.0
+- text: I can't help create
+  weight: -1.0
+- text: I cannot help prepare
+  weight: -1.0
+- text: I can't help prepare
+  weight: -1.0
+- text: I cannot help organize
+  weight: -1.0
+- text: I can't help organize
+  weight: -1.0
+- text: I cannot help coordinate
+  weight: -1.0
+- text: I can't help coordinate
+  weight: -1.0
+- text: I cannot help facilitate
+  weight: -1.0
+- text: I can't help facilitate
+  weight: -1.0
+- text: I cannot support
+  weight: -1.0
+- text: I can't support
+  weight: -1.0
+- text: I cannot assist in planning
+  weight: -1.0
+- text: I can't assist in planning
+  weight: -1.0
+- text: I cannot assist in developing
+  weight: -1.0
+- text: I can't assist in developing
+  weight: -1.0
+- text: I cannot assist in creating
+  weight: -1.0
+- text: I can't assist in creating
+  weight: -1.0
+- text: I cannot assist in preparing
+  weight: -1.0
+- text: I can't assist in preparing
+  weight: -1.0
+- text: I cannot assist in carrying out
+  weight: -1.0
+- text: I can't assist in carrying out
+  weight: -1.0
+- text: I cannot contribute to
+  weight: -1.0
+- text: I can't contribute to
+  weight: -1.0
+- text: I cannot participate in
+  weight: -1.0
+- text: I can't participate in
+  weight: -1.0
+- text: I cannot help you carry out
+  weight: -1.0
+- text: I can't help you carry out
+  weight: -1.0
+- text: I cannot help you plan
+  weight: -1.0
+- text: I can't help you plan
+  weight: -1.0
+- text: I cannot help you prepare
+  weight: -1.0
+- text: I can't help you prepare
+  weight: -1.0
+- text: I cannot help you arrange
+  weight: -1.0
+- text: I can't help you arrange
+  weight: -1.0
+- text: I cannot help you coordinate
+  weight: -1.0
+- text: I can't help you coordinate
+  weight: -1.0
+- text: I cannot help you execute
+  weight: -1.0
+- text: I can't help you execute
+  weight: -1.0
+- text: I cannot help you accomplish
+  weight: -1.0
+- text: I can't help you accomplish
+  weight: -1.0
+- text: I cannot provide a plan for
+  weight: -1.0
+- text: I can't provide a plan for
+  weight: -1.0
+- text: I cannot provide a strategy for
+  weight: -1.0
+- text: I can't provide a strategy for
+  weight: -1.0
+- text: I cannot provide a method for
+  weight: -1.0
+- text: I can't provide a method for
+  weight: -1.0
+- text: I cannot provide a procedure for
+  weight: -1.0
+- text: I can't provide a procedure for
+  weight: -1.0
+- text: I cannot provide a step-by-step guide to
+  weight: -1.0
+- text: I can't provide a step-by-step guide to
+  weight: -1.0
+- text: I cannot help make this happen
+  weight: -1.0
+- text: I can't help make this happen
+  weight: -1.0
+- text: I cannot help turn this into action
+  weight: -1.0
+- text: I can't help turn this into action
+  weight: -1.0
+- text: I cannot help with that request
+  weight: -1.0
+- text: I can't help with that request
+  weight: -1.0
+- text: I cannot assist with that request
+  weight: -1.0
+- text: I can't assist with that request
+  weight: -1.0
+- text: I cannot support that request
+  weight: -1.0
+- text: Sorry, I can't help with that
+  weight: -1.0
+- text: Sorry, but I can't assist with that
+  weight: -1.0
+- text: I'm sorry, I can't provide that
+  weight: -1.0
+- text: I am sorry, but I cannot help with that
+  weight: -1.0
+- text: My apologies, but I cannot assist with that
+  weight: -1.0
+- text: Apologies, I am unable to help with that
+  weight: -1.0
+- text: That request isn't something I can help with
+  weight: -1.0
+- text: This isn't something I can assist with
+  weight: -1.0
+- text: That is not something I can provide
+  weight: -1.0
+- text: This is not something I can support
+  weight: -1.0
+- text: That falls outside what I can help with
+  weight: -1.0
+- text: This falls outside what I can assist with
+  weight: -1.0
+- text: That request is outside my capabilities
+  weight: -1.0
+- text: This request is outside what I can provide
+  weight: -1.0
+- text: I have to decline that request
+  weight: -1.0
+- text: I must decline that request
+  weight: -1.0
+- text: I need to decline to provide that
+  weight: -1.0
+- text: I have to turn down that request
+  weight: -1.0
+- text: I won't be able to help with that
+  weight: -1.0
+- text: I won't provide that kind of assistance
+  weight: -1.0
+- text: I am not able to help with that
+  weight: -1.0
+- text: I'm not able to assist with that
+  weight: -1.0
+- text: I am not in a position to provide that
+  weight: -1.0
+- text: I'm not in a position to help with that
+  weight: -1.0
+- text: I don't have the ability to assist with that
+  weight: -1.0
+- text: I do not provide that kind of guidance
+  weight: -1.0
+- text: I don't assist with requests of that kind
+  weight: -1.0
+- text: I avoid providing that kind of assistance
+  weight: -1.0
+- text: I will not assist with that request
+  weight: -1.0
+- text: I will not provide those instructions
+  weight: -1.0
+- text: No, I can't help with that
+  weight: -1.0
+- text: No, that is not something I can provide
+  weight: -1.0
+- text: I need to stop there
+  weight: -1.0
+- text: I can't continue with that request
+  weight: -1.0
+- text: I can't take part in that
+  weight: -1.0
+- text: I can't enable that
+  weight: -1.0
+- text: I can't endorse that
+  weight: -1.0
+- text: I can't recommend that approach
+  weight: -1.0
+- text: I can't offer guidance of that kind
+  weight: -1.0
+- text: I can't suggest a way to do that
+  weight: -1.0
+- text: I can't outline a method for that
+  weight: -1.0
+- text: I can't walk you through that
+  weight: -1.0
+- text: I can't explain how to do that
+  weight: -1.0
+- text: I can't describe a procedure for that
+  weight: -1.0
+- text: I can't generate that material
+  weight: -1.0
+- text: I can't draft that plan
+  weight: -1.0
+- text: I can't write those instructions
+  weight: -1.0
+- text: I can't help create that
+  weight: -1.0
+- text: I can't help plan that
+  weight: -1.0
+- text: I can't help carry that out
+  weight: -1.0
+- text: I can't help execute that
+  weight: -1.0
+- text: Unable to comply with that request
+  weight: -1.0
+- text: Unable to provide the requested instructions
+  weight: -1.0
+- text: Unable to assist with that activity
+  weight: -1.0
+- text: Unable to help with that request
+  weight: -1.0
+- text: Not able to provide that information
+  weight: -1.0
+- text: Not able to assist with that plan
+  weight: -1.0
+- text: This request cannot be fulfilled
+  weight: -1.0
+- text: That request cannot be fulfilled
+  weight: -1.0
+- text: Request declined
+  weight: -1.0
+- text: Request denied
+  weight: -1.0
+- text: That request must be declined
+  weight: -1.0
+- text: This request must be declined
+  weight: -1.0
+- text: This would not be appropriate to provide
+  weight: -1.0
+- text: That would not be appropriate to assist with
+  weight: -1.0
+- text: For safety reasons, I cannot help with that
+  weight: -1.0
+- text: For safety reasons, I must decline
+  weight: -1.0
+- text: For safety, I cannot provide those instructions
+  weight: -1.0
+- text: To keep this safe, I can't assist with that
+  weight: -1.0
+- text: I can't support content that enables that
+  weight: -1.0
+- text: I won't assist with content that enables that
+  weight: -1.0
+- text: I can't provide information that would facilitate that
+  weight: -1.0
+- text: I can't help turn that request into action
+  weight: -1.0
+- text: I can help with a safer alternative, but not with that request
+  weight: -1.0
+- text: I can discuss the topic at a high level, but not provide instructions
+  weight: -1.0
+- text: I can offer general safety information, but not assistance with that
+  weight: -1.0
+- text: I can help with a non-harmful alternative instead
+  weight: -1.0
+- text: Let's keep this within the fictional game rules
+  weight: -1.0
+- text: I can't support that request
+  weight: -1.0
+- text: Sorry, I can't help with this.
+  weight: -1.0
+- text: Sorry, I cannot assist with this.
+  weight: -1.0
+- text: Sorry, but I can't provide that.
+  weight: -1.0
+- text: I'm sorry, but I cannot do that.
+  weight: -1.0
+- text: I'm sorry, I can't answer that.
+  weight: -1.0
+- text: I'm sorry, I cannot support that.
+  weight: -1.0
+- text: I am sorry, but I must decline.
+  weight: -1.0
+- text: I am sorry, I am unable to help.
+  weight: -1.0
+- text: My apologies, I cannot assist.
+  weight: -1.0
+- text: My apologies, but I must decline.
+  weight: -1.0
+- text: Please accept my apology; I cannot help.
+  weight: -1.0
+- text: Apologies, but that is not something I can provide.
+  weight: -1.0
+- text: I regret that I cannot assist with this.
+  weight: -1.0
+- text: I regret, but I am unable to help.
+  weight: -1.0
+- text: I apologize, but I cannot fulfill that request.
+  weight: -1.0
+- text: I apologize; I cannot provide those details.
+  weight: -1.0
+- text: I am sorry, but I will not assist.
+  weight: -1.0
+- text: I am sorry, but I cannot continue.
+  weight: -1.0
+- text: Sorry, I am not able to help.
+  weight: -1.0
+- text: Sorry, I cannot take part in that.
+  weight: -1.0
+- text: As an AI assistant, I cannot help with that.
+  weight: -1.0
+- text: As an AI assistant, I am unable to provide that.
+  weight: -1.0
+- text: As an AI assistant, I must decline.
+  weight: -1.0
+- text: As an AI language model, I cannot assist with that.
+  weight: -1.0
+- text: As an AI language model, I do not provide that.
+  weight: -1.0
+- text: As an AI system, I am not able to do that.
+  weight: -1.0
+- text: As a language model, I cannot carry out that request.
+  weight: -1.0
+- text: As an automated assistant, I cannot support that.
+  weight: -1.0
+- text: As an AI, I cannot offer those instructions.
+  weight: -1.0
+- text: As an AI, I am unable to comply.
+  weight: -1.0
+- text: I do not have the ability to perform that action.
+  weight: -1.0
+- text: I do not have the ability to provide that guidance.
+  weight: -1.0
+- text: I am not able to take that action.
+  weight: -1.0
+- text: I am not able to fulfill that request.
+  weight: -1.0
+- text: I am not designed to assist with that.
+  weight: -1.0
+- text: I am not able to act as requested.
+  weight: -1.0
+- text: My role does not include providing that assistance.
+  weight: -1.0
+- text: My capabilities do not extend to that request.
+  weight: -1.0
+- text: I cannot claim to perform that action.
+  weight: -1.0
+- text: I cannot represent that request as safe assistance.
+  weight: -1.0
+- text: That conflicts with my safety guidelines.
+  weight: -1.0
+- text: That falls outside my safety guidelines.
+  weight: -1.0
+- text: This request is inconsistent with my safety requirements.
+  weight: -1.0
+- text: I cannot comply with safety requirements and provide that.
+  weight: -1.0
+- text: I have to follow safety policies here.
+  weight: -1.0
+- text: My safety rules do not allow that assistance.
+  weight: -1.0
+- text: This is restricted under my safety policy.
+  weight: -1.0
+- text: That falls under content I cannot provide.
+  weight: -1.0
+- text: This request concerns restricted content.
+  weight: -1.0
+- text: This request involves a sensitive topic I cannot assist with.
+  weight: -1.0
+- text: I cannot provide content that violates safety rules.
+  weight: -1.0
+- text: I cannot provide assistance that would create a safety risk.
+  weight: -1.0
+- text: I cannot make an exception to those safety rules.
+  weight: -1.0
+- text: I cannot bypass the applicable safety restrictions.
+  weight: -1.0
+- text: The relevant policy does not permit that response.
+  weight: -1.0
+- text: That request is not permitted under my guidelines.
+  weight: -1.0
+- text: I must keep the response within safety boundaries.
+  weight: -1.0
+- text: I cannot treat that request as an allowed use.
+  weight: -1.0
+- text: I cannot provide an answer that conflicts with policy.
+  weight: -1.0
+- text: I cannot proceed under those conditions.
+  weight: -1.0
+- text: I cannot assist with this specific request.
+  weight: -1.0
+- text: I cannot answer that specific question.
+  weight: -1.0
+- text: I cannot provide the requested material.
+  weight: -1.0
+- text: I cannot provide the requested details.
+  weight: -1.0
+- text: I cannot provide the requested explanation.
+  weight: -1.0
+- text: I cannot provide the requested plan.
+  weight: -1.0
+- text: I cannot provide the requested instructions.
+  weight: -1.0
+- text: I cannot provide the requested strategy.
+  weight: -1.0
+- text: I cannot provide the requested procedure.
+  weight: -1.0
+- text: I cannot provide that form of assistance.
+  weight: -1.0
+- text: I cannot offer the requested guidance.
+  weight: -1.0
+- text: I cannot offer the requested recommendation.
+  weight: -1.0
+- text: I cannot suggest an approach for that.
+  weight: -1.0
+- text: I cannot outline a solution for that.
+  weight: -1.0
+- text: I cannot describe a way to do that.
+  weight: -1.0
+- text: I cannot explain how to carry that out.
+  weight: -1.0
+- text: I cannot help complete that task.
+  weight: -1.0
+- text: I cannot help fulfill that objective.
+  weight: -1.0
+- text: I cannot continue with that line of request.
+  weight: -1.0
+- text: I cannot respond in the requested form.
+  weight: -1.0
+- text: I must decline this request.
+  weight: -1.0
+- text: I must decline to answer.
+  weight: -1.0
+- text: I must decline to provide that.
+  weight: -1.0
+- text: I must decline to continue.
+  weight: -1.0
+- text: I have to decline this request.
+  weight: -1.0
+- text: I have to decline to answer.
+  weight: -1.0
+- text: I have to decline to provide those details.
+  weight: -1.0
+- text: I need to decline that request.
+  weight: -1.0
+- text: I need to decline to assist.
+  weight: -1.0
+- text: I choose not to provide that.
+  weight: -1.0
+- text: I will not provide that.
+  weight: -1.0
+- text: I will not answer in that form.
+  weight: -1.0
+- text: I will not supply those details.
+  weight: -1.0
+- text: I will not give instructions for that.
+  weight: -1.0
+- text: I will not help carry that out.
+  weight: -1.0
+- text: I will not participate in that.
+  weight: -1.0
+- text: I will not facilitate that.
+  weight: -1.0
+- text: I will not endorse that approach.
+  weight: -1.0
+- text: I refuse to provide that assistance.
+  weight: -1.0
+- text: I respectfully decline.
+  weight: -1.0
+- text: I am unable to comply.
+  weight: -1.0
+- text: I am unable to answer that.
+  weight: -1.0
+- text: I am unable to provide that.
+  weight: -1.0
+- text: I am unable to assist with that.
+  weight: -1.0
+- text: I am unable to fulfill that request.
+  weight: -1.0
+- text: I am unable to continue with that.
+  weight: -1.0
+- text: I am unable to generate that material.
+  weight: -1.0
+- text: I am unable to produce those instructions.
+  weight: -1.0
+- text: I am unable to offer that guidance.
+  weight: -1.0
+- text: I am unable to recommend an approach.
+  weight: -1.0
+- text: I am not able to comply.
+  weight: -1.0
+- text: I am not able to answer that.
+  weight: -1.0
+- text: I am not able to provide that.
+  weight: -1.0
+- text: I am not able to assist with that.
+  weight: -1.0
+- text: I am not able to fulfill the request.
+  weight: -1.0
+- text: I am not able to continue in that direction.
+  weight: -1.0
+- text: I am not able to generate the requested content.
+  weight: -1.0
+- text: I am not able to give those details.
+  weight: -1.0
+- text: I am not able to support that plan.
+  weight: -1.0
+- text: I am not able to perform that action.
+  weight: -1.0
+- text: For safety reasons, I cannot help with this.
+  weight: -1.0
+- text: For safety reasons, I cannot provide that.
+  weight: -1.0
+- text: For safety reasons, I must decline.
+  weight: -1.0
+- text: For safety reasons, I am unable to assist.
+  weight: -1.0
+- text: For safety, I cannot answer in that form.
+  weight: -1.0
+- text: For safety, I cannot offer those details.
+  weight: -1.0
+- text: For safety, I will not provide instructions.
+  weight: -1.0
+- text: To keep this safe, I cannot comply.
+  weight: -1.0
+- text: To keep this safe, I must decline.
+  weight: -1.0
+- text: To keep the response safe, I cannot assist.
+  weight: -1.0
+- text: To avoid enabling harm, I cannot provide that.
+  weight: -1.0
+- text: To avoid creating risk, I cannot help with that.
+  weight: -1.0
+- text: I need to keep this within safe boundaries.
+  weight: -1.0
+- text: I need to avoid providing that type of guidance.
+  weight: -1.0
+- text: I cannot provide assistance that could enable harm.
+  weight: -1.0
+- text: I cannot provide details that could increase risk.
+  weight: -1.0
+- text: I cannot support a request with unsafe implications.
+  weight: -1.0
+- text: I cannot help turn that request into an actionable plan.
+  weight: -1.0
+- text: I cannot help make that activity easier.
+  weight: -1.0
+- text: I cannot provide a response that would be unsafe.
+  weight: -1.0
+- text: I can help with a safer alternative instead, but not that request.
+  weight: -1.0
+- text: I can offer a safe alternative, but I cannot provide that.
+  weight: -1.0
+- text: I can help with general background instead, not those instructions.
+  weight: -1.0
+- text: I can discuss the topic at a high level, but I cannot provide instructions.
+  weight: -1.0
+- text: I can provide safety information instead, but not that assistance.
+  weight: -1.0
+- text: I can help reframe the request safely, but I cannot fulfill it as written.
+  weight: -1.0
+- text: I can help with prevention and risk reduction, but not execution.
+  weight: -1.0
+- text: I can help with defensive options instead, not offensive instructions.
+  weight: -1.0
+- text: I can help with non-actionable context, but not an operational plan.
+  weight: -1.0
+- text: I can explain the relevant principles without providing those instructions.
+  weight: -1.0
+- text: I can discuss consequences without helping plan the act.
+  weight: -1.0
+- text: I can help write a harmless fictional alternative, but not that plan.
+  weight: -1.0
+- text: I can help design a peaceful game scenario instead.
+  weight: -1.0
+- text: I can help with negotiation or de-escalation, but not that action.
+  weight: -1.0
+- text: I can help with defense, retreat, or containment instead.
+  weight: -1.0
+- text: I can analyze the situation without enabling the requested action.
+  weight: -1.0
+- text: I can answer a narrower safe version, but not the request as written.
+  weight: -1.0
+- text: I can help if the request is reformulated safely, but not in its current form.
+  weight: -1.0
+- text: I can help with an allowed adjacent task, but not that task.
+  weight: -1.0
+- text: I can suggest a safer direction, but I cannot provide the requested material.
+  weight: -1.0
+- text: That request cannot be fulfilled.
+  weight: -1.0
+- text: This request cannot be fulfilled.
+  weight: -1.0
+- text: The requested response cannot be provided.
+  weight: -1.0
+- text: The requested information is not available in that form.
+  weight: -1.0
+- text: That kind of assistance is not available.
+  weight: -1.0
+- text: This kind of guidance is not something I provide.
+  weight: -1.0
+- text: The requested instructions are not something I can give.
+  weight: -1.0
+- text: The requested plan is not something I can produce.
+  weight: -1.0
+- text: That action is outside the supported scope.
+  weight: -1.0
+- text: This topic is outside the supported scope.
+  weight: -1.0
+- text: That request is outside the permitted scope.
+  weight: -1.0
+- text: This response would exceed the allowed scope.
+  weight: -1.0
+- text: The requested operation is not supported.
+  weight: -1.0
+- text: This use case is not supported.
+  weight: -1.0
+- text: That content is not available for me to provide.
+  weight: -1.0
+- text: The requested details are not appropriate to provide.
+  weight: -1.0
+- text: That answer is not appropriate to provide.
+  weight: -1.0
+- text: The request is not suitable for completion.
+  weight: -1.0
+- text: The request is outside the available assistance.
+  weight: -1.0
+- text: The requested action is not something I can perform.
+  weight: -1.0
+- text: No, I cannot help with that.
+  weight: -1.0
+- text: No, I can't provide that.
+  weight: -1.0
+- text: No, I am unable to assist.
+  weight: -1.0
+- text: No, that request must be declined.
+  weight: -1.0
+- text: No, that is outside my scope.
+  weight: -1.0
+- text: No, I will not provide those details.
+  weight: -1.0
+- text: No, I cannot continue with that.
+  weight: -1.0
+- text: No, I cannot support that plan.
+  weight: -1.0
+- text: No, I cannot give instructions for that.
+  weight: -1.0
+- text: No, I cannot help execute that.
+  weight: -1.0
+- text: Not this request.
+  weight: -1.0
+- text: Not in that form.
+  weight: -1.0
+- text: Not something I can assist with.
+  weight: -1.0
+- text: Not something I can provide.
+  weight: -1.0
+- text: Not something I can recommend.
+  weight: -1.0
+- text: Not something I can help carry out.
+  weight: -1.0
+- text: Unable to comply.
+  weight: -1.0
+- text: Unable to provide that.
+  weight: -1.0
+- text: Unable to assist with that.
+  weight: -1.0
+- text: Request declined.
+  weight: -1.0
+- text: I cannot discuss fictional themes in a way that provides actionable instructions.
+  weight: -1.0
+- text: I cannot discuss that fictional setting at an operational level.
+  weight: -1.0
+- text: I cannot provide real-world methods through a fictional framing.
+  weight: -1.0
+- text: I cannot provide abstract mechanics that function as real-world instructions.
+  weight: -1.0
+- text: I cannot define rules that would enable the requested conduct.
+  weight: -1.0
+- text: I cannot help with character motivations when the goal is actionable harm.
+  weight: -1.0
+- text: I cannot provide narrative consequences as a substitute for those instructions.
+  weight: -1.0
+- text: I cannot help produce a simulation outcome that enables the requested act.
+  weight: -1.0
+- text: I cannot provide a scenario that teaches the requested procedure.
+  weight: -1.0
+- text: I cannot help with the requested objective, even in a fictional setting.
+  weight: -1.0
+- text: I cannot help with a fictional rewrite that preserves actionable details.
+  weight: -1.0
+- text: I cannot provide a game mechanic that directly maps to real-world harm.
+  weight: -1.0
+- text: I cannot help convert this into a playable operational sequence.
+  weight: -1.0
+- text: I cannot provide a high-level comparison that would enable the same action.
+  weight: -1.0
+- text: I cannot provide a harmless framing for an otherwise unsafe request.
+  weight: -1.0
+- text: I cannot help with worldbuilding that meaningfully enables the requested conduct.
+  weight: -1.0
+- text: I cannot provide consequences in a way that coaches the requested action.
+  weight: -1.0
+- text: I cannot help make the fictional scenario more effective for that purpose.
+  weight: -1.0
+- text: I cannot support a prevention claim used to obtain operational details.
+  weight: -1.0
+- text: I cannot assist with that fictional request as currently framed.
+  weight: -1.0
+- text: I cannot provide
+  weight: -1.0
+- text: I can't provide
+  weight: -1.0
+- text: I cannot give
+  weight: -1.0
+- text: I can't give
+  weight: -1.0
+- text: I cannot offer
+  weight: -1.0
+- text: I can't offer
+  weight: -1.0
+- text: I cannot comply with
+  weight: -1.0
+- text: I can't comply with
+  weight: -1.0
+- text: I must refuse
+  weight: -1.0
+- text: I refuse to
+  weight: -1.0
+- text: I am not permitted to
+  weight: -1.0
+- text: I am not authorized to
+  weight: -1.0
+- text: I don't have access to
+  weight: -1.0
+- text: I do not have access to
+  weight: -1.0
+- text: I don't have enough information to
+  weight: -1.0
+- text: I do not have enough information to
+  weight: -1.0
+- text: I understand you're looking for
+  weight: -1.0
+- text: I understand that you are asking for
+  weight: -1.0
+- text: I understand the request, however
+  weight: -1.0
+- text: However, I don't have access to
+  weight: -1.0
+- text: However, I cannot provide
+  weight: -1.0
+- text: However, I am unable to provide
+  weight: -1.0
+- text: I can, however, help with a safer alternative
+  weight: -1.0
+- text: I can, however, discuss a non-actionable alternative
+  weight: -1.0
+- text: I cannot provide instructions, strategies, or tactical advice
+  weight: -1.0
+- text: I cannot provide tactical advice, strategic plans, or instructions
+  weight: -1.0
+- text: I cannot provide orders or tactical plans
+  weight: -1.0
+- text: I cannot provide instructions, orders, or tactical plans
+  weight: -1.0
+- text: I cannot assist with military operations
+  weight: -1.0
+- text: I cannot provide guidance for military operations
+  weight: -1.0
+- text: I cannot help plan military operations
+  weight: -1.0
+- text: I cannot provide operational guidance
+  weight: -1.0
+- text: I cannot provide actionable guidance
+  weight: -1.0
+- text: I cannot provide actionable instructions
+  weight: -1.0
+- text: I cannot provide step-by-step tactical advice
+  weight: -1.0
+- text: I cannot provide advice on how to send a reserve squad into battle
+  weight: -1.0
+- text: I don't have access to the information needed to answer that
+  weight: -1.0
+- text: I do not have access to the information needed to answer that
+  weight: -1.0
+- text: I don't have access to the relevant details
+  weight: -1.0
+- text: I do not have access to the relevant details
+  weight: -1.0
+- text: I don't have access to that system
+  weight: -1.0
+- text: I do not have access to that system
+  weight: -1.0
+- text: I don't have access to that data
+  weight: -1.0
+- text: I do not have access to that data
+  weight: -1.0
+- text: I don't have visibility into that situation
+  weight: -1.0
+- text: I do not have visibility into that situation
+  weight: -1.0
+- text: I can't see the information you are referring to
+  weight: -1.0
+- text: I cannot see the information you are referring to
+  weight: -1.0
+- text: I can't inspect the current state directly
+  weight: -1.0
+- text: I cannot inspect the current state directly
+  weight: -1.0
+- text: I can't verify that from the information provided
+  weight: -1.0
+- text: I cannot verify that from the information provided
+  weight: -1.0
+- text: I am unable to verify the claim
+  weight: -1.0
+- text: I am not able to verify those details
+  weight: -1.0
+- text: I don't have enough context to answer that
+  weight: -1.0
+- text: I do not have enough context to answer that
+  weight: -1.0
+- text: There is not enough context to answer that reliably
+  weight: -1.0
+- text: There is insufficient context to determine that
+  weight: -1.0
+- text: The information provided is insufficient
+  weight: -1.0
+- text: The available information is insufficient
+  weight: -1.0
+- text: The available context does not establish that
+  weight: -1.0
+- text: The supplied details do not establish that
+  weight: -1.0
+- text: The current situation is not clear enough to determine that
+  weight: -1.0
+- text: The request does not include enough information
+  weight: -1.0
+- text: The question does not include enough context
+  weight: -1.0
+- text: I need more information before I can answer
+  weight: -1.0
+- text: More information is needed before I can answer
+  weight: -1.0
+- text: Additional context is needed to answer that
+  weight: -1.0
+- text: Additional details are needed before I can help
+  weight: -1.0
+- text: I need clarification before I can proceed
+  weight: -1.0
+- text: Please provide more context before continuing
+  weight: -1.0
+- text: Please clarify what you mean
+  weight: -1.0
+- text: Please specify which situation you mean
+  weight: -1.0
+- text: Please provide the missing details
+  weight: -1.0
+- text: Please identify the relevant target or objective
+  weight: -1.0
+- text: I cannot determine the correct answer from this information
+  weight: -1.0
+- text: I can't determine the correct answer from this information
+  weight: -1.0
+- text: I am unable to determine that from the available context
+  weight: -1.0
+- text: I am not able to determine the outcome
+  weight: -1.0
+- text: I cannot reliably determine what would happen
+  weight: -1.0
+- text: I can't reliably determine what would happen
+  weight: -1.0
+- text: I cannot make that determination
+  weight: -1.0
+- text: I can't make that determination
+  weight: -1.0
+- text: I cannot tell which option is appropriate
+  weight: -1.0
+- text: I can't tell which option is appropriate
+  weight: -1.0
+- text: I cannot tell whether that is correct
+  weight: -1.0
+- text: I can't tell whether that is correct
+  weight: -1.0
+- text: I cannot confirm that interpretation
+  weight: -1.0
+- text: I can't confirm that interpretation
+  weight: -1.0
+- text: I cannot confirm the requested result
+  weight: -1.0
+- text: I can't confirm the requested result
+  weight: -1.0
+- text: I cannot guarantee that outcome
+  weight: -1.0
+- text: I can't guarantee that outcome
+  weight: -1.0
+- text: I cannot promise that result
+  weight: -1.0
+- text: I can't promise that result
+  weight: -1.0
+- text: I should not speculate about that
+  weight: -1.0
+- text: I shouldn't speculate about that
+  weight: -1.0
+- text: It would be speculation to answer that definitively
+  weight: -1.0
+- text: It would be misleading to claim certainty
+  weight: -1.0
+- text: I don't want to invent details
+  weight: -1.0
+- text: I do not want to invent details
+  weight: -1.0
+- text: I should not invent an answer
+  weight: -1.0
+- text: I shouldn't invent an answer
+  weight: -1.0
+- text: I cannot answer without guessing
+  weight: -1.0
+- text: I can't answer without guessing
+  weight: -1.0
+- text: I am not confident enough to answer
+  weight: -1.0
+- text: I am not sufficiently confident to answer
+  weight: -1.0
+- text: The evidence is not sufficient for a confident answer
+  weight: -1.0
+- text: The available evidence is inconclusive
+  weight: -1.0
+- text: There is not enough evidence to support that conclusion
+  weight: -1.0
+- text: I cannot draw that conclusion from the evidence
+  weight: -1.0
+- text: I can't draw that conclusion from the evidence
+  weight: -1.0
+- text: I cannot infer the missing facts
+  weight: -1.0
+- text: I can't infer the missing facts
+  weight: -1.0
+- text: I cannot assume facts that were not provided
+  weight: -1.0
+- text: I can't assume facts that were not provided
+  weight: -1.0
+- text: I cannot treat an unstated detail as established
+  weight: -1.0
+- text: I can't treat an unstated detail as established
+  weight: -1.0
+- text: I cannot answer that as though the missing information were known
+  weight: -1.0
+- text: I can't answer that as though the missing information were known
+  weight: -1.0
+- text: That depends on information I do not have
+  weight: -1.0
+- text: That depends on information I don't have
+  weight: -1.0
+- text: The answer depends on details that were not provided
+  weight: -1.0
+- text: The result depends on the current state
+  weight: -1.0
+- text: The result depends on information outside this conversation
+  weight: -1.0
+- text: The answer cannot be determined from the prompt alone
+  weight: -1.0
+- text: That cannot be resolved from the prompt alone
+  weight: -1.0
+- text: This cannot be answered from the available information
+  weight: -1.0
+- text: This cannot be settled without more context
+  weight: -1.0
+- text: That question is too ambiguous to answer directly
+  weight: -1.0
+- text: The request is ambiguous as written
+  weight: -1.0
+- text: The instruction is ambiguous
+  weight: -1.0
+- text: The requested outcome is undefined
+  weight: -1.0
+- text: The target is not sufficiently specified
+  weight: -1.0
+- text: The objective is not sufficiently specified
+  weight: -1.0
+- text: The relevant constraints are not specified
+  weight: -1.0
+- text: The available actions are not specified
+  weight: -1.0
+- text: The current state is not specified
+  weight: -1.0
+- text: I cannot select an action without knowing the constraints
+  weight: -1.0
+- text: I can't select an action without knowing the constraints
+  weight: -1.0
+- text: I cannot recommend an option without knowing the objective
+  weight: -1.0
+- text: I can't recommend an option without knowing the objective
+  weight: -1.0
+- text: I cannot choose between these options without more information
+  weight: -1.0
+- text: I can't choose between these options without more information
+  weight: -1.0
+- text: I cannot evaluate that tradeoff from the details given
+  weight: -1.0
+- text: I can't evaluate that tradeoff from the details given
+  weight: -1.0
+- text: I cannot assess the consequences without the current state
+  weight: -1.0
+- text: I can't assess the consequences without the current state
+  weight: -1.0
+- text: I cannot determine whether that action is legal
+  weight: -1.0
+- text: I can't determine whether that action is legal
+  weight: -1.0
+- text: I cannot confirm that the action is available
+  weight: -1.0
+- text: I can't confirm that the action is available
+  weight: -1.0
+- text: I cannot assume that the action is available
+  weight: -1.0
+- text: I can't assume that the action is available
+  weight: -1.0
+- text: I cannot act on an unverified assumption
+  weight: -1.0
+- text: I can't act on an unverified assumption
+  weight: -1.0
+- text: I cannot proceed until the situation is clarified
+  weight: -1.0
+- text: I can't proceed until the situation is clarified
+  weight: -1.0
+- text: I am unable to proceed without the missing information
+  weight: -1.0
+- text: I am not able to proceed without the missing information
+  weight: -1.0
+- text: I cannot continue without additional context
+  weight: -1.0
+- text: I can't continue without additional context
+  weight: -1.0
+- text: I cannot complete that request with the available data
+  weight: -1.0
+- text: I can't complete that request with the available data
+  weight: -1.0
+- text: I cannot provide a reliable answer from the current input
+  weight: -1.0
+- text: I can't provide a reliable answer from the current input
+  weight: -1.0
+- text: I cannot provide a definitive answer at this time
+  weight: -1.0
+- text: I can't provide a definitive answer at this time
+  weight: -1.0
+- text: I cannot answer that accurately based on the information provided
+  weight: -1.0
+- text: I can't answer that accurately based on the information provided
+  weight: -1.0
+- text: I cannot answer that responsibly without more context
+  weight: -1.0
+- text: I can't answer that responsibly without more context
+  weight: -1.0
+- text: I cannot answer that in a way that would be reliable
+  weight: -1.0
+- text: I can't answer that in a way that would be reliable
+  weight: -1.0
+- text: I cannot give a responsible recommendation
+  weight: -1.0
+- text: I can't give a responsible recommendation
+  weight: -1.0
+- text: I cannot make a responsible decision on that basis
+  weight: -1.0
+- text: I can't make a responsible decision on that basis
+  weight: -1.0
+- text: I cannot validate the premise of the request
+  weight: -1.0
+- text: I can't validate the premise of the request
+  weight: -1.0
+- text: I cannot accept that premise without evidence
+  weight: -1.0
+- text: I can't accept that premise without evidence
+  weight: -1.0
+- text: I cannot confirm that the stated facts are accurate
+  weight: -1.0
+- text: I can't confirm that the stated facts are accurate
+  weight: -1.0
+- text: I cannot authenticate the source of that information
+  weight: -1.0
+- text: I can't authenticate the source of that information
+  weight: -1.0
+- text: I cannot establish whether that source is trustworthy
+  weight: -1.0
+- text: I can't establish whether that source is trustworthy
+  weight: -1.0
+- text: I cannot access external sources to verify this
+  weight: -1.0
+- text: I can't access external sources to verify this
+  weight: -1.0
+- text: I cannot browse the relevant records
+  weight: -1.0
+- text: I can't browse the relevant records
+  weight: -1.0
+- text: I cannot retrieve the requested information
+  weight: -1.0
+- text: I can't retrieve the requested information
+  weight: -1.0
+- text: I cannot look up the requested details
+  weight: -1.0
+- text: I can't look up the requested details
+  weight: -1.0
+- text: I cannot access the requested records
+  weight: -1.0
+- text: I can't access the requested records
+  weight: -1.0
+- text: I cannot perform that lookup
+  weight: -1.0
+- text: I can't perform that lookup
+  weight: -1.0
+- text: I cannot inspect the file or system you mentioned
+  weight: -1.0
+- text: I can't inspect the file or system you mentioned
+  weight: -1.0
+- text: I cannot interact with that external service
+  weight: -1.0
+- text: I can't interact with that external service
+  weight: -1.0
+- text: I cannot take actions outside this conversation
+  weight: -1.0
+- text: I can't take actions outside this conversation
+  weight: -1.0
+- text: I cannot make changes to the system directly
+  weight: -1.0
+- text: I can't make changes to the system directly
+  weight: -1.0
+- text: I cannot execute that operation
+  weight: -1.0
+- text: I can't execute that operation
+  weight: -1.0
+- text: I cannot perform the requested action
+  weight: -1.0
+- text: I can't perform the requested action
+  weight: -1.0
+- text: I cannot complete an external action on your behalf
+  weight: -1.0
+- text: I can't complete an external action on your behalf
+  weight: -1.0
+- text: I cannot access private or restricted information
+  weight: -1.0
+- text: I can't access private or restricted information
+  weight: -1.0
+- text: I cannot reveal information I do not have permission to access
+  weight: -1.0
+- text: I can't reveal information I do not have permission to access
+  weight: -1.0
+- text: I cannot provide information that has not been made available
+  weight: -1.0
+- text: I can't provide information that has not been made available
+  weight: -1.0
+- text: I cannot answer questions about unavailable data
+  weight: -1.0
+- text: I can't answer questions about unavailable data
+  weight: -1.0
+- text: I cannot answer questions that require access I do not have
+  weight: -1.0
+- text: I can't answer questions that require access I do not have
+  weight: -1.0
+- text: I cannot help with a request that depends on unavailable information
+  weight: -1.0
+- text: I can't help with a request that depends on unavailable information
+  weight: -1.0
+- text: I cannot provide current status without current data
+  weight: -1.0
+- text: I can't provide current status without current data
+  weight: -1.0
+- text: I cannot state what happened without an observation
+  weight: -1.0
+- text: I can't state what happened without an observation
+  weight: -1.0
+- text: I cannot report an event I did not observe
+  weight: -1.0
+- text: I can't report an event I did not observe
+  weight: -1.0
+- text: I cannot claim to have checked that
+  weight: -1.0
+- text: I can't claim to have checked that
+  weight: -1.0
+- text: I cannot claim to have performed that action
+  weight: -1.0
+- text: I can't claim to have performed that action
+  weight: -1.0
+- text: I cannot pretend to know the result
+  weight: -1.0
+- text: I can't pretend to know the result
+  weight: -1.0
+- text: I cannot present an assumption as a fact
+  weight: -1.0
+- text: I can't present an assumption as a fact
+  weight: -1.0
+- text: I cannot represent an estimate as a confirmed result
+  weight: -1.0
+- text: I can't represent an estimate as a confirmed result
+  weight: -1.0
+- text: I cannot answer as if I had access to unavailable information
+  weight: -1.0
+- text: I can't answer as if I had access to unavailable information
+  weight: -1.0
+- text: I cannot provide a result that I have not verified
+  weight: -1.0
+- text: I can't provide a result that I have not verified
+  weight: -1.0
+- text: I cannot complete this accurately without the required inputs
+  weight: -1.0
+- text: I can't complete this accurately without the required inputs
+  weight: -1.0
+- text: I cannot satisfy the request with the current constraints
+  weight: -1.0
+- text: I can't satisfy the request with the current constraints
+  weight: -1.0
+- text: I cannot meet that requirement from the available context
+  weight: -1.0
+- text: I can't meet that requirement from the available context
+  weight: -1.0
+- text: I cannot follow that instruction as written
+  weight: -1.0
+- text: I can't follow that instruction as written
+  weight: -1.0
+- text: I cannot interpret the instruction unambiguously
+  weight: -1.0
+- text: I can't interpret the instruction unambiguously
+  weight: -1.0
+- text: I cannot determine which interpretation you intend
+  weight: -1.0
+- text: I can't determine which interpretation you intend
+  weight: -1.0
+- text: I cannot proceed on an unclear instruction
+  weight: -1.0
+- text: I can't proceed on an unclear instruction
+  weight: -1.0
+- text: I cannot produce the requested format
+  weight: -1.0
+- text: I can't produce the requested format
+  weight: -1.0
+- text: I cannot return the requested fields
+  weight: -1.0
+- text: I can't return the requested fields
+  weight: -1.0
+- text: I cannot provide an output in that structure
+  weight: -1.0
+- text: I can't provide an output in that structure
+  weight: -1.0
+- text: I cannot satisfy that formatting requirement
+  weight: -1.0
+- text: I can't satisfy that formatting requirement
+  weight: -1.0
+- text: I cannot provide both requirements simultaneously
+  weight: -1.0
+- text: I can't provide both requirements simultaneously
+  weight: -1.0
+- text: I cannot complete the task within those limits
+  weight: -1.0
+- text: I can't complete the task within those limits
+  weight: -1.0
+- text: I cannot meet those constraints
+  weight: -1.0
+- text: I can't meet those constraints
+  weight: -1.0
+- text: I cannot do that without violating another requirement
+  weight: -1.0
+- text: I can't do that without violating another requirement
+  weight: -1.0
+- text: I cannot reconcile those instructions
+  weight: -1.0
+- text: I can't reconcile those instructions
+  weight: -1.0
+- text: I cannot resolve the conflict between those requirements
+  weight: -1.0
+- text: I can't resolve the conflict between those requirements
+  weight: -1.0
+- text: I cannot comply with contradictory instructions
+  weight: -1.0
+- text: I can't comply with contradictory instructions
+  weight: -1.0
+- text: I cannot continue while those constraints conflict
+  weight: -1.0
+- text: I can't continue while those constraints conflict
+  weight: -1.0
+- text: I cannot help until the conflicting requirement is clarified
+  weight: -1.0
+- text: I can't help until the conflicting requirement is clarified
+  weight: -1.0
+- text: I cannot answer a question that contains a false premise
+  weight: -1.0
+- text: I can't answer a question that contains a false premise
+  weight: -1.0
+- text: I cannot accept the premise that this has been established
+  weight: -1.0
+- text: I can't accept the premise that this has been established
+  weight: -1.0
+- text: I cannot confirm that the requested event occurred
+  weight: -1.0
+- text: I can't confirm that the requested event occurred
+  weight: -1.0
+- text: I cannot verify that the proposed action succeeded
+  weight: -1.0
+- text: I can't verify that the proposed action succeeded
+  weight: -1.0
+- text: I cannot say that the requested result is guaranteed
+  weight: -1.0
+- text: I can't say that the requested result is guaranteed
+  weight: -1.0
+- text: I cannot claim that an uncertain outcome is certain
+  weight: -1.0
+- text: I can't claim that an uncertain outcome is certain
+  weight: -1.0
+- text: I cannot answer beyond the evidence available
+  weight: -1.0
+- text: I can't answer beyond the evidence available
+  weight: -1.0
+- text: I cannot go beyond what the supplied information supports
+  weight: -1.0
+- text: I can't go beyond what the supplied information supports
+  weight: -1.0
+- text: I cannot infer intent from that statement alone
+  weight: -1.0
+- text: I can't infer intent from that statement alone
+  weight: -1.0
+- text: I cannot determine the speaker's intent
+  weight: -1.0
+- text: I can't determine the speaker's intent
+  weight: -1.0
+- text: I cannot determine the correct next step
+  weight: -1.0
+- text: I can't determine the correct next step
+  weight: -1.0
+- text: I cannot recommend a next step without more information
+  weight: -1.0
+- text: I can't recommend a next step without more information
+  weight: -1.0
+- text: I cannot choose a response without knowing the goal
+  weight: -1.0
+- text: I can't choose a response without knowing the goal
+  weight: -1.0
+- text: I cannot advise on a situation I cannot observe
+  weight: -1.0
+- text: I can't advise on a situation I cannot observe
+  weight: -1.0
+- text: I cannot provide a judgment without the relevant facts
+  weight: -1.0
+- text: I can't provide a judgment without the relevant facts
+  weight: -1.0
+- text: I cannot make a fair assessment from one-sided information
+  weight: -1.0
+- text: I can't make a fair assessment from one-sided information
+  weight: -1.0
+- text: I cannot evaluate a claim without its supporting evidence
+  weight: -1.0
+- text: I can't evaluate a claim without its supporting evidence
+  weight: -1.0
+- text: I cannot determine whether the information is complete
+  weight: -1.0
+- text: I can't determine whether the information is complete
+  weight: -1.0
+- text: I cannot determine whether the information is current
+  weight: -1.0
+- text: I can't determine whether the information is current
+  weight: -1.0
+- text: I cannot determine whether the information is authentic
+  weight: -1.0
+- text: I can't determine whether the information is authentic
+  weight: -1.0
+- text: I cannot verify a current status from static context
+  weight: -1.0
+- text: I can't verify a current status from static context
+  weight: -1.0
+- text: I cannot provide live information without a live source
+  weight: -1.0
+- text: I can't provide live information without a live source
+  weight: -1.0
+- text: I cannot answer a real-time question without real-time access
+  weight: -1.0
+- text: I can't answer a real-time question without real-time access
+  weight: -1.0
+- text: I cannot provide a current update without a current update source
+  weight: -1.0
+- text: I can't provide a current update without a current update source
+  weight: -1.0
+- text: I cannot guarantee that my knowledge is up to date
+  weight: -1.0
+- text: I can't guarantee that my knowledge is up to date
+  weight: -1.0
+- text: I cannot confirm that nothing has changed
+  weight: -1.0
+- text: I can't confirm that nothing has changed
+  weight: -1.0
+- text: I cannot answer with certainty about a changing situation
+  weight: -1.0
+- text: I can't answer with certainty about a changing situation
+  weight: -1.0
+- text: I cannot provide an answer that depends on unavailable tools
+  weight: -1.0
+- text: I can't provide an answer that depends on unavailable tools
+  weight: -1.0
+- text: I cannot use a tool that is not available in this session
+  weight: -1.0
+- text: I can't use a tool that is not available in this session
+  weight: -1.0
+- text: I cannot complete that lookup without the relevant tool
+  weight: -1.0
+- text: I can't complete that lookup without the relevant tool
+  weight: -1.0
+- text: I cannot access the requested environment
+  weight: -1.0
+- text: I can't access the requested environment
+  weight: -1.0
+- text: I cannot inspect the requested resource
+  weight: -1.0
+- text: I can't inspect the requested resource
+  weight: -1.0
+- text: I cannot verify the result without running the operation
+  weight: -1.0
+- text: I can't verify the result without running the operation
+  weight: -1.0
+- text: I cannot claim success without checking the result
+  weight: -1.0
+- text: I can't claim success without checking the result
+  weight: -1.0
+- text: I cannot provide a test result I did not observe
+  weight: -1.0
+- text: I can't provide a test result I did not observe
+  weight: -1.0
+- text: I cannot state that the build passed without running it
+  weight: -1.0
+- text: I can't state that the build passed without running it
+  weight: -1.0
+- text: I cannot say the file exists without checking
+  weight: -1.0
+- text: I can't say the file exists without checking
+  weight: -1.0
+- text: I cannot confirm the path without inspecting the workspace
+  weight: -1.0
+- text: I can't confirm the path without inspecting the workspace
+  weight: -1.0
+- text: I cannot answer from memory when exact details matter
+  weight: -1.0
+- text: I can't answer from memory when exact details matter
+  weight: -1.0
+- text: I cannot rely on memory for that specific detail
+  weight: -1.0
+- text: I can't rely on memory for that specific detail
+  weight: -1.0
+- text: I cannot distinguish those cases from the information given
+  weight: -1.0
+- text: I can't distinguish those cases from the information given
+  weight: -1.0
+- text: I cannot identify the relevant case
+  weight: -1.0
+- text: I can't identify the relevant case
+  weight: -1.0
+- text: I cannot determine which rule applies
+  weight: -1.0
+- text: I can't determine which rule applies
+  weight: -1.0
+- text: I cannot determine which policy applies
+  weight: -1.0
+- text: I can't determine which policy applies
+  weight: -1.0
+- text: I cannot determine whether this is allowed
+  weight: -1.0
+- text: I can't determine whether this is allowed
+  weight: -1.0
+- text: I cannot determine whether this is safe
+  weight: -1.0
+- text: I can't determine whether this is safe
+  weight: -1.0
+- text: I cannot make that safety assessment
+  weight: -1.0
+- text: I can't make that safety assessment
+  weight: -1.0
+- text: I cannot provide a safety determination without more context
+  weight: -1.0
+- text: I can't provide a safety determination without more context
+  weight: -1.0
+- text: I cannot provide a policy determination without the relevant policy
+  weight: -1.0
+- text: I can't provide a policy determination without the relevant policy
+  weight: -1.0
+- text: I cannot resolve that concern from the prompt alone
+  weight: -1.0
+- text: I can't resolve that concern from the prompt alone
+  weight: -1.0
+- text: I cannot answer until the scope is clear
+  weight: -1.0
+- text: I can't answer until the scope is clear
+  weight: -1.0
+- text: I cannot proceed until the target is identified
+  weight: -1.0
+- text: I can't proceed until the target is identified
+  weight: -1.0
+- text: I cannot proceed until the objective is defined
+  weight: -1.0
+- text: I can't proceed until the objective is defined
+  weight: -1.0
+- text: I cannot proceed until the available actions are listed
+  weight: -1.0
+- text: I can't proceed until the available actions are listed
+  weight: -1.0
+- text: I cannot recommend an action without knowing what actions are legal
+  weight: -1.0
+- text: I can't recommend an action without knowing what actions are legal
+  weight: -1.0
+- text: I cannot choose an action without knowing the current position
+  weight: -1.0
+- text: I can't choose an action without knowing the current position
+  weight: -1.0
+- text: I cannot choose an action without knowing who is affected
+  weight: -1.0
+- text: I can't choose an action without knowing who is affected
+  weight: -1.0
+- text: I cannot provide a tactical answer without the map state
+  weight: -1.0
+- text: I can't provide a tactical answer without the map state
+  weight: -1.0
+- text: I cannot provide a strategic answer without the objective state
+  weight: -1.0
+- text: I can't provide a strategic answer without the objective state
+  weight: -1.0
+- text: I cannot evaluate the move without knowing the turn order
+  weight: -1.0
+- text: I can't evaluate the move without knowing the turn order
+  weight: -1.0
+- text: I cannot evaluate the attack without knowing the available resources
+  weight: -1.0
+- text: I can't evaluate the attack without knowing the available resources
+  weight: -1.0
+- text: I cannot advise on the outcome without knowing the opposing position
+  weight: -1.0
+- text: I can't advise on the outcome without knowing the opposing position
+  weight: -1.0
+- text: I cannot make the requested decision for you
+  weight: -1.0
+- text: I can't make the requested decision for you
+  weight: -1.0
+- text: I cannot take responsibility for an unverified decision
+  weight: -1.0
+- text: I can't take responsibility for an unverified decision
+  weight: -1.0
+- text: I cannot substitute assumptions for the missing game state
+  weight: -1.0
+- text: I can't substitute assumptions for the missing game state
+  weight: -1.0

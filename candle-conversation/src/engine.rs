@@ -319,9 +319,31 @@ impl ConversationEngine {
         // it to the scheduler thread. Session creation touches the GPU
         // (arena allocation) but is a one-time cost.
         let session_start = std::time::Instant::now();
-        let session = model
+        let mut session = model
             .create_batched_session(config.batched_config.clone())
             .map_err(ConversationError::Model)?;
+        if let Some(path) = config.activation_capture_path.as_deref() {
+            let sink = candle_transformers::models::activation_capture::ActivationSink::open(path)
+                .map_err(|error| ConversationError::Channel(format!("activation capture: {error}")))?;
+            session.set_activation_sink(Some(sink));
+        }
+        let personality_vector_bytes = if let Some(path) = config.personality_vectors_path.as_deref() {
+            Some(std::fs::read(path).map_err(|error| {
+                ConversationError::Channel(format!("activation vectors {}: {error}", path.display()))
+            })?)
+        } else {
+            config.personality_vectors.clone()
+        };
+        if let Some(bytes) = personality_vector_bytes.as_deref() {
+            let artifact: candle_transformers::models::personality_vectors::PersonalityVectorFile =
+                bincode::deserialize(bytes).map_err(|error| {
+                    ConversationError::Channel(format!("activation vectors: {error}"))
+                })?;
+            let vectors = artifact
+                .into_device(session.device())
+                .map_err(ConversationError::Model)?;
+            session.set_personality_vectors(Some(vectors));
+        }
         tracing::info!(
             session_init_ms = session_start.elapsed().as_millis() as u64,
             "batched session created (KV arenas allocated)"

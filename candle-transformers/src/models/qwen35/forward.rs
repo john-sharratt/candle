@@ -882,6 +882,8 @@ fn sweep_layers(
     )?);
     g_meta.end();
 
+    let activation_sink = session.activation_sink();
+    let personality_vectors = session.personality_vectors().cloned();
     let mut contexts = assemble_wave_contexts(session, seq_ids, inputs)?;
     let contexts = contexts.as_mut_slice();
 
@@ -1300,6 +1302,32 @@ fn sweep_layers(
         // Bisect *when* a narrowed weight changes, not merely *that* it did.
         #[cfg(feature = "tensor-assert")]
         crate::models::nan_capture::watch_layer(capture_dev, li);
+        if let Some(sink) = activation_sink.as_ref() {
+            for (index, span) in spans.iter().enumerate().take(n_decode + n_prefill) {
+                let row = x.as_cat_tensor().narrow(1, span.start + span.len - 1, 1)?;
+                let position = offsets[index] + q_lens[index] - 1;
+                sink.lock()
+                    .map_err(|_| candle::Error::Msg("activation capture sink poisoned".into()))?
+                    .record_prefill_row(
+                        span.seq,
+                        position,
+                        li,
+                        &row,
+                        if index < n_decode {
+                            crate::models::activation_capture::CapturePhase::Decode
+                        } else {
+                            crate::models::activation_capture::CapturePhase::Prefill
+                        },
+                    )?;
+            }
+                #[cfg(feature = "cuda")]
+                if let Some(vectors) = personality_vectors.as_ref() {
+                    for span in spans.iter().take(n_decode + n_prefill) {
+                        let row = x.as_cat_tensor().narrow(1, span.start + span.len - 1, 1)?;
+                        vectors.apply_to_activation(li, &row, 0.0)?;
+                    }
+                }
+        }
         // This layer's compute is issued, so the copy stream can overlap the
         // next layers' transfers with it rather than serialising in front of
         // them. Safe to evict from here: `issue` orders every copy behind an

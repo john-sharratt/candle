@@ -53,6 +53,7 @@ thiserror = { workspace = true }
 tokenizers = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+bincode = "1.3"
 half = { workspace = true }
 
 [dev-dependencies]
@@ -84,7 +85,10 @@ type_complexity = "allow"
 large_enum_variant = "allow"
 
 [features]
-default = []
+# Model loading is part of the common conversation runtime. Keep the feature
+# name for compatibility, but enable it by default so every host gets the same
+# complete engine without an opt-in build flag.
+default = ["hub"]
 # Feature-gated, zero-cost scoped timing of the projection / reproject hot path
 # (see `scheduler::profile`). Emits an aggregated, sorted-by-cost breakdown.
 # Also enables candle-transformers' per-op pipeline profile (attn_core, mlp_ffn,

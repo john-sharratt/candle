@@ -3907,9 +3907,13 @@ impl<'w> LiveTensor<'w> {
         self.storage.write().unwrap()
     }
 
-    // If we extend the visibility of this function to be usable outside of this crate, we should
-    // make it unsafe.
-    pub(crate) fn storage_mut_and_layout(
+    /// Borrow storage for an in-place device operation together with its layout.
+    ///
+    /// # Safety
+    /// Raw pointers derived from the returned storage must be used only for the
+    /// operation being launched, and no other operation may access this tensor
+    /// until the device stream has completed that operation.
+    pub unsafe fn storage_mut_and_layout(
         &self,
     ) -> (std::sync::RwLockWriteGuard<'_, Storage>, &Layout) {
         let storage = self.storage.write().unwrap();

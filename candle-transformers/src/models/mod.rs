@@ -199,6 +199,8 @@ pub mod qwen3_moe;
 pub mod qwen4exp;
 pub mod rope_tables;
 pub mod rotary_layout;
+pub mod activation_capture;
+pub mod personality_vectors;
 pub mod routing_capture;
 
 // The batched-test harness drives the cuda-only batched/paged inference path (batched_inference,

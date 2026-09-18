@@ -110,6 +110,11 @@ pub struct ModelBuilder {
     show_special_tokens: bool,
     /// Optional path to write penalty state to during decoding.
     penalty_log_path: Option<PathBuf>,
+    /// Optional append-only path for post-layer activation capture.
+    activation_capture_path: Option<PathBuf>,
+    /// Optional serialized activation-vector corpus loaded into the session.
+    personality_vectors: Option<Vec<u8>>,
+    personality_vectors_path: Option<PathBuf>,
     /// Decode health monitoring configuration.
     health_config: DecodeHealthConfig,
     /// Maximum Hot-tier turns before triggering Hot → Warm eviction.
@@ -179,6 +184,9 @@ impl ModelBuilder {
             kv_compression_level: 5,
             show_special_tokens: false,
             penalty_log_path: None,
+            activation_capture_path: None,
+            personality_vectors: None,
+            personality_vectors_path: None,
             health_config: DecodeHealthConfig::default(),
             max_hot_turns: 0,
             workspace_path: None,
@@ -619,6 +627,35 @@ impl ModelBuilder {
         self
     }
 
+    /// Append post-layer activation records to `path` during inference.
+    ///
+    /// The file is opened by the inference engine and owned by its scheduler;
+    /// capture is disabled when this method is not called.
+    pub fn activation_capture(mut self, path: impl Into<PathBuf>) -> Self {
+        self.activation_capture_path = Some(path.into());
+        self
+    }
+
+    /// Load a serialized activation-vector corpus from a path at engine startup.
+    pub fn personality_vectors_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.personality_vectors_path = Some(path.into());
+        self
+    }
+
+    /// Load a serialized activation-vector corpus from any reader.
+    ///
+    /// The reader is consumed when this method is called so the builder remains
+    /// clonable and the bytes can be transferred to the engine-owned session.
+    pub fn personality_vectors_reader(
+        mut self,
+        mut reader: impl std::io::Read,
+    ) -> std::io::Result<Self> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        self.personality_vectors = Some(bytes);
+        Ok(self)
+    }
+
     /// Maximum sequence length (KV cache allocation).
     pub fn max_seq_len(mut self, n: usize) -> Self {
         self.max_seq_len = n;
@@ -816,6 +853,9 @@ impl ModelBuilder {
         ret.max_concurrent_conversations = self.max_concurrent;
         ret.show_special_tokens = self.show_special_tokens;
         ret.penalty_log_path = self.penalty_log_path.clone();
+        ret.activation_capture_path = self.activation_capture_path.clone();
+        ret.personality_vectors = self.personality_vectors.clone();
+        ret.personality_vectors_path = self.personality_vectors_path.clone();
         ret.health = self.health_config.clone();
         ret.workspace_path = self.workspace_path.clone();
         ret.substrate = self.substrate.clone();
