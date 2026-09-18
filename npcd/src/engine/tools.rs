@@ -1775,6 +1775,11 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
                         None => fixed_values(t.name, p.name)
                             .map(|v| v.iter().map(|s| (*s).to_string()).collect()),
                     },
+                    // An act's arguments are scalars; none is a container, and
+                    // none may be null.
+                    items: None,
+                    properties: None,
+                    nullable: false,
                 })
                 .collect(),
         })

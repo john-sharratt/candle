@@ -3,14 +3,22 @@
 //!
 //! It runs over the decoded **bytes** of each token (not token identity), which
 //! is what makes it robust to however the tokenizer happened to chunk a value.
-//! State (`escaped` / `in_string` / `depth`) carries across `feed` calls so a
-//! span that spans many tokens is lexed correctly.
+//! State carries across `feed` calls so a span that spans many tokens is lexed
+//! correctly.
+//!
+//! The two JSON terminators do more than find the end: they validate as they go
+//! (see [`JsonLexer`]), and a token that would make the value invalid comes back
+//! as [`Feed::Rewrite`] — the bytes to commit in its place.
+
+use super::json_lexer::{Effect, JsonLexer};
 
 /// What ends a free-text span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Terminator {
-    /// A JSON string value: ends at the first UNESCAPED `"`.  A `\` escapes the
-    /// next byte, so `\"` and `\\` are handled.  The closing quote is consumed.
+    /// A JSON string value whose opening quote is already written: ends at the
+    /// first UNESCAPED `"`, which is consumed.  A raw control character is
+    /// rewritten as its escape, an escape JSON does not have as a literal
+    /// backslash, a short `\u` padded — so the string always parses.
     JsonString,
     /// A JSON number value: lookahead-terminated at the first byte that cannot
     /// extend a number.  The terminator byte is NOT consumed — it belongs to the
@@ -29,8 +37,12 @@ pub enum Terminator {
     /// ending it anywhere later lets the model write past it (`["a"]]`). A bare
     /// scalar is lookahead-terminated at the first `,`, `}` or `]` at the
     /// ENCLOSING object's depth (depth 0); that delimiter is NOT consumed — it
-    /// belongs to the following node.  Guarantees a structurally-valid JSON
-    /// value without enforcing its scalar type.
+    /// belongs to the following node.
+    ///
+    /// Validated byte by byte: the first byte that cannot continue the value
+    /// ends it, with the value completed as written — a mismatched closer
+    /// closes what was actually opened, an empty value becomes `null`. Guarantees
+    /// a valid JSON value without enforcing its scalar type.
     JsonValue,
     /// No byte delimiter at all: `feed` always returns `Continue`.  The span
     /// ends only via a close *token* (`FreeTextSpan::close_token`), an EOS
@@ -70,28 +82,6 @@ impl Terminator {
         matches!(self, Terminator::JsonNumber { .. } | Terminator::JsonValue)
     }
 
-    /// The text this terminator **consumes** when it fires — and therefore the
-    /// text the grammar has to write itself if the span ends any other way.
-    ///
-    /// A consuming terminator leaves its delimiter in the output only because
-    /// the model wrote it. That holds on the path where the model reaches the
-    /// delimiter and nowhere else: a span cut short by an intercepted EOS
-    /// closed with nothing, so a JSON string ran on unquoted and an element ran
-    /// into the next tag. Both make the whole call unreadable, which costs the
-    /// arguments the model *did* finish as well as the one it did not.
-    ///
-    /// `None` for the lookahead terminators, whose delimiter belongs to the
-    /// successor and is emitted by it regardless, and for [`Terminator::Never`],
-    /// which has no delimiter of its own.
-    pub fn consumed_close(self) -> Option<String> {
-        match self {
-            Terminator::JsonString => Some("\"".to_string()),
-            Terminator::Balanced { close, .. } => Some((close as char).to_string()),
-            Terminator::Until { marker } => Some(marker.to_string()),
-            Terminator::JsonNumber { .. } | Terminator::JsonValue | Terminator::Never => None,
-        }
-    }
-
     pub fn start(self) -> TerminatorState {
         TerminatorState {
             kind: self,
@@ -100,6 +90,11 @@ impl Terminator {
             escaped: false,
             started: false,
             matched: 0,
+            json: match self {
+                Terminator::JsonString => Some(JsonLexer::string()),
+                Terminator::JsonValue => Some(JsonLexer::value()),
+                _ => None,
+            },
         }
     }
 }
@@ -123,10 +118,13 @@ pub struct TerminatorState {
     /// spans tokens — `</parameter>` is several BPE pieces — so a partial match
     /// at the end of one token must survive into the next.
     matched: usize,
+    /// [`Terminator::JsonString`] / [`Terminator::JsonValue`]: the value's
+    /// full JSON state.
+    json: Option<JsonLexer>,
 }
 
 /// The outcome of feeding one token's bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Feed {
     /// The span continues.
     Continue,
@@ -137,6 +135,14 @@ pub enum Feed {
     /// the following node — the integration heals this (§7.3); standalone
     /// callers observe it via `consumed`.
     Close { consumed: usize },
+    /// The token cannot be committed as written: commit `bytes` in its place.
+    ///
+    /// Either a byte had to be escaped (and the span goes on, `closed: false`),
+    /// or a byte could not continue the value at all, in which case `bytes` is
+    /// what was valid before it plus the text that completes the value, and the
+    /// span has ended (`closed: true`). Empty `bytes` means the token
+    /// contributes nothing — it is dropped.
+    Rewrite { bytes: Vec<u8>, closed: bool },
 }
 
 impl TerminatorState {
@@ -148,14 +154,138 @@ impl TerminatorState {
     /// terminator fires, with the count of bytes that belong to the span.
     pub fn feed(&mut self, bytes: &[u8]) -> Feed {
         match self.kind {
-            Terminator::JsonString => self.feed_json_string(bytes),
+            Terminator::JsonString | Terminator::JsonValue => self.feed_json(bytes),
             Terminator::JsonNumber { integer_only } => self.feed_number(bytes, integer_only),
             Terminator::Balanced { open, close } => self.feed_balanced(bytes, open, close),
-            Terminator::JsonValue => self.feed_value(bytes),
             // No byte pattern ever closes this span — only a close token, EOS,
             // or the hard limit (all handled by the session, not the lexer).
             Terminator::Never => Feed::Continue,
             Terminator::Until { marker } => self.feed_until(bytes, marker.as_bytes()),
+        }
+    }
+
+    /// The text that finishes the span as written so far — what the tree writes
+    /// when the span ends **without its terminator firing**: an intercepted
+    /// EOS, or the hard limit.
+    ///
+    /// # Why the grammar has to own its own closing text
+    ///
+    /// A consuming terminator (`JsonString`'s `"`, `Until`'s `</parameter>`)
+    /// leaves its closing text in the output only because the *model* wrote
+    /// it. That is fine on the path where the model reaches it and wrong on
+    /// every other path: a span cut short by EOS closed with nothing, so a JSON
+    /// string ran on unquoted and an element ran straight into whatever the
+    /// tree emitted next.
+    ///
+    /// Measured live: a `reflect` whose last argument was cut short arrived as
+    /// `<parameter=my_reflections>\ntext</function>`, and the argument was
+    /// dropped — taking the two the character *had* written down with it, as
+    /// "needed `my_reflections` and did not have it".
+    ///
+    /// For a JSON value the text depends on where it was cut — `"`, `]}`,
+    /// ` null`, a missing digit — so it is computed from the lexer state rather
+    /// than fixed per span. Empty when the span is already complete, and for a
+    /// lookahead scalar or [`Terminator::Never`], which have nothing of their
+    /// own to close.
+    pub fn completion(&self) -> Vec<u8> {
+        match (self.kind, &self.json) {
+            (_, Some(json)) => json.completion(),
+            (Terminator::Until { marker }, _) => marker.as_bytes().to_vec(),
+            (Terminator::Balanced { close, .. }, _) => vec![close; self.depth.max(1) as usize],
+            _ => Vec::new(),
+        }
+    }
+
+    /// [`Terminator::JsonString`] / [`Terminator::JsonValue`]: validate each
+    /// byte, and rewrite the token when it cannot be committed as written.
+    fn feed_json(&mut self, bytes: &[u8]) -> Feed {
+        let json = self
+            .json
+            .as_mut()
+            .expect("a JSON terminator starts with its lexer");
+        // `Some` from the first rewritten byte on: the bytes to commit.
+        let mut written: Option<Vec<u8>> = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            let mut step = json.step(b);
+            if step.effect == Effect::TrailingComma {
+                let mut out = written.take().unwrap_or_else(|| bytes[..i].to_vec());
+                match out
+                    .iter()
+                    .rposition(|&c| !matches!(c, b' ' | b'\t' | b'\n' | b'\r'))
+                {
+                    // The separator is in this token, so it is not committed
+                    // yet: take it back, with the whitespace after it, and the
+                    // closer closes what came before.
+                    Some(p) if out[p] == b',' => {
+                        out.truncate(p);
+                        json.retract_separator(out.last().copied());
+                        written = Some(out);
+                        step = json.step(b);
+                    }
+                    // Committed by an earlier token: it stays, and the value is
+                    // completed after it.
+                    _ => {
+                        out.extend(json.completion());
+                        return Feed::Rewrite {
+                            bytes: out,
+                            closed: true,
+                        };
+                    }
+                }
+            }
+            match step.effect {
+                Effect::Invalid => {
+                    let mut out = written.unwrap_or_else(|| bytes[..i].to_vec());
+                    out.extend(step.write.unwrap_or_default());
+                    out.extend(json.completion());
+                    return Feed::Rewrite {
+                        bytes: out,
+                        closed: true,
+                    };
+                }
+                Effect::Delimiter => {
+                    return match (written, step.write) {
+                        (None, None) => Feed::Close { consumed: i },
+                        // The delimiter is not committed with a rewrite: the
+                        // successor writes it, or the model chooses it again.
+                        (out, write) => {
+                            let mut out = out.unwrap_or_else(|| bytes[..i].to_vec());
+                            out.extend(write.unwrap_or_default());
+                            Feed::Rewrite {
+                                bytes: out,
+                                closed: true,
+                            }
+                        }
+                    };
+                }
+                Effect::Continue | Effect::Complete | Effect::TrailingComma => {}
+            }
+            match (step.write, written.as_mut()) {
+                (Some(w), None) => {
+                    let mut out = bytes[..i].to_vec();
+                    out.extend(w);
+                    written = Some(out);
+                }
+                (Some(w), Some(out)) => out.extend(w),
+                (None, Some(out)) => out.push(b),
+                (None, None) => {}
+            }
+            if step.effect == Effect::Complete {
+                return match written {
+                    None => Feed::Close { consumed: i + 1 },
+                    Some(out) => Feed::Rewrite {
+                        bytes: out,
+                        closed: true,
+                    },
+                };
+            }
+        }
+        match written {
+            None => Feed::Continue,
+            Some(out) => Feed::Rewrite {
+                bytes: out,
+                closed: false,
+            },
         }
     }
 
@@ -197,60 +327,6 @@ impl TerminatorState {
                     .rev()
                     .find(|&n| marker[..n] == marker[keep + 1 - n..=keep])
                     .unwrap_or(0);
-            }
-        }
-        Feed::Continue
-    }
-
-    fn feed_value(&mut self, bytes: &[u8]) -> Feed {
-        for (i, &b) in bytes.iter().enumerate() {
-            if self.in_string {
-                if self.escaped {
-                    self.escaped = false;
-                } else if b == b'\\' {
-                    self.escaped = true;
-                } else if b == b'"' {
-                    self.in_string = false;
-                    // The string that IS the value has closed: it is complete.
-                    if self.depth == 0 {
-                        return Feed::Close { consumed: i + 1 };
-                    }
-                }
-                continue;
-            }
-            match b {
-                b'"' => self.in_string = true,
-                b'[' | b'{' => self.depth += 1,
-                b']' | b'}' if self.depth > 0 => {
-                    self.depth -= 1;
-                    // **The array or object that IS the value has closed.** It
-                    // is complete, so the span ends on its bracket. Left open to
-                    // the enclosing `}`, the span let a stray `]` through: a
-                    // `]` at depth 0 was saturated away, and a live Cline call
-                    // came out `{"commands": ["dir …"]]}` — not JSON, so no
-                    // call.
-                    if self.depth == 0 {
-                        return Feed::Close { consumed: i + 1 };
-                    }
-                }
-                // At depth 0 these belong to the enclosing object — the field
-                // separator, its close, or a bracket closing nothing the value
-                // opened — and end a bare scalar. Lookahead, not consumed.
-                b',' | b'}' | b']' if self.depth == 0 => return Feed::Close { consumed: i },
-                _ => {}
-            }
-        }
-        Feed::Continue
-    }
-
-    fn feed_json_string(&mut self, bytes: &[u8]) -> Feed {
-        for (i, &b) in bytes.iter().enumerate() {
-            if self.escaped {
-                self.escaped = false;
-            } else if b == b'\\' {
-                self.escaped = true;
-            } else if b == b'"' {
-                return Feed::Close { consumed: i + 1 };
             }
         }
         Feed::Continue
@@ -538,6 +614,75 @@ mod tests {
     fn value_delimiter_mid_token() {
         // "42}" as one token: closes at the '}', consuming the "42".
         assert_eq!(run(Terminator::JsonValue, &[b"42}"]), (0, Some(2)));
+    }
+
+    /// A token that cannot be committed as written comes back as the bytes to
+    /// commit instead — escaped in place while the span goes on, or completed
+    /// and closed at the first byte that cannot continue it.
+    #[test]
+    fn a_token_that_breaks_the_value_is_rewritten() {
+        let mut st = Terminator::JsonString.start();
+        assert_eq!(st.feed(b"ab"), Feed::Continue);
+        assert_eq!(
+            st.feed(b"c\nd"),
+            Feed::Rewrite {
+                bytes: b"c\\nd".to_vec(),
+                closed: false
+            }
+        );
+        // Escaped earlier in the token, closed later in it: one rewrite.
+        assert_eq!(
+            st.feed(b"\te\"]"),
+            Feed::Rewrite {
+                bytes: b"\\te\"".to_vec(),
+                closed: true
+            }
+        );
+
+        let mut st = Terminator::JsonValue.start();
+        assert_eq!(st.feed(b" [1, [2"), Feed::Continue);
+        assert_eq!(
+            st.feed(b"3}"),
+            Feed::Rewrite {
+                bytes: b"3]]".to_vec(),
+                closed: true
+            }
+        );
+
+        // Nothing written, nothing to complete with: the token is dropped.
+        let mut st = Terminator::JsonValue.start();
+        assert_eq!(st.feed(b" 5 "), Feed::Continue);
+        assert_eq!(
+            st.feed(b"6"),
+            Feed::Rewrite {
+                bytes: Vec::new(),
+                closed: true
+            }
+        );
+    }
+
+    /// What a span cut short writes: computed from where the JSON was cut, the
+    /// marker for a raw value, nothing for a span with no closing text.
+    #[test]
+    fn a_cut_span_completes_from_where_it_was_cut() {
+        let mut st = Terminator::JsonValue.start();
+        st.feed(b" {\"a\": [\"x");
+        assert_eq!(st.completion(), b"\"]}");
+
+        let mut st = Terminator::JsonString.start();
+        st.feed(b"abc\\");
+        assert_eq!(st.completion(), b"\\\"");
+
+        let st = Terminator::Until { marker: "</p>" }.start();
+        assert_eq!(st.completion(), b"</p>");
+        assert!(Terminator::Never.start().completion().is_empty());
+
+        let mut st = Terminator::JsonValue.start();
+        st.feed(b" 42");
+        assert!(
+            st.completion().is_empty(),
+            "a complete scalar needs nothing"
+        );
     }
 
     // ── Never (token-closed span; bytes never close it) ──────────────────────

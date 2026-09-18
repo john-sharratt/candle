@@ -46,27 +46,6 @@ pub struct FreeTextSpan {
     /// close token is kept (committed normally).  Only meaningful with
     /// `close_token`.
     pub suppress_close: bool,
-    /// The structural text that closes this span, injected when the span ends
-    /// **without its terminator firing** — an intercepted EOS.
-    ///
-    /// # Why the grammar has to own its own closing tag
-    ///
-    /// A consuming terminator (`JsonString`'s `"`, `Until`'s `</parameter>`)
-    /// leaves the closing text in the output only because the *model* wrote it.
-    /// That is fine on the path where the model reaches it and wrong on every
-    /// other path: a span cut short by EOS closed with no tag at all, so the
-    /// element ran straight into whatever the tree emitted next.
-    ///
-    /// Measured live: a `reflect` whose last argument was cut short arrived as
-    /// `<parameter=my_reflections>\ntext</function>`, and the argument was
-    /// dropped — taking the two the character *had* written down with it, as
-    /// "needed `my_reflections` and did not have it".
-    ///
-    /// With this, the tag is structural on every path: written by the model
-    /// when it gets there, injected by the tree when it does not. Empty for
-    /// spans whose terminator emits nothing of its own (lookahead terminators,
-    /// where the delimiter belongs to the successor anyway).
-    pub close_run: Vec<TokenId>,
     pub next: NodeId,
 }
 

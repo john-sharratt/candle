@@ -23,6 +23,64 @@ JSON schema.
   tree onto the tool-call base.
 - The `§15` module layout and the `§13` public-API sketch predate `driver.rs`,
   `think.rs`, and `trigger.rs` and are illustrative, not exhaustive.
+- **Value sub-trees as shipped** (§8.3). Scalars (`integer`/`number`) and any
+  container the grammar does not guide are one `FreeText{JsonValue}` span —
+  any structurally-valid JSON value, lookahead-terminated at the enclosing
+  `,`/`}`/`]` — rather than `JsonNumber` / `Balanced`. **Guided containers**
+  follow the table: an `object` with `properties` is recursed (its fields under
+  the same required/optional gates as the arguments, closed by `}`), and an
+  `array` whose elements the grammar can begin (string, boolean, enum, object
+  with properties) is `[` · `Branch{ <open> element | "]" }` ·
+  (`Branch{ ", <open>" element | "]" }`)*. The repetition is **unrolled** to
+  `MAX_ARRAY_ELEMENTS` (64) levels, the last offering only `]`, because the
+  compiler rejects cycles (§8.1). Left free: arrays of numbers (an element the
+  model opens has nothing for an arm to carry), and an array inside a guided
+  array's elements (it would repeat per enclosing level).
+- **Lowering shares nodes** (§8.1). The spec is a DAG — optional gates share
+  successors, every unrolled array level shares the value after the array — and
+  the compiler lowers each `(spec node, left context)` once, so the runtime
+  tree is a DAG too. Lowered per path, an array of objects with optional
+  fields grows exponentially in the array bound.
+- **A lookahead delimiter the successor does not continue with is dropped**
+  (§7.3), not pushed back and bailed on: the session returns
+  `Observe::DelimiterDropped`, the driver `Healed::Drop` (counted in
+  `PathStats::dropped_delimiters`), and the successor writes the structure in
+  its place. Live, a free-array `read_files` call ended
+  `"end_line": 3420]}}}` — the element's `}` never written — and was not JSON.
+- **Free JSON spans validate and repair** (§6, §7.3, §12). `JsonString` and
+  `JsonValue` run a full incremental JSON lexer (`json_lexer.rs`: container
+  stack, escapes, number and literal states) instead of a quote finder and a
+  depth counter. A free decode cannot be masked, so a token that would break
+  the value is **rewritten**: a raw control character in a string becomes its
+  escape, an escape JSON lacks becomes a literal backslash, a short `\u` is
+  padded; and at the first byte that cannot continue the value, the value ends
+  with the smallest completion of what was written — the string closed, the
+  containers closed in the order they opened (`[1, [2}` → `[1, [2]]`), the
+  missing digit or value supplied (`"end_line":,` → `"end_line": null`). An EOS
+  inside a span, or the hard limit, completes it the same way, so the fixed
+  per-span `close_run` is gone: the session hands the decode loop the bytes to
+  commit (`StencilSession::take_rewrite` → `Healed::Rewrite`, re-tokenized in
+  the heal path that already committed mid-token closes). The design's
+  "healing impossible → abort" (§12) does not arise: every cut has a completion.
+- **A repair keeps the meaning.** What another language spells differently is
+  respelled, not replaced: `True`/`FALSE`/`None`/`nil`/`undefined` (any case) are
+  the JSON literals; `NaN`/`Infinity`/`inf` are `null`, as `JSON.stringify`
+  writes them; single-quoted strings and keys, bare keys (`{path: 1}`), a
+  missing `:` or `,`, `.5`/`5.`, and `\'`/`\xHH`/`\a`/`\v` escapes all keep their
+  value. `null` is supplied only where nothing recoverable was written. The one
+  cut-dependent repair is a trailing comma: dropped when it shares a token with
+  the closer, completed after (`[1, 2, null]`) when an earlier token committed
+  it. `edge_tests::intent` asserts the parsed value under every cut of each case
+  and under 600 generated values, spellings and cuts.
+- **A closed set is a choice, with `null` where the schema allows it** (§8.3's
+  `nullable T` row, built). A boolean, an enum, and every nullable value are
+  offered as branch arms — `true`/`false`/`null`, `"a"`/`"b"`/`null`,
+  `"`/`null`, `[`/`null`, `{`/`null` — so a closed value is never free text and a
+  nullable field can be `null`. Nullable is read from a `null` in `type` or
+  `enum`, `nullable: true`, and `anyOf`/`oneOf` of one schema and
+  `{"type": "null"}`. Arrays of booleans and enums are guided like arrays of
+  strings, their elements chosen per level (`true`, `false`, `]`, then
+  `, true`, …). Numbers, and values with no schema, stay free.
 
 ---
 
@@ -50,7 +108,8 @@ include an optional field) and a few **free spans** (string and number
   decode.
 - **Constrain the sampler only at decision points.** A handful of masked
   decodes, not one per token.
-- **Let the model decode values freely**, watching for the terminator that ends
+- **Let the model decode scalar values freely** (a container with a schema is
+  scaffolding and decision points too, §8.3), watching for the terminator that ends
   the span — escape- and nesting-aware (§6) — with optional soft/hard limits
   (§6.3) so a value can't ramble forever.
 
@@ -388,7 +447,9 @@ lexer works on **bytes** (§6), it detects the close *inside* the token and
 reports `byte_in_token`. If the close is mid-token, the session **heals**:
 truncate the KV by that one token (`truncate_sequence_to_tokens`), and re-tokenize
 the value tail + the stencil's close run as one canonical run, then prefill it.
-For `JsonNumber` the same machinery handles lookahead push-back. Healing is rare
+For `JsonNumber` the same machinery handles lookahead push-back — and a
+delimiter that is its own token but is not what the successor starts with is
+dropped rather than pushed back, so the successor writes the right one. Healing is rare
 (models emit the quote as its own token) but must be correct; §12 turns
 "healing impossible" into a clean abort, never corruption.
 
@@ -604,9 +665,11 @@ changes *which* tokens are produced and *how fast*, not their representation.
 |---|---|
 | **Runaway free-text** | `limits.forced_after` force-closes; the close-token `ramp` nudges it to close naturally first (§6.3). Bounded. |
 | **Escaped terminator** (`\"`, `\}` in a string) | The byte lexer's `escaped`/`in_string` state ignores them (§6.2). |
-| **Nested structure value** (`{…{…}…}`) | `Balanced` depth counter, string-aware so brackets inside strings don't count (§6.1). |
+| **Nested structure value** (`{…{…}…}`) | With a schema, the grammar writes every bracket (§8.3). Without one, the `JsonValue` lexer keeps a container stack, string-aware so brackets inside strings don't count: a mismatched closer ends the value and closes what was actually opened; a wrong delimiter *after* the value is dropped (§7.3). |
+| **Malformed free value** (empty, `True`, `'x'`, `{k: 1}`, `[1 2]`, `[1,]`, `01`, a raw newline in a string, `\q`) | Where another language spells the same value differently it is respelled, keeping the meaning (`True` → `true`, never `null`). Otherwise the value ends at the first byte that cannot continue it and is completed as written (`null` only for a value that is missing). Never committed as invalid JSON. |
+| **Closed or nullable field** (boolean, enum, `["T","null"]`, `anyOf` with null) | A choice under the mask, `null` among the arms where allowed — the wrong spelling is never offered. |
 | **Token healing impossible** | Session aborts to free decode, logs `WARN`; the partial call fails the caller's JSON parse loudly — never silent corruption (§7.3). |
-| **EOS sampled in a session** | Masked out at every `Branch` and ignored by `FreeText` unless `eos_ends`; a session only ends at `End`. |
+| **EOS sampled in a session** | Masked out at every `Branch`; inside a `FreeText` without `eos_ends` it is never committed — replaced by the completion of the value as written (a closing quote, `]}`, ` null`, a `</parameter>` marker), or dropped when there is nothing to close. A session only ends at `End`. |
 | **Model "fights" the stencil** | The mask is the last word at branches, so an out-of-grammar token shouldn't occur. As a failsafe, if one ever escapes the mask the session **bails** — logs `DEBUG`, emits the tree's configurable bail tokens to terminate the call cleanly, then exits. |
 | **Empty / one-arm branch** | Invariant violations folded/checked at compile (§8.1); empty `debug_assert`s, release logs `ERROR` and aborts the session. |
 | **Empty tool catalog** | No tree registered; `<tool_call>` isn't a trigger; tool calls decode freely. Logged once. |

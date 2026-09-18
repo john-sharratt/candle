@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use super::driver::{healing, Healed};
 use super::error::WalkError;
 use super::mask::AllowedSet;
 use super::session::{Observe, StencilAction, StencilSession};
@@ -41,8 +42,12 @@ pub struct SimRun {
     pub actions: Vec<StencilAction>,
     pub observes: Vec<Observe>,
     /// All tokens that entered the KV — prefilled static runs and decoded tokens,
-    /// in order.
+    /// in order. A decoded token is committed as the decode loop commits it: a
+    /// dropped token never enters, and a rewritten one enters as its
+    /// re-tokenized bytes.
     pub tokens: Vec<TokenId>,
+    /// Decoded tokens the session dropped.
+    pub dropped: Vec<TokenId>,
     /// Total leftover bytes across span closes (a non-zero value means a close
     /// fell mid-token and the integration would heal).
     pub healed_bytes: usize,
@@ -78,6 +83,7 @@ pub fn simulate(
         actions: Vec::new(),
         observes: Vec::new(),
         tokens: Vec::new(),
+        dropped: Vec::new(),
         healed_bytes: 0,
         forced_closes: 0,
     };
@@ -95,15 +101,13 @@ pub fn simulate(
             StencilAction::MaskedDecode(set) => {
                 let token = oracle.next(Some(&set), step)?;
                 step += 1;
-                run.tokens.push(token);
-                let obs = session.observe(token, &vocab.token_bytes(token))?;
+                let obs = commit(&mut session, vocab, &mut run, token)?;
                 run.observes.push(obs);
             }
             StencilAction::FreeDecode { .. } => {
                 let token = oracle.next(None, step)?;
                 step += 1;
-                run.tokens.push(token);
-                let obs = session.observe(token, &vocab.token_bytes(token))?;
+                let obs = commit(&mut session, vocab, &mut run, token)?;
                 run.observes.push(obs);
                 match obs {
                     Observe::SpanClosed { leftover } => run.healed_bytes += leftover,
@@ -115,6 +119,25 @@ pub fn simulate(
         }
     }
     Ok(run)
+}
+
+/// Observe `token` and commit it the way the decode loop would.
+fn commit(
+    session: &mut StencilSession,
+    vocab: &dyn Vocab,
+    run: &mut SimRun,
+    token: TokenId,
+) -> Result<Observe, SimError> {
+    let bytes = vocab.token_bytes(token);
+    let obs = session.observe(token, &bytes)?;
+    match healing(obs, session.take_rewrite(), &bytes) {
+        Healed::No => run.tokens.push(token),
+        Healed::Drop => run.dropped.push(token),
+        Healed::Rewrite { bytes } => run
+            .tokens
+            .extend(vocab.encode(&String::from_utf8_lossy(&bytes))),
+    }
+    Ok(obs)
 }
 
 /// A convenience policy that, at a branch, always picks the lowest-id allowed
