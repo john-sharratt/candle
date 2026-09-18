@@ -61,6 +61,7 @@ use crate::repo_scan::RepoMap;
 use crate::resume;
 use crate::think_budget;
 use crate::think_progress::{ThinkProgress, ThinkUpdate};
+use crate::tool_round;
 use crate::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, Dispatch,
     ToolCall, ToolHost, CALIB_TOOL_SELECTOR,
@@ -282,6 +283,19 @@ fn think_mode_from_selection(selection: &candle_conversation::SelectionState) ->
         _ => ThinkMode::Balanced,
     }
 }
+
+/// The hard cap on one assistant turn, in generated tokens — the scheduler's
+/// `max_tokens` for every turn that does not name its own.
+///
+/// A prose answer never gets near it: the think and answer budgets
+/// ([`think_budget::steer`]) end one long before. It exists for the turn those
+/// budgets stand down for — one writing a tool call, whose string values may
+/// each run to
+/// [`MAX_STRING_VALUE_TOKENS`](candle_conversation::stencil::MAX_STRING_VALUE_TOKENS)
+/// so a whole file can be written. So it has to hold the longest think block and
+/// one full value with room to spare, which the engine's default of 16k does
+/// not.
+const MAX_TURN_TOKENS: usize = 65_536;
 
 /// Maps the composer's `response_length` dial (terse/concise/standard/detailed/
 /// comprehensive = 0..4, the verbosity toggle) to the answer's token budget — the
@@ -829,6 +843,7 @@ impl InferenceState {
         compact_substrate: bool,
         read_only_substrate: bool,
         qsa_selection_budget: Option<usize>,
+        summarize: bool,
         progress: Arc<LoadProgress>,
         status_tx: tokio::sync::watch::Sender<String>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
@@ -1027,6 +1042,7 @@ impl InferenceState {
             .workspace_path(workspace.clone())
             .read_only_substrate(read_only_substrate)
             .qsa_selection_budget(qsa_selection_budget)
+            .max_response_tokens(MAX_TURN_TOKENS)
             // Dialogue turns compress at C5 (moderate adaptive quantization).
             // Paired with the removed uniform-K pin (see `ModelBuilder::engine`),
             // so K is adaptive too.
@@ -1085,6 +1101,16 @@ impl InferenceState {
         // zend decodes code, not prose: every conversation it opens — dialogue,
         // passthrough, ingest — derives from this config. See `coding_sampling`.
         coding_sampling::apply(&mut conv_config.sampling);
+        // Every conversation — dialogue, titler, passthrough, ingest — derives
+        // from this config, so this one switch covers them all. See
+        // `DaemonConfig::summarize` for why summaries are opt-in.
+        if !summarize {
+            conv_config.tree.disable_summarization();
+        }
+        tracing::info!(
+            enabled = conv_config.tree.summarizes(),
+            "background tree summaries (--summarize)",
+        );
         if conv_config.sampling.segment_close_token_id < 0
             || conv_config.sampling.segment_open_token_id < 0
         {
@@ -3486,12 +3512,25 @@ fn run_inference_stream(
                 }
             }
 
-            let calls = extract_tool_calls(&resp.text);
+            // Every call the answer made, in order — including any that could
+            // not be read, which are answered with an error rather than dropped
+            // (see `tool_round`), so a broken call is a failed round the model
+            // and the GUI both see, not a turn that silently reads as final.
+            let round = tool_round::plan(&resp.text);
             // Force-high-resolution is a capture mode: seal the first turn (the
             // tool invocation) into the substrate as the dataset baseline, but
             // do NOT execute the tools — capture-only, so `code_run` / network
             // tools have no real side effects.
-            let is_final = calls.is_empty() || force_hires.is_some();
+            let is_final = round.is_empty() || force_hires.is_some();
+            // A call the turn stopped writing has no `</tool_call>` in the
+            // stream, and the GUI reads everything after an unclosed opener —
+            // the rounds that follow included — as that call's JSON. Close it
+            // in the stream so its card ends where the call did.
+            if !is_final && tool_round::ends_inside_a_call(&resp.text) {
+                let _ = tx
+                    .send(Ok(StreamItem::Token("\n</tool_call>".to_string())))
+                    .await;
+            }
 
             // If tools will run, tell the GUI *now* — before sealing/persisting
             // this turn — so the in-flight tool cards show their spinner across
@@ -3501,7 +3540,7 @@ fn run_inference_stream(
             let tool_names: Vec<String> = if is_final {
                 Vec::new()
             } else {
-                calls.iter().map(|c| c.name.clone()).collect()
+                round.iter().map(|s| s.name().to_string()).collect()
             };
             if !is_final {
                 let _ = tx
@@ -3565,7 +3604,7 @@ fn run_inference_stream(
             tracing::info!(
                 conv_id = %conv_id,
                 iteration,
-                n_calls = calls.len(),
+                n_calls = round.len(),
                 "dispatching tool calls",
             );
             // The "running" notice was already sent above (before the seal).  Run
@@ -3573,10 +3612,10 @@ fn run_inference_stream(
             // this task stays parked — then the "done" notice clears the spinner
             // and carries each result so the cards resolve immediately, before
             // the post-stream hydrate.
-            let n_calls = calls.len();
+            let n_calls = round.len();
             let tool_state = Arc::clone(&state);
             let results = match tokio::task::spawn_blocking(move || {
-                run_tool_calls(&tool_state.tool_host.ctx, calls, Dispatch::Live)
+                tool_round::run(&tool_state.tool_host.ctx, round)
             })
             .await
             {
@@ -5375,6 +5414,7 @@ impl ZendSession {
         let compact_substrate = self.config.compact_substrate;
         let read_only_substrate = self.config.read_only_substrate;
         let qsa_selection_budget = self.config.qsa_selection_budget;
+        let summarize = self.config.summarize;
         // Resolved once, here, and handed to both the downloader and the engine
         // builder, so the artifact fetched and the model built are the same one.
         let model = model_choice::resolve(&self.config.model);
@@ -5466,6 +5506,7 @@ impl ZendSession {
                     compact_substrate,
                     read_only_substrate,
                     qsa_selection_budget,
+                    summarize,
                     load_progress_for_blocking,
                     status_tx.clone(),
                 ) {
@@ -6540,6 +6581,33 @@ mod held_tail_tests {
     #[test]
     fn empty_tail_emits_nothing() {
         assert!(render_held_tail("   \n  ").is_none());
+    }
+}
+
+#[cfg(test)]
+mod turn_cap_tests {
+    use super::MAX_TURN_TOKENS;
+    use candle_conversation::stencil::{ThinkMode, MAX_STRING_VALUE_TOKENS};
+
+    /// **A turn can think as long as any dial allows and still write one whole
+    /// string value.** Otherwise the turn's own cap, not the value's, is what
+    /// cuts a large file — which is the failure this cap exists to remove.
+    #[test]
+    fn a_turn_holds_the_longest_think_block_and_a_full_string_value() {
+        let longest_think = [
+            ThinkMode::Quick,
+            ThinkMode::Balanced,
+            ThinkMode::Deep,
+            ThinkMode::Exhaustive,
+        ]
+        .into_iter()
+        .map(|m| m.span_cap() as usize)
+        .max()
+        .unwrap();
+        assert!(
+            MAX_TURN_TOKENS > longest_think + MAX_STRING_VALUE_TOKENS as usize,
+            "{MAX_TURN_TOKENS} cannot hold {longest_think} thinking + {MAX_STRING_VALUE_TOKENS} of value",
+        );
     }
 }
 

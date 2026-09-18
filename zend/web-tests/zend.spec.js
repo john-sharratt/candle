@@ -148,6 +148,26 @@ test.describe('1.3 streaming', () => {
   });
 });
 
+test.describe('1.3a a long write shows as it is written', () => {
+  test('the writing box shows the file and its text mid-call, then gives way to the card', async ({ page }) => {
+    await boot(page);
+    await page.getByTitle('Expand sidebar').click();
+    await page.getByText('Why is decode latency spiking under load?').click();
+    const ta = page.locator('#zend-prompt');
+    await ta.fill('write up the redo log as a doc');
+    await ta.press('Enter');
+    const last = page.locator('[data-msg]').last();
+    // Mid-call: the box names the file and carries the content decoded so far.
+    const box = last.locator('.tool-author');
+    await expect(box).toBeVisible({ timeout: 10000 });
+    await expect(box.locator('.tool-author-file')).toHaveText('docs/redo_log.md');
+    await expect(box.locator('.tool-author-body')).toContainText('The redo log');
+    // Once the call closes, the finished tool card replaces the box.
+    await expect(last.locator('.tool-call-card .tool-call-name')).toHaveText('write', { timeout: 15000 });
+    await expect(last.locator('.tool-author')).toHaveCount(0);
+  });
+});
+
 test.describe('1.3b a failed send', () => {
   async function sendFailing(page, failure) {
     await boot(page);

@@ -177,6 +177,14 @@ struct Cli {
     /// selection kernel cannot run (between its ceiling and the context).
     #[arg(long, value_name = "N")]
     qsa_selection_budget: Option<usize>,
+
+    /// Let conversations launch background tree summaries — a summary of the
+    /// last eight turns, of accumulated segments, and at each UTC day boundary.
+    /// Off by default: each summary re-reads its window as a fresh prefill on
+    /// the same scheduler, ahead of the live turn, and a conversation's next
+    /// tool round waits behind it.
+    #[arg(long)]
+    summarize: bool,
 }
 
 /// A `--model` value: the preset whose variant name it is.
@@ -409,6 +417,7 @@ async fn main() -> anyhow::Result<()> {
             ModelChoice::Preset(Box::new(m))
         }),
         qsa_selection_budget: cli.qsa_selection_budget,
+        summarize: cli.summarize,
     };
 
     if !disabled_layers.is_empty() {

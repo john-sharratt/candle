@@ -160,9 +160,26 @@ The compiler memoises shared successors (`stencil::compile`). A loop spec is a D
 
 **Results are correlated in the text.** OpenAI pairs a result with its call by `tool_call_id`. Here each result's `<tool_response>` block opens with `[n/total tool_name]` when a turn made more than one call — explicit rather than positional, because a failed call returns an error envelope instead of the shape its position would suggest. A single-call round carries no label, so it stays byte-identical to the `code_reading` ingest's prefilled rounds. The label is literal text, so `tool_round_text` rebuilds a stored round into exactly the pieces it was submitted as.
 
-**Dispatch is sequential.** `run_tool_calls` runs a turn's calls in order. The file tools run in milliseconds, so the round-trips batching removes are the whole win; concurrent execution would add ordering hazards for the stateful session tools (`ssh_session_open` → `ssh_session_exec`) for no measurable gain.
+**Dispatch is sequential.** `tool_round::run` runs a turn's calls in order. The file tools run in milliseconds, so the round-trips batching removes are the whole win; concurrent execution would add ordering hazards for the stateful session tools (`ssh_session_open` → `ssh_session_exec`) for no measurable gain.
 
 **The model must be taught it.** The prompt invites batching explicitly, and `file_read` carries two batched trajectories. A permission the corpus never demonstrates is one the model does not use.
+
+### A call that cannot be read
+
+A `<tool_call>` block whose JSON does not parse is **answered, not dropped**. `tool_round::plan` walks every block in the answer, in order: a call that parses runs; one that does not gets an ordinary error result in its place and nothing runs:
+
+| Error | When | Detail tells the model |
+|---|---|---|
+| `call_cut_off` | The JSON ends before the call does — no `</tool_call>`, or a value that never closes | Nothing ran; split a large value across smaller calls |
+| `malformed_call` | The call is complete but not valid JSON, or names no tool | Nothing ran; issue it again as one JSON object |
+
+Because it is a normal `{"error", "detail"}` result, the round continues: the model reads it in the next turn like any failed tool, and the GUI pairs it with the call's card (by position, which is why refused calls keep their place in the round) and renders it as an error. A card whose JSON does not parse takes its tool name and path from the call's text. When the turn stopped inside a call, the daemon writes the missing `</tool_call>` to the stream so the card ends where the call did.
+
+Silently skipping such a block — the behaviour this replaces — left no call, so the turn read as a final answer: the loop ended, nothing ran, and neither the model nor the user was told.
+
+### How long a call may be
+
+A string argument is as often a whole file as a name, so each string value may run to `MAX_STRING_VALUE_TOKENS` (32,768) before the grammar closes it. The turn's prose budgets do not apply inside a call: while the tool-call stencil is steering (`SequenceSamplingState::writing_call`) the EOS ramp and the graceful and forced EOS failsafes stand down, because an EOS inside a call is intercepted and closes the value where it stands. The call is bounded by its grammar, and the turn by zend's `MAX_TURN_TOKENS` (65,536), which holds the longest think block plus one full value.
 
 ### Tool Description Format
 

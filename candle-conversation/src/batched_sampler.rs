@@ -79,6 +79,19 @@ pub struct SequenceSamplingState {
     /// retains full repetition control.
     pub in_tool_call: bool,
 
+    /// True while the tool-call stencil is steering this sequence — it is
+    /// writing a call — whatever `in_tool_call`'s penalty policy says. Synced
+    /// from the stencil each decode step.
+    ///
+    /// **The turn's length budget does not apply while it is set**: the EOS
+    /// boost ramp sees a length of 0 and the graceful and forced EOS failsafes
+    /// stand down. Those budgets size a prose answer, and inside a call an EOS
+    /// is not an ending — the stencil intercepts it and closes the value where
+    /// it stands. A `write` whose content outran the answer budget came out as
+    /// a file cut mid-sentence. The call is bounded by its own grammar instead
+    /// (each value's `forced_after`), and the turn by `max_tokens`.
+    pub writing_call: bool,
+
     /// Next index into [`crate::SamplingConfig::segment_close_script`] while the
     /// hard-cap closer script is playing; `None` when no script is in flight.
     /// The script overrides sampling until every phrase token has played, then
@@ -117,6 +130,7 @@ impl SequenceSamplingState {
             dry_span_len: 0,
             dry_suppressed: false,
             in_tool_call: false,
+            writing_call: false,
             close_script_pos: None,
             close_would_continue: false,
             degenerate_run: 0,
@@ -191,6 +205,7 @@ impl SequenceSamplingState {
         self.dry_span_len = 0;
         self.dry_suppressed = false;
         self.in_tool_call = false;
+        self.writing_call = false;
         self.close_script_pos = None;
         self.close_would_continue = false;
         self.rng_offset = 0;
@@ -242,6 +257,7 @@ impl SequenceSamplingState {
         // segment, or in-flight closer script from the prior turn is cleared.
         self.dry_span_len = 0;
         self.dry_suppressed = false;
+        self.writing_call = false;
         self.in_segment = false;
         self.segment_len = 0;
         self.close_script_pos = None;
@@ -752,6 +768,12 @@ impl BatchedSampler {
             return eos_token_id;
         }
 
+        // A call being written is bounded by its grammar, not by the answer's
+        // length budget — see `SequenceSamplingState::writing_call`.
+        if state.writing_call {
+            return sampled;
+        }
+
         if config.forced_eos_after > 0 && state.current_len >= config.forced_eos_after {
             // Hard stop: unconditionally force EOS regardless of sentence position.
             tracing::debug!(
@@ -1239,8 +1261,13 @@ impl BatchedSampler {
             recent_tokens.extend(std::iter::repeat_n(0, self.max_recent_len - window));
         }
 
-        // Current generated lengths (for dynamic EOS ramp)
-        let current_lens: Vec<i32> = states.iter().map(|s| s.current_len).collect();
+        // Current generated lengths (for dynamic EOS ramp). A sequence writing
+        // a tool call reports 0, which holds its ramp at zero boost — see
+        // `SequenceSamplingState::writing_call`.
+        let current_lens: Vec<i32> = states
+            .iter()
+            .map(|s| if s.writing_call { 0 } else { s.current_len })
+            .collect();
 
         Ok((
             token_counts,
@@ -1895,6 +1922,48 @@ mod tests {
         // guard fires on a consecutive run, never on token 0 being frequent.
         state.record_token(42, MAX_RECENT);
         assert_eq!(sampler.resolve_final_token(0, 7, &mut state, &config), 7);
+    }
+
+    /// **A call being written is not cut by the answer's length budget.** Past
+    /// both EOS thresholds a prose turn is ended; the same length inside a tool
+    /// call keeps the model's own token, and the EOS ramp sees a length of 0.
+    /// The call's own grammar and the turn's `max_tokens` bound it instead.
+    #[test]
+    fn writing_a_call_stands_the_length_budget_down() {
+        let sampler = make_sampler();
+        let mut config = SamplingConfig::argmax();
+        config.graceful_eos_after = 10;
+        config.forced_eos_after = 20;
+        let mut state = make_state();
+        for _ in 0..25 {
+            state.record_token(42, MAX_RECENT);
+        }
+        assert_eq!(
+            sampler.resolve_final_token(0, 7, &mut state, &config),
+            EOS_TOKEN,
+            "a prose turn past its budget is ended"
+        );
+
+        state.writing_call = true;
+        assert_eq!(
+            sampler.resolve_final_token(0, 7, &mut state, &config),
+            7,
+            "a call past the same budget keeps its token"
+        );
+        let (_, _, _, _, current_lens) = sampler
+            .build_penalty_buffers_from_states(&[&mut state], 0.0, 16, 0)
+            .unwrap();
+        assert_eq!(current_lens, vec![0], "the EOS ramp sees no length");
+
+        // The degenerate-decode guard is a fault check, not a budget: it still
+        // fires inside a call.
+        for _ in 0..DEGENERATE_TOKEN_RUN {
+            state.record_token(0, MAX_RECENT);
+        }
+        assert_eq!(
+            sampler.resolve_final_token(0, 7, &mut state, &config),
+            EOS_TOKEN
+        );
     }
 
     fn make_sampler() -> BatchedSampler {

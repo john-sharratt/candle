@@ -39,6 +39,7 @@ pub mod think_gate;
 pub mod think_progress;
 pub mod tool_call_split;
 pub mod tool_def;
+pub mod tool_round;
 pub mod tool_summary;
 pub mod tools;
 pub mod turn_sink;

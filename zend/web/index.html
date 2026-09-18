@@ -122,6 +122,21 @@
   .zmd .tool-prefill-bar::after { content: ''; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255,238,205,0.6), transparent); transform: translateX(-100%); animation: zsheen 1.4s ease-in-out infinite; animation-delay: var(--zsheen, 0ms); }
   .zmd .tool-prefill .tool-call-icon { display: inline-block; animation: zspin 2.4s linear infinite; animation-delay: var(--zgear, 0ms); }
   @media (prefers-reduced-motion: reduce) { .zmd .tool-prefill-bar::after, .zmd .tool-prefill .tool-call-icon { animation: none; } }
+  /* A tool call writing a long value — a file's content — shown as it decodes:
+     the tool card's chrome, the file it is going to on top, and the text so far
+     in a box pinned to its newest line. `column-reverse` keeps the scroll at
+     the bottom with no script, so a redraw on every token never jumps. */
+  .zmd .tool-author { margin: .5rem 0; background: #26231f; border: 1px solid #38342f; border-left: 3px solid #8c5f28; border-radius: 8px; overflow: hidden; font-family: "Cascadia Code","Fira Code","JetBrains Mono",Consolas,monospace; font-size: .82rem; }
+  .zmd .tool-author-head { display: flex; align-items: center; flex-wrap: wrap; gap: .2rem .5rem; padding: .4rem .75rem; background: #1e1b19; border-bottom: 1px solid #2e2b27; }
+  .zmd .tool-author-icon { color: #e0a85a; animation: zpulse 1.5s ease-in-out infinite; }
+  .zmd .tool-author-label { font-weight: 600; color: #c98a3e; letter-spacing: .02em; }
+  .zmd .tool-author-file { color: #e6ddd0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .zmd .tool-author-meta { margin-left: auto; color: #7d766e; font-size: .76rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .zmd .tool-author-body { display: flex; flex-direction: column-reverse; max-height: 18rem; overflow: auto; background: #1a1816; }
+  .zmd .tool-author-body pre { margin: 0; padding: .5rem .75rem; color: #c7bdb0; font-size: .78rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+  .zmd .tool-author-more { color: #5a5652; }
+  .zmd .tool-author-caret { display: inline-block; width: .5em; height: 1em; margin-left: 1px; vertical-align: -.12em; background: #e0a85a; animation: zblink 1s steps(1) infinite; }
+  @media (prefers-reduced-motion: reduce) { .zmd .tool-author-icon, .zmd .tool-author-caret { animation: none; } }
   /* An expanded tool card's output header: the label, and on the right the
      output's length in tokens as it sits in the context. */
   .zmd .tool-call-out-label { display: flex; align-items: baseline; justify-content: space-between; gap: .5rem; }
@@ -277,6 +292,7 @@
 <script src="zend-api.mock.js"></script>
 <script src="zend-api.live.js"></script>
 <script src="zend-api.js"></script>
+<script src="partial-call.js"></script>
 <script type="module">
 /* ============================================================================
  * Zend UI — vanilla single-file app (plain DOM, no framework).
@@ -685,17 +701,55 @@ import { estateSwitcher } from './common/lib/estate.js';
       row(k, hasDefault(props[k]) ? show(props[k].default) + ' (default)' : 'default', true));
     return passed.concat(omitted).join('');
   }
+  // Argument names that hold where a call writes, not what — shown as the
+  // writing box's file, and never themselves the "content" being written.
+  const TARGET_KEYS = ['path', 'file_path', 'filename', 'file', 'name'];
+  // A call still being decoded. Once it is writing a value other than its
+  // target — a file's content, typically thousands of tokens — the text is
+  // shown as it arrives, under the tool and the file it is going to, so a long
+  // write reads as work in progress rather than a frozen "Calling tool…".
+  function pendingCallCard(json) {
+    const call = window.ZendPartialCall ? window.ZendPartialCall.parse(json) : { name: null, args: {}, writing: null };
+    if (call.writing && TARGET_KEYS.indexOf(call.writing) === -1) return authoringCard(call);
+    const label = call.name ? 'Calling ' + esc(call.name) + '…' : 'Calling tool…';
+    return '<div class="tool-call-card pending"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">' + label + '</span></div></div>';
+  }
+  // The live writing box: the value being written, pinned to its newest lines.
+  // Only the tail is drawn — the card is redrawn on every token, and a file can
+  // run to tens of thousands of characters.
+  function authoringCard(call) {
+    const text = call.args[call.writing] || '';
+    const key = TARGET_KEYS.find((k) => k !== 'name' && typeof call.args[k] === 'string');
+    const target = key ? call.args[key] : '';
+    const lines = text ? text.split('\n').length : 0;
+    const TAIL = 6000;
+    const shown = text.length > TAIL ? text.slice(-TAIL) : text;
+    return '<div class="tool-author" aria-live="off">' +
+      '<div class="tool-author-head"><span class="tool-author-icon">✎</span>' +
+      '<span class="tool-author-label">Writing</span>' +
+      (target ? '<span class="tool-author-file">' + esc(target) + '</span>' : '') +
+      '<span class="tool-author-meta">' + esc(call.name || 'tool') + ' · ' + esc(call.writing) + ' · ' +
+      lines.toLocaleString() + (lines === 1 ? ' line · ' : ' lines · ') + text.length.toLocaleString() + ' chars</span></div>' +
+      '<div class="tool-author-body"><pre>' + (text.length > TAIL ? '<span class="tool-author-more">…</span>' : '') +
+      esc(shown) + '<span class="tool-author-caret"></span></pre></div></div>';
+  }
   // An expandable tool-call block: header (name, what it touched, result
   // badge), then every parameter and — when the matching `<tool_response>` is
-  // paired in — the tool output.
+  // paired in — the tool output. A call still being decoded is drawn by
+  // `pendingCallCard` instead.
   // `tokens`: the output's length in tokens as it sits in the context, when
   // the daemon reported it.
   function toolCard(json, complete, output, running, tokens) {
-    if (!complete) return '<div class="tool-call-card pending"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">Calling tool…</span></div></div>';
+    if (!complete) return pendingCallCard(json);
     let parsed;
     try { parsed = JSON.parse(json.trim()); } catch (e) { parsed = null; }
-    const name = (parsed && parsed.name) || 'tool call';
+    // A call that is not JSON — cut off, or malformed — still names its tool
+    // and usually its path in its text; the daemon answers it with an error
+    // result, and the card should say which call that error belongs to.
+    const textField = (key) => { const m = new RegExp('"' + key + '"\\s*:\\s*"([^"\\\\]+)"').exec(json); return m ? m[1] : null; };
+    const name = (parsed && parsed.name) || textField('name') || 'tool call';
     let args = (parsed && (parsed.arguments || parsed.parameters || parsed.params)) || {};
+    if (!parsed && textField('path')) args = { path: textField('path') };
     // Some calls carry their arguments as a JSON-encoded string.
     if (typeof args === 'string') { try { args = JSON.parse(args); } catch (_) { args = { arguments: args }; } }
     if (!args || typeof args !== 'object' || Array.isArray(args)) args = {};

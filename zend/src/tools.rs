@@ -57,7 +57,7 @@ pub struct ToolCall {
 }
 
 /// One executed tool's result, ready to be wrapped in `<tool_response>`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolResult {
     /// The call this result answers. Its `name` is what labels the result's
     /// `<tool_response>` block when a turn made several calls — the text-side
@@ -294,19 +294,45 @@ fn balanced_object_spans(text: &str) -> Vec<(usize, usize)> {
 ///
 /// [`CallStyle`]: candle_conversation::stencil::CallStyle
 pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
+    calls_in_answer(&answer_text(response_text))
+        .into_iter()
+        .map(|(_, call)| call)
+        .collect()
+}
+
+/// The part of a response that can make calls, in the one syntax the call
+/// scanners read: `<think>…</think>` blocks blanked out, and function blocks
+/// translated to JSON.
+///
+/// A `<tool_call>` emitted *inside* a reasoning block is the model thinking out
+/// loud, not an invocation to dispatch, so the reasoning is stripped first — the
+/// JSON still streams to the client inline, it is simply never executed.
+///
+/// **Translated after the strip**, so a call written mid-thought is already
+/// gone — translating first would spend the work rewriting text about to be
+/// discarded, and would put a dispatchable shape into deliberation.
+///
+/// Every scanner of a round's calls reads this same text, so the byte offsets
+/// they report are comparable — see [`crate::tool_round`].
+pub(crate) fn answer_text(response_text: &str) -> String {
+    let stripped = strip_think_blocks_keep_layout(response_text);
+    match function_blocks_to_json(&stripped, tool_catalog()) {
+        Some(translated) => translated,
+        None => stripped,
+    }
+}
+
+/// Every call in `answer` (see [`answer_text`]), each with the byte offset it
+/// starts at, in the order they appear.
+///
+/// Text order, not pass order: the results of a round are paired with the
+/// calls that asked for them by position — the GUI puts the n-th result on the
+/// n-th call card — so a call recovered by a later, looser pass must still take
+/// its place among the rest.
+pub(crate) fn calls_in_answer(answer: &str) -> Vec<(usize, ToolCall)> {
     use regex::Regex;
     use std::sync::OnceLock;
-    // A `<tool_call>` emitted *inside* a `<think>…</think>` reasoning block is the
-    // model thinking out loud, not an invocation to dispatch. Strip the reasoning
-    // blocks first so only calls in the post-think answer are extracted — the JSON
-    // still streams to the client inline, it is simply never executed.
-    let response_text = strip_think_blocks_keep_layout(response_text);
-    // **Translated before anything looks for a `{`.** After the think-strip
-    // rather than before it, so a call written mid-thought is already gone —
-    // translating first would spend the work rewriting text about to be
-    // discarded, and would put a dispatchable shape into deliberation.
-    let translated = function_blocks_to_json(&response_text, tool_catalog());
-    let response_text = translated.as_deref().unwrap_or(response_text.as_str());
+    let response_text = answer;
     // Strict, well-formed match: <tool_call>...{...}...</tool_call>
     static STRICT_RE: OnceLock<Regex> = OnceLock::new();
     let strict_re = STRICT_RE.get_or_init(|| {
@@ -330,7 +356,7 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
 
     // Pass 1: strict <tool_call>...</tool_call> matches.
     for cap in strict_re.captures_iter(response_text) {
-        let full_end = cap.get(0).map(|m| m.end()).unwrap_or(0);
+        let (full_start, full_end) = cap.get(0).map_or((0, 0), |m| (m.start(), m.end()));
         let json = match cap.get(1) {
             Some(m) => m,
             None => continue,
@@ -338,10 +364,13 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
         if let Ok(raw) = serde_json::from_str::<RawCall>(json.as_str()) {
             if !raw.name.is_empty() {
                 let arguments = raw.args();
-                out.push(ToolCall {
-                    name: raw.name,
-                    arguments,
-                });
+                out.push((
+                    full_start,
+                    ToolCall {
+                        name: raw.name,
+                        arguments,
+                    },
+                ));
             }
         }
         consumed_ends.push(full_end);
@@ -370,10 +399,13 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
         if let Ok(raw) = serde_json::from_str::<RawCall>(json.as_str()) {
             if !raw.name.is_empty() {
                 let arguments = raw.args();
-                out.push(ToolCall {
-                    name: raw.name,
-                    arguments,
-                });
+                out.push((
+                    json.start(),
+                    ToolCall {
+                        name: raw.name,
+                        arguments,
+                    },
+                ));
             }
         }
         consumed_spans.push((json.start(), json.end()));
@@ -400,13 +432,18 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
                 && registry::find(&raw.name).is_some()
             {
                 let arguments = raw.args();
-                out.push(ToolCall {
-                    name: raw.name,
-                    arguments,
-                });
+                out.push((
+                    start,
+                    ToolCall {
+                        name: raw.name,
+                        arguments,
+                    },
+                ));
             }
         }
     }
+    // Stable, so two calls reported at one offset keep their pass order.
+    out.sort_by_key(|&(at, _)| at);
     out
 }
 
@@ -430,6 +467,15 @@ fn tool_catalog() -> &'static [ToolSpec] {
             .map(|d| ToolSpec::from_json_schema(&d.name, &d.parameters))
             .collect()
     })
+}
+
+/// Parse one call object's JSON. `Ok(None)` when it parses but names no tool.
+pub(crate) fn parse_call(json: &str) -> Result<Option<ToolCall>, serde_json::Error> {
+    let raw = serde_json::from_str::<RawCall>(json)?;
+    Ok((!raw.name.is_empty()).then(|| ToolCall {
+        arguments: raw.args(),
+        name: raw.name,
+    }))
 }
 
 #[derive(Deserialize)]

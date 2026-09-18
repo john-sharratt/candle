@@ -73,7 +73,9 @@ pub use tool_call::{
 // character's prompt. Re-exported here rather than making every such caller
 // depend on `candle-transformers` for one enum.
 pub use candle_transformers::models::dialect::CallStyle;
-pub use tree::{FreeTextLimits, FreeTextSpan, NodeId, StencilNode, StencilTree};
+pub use tree::{
+    FreeTextLimits, FreeTextSpan, NodeId, StencilNode, StencilTree, MAX_STRING_VALUE_TOKENS,
+};
 pub use trie::{Step, TokenTrie, TrieNodeId};
 pub use trigger::TriggerRegistry;
 pub use vocab::{HfVocab, TestVocab, TokenId, Vocab};

@@ -489,9 +489,35 @@
           });
         });
       };
+      // A message asking to write a file streams a `write` whose content runs
+      // long — the case the live writing box exists for — then its result.
+      const writeRound = () => {
+        const path = 'docs/redo_log.md';
+        const body = ['# The redo log', '',
+          'Every substrate mutation is appended to one log before it is applied, so a crash',
+          'loses at most the record being written and never a record already acknowledged.', '',
+          '## Records', '',
+          'A record is a type byte, a length, the payload and a Fletcher-32 checksum. The',
+          'reader stops at the first record whose checksum fails and treats it as the tail.', '',
+          '## Segments', '',
+          'The log rolls to a new segment at 64 MiB. Compaction rewrites a closed segment',
+          'without its tombstoned records and swaps it in atomically.', '',
+          '## Recovery', '',
+          'On open the reader replays every segment in order, rebuilding the substrate from',
+          'the records it can verify. A torn tail is truncated, not repaired.'].join('\n');
+        const call = JSON.stringify({ name: 'write', arguments: { path, content: body } });
+        streamText('<tool_call>' + call + '</tool_call>\n\n', () => {
+          if (handlers.onTool) handlers.onTool({ phase: 'running', tools: ['write'] });
+          later(250, () => {
+            if (handlers.onTool) handlers.onTool({ phase: 'done', tools: ['write'], results: [{ path, bytes: body.length }], tokens: [24] });
+            answer();
+          });
+        });
+      };
       later(34, () => {
         handlers.onStatus('');
         if (/\bread\b[\s\S]*\bfile\b/i.test(text || '')) toolRound();
+        else if (/\bwrite\b/i.test(text || '')) writeRound();
         else answer();
       });
       return { cancel: () => { cancelled = true; timers.forEach((t) => { clearInterval(t); clearTimeout(t); }); } };

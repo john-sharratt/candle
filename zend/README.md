@@ -103,6 +103,7 @@ CLI flags (`src/main.rs`, `clap`-derived):
 | `--ingest-dir <layer>=<path>` (repeatable) | Override the content root a derived ingest layer reads from |
 | `--max-depth <N>` | Bound how deep the `repo_map` and `code_reading` layers read, in path components below each layer's content root (`1` = the root's own files, `2` = one folder down, like `find -maxdepth`). Covers the startup ingest, the watcher-driven refresh and the watcher's event filter. Content already ingested from deeper is **frozen**: kept and retrievable, but never re-read and never retired by the deleted-file sweep. Changing or dropping the bound changes the listing of the root and of every folder with subfolders, so those folders are re-summarised once |
 | `--compact-substrate` | Force a whole-store redo-log compaction on load |
+| `--summarize` | Let conversations launch background tree summaries — of every eight turns, of accumulated segments, and at each UTC day boundary. **Off by default**: each summary re-reads its window as a fresh prefill on the same scheduler, ahead of the live turn, so a conversation's next tool round waits behind it |
 | `--wipe-substrate` | **Destructive** — delete `<workspace>/.substrate` before loading |
 | `--model <PRESET>` | Run this model preset, by its variant name (e.g. `Qwen35_0_8B_Q8`, `Qwen38_FlashNext_Q4KO`), instead of choosing one from the card's measured VRAM. A substrate holds one model's K/V, so pair a different model with its own `--working-dir` |
 
