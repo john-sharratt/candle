@@ -139,7 +139,7 @@ fn a_body_that_walks_in_is_told_what_the_room_is() {
     walk(&mut w, "m1", "core");
     let told = narrate(&w, &since(&w, "m1")).expect("it got somewhere");
     assert!(
-        told.contains("The car and the stairwell share one shaft at the corner"),
+        told.contains("The one car serves every level from this corner"),
         "the room said nothing about itself: {told}"
     );
 }
@@ -155,8 +155,8 @@ fn what_the_room_is_comes_after_the_line_saying_you_got_there() {
     walk(&mut w, "m1", "core");
 
     let told = narrate(&w, &since(&w, "m1")).expect("it got somewhere");
-    let arrived = told.find("got to the lift and the stair");
-    let described = told.find("The car and the stairwell");
+    let arrived = told.find("got to the lift");
+    let described = told.find("The one car serves");
     assert!(arrived.is_some() && described.is_some(), "{told}");
     assert!(arrived < described, "{told}");
 }
@@ -192,7 +192,7 @@ fn watching_somebody_else_walk_in_says_nothing_about_the_room() {
 
     let told = narrate(&w, &since(&w, "m1")).expect("somebody came in");
     assert!(
-        !told.contains("The car and the stairwell"),
+        !told.contains("The one car serves"),
         "it described the room to somebody already standing in it: {told}"
     );
 }

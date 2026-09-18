@@ -68,6 +68,7 @@ pub mod mind;
 pub mod mission;
 pub mod mission_acts;
 pub mod mission_api;
+pub mod narration;
 pub mod narrator;
 pub mod perceived;
 pub mod persona;

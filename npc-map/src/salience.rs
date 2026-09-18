@@ -101,6 +101,11 @@ pub fn weight(w: &Witnessed) -> Weight {
         // going are the same kind of event and are worth entirely different
         // amounts, so the thing that knows which it was says so.
         Happening::Stirred { weight, .. } => *weight,
+        // Somebody ran into you as you were both crossing — you stop and deal
+        // with it, the same demand being spoken to makes. A bystander watching
+        // two others collide only looks up.
+        Happening::Bumped { into } if w.reader == *into => Weight::Preempt,
+        Happening::Bumped { .. } => Weight::Wake,
         // Somebody came in. You look up.
         Happening::Arrived => Weight::Wake,
         // Somebody left, or the room's furniture changed state — both of which
@@ -169,6 +174,33 @@ mod tests {
         let seen = since(world, id);
         assert_eq!(seen.len(), 1, "expected exactly one change for {id}");
         weight(&seen[0])
+    }
+
+    /// **A collision is worth a turn to both of them.** The whole point of the
+    /// bump is to break a chase, which it cannot do unless each body stops to
+    /// deal with it — so the mover (its own outcome) and the one run into both
+    /// preempt.
+    #[test]
+    fn a_collision_preempts_both_of_them() {
+        let mut w = vault();
+        w.enter("m1", "Maker-01", at("band-one")).unwrap();
+        w.enter("m2", "Maker-02", at("green-room")).unwrap();
+        w.mark_seen("m1");
+        w.mark_seen("m2");
+        let elsewhere = Where::new("vault-chronicle", "core");
+        w.set_off("m1", elsewhere.clone()).unwrap();
+        w.set_off("m2", elsewhere).unwrap();
+        w.tick();
+        assert_eq!(
+            loudest(&since(&w, "m1")),
+            Some(Weight::Preempt),
+            "the mover must get a turn to react"
+        );
+        assert_eq!(
+            loudest(&since(&w, "m2")),
+            Some(Weight::Preempt),
+            "the one run into must get a turn to react"
+        );
     }
 
     // -- the ladder itself -------------------------------------------------

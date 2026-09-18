@@ -149,6 +149,15 @@ pub enum Availability {
     /// somebody down a voice line, and being invited to is what makes a
     /// character try it.
     PhysicalOnly,
+    /// Only while standing on a lift landing with the car somewhere else — the
+    /// one moment calling it does anything. With the car already open here there
+    /// is nothing to call, so the act is absent and [`Availability::InLift`]'s is
+    /// present instead. See [`crate::engine::lift`].
+    AtLift,
+    /// Only while standing on a landing with the car open at it — you are in the
+    /// lift and can choose a floor. Absent while the car is elsewhere, when there
+    /// is nothing to ride.
+    InLift,
 }
 
 /// One parameter, as the model sees it.
@@ -974,6 +983,10 @@ pub fn for_body(mode: Mode, embodied: bool) -> Vec<&'static Tool> {
             // it walks. The prompt is written once, so this is the situation's
             // to offer — the same reason `Nearby` is absent here.
             Availability::AwayFromHome => false,
+            // Whether you are at the lift, and whether the car is there, are both
+            // facts about where the body is standing this moment — the
+            // situation's to offer, not the prompt's.
+            Availability::AtLift | Availability::InLift => false,
         })
         .collect()
 }
@@ -1223,6 +1236,10 @@ pub enum Choices {
     /// from the branch it is not a mistake available to it — the same move that
     /// killed invented tool names and invented addressees.
     Reachable,
+    /// A floor the lift can carry this body to, by the level's name — never the
+    /// one it is standing on. Bound to `lift_use`, and offered only while the
+    /// body is in the lift (see [`Availability::InLift`]).
+    Floors,
 
     // ---- what a body carries ----
     //
@@ -1451,6 +1468,7 @@ const LIVE: &[(&str, &str, Choices)] = &[
     ("reach_out", "to", Choices::Contacts),
     ("reflect", "feeling", Choices::Feelings),
     ("move_to", "destination", Choices::Reachable),
+    ("lift_use", "floor", Choices::Floors),
     // ---- contact and obligation ----
     ("act", "on", Choices::CompanyOrSelf),
     ("give", "what", Choices::Carried),
@@ -1573,6 +1591,15 @@ pub struct Within {
     /// which are the same answer to the only question it is asked: is there a
     /// journey home to make.
     pub away_from_home: bool,
+    /// Whether this body is standing on a lift landing — where the lift acts can
+    /// be reached. See [`Availability::AtLift`] / [`Availability::InLift`].
+    pub at_lift: bool,
+    /// Whether the car is open at this landing right now, so a body here can step
+    /// in and ride. `false` while the car is away or its doors are shut.
+    pub lift_here: bool,
+    /// The floors the lift can take this body to, by the level's name — never the
+    /// one it is standing on. What [`Choices::Floors`] binds `lift_use` to.
+    pub floors: Vec<String>,
     /// This character's own name, as the world writes it.
     ///
     /// Needed because some live sets are about the *relationship* between this
@@ -1717,6 +1744,11 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
             // The map decides. A station in the room is what puts its acts in
             // reach, and walking out takes them with you.
             Availability::AtPart => within.station.iter().any(|s| s == t.name),
+            // On a landing, calling the car is offered only while it is away;
+            // riding it only while it is open here. The two never overlap, so a
+            // body at the lift is offered exactly one of them.
+            Availability::AtLift => within.at_lift && !within.lift_here,
+            Availability::InLift => within.at_lift && within.lift_here,
         })
         // **An act whose required argument has nothing to choose from is an act
         // that cannot be performed**, so it goes.
@@ -1828,6 +1860,7 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
             who
         }
         Choices::Reachable => within.places.clone(),
+        Choices::Floors => within.floors.clone(),
         Choices::Feelings => within.feelings.clone(),
         Choices::Carried => within.carried.clone(),
         Choices::Equippable => within.equippable.clone(),

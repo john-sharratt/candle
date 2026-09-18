@@ -993,8 +993,8 @@ canvas { width: 100%; display: block; }
   font-weight: 700; color: var(--ink-faint);
 }
 .cast-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
-.cast-card.is-pending   .cast-state { color: var(--info); }
-.cast-card.is-preempted .cast-state { color: var(--warn); }
+.cast-card.is-waiting     .cast-state { color: var(--info); }
+.cast-card.is-interrupted .cast-state { color: var(--warn); }
 .cast-figs {
   display: flex; gap: 11px; flex-wrap: wrap;
   font-family: var(--mono); font-size: .7rem; color: var(--ink-ghost);
@@ -1047,7 +1047,7 @@ canvas { width: 100%; display: block; }
    looks like, and it should not compete with the one preempt among them. */
 .tick.is-quiet { background: var(--bg-deep); }
 .tick.is-quiet .tick-spine { opacity: .4; }
-.tick.is-preempted { border-color: var(--accent-line); }
+.tick.is-interrupted { border-color: var(--accent-line); }
 /* Only genuinely new rows animate, so a poll does not re-animate the page. */
 .tick.is-new { animation: tick-in .26s ease both; }
 @keyframes tick-in { from { opacity: 0; transform: translateY(-4px); } }
@@ -1068,8 +1068,8 @@ canvas { width: 100%; display: block; }
   letter-spacing: .9px; font-weight: 800; color: var(--ink-ghost);
   border: 1px solid var(--line-2); border-radius: 3px; padding: 1px 5px;
 }
-.tick.is-preempted .tick-cause { color: var(--warn); border-color: var(--warn); }
-.tick.is-pending   .tick-cause { color: var(--info); border-color: var(--line-3); }
+.tick.is-interrupted .tick-cause { color: var(--warn); border-color: var(--warn); }
+.tick.is-waiting     .tick-cause { color: var(--info); border-color: var(--line-3); }
 .tick-beat {
   font-family: var(--mono); font-size: .68rem; color: var(--ink-ghost);
   font-variant-numeric: tabular-nums;
@@ -1171,10 +1171,13 @@ canvas { width: 100%; display: block; }
 }
 .act-said { font-size: .78rem; color: var(--ink-faint); line-height: 1.5; }
 .act.refused .act-mark { color: var(--warn); }
-/* A refused act is not a quieter success: the thing it asked for did not
-   happen, so the request reads as struck through rather than merely dim. */
+/* A refused act did not get what it asked for, and the `✗` mark and the world's
+   warn-coloured reply say so. The request itself stays readable — dimmed, not
+   struck through: a line to somebody who has just walked out is a near miss, not
+   a mistake, and striking the words out made the feed read as broken when it was
+   only a body that stepped away. */
 .act.refused .act-intent,
-.act.refused .act-val { color: var(--ink-faint); text-decoration: line-through; }
+.act.refused .act-val { color: var(--ink-faint); }
 .act.refused .act-said { color: var(--warn); }
 .tick-silent {
   margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line-2);

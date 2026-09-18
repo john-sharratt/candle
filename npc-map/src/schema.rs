@@ -83,7 +83,7 @@ impl AreaKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeKind {
-    /// The lift and the stair. Where an area is entered and left.
+    /// The lift. Where an area is entered and left.
     Core,
     /// A corridor. Plumbing: walked through, never gone to.
     Passage,

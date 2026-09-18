@@ -12,7 +12,7 @@ character: >
   A portrait is judged against the ones beside it, so this is the level where
   what everybody else is doing matters most to what you are doing.
 lacks:
-  - way off this level except the lift and the stair
+  - way off this level except the lift
 spine:
   name: the ring
   loop: true
@@ -27,8 +27,8 @@ nodes:
 
   - id: core
     kind: core
-    name: the lift and the stair
-    plural: true
+    name: the lift
+    plural: false
     off: [ring-north]
 
   - id: north-studio

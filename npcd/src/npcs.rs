@@ -868,6 +868,41 @@ impl Npcs {
         Ok(())
     }
 
+    /// Every character record, live and tombstoned, for a backup.
+    ///
+    /// Tombstoned ones travel too, so a restore keeps the whole id-space taken —
+    /// an id that was retired must not be minted again for a different character
+    /// after a wipe-and-restore.
+    pub fn export_all(&self) -> Vec<NpcPayload> {
+        self.by_id.values().cloned().collect()
+    }
+
+    /// Restore backed-up character records into a fresh substrate.
+    ///
+    /// Each payload is written verbatim — its id, owner, revision and last place
+    /// are preserved — so a restored cast is the same characters, only with the
+    /// conversation/belief/dream history the wipe cleared. One fsync covers the
+    /// batch. Returns how many were written.
+    pub fn import(&mut self, payloads: Vec<NpcPayload>) -> Result<usize, NpcError> {
+        {
+            let mut p = self
+                .shared
+                .persistence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for npc in &payloads {
+                p.write_npc(npc)
+                    .map_err(|e| NpcError::Persist(e.to_string()))?;
+            }
+            p.commit().map_err(|e| NpcError::Persist(e.to_string()))?;
+        }
+        let n = payloads.len();
+        for npc in payloads {
+            self.by_id.insert(npc.npc_id, npc);
+        }
+        Ok(n)
+    }
+
     /// Write the record, then update memory — in that order.
     ///
     /// If the append fails the map is untouched, so the daemon's view still

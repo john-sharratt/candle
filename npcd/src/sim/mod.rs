@@ -73,9 +73,11 @@ pub struct Sim {
     #[serde(default)]
     pub missions: Missions,
     /// Whether the command table is open — handing out missions and calling
-    /// characters with none to come and take one. `serde(default)` (false): a
-    /// world loads with the table shut until an operator opens it, and a saved
-    /// world from before the table existed reads as shut, which is correct.
+    /// characters with none to come and take one. The runtime default is set as
+    /// a world is hosted, not here: a fresh world comes up **open** so its cast
+    /// has work, and only an operator's explicit shut (durable, `TABLE_OPEN_KEY`)
+    /// keeps it closed across a reboot — see [`crate::engine::runtime`]'s host
+    /// path. `serde(default)` covers a saved world from before the field existed.
     #[serde(default)]
     pub table_open: bool,
     /// What the world is made of, as the Makers hold it — see [`record`].

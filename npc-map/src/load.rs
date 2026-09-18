@@ -151,7 +151,7 @@ impl MapSet {
     ///
     /// 1. **What the area says**, if it names an arrival. Nothing beats being
     ///    told.
-    /// 2. **A core, in this area or under it** — the lift and the stair, which
+    /// 2. **A core, in this area or under it** — the lift, which
     ///    is what a core *is*: the way in. Validation already walks from a core
     ///    to prove a level is reachable, so a body starting anywhere else could
     ///    begin somewhere the map has never checked leads anywhere.

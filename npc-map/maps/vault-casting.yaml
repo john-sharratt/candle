@@ -11,7 +11,7 @@ character: >
   The busiest level in the vault, and the one the standing orders send the
   whole crew to most often.
 lacks:
-  - way off this level except the lift and the stair
+  - way off this level except the lift
 spine:
   name: the ring
   loop: true
@@ -26,8 +26,8 @@ nodes:
 
   - id: core
     kind: core
-    name: the lift and the stair
-    plural: true
+    name: the lift
+    plural: false
     off: [ring-north]
 
   - id: band-one

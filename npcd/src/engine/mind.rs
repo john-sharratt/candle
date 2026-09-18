@@ -59,7 +59,7 @@ use candle_conversation::stencil::{
     ToolCallEnvelope,
 };
 use candle_conversation::{
-    ConversationEngine, SamplingConfig, SelectionState, Sequence, SequenceConfig, TurnOptions,
+    ConversationEngine, SamplingConfig, Sequence, SequenceConfig, TurnOptions,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -69,6 +69,7 @@ use crate::engine::dreams;
 use crate::engine::event::Event;
 use crate::engine::identity;
 use crate::engine::layers;
+use crate::engine::narration;
 use crate::engine::narrator;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::reflect;
@@ -108,12 +109,6 @@ const META_FRAME: &str = "frame_sha256";
 /// A character's live conversation.
 struct Live {
     sequence: Sequence,
-    /// The character's narrator thread — forked from the shared base, projection
-    /// off, a short window. Each tick's events are decoded through this into the
-    /// third-person prose the character actually reads, in place of the raw event
-    /// concatenation. Its lifecycle matches [`Self::sequence`]: opened beside it,
-    /// rolled over with it, tombstoned with it. See [`crate::engine::narrator`].
-    narrator: Sequence,
     /// The day this conversation belongs to. A mismatch against the world's day
     /// is what triggers the roll-over.
     day: u64,
@@ -197,12 +192,6 @@ pub struct Minds {
     /// Each conversation behind its own async lock, so a decode holds only the
     /// character that is thinking — see the module's *Locking* note.
     live: Mutex<HashMap<u64, Arc<ConversationLock<Live>>>>,
-    /// The one narrator conversation every character's narrator thread forks
-    /// from. Created once, on first use, holding only [`crate::engine::narrator::SYSTEM`]
-    /// and nothing else — so that prefix is prefilled a single time and its K/V
-    /// is shared across every fork. Never decoded on itself; it exists only to be
-    /// forked. `None` until the first character opens its conversation.
-    narrator_base: Mutex<Option<Sequence>>,
     /// How many turns stay verbatim in the redo log, or `None` to keep them all.
     ///
     /// **Off unless the projection asks for it**, because most conversations are
@@ -437,17 +426,13 @@ impl Minds {
                 .sampling
                 .apply_think_mode(ThinkMode::Off, e.tokenizer(), max);
         }
-        // **A cast is not an assistant, and the architecture default is tuned
-        // for one.** A character handed a situation much like the last one lands
-        // on the same act out of a narrow nucleus, and did: one said the same
-        // thing, word for word, for a hundred turns, and on the card's think-off
-        // row another walked between two rooms twenty times without answering
-        // the question in front of it. So the think-off row is widened to
-        // `1.0 / 0.95`, and the repetition load moves onto DRY and a cross-turn
-        // penalty. Set on the row rather than on the temperature, so the
-        // per-turn switch in [`Self::sampling_for`] still picks it — see
-        // [`SamplingConfig::for_character_dialogue`].
-        base_config.sampling = base_config.sampling.for_character_dialogue();
+        // The cast decodes on the checkpoint's own published sampling. An earlier
+        // "character dialogue" tuning widened the think-off row and layered on
+        // DRY, presence and a cross-turn penalty to fight repetition from the
+        // sampler; it read as stilted on every prose path that borrowed it (the
+        // narrator among them, whose first token it occasionally misfired) and
+        // never reliably did its job. Repetition is the loop guard's to break, at
+        // the grammar, where a repeated act is struck from the turn's own stencil.
         // Compiled at boot for the empty room, which proves the catalog builds
         // at all and warms the cache for the commonest case. A checkpoint whose
         // tokenizer lacks the markers yields nothing and turns free-decode
@@ -511,7 +496,6 @@ impl Minds {
             grammar_ok: ok,
             projection: RwLock::new(None),
             live: Mutex::new(HashMap::new()),
-            narrator_base: Mutex::new(None),
             keep_turns: None,
             reflection: None,
         }
@@ -800,11 +784,8 @@ impl Minds {
     /// **Each think mode has its own temperature and nucleus**, and the dial
     /// picks one per turn: the reasoning row for a mission that raises it, the
     /// cast's think-off row for [`identity::Deliberation::None`], which is what
-    /// almost every turn runs. For this checkpoint the two rows differ: the
-    /// preset runs both at `0.7 / 0.95`, and
-    /// [`SamplingConfig::for_character_dialogue`] widens the cast's think-off
-    /// row to `1.0 / 0.95` — so a character decodes hotter on an ordinary turn
-    /// than when a mission has it reason.
+    /// almost every turn runs. The cast decodes on the checkpoint's own
+    /// published rows — the daemon no longer retunes the sampling per role.
     ///
     /// The two paths that decide a turn — the probe and the live act — both
     /// come through here, which is what keeps them from drifting.
@@ -837,92 +818,6 @@ impl Minds {
         })
     }
 
-    /// Fork a fresh narrator thread for a character, creating the shared base on
-    /// first use.
-    ///
-    /// The base holds only [`narrator::SYSTEM`] and is never decoded on, so that
-    /// prefix is prefilled once and every fork shares its K/V — the whole of the
-    /// narrator's cost after the first is the short per-tick decode. A fork
-    /// carries the base's short window and, because it is a plain
-    /// [`ConversationEngine::new_conversation`], no projection: a narrator
-    /// gathers nothing.
-    ///
-    /// Tagged with a derived `narrator-<id>-day-<n>` conv id so its stale
-    /// generations are retired by the same prefix sweep as the action
-    /// conversation — see [`retire_superseded`]. It is not rejoined across a
-    /// restart: the narration is derived prose, cheaply rebuilt from a fresh
-    /// window, so a restart simply starts a new thread.
-    fn open_narrator(&self, npc_id: u64, day: u64) -> anyhow::Result<Sequence> {
-        // The base lock is held only to create-if-needed and fork; priming (a
-        // blocking seal) happens on the fork after it is released, so one
-        // character's open does not queue the whole cast's behind it.
-        let mut fork = {
-            let mut base = self.narrator_base.lock().unwrap();
-            if base.is_none() {
-                let mut cfg = self.base_config.clone();
-                cfg.context_window_turns = narrator::WINDOW_TURNS;
-                let seq = self
-                    .engine
-                    .lock()
-                    .unwrap()
-                    .new_conversation(narrator::SYSTEM, cfg)?;
-                *base = Some(seq);
-            }
-            base.as_ref().expect("just created").fork()?
-        };
-        let id = format!("narrator-{npc_id}-day-{day}");
-        if let Err(e) = self
-            .engine
-            .lock()
-            .unwrap()
-            .set_conversation_conv_id(fork.timeline_id(), &id)
-        {
-            tracing::warn!(
-                "narrator {id} could not be named in the log: {e:?} — its stale generations may \
-                 not be retired"
-            );
-        }
-        // **Prime the thread with worked exchanges.** A freshly-forked thread
-        // holds only the system prefix, and the model's first decode on it
-        // sometimes echoes its own input turn instead of narrating it. Prefilled
-        // examples (input, then its narration) give the first real decode a
-        // precedent to follow — no decode here, both sides are given. Two shapes
-        // are primed: a scene turn, and an own-act turn (whose actor is the
-        // focal character), so both the perception and the act-outcome decodes
-        // land on a precedent rather than a cold start.
-        for (user, assistant) in [
-            (narrator::PRIME_INPUT, narrator::PRIME_NARRATION),
-            (narrator::PRIME_ACT_INPUT, narrator::PRIME_ACT_NARRATION),
-        ] {
-            let handle = fork.submit_prefilled_turn(
-                user,
-                assistant,
-                "\u{0}\u{0}",
-                SelectionState::new(),
-                Vec::new(),
-            )?;
-            let primed = handle.wait()?;
-            fork.finish_turn(handle, &primed)?;
-        }
-        Ok(fork)
-    }
-
-    /// The turn options for a narrator decode: capped short, no grammar (free
-    /// prose), and prefilled with the dialect's closed no-think block so the
-    /// narration is not preceded — or replaced — by a reasoning block. Without
-    /// this the model opens `<think>` on its own and sometimes reasons about the
-    /// task there, and that reasoning becomes the character's perception. The
-    /// prefill rides back at the head of the decode, so [`narrator::strip_reasoning`]
-    /// removes it before the prose is used.
-    fn narrator_options(&self) -> TurnOptions {
-        TurnOptions {
-            max_tokens: Some(narrator::MAX_TOKENS),
-            sampling: Some(self.base_config.sampling.clone()),
-            assistant_prefill: Some(self.base_config.dialect.no_think_block.to_string()),
-            ..Default::default()
-        }
-    }
-
     /// Narrate the character's **own** act, for the tool response it reads back
     /// and the feed the GUI shows — in place of the bare confirmation the world
     /// gives an intent-carrying act ("You tell Pax."). Only the acts
@@ -937,13 +832,15 @@ impl Minds {
         npc_id: u64,
         persona: &Persona<'_>,
         act: &act::Act,
+        departing: bool,
     ) -> anyhow::Result<Option<String>> {
-        let Some(line) = own_act_line(act) else {
+        let Some(line) = own_act_line(act, departing) else {
             return Ok(None);
         };
-        let Some(live) = self.live.lock().unwrap().get(&npc_id).map(Arc::clone) else {
+        // A character the daemon no longer holds narrates nothing.
+        if self.live.lock().unwrap().get(&npc_id).is_none() {
             return Ok(None);
-        };
+        }
         // Whoever the act is aimed at, so the narration has them present.
         let near: Vec<String> = ["to", "on"]
             .iter()
@@ -956,14 +853,7 @@ impl Minds {
             &near,
             &line,
         );
-        let raw = {
-            let mut live = live.lock().await;
-            live.narrator
-                .send_turn_with_options_async(&turn, self.narrator_options())
-                .await?
-                .text
-        };
-        let narration = narrator::strip_reasoning(&raw);
+        let narration = narration::render(&turn);
         Ok((!narration.is_empty()).then_some(narration))
     }
 
@@ -1335,7 +1225,6 @@ impl Minds {
         if let Some((sequence, watermark)) = rejoined {
             return Ok(Live {
                 sequence,
-                narrator: self.open_narrator(npc_id, day)?,
                 day,
                 id,
                 // Not zero: a conversation this deep has already retired its
@@ -1402,7 +1291,6 @@ impl Minds {
         }
         Ok(Live {
             sequence,
-            narrator: self.open_narrator(npc_id, day)?,
             day,
             id,
             retired_through: 0,
@@ -1575,14 +1463,7 @@ impl Minds {
                 &within.company,
                 events,
             ) {
-                Some(turn) => {
-                    let raw = live
-                        .narrator
-                        .send_turn_with_options_async(&turn, self.narrator_options())
-                        .await?
-                        .text;
-                    narrator::strip_reasoning(&raw)
-                }
+                Some(turn) => narration::render(&turn),
                 None => String::new(),
             };
             let narration = narration.trim().to_string();
@@ -1868,11 +1749,6 @@ fn retire(engine: &Arc<Mutex<ConversationEngine>>, l: &Live) {
             l.id
         ),
     }
-    // The narrator thread rides with the conversation it narrates: tombstoned
-    // beside it so its derived prose does not outlive the day it belonged to.
-    if let Err(e) = engine.tombstone_timeline(l.narrator.timeline_id()) {
-        tracing::warn!("narrator for {} could not be tombstoned: {e:?}", l.id);
-    }
 }
 
 /// What the character reads this tick: the answers to what it did, then what
@@ -1922,10 +1798,10 @@ fn retire(engine: &Arc<Mutex<ConversationEngine>>, l: &Live) {
 /// The one-line description of a character's own act for the narrator, or `None`
 /// when the act carries no intent to render.
 ///
-/// The actor is the focal character, so it opens with `you —` and the
-/// [`narrator::SYSTEM`] person rule renders "You tell Pax that …". The verb
+/// The actor is the focal character, so it opens with `you —` and
+/// [`narration::render`] turns that into "You tell Pax that …". The verb
 /// names the act and its target; the intent is the substance to voice.
-fn own_act_line(act: &act::Act) -> Option<String> {
+fn own_act_line(act: &act::Act, departing: bool) -> Option<String> {
     let arg = |k: &str| {
         act.args
             .get(k)
@@ -1946,6 +1822,14 @@ fn own_act_line(act: &act::Act) -> Option<String> {
         },
         "act" => format!("act on {}", to.unwrap_or("yourself")),
         other => other.to_string(),
+    };
+    // A line called after somebody leaving carries a marker the narrator turns
+    // into the parting frame ("As X walks away, you tell them …"). It is a
+    // prefix on the relation so the verb and target parse unchanged after it.
+    let verb = if departing {
+        format!("(leaving) {verb}")
+    } else {
+        verb
     };
     Some(format!("you — {verb} — meaning: \"{intent}\""))
 }

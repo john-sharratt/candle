@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use web::auth::session::Identity;
 
+use candle_conversation::persistence::record::NpcPayload;
 use web::auth::{Role, Roles};
 
 use crate::accounts::{self, Accounts, NameError, PatchError};
@@ -348,6 +349,11 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         // bar; *ownership* is the rest of the answer and is checked per-record
         // in the handler, because a role cannot express "yours" (§8.2).
         .route("/v1/npc", Role::User, get(list_npcs).post(create_npc))
+        // Backup and restore the whole cast, for a substrate wipe-and-rebuild.
+        // Admin-only: export carries every character's record regardless of
+        // owner, and import writes them verbatim into a fresh substrate.
+        .route("/v1/npcs/export", Role::Admin, get(export_npcs))
+        .route("/v1/npcs/import", Role::Admin, post(import_npcs))
         .route(
             "/v1/npc/:nid",
             Role::User,
@@ -520,6 +526,39 @@ pub(crate) fn npc_err(e: NpcError) -> Response {
 }
 
 /// The caller's characters. No total is returned — see §8.3.
+/// `GET /v1/npcs/export` — the whole cast as records, for a backup.
+///
+/// Every character, live and tombstoned, so a restore into a fresh substrate
+/// brings the cast back with its ids intact. Admin-only and owner-blind: this
+/// is an operator backup of the entire deployment, not a per-account listing.
+async fn export_npcs(State(s): State<Arc<Authored>>) -> Response {
+    let npcs = s.npcs.read().await.export_all();
+    Json(json!({ "count": npcs.len(), "npcs": npcs })).into_response()
+}
+
+/// `POST /v1/npcs/import` — restore backed-up character records.
+///
+/// Body is `{"npcs": [<record>, …]}` from [`export_npcs`]. Each record is
+/// written verbatim (id, owner, revision, last place preserved). The characters
+/// come back on the next daemon start, which loads them from the log and spawns
+/// their loops — the ordinary boot path, so nothing here needs to embody them.
+async fn import_npcs(State(s): State<Arc<Authored>>, Json(body): Json<Value>) -> Response {
+    let payloads: Vec<NpcPayload> =
+        match serde_json::from_value(body.get("npcs").cloned().unwrap_or(Value::Null)) {
+            Ok(v) => v,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("bad npcs payload: {e}")).into_response()
+            }
+        };
+    match s.npcs.write().await.import(payloads) {
+        Ok(n) => Json(json!({ "imported": n })).into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "npc import failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "import failed").into_response()
+        }
+    }
+}
+
 async fn list_npcs(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
@@ -3162,6 +3201,10 @@ mod tests {
                 ("/v1/schema/layers", "user"),
                 // The cast: signed in, then ownership per record.
                 ("/v1/npc", "user"),
+                // The whole cast in and out as records, for backup/restore —
+                // `admin`, a full-estate read and a bulk write.
+                ("/v1/npcs/export", "admin"),
+                ("/v1/npcs/import", "admin"),
                 ("/v1/npc/:nid", "user"),
                 ("/v1/npc/:nid/tags", "user"),
                 ("/v1/npc/:nid/hidden", "user"),

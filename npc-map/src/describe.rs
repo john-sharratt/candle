@@ -240,7 +240,7 @@ pub fn building(set: &MapSet, id: &str, known: &Known) -> String {
     out
 }
 
-/// "X is a building of six levels, joined by a lift and a stair."
+/// "X is a building of six levels, joined by a lift."
 ///
 /// The count comes from what the reader actually knows, not from what exists,
 /// so an NPC that has learned two levels is told about two.
@@ -263,7 +263,7 @@ fn building_head(area: &Area, children: &[&Area]) -> String {
     s
 }
 
-/// "Every level is entered at the same place: the lift and the stair."
+/// "Every level is entered at the same place: the lift."
 ///
 /// Only said when it is true — every portal in the building landing on a node
 /// with one id. It is the most useful navigational fact about a building of

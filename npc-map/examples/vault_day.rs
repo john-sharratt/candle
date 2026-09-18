@@ -65,12 +65,13 @@ fn main() -> Result<()> {
     show(&w, "m5", "AND FROM THE CORRIDOR, WHICH HEARD NONE OF IT");
     show(&w, "m3", "AT THE WATCH, WHICH SEES NEITHER ROOM");
 
-    // Maker-05 starts the long walk upstairs, gets one room into it, and is
-    // called back to where orders are given instead. Both halves of that reach
-    // it as events, because by now neither is something it already knew.
+    // Maker-05 starts the long walk round the ring to the relations table, gets
+    // one room into it, and is called back to the terminals instead. Both halves
+    // of that reach it as events, because by now neither is something it already
+    // knew. (A level is only left by the lift now, never on foot.)
     w.mark_seen("m5");
-    let stops = w.set_off("m5", Where::new("vault-command", "command-room"))?;
-    println!("\n\n[Maker-05 sets off for the command room: {stops} stops]");
+    let stops = w.set_off("m5", casting("relations"))?;
+    println!("\n\n[Maker-05 sets off for the relations table: {stops} stops]");
     w.tick();
     show(&w, "m5", "ONE STOP INTO A LONG WALK");
 

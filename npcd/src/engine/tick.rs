@@ -135,10 +135,14 @@ pub enum Readiness {
     /// Its doc named a heartbeat too. There is no heartbeat: a character with an
     /// empty inbox is waiting on the world, not on a clock.
     Quiet,
-    /// Events waiting; will tick at its scheduled moment.
-    Pending,
-    /// A high-salience arrival is forcing a tick now.
-    Preempted,
+    /// Events are waiting, and the character will think about them at its next
+    /// scheduled beat — the ordinary way a tick comes due. Not stuck: simply
+    /// waiting for its beat.
+    Waiting,
+    /// A high-salience arrival — usually being spoken to — is interrupting the
+    /// schedule to force a tick right now. From the character's side it has been
+    /// interrupted, which is what the name reads as.
+    Interrupted,
 }
 
 /// One character's loop state.
@@ -361,11 +365,11 @@ impl Inbox {
 
     pub fn readiness(&self) -> Readiness {
         if self.preempted {
-            Readiness::Preempted
+            Readiness::Interrupted
         } else if self.queue.is_empty() {
             Readiness::Quiet
         } else {
-            Readiness::Pending
+            Readiness::Waiting
         }
     }
 
@@ -1196,7 +1200,7 @@ mod tests {
     ///    as "an entry is standing in the heap") suppressed every future push.
     ///
     /// From there the character is unschedulable for the life of the daemon:
-    /// events accumulate, `readiness` reports `Preempted`, and nothing runs it.
+    /// events accumulate, `readiness` reports `Interrupted`, and nothing runs it.
     /// Measured on the live daemon — three characters wedged inside a minute,
     /// inboxes past sixty, and an URGENT broadcast could not move them.
     #[test]
@@ -1349,12 +1353,12 @@ mod tests {
         s.wake(1, 0, 0);
         assert_eq!(s.census()[0].readiness, Readiness::Quiet);
         s.deliver(1, 0, Salience::NORMAL, say("a noise"));
-        assert_eq!(s.census()[0].readiness, Readiness::Pending);
+        assert_eq!(s.census()[0].readiness, Readiness::Waiting);
     }
 
     /// **The tick must record why it ran, not what it looks like afterwards.**
-    /// `drain` clears the preempt flag, so reading readiness after it reports
-    /// `Blocked` for every tick — and the Pulse feed's cause column, the one
+    /// `drain` clears the interrupt flag, so reading readiness after it reports
+    /// `Quiet` for every tick — and the Pulse feed's cause column, the one
     /// thing that says why a character woke, silently becomes a constant.
     #[test]
     fn a_ticks_recorded_cause_is_its_state_before_the_drain() {
@@ -1362,11 +1366,11 @@ mod tests {
         s.wake(1, 0, 0);
         s.deliver(1, 0, Salience::URGENT, say("a bolt"));
         let rec = s.tick(1, 0, 0, |_, _| vec![]).expect("ticked");
-        assert_eq!(rec.cause, Readiness::Preempted);
+        assert_eq!(rec.cause, Readiness::Interrupted);
 
         s.deliver(1, 0, Salience::NORMAL, say("footsteps"));
         let rec = s.tick(1, 0, 0, |_, _| vec![]).expect("ticked");
-        assert_eq!(rec.cause, Readiness::Pending);
+        assert_eq!(rec.cause, Readiness::Waiting);
     }
 
     /// A high-salience arrival forces a tick now rather than waiting for the
@@ -1377,7 +1381,7 @@ mod tests {
         s.wake(1, 10_000, 0);
         assert!(!s.is_due(1, 10_000), "not due yet");
         s.deliver(1, 0, Salience::URGENT, say("the beam gives"));
-        assert_eq!(s.census()[0].readiness, Readiness::Preempted);
+        assert_eq!(s.census()[0].readiness, Readiness::Interrupted);
         assert!(s.is_due(1, 10_000));
     }
 
@@ -1416,7 +1420,7 @@ mod tests {
         s.wake(1, 0, 0);
         s.deliver(1, 0, Salience::NORMAL, say("a rumour"));
         assert_eq!(s.census()[0].inbox_depth, 1);
-        assert_eq!(s.census()[0].readiness, Readiness::Pending);
+        assert_eq!(s.census()[0].readiness, Readiness::Waiting);
     }
 
     /// A busy character drains everything at once — one better-informed step,

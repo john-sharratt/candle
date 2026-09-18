@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use futures::executor::block_on;
 use tokio::sync::oneshot;
 
+use candle_conversation::persistence::record::CustomObjectPayload;
 use candle_conversation::persistence::SharedSubstrate;
 use candle_conversation::projection::{Builder, ProjectionEvent, SelectionState};
 use candle_conversation::{
@@ -133,6 +134,9 @@ pub struct Recorded {
     /// What decides whether a `reflect` goes on to a reflection: one the world
     /// refused was not a character stopping to think.
     pub landed: bool,
+    /// Whether the act was a line called after somebody leaving the room, so the
+    /// narration voices the parting rather than a word spoken face to face.
+    pub departing: bool,
 }
 
 /// What a turn with a reflection in it still owes, held until the reflection's
@@ -493,12 +497,22 @@ pub const NO_MISSION: &str = "Nothing has been asked of you, and you are on your
 /// the lesson [`IN_COMPANY`] records. The loud call that reaches a character
 /// mid-conversation is the tannoy the table's opening sends; this is what keeps
 /// drawing one that has drifted, and what a character reads on its way.
+/// Substrate key for the durable command-table open flag — see
+/// [`Runtime::set_table_open`], which writes it, and [`Runtime::host`], which
+/// reads it back as a world loads. One key for the daemon: `set_table_open`
+/// drives every loaded world identically, so the flag is a single daemon-wide
+/// state rather than per-world.
+pub const TABLE_OPEN_KEY: &str = "command-table";
+
 pub const TO_THE_TABLE: &str =
     "The command table is open and there is work waiting for you. Leave off \
-     whatever you are doing or saying and go to it now: `move_to` the command \
-     room. This comes before talk — do not answer the room, go. Once you are \
-     there, at the table, take up a mission with `collect_mission`; carry it \
-     out, and when it is done come back to the table and take up the next.";
+     whatever you are doing or saying and go to it now. The table is in the \
+     command room, on the command level: if you are on another floor, go to the \
+     lift, call it with `lift_call`, ride it to the command level with \
+     `lift_use`, and then `move_to` the command room — you cannot walk between \
+     floors. This comes before talk — do not answer the room, go. Once \
+     you are there, at the table, take up a mission with `collect_mission`; carry \
+     it out, and when it is done come back to the table and take up the next.";
 
 /// The summons for a character that is **already at the table** with no mission.
 ///
@@ -667,6 +681,25 @@ impl Runtime {
             anyhow::bail!("no async runtime to beat `{id}`'s metronome on");
         };
         let world = self.hosted.load(id, dir)?;
+        // **The command table opens by default.** A world that hands out no
+        // missions leaves its whole cast with nothing asked of it, drifting — so
+        // a fresh world comes up open and its characters take up work. The one
+        // exception is a world an operator has explicitly shut: that choice is
+        // durable (`TABLE_OPEN_KEY`) and survives a reboot, so a stood-down cast
+        // stays stood down. Absent the flag — a new world, or one from before it
+        // existed — the table is open. See [`Self::set_table_open`].
+        let open = self
+            .substrate
+            .read()
+            .unwrap()
+            .clone()
+            .and_then(|shared| {
+                shared
+                    .custom_object(TABLE_OPEN_KEY)
+                    .and_then(|obj| obj.blob.get("open").and_then(|v| v.as_bool()))
+            })
+            .unwrap_or(true);
+        world.with_sim(|s| s.table_open = open);
         let back = Arc::downgrade(self);
         let name = id.to_string();
         let moving = world.clone();
@@ -937,10 +970,22 @@ impl Runtime {
     /// The state the standing task ([`TO_THE_TABLE`]) and `collect_mission` read.
     /// Opening it does not itself call anyone — [`Self::call_to_table`] sends the
     /// tannoy and the chat-channel line that do.
+    ///
+    /// The flag is durable: it is written to the substrate as a `CustomObject`
+    /// under [`TABLE_OPEN_KEY`] so a reboot restores it. The sim itself is in-RAM
+    /// and rebuilt each boot, so without this the table shut on every restart and
+    /// the missions stopped flowing until someone re-opened it. A world hosted
+    /// after a reboot reads the flag back as it loads — see [`Self::host`].
     pub fn set_table_open(&self, open: bool) {
         for id in self.hosted.ids() {
             if let Some(hosted) = self.hosted.get(&id) {
                 hosted.with_sim(|s| s.table_open = open);
+            }
+        }
+        if let Some(shared) = self.substrate.read().unwrap().clone() {
+            let obj = CustomObjectPayload::new(TABLE_OPEN_KEY, serde_json::json!({ "open": open }));
+            if let Err(e) = shared.put_custom_object(obj) {
+                tracing::warn!("persisting command-table state failed: {e}");
             }
         }
     }
@@ -1008,8 +1053,17 @@ impl Runtime {
                 .map(|a| a.name.clone())
                 .collect()
         });
+        // The lift, from where this body stands: whether it is on a landing,
+        // whether the car is open there, and the floors it could ride to. What
+        // `lift_call` / `lift_use` are gated on, and what the ride binds to — one
+        // read, from [`World::lift_within`], so the situation and the grammar
+        // cannot disagree about it.
+        let (at_lift, lift_here, floors) = hosted.read(|w| w.lift_within(&body));
         let base = tools::Within {
             company,
+            at_lift,
+            lift_here,
+            floors,
             // Never where it stands — see [`body::reachable`]. Walking to your
             // own room was refused, and refusal is not a lesson.
             places: body::reachable(&hosted, &body),
@@ -1448,9 +1502,14 @@ impl Runtime {
         // exactly those marks to set each part in its own face
         // (`pulse.js::splitAct`), which is why they are single characters with
         // spaces around them and not words.
+        let departing = outcome.departing();
         let feed = match outcome {
             Outcome::Refused(why) => format!("{} {REFUSED} {why}", act.summary()),
-            Outcome::Did(line) => format!("{} {LANDED} {line}", act.summary()),
+            // A landed act — spoken here or called after somebody leaving —
+            // reads `tool — what was asked → what came of it`.
+            Outcome::Did(line) | Outcome::Departed(line) => {
+                format!("{} {LANDED} {line}", act.summary())
+            }
             // Nothing in a world happened, so there is nothing to arrow to.
             Outcome::NotOfTheBody => act.summary(),
         };
@@ -1458,6 +1517,7 @@ impl Runtime {
             feed,
             answer,
             landed,
+            departing,
         }
     }
 
@@ -3599,7 +3659,10 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                                 let (feed, answer) = if r.landed
                                     && crate::engine::tools::narrates(a.tool)
                                 {
-                                    match minds.narrate_act(id, &p.as_persona(), a).await {
+                                    match minds
+                                        .narrate_act(id, &p.as_persona(), a, r.departing)
+                                        .await
+                                    {
                                         Ok(Some(n)) => (format!("{} {LANDED} {n}", a.summary()), n),
                                         _ => (r.feed, r.answer),
                                     }
@@ -4740,6 +4803,9 @@ mod tests {
         rt.scheduler.wake(1, 0, 0);
         rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
             .unwrap();
+        // The command table opens by default now; shut it to read the
+        // no-mission-no-table standing task this test is about.
+        rt.set_table_open(false);
 
         let nudge = rt.nudge_for(1).expect("something to be getting on with");
         assert_eq!(nudge, NO_MISSION);
@@ -4756,6 +4822,20 @@ mod tests {
         }
     }
 
+    /// **A fresh world opens the command table by default.** A world that hands
+    /// out no missions leaves its whole cast with nothing asked of it; so an
+    /// untouched world comes up open, and an idle character with no mission is
+    /// pointed at the table rather than left to drift. (Shutting it is durable
+    /// and an operator's to do — see [`Self::host`].)
+    #[tokio::test]
+    async fn a_fresh_world_opens_the_command_table_by_default() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        // Nobody has touched the table; its default is open, so a free character
+        // out in the wing is called to make its way to it.
+        assert_eq!(rt.nudge_for(1).as_deref(), Some(TO_THE_TABLE));
+    }
+
     /// **Company changes the standing task.** Told to go somewhere new every
     /// quiet turn, two characters explored a seventy-eight room building and
     /// never held a conversation: each moved every four seconds, so sharing a
@@ -4764,6 +4844,9 @@ mod tests {
     async fn a_character_that_is_not_alone_is_told_to_stay_and_talk() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
+        // Shut the (now default-open) table so company, not the table, is what
+        // changes the standing task here.
+        rt.set_table_open(false);
         assert_eq!(rt.nudge_for(1).as_deref(), Some(NO_MISSION));
 
         // Somebody walks in, and what there is to do changes with them.
@@ -4826,6 +4909,9 @@ mod tests {
         use crate::engine::mission::{Mission, Origin, Todo};
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
+        // Shut the (now default-open) table so "no mission" reads as the
+        // NO_MISSION default rather than a call to the table.
+        rt.set_table_open(false);
         // No mission yet: the default stands.
         assert_eq!(rt.nudge_for(1).as_deref(), Some(NO_MISSION));
 
@@ -4900,7 +4986,9 @@ mod tests {
         // Out in the wing, away from the table.
         embody(&rt, 1, "m1", "green-room");
 
-        // Shut table: nothing to be summoned to.
+        // Shut table: nothing to be summoned to. (The default is open, so this
+        // shuts it first to exercise the closed→open transition.)
+        rt.set_table_open(false);
         assert_eq!(rt.table_summons(1), None, "the table is not open");
 
         // Opened: now it is called to the command room.
@@ -5086,6 +5174,9 @@ mod tests {
         let rt = vaulted();
         embody(&rt, 1, "m1", "band-one");
         embody(&rt, 2, "m2", "ring-north");
+        // Shut the (now default-open) table so the standing task reflects
+        // company (there is none here), not a call to the table.
+        rt.set_table_open(false);
         assert_eq!(rt.nudge_for(1).as_deref(), Some(NO_MISSION));
     }
 

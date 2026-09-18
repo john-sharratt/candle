@@ -92,10 +92,14 @@ fn offered(h: &Hosted, body: &str) -> Vec<String> {
             .map(|a| a.name.clone())
             .collect()
     });
+    let (at_lift, lift_here, floors) = lift_within(h, body);
     let within = Within {
         company,
         places: npcd::engine::body::reachable(h, body),
         me: h.read(|w| w.actor(body).map(|a| a.name.clone()).unwrap_or_default()),
+        at_lift,
+        lift_here,
+        floors,
         ..Default::default()
     };
     let within = h.sim(|s| within.from_sim(s, body, &place));
@@ -103,6 +107,14 @@ fn offered(h: &Hosted, body: &str) -> Vec<String> {
         .into_iter()
         .map(|t| t.name)
         .collect()
+}
+
+/// The lift half of what a body's grammar is built from — whether it is at a
+/// landing, whether the car is open there, and the floors it could ride to.
+/// Drives the very computation `engine::runtime::within` uses ([`World::lift_within`]),
+/// so these `Runtime`-less tests cannot pass against a stale mirror of it.
+fn lift_within(h: &Hosted, body: &str) -> (bool, bool, Vec<String>) {
+    h.read(|w| w.lift_within(body))
 }
 
 /// The values an argument admits, here. `None` when the act is not offered at
@@ -116,10 +128,14 @@ fn admits(h: &Hosted, body: &str, tool: &str, param: &str) -> Option<Vec<String>
             .map(|a| a.name.clone())
             .collect()
     });
+    let (at_lift, lift_here, floors) = lift_within(h, body);
     let within = Within {
         company,
         places: npcd::engine::body::reachable(h, body),
         me: h.read(|w| w.actor(body).map(|a| a.name.clone()).unwrap_or_default()),
+        at_lift,
+        lift_here,
+        floors,
         ..Default::default()
     };
     let within = h.sim(|s| within.from_sim(s, body, &place));

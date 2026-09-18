@@ -243,6 +243,12 @@ fn legible(reach: Reach, what: &Happening, reader: &str) -> Option<Happening> {
                 voice: Voice::Shouted,
                 ..
             } => Some(what.clone()),
+            // An aimed line called after somebody as they leave carries one room
+            // — to the one it was aimed at, and to nobody else. Everybody in the
+            // room the speaker is in still hears it (that is `Reach::Here`); a
+            // bystander one doorway away, who is not who it was for, does not.
+            // This is the reciprocal of [`crate::world::World::call_after`].
+            Happening::Said { to: Some(t), .. } if t == reader => Some(what.clone()),
             Happening::Said { .. } => None,
             // A building noise belongs to the room it happened in. Carrying it
             // through a doorway would put the same fan, the same rat and the
@@ -480,6 +486,18 @@ fn verb_phrase(world: &World, w: &Witnessed, named: &mut BTreeSet<String>) -> Op
         Happening::LostTheWay { toward, why } => {
             format!("never got to {}, {why}", place_of(world, toward))
         }
+        // A collision reads three ways, like an utterance: your own doing, a
+        // thing done to you, or a thing watched between two others. "While
+        // travelling" says why it happened — you were both on your way and ran
+        // into each other — and it is the same clause each way so the stop reads
+        // as mutual.
+        Happening::Bumped { into } if w.mine() => {
+            format!("bump into {} while travelling", who(world, into))
+        }
+        Happening::Bumped { into } if w.reader == *into => "bumps into you while travelling".into(),
+        Happening::Bumped { into } => {
+            format!("bumps into {} while travelling", who(world, into))
+        }
         // Never reached: `narrate` takes a stirring out before it gets here,
         // because a sentence with no actor cannot be a clause in a run that is
         // grouped by actor. Classified rather than wildcarded so a new
@@ -645,6 +663,119 @@ mod tests {
         assert!(
             told.contains("shouted") && told.contains("the lift is not safe"),
             "{told}"
+        );
+    }
+
+    /// **A line called after somebody leaving reaches them one room away — and
+    /// only them.** An ordinary word does not carry between rooms, but a line
+    /// aimed at the one person who has just stepped out does: it is the parting
+    /// word thrown after them. A bystander standing in the room they walked into,
+    /// who the line was not for, hears nothing of it — the aim is the whole of
+    /// what carries.
+    #[test]
+    fn a_line_called_after_someone_leaving_reaches_only_them() {
+        let mut w = vault();
+        // The two are together in band-one; the addressee then walks out to
+        // ring-north (which can see into band-one), the whole move settling as a
+        // real journey — so it arrives with `walk` cleared, exactly the everyday
+        // state a reply has to catch. A third body already in ring-north is who
+        // the line is NOT for.
+        w.enter("m1", "Maker-01", casting("band-one")).unwrap();
+        w.enter("m2", "Maker-02", casting("band-one")).unwrap();
+        w.enter("m3", "Maker-03", casting("ring-north")).unwrap();
+        w.mark_seen("m2");
+        w.mark_seen("m3");
+        w.set_off("m2", casting("ring-north")).unwrap();
+        w.settle();
+        assert!(
+            w.actor("m2").unwrap().walk.is_none(),
+            "the walk must have finished — the reply has to catch the arrived state"
+        );
+
+        assert_eq!(
+            w.within_earshot("m1", "Maker-02"),
+            Some("m2".to_string()),
+            "the walker who just stepped out is who a call-after resolves to"
+        );
+        w.call_after("m1", "m2", "take the north stair", Voice::Said)
+            .unwrap();
+
+        // The one it was called after hears it, from the room they left — the
+        // aimed line reaches them across the doorway, and not as an in-room word
+        // (`here` is false: it carried from the speaker's room, not theirs).
+        let heard = since(&w, "m2");
+        let line = heard
+            .iter()
+            .find(|s| matches!(&s.what, Happening::Said { .. }))
+            .expect("the addressee did not hear the line called after them");
+        assert!(
+            matches!(
+                &line.what,
+                Happening::Said { to: Some(t), words, .. }
+                    if t == "m2" && words == "take the north stair"
+            ) && !line.here,
+            "the called-after line was wrong or read as in-room: {line:?}"
+        );
+
+        // A bystander in the walker's room, who the line was not for, hears none
+        // of it — an aimed line at a distance carries only to its addressee.
+        let bystander = since(&w, "m3");
+        assert!(
+            !bystander
+                .iter()
+                .any(|s| matches!(&s.what, Happening::Said { .. })),
+            "a bystander overheard a line aimed at someone else across a room: {bystander:?}"
+        );
+    }
+
+    /// `within_earshot` resolves *only* the one who has stepped out: a body
+    /// still in the room with the speaker is `here_by_name`'s to answer for, not
+    /// this, and a name nobody answers to resolves to nobody. (That the
+    /// addressee was in the room a moment ago is the grammar's guarantee — `to`
+    /// is bound to the room's company — so the world does not re-derive it.)
+    #[test]
+    fn within_earshot_is_the_leaver_only_never_here_and_never_nobody() {
+        let mut w = vault();
+        w.enter("m1", "Maker-01", casting("band-one")).unwrap();
+        w.enter("m2", "Maker-02", casting("band-one")).unwrap();
+        assert_eq!(
+            w.within_earshot("m1", "Maker-02"),
+            None,
+            "somebody still in the room is not called after — that is `here_by_name`"
+        );
+        assert_eq!(
+            w.within_earshot("m1", "Nobody At All"),
+            None,
+            "a name nobody answers to resolves to nobody"
+        );
+        assert!(w.call_after("m1", "m2", "wait", Voice::Said).is_err());
+    }
+
+    /// **A collision reads as a bump from both sides.** The mover reads it as
+    /// their own doing ("you bump into …"); the one run into reads it as done to
+    /// them ("… bumps into you"). Both learn of it, so a chase that has kept them
+    /// apart finally puts a moment in front of each of them.
+    #[test]
+    fn a_collision_reads_as_a_bump_from_both_sides() {
+        let mut w = vault();
+        w.enter("m1", "Maker-01", casting("band-one")).unwrap();
+        w.enter("m2", "Maker-02", casting("green-room")).unwrap();
+        w.mark_seen("m1");
+        w.mark_seen("m2");
+        let elsewhere = Where::new("vault-chronicle", "core");
+        w.set_off("m1", elsewhere.clone()).unwrap();
+        w.set_off("m2", elsewhere).unwrap();
+        w.tick();
+
+        let m1 = narrate(&w, &since(&w, "m1")).expect("m1 made something out");
+        assert!(
+            m1.contains("You bump into Maker-02") && m1.contains("while travelling"),
+            "{m1}"
+        );
+        let m2 = narrate(&w, &since(&w, "m2")).expect("m2 made something out");
+        assert!(
+            m2.contains("Maker-01 bumps into you") && m2.contains("while travelling"),
+            "{m2}"
         );
     }
 

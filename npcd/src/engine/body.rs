@@ -36,7 +36,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
 
-use npc_map::world::{Refused, Where};
+use npc_map::world::{Refused, Voice, Where};
 
 use crate::engine::act::Act;
 use crate::world::Hosted;
@@ -46,6 +46,11 @@ use crate::world::Hosted;
 pub enum Outcome {
     /// It happened. Carries how it reads back to the character.
     Did(String),
+    /// It happened, and it was a line called after somebody as they walked out
+    /// of the room — a landed act like [`Outcome::Did`], marked apart only so
+    /// the narration voices the parting ("as they walk away") rather than an
+    /// ordinary word spoken face to face.
+    Departed(String),
     /// The world would not have it, and why — in the character's own second
     /// person, because it is going to read this.
     Refused(String),
@@ -56,13 +61,18 @@ pub enum Outcome {
 
 impl Outcome {
     pub fn happened(&self) -> bool {
-        matches!(self, Outcome::Did(_))
+        matches!(self, Outcome::Did(_) | Outcome::Departed(_))
+    }
+
+    /// Whether the act was a line called after somebody leaving the room.
+    pub fn departing(&self) -> bool {
+        matches!(self, Outcome::Departed(_))
     }
 
     /// The line the character reads, if there is one.
     pub fn line(&self) -> Option<&str> {
         match self {
-            Outcome::Did(s) | Outcome::Refused(s) => Some(s),
+            Outcome::Did(s) | Outcome::Departed(s) | Outcome::Refused(s) => Some(s),
             Outcome::NotOfTheBody => None,
         }
     }
@@ -216,6 +226,20 @@ fn ask(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         };
     };
     let Some(id) = here_by_name(hosted, body, &to) else {
+        // Not in the room. If they have just stepped out and are still within
+        // earshot, the question is called after them rather than lost — the same
+        // parting-line exception `tell` and `whisper` make below.
+        if let Some(id) = hosted.read(|w| w.within_earshot(body, &to)) {
+            return match hosted
+                .with(|w| w.call_after(body, &id, format!("asking {about}"), Voice::Said))
+            {
+                Ok(()) => {
+                    hosted.with_sim(|s| s.ledger.asked(body, &id, &about));
+                    Outcome::Departed(format!("You call after {to}, asking as they go."))
+                }
+                Err(why) => Outcome::Refused(refusal(hosted, &why)),
+            };
+        }
         return Outcome::Refused(format!("{to} is not here. {}", who_is_here(hosted, body)));
     };
     match hosted.with(|w| w.tell(body, &id, format!("asking {about}"))) {
@@ -301,6 +325,17 @@ fn tell(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     // Addressed by the name the character knows them by, resolved against who
     // is actually here. A name it cannot see is not a name it can speak to.
     let Some(id) = here_by_name(hosted, body, &to) else {
+        // Just stepped out and still within earshot: call the line after them
+        // rather than lose it. See [`npc_map::world::World::call_after`].
+        if let Some(id) = hosted.read(|w| w.within_earshot(body, &to)) {
+            return match hosted.with(|w| w.call_after(body, &id, intent.clone(), Voice::Said)) {
+                Ok(()) => {
+                    hosted.with_sim(|s| s.ledger.answered(body, &id));
+                    Outcome::Departed(format!("You tell {to} as they walk away."))
+                }
+                Err(why) => Outcome::Refused(refusal(hosted, &why)),
+            };
+        }
         return Outcome::Refused(format!("{to} is not here. {}", who_is_here(hosted, body)));
     };
     match hosted.with(|w| w.tell(body, &id, intent.clone())) {
@@ -329,6 +364,18 @@ fn whisper(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         return Outcome::Refused("You meant to whisper to somebody, but not to whom.".into());
     };
     let Some(id) = here_by_name(hosted, body, &to) else {
+        // Just stepped out and still within earshot: the line goes after them,
+        // low, meant only for them. See [`npc_map::world::World::call_after`].
+        if let Some(id) = hosted.read(|w| w.within_earshot(body, &to)) {
+            return match hosted.with(|w| w.call_after(body, &id, intent.clone(), Voice::Whispered))
+            {
+                Ok(()) => {
+                    hosted.with_sim(|s| s.ledger.answered(body, &id));
+                    Outcome::Departed(format!("You whisper to {to} as they walk away."))
+                }
+                Err(why) => Outcome::Refused(refusal(hosted, &why)),
+            };
+        }
         return Outcome::Refused(format!("{to} is not here. {}", who_is_here(hosted, body)));
     };
     match hosted.with(|w| w.whisper(body, &id, intent.clone())) {
@@ -383,6 +430,22 @@ fn move_to(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
             return Outcome::Refused(format!(
                 "{thing} is here with you, but it is a thing rather than somewhere to go, so \
                  there is nowhere to walk to. You are already beside it."
+            ));
+        }
+        // **Another level is reached by the lift, not on foot.** A body cannot
+        // walk between floors — naming a level to `move_to` is the old instant
+        // stair, gone now — so a level is refused with the way that does work:
+        // go to the lift and ride it.
+        if hosted.read(|w| {
+            let here = w.actor(body).map(|a| a.at.clone());
+            w.map().areas().any(|a| {
+                a.kind == npc_map::AreaKind::Level
+                    && here.as_ref().map(|h| h.area.as_str()) != Some(a.id.as_str())
+                    && (a.id.eq_ignore_ascii_case(want.trim()) || bare(&a.name) == bare(&want))
+            })
+        }) {
+            return Outcome::Refused(format!(
+                "You cannot walk to {want} — it is another level. Go to the lift and ride it there."
             ));
         }
         // Naming what *is* reachable, because a refusal that only says no
@@ -499,8 +562,16 @@ pub fn destinations(hosted: &Hosted, body: &str) -> Vec<(String, Where)> {
             .collect();
 
         let mut out: Vec<(String, Where)> = Vec::new();
-        // The rooms off this level. Passages are how you get between them
-        // rather than somewhere to be, so they are not destinations.
+        // The rooms off this level, the lift's landing (`core`) among them.
+        // Passages are how you get between them rather than somewhere to be, so
+        // they are not destinations.
+        //
+        // **Only this level.** Walking between floors is not a thing a body does
+        // — the way up and down is the lift, so another level is reached by going
+        // to the lift and riding it (`lift_call` / `lift_use`), not by naming it
+        // to `move_to`. Offering a level here is what let the cast cross floors
+        // instantly by the stair and never touch the lift; a level named to
+        // `move_to` anyway is refused with that instruction (see [`move_to`]).
         if let Some(area) = w.map().get(&here.area) {
             for node in &area.nodes {
                 let place = Where::new(here.area.clone(), node.id.clone());
@@ -509,20 +580,6 @@ pub fn destinations(hosted: &Hosted, body: &str) -> Vec<(String, Where)> {
                 }
                 out.push((node.name.clone(), place));
             }
-        }
-        // The other levels, each by the way in. Without these the answer to "I
-        // want the chronicle" is a list with no chronicle in it.
-        for area in w.map().areas() {
-            if area.id == here.area || area.nodes.is_empty() {
-                continue;
-            }
-            let Some(way_in) = w.map().arrival_in(&area.id) else {
-                continue;
-            };
-            if !open.contains(&way_in) {
-                continue;
-            }
-            out.push((area.name.clone(), way_in));
         }
 
         // One name, one place. First mention wins, so a room on this level
@@ -555,17 +612,18 @@ fn rooms_on_this_level(hosted: &Hosted, body: &str) -> String {
             .map(|n| n.name.clone())
             .collect()
     });
-    // The levels too, because a character that asked for somewhere off this
-    // floor is told what floors there are rather than only what is on this one
-    // — otherwise the answer to "I want the chronicle" is a list that does not
-    // contain the chronicle.
+    // The other levels are named as what they are — reached by the lift, not on
+    // foot — so a character that asked for one is pointed at the way that works
+    // rather than left to guess a room name it will not find.
     let levels: Vec<String> = hosted.read(|w| {
         let Some(here) = w.actor(body).map(|a| a.at.clone()) else {
             return Vec::new();
         };
         w.map()
             .areas()
-            .filter(|a| !a.nodes.is_empty() && a.id != here.area)
+            .filter(|a| {
+                !a.nodes.is_empty() && a.id != here.area && a.kind == npc_map::AreaKind::Level
+            })
             .map(|a| a.name.clone())
             .collect()
     });
@@ -576,7 +634,7 @@ fn rooms_on_this_level(hosted: &Hosted, body: &str) -> String {
     };
     if !levels.is_empty() {
         said.push_str(&format!(
-            " Elsewhere in the building: {}.",
+            " Other levels — {} — are reached by the lift, not on foot.",
             npc_map::text::list(&levels)
         ));
     }
@@ -666,45 +724,25 @@ fn place_by_name(hosted: &Hosted, body: &str, want: &str) -> Option<Where> {
             return Some(here);
         }
 
-        // Everywhere else there is a way to. The grammar names only this
-        // level's rooms and the other levels, because a list of sixty is a list
-        // nobody reads — but a character whose memory named a corridor, or a
-        // room three floors up, should not be told the place does not exist.
-        // Anything unreachable stays absent, which is the half that matters.
+        // Anywhere on *this level* the memory named that the grammar's short
+        // list left out — a corridor, a room by an id rather than its name.
+        //
+        // **Only this level.** Walking between floors is gone: the way up and
+        // down is the lift, so a room three floors up, or another level by name,
+        // is not something `move_to` resolves — it is refused with the lift as
+        // the way (see [`move_to`]). Resolving it here would be the instant stair
+        // by another door.
         let open: BTreeSet<Where> = npc_map::route::reachable_from(w.map(), &here)
             .into_iter()
             .collect();
-        // **This level before anywhere else.** Every level has a north run, and
-        // asking for it from the casting floor must not send a body to the
-        // chronicle's. The offered list above already reads this way — it is
-        // built from this area first — and the fallback has to agree with it or
-        // the two orders differ for exactly the names the grammar left out.
-        let find_in = |area: &str| -> Option<Where> {
-            let a = w.map().get(area)?;
-            a.nodes
-                .iter()
-                .map(|n| (n, Where::new(area.to_string(), n.id.clone())))
-                .find(|(n, place)| {
-                    open.contains(place) && (named(&n.name) || n.id.eq_ignore_ascii_case(want))
-                })
-                .map(|(_, place)| place)
-        };
-        if let Some(near) = find_in(&here.area) {
-            return Some(near);
-        }
-        let ids: Vec<String> = w.map().areas().map(|a| a.id.clone()).collect();
-        if let Some(far) = ids.iter().find_map(|id| find_in(id)) {
-            return Some(far);
-        }
-
-        // And a level is somewhere to go. The memory names levels as well as
-        // rooms — "Level 2, the chronicle" — so asking for the chronicle means
-        // the floor, and the way in is the way in.
-        w.map()
-            .areas()
-            .find(|a| a.id.eq_ignore_ascii_case(want) || bare(&a.name) == asked)
-            .and_then(|a| w.map().arrival_in(&a.id))
-            .filter(|way_in| open.contains(way_in))
+        let a = w.map().get(&here.area)?;
+        a.nodes
+            .iter()
+            .map(|n| (n, Where::new(here.area.clone(), n.id.clone())))
+            .find(|(n, place)| {
+                open.contains(place) && (named(&n.name) || n.id.eq_ignore_ascii_case(want))
+            })
+            .map(|(_, place)| place)
     })
 }
 
@@ -966,6 +1004,200 @@ mod tests {
         );
     }
 
+    /// Two together in a room; one walks out and its whole journey settles (so
+    /// it arrives with `walk` cleared, the everyday state); then the one left
+    /// behind speaks. This drives the *real* movement path — enter together,
+    /// `set_off`, `settle` — rather than a hand-frozen mid-walk, because the
+    /// frozen state is not the one a reply actually meets.
+    fn one_walks_out() -> Hosted {
+        let h = vault();
+        h.with(|w| {
+            w.enter("m1", "Maker-01", at("band-one")).unwrap();
+            w.enter("m2", "Maker-02", at("band-one")).unwrap();
+            w.set_off("m2", at("ring-north")).unwrap();
+            w.settle();
+            assert!(
+                w.actor("m2").unwrap().walk.is_none(),
+                "the walk must have finished for this to be the everyday case"
+            );
+        });
+        h.delta("m1");
+        h.delta("m2");
+        h
+    }
+
+    fn heard_words(h: &Hosted, id: &str, needle: &str) -> bool {
+        h.peek(id).events.iter().any(|e| {
+            e.addressed()
+                && matches!(&e.what, npc_map::world::Happening::Said { words, .. }
+                    if words.contains(needle))
+        })
+    }
+
+    /// **A tell is called after somebody who has just walked out.** The moving
+    /// cast means the person you are answering is often one doorway away by the
+    /// time your turn comes round; the line goes after them rather than being
+    /// refused, and reads back as a parting word.
+    #[test]
+    fn a_tell_is_called_after_somebody_who_just_walked_out() {
+        let h = one_walks_out();
+        let out = perform(
+            &h,
+            "m1",
+            &act(
+                "tell",
+                json!({"to": "Maker-02", "intent": "that the record still holds"}),
+            ),
+        );
+        assert!(
+            out.departing(),
+            "a line after a leaver is a departing act: {out:?}"
+        );
+        assert!(
+            out.line().unwrap().contains("as they walk away"),
+            "the reply back does not read as a parting word: {out:?}"
+        );
+        assert!(
+            heard_words(&h, "m2", "record still holds"),
+            "the walker did not hear the tell called after them"
+        );
+    }
+
+    /// A question, too, is called after a leaver — a different code path
+    /// (`asking …`, the question ledger) than `tell`.
+    #[test]
+    fn an_ask_is_called_after_somebody_who_just_walked_out() {
+        let h = one_walks_out();
+        let out = perform(
+            &h,
+            "m1",
+            &act(
+                "ask",
+                json!({"to": "Maker-02", "about": "whether the gap has widened"}),
+            ),
+        );
+        assert!(out.departing(), "{out:?}");
+        assert!(
+            heard_words(&h, "m2", "whether the gap has widened"),
+            "the walker did not hear the question called after them"
+        );
+    }
+
+    /// A whisper called after a leaver still carries its full words to the one
+    /// it is for — low, but heard, because it is aimed only at them.
+    #[test]
+    fn a_whisper_is_called_after_somebody_who_just_walked_out() {
+        let h = one_walks_out();
+        let out = perform(
+            &h,
+            "m1",
+            &act(
+                "whisper",
+                json!({"to": "Maker-02", "intent": "that I do not trust the record"}),
+            ),
+        );
+        assert!(out.departing(), "{out:?}");
+        assert!(
+            heard_words(&h, "m2", "do not trust the record"),
+            "the walker did not hear the whisper called after them"
+        );
+    }
+
+    /// **The whole lift flow through the act layer**: stand at the shaft, call
+    /// the car, ride it, and be set down on the level you chose. This drives the
+    /// tools the way a character does — `lift_call` then `lift_use` — not the
+    /// world methods directly.
+    #[test]
+    fn a_character_calls_and_rides_the_lift_between_levels() {
+        let h = vault();
+        let shaft: Vec<Where> = h.read(|w| w.shaft().to_vec());
+        assert!(shaft.len() >= 2, "the vault has a shaft");
+        let (from, dest) = (shaft.len() - 1, 0);
+        h.with(|w| {
+            w.enter("m1", "Maker-01", shaft[from].clone()).unwrap();
+        });
+        h.delta("m1");
+
+        // Call it — it is not on our floor.
+        assert!(
+            perform(&h, "m1", &act("lift_call", json!({}))).happened(),
+            "the call was refused"
+        );
+        for _ in 0..80 {
+            if h.read(|w| w.lift().unwrap().boardable_at(from)) {
+                break;
+            }
+            h.with(|w| {
+                w.tick();
+            });
+        }
+        assert!(
+            h.read(|w| w.lift().unwrap().boardable_at(from)),
+            "the car never arrived"
+        );
+
+        // Ride it, by the level's name.
+        let dest_name = h.read(|w| w.floor_name(dest).unwrap().to_string());
+        let out = perform(&h, "m1", &act("lift_use", json!({ "floor": dest_name })));
+        assert!(out.happened(), "the ride was refused: {out:?}");
+
+        let dest_core = shaft[dest].clone();
+        for _ in 0..80 {
+            if h.read(|w| w.actor("m1").unwrap().at.clone()) == dest_core {
+                break;
+            }
+            h.with(|w| {
+                w.tick();
+            });
+        }
+        assert_eq!(
+            h.read(|w| w.actor("m1").unwrap().at.clone()),
+            dest_core,
+            "the rider was not set down on the level they chose"
+        );
+    }
+
+    /// Riding the lift from off the shaft, or with the car away, is refused with
+    /// something to do about it — the paths the grammar's conditional offering
+    /// does not already prevent (the API, an unarmed decode).
+    #[test]
+    fn the_lift_refuses_when_you_are_not_in_it() {
+        let h = vault();
+        // Standing in an ordinary room, not at the shaft.
+        h.with(|w| {
+            w.enter("m1", "Maker-01", at("green-room")).unwrap();
+        });
+        h.delta("m1");
+        let call = perform(&h, "m1", &act("lift_call", json!({})));
+        assert!(!call.happened(), "{call:?}");
+        assert!(call.line().unwrap().contains("not at the lift"), "{call:?}");
+        let ride = perform(
+            &h,
+            "m1",
+            &act("lift_use", json!({"floor": "the chronicle level"})),
+        );
+        assert!(!ride.happened(), "{ride:?}");
+    }
+
+    /// Somebody genuinely gone — not one doorway away, not walking — is still
+    /// refused, and the refusal still names who is here to speak to instead.
+    #[test]
+    fn a_reply_to_somebody_genuinely_gone_is_still_refused() {
+        let h = room();
+        let out = perform(
+            &h,
+            "m1",
+            &act(
+                "tell",
+                json!({"to": "Maker-09", "intent": "that the record still holds"}),
+            ),
+        );
+        let Outcome::Refused(said) = out else {
+            panic!("a line to an absent, non-leaving addressee was not refused");
+        };
+        assert!(said.contains("Maker-09 is not here"), "{said}");
+    }
+
     #[test]
     fn a_whisper_needs_somebody_here_to_hear_it() {
         let h = room();
@@ -1066,16 +1298,21 @@ mod tests {
         assert!(h.read(|w| w.actor("m1").unwrap().walk.is_some()));
     }
 
+    /// **A place on another level cannot be walked to.** Once the stair went,
+    /// crossing floors is the lift's job — so a room on another level is refused
+    /// (it is not somewhere a body can set off for), and the refusal points at
+    /// the way that does work.
     #[test]
-    fn a_place_on_another_level_says_what_it_will_cost() {
+    fn a_place_on_another_level_cannot_be_walked_to() {
         let h = room();
         let out = perform(
             &h,
             "m1",
             &act("move_to", json!({"destination": "the command room"})),
         );
-        let line = out.line().unwrap();
-        assert!(line.contains("3 stops"), "{line}");
+        assert!(!out.happened(), "walked to another level: {out:?}");
+        assert!(out.line().unwrap().contains("lift"), "{out:?}");
+        assert!(h.read(|w| w.actor("m1").unwrap().walk.is_none()));
     }
 
     #[test]
@@ -1405,13 +1642,14 @@ mod tests {
         assert_eq!(toward, at("ring-north"));
     }
 
-    /// **A level is somewhere to go.** The memory names levels as well as
-    /// rooms, so a character reading it asks for "the chronicle" — meaning the
-    /// floor. Refusing that refuses the map's own vocabulary, and it is what a
-    /// Maker actually did: thirty attempts an hour at a name printed in its own
-    /// memory, every one of them turned down.
+    /// **A level cannot be walked to, by any name the memory prints for it.**
+    /// The memory names levels as well as rooms — "the chronicle", "the chronicle
+    /// level", "chronicle", the id — so a character reading it may ask for any of
+    /// them. With the stair gone, every spelling is refused with the way that
+    /// does work: the lift. (This is the mirror of the old behaviour, where each
+    /// of these walked there instantly.)
     #[test]
-    fn a_level_can_be_walked_to_by_the_name_the_memory_prints() {
+    fn a_level_is_not_walkable_by_any_name_and_points_at_the_lift() {
         for named in [
             "the chronicle",
             "the chronicle level",
@@ -1420,9 +1658,17 @@ mod tests {
         ] {
             let h = room();
             let out = perform(&h, "m1", &act("move_to", json!({ "destination": named })));
-            assert!(out.happened(), "`{named}` was refused: {out:?}");
-            let toward = h.read(|w| w.actor("m1").unwrap().walk.as_ref().unwrap().toward.clone());
-            assert_eq!(toward.area, "vault-chronicle", "`{named}` went elsewhere");
+            let Outcome::Refused(said) = out else {
+                panic!("`{named}` was walked to instead of refused: {out:?}");
+            };
+            assert!(
+                said.contains("another level") && said.contains("lift"),
+                "`{named}`: {said}"
+            );
+            assert!(
+                h.read(|w| w.actor("m1").unwrap().walk.is_none()),
+                "`{named}` set a body walking between floors"
+            );
         }
     }
 
@@ -1441,9 +1687,10 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_names_the_levels_as_well_as_the_rooms() {
-        // Otherwise the answer to "I want the chronicle" is a list that does
-        // not contain the chronicle.
+    fn a_refusal_names_the_levels_and_points_at_the_lift() {
+        // A lost character is told the other levels exist — so the answer to "I
+        // want the chronicle" is not a list without the chronicle in it — and, now
+        // that walking between floors is gone, that they are reached by the lift.
         let h = room();
         let out = perform(
             &h,
@@ -1451,8 +1698,28 @@ mod tests {
             &act("move_to", json!({"destination": "the observatory"})),
         );
         let line = out.line().unwrap();
-        assert!(line.contains("Elsewhere in the building"), "{line}");
         assert!(line.contains("chronicle"), "{line}");
+        assert!(line.contains("reached by the lift"), "{line}");
+    }
+
+    /// **A level cannot be walked to — it is the lift's to reach.** Naming a
+    /// level to `move_to` (the old instant stair) is refused with the way that
+    /// does work.
+    #[test]
+    fn move_to_a_level_is_refused_and_points_at_the_lift() {
+        let h = room();
+        let out = perform(
+            &h,
+            "m1",
+            &act("move_to", json!({"destination": "the chronicle level"})),
+        );
+        let Outcome::Refused(said) = out else {
+            panic!("walking to a level was not refused: {out:?}");
+        };
+        assert!(said.contains("another level"), "{said}");
+        assert!(said.contains("lift"), "{said}");
+        // And it did not set off anywhere.
+        assert!(h.read(|w| w.actor("m1").unwrap().walk.is_none()));
     }
 
     #[test]

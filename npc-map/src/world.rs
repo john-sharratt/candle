@@ -56,14 +56,16 @@
 //! The exception, [`World::teleport`], goes to exactly one place in the
 //! building and goes there instantly. Everything else is walked.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
+use crate::lift::{Lift, Moment};
 use crate::load::MapSet;
 use crate::part::PartKind;
 use crate::route;
 use crate::salience::Weight;
-use crate::schema::Node;
+use crate::schema::{AreaKind, Node, NodeKind};
+use crate::witness::{Reach, Scope};
 
 pub use crate::schema::Where;
 
@@ -212,6 +214,17 @@ pub enum Happening {
         toward: Where,
         why: Lost,
     },
+    /// Two bodies travelling crossed paths and stopped — a collision at a shared
+    /// doorway or lift that ends both journeys where they met. `into` is the id
+    /// of the other body. Unlike a journey's other outcomes it is **not**
+    /// private: the one bumped into is standing right there and knows it
+    /// happened, and a bystander sees two people run into each other. It is an
+    /// outcome all the same — the walker is told, because a collision it did not
+    /// plan is news — which is why it rides the `is_outcome` gate without the
+    /// `is_private` one.
+    Bumped {
+        into: String,
+    },
     /// A station lit up. The subject is carried but is only *shown* to
     /// somebody in the same room.
     TookStation {
@@ -283,13 +296,21 @@ impl Happening {
     pub fn is_outcome(&self) -> bool {
         matches!(
             self,
-            Happening::GotThere { .. } | Happening::LostTheWay { .. }
+            Happening::GotThere { .. } | Happening::LostTheWay { .. } | Happening::Bumped { .. }
         )
     }
 
     /// Whether this happened inside one body and is visible to nobody else.
+    ///
+    /// The journey internals are — where a body meant to go, and its own sense of
+    /// having got there or given up. A [`Happening::Bumped`] is an outcome but
+    /// **not** private: it is a collision two bodies share, so the private set is
+    /// listed rather than derived from [`Self::is_outcome`].
     pub fn is_private(&self) -> bool {
-        self.is_outcome() || matches!(self, Happening::SetOut { .. })
+        matches!(
+            self,
+            Happening::SetOut { .. } | Happening::GotThere { .. } | Happening::LostTheWay { .. }
+        )
     }
 }
 
@@ -450,16 +471,229 @@ pub struct World {
     names: BTreeMap<String, String>,
     log: Vec<Event>,
     now: Tick,
+    /// The building's one lift, and the landings it serves. `shaft[i]` is the
+    /// core of floor `i`, in level order (bottom to top by `ordinal`); the lift
+    /// is `None` in a world with fewer than two floors to join. See
+    /// [`crate::lift`].
+    lift: Option<Lift>,
+    shaft: Vec<Where>,
+    /// Who is riding, and the floor each is bound for. They come off at their
+    /// floor when the car opens there.
+    riders: BTreeMap<String, usize>,
 }
 
 impl World {
     pub fn new(map: MapSet) -> World {
+        let shaft = Self::build_shaft(&map);
+        // The car starts at the floor the building says a body arrives on, so
+        // the first Maker down finds it waiting rather than having to call it up
+        // from somewhere. Falls back to the bottom of the shaft.
+        let start = map
+            .arrival()
+            .and_then(|at| shaft.iter().position(|c| c.area == at.area))
+            .unwrap_or(0);
+        let lift = (shaft.len() >= 2).then(|| Lift::new(shaft.len(), start));
         World {
             map,
             actors: BTreeMap::new(),
             names: BTreeMap::new(),
             log: Vec::new(),
             now: 0,
+            lift,
+            shaft,
+            riders: BTreeMap::new(),
+        }
+    }
+
+    /// The cores of the building's levels, bottom to top by `ordinal` — the
+    /// landings the lift stops at, one per floor. Everything the lift needs to
+    /// know about the map is captured here once, so the car itself stays a plain
+    /// state machine that knows only floor indices.
+    fn build_shaft(map: &MapSet) -> Vec<Where> {
+        let mut levels: Vec<&crate::schema::Area> =
+            map.areas().filter(|a| a.kind == AreaKind::Level).collect();
+        levels.sort_by_key(|a| a.ordinal.unwrap_or(u32::MAX));
+        levels
+            .into_iter()
+            .filter_map(|a| {
+                a.nodes
+                    .iter()
+                    .find(|n| n.kind == NodeKind::Core)
+                    .map(|n| Where::new(a.id.clone(), n.id.clone()))
+            })
+            .collect()
+    }
+
+    /// The building's lift, if it has one.
+    pub fn lift(&self) -> Option<&Lift> {
+        self.lift.as_ref()
+    }
+
+    /// The landings the lift serves, floor by floor (each level's core).
+    pub fn shaft(&self) -> &[Where] {
+        &self.shaft
+    }
+
+    /// Which floor a place is on — the shaft index of its level — if the lift
+    /// serves that level.
+    pub fn floor_of(&self, place: &Where) -> Option<usize> {
+        self.shaft.iter().position(|c| c.area == place.area)
+    }
+
+    /// The floor whose landing a body is standing on, if it is on one — where it
+    /// can call or board the lift. `None` when the body is not at a lift core.
+    pub fn at_landing(&self, id: &str) -> Option<usize> {
+        let at = &self.actor(id)?.at;
+        self.shaft.iter().position(|c| c == at)
+    }
+
+    /// The floor a body is riding to, if it has boarded and not yet been set down.
+    /// A rider waits on its origin landing until the car opens at this floor (see
+    /// [`World::ride_lift`]); until then it has already chosen, so it is neither
+    /// offered the lift again nor told the car has left without it.
+    pub fn riding(&self, id: &str) -> Option<usize> {
+        self.riders.get(id).copied()
+    }
+
+    /// The lift facts a tool grammar is gated on, for the body `id`, in one pass:
+    /// whether it stands on a landing (`lift_call`/`lift_use` are possible at
+    /// all), whether the car is open there (ready to board), and the other levels
+    /// it could ride to. A body already aboard is offered nothing — it has chosen
+    /// and is waiting — so all three come back empty for it.
+    ///
+    /// The single source for this, so the situation the character is shown and the
+    /// grammar it is masked to cannot compute it two different ways.
+    pub fn lift_within(&self, id: &str) -> (bool, bool, Vec<String>) {
+        if self.riding(id).is_some() {
+            return (false, false, Vec::new());
+        }
+        let Some(here) = self.at_landing(id) else {
+            return (false, false, Vec::new());
+        };
+        let lift_here = self.lift.as_ref().is_some_and(|l| l.boardable_at(here));
+        let floors = self
+            .floor_names()
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| *i != here)
+            .map(|(_, n)| n)
+            .collect();
+        (true, lift_here, floors)
+    }
+
+    /// The level id of floor `i`, for naming a floor in prose.
+    pub fn floor_area(&self, floor: usize) -> Option<&str> {
+        self.shaft.get(floor).map(|c| c.area.as_str())
+    }
+
+    /// The name of floor `i`'s level — "the chronicle level" — as a rider would
+    /// say it.
+    pub fn floor_name(&self, floor: usize) -> Option<&str> {
+        let area = &self.shaft.get(floor)?.area;
+        self.map.get(area).map(|a| a.name.as_str())
+    }
+
+    /// The floor a level name picks out, matched case-insensitively — the mirror
+    /// of [`World::floor_name`], for turning a rider's chosen level back into a
+    /// shaft index.
+    pub fn floor_named(&self, name: &str) -> Option<usize> {
+        let want = name.trim();
+        (0..self.shaft.len()).find(|&i| {
+            self.floor_name(i)
+                .is_some_and(|n| n.eq_ignore_ascii_case(want))
+        })
+    }
+
+    /// Every floor's level name, in shaft order — the set `lift_use` binds its
+    /// `floor` to. The caller drops the one the rider is on.
+    pub fn floor_names(&self) -> Vec<String> {
+        (0..self.shaft.len())
+            .filter_map(|i| self.floor_name(i).map(str::to_string))
+            .collect()
+    }
+
+    /// Call the car to `floor`. A no-op in a world with no lift, or for a floor
+    /// off the end of the shaft.
+    pub fn call_lift(&mut self, floor: usize) {
+        if let Some(lift) = self.lift.as_mut() {
+            lift.call(floor);
+        }
+    }
+
+    /// Board `rider` into the car and send it to `dest`; the rider comes off
+    /// there when the doors open. `false` — refused — when the rider is not on a
+    /// landing with the car open at it, there is no lift, or `dest` is off the
+    /// shaft. The rider stays on its landing until the car reaches `dest`, so a
+    /// body waiting with it is company until then.
+    pub fn ride_lift(&mut self, rider: &str, dest: usize) -> bool {
+        let Some(from) = self.at_landing(rider) else {
+            return false;
+        };
+        if dest >= self.shaft.len() {
+            return false;
+        }
+        if !self.lift.as_ref().is_some_and(|l| l.boardable_at(from)) {
+            return false;
+        }
+        self.riders.insert(rider.to_string(), dest);
+        self.lift.as_mut().expect("checked above").call(dest);
+        true
+    }
+
+    /// Advance the car one moment, on its own clock — it moves whether or not
+    /// anybody is walking. Each moment is voiced on the floor it happened at, so
+    /// a body on a landing hears the car close, pass, or arrive; and a rider
+    /// bound for a floor the car has just opened at is set down there.
+    fn step_lift(&mut self) {
+        let moments = match self.lift.as_mut() {
+            Some(lift) => lift.step(),
+            None => return,
+        };
+        if moments.is_empty() {
+            return;
+        }
+        self.now += 1;
+        let at = self.now;
+        for m in &moments {
+            let (floor, text) = match m {
+                Moment::Closed(f) => (*f, "The lift doors close and it sets off."),
+                Moment::Passed(f) => (*f, "The lift passes the landing without stopping."),
+                Moment::Arrived(f) => (*f, "The lift arrives, and its doors open."),
+            };
+            if let Some(core) = self.shaft.get(floor).cloned() {
+                self.log.push(Event {
+                    at,
+                    actor: String::new(),
+                    place: core,
+                    what: Happening::Stirred {
+                        text: text.into(),
+                        weight: Weight::Note,
+                    },
+                });
+            }
+        }
+        // Set down every rider bound for a floor the car has just opened at.
+        let opened: Vec<usize> = moments
+            .iter()
+            .filter_map(|m| match m {
+                Moment::Arrived(f) => Some(*f),
+                _ => None,
+            })
+            .collect();
+        for floor in opened {
+            let Some(core) = self.shaft.get(floor).cloned() else {
+                continue;
+            };
+            let arrivals: Vec<String> = self
+                .riders
+                .iter()
+                .filter(|(_, f)| **f == floor)
+                .map(|(r, _)| r.clone())
+                .collect();
+            for r in arrivals {
+                self.riders.remove(&r);
+                self.land(&r, &core, at);
+            }
         }
     }
 
@@ -493,6 +727,31 @@ impl World {
     /// Everybody standing in one place, in a stable order.
     pub fn actors_at(&self, place: &Where) -> Vec<&Actor> {
         self.actors.values().filter(|a| &a.at == place).collect()
+    }
+
+    /// Somebody `speaker` could call after: named `name`, no longer in the room
+    /// but one doorway away, in a room the speaker's voice still reaches
+    /// ([`Reach::InSight`] of the *walker's* scope, since it is the walker who
+    /// must make out the voice).
+    ///
+    /// **It does not re-check that they were just in the speaker's room**, and it
+    /// does not need to: that guarantee is the caller's. The grammar only ever
+    /// offers an addressee drawn from the room's own company (`tell`/`ask`/
+    /// `whisper` bind `to` to `Choices::Company`), so a named addressee who is no
+    /// longer present is, by construction, somebody who was standing here a
+    /// moment ago and has stepped out. The world's part is only to find where
+    /// they went and confirm the line can still carry. Speech does not otherwise
+    /// cross a room — this is the one aimed exception, and it reaches only the
+    /// one it is aimed at.
+    pub fn within_earshot(&self, speaker: &str, name: &str) -> Option<String> {
+        let want = name.trim();
+        let place = self.actor(speaker)?.at.clone();
+        self.actors
+            .values()
+            .filter(|a| a.id != speaker && a.at != place)
+            .filter(|a| a.name.eq_ignore_ascii_case(want))
+            .find(|a| Scope::at(self, &a.at).reach(&place) == Reach::InSight)
+            .map(|a| a.id.clone())
     }
 
     /// Who holds a subject, anywhere in the world.
@@ -629,6 +888,9 @@ impl World {
         }
 
         self.end_walk(id, &from, Lost::Diverted);
+        // Walking away cancels a lift you were waiting on: you are no longer on
+        // the landing to be carried off, so the car must not set you down later.
+        self.riders.remove(id);
         if self.actors[id].hold.is_some() {
             self.release(id)?;
         }
@@ -669,6 +931,8 @@ impl World {
         // only while somebody happened to be walking — which is exactly not the
         // condition that grows the log.
         self.forget_old_events();
+        // The lift runs on its own clock, whether or not anybody is walking.
+        self.step_lift();
         let legs: Vec<(String, Where)> = self
             .actors
             .values()
@@ -679,8 +943,106 @@ impl World {
         }
         self.now += 1;
         let at = self.now;
-        for (id, to) in &legs {
-            self.land(id, to, at);
+
+        // Where each mover starts and where its leg ends, captured (owned, so
+        // the land calls below may borrow the world mutably) before anyone moves
+        // — so a *swap*, two bodies exchanging rooms across the same edge, can be
+        // told apart from an ordinary arrival.
+        let from: BTreeMap<String, Where> = legs
+            .iter()
+            .map(|(id, _)| (id.clone(), self.actors[id].at.clone()))
+            .collect();
+        let to: BTreeMap<String, Where> =
+            legs.iter().map(|(id, d)| (id.clone(), d.clone())).collect();
+
+        // **Swaps first.** Two travellers crossing the same lift or stair in
+        // opposite directions meet on it: the one heading into the other's room
+        // stops there, and the other never leaves — they end up together in the
+        // doorway. Resolved before the ordinary land so no departure is logged
+        // that then has to be taken back. This is the crossing a chase between
+        // two levels is made of, where an arrival never catches anybody because
+        // the one it is chasing has left by the time it lands.
+        let ids: Vec<String> = legs.iter().map(|(id, _)| id.clone()).collect();
+        let mut caught: BTreeSet<String> = BTreeSet::new();
+        let mut bumps: Vec<(String, String, Where)> = Vec::new();
+        for a in &ids {
+            if caught.contains(a) {
+                continue;
+            }
+            let (af, at2) = (from[a].clone(), to[a].clone());
+            let partner = ids.iter().find(|b| {
+                b.as_str() != a
+                    && !caught.contains(*b)
+                    && from.get(*b) == Some(&at2)
+                    && to.get(*b) == Some(&af)
+            });
+            if let Some(b) = partner.cloned() {
+                // `a` walks into `b`'s room (`at2` is where `b` still stands);
+                // `b` holds there. Both stop, together, where they met.
+                self.land(a, &at2, at);
+                caught.insert(a.clone());
+                caught.insert(b.clone());
+                bumps.push((a.clone(), b, at2));
+            }
+        }
+
+        // Everyone not caught in a swap takes their leg.
+        for (id, dest) in &legs {
+            if !caught.contains(id) {
+                self.land(id, dest, at);
+            }
+        }
+
+        // **Co-locations.** A traveller still on its way that has landed where
+        // somebody already is stops there too — walked into them. One that has
+        // *arrived* (its walk cleared on landing) went there on purpose and is
+        // joining them, not colliding.
+        for (id, _) in &legs {
+            if caught.contains(id) {
+                continue;
+            }
+            let Some(a) = self.actors.get(id) else {
+                continue;
+            };
+            if a.walk.is_none() {
+                continue;
+            }
+            let place = a.at.clone();
+            if let Some(other) = self.actors.values().find(|o| &o.id != id && o.at == place) {
+                let oid = other.id.clone();
+                caught.insert(id.clone());
+                if other.walk.is_some() {
+                    caught.insert(oid.clone());
+                }
+                bumps.push((id.clone(), oid, place));
+            }
+        }
+
+        // A collision ends the journey where it happened — the walk is cleared
+        // directly rather than through `end_walk`, because the `Bumped` event is
+        // the news the walker reads, not a `LostTheWay` on top of it. And each
+        // pair is recorded once: it is perceived from both sides already (the
+        // actor reads "you bump into …", the other "… bumps into you").
+        for id in &caught {
+            if let Some(a) = self.actors.get_mut(id) {
+                a.walk = None;
+            }
+        }
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        for (actor, into, place) in bumps {
+            let key = if actor < into {
+                (actor.clone(), into.clone())
+            } else {
+                (into.clone(), actor.clone())
+            };
+            if seen.insert(key) {
+                self.log.push(Event {
+                    at,
+                    actor,
+                    place,
+                    what: Happening::Bumped { into },
+                });
+            }
         }
         legs.len()
     }
@@ -734,6 +1096,11 @@ impl World {
             return;
         };
         let from = actor.at.clone();
+        // Any relocation clears a pending ride: the lift's own set-down has
+        // already taken the rider off the roster before landing it here, so this
+        // only catches a body moved by some other means (placed, teleported)
+        // while it was waiting, which must not then be carried off a second time.
+        self.riders.remove(id);
         // Leaving is releasing, wherever the move came from.
         if actor.hold.is_some() {
             let _ = self.release_at(id, at);
@@ -1025,6 +1392,54 @@ impl World {
             what: Happening::Did {
                 to,
                 what: what.into(),
+            },
+        });
+        Ok(())
+    }
+
+    /// Raise your voice after somebody who has just left the room.
+    ///
+    /// The one aimed line that carries through a doorway. [`World::tell`] and its
+    /// kin refuse an addressee who is not here, because two people talking need
+    /// to be in the same room — but somebody mid-sentence when the other steps
+    /// out has one parting line to call after them, and losing it turned a moving
+    /// cast's exchanges into questions nobody ever answered.
+    ///
+    /// Delivered under the same rule the world enforces itself rather than trusts
+    /// from the caller: `to` must be one doorway away ([`Reach::InSight`]),
+    /// exactly what [`World::within_earshot`] resolves. It logs at the speaker's
+    /// place, so [`crate::witness`] carries it to the one it is aimed at and to
+    /// nobody else.
+    pub fn call_after(
+        &mut self,
+        id: &str,
+        to: &str,
+        words: impl Into<String>,
+        voice: Voice,
+    ) -> Done {
+        let place = self
+            .actor(id)
+            .ok_or_else(|| Refused::NoSuchActor(id.into()))?
+            .at
+            .clone();
+        if id == to {
+            return Err(Refused::SpeakingToYourself);
+        }
+        let in_sight = self.actor(to).is_some_and(|a| {
+            a.at != place && Scope::at(self, &a.at).reach(&place) == Reach::InSight
+        });
+        if !in_sight {
+            return Err(Refused::NotHere { who: to.into() });
+        }
+        self.now += 1;
+        self.log.push(Event {
+            at: self.now,
+            actor: id.into(),
+            place,
+            what: Happening::Said {
+                to: Some(to.into()),
+                words: words.into(),
+                voice,
             },
         });
         Ok(())
@@ -1365,6 +1780,180 @@ mod tests {
         assert_eq!(route.last().unwrap(), &at("relations"));
     }
 
+    /// **The vault's lift serves every level, in order.** The shaft is built
+    /// from the map — one landing per level, bottom to top — so the car knows
+    /// only floor indices and the world knows which core each is.
+    #[test]
+    fn the_lift_serves_a_landing_on_every_level() {
+        let w = vault();
+        let shaft = w.shaft();
+        assert!(shaft.len() >= 2, "the vault has more than one level");
+        // Every landing is a real node, and each is on a distinct level.
+        let areas: BTreeSet<&str> = shaft.iter().map(|c| c.area.as_str()).collect();
+        assert_eq!(areas.len(), shaft.len(), "two floors shared a level");
+        assert!(w.lift().is_some(), "a multi-floor building has a lift");
+    }
+
+    /// **The lift carries a rider to the floor they chose.** Call it, board it,
+    /// ride it: the rider is set down on the landing of the level they picked,
+    /// and the trip takes real time (the car moves a floor at a moment).
+    #[test]
+    fn the_lift_carries_a_rider_to_the_floor_they_chose() {
+        let mut w = vault();
+        let shaft: Vec<Where> = w.shaft().to_vec();
+        let (from, dest) = (0usize, shaft.len() - 1);
+        w.enter("m1", "Maker-01", shaft[from].clone()).unwrap();
+        w.mark_seen("m1");
+
+        // Bring the car to our landing and wait for its doors.
+        w.call_lift(from);
+        for _ in 0..50 {
+            if w.lift().unwrap().boardable_at(from) {
+                break;
+            }
+            w.tick();
+        }
+        assert!(
+            w.lift().unwrap().boardable_at(from),
+            "the car never came to be boarded"
+        );
+
+        // Board for the top floor; it should not arrive the same moment.
+        assert!(w.ride_lift("m1", dest), "boarding was refused");
+        assert_eq!(
+            w.actor("m1").unwrap().at,
+            shaft[from],
+            "carried off instantly"
+        );
+
+        // Ride it out. The rider is set down on the chosen landing.
+        for _ in 0..50 {
+            if w.actor("m1").unwrap().at == shaft[dest] {
+                break;
+            }
+            w.tick();
+        }
+        assert_eq!(
+            w.actor("m1").unwrap().at,
+            shaft[dest],
+            "the rider was not set down at the floor they chose"
+        );
+        assert!(w.at_landing("m1") == Some(dest));
+    }
+
+    /// **Two riders bound for different floors are both set down.** The car is
+    /// shared, and the far rider presses last — which a single-target car would
+    /// obey by carrying the near rider straight past their floor. Each must be
+    /// let off where they chose.
+    #[test]
+    fn two_riders_bound_for_different_floors_are_both_set_down() {
+        let mut w = vault();
+        let shaft: Vec<Where> = w.shaft().to_vec();
+        assert!(shaft.len() >= 3, "need three floors for a near and a far");
+        let (from, near, far) = (0usize, 1usize, shaft.len() - 1);
+        w.enter("m1", "Maker-01", shaft[from].clone()).unwrap();
+        w.enter("m2", "Maker-02", shaft[from].clone()).unwrap();
+        w.mark_seen("m1");
+        w.mark_seen("m2");
+
+        w.call_lift(from);
+        for _ in 0..50 {
+            if w.lift().unwrap().boardable_at(from) {
+                break;
+            }
+            w.tick();
+        }
+        assert!(w.lift().unwrap().boardable_at(from), "the car never came");
+
+        // Both board while the doors are open — the far one last.
+        assert!(w.ride_lift("m1", near), "m1 boarding refused");
+        assert!(w.ride_lift("m2", far), "m2 boarding refused");
+
+        for _ in 0..50 {
+            let done =
+                w.actor("m1").unwrap().at == shaft[near] && w.actor("m2").unwrap().at == shaft[far];
+            if done {
+                break;
+            }
+            w.tick();
+        }
+        assert_eq!(
+            w.actor("m1").unwrap().at,
+            shaft[near],
+            "the near rider was carried past their floor"
+        );
+        assert_eq!(
+            w.actor("m2").unwrap().at,
+            shaft[far],
+            "the far rider never arrived"
+        );
+    }
+
+    /// **Walking off the landing cancels the ride.** A rider waits on its origin
+    /// landing until the car opens at its floor; if it changes its mind and walks
+    /// away, it must not be teleported to the old destination when the car later
+    /// gets there.
+    #[test]
+    fn walking_off_the_landing_cancels_the_ride() {
+        let mut w = vault();
+        let shaft: Vec<Where> = w.shaft().to_vec();
+        let (from, dest) = (0usize, shaft.len() - 1);
+        w.enter("m1", "Maker-01", shaft[from].clone()).unwrap();
+        w.mark_seen("m1");
+
+        w.call_lift(from);
+        for _ in 0..50 {
+            if w.lift().unwrap().boardable_at(from) {
+                break;
+            }
+            w.tick();
+        }
+        assert!(w.ride_lift("m1", dest), "boarding refused");
+        assert_eq!(w.riding("m1"), Some(dest));
+
+        // Change your mind: walk to a room on this level instead.
+        let room = Where::new(shaft[from].area.clone(), "command-room");
+        w.set_off("m1", room).unwrap();
+        assert_eq!(w.riding("m1"), None, "walking away left the ride pending");
+
+        // Ride the car all the way out; the walker is never carried off to dest.
+        for _ in 0..50 {
+            w.tick();
+        }
+        assert_ne!(
+            w.actor("m1").unwrap().at,
+            shaft[dest],
+            "a cancelled rider was still teleported to the old destination"
+        );
+    }
+
+    /// A body on a landing hears the car work — its doors, its arrival — so the
+    /// lift is a thing that happens in the world, not a silent teleport.
+    #[test]
+    fn a_body_on_a_landing_hears_the_lift_arrive() {
+        let mut w = vault();
+        let shaft: Vec<Where> = w.shaft().to_vec();
+        let floor = shaft.len() - 1; // somewhere the car is not already parked
+        w.enter("m1", "Maker-01", shaft[floor].clone()).unwrap();
+        w.mark_seen("m1");
+        w.call_lift(floor);
+        for _ in 0..50 {
+            if w.lift().unwrap().boardable_at(floor) {
+                break;
+            }
+            w.tick();
+        }
+        let heard: Vec<_> = crate::witness::since(&w, "m1")
+            .into_iter()
+            .filter(|s| matches!(&s.what, Happening::Stirred { .. }))
+            .collect();
+        assert!(
+            heard.iter().any(|s| matches!(&s.what,
+                Happening::Stirred { text, .. } if text.contains("lift arrives"))),
+            "the body on the landing did not hear the lift arrive: {heard:?}"
+        );
+    }
+
     #[test]
     fn walking_out_of_a_room_lets_go_of_what_was_held() {
         let mut w = vault();
@@ -1376,5 +1965,100 @@ mod tests {
         // its holder is in a corridor.
         assert!(w.actor("m1").unwrap().hold.is_none());
         assert!(w.holder_of("a-character").is_none());
+    }
+
+    /// **Two bodies crossing at the lift run into each other and both stop.**
+    /// The whole point of the collision: a pair chasing each other between
+    /// levels, forever swapping, finally end up in one place. Both leave the
+    /// casting level for elsewhere, so their first leg ends at the lift (`core`),
+    /// where they meet — still on their way — and stop there.
+    #[test]
+    fn two_travellers_crossing_at_the_lift_bump_and_both_stop() {
+        let mut w = vault();
+        w.enter("m1", "Maker-01", at("band-one")).unwrap();
+        w.enter("m2", "Maker-02", at("green-room")).unwrap();
+        let elsewhere = Where::new("vault-chronicle", "core");
+        w.set_off("m1", elsewhere.clone()).unwrap();
+        w.set_off("m2", elsewhere).unwrap();
+
+        // One leg carries both to the casting lift, still bound onward.
+        w.tick();
+        assert_eq!(w.actor("m1").unwrap().at, at("core"), "m1 not at the lift");
+        assert_eq!(w.actor("m2").unwrap().at, at("core"), "m2 not at the lift");
+
+        // The collision stops both — neither carries on to the other level.
+        assert!(
+            w.actor("m1").unwrap().walk.is_none(),
+            "m1 kept walking through the collision"
+        );
+        assert!(w.actor("m2").unwrap().walk.is_none(), "m2 kept walking");
+
+        // And it is recorded, once, as a collision between the two of them.
+        let bumps: Vec<_> = w
+            .log()
+            .iter()
+            .filter(|e| matches!(&e.what, Happening::Bumped { .. }))
+            .collect();
+        assert_eq!(bumps.len(), 1, "one collision per pair: {bumps:?}");
+        assert!(
+            matches!(&bumps[0].what, Happening::Bumped { into } if into == "m2")
+                && bumps[0].actor == "m1",
+            "{:?}",
+            bumps[0]
+        );
+    }
+
+    /// **Two bodies swapping levels cross on the lift and end up together.**
+    /// This is the exact shape of the chase the collision exists to break: each
+    /// heads for the level the other is on, over the one lift between them, and
+    /// without this they would swap past each other for ever. Instead they meet
+    /// on it and both stop, in the same room.
+    #[test]
+    fn two_travellers_swapping_levels_meet_and_stop_together() {
+        let mut w = vault();
+        let command = Where::new("vault-command", "core");
+        let chronicle = Where::new("vault-chronicle", "core");
+        w.enter("m1", "Maker-01", command.clone()).unwrap();
+        w.enter("m2", "Maker-02", chronicle.clone()).unwrap();
+        w.set_off("m1", chronicle.clone()).unwrap();
+        w.set_off("m2", command).unwrap();
+
+        w.tick();
+        let p1 = w.actor("m1").unwrap().at.clone();
+        let p2 = w.actor("m2").unwrap().at.clone();
+        assert_eq!(p1, p2, "the swap left them apart: {p1:?} vs {p2:?}");
+        assert!(w.actor("m1").unwrap().walk.is_none(), "m1 kept going");
+        assert!(w.actor("m2").unwrap().walk.is_none(), "m2 kept going");
+
+        let bumps: Vec<_> = w
+            .log()
+            .iter()
+            .filter(|e| matches!(&e.what, Happening::Bumped { .. }))
+            .collect();
+        assert_eq!(
+            bumps.len(),
+            1,
+            "one collision for the crossing pair: {bumps:?}"
+        );
+    }
+
+    /// Arriving where somebody is standing is joining them, not a collision — you
+    /// walked there on purpose. Only a body still on its way bumps.
+    #[test]
+    fn arriving_where_somebody_stands_is_not_a_bump() {
+        let mut w = vault();
+        w.enter("m1", "Maker-01", at("green-room")).unwrap();
+        w.enter("m2", "Maker-02", at("band-one")).unwrap();
+        // m2 walks to green-room, where m1 is — a same-level journey it finishes
+        // in one leg, so it arrives rather than crossing anybody mid-way.
+        w.set_off("m2", at("green-room")).unwrap();
+        w.settle();
+        assert_eq!(w.actor("m2").unwrap().at, at("green-room"));
+        assert!(
+            !w.log()
+                .iter()
+                .any(|e| matches!(&e.what, Happening::Bumped { .. })),
+            "arriving at a room where somebody stands read as a collision"
+        );
     }
 }

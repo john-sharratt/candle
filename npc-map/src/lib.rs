@@ -36,6 +36,7 @@
 
 pub mod delta;
 pub mod describe;
+pub mod lift;
 pub mod load;
 pub mod part;
 pub mod perceive;

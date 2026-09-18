@@ -1099,9 +1099,11 @@ async fn what_a_maker_can_do_changes_as_it_walks() {
 }
 
 #[tokio::test]
-async fn a_journey_across_the_building_is_three_moments_and_one_decision() {
-    // The character names a destination once. Getting there is the world's
-    // business, and it is told when it arrives — not before.
+async fn another_level_is_reached_by_the_lift_not_walked() {
+    // The stair is gone: naming a room on another level no longer sets a body
+    // walking across the building. Crossing floors is the lift's — go to it,
+    // call it, ride it — so a far level is refused with that, and the body stays
+    // put rather than setting off.
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     think(&rt, 1);
@@ -1114,23 +1116,12 @@ async fn a_journey_across_the_building_is_three_moments_and_one_decision() {
         .line()
         .expect("a body act")
         .to_string();
-    assert!(out.contains("3 stops"), "{out}");
-
-    for step in 1..=2 {
-        moment(&rt);
-        think(&rt, step * 10_000);
-        assert!(
-            !reads(&rt, 1).contains("You got to"),
-            "told it arrived after {step} of 3"
-        );
-    }
-    moment(&rt);
-    think(&rt, 30_000);
+    assert!(out.to_lowercase().contains("lift"), "{out}");
     assert_eq!(
         standing(&rt, "m1"),
-        Where::new("vault-command", "command-room")
+        Where::new("vault-casting", "band-one"),
+        "it set off across the building anyway"
     );
-    assert!(reads(&rt, 1).contains("You got to the command room"));
 }
 
 // =========================================================================
@@ -1172,6 +1163,9 @@ async fn a_character_with_nothing_asked_of_it_is_pointed_at_the_work() {
     rt.scheduler.wake(1, 0, 0);
     rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
         .unwrap();
+    // The command table opens by default now; shut it to read the
+    // no-mission-no-table standing task this test is about.
+    rt.set_table_open(false);
 
     let nudge = rt.nudge_for(1).expect("something to be getting on with");
     rt.scheduler.deliver(
