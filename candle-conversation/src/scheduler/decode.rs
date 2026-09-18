@@ -704,6 +704,27 @@ impl Scheduler {
         self.wave_stats
             .record(false, seq_ids.len(), wave_rows, kv_len, fwd_ms);
 
+        // **The wave's own accounting, checked before the split reads it.**
+        // `end_verify` splits against `spec_blocks`; the wave was composed from
+        // `plan.verify_inputs`. Those are the same list unless something between
+        // them dropped a member, and when they disagree the split reports a row
+        // count matching neither — naming the plan it was composed for is what
+        // says which side is short.
+        if logits.len() != wave_rows {
+            let planned: usize = plan.verify_inputs.len();
+            self.model.abort_verify(&spec_seqs);
+            self.fail_all_decodes(
+                &seq_ids,
+                &format!(
+                    "verify readback: the wave scored {} rows for a plan of {wave_rows} \
+                     ({} plain + {planned} verify blocks); the cohort the forward carried \
+                     and the cohort the split expects have diverged",
+                    logits.len(),
+                    plain.len(),
+                ),
+            );
+            return;
+        }
         // Reads the scored rows back and advances each sequence by what the wave
         // actually wrote — the walk below rolls the rejected tail off again.
         let (plain_rows, spec_rows) =

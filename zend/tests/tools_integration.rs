@@ -62,8 +62,8 @@ mod tool_scenarios {
     use std::path::Path;
 
     use crate::common::{needs_compaction, production_workspace, run_conv_id, Workspace};
-    use candle_conversation::models::Model;
     use candle::vram::host_pinned_bytes;
+    use candle_conversation::models::Model;
     use candle_conversation::projection::SectionLoads;
     use candle_conversation::{SamplingConfig, SelectionState};
     use zend::api::chat::apply_tools_dial;

@@ -260,11 +260,27 @@ impl HybridBatched {
 
     /// Name the verifying sequences for the next forward.
     pub fn set_verify_row_seqs(&self, seqs: &[usize]) -> Result<()> {
-        *self
+        let mut held = self
             .verify_rows
             .lock()
-            .map_err(|_| candle::Error::Msg("qwen35: verify_rows lock poisoned".into()))? =
-            seqs.to_vec();
+            .map_err(|_| candle::Error::Msg("qwen35: verify_rows lock poisoned".into()))?;
+        // **Every transition of the set the head scores from.** The head reads
+        // this state rather than the cohort it was handed, so a step that runs
+        // against a set some other step left behind scores one row where the
+        // caller counted a whole block — and the shortfall only surfaces
+        // downstream, as a verify split matching neither cohort. One line per
+        // speculative step, so the history is in the log when that happens.
+        // No custom `target:`. The daemon's filter selects by module path
+        // (`candle_transformers=debug`), so a target of its own is dropped —
+        // which is how the first attempt at this line logged nothing through a
+        // whole 380-directory pass while drafting ran on 1,250 waves.
+        tracing::debug!(
+            was = held.len(),
+            now = seqs.len(),
+            ?seqs,
+            "verify row set replaced"
+        );
+        *held = seqs.to_vec();
         Ok(())
     }
 

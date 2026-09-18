@@ -3767,6 +3767,44 @@ impl Scheduler {
         }
     }
 
+    /// The `[decode | verify]` prefix of a wave's logits — every row of it, or
+    /// an error naming what is missing.
+    ///
+    /// **A short head is a broken contract, not a small answer.** The wave
+    /// promised `head_rows` scored rows: one per decode row and one per verify
+    /// row, named to the head through `set_verify_row_seqs` before the forward
+    /// opened. Clamping the prefix to whatever came back (`head_rows.min(len)`)
+    /// turned that into a shorter vector and handed it on, so the shortfall
+    /// surfaced downstream as `split_block_rows` reporting a row count that
+    /// matched nothing — a symptom carrying none of the composition that
+    /// produced it, and no clue whether the missing rows were decode or verify.
+    ///
+    /// More rows than `head_rows` is ordinary: the creep's and glue's rows
+    /// follow the head, and the caller slices them off separately.
+    ///
+    /// **A caller must settle its own co-batched members before returning this
+    /// error.** The rows after the head are positioned by `head_rows`, so a
+    /// short head misplaces every creep and section row behind it too; those
+    /// members are failed, never completed from misaligned logits and never left
+    /// half-advanced.
+    fn head_logits(
+        logits: &[Tensor],
+        head_rows: usize,
+        n_dec: usize,
+        verify_tok: usize,
+        segment: &str,
+    ) -> candle::Result<Vec<Tensor>> {
+        if logits.len() < head_rows {
+            candle::bail!(
+                "co-batch wave ({segment}): the head scored {} rows for a wave whose head is \
+                 {head_rows} ({n_dec} decode + {verify_tok} verify) — every named row is \
+                 scored or the verify split downstream cannot be trusted",
+                logits.len(),
+            );
+        }
+        Ok(logits[..head_rows].to_vec())
+    }
+
     /// The unified continuous-fair-wave step (`docs/continuous_fair_waves.md`): ONE
     /// forward folding every class of work through the shared grouped GEMM so one
     /// expert load per layer serves them all — the whole point on the streaming box.
@@ -3938,8 +3976,12 @@ impl Scheduler {
                 self.reconcile_wave_offsets(glue_seqs)?;
             }
             let logits = out.logits_owned()?;
-            let d = head_rows.min(logits.len());
-            let dec_logits = logits[..d].to_vec();
+            // **The section is settled before the head is checked.** It was
+            // written by the forward that just ran — every row's K/V, whichever
+            // rows the head went on to score — and it completes from its
+            // advances, not its logits. So its progress is real even when the
+            // head comes back short, and checking the head first would return
+            // with the section flagged advanced but never completed.
             if !sec_gidx.is_empty() {
                 // Attended-KV summed before `complete_section_chunk` advances the
                 // sequences. One record per co-batched section chunk.
@@ -3967,7 +4009,7 @@ impl Scheduler {
                 draft_of(n_dec, verify_tok),
                 t_wave.elapsed(),
             );
-            return Ok(dec_logits);
+            return Self::head_logits(&logits, head_rows, n_dec, verify_tok, "one-shot");
         }
 
         // Creep group present. Full-sweep members (decode + glue) ride all N layers;
@@ -4177,10 +4219,25 @@ impl Scheduler {
                 self.reconcile_wave_offsets(glue_seqs)?;
             }
             let logits = seg2.logits_owned()?;
-            let d = head_rows.min(logits.len());
-            let creep_end = (d + members.len()).min(logits.len());
-            let dec_logits = logits[..d].to_vec();
-            let member_logits = logits[d..creep_end].to_vec();
+            let dec_logits = match Self::head_logits(&logits, head_rows, n_dec, verify_tok, "seg2")
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    // The creep's rows sit behind the head, so a short head
+                    // misplaces them too. Drop the group exactly as a failed
+                    // seg2 forward does, rather than complete it from
+                    // misaligned logits or leave it with its residual taken,
+                    // its cursor above zero and nothing to resume from.
+                    self.fail_wave_group(&members, &prefill_gidxs, &e);
+                    return Err(e);
+                }
+            };
+            // The creep's own rows follow the head. They are still clamped: a
+            // creep member that scored nothing is a member the wave paused
+            // rather than a contract broken, and `complete_wave_group` reads
+            // only as many as came back.
+            let creep_end = (head_rows + members.len()).min(logits.len());
+            let member_logits = logits[head_rows..creep_end].to_vec();
             self.complete_wave_group(&members, &member_logits);
             // The full-sweep members crossed every layer; the creep crossed
             // `[cursor, N)` of them, so its rows count in that proportion.
@@ -4238,8 +4295,8 @@ impl Scheduler {
         if has_glue {
             self.reconcile_wave_offsets(glue_seqs)?;
         }
-        let mut logits = seg3.logits_owned()?;
-        logits.truncate(head_rows);
+        let seg3_logits = seg3.logits_owned()?;
+        let logits = Self::head_logits(&seg3_logits, head_rows, n_dec, verify_tok, "seg3")?;
         // Segments 1–3 together are one `[0, N)` sweep for the full-sweep
         // members; the creep crossed `[cursor, win_end)`.
         self.observe_wave_rate(
@@ -5883,5 +5940,61 @@ mod prefill_think_tests {
             OPEN,
             None
         ));
+    }
+}
+
+#[cfg(test)]
+mod head_logits_tests {
+    use super::Scheduler;
+    use candle::{Device, Tensor};
+
+    /// One scored row, as the head hands them back.
+    fn row(v: f32) -> Tensor {
+        Tensor::from_vec(vec![v], 1, &Device::Cpu).expect("row")
+    }
+
+    /// The ordinary shape: the head's rows are the whole answer.
+    #[test]
+    fn an_exact_head_is_returned_whole() {
+        let logits: Vec<Tensor> = (0..4).map(|i| row(i as f32)).collect();
+        let head = Scheduler::head_logits(&logits, 4, 1, 3, "test").expect("exact");
+        assert_eq!(head.len(), 4);
+    }
+
+    /// **More rows than the head is ordinary, not an error.** The creep's and
+    /// glue's rows follow it and the caller slices them off separately, so the
+    /// check is a floor on the head and never a ceiling on the wave.
+    #[test]
+    fn rows_beyond_the_head_are_left_for_the_caller() {
+        let logits: Vec<Tensor> = (0..9).map(|i| row(i as f32)).collect();
+        let head = Scheduler::head_logits(&logits, 4, 1, 3, "test").expect("prefix");
+        assert_eq!(head.len(), 4, "only the head, with the creep left behind");
+    }
+
+    /// **A short head is an error naming both halves.** This is the case the
+    /// old `head_rows.min(len)` clamp turned into a shorter vector: the verify
+    /// split downstream then reported a row count matching neither cohort, with
+    /// nothing in it to say which side was short or which segment produced it.
+    #[test]
+    fn a_short_head_names_what_is_missing() {
+        let logits: Vec<Tensor> = (0..9).map(|i| row(i as f32)).collect();
+        let err = Scheduler::head_logits(&logits, 18, 0, 18, "seg3")
+            .expect_err("nine rows cannot answer for eighteen")
+            .to_string();
+        assert!(err.contains("seg3"), "names the segment: {err}");
+        assert!(err.contains('9'), "names what was scored: {err}");
+        assert!(err.contains("18"), "names what was promised: {err}");
+    }
+
+    /// A wave with no head at all asks for nothing and gets nothing.
+    #[test]
+    fn an_empty_head_is_satisfied_by_any_wave() {
+        let logits: Vec<Tensor> = (0..3).map(|i| row(i as f32)).collect();
+        assert!(Scheduler::head_logits(&logits, 0, 0, 0, "test")
+            .expect("empty")
+            .is_empty());
+        assert!(Scheduler::head_logits(&[], 0, 0, 0, "test")
+            .expect("empty on empty")
+            .is_empty());
     }
 }
