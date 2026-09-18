@@ -12,7 +12,29 @@ use std::time::{Duration, Instant};
 
 use axum::routing::{get, post};
 use axum::Router;
+use tokio::net::TcpSocket;
 use web::{Builder, Config};
+
+/// A port that refuses connections **and stays this test's** until the socket
+/// is dropped: bound, never listening.
+///
+/// Binding an ephemeral port and dropping it — "almost certainly closed" — is
+/// not a reservation. The next `bind("127.0.0.1:0")` anywhere in the process can
+/// be handed that same number, and this binary runs its tests concurrently, so
+/// under a full-width pass the "dead" upstream came back alive (a 200 where the
+/// test wanted 503) and the recovery test's re-bind met `AddrInUse`. A socket
+/// that is bound but not listening holds the number and answers every connect
+/// with a refusal — the failure an operator sees when a daemon is not running —
+/// and `TcpSocket::listen` turns it into the live upstream later without ever
+/// letting go of the port.
+fn closed_port() -> (TcpSocket, SocketAddr) {
+    let socket = TcpSocket::new_v4().expect("socket");
+    socket
+        .bind("127.0.0.1:0".parse().expect("addr"))
+        .expect("bind");
+    let addr = socket.local_addr().expect("local addr");
+    (socket, addr)
+}
 
 /// Serve a router on an ephemeral port and return its address. The task is
 /// detached: it dies with the test process, which is what we want.
@@ -476,13 +498,9 @@ async fn the_host_header_picks_the_site() {
 
 #[tokio::test]
 async fn a_dead_upstream_gives_a_readable_page_then_backs_off() {
-    // Bind and immediately drop, so the port is almost certainly closed: a
-    // connection refused, which is the failure an operator actually sees when a
-    // daemon is not running.
-    let dead = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
+    // A connection refused, which is the failure an operator actually sees when
+    // a daemon is not running. Held for the whole test — see `closed_port`.
+    let (_held, dead) = closed_port();
     let addr = spawn(Builder::new(proxy_cfg(dead)).router()).await;
 
     // First request pays the connect attempt and reports it.
@@ -633,10 +651,7 @@ async fn an_outage_does_not_leak_the_upstream_address() {
 /// reconnecting forever against a service a manual refresh would reach.
 #[tokio::test]
 async fn the_gateway_signs_its_own_error_responses() {
-    let dead = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
+    let (_held, dead) = closed_port();
     let addr = spawn(Builder::new(proxy_cfg(dead)).router()).await;
 
     let down = head_of(addr, "/v1/status", "npcd.test").await;
@@ -678,13 +693,10 @@ async fn the_gateway_signs_its_own_error_responses() {
 
 #[tokio::test]
 async fn recovery_needs_no_operator() {
-    // Reserve a port, close it, point the proxy at it, then start the real
-    // upstream there once the window has opened.
-    let port = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap().port()
-    };
-    let target: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    // Reserve a port that refuses, point the proxy at it, then start the real
+    // upstream on that same socket once the window has opened. The socket is
+    // never let go, so no other test can be handed the port in between.
+    let (held, target) = closed_port();
     let addr = spawn(Builder::new(proxy_cfg(target)).router()).await;
 
     assert_eq!(
@@ -694,7 +706,7 @@ async fn recovery_needs_no_operator() {
         503
     );
 
-    let listener = tokio::net::TcpListener::bind(target).await.unwrap();
+    let listener = held.listen(1024).expect("listen on the held port");
     tokio::spawn(async move {
         axum::serve(
             listener,
