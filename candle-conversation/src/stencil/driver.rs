@@ -428,13 +428,31 @@ mod tests {
         assert!(!driver.in_terminal_close_span());
     }
 
+    /// Write a string value's opening ` "` — the model's, not the grammar's.
+    fn open_string(d: &mut StencilDriver) {
+        assert_eq!(d.accept(b' ' as TokenId, b" "), Healed::No);
+        assert_eq!(d.accept(b'"' as TokenId, b"\""), Healed::No);
+    }
+
     #[test]
     fn clean_string_close_does_not_heal() {
         // Closing quote is its own byte token — a clean boundary, no heal.
         let v = TestVocab::new();
         let mut d = driver_at_first_value(STR_OPT, &v);
+        open_string(&mut d);
         assert_eq!(d.accept(b'a' as TokenId, b"a"), Healed::No);
         assert_eq!(d.accept(b'"' as TokenId, b"\""), Healed::No);
+    }
+
+    /// **Bare text where the opening quote belonged is not the string's.** Let
+    /// through, its first later `"` would open the string and the call's own
+    /// close would be swallowed as content; instead it is dropped and the value
+    /// written empty, like any other skipped value.
+    #[test]
+    fn bare_text_before_the_opening_quote_is_dropped() {
+        let v = TestVocab::new();
+        let mut d = driver_at_first_value(STR_OPT, &v);
+        assert_eq!(d.accept(b'a' as TokenId, b"a"), Healed::Drop);
     }
 
     #[test]
@@ -442,6 +460,7 @@ mod tests {
         // `",` — quote exits at byte 0, the comma is leftover.
         let v = TestVocab::new().with_special("\",", 300);
         let mut d = driver_at_first_value(STR_OPT, &v);
+        open_string(&mut d);
         assert_eq!(d.accept(b'a' as TokenId, b"a"), Healed::No);
         assert_eq!(d.accept(300, b"\","), Healed::Exit { consumed: 1 });
     }
@@ -452,6 +471,7 @@ mod tests {
         // closes the string merged with the first `}` (`"}`).
         let v = TestVocab::new().with_special("\"}", 300);
         let mut d = driver_at_first_value(STR_ONLY, &v);
+        open_string(&mut d);
         assert_eq!(d.accept(b'a' as TokenId, b"a"), Healed::No);
         assert_eq!(d.accept(300, b"\"}"), Healed::Exit { consumed: 1 });
     }
@@ -462,7 +482,33 @@ mod tests {
         // (the `h` value byte + the closing quote), `,` leftover.
         let v = TestVocab::new().with_special("h\",", 300);
         let mut d = driver_at_first_value(STR_OPT, &v);
+        open_string(&mut d);
         assert_eq!(d.accept(300, b"h\","), Healed::Exit { consumed: 2 });
+    }
+
+    /// **The empty string Qwen actually writes — ` ""`, one token — closes the
+    /// value cleanly.** This is the token a prefilled opening quote made
+    /// unreachable; with the quote the model's, it is an ordinary exit.
+    #[test]
+    fn the_empty_string_token_closes_the_value() {
+        let v = TestVocab::new().with_special(" \"\"", 300);
+        let mut d = driver_at_first_value(STR_OPT, &v);
+        assert_eq!(d.accept(300, b" \"\""), Healed::No);
+    }
+
+    /// **The failure that motivated all of this no longer swallows the call.**
+    /// A model that writes `}}` where the value belonged had it taken as string
+    /// content, with the call's own close after it. Before any opening quote it
+    /// is now a delimiter handed back to the grammar.
+    #[test]
+    fn a_closer_where_the_value_belonged_is_not_string_content() {
+        let v = TestVocab::new().with_special("}}", 300);
+        let mut d = driver_at_first_value(STR_OPT, &v);
+        assert_eq!(
+            d.accept(300, b"}}"),
+            Healed::Drop,
+            "`}}` before the opening quote is dropped and the value written empty"
+        );
     }
 
     #[test]
@@ -470,6 +516,7 @@ mod tests {
         // An escaped quote mid-value must not be treated as the close.
         let v = TestVocab::new();
         let mut d = driver_at_first_value(STR_OPT, &v);
+        open_string(&mut d);
         assert_eq!(d.accept(b'\\' as TokenId, b"\\"), Healed::No);
         assert_eq!(d.accept(b'"' as TokenId, b"\""), Healed::No); // escaped — not a close
         assert_eq!(d.accept(b'b' as TokenId, b"b"), Healed::No);

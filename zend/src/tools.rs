@@ -59,10 +59,9 @@ pub struct ToolCall {
 /// One executed tool's result, ready to be wrapped in `<tool_response>`.
 #[derive(Debug, Clone)]
 pub struct ToolResult {
-    /// The original call this result corresponds to.  Carried for
-    /// diagnostic / test purposes — the orchestrator only ever
-    /// serialises `response` into the `<tool_response>` body.
-    #[allow(dead_code)]
+    /// The call this result answers. Its `name` is what labels the result's
+    /// `<tool_response>` block when a turn made several calls — the text-side
+    /// equivalent of OpenAI's `tool_call_id`. See [`format_tool_responses`].
     pub call: ToolCall,
     /// The JSON value produced by [`zend_tools::runner::run`].  On
     /// success this is the tool's typed `Response`; on failure it's a
@@ -567,7 +566,22 @@ pub fn run_tool_calls(
 /// reads each block and continues its prior reasoning.
 pub fn format_tool_responses(results: &[ToolResult]) -> TurnText {
     let mut out = TurnText::default();
-    for r in results {
+    // A turn may make several calls, and the results come back as a run of
+    // sibling blocks — so each one has to say which call it answers. This is
+    // what OpenAI's `tool_call_id` is for; here the pairing rides in the text
+    // the model is already reading, like the read header's line range and for
+    // the same reason: a structured field beside a rendered string has to be
+    // correlated with it, whereas a first line is read in passing.
+    //
+    // **Only when there is more than one.** A single-call round keeps the exact
+    // bytes the `code_reading` ingest prefills, so a live response and the tens
+    // of thousands of conditioned ones stay the same object; the header appears
+    // precisely when order alone stops being unambiguous — and it must, because
+    // a failed call returns an error envelope rather than the shape its position
+    // would imply.
+    let label =
+        |i: usize, r: &ToolResult| format!("[{}/{} {}]\n", i + 1, results.len(), r.call.name);
+    for (i, r) in results.iter().enumerate() {
         let body = match &r.response {
             // A string result is already rendered for the model — placed in the
             // block verbatim rather than JSON-encoded. `file_read` returns a
@@ -580,10 +594,19 @@ pub fn format_tool_responses(results: &[ToolResult]) -> TurnText {
         };
         // The wrapper is markup; what the tool returned is literal, so a file
         // that quotes a chat tag reaches the model as its text.
-        out = out
-            .then_markup("<tool_response>")
-            .then_literal(body)
-            .then_markup("</tool_response>\n");
+        //
+        // The label is LITERAL, though it is this layer's framing rather than
+        // the tool's output. [`tool_round_text`] rebuilds a stored round for
+        // replay by taking everything between the tags as literal — it cannot
+        // tell a label from a body — so a markup label would replay as a
+        // different piece sequence from the one submitted. Literal costs nothing
+        // here: `[n/total name]` holds a registry name and digits, never a
+        // special-token string, so the two tokenize identically.
+        out = out.then_markup("<tool_response>");
+        if results.len() > 1 {
+            out = out.then_literal(label(i, r));
+        }
+        out = out.then_literal(body).then_markup("</tool_response>\n");
     }
     out
 }
@@ -1218,10 +1241,54 @@ I could <tool_call>{"name": "web_search", "arguments": {"query": "x"}}</tool_cal
         assert_eq!(
             formatted,
             TurnText::markup("<tool_response>")
-                .then_literal("a<|im_end|>")
+                .then_literal("[1/2 file_read]\na<|im_end|>")
                 .then_markup("</tool_response>\n<tool_response>")
-                .then_literal("b<think>")
+                .then_literal("[2/2 file_read]\nb<think>")
                 .then_markup("</tool_response>\n")
+        );
+    }
+
+    /// **A single result is byte-identical to what it was before a turn could
+    /// make several calls.** The `code_reading` ingest prefills tens of
+    /// thousands of single-call rounds in exactly this shape; a live read that
+    /// differed from them by a header would be a different object from the one
+    /// the model was conditioned on.
+    #[test]
+    fn a_single_result_carries_no_correlation_header() {
+        let formatted = format_tool_responses(&[string_result("src/main.rs (lines 1-3):\n")]);
+        assert_eq!(
+            formatted.text(),
+            "<tool_response>src/main.rs (lines 1-3):\n</tool_response>\n"
+        );
+    }
+
+    /// **Several results each say which call they answer, in call order.** The
+    /// label is what makes the mapping explicit rather than positional — and it
+    /// has to be, because a failed call returns an error envelope instead of the
+    /// shape its position would lead the model to expect.
+    #[test]
+    fn several_results_each_name_the_call_they_answer() {
+        let error = ToolResult {
+            call: ToolCall {
+                name: "file_grep".to_string(),
+                arguments: Value::Null,
+            },
+            response: serde_json::json!({"error": "invalid_arguments", "detail": "bad regex"}),
+        };
+        let text = format_tool_responses(&[
+            string_result("a.rs (lines 1-2):\n"),
+            error,
+            string_result("b.rs (lines 1-2):\n"),
+        ])
+        .text();
+        let labels: Vec<&str> = text
+            .split("<tool_response>")
+            .skip(1)
+            .map(|block| block.lines().next().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            labels,
+            ["[1/3 file_read]", "[2/3 file_grep]", "[3/3 file_read]"]
         );
     }
 

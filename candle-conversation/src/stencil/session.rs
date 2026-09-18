@@ -367,11 +367,15 @@ impl StencilSession {
                     // The span's terminator never fired, so whatever closing
                     // text it would have consumed was never written. The tree
                     // writes it now, then carries on — the element is closed
-                    // properly rather than running into whatever follows.
-                    self.cursor = match span.close_run.is_empty() {
+                    // properly rather than running into whatever follows. Which
+                    // text depends on how far the value got: a string whose
+                    // opening quote was never written closes as a whole empty
+                    // value, not a lone quote.
+                    let run = span.interrupted_close_run(&term).to_vec();
+                    self.cursor = match run.is_empty() {
                         true => Cursor::At(span.next),
                         false => Cursor::Closing {
-                            run: span.close_run.clone(),
+                            run,
                             then: span.next,
                         },
                     };
@@ -400,6 +404,26 @@ impl StencilSession {
                     }
                 }
                 match term.feed(bytes) {
+                    // **A value closed before it opened: the model skipped it.**
+                    // `JsonStringValue` does this on any non-whitespace byte where
+                    // the opening quote belonged — `}}` for an empty `prefix`. The
+                    // token cannot stay: text cannot be written in front of a
+                    // token already in the sequence, and without it the call
+                    // reads `"prefix":}}`, which is not JSON. So it is dropped,
+                    // the grammar writes the whole empty value, and the model
+                    // decides again at whatever follows — the same repair an
+                    // intercepted EOS gets.
+                    Feed::Close { .. } if !term.opened() => {
+                        let run = span.interrupted_close_run(&term).to_vec();
+                        self.cursor = match run.is_empty() {
+                            true => Cursor::At(span.next),
+                            false => Cursor::Closing {
+                                run,
+                                then: span.next,
+                            },
+                        };
+                        Ok(Observe::TokenClosedDrop)
+                    }
                     Feed::Close { consumed } => {
                         self.cursor = Cursor::At(span.next);
                         // A lookahead terminator's delimiter belongs to the next
@@ -429,10 +453,11 @@ impl StencilSession {
                             // on came back missing `feeling`, a required
                             // argument the grammar had in fact forced, with the
                             // feeling itself swallowed into the thoughts.
-                            self.cursor = match span.close_run.is_empty() {
+                            let run = span.interrupted_close_run(&term).to_vec();
+                            self.cursor = match run.is_empty() {
                                 true => Cursor::At(span.next),
                                 false => Cursor::Closing {
-                                    run: span.close_run.clone(),
+                                    run,
                                     then: span.next,
                                 },
                             };

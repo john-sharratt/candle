@@ -136,8 +136,10 @@ fn install_tool_catalog_returns_section_ids_in_registry_order() {
     );
 }
 
-/// `file_read` and `file_list` are marked mandatory on the `tools` collection,
-/// so they project on every turn on top of the belief top-k.
+/// The four file tools — `file_search`, `file_grep`, `file_read`, `file_list` —
+/// are marked mandatory on the `tools` collection, so they project on every turn
+/// on top of the belief top-k. Finding is in the set alongside reading because a
+/// turn holding only the read pair answers "where is this" by guessing.
 #[test]
 fn install_tool_catalog_marks_the_mandatory_tools() {
     let mut builder = build_test_projection();
@@ -149,7 +151,10 @@ fn install_tool_catalog_marks_the_mandatory_tools() {
         .map(|(n, _, _)| n.as_str())
         .collect();
     names.sort();
-    assert_eq!(names, ["file_list", "file_read"]);
+    assert_eq!(
+        names,
+        ["file_grep", "file_list", "file_read", "file_search"]
+    );
 }
 
 #[test]

@@ -4,7 +4,7 @@
 //! Built once by [`compile`](super::compile::compile) and shared (`Arc`) across
 //! decode sessions.
 
-use super::terminator::Terminator;
+use super::terminator::{Terminator, TerminatorState};
 use super::trie::TokenTrie;
 use super::vocab::TokenId;
 
@@ -67,7 +67,23 @@ pub struct FreeTextSpan {
     /// spans whose terminator emits nothing of its own (lookahead terminators,
     /// where the delimiter belongs to the successor anyway).
     pub close_run: Vec<TokenId>,
+    /// [`Self::close_run`] for a span interrupted **before its value opened**
+    /// — see [`Terminator::unopened_close`]. Empty when the two do not differ,
+    /// in which case `close_run` serves both. Chosen at runtime from
+    /// `TerminatorState::opened`, since which one a span needs depends on how
+    /// far the model got.
+    pub unopened_close_run: Vec<TokenId>,
     pub next: NodeId,
+}
+
+impl FreeTextSpan {
+    /// The closing run for a span interrupted in state `term`.
+    pub fn interrupted_close_run(&self, term: &TerminatorState) -> &[TokenId] {
+        match term.opened() || self.unopened_close_run.is_empty() {
+            true => &self.close_run,
+            false => &self.unopened_close_run,
+        }
+    }
 }
 
 /// Span-scoped EOS-style limits, mirroring `SamplingConfig`'s whole-turn ramp.

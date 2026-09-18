@@ -25,6 +25,7 @@ questions:
 - find lines matching wave_offsets in candle-conversation
 - show me every place that constructs a ToolContext
 category: Files
+mandatory: true
 description: 'Search the CONTENTS of every file in the project for a string or regular expression, returning the matching lines with their file paths and line numbers. Use for: finding where a function, type, constant or error message is defined or used; checking whether something exists in the codebase at all; tracing the callers of an API; locating a config key, a magic string, or a leftover TODO. Takes a regex in Rust regex syntax (`^pub fn `, `Error::\w+`, `foo|bar`) — a plain string matches itself — plus an optional path prefix to narrow the search and an optional ignore_case. Returns path, line number and the matching line, paged, along with files_searched so that an empty result is unambiguous: scanning four thousand files and finding nothing reads differently from a prefix that matched nothing to scan. Capped at twenty hits per file so one generated file cannot hide every other file that matched; `truncated` says when a cap was reached. THIS IS THE TOOL FOR FINDING CODE BY CONTENT — reach for it before guessing directory names with file_list. The line number it returns is what file_read takes as start_line, so the two compose directly. Use file_search to find a file by its NAME rather than its contents.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

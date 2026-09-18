@@ -146,12 +146,18 @@ pub struct GrepOutcome {
     pub truncated: bool,
 }
 
-/// One entry in a listing: normalised path, byte size, line count.
+/// One entry in a listing: normalised path and byte size.
+///
+/// **No line count.** Producing one means opening and UTF-8-decoding every file
+/// the walk touches — the whole tree, before paging, to fill fifty rows. `bytes` comes free from the directory metadata the walk
+/// already has; lines do not, and a listing is not worth reading a codebase for.
+/// A file's length reaches the model through `file_read`'s own header instead
+/// (`(lines 1-200 of 2499)`), which is exact, costs nothing extra, and arrives
+/// at the moment the number is actually needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListEntry {
     pub path: String,
     pub bytes: usize,
-    pub lines: usize,
     /// `true` when the entry is the session's own copy (upper layer) rather than
     /// a file read straight off the workspace.
     pub modified: bool,
@@ -254,7 +260,6 @@ impl VfsStore {
                 out.push(ListEntry {
                     path: k.clone(),
                     bytes: v.len(),
-                    lines: v.lines().count(),
                     modified: true,
                 });
             }
@@ -263,14 +268,13 @@ impl VfsStore {
             }
         }
 
-        for (path, bytes, lines) in self.list_lower(&norm_prefix) {
+        for (path, bytes) in self.list_lower(&norm_prefix) {
             if seen.contains(&path) {
                 continue;
             }
             out.push(ListEntry {
                 path,
                 bytes,
-                lines,
                 modified: false,
             });
         }
@@ -382,12 +386,6 @@ impl VfsStore {
             .map_err(|_| VfsError::Unreadable(format!("{norm} is not valid UTF-8 text")))
     }
 
-    /// Walk the workspace under `norm_prefix`, honouring every ignore file the
-    /// `ignore` crate knows. Returns `(normalised path, bytes, lines)`.
-    ///
-    /// Line counts require reading each file, so they are only computed for files
-    /// within [`MAX_LOWER_FILE_BYTES`] that parse as UTF-8; anything else reports
-    /// `0` lines alongside its true byte size.
     /// The ignore-driven walker both lower-layer passes use.
     ///
     /// One builder, so a listing and a search can never disagree about what is
@@ -409,9 +407,7 @@ impl VfsStore {
     /// Normalised keys of the workspace files under `norm_prefix`.
     ///
     /// Deliberately stats nothing and reads nothing: this backs path search and
-    /// the candidate list for a content search, and computing the line counts
-    /// [`VfsStore::list`] needs would mean reading every file in the repository
-    /// to throw the number away.
+    /// the candidate list for a content search, which need only the names.
     fn walk_lower_paths(&self, norm_prefix: &str) -> Vec<String> {
         let Some(root) = self.workspace.as_ref() else {
             return Vec::new();
@@ -449,7 +445,15 @@ impl VfsStore {
         out
     }
 
-    fn list_lower(&self, norm_prefix: &str) -> Vec<(String, usize, usize)> {
+    /// Walk the workspace under `norm_prefix`, honouring every ignore file the
+    /// `ignore` crate knows. Returns `(normalised path, bytes)`.
+    ///
+    /// **Metadata only — nothing here opens a file.** `bytes` is the directory
+    /// entry's own length, so the cost of a listing is the walk. A line count
+    /// would mean a `read` plus a UTF-8 decode of every file the walk touches —
+    /// on this workspace ~2,900 files, for a listing that pages down to fifty
+    /// rows.
+    fn list_lower(&self, norm_prefix: &str) -> Vec<(String, usize)> {
         let Some(root) = self.workspace.as_ref() else {
             return Vec::new();
         };
@@ -485,17 +489,7 @@ impl VfsStore {
                 }
             }
             let Ok(meta) = entry.metadata() else { continue };
-            let bytes = meta.len();
-            let lines = if bytes <= MAX_LOWER_FILE_BYTES {
-                std::fs::read(entry.path())
-                    .ok()
-                    .and_then(|b| String::from_utf8(b).ok())
-                    .map(|s| s.lines().count())
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            out.push((key, bytes as usize, lines));
+            out.push((key, meta.len() as usize));
         }
         out
     }
@@ -873,7 +867,6 @@ mod tests {
             .next()
             .expect("oversize files still list");
         assert_eq!(entry.bytes, big, "with their true size");
-        assert_eq!(entry.lines, 0, "but no line count, since it is not read");
     }
 
     // ── Lower layer: listing ─────────────────────────────────────────────────
@@ -906,12 +899,33 @@ mod tests {
     }
 
     #[test]
-    fn list_reports_line_counts_and_sizes_from_disk() {
+    fn list_reports_sizes_from_disk() {
         let (_dir, s) = store_with_tree();
         let e = &s.list("src/main.rs")[0];
         assert_eq!(e.bytes, "fn main() {}\n".len());
-        assert_eq!(e.lines, 1);
         assert!(!e.modified);
+    }
+
+    /// **A listing never opens a file.** `bytes` comes from the walk's metadata;
+    /// anything that needs a file's contents — a line count, once — turns a
+    /// listing into a read of the whole tree. A file that cannot be opened at
+    /// all therefore still lists, with its true size, which is the cheapest
+    /// available proof that nothing on this path reads.
+    #[test]
+    fn listing_does_not_read_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not valid UTF-8: a listing that decoded contents would have to either
+        // fail or special-case this, and it does neither because it never looks.
+        std::fs::write(dir.path().join("blob.bin"), [0xffu8, 0xfe, 0x00, 0x01]).unwrap();
+        let s = VfsStore::with_workspace(dir.path());
+
+        let e = &s.list("blob.bin")[0];
+        assert_eq!(e.path, "blob.bin");
+        assert_eq!(e.bytes, 4, "size comes from metadata, not from decoding");
+
+        // And reading it is still the error it always was — the listing's
+        // silence about contents is not the read path going soft.
+        assert!(matches!(s.read("blob.bin"), Err(VfsError::Unreadable(_))));
     }
 
     #[test]

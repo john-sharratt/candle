@@ -210,6 +210,7 @@ mod resolver;
 mod schema;
 mod score;
 mod selection;
+pub mod warm_pool;
 mod yaml;
 
 #[cfg(test)]

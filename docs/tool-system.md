@@ -139,6 +139,31 @@ The example above shows the full web-chat system prompt with all ninety-three to
 
 The example is shown as a flat enumeration for documentation clarity. At runtime the `<tools>` block is rendered dynamically by the inference engine's tool surface mechanism — full schemas for the tool currently being constructed, descriptions for nearby candidates, names only for everything else — and adapts during decode. The mechanism is specified separately; what matters here is the authored content each tool provides, covered in the next subsection.
 
+### Several calls in one turn
+
+One assistant turn may make up to `MAX_TOOL_CALLS_PER_TURN` (4) calls — OpenAI's *parallel function calling* expressed in the Hermes text format: one `<tool_call>` block per call, in one reply, with nothing but calls in it.
+
+```
+<tool_call>
+{"name": "file_read", "arguments": {"path": "src/main.rs", "start_line": 1, "end_line": 200}}
+</tool_call>
+<tool_call>
+{"name": "file_read", "arguments": {"path": "Cargo.toml", "start_line": 1, "end_line": 200}}
+</tool_call>
+```
+
+**Why.** A turn that can call only once pays a full round-trip per call — a reasoning block, a prefill of the growing context, a reprojection and a belief scan — while the calls themselves run in milliseconds. Measured on a codebase tour: fifteen single-call rounds, most of the conversation's non-answer wall clock. A model that already knows it wants three files should ask for them together.
+
+**The grammar enforces the shape.** `Engine::compile_tool_stencil` compiles `compile_tool_call_loop`: after each call the only continuations are the `<tool_call>` marker (another call) or the assistant-turn terminator. So the decoder is never free between a call and whatever follows it — no prose after a call, no answer to a result not yet seen — and a fifth call is off-grammar rather than counted and refused downstream. The envelope is `ToolCallEnvelope::for_assistant_calls`, which keeps the turn terminator *off* the call's close: the single-call envelope baked it in, which would end the turn before the loop could choose.
+
+The compiler memoises shared successors (`stencil::compile`). A loop spec is a DAG — every tool's arguments at level `k` end at the same "call again or stop" branch — and lowering it as a tree copies level `k+1` once per path through level `k`. Over the 95-tool catalog that never finished compiling; memoised it is 902 / 1,805 / 2,707 / 3,609 nodes for one to four calls.
+
+**Results are correlated in the text.** OpenAI pairs a result with its call by `tool_call_id`. Here each result's `<tool_response>` block opens with `[n/total tool_name]` when a turn made more than one call — explicit rather than positional, because a failed call returns an error envelope instead of the shape its position would suggest. A single-call round carries no label, so it stays byte-identical to the `code_reading` ingest's prefilled rounds. The label is literal text, so `tool_round_text` rebuilds a stored round into exactly the pieces it was submitted as.
+
+**Dispatch is sequential.** `run_tool_calls` runs a turn's calls in order. The file tools run in milliseconds, so the round-trips batching removes are the whole win; concurrent execution would add ordering hazards for the stateful session tools (`ssh_session_open` → `ssh_session_exec`) for no measurable gain.
+
+**The model must be taught it.** The prompt invites batching explicitly, and `file_read` carries two batched trajectories. A permission the corpus never demonstrates is one the model does not use.
+
 ### Tool Description Format
 
 Each tool has three authored forms — name, description, and full — corresponding to the tiers of the dynamic tool surface. Tool authors provide all three; the surface mechanism selects which tier to render at any given decode step.
@@ -533,7 +558,9 @@ Create a new file or overwrite an existing one in the in-memory virtual filesyst
 
 ### `file_read`
 
-Read a file, or a range of its lines, from the session VFS. Use for: looking at what was previously written, inspecting a file the user uploaded into the chat, retrieving content the model needs to reference for editing or summarising, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what's in", "open the file", "cat", "display the contents of". Only `path` is required: given alone it returns the whole file, and `start_line` / `end_line` narrow the read to part of it. Returns the excerpt as numbered source in a fenced block, headed by the path and the line range it covers. Limited to files in the in-memory VFS — for remote filesystems use `remote_fs_session_get` to download first, then `file_read`.
+Read a range of lines from a file in the session VFS. Use for: looking at what was previously written, inspecting a file the user uploaded into the chat, retrieving content the model needs to reference for editing or summarising, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what's in", "open the file", "cat", "display the contents of". **`path`, `start_line` and `end_line` are all required, and a call returns at most `MAX_READ_LINES` (200) lines — there is no whole-file read.** Returns the excerpt as numbered source in a fenced block, headed by the path and the line range it covers. Limited to files in the in-memory VFS — for remote filesystems use `remote_fs_session_get` to download first, then `file_read`.
+
+**Why the range is mandatory rather than merely encouraged.** An unbounded read is not a slower read; it is a different failure, and it is one that guidance does not prevent. With the range optional, a single live conversation made nine `file_read` calls and all nine asked for whole files — 9,534 lines, including one 2,499-line module that arrived as 144 KB of `<tool_response>`. Three such reads made the following turn a 53,288-token prefill, which the scheduler delivered in 8,192-token chunks while the KV pool ratcheted 6 GB against a card already at 99% occupancy: one turn, three minutes and fifty seconds, with the per-chunk cost rising as the prefill went on (12.3 s → 23.0 s for identical work at identical depth). An emphatic description had been in place for that entire conversation. The schema is what holds, because `required` drives the constrained-decode stencil: a call with no range is not discouraged, it is undecodable.
 
 **Parameters**
 
@@ -545,15 +572,15 @@ Read a file, or a range of its lines, from the session VFS. Use for: looking at 
     "start_line": {
       "type": "integer",
       "minimum": 1,
-      "description": "First line to return, 1-based. Omit to read from the top of the file."
+      "description": "First line of the range to return, 1-based. Required."
     },
     "end_line": {
       "type": "integer",
       "minimum": 1,
-      "description": "Last line to return, 1-based and inclusive. Omit to read to the end of the file."
+      "description": "Last line of the range, 1-based and inclusive. Required. At most 200 lines come back per call."
     }
   },
-  "required": ["path"]
+  "required": ["path", "start_line", "end_line"]
 }
 ```
 
@@ -571,11 +598,13 @@ src/main.rs (lines 1-3):
 ```
 ````
 
-A missing bound is the file's own edge: with no range the whole file comes back, `start_line` alone reads to the end, and `end_line` alone reads from the top. A given `start_line` is clamped into `[1, total]` and `end_line` into `[start_line, total]`. When the excerpt stops before the end of the file the header reads `(lines 47-93 of 900)`, which is the signal to continue with `start_line` 94; otherwise it reads `(lines a-b)`. An empty file reads as `(empty)`.
+`start_line` is clamped into `[1, total]` and `end_line` into `[start_line, total]`, so a range running past the end of the file ends at the file rather than failing, and a transposed pair collapses to a one-line read rather than costing a round trip. The span cap applies last, to whatever the clamps produced: `end` becomes at most `start_line + 199`.
 
-The properties are declared `path, start_line, end_line`, and the constrained decoder offers optional parameters in declared order (the workspace builds `serde_json` with `preserve_order`), so a call names its range start first.
+**A range wider than the cap is served, not refused.** Asking for lines 1-900 of a 900-line file returns lines 1-200, and because the excerpt now stops short of the end the header reads `(lines 1-200 of 900)` — which states both that it was cut and where to resume. Returning `invalid_arguments` would spend a whole turn conveying what the header already carries. When the excerpt does reach the end of the file the header is the plain `(lines a-b)`, which is how the model knows there is nothing further to fetch. An empty file reads as `(empty)`.
 
-**Errors.** Missing file returns `{"error": "not_found", "path": "..."}`. A call missing `path` returns `{"error": "invalid_arguments", ...}`.
+The `required` list is declared `path, start_line, end_line`, and the constrained decoder emits required parameters in that order, so a call reads in the order it is written.
+
+**Errors.** Missing file returns `{"error": "not_found", "path": "..."}`. A call missing `path`, `start_line` or `end_line` returns `{"error": "invalid_arguments", ...}` naming the absent field. A path under a `secrets/` directory returns `{"error": "forbidden"}` — note that argument validation runs before the tool, so a malformed call to a protected path reports the malformation first; the guard is unaffected, since neither call reads anything.
 
 ---
 
@@ -611,7 +640,7 @@ Apply a unified diff to an existing VFS file. The patch is one or more `@@ -old,
 
 ### `file_list`
 
-Enumerate the files in a directory you already know the name of — the project's working directory unioned with anything this session has written, which shadows the file of the same path on disk. Use for: seeing what is in a specific directory, checking what the session has created, getting an overview of a subtree you have already located. Triggered by "list files", "what files are in", "show me what's in", "ls", "what's been created so far". Returns path, byte size and line count per entry, paged. Ignored paths (`.gitignore` and friends) never appear, and neither does anything under a `secrets/` directory.
+Enumerate the files in a directory you already know the name of — the project's working directory unioned with anything this session has written, which shadows the file of the same path on disk. Use for: seeing what is in a specific directory, checking what the session has created, getting an overview of a subtree you have already located. Triggered by "list files", "what files are in", "show me what's in", "ls", "what's been created so far". Returns path and byte size per entry, paged. **No line count** — for the reason `file_search` gives below: the walk has each entry's size from its directory metadata, but a line count means opening and decoding the file, and the listing then pages down to 50 entries and discards the rest. On this workspace that was ~2,900 files read to fill fifty rows. A file's length reaches the model through `file_read`'s header instead (`(lines 1-200 of 2499)`), which is exact and arrives when the number is actually needed. Ignored paths (`.gitignore` and friends) never appear, and neither does anything under a `secrets/` directory.
 
 **To *find* a file rather than enumerate one, use `file_search`; to find code by its contents, use `file_grep`.** Calling `file_list` on a guessed directory name is the slow way to answer either question — an empty result is indistinguishable from a wrong guess. For listing remote directories use `remote_fs_session_list_dir`.
 
@@ -636,9 +665,9 @@ Enumerate the files in a directory you already know the name of — the project'
 ```json
 {
   "files": [
-    {"path": "Cargo.toml", "bytes": 142, "lines": 8},
-    {"path": "src/lib.rs", "bytes": 312, "lines": 18},
-    {"path": "src/main.rs", "bytes": 1289, "lines": 47, "modified": true}
+    {"path": "Cargo.toml", "bytes": 142},
+    {"path": "src/lib.rs", "bytes": 312},
+    {"path": "src/main.rs", "bytes": 1289, "modified": true}
   ],
   "paging": {"page": 0, "pages": 1, "per_page": 50, "total": 3, "next_page": null},
   "total_bytes": 1743

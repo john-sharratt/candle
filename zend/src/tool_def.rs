@@ -46,7 +46,16 @@ pub struct ToolDef {
     /// Projected on every turn, outside the `tools` collection's top-k:
     /// provenance still selects its usual number of tools, and a mandatory one
     /// is added on top rather than taking a slot. For the tools a coding turn
-    /// needs whatever the question — reading and listing files.
+    /// needs whatever the question — finding a file, finding code inside one,
+    /// reading and listing.
+    ///
+    /// The set is those four together, not reading and listing alone. A turn
+    /// that can only enumerate and read answers "where is this" by guessing a
+    /// directory at `file_list` and reading whole files to check, which is what
+    /// `file_search` and `file_grep` were added to stop; leaving them to win a
+    /// belief slot meant the turns that most needed them — the ones with no
+    /// path in the question to score against — were exactly the turns that did
+    /// not get them.
     #[serde(default)]
     pub mandatory: bool,
     /// JSON Schema for the call arguments (the tool's Request type).
@@ -443,18 +452,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Reading and listing files project on every turn; nothing else does. A
-    /// mandatory tool rides on top of the belief top-k, so adding one here
-    /// widens every prompt — the set is pinned so that is a deliberate change.
+    /// The four file tools a coding turn needs whatever the question project on
+    /// every turn; nothing else does. A mandatory tool rides on top of the
+    /// belief top-k, so adding one here widens every prompt — the set is pinned
+    /// so that is a deliberate change.
     #[test]
-    fn only_file_read_and_file_list_are_mandatory() {
+    fn the_four_file_tools_are_mandatory() {
         let mut mandatory: Vec<&str> = all()
             .iter()
             .filter(|d| d.mandatory)
             .map(|d| d.name.as_str())
             .collect();
         mandatory.sort();
-        assert_eq!(mandatory, ["file_list", "file_read"]);
+        assert_eq!(
+            mandatory,
+            ["file_grep", "file_list", "file_read", "file_search"]
+        );
     }
 
     #[test]

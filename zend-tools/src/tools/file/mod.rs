@@ -72,10 +72,14 @@ use crate::ToolError;
 /// Tool results are injected into the conversation verbatim, so an unbounded one
 /// is a context hazard — a single `file_list` over `zend/src/` produced a 5.7k
 /// token turn. Listings are therefore paged and report here how much they held
-/// back. `file_read` is not paged: it returns the lines asked for, or the whole
-/// file when no range is given, and its excerpt header states the span it
-/// covers — `(lines a-b of N)` when it stops short of the end — in the
-/// `code_reading` ingest's format.
+/// back.
+///
+/// `file_read` is bounded too, but carries no `Paging`: its range is required
+/// and capped at [`read::MAX_READ_LINES`], and the excerpt header is its own
+/// paging record — `(lines a-b of N)` when it stops short of the end, the plain
+/// `(lines a-b)` when it reached it, in the `code_reading` ingest's format. The
+/// header serves the model directly, in the text it is already reading, where a
+/// structured field beside a rendered string would have to be correlated with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Paging {
     /// Zero-based index of the page returned. Clamped into range, so asking past

@@ -247,7 +247,7 @@ fn file_edit_patches_through_the_overlay_and_leaves_disk_untouched() {
     let patched = "fn main() {\n    let retries = 30;\n    run(retries);\n}\n";
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs"}),
+        json!({"path": "src/main.rs", "start_line": 1, "end_line": 200}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&read), patched.trim_end());
@@ -269,7 +269,7 @@ fn file_edit_patches_through_the_overlay_and_leaves_disk_untouched() {
     assert_eq!(second["bytes"], 54);
     let reread = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs"}),
+        json!({"path": "src/main.rs", "start_line": 1, "end_line": 200}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&reread), patched.trim_end());
@@ -331,7 +331,7 @@ fn file_edit_writes_nothing_when_one_hunk_fails() {
     );
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "all.txt"}),
+        json!({"path": "all.txt", "start_line": 1, "end_line": 200}),
         &ctx,
     ));
     assert_eq!(
@@ -443,7 +443,7 @@ fn workspace_mount_prefix_normalises_to_the_same_entry() {
         let files = resp["files"].as_array().unwrap();
         assert_eq!(files.len(), 1, "prefix {prefix:?}");
         assert_eq!(files[0]["path"], "src/main.rs");
-        assert_eq!(files[0]["lines"], 1);
+        assert_eq!(files[0]["bytes"], "fn main() {}\n".len());
     }
     // The same file resolves under either spelling.
     let bare = harness::expect_success(harness::invoke_with_ctx(

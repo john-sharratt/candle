@@ -25,6 +25,7 @@ questions:
 - hunt down the file that ends with _moe.rs
 - what is the location of the substrate persistence module
 category: Files
+mandatory: true
 description: 'Find files by NAME or PATH anywhere in the project, without knowing which directory they are in. Give a filename (`config.rs`), a stem (`compress`), an extension (`.toml`), a path fragment (`kv_cache/chunked`), or a glob (`*_test.rs`, `src/*/mod.rs`); matching is case-insensitive over the whole path and `*` spans directory separators, so one pattern reaches any depth. Use for: locating a file whose name you know but whose directory you do not, checking whether a module exists at all, finding every file of a kind, discovering where a subsystem lives before reading it. Returns paths only, shortest first (the shortest path bearing a name is usually the definition rather than a vendored copy), paged via `paging.next_page`. THIS IS THE TOOL FOR FINDING A FILE: do not guess directory names and call file_list repeatedly, because an empty listing looks the same whether the directory is empty or the guess was wrong, so the guessing never converges. One file_search covers the whole project. Use file_grep to search file CONTENTS for a string or symbol; use file_list to enumerate a directory you have already located; use file_read once you have the path.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

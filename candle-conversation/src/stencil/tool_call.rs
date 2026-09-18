@@ -7,22 +7,25 @@
 //! leading/trailing comma is ever produced.
 //!
 //! Value handling by type:
-//! - `string` — a free-text span closed at the unescaped closing quote.
+//! - `string` — a free-text span (`Terminator::JsonStringValue`) that includes
+//!   its own opening quote and ends at the unescaped closing one.
 //! - `boolean` — a `true`/`false` branch.
-//! - string `enum` — a branch over the allowed strings.
+//! - string `enum` — a branch over the allowed strings, each arm quoted.
 //! - `integer`/`number`/`array`/`object` — emitted as any structurally-valid
 //!   JSON value (`Terminator::JsonValue`), lookahead-terminated at the enclosing
 //!   `,`/`}`, which the session pushes back to the next node.  This guarantees
 //!   valid JSON structure without strictly enforcing the scalar type.
 //!
-//! **A key stops where the model's own token begins.** A value with a lead-in
-//! (a string's opening `"`) is keyed through it — `"path": "` ends on the ` "`
-//! token the model writes there anyway. A value with none is keyed up to `":`
-//! and no further, so the model writes ` [`, ` ["`, ` 5` or ` true` as the one
-//! token it was trained on. A key ending in a bare space leaves the model
-//! mid-token: grammar-written calls came out `"commands":  [` with the space
-//! doubled, and on one Cline turn the first token for the value was a space
-//! and a closer, which ended it empty — `{"commands":  }}`, not a call.
+//! **A key stops at its colon, and every value's first token is the model's.**
+//! `"path":` and no further, so the model writes ` "`, ` ""`, ` [`, ` ["`, ` 5`
+//! or ` true` as the one token it was trained on. Which token opens a value
+//! depends on the value: Qwen spells an empty string ` ""` as one token and a
+//! non-empty one ` "` then content, so a grammar that prefilled ` "` had chosen
+//! "non-empty" before the model chose anything — asked for an empty `prefix`,
+//! the model wrote `}}` and the string swallowed the call's own close. A key
+//! ending in a bare space fails the same way from the other side: calls came
+//! out `"commands":  [` with the space doubled, and one Cline turn opened its
+//! value with a space and a closer — `{"commands":  }}`, not a call.
 
 use std::collections::HashMap;
 
@@ -201,6 +204,17 @@ pub struct ToolCallEnvelope {
     /// trigger to fire, so the grammar has to offer the marker as the arm that
     /// means "act again".
     pub marker: String,
+    /// What the chat template writes between one call's `close` and the next
+    /// call's `marker`, when a message carries several — `"\n"` for both Qwen
+    /// shapes, whose templates emit a newline before every call after the
+    /// first.
+    ///
+    /// [`compile_tool_call_loop`]'s "act again" arm is this followed by the
+    /// marker. The marker glued straight onto the previous close would mask
+    /// the one token a model trained on the template writes to continue, and
+    /// offered only that or the turn terminator, the model ends the turn — a
+    /// grammar permitting four calls would produce one.
+    pub between_calls: String,
 }
 
 impl ToolCallEnvelope {
@@ -215,6 +229,7 @@ impl ToolCallEnvelope {
             args_open: ", \"arguments\": {".to_string(),
             close: "}}\n</tool_call>".to_string(),
             marker: "<tool_call>".to_string(),
+            between_calls: "\n".to_string(),
             name_close: "\"".to_string(),
             param_open: String::new(),
             param_name_close: String::new(),
@@ -255,6 +270,7 @@ impl ToolCallEnvelope {
             // call and the model is never required to produce one.
             close: "\n</function>\n</tool_call>".to_string(),
             marker: "<tool_call>".to_string(),
+            between_calls: "\n".to_string(),
             name_close: ">".to_string(),
             param_open: "\n<parameter=".to_string(),
             param_name_close: ">\n".to_string(),
@@ -386,6 +402,40 @@ impl ToolCallEnvelope {
             ..base
         }
     }
+
+    /// [`Self::for_assistant_turn`]'s sibling for a turn that may make **several**
+    /// calls ([`compile_tool_call_loop`]): the marker comes off the front for the
+    /// same reason, and the turn terminator stays **off** the close.
+    ///
+    /// That is the whole difference, and it is structural rather than stylistic.
+    /// A single-call tree ends the turn unconditionally, so its close may carry
+    /// the terminator. A loop must decide *after* each call whether to open
+    /// another or stop, so the terminator is the loop's other arm — baked into
+    /// `close` it would end the turn before that choice exists, and the tree
+    /// would be the single-call tree with extra nodes.
+    ///
+    /// [`Self::turn_close`] is the terminator to pass alongside it, so the two
+    /// halves of the split come from one place.
+    pub fn for_assistant_calls(d: &Dialect) -> Self {
+        let base = Self::for_dialect(d);
+        Self {
+            open: base
+                .open
+                .strip_prefix(&base.marker)
+                .unwrap_or(&base.open)
+                .to_string(),
+            ..base
+        }
+    }
+
+    /// The assistant-turn terminator, trimmed to end exactly ON the EOS — the
+    /// `close_turn` argument [`compile_tool_call_loop`] finishes a turn with.
+    /// Trimmed for the reason [`Self::for_assistant_turn`] records: a dialect's
+    /// `assistant_end` carries a trailing newline, and an EOS one slot from the
+    /// end is an EOS nothing sees.
+    pub fn turn_close(d: &Dialect) -> String {
+        d.assistant_end.trim_end().to_string()
+    }
 }
 
 /// One argument value as JSON: a number or boolean verbatim, anything else as a
@@ -404,6 +454,23 @@ fn json_scalar(v: &str) -> String {
 /// suppression, the in-call reprojection freeze at first-token promotion), so
 /// the label is a shared constant rather than a string literal in each place.
 pub const TOOL_CALL_TREE_LABEL: &str = "tool_call";
+
+/// How many tool calls one assistant turn may make.
+///
+/// **A turn that can only call once pays a full round-trip per call.** Reading
+/// four files it already knows it wants costs four reasoning blocks, four
+/// prefills of a growing context, four reprojections and four belief scans — and
+/// measured on a codebase tour, fifteen such rounds were the bulk of the wall
+/// clock while the calls themselves ran in milliseconds. Batching what the model
+/// already knows it needs collapses those round-trips into one.
+///
+/// Four is a starting point, not a tuned constant: it covers the common fan-out
+/// (list a directory, read the two or three files it names) without letting one
+/// turn commit to a long speculative run whose later calls are chosen before any
+/// result has come back. The ceiling is a grammar bound, not a target — a turn
+/// making one call remains perfectly ordinary, because the loop's other arm is
+/// always the turn terminator.
+pub const MAX_TOOL_CALLS_PER_TURN: usize = 4;
 
 /// Compile a tool catalog into a [`TreeSpec`].  Errors on an empty catalog or a
 /// name/enum collision the trie rejects.
@@ -598,10 +665,14 @@ pub fn compile_action_loop(
         });
 
         // What the *previous* level's close leads to: go again, or finish. The
-        // continuation arm carries the marker the model would have emitted to
-        // start another call, so choosing it is choosing to act again.
+        // continuation arm carries what the template writes between two calls
+        // and then the marker — exactly the text the model would have emitted
+        // to start another call — so choosing it is choosing to act again.
         after_call = b.spec.push(NodeSpec::Branch {
-            arms: vec![(env.marker.clone(), open), (close_turn.to_string(), end)],
+            arms: vec![
+                (format!("{}{}", env.between_calls, env.marker), open),
+                (close_turn.to_string(), end),
+            ],
         });
         if level == 0 {
             root_open = Some(open);
@@ -756,26 +827,34 @@ impl ToolTreeBuilder<'_> {
             });
             return Ok(("", span));
         }
+        // **Neither string shape prefills its opening quote.** The key stops at
+        // the colon and the quote is the model's, as it already was for every
+        // other type — because which token opens a string depends on the value.
+        // Qwen writes an empty string as the single token ` ""` and a non-empty
+        // one as ` "` then content, so a prefilled ` "` has chosen "non-empty"
+        // before the model has chosen anything. See `Terminator::JsonStringValue`.
         if let Some(values) = &p.enum_values {
-            // `"` <branch over `value"`> — the closing quote rides on each arm
-            // so a value that prefixes another stays distinguishable.  The
-            // opening `"` is the lead-in (folded into the key).
+            // A branch over ` "value"` — both quotes ride on each arm, the
+            // closing one so a value that prefixes another stays
+            // distinguishable. The arms' shared ` "` is not lost: the compiler
+            // heals the common token prefix of their real encodings into a
+            // static, which is the prefill a tokenizer actually agrees with.
             let branch = self.spec.push(NodeSpec::Branch {
-                arms: values.iter().map(|v| (format!("{v}\""), next)).collect(),
+                arms: values.iter().map(|v| (format!(" \"{v}\""), next)).collect(),
             });
-            return Ok(("\"", branch));
+            return Ok(("", branch));
         }
         match p.ty {
             ParamType::String => {
                 let span = self.spec.push(NodeSpec::FreeText {
-                    term: Terminator::JsonString,
+                    term: Terminator::JsonStringValue,
                     eos_ends: false,
                     limits: FreeTextLimits::json_string(),
                     close_token: None,
                     suppress_close: false,
                     next,
                 });
-                Ok(("\"", span))
+                Ok(("", span))
             }
             ParamType::Boolean => Ok((
                 "",

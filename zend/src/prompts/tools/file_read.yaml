@@ -1,32 +1,32 @@
 name: file_read
 questions:
+- show me lines 120 through 180 of candle-nn/src/kv_cache/chunked/compress.rs
+- print the opening of candle-kernels/build.rs where the archive groups are registered
+- the panic points at line 512, show me the code around it
+- show me that file from line 900 onward
+- I only need the impl block, not the whole two-thousand-line module
+- give me a window around line 47 so I can see the surrounding context
+- continue from where that excerpt stopped
+- something matched at line 214, show me the function it belongs to
+- what do lines 598 to 630 actually do
+- open src/lib.rs but only the top where the modules are declared
+- that excerpt cut off mid-function, show me the next stretch
+- skip ahead to line 300 and read from there
 - cat zend/src/session.rs
 - print docs/kv_tier_migration.md
 - open the Dockerfile so I can check the base image
 - show me what's in .gitignore
-- what does the build script actually do
-- does that module still import the old helper
 - what version is pinned in the lockfile
-- how long is that source file
-- I want to review the code before we change it
-- need to see the current config to know what to override
 - checking whether my earlier edit actually landed
-- the error mentions line 240, let me see the file
 - read it
 - print that file's contents
-- open the file and show me the text
-- let's look at the source
 - show me the contents of src/main.rs
 - read that config file for me
 - what's in README.md
-- open the file I wrote earlier and print it
-- let me see what's inside Cargo.toml
-- print the contents of the log file
-- pull up that source file so I can look at it
 - read back the notes file from this session
 category: Files
 mandatory: true
-description: 'Read a file, or a range of its lines. Resolves against this session''s edits first, then falls through to the project''s working directory, so real project files can be read directly. Use for: reading a source file from the project, looking at what was previously written, inspecting a file the user uploaded into the chat, checking the current state of a draft after edits. Give only path to read the whole file; add start_line and/or end_line to read part of it — start_line alone reads to the end, end_line alone reads from the top, and a named range asks for exactly those lines. Returns the lines as numbered source in a fenced block, headed by the path and the line range it covers; a partial read''s header reads `(lines 47-93 of 900)`. For remote filesystems use remote_fs_session_get to download first, then file_read.'
+description: 'Read a range of lines from a file. Resolves against this session''s edits first, then falls through to the project''s working directory, so real project files can be read directly. Use for: reading the part of a source file that bears on the question, checking what was written earlier, inspecting a file the user uploaded, confirming the current state of a draft after edits. path, start_line and end_line are ALL REQUIRED — there is no whole-file read, and at most 200 lines come back per call. Aim the range at the answer: a file_grep hit''s line number, a line named in an error, the line after the previous excerpt ended. Returns the lines as numbered source in a fenced block, headed by the path and the range it covers — `(lines 1-200 of 2499)` means 200 lines came back and the file runs to 2499, so the next call starts at 201, while a plain `(lines 47-93)` means that range reached the end of the file. A range wider than 200 lines is served from start_line and the header says what is left, so asking for more does not get more. There is no need to find a file''s length before reading it: read from line 1 and the header reports it. To find the line worth reading, use file_grep rather than paging a large file looking for it. For remote filesystems use remote_fs_session_get to download first, then file_read.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
@@ -35,17 +35,19 @@ parameters:
       minLength: 1
       type: string
     start_line:
-      description: First line to return, 1-based. Omit to read from the top of the file.
+      description: 'First line of the range to return, 1-based. Required — every read names a range. Start where the answer is: a file_grep hit''s line, a line named in an error, or the line after the previous excerpt ended.'
       format: uint32
       minimum: 1.0
       type: integer
     end_line:
-      description: Last line to return, 1-based and inclusive. Omit to read to the end of the file.
+      description: Last line of the range, 1-based and inclusive. Required. At most 200 lines come back per call; a wider range is served from start_line and the header says how much of the file is left.
       format: uint32
       minimum: 1.0
       type: integer
   required:
   - path
+  - start_line
+  - end_line
   title: ReadRequest
   type: object
 examples:
@@ -53,71 +55,71 @@ examples:
   show me the contents of /workspace/Cargo.toml<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user wants to see /workspace/Cargo.toml. No range was named, so file_read takes only the path and returns the whole file.<|projection|> The header states the lines it covers.
+  The user wants to see /workspace/Cargo.toml. Every read names a range, and a read returns at most 200 lines, so I ask for 1-200 — a manifest is<|projection|> comfortably under that. If the header comes back as a plain `(lines 1-N)` I have the whole file; if it says `of N` there is more and I read on from where it stopped.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/Cargo.toml"}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/Cargo.toml", "start_line": 1, "end_line": 200}}
   </tool_call><|projection|>
 - |-
   read the file /workspace/src/main.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  A direct read of /workspace/src/main.rs. With no range given, file_read needs only the path and returns the whole file,<|projection|> numbered so I can point at specific lines.
+  A direct read of /workspace/src/main.rs, asked for as a file rather than as a question about one part of it. A main.rs is normally a short entry point, so the first 200 lines are likely<|projection|> all of it — path, start_line 1, end_line 200. It comes back numbered, so I can point at specific lines, and the header will tell me whether anything was left.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/src/main.rs"}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/src/main.rs", "start_line": 1, "end_line": 200}}
   </tool_call><|projection|>
 - |-
   what's in /workspace/.gitignore<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user asks what /workspace/.gitignore contains. That is a whole-file read, so file_read with only the path — a .gitignore<|projection|> is short, and all of it is the answer.
+  The user asks what /workspace/.gitignore contains, and all of it is the answer. A .gitignore runs to a few dozen lines,<|projection|> well inside the 200 a read returns, so 1-200 fetches it entire and the header confirms it by not reporting a larger total.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/.gitignore"}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/.gitignore", "start_line": 1, "end_line": 200}}
   </tool_call><|projection|>
 - |-
   cat /workspace/docs/architecture.md for me<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  "cat" means show the whole file, which is what file_read returns when it is given only a path, so the call names /workspace/docs/architecture.md<|projection|> and no range.
+  "cat" asks for the whole file, but a read returns at most 200 lines and an architecture document is usually longer than that. So this is the first page rather than the file: 1-200 of<|projection|> /workspace/docs/architecture.md. The header will report the true total, and I continue from 201 if the part that answers the user is further down.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/docs/architecture.md"}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/docs/architecture.md", "start_line": 1, "end_line": 200}}
   </tool_call><|projection|>
 - |-
   read src/main.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user wants the contents of src/main.rs. file_read resolves a path against this session's edits first and then falls through to the project's working directory, so it will return the<|projection|> real file. No range was named, so the path alone, and the whole file comes back.
+  The user wants the contents of src/main.rs. file_read resolves a path against this session's edits first and then falls through to the project's working directory, so it will return the<|projection|> real file. Nothing here points at a particular region, so I start at the top: 1-200, which is the most a single read returns anyway.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/main.rs"}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/main.rs", "start_line": 1, "end_line": 200}}
   </tool_call><|projection|>
 - |-
   what does the README say<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user is asking about the README's contents. That means actually reading it rather than guessing, so file_read on README.md.<|projection|> No range: the whole README comes back.
+  The user is asking about the README's contents. That means actually reading it rather than guessing, so file_read on README.md<|projection|> from line 1. A README is usually short enough to arrive in one read, and 200 is the most that comes back regardless, so 1-200 is the call.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "README.md"}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "README.md", "start_line": 1, "end_line": 200}}
   </tool_call><|projection|>
 - |-
   show me the first 30 lines of src/lib.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Only the top of src/lib.rs is wanted, up to line 30. end_line alone reads from the start of the file,<|projection|> so the call gives path and end_line 30.
+  Only the top of src/lib.rs is wanted, up to line 30. Both bounds are named on every read, so the top of a file is<|projection|> start_line 1 with end_line 30 rather than an end on its own.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/lib.rs", "end_line": 30}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/lib.rs", "start_line": 1, "end_line": 30}}
   </tool_call><|projection|>
 - |-
   read lines 47 to 93 of src/auth/handler.rs<|im_end|>
@@ -153,9 +155,68 @@ examples:
   show me the rest of that file<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The previous excerpt covered lines 47-93 and its header reported a larger total, so the rest starts at line 94. start_line alone reads from there to the end of the file.<|projection|> The header will show where it stops.
+  The previous excerpt covered lines 47-93 and its header reported a larger total, so the rest starts at line 94. "The rest" is not a range a read can take —<|projection|> every call names an end, and at most 200 lines come back — so this is the next page, 94 to 293. The header says whether that reached the end, and I continue from 294 if it did not.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/auth/handler.rs", "start_line": 94}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/auth/handler.rs", "start_line": 94, "end_line": 293}}
+  </tool_call><|projection|>
+- |-
+  what does zend/src/session.rs set up at startup<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Nobody named a range, so I choose one from what the question is about. session.rs is one of the largest modules in the daemon and startup lives at the top — the module doc,<|projection|> the imports and the constants — so lines 1-120 is where the answer should be. The header reports the file's total, so if it is not there I know how much is left and can read on.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "zend/src/session.rs", "start_line": 1, "end_line": 120}}
+  </tool_call><|projection|>
+- |-
+  so what does that function actually do<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The search above put reconcile_wave_offsets at line 412 of candle-conversation/src/wave/stager.rs. The question is about that function, not about the module it sits in, so the read is a window around the hit rather than the file:<|projection|> lines 400 to 470 catch the signature, the body and a little of what precedes it. If the body runs past 470 the header's total will say so and I can read on.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "candle-conversation/src/wave/stager.rs", "start_line": 400, "end_line": 470}}
+  </tool_call><|projection|>
+- |-
+  that window cut off before the match arm, show me more<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The excerpt covered lines 400-470 of 1,240 and the match it belongs to continues past the end, so the arm is below what I was shown. I widen rather than<|projection|> re-read from the top: 460 to 540, starting ten lines back so the join reads continuously against what I already have.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "candle-conversation/src/wave/stager.rs", "start_line": 460, "end_line": 540}}
+  </tool_call><|projection|>
+- |-
+  compare src/main.rs, src/lib.rs and Cargo.toml for me<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Three files, all named, and none of the reads depends on another's result — so they are one reply with three calls, not three replies. Each is likely short, so 1-200 of each; any header<|projection|> that reports a larger total tells me where to read on.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/main.rs", "start_line": 1, "end_line": 200}}
+  </tool_call>
+  <tool_call>
+  {"name": "file_read", "arguments": {"path": "src/lib.rs", "start_line": 1, "end_line": 200}}
+  </tool_call>
+  <tool_call>
+  {"name": "file_read", "arguments": {"path": "Cargo.toml", "start_line": 1, "end_line": 200}}
+  </tool_call><|projection|>
+- |-
+  so how do the two parsers in that listing differ<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The listing above named zend/src/code_read/parsers/rust.rs and zend/src/code_read/parsers/python.rs. Comparing them needs both, and I already know both paths, so I read them together rather than one now and the other next turn.<|projection|> The top of each file is where the parser's entry point and its types are declared, so 1-200 of each.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "zend/src/code_read/parsers/rust.rs", "start_line": 1, "end_line": 200}}
+  </tool_call>
+  <tool_call>
+  {"name": "file_read", "arguments": {"path": "zend/src/code_read/parsers/python.rs", "start_line": 1, "end_line": 200}}
   </tool_call><|projection|>

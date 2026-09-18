@@ -63,7 +63,7 @@ fn file_read_refuses_the_daemons_secrets() {
     let dir = workspace();
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "secrets/tools.yaml"}),
+        json!({"path": "secrets/tools.yaml", "start_line": 1, "end_line": 200}),
         &ctx(&dir),
     );
     let detail = harness::expect_error(&resp, "forbidden");
@@ -78,7 +78,7 @@ fn file_read_refuses_the_gateways_secrets() {
     let dir = workspace();
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "web/secrets/auth.yaml"}),
+        json!({"path": "web/secrets/auth.yaml", "start_line": 1, "end_line": 200}),
         &ctx(&dir),
     );
     harness::expect_error(&resp, "forbidden");
@@ -105,7 +105,11 @@ fn no_spelling_of_the_path_gets_through() {
         r"secrets\tools.yaml",
         r"\workspace\secrets\tools.yaml",
     ] {
-        let resp = harness::invoke_with_ctx("file_read", json!({ "path": path }), &c);
+        let resp = harness::invoke_with_ctx(
+            "file_read",
+            json!({ "path": path, "start_line": 1, "end_line": 200 }),
+            &c,
+        );
         harness::expect_error(&resp, "forbidden");
         assert!(!text(&resp).contains(TAVILY), "leaked via {path:?}");
     }
@@ -193,7 +197,7 @@ fn ordinary_files_still_read_and_search() {
 
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs"}),
+        json!({"path": "src/main.rs", "start_line": 1, "end_line": 200}),
         &c,
     ));
     assert!(read.as_str().unwrap().contains("fn main()"));
@@ -224,7 +228,7 @@ fn the_segment_matches_at_any_depth() {
     std::fs::write(dir.path().join("a/b/secrets/c/deep.txt"), "buried").unwrap();
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "a/b/secrets/c/deep.txt"}),
+        json!({"path": "a/b/secrets/c/deep.txt", "start_line": 1, "end_line": 200}),
         &ToolContext::with_workspace(dir.path()),
     );
     harness::expect_error(&resp, "forbidden");

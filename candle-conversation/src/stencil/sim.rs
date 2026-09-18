@@ -102,9 +102,14 @@ pub fn simulate(
             StencilAction::FreeDecode { .. } => {
                 let token = oracle.next(None, step)?;
                 step += 1;
-                run.tokens.push(token);
                 let obs = session.observe(token, &vocab.token_bytes(token))?;
                 run.observes.push(obs);
+                // A token the span drops never reaches the sequence — the decode
+                // loop discards it on `Healed::Drop`. Committing it here made the
+                // simulator emit text the daemon never would.
+                if obs != Observe::TokenClosedDrop {
+                    run.tokens.push(token);
+                }
                 match obs {
                     Observe::SpanClosed { leftover } => run.healed_bytes += leftover,
                     Observe::SpanForcedClosed => run.forced_closes += 1,

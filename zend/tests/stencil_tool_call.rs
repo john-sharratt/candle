@@ -10,9 +10,9 @@
 use std::sync::Arc;
 
 use candle_conversation::stencil::{
-    compile, compile_tool_call_tree, AllowedSet, HfVocab, Param, ParamType, StencilAction,
-    StencilNode, StencilSession, StencilTree, TestVocab, ToolCallEnvelope, ToolSpec, Vocab,
-    WalkError,
+    compile, compile_tool_call_loop, AllowedSet, FreeTextLimits, HfVocab, NodeSpec, Observe, Param,
+    ParamType, StencilAction, StencilNode, StencilSession, StencilTree, Terminator, TestVocab,
+    ToolCallEnvelope, ToolSpec, TreeSpec, Vocab, WalkError, MAX_TOOL_CALLS_PER_TURN,
 };
 
 // ── Building the tree from the live registry ────────────────────────────────
@@ -24,12 +24,47 @@ fn catalog() -> Vec<ToolSpec> {
         .collect()
 }
 
+/// What a turn ends with once the loop decides to stop calling. The tests drive
+/// whole turns, so every target carries it.
+const TURN_CLOSE: &str = "<|im_end|>";
+
+/// The marker that opens a call — and, the first time, fires the stencil.
+const MARKER: &str = "<tool_call>";
+
+/// The envelope `Engine::compile_tool_stencil` compiles with: the Qwen3 JSON
+/// block with the marker taken off `open`, as `for_assistant_calls` does.
+///
+/// Not the raw [`ToolCallEnvelope::qwen3`]. The loop's contract is that `open`
+/// excludes the marker — the model emits the first one itself to fire the
+/// stencil, and the loop's continuation arm emits every later one before
+/// `open`. Handed a marker-bearing `open`, every call after the first comes out
+/// `<tool_call><tool_call>…`. Building the tests from the raw envelope is what
+/// made the first two multi-call tests fail against a grammar that is correct.
+fn production_envelope() -> ToolCallEnvelope {
+    let base = ToolCallEnvelope::qwen3();
+    ToolCallEnvelope {
+        open: base
+            .open
+            .strip_prefix(&base.marker)
+            .unwrap_or(&base.open)
+            .to_string(),
+        ..base
+    }
+}
+
+/// The spec for a turn of up to `max_calls` calls over the live catalog.
+fn loop_spec(max_calls: usize) -> TreeSpec {
+    compile_tool_call_loop(&catalog(), &production_envelope(), max_calls, TURN_CLOSE)
+        .expect("the whole registry compiles to one tree")
+}
+
+/// **The tree the daemon actually compiles.** `Engine::compile_tool_stencil`
+/// builds a [`compile_tool_call_loop`] over the live catalog, so a test driving
+/// the single-call tree would be exercising a grammar that no longer runs —
+/// which is how a suite goes green against a shape production does not have.
 fn build_tree() -> (Arc<StencilTree>, TestVocab) {
-    let tools = catalog();
-    let spec = compile_tool_call_tree(&tools, &ToolCallEnvelope::qwen3())
-        .expect("the whole registry compiles to one tree");
     let vocab = TestVocab::new();
-    let tree = compile(&spec, &vocab).expect("the spec tokenizes");
+    let tree = compile(&loop_spec(MAX_TOOL_CALLS_PER_TURN), &vocab).expect("the spec tokenizes");
     (Arc::new(tree), vocab)
 }
 
@@ -41,9 +76,7 @@ fn build_tree() -> (Arc<StencilTree>, TestVocab) {
 /// the GPU at daemon startup.
 #[test]
 fn full_catalog_compiles_with_structural_json_merges() {
-    let tools = catalog();
-    let spec = compile_tool_call_tree(&tools, &ToolCallEnvelope::qwen3())
-        .expect("the whole registry compiles to one tree");
+    let spec = loop_spec(MAX_TOOL_CALLS_PER_TURN);
     let vocab = TestVocab::new()
         .with_special("{\"", 300)
         .with_special("\":", 301)
@@ -104,9 +137,7 @@ fn full_catalog_compiles_against_real_qwen3_tokenizer() {
     // eos/fingerprint are irrelevant to compilation (the tool grammar is not
     // eos-terminated), so any value works.
     let vocab = HfVocab::new(tok, &[0], 0);
-    let tools = catalog();
-    let spec = compile_tool_call_tree(&tools, &ToolCallEnvelope::qwen3())
-        .expect("the whole registry compiles to one tree");
+    let spec = loop_spec(MAX_TOOL_CALLS_PER_TURN);
     let tree = compile(&spec, &vocab).expect("full catalog compiles against real Qwen3 BPE");
     assert!(tree.len() > 50);
     eprintln!("real-tokenizer tree: {} nodes", tree.len());
@@ -174,14 +205,24 @@ enum DriveErr {
     PrefillMismatch { pos: usize, got: String },
     /// The target ran out before the call completed.
     Truncated { pos: usize },
+    /// The tree finished with target text left over — the grammar ended the
+    /// turn somewhere the target says it continued.
+    Trailing { pos: usize },
     /// The session itself errored (e.g. out-of-mask token observed).
     Walk(WalkError),
 }
 
-/// Drive the session to follow `target` (the full materialized call).  Returns
-/// the emitted text on success, or the first place the grammar diverged.
+/// Drive the session to follow `target` — the whole assistant turn as the model
+/// writes it. Returns the emitted text on success, or the first place the
+/// grammar diverged.
+///
+/// The target opens with [`MARKER`] because the turn does; the stencil does not
+/// emit that one. In production the model decodes the first marker itself and
+/// that token is what fires the stencil, so the tree begins just after it. The
+/// driver takes the marker off the front for the walk and puts it back on the
+/// result, so every target reads as the real turn text.
 fn drive(tree: Arc<StencilTree>, target: &str, vocab: &TestVocab) -> Result<String, DriveErr> {
-    let bytes = target.as_bytes();
+    let bytes = target.strip_prefix(MARKER).unwrap_or(target).as_bytes();
     let mut session = StencilSession::new(tree);
     let mut pos = 0usize;
     let mut out: Vec<u32> = Vec::new();
@@ -230,10 +271,21 @@ fn drive(tree: Arc<StencilTree>, target: &str, vocab: &TestVocab) -> Result<Stri
                     .map_err(DriveErr::Walk)?;
                 pos += 1;
             }
-            StencilAction::Exit => break,
+            StencilAction::Exit => {
+                // Without this a target with anything after the turn's end —
+                // prose, a fifth call — "drives" as long as its prefix does,
+                // and every negative test built on it passes vacuously.
+                if pos != bytes.len() {
+                    return Err(DriveErr::Trailing { pos });
+                }
+                break;
+            }
         }
     }
-    Ok(String::from_utf8_lossy(&vocab.decode(&out)).into_owned())
+    Ok(format!(
+        "{MARKER}{}",
+        String::from_utf8_lossy(&vocab.decode(&out))
+    ))
 }
 
 /// The mask offered at the very first decode (the name-branch frontier), after
@@ -278,11 +330,15 @@ fn minimal_call(spec: &ToolSpec) -> String {
     s.push_str("\", \"arguments\": {");
     s.push_str(&fields.join(", "));
     s.push_str("}}\n</tool_call>");
+    s.push_str(TURN_CLOSE);
     s
 }
 
+/// The JSON object of a single-call turn — the envelope, the block close and the
+/// turn terminator stripped.
 fn json_body(text: &str) -> &str {
     text.trim_start_matches("<tool_call>\n")
+        .trim_end_matches(TURN_CLOSE)
         .trim_end_matches("\n</tool_call>")
 }
 
@@ -427,42 +483,53 @@ fn hallucinated_parameter_is_masked() {
     );
 }
 
-// ── file_read's range is optional and ordered ───────────────────────────────
+// ── file_read's range is mandatory and ordered ──────────────────────────────
 
-/// `file_read` may stop after any part of its range — the path alone reads the
-/// whole file, and either bound alone reads to the file's edge — and names what
-/// it gives in `path, start_line, end_line` order, the order its schema
-/// declares them in.
+/// **A whole-file read is not expressible.** `file_read` declares all three of
+/// `path, start_line, end_line` required, so the stencil emits them in that
+/// order and a call that stops early cannot be driven at all.
+///
+/// This is the test that carries the guarantee. The description said to read
+/// part of a file and a live conversation asked for whole files nine times out
+/// of nine; prose does not bind a decode, a grammar does. What the model cannot
+/// spell, it cannot do.
 #[test]
-fn file_read_drives_any_part_of_its_range_in_declared_order() {
+fn file_read_cannot_drive_a_call_without_its_range() {
     let (tree, vocab) = build_tree();
-    for (args, start, end) in [
-        (r#""path": "a.rs""#, None, None),
-        (r#""path": "a.rs", "start_line": 94"#, Some(94), None),
-        (r#""path": "a.rs", "end_line": 30"#, None, Some(30)),
-        (
-            r#""path": "a.rs", "start_line": 598, "end_line": 630"#,
-            Some(598),
-            Some(630),
-        ),
+    for args in [
+        r#""path": "a.rs""#,
+        r#""path": "a.rs", "start_line": 94"#,
+        r#""path": "a.rs", "end_line": 30"#,
     ] {
         let target = format!(
             "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{{args}}}}}\n</tool_call>"
         );
-        let out = drive(Arc::clone(&tree), &target, &vocab)
-            .unwrap_or_else(|e| panic!("{args} must drive, got {e:?}"));
-        let parsed: serde_json::Value = serde_json::from_str(json_body(&out)).unwrap();
-        let arguments = &parsed["arguments"];
-        assert_eq!(arguments["path"], "a.rs");
-        assert_eq!(arguments.get("start_line").and_then(|v| v.as_u64()), start);
-        assert_eq!(arguments.get("end_line").and_then(|v| v.as_u64()), end);
+        assert!(
+            drive(Arc::clone(&tree), &target, &vocab).is_err(),
+            "{args} must NOT drive — the range is required, so a partial call is \
+             off-grammar and the mask never offers the closing brace there",
+        );
     }
 }
 
-/// The bounds come start first. Optionals are offered in declared order, each
-/// at most once, so a tree that offered `end_line` first would strand a call
-/// written in reading order: once `start_line` is taken, the `end_line` gate
-/// is behind it. The reverse order is what cannot be expressed.
+/// The complete call drives, and names its fields in the order the `required`
+/// list declares them.
+#[test]
+fn file_read_drives_a_complete_range_in_declared_order() {
+    let (tree, vocab) = build_tree();
+    let target = "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"a.rs\", \
+                  \"start_line\": 598, \"end_line\": 630}}\n</tool_call><|im_end|>";
+    let out = drive(Arc::clone(&tree), target, &vocab).expect("a full range must drive");
+    let parsed: serde_json::Value = serde_json::from_str(json_body(&out)).unwrap();
+    let arguments = &parsed["arguments"];
+    assert_eq!(arguments["path"], "a.rs");
+    assert_eq!(arguments["start_line"], 598);
+    assert_eq!(arguments["end_line"], 630);
+}
+
+/// The bounds come start first. Required fields are emitted in the order the
+/// `required` list names them, each exactly once, so `end_line` before
+/// `start_line` is off-grammar. The reverse order is what cannot be expressed.
 #[test]
 fn file_read_rejects_its_range_end_first() {
     let (tree, vocab) = build_tree();
@@ -480,6 +547,20 @@ fn file_read_rejects_its_range_end_first() {
 
 // ── Negative: a wrong boolean / wrong enum value is rejected ────────────────
 
+/// A production-shaped loop tree over a hand-written catalog, for tests that
+/// need one precise parameter shape rather than the live registry.
+fn synthetic_tree(tools: &[ToolSpec]) -> (Arc<StencilTree>, TestVocab) {
+    let spec = compile_tool_call_loop(
+        tools,
+        &production_envelope(),
+        MAX_TOOL_CALLS_PER_TURN,
+        TURN_CLOSE,
+    )
+    .unwrap();
+    let vocab = TestVocab::new();
+    (Arc::new(compile(&spec, &vocab).unwrap()), vocab)
+}
+
 #[test]
 fn boolean_value_is_constrained() {
     // A synthetic tool with a required boolean, to drive an illegal value.
@@ -491,14 +572,13 @@ fn boolean_value_is_constrained() {
             "required": ["on"]
         }),
     )];
-    let spec = compile_tool_call_tree(&tools, &ToolCallEnvelope::qwen3()).unwrap();
-    let vocab = TestVocab::new();
-    let tree = Arc::new(compile(&spec, &vocab).unwrap());
+    let (tree, vocab) = synthetic_tree(&tools);
 
     // Valid: true / false drive cleanly.
     for good in ["true", "false"] {
         let target = format!(
-            "<tool_call>\n{{\"name\": \"toggle\", \"arguments\": {{\"on\": {good}}}}}\n</tool_call>"
+            "<tool_call>\n{{\"name\": \"toggle\", \"arguments\": {{\"on\": {good}}}}}\n\
+             </tool_call>{TURN_CLOSE}"
         );
         assert!(
             drive(Arc::clone(&tree), &target, &vocab).is_ok(),
@@ -525,11 +605,10 @@ fn enum_value_is_constrained() {
             "required": ["level"]
         }),
     )];
-    let spec = compile_tool_call_tree(&tools, &ToolCallEnvelope::qwen3()).unwrap();
-    let vocab = TestVocab::new();
-    let tree = Arc::new(compile(&spec, &vocab).unwrap());
+    let (tree, vocab) = synthetic_tree(&tools);
 
-    let ok = "<tool_call>\n{\"name\": \"set_level\", \"arguments\": {\"level\": \"high\"}}\n</tool_call>";
+    let ok = "<tool_call>\n{\"name\": \"set_level\", \"arguments\": {\"level\": \"high\"}}\n\
+              </tool_call><|im_end|>";
     assert!(drive(Arc::clone(&tree), ok, &vocab).is_ok());
 
     // "medium" is not an allowed enum value.
@@ -553,9 +632,7 @@ fn required_field_cannot_be_closed_early() {
             "required": ["path"]
         }),
     )];
-    let spec = compile_tool_call_tree(&tools, &ToolCallEnvelope::qwen3()).unwrap();
-    let vocab = TestVocab::new();
-    let tree = Arc::new(compile(&spec, &vocab).unwrap());
+    let (tree, vocab) = synthetic_tree(&tools);
 
     // Empty arguments — the prefilled `"path": "` will not match `}`.
     let target = "<tool_call>\n{\"name\": \"must\", \"arguments\": {}}\n</tool_call>";
@@ -569,7 +646,8 @@ fn required_field_cannot_be_closed_early() {
     );
 
     // The valid minimal call DOES include the required field.
-    let ok = "<tool_call>\n{\"name\": \"must\", \"arguments\": {\"path\": \"\"}}\n</tool_call>";
+    let ok = "<tool_call>\n{\"name\": \"must\", \"arguments\": {\"path\": \"\"}}\n\
+              </tool_call><|im_end|>";
     let out = drive(tree, ok, &vocab).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(json_body(&out)).unwrap();
     assert!(parsed["arguments"]["path"].is_string());
@@ -594,9 +672,10 @@ fn action_trace_alternates_prefill_and_decode() {
         .expect("some tool has exactly one required string param and no optionals");
     let target = minimal_call(spec);
 
-    // Drive manually, recording the action kinds.
+    // Drive manually, recording the action kinds. The tree starts after the
+    // marker the model emits itself — see `drive`.
     let mut session = StencilSession::new(Arc::clone(&tree));
-    let bytes = target.as_bytes();
+    let bytes = target.strip_prefix(MARKER).unwrap_or(&target).as_bytes();
     let mut pos = 0;
     let mut kinds = Vec::new();
     loop {
@@ -666,8 +745,439 @@ fn escaped_token_bails_and_terminates() {
         text.contains('Z'),
         "the escaped token is still in the stream"
     );
+    // The bail closes the block AND the turn: a bail mid-call must not leave the
+    // decoder free after `</tool_call>`, which in a loop tree is a point where
+    // it would otherwise be choosing whether to call again.
     assert!(
-        text.ends_with("</tool_call>"),
-        "bail must terminate the tool-call block: {text:?}"
+        text.ends_with(&format!("</tool_call>{TURN_CLOSE}")),
+        "bail must terminate the tool-call block and the turn: {text:?}"
+    );
+}
+
+// ── Empty string arguments ──────────────────────────────────────────────────
+
+/// **An empty string argument must drive.** `file_list`'s own exemplars teach
+/// `{"prefix": ""}` three times over — it is how the catalog says "list from the
+/// project root" — so the grammar has to be able to express it.
+///
+/// A live turn produced this instead:
+///
+/// ```text
+/// {"name": "file_list", "arguments": {"prefix": "}}
+/// </tool_call>"}}
+/// </tool_call>
+/// ```
+///
+/// The model wrote `}}` where the value's closing quote belonged, and the value
+/// span — a free-text run that ends at an unescaped `"` — swallowed the call's
+/// own terminator as string content. This test establishes whether the grammar
+/// can represent the empty value at all, which separates "the stencil cannot
+/// express it" from "the model dropped a quote".
+#[test]
+fn an_empty_string_argument_drives() {
+    let (tree, vocab) = build_tree();
+    let target = "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"prefix\": \"\"}}\n\
+                  </tool_call><|im_end|>";
+    let out = drive(Arc::clone(&tree), target, &vocab)
+        .unwrap_or_else(|e| panic!("an empty prefix must drive, got {e:?}"));
+    let parsed: serde_json::Value = serde_json::from_str(json_body(&out)).unwrap();
+    assert_eq!(parsed["arguments"]["prefix"], "");
+}
+
+/// **Each call level costs one catalog's worth of grammar — linear, never
+/// multiplicative.**
+///
+/// `compile_action_loop` builds every tool's argument sub-tree once per level,
+/// so the *spec* grows linearly with `max_calls` by construction. The compiled
+/// tree did not: lowering expanded the spec's shared joins into a tree, copying
+/// level `k+1` once per path through level `k`, and with 95 tools the compile
+/// for four levels never finished — this suite hung. Measured once the compiler
+/// memoised shared successors: 902, 1,805, 2,707, 3,609 nodes for one to four
+/// calls. The bound below allows a level to cost at most a little over one
+/// single-call catalog, which the multiplicative regression overshoots at two
+/// levels already.
+#[test]
+fn each_call_level_adds_one_catalog_of_grammar() {
+    let vocab = TestVocab::new();
+    let size = |max_calls| {
+        compile(&loop_spec(max_calls), &vocab)
+            .expect("the loop compiles")
+            .len()
+    };
+    let one = size(1);
+    for max_calls in 2..=MAX_TOOL_CALLS_PER_TURN {
+        let n = size(max_calls);
+        assert!(
+            n <= one * max_calls + one / 10,
+            "{max_calls} calls compiled to {n} nodes against {one} for one — levels are \
+             being duplicated rather than shared"
+        );
+    }
+}
+
+// ── Several calls in one turn ───────────────────────────────────────────────
+
+/// One `file_read` call on `path`, as the tree formats it.
+fn read_call(path: &str) -> String {
+    format!(
+        "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": \"{path}\", \
+         \"start_line\": 1, \"end_line\": 200}}}}\n</tool_call>"
+    )
+}
+
+/// Several calls as the chat template lays them out: one block per call, a
+/// newline between consecutive blocks.
+fn read_calls<'a>(paths: impl IntoIterator<Item = &'a str>) -> String {
+    paths
+        .into_iter()
+        .map(read_call)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// **Consecutive calls are separated the way the template separates them —
+/// by a newline — and only that way.**
+///
+/// The checkpoint's chat template writes `</tool_call>\n<tool_call>` between
+/// the calls of one message, and zend's own `openai_tools::canonical` renders a
+/// multi-call reply identically. The loop first offered the marker glued
+/// straight onto the previous close, so the one token a model trained on that
+/// template writes to continue — the newline — was masked, and every turn ended
+/// after one call: nine tool rounds, one call each, on a live codebase tour.
+#[test]
+fn consecutive_calls_are_separated_by_the_templates_newline() {
+    let (tree, vocab) = build_tree();
+    let a = read_call("a.rs");
+    let b = read_call("b.rs");
+    drive(Arc::clone(&tree), &format!("{a}\n{b}{TURN_CLOSE}"), &vocab)
+        .expect("the template's `</tool_call>\\n<tool_call>` must drive");
+    assert!(
+        drive(Arc::clone(&tree), &format!("{a}{b}{TURN_CLOSE}"), &vocab).is_err(),
+        "the marker glued to the previous close is not the template's layout"
+    );
+}
+
+/// **Three reads in one turn drive, and every one of them is dispatched.**
+///
+/// This is the point of the loop: a model that already knows it wants three
+/// files asks for them in one turn instead of paying a reasoning block, a
+/// prefill and a belief scan for each. The grammar has to accept the run, and
+/// the extractor downstream has to find every call in it — a turn whose second
+/// and third calls were grammatical but never dispatched would look, from the
+/// model's side, like tools that silently returned nothing.
+#[test]
+fn several_calls_in_one_turn_drive_and_are_all_extracted() {
+    let (tree, vocab) = build_tree();
+    let paths = ["src/main.rs", "src/lib.rs", "Cargo.toml"];
+    let target = format!("{}{TURN_CLOSE}", read_calls(paths));
+    let out = drive(Arc::clone(&tree), &target, &vocab)
+        .unwrap_or_else(|e| panic!("three calls must drive, got {e:?}"));
+    assert_eq!(out, target);
+
+    let calls = zend::tools::extract_tool_calls(&out);
+    let got: Vec<&str> = calls
+        .iter()
+        .map(|c| c.arguments["path"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(got, paths, "every call in the turn is extracted, in order");
+}
+
+/// **The ceiling is enforced by the grammar, not by a count downstream.** After
+/// the last permitted call the only arm left is the turn terminator, so the
+/// marker that would open one more call is off-grammar.
+#[test]
+fn a_turn_cannot_make_more_calls_than_the_limit() {
+    let (tree, vocab) = build_tree();
+    let names: Vec<String> = (0..MAX_TOOL_CALLS_PER_TURN)
+        .map(|i| format!("f{i}.rs"))
+        .collect();
+    let at_limit = read_calls(names.iter().map(String::as_str));
+    drive(
+        Arc::clone(&tree),
+        &format!("{at_limit}{TURN_CLOSE}"),
+        &vocab,
+    )
+    .expect("exactly the limit drives");
+
+    let over = format!("{at_limit}\n{}{TURN_CLOSE}", read_call("one_too_many.rs"));
+    assert!(
+        drive(Arc::clone(&tree), &over, &vocab).is_err(),
+        "a call past MAX_TOOL_CALLS_PER_TURN must not drive"
+    );
+}
+
+/// **Nothing but another call or the end of the turn may follow a call.** That
+/// is what stops the model free-decoding an answer to a result it has not seen
+/// — the single-call tree guaranteed it by baking the terminator into its
+/// close, and the loop has to guarantee it at every level.
+#[test]
+fn a_call_cannot_be_followed_by_prose() {
+    let (tree, vocab) = build_tree();
+    let target = format!("{}The file says{TURN_CLOSE}", read_call("src/main.rs"));
+    assert!(
+        drive(Arc::clone(&tree), &target, &vocab).is_err(),
+        "prose after a call must be masked"
+    );
+}
+
+/// The live checkpoint's tokenizer — Qwen3.8-Flash-Next, the one the daemon
+/// actually compiles its grammar against. The Qwen3 lookup above predates it and
+/// finds an older vocabulary, so a boundary that tokenizes differently in 3.8
+/// was invisible to every "real BPE" test.
+fn cached_live_tokenizer() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)?;
+    let snaps = home.join(".cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots");
+    std::fs::read_dir(&snaps)
+        .ok()?
+        .flatten()
+        .map(|e| e.path().join("tokenizer.json"))
+        .find(|p| p.exists())
+}
+
+// ── The live tokenizer's own encoding of a correct call ─────────────────────
+
+/// Walk the grammar the way the daemon's decode loop does, feeding at every
+/// decision point the token the **live tokenizer's natural encoding** of
+/// `target` puts there — the token a model trained on that encoding writes.
+///
+/// The invariant is the one both of this build's live failures broke: **every
+/// point where the model decides must fall on a boundary of the natural
+/// encoding, and the natural token there must be one the grammar allows.** A
+/// prefill that ends inside a natural token (` "` where the value is ` ""`)
+/// hands the model a state its training never produced; a mask that forbids
+/// the natural token (the `\n` between two calls) makes it pick something else.
+/// A byte-level vocabulary has no multi-byte tokens and cannot see either,
+/// which is how both passed the byte-level suite and failed live.
+fn drive_natural(
+    tree: Arc<StencilTree>,
+    tok: &tokenizers::Tokenizer,
+    target: &str,
+) -> Result<(), String> {
+    // The first marker is the model's: decoding it is what fires the stencil,
+    // so the walk starts after it and the natural encoding is of the rest.
+    let body = target
+        .strip_prefix(MARKER)
+        .ok_or("target must open with the marker")?;
+    let bytes = body.as_bytes();
+    let ids = tok.encode(body, false).map_err(|e| e.to_string())?;
+    let pieces: Vec<(u32, Vec<u8>)> = ids
+        .get_ids()
+        .iter()
+        .map(|&id| {
+            (
+                id,
+                tok.decode(&[id], false).unwrap_or_default().into_bytes(),
+            )
+        })
+        .collect();
+    let mut starts = Vec::with_capacity(pieces.len());
+    let mut at = 0usize;
+    for (_, p) in &pieces {
+        starts.push(at);
+        at += p.len();
+    }
+    let token_at = |b: usize| starts.iter().position(|&s| s == b).map(|i| &pieces[i]);
+    let before = |b: usize| String::from_utf8_lossy(&bytes[b.saturating_sub(24)..b]).into_owned();
+
+    let mut session = StencilSession::new(tree);
+    let mut b = 0usize;
+    for _ in 0..100_000 {
+        match session.next_action() {
+            StencilAction::Prefill(toks) => {
+                let text = tok.decode(&toks, false).map_err(|e| e.to_string())?;
+                if !bytes[b..].starts_with(text.as_bytes()) {
+                    return Err(format!(
+                        "prefill {text:?} does not match the target after {:?}",
+                        before(b)
+                    ));
+                }
+                b += text.len();
+            }
+            // A masked decision fails only when the target's TEXT is unreachable:
+            // no allowed token is a prefix of what comes next. Re-splitting the
+            // same text into different tokens is how every masked branch works —
+            // the model's `",` at the end of a tool name is only ever offered as
+            // `"`, with the comma prefilled, and there is no choice in that. The
+            // separator bug was different in kind: the allowed tokens spelled
+            // other text, so the model had to choose something it did not mean.
+            StencilAction::MaskedDecode(set) => {
+                let (id, len) = set
+                    .tokens()
+                    .iter()
+                    .filter_map(|&id| {
+                        let t = tok.decode(&[id], false).ok()?;
+                        (!t.is_empty() && bytes[b..].starts_with(t.as_bytes()))
+                            .then_some((id, t.len()))
+                    })
+                    .max_by_key(|&(_, len)| len)
+                    .ok_or_else(|| {
+                        format!(
+                            "no allowed token spells the target after {:?} — the model's \
+                             continuation {:?} is masked out",
+                            before(b),
+                            String::from_utf8_lossy(&bytes[b..(b + 16).min(bytes.len())])
+                        )
+                    })?;
+                session
+                    .observe(id, &bytes[b..b + len])
+                    .map_err(|e| format!("{e:?}"))?;
+                b += len;
+            }
+            StencilAction::FreeDecode { .. } => {
+                let (id, p) = token_at(b).ok_or_else(|| {
+                    format!(
+                        "a free decode starts INSIDE a natural token, after {:?} — \
+                         the grammar prefilled part of a token the model writes whole",
+                        before(b)
+                    )
+                })?;
+                match session.observe(*id, p).map_err(|e| format!("{e:?}"))? {
+                    Observe::TokenClosedDrop => {
+                        return Err(format!(
+                            "the natural token {:?} after {:?} was dropped as a repair",
+                            String::from_utf8_lossy(p),
+                            before(b)
+                        ))
+                    }
+                    // The close fell inside this token: only the span's part is
+                    // committed, and the successor writes the rest.
+                    Observe::SpanClosed { leftover } if leftover > 0 && leftover < p.len() => {
+                        b += p.len() - leftover
+                    }
+                    _ => b += p.len(),
+                }
+            }
+            StencilAction::Exit => {
+                return match b == bytes.len() {
+                    true => Ok(()),
+                    false => Err(format!(
+                        "the turn ended with {:?} still to write",
+                        &body[b..]
+                    )),
+                };
+            }
+        }
+    }
+    Err("runaway walk".into())
+}
+
+/// The daemon's grammar compiled against the live checkpoint's tokenizer.
+fn live_tree() -> (Arc<StencilTree>, tokenizers::Tokenizer) {
+    let path = cached_live_tokenizer().expect("Qwen3.8 tokenizer cached");
+    let tok = tokenizers::Tokenizer::from_file(&path).unwrap();
+    let im_end = tok.token_to_id(TURN_CLOSE).expect("<|im_end|> resolves");
+    let vocab = HfVocab::new(tok.clone(), &[im_end], 0);
+    let tree = compile(&loop_spec(MAX_TOOL_CALLS_PER_TURN), &vocab)
+        .expect("the grammar compiles against the live tokenizer");
+    (Arc::new(tree), tok)
+}
+
+/// **Every call a model would naturally write drives the live grammar.**
+///
+/// Each target is a whole turn exactly as the checkpoint's template lays it
+/// out, walked with the live tokenizer's own encoding. The empty `prefix` and
+/// the three-call turn are the two live failures; the rest pin the ordinary
+/// shapes, so a grammar change that breaks one is caught here on the CPU
+/// rather than in a conversation that ends silently.
+#[test]
+#[ignore = "requires the cached Qwen3.8 tokenizer.json"]
+fn natural_calls_drive_the_live_grammar() {
+    let (tree, tok) = live_tree();
+    let calls = [
+        r#"{"name": "file_list", "arguments": {"prefix": ""}}"#,
+        r#"{"name": "file_list", "arguments": {}}"#,
+        r#"{"name": "file_list", "arguments": {"prefix": "zend/src"}}"#,
+        r#"{"name": "file_read", "arguments": {"path": "src/main.rs", "start_line": 1, "end_line": 200}}"#,
+        r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "prefix": "zend/"}}"#,
+        r#"{"name": "calculator", "arguments": {"expression": "2 + 2"}}"#,
+    ];
+    let mut failures = Vec::new();
+    for call in calls {
+        let target = format!("{MARKER}\n{call}\n</tool_call>{TURN_CLOSE}");
+        if let Err(e) = drive_natural(Arc::clone(&tree), &tok, &target) {
+            failures.push(format!("{call}\n    {e}"));
+        }
+    }
+    // Several calls in one turn, laid out as the template lays them out.
+    let batched = ["src/main.rs", "src/lib.rs", "Cargo.toml"]
+        .iter()
+        .map(|p| {
+            format!(
+                "{MARKER}\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": \"{p}\", \
+                 \"start_line\": 1, \"end_line\": 200}}}}\n</tool_call>"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Err(e) = drive_natural(Arc::clone(&tree), &tok, &format!("{batched}{TURN_CLOSE}")) {
+        failures.push(format!("three file_reads in one turn\n    {e}"));
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// **The natural drive rejects both shapes that failed live.** A harness that
+/// passes the fixed grammar proves nothing unless it fails the broken one, so
+/// both old shapes are rebuilt here and must be refused — for the right reason.
+#[test]
+#[ignore = "requires the cached Qwen3.8 tokenizer.json"]
+fn the_natural_drive_rejects_both_live_failures() {
+    let path = cached_live_tokenizer().expect("Qwen3.8 tokenizer cached");
+    let tok = tokenizers::Tokenizer::from_file(&path).unwrap();
+    let im_end = tok.token_to_id(TURN_CLOSE).unwrap();
+    let vocab = HfVocab::new(tok.clone(), &[im_end], 0);
+
+    // 1. The marker glued to the previous close, as the loop first offered it.
+    let glued = ToolCallEnvelope {
+        between_calls: String::new(),
+        ..production_envelope()
+    };
+    let spec =
+        compile_tool_call_loop(&catalog(), &glued, MAX_TOOL_CALLS_PER_TURN, TURN_CLOSE).unwrap();
+    let tree = Arc::new(compile(&spec, &vocab).unwrap());
+    let two = ["a.rs", "b.rs"]
+        .iter()
+        .map(|p| {
+            format!(
+                "{MARKER}\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": \"{p}\", \
+                 \"start_line\": 1, \"end_line\": 200}}}}\n</tool_call>"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let err = drive_natural(tree, &tok, &format!("{two}{TURN_CLOSE}"))
+        .expect_err("a glued separator must fail the natural drive");
+    assert!(err.contains("masked out"), "wrong reason: {err}");
+
+    // 2. A string value whose opening quote is prefilled, as every string was.
+    let mut s = TreeSpec::new("prefilled-quote");
+    let end = s.push(NodeSpec::End);
+    let close = s.push(NodeSpec::Static {
+        text: format!("}}}}\n</tool_call>{TURN_CLOSE}"),
+        next: end,
+    });
+    let value = s.push(NodeSpec::FreeText {
+        term: Terminator::JsonString,
+        eos_ends: false,
+        limits: FreeTextLimits::json_string(),
+        close_token: None,
+        suppress_close: false,
+        next: close,
+    });
+    s.root = s.push(NodeSpec::Static {
+        text: "\n{\"name\": \"file_list\", \"arguments\": {\"prefix\": \"".into(),
+        next: value,
+    });
+    let tree = Arc::new(compile(&s, &vocab).unwrap());
+    let target = format!(
+        "{MARKER}\n{{\"name\": \"file_list\", \"arguments\": {{\"prefix\": \"\"}}}}\n\
+         </tool_call>{TURN_CLOSE}"
+    );
+    let err = drive_natural(tree, &tok, &target)
+        .expect_err("a prefilled opening quote must fail the natural drive");
+    assert!(
+        err.contains("INSIDE a natural token"),
+        "wrong reason: {err}"
     );
 }

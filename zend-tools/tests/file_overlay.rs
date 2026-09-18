@@ -553,46 +553,111 @@ fn read_returns_a_numbered_fenced_excerpt() {
     );
 }
 
-/// Without a range a read returns the whole file, however long, and the header
-/// states the full span — no `of N`, so the model knows it has all of it.
+/// **There is no whole-file read.** A call that names no range — or only one
+/// bound — is refused before it runs, so the unbounded read that put 144 KB of
+/// one module into a live conversation cannot be expressed. The model is told
+/// which field is missing, which is what it needs to reissue the call.
 #[test]
-fn read_without_a_range_returns_the_whole_file() {
+fn a_read_without_both_bounds_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let body: String = (1..=900).map(|i| format!("line {i}\n")).collect();
     write_disk(dir.path(), "big.rs", &body);
     let ctx = ToolContext::with_workspace(dir.path());
 
-    let resp = harness::invoke_with_ctx("file_read", json!({"path": "big.rs"}), &ctx);
-    let numbered: String = (1..=900).map(|i| format!("{i:3}  line {i}\n")).collect();
+    for args in [
+        json!({"path": "big.rs"}),
+        json!({"path": "big.rs", "start_line": 1}),
+        json!({"path": "big.rs", "end_line": 200}),
+    ] {
+        let resp = harness::invoke_with_ctx("file_read", args.clone(), &ctx);
+        harness::expect_error(&resp, "invalid_arguments");
+        let detail = resp["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("start_line") || detail.contains("end_line"),
+            "the refusal must name the missing bound, got {detail:?} for {args}",
+        );
+    }
+}
+
+/// A range wider than the cap is **served, not refused**: the first
+/// `MAX_READ_LINES` lines come back, and because the excerpt now stops short of
+/// the end the header carries `of N` — which says both that it was cut and where
+/// to resume. Asking for the whole of a 900-line file therefore costs 200 lines
+/// and a continuation hint, not 900 lines.
+#[test]
+fn a_range_wider_than_the_cap_returns_the_first_200_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let body: String = (1..=900).map(|i| format!("line {i}\n")).collect();
+    write_disk(dir.path(), "big.rs", &body);
+    let ctx = ToolContext::with_workspace(dir.path());
+
+    let resp = harness::invoke_with_ctx(
+        "file_read",
+        json!({"path": "big.rs", "start_line": 1, "end_line": 900}),
+        &ctx,
+    );
+    let numbered: String = (1..=200).map(|i| format!("{i:3}  line {i}\n")).collect();
     assert_eq!(
         resp.as_str().expect("file_read returns a rendered string"),
-        format!("\nbig.rs (lines 1-900):\n\n```rust\n{numbered}```\n"),
+        format!("\nbig.rs (lines 1-200 of 900):\n\n```rust\n{numbered}```\n"),
+    );
+
+    // The header's own arithmetic is the continuation protocol: resuming at 201
+    // picks up exactly where it stopped, with no gap and no repeated line.
+    let next = harness::invoke_with_ctx(
+        "file_read",
+        json!({"path": "big.rs", "start_line": 201, "end_line": 400}),
+        &ctx,
+    );
+    let text = next.as_str().unwrap();
+    assert!(
+        text.starts_with("\nbig.rs (lines 201-400 of 900):"),
+        "{text:.60}"
+    );
+    assert!(text.contains("201  line 201"), "resumes at the next line");
+}
+
+/// Exactly the cap is not truncated — the boundary is inclusive, so a 200-line
+/// range returns 200 lines. Off by one here would silently shorten every read.
+#[test]
+fn a_range_of_exactly_the_cap_is_returned_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let body: String = (1..=900).map(|i| format!("line {i}\n")).collect();
+    write_disk(dir.path(), "big.rs", &body);
+    let ctx = ToolContext::with_workspace(dir.path());
+
+    let resp = harness::invoke_with_ctx(
+        "file_read",
+        json!({"path": "big.rs", "start_line": 51, "end_line": 250}),
+        &ctx,
+    );
+    let text = resp.as_str().unwrap();
+    assert!(
+        text.starts_with("\nbig.rs (lines 51-250 of 900):"),
+        "{text:.60}"
+    );
+    assert_eq!(
+        text.lines().filter(|l| l.contains("  line ")).count(),
+        200,
+        "a 200-line range is the cap, not one past it",
     );
 }
 
-/// A bound on its own reads to the file's edge: `start_line` alone to the end,
-/// `end_line` alone from the top. A read that stops short of the end says `of N`.
+/// The cap bounds the SPAN, not the file: a short file read with a wide range
+/// still ends at the last line, and the header stays in the plain `(lines a-b)`
+/// form that says there is no more to fetch.
 #[test]
-fn read_with_one_bound_reads_to_the_files_edge() {
+fn a_wide_range_over_a_short_file_ends_at_the_last_line() {
     let dir = workspace();
     let ctx = ctx_for(&dir);
-    let tail = harness::invoke_with_ctx(
+    let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs", "start_line": 2}),
+        json!({"path": "src/main.rs", "start_line": 1, "end_line": 200}),
         &ctx,
     );
     assert_eq!(
-        tail.as_str().unwrap(),
-        "\nsrc/main.rs (lines 2-3):\n\n```rust\n2      println!(\"hi\");\n3  }\n```\n",
-    );
-    let head = harness::invoke_with_ctx(
-        "file_read",
-        json!({"path": "src/main.rs", "end_line": 2}),
-        &ctx,
-    );
-    assert_eq!(
-        head.as_str().unwrap(),
-        "\nsrc/main.rs (lines 1-2 of 3):\n\n```rust\n1  fn main() {\n2      println!(\"hi\");\n```\n",
+        resp.as_str().unwrap(),
+        "\nsrc/main.rs (lines 1-3):\n\n```rust\n1  fn main() {\n2      println!(\"hi\");\n3  }\n```\n",
     );
 }
 
@@ -648,6 +713,55 @@ fn read_past_the_end_clamps_into_the_file() {
     );
 }
 
+/// **The read header is the only place a file's length is reported, so it has to
+/// be right for every shape of ending.**
+///
+/// A listing carries no line count, so the header's `of N` is the single source
+/// of a file's length — the number the model pages against — and an off-by-one over
+/// a trailing newline would misplace the last range of every file.
+#[test]
+fn the_read_header_reports_the_files_true_length() {
+    let dir = tempfile::tempdir().unwrap();
+    // Each shape that has ever made a line count ambiguous.
+    let cases = [
+        ("trailing.rs", "a\nb\n", 2),
+        ("no_trailing.rs", "a\nb", 2),
+        ("blank_last.rs", "a\n\n", 2),
+        ("just_newline.rs", "\n", 1),
+        ("one_line.rs", "only", 1),
+        ("crlf.rs", "a\r\nb\r\n", 2),
+    ];
+    for (name, body, _) in cases {
+        write_disk(dir.path(), name, body);
+    }
+    let ctx = ToolContext::with_workspace(dir.path());
+
+    for (name, _, expected) in cases {
+        // Read one line only, so the header is forced to state `of N` — reading
+        // the whole file would render the short form and prove nothing.
+        let resp = harness::invoke_with_ctx(
+            "file_read",
+            json!({"path": name, "start_line": 1, "end_line": 1}),
+            &ctx,
+        );
+        let text = resp.as_str().unwrap();
+        let header_total = text
+            .split_once(" of ")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(n, _)| n.parse::<i64>().unwrap());
+        match header_total {
+            // A multi-line file reports its total, and it must be the true one.
+            Some(total) => assert_eq!(
+                total, expected,
+                "{name}: header total {total} != true length {expected}",
+            ),
+            // A one-line file's read reached the end, so the header carries no
+            // total — which is only correct when the file really is one line.
+            None => assert_eq!(expected, 1, "{name}: header omitted `of N`: {text:?}"),
+        }
+    }
+}
+
 /// An empty file reads as empty rather than as an impossible line range.
 #[test]
 fn read_of_an_empty_file_reports_empty() {
@@ -663,4 +777,48 @@ fn read_of_an_empty_file_reports_empty() {
         resp.as_str().unwrap(),
         "\nblank.rs (empty):\n\n```rust\n```\n"
     );
+}
+
+/// **Every spelling of a directory prefix lists the same files.** A trailing
+/// slash, a leading slash, the `/workspace` mount, and the bare name are the
+/// four ways a model writes the same directory, and a listing that answered
+/// only some of them would look to the caller like an empty directory — the one
+/// result that is indistinguishable from a wrong guess.
+#[test]
+fn every_spelling_of_a_directory_prefix_lists_the_same_files() {
+    let dir = tempfile::tempdir().unwrap();
+    // A workspace shaped like this repo: crates at the root, sources nested.
+    write_disk(dir.path(), "zend/src/main.rs", "fn main() {}\n");
+    write_disk(dir.path(), "zend/src/session.rs", "// session\n");
+    write_disk(dir.path(), "zend/Cargo.toml", "[package]\n");
+    write_disk(dir.path(), "candle-core/src/lib.rs", "// core\n");
+    let ctx = ToolContext::with_workspace(dir.path());
+
+    let expected = vec!["zend/src/main.rs", "zend/src/session.rs"];
+    for prefix in [
+        "zend/src",
+        "zend/src/",
+        "/zend/src",
+        "/zend/src/",
+        "workspace/zend/src",
+        "/workspace/zend/src/",
+        r"zend\src",
+    ] {
+        let resp = harness::expect_success(harness::invoke_with_ctx(
+            "file_list",
+            json!({ "prefix": prefix }),
+            &ctx,
+        ));
+        assert_eq!(paths(&resp), expected, "prefix {prefix:?}");
+    }
+
+    // The root, however it is spelled, lists everything.
+    for prefix in ["", "/", "workspace", "/workspace/"] {
+        let resp = harness::expect_success(harness::invoke_with_ctx(
+            "file_list",
+            json!({ "prefix": prefix }),
+            &ctx,
+        ));
+        assert_eq!(paths(&resp).len(), 4, "prefix {prefix:?}");
+    }
 }

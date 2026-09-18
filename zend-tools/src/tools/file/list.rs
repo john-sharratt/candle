@@ -25,8 +25,10 @@ pub struct ListRequest {
 #[derive(Serialize)]
 pub struct FileEntry {
     pub path: String,
+    /// Size from the directory entry's metadata — the only measure of a file a
+    /// listing can give without opening it. There is deliberately no line count
+    /// beside it: see [`crate::state::vfs::ListEntry`].
     pub bytes: usize,
-    pub lines: usize,
     /// `true` when this session has written or edited the file, so the content
     /// differs from what is on disk in the workspace. Omitted when false, which
     /// is the common case — it would otherwise be a third of the payload.
@@ -55,9 +57,10 @@ impl Tool for FileList {
          omit it to list from the project root. Ignored paths (per .gitignore and \
          friends) never appear. Results are paged: the response's `paging` reports \
          the total and, when more remain, a `next_page` to pass back as `page`. \
-         Returns names, sizes, and line counts, not file contents; an entry \
+         Returns names and byte sizes, not file contents or line counts; an entry \
          carries `modified: true` when this session has changed it. Use file_read \
-         to get a file's contents.";
+         to get a file's contents — read from line 1 and its header reports the \
+         file's length, so there is no need to size a file before reading it.";
 
     type Request = ListRequest;
     type Response = ListResponse;
@@ -80,7 +83,6 @@ impl Tool for FileList {
             .map(|e| FileEntry {
                 path: e.path,
                 bytes: e.bytes,
-                lines: e.lines,
                 modified: e.modified,
             })
             .collect();

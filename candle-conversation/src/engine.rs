@@ -14,8 +14,9 @@ use crate::projection::{
 use crate::scheduler::{Scheduler, SchedulerRequest};
 use crate::sequence_handle::SequenceId;
 use crate::stencil::{
-    compile, compile_think_tree, compile_tool_call_tree, HfVocab, StencilTree, ThinkMode,
+    compile, compile_think_tree, compile_tool_call_loop, HfVocab, StencilTree, ThinkMode,
     ThinkSteerEnvelope, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
+    MAX_TOOL_CALLS_PER_TURN,
 };
 // `ChannelProbeRunner` is deliberately not imported: the summariser is
 // disconnected, so nothing constructs a runner. `Substrate` comes from our side.
@@ -1364,11 +1365,19 @@ impl ConversationEngine {
         // The model emits the `<tool_call>` trigger itself, so the tree resumes
         // *after* that marker: its `open` is the envelope minus the marker.
         //
-        // The close ends with the assistant-turn EOS (`<|im_end|>`): a tool call
-        // is the entire assistant turn, so once it is emitted the turn must end.
-        // Without this the stencil releases control after `</tool_call>` and the
-        // model free-decodes a hallucinated answer past the call. The decode
-        // loop detects the EOS in the injected close run and seals the turn.
+        // **A turn may make up to [`MAX_TOOL_CALLS_PER_TURN`] calls.** After each
+        // one the loop offers exactly two continuations — the marker, which opens
+        // another call, or the assistant-turn terminator, which ends the turn — so
+        // the decoder is never free between a call and whatever follows it. That
+        // is the same guarantee the single-call tree gave by baking the EOS into
+        // its close (without which the model free-decodes a hallucinated answer
+        // past the call), now expressed as the loop's second arm rather than as an
+        // unconditional ending. The decode loop still detects the EOS in the
+        // injected close run and seals the turn.
+        //
+        // The batching is what this buys: a model that already knows it wants
+        // three files says so in one turn instead of paying a reasoning block, a
+        // prefill and a belief scan for each.
         //
         // **Taken from the dialect, not written here.** The shape of a call is
         // decided by the template the weights were trained against — Qwen3.5
@@ -1379,8 +1388,10 @@ impl ConversationEngine {
         // the close ending exactly ON that terminator — see
         // [`ToolCallEnvelope::for_assistant_turn`] for why the trailing newline
         // in `assistant_end` cannot be allowed to ride along.
-        let envelope = ToolCallEnvelope::for_assistant_turn(&self.config.dialect);
-        let spec = compile_tool_call_tree(tools, &envelope).map_err(|e| {
+        let envelope = ToolCallEnvelope::for_assistant_calls(&self.config.dialect);
+        let close_turn = ToolCallEnvelope::turn_close(&self.config.dialect);
+        let spec = compile_tool_call_loop(tools, &envelope, MAX_TOOL_CALLS_PER_TURN, &close_turn)
+            .map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
         })?;
         let vocab = HfVocab::new(

@@ -63,7 +63,7 @@ pub use terminator::{Feed, Terminator, TerminatorState};
 pub use think::{compile_think_tree, ThinkMode, ThinkSteerEnvelope};
 pub use tool_call::{
     compile_action_loop, compile_tool_call_loop, compile_tool_call_tree, parse_tools, Param,
-    ParamType, ToolCallEnvelope, ToolSpec, TOOL_CALL_TREE_LABEL,
+    ParamType, ToolCallEnvelope, ToolSpec, MAX_TOOL_CALLS_PER_TURN, TOOL_CALL_TREE_LABEL,
 };
 // `ToolCallEnvelope::style` is public, so a consumer has to be able to name its
 // type to match on it — and `npcd` does, to describe the call format in a
