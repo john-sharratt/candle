@@ -28,6 +28,7 @@ impl Scheduler {
             branch_tokens = s.branch_tokens,
             free_tokens = s.free_tokens,
             heals = s.heals,
+            dropped_delimiters = s.dropped_delimiters,
             bailed = s.bailed,
             "stencil steering finished",
         );
@@ -1040,9 +1041,10 @@ impl Scheduler {
         // Only an *active* walk needs the token's decoded bytes (free-text
         // terminators read them); starting a walk needs only the token id, so the
         // tokenizer decode stays off the hot path when no tool call is running.
-        // `(row, consumed, token bytes)` for rows whose free-text span closed
-        // strictly inside the sampled token — healed after this loop.
-        let mut heals: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+        // `(row, bytes to commit)` for rows whose sampled token is committed as
+        // other bytes — a span that closed strictly inside it, or a repair of a
+        // token that could not be committed as written — healed after this loop.
+        let mut heals: Vec<(usize, Vec<u8>)> = Vec::new();
         // Rows whose suppressed `</think>` close was dropped (a deep/exhaustive
         // think-steer retry): the sampled close is not committed, so it never
         // lands in the output and `inside_think_block` stays set;
@@ -1067,7 +1069,7 @@ impl Scheduler {
                 match state.stencil.as_mut() {
                     Some(driver) => {
                         match driver.accept(token, &bytes) {
-                            Healed::Exit { consumed } => heals.push((i, consumed, bytes)),
+                            Healed::Rewrite { bytes } => heals.push((i, bytes)),
                             // A suppressed close: drop the closing token (do not
                             // commit it).  This is the model's own `</think>` OR an
                             // intercepted EOS (a token-closed span now closes on
@@ -1075,7 +1077,9 @@ impl Scheduler {
                             // skipped by the commit loop below, including the EOS-seal,
                             // so neither is written to the sequence; the steering's
                             // injected closing tag / continuation prefills in its place.
-                            // On a replayed turn the refusal is the steering's
+                            // A delimiter the grammar does not continue with after a
+                            // value lands here too, and the grammar writes the right
+                            // structure in its place. On a replayed turn the refusal is the steering's
                             // own close, which the recording holds — once. See
                             // `Replay::refuse`.
                             Healed::Drop => {
@@ -1207,15 +1211,18 @@ impl Scheduler {
             }
         }
 
-        // Heal merged exit tokens: the model closed a free-text value with a
-        // token that also carries the next node's delimiter (e.g. `",`).  Commit
-        // only the re-tokenized valid prefix (the value + closing char); the
-        // delimiter is dropped and re-emitted by the successor node.  Common case
-        // (the valid prefix is a single token) is a plain swap; a multi-token
-        // prefix forwards all-but-last and lets the last ride this step's decode.
-        for (i, consumed, bytes) in heals {
+        // Heal rewritten tokens: commit the re-tokenized bytes the stencil gave
+        // in place of the sampled token. Either the model closed a free-text
+        // value with a token that also carries the next node's delimiter (e.g.
+        // `",`) — the bytes are the valid prefix, and the successor re-emits the
+        // delimiter — or the token could not be committed as written, and the
+        // bytes are its repair (an escaped character, a completed value, the
+        // text replacing an EOS inside a value). Common case (a single token) is
+        // a plain swap; a multi-token rewrite forwards all-but-last and lets the
+        // last ride this step's decode.
+        for (i, bytes) in heals {
             let seq_id = seq_ids[i];
-            let text = String::from_utf8_lossy(&bytes[..consumed]);
+            let text = String::from_utf8_lossy(&bytes);
             let healed: Vec<u32> = self
                 .tokenizer
                 .encode(text.as_ref(), false)

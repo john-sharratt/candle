@@ -4,7 +4,7 @@
 //! Built once by [`compile`](super::compile::compile) and shared (`Arc`) across
 //! decode sessions.
 
-use super::terminator::{Terminator, TerminatorState};
+use super::terminator::Terminator;
 use super::trie::TokenTrie;
 use super::vocab::TokenId;
 
@@ -46,44 +46,7 @@ pub struct FreeTextSpan {
     /// close token is kept (committed normally).  Only meaningful with
     /// `close_token`.
     pub suppress_close: bool,
-    /// The structural text that closes this span, injected when the span ends
-    /// **without its terminator firing** — an intercepted EOS.
-    ///
-    /// # Why the grammar has to own its own closing tag
-    ///
-    /// A consuming terminator (`JsonString`'s `"`, `Until`'s `</parameter>`)
-    /// leaves the closing text in the output only because the *model* wrote it.
-    /// That is fine on the path where the model reaches it and wrong on every
-    /// other path: a span cut short by EOS closed with no tag at all, so the
-    /// element ran straight into whatever the tree emitted next.
-    ///
-    /// Measured live: a `reflect` whose last argument was cut short arrived as
-    /// `<parameter=my_reflections>\ntext</function>`, and the argument was
-    /// dropped — taking the two the character *had* written down with it, as
-    /// "needed `my_reflections` and did not have it".
-    ///
-    /// With this, the tag is structural on every path: written by the model
-    /// when it gets there, injected by the tree when it does not. Empty for
-    /// spans whose terminator emits nothing of its own (lookahead terminators,
-    /// where the delimiter belongs to the successor anyway).
-    pub close_run: Vec<TokenId>,
-    /// [`Self::close_run`] for a span interrupted **before its value opened**
-    /// — see [`Terminator::unopened_close`]. Empty when the two do not differ,
-    /// in which case `close_run` serves both. Chosen at runtime from
-    /// `TerminatorState::opened`, since which one a span needs depends on how
-    /// far the model got.
-    pub unopened_close_run: Vec<TokenId>,
     pub next: NodeId,
-}
-
-impl FreeTextSpan {
-    /// The closing run for a span interrupted in state `term`.
-    pub fn interrupted_close_run(&self, term: &TerminatorState) -> &[TokenId] {
-        match term.opened() || self.unopened_close_run.is_empty() {
-            true => &self.close_run,
-            false => &self.unopened_close_run,
-        }
-    }
 }
 
 /// Span-scoped EOS-style limits, mirroring `SamplingConfig`'s whole-turn ramp.

@@ -34,6 +34,7 @@ mod compile;
 mod driver;
 mod error;
 mod function_block;
+mod json_lexer;
 mod mask;
 mod session;
 mod sim;
@@ -47,6 +48,8 @@ mod trigger;
 mod vocab;
 mod yaml;
 
+#[cfg(test)]
+mod edge_tests;
 #[cfg(test)]
 mod tests;
 

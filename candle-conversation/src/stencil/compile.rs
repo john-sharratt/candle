@@ -5,6 +5,14 @@
 //! node, and **tokenizing in context** (so boundary merges match a real decode).
 //! It then verifies the invariants the runtime relies on: no two adjacent
 //! `Static` nodes, every `Branch` has ≥2 arms, every `FreeText` has a hard limit.
+//!
+//! **A spec node reached along several paths is lowered once.** The spec is a
+//! DAG — optional-field gates share their successors, an unrolled array's
+//! every level shares the value that follows it — and lowering each path
+//! separately grows the tree as the number of paths, which for an array of
+//! objects with optional fields is exponential in the array's bound. Lowering
+//! is a function of the spec node and its left context, and the runtime tree's
+//! nodes are immutable, so a node lowered once is shared by every edge to it.
 
 use std::collections::HashMap;
 
@@ -14,24 +22,12 @@ use super::tree::{FreeTextSpan, NodeId, StencilNode, StencilTree};
 use super::trie::TokenTrie;
 use super::vocab::{TokenId, Vocab};
 
-/// Lowered spec nodes, keyed by `(spec node, left context)`.
-///
-/// Lowering is a pure function of those two: the node decides the text and
-/// shape, the prefix decides how its first run tokenizes. So a spec node
-/// reached along several paths with the same prefix lowers to the same arena
-/// node, and is lowered once. Without this the DAG a spec describes is expanded
-/// into a tree — each shared successor copied once per path that reaches it —
-/// which is exponential in the number of shared joins a spec chains together.
-/// The runtime needs no tree: nodes are immutable and addressed by id, so a
-/// node with several parents is walked exactly like one with a single parent.
-type Memo = HashMap<(usize, String), NodeId>;
-
 /// Compile a string-space spec against a tokenizer.
 pub fn compile(spec: &TreeSpec, vocab: &dyn Vocab) -> Result<StencilTree, BuildError> {
     validate(spec)?;
-    let mut arena: Vec<StencilNode> = Vec::new();
-    let mut memo = Memo::new();
-    let root = lower(spec, vocab, spec.root, "", &mut arena, &mut memo)?;
+    let mut arena = Arena::default();
+    let root = lower(spec, vocab, spec.root, "", &mut arena)?;
+    let arena = arena.nodes;
     verify_invariants(&arena)?;
     // The bail set is tokenized standalone — it is emitted from an unknown point
     // (wherever the failsafe fires), so there is no stable left context.
@@ -113,20 +109,27 @@ fn dfs(
 
 // ── Lowering (fold + fuse + tokenize, bottom-up) ────────────────────────────
 
+/// The lowered nodes, and which spec node (in which left context) each lowered
+/// entry came from — see the module docs.
+#[derive(Default)]
+struct Arena {
+    nodes: Vec<StencilNode>,
+    lowered: HashMap<(SpecId, String), NodeId>,
+}
+
 fn lower(
     spec: &TreeSpec,
     vocab: &dyn Vocab,
     cur: SpecId,
     prefix: &str,
-    arena: &mut Vec<StencilNode>,
-    memo: &mut Memo,
+    arena: &mut Arena,
 ) -> Result<NodeId, BuildError> {
-    let key = (cur.0, prefix.to_string());
-    if let Some(&id) = memo.get(&key) {
+    let key = (cur, prefix.to_string());
+    if let Some(&id) = arena.lowered.get(&key) {
         return Ok(id);
     }
-    let id = lower_uncached(spec, vocab, cur, prefix, arena, memo)?;
-    memo.insert(key, id);
+    let id = lower_uncached(spec, vocab, cur, prefix, arena)?;
+    arena.lowered.insert(key, id);
     Ok(id)
 }
 
@@ -135,8 +138,7 @@ fn lower_uncached(
     vocab: &dyn Vocab,
     cur: SpecId,
     prefix: &str,
-    arena: &mut Vec<StencilNode>,
-    memo: &mut Memo,
+    arena: &mut Arena,
 ) -> Result<NodeId, BuildError> {
     // Gather a maximal run of statics and single-arm branches (fold + fuse).
     let mut run = String::new();
@@ -160,11 +162,9 @@ fn lower_uncached(
         // so the branch point is placed at the token where the arms *diverge*,
         // not at the grammar boundary — any merged token is absorbed into the
         // arms.  (Single-arm branches were folded into `run` above.)
-        NodeSpec::Branch { arms } => {
-            lower_branch(spec, vocab, prefix, &run, node.0, arms, arena, memo)
-        }
+        NodeSpec::Branch { arms } => lower_branch(spec, vocab, prefix, &run, node.0, arms, arena),
         _ => {
-            let term = lower_terminal(spec, vocab, node, arena, memo)?;
+            let term = lower_terminal(spec, vocab, node, arena)?;
             if run.is_empty() {
                 Ok(term)
             } else {
@@ -186,8 +186,7 @@ fn lower_branch(
     run: &str,
     node: usize,
     arms: &[(String, SpecId)],
-    arena: &mut Vec<StencilNode>,
-    memo: &mut Memo,
+    arena: &mut Arena,
 ) -> Result<NodeId, BuildError> {
     let pre = vocab.encode(prefix);
     let context = format!("{prefix}{run}");
@@ -222,7 +221,7 @@ fn lower_branch(
         // name arm's closing `"` with the args_open `,` → `",`, or a value's
         // opening `"` with the preceding space → ` "` — which would be an
         // unrepresentable retract.  (Same rule as a free-text successor.)
-        let next_id = lower(spec, vocab, *arm_next, "", arena, memo)?;
+        let next_id = lower(spec, vocab, *arm_next, "", arena)?;
         trie_arms.push((arm_toks, next_id));
     }
     let trie = TokenTrie::build(&trie_arms)?;
@@ -254,8 +253,7 @@ fn lower_terminal(
     spec: &TreeSpec,
     vocab: &dyn Vocab,
     cur: SpecId,
-    arena: &mut Vec<StencilNode>,
-    memo: &mut Memo,
+    arena: &mut Arena,
 ) -> Result<NodeId, BuildError> {
     match spec.node(cur) {
         NodeSpec::End => Ok(push(arena, StencilNode::End)),
@@ -282,7 +280,7 @@ fn lower_terminal(
             // that would otherwise have to retract a committed byte of the value
             // context (the opening quote, or the value's last digit) — which is
             // unrepresentable.
-            let next_id = lower(spec, vocab, *next, "", arena, memo)?;
+            let next_id = lower(spec, vocab, *next, "", arena)?;
             Ok(push(
                 arena,
                 StencilNode::FreeText(FreeTextSpan {
@@ -293,18 +291,6 @@ fn lower_terminal(
                     // copy it verbatim (never tokenize it in context).
                     close_token: *close_token,
                     suppress_close: *suppress_close,
-                    // What to write if the span is interrupted before its
-                    // terminator fires — see `Terminator::consumed_close`.
-                    // Tokenized from a fresh boundary, like the successor above
-                    // and for the same reason.
-                    close_run: term
-                        .consumed_close()
-                        .map(|c| vocab.encode(&c))
-                        .unwrap_or_default(),
-                    unopened_close_run: term
-                        .unopened_close()
-                        .map(|c| vocab.encode(&c))
-                        .unwrap_or_default(),
                     next: next_id,
                 }),
             ))
@@ -315,9 +301,9 @@ fn lower_terminal(
     }
 }
 
-fn push(arena: &mut Vec<StencilNode>, node: StencilNode) -> NodeId {
-    let id = NodeId(arena.len() as u32);
-    arena.push(node);
+fn push(arena: &mut Arena, node: StencilNode) -> NodeId {
+    let id = NodeId(arena.nodes.len() as u32);
+    arena.nodes.push(node);
     id
 }
 
@@ -419,39 +405,6 @@ mod tests {
         }
     }
 
-    /// **A successor shared by several arms is lowered once, not once per arm.**
-    ///
-    /// A spec is a DAG — every tool's argument object ends at the same "call
-    /// finished" node, every level of a multi-call loop at the same "go again or
-    /// stop" branch. Lowering it without memoisation expands the DAG into a tree,
-    /// duplicating each shared successor once per path that reaches it, so a
-    /// chain of `k` diamonds costs `2^k` nodes. The tool-call loop is exactly that
-    /// shape (four levels of a 95-tool catalog) and the unmemoised compile never
-    /// finished. Twenty diamonds: a million nodes unshared, about eighty shared.
-    #[test]
-    fn a_shared_successor_is_lowered_once() {
-        const DIAMONDS: usize = 20;
-        let mut s = TreeSpec::new("t");
-        let mut next = s.push(NodeSpec::End);
-        for _ in 0..DIAMONDS {
-            let join = s.push(NodeSpec::Static {
-                text: "x".into(),
-                next,
-            });
-            next = s.push(NodeSpec::Branch {
-                arms: vec![("a".into(), join), ("b".into(), join)],
-            });
-        }
-        s.root = next;
-        let tree = compile(&s, &TestVocab::new()).unwrap();
-        // Per diamond: one branch, one join static. Plus End.
-        assert!(
-            tree.len() <= DIAMONDS * 4 + 1,
-            "{} nodes for {DIAMONDS} diamonds — the shared join is being duplicated",
-            tree.len()
-        );
-    }
-
     #[test]
     fn fuses_adjacent_statics() {
         // Static "a" -> Static "b" -> End  should fuse to one Static "ab".
@@ -506,6 +459,28 @@ mod tests {
             StencilNode::Branch { trie } => assert_eq!(trie.arm_count(), 2),
             _ => panic!(),
         }
+    }
+
+    /// **A successor shared by several arms is lowered once.** Sixteen diamonds
+    /// in a row — two arms converging on one static, sixteen times — are 2¹⁶
+    /// paths. Lowered per path that is 65,536 copies of the tail; shared it is
+    /// a branch and a static per diamond, and one `End`.
+    #[test]
+    fn a_shared_successor_is_lowered_once() {
+        let mut s = TreeSpec::new("t");
+        let mut next = s.push(NodeSpec::End);
+        for _ in 0..16 {
+            let join = s.push(NodeSpec::Static {
+                text: "x".into(),
+                next,
+            });
+            next = s.push(NodeSpec::Branch {
+                arms: vec![("a".into(), join), ("b".into(), join)],
+            });
+        }
+        s.root = next;
+        let tree = compile(&s, &TestVocab::new()).unwrap();
+        assert_eq!(tree.len(), 16 * 2 + 1);
     }
 
     #[test]

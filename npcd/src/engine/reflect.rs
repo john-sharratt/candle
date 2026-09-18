@@ -370,6 +370,9 @@ fn call_tree(
                 ty: ParamType::String,
                 required: p.required,
                 enum_values: None,
+                items: None,
+                properties: None,
+                nullable: false,
             })
             .collect(),
     };
