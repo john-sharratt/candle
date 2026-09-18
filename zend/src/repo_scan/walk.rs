@@ -12,6 +12,7 @@ use std::path::Path;
 use ignore::WalkBuilder;
 
 use super::binary_sniff::is_binary_sample;
+use super::probe::idf::record_symbols;
 use super::types::{FileEntry, Language, ModuleHint, RepoMap};
 
 /// Hard size ceiling for any single file the walker accepts.  Above
@@ -148,6 +149,17 @@ pub fn walk_workspace(root: &Path, max_depth: Option<usize>) -> RepoMap {
         }
 
         let (line_count, module_hint) = describe_file(path, &bytes, language);
+        // The declared-name side-table, extracted from the bytes this pass has
+        // already read. Two consumers depend on it and both read as empty
+        // without it: `TermIndex::build` seeds every folder probe from these
+        // names, and `hash_unit` folds the set into a unit's content hash so
+        // that API churn in a file the listing never shows still re-ingests.
+        record_symbols(
+            &mut map,
+            &rel_normalised,
+            &String::from_utf8_lossy(&bytes),
+            language,
+        );
         map.files.push(FileEntry {
             path: rel_normalised,
             line_count,

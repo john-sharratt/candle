@@ -47,6 +47,28 @@ pub(crate) struct Cost {
     /// wave planner; the two must move together or the tier is sized for a
     /// wave the rate was never judged on.
     pub rows: usize,
+    /// This prefill's turn goes on to **decode** — so admitting it commits the
+    /// engine to serving a decode at whatever residency this admission leaves.
+    ///
+    /// Not a cost, and it buys nothing: the decode's ground is still taken a
+    /// lease at a time, exactly as the note on `WaveFill::peek` insists. It says
+    /// only that a decode is coming, so the offer can be judged by the decode
+    /// model as well as the prefill one.
+    ///
+    /// The two models disagree about residency, and that disagreement is the
+    /// reason this field exists. A prefill's copy is paid **per forward** and
+    /// amortises across its rows, so widening looks like a gain right down to
+    /// the weight floor. A decode's copy is paid **per layer** and scales with
+    /// `1 - hit(resident)`, so the same dislodge that the prefill shrugged off
+    /// multiplies every decode step that follows. Judging a turn that will do
+    /// both by the prefill model alone lets the cheap phase spend the residency
+    /// the expensive one is about to need — measured on a whole-workspace
+    /// repo_map ingest as decode cost per directory going 4.3 s to 12.3 s for
+    /// the same bounded summary, while prefill fell from 149 s to 5 s.
+    ///
+    /// False for a section (nothing decodes after it) and for a decode's own
+    /// cost (a continuation of a turn already admitted).
+    pub decodes_after: bool,
 }
 
 impl Cost {
@@ -174,6 +196,7 @@ mod tests {
             recurrent: 200,
             activations: 3_000,
             rows: 128,
+            decodes_after: false,
         };
         assert_eq!(c.total(), 3_210);
         assert_eq!(Cost::default().total(), 0);
@@ -192,6 +215,7 @@ mod tests {
             recurrent: 0,
             activations: 64 * region,
             rows: 128,
+            decodes_after: false,
         };
         assert_eq!(c.claimed_bytes(), 2 * region, "rounded up, tier excluded");
         assert_eq!(Cost::default().claimed_bytes(), 0);
@@ -222,6 +246,7 @@ mod tests {
             recurrent: 0,
             activations: 3 * region,
             rows: 8,
+            decodes_after: false,
         };
         assert_eq!(step.claimed_bytes(), 0);
         assert_eq!(step.dislodged_bytes(), 3 * region);
@@ -246,6 +271,7 @@ mod tests {
             recurrent: 0,
             activations: 128 << 20,
             rows: 3,
+            decodes_after: false,
         };
         assert_eq!(step.claimed_bytes(), 0);
     }

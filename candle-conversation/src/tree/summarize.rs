@@ -271,7 +271,6 @@ impl SummarizationTask {
                 sampling: summarization_sampling,
                 event_tx,
                 reprojection: None,
-                disable_reprojection: false,
                 // Summarization decodes free text only — no tool stencils.
                 triggers: Arc::new(TriggerRegistry::new()),
                 turn_grammar: None,

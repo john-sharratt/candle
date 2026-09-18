@@ -10,8 +10,8 @@
 
 use candle_conversation::{
     models::{Model, ModelBuilder},
-    ConversationEngine, ConversationError, ConversationNode, SamplingConfig, SequenceConfig,
-    TurnEvent, TurnOptions, TurnType,
+    ConversationEngine, ConversationError, ConversationNode, SamplingConfig, SelectionState,
+    SequenceConfig, TurnEvent, TurnOptions, TurnType,
 };
 
 /// Model used for all integration tests — change this one line to switch.
@@ -1087,12 +1087,14 @@ fn test_insert_turn_staged_records_projection_events() {
         "Source excerpt — `src/a.rs` lines 1-1:",
         "<tool_response>fn alpha() {}</tool_response>",
         tags.clone(),
+        SelectionState::default(),
     )
     .expect("first staged insert failed");
     conv.insert_turn_staged(
         "Source excerpt — `src/a.rs` lines 2-2:",
         "<tool_response>fn beta() {}</tool_response>",
         tags,
+        SelectionState::default(),
     )
     .expect("second staged insert failed");
 

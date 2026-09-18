@@ -102,6 +102,8 @@ mod replay {
                 None,
                 None,
                 false,
+                // Reprojection stays ON: it is part of the path this control drives.
+                false,
                 ToolMode::None,
                 None,
                 no_think_standard_selection(),

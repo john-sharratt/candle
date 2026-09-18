@@ -690,7 +690,7 @@ throughput/latency probes for steps 5–6.
 | Glue assembly / bridge window | `scheduler/projection_assembler.rs` (`GapFillPlan`, `fire_gap_fill_batch`), `paged-glue/api.rs:44-54` |
 | Cross-session concat | `batched_model.rs:288` (`forward_batch`) |
 | Dormant Phase-2 config | `config.rs:1273-1292` |
-| Ingest turns always projected (§4.7) | `repo_scan/mod.rs` `utility_config` (`disable_reprojection`: no mid-decode reprojection), `scheduler/mod.rs` `SubmitTurn` handler, `projection/project.rs` `target_is_ingest_self` arm |
+| Ingest turns always projected (§4.7) | `repo_scan/mod.rs` `utility_config` (`disable_reprojection`), `conversation.rs` `submit_turn_with_options` (the flag's whole effect: `reprojection: None`, so the scheduler is handed no mid-decode policy and has no skip to make), `projection/project.rs` `target_is_ingest_self` arm |
 | Ingest context bound | per-unit conversations (`fork_scope`, one per folder), the layer `window` in `prompts/projection.yaml` |
 | Dormant rolling-window field | `config.rs` (`context_window_turns`, default 0), `conversation.rs` (`window_state`) |
 | Expert affinity / prefetch (for §4.6) | `expert_lre/transition.rs` (`predict_prefetch`, `observe`) |

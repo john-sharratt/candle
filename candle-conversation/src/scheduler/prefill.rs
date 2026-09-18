@@ -2,10 +2,8 @@ use super::admit;
 use super::admit::{Ground, Order};
 use super::interleave;
 use super::*;
-use crate::persistence::thread::effective_turn_policy;
 use crate::projection::DecodePriority;
 use crate::recorded_reply::replayed_step;
-use crate::substrate::ConvCompression;
 use std::time::Duration;
 
 /// The engine as [`interleave::fill`] sees it: a cursor over both queues that
@@ -916,6 +914,9 @@ impl WaveFill<'_> {
             // The rows the forward actually gains — the same `advance` the tier
             // was priced for. What the throughput model earns its copy back on.
             rows: advance,
+            // The price is the same whether or not a decode follows; the caller
+            // that knows which turn this is sets the fact (`WaveFill::peek`).
+            decodes_after: false,
         }
     }
 }
@@ -1110,7 +1111,7 @@ impl admit::Ground for WaveFill<'_> {
         let band = band_index(prio);
         match kind {
             Kind::Prefill => {
-                let (_, seq, whole, advance) = self.peek_prefill(band)?;
+                let (idx, seq, whole, advance) = self.peek_prefill(band)?;
                 // **The price is the prompt, and only the prompt.** Admitting a
                 // prefill commits to prefilling this turn; the decode that
                 // follows buys its own ground one lease at a time through
@@ -1122,7 +1123,16 @@ impl admit::Ground for WaveFill<'_> {
                 // and then handed it a decode seat no gate had approved: the
                 // boundary was the one lease boundary that never asked, so
                 // concurrency grew by however many prefills were admitted.
-                Some(self.price(seq, whole, advance))
+                //
+                // What the turn's decode budget carries is not a price but a
+                // *fact* — whether a decode follows at all — so admission can
+                // judge this offer by the decode model too (`Cost::decodes_after`).
+                // The price below is still the prompt and only the prompt.
+                let decodes_after = self.sched.prefill_queue[idx].max_decode_tokens > 0;
+                Some(admit::Cost {
+                    decodes_after,
+                    ..self.price(seq, whole, advance)
+                })
             }
             Kind::Decode => {
                 let seq = self.peek_decode(band)?;
@@ -1498,6 +1508,9 @@ impl Scheduler {
                     // A renewal buys ground, not width: the turn was already
                     // riding the wave and its rows are unchanged.
                     rows: 0,
+                    // A lease renewal IS the decode; there is no prefill here to
+                    // judge on its behalf.
+                    decodes_after: false,
                 },
                 least_tier,
             );
@@ -4414,6 +4427,9 @@ impl Scheduler {
             // Rows are the wave's to price when it composes; what is being
             // judged here is whether to carry the turn at all.
             rows: 0,
+            // This IS the promotion question, asked of a turn whose prefill is
+            // already done — only `claimed_bytes` is read from this cost.
+            decodes_after: false,
         }
         .claimed_bytes();
 

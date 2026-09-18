@@ -176,6 +176,8 @@ mod control {
                 None,
                 None,
                 false,
+                // Reprojection stays ON: this test exists to measure its cost.
+                false,
                 zend::types::ToolMode::Comprehensive,
                 None,
                 candle_conversation::SelectionState::default(),

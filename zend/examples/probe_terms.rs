@@ -41,7 +41,8 @@ fn main() {
     }
 
     let started = std::time::Instant::now();
-    let map = walk_workspace(&root);
+    // Unbounded: this tool reports on the whole workspace, not a --max-depth slice.
+    let map = walk_workspace(&root, None);
     let walk_ms = started.elapsed().as_millis();
     let units = build_units(&map, &root);
     let index = TermIndex::build(&units, &map);

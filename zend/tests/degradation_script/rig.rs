@@ -184,6 +184,8 @@ async fn ask(session: &ZendSession, conv_id: &str, question: &str, selection: &S
             None,
             None,
             false,
+            // Reprojection stays ON: the script measures the daemon's real turn.
+            false,
             ToolMode::Comprehensive,
             None,
             selection.clone(),

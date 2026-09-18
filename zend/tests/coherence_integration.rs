@@ -126,6 +126,8 @@ mod coherence {
                 None,
                 None,
                 false,
+                // Reprojection stays ON: a coherent multi-turn reply depends on it.
+                false,
                 zend::types::ToolMode::Comprehensive,
                 None,
                 candle_conversation::SelectionState::default(),

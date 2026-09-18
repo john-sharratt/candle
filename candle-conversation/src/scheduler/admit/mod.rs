@@ -350,14 +350,48 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                 // the wave without passing here at all, and one minute of them
                 // took the weight zone from 10,398 MiB to its hold.
                 Kind::Prefill | Kind::Section => {
-                    match rate.try_admit(Admission::Prefill { tokens: cost.rows }, before, after) {
-                        rate::Admit::Admitted { .. } => true,
-                        rate::Admit::Refused(r) => {
-                            out.note(r);
-                            log_refusal(kind, prio, &cost, before, after, &budget, r);
-                            false
+                    // **A turn that will decode is judged by both models, here.**
+                    //
+                    // The prefill model prices a copy paid per forward, so it
+                    // amortises across the chunk and keeps saying yes down to the
+                    // floor. The decode that this turn becomes pays its copy per
+                    // layer, against `1 - hit(resident)` — so the residency this
+                    // admission spends is charged again on every step of a decode
+                    // no gate had yet asked about. Asking both questions at the
+                    // one moment a refusal is still cheap is what stops the cheap
+                    // phase spending what the expensive one needs.
+                    //
+                    // It buys nothing extra: the decode still takes its ground a
+                    // lease at a time. The head waiver is applied explicitly
+                    // because the second question is outside the model's own.
+                    let decode_ok = if cost.decodes_after && !rate.carries_nothing() {
+                        // The decode that follows steps one row at a time; a
+                        // drafted turn is wider, and would only be refused more
+                        // readily than this asks for.
+                        match rate.decode_would_carry(0, after) {
+                            Ok(_) => true,
+                            Err(r) => {
+                                out.note(r);
+                                log_refusal(kind, prio, &cost, before, after, &budget, r);
+                                false
+                            }
                         }
-                    }
+                    } else {
+                        true
+                    };
+                    decode_ok
+                        && match rate.try_admit(
+                            Admission::Prefill { tokens: cost.rows },
+                            before,
+                            after,
+                        ) {
+                            rate::Admit::Admitted { .. } => true,
+                            rate::Admit::Refused(r) => {
+                                out.note(r);
+                                log_refusal(kind, prio, &cost, before, after, &budget, r);
+                                false
+                            }
+                        }
                 }
             };
             if !allowed {

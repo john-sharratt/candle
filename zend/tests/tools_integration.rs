@@ -59,12 +59,14 @@ mod tool_scenarios {
 
     use futures::StreamExt;
 
-    use crate::common::{needs_compaction, production_workspace, run_conv_id};
-    use candle::vram::host_pinned_bytes;
+    use std::path::Path;
+
+    use crate::common::{needs_compaction, production_workspace, run_conv_id, Workspace};
     use candle_conversation::models::Model;
+    use candle::vram::host_pinned_bytes;
     use candle_conversation::projection::SectionLoads;
     use candle_conversation::{SamplingConfig, SelectionState};
-    use zend::api::chat::{apply_tools_dial, dial_selection};
+    use zend::api::chat::apply_tools_dial;
     use zend::config::{DaemonConfig, ModelChoice};
     use zend::log_broadcast::LogBus;
     use zend::session::{timeline_for, StreamItem, ZendSession};
@@ -101,18 +103,12 @@ mod tool_scenarios {
         // history and its recurrent memory — and the scenario would no longer be
         // the one prompt it names.
         let conv_id = run_conv_id(conv_id);
-        let (workspace, model, mut selection) = match rig {
-            Rig::Small => (
-                workspace(),
-                ModelChoice::Preset(Box::new(MODEL)),
-                dial_selection(None, None, Some(false)),
-            ),
-            Rig::Production => (
-                production_workspace(),
-                ModelChoice::MeasuredVram,
-                SelectionState::default(),
-            ),
-        };
+        // One rig, stated at the top of this file: the production model over the
+        // shared production workspace, which is where its tool calibration lives.
+        // A smaller model is not a cheaper version of this suite — a scenario
+        // asks whether the model CHOOSES to call a tool, and the 0.8B never does.
+        let workspace = production_workspace();
+        let mut selection = SelectionState::default();
         let compact_substrate = needs_compaction(&workspace);
         // The tool prompt a chat turn gets — the block AND its worked call — so
         // the suite exercises what a user is shown, not a catalog with no example.
@@ -229,16 +225,25 @@ mod tool_scenarios {
         *previous = Some(now);
     }
 
-    /// Boot a ZendSession on the small rig, wait for every startup step to
+    /// The rig the section-restore check runs on: a small model over a
+    /// workspace of its own.
+    ///
+    /// Every scenario below asks whether the model *chooses* a tool, which only
+    /// the production rig can answer. Whether a boot re-seals sections the redo
+    /// log already holds is model-agnostic, so it runs small — and stays in the
+    /// ordinary pass instead of behind `#[ignore]`. Its own workspace, because
+    /// the assertion is about what the previous boot left there.
+    const SECTION_RIG: Model = Model::Qwen35_0_8B_Q8;
+
+    /// Boot a ZendSession over `workspace`, wait for every startup step to
     /// finish, and report how it loaded its prompt sections — the tool catalog
     /// among them.
-    async fn boot_and_count_sections() -> SectionLoads {
-        let workspace = workspace();
-        let compact_substrate = needs_compaction(&workspace);
+    async fn boot_and_count_sections(workspace: &Path) -> SectionLoads {
+        let compact_substrate = needs_compaction(workspace);
         let config = DaemonConfig {
-            workspace,
+            workspace: workspace.to_path_buf(),
             port: 0,
-            model: ModelChoice::Preset(Box::new(MODEL)),
+            model: ModelChoice::Preset(Box::new(SECTION_RIG)),
             compact_substrate,
             ..Default::default()
         };
@@ -266,21 +271,36 @@ mod tool_scenarios {
     fn a_second_boot_restores_every_prompt_section() {
         init_tracing();
         // Both boots under one scenario lock, so no other scenario runs on the
-        // shared workspace between them.
-        let (first, second) = run_with_timeout(async {
-            let first = boot_and_count_sections().await;
-            (first, boot_and_count_sections().await)
+        // workspace between them — and both over the SAME workspace, since the
+        // second boot's restore is of what the first one sealed there.
+        let ws = Workspace::for_model(SECTION_RIG);
+        let path = ws.path().to_path_buf();
+        let (first, second) = run_with_timeout(async move {
+            let first = boot_and_count_sections(&path).await;
+            (first, boot_and_count_sections(&path).await)
         });
         assert_eq!(
-            second,
-            SectionLoads {
-                restored: first.restored + first.prefilled,
-                prefilled: 0,
-            },
-            "the second boot prefilled {} of the {} prompt section(s) the first had in the \
-             log or sealed",
-            second.prefilled,
-            first.restored + first.prefilled
+            second.prefilled, 0,
+            "the second boot prefilled {} prompt section(s) the first had already sealed \
+             ({first:?} → {second:?}); each one is sealed again and supersedes the last \
+             boot's record, which only compaction reclaims",
+            second.prefilled
+        );
+        // Restored, not merely absent: a boot that loaded no section at all would
+        // satisfy the line above without proving anything came back from the log.
+        assert!(
+            second.restored > 0,
+            "the second boot restored nothing, so the log held nothing to restore ({second:?})"
+        );
+        // The two boots do NOT load the same number of sections, and equality here
+        // would be wrong rather than merely strict: the first boot runs the tool
+        // catalog's calibration (measured `resumed=0, ran=856`) and loads every
+        // section that work touches, while the second resumes all 2,995 exemplars
+        // from the log (`resumed=2995, ran=0`) and so never loads them. Fewer
+        // sections on the second boot is the resume working, not a section lost.
+        assert!(
+            first.prefilled > 0,
+            "a fresh workspace must prefill its prompt sections ({first:?})"
         );
     }
 

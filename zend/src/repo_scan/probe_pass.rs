@@ -355,12 +355,13 @@ pub fn seed_context(conv: &mut Sequence, unit: &DirUnit, summary: &str) -> anyho
         return Ok(0);
     }
     // Every turn of this conversation — this seed and the probe groups after it
-    // — projects under the answering branch.
-    conv.set_selection(branch_state(ANSWER_BRANCH));
+    // — projects under the answering branch, which the staged insert takes and
+    // the conversation then keeps.
     conv.insert_turn_staged(
         crate::repo_scan::render::render_request(unit),
         summary,
         vec!["repo_map".to_string(), unit.dir.clone()],
+        branch_state(ANSWER_BRANCH),
     )
     .map_err(|e| anyhow::anyhow!("probe context seed: {e}"))
 }

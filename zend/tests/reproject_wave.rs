@@ -173,6 +173,8 @@ mod wave {
                 None,
                 None,
                 false,
+                // Reprojection stays ON: this test measures the reproject wave.
+                false,
                 zend::types::ToolMode::Comprehensive,
                 None,
                 candle_conversation::SelectionState::default(),

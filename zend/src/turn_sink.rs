@@ -18,7 +18,7 @@
 //! model.
 
 use candle_conversation::stencil::TriggerRegistry;
-use candle_conversation::{Sequence, TurnText};
+use candle_conversation::{SelectionState, Sequence, TurnText};
 use std::sync::Arc;
 
 /// Per-scope progress callback, invoked with a scope's ingested token count as it
@@ -187,7 +187,7 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
         );
         let result = self
             .inner
-            .insert_turn_staged(user.clone(), assistant, tags)
+            .insert_turn_staged(user.clone(), assistant, tags, SelectionState::default())
             .map_err(|e| anyhow::anyhow!("insert_turn_staged: {e}"));
         tracing::debug!(
             target: "zend::turn_sink",

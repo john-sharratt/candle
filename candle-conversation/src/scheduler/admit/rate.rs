@@ -709,6 +709,17 @@ impl WaveRate {
         self.full
     }
 
+    /// Whether nothing has been admitted since the reset — the head of the
+    /// wave, which is carried whatever it costs.
+    ///
+    /// The model applies that waiver itself for the offers it judges; a caller
+    /// asking a second question about the same offer (see
+    /// [`Self::decode_would_carry`]) has to apply it too, or the head it is
+    /// about to be handed anyway is refused on the extra question.
+    pub fn carries_nothing(&self) -> bool {
+        !self.admitted_any
+    }
+
     /// Prefill rows admitted into the wave since the last reset.
     pub fn tokens(&self) -> usize {
         self.tokens
@@ -770,6 +781,55 @@ impl WaveRate {
                 Admit::Refused(refusal)
             }
         }
+    }
+
+    /// Whether the decode a prefill is going to become could be carried at
+    /// `resident` — asked **while judging that prefill**, so the turn is priced
+    /// by both models at the one moment a refusal is still cheap.
+    ///
+    /// **Pure, and it buys nothing.** The decode rides a later wave and takes
+    /// its ground a lease at a time; committing counters here would charge this
+    /// wave for a row it will not run. So nothing is mutated and nothing is
+    /// latched — this is a question, and [`Self::try_admit`] still makes the
+    /// decision.
+    ///
+    /// Why the prefill model cannot answer it: a prefill's copy is paid per
+    /// forward, so `rate()` amortises it across the chunk's rows and widening
+    /// stays a gain down to the floor. A decode's copy is paid per layer and
+    /// scales with `1 - hit(resident)`, so the residency the prefill spent is
+    /// multiplied across every step of the decode that follows. The two answers
+    /// diverge exactly when the weight side is under pressure, which is when it
+    /// matters.
+    ///
+    /// The unlearned window is honoured for the same reason
+    /// [`Self::judge_promotion`] honours it, and it matters more here: refusing
+    /// on a seed measured 26x optimistic would turn away prefills that have not
+    /// yet run the decode forwards the estimate is learned from, and the engine
+    /// would never leave the window it is refusing on.
+    pub fn decode_would_carry(&self, draft: usize, resident: u64) -> Result<f64, Refusal> {
+        let routed_after = self
+            .routed_per_layer
+            .saturating_add(self.experts_per_decode(draft));
+        let projected = self.decode_rate(self.decodes + 1, routed_after, resident);
+        if self.decode_samples < Self::MIN_DECODE_SAMPLES {
+            return Ok(projected);
+        }
+        if resident < self.floor_bytes {
+            return Err(Refusal::Floor {
+                resident_after: resident,
+                floor: self.floor_bytes,
+            });
+        }
+        // Against the wave's decodes as they stand: if adding the decode this
+        // turn becomes would not pay for itself at this residency, the prefill
+        // that creates it should not be admitted either. With no decode in the
+        // wave yet there is nothing to compare against and the turn is carried —
+        // the same head rule the rest of the model keeps.
+        if self.decodes > 0 {
+            let current = self.decode_rate(self.decodes, self.routed_per_layer, resident);
+            Self::judge_gain(current, projected, self.min_gain)?;
+        }
+        Ok(projected)
     }
 
     /// Judge a turn that has finished prefilling and is asking to become a
@@ -1359,6 +1419,59 @@ mod tests {
             p.judge_promotion(2, after.saturating_add(DECODE_DISLODGE), FLOOR_16GB - 1),
             Admit::Admitted { .. }
         ));
+    }
+
+    /// **The prefill of a turn that will decode is asked the decode question
+    /// too, and refused on it.** The whole defect this closes: a prefill's copy
+    /// is paid per forward, so `judge_prefill` amortises it and keeps admitting
+    /// down to the floor, while the decode that turn becomes pays per layer
+    /// against `1 - hit(resident)`. Judged by the prefill model alone, the cheap
+    /// phase spends the residency the expensive one is about to need.
+    #[test]
+    fn a_decode_that_could_not_be_carried_refuses_its_prefill() {
+        let mut p = planner_judging(20e-3);
+        // The floor is the wave's, so the question has to be asked of a wave.
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        // Residency under the floor: the decode side cannot stand there.
+        assert!(matches!(
+            p.decode_would_carry(0, FLOOR_16GB - 1),
+            Err(Refusal::Floor { .. })
+        ));
+        // And where it can, the same question answers yes.
+        assert!(p.decode_would_carry(0, RESIDENT_RUN15).is_ok());
+    }
+
+    /// **The question commits nothing.** The decode rides a later wave and buys
+    /// its ground a lease at a time; charging this wave for a row it will not
+    /// run would price every offer behind it against a decode that is not there.
+    #[test]
+    fn asking_whether_a_decode_fits_changes_no_counter() {
+        let mut p = planner_judging(20e-3);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        let decodes = p.decodes();
+        let resident = p.resident_now();
+        for _ in 0..4 {
+            let _ = p.decode_would_carry(0, RESIDENT_RUN15);
+            let _ = p.decode_would_carry(0, FLOOR_16GB - 1);
+        }
+        assert_eq!(p.decodes(), decodes, "no decode was counted in");
+        assert_eq!(p.resident_now(), resident, "no residency was spent");
+        assert!(!p.is_full(), "a question never latches the wave");
+    }
+
+    /// **The unlearned window applies here too, and it has to.** Refusing on a
+    /// seed measured ~26x optimistic would turn away the prefills whose decode
+    /// forwards the estimate is learned from — the engine would never leave the
+    /// window it was refusing on.
+    #[test]
+    fn an_unlearned_layer_time_never_refuses_a_prefill_on_its_decode() {
+        let mut p = planner(LINK_4090_MOBILE);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        assert!(p.decode_samples() < WaveRate::MIN_DECODE_SAMPLES);
+        assert!(
+            p.decode_would_carry(0, FLOOR_16GB - 1).is_ok(),
+            "while unlearned the decode question cannot refuse"
+        );
     }
 
     /// And once it *is* learned, the same offer is refused — so the bypass is a

@@ -2405,7 +2405,6 @@ impl Sequence {
                 sampling: self.config.sampling.clone(),
                 event_tx,
                 reprojection: None,
-                disable_reprojection: self.config.disable_reprojection,
                 triggers: Arc::new(TriggerRegistry::new()),
                 // Every case's assistant half is supplied in the grid, so there
                 // is nothing to constrain and nothing to exempt.
@@ -2570,7 +2569,6 @@ impl Sequence {
                 sampling,
                 event_tx,
                 reprojection,
-                disable_reprojection,
                 triggers,
                 turn_grammar,
                 free_tool_calls_from_penalties,
@@ -2671,12 +2669,24 @@ impl Sequence {
     /// Returns the number of tokens prefilled (the full formatted grid), which
     /// the prefill-only ingest paths (repo map, code read) surface as the "tokens
     /// ingested" metric.
+    ///
+    /// `selection` is the section-tree state the turn projects under, and it
+    /// becomes the conversation's — the same contract as
+    /// [`submit_prefilled_turn`](Self::submit_prefilled_turn) and
+    /// [`submit_prefilled_turn_group`](Self::submit_prefilled_turn_group). An
+    /// ingest turn that wants the default tree passes
+    /// [`SelectionState::default`]; a caller seeding a branch (the folder-probe
+    /// layer's answering branch) passes that branch's state, because the staged
+    /// insert projects through [`Self::projection_inputs`] and would otherwise
+    /// take whichever state the conversation happened to be left in.
     pub fn insert_turn_staged(
         &mut self,
         user_message: impl Into<TurnText>,
         assistant_text: &str,
         tags: Vec<String>,
+        selection: SelectionState,
     ) -> crate::Result<usize> {
+        self.selection = selection;
         let (assistant_content_start, turn_index, tokens) =
             self.insert_turn_inner(&user_message.into(), assistant_text, tags)?;
         let Some(idx) = turn_index else {
@@ -5013,7 +5023,6 @@ impl ProbeCtx {
                 sampling: SamplingConfig::argmax(),
                 event_tx,
                 reprojection: None,
-                disable_reprojection: false,
                 triggers: Arc::new(TriggerRegistry::new()),
                 // A one-token wide-Q probe constrains nothing.
                 turn_grammar: None,

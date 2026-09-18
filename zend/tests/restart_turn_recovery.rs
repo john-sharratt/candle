@@ -21,7 +21,8 @@ mod common;
 
 use candle::Device;
 use candle_conversation::models::Model;
-use candle_conversation::{SectionInserts, SelectionState, TurnEvent};
+use candle_conversation::projection::SectionLoads;
+use candle_conversation::{SelectionState, TurnEvent};
 use common::{say, sealed_memory_at, Workspace};
 
 const MODEL: Model = Model::Qwen35_0_8B_Q8;
@@ -42,21 +43,22 @@ fn a_restart_restores_the_prompt_rather_than_prefilling_it() {
     let ws = Workspace::for_model(MODEL);
 
     let first = {
-        let (engine, conv) = ws.open(&device);
-        let inserts = conv.section_inserts();
+        let (engine, _conv) = ws.open(&device);
+        // The counters live on the engine's shared substrate handle, not on the
+        // sequence: they count what this OPEN loaded, across every conversation.
+        let loads = engine.conversation().section_loads();
         engine.shutdown().expect("clean shutdown");
-        inserts
+        loads
     };
     assert!(
         first.prefilled > 0,
         "a fresh workspace prefills its prompt: {first:?}"
     );
 
-    let (_engine, conv) = ws.open(&device);
+    let (engine, _conv) = ws.open(&device);
     assert_eq!(
-        conv.section_inserts(),
-        SectionInserts {
-            present: first.present,
+        engine.conversation().section_loads(),
+        SectionLoads {
             restored: first.prefilled,
             prefilled: 0,
         },

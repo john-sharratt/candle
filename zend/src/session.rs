@@ -2023,6 +2023,7 @@ impl InferenceState {
                         &progress,
                         &il.name,
                         &il.group,
+                        wipe_metadata,
                     )?;
                     // An incomplete map is reported, not fatal: affected
                     // directories keep their prior generation live and retry on

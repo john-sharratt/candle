@@ -276,12 +276,6 @@ pub(crate) enum SchedulerRequest {
         /// for the full contract.  `None` skips re-projection entirely
         /// (used by single-shot paths like RULER eval and summarisation).
         reprojection: Option<ReprojectionPolicy>,
-        /// Skip the per-turn projection rebuild: the turn still seals into the
-        /// substrate, and its slot keeps the prefix priming seeded at creation.
-        /// Used by append-only utility ingests (`code_reading`, `repo_map`),
-        /// where re-projecting the whole trunk every turn is unnecessary and
-        /// O(n²) — see `zend::code_read`.
-        disable_reprojection: bool,
         /// Tool-call stencils that may fire during this turn's decode, keyed by
         /// their trigger token (e.g. `<tool_call>`).  An empty registry means no
         /// constrained decoding — the turn free-decodes.
@@ -3894,7 +3888,6 @@ impl Scheduler {
                 sampling,
                 event_tx,
                 reprojection,
-                disable_reprojection,
                 triggers,
                 turn_grammar,
                 free_tool_calls_from_penalties,
@@ -12623,6 +12616,7 @@ mod tests {
             triggers: Arc::new(TriggerRegistry::new()),
             turn_grammar: None,
             free_tool_calls_from_penalties: false,
+            recorded_reply: None,
         }
     }
 
@@ -13167,6 +13161,7 @@ mod tests {
             triggers: Arc::new(TriggerRegistry::new()),
             stencil: None,
             pending_mask: None,
+            recorded_reply: None,
         }
     }
 
@@ -14220,7 +14215,6 @@ mod tests {
             sampling: SamplingConfig::default(),
             event_tx,
             reprojection: None,
-            disable_reprojection: false,
             triggers: Arc::new(TriggerRegistry::new()),
             turn_grammar: None,
             free_tool_calls_from_penalties: false,

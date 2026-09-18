@@ -32,7 +32,6 @@ use crate::kv_cache::arena_table::{ArenaFormatTag, ResolvedArenaInfo};
 use candle::cuda_backend::cudarc::driver::CudaStream;
 #[cfg(feature = "tensor-assert")]
 use std::collections::VecDeque;
-use std::ops::Range;
 use std::sync::Arc;
 
 /// Block-table mutations each sequence keeps under `tensor-assert`.

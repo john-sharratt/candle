@@ -2009,7 +2009,6 @@ impl ConversationEngine {
                 sampling: SamplingConfig::argmax(),
                 event_tx,
                 reprojection: None,
-                disable_reprojection: false,
                 // Raw eval/summarisation path: no tools, no constrained decode.
                 triggers: Arc::new(TriggerRegistry::new()),
                 turn_grammar: None,

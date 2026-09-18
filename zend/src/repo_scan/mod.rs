@@ -17,6 +17,9 @@
 pub mod anchor;
 pub mod binary_sniff;
 pub mod dir_unit;
+pub mod metadata;
+pub mod probe;
+pub mod probe_pass;
 pub mod render;
 pub mod types;
 pub mod walk;
@@ -60,9 +63,14 @@ pub use walk::{walk_workspace, MAX_FILE_BYTES};
 /// batch. Sustaining four or more ready sequences takes roughly twice that many
 /// open conversations, since each spends part of its chain decoding.
 ///
-/// **This is a ceiling on [`scan_width`], not the width itself.** The live value
-/// is derived from the card; this only stops that derivation running away. It
-/// was previously 24, matched to the scheduler's `MAX_PREFILL_WIDTH` on the
+/// **This is the number of WORKERS, not the number admitted.** The pool spawns
+/// this many threads and [`reserve_scan_slot`] decides how many may hold a
+/// conversation open at once, re-deciding on every claim against a live memory
+/// report. A blocked worker costs a thread; only an admitted one costs VRAM. So
+/// on a small card this is simply an upper bound the gate never reaches, and the
+/// card — not a number chosen before the scan started — sets the real width.
+///
+/// It was previously 24, matched to the scheduler's `MAX_PREFILL_WIDTH` on the
 /// reasoning that the pool should never ask for more concurrency than a wave can
 /// carry — but that ceiling is a *prefill* backstop, and it was sizing the pool
 /// for the wrong phase.
@@ -100,24 +108,14 @@ pub use walk::{walk_workspace, MAX_FILE_BYTES};
 /// warm-tier drain, which an over-wide ingest can outrun.
 ///
 /// **Caveat worth knowing before changing this.** [`scan_width`]'s per-conversation
-/// costing is meant to be the real governor, with this constant only a backstop.
-/// On the 72 GB card it has never bound: the pool logged `n_workers == ceiling`
-/// at every value swept above (24, 64, 96, 128), so the ceiling — not the
-/// memory estimate — is what actually limits width here, and the 128 regression
-/// was found by throughput rather than refused by the costing. On a smaller card
-/// the estimate does bind and picks the width; on a large one, treat this
-/// constant as the live limit.
+/// costing is the real governor, and this constant only bounds it. On the 72 GB
+/// card the costing has never bound: the pool logged `n_workers == ceiling` at
+/// every value swept above (24, 64, 96, 128), so the ceiling — not the memory
+/// estimate — is what limits width there, and the 128 regression was found by
+/// throughput rather than refused by the costing. On a smaller card the costing
+/// binds and holds the admitted count well under this number; on a large one,
+/// treat this constant as the live limit.
 pub const REPO_MAP_PARALLELISM: usize = 96;
-
-/// Width used when the card can say NOTHING — neither the memory report nor the
-/// governor is available, which is the normal state at scan start.
-///
-/// Deliberately not [`REPO_MAP_PARALLELISM`]: that is a measured ceiling for a
-/// 72 GB card, and using it as the blind default would open 96 conversations on
-/// a 16 GB one. This is the pre-tuning value, which ran without a single
-/// transient-tier failure on every card in the fleet; the runtime gate widens
-/// from here once the governor reports.
-const REPO_MAP_BLIND_PARALLELISM: usize = 24;
 
 /// Longest a worker will wait for VRAM before claiming its unit anyway.
 ///
@@ -357,17 +355,19 @@ fn reserve_scan_slot(live: &AtomicUsize) {
     loop {
         let cap = {
             let _turn = GATE.lock().unwrap_or_else(|e| e.into_inner());
-            let cap = max_live_conversations();
-            let now = live.load(Ordering::Relaxed);
-            // Always let one through: a pool whose only route to freeing VRAM is
-            // finishing work it is not allowed to start would deadlock.
-            match cap {
-                Some(c) if now >= c && now > 0 => c,
-                _ => {
-                    take_scan_slot(live);
-                    return;
-                }
+            // The same chain the pass used to run ONCE before spawning, run here
+            // instead — per claim, so it improves as the scan proceeds. The
+            // governor fallback is what makes an unmeasurable card safe: without
+            // it this returns `None` at scan start (the report is published a few
+            // seconds after the walk) and the arm below admits every waiting
+            // worker at once, which is the herd that put 24 conversations on the
+            // card together and failed all 24.
+            let cap = max_live_conversations().or_else(scan_width_from_governor);
+            if admits_now(cap, live.load(Ordering::Relaxed)) {
+                take_scan_slot(live);
+                return;
             }
+            cap
         };
         if start.elapsed() >= SCAN_POOL_WAIT_CAP {
             // Waited long enough that stalling the whole ingest is the worse
@@ -381,11 +381,38 @@ fn reserve_scan_slot(live: &AtomicUsize) {
             tracing::debug!(
                 target: "zend::repo_scan",
                 live_conversations = live.load(Ordering::Relaxed),
-                max_live = cap,
+                max_live = ?cap,
                 "scan pool: waiting for KV room before opening another directory",
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Whether a worker holding the gate may open its conversation now.
+///
+/// The whole admission rule, kept pure so it can be stated and tested rather
+/// than read out of a `match` arm — which is where it was, and where being
+/// wrong cost a 24-conversation herd.
+///
+/// Three cases, and the third is the one that bit:
+///
+/// * `live == 0` always proceeds. A pool whose only route to freeing VRAM is
+///   finishing work it is not allowed to start would deadlock.
+/// * A measured cap admits while the pool is under it.
+/// * **An unmeasurable card HOLDS.** Nothing can price the scan — no memory
+///   report, no governor — so admitting is a guess made simultaneously by every
+///   waiting worker. Holding is bounded: [`SCAN_POOL_WAIT_CAP`] releases the
+///   wait, one worker at a time through the gate, so a card that never reports
+///   degrades to a slow scan rather than a flood. The old rule admitted here,
+///   which is why the pass had to be capped before it started.
+fn admits_now(cap: Option<usize>, live: usize) -> bool {
+    if live == 0 {
+        return true;
+    }
+    match cap {
+        Some(c) => live < c,
+        None => false,
     }
 }
 
@@ -499,9 +526,19 @@ pub fn ingest_repo_map(
     progress: &Arc<LoadProgress>,
     layer_name: &str,
     group_name: &str,
+    wipe_metadata: bool,
 ) -> anyhow::Result<(RepoMap, DirState, IngestReport)> {
     let map = walk_workspace(workspace, max_depth);
     let units = build_units(&map, workspace);
+
+    // `--wipe-metadata`, applied before anything reads a folder's file: the
+    // daemon fills in what is missing and never overwrites what is there, so
+    // this is the only way to regenerate questions someone has since edited.
+    // Scoped to the walked units, never a recursive delete by filename.
+    if wipe_metadata {
+        let removed = metadata::wipe(workspace, &units);
+        tracing::info!(removed, "--wipe-metadata: folder metadata deleted");
+    }
 
     tracing::info!(
         n_files = map.files.len(),
@@ -831,31 +868,31 @@ fn run_dir_pool(
     let failures = Failures::new();
 
     std::thread::scope(|s| {
-        // Size the pool to the CARD before spawning, not to a constant.
+        // The pool is spawned at its ceiling and the KV gate decides how much of
+        // it may be OPEN. A worker costs a thread and a `ToolContext`; only an
+        // admitted conversation costs VRAM, and `reserve_scan_slot` is what
+        // admits — under a lock, against a live report, re-decided per claim.
         //
-        // The runtime gate alone cannot bound the opening burst: it reads the
-        // scheduler's published memory report, and at scan start that report is
-        // either absent or predates the scan, so every worker sees an empty pool
-        // and claims. Measured: the gate computed `max_live=6` while 21
-        // conversations were already open. Deciding the width once, up front,
-        // removes the race entirely; the runtime gate then handles drift as
-        // directories vary in size.
-        // The fallback is the BLIND width, taken when neither the memory report
-        // nor the governor can say anything — which the call site above notes is
-        // normal at scan start. It must NOT be `REPO_MAP_PARALLELISM`: that
-        // constant is a measured ceiling for a 72 GB card, and defaulting to it
-        // would open 96 conversations on any card with zero memory input.
-        // Over-subscription there is not a slowdown — the wave's transient tier
-        // fails and the ingest aborts, losing files (see the table on
-        // `MAX_SCOPE_LINES`). Start conservative and let the runtime gate widen.
-        let n_workers = max_live_conversations()
-            .or_else(scan_width_from_governor)
-            .unwrap_or(REPO_MAP_BLIND_PARALLELISM);
+        // Sizing the pool up front instead was a second governor that could only
+        // ever be worse informed than the gate: it ran once, between the walk and
+        // the first published memory report, so on a 16 GB card with weights
+        // resident it priced the scan from instantaneous headroom —
+        // `(2492 MiB - 1536 MiB) / 480 MiB` — and pinned the whole pass at ONE
+        // worker, 24x under the width that runs clean on every card in the fleet.
+        // Worse, it froze that answer: the threads are spawned once, so the width
+        // could never rise as finished directories demoted to warm and handed
+        // their arenas back. It priced a recycling resource as a static one, at
+        // the single instant the card had least to say.
+        //
+        // What that up-front sizing was really protecting against was the gate's
+        // own unmeasurable-card fallback, which admitted unconditionally; the
+        // gate now falls back to the governor instead, so the opening burst is
+        // bounded where every other claim is bounded.
+        let n_workers = REPO_MAP_PARALLELISM;
         tracing::info!(
             target: "zend::repo_scan",
             n_workers,
-            ceiling = REPO_MAP_PARALLELISM,
-            "repo map pool width sized to available KV",
+            "repo map pool spawned at its ceiling; the KV gate governs how many are open",
         );
         let mut handles = Vec::with_capacity(n_workers);
         for _ in 0..n_workers.max(1) {
@@ -1561,5 +1598,42 @@ mod tests {
             scan_width(1024 * 1024 * 1024 * 1024, SCRATCH, 0, 0, 0, 0),
             REPO_MAP_PARALLELISM,
         );
+    }
+
+    /// **An empty pool always proceeds**, whatever the card says — including a
+    /// cap of zero and a card that cannot be measured at all. The pool's only
+    /// route to freeing VRAM is finishing a directory, so a rule that can refuse
+    /// the first one deadlocks the scan.
+    #[test]
+    fn the_first_conversation_is_never_refused() {
+        assert!(admits_now(None, 0));
+        assert!(admits_now(Some(0), 0));
+        assert!(admits_now(Some(96), 0));
+    }
+
+    /// A measured cap admits up to itself and holds at it.
+    #[test]
+    fn a_measured_cap_admits_under_it_and_holds_at_it() {
+        assert!(admits_now(Some(4), 1));
+        assert!(admits_now(Some(4), 3));
+        assert!(!admits_now(Some(4), 4), "at the cap the pool must wait");
+        assert!(!admits_now(Some(4), 9), "over the cap it must still wait");
+        assert!(!admits_now(Some(1), 1));
+    }
+
+    /// **A card that cannot be priced HOLDS rather than admits** — the rule the
+    /// pool width was compensating for.
+    ///
+    /// Every worker that reaches the gate before the first memory report gets
+    /// the same `None`, so admitting on it is not one guess but as many
+    /// simultaneous guesses as there are workers: measured, 24 conversations
+    /// opened together and all 24 failed. Holding is bounded by
+    /// `SCAN_POOL_WAIT_CAP`, which releases waiters one at a time through the
+    /// gate, so an unreportable card scans slowly instead of failing.
+    #[test]
+    fn an_unmeasurable_card_holds_instead_of_flooding() {
+        assert!(!admits_now(None, 1));
+        assert!(!admits_now(None, 23));
+        assert!(!admits_now(None, REPO_MAP_PARALLELISM));
     }
 }

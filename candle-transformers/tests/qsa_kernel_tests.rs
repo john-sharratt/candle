@@ -1365,7 +1365,6 @@ fn prefill_paged_case(g: Geom, seed: u64) -> Result<()> {
                 &rope_cs,
                 false,
                 &generation,
-                &std::cell::RefCell::new(None),
                 sel,
             )?
         };
