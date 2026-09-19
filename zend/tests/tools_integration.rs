@@ -185,6 +185,15 @@ mod tool_scenarios {
             self.peak_score.get(tool).copied().unwrap_or(0.0)
         }
 
+        /// The `n` tools with the highest belief this turn, strongest first. A
+        /// tool whose belief never rose above zero is not ranked.
+        fn strongest(&self, n: usize) -> Vec<&str> {
+            let mut rows: Vec<(&String, &f32)> =
+                self.peak_score.iter().filter(|(_, s)| **s > 0.0).collect();
+            rows.sort_by(|a, b| b.1.total_cmp(a.1));
+            rows.iter().take(n).map(|(name, _)| name.as_str()).collect()
+        }
+
         /// The strongest tools this turn, highest first. A selection failure is
         /// only actionable if it says what won instead.
         fn ranking(&self) -> String {
@@ -713,20 +722,32 @@ mod tool_scenarios {
         // is written in — `belief-eval` defaults that gate to 35, the schema
         // says 800, the results doc says 1000, and live scores run past 800,000.
         // A threshold here would be a number with no defensible origin, so the
-        // assertion is on the outcome that actually costs something: the
-        // collection admits between one and three tools, so a repository search
-        // tool taking a slot on a web question is a slot the right tool cannot
-        // have.
+        // assertion is on rank: the belief top-k admits up to three tools, and a
+        // repository search tool among the three strongest on a web question is
+        // a seed borrowing another tool's vocabulary.
+        //
+        // **On belief, not on `selected`.** `file_search` and `file_grep` are
+        // mandatory (`tool_def::ToolDef::mandatory`): they project on every turn,
+        // on top of the belief top-k and without taking a slot, so they are
+        // always selected and "selected" says nothing about their seeds. This
+        // test asserted `!selected` until they became mandatory, after which it
+        // failed on every run whatever the seeds did.
+        let strongest = out.strongest(3);
         for tool in ["file_search", "file_grep"] {
             assert!(
-                !out.selected.contains(tool),
-                "{tool} was projected for a web-search question (belief {:.0}) — \
-                 its question seeds are borrowing another tool's vocabulary, and \
-                 the collection's budget is 1..3, so this is a slot taken from \
-                 the tool the question was actually about. Strongest tools: {}",
+                !strongest.contains(&tool),
+                "{tool} ranked in the belief top 3 for a web-search question \
+                 (belief {:.0}) — its question seeds are borrowing another tool's \
+                 vocabulary. Strongest tools: {}",
                 out.peak(tool),
                 out.ranking(),
             );
         }
+        assert!(
+            out.reached_the_model("web_search"),
+            "web_search did not reach the model for a web-search question. \
+             Strongest tools: {}",
+            out.ranking(),
+        );
     }
 }
