@@ -322,8 +322,8 @@ pub(crate) struct WarmPool {
     use_: candle::vram::PinnedUse,
 }
 
-#[cfg(feature = "cuda")]
 /// How far a refused warm-tier allocation steps down before retrying.
+#[cfg(feature = "cuda")]
 const REFUSAL_STEP_BYTES: usize = 512 * 1024 * 1024;
 
 /// Slots in one [`REFUSAL_STEP_BYTES`] step of `slot_size`-byte slots, rounded
@@ -347,6 +347,7 @@ fn step_up(held: usize, want: usize, slot_size: usize) -> usize {
     held.saturating_add(step_slots(slot_size)).min(want)
 }
 
+#[cfg(feature = "cuda")]
 impl WarmPool {
     /// Allocate as much of `want_slots` as the machine will give.
     ///

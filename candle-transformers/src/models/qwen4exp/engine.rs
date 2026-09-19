@@ -196,8 +196,18 @@ impl Qwen4ExpGpu {
 
         // Resident, stored BF16 — a table-storage width chosen at load, 1.27 GB
         // for the 248,320-row table; the per-wave gather widens its rows to the
-        // Gated Residual's F32.
-        let embed = f32t(&mut gguf, "token_embd.weight")?.to_dtype(candle::DType::BF16)?;
+        // Gated Residual's F32. Dequantized straight to BF16 where the device
+        // path takes the source type — through F32 it holds a 2.5 GB
+        // intermediate in the pool beside the result — and through F32
+        // otherwise, which `load_headroom_bytes` prices for exactly those types.
+        let embed = {
+            let q = gguf.qtensor("token_embd.weight", device)?;
+            if q.dtype().dequantizes_to_bf16() {
+                q.dequantize_bf16(device)?
+            } else {
+                q.dequantize(device)?.to_dtype(candle::DType::BF16)?
+            }
+        };
         // Tied embeddings, as the oracle loader handles them: a checkpoint
         // without `output.weight` projects through the embedding table. Reading
         // it unconditionally made the engine refuse artifacts the oracle

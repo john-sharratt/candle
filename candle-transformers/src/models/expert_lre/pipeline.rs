@@ -510,6 +510,16 @@ pub(crate) fn startup_from_pack(
                 break 'fill;
             };
             let slot_base = t.inner.slot_base(slot_idx);
+            // Names the upload that failed: which expert, which source, and how
+            // far the fill had got.
+            let at = |source: &'static str| {
+                move |e: candle::Error| {
+                    e.context(format!(
+                        "startup fill: L{moe_idx}E{expert_idx} from {source} into VRAM slot \
+                         {slot_idx} ({vram_count} resident so far)"
+                    ))
+                }
+            };
             // SAFETY (both arms): `slot_idx` was just handed out by the zone and
             // is not reclaimed while this runs.
             let slot = match t.residency[moe_idx][expert_idx].ram {
@@ -522,7 +532,8 @@ pub(crate) fn startup_from_pack(
                         geom,
                         cuda_dev,
                         slot_base,
-                    )?
+                    )
+                    .map_err(at("a pinned warm slot"))?
                 },
                 // A pageable one is never an upload source: through staging.
                 Some(warm_slot) => {
@@ -537,7 +548,8 @@ pub(crate) fn startup_from_pack(
                             geom,
                             cuda_dev,
                             slot_base,
-                        )?
+                        )
+                        .map_err(at("a pageable warm slot, staged"))?
                     };
                     staging.publish(idx, stream.record_event(None).map_err(candle::Error::wrap)?);
                     slot
@@ -552,7 +564,8 @@ pub(crate) fn startup_from_pack(
                             geom,
                             cuda_dev,
                             slot_base,
-                        )?
+                        )
+                        .map_err(at("the pack, staged"))?
                     };
                     staging.publish(idx, stream.record_event(None).map_err(candle::Error::wrap)?);
                     cold_reads += 1;
@@ -916,14 +929,20 @@ unsafe fn build_slot_from_repacked_on_stream_inner(
 /// Build an `ExpertSlot` from one pack **record** — the form both resident
 /// tiers hold — uploading it into the weight-zone slot at `slot_base`.
 ///
-/// The record is the three projections at the offsets `layout` names, which is
-/// the same arrangement a VRAM slot uses, so this is three subslices and the
-/// ordinary upload. Everything downstream of the pack goes through here: warm
-/// promotions, cold misses, and the startup fill.
+/// **One copy, not three.** The record is the three projections at the offsets
+/// `layout` names, which are the slot's own [`slot_offsets`] — the pack is laid
+/// out as slot images — so the whole record from the gate's start to the down
+/// projection's end goes over in a single `cuMemcpyHtoDAsync`, padding and
+/// all, and the three storages are views over the result
+/// ([`build_slot_view`]). Three copies of ~0.44 MB each were launch-bound:
+/// 20,421 of them took 1.27 s of a BF16×1 prefill, ~62 µs apiece against
+/// ~18 µs of bandwidth. Everything downstream of the pack goes through here:
+/// warm promotions, cold misses, and the startup fill.
 ///
 /// # Safety
 ///
-/// As [`build_slot_from_repacked_with_device`].
+/// As [`build_slot_from_repacked_with_device`]; `record` must stay unwritten
+/// until the copy on `stream` has landed.
 #[cfg(feature = "cuda")]
 pub(crate) unsafe fn build_slot_from_record_on_stream(
     record: &[u8],
@@ -934,17 +953,24 @@ pub(crate) unsafe fn build_slot_from_record_on_stream(
     slot_base: u64,
     profile: Option<&mut ProfileAccumulator>,
 ) -> Result<ExpertSlot> {
-    let at = |s: super::pack::RecordSpan| &record[s.offset..s.offset + s.bytes];
-    build_slot_from_repacked_on_stream_inner(
-        at(layout.gate),
-        at(layout.up),
-        at(layout.down),
-        geom,
-        cuda_dev,
-        stream,
-        slot_base,
-        profile,
-    )
+    let (gate_off, up_off, down_off, _) = slot_offsets(geom);
+    if (layout.gate.offset, layout.up.offset, layout.down.offset) != (gate_off, up_off, down_off) {
+        candle::bail!(
+            "expert record layout ({}, {}, {}) is not the slot's ({gate_off}, {up_off}, \
+             {down_off}); the record cannot be copied into the slot whole",
+            layout.gate.offset,
+            layout.up.offset,
+            layout.down.offset,
+        )
+    }
+    let extent = layout.down.offset + layout.down.bytes;
+    let t = profile_now();
+    cudarc::driver::result::memcpy_htod_async(slot_base, &record[..extent], stream.cu_stream())
+        .map_err(candle::Error::wrap)?;
+    if let Some(p) = profile {
+        p.record("dma_h2d", t);
+    }
+    build_slot_view(geom, cuda_dev, slot_base)
 }
 
 /// [`build_slot_from_record_on_stream`] on the device's default stream.

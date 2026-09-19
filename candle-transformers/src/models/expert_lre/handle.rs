@@ -127,14 +127,14 @@ const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
 /// pages taken past that point come out of the page cache and the warm KV tier,
 /// which this gate barely exercises and a daemon workload does.
 ///
-/// **2 GiB was tried and fails on the 31.5 GiB box.** Flash-Next's own
-/// non-pinned footprint after pinning measures only ~1.4 GiB, but at 2 GiB the
-/// warm tier (pinned plus its pageable remainder) took all but ~2 GiB of the
-/// machine during the load, and the startup fill died with
-/// `CUDA_ERROR_OUT_OF_MEMORY` — twice — before the OS paged anything else out.
-/// The headroom covers the load's transient as well as the process's steady
-/// state. Warm KV does not come out of it: it has a pageable floor of its own
-/// (`vram::KV_WARM_FLOOR`) that the OS pages rather than refusing.
+/// **Smaller was measured and is slower, not faster**, on Flash-Next at 16 GB
+/// with 21.9 GiB free at launch. At 3 GiB the warm tier grew 13,508 → 14,283
+/// experts and pack reads fell ~9%, but free RAM bottomed at 2.05 GiB and the
+/// run paid for it: decode 13.8 / 67.6 / 26.8 → 13.5 / 64.7 / 22.8 t/s
+/// (BF16×1 / BF16×8 / C5×2), prefill 269.5 → 256.0 on C5. At 4 GiB the low
+/// point is 3.57 GiB. Warm KV does not come out of this: it has a pageable
+/// floor of its own (`vram::KV_WARM_FLOOR`) that the OS pages rather than
+/// refusing.
 pub const WARM_TIER_HEADROOM: u64 = 4 * 1024 * 1024 * 1024;
 
 use candle::vram::PAGEABLE_RESERVE;

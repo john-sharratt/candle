@@ -28,6 +28,10 @@ use std::alloc::{alloc, dealloc, Layout};
 /// Page-locked host memory left for the driver's own staging once the pinned
 /// part is sized: an upload from pageable memory, the embedding shadow, the
 /// stagers. The warm pool that left it none measured ~16 GiB of 31.5 GiB.
+///
+/// Half a GiB also loads (15.16 GiB pinned) and runs no faster — every rate
+/// within run-to-run noise of 1 GiB — so the wider margin stays: it is the
+/// driver's room, and running it short fails the load rather than slowing it.
 const DRIVER_LOCK_MARGIN: u64 = 1024 * 1024 * 1024;
 
 /// Most of `total_ram` the pinned part may page-lock, less what is already

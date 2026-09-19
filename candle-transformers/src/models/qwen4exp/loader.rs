@@ -19,7 +19,7 @@ use candle::quantized::ggml_file::qtensor_from_ggml;
 use candle::quantized::gguf_file::{Content, TensorInfo, Value};
 use candle::quantized::ko_quant::dequant_ko;
 use candle::quantized::GgmlDType;
-use candle::{Device, Result, Tensor};
+use candle::{DType, Device, Result, Tensor};
 
 use super::config::Qwen4ExpConfig;
 use super::hyper::HcWeights;
@@ -232,21 +232,44 @@ pub(crate) fn offloaded_bytes(content: &Content) -> Result<u64> {
     Ok(tensor_bytes(table).saturating_sub(PLE_CACHE_BYTES as u64) + device_resident)
 }
 
+/// The token embedding's name in the artifact.
+const TOKEN_EMBD: &str = "token_embd.weight";
+
 /// CUDA-pool room the engine's load needs — [`peak_load_pool_bytes`] over every
-/// tensor the load reads to the device, which is every one but the n-gram table.
+/// tensor the load reads to the device, which is every one but the n-gram table,
+/// **plus the resident BF16 embedding**.
 ///
 /// The table is the checkpoint's largest 2-D tensor by two orders of magnitude
 /// (54 GB against a ~1 GB head), and it never reaches the device: its row cache
 /// reads from the file. Bounded with it, the load would concede the whole card
 /// to the pool and leave the span nothing.
+///
+/// The embedding is the one weight that stays in the pool after load: a plain
+/// BF16 table (1.27 GB for 248,320 × 2,560) the per-wave gather reads, not a KO
+/// twin the dense block holds. `peak_load_pool_bytes` prices only a transient
+/// source tensor, so without this term the resident table came out of the
+/// 512 MiB runtime cushion, and on an idle card the first post-load pool
+/// allocation — the pinned prefix's repack, a session's metadata — had nothing
+/// left and failed with `CUDA_ERROR_OUT_OF_MEMORY`.
 pub(crate) fn load_headroom_bytes(content: &Content) -> usize {
+    // The resident BF16 table, plus the F32 intermediate the load holds beside
+    // it for a source type the device cannot dequantize straight to BF16.
+    let embedding = content.tensor_infos.get(TOKEN_EMBD).map_or(0, |info| {
+        let n = info.shape.elem_count();
+        let intermediate = if info.ggml_dtype.dequantizes_to_bf16() {
+            0
+        } else {
+            n * DType::F32.size_in_bytes()
+        };
+        n * DType::BF16.size_in_bytes() + intermediate
+    });
     peak_load_pool_bytes(
         content
             .tensor_infos
             .iter()
             .filter(|(name, _)| name.as_str() != PLE_TABLE)
             .map(|(_, info)| info),
-    )
+    ) + embedding
 }
 
 /// Dequantize one whole tensor to F32.
@@ -556,6 +579,47 @@ mod tests {
         assert_eq!(
             load_headroom_bytes(&c),
             5_570_560 + 2 * candle::quantized::cuda::REPACK_BAND_BYTES
+        );
+    }
+
+    /// The resident BF16 embedding is added on top: a `[2048, 2560]` table is
+    /// 10,485,760 bytes at BF16, and as the checkpoint's largest 2-D tensor its
+    /// Q8_0 source (5,570,560 bytes) also sets the transient term.
+    #[test]
+    fn the_load_headroom_holds_the_resident_embedding() {
+        let mut c = content_with_ple(1_000);
+        c.tensor_infos.insert(
+            "token_embd.weight".to_string(),
+            TensorInfo {
+                ggml_dtype: GgmlDType::Q8_0,
+                shape: (2048, 2560).into(),
+                offset: 0,
+            },
+        );
+        assert_eq!(
+            load_headroom_bytes(&c),
+            5_570_560 + 2 * candle::quantized::cuda::REPACK_BAND_BYTES + 10_485_760
+        );
+    }
+
+    /// A float-stored embedding is widened through F32 at load, and the
+    /// intermediate is priced beside the table: a `[2048, 2560]` BF16 source is
+    /// 10,485,760 bytes (also the transient term), the resident table the same,
+    /// and the F32 intermediate 20,971,520.
+    #[test]
+    fn a_float_embedding_prices_its_f32_intermediate() {
+        let mut c = content_with_ple(1_000);
+        c.tensor_infos.insert(
+            "token_embd.weight".to_string(),
+            TensorInfo {
+                ggml_dtype: GgmlDType::BF16,
+                shape: (2048, 2560).into(),
+                offset: 0,
+            },
+        );
+        assert_eq!(
+            load_headroom_bytes(&c),
+            10_485_760 + 2 * candle::quantized::cuda::REPACK_BAND_BYTES + 10_485_760 + 20_971_520
         );
     }
 

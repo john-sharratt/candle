@@ -6,11 +6,11 @@
 
 use crate::models::with_tracing::QMatMul;
 use crate::quantized_var_builder::VarBuilder;
-use candle::quantized::{GgmlDType, Int8Mode, QTensor};
+use candle::quantized::{Int8Mode, QTensor};
 #[cfg(feature = "cuda")]
 use candle::wave_provenance::WaveTicket;
 use candle::{DType, LiveTensor, Module, Result, Tensor};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct Embedding {
@@ -145,22 +145,18 @@ pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<L
 
 #[derive(Debug, Clone)]
 pub struct RmsNorm {
-    /// The quantized weight as it sits in the checkpoint.
+    /// The weight materialised once in every float width activations can arrive
+    /// in — F32, F16, BF16, indexed by [`width_slot`] — when the norm is built.
     ///
-    /// Retained so the norm weight can be **re-materialised** in a different
-    /// activation dtype rather than cast from a resident F32 copy. Dequantizing
-    /// straight from the source means exactly one materialised weight exists at
-    /// a time; a cast keeps the F32 original alive alongside every dtype it has
-    /// been asked for, which is a copy of every norm weight per dtype for the
-    /// life of the process.
-    src: Arc<QTensor>,
-    /// `src` dequantized into the dtype activations arrive in.
-    ///
-    /// Behind a lock because the dtype is chosen when a session is created,
-    /// which happens through `&self` — and because a model is shared across
-    /// threads. Replaced wholesale by [`RmsNorm::maybe_change_dtype`], never
-    /// added to.
-    weight: Arc<RwLock<Tensor>>,
+    /// **At load, never later.** A session picks its widths when it is created,
+    /// and materialising then meant a device allocation after the model's span
+    /// had claimed the card: the weights are a few KB, but on a card the expert
+    /// zone fills to the last granule the allocation had nowhere to come from,
+    /// and a Flash-Next session died at creation with `CUDA_ERROR_OUT_OF_MEMORY`
+    /// whenever the pool happened to hold nothing cached from the load. Three
+    /// copies of a `[hidden]` vector per norm is the price of never allocating
+    /// after load.
+    weights: Arc<[Tensor; 3]>,
     eps: f64,
     span: tracing::Span,
     /// How the fused int8 path stores the per-128 `Σx` of the operand it emits —
@@ -176,20 +172,23 @@ pub struct RmsNorm {
 /// Materialise `src` in `dtype`, taking the fused path when there is one.
 ///
 /// `dequantize_f16` / `dequantize_bf16` are quantized *kernels*: they dispatch on
-/// the source's [`GgmlDType`] and have a case only for genuinely quantized
+/// the source's [`candle::quantized::GgmlDType`] and have a case only for genuinely quantized
 /// formats. Norm weights are commonly stored unquantized — Qwen3-30B-A3B keeps
 /// them F32 — and such a source has no `QType`, so the fused path fails outright
 /// rather than falling back.
 ///
 /// So a float-stored source dequantizes to its own dtype and converts, and only a
-/// quantized one takes the fused path. The conversion on that branch is the very
-/// thing the hot loop must not do, but this runs at session setup, where one
-/// transient over a `[hidden]` vector costs nothing.
+/// source whose format the device kernel reads
+/// ([`candle::quantized::GgmlDType::dequantizes_to_bf16`],
+/// which also covers the F16 kernel the BF16 one runs through) takes the fused
+/// path. Every other source — float storage, and the formats with no narrow
+/// kernel — goes through F32 and converts, which every backend can do: the norm
+/// materialises all three widths at load, so a width no session asks for must
+/// not be able to fail it. The conversion is the very thing the hot loop must
+/// not do, but this runs at load, where one transient over a `[hidden]` vector
+/// costs nothing.
 fn dequantize_as(src: &QTensor, dtype: DType, device: &candle::Device) -> Result<Tensor> {
-    if matches!(
-        src.dtype(),
-        GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
-    ) {
+    if !src.dtype().dequantizes_to_bf16() {
         return src.dequantize(device)?.to_dtype(dtype);
     }
     match dtype {
@@ -197,6 +196,16 @@ fn dequantize_as(src: &QTensor, dtype: DType, device: &candle::Device) -> Result
         DType::F16 => src.dequantize_f16(device),
         DType::BF16 => src.dequantize_bf16(device),
         other => candle::bail!("RmsNorm: no dequantize path for activation dtype {other:?}"),
+    }
+}
+
+/// Where `dtype`'s materialised weight sits in [`RmsNorm`]'s `weights`.
+fn width_slot(dtype: DType) -> Option<usize> {
+    match dtype {
+        DType::F32 => Some(0),
+        DType::F16 => Some(1),
+        DType::BF16 => Some(2),
+        _ => None,
     }
 }
 
@@ -210,10 +219,14 @@ impl RmsNorm {
     }
 
     fn from_arc(src: Arc<QTensor>, eps: f64) -> Result<Self> {
-        let weight = src.dequantize(&src.device())?;
+        let device = src.device();
+        let weights = [
+            dequantize_as(&src, DType::F32, &device)?,
+            dequantize_as(&src, DType::F16, &device)?,
+            dequantize_as(&src, DType::BF16, &device)?,
+        ];
         Ok(Self {
-            src,
-            weight: Arc::new(RwLock::new(weight)),
+            weights: Arc::new(weights),
             eps,
             span: tracing::span!(tracing::Level::TRACE, "rms-norm"),
             sum_scale: candle::quantized::SumScale::default(),
@@ -227,44 +240,28 @@ impl RmsNorm {
         self
     }
 
-    /// Re-materialise the weight in the dtype activations will arrive in, if it
-    /// is not already.
+    /// Confirm the norm can serve activations of `dtype`.
     ///
-    /// **Called when a session is created, never inside a wave.** The norm
-    /// kernels need the weight in the activation dtype, and a quantized
-    /// checkpoint dequantizes to F32 while inference runs F16 or BF16. Doing the
-    /// conversion on demand inside the forward costs one device allocation and
-    /// one launch per norm, per layer, per token — and it is invisible in a
-    /// profile, surfacing only as a slightly slower forward. That is why
-    /// [`Self::weight_for`] refuses a dtype it was not prepared for instead of
-    /// quietly converting.
-    ///
-    /// Idempotent, and re-entrant across dtype switches: the previous weight is
-    /// dropped as the new one replaces it, so switching back and forth costs a
-    /// reload rather than an accumulating set of copies.
+    /// Called when a session is created. Every float width is materialised at
+    /// load (see `weights`), so this allocates nothing and only refuses a width
+    /// no norm kernel takes — at session creation rather than inside a wave.
     pub fn maybe_change_dtype(&self, dtype: DType) -> Result<()> {
-        if self.weight.read().unwrap().dtype() == dtype {
-            return Ok(());
-        }
-        let fresh = dequantize_as(&self.src, dtype, &self.src.device())?;
-        *self.weight.write().unwrap() = fresh;
-        Ok(())
+        self.weight_for(dtype).map(|_| ())
     }
 
-    /// The weight, which must already be in the activation dtype.
+    /// The weight in the activation dtype.
     ///
-    /// The hot-loop guard. Cloning is an `Arc` bump, not a copy.
+    /// The hot-loop guard: a width with no materialised weight is refused
+    /// rather than converted, which would allocate and launch per call inside
+    /// the wave. Cloning is an `Arc` bump, not a copy.
     fn weight_for(&self, dtype: DType) -> Result<Tensor> {
-        let weight = self.weight.read().unwrap();
-        if weight.dtype() != dtype {
-            candle::bail!(
-                "RmsNorm: weight is {:?} but activations are {dtype:?}. The weight is \
-                 materialised by `maybe_change_dtype` when a session is created; converting \
-                 it here would allocate and launch per call inside the wave.",
-                weight.dtype(),
-            )
+        match width_slot(dtype) {
+            Some(i) => Ok(self.weights[i].clone()),
+            None => candle::bail!(
+                "RmsNorm: no weight for {dtype:?} activations — the norm is materialised in \
+                 F32, F16 and BF16 at load"
+            ),
         }
-        Ok(weight.clone())
     }
 }
 
@@ -363,5 +360,60 @@ impl RmsNorm {
             self.sum_scale,
         )?;
         Ok(DynamicActs::Int8(op))
+    }
+}
+
+#[cfg(test)]
+mod rms_norm_tests {
+    use super::RmsNorm;
+    use candle::quantized::{GgmlDType, QTensor};
+    use candle::{DType, Device, Tensor};
+
+    fn norm() -> RmsNorm {
+        let w = Tensor::new(&[0.5f32, 1.0, 1.5, 2.0], &Device::Cpu).unwrap();
+        RmsNorm::from_qtensor(QTensor::quantize(&w, GgmlDType::F32).unwrap(), 1e-6).unwrap()
+    }
+
+    /// Every float width is materialised at load, so a session's width is
+    /// served without converting anything — the same values in each.
+    #[test]
+    fn every_float_width_is_ready_at_load() {
+        let n = norm();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            n.maybe_change_dtype(dtype).unwrap();
+            let w = n.weight_for(dtype).unwrap();
+            assert_eq!(w.dtype(), dtype);
+            let v: Vec<f32> = w.to_dtype(DType::F32).unwrap().to_vec1().unwrap();
+            assert_eq!(v, vec![0.5, 1.0, 1.5, 2.0]);
+        }
+    }
+
+    /// A quantized-stored norm materialises every width too. The 127 sets the
+    /// `Q8_0` block's scale to exactly 1, so it holds these integers exactly and
+    /// each width reads them back.
+    #[test]
+    fn a_quantized_norm_materialises_every_width() {
+        let vals: Vec<f32> = (0..32)
+            .map(|i| if i == 0 { 127.0 } else { (i % 5) as f32 })
+            .collect();
+        let w = Tensor::new(vals.as_slice(), &Device::Cpu).unwrap();
+        let n =
+            RmsNorm::from_qtensor(QTensor::quantize(&w, GgmlDType::Q8_0).unwrap(), 1e-6).unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let v: Vec<f32> = n
+                .weight_for(dtype)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_eq!(v, vals, "{dtype:?}");
+        }
+    }
+
+    /// A width no norm kernel takes is refused at session creation.
+    #[test]
+    fn a_non_float_width_is_refused() {
+        assert!(norm().maybe_change_dtype(DType::U32).is_err());
     }
 }

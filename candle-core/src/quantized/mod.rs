@@ -828,6 +828,48 @@ pub enum GgmlDType {
 }
 
 impl GgmlDType {
+    /// Whether a CUDA tensor of this type dequantizes straight to BF16 on the device
+    /// ([`QTensor::dequantize_bf16`]) with no F32 intermediate: the block formats the
+    /// dequantize kernel reads, and MXFP4. Float and integer storage, P2, and the KO twins
+    /// (which refuse any float dequantize) go through F32 instead — a full-size F32 copy that
+    /// a load sizing its pool headroom has to count.
+    pub fn dequantizes_to_bf16(self) -> bool {
+        use GgmlDType::*;
+        matches!(
+            self,
+            Q4_0 | Q4_1
+                | Q5_0
+                | Q5_1
+                | Q8_0
+                | Q8_1
+                | Q2_K
+                | Q3_K
+                | Q4_K
+                | Q5_K
+                | Q6_K
+                | Q8_K
+                | QAWQ
+                | QAWQ_G64
+                | Q4_KS
+                | Q8_KS
+                | Q2_0
+                | Q3_0
+                | R16
+                | Q0
+                | Q1_S
+                | Q2_S
+                | Q2_A
+                | Q2_1
+                | Q3_1
+                | Q0_V
+                | Q1_A
+                | Q0_X
+                | Q0_M2
+                | Q0_M4
+                | MXFP4
+        )
+    }
+
     /// Storage cost in bits per weight, scales and all.
     ///
     /// `type_size × 8 / block_size` — the number that decides how many bytes a weight puts on
