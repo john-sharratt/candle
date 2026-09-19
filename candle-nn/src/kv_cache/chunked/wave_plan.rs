@@ -167,6 +167,15 @@ pub struct WaveWidth {
     /// against). So an ordinary wave scores one row per sequence, and a
     /// speculative one scores a block per verifying sequence.
     pub scored_rows: usize,
+    /// Prefill-group sequences contributing **more than one row** — the spans
+    /// a DeltaNet mixer runs through its prefill kernels rather than its
+    /// decode ones (a verifying block rides the prefill group, so it counts).
+    ///
+    /// Two costs hang on it and neither is a row count: the mixer's span
+    /// tables hold an entry per such span, and the prefill scan's transients
+    /// exist only when there is at least one — though they are then sized by
+    /// the whole wave.
+    pub prefill_spans: usize,
     /// Rows a speculative **replay** stages onto the wave, and the spans it
     /// stages them for.
     ///
@@ -193,11 +202,16 @@ impl WaveWidth {
 
     /// A wave that is all prefill: `rows` tokens over `sequences` sequences,
     /// none of them verifying, so the head scores one row each.
+    ///
+    /// The per-sequence lengths are not known here, so the multi-row spans are
+    /// bounded: at most every sequence, and at most one per two rows.
     pub const fn prefill(rows: usize, sequences: usize) -> Self {
+        let pairs = rows / 2;
         Self {
             prefill_rows: rows,
             decode_rows: 0,
             scored_rows: sequences,
+            prefill_spans: if sequences < pairs { sequences } else { pairs },
             staged_rows: 0,
             staged_spans: 0,
         }
@@ -210,6 +224,7 @@ impl WaveWidth {
             prefill_rows: 0,
             decode_rows: sequences,
             scored_rows: sequences,
+            prefill_spans: 0,
             staged_rows: 0,
             staged_spans: 0,
         }
@@ -227,19 +242,28 @@ impl WaveWidth {
             prefill_rows: 0,
             decode_rows: 0,
             scored_rows: 0,
+            prefill_spans: 0,
             staged_rows: rows,
             staged_spans: spans,
         }
     }
 
-    /// `rows` more prefill tokens on top of this wave.
+    /// `rows` more prefill tokens on top of this wave, from one more sequence —
+    /// a multi-row span once there are two of them.
     pub const fn with_prefill(self, rows: usize) -> Self {
         Self {
             prefill_rows: self.prefill_rows + rows,
+            prefill_spans: self.prefill_spans + if rows > 1 { 1 } else { 0 },
             ..self
         }
     }
 }
+
+/// Rows in one chunk of the DeltaNet prefill scan — the width of its
+/// intra-chunk `kq` transient ([`WaveBuffer::DeltaNetLiveScanKq`]). The kernel's
+/// own constant is `candle_kernels::delta_net::DELTA_NET_PREFILL_CHUNK`, out of
+/// reach of a build without CUDA; a CUDA test holds the two equal.
+pub const DELTA_NET_SCAN_CHUNK: usize = 64;
 
 /// The width the FFN carries its intermediates in, for activations of `act`.
 ///
@@ -720,12 +744,15 @@ pub enum WaveBuffer {
     // ── The live DeltaNet mixer on the Gated Residual stack ─────────────────
     // Under the pre-mix the mixer's input is F32 on the span and the
     // projections' activation quantize inherits it, so the whole mixer lands on
-    // the span — nothing breaks provenance. Measured on Qwen3.8-Flash-Next at
-    // 515 rows, in carve order: the operand, the stacked `[qkv | z | β | α]`
-    // projection and its split, the two span tables, the conv, the scan's two
-    // outputs and the decay, then the norm-gate and `w_out` — the last three
-    // overflowed an attention span priced without them. Priced zero elsewhere:
-    // the qwen35 stack's live chain has not been re-measured.
+    // the span — nothing breaks provenance. In carve order: the operand, the
+    // stacked `[qkv | z | β | α]` projection and its split, the two span
+    // tables, the conv, the recurrence output, the prefill scan's four
+    // transients (`u`, `w`, `kq`, `g_cs`), then the norm-gate and `w_out`.
+    // Measured on Qwen3.8-Flash-Next at 2100 rows over four spans. A span
+    // priced without `w` and `kq` fills at `g_cs`, and the rest of the chain
+    // then falls back to the pool without a word — so the census of an
+    // under-priced span reads as a plan with slack, not as an overrun. Priced
+    // zero elsewhere: the qwen35 stack's live chain has not been re-measured.
     /// The four projections' q8a128 operand: the mix output quantized once.
     DeltaNetLiveOperand,
     /// The stacked projection, `conv_dim + value_dim + 2 · n_v_heads` wide, F32.
@@ -733,18 +760,24 @@ pub enum WaveBuffer {
     /// Its ragged split into the four parts — one carve the same width.
     DeltaNetLiveSplit,
     /// The per-span pointer table the mixer builds beside its operands: four
-    /// device pointers a span. Priced at a span per row, the bound a row count
-    /// can give — tens of bytes a sequence either way.
+    /// device pointers for each multi-row span ([`WaveWidth::prefill_spans`]).
     DeltaNetLiveSpanPtrs,
-    /// The per-span extents: two `u32` a span, bounded as above.
+    /// The per-span extents: two `u32` for each multi-row span.
     DeltaNetLiveSpanExtents,
     /// The causal conv's output, `conv_dim` wide.
     DeltaNetLiveConv,
     /// The recurrence's output, `value_dim` wide.
     DeltaNetLiveScanOut,
-    /// The scan's second `value_dim`-wide carve.
-    DeltaNetLiveScanAux,
-    /// The per-head decay, one F32 per V head per row.
+    /// The prefill scan's `u` transient, `[n_v_heads, rows, head_dim]` —
+    /// `value_dim` a row. This and the three below are carved only when a
+    /// multi-row span runs the scan, and then over every row of the wave.
+    DeltaNetLiveScanU,
+    /// The prefill scan's `w` transient, the same shape as `u`.
+    DeltaNetLiveScanW,
+    /// The prefill scan's intra-chunk `kq`, `[n_v_heads, rows,
+    /// DELTA_NET_SCAN_CHUNK]`.
+    DeltaNetLiveScanKq,
+    /// The scan's cumulative decay `g_cs`, one F32 per V head per row.
     DeltaNetLiveDecay,
     /// `norm(out) ⊙ gate(z)`, `value_dim` wide — what `w_out` reads.
     DeltaNetLiveNormGate,
@@ -1091,7 +1124,9 @@ impl WaveBuffer {
             | Self::DeltaNetLiveSpanExtents
             | Self::DeltaNetLiveConv
             | Self::DeltaNetLiveScanOut
-            | Self::DeltaNetLiveScanAux
+            | Self::DeltaNetLiveScanU
+            | Self::DeltaNetLiveScanW
+            | Self::DeltaNetLiveScanKq
             | Self::DeltaNetLiveDecay
             | Self::DeltaNetLiveNormGate
             | Self::DeltaNetLiveOutOperand
@@ -1129,7 +1164,9 @@ impl WaveBuffer {
             | Self::DeltaNetLiveSpanExtents
             | Self::DeltaNetLiveConv
             | Self::DeltaNetLiveScanOut
-            | Self::DeltaNetLiveScanAux
+            | Self::DeltaNetLiveScanU
+            | Self::DeltaNetLiveScanW
+            | Self::DeltaNetLiveScanKq
             | Self::DeltaNetLiveDecay
             | Self::DeltaNetLiveNormGate
             | Self::DeltaNetLiveOutOperand
@@ -1431,7 +1468,9 @@ impl WaveBuffer {
             | Self::DeltaNetLiveSpanExtents
             | Self::DeltaNetLiveConv
             | Self::DeltaNetLiveScanOut
-            | Self::DeltaNetLiveScanAux
+            | Self::DeltaNetLiveScanU
+            | Self::DeltaNetLiveScanW
+            | Self::DeltaNetLiveScanKq
             | Self::DeltaNetLiveDecay
             | Self::DeltaNetLiveNormGate
             | Self::DeltaNetLiveOutOperand
@@ -1445,25 +1484,43 @@ impl WaveBuffer {
                 let d = g.delta_net.expect("guarded above");
                 dense(rows, d.conv_dim + d.value_dim + 2 * d.n_v_heads, DType::F32)
             }
-            Self::DeltaNetLiveSpanPtrs => dense(rows, 4, DType::I64),
-            Self::DeltaNetLiveSpanExtents => dense(rows, 2, DType::U32),
+            // One entry per multi-row span; a decode row has none.
+            Self::DeltaNetLiveSpanPtrs => dense(w.prefill_spans, 4, DType::I64),
+            Self::DeltaNetLiveSpanExtents => dense(w.prefill_spans, 2, DType::U32),
             Self::DeltaNetLiveConv => dense(
                 rows,
                 g.delta_net.expect("guarded above").conv_dim,
                 DType::F32,
             ),
-            Self::DeltaNetLiveScanOut | Self::DeltaNetLiveScanAux | Self::DeltaNetLiveNormGate => {
+            Self::DeltaNetLiveScanOut | Self::DeltaNetLiveNormGate => dense(
+                rows,
+                g.delta_net.expect("guarded above").value_dim,
+                DType::F32,
+            ),
+            // The prefill scan's four transients exist only when a multi-row
+            // span runs it, and are then sized by the WHOLE wave: each span
+            // writes its own rows of one wave-wide allocation.
+            Self::DeltaNetLiveScanU | Self::DeltaNetLiveScanW => {
+                let scan_rows = if w.prefill_spans > 0 { rows } else { 0 };
                 dense(
-                    rows,
+                    scan_rows,
                     g.delta_net.expect("guarded above").value_dim,
                     DType::F32,
                 )
             }
-            Self::DeltaNetLiveDecay => dense(
-                rows,
-                g.delta_net.expect("guarded above").n_v_heads,
-                DType::F32,
-            ),
+            Self::DeltaNetLiveScanKq => {
+                let d = g.delta_net.expect("guarded above");
+                let scan_rows = if w.prefill_spans > 0 { rows } else { 0 };
+                dense(scan_rows, d.n_v_heads * DELTA_NET_SCAN_CHUNK, DType::F32)
+            }
+            Self::DeltaNetLiveDecay => {
+                let scan_rows = if w.prefill_spans > 0 { rows } else { 0 };
+                dense(
+                    scan_rows,
+                    g.delta_net.expect("guarded above").n_v_heads,
+                    DType::F32,
+                )
+            }
             Self::DeltaNetLiveOutOperand => q8(rows, g.delta_net.expect("guarded above").value_dim),
             Self::DeltaNetLiveOut => dense(rows, g.hidden, g.act_dtype),
             // Sized by the **staged** rows and spans, which are zero on every
@@ -1843,6 +1900,7 @@ impl WavePlan {
         }
         let head = WaveWidth {
             prefill_rows: 0,
+            prefill_spans: 0,
             ..w
         };
         let widest = self.max_rows_within(budget, head);
@@ -1991,30 +2049,77 @@ mod tests {
     }
 
     /// Pinned to the `wave-census-labels` itemisation of a DeltaNet layer's
-    /// attention-phase generation on Qwen3.8-Flash-Next at 515 rows: the
-    /// pre-mix's full-width carves, then the live mixer's, byte for byte. The
-    /// pre-mix's two projection outputs are pinned by
+    /// attention-phase generation on Qwen3.8-Flash-Next at 2100 rows over four
+    /// prefill spans: the pre-mix's full-width carves, then the live mixer's,
+    /// byte for byte, through the scan's four transients. The pre-mix's two
+    /// projection outputs are pinned by
     /// [`the_hyper_prelude_prices_its_carves_as_the_cursor_walks`], whose widths
     /// the KO padding sets.
+    ///
+    /// The census stopped at `g_cs`: the span it measured was priced without
+    /// `w` and `kq`, so it filled there and the norm-gate and `w_out` fell back
+    /// to the pool. Those three are the chain's own arithmetic — `value_dim`
+    /// F32, its q8a128 operand (12,902,400 elements → 12,600 blocks × 1,152),
+    /// and `hidden` in the F32 activation dtype.
     #[test]
     fn the_pre_mix_and_live_delta_net_match_the_census() {
         let g = hyper_hybrid();
-        let w = WaveWidth::prefill(515, 1);
+        let w = WaveWidth::prefill(2100, 4);
         let measured = [
-            (WaveBuffer::HyperAttnNorm, 21_094_400),
-            (WaveBuffer::HyperAttnGateRaw, 21_094_400),
-            (WaveBuffer::HyperAttnMixed, 5_273_600),
-            (WaveBuffer::DeltaNetLiveOperand, 1_483_776),
-            (WaveBuffer::DeltaNetLiveProjection, 33_948_800),
-            (WaveBuffer::DeltaNetLiveSplit, 33_948_800),
-            (WaveBuffer::DeltaNetLiveConv, 21_094_400),
-            (WaveBuffer::DeltaNetLiveScanOut, 12_656_640),
-            (WaveBuffer::DeltaNetLiveScanAux, 12_656_640),
-            (WaveBuffer::DeltaNetLiveDecay, 98_880),
+            (WaveBuffer::HyperAttnNorm, 86_016_000),
+            (WaveBuffer::HyperAttnGateRaw, 86_016_000),
+            (WaveBuffer::HyperAttnMixed, 21_504_000),
+            (WaveBuffer::DeltaNetLiveOperand, 6_048_000),
+            (WaveBuffer::DeltaNetLiveProjection, 138_432_000),
+            (WaveBuffer::DeltaNetLiveSplit, 138_432_000),
+            (WaveBuffer::DeltaNetLiveSpanPtrs, 128),
+            (WaveBuffer::DeltaNetLiveSpanExtents, 32),
+            (WaveBuffer::DeltaNetLiveConv, 86_016_000),
+            (WaveBuffer::DeltaNetLiveScanOut, 51_609_600),
+            (WaveBuffer::DeltaNetLiveScanU, 51_609_600),
+            (WaveBuffer::DeltaNetLiveScanW, 51_609_600),
+            (WaveBuffer::DeltaNetLiveScanKq, 25_804_800),
+            (WaveBuffer::DeltaNetLiveDecay, 403_200),
+            (WaveBuffer::DeltaNetLiveNormGate, 51_609_600),
+            (WaveBuffer::DeltaNetLiveOutOperand, 14_515_200),
+            (WaveBuffer::DeltaNetLiveOut, 21_504_000),
         ];
         for (b, bytes) in measured {
             assert_eq!(b.bytes(&g, w), bytes, "{b:?}");
         }
+    }
+
+    /// A wave with no multi-row span runs the decode kernels only: no span
+    /// tables and none of the prefill scan's transients, while the recurrence
+    /// output, the norm-gate and `w_out` are carved as on any wave.
+    #[test]
+    fn a_decode_wave_carves_no_prefill_scan() {
+        let g = hyper_hybrid();
+        let w = WaveWidth::decode(8);
+        for b in [
+            WaveBuffer::DeltaNetLiveSpanPtrs,
+            WaveBuffer::DeltaNetLiveSpanExtents,
+            WaveBuffer::DeltaNetLiveScanU,
+            WaveBuffer::DeltaNetLiveScanW,
+            WaveBuffer::DeltaNetLiveScanKq,
+            WaveBuffer::DeltaNetLiveDecay,
+        ] {
+            assert_eq!(b.bytes(&g, w), 0, "{b:?}");
+        }
+        // 8 × 6144 × 4.
+        assert_eq!(WaveBuffer::DeltaNetLiveScanOut.bytes(&g, w), 196_608);
+        assert_eq!(WaveBuffer::DeltaNetLiveNormGate.bytes(&g, w), 196_608);
+    }
+
+    /// The prefill bound on multi-row spans: every sequence, but never more
+    /// than one per two rows — a one-row prefill is a decode-kernel span.
+    #[test]
+    fn a_prefill_width_bounds_its_multi_row_spans() {
+        assert_eq!(WaveWidth::prefill(2100, 4).prefill_spans, 4);
+        assert_eq!(WaveWidth::prefill(1, 1).prefill_spans, 0);
+        assert_eq!(WaveWidth::prefill(5, 4).prefill_spans, 2);
+        assert_eq!(WaveWidth::decode(3).with_prefill(1).prefill_spans, 0);
+        assert_eq!(WaveWidth::decode(3).with_prefill(7).prefill_spans, 1);
     }
 
     /// Under the pre-mix a float session's norms carve nothing: the mix output
@@ -2343,7 +2448,9 @@ mod tests {
                                 | WaveBuffer::DeltaNetLiveSpanExtents
                                 | WaveBuffer::DeltaNetLiveConv
                                 | WaveBuffer::DeltaNetLiveScanOut
-                                | WaveBuffer::DeltaNetLiveScanAux
+                                | WaveBuffer::DeltaNetLiveScanU
+                                | WaveBuffer::DeltaNetLiveScanW
+                                | WaveBuffer::DeltaNetLiveScanKq
                                 | WaveBuffer::DeltaNetLiveDecay
                                 | WaveBuffer::DeltaNetLiveNormGate
                                 | WaveBuffer::DeltaNetLiveOutOperand
@@ -2365,6 +2472,7 @@ mod tests {
                         prefill_rows: rows,
                         decode_rows: rows,
                         scored_rows: rows,
+                        prefill_spans: rows,
                         staged_rows: rows,
                         staged_spans: rows,
                     };
@@ -3248,6 +3356,7 @@ mod tests {
                 prefill_rows: rows,
                 decode_rows: rows,
                 scored_rows: rows + 1,
+                prefill_spans: 1,
                 ..WaveWidth::default()
             },
         );

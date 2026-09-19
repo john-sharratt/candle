@@ -904,6 +904,15 @@ mod tests {
     use super::super::mix::{causal_conv1d, delta_recurrence, l2_norm};
     use super::*;
     use candle::{DType, Device};
+    use candle_nn::kv_cache::DELTA_NET_SCAN_CHUNK;
+
+    /// The wave planner prices the prefill scan's `kq` transient at its own
+    /// copy of the chunk width, since it builds without CUDA; the two must be
+    /// the same number or the span is sized for a different scan.
+    #[test]
+    fn the_planner_prices_the_kernels_scan_chunk() {
+        assert_eq!(DELTA_NET_SCAN_CHUNK, DELTA_NET_PREFILL_CHUNK);
+    }
 
     /// One span as the kernel tests hold it: they drive the launches directly,
     /// without the mixer's [`DeltaNetSeq`] bookkeeping around them.

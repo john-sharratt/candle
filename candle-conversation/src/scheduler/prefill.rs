@@ -440,7 +440,21 @@ fn published_tier_width(
         prefill_rows: head.prefill_rows.saturating_add(extra_rows),
         decode_rows: head.decode_rows,
         scored_rows: head.scored_rows.saturating_add(extra_seqs),
+        prefill_spans: head.prefill_spans
+            + WaveWidth::prefill(extra_rows, extra_seqs).prefill_spans,
         ..head
+    }
+}
+
+/// Multi-row spans among `decodes` decode sequences carrying `rows` rows: every
+/// one of them once a draft makes each a verify block longer than a row, none
+/// on a plain decode. A verify block runs the DeltaNet mixer's prefill kernels,
+/// so it is a span the plan prices the prefill scan for.
+fn verify_spans(decodes: usize, rows: usize) -> usize {
+    if rows > decodes {
+        decodes
+    } else {
+        0
     }
 }
 
@@ -559,11 +573,15 @@ impl<'a> WaveFill<'a> {
     }
 
     pub(super) fn head_width(&self) -> WaveWidth {
-        let decodes = self.decode_rows(self.decodes_taken.len());
+        let taken = self.decodes_taken.len();
+        let decodes = self.decode_rows(taken);
+        let (creep_rows, creep_seqs) = (self.sched.held_creep_rows(), self.sched.held_creep_seqs());
         WaveWidth {
-            prefill_rows: self.sched.held_creep_rows(),
+            prefill_rows: creep_rows,
             decode_rows: decodes,
-            scored_rows: decodes + self.sched.held_creep_seqs(),
+            scored_rows: decodes + creep_seqs,
+            prefill_spans: WaveWidth::prefill(creep_rows, creep_seqs).prefill_spans
+                + verify_spans(taken, decodes),
             // The scheduler composes waves, never replays: a verify replay is
             // the speculative driver's, priced where it stages.
             ..WaveWidth::default()
@@ -900,9 +918,8 @@ impl WaveFill<'_> {
         // One more sequence, scored once however many tokens it advances.
         let head = self.head_width();
         let after = WaveWidth {
-            prefill_rows: head.prefill_rows + advance,
             scored_rows: head.scored_rows + 1,
-            ..head
+            ..head.with_prefill(advance)
         };
         let dtype = self.sched.session.activation_dtype();
         let plan = WavePlan::new(self.sched.model.wave_geometry(dtype));
@@ -1166,9 +1183,15 @@ impl admit::Ground for WaveFill<'_> {
                 // scored — a verify block compares a proposal per row.
                 let decodes_after = self.decode_rows(taken + 1);
                 let added = decodes_after.saturating_sub(head.decode_rows);
+                // Every block longer than a row is a verify span, which the
+                // DeltaNet mixer runs through its prefill kernels. Recounted
+                // over all the decodes, not added for this one: the draft is
+                // the ladder's for the new width, so it can change every block.
                 let after = WaveWidth {
                     decode_rows: decodes_after,
                     scored_rows: head.scored_rows + added,
+                    prefill_spans: head.prefill_spans - verify_spans(taken, head.decode_rows)
+                        + verify_spans(taken + 1, decodes_after),
                     ..head
                 };
                 let dtype = self.sched.session.activation_dtype();
@@ -4016,10 +4039,14 @@ impl Scheduler {
             // Decode and verify rows are all scored; each section scores one
             // row however many tokens it advances, and glue scores none — it
             // only scattered K/V.
+            // Every verify block, section and the glue counted as a multi-row
+            // span: a hold bounds the wave, and an extra span costs a table
+            // entry where a missing one would drop the prefill scan's transients.
             self.hold_wave_tier(WaveWidth {
                 prefill_rows: sec_tok + glue_tok,
                 decode_rows: head_rows,
                 scored_rows: head_rows + sec_seqs.len(),
+                prefill_spans: pre_seqs.len() + usize::from(glue_tok > 0),
                 ..WaveWidth::default()
             });
             let out = self.model.forward_wave(
@@ -4142,6 +4169,9 @@ impl Scheduler {
             // Every decode and verify row is scored; each creep member scores
             // one row however many tokens it advances, and glue scores none.
             scored_rows: head_rows + inputs.len(),
+            // Every creep member, verify block and the glue counted as a
+            // multi-row span, as the one-shot hold above counts them.
+            prefill_spans: inputs.len() + verify_seqs.len() + usize::from(glue_tok > 0),
             ..WaveWidth::default()
         });
 
@@ -5584,7 +5614,7 @@ mod idle_demote_tests {
 
 #[cfg(test)]
 mod published_tier_tests {
-    use super::{published_tier_rows, PREFILL_MIN_ADVANCE};
+    use super::{published_tier_rows, verify_spans, PREFILL_MIN_ADVANCE};
 
     /// **The reservation follows the wave that was composed.** Publishing the
     /// minimum instead is a fixed point: the weight side reclaims the gap to
@@ -5606,6 +5636,17 @@ mod published_tier_tests {
             .map(|n| published_tier_rows(200, n * 128, PREFILL_MIN_ADVANCE))
             .collect();
         assert!(widths.windows(2).all(|w| w[1] > w[0]), "{widths:?}");
+    }
+
+    /// Drafted decodes are verify blocks, each a multi-row span the DeltaNet
+    /// mixer runs its prefill scan over; plain decodes are one row and none.
+    #[test]
+    fn verify_blocks_count_as_multi_row_spans() {
+        // 64 decodes at a draft of 3: four rows each, sixty-four spans.
+        assert_eq!(verify_spans(64, 256), 64);
+        // No draft: one row a decode, no span.
+        assert_eq!(verify_spans(64, 64), 0);
+        assert_eq!(verify_spans(0, 0), 0);
     }
 
     /// **A fill that admitted nothing still leaves room for a forward.** A tier

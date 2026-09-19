@@ -889,9 +889,21 @@ pub(crate) fn wave_width(
         })
         .sum();
     WaveWidth {
+        scored_rows: n_decode + scored_prefill,
+        ..window_width(n_decode, pre_rows, pre_q)
+    }
+}
+
+/// A layer window's width with no head behind it: the rows, and the prefill
+/// spans the DeltaNet mixer runs through its prefill kernels — every prefill
+/// group longer than one row, verifying blocks included. A one-row prefill
+/// group takes the decode kernels, so it carves no span-table entry and, alone,
+/// no scan transient.
+pub(crate) fn window_width(n_decode: usize, pre_rows: usize, pre_q: &[usize]) -> WaveWidth {
+    WaveWidth {
         prefill_rows: pre_rows,
         decode_rows: n_decode,
-        scored_rows: n_decode + scored_prefill,
+        prefill_spans: pre_q.iter().filter(|&&l| l > 1).count(),
         // A forward stages nothing; only the verify *replay* does, and it
         // prices itself through `WaveWidth::replay`.
         ..WaveWidth::default()
@@ -1049,11 +1061,7 @@ fn sweep_layers(
             let width = if layer_end == num_layers {
                 wave_width(n_decode, pre_rows, pre_q, seq_ids, &verify_seqs)
             } else {
-                WaveWidth {
-                    prefill_rows: pre_rows,
-                    decode_rows: n_decode,
-                    ..WaveWidth::default()
-                }
+                window_width(n_decode, pre_rows, pre_q)
             };
             let per_phase = [
                 plan.phase_bytes(LayerPhase::Attention, width),

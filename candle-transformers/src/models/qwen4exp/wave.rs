@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use candle::cuda_backend::cudarc::driver::CudaStream;
-use candle::quantized::cuda::to_dynamic;
+use candle::quantized::cuda::{gather_rows_bf16_to_f32, to_dynamic};
 use candle::{DType, Device, LiveTensor, Result, Tensor};
 use candle_kernels::simple::qsa_topk::MAX_KEEP;
 use candle_nn::kv_cache::{
@@ -72,7 +72,7 @@ use crate::models::expert_lre::{PipelineStats, ProfileSnapshot};
 use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::qwen35::attention::RopeTables;
-use crate::models::qwen35::forward::wave_width;
+use crate::models::qwen35::forward::{wave_width, window_width};
 use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
 use crate::models::qwen35::spec::split_block_rows;
 use crate::models::tensor_cat::TensorCat;
@@ -2451,11 +2451,7 @@ impl Qwen4ExpBatched {
                 .unwrap_or_default();
             wave_width(n_decode, pre_rows, pre_q, seq_ids, &verify_seqs)
         } else {
-            WaveWidth {
-                prefill_rows: pre_rows,
-                decode_rows: n_decode,
-                ..WaveWidth::default()
-            }
+            window_width(n_decode, pre_rows, pre_q)
         };
         let plan = WavePlan::new(self.wave_geometry(act_dtype));
         plan_wave_transient(
@@ -2563,8 +2559,8 @@ impl Qwen4ExpBatched {
             }
             let ids = Tensor::from_vec(flat_ids, (total_rows,), dev)?;
             // The table is stored BF16 (a load-time storage width); the gather
-            // widens the wave's rows to the Gated Residual's F32.
-            Some(m.embed.index_select(&ids, 0)?.to_dtype(DType::F32)?)
+            // writes the wave's rows as the Gated Residual's F32 in one pass.
+            Some(gather_rows_bf16_to_f32(&m.embed, &ids)?)
         } else {
             None
         };

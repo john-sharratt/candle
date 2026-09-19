@@ -74,6 +74,7 @@ pub use chunked::span_geometry::{REGION_BYTES, TIER_MARGIN_BYTES, TIER_MARGIN_RE
 pub use chunked::wave_plan::{
     ffn_work_dtype, BufferShape, Chain, DeltaNetWidths, Encoding, HyperWidths, LayerPhase,
     ModelGeometry, SharedExpertWidths, WaveBuffer, WavePlan, WaveWidth, BUMP_ALIGNMENT,
+    DELTA_NET_SCAN_CHUNK,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{

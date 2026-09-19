@@ -5412,6 +5412,9 @@ pub(crate) fn verify_width(sequences: usize, block_rows: usize) -> WaveWidth {
     WaveWidth {
         prefill_rows: rows,
         scored_rows: rows,
+        // Each block longer than a row is a span the DeltaNet mixer runs
+        // through its prefill kernels.
+        prefill_spans: if block_rows > 1 { sequences } else { 0 },
         ..WaveWidth::default()
     }
 }

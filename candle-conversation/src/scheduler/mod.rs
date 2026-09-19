@@ -13005,9 +13005,8 @@ mod tests {
             "a section advances its least chunk"
         );
         let from_rows = WaveWidth {
-            prefill_rows: head_width.prefill_rows + cost.rows,
             scored_rows: head_width.scored_rows + 1,
-            ..head_width
+            ..head_width.with_prefill(cost.rows)
         };
         assert_eq!(
             plan.tier_bytes(from_rows) as u64 - head,
