@@ -117,14 +117,6 @@ pub use walk::{walk_workspace, MAX_FILE_BYTES};
 /// treat this constant as the live limit.
 pub const REPO_MAP_PARALLELISM: usize = 96;
 
-/// Longest a worker will wait for VRAM before claiming its unit anyway.
-///
-/// A bound, not a timeout to rely on: without it a pathological state where the
-/// pool never drops would stall the scan forever. Reaching it means the gate
-/// failed to help, and the arena allocator's own refusal is the next line of
-/// defence.
-const SCAN_POOL_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(20);
-
 /// How many conversations this pool may hold open at once, derived from the
 /// card rather than from a thread count.
 ///
@@ -350,8 +342,24 @@ fn reserve_scan_slot(live: &AtomicUsize) {
     // Serialises the decision so workers cannot all read the same pre-allocation
     // state and admit together (see `max_live_conversations`).
     static GATE: Mutex<()> = Mutex::new(());
-    let start = std::time::Instant::now();
-    let mut logged = false;
+    // **No timeout.** The wait ends when the gate admits and in no other way.
+    //
+    // There used to be one — 20 s, "then claim your unit anyway" — as a guard
+    // against a pool that never drained. It guarded nothing the rule does not
+    // already cover: an empty pool always admits (`admits_now`), and a pool with
+    // conversations open drains as they finish. What it did instead, once the
+    // pool was spawned at its ceiling rather than sized to the card, was release
+    // every waiter at once: measured, 95 workers blocked on a cap of 1 at the
+    // start of a pass all timed out together 20 s later, put 128 slots and
+    // 7.2 GB of KV on a 16 GB card, crushed the expert zone until a decode layer
+    // took 42 ms, and finished no directory in ten minutes. A conversation that
+    // never finishes is a hang to fix where it happens; opening more on a timer
+    // only feeds it.
+    //
+    // The cap is logged each time it moves, not only on the first wait: a
+    // waiter logging once reports the gate as it stood when the pass began,
+    // which is exactly the reading that stays wrong the longest.
+    let mut logged_cap: Option<Option<usize>> = None;
     loop {
         let cap = {
             let _turn = GATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -369,15 +377,8 @@ fn reserve_scan_slot(live: &AtomicUsize) {
             }
             cap
         };
-        if start.elapsed() >= SCAN_POOL_WAIT_CAP {
-            // Waited long enough that stalling the whole ingest is the worse
-            // outcome. Still taken under the gate, so the count stays exact.
-            let _turn = GATE.lock().unwrap_or_else(|e| e.into_inner());
-            take_scan_slot(live);
-            return;
-        }
-        if !logged {
-            logged = true;
+        if logged_cap != Some(cap) {
+            logged_cap = Some(cap);
             tracing::debug!(
                 target: "zend::repo_scan",
                 live_conversations = live.load(Ordering::Relaxed),
@@ -402,10 +403,11 @@ fn reserve_scan_slot(live: &AtomicUsize) {
 /// * A measured cap admits while the pool is under it.
 /// * **An unmeasurable card HOLDS.** Nothing can price the scan — no memory
 ///   report, no governor — so admitting is a guess made simultaneously by every
-///   waiting worker. Holding is bounded: [`SCAN_POOL_WAIT_CAP`] releases the
-///   wait, one worker at a time through the gate, so a card that never reports
-///   degrades to a slow scan rather than a flood. The old rule admitted here,
-///   which is why the pass had to be capped before it started.
+///   waiting worker. Holding is bounded by the first case, not by a timer: the
+///   open conversations finish, the pool reaches zero, and one more is let in,
+///   so a card that never reports degrades to one directory at a time rather
+///   than a flood. The old rule admitted here, which is why the pass had to be
+///   capped before it started.
 fn admits_now(cap: Option<usize>, live: usize) -> bool {
     if live == 0 {
         return true;
@@ -1627,13 +1629,30 @@ mod tests {
     /// Every worker that reaches the gate before the first memory report gets
     /// the same `None`, so admitting on it is not one guess but as many
     /// simultaneous guesses as there are workers: measured, 24 conversations
-    /// opened together and all 24 failed. Holding is bounded by
-    /// `SCAN_POOL_WAIT_CAP`, which releases waiters one at a time through the
-    /// gate, so an unreportable card scans slowly instead of failing.
+    /// opened together and all 24 failed. The hold ends when the pool drains to
+    /// zero and the first case admits one, so an unreportable card scans one
+    /// directory at a time instead of failing.
     #[test]
     fn an_unmeasurable_card_holds_instead_of_flooding() {
         assert!(!admits_now(None, 1));
         assert!(!admits_now(None, 23));
         assert!(!admits_now(None, REPO_MAP_PARALLELISM));
+        assert!(admits_now(None, 0), "a drained pool always takes one more");
+    }
+
+    /// **Nothing admits past a measured cap, however long a worker has waited.**
+    ///
+    /// The rule has no notion of time, and that is the property: a timed
+    /// "claim it anyway" once sat beside it, and with the pool spawned at its
+    /// ceiling it released every waiter at once — 95 workers held on a cap of
+    /// one at the start of a pass, all through together 20 s later, 7.2 GB of KV
+    /// on a 16 GB card and no directory finished in ten minutes. The only way in
+    /// past a full pool is the pool draining.
+    #[test]
+    fn a_full_pool_admits_only_by_draining() {
+        for live in 1..=REPO_MAP_PARALLELISM {
+            assert!(!admits_now(Some(1), live), "cap 1, {live} open: must wait");
+        }
+        assert!(admits_now(Some(1), 0), "drained to zero: one more");
     }
 }

@@ -54,6 +54,7 @@ use super::log_file::{read_record_at, LogFile, Superblock, SUPERBLOCK_SIZE};
 use super::manifest::Manifest;
 use super::record::Record;
 use super::recovery;
+use super::sealed_reader::{ActiveSegment, SealedReader};
 use super::segment::{SegmentId, FIRST_SEGMENT};
 use super::walker::WalkEntry;
 use super::{PersistenceError, Result};
@@ -84,6 +85,11 @@ const LEGACY_LOG_NAME: &str = "substrate.log";
 /// id is zero-padded so a lexical directory sort matches numeric id order.
 fn segment_name(id: SegmentId) -> String {
     format!("{SEGMENT_PREFIX}{:010}.{SEGMENT_EXT}", id.raw())
+}
+
+/// The file a segment lives in, under `dir`.
+pub fn segment_path(dir: &Path, id: SegmentId) -> PathBuf {
+    dir.join(segment_name(id))
 }
 
 /// Parse a `seg-<id>.log` name into its id. `None` for any other name
@@ -184,6 +190,9 @@ impl SealedPool {
 pub struct SegmentedLog {
     dir: PathBuf,
     active_id: SegmentId,
+    /// `active_id`, published for readers that do not hold this log — see
+    /// [`SealedReader`]. Moves only after the previous active is fully sealed.
+    active_published: ActiveSegment,
     active: LogFile,
     /// Sealed segment ids present on disk, ascending. Excludes the active.
     sealed: Vec<SegmentId>,
@@ -421,6 +430,7 @@ impl SegmentedLog {
         let segments = SegmentedLog {
             dir: dir.to_path_buf(),
             active_id,
+            active_published: ActiveSegment::new(active_id),
             active,
             sealed,
             pool: SealedPool::held(held),
@@ -501,6 +511,7 @@ impl SegmentedLog {
         let segments = SegmentedLog {
             dir: dir.to_path_buf(),
             active_id,
+            active_published: ActiveSegment::new(active_id),
             active,
             sealed,
             pool: SealedPool::new(OPEN_SEALED_SEGMENTS),
@@ -620,7 +631,17 @@ impl SegmentedLog {
         drop(old_active);
         self.sealed.push(old_id);
         self.active_id = new_id;
+        // Only now is `old_id` sealed in every sense a lock-free reader relies
+        // on — committed, fsynced, truncated, write handle closed — so only now
+        // may one see it as sealed.
+        self.active_published.publish(new_id);
         Ok(())
+    }
+
+    /// A reader for this log's sealed segments that needs no lock on the log.
+    /// See [`SealedReader`].
+    pub fn sealed_reader(&self) -> SealedReader {
+        SealedReader::new(self.dir.clone(), self.active_published.clone())
     }
 
     /// Read one record, routing to the segment that physically holds it.
@@ -781,6 +802,13 @@ impl SegmentedLog {
             }
         }
         self.sealed.clear();
+        // Published last, after the old segments are gone. The previous active is
+        // one of them, and it was never sealed — so it must not become readable
+        // through a `SealedReader` in the window between the rename and the
+        // delete. Published here, a reader holding a stale location into any of
+        // them finds the file missing and re-reads a location that already
+        // points into the new active.
+        self.active_published.publish(new_id);
         Ok(())
     }
 

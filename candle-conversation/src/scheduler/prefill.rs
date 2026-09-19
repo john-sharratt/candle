@@ -2185,6 +2185,8 @@ impl Scheduler {
         // …then restore submission order among the admitted set.
         admitted.reverse();
 
+        self.prelift_demoted_working_sets(&admitted);
+
         for mut work in admitted {
             // **A demoted turn is put back before it runs.** Its block tables
             // were given up while it waited; the projection it carries rebuilds
@@ -2240,6 +2242,62 @@ impl Scheduler {
                 prefill_start: None,
             });
         }
+    }
+
+    /// Lift the working sets of every demoted turn this fill admitted — one
+    /// elevate per substrate, over their union — before any of them is rebuilt.
+    ///
+    /// **Only the lift is batched, and it only warms.** Each rebuild still runs
+    /// its own elevate immediately before its `apply_projection`, exactly as it
+    /// did alone, and that call is what the rebuild's correctness rests on. The
+    /// batch just means that call usually finds everything hot and returns after
+    /// an O(1) tier check per unit, instead of paying an eviction pass and two
+    /// promotion-state snapshots per turn for units the turns largely share.
+    ///
+    /// The per-turn call cannot be dropped. `elevate_projection_working_set`
+    /// publishes the pin set wholesale each time, so the next turn's call
+    /// narrows the pins to its own units and the persistence thread may drop an
+    /// earlier turn's lifted residence before that turn reaches
+    /// `apply_projection` — which refuses a unit that is not hot rather than
+    /// build a context without it. The per-turn elevate re-lifts anything
+    /// dropped in that window, so the worst this can do is what the rebuild
+    /// already did.
+    ///
+    /// A fill with one demoted turn is left alone: there is nothing to share,
+    /// and its rebuild's own elevate is the whole of the work.
+    fn prelift_demoted_working_sets(&mut self, admitted: &[PrefillWork]) {
+        let sets: Vec<(Conversation, Vec<SectionId>, Vec<TurnKey>)> = admitted
+            .iter()
+            .filter(|w| w.demoted)
+            .filter_map(|w| {
+                let parent = self.turn_views.get(&w.sequence_id)?.parent_id;
+                let conversation = self.slot_conversations.get(&parent)?.clone();
+                let (sections, turns) = projection_assembler::projection_working_set(&w.projection);
+                Some((conversation, sections, turns))
+            })
+            .collect();
+        if sets.len() < 2 {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let turns_batched = sets.len();
+        let groups = projection_assembler::union_working_sets(sets, |a, b| a.same_substrate(b));
+        let n_groups = groups.len();
+        for (conversation, sections, turns) in groups {
+            self.elevate_projection_working_set(
+                &conversation,
+                &sections,
+                &turns,
+                "rematerialise (batched)",
+            );
+        }
+        tracing::debug!(
+            target: "candle_conversation::scheduler::interleave",
+            turns = turns_batched,
+            substrates = n_groups,
+            ms = t.elapsed().as_millis() as u64,
+            "demoted turns' working sets lifted together before their rebuilds",
+        );
     }
 
     /// Rebuild a turn whose block tables were given back while it waited.
@@ -2301,6 +2359,11 @@ impl Scheduler {
         // selected get demoted to RAM, and a unit that is not hot cannot be
         // injected: `apply_projection` refuses it rather than build a context
         // that silently lacks it.
+        //
+        // When several turns are rebuilt in one fill this is usually a skip —
+        // `prelift_demoted_working_sets` lifted the union first — but it is not
+        // redundant: it is the call that guarantees *this* turn's units are hot
+        // at the moment it applies them. See that function for why.
         if let Some(conversation) = self.slot_conversations.get(&parent_id).cloned() {
             let (sections, turns) = projection_assembler::projection_working_set(&work.projection);
             self.elevate_projection_working_set(&conversation, &sections, &turns, "rematerialise");

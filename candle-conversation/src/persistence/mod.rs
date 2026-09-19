@@ -38,6 +38,7 @@ pub mod pipeline;
 pub mod record;
 pub mod recovery;
 pub mod resume;
+pub mod sealed_reader;
 pub mod segment;
 pub mod segmented_log;
 pub mod streams;
@@ -66,6 +67,7 @@ use record::{
     decode_record, encode_record, ChunkPayload, DebugIdPayload, NpcPayload, RecordHeader,
     RecordType, TombstonePayload, TreeMetadataPayload,
 };
+use sealed_reader::SealedReader;
 use segment::SegmentId;
 use segmented_log::SegmentedLog;
 use streams::{ContentAddress, StreamDecl, StreamId, StreamKind, StreamRef};
@@ -1570,6 +1572,13 @@ impl SubstratePersistence {
             }
         }
         Ok(None)
+    }
+
+    /// A reader for this store's sealed segments that needs no lock on it —
+    /// taken once, beside the handle, so a read that finds its record sealed
+    /// never waits on this persistence's mutex. See [`sealed_reader`].
+    pub fn sealed_reader(&self) -> SealedReader {
+        self.segments.sealed_reader()
     }
 
     /// Read one record's payload back by location — the snapshot-restore

@@ -1227,6 +1227,44 @@ pub(super) fn projection_working_set(
     (sections, turns)
 }
 
+/// Several turns' working sets merged per substrate: one entry per distinct key
+/// (by `same`), in the order each key was first seen, its sections and turns a
+/// sorted, deduplicated union.
+///
+/// For lifting a whole fill's rebuilds at once. Each elevate pays a fixed cost
+/// before it lifts anything — an eviction pass sized to the incoming set and two
+/// promotion-state snapshots — so N demoted turns elevated one by one pay it N
+/// times for units that often overlap (every folder conversation projects the
+/// same system prompt and tool sections). The union pays it once per substrate.
+///
+/// Generic over the key because the scheduler's key, a [`Conversation`] handle,
+/// has identity (`same_substrate`) but no equality, and the grouping rule is
+/// worth testing without one.
+///
+/// [`Conversation`]: crate::projection::Conversation
+pub(super) fn union_working_sets<K>(
+    sets: impl IntoIterator<Item = (K, Vec<SectionId>, Vec<TurnKey>)>,
+    same: impl Fn(&K, &K) -> bool,
+) -> Vec<(K, Vec<SectionId>, Vec<TurnKey>)> {
+    let mut out: Vec<(K, Vec<SectionId>, Vec<TurnKey>)> = Vec::new();
+    for (key, sections, turns) in sets {
+        match out.iter_mut().find(|(k, _, _)| same(k, &key)) {
+            Some((_, s, t)) => {
+                s.extend(sections);
+                t.extend(turns);
+            }
+            None => out.push((key, sections, turns)),
+        }
+    }
+    for (_, s, t) in &mut out {
+        s.sort_unstable();
+        s.dedup();
+        t.sort_unstable();
+        t.dedup();
+    }
+    out
+}
+
 #[cfg(test)]
 mod working_set_tests {
     use super::projection_working_set;
@@ -2624,5 +2662,88 @@ mod tests {
             }
             _ => panic!("expected Generated"),
         }
+    }
+}
+
+#[cfg(test)]
+mod union_working_set_tests {
+    use super::union_working_sets;
+    use crate::projection::{SectionId, TimelineId, TurnIndex, TurnKey};
+
+    fn t(tl: u64, i: u32) -> TurnKey {
+        TurnKey::new(TimelineId::for_test(tl), TurnIndex(i))
+    }
+
+    /// **Turns on one substrate lift as one set.** Every folder conversation
+    /// projects the same system prompt and tool sections, so the overlap is the
+    /// common case: it is named once, and the turns' own units all survive.
+    #[test]
+    fn one_substrate_merges_into_one_deduplicated_set() {
+        let sets = vec![
+            (
+                1u32,
+                vec![SectionId::new(5), SectionId::new(2)],
+                vec![t(9, 1)],
+            ),
+            (
+                1u32,
+                vec![SectionId::new(2), SectionId::new(7)],
+                vec![t(9, 0), t(9, 1)],
+            ),
+        ];
+        let merged = union_working_sets(sets, |a, b| a == b);
+        assert_eq!(merged.len(), 1, "one substrate, one elevate");
+        let (key, sections, turns) = &merged[0];
+        assert_eq!(*key, 1);
+        assert_eq!(
+            sections,
+            &vec![SectionId::new(2), SectionId::new(5), SectionId::new(7)]
+        );
+        assert_eq!(turns, &vec![t(9, 0), t(9, 1)]);
+    }
+
+    /// Distinct substrates stay apart, each in the order it was first seen, and
+    /// a unit named by both is lifted by both — pins and budgets are per
+    /// substrate, so neither may borrow the other's.
+    #[test]
+    fn distinct_substrates_stay_apart_in_first_seen_order() {
+        let sets = vec![
+            (2u32, vec![SectionId::new(1)], vec![]),
+            (1u32, vec![SectionId::new(1)], vec![t(3, 0)]),
+            (2u32, vec![SectionId::new(4)], vec![]),
+        ];
+        let merged = union_working_sets(sets, |a, b| a == b);
+        let keys: Vec<u32> = merged.iter().map(|(k, _, _)| *k).collect();
+        assert_eq!(keys, vec![2, 1]);
+        assert_eq!(merged[0].1, vec![SectionId::new(1), SectionId::new(4)]);
+        assert_eq!(merged[1].1, vec![SectionId::new(1)]);
+        assert_eq!(merged[1].2, vec![t(3, 0)]);
+    }
+
+    /// The grouping is the caller's `same`, not the key's equality — the
+    /// scheduler's key is a handle compared by the substrate it points at.
+    #[test]
+    fn grouping_follows_the_callers_rule() {
+        let sets = vec![
+            (10u32, vec![SectionId::new(1)], vec![]),
+            (11u32, vec![SectionId::new(2)], vec![]),
+        ];
+        let merged = union_working_sets(sets, |a, b| a / 10 == b / 10);
+        assert_eq!(merged.len(), 1, "same substrate by the caller's rule");
+        assert_eq!(
+            merged[0].0, 10,
+            "the first handle seen represents the group"
+        );
+        assert_eq!(merged[0].1, vec![SectionId::new(1), SectionId::new(2)]);
+    }
+
+    /// Nothing demoted, nothing to lift.
+    #[test]
+    fn no_sets_is_no_elevates() {
+        let merged =
+            union_working_sets(Vec::<(u32, Vec<SectionId>, Vec<TurnKey>)>::new(), |a, b| {
+                a == b
+            });
+        assert!(merged.is_empty());
     }
 }
