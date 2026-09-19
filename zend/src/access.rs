@@ -144,17 +144,30 @@ pub fn default_mode(role: Role) -> ToolMode {
 ///
 /// - None and Restricted grant nothing: their tools answer from the
 ///   conversation, the overlay and the workspace as read.
-/// - Comprehensive grants the network, execution and stored credentials, and
-///   never the disk — its file changes stay in the overlay.
-/// - Mutable grants everything, the disk included.
+/// - Comprehensive grants the network and stored credentials. Its file changes
+///   stay in the overlay, so it grants neither the disk nor execution on this
+///   host: code or a program that runs here reaches the real filesystem,
+///   which no overlay can stand in front of.
+/// - Mutable grants everything, the disk and execution included.
 pub fn grants(mode: ToolMode) -> Grants {
     match mode {
         ToolMode::None | ToolMode::Restricted => Grants::NONE,
         ToolMode::Comprehensive => Grants::NONE
             .with(Capability::Network)
-            .with(Capability::Exec)
             .with(Capability::Secrets),
         ToolMode::Mutable => Grants::ALL,
+    }
+}
+
+/// Whether a tool needing `requires` is offered in `mode`: its needs are
+/// within the mode's grants, and — below Comprehensive — it is not marked
+/// high-risk. A mode never offers a tool it would refuse.
+pub fn offers(mode: ToolMode, requires: &[Capability], high_risk: bool) -> bool {
+    let within = grants(mode).require_all(requires).is_ok();
+    match mode {
+        ToolMode::None => false,
+        ToolMode::Restricted => within && !high_risk,
+        ToolMode::Comprehensive | ToolMode::Mutable => within,
     }
 }
 
@@ -215,16 +228,18 @@ mod tests {
         }
     }
 
-    /// **Only Mutable may touch the disk, and nothing below Comprehensive may
-    /// reach past the conversation.** A non-admin is held to Restricted, so a
-    /// non-admin's round runs with no grant at all.
+    /// **Only Mutable may touch the disk or run code here, and nothing below
+    /// Comprehensive may reach past the conversation.** A non-admin is held to
+    /// Restricted, so a non-admin's round runs with no grant at all.
     #[test]
     fn each_mode_grants_what_it_offers_and_no_more() {
         assert_eq!(grants(ToolMode::None), Grants::NONE);
         assert_eq!(grants(ToolMode::Restricted), Grants::NONE);
         let comprehensive = grants(ToolMode::Comprehensive);
-        assert!(!comprehensive.has(Capability::DiskWrite));
-        for cap in [Capability::Network, Capability::Exec, Capability::Secrets] {
+        for cap in [Capability::DiskWrite, Capability::Exec] {
+            assert!(!comprehensive.has(cap), "comprehensive holds {cap}");
+        }
+        for cap in [Capability::Network, Capability::Secrets] {
             assert!(comprehensive.has(cap), "comprehensive lacks {cap}");
         }
         assert_eq!(grants(ToolMode::Mutable), Grants::ALL);
@@ -234,6 +249,22 @@ mod tests {
             }
             assert_eq!(grants(effective_mode(role, None)), Grants::NONE);
         }
+    }
+
+    /// A mode offers exactly the tools its grants cover: code execution only
+    /// in Mutable, the network from Comprehensive up, high-risk tools never
+    /// in Restricted, and nothing at all in None.
+    #[test]
+    fn a_mode_offers_only_what_it_would_run() {
+        let exec = [Capability::Exec];
+        let net = [Capability::Network];
+        assert!(offers(ToolMode::Mutable, &exec, true));
+        assert!(!offers(ToolMode::Comprehensive, &exec, true));
+        assert!(offers(ToolMode::Comprehensive, &net, true));
+        assert!(!offers(ToolMode::Restricted, &net, false));
+        assert!(offers(ToolMode::Restricted, &[], false));
+        assert!(!offers(ToolMode::Restricted, &[], true));
+        assert!(!offers(ToolMode::None, &[], false));
     }
 
     /// The role comes from the gateway's headers; a request without them is

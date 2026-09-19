@@ -60,9 +60,10 @@ pub enum Reserved {
     /// like any plain prompt's (see [`super::PlainPromptFrames`]).
     Titler,
     /// The cached tool-catalog summary section for "Comprehensive" tools mode —
-    /// an overview of the full catalog. Sealed at runtime (its content is
-    /// model-generated, not in the schema) and pinned under this reserved
-    /// [`SectionId`] so it can be injected just before the `tools` collection.
+    /// an overview of the tools that mode offers. Sealed at runtime (its
+    /// content is built by the daemon, not in the schema) and pinned under this
+    /// reserved [`SectionId`] so it can be injected just before the `tools`
+    /// collection.
     ToolSummary,
     /// The cached tool-catalog summary section for "Restricted" tools mode — an
     /// overview built from the safe (non-high-risk) tool subset only. The
@@ -79,6 +80,10 @@ pub enum Reserved {
     /// and group so a job's turns never enter a character's projection; the
     /// caller closes the group per conversation, so one job never reads another's.
     Prose,
+    /// The cached tool-catalog summary section for "Mutable" tools mode — an
+    /// overview of the full catalog, code execution included, which the
+    /// Comprehensive summary leaves out.
+    ToolSummaryMutable,
     /// OpenAI-passthrough conversations — the client supplies the whole context
     /// (its own system prompt and history) and the daemon runs it as-is. Their
     /// own layer/group keep those turns out of every YAML projection; each
@@ -91,7 +96,7 @@ impl Reserved {
     /// Number of reserved kinds — the width of the band at the very top of the
     /// u32 space that is disjoint from the `1..n` ids YAML allocates. Bump this
     /// when adding a `Reserved` variant.
-    pub const COUNT: u32 = 6;
+    pub const COUNT: u32 = 7;
 
     /// Per-kind offset from the top of the u32 range. Slot 0 = `u32::MAX`,
     /// slot 1 = `u32::MAX - 1`, etc.
@@ -103,6 +108,7 @@ impl Reserved {
             Reserved::Calibration => 3,
             Reserved::Prose => 4,
             Reserved::Passthrough => 5,
+            Reserved::ToolSummaryMutable => 6,
         }
     }
 

@@ -8,7 +8,7 @@
 //! |---|---|
 //! | [`Capability::DiskWrite`] | changing files on the host's disk |
 //! | [`Capability::Network`] | any outbound connection — HTTP, sockets, DNS, ICMP |
-//! | [`Capability::Exec`] | running code or programs — the JS VM, subprocesses, remote shells, sub-agents |
+//! | [`Capability::Exec`] | running code or programs on this host — the JS VM, subprocesses, sub-agents. A remote shell (SSH, telnet) runs on the remote host and is [`Capability::Network`] |
 //! | [`Capability::Secrets`] | reading or changing stored credentials |
 //!
 //! # Deny by default, checked where the action happens

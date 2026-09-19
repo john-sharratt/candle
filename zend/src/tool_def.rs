@@ -6,7 +6,7 @@
 //! selection-calibration `examples`, and the plain-question `questions` seeds.
 //! These drive everything the prompt and calibration need — the tool catalog
 //! surfaced into the `tools` collection, the constrained-decode stencil, the
-//! safe-subset for Restricted mode, and the per-tool trajectories.
+//! subset each tools mode offers ([`names_for`]), and the per-tool trajectories.
 //!
 //! This is the definition half of the tool system, and the only half the model
 //! ever sees: the `description` and `parameters` here are what get rendered into
@@ -23,6 +23,10 @@ use std::sync::OnceLock;
 use include_dir::{include_dir, Dir};
 use serde::Deserialize;
 use serde_json::Value;
+use zend_tools::registry;
+
+use crate::access;
+use crate::types::ToolMode;
 
 /// The tool definitions, embedded at compile time. The `tools` collection in
 /// `prompts/projection.yaml` is filled from here.
@@ -222,16 +226,15 @@ pub fn find(name: &str) -> Option<&'static ToolDef> {
     all().iter().find(|d| d.name == name)
 }
 
-/// The names of the tools projected in "Restricted" tools mode: not marked
-/// high-risk, and needing no capability. Restricted runs with no grants
-/// ([`crate::access::grants`]), so a tool that needs one would only ever answer
-/// `not_permitted` there — offering it would spend a projection slot on a
-/// refusal.
-pub fn safe_names() -> HashSet<String> {
+/// The names of the tools projected in `mode` — those [`access::offers`]
+/// admits. A mode never offers a tool its grants would refuse: offering it
+/// would spend a projection slot on a `not_permitted`.
+pub fn names_for(mode: ToolMode) -> HashSet<String> {
     all()
         .iter()
-        .filter(|d| !d.high_risk)
-        .filter(|d| zend_tools::registry::find(&d.name).is_some_and(|t| t.requires.is_empty()))
+        .filter(|d| {
+            registry::find(&d.name).is_some_and(|t| access::offers(mode, t.requires, d.high_risk))
+        })
         .map(|d| d.name.clone())
         .collect()
 }
@@ -475,34 +478,68 @@ mod tests {
     }
 
     #[test]
-    fn safe_names_excludes_high_risk() {
-        let safe = safe_names();
+    fn restricted_excludes_high_risk() {
+        let safe = names_for(ToolMode::Restricted);
         assert!(safe.contains("datetime"), "datetime is safe");
-        assert!(!safe.contains("code_run"), "code_run is high-risk");
+        assert!(!safe.contains("write"), "write is high-risk");
     }
 
-    /// **Restricted offers nothing it would refuse.** Every tool it projects
-    /// runs under no grants, and the file tools a coding turn needs are there.
+    /// **No mode offers what it would refuse.** Every tool a mode projects
+    /// runs under that mode's grants, and the file tools a coding turn needs
+    /// are in every mode that has tools.
     #[test]
-    fn safe_names_need_no_capability() {
-        let safe = safe_names();
-        for name in &safe {
-            let tool = zend_tools::registry::find(name).expect("defined tools execute");
-            assert!(
-                tool.requires.is_empty(),
-                "{name} is offered in Restricted but needs {:?}",
-                tool.requires
-            );
+    fn every_mode_offers_only_what_its_grants_cover() {
+        for mode in ToolMode::ALL {
+            let names = names_for(mode);
+            for name in &names {
+                let tool = registry::find(name).expect("defined tools execute");
+                assert!(
+                    access::grants(mode).require_all(tool.requires).is_ok(),
+                    "{name} is offered in {} but needs {:?}",
+                    mode.id(),
+                    tool.requires
+                );
+            }
+            if mode != ToolMode::None {
+                for name in ["file_read", "file_list", "file_grep", "calculator"] {
+                    assert!(names.contains(name), "{name} missing from {}", mode.id());
+                }
+            }
         }
+        assert!(names_for(ToolMode::None).is_empty());
+        let restricted = names_for(ToolMode::Restricted);
         for name in ["web_search", "web_fetch", "dns_lookup", "sql_session_open"] {
-            assert!(!safe.contains(name), "{name} needs a capability");
+            assert!(!restricted.contains(name), "{name} needs a capability");
         }
-        for name in ["file_read", "file_list", "file_grep", "calculator"] {
+    }
+
+    /// **Code runs here only in Mutable.** The overlay modes cannot stand in
+    /// front of a program or a script, so none of them offers one; the network
+    /// and remote-shell tools stay in Comprehensive.
+    #[test]
+    fn code_execution_is_offered_only_in_mutable() {
+        let comprehensive = names_for(ToolMode::Comprehensive);
+        let mutable = names_for(ToolMode::Mutable);
+        for name in [
+            "code_run",
+            "code_session_exec",
+            "ping_icmp",
+            "trace_route",
+            "sub_run",
+        ] {
             assert!(
-                safe.contains(name),
-                "{name} should be offered in Restricted"
+                !comprehensive.contains(name),
+                "{name} offered in comprehensive"
+            );
+            assert!(mutable.contains(name), "{name} missing from mutable");
+        }
+        for name in ["web_fetch", "web_search", "ssh_session_exec", "write"] {
+            assert!(
+                comprehensive.contains(name),
+                "{name} missing from comprehensive"
             );
         }
+        assert_eq!(mutable.len(), all().len(), "mutable offers every tool");
     }
 
     /// Every definition carries a real category (never the `"Other"` fallback the

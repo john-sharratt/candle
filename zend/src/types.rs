@@ -176,11 +176,12 @@ pub enum ToolMode {
     /// Safe tools only: high-risk tool sections are omitted; the restricted
     /// summary is injected.
     Restricted,
-    /// Every tool; the comprehensive summary is injected. File writes and
-    /// deletes land in the session's in-memory overlay, never on disk.
+    /// Every tool that does not run code on this host; the comprehensive
+    /// summary is injected. File writes and deletes land in the session's
+    /// in-memory overlay, never on disk.
     Comprehensive,
-    /// Comprehensive's catalog, with the file tools working on the workspace on
-    /// disk: a write or delete changes the project itself.
+    /// Every tool, code execution included, with the file tools working on the
+    /// workspace on disk: a write or delete changes the project itself.
     Mutable,
 }
 
@@ -216,15 +217,6 @@ impl ToolMode {
             .get(level as usize)
             .copied()
             .unwrap_or(ToolMode::None)
-    }
-
-    /// The mode whose tool catalog this one projects. Mutable offers the same
-    /// tools as Comprehensive; only where their file changes land differs.
-    pub fn catalog(self) -> ToolMode {
-        match self {
-            ToolMode::Mutable => ToolMode::Comprehensive,
-            other => other,
-        }
     }
 
     /// Whether the file tools change the workspace on disk.

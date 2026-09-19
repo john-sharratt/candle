@@ -859,7 +859,6 @@ fn register_all() -> &'static [RegisteredTool] {
     const NET: &[Capability] = &[Network];
     const NET_EXEC: &[Capability] = &[Network, Exec];
     const NET_SECRETS: &[Capability] = &[Network, Secrets];
-    const NET_EXEC_SECRETS: &[Capability] = &[Network, Exec, Secrets];
     const EXEC: &[Capability] = &[Exec];
     const SECRETS: &[Capability] = &[Secrets];
     // SQLite opens any path it is given, and `ATTACH` or `VACUUM INTO` create
@@ -897,16 +896,17 @@ fn register_all() -> &'static [RegisteredTool] {
         CREDENTIAL_SAVE.requires(SECRETS),
         CREDENTIAL_LIST.requires(SECRETS),
         CREDENTIAL_DELETE.requires(SECRETS),
-        // SSH tools (6) — all high-risk (remote exec)
-        SSH_SESSION_OPEN.requires(NET_EXEC_SECRETS),
-        SSH_SESSION_EXEC.requires(NET_EXEC),
-        SSH_SESSION_EXEC_ASYNC.requires(NET_EXEC),
-        SSH_SESSION_POLL.requires(NET_EXEC),
+        // SSH tools (6) — all high-risk. Commands run on the remote host, not
+        // this one, so a session is network (and its credential), not `Exec`.
+        SSH_SESSION_OPEN.requires(NET_SECRETS),
+        SSH_SESSION_EXEC.requires(NET),
+        SSH_SESSION_EXEC_ASYNC.requires(NET),
+        SSH_SESSION_POLL.requires(NET),
         SSH_SESSION_LIST.requires(NET),
         SSH_SESSION_CLOSE.requires(NET),
-        // Telnet tools (4) — all high-risk (a remote shell)
-        TELNET_SESSION_OPEN.requires(NET_EXEC_SECRETS),
-        TELNET_SESSION_SEND.requires(NET_EXEC),
+        // Telnet tools (4) — all high-risk (a remote shell, as SSH)
+        TELNET_SESSION_OPEN.requires(NET_SECRETS),
+        TELNET_SESSION_SEND.requires(NET),
         TELNET_SESSION_LIST.requires(NET),
         TELNET_SESSION_CLOSE.requires(NET),
         // HTTP session tools (4) — all high-risk (network)
@@ -1033,11 +1033,11 @@ mod capability_tests {
             exec.call(&ctx, &json!({"code": "1"}))["error"],
             NotPermitted::CODE
         );
-        let ssh = find("ssh_session_exec").unwrap();
+        let ping = find("ping_icmp").unwrap();
         assert_eq!(
-            ssh.call(&ctx, &json!({"session_id": "x", "command": "id"}))["error"],
+            ping.call(&ctx, &json!({"host": "127.0.0.1"}))["error"],
             NotPermitted::CODE,
-            "network alone does not open remote exec"
+            "network alone does not start a local program"
         );
     }
 
@@ -1057,14 +1057,19 @@ mod capability_tests {
         ] {
             assert!(needs(name).contains(&Capability::Network), "{name}");
         }
+        // Exec is code or a program running on this host.
         for name in [
             "code_run",
             "code_session_exec",
-            "ssh_session_exec",
             "ping_icmp",
+            "trace_route",
             "sub_run",
         ] {
             assert!(needs(name).contains(&Capability::Exec), "{name}");
+        }
+        // A remote shell runs on the remote host.
+        for name in ["ssh_session_exec", "telnet_send"] {
+            assert!(!needs(name).contains(&Capability::Exec), "{name}");
         }
         for name in ["credential_delete", "credential_save", "ssh_open"] {
             assert!(needs(name).contains(&Capability::Secrets), "{name}");

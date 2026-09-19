@@ -44,12 +44,10 @@ use zend_tools::{registry, replay, Replay, ToolContext};
 use crate::access;
 use crate::types::ToolMode;
 
-/// The names of the tools projected in "Restricted" tools mode: those neither
-/// marked high-risk nor needing any capability — see
-/// [`crate::tool_def::safe_names`]. "None" mode projects no tools,
-/// "Comprehensive" projects all of them.
-pub fn safe_tool_names() -> HashSet<String> {
-    crate::tool_def::safe_names()
+/// The names of the tools projected in `mode` — see
+/// [`crate::tool_def::names_for`].
+pub fn offered_tool_names(mode: ToolMode) -> HashSet<String> {
+    crate::tool_def::names_for(mode)
 }
 
 /// One Hermes tool-call block parsed from a model response.
@@ -121,8 +119,8 @@ pub fn install_tool_catalog(
         out.push((def.name.clone(), id, json_line));
     }
     // This function only lays down the per-tool sections. The tool-catalog
-    // *overview* is sealed separately into the `ToolSummary` /
-    // `ToolSummaryRestricted` reserved sections at session startup and associated
+    // *overview* is sealed separately into the `ToolSummaryRestricted` /
+    // `ToolSummary` / `ToolSummaryMutable` reserved sections at session startup and associated
     // with this collection per mode in `build_mode_builder` (via
     // `set_collection_summary_section`), so projection emits the full name listing
     // ahead of the provenance-selected subset.

@@ -86,8 +86,10 @@ Anything not matched falls back to the embedded `web/` frontend (`GET /`, `/perf
 |---|---|---|---|
 | `none` | none | — | none |
 | `restricted` | the safe subset: not high-risk, needing no grant | the session's in-memory overlay | none |
-| `comprehensive` | every tool | the session's in-memory overlay | network, exec, secrets |
-| `mutable` | every tool | **the workspace on disk** | all, disk write included |
+| `comprehensive` | every tool except those that run code on this host (`code_*`, `ping_icmp`, `trace_route`, `sub_run`) | the session's in-memory overlay | network, secrets |
+| `mutable` | every tool | **the workspace on disk** | all, disk write and exec included |
+
+Code execution is Mutable-only because no overlay can stand in front of it: a script or program that runs here reaches the real filesystem. SSH and telnet stay in `comprehensive` — their commands run on the remote host. Each mode projects, and summarises, exactly the tools its grants cover.
 
 `comprehensive` and `mutable` are for admins. The caller's role comes from the gateway's `x-tokera-*` identity headers, resolved against `zend.roles.yaml` (embedded at build time; same shape as `npcd/npcd.web.yaml`'s `roles`). An admin defaults to `comprehensive`; everyone else — signed in or not — defaults to `restricted`, and a request asking for a mode above its role runs as `restricted` rather than failing (`src/access.rs`). The GUI asks `GET /v1/me` and offers only the allowed modes.
 

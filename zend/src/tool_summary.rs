@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use candle_conversation::projection::SectionId;
 
 use crate::tool_def::category_for;
+use crate::types::ToolMode;
 
 /// One installed tool: `(name, section_id, json_line)` — the triple
 /// [`crate::tools::install_tool_catalog`] returns, in registry order.
@@ -44,19 +45,20 @@ pub fn build_tool_summary(tools: &[InstalledTool]) -> String {
     out.trim_end().to_string()
 }
 
-/// Rebuild the mode-appropriate tool-catalog summary straight from the bundled
+/// Rebuild `mode`'s tool-catalog summary straight from the bundled
 /// definitions — the same text the startup seals, without needing the
-/// installed-section handles. `restricted` selects the safe (non-high-risk)
-/// subset. Used by the projection panel to display the injected summary on demand.
-pub fn tool_summary_for_mode(restricted: bool) -> String {
-    let safe = crate::tools::safe_tool_names();
+/// installed-section handles: the tools `mode` offers
+/// ([`crate::tools::offered_tool_names`]). Used by the projection panel to
+/// display the injected summary on demand.
+pub fn tool_summary_for_mode(mode: ToolMode) -> String {
+    let offered = crate::tools::offered_tool_names(mode);
     // `build_tool_summary` reads only the name — the section id / json are unused
     // here, so a placeholder id is fine (it must be non-zero: `SectionId::new`
     // rejects 0).
     let tools: Vec<InstalledTool> = crate::tool_def::all()
         .iter()
         .map(|d| d.name.as_str())
-        .filter(|name| !restricted || safe.contains(*name))
+        .filter(|name| offered.contains(*name))
         .map(|name| (name.to_string(), SectionId::new(1), String::new()))
         .collect();
     build_tool_summary(&tools)

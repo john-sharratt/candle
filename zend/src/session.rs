@@ -1257,34 +1257,39 @@ impl InferenceState {
             "base conversation ready (prelude + tool catalog + outro pinned at init)",
         );
 
-        // Tool-catalog summaries: one for "Comprehensive" tools mode (the full
-        // catalog) and one for "Restricted" mode (the safe / non-high-risk
-        // subset). Each is assembled **deterministically** from the catalog
-        // metadata — every tool grouped under its category — so there is no model
-        // call and nothing to cache: the text is rebuilt and its section prefilled
-        // on every startup, exactly like the tool sections themselves.
+        // Tool-catalog summaries: one per tools mode that projects tools, each
+        // listing exactly the tools that mode offers. Each is assembled
+        // **deterministically** from the catalog metadata — every tool grouped
+        // under its category — so there is no model call and nothing to cache:
+        // the text is rebuilt and its section prefilled on every startup, exactly
+        // like the tool sections themselves.
         {
             let prelude = pre_tools_section_ids(&proj_builder_refresh);
-            let safe_names = crate::tools::safe_tool_names();
-            let safe_sections: Vec<crate::tool_summary::InstalledTool> = tool_sections
-                .iter()
-                .filter(|(name, _, _)| safe_names.contains(name))
-                .cloned()
-                .collect();
-            let comp_text = crate::tool_summary::build_tool_summary(&tool_sections);
-            let restr_text = crate::tool_summary::build_tool_summary(&safe_sections);
+            let summary_for = |mode: ToolMode| {
+                let offered = crate::tools::offered_tool_names(mode);
+                let sections: Vec<crate::tool_summary::InstalledTool> = tool_sections
+                    .iter()
+                    .filter(|(name, _, _)| offered.contains(name))
+                    .cloned()
+                    .collect();
+                crate::tool_summary::build_tool_summary(&sections)
+            };
+            let summaries: Vec<(String, Reserved, &str)> = [
+                ToolMode::Restricted,
+                ToolMode::Comprehensive,
+                ToolMode::Mutable,
+            ]
+            .into_iter()
+            .filter_map(|mode| Some((summary_for(mode), tool_summary_section(mode)?, mode.id())))
+            .collect();
             // Assembly is instant — the step's second half completes immediately.
             progress.set_step_progress(10_000, 10_000);
 
             // Seal each mode's summary under its reserved section id, prefilled with
             // the same pre-tools prefix so its KV is position-correct for "just
-            // before the tools". The Restricted projection points the tools
-            // collection at `ToolSummaryRestricted`, Comprehensive at `ToolSummary`;
-            // None emits neither.
-            for (text, reserved, label) in [
-                (comp_text, Reserved::ToolSummary, "comprehensive"),
-                (restr_text, Reserved::ToolSummaryRestricted, "restricted"),
-            ] {
+            // before the tools". Each mode's projection points the tools collection
+            // at its own summary ([`tool_summary_section`]); None emits none.
+            for (text, reserved, label) in summaries {
                 let sid = SectionId::reserved(reserved);
                 match base_conv.insert_section_with_prefix(sid, &text, &prelude) {
                     Ok(()) => tracing::info!(
@@ -2240,12 +2245,11 @@ impl InferenceState {
         // title generation never serialises against the request path), and is
         // awaited on shutdown so its in-flight turn unwinds.
         let (titler_tx, titler_rx) = mpsc::channel(TITLER_QUEUE_DEPTH);
-        // Build the three per-tools-mode projection builders once, up front, so
-        // each turn only pays a cheap `Arc` clone instead of re-cloning the
+        // Build the per-tools-mode projection builders once, up front, so each
+        // turn only pays a cheap `Arc` clone instead of re-cloning the
         // ~93-section schema (see `ModeBuilders`).
-        let mode_builders =
-            ModeBuilders::build(&proj_builder_refresh, &crate::tools::safe_tool_names())
-                .map_err(|e| anyhow::anyhow!("tools-mode projection builders: {e}"))?;
+        let mode_builders = ModeBuilders::build(&proj_builder_refresh)
+            .map_err(|e| anyhow::anyhow!("tools-mode projection builders: {e}"))?;
         // Identity scoping rides the tools-mode builders (see `IdentityBuilders`).
         // Empty when the schema has no `identities/` content — then it's a no-op
         // and conversations use the plain tools-mode projection.
@@ -2580,44 +2584,32 @@ impl InferenceState {
     }
 }
 
-/// Run a complete user request: stream tokens to the client as they
-/// arrive, then on turn completion scan the response text for tool
-/// calls.  If calls are found, dispatch them and loop with a
-/// `<tool_response>` user turn; otherwise the turn is the final answer.
-///
-/// Every turn's tokens are streamed to the client — including tool-call
-/// turns.  `<tool_call>` markup appears at the tail of those responses
-/// so the user sees the natural-language prefix streamed live and the
-/// tool markup appear at the end before the follow-up response begins.
-/// Build the projection for one tools mode by cloning `base` and filtering the
-/// `tools` collection MEMBERS: `Comprehensive` is the base unchanged (full
-/// catalog); `Restricted` retains only the safe (non-high-risk) tool sections;
-/// `None` retains none.  These builders control only WHICH members project — the
-/// WHOLE tool block (markers, catalog, summary) is gated separately by the
-/// `tools_enabled` optional_group, which chat.rs sets `absent` for `None`.  The
-/// `tool_summary` overview is the comprehensive one for every mode (sealed once on
-/// the base builder).  Called once per mode at startup by [`ModeBuilders::build`];
-/// the results are cached and handed out as cheap `Arc` clones each turn, since
-/// both projection and reprojection just read the swapped builder.
-fn build_mode_builder(
-    base: &Builder,
-    safe_tool_names: &HashSet<String>,
-    mode: ToolMode,
-) -> anyhow::Result<Arc<Builder>> {
-    let mut b = base.clone();
-    match mode.catalog() {
-        ToolMode::Comprehensive | ToolMode::Mutable => {}
-        ToolMode::Restricted => {
-            // Drop the high-risk tools; the summary association below points this
-            // mode at the restricted catalog listing.
-            b.retain_collection_sections("tools", safe_tool_names)
-                .map_err(|e| anyhow::anyhow!("restricted tools projection: {e}"))?;
-        }
-        ToolMode::None => {
-            b.retain_collection_sections("tools", &HashSet::new())
-                .map_err(|e| anyhow::anyhow!("none tools projection: {e}"))?;
-        }
+/// The reserved section holding `mode`'s tool-catalog summary; `None` projects
+/// no tools and has none.
+fn tool_summary_section(mode: ToolMode) -> Option<Reserved> {
+    match mode {
+        ToolMode::None => None,
+        ToolMode::Restricted => Some(Reserved::ToolSummaryRestricted),
+        ToolMode::Comprehensive => Some(Reserved::ToolSummary),
+        ToolMode::Mutable => Some(Reserved::ToolSummaryMutable),
     }
+}
+
+/// Build the projection for one tools mode by cloning `base` and filtering the
+/// `tools` collection MEMBERS to the tools the mode offers
+/// ([`crate::tools::offered_tool_names`]). These builders control only WHICH
+/// members project — the WHOLE tool block (markers, catalog, summary) is gated
+/// separately by the `tools_enabled` optional_group, which chat.rs sets
+/// `absent` for `None`. Called once per mode at startup by
+/// [`ModeBuilders::build`]; the results are cached and handed out as cheap
+/// `Arc` clones each turn, since both projection and reprojection just read the
+/// swapped builder.
+fn build_mode_builder(base: &Builder, mode: ToolMode) -> anyhow::Result<Arc<Builder>> {
+    let mut b = base.clone();
+    // Keep exactly the tools this mode offers — none in None, everything in
+    // Mutable; the summary association below points the mode at its listing.
+    b.retain_collection_sections("tools", &crate::tools::offered_tool_names(mode))
+        .map_err(|e| anyhow::anyhow!("{} tools projection: {e}", mode.id()))?;
     // Associate the sealed tool-catalog summary (built by `build_tool_summary`,
     // prefilled into its reserved section at startup) with the `tools` collection,
     // so projection emits the FULL tool-name listing just before the selected
@@ -2627,12 +2619,7 @@ fn build_mode_builder(
     // emits it whenever the selection is a proper subset (§ `record` in
     // `emit_system_prompt_items`), which for a 93-tool catalog is every turn.
     // `None` mode has no tools block, so no summary.
-    let summary = match mode.catalog() {
-        ToolMode::Comprehensive | ToolMode::Mutable => Some(Reserved::ToolSummary),
-        ToolMode::Restricted => Some(Reserved::ToolSummaryRestricted),
-        ToolMode::None => None,
-    };
-    if let Some(reserved) = summary {
+    if let Some(reserved) = tool_summary_section(mode) {
         let tools = b
             .id_for_system_collection("tools")
             .ok_or_else(|| anyhow::anyhow!("projection schema missing 'tools' collection"))?;
@@ -2642,54 +2629,29 @@ fn build_mode_builder(
     Ok(Arc::new(b))
 }
 
-/// The three per-tools-mode projection builders, built once at startup so each
-/// turn hands out a cheap `Arc` clone instead of re-cloning the ~93-section
-/// schema. Restricted / None fall back to the comprehensive builder if their
-/// section-retain fails, so the daemon still starts; Comprehensive is fatal (see
-/// [`ModeBuilders::build`]).
+/// The per-tools-mode projection builders, built once at startup so each turn
+/// hands out a cheap `Arc` clone instead of re-cloning the ~93-section schema.
 struct ModeBuilders {
-    none: Arc<Builder>,
-    restricted: Arc<Builder>,
-    comprehensive: Arc<Builder>,
+    /// Indexed by [`ToolMode::level`].
+    builders: [Arc<Builder>; 4],
 }
 
 impl ModeBuilders {
-    fn build(base: &Builder, safe_tool_names: &HashSet<String>) -> anyhow::Result<Self> {
-        // Comprehensive is the default mode and has no better fallback than itself:
-        // a `base.clone()` here would silently re-orphan the tool-catalog summary
-        // (the exact bug `build_mode_builder`'s association fixes), so a failure —
-        // only reachable via a missing dialogue layer / `tools` collection, i.e. a
-        // broken schema the daemon can't serve anyway — is fatal.
-        let comprehensive = build_mode_builder(base, safe_tool_names, ToolMode::Comprehensive)?;
-        let restricted = match build_mode_builder(base, safe_tool_names, ToolMode::Restricted) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("restricted tools projection build failed, using full catalog: {e}");
-                Arc::clone(&comprehensive)
-            }
-        };
-        let none = match build_mode_builder(base, safe_tool_names, ToolMode::None) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("none tools projection build failed, using full catalog: {e}");
-                Arc::clone(&comprehensive)
-            }
-        };
+    /// Every mode's builder, or the first failure. A failure is only reachable
+    /// through a missing dialogue layer or `tools` collection — a broken schema
+    /// the daemon cannot serve — and falling back to another mode's builder
+    /// would offer a mode tools it does not grant.
+    fn build(base: &Builder) -> anyhow::Result<Self> {
+        let [none, restricted, comprehensive, mutable] =
+            ToolMode::ALL.map(|mode| build_mode_builder(base, mode));
         Ok(Self {
-            none,
-            restricted,
-            comprehensive,
+            builders: [none?, restricted?, comprehensive?, mutable?],
         })
     }
 
-    /// The prebuilt projection for `mode` (a cheap `Arc` clone). Mutable
-    /// projects Comprehensive's catalog — see [`ToolMode::catalog`].
+    /// The prebuilt projection for `mode` (a cheap `Arc` clone).
     fn get(&self, mode: ToolMode) -> Arc<Builder> {
-        match mode.catalog() {
-            ToolMode::None => Arc::clone(&self.none),
-            ToolMode::Restricted => Arc::clone(&self.restricted),
-            ToolMode::Comprehensive | ToolMode::Mutable => Arc::clone(&self.comprehensive),
-        }
+        Arc::clone(&self.builders[mode.level() as usize])
     }
 }
 
@@ -5313,10 +5275,10 @@ impl ZendSession {
         };
         // The `tools` collection's summary section is generated at runtime (not a
         // schema section), so its text isn't in `section_contents`. Serve the
-        // summary matching this conversation's tools mode — the restricted
-        // (safe-subset) summary in Restricted, the full one in Comprehensive, and
-        // none in None (no tools are projected) — under the key the projection
-        // event uses (`<collection> summary`) so the panel expands the right list.
+        // summary matching this conversation's tools mode — the tools that mode
+        // offers, and none in None (no tools are projected) — under the key the
+        // projection event uses (`<collection> summary`) so the panel expands the
+        // right list.
         let mode = state
             .tool_modes
             .lock()
@@ -5324,15 +5286,13 @@ impl ZendSession {
             .get(conv_id)
             .copied()
             .unwrap_or(ToolMode::Comprehensive);
-        let restricted = match mode.catalog() {
-            ToolMode::None => return Some(out),
-            ToolMode::Restricted => true,
-            ToolMode::Comprehensive | ToolMode::Mutable => false,
-        };
+        if mode == ToolMode::None {
+            return Some(out);
+        }
         // The tools-collection summary is assembled deterministically from the
         // catalog (the same text the startup seals); rebuild the mode-appropriate
         // one for the panel rather than reading a cache.
-        let text = crate::tool_summary::tool_summary_for_mode(restricted);
+        let text = crate::tool_summary::tool_summary_for_mode(mode);
         if !text.is_empty() {
             out.push(("tools summary".to_string(), text));
         }

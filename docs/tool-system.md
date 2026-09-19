@@ -20,7 +20,7 @@ Every tool call runs in a `ToolContext` that carries **grants** — a subset of 
 |---|---|
 | `disk_write` | changing files on the host's disk — the direct file store and SQLite connections |
 | `network` | any outbound connection — HTTP, sockets, DNS, ICMP |
-| `exec` | running code or programs — the JS VM, subprocesses, remote shells, sub-agents |
+| `exec` | running code or programs on this host — the JS VM, subprocesses, sub-agents |
 | `secrets` | reading or changing stored credentials |
 
 A context grants nothing unless its builder grants it, and the check is made twice, independently:
@@ -30,7 +30,7 @@ A context grants nothing unless its builder grants it, and the check is made twi
 
 So a tool whose declaration is wrong, or a call the model makes for a tool its mode never offered, still cannot act. The refusal is an ordinary tool error the model reads: `{"error":"not_permitted","detail":"this action needs the `network` permission, which this conversation does not have; nothing was done"}`.
 
-In `zend` the grants follow the tools mode (`zend/src/access.rs`): `none` and `restricted` grant nothing, `comprehensive` grants `network`, `exec` and `secrets`, and `mutable` grants everything. Restricted mode offers only tools that are neither high-risk nor in need of a grant.
+In `zend` the grants follow the tools mode (`zend/src/access.rs`): `none` and `restricted` grant nothing, `comprehensive` grants `network` and `secrets`, and `mutable` grants everything. Code execution on this host (`exec`) is Mutable-only, because the overlay that keeps Comprehensive's file changes off the disk cannot stand in front of a script or a program; SSH and telnet run their commands on the remote host and need only `network`. Each mode offers exactly the tools its grants cover, and Restricted also drops the high-risk ones.
 
 `web_fetch` additionally refuses private and local addresses — literal, resolved, and redirect targets — and connects through a resolver that applies the same rule, so a name cannot pass the check with a public address and connect with a private one.
 

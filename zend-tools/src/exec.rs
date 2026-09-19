@@ -1,8 +1,8 @@
 //! Every way a tool starts a program, refused without [`Capability::Exec`].
 //!
-//! The JS VM checks the same capability itself (`tools::code::engine`), and
-//! remote execution over SSH is declared at dispatch and reaches its host only
-//! through [`crate::net`]; this module covers local subprocesses.
+//! The JS VM checks the same capability itself (`tools::code::engine`); this
+//! module covers local subprocesses. Remote execution over SSH or telnet runs
+//! on the remote host, and reaches it only through [`crate::net`].
 
 use std::process::Command;
 
