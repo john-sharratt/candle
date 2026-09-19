@@ -15,6 +15,10 @@ pub enum MoeScatterDType {
     BF16 = 2,
 }
 
+/// `run_moe_gather`'s dispatch code for the widening gather: BF16 table rows
+/// written out as F32 in the same pass.
+pub const MOE_GATHER_BF16_TO_F32: i32 = 4;
+
 extern "C" {
     /// Fused gather: out[i, j] = xs[token_ids[i], j]
     ///
@@ -25,6 +29,9 @@ extern "C" {
     /// - `total_rows`: number of rows to gather
     /// - `hidden_dim`: column count — or, for `dtype` 3 (the q8a128 tile gather), the
     ///   128-element tiles per row
+    ///
+    /// `dtype` 4 is the widening gather: a BF16 table in, F32 rows out
+    /// ([`MOE_GATHER_BF16_TO_F32`]).
     pub fn run_moe_gather(
         dtype: i32,
         out: *mut c_void,

@@ -63,7 +63,7 @@ use crate::models::delta_net::SeqSpan;
 use crate::models::draft_walk::{draft_reserve, draft_rope_depth, draft_walk};
 use crate::models::kv_cache_utils::SequenceContext;
 use crate::models::qwen35::attention::RopeTables;
-use candle::quantized::cuda::to_dynamic;
+use candle::quantized::cuda::{gather_rows_bf16_to_f32, to_dynamic};
 use candle_nn::kv_cache::KvCache;
 
 /// Each sequence's last wide residual, carried between waves so the head's
@@ -617,7 +617,8 @@ impl Qwen4ExpBatched {
                 &q_lens,
                 generation,
             );
-            let embeds = m.embed.index_select(ids, 0)?.to_dtype(DType::F32)?;
+            // The BF16 table's rows, written as the head's F32 in one pass.
+            let embeds = gather_rows_bf16_to_f32(&m.embed, ids)?;
             self.head_draft_step(
                 head,
                 &embeds,

@@ -902,6 +902,7 @@ extern "C" __global__ void fused_silu_mul_f8_e4m3_vec4(const unsigned int, const
 extern "C" __global__ void moe_gather_bf16(__nv_bfloat16*, const __nv_bfloat16*, const uint32_t*, size_t, size_t);
 extern "C" __global__ void moe_gather_f16(__half*, const __half*, const uint32_t*, size_t, size_t);
 extern "C" __global__ void moe_gather_f32(float*, const float*, const uint32_t*, size_t, size_t);
+extern "C" __global__ void moe_gather_bf16_f32(float*, const __nv_bfloat16*, const uint32_t*, size_t, size_t);
 extern "C" __global__ void moe_gather_q8a128_tiles(uint8_t*, const uint8_t*, const uint32_t*, size_t, size_t);
 // Fused router: softmax + top-k select + (optional) renormalize, one thread per token.
 // The `_x512` variants are the 16-slot instantiation (up to 512 experts).
@@ -1447,6 +1448,19 @@ void run_moe_gather(int32_t dtype, void* out, const void* xs,
         case 2: // bf16
             moe_gather_bf16<<<grid, BLOCK_SIZE>>>((__nv_bfloat16*)out, (const __nv_bfloat16*)xs, token_ids, total_rows, hidden_dim);
             break;
+        case 4: { // widening: bf16 table rows out as f32; hidden_dim % 8 == 0
+            // One 8-element chunk a thread, 256 a block, one block per 256
+            // chunks up to 4,096 blocks, grid-strided past that. Capping the
+            // grid at one or four resident waves to trim the last wave's tail
+            // measured slower (see the kernel): many short-lived warps keep
+            // more loads in flight.
+            const size_t chunks = total_rows * (hidden_dim / 8);
+            size_t blocks = (chunks + 255) / 256;
+            if (blocks > 4096) blocks = 4096;
+            moe_gather_bf16_f32<<<(unsigned)(blocks > 0 ? blocks : 1), 256>>>(
+                (float*)out, (const __nv_bfloat16*)xs, token_ids, total_rows, hidden_dim);
+            break;
+        }
         case 3: { // q8a128 tile gather; hidden_dim = 128-element tiles per row
             // One warp per output tile, 8 warps a block, grid-strided.
             const size_t tiles = total_rows * hidden_dim;

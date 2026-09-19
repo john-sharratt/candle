@@ -88,6 +88,59 @@ extern "C" __global__ void moe_gather_f32(
     moe_gather_impl(out, xs, token_ids, total_rows, hidden_dim);
 }
 
+// Widening gather: BF16 table rows out as F32, in the one pass. The consumer is
+// a table stored narrower than the activations that read it (Flash-Next's
+// embedding: BF16 at rest, F32 in the Gated Residual), so the gather writes the
+// consumer's type rather than leaving a separate conversion pass to the wave.
+// A padding row (0xFFFFFFFF) is written as zeros, as in moe_gather_impl.
+//
+// Pure bandwidth: 2 bytes read and 4 written per element, no arithmetic worth
+// the name. So each thread moves one 8-element chunk — a single 16-byte load
+// and two 16-byte stores — over a flat, grid-strided index of every chunk of
+// every row: whole warps on every row width, a warp's stores one contiguous
+// 512-byte run, and no per-row block for a narrow wave to leave idle. BF16 →
+// F32 is exact and is a 16-bit shift of the bit pattern, so the widening costs
+// two integer ops per pair. Requires `hidden_dim % 8 == 0` (the host checks),
+// which also makes every row start 16-byte aligned.
+#define GATHER_WIDEN_THREADS 256
+extern "C" __global__ void __launch_bounds__(GATHER_WIDEN_THREADS) moe_gather_bf16_f32(
+    float* __restrict__ out, const __nv_bfloat16* __restrict__ xs,
+    const uint32_t* __restrict__ token_ids,
+    size_t total_rows, size_t hidden_dim
+) {
+    // 32-bit index math: a gather of 2^32 chunks would be 64 GB of output, far
+    // past any wave, and a 64-bit divide is ~4× the instructions of a 32-bit one.
+    const uint32_t chunks_per_row = (uint32_t)(hidden_dim >> 3);
+    const uint32_t total = (uint32_t)(total_rows * (size_t)chunks_per_row);
+    const uint32_t stride = gridDim.x * GATHER_WIDEN_THREADS;
+    // One chunk a thread per trip, over a grid of many waves: measured on
+    // 5,748 × 2,560, the device time was 108 µs this way, 128 µs with the grid
+    // cut to one resident wave (each thread serialises its loads), and 121 µs
+    // with two loads a thread in flight over four waves. Many short-lived warps
+    // cover DRAM latency better than fewer, longer ones. Past that the shape
+    // stops mattering: an uncapped grid (one chunk a thread, 15.8 waves) ran
+    // 112 µs and evict-first `__stcs` stores 113 µs, all at ~73% of DRAM peak
+    // with 22 registers and ~84% achieved occupancy. Plain stores are kept so
+    // the rows stay in L2 for the layer that reads them next.
+    for (uint32_t v = blockIdx.x * GATHER_WIDEN_THREADS + threadIdx.x; v < total; v += stride) {
+        const uint32_t row = v / chunks_per_row;
+        const uint32_t chunk = v - row * chunks_per_row;
+        const uint32_t src_row = __ldg(token_ids + row);
+        uint4 r = make_uint4(0u, 0u, 0u, 0u);
+        if (src_row != 0xFFFFFFFFu) {
+            r = __ldg(reinterpret_cast<const uint4*>(xs + (size_t)src_row * hidden_dim) + chunk);
+        }
+        // Each 32-bit word holds two BF16: the low half is element 2k, the high
+        // half element 2k+1. A BF16's bits are an F32's top 16. A padding row's
+        // words are zero, so it widens to zeros.
+        float4* dst = reinterpret_cast<float4*>(out + (size_t)row * hidden_dim) + 2 * (size_t)chunk;
+        dst[0] = make_float4(__uint_as_float(r.x << 16), __uint_as_float(r.x & 0xFFFF0000u),
+                             __uint_as_float(r.y << 16), __uint_as_float(r.y & 0xFFFF0000u));
+        dst[1] = make_float4(__uint_as_float(r.z << 16), __uint_as_float(r.z & 0xFFFF0000u),
+                             __uint_as_float(r.w << 16), __uint_as_float(r.w & 0xFFFF0000u));
+    }
+}
+
 // B3: TILE gather for pre-quantized q8a128 activations, so the experts consume the
 // already-quantized FFN input directly — no gather-then-quantize.
 //

@@ -5346,6 +5346,95 @@ fn rms_norm_q8a128_matches_reference() -> Result<()> {
     Ok(())
 }
 
+/// `GgmlDType::dequantizes_to_bf16` must name exactly the types the device path accepts: a
+/// block type the dequantize kernel dispatches (not a KO twin, which refuses), or MXFP4.
+#[test]
+fn the_bf16_dequantize_predicate_matches_the_kernel_dispatch() {
+    // Every code the GGUF reader knows, whatever numbering it uses.
+    for code in 0..=255u32 {
+        let Ok(dtype) = GgmlDType::from_u32(code) else {
+            continue;
+        };
+        let ko = matches!(
+            dtype,
+            GgmlDType::Q4_KO
+                | GgmlDType::Q5_KO
+                | GgmlDType::Q6_KO
+                | GgmlDType::Q8_KO
+                | GgmlDType::MXFP4_KO
+                | GgmlDType::Q2_KO
+                | GgmlDType::Q3_KO
+        );
+        let dispatched = dtype == GgmlDType::MXFP4 || (!ko && dtype_to_qtype(dtype).is_ok());
+        assert_eq!(dtype.dequantizes_to_bf16(), dispatched, "{dtype:?}");
+    }
+}
+
+/// The widening gather writes each gathered BF16 row as F32, exactly: every BF16 value is
+/// representable in F32, so the output is the table's values, in `ids` order, repeats and all,
+/// and a padding id (`0xFFFFFFFF`) is a row of zeros.
+#[test]
+fn widening_gather_writes_bf16_rows_as_f32() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    // One 8-element chunk per row. Values exact in BF16 (few mantissa bits),
+    // so the widening is exact too.
+    let rows: [[f32; 8]; 3] = [
+        [0.5, -1.0, 2.0, 0.25, 4.0, -8.0, 1.5, 0.0],
+        [-0.125, 3.0, 6.0, -0.5, 16.0, 0.75, -2.0, 1.0],
+        [1.5, 0.0, -0.125, 8.0, -4.0, 0.375, 2.5, -1.25],
+    ];
+    let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+    let table = crate::Tensor::from_vec(flat, (3, 8), &device)?.to_dtype(crate::DType::BF16)?;
+    let ids = crate::Tensor::from_vec(vec![2u32, 0, 2, u32::MAX], (4,), &device)?;
+    let got = gather_rows_bf16_to_f32(&table, &ids)?;
+    assert_eq!(got.dtype(), crate::DType::F32);
+    assert_eq!(
+        got.to_vec2::<f32>()?,
+        vec![
+            rows[2].to_vec(),
+            rows[0].to_vec(),
+            rows[2].to_vec(),
+            vec![0.0; 8]
+        ]
+    );
+    Ok(())
+}
+
+/// At the released width over a prefill's rows the widening gather equals the
+/// two-pass `index_select` then `to_dtype` bit for bit: the widening is exact, so
+/// any difference is a wrong row or a wrong chunk.
+#[test]
+fn widening_gather_equals_select_then_widen_at_2560() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let (vocab, cols, n) = (4096usize, 2560usize, 713usize);
+    let vals: Vec<f32> = (0..vocab * cols)
+        .map(|i| ((i * 7919 % 4093) as f32 - 2046.0) * 0.0137)
+        .collect();
+    let table =
+        crate::Tensor::from_vec(vals, (vocab, cols), &device)?.to_dtype(crate::DType::BF16)?;
+    let ids: Vec<u32> = (0..n)
+        .map(|i| ((i * 2654435761usize) % vocab) as u32)
+        .collect();
+    let ids = crate::Tensor::from_vec(ids, (n,), &device)?;
+    let want = table.index_select(&ids, 0)?.to_dtype(crate::DType::F32)?;
+    let got = gather_rows_bf16_to_f32(&table, &ids)?;
+    assert_eq!(got.to_vec2::<f32>()?, want.to_vec2::<f32>()?);
+    Ok(())
+}
+
+/// A row width the 8-element chunks do not divide is refused, not truncated.
+#[test]
+fn widening_gather_refuses_a_width_not_a_multiple_of_8() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev);
+    let table = crate::Tensor::zeros((2, 12), crate::DType::BF16, &device)?;
+    let ids = crate::Tensor::from_vec(vec![0u32], (1,), &device)?;
+    assert!(gather_rows_bf16_to_f32(&table, &ids).is_err());
+    Ok(())
+}
+
 /// The tile gather must hand the experts **the same bytes** whichever order the work is done
 /// in: quantizing the tokens once and gathering tiles of the result, or gathering the float
 /// rows and quantizing those. Quantization is per 128-element tile, so the two agree exactly —

@@ -7064,6 +7064,73 @@ pub fn fused_moe_gather(
     ))
 }
 
+/// Gather rows of a BF16 `table` `[rows, cols]` by `ids` (U32 `[n]`) and write
+/// them out as F32 `[n, cols]` — one launch, in place of `index_select` then a
+/// `to_dtype` pass over the result.
+///
+/// For a table stored narrower than the activations that read it: the gather
+/// emits the consumer's type (hot-path invariant 1) instead of a second
+/// full-width pass converting what it just wrote.
+pub fn gather_rows_bf16_to_f32(
+    table: &crate::Tensor,
+    ids: &crate::Tensor,
+) -> Result<crate::Tensor> {
+    use crate::cuda_backend::CudaStorageSlice;
+
+    let (_, cols) = table.dims2()?;
+    let n = ids.dims1()?;
+    // The kernel moves 8-element (16-byte) chunks, which is also what keeps
+    // every row 16-byte aligned.
+    if cols % 8 != 0 {
+        crate::bail!("gather_rows_bf16_to_f32: row width {cols} is not a multiple of 8");
+    }
+    if !table.is_contiguous() || table.layout().start_offset() != 0 {
+        crate::bail!("gather_rows_bf16_to_f32: the table must be a whole contiguous tensor");
+    }
+    if !ids.is_contiguous() || ids.layout().start_offset() != 0 {
+        crate::bail!("gather_rows_bf16_to_f32: the ids must be a whole contiguous tensor");
+    }
+    let table_storage = table.storage_and_layout().0;
+    let ids_storage = ids.storage_and_layout().0;
+    let (crate::Storage::Cuda(t), crate::Storage::Cuda(i)) = (&*table_storage, &*ids_storage)
+    else {
+        crate::bail!("gather_rows_bf16_to_f32: expected CUDA tensors");
+    };
+    let (CudaStorageSlice::BF16(src), CudaStorageSlice::U32(idx)) = (&t.slice, &i.slice) else {
+        crate::bail!(
+            "gather_rows_bf16_to_f32: expected a BF16 table and U32 ids, got {:?} and {:?}",
+            table.dtype(),
+            ids.dtype()
+        );
+    };
+    let device = t.device.clone();
+    let stream = device.cuda_stream();
+    // Every row is written — a gathered row or a zero for padding — so the
+    // output needs no initialisation.
+    let out: CudaSlice<f32> = unsafe { device.alloc::<f32>(n * cols)? };
+    {
+        let (src_ptr, _sg) = src.device_ptr(&stream);
+        let (out_ptr, _og) = out.device_ptr(&stream);
+        let (ids_ptr, _ig) = idx.device_ptr(&stream);
+        unsafe {
+            candle_kernels::simple::moe_scatter::run_moe_gather(
+                candle_kernels::simple::moe_scatter::MOE_GATHER_BF16_TO_F32,
+                out_ptr as *mut std::ffi::c_void,
+                src_ptr as *const std::ffi::c_void,
+                ids_ptr as *const u32,
+                n,
+                cols,
+            );
+        }
+    }
+    Ok(crate::tensor::from_storage(
+        crate::Storage::Cuda(CudaStorage::wrap_cuda_slice(out, device)),
+        Shape::from((n, cols)),
+        crate::op::BackpropOp::none(),
+        false,
+    ))
+}
+
 /// Fused MoE router: softmax + top-k select + (optional) renormalize over `logits`
 /// `[num_tokens, n_experts]` in **one** kernel launch, replacing the
 /// `softmax → sort(desc) → narrow(k) → renorm → flatten` op chain (≈6 launches over a tiny
