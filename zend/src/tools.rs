@@ -25,6 +25,7 @@
 //! final natural-language answer.
 
 use std::collections::HashSet;
+use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -42,6 +43,7 @@ use zend_tools::state::ToolSecrets;
 use zend_tools::{registry, replay, Replay, ToolContext};
 
 use crate::access;
+use crate::tool_guidance;
 use crate::types::ToolMode;
 
 /// The names of the tools projected in `mode` — see
@@ -460,12 +462,25 @@ pub(crate) fn calls_in_answer(answer: &str) -> Vec<(usize, ToolCall)> {
 /// [`crate::tool_def::all`] is itself `OnceLock`-resolved and fixed for the
 /// process once `init` has run, so caching the derived specs here costs one
 /// schema walk per daemon rather than one per decoded turn.
-fn tool_catalog() -> &'static [ToolSpec] {
+///
+/// **Every alias a tool answers to is a spec too**, with the tool's own
+/// parameters. The grammar admits only the names it was compiled from, so a
+/// model that writes a natural alias — `file_write` for `write` — had its name
+/// healed into the nearest compiled one instead: `file_` then `list`, not
+/// `write`. A turn that meant to create a file listed the directory forty
+/// times, its reasoning saying "write the file now" before every call.
+/// Dispatch already resolves aliases ([`registry::find`]); compiling them
+/// lets the call reach it as the model wrote it.
+pub fn tool_catalog() -> &'static [ToolSpec] {
     static SPECS: OnceLock<Vec<ToolSpec>> = OnceLock::new();
     SPECS.get_or_init(|| {
         crate::tool_def::all()
             .iter()
-            .map(|d| ToolSpec::from_json_schema(&d.name, &d.parameters))
+            .flat_map(|d| {
+                iter::once(d.name.as_str())
+                    .chain(registry::aliases(&d.name).iter().copied())
+                    .map(|name| ToolSpec::from_json_schema(name, &d.parameters))
+            })
             .collect()
     })
 }
@@ -528,15 +543,12 @@ impl RawCall {
 
 /// Run one parsed tool call against the registry.  Always returns a
 /// JSON value the model can consume — successful tools return their
-/// typed response, missing tools return
-/// `{"error":"unknown_tool","detail":"..."}`.
+/// typed response; a refused call carries what the model needs to correct
+/// it ([`crate::tool_guidance`]).
 pub fn run_tool(ctx: &ToolContext, call: &ToolCall) -> Value {
     match registry::find(&call.name) {
-        Some(t) => t.call(ctx, &call.arguments),
-        None => serde_json::json!({
-            "error": "unknown_tool",
-            "detail": format!("no tool named {:?}", call.name),
-        }),
+        Some(t) => tool_guidance::with_guidance(t.name, t.call(ctx, &call.arguments)),
+        None => tool_guidance::unknown_tool(&call.name, ctx.grants()),
     }
 }
 

@@ -18,11 +18,10 @@ use candle_conversation::stencil::{
 
 // ── Building the tree from the live registry ────────────────────────────────
 
+/// The catalog the daemon compiles its stencil from — canonical names and
+/// every alias.
 fn catalog() -> Vec<ToolSpec> {
-    zend::tool_def::all()
-        .iter()
-        .map(|d| ToolSpec::from_json_schema(&d.name, &d.parameters))
-        .collect()
+    zend::tools::tool_catalog().to_vec()
 }
 
 /// What a turn ends with once the loop decides to stop calling. The tests drive
@@ -674,6 +673,20 @@ fn unknown_tool_name_is_masked() {
         matches!(err, DriveErr::MaskRejected { .. }),
         "expected a mask rejection for an unknown tool, got {err:?}"
     );
+}
+
+/// **An alias decodes as written.** `file_write` is `write` under another
+/// name; the grammar compiled only canonical names used to heal it into
+/// `file_list`, so a turn meant to create a file listed a directory instead.
+#[test]
+fn an_alias_name_drives_to_its_tools_arguments() {
+    let (tree, vocab) = build_tree();
+    let target = format!(
+        "<tool_call>\n{{\"name\": \"file_write\", \"arguments\": {{\"path\": \"a.txt\", \
+         \"content\": \"hi\"}}}}\n</tool_call>{TURN_CLOSE}"
+    );
+    let out = drive(tree, &target, &vocab).expect("an alias must not be masked");
+    assert!(out.contains("\"file_write\""), "{out}");
 }
 
 #[test]

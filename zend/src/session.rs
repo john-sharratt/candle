@@ -25,7 +25,7 @@ use candle_conversation::projection::{
     self, Builder, GroupSchema, Reserved, SectionId, SectionLoads, SelectionRule, SystemItem,
     SystemPromptItem, SystemPromptSchema, TimelineId, TurnIndex,
 };
-use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
+use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
 use candle_conversation::FinishReason;
@@ -59,6 +59,7 @@ use crate::model_choice;
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::ProjectionEventOut;
 use crate::refresh_ctx::RefreshContext;
+use crate::repeat_guard::{self, RepeatGuard, Verdict};
 use crate::repo_scan::RepoMap;
 use crate::resume;
 use crate::think_budget;
@@ -1115,12 +1116,8 @@ impl InferenceState {
         let tool_stencil = if tool_sections.is_empty() {
             Arc::new(TriggerRegistry::new())
         } else {
-            let tool_specs: Vec<ToolSpec> = crate::tool_def::all()
-                .iter()
-                .map(|d| ToolSpec::from_json_schema(&d.name, &d.parameters))
-                .collect();
             engine
-                .compile_tool_stencil(&tool_specs)
+                .compile_tool_stencil(crate::tools::tool_catalog())
                 .map_err(|e| anyhow::anyhow!("tool stencil compile: {e}"))?
         };
         // The thinking-block steering trees (one per non-off effort dial),
@@ -3160,6 +3157,10 @@ fn run_inference_stream(
         // the only bound is [`MAX_TOOL_ROUNDS`], which sits far above any real
         // one — see the note there for why a bound has to exist at all now that
         // a disconnect no longer ends the turn.
+        let mut repeat_guard = RepeatGuard::new();
+        // Set once the repeat guard closes the loop: the turn that answers the
+        // closing round is the last, and no call it makes runs.
+        let mut closing = false;
         for iteration in start_iteration.. {
             if iteration >= MAX_TOOL_ROUNDS {
                 tracing::warn!(
@@ -3173,9 +3174,24 @@ fn run_inference_stream(
             // Collect this turn's projection events (reprojections + decode-end)
             // so they survive a browser reload (served back on hydrate).
             let mut turn_events: Vec<ProjectionEventOut> = Vec::new();
+            // The turn that answers the repeat guard's closing round may not
+            // open a tool call: its results said none would run, and a call
+            // written anyway would be sealed with no answer.
+            // An explicit caller config may carry no resolved id; the
+            // conversation's own config always does.
+            let mut this_turn = sampling.clone();
+            if closing {
+                let open = match this_turn.tool_call_open_token_id {
+                    id if id >= 0 => id,
+                    _ => cs.conv.default_sampling().tool_call_open_token_id,
+                };
+                if open >= 0 {
+                    this_turn.banned_tokens.push(open);
+                }
+            }
             let options = candle_conversation::TurnOptions {
                 max_tokens,
-                sampling: Some(sampling.clone()),
+                sampling: Some(this_turn),
                 // Apply the caller's assistant prefill only on the first tool
                 // iteration — re-prefilling it on every chained iteration would
                 // prevent the model ever reaching a final answer.
@@ -3466,7 +3482,18 @@ fn run_inference_stream(
             // tool invocation) into the substrate as the dataset baseline, but
             // do NOT execute the tools — capture-only, so `code_run` / network
             // tools have no real side effects.
-            let is_final = round.is_empty() || force_hires.is_some();
+            //
+            // A turn answering the repeat guard's closing round is final too:
+            // its results told the model no further call runs.
+            if closing && !round.is_empty() {
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    iteration,
+                    n_calls = round.len(),
+                    "the turn after the repeat guard closed the loop made tool calls — not run",
+                );
+            }
+            let is_final = round.is_empty() || force_hires.is_some() || closing;
             // A call the turn stopped writing has no `</tool_call>` in the
             // stream, and the GUI reads everything after an unclosed opener —
             // the rounds that follow included — as that call's JSON. Close it
@@ -3559,7 +3586,7 @@ fn run_inference_stream(
             // the post-stream hydrate.
             let n_calls = round.len();
             let tool_state = Arc::clone(&state);
-            let results = match tokio::task::spawn_blocking(move || {
+            let mut results = match tokio::task::spawn_blocking(move || {
                 tool_round::run(tool_state.tool_host.context_for(tools_mode), round)
             })
             .await
@@ -3575,6 +3602,16 @@ fn run_inference_stream(
                     break;
                 }
             };
+            if repeat_guard.screen(&mut results) == Verdict::Close {
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    iteration,
+                    "the same tool call returned the same result {} rounds running — the \
+                     next turn answers without tools",
+                    repeat_guard::STOP_AFTER,
+                );
+                closing = true;
+            }
             // Each result measured as its own block of the turn it is about to
             // become — the length its card shows.
             let tokens = results

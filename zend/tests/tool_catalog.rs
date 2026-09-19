@@ -136,10 +136,13 @@ fn install_tool_catalog_returns_section_ids_in_registry_order() {
     );
 }
 
-/// The four file tools — `file_search`, `file_grep`, `file_read`, `file_list` —
-/// are marked mandatory on the `tools` collection, so they project on every turn
-/// on top of the belief top-k. Finding is in the set alongside reading because a
-/// turn holding only the read pair answers "where is this" by guessing.
+/// The file tools — `file_search`, `file_grep`, `file_read`, `file_list` and
+/// `write` — and the two web tools are marked mandatory on the `tools`
+/// collection, so they project on every turn on top of the belief top-k.
+/// Finding is in the set alongside reading because a turn holding only the read
+/// pair answers "where is this" by guessing, `write` because the edit tool
+/// cannot create a file, and the web pair because a tool shown only by name is
+/// one the model concludes it does not have.
 #[test]
 fn install_tool_catalog_marks_the_mandatory_tools() {
     let mut builder = build_test_projection();
@@ -153,7 +156,15 @@ fn install_tool_catalog_marks_the_mandatory_tools() {
     names.sort();
     assert_eq!(
         names,
-        ["file_grep", "file_list", "file_read", "file_search"]
+        [
+            "file_grep",
+            "file_list",
+            "file_read",
+            "file_search",
+            "web_fetch",
+            "web_search",
+            "write"
+        ]
     );
 }
 

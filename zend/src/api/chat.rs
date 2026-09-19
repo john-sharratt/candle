@@ -13,7 +13,9 @@ use axum::{
 };
 use futures::{Stream, StreamExt};
 
-use candle_conversation::{FinishReason, OptionalState, SelectionState, NO_THINK_SELECTOR};
+use candle_conversation::{
+    FinishReason, OptionalState, SelectionState, NO_THINK_SELECTOR, TOOL_ROUND_SELECTOR,
+};
 
 use super::chat_frames::{call_id, finish_reason, Framer, Framing};
 use crate::access;
@@ -57,7 +59,9 @@ pub fn apply_tools_dial(selection: &mut SelectionState, tools_mode: ToolMode) {
 
 /// The selection for a tool round — a turn whose user message is the results
 /// of the calls the turn before it made: the reply's own selection, less the
-/// worked demonstration.
+/// worked demonstration, and marked as a tool round
+/// ([`TOOL_ROUND_SELECTOR`]) so the layers that declare `in_tool_rounds: false`
+/// sit it out.
 ///
 /// The demonstration is there to teach the call's shape, and by a tool round
 /// the model has already made its call. What it does instead there is supply a
@@ -68,9 +72,15 @@ pub fn apply_tools_dial(selection: &mut SelectionState, tools_mode: ToolMode) {
 /// the demonstration instead, four rounds in, with the request still in its
 /// context. The code_reading ingest had failed the same way and leaves the
 /// demonstration out for the same reason (see `projection.yaml`).
+///
+/// The repo_map layer's turns supplied the same competing question: each is a
+/// request — "Summarize the root folder of this project in one or two complete
+/// sentences" — and a chat that had fetched a crate's docs to list its modules
+/// described the workspace instead, two runs of two.
 pub fn tool_round_selection(selection: &SelectionState) -> SelectionState {
     let mut round = selection.clone();
     round.set_optional(TOOL_EXAMPLE_SELECTOR, OptionalState::Absent);
+    round.set_optional(TOOL_ROUND_SELECTOR, OptionalState::Present);
     round
 }
 
@@ -507,6 +517,12 @@ mod dial_tests {
             round.optional(TOOLS_ENABLED_SELECTOR),
             Some(OptionalState::Present)
         );
+        assert_eq!(
+            round.optional(TOOL_ROUND_SELECTOR),
+            Some(OptionalState::Present),
+            "a tool round is marked, so ingest layers sit it out"
+        );
+        assert_eq!(reply.optional(TOOL_ROUND_SELECTOR), None);
         assert_eq!(round.get("thinking_effort"), Some("balanced"));
         assert_eq!(round.get("response_length"), Some("detailed"));
         assert_eq!(

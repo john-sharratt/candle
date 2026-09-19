@@ -51,9 +51,22 @@ pub struct ToolDef {
     /// provenance still selects its usual number of tools, and a mandatory one
     /// is added on top rather than taking a slot. For the tools a coding turn
     /// needs whatever the question — finding a file, finding code inside one,
-    /// reading and listing.
+    /// reading and listing, and creating one.
     ///
-    /// The set is those four together, not reading and listing alone. A turn
+    /// `write` is in the set because the edit tool cannot create a file: a
+    /// "create scratch/x.py" turn that was projected `file_edit` but not `write`
+    /// spent ten calls patching a file that did not exist, then printed the code
+    /// and gave up.
+    ///
+    /// `web_search` and `web_fetch` are in it because a tool shown only by name
+    /// in the catalog listing is, to the model, not really there: asked to
+    /// "search the web and cite your source", a turn projected without
+    /// `web_search` reasoned that the tool was "only in the descriptions, not my
+    /// actual tool list" and answered that it could not search. Looking something
+    /// up is as ordinary a coding-assistant step as reading a file. A mode that
+    /// does not grant the network drops them with the rest of its exclusions.
+    ///
+    /// The find tools are there with reading and listing, not left out. A turn
     /// that can only enumerate and read answers "where is this" by guessing a
     /// directory at `file_list` and reading whole files to check, which is what
     /// `file_search` and `file_grep` were added to stop; leaving them to win a
@@ -459,12 +472,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The four file tools a coding turn needs whatever the question project on
-    /// every turn; nothing else does. A mandatory tool rides on top of the
+    /// The file tools a coding turn needs whatever the question, and the two web
+    /// tools, project on every turn; nothing else does. A mandatory tool rides on top of the
     /// belief top-k, so adding one here widens every prompt — the set is pinned
     /// so that is a deliberate change.
     #[test]
-    fn the_four_file_tools_are_mandatory() {
+    fn the_file_tools_a_coding_turn_needs_are_mandatory() {
         let mut mandatory: Vec<&str> = all()
             .iter()
             .filter(|d| d.mandatory)
@@ -473,7 +486,15 @@ mod tests {
         mandatory.sort();
         assert_eq!(
             mandatory,
-            ["file_grep", "file_list", "file_read", "file_search"]
+            [
+                "file_grep",
+                "file_list",
+                "file_read",
+                "file_search",
+                "web_fetch",
+                "web_search",
+                "write"
+            ]
         );
     }
 
@@ -513,27 +534,29 @@ mod tests {
         }
     }
 
-    /// **Code runs here only in Mutable.** The overlay modes cannot stand in
-    /// front of a program or a script, so none of them offers one; the network
-    /// and remote-shell tools stay in Comprehensive.
+    /// **Programs run on the host only in Mutable.** The overlay cannot stand
+    /// in front of a program, so no overlay mode offers one; the JS sandbox,
+    /// whose only filesystem is the overlay, and the network and remote-shell
+    /// tools stay in Comprehensive.
     #[test]
-    fn code_execution_is_offered_only_in_mutable() {
+    fn host_execution_is_offered_only_in_mutable() {
         let comprehensive = names_for(ToolMode::Comprehensive);
         let mutable = names_for(ToolMode::Mutable);
-        for name in [
-            "code_run",
-            "code_session_exec",
-            "ping_icmp",
-            "trace_route",
-            "sub_run",
-        ] {
+        for name in ["ping_icmp", "trace_route", "sub_run"] {
             assert!(
                 !comprehensive.contains(name),
                 "{name} offered in comprehensive"
             );
             assert!(mutable.contains(name), "{name} missing from mutable");
         }
-        for name in ["web_fetch", "web_search", "ssh_session_exec", "write"] {
+        for name in [
+            "code_run",
+            "code_session_exec",
+            "web_fetch",
+            "web_search",
+            "ssh_session_exec",
+            "write",
+        ] {
             assert!(
                 comprehensive.contains(name),
                 "{name} missing from comprehensive"
