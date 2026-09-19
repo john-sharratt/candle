@@ -58,13 +58,16 @@ impl BatchedAttentionLayer for Qwen4ExpAttentionLayer<'_> {
     /// Pass-through: the Gated Residual's `hc_mix` already produced the block
     /// input (it IS this layer's norm), so this only prepares the numeric
     /// operand — quantize-only on int8 modes, a wrap on `Off`.
+    ///
+    /// The phase is already seeded: `x` is the pre-mix's output, carved from
+    /// the attention phase, so the projections inherit it and `wave` names
+    /// nothing new.
     fn attention_norm<'w>(
         &self,
-        x: &Tensor,
+        x: &LiveTensor<'w>,
         mode: Int8Mode,
-        wave: WaveRef<'w>,
+        _wave: WaveRef<'w>,
     ) -> Result<DynamicActs<'w>> {
-        let _ = wave;
         let candle::Device::Cuda(dev) = x.device() else {
             candle::bail!("qwen4exp attention runs on CUDA");
         };

@@ -11,6 +11,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use hf_hub::{Cache, Repo, RepoType};
+
+use crate::models::qwen4exp::prepare::{SourceFile, SourceStore};
+
 /// ureq resolver that returns only the IPv4 addresses for a host.
 struct Ipv4Resolver;
 
@@ -158,6 +162,13 @@ fn hf_get_repo(repo: &hf_hub::Repo, filename: &str) -> candle::Result<PathBuf> {
     if let Some(p) = hf_hub::Cache::default().repo(repo.clone()).get(filename) {
         return Ok(p);
     }
+    // The fallback cache is a cache too, and is consulted before the network
+    // for the same reason: a file already fetched there must not be fetched
+    // again into the hub cache just because the hub answered first.
+    let dest = fallback_path(repo, filename);
+    if dest.exists() {
+        return Ok(dest);
+    }
     if let Ok(api) = hf_hub::api::sync::Api::new() {
         if let Ok(p) = api.repo(repo.clone()).get(filename) {
             return Ok(p);
@@ -169,11 +180,41 @@ fn hf_get_repo(repo: &hf_hub::Repo, filename: &str) -> candle::Result<PathBuf> {
         repo.url(),
         repo.revision()
     );
-    let dest = hf_fallback_cache()
+    download_ipv4(&url, &dest)
+}
+
+/// Where the IPv4 fallback stores `filename` of `repo`.
+fn fallback_path(repo: &hf_hub::Repo, filename: &str) -> PathBuf {
+    hf_fallback_cache()
         .join(repo.folder_name())
         .join(repo.revision())
-        .join(filename);
-    download_ipv4(&url, &dest)
+        .join(filename)
+}
+
+/// The engine-build [`SourceStore`] over the Hugging Face caches: fetched with
+/// [`hf_get`], and cached in the hub cache or the IPv4 fallback cache — both
+/// are reported, so releasing a source clears whichever copy exists.
+pub struct HfSourceStore;
+
+impl SourceStore for HfSourceStore {
+    fn fetch(&self, file: &SourceFile) -> candle::Result<PathBuf> {
+        hf_get(file.repo, RepoType::Model, file.revision, file.path)
+    }
+
+    fn cached_copies(&self, file: &SourceFile) -> Vec<PathBuf> {
+        let repo = Repo::with_revision(
+            file.repo.to_string(),
+            RepoType::Model,
+            file.revision.to_string(),
+        );
+        let mut copies: Vec<PathBuf> = Cache::default()
+            .repo(repo.clone())
+            .get(file.path)
+            .into_iter()
+            .collect();
+        copies.push(fallback_path(&repo, file.path));
+        copies
+    }
 }
 
 /// Fetch a model-repo file (`revision = "main"`) with IPv6→IPv4 fallback.

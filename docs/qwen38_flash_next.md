@@ -124,6 +124,28 @@ machine VRAM is almost entirely expert working set. That is precisely what
 `expert_lre/` was built for, and it is why a 180B model is a reasonable target
 on a 16 GB card.
 
+**The per-rung artifact is a prepared hybrid, identified by its recipe.** No
+repository publishes an engine file at any rung, so each machine builds one
+(`qwen4exp::prepare`): the pinned `Q8_0` split's trunk and n-gram (PLE) table
+verbatim at `Q8_0`, the MTP head's dense weights at `Q8_0`, and the routed
+experts at the rung `quant_ladder::expert_format` names — `Q4_KO` by the
+bit-exact W4A16 import, `Q3_KO`/`Q2_KO` requantized from the `Q8_0` experts on
+the GPU in one pass (no intermediate `Q*_K`), and the draft head's experts at
+the trunk's width (`quant_ladder::drafter_format`). The recipe — every source
+file's repo, revision, path, length and LFS SHA-256, plus each of those
+choices and a converter version — hashes to the artifact's identity: stamped
+into its GGUF metadata (`zen.prepare.recipe`, with the canonical text beside it)
+and tagged into its filename. A present artifact with the matching stamp is
+used without touching any source; anything else is built — sources fetched and
+checked against their pins, converted, merged, its header read back and checked
+(stamp, every block's three expert tensors at the recipe's width, the head's
+block, the directory within the file) — and the sources are then deleted, on
+every resolve that finds them, because the artifact carries
+everything the engine reads. A new quant level, pin or converter version is a
+new recipe, so every machine rebuilds rather than loading stale bytes. The
+expert pack is kept beside the artifact and keyed on its identity, so it
+follows.
+
 ### 0.3 Every hot-path invariant holds, without exception
 
 `docs/deepseek/deepseek_hot_path_invariants.md` is binding on every line of this
@@ -1304,6 +1326,29 @@ What *did* land for the cutover: `ModelArch::Qwen4Exp` and its builder arm, so
 the conversation layer can construct this engine from a path like any other
 model. That is the part that needed no decision.
 
+The artifact half of the ladder is built — every rung has a recipe and a build
+(§0.2, *The per-rung artifact*), the gate prepares the rung for the card it runs
+on, and zend's preset resolves its artifact by the `Q4_KO` recipe's name. What
+`model_choice` runs is a separate decision: it runs Flash-Next above 60 GiB and
+Qwen3.6-35B-A3B below.
+
+Measured on the RTX 4090 Mobile (16 GB, 32 GB RAM) at the `Q2_KO` rung, 88 GiB
+artifact, BF16 ×1/×4/×8 and C0/C5/C8/C10 all 100% valid, twice:
+
+| rung | bulk t/s | decode t/s | ratio |
+|---|---|---|---|
+| BF16 ×1 | 117 | 11.4 | — |
+| BF16 ×4 | 402 | 30.8 | — |
+| BF16 ×8 | 303 | 44.0 | — |
+| C5 ×2 | 240 | 17.2 | 4.06× |
+| C10 ×8 | 261 | 28.1 | 6.38× |
+
+The expert zone sits on its floor (2 GiB, ~6% of 25,088 slots), the warm tier
+holds 30% (9.3 GiB of pinned RAM), and the hit rate is 10–18%: every wave
+streams most of its experts from RAM or the pack. BF16 ×16 does not fit — 36
+GDN layers carry 256 MiB of recurrent state per sequence — and is gated at
+24 GiB.
+
 ### Phase 7 — Optional, after the above
 
 MTP with IndexShare (§3.4), and the vision tower (§6.4). Neither blocks
@@ -2126,22 +2171,27 @@ looks like "the model won't stop":
 
 ### 14.7 How the head is wired, and the one thing measurement could not settle
 
-The head is `blk.48`, a full routed block of this architecture, plus four
-`nextn` tensors and one spare hyper-connection mixer. Their widths are what
-assign the roles, because `[hc_dim]` and `[n_embd]` are different *kinds* of
-norm in this stack:
+The head is `blk.48`, a full routed block of this architecture, plus its
+`nextn` tensors — three input tensors and one hyper-connection mixer. Their
+widths are what assign the roles, because `[hc_dim]` and `[n_embd]` are
+different *kinds* of norm in this stack:
 
 ```
-enorm            [2560]   plain RMSNorm over the token embedding
-hnorm            [10240]  grouped norm (per-stream reduction, flat gain) over the wide residual
-eh_proj          [2560, 5120]   fuses fc_embedding | fc_hidden side by side
-shared_head_norm [10240]  grouped norm before the SHARED head
-hc_mixer_*       {norm, down, up}, no inject — the head's own OUTPUT mix
+nextn.enorm        [2560]   plain RMSNorm over the token embedding
+nextn.hnorm        [10240]  grouped norm (per-stream reduction, flat gain) over the wide residual
+nextn.eh_proj      [2560, 5120]   fuses fc_embedding | fc_hidden side by side
+nextn.hc_head_*    {norm, down, up}, no inject — the head's own OUTPUT mix
 ```
 
 So: `hnorm` the wide residual, run `eh_proj` **per hyper-connection stream**,
-run the block, `shared_head_norm` its output, collapse through the head's own
-mixer, and score with the trunk's `lm_head`.
+run the block, collapse its output through the head's own mixer, and score with
+the trunk's `lm_head`. The mixer **is** the output norm — `hc_mix` opens with the
+grouped norm over `nextn.hc_head_norm` — so nothing precedes it, exactly as
+nothing precedes the trunk's `output_hc_*`. That is the reference graph's wiring
+(llama.cpp #28243, `graph_mtp`: *"the final mixer is the output norm: there is no
+separate one"*), and the pinned head file (`MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf`
+at `38bb39ee`) publishes exactly these tensors under exactly these names, with no
+`shared_head_norm`.
 
 **`eh_proj` runs per stream, and this is the one part reasoning got wrong.**
 The natural-looking assembly collapses the wide residual to `n_embd`, projects,
@@ -2155,9 +2205,8 @@ the acceptance rate drops catastrophically."* The head folds its embedding
 what makes a proposal conditional on the state the trunk actually built.
 
 The same source confirms the two conventions the shapes cannot check: the concat
-is `[e ; h]` (measured strictly worse reversed), and the spare mixer is the
-head's *output* mix — which the converter's original name, `output_hc_*`, said
-all along.
+is `[e ; h]` (measured strictly worse reversed), and the head's mixer is its
+*output* mix.
 
 ### 14.8 The rewind: three recurrences, one that replays
 

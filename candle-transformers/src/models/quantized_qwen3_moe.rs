@@ -965,7 +965,7 @@ impl BatchedAttentionLayer for LayerWeights {
     #[cfg(feature = "cuda")]
     fn attention_norm<'w>(
         &self,
-        x: &Tensor,
+        x: &LiveTensor<'w>,
         mode: Int8Mode,
         wave: WaveRef<'w>,
     ) -> Result<DynamicActs<'w>> {
@@ -2317,6 +2317,7 @@ impl ModelWeights {
                 expert_pack_dir: expert_pack_dir.as_deref(),
                 progress: cache_progress,
                 int8mode,
+                offloaded_bytes: 0,
             })?;
             // Record the resident expert footprint with the governor. Reporting
             // only — nothing sizes itself from this any more.

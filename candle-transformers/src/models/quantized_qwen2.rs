@@ -329,7 +329,7 @@ impl BatchedAttentionLayer for LayerWeights {
     #[cfg(feature = "cuda")]
     fn attention_norm<'w>(
         &self,
-        x: &Tensor,
+        x: &LiveTensor<'w>,
         mode: Int8Mode,
         wave: WaveRef<'w>,
     ) -> Result<DynamicActs<'w>> {

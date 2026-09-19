@@ -32,7 +32,7 @@
 //! placement and the forward that reads it is the arena-window hazard the
 //! span rules exist to prevent (hot-path invariant 7).
 
-use candle::{DType, Device, Result, Tensor};
+use candle::{DType, Device, LiveTensor, Result, Tensor};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -776,11 +776,11 @@ impl IndexCache {
     #[allow(clippy::too_many_arguments)]
     pub fn score_rows(
         &self,
-        q: &Tensor,
+        q: &LiveTensor<'_>,
         qpos: &[usize],
         cfg: &IndexerConfig,
         ratio: usize,
-        out: &Tensor,
+        out: &LiveTensor<'_>,
         out_stride: usize,
         row_base: usize,
     ) -> Result<Vec<u32>> {
@@ -921,12 +921,12 @@ impl IndexCache {
     #[allow(clippy::too_many_arguments)]
     fn score_pages(
         &self,
-        q: &Tensor,
+        q: &LiveTensor<'_>,
         cand: &[u32],
         t: usize,
         h: usize,
         d: usize,
-        out: &Tensor,
+        out: &LiveTensor<'_>,
         out_stride: usize,
         row_base: usize,
     ) -> Result<()> {
@@ -1051,7 +1051,7 @@ impl SelectionTable {
     #[allow(clippy::too_many_arguments)]
     pub fn fill_rows(
         &mut self,
-        scores: &Tensor,
+        scores: &LiveTensor<'_>,
         cand: &[u32],
         qpos: &[usize],
         // Cells of its own block each query has, `1..=ratio` — the one thing
@@ -1175,7 +1175,9 @@ impl SelectionTable {
 /// ([`IndexCache::append`]); splitting the projection instead would put one
 /// small GEMM per sequence per layer on the decode path, where launches are
 /// the wall.
-pub fn project_keys(h: &Tensor, w: &IndexerWeights) -> Result<Tensor> {
+///
+/// The keys live where `h` does — on the layer's wave when the sweep seeded it.
+pub fn project_keys<'w>(h: &LiveTensor<'w>, w: &IndexerWeights) -> Result<LiveTensor<'w>> {
     h.matmul(&w.k_proj.t()?)
 }
 
@@ -1184,14 +1186,14 @@ pub fn project_keys(h: &Tensor, w: &IndexerWeights) -> Result<Tensor> {
 ///
 /// The reference's order (`qsa_selection_mask`): project, RMS-norm with
 /// `q_norm`, then rotate.
-pub fn project_queries(
-    h: &Tensor,
+pub fn project_queries<'w>(
+    h: &LiveTensor<'w>,
     w: &IndexerWeights,
     cfg: &IndexerConfig,
     rope: &RopeTables,
     positions: &[usize],
     rms_eps: f64,
-) -> Result<Tensor> {
+) -> Result<LiveTensor<'w>> {
     let rows = h.dim(0)?;
     let q = h
         .matmul(&w.q_proj.t()?)?
@@ -1210,11 +1212,11 @@ pub fn project_queries(
 /// is bounded by its own candidate count.
 #[allow(clippy::too_many_arguments)]
 fn fold_heads_into(
-    raw: &Tensor,
+    raw: &LiveTensor<'_>,
     rows: usize,
     h: usize,
     m: usize,
-    out: &Tensor,
+    out: &LiveTensor<'_>,
     out_stride: usize,
     row_base: usize,
 ) -> Result<()> {
@@ -1267,7 +1269,7 @@ fn fold_heads_into(
 }
 
 /// A tensor's device address.
-pub(super) fn tensor_ptr(t: &Tensor) -> Result<u64> {
+pub(super) fn tensor_ptr(t: &LiveTensor<'_>) -> Result<u64> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     let candle::Device::Cuda(dev) = t.device() else {
         candle::bail!("qsa index cache lives on CUDA");
@@ -1308,7 +1310,7 @@ pub struct AppendSpan<'a> {
 /// trailing rows. Same stream, append first.
 pub fn append_wave(
     work: &mut [AppendSpan<'_>],
-    k_all: &Tensor,
+    k_all: &LiveTensor<'_>,
     w: &IndexerWeights,
     rope: &RopeTables,
     ratio: usize,
@@ -1508,7 +1510,7 @@ pub fn select_layer(
     compress_ratio: usize,
     indexer: &IndexerWeights,
     rope: &RopeTables,
-    h: &Tensor,
+    h: &LiveTensor<'_>,
     spans: &[SeqSpan],
     offsets: &[usize],
     idx_map: &mut HashMap<usize, Vec<IndexCache>>,
@@ -1648,7 +1650,8 @@ pub fn select_layer(
             .max()
             .unwrap_or(0)
             .max(1);
-        let scores = Tensor::empty((total_rows, widest), DType::F32, device)?;
+        // Beside the queries, so it lands on the layer's wave with them.
+        let scores = q_all.empty_beside((total_rows, widest), DType::F32)?;
         let mut cand: Vec<u32> = vec![0; total_rows];
         let mut tail: Vec<u32> = vec![1; total_rows];
         for span in spans {

@@ -28,8 +28,10 @@
 //!   Q4_KO bit-exactly (both are per-128 symmetric affine), which carries the
 //!   release's AWQ calibration into the resident expert format.
 //!
-//! plus the MTP draft head folded in as `blk.{num_layers}`. The result is one
-//! mmap and one `Content`, which is what the engine's loader takes.
+//! plus the MTP draft head (`MTP/` of the same repo) folded in as
+//! `blk.{num_layers}`. The result is one mmap and one `Content`, which is what
+//! the engine's loader takes, named by its recipe's digest
+//! (`qwen4exp::prepare`).
 //!
 //! [`ModelSpec::prepared_from_source`] marks that, so resolution looks locally
 //! and reports the prepare step instead of asking the hub for a filename nobody
@@ -37,12 +39,17 @@
 
 use super::{ModelArch, ModelSpec};
 use crate::{config::SamplingConfig, models::DialectType};
+use candle::quantized::GgmlDType;
 use candle_transformers::models::quantized_qwen38_moe;
 
 const PROMPT: &str = "You are a helpful, accurate, and concise assistant.";
 
-/// The merged engine artifact `qwen4exp::convert` produces.
-pub const ENGINE_GGUF: &str = "Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf";
+/// The engine artifact this preset loads: the `Q4_KO` rung's, named by its
+/// recipe (`quantized_qwen38_moe::engine_recipe_at`), so a change to what the
+/// build would produce names a different file and the old one is not loaded.
+pub fn engine_gguf() -> String {
+    quantized_qwen38_moe::engine_recipe_at(Some(GgmlDType::Q4_KO)).artifact_name()
+}
 
 /// Qwen3.8-Flash-Next, Q4_KO experts over a Q8_0 trunk.
 ///
@@ -61,7 +68,7 @@ pub(super) fn qwen38_flash_next_q4ko() -> ModelSpec {
         // The repo the engine artifact is BUILT FROM. Nothing here publishes
         // `model_filename`; see the module docs.
         model_repo: quantized_qwen38_moe::QWEN4EXP_REPO.into(),
-        model_filename: ENGINE_GGUF.into(),
+        model_filename: engine_gguf(),
         prepared_from_source: true,
         // Nothing to pin: the engine GGUF is built locally from
         // `model_repo`'s published files, so there is no upstream commit that

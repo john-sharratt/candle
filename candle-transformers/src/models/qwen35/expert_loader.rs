@@ -158,6 +158,7 @@ pub fn build_expert_cache(
         mmap,
         int8mode,
         expert_pack_dir,
+        0,
     )
 }
 
@@ -165,6 +166,9 @@ pub fn build_expert_cache(
 /// [`expert_host_refs_for`] for why the scan is model-agnostic. Everything
 /// below the tensor names (the span measurement, the elastic boundary, the
 /// zone floor, the ground broker) was already the engine's.
+///
+/// `offloaded_bytes` is [`ExpertCacheSetup::offloaded_bytes`]: mapped bytes a
+/// bounded cache of the model's own serves instead of the page cache.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_expert_cache_for(
@@ -176,6 +180,7 @@ pub fn build_expert_cache_for(
     mmap: Arc<memmap2::Mmap>,
     int8mode: candle::quantized::Int8Mode,
     expert_pack_dir: Option<&std::path::Path>,
+    offloaded_bytes: u64,
 ) -> Result<Option<Arc<ExpertCache>>> {
     use crate::models::expert_lre::{layer_geometries, slot_bytes_for};
     use candle_nn::kv_cache::{
@@ -270,6 +275,7 @@ pub fn build_expert_cache_for(
         expert_pack_dir,
         progress: None,
         int8mode,
+        offloaded_bytes,
     })?;
     // The weight side sells ground to the KV side through
     // `ExpertCache::request_kv_ground`, which the scheduler's admission reaches

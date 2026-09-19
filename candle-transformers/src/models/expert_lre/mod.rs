@@ -18,9 +18,10 @@
 //!
 //! - **Score-based eviction**: each expert carries a lightly-decayed access
 //!   frequency (hit: +1.0, prediction hit: +0.3, end-of-pass decay: ×0.85).
-//!   The eviction key multiplies it by two more terms — what the reload would
-//!   cost and how far the expert's layer is from being routed again — and the
-//!   victims are chosen by an O(n) partial sort over contiguous memory.
+//!   The eviction key multiplies it by how far the expert's layer is from being
+//!   routed again, the policy runs over warm-backed experts before pack-only
+//!   ones, and the victims are chosen by an O(n) partial sort over contiguous
+//!   memory.
 //!
 //! - **Two-phase dispatch**: the pipeline thread partitions routed experts
 //!   into cache hits (WARM/READY) and misses (COLD→LOADING), runs hit compute
@@ -52,20 +53,22 @@
 //! 0.  Knowing the exact deficit removes both, and the headroom it was
 //! creating bought nothing once eviction stopped copying.
 //!
-//! ### 2. The eviction key: `score × reload_cost × position`
+//! ### 2. The eviction key: `score × position`, run once per reload tier
 //!
 //!   - **score** — the lightly-decayed access frequency above; the dominant
 //!     term, so the cache behaves as LFU with a recency decay.
-//!   - **`reload_cost`** — 1.0 when the warm tier holds a copy, else
-//!     `COLD_RELOAD_PENALTY`.  Under the three-tier cache the two outcomes
-//!     differ by an order of magnitude (a pinned-memory H2D against a
-//!     page-cache-bypassing NVMe read), so a policy that ignores it is
-//!     choosing blind.
 //!   - **position** — a mild `[0.5, 1.0]` multiplier that FALLS with forward
 //!     (wrapped) reuse distance.  Bélády's direction, and computable rather
 //!     than predicted: the layer traversal is a cycle, so the distance to an
 //!     expert's next use is a subtraction.  The layer about to be routed is
 //!     most protected; the layer just executed is the preferred victim.
+//!   - **reload tier** — every eviction runs that policy over the experts the
+//!     warm tier holds first, and over the NVMe-pack-only experts only for
+//!     the shortfall.  The warm tier and the pack hold disjoint experts and
+//!     routing is trained balanced, so which experts VRAM holds does not move
+//!     the hit rate — it decides where the misses land, and a warm miss is a
+//!     pinned-memory H2D where a pack miss is a page-cache-bypassing NVMe
+//!     read an order of magnitude slower.
 //!
 //! ### 3. Layer-aware forced eviction (the backstop)
 //!
@@ -186,6 +189,8 @@ mod matmul_baseline;
 /// weights repacked by identical code, so a change that invalidates one must
 /// invalidate the other.
 pub(crate) mod pack;
+#[cfg(feature = "cuda")]
+mod page_pressure;
 /// `pub(crate)` for [`WarmPool`](pinned::WarmPool) alone, which is a generic
 /// pinned-slot allocator with nothing expert-specific in it and is shared with
 /// [`layer_stream`](crate::models::layer_stream). Its neighbour
@@ -201,6 +206,8 @@ pub mod slot_integrity;
 mod streamer;
 mod transition;
 mod types;
+#[cfg(feature = "cuda")]
+mod warm_tier;
 mod zone_geometry;
 
 // Re-exports — the public API of this module.

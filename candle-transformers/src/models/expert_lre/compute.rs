@@ -513,76 +513,15 @@ pub fn compute_experts_grouped(
             // converts, and says so by name.
             down_out
         }
-        // A Float input against a KO pack: the KO twins are int8-MMA formats
-        // with no float GEMM loader, so the rows are gathered as float and the
-        // stacked block quantized ONCE into the q8a128 operand the int8
-        // grouped path consumes. This is gather-then-quantize — one extra
-        // launch per layer against the byte-gather above, which is reserved
-        // for hidden widths that tile the q8a1024 row layout (2560 does not).
-        MoeInput::Float(xs) if gate_dtype.is_ko() => {
-            use candle::quantized::cuda::{
-                grouped_qmatmul, silu_mul_q8a128, to_dynamic, DynamicActs, DynamicTensor,
-            };
-            use candle::quantized::Int8Mode;
-            let t = profile_now();
-            let stacked_xs =
-                candle::quantized::cuda::fused_moe_gather(xs, &tok_ids_dev, total_batch, cuda_dev)?;
-            // Raw Σx — a language model's block sums stay far below f16's ceiling.
-            let stacked_q8 =
-                match to_dynamic(&stacked_xs, Int8Mode::Precision, cuda_dev, SumScale::Raw)? {
-                    DynamicActs::Int8(op) => op,
-                    DynamicActs::Float(_) => {
-                        candle::bail!("q8a128 activation quantize returned a non-int8 operand")
-                    }
-                };
-            profile.record("gemm_gather", t);
-            let t = profile_now();
-            let gate_out = grouped_qmatmul(
-                DynamicTensor::Int8(&stacked_q8),
-                &gate_ptrs,
-                gate_dtype,
-                gate_nrows,
-                &expert_offsets,
-                cuda_dev,
-                stacked_q8.backing(),
-            )?;
-            profile.record("gemm_gate", t);
-            let t = profile_now();
-            let up_out = grouped_qmatmul(
-                DynamicTensor::Int8(&stacked_q8),
-                &up_ptrs,
-                gate_dtype, // up shares gate's KO dtype
-                gate_nrows,
-                &expert_offsets,
-                cuda_dev,
-                stacked_q8.backing(),
-            )?;
-            profile.record("gemm_up", t);
-            let t = profile_now();
-            let inter_acts =
-                // Raw Σx — a language model's SwiGLU intermediate stays orders
-                // of magnitude below f16's 65504; the consumer below reads this
-                // operand's own `sum_scale`, so the two agree by construction.
-                silu_mul_q8a128(
-                    &gate_out,
-                    &up_out,
-                    cuda_dev,
-                    gate_out.cuda_backing(),
-                    SumScale::Raw,
-                )?;
-            profile.record("gemm_silu_mul", t);
-            let t = profile_now();
-            let down_out = grouped_qmatmul(
-                DynamicTensor::Int8(&inter_acts),
-                &down_ptrs,
-                down_dtype,
-                down_nrows,
-                &expert_offsets,
-                cuda_dev,
-                inter_acts.backing(),
-            )?;
-            profile.record("gemm_down", t);
-            down_out
+        // A KO pack is int8-MMA only — there is no float GEMM loader for it — so
+        // its caller quantizes the FFN input once and hands over the q8a128
+        // operand above; the tile gather serves any hidden width.
+        MoeInput::Float(_) if gate_dtype.is_ko() => {
+            candle::bail!(
+                "grouped expert compute: a KO expert pack needs a q8a128 operand, but the \
+                 FFN input arrived float — quantize it once with `to_dynamic` in the \
+                 session's int8 mode"
+            )
         }
         MoeInput::Float(xs) => {
             let t = profile_now();

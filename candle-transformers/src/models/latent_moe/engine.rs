@@ -428,6 +428,7 @@ impl Engine {
             expert_pack_dir: merged_path.parent(),
             progress: None,
             int8mode,
+            offloaded_bytes: 0,
         })?);
         #[cfg(feature = "cuda")]
         {

@@ -5259,6 +5259,47 @@ pub trait ManagedBatchedModel {
         }
     }
 
+    /// Replace the purchase's hold with what the **decode** phase still needs,
+    /// once a driver with no scheduler has finished its prefill; returns the
+    /// bytes now held.
+    ///
+    /// [`Self::buy_ground_for_sequences`] holds the whole turn it priced —
+    /// every region its claims will take and the prefill's tier — and that is
+    /// right until the prefill lands. After it, the prefill's claims are *live*
+    /// and its tier is gone, yet the hold still deducts both from the free ground
+    /// the weight side's growth is offered: measured on Qwen3.8-Flash-Next at
+    /// eight contexts, ~6.2 GB held against ~3.9 GB free, so every negotiation
+    /// through the decode answered `Occupied` and the expert zone sat on its
+    /// floor with the ground idle. The scheduler never does this — it publishes
+    /// each wave's own tier (`hold_wave_tier`) — so the gate was measuring a
+    /// decode production does not run.
+    ///
+    /// What still has to stand is the decode's own K/V — `tokens` more per
+    /// sequence, priced exactly as the purchase prices them — and the tier of its
+    /// widest forward, a verify step of `block_rows` a sequence ([`verify_width`]).
+    fn hold_ground_for_decode(
+        &self,
+        sequences: usize,
+        tokens: usize,
+        block_rows: usize,
+        act_dtype: DType,
+        kv_block_bytes: u64,
+    ) -> usize {
+        use candle_nn::kv_cache::{set_least_tier_bytes, CHUNK_SIZE};
+        let candle::DeviceLocation::Cuda { gpu_id } = self.device().location() else {
+            return 0;
+        };
+        let plan = WavePlan::new(self.wave_geometry(act_dtype));
+        let tier = plan.tier_bytes(verify_width(sequences, block_rows));
+        let claims = (kv_block_bytes as usize)
+            .saturating_mul(tokens.div_ceil(CHUNK_SIZE))
+            .saturating_mul(sequences)
+            .div_ceil(REGION_BYTES);
+        let hold = driver_ground_hold(claims, tier);
+        set_least_tier_bytes(gpu_id, hold);
+        hold
+    }
+
     /// Live VRAM held by the model's weights (fixed base + time-varying resident
     /// experts), for the whole-card VRAM decomposition. `None` if unavailable.
     fn resident_weight_bytes(&self) -> Option<usize> {
@@ -5360,6 +5401,19 @@ pub(crate) fn driver_ground_hold(claims_regions: usize, tier_bytes: usize) -> us
     claims_regions
         .saturating_mul(REGION_BYTES)
         .saturating_add(tier_bytes)
+}
+
+/// The widest forward of a decode phase: a verify step, every sequence's block
+/// of `block_rows` — the drafted proposals and the row they follow — scored
+/// whole. A plain decode (no drafter, `block_rows` 1) is the same shape at one
+/// row a sequence.
+pub(crate) fn verify_width(sequences: usize, block_rows: usize) -> WaveWidth {
+    let rows = sequences.saturating_mul(block_rows.max(1));
+    WaveWidth {
+        prefill_rows: rows,
+        scored_rows: rows,
+        ..WaveWidth::default()
+    }
 }
 
 /// Pack pure-prefill sequences into token-bounded slabs, returned as
@@ -5797,7 +5851,7 @@ mod slab_tests {
 
 #[cfg(test)]
 mod ground_hold_tests {
-    use super::{driver_ground_hold, widest_prefill_rows, MAX_PREFILL_TOKENS};
+    use super::{driver_ground_hold, verify_width, widest_prefill_rows, MAX_PREFILL_TOKENS};
     use candle_nn::kv_cache::REGION_BYTES;
 
     /// A turn set wider than the cap is priced at the slack ceiling the final
@@ -5822,5 +5876,20 @@ mod ground_hold_tests {
     fn the_hold_is_the_claims_and_the_tier() {
         assert_eq!(driver_ground_hold(3, 1000), 3 * REGION_BYTES + 1000);
         assert_eq!(driver_ground_hold(0, 0), 0);
+    }
+
+    /// A verify step at eight sequences and a block of five is forty rows, all
+    /// of them scored — each is a prediction a proposal is checked against.
+    #[test]
+    fn a_verify_step_scores_every_row_of_every_block() {
+        let w = verify_width(8, 5);
+        assert_eq!((w.prefill_rows, w.decode_rows, w.scored_rows), (40, 0, 40));
+    }
+
+    /// With no drafter a decode step is one row a sequence, never zero.
+    #[test]
+    fn a_plain_decode_step_is_one_row_a_sequence() {
+        let w = verify_width(8, 0);
+        assert_eq!((w.prefill_rows, w.scored_rows), (8, 8));
     }
 }

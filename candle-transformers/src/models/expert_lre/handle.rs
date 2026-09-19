@@ -21,20 +21,24 @@ use super::pack::{
     RecordLayout,
 };
 #[cfg(feature = "cuda")]
-use super::pinned::{stratified_membership, ExpertResidency, WarmPool};
+use super::pinned::{stratified_membership, ExpertResidency};
 #[cfg(not(feature = "cuda"))]
 use super::pipeline::prewarm_expert_cache;
 #[cfg(feature = "cuda")]
 use super::pipeline::{
-    slot_bytes_for, slot_offsets, startup_from_pack, startup_repack, ColdStaging, StartupTargets,
-    COLD_STAGING_BUFFERS,
+    slot_bytes_for, slot_offsets, startup_from_pack, startup_pinned_prefix, startup_repack,
+    ColdStaging, StartupTargets, COLD_STAGING_BUFFERS,
 };
 use super::pipeline::{spawn_pipeline_thread, PipelineState};
+#[cfg(feature = "cuda")]
+use super::streamer::STREAM_STAGING_BUFFERS;
 use super::transition::TransitionMatrix;
 use super::types::{
     ClassifiedExperts, CopyBatchFence, ExpertSlot, MmapExpertRef, MoeInput, MoeWorkRequest,
     PipelineMessage, PipelineStats,
 };
+#[cfg(feature = "cuda")]
+use super::warm_tier::{page_lock_ceiling, WarmTier};
 use super::zone_geometry::ZoneGeometry;
 use crate::models::profile::{profile_now, ProfileAccumulator, ProfileMark, ProfileSnapshot};
 
@@ -121,8 +125,16 @@ const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
 /// single-stream t/s falling further (204.5 → 197.0). Once the draw covers
 /// VRAM's complement the remaining cold reads are not the bottleneck, and pinned
 /// pages taken past that point come out of the page cache and the warm KV tier,
-/// which this gate barely exercises and a daemon workload does. When the
-/// performance argument is a wash, the safety argument decides.
+/// which this gate barely exercises and a daemon workload does.
+///
+/// **2 GiB was tried and fails on the 31.5 GiB box.** Flash-Next's own
+/// non-pinned footprint after pinning measures only ~1.4 GiB, but at 2 GiB the
+/// warm tier (pinned plus its pageable remainder) took all but ~2 GiB of the
+/// machine during the load, and the startup fill died with
+/// `CUDA_ERROR_OUT_OF_MEMORY` — twice — before the OS paged anything else out.
+/// The headroom covers the load's transient as well as the process's steady
+/// state. Warm KV does not come out of it: it has a pageable floor of its own
+/// (`vram::KV_WARM_FLOOR`) that the OS pages rather than refusing.
 pub const WARM_TIER_HEADROOM: u64 = 4 * 1024 * 1024 * 1024;
 
 use candle::vram::PAGEABLE_RESERVE;
@@ -144,9 +156,10 @@ use candle::vram::PAGEABLE_RESERVE;
 /// question about the machine. This one is "may I have these pages now", which
 /// is a question about this moment.
 ///
-/// `cuMemAllocHost` remains the authority — [`WarmPool::new`] steps the request
-/// down by an eighth on refusal — but every refusal costs a slice of the tier
-/// and a round trip, so the first ask should be one that can succeed.
+/// `cuMemAllocHost` remains the authority for the pinned part — `WarmPool::new`
+/// steps the request down by 512 MiB on refusal, and whatever it cannot pin
+/// the warm tier holds pageable (`WarmTier`) — but every refusal costs a round
+/// trip, so the first ask should be one that can succeed.
 /// The warm tier's sizing decision, kept so a report can name **which** ceiling
 /// bound it.
 ///
@@ -529,6 +542,16 @@ pub struct ExpertCacheSetup<'a> {
     pub expert_pack_dir: Option<&'a std::path::Path>,
     pub progress: Option<&'a dyn Fn(usize, usize)>,
     pub int8mode: Int8Mode,
+    /// Mapped bytes outside the experts that host RAM never serves after load —
+    /// read through a bounded cache of the model's own (net of that cache's
+    /// RAM), or uploaded to the device once and never read from the file again.
+    /// Flash-Next's n-gram table is 54 GB of the mapping read through a 2 GiB row
+    /// cache, and its dense stack is 5.2 GiB living on the card; left counted as
+    /// live weight, the host budget reserves them as page cache out of the warm
+    /// tier's RAM. `0` for a model whose whole non-expert mapping is paged —
+    /// one that reads a weight from the mapping at run time, such as a
+    /// host-mapped embedding gather.
+    pub offloaded_bytes: u64,
 }
 
 impl ExpertCache {
@@ -553,6 +576,7 @@ impl ExpertCache {
             expert_pack_dir,
             progress,
             int8mode,
+            offloaded_bytes,
         } = setup;
         // Experts run only on the KO int8 tensor-core path: the FP GEMX kernel
         // was deleted with the float fast path, so an `Off` slot would repack
@@ -667,7 +691,7 @@ impl ExpertCache {
 
         // ── CUDA startup: the pack, then the two resident tiers from it ──
         #[cfg(feature = "cuda")]
-        let (pack, warm, cold_staging, residency, layer_geometries, all_resident) =
+        let (pack, warm, cold_staging, streamer_staging, residency, layer_geometries, all_resident) =
             if let Device::Cuda(cuda_dev) = device {
                 let geoms = super::pinned::layer_geometries(&host_refs, int8mode)?;
                 let total_experts = num_moe_layers * experts_per_layer;
@@ -688,12 +712,18 @@ impl ExpertCache {
                     .flatten()
                     .map(|r| (r.gate_len + r.up_len + r.down_len) as u64)
                     .sum();
-                let live_weight_bytes = (mmap.len() as u64).saturating_sub(expert_source_bytes);
+                // The same holds for any other region a bounded cache of the
+                // model's own serves (`offloaded_bytes`): its pages are not the
+                // page cache's to keep.
+                let live_weight_bytes = (mmap.len() as u64)
+                    .saturating_sub(expert_source_bytes)
+                    .saturating_sub(offloaded_bytes);
                 candle::vram::set_weights_mmap(live_weight_bytes);
                 tracing::info!(
                     target: "candle_transformers::expert_lre",
                     mapped_gib = mmap.len() as f64 / 1e9,
                     dead_gib = expert_source_bytes as f64 / 1e9,
+                    offloaded_gib = offloaded_bytes as f64 / 1e9,
                     live_gib = live_weight_bytes as f64 / 1e9,
                     "expert cache: the GGUF's expert pages are the pack's job now"
                 );
@@ -737,14 +767,29 @@ impl ExpertCache {
                 // what residency demands — the cold tier serves every expert at
                 // any warm size, including zero.
                 let stride = candle::direct_io::round_up_sector(slot_bytes);
-                // **Before the warm tier, not after.** This is 46 MB and
-                // mandatory; the warm tier is ~14 GB and elastic. Taking the
-                // elastic one first left this to fail on a machine the warm
-                // tier had just filled — a model load dying with
-                // `CUDA_ERROR_OUT_OF_MEMORY` where it should have been a
-                // slightly smaller warm tier. The order is the fix; the
-                // aligned-host fallback inside is the belt.
-                let cold_staging = ColdStaging::new(stride, COLD_STAGING_BUFFERS)?;
+                // **Every staging ring before the warm tier, not after.** They
+                // are small and mandatory; the warm tier is ~14 GB and elastic,
+                // and it pins up to the driver's page-lock ceiling. A ring taken
+                // after it lands on an exhausted page-lock budget, falls back to
+                // pageable memory, and the upload out of that fails with
+                // `CUDA_ERROR_OUT_OF_MEMORY` — the driver cannot lock the bounce
+                // buffer a pageable source needs. That killed a load in the
+                // startup fill, whose ring was allocated after the pool. So the
+                // pipeline's ring (which the startup fill reuses) and the
+                // streamer's ring both come first.
+                let mut cold_staging = ColdStaging::new(stride, COLD_STAGING_BUFFERS)?;
+                let streamer_staging = if all_resident {
+                    None
+                } else {
+                    ColdStaging::new(stride, STREAM_STAGING_BUFFERS)
+                        .inspect_err(|e| {
+                            tracing::warn!(
+                                target: "candle_transformers::expert_lre",
+                                "streamer staging ring unavailable ({e}); expert streaming disabled"
+                            )
+                        })
+                        .ok()
+                };
                 // **A cache that holds every expert in VRAM wants no warm tier
                 // at all.** Nothing is ever evicted in that state — `post_compute`
                 // returns before the eviction and boundary passes — so a warm
@@ -758,6 +803,19 @@ impl ExpertCache {
                 // that used to be spent on experts no load could ever ask for.
                 let pinned = pinned_layer_count(num_moe_layers);
                 let evictable = total_experts - pinned * experts_per_layer;
+                let mut residency =
+                    vec![vec![ExpertResidency::default(); experts_per_layer]; num_moe_layers];
+                // The pinned prefix, from the checkpoint, before the warm tier
+                // takes the page-lock budget its pageable uploads need.
+                startup_pinned_prefix(
+                    &mut inner,
+                    &mut residency,
+                    &geoms,
+                    &mmap,
+                    &host_refs,
+                    cuda_dev,
+                    progress,
+                )?;
                 let want_warm = if all_resident {
                     0
                 } else {
@@ -773,17 +831,17 @@ impl ExpertCache {
                     pinned,
                     WARM_DRAW_SEED,
                 );
-                let mut warm = WarmPool::new(
-                    membership.len(),
-                    stride,
-                    candle::vram::PinnedUse::WeightWarmTier,
-                );
-                // A refusal shortens the draw rather than leaving slots the pool
+                // Pinned up to the page-lock ceiling, pageable for the rest —
+                // see `warm_tier` for why the driver needs the margin.
+                let pinned_cap_slots = candle::vram::total_physical_ram().map_or(0, |total| {
+                    (page_lock_ceiling(total, candle::vram::host_pinned_bytes()) / stride as u64)
+                        as usize
+                });
+                let mut warm = WarmTier::new(membership.len(), pinned_cap_slots, stride);
+                // A refusal shortens the draw rather than leaving slots the tier
                 // does not have: `ram` must never name a slot outside it.
                 let membership = &membership[..membership.len().min(warm.num_slots())];
 
-                let mut residency =
-                    vec![vec![ExpertResidency::default(); experts_per_layer]; num_moe_layers];
                 // The eviction policy weighs what a reload would cost, so it has
                 // to know which experts the warm tier holds before the first
                 // victim is chosen.
@@ -804,6 +862,7 @@ impl ExpertCache {
                         startup_from_pack(
                             targets,
                             &pack,
+                            &mut cold_staging,
                             num_moe_layers,
                             experts_per_layer,
                             cuda_dev,
@@ -812,7 +871,13 @@ impl ExpertCache {
                         pack
                     }
                     PackSource::Build(mut writer) => {
-                        startup_repack(targets, &mut writer, cuda_dev, progress)?;
+                        startup_repack(
+                            targets,
+                            &mut writer,
+                            &mut cold_staging,
+                            cuda_dev,
+                            progress,
+                        )?;
                         writer.finish()?
                     }
                 };
@@ -820,7 +885,15 @@ impl ExpertCache {
                 // The pack's stride is what the geometry said it would be — the
                 // buffers above were cut to it before the file was opened.
                 debug_assert_eq!(pack.stride(), stride);
-                (pack, warm, cold_staging, residency, geoms, all_resident)
+                (
+                    pack,
+                    warm,
+                    cold_staging,
+                    streamer_staging,
+                    residency,
+                    geoms,
+                    all_resident,
+                )
             } else {
                 // **A cuda-feature build has no expert path for a CPU device,
                 // and never had one.** Every tier is device-side or DMA-bound:
@@ -880,6 +953,7 @@ impl ExpertCache {
             if let Ok(mut s) = stats.lock() {
                 s.resident_vram_bytes = seeded;
                 s.warm_slots = warm.num_slots();
+                s.warm_paged_slots = warm.paged_slots();
                 s.total_experts = num_moe_layers * experts_per_layer;
                 // Which MoE path this cache will take, as a reported gauge.
                 // `all_resident` is the whole of it: a streaming cache's slot
@@ -910,9 +984,10 @@ impl ExpertCache {
 
         // Arc-share the two source tiers and the geometry table with the
         // off-thread expert streamer (both are immutable from here on), and
-        // spawn it — it owns its own staging ring and CUDA stream, so a
-        // whole-layer prefill stream never runs its reads on the pipeline
-        // thread. All-resident caches have nothing to stream.
+        // spawn it — it owns the staging ring allocated for it before the warm
+        // tier, and its own CUDA stream, so a whole-layer prefill stream never
+        // runs its reads on the pipeline thread. All-resident caches have
+        // nothing to stream, and were given no ring.
         #[cfg(feature = "cuda")]
         let pack = Arc::new(pack);
         #[cfg(feature = "cuda")]
@@ -920,20 +995,19 @@ impl ExpertCache {
         #[cfg(feature = "cuda")]
         let layer_geometries = Arc::new(layer_geometries);
         #[cfg(feature = "cuda")]
-        let streamer = if all_resident {
-            None
-        } else if let Device::Cuda(cuda_dev) = device {
+        let streamer = if let (Some(staging), Device::Cuda(cuda_dev)) = (streamer_staging, device) {
             match cuda_dev.cuda_context().new_stream() {
-                Ok(stream) => {
-                    super::streamer::spawn_streamer_thread(super::streamer::StreamerCtx {
+                Ok(stream) => super::streamer::spawn_streamer_thread(
+                    super::streamer::StreamerCtx {
                         pack: pack.clone(),
                         warm: warm.clone(),
                         layer_geometries: layer_geometries.clone(),
                         cuda_dev: cuda_dev.clone(),
                         stream,
                         stats: stats.clone(),
-                    })
-                }
+                    },
+                    staging,
+                ),
                 Err(e) => {
                     tracing::warn!(
                         target: "candle_transformers::expert_lre",
@@ -2041,20 +2115,19 @@ mod warm_sizing_tests {
         assert_eq!(none.pinnable_cap - some.pinnable_cap, 4 * GIB);
     }
 
-    /// **The two warm tiers must fit the machine TOGETHER.**
+    /// **What is page-locked must fit the machine beside everything it owes.**
     ///
     /// The failure this pins, measured on the 16 GB box during a tool
     /// calibration: this tier page-locked 13.5 GiB at launch, the warm KV tier
     /// then grew to 7.1 GiB against a budget that believed it had 14.5, and the
-    /// host reached 0.9 GiB free while paging at 1,302 pages/sec. Neither tier
-    /// was individually wrong; they were sized against snapshots that did not
-    /// contain each other.
+    /// host reached 0.9 GiB free while paging at 1,302 pages/sec — two tiers
+    /// sized against snapshots that did not contain each other.
     ///
-    /// Sizing this tier from the shared partition is what makes the sum safe, so
-    /// the assertion is on the sum — the two budgets plus everything the machine
-    /// owes, against the machine.
+    /// Warm KV is now a fixed pageable floor outside the partition (the OS pages
+    /// it rather than refusing), so the sum that must hold is the pinned one:
+    /// this tier, what else is pinned, the weights and the pageable reserve.
     #[test]
-    fn the_expert_tier_and_the_kv_tier_fit_the_machine_together() {
+    fn the_pinned_expert_tier_fits_the_machine() {
         let total = 31 * GIB + GIB / 2;
         let weights = 2 * GIB + GIB / 2;
         let budget = candle::vram::host_ram_budget_from(total, 0, weights, 30, 1024 * 1024 * 1024);
@@ -2071,16 +2144,14 @@ mod warm_sizing_tests {
             budget.expert_pinned_budget_bytes,
         );
         let committed = s.taken_bytes
-            + budget.kv_warm_budget_bytes
             + budget.weights_reserved_bytes
             + already
             + candle::vram::PAGEABLE_RESERVE;
         assert!(
             committed <= total,
-            "expert tier {:.2} + warm KV {:.2} + weights {:.2} + pinned {:.2} + \
+            "expert tier {:.2} + weights {:.2} + pinned {:.2} + \
              pageable reserve {:.2} = {:.2} GiB on a {:.2} GiB machine",
             gib(s.taken_bytes),
-            gib(budget.kv_warm_budget_bytes),
             gib(budget.weights_reserved_bytes),
             gib(already),
             gib(candle::vram::PAGEABLE_RESERVE),
@@ -2110,13 +2181,13 @@ mod warm_sizing_tests {
         let s = warm_sizing_from(SLOT, EVICTABLE, 64 * GIB, 6 * GIB, 6 * GIB, 0, LOOSE_BUDGET);
         assert_eq!(s.bound_by, CEILING_AVAILABLE);
 
-        // Pinnable half lowest — and it leaves the headroom like the others, so
-        // an 8 GiB machine offers a 4 GiB pinnable region of which the tier may
-        // take 1 GiB.
+        // Pinnable region lowest — and it leaves the headroom like the others,
+        // so a 16 GiB machine offers `16 − PAGEABLE_RESERVE` pinnable, of which
+        // the tier may take all but the headroom.
         let s = warm_sizing_from(
             SLOT,
             EVICTABLE,
-            8 * GIB,
+            16 * GIB,
             60 * GIB,
             60 * GIB,
             0,
@@ -2125,7 +2196,7 @@ mod warm_sizing_tests {
         assert_eq!(s.bound_by, CEILING_PINNABLE);
         assert_eq!(
             s.slots,
-            ((4 * GIB - WARM_TIER_HEADROOM) / SLOT as u64) as usize
+            ((16 * GIB - PAGEABLE_RESERVE - WARM_TIER_HEADROOM) / SLOT as u64) as usize
         );
 
         // Nothing binds: the tier covers every evictable expert.

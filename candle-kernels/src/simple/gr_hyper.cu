@@ -18,7 +18,7 @@
 //               grouped RMS (per stream, over d) × the [hc*d] gain, one pass
 //   gr_mix      xn[n,hc*d], gate_raw[n,hc*d]  → mixed[n,d]
 //               mean over streams of xn ⊙ sigmoid(gate_raw), one pass
-//   gr_combine  res[n,hc,d] += out[n,d] · 2·sigmoid(inject[n,hc]/hc)
+//   gr_combine  res[n,hc,d] += block_out[n,d] · 2·sigmoid(inject[n,hc]/hc)
 //               in place, one pass
 //
 // WHY THESE ARE NEW KERNELS AND NOT AN EXTENSION OF `hyper_mhc.cu`
@@ -70,7 +70,17 @@
 
 namespace gr_hyper {
 
-constexpr int THREADS = 256;
+// 128, not 256: at the released `d` of 2560 a row is 640 `float4`s, which is
+// exactly five per thread at 128 and two and a half at 256 — where the last
+// pass ran with half its warps idle. It also sizes `gr_mix`/`gr_combine`'s
+// column chunks so a row is five whole blocks with no tail.
+constexpr int THREADS = 128;
+
+// `float4`s per thread that `gr_norm` keeps in registers between its reduction
+// and its write, so the second pass never re-fetches the row. Five covers a
+// 2560-wide stream exactly (5 × 128 × 4); a wider stream re-reads only the part
+// past it.
+constexpr int NORM_CACHE = 5;
 
 __device__ __forceinline__ float gr_sigmoid(float x) {
     return fast_exp::sigmoid<float>(x);
@@ -101,7 +111,7 @@ __device__ __forceinline__ float4 gr_sigmoid4(float4 x) {
 // 4-byte aligned no matter how well-behaved `d` is. The host ANDs the offset
 // alignment of every operand into this flag; the kernel keeps the width test,
 // because both have to hold.
-__device__ __forceinline__ int gr_vec_width(int d, int vec_ok) {
+__host__ __device__ __forceinline__ int gr_vec_width(int d, int vec_ok) {
     return (vec_ok != 0 && (d & 3) == 0) ? (d >> 2) : 0;
 }
 
@@ -143,6 +153,11 @@ __device__ __forceinline__ float block_sum(float v, float* shared) {
 // Vectorised `float4` throughout — `d` is 2560 on the released checkpoint, a
 // multiple of 4; the scalar tail below keeps the kernel correct for widths
 // that are not.
+//
+// Occupancy is register-limited at 75% (55 registers, most of them the held
+// row), and deliberately left there: capping it at 10 or 12 blocks per SM
+// spills 20–24 bytes a thread, and `ncu` already measures this kernel at 91%
+// of DRAM peak, so the headroom a cap could buy is under a tenth.
 extern "C" __global__ void __launch_bounds__(THREADS) gr_norm_kernel(
     const float* __restrict__ x,     // [n, hc, d]
     const float* __restrict__ gain,  // [hc * d]
@@ -162,7 +177,21 @@ extern "C" __global__ void __launch_bounds__(THREADS) gr_norm_kernel(
     const int vec = gr_vec_width(d, vec_ok);
     float acc = 0.f;
     const float4* x4 = reinterpret_cast<const float4*>(xs);
-    for (int i = threadIdx.x; i < vec; i += THREADS) {
+    // The row is held in registers across the reduction, so the write pass
+    // below reads only the gain. Unrolled with a guard rather than looped, so
+    // `held` is indexed statically and stays in registers.
+    float4 held[NORM_CACHE];
+    #pragma unroll
+    for (int k = 0; k < NORM_CACHE; ++k) {
+        const int i = (int)threadIdx.x + k * THREADS;
+        held[k] = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (i < vec) {
+            const float4 v = x4[i];
+            held[k] = v;
+            acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+    }
+    for (int i = (int)threadIdx.x + NORM_CACHE * THREADS; i < vec; i += THREADS) {
         const float4 v = x4[i];
         acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
     }
@@ -182,7 +211,21 @@ extern "C" __global__ void __launch_bounds__(THREADS) gr_norm_kernel(
 
     const float4* g4 = reinterpret_cast<const float4*>(gs);
     float4* o4 = reinterpret_cast<float4*>(out);
-    for (int i = threadIdx.x; i < vec; i += THREADS) {
+    #pragma unroll
+    for (int k = 0; k < NORM_CACHE; ++k) {
+        const int i = (int)threadIdx.x + k * THREADS;
+        if (i < vec) {
+            const float4 v = held[k];
+            const float4 g = g4[i];
+            float4 o;
+            o.x = v.x * rs * g.x;
+            o.y = v.y * rs * g.y;
+            o.z = v.z * rs * g.z;
+            o.w = v.w * rs * g.w;
+            o4[i] = o;
+        }
+    }
+    for (int i = (int)threadIdx.x + NORM_CACHE * THREADS; i < vec; i += THREADS) {
         const float4 v = x4[i];
         const float4 g = g4[i];
         float4 o;
@@ -198,122 +241,171 @@ extern "C" __global__ void __launch_bounds__(THREADS) gr_norm_kernel(
 }
 
 // ── gr_mix ─────────────────────────────────────────────────────────────────
-// One block per row. Each thread owns a column slice and walks the `hc`
-// streams, so the stream axis is a register accumulation rather than the
-// middle-axis reduction that a `sum(1)` would take (measured at ~9.6 ms a call
-// on the eager path — the strided-reduce trap this model already paid for
-// once).
+// A 2-D grid: `blockIdx.x` is the row, `blockIdx.y` a `THREADS`-wide chunk of
+// its columns, and each thread owns exactly one column (one `float4` on the
+// vector path). Every lane of every warp is live at the released width, and a
+// decode wave of a few rows still launches five blocks per row rather than one.
 //
 //   mixed[t, j] = (1/hc) · Σ_s xn[t, s*d + j] · sigmoid(gate_raw[t, s*d + j])
 //
+// The stream axis is a register accumulation rather than the middle-axis
+// reduction a `sum(1)` would take (measured at ~9.6 ms a call on the eager path
+// — the strided-reduce trap this model already paid for once). `HC` is a
+// template parameter so the stream loop unrolls and all `2·HC` loads issue
+// before the first multiply.
+//
 // The sigmoid is applied here rather than by a separate launch over the wide
 // buffer: `gate_raw` arrives straight from the up-projection GEMM.
-extern "C" __global__ void __launch_bounds__(THREADS) gr_mix_kernel(
+template <int HC>
+__global__ void __launch_bounds__(THREADS) gr_mix_kernel(
     const float* __restrict__ xn,        // [n, hc * d]
     const float* __restrict__ gate_raw,  // [n, hc * d]
     float* __restrict__ mixed,           // [n, d]
     int d,
-    int hc,
     int vec_ok
 ) {
     const int row = (int)blockIdx.x;
-    const long long rbase = (long long)row * hc * d;
-    const float inv_hc = 1.0f / (float)hc;
+    const int col = (int)blockIdx.y * THREADS + (int)threadIdx.x;
+    const long long rbase = (long long)row * HC * d;
+    // Exact: `HC` is a power of two, and the eager path scales by the same.
+    constexpr float inv_hc = 1.0f / (float)HC;
     const int vec = gr_vec_width(d, vec_ok);
 
-    float4* m4 = reinterpret_cast<float4*>(mixed + (long long)row * d);
-    for (int i = threadIdx.x; i < vec; i += THREADS) {
-        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
-        for (int s = 0; s < hc; ++s) {
+    if (vec > 0) {
+        if (col >= vec) return;
+        float4 v[HC];
+        float4 g[HC];
+        #pragma unroll
+        for (int s = 0; s < HC; ++s) {
             const long long off = rbase + (long long)s * d;
-            const float4 v = reinterpret_cast<const float4*>(xn + off)[i];
-            const float4 g = gr_sigmoid4(reinterpret_cast<const float4*>(gate_raw + off)[i]);
+            v[s] = reinterpret_cast<const float4*>(xn + off)[col];
+            g[s] = reinterpret_cast<const float4*>(gate_raw + off)[col];
+        }
+        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+        #pragma unroll
+        for (int s = 0; s < HC; ++s) {
+            const float4 gs = gr_sigmoid4(g[s]);
             // Accumulated in ascending stream order, which is the order the
             // eager path's `hc − 1` pairwise adds produce: `0 + s0` is exact,
             // so `(((0+s0)+s1)+s2)+s3` is `((s0+s1)+s2)+s3`.
-            acc.x += v.x * g.x;
-            acc.y += v.y * g.y;
-            acc.z += v.z * g.z;
-            acc.w += v.w * g.w;
+            acc.x += v[s].x * gs.x;
+            acc.y += v[s].y * gs.y;
+            acc.z += v[s].z * gs.z;
+            acc.w += v[s].w * gs.w;
         }
         acc.x *= inv_hc;
         acc.y *= inv_hc;
         acc.z *= inv_hc;
         acc.w *= inv_hc;
-        m4[i] = acc;
-    }
-    for (int j = (vec << 2) + (int)threadIdx.x; j < d; j += THREADS) {
+        reinterpret_cast<float4*>(mixed + (long long)row * d)[col] = acc;
+    } else {
+        if (col >= d) return;
         float acc = 0.f;
-        for (int s = 0; s < hc; ++s) {
-            const long long off = rbase + (long long)s * d + j;
+        #pragma unroll
+        for (int s = 0; s < HC; ++s) {
+            const long long off = rbase + (long long)s * d + col;
             acc += xn[off] * gr_sigmoid(gate_raw[off]);
         }
-        mixed[(long long)row * d + j] = acc * inv_hc;
+        mixed[(long long)row * d + col] = acc * inv_hc;
     }
 }
 
 // ── gr_combine ─────────────────────────────────────────────────────────────
-// One block per row, writing a FRESH residual.
+// The same 2-D grid as `gr_mix` — row by column chunk, one column per thread —
+// updating the residual IN PLACE.
 //
-//   out[t, s, j] = res[t, s, j] + block_out[t, j] · 2·sigmoid(inject[t, s] / hc)
+//   res[t, s, j] += block_out[t, j] · 2·sigmoid(inject[t, s] / hc)
 //
-// A fresh output rather than an in-place update, for two reasons. The caller's
-// `res` is the live residual stream and may be aliased by anything holding a
-// clone of that tensor, so mutating it through a raw pointer would be unsound
-// in a way nothing would catch; and updating in place would need the caller to
-// copy first, which is a whole extra pass over the wide buffer — the copy plus
-// the update reads and writes it twice, where this reads once and writes once.
+// In place because the residual is the wave's own buffer, held by the caller
+// through `&mut` (the same contract as `Tensor::add_mut`), and a fresh output
+// would allocate a whole `[rows, hc, d]` F32 residual twice per layer — 96
+// times a forward — for a buffer the next line discards. Each element is read
+// and written by the same thread at the same index, so the update needs no
+// second buffer; `res` is therefore not `__restrict__`-qualified against
+// itself, only against the operands it never aliases.
 //
 // The scatter weight is centred on 1 (`2·sigmoid(0) == 1`), so a zero
 // injection is exactly a plain residual add on every stream — the property the
 // reference's own test pins.
 //
-// `inject` is `[n, hc]` with `hc ≤ GR_MAX_HC`; the weights are computed once
-// per row into registers rather than re-derived per column.
-#define GR_MAX_HC 16
-
-extern "C" __global__ void __launch_bounds__(THREADS) gr_combine_kernel(
-    const float* __restrict__ res,       // [n, hc, d]
+// `inject` is `[n, hc]` with `hc ≤ GR_MAX_HC`, rows `inject_stride` elements
+// apart: it is the tail columns of the pre-mix's stacked down-projection, read
+// where that GEMM wrote it rather than compacted first. Every lane of a warp
+// reads the same `HC` weights, so those loads are broadcasts.
+//
+// `HC` is a template parameter so the weights are a statically indexed
+// register array. Indexed by a runtime stream count they were not: ptxas put
+// them in a 64-byte local-memory stack frame, a round trip per weight per
+// column.
+template <int HC>
+__global__ void __launch_bounds__(THREADS) gr_combine_kernel(
+    float* res,                          // [n, hc, d], read and written
     const float* __restrict__ block_out, // [n, d]
-    const float* __restrict__ inject,    // [n, hc]
-    float* __restrict__ out,             // [n, hc, d]
+    const float* __restrict__ inject,    // [n, hc], row stride `inject_stride`
     int d,
-    int hc,
+    int inject_stride,
     int vec_ok
 ) {
     const int row = (int)blockIdx.x;
-    const float inv_hc = 1.0f / (float)hc;
-
-    float w[GR_MAX_HC];
-    for (int s = 0; s < hc; ++s) {
-        w[s] = 2.0f * gr_sigmoid(inject[(long long)row * hc + s] * inv_hc);
-    }
-
+    const int col = (int)blockIdx.y * THREADS + (int)threadIdx.x;
+    constexpr float inv_hc = 1.0f / (float)HC;
     const int vec = gr_vec_width(d, vec_ok);
-    const float* out_row = block_out + (long long)row * d;
-    for (int i = threadIdx.x; i < vec; i += THREADS) {
-        const float4 o = reinterpret_cast<const float4*>(out_row)[i];
-        for (int s = 0; s < hc; ++s) {
-            const long long off = ((long long)row * hc + s) * d;
-            const float4 r = reinterpret_cast<const float4*>(res + off)[i];
-            float4 v;
-            v.x = r.x + o.x * w[s];
-            v.y = r.y + o.y * w[s];
-            v.z = r.z + o.z * w[s];
-            v.w = r.w + o.w * w[s];
-            reinterpret_cast<float4*>(out + off)[i] = v;
-        }
+    if (col >= (vec > 0 ? vec : d)) return;
+
+    float w[HC];
+    #pragma unroll
+    for (int s = 0; s < HC; ++s) {
+        w[s] = 2.0f * gr_sigmoid(inject[(long long)row * inject_stride + s] * inv_hc);
     }
-    for (int j = (vec << 2) + (int)threadIdx.x; j < d; j += THREADS) {
-        const float o = out_row[j];
-        for (int s = 0; s < hc; ++s) {
-            const long long off = ((long long)row * hc + s) * d + j;
-            out[off] = res[off] + o * w[s];
+
+    const long long rbase = (long long)row * HC * d;
+    if (vec > 0) {
+        const float4 o = reinterpret_cast<const float4*>(block_out + (long long)row * d)[col];
+        float4 v[HC];
+        #pragma unroll
+        for (int s = 0; s < HC; ++s) {
+            v[s] = reinterpret_cast<const float4*>(res + rbase + (long long)s * d)[col];
+        }
+        #pragma unroll
+        for (int s = 0; s < HC; ++s) {
+            v[s].x += o.x * w[s];
+            v[s].y += o.y * w[s];
+            v[s].z += o.z * w[s];
+            v[s].w += o.w * w[s];
+            reinterpret_cast<float4*>(res + rbase + (long long)s * d)[col] = v[s];
+        }
+    } else {
+        const float o = block_out[(long long)row * d + col];
+        #pragma unroll
+        for (int s = 0; s < HC; ++s) {
+            res[rbase + (long long)s * d + col] += o * w[s];
         }
     }
 }
 
 } // namespace gr_hyper
+
+// The stream counts `gr_mix` and `gr_combine` are instantiated for — powers of
+// two up to `GR_MAX_HC`, the only counts the host lets through (a count that is
+// not a power of two would also make the gate's `1/hc` fold inexact).
+#define GR_MAX_HC 16
+#define GR_DISPATCH_HC(hc, LAUNCH) \
+    switch (hc) {                  \
+        case 1: LAUNCH(1); break;  \
+        case 2: LAUNCH(2); break;  \
+        case 4: LAUNCH(4); break;  \
+        case 8: LAUNCH(8); break;  \
+        case 16: LAUNCH(16); break; \
+        default: break;            \
+    }
+
+// The 2-D grid shared by `gr_mix` and `gr_combine`: rows on x, `THREADS`-wide
+// column chunks on y — `float4` columns on the vector path, scalar otherwise.
+static dim3 gr_row_chunk_grid(int n, int d, int vec_ok) {
+    const int vec = gr_hyper::gr_vec_width(d, vec_ok);
+    const int cols = vec > 0 ? vec : d;
+    return dim3((unsigned)n, (unsigned)((cols + gr_hyper::THREADS - 1) / gr_hyper::THREADS), 1);
+}
 
 extern "C" void run_gr_norm(
     const float* x, const float* gain, float* xn,
@@ -329,15 +421,23 @@ extern "C" void run_gr_mix(
     int32_t n, int32_t hc, int32_t d, int32_t vec_ok, void* stream
 ) {
     if (n <= 0 || hc <= 0 || d <= 0) return;
-    gr_hyper::gr_mix_kernel<<<(unsigned)n, gr_hyper::THREADS, 0, (cudaStream_t)stream>>>(
-        xn, gate_raw, mixed, d, hc, vec_ok);
+    const dim3 grid = gr_row_chunk_grid(n, d, vec_ok);
+#define GR_LAUNCH_MIX(HC)                                                              \
+    gr_hyper::gr_mix_kernel<HC><<<grid, gr_hyper::THREADS, 0, (cudaStream_t)stream>>>( \
+        xn, gate_raw, mixed, d, vec_ok)
+    GR_DISPATCH_HC(hc, GR_LAUNCH_MIX)
+#undef GR_LAUNCH_MIX
 }
 
 extern "C" void run_gr_combine(
-    const float* res, const float* block_out, const float* inject, float* out,
-    int32_t n, int32_t hc, int32_t d, int32_t vec_ok, void* stream
+    float* res, const float* block_out, const float* inject,
+    int32_t n, int32_t hc, int32_t d, int32_t inject_stride, int32_t vec_ok, void* stream
 ) {
-    if (n <= 0 || hc <= 0 || d <= 0 || hc > GR_MAX_HC) return;
-    gr_hyper::gr_combine_kernel<<<(unsigned)n, gr_hyper::THREADS, 0, (cudaStream_t)stream>>>(
-        res, block_out, inject, out, d, hc, vec_ok);
+    if (n <= 0 || hc <= 0 || d <= 0 || inject_stride < hc) return;
+    const dim3 grid = gr_row_chunk_grid(n, d, vec_ok);
+#define GR_LAUNCH_COMBINE(HC)                                                              \
+    gr_hyper::gr_combine_kernel<HC><<<grid, gr_hyper::THREADS, 0, (cudaStream_t)stream>>>( \
+        res, block_out, inject, d, inject_stride, vec_ok)
+    GR_DISPATCH_HC(hc, GR_LAUNCH_COMBINE)
+#undef GR_LAUNCH_COMBINE
 }

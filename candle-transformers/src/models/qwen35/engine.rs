@@ -129,6 +129,7 @@ pub fn wave_geometry(cfg: &Qwen35Config, act_dtype: DType, int8mode: Int8Mode) -
         // `rope_dim` says (`rope.dimension_count`, ggml's `n_rot`), so ask it
         // rather than assert this lineage's 64-of-256.
         partial_rotary: cfg.rope_dim < cfg.attn_head_dim,
+        hyper: None,
     }
 }
 

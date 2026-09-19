@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use candle::quantized::ggml_file::qtensor_from_ggml;
-use candle::quantized::gguf_file::Value;
+use candle::quantized::gguf_file::{Content, TensorInfo, Value};
 use candle::quantized::ko_quant::dequant_ko;
 use candle::quantized::GgmlDType;
 use candle::{Device, Result, Tensor};
@@ -28,6 +28,7 @@ use super::ple::PleWeights;
 use super::ple_cache::{PleCacheStats, PleRowCache, PleRowFetch};
 use super::qsa::IndexerWeights;
 use crate::models::delta_net::{DeltaNetWeights, LayerKind};
+use crate::models::dense_span::peak_load_pool_bytes;
 use crate::models::latent_moe::GgufModel;
 use crate::models::qwen35::attention::{AttentionWeights, RopeTables};
 use crate::models::qwen35::moe::FfnWeights;
@@ -194,6 +195,60 @@ impl PleSource for CachedPle {
 /// §0.1's figure: the row cache's arena budget.
 const PLE_CACHE_BYTES: usize = 2 << 30;
 
+/// The n-gram (PLE) table's name in the artifact.
+const PLE_TABLE: &str = "per_layer_token_embd.weight";
+
+/// A tensor's size in the file.
+fn tensor_bytes(info: &TensorInfo) -> u64 {
+    (info.shape.elem_count() / info.ggml_dtype.block_size() * info.ggml_dtype.type_size()) as u64
+}
+
+/// Mapped bytes outside the expert slabs that host RAM never serves after load
+/// — the figure `ExpertCacheSetup::offloaded_bytes` takes, so the host budget
+/// reserves only what this engine really keeps reading from the host.
+///
+/// Two kinds, and between them every non-expert byte but one arena:
+///
+/// - **The n-gram (PLE) table**, read only through the §0.1 row cache, so its
+///   pages are that cache's to serve — less the cache's own arena, which is
+///   real pageable RAM and stays reserved.
+/// - **Every other tensor**, which the load reads once into device memory (the
+///   dense block, or the pool for the embedding) through a per-tensor buffer
+///   that is dropped at upload. Nothing reads them from the file again, so
+///   their pages are the OS file cache's, not this engine's. Reserved, they
+///   were 5.2 GiB of a 31.5 GiB box held back from the warm tier for weights
+///   living on the card.
+pub(crate) fn offloaded_bytes(content: &Content) -> Result<u64> {
+    let table = content
+        .tensor_infos
+        .get(PLE_TABLE)
+        .ok_or_else(|| candle::Error::Msg(format!("qwen4exp: no {PLE_TABLE}")))?;
+    let device_resident: u64 = content
+        .tensor_infos
+        .iter()
+        .filter(|(name, _)| name.as_str() != PLE_TABLE && !name.ends_with("_exps.weight"))
+        .map(|(_, info)| tensor_bytes(info))
+        .sum();
+    Ok(tensor_bytes(table).saturating_sub(PLE_CACHE_BYTES as u64) + device_resident)
+}
+
+/// CUDA-pool room the engine's load needs — [`peak_load_pool_bytes`] over every
+/// tensor the load reads to the device, which is every one but the n-gram table.
+///
+/// The table is the checkpoint's largest 2-D tensor by two orders of magnitude
+/// (54 GB against a ~1 GB head), and it never reaches the device: its row cache
+/// reads from the file. Bounded with it, the load would concede the whole card
+/// to the pool and leave the span nothing.
+pub(crate) fn load_headroom_bytes(content: &Content) -> usize {
+    peak_load_pool_bytes(
+        content
+            .tensor_infos
+            .iter()
+            .filter(|(name, _)| name.as_str() != PLE_TABLE)
+            .map(|(_, info)| info),
+    )
+}
+
 /// Dequantize one whole tensor to F32.
 fn f32t(gguf: &mut GgufModel, name: &str, device: &Device) -> Result<Tensor> {
     gguf.qtensor(name, device)?.dequantize(device)
@@ -204,6 +259,7 @@ fn hc_weights(
     gguf: &mut GgufModel,
     prefix: &str,
     with_inject: bool,
+    hc: usize,
     device: &Device,
 ) -> Result<HcWeights> {
     // The inject rows are stacked under the down projection, exactly as the
@@ -216,11 +272,12 @@ fn hc_weights(
     } else {
         down
     };
-    Ok(HcWeights {
-        norm: f32t(gguf, &format!("{prefix}_norm.weight"), device)?,
+    HcWeights::from_checkpoint(
+        f32t(gguf, &format!("{prefix}_norm.weight"), device)?,
         down,
-        up: f32t(gguf, &format!("{prefix}_up.weight"), device)?,
-    })
+        f32t(gguf, &format!("{prefix}_up.weight"), device)?,
+        hc,
+    )
 }
 
 /// Load the oracle model from any member path of the split GGUF. Everything
@@ -243,7 +300,7 @@ pub fn load_oracle_model(one_split: &Path, device: &Device) -> Result<Qwen4ExpMo
     } else {
         embed.clone()
     };
-    let out_hc = hc_weights(&mut gguf, "output_hc", false, device)?;
+    let out_hc = hc_weights(&mut gguf, "output_hc", false, cfg.hc.count, device)?;
 
     let mut layers = Vec::with_capacity(cfg.num_layers);
     let mut expert_slabs = Vec::with_capacity(cfg.num_layers);
@@ -251,8 +308,8 @@ pub fn load_oracle_model(one_split: &Path, device: &Device) -> Result<Qwen4ExpMo
     for li in 0..cfg.num_layers {
         let p = format!("blk.{li}");
         let g = &mut gguf;
-        let hc_attn = hc_weights(g, &format!("{p}.hc_attn"), true, device)?;
-        let hc_ffn = hc_weights(g, &format!("{p}.hc_ffn"), true, device)?;
+        let hc_attn = hc_weights(g, &format!("{p}.hc_attn"), true, cfg.hc.count, device)?;
+        let hc_ffn = hc_weights(g, &format!("{p}.hc_ffn"), true, cfg.hc.count, device)?;
 
         let mix = match cfg.layer_kinds[li] {
             LayerKind::DeltaNet => LayerMix::DeltaNet(DeltaNetWeights {
@@ -411,4 +468,101 @@ pub(crate) fn open_cached_ple(
             PLE_CACHE_BYTES,
         )?,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::quantized::gguf_file::VersionedMagic;
+    use std::collections::HashMap;
+
+    fn content_with_ple(rows: usize) -> Content {
+        let mut tensor_infos = HashMap::new();
+        tensor_infos.insert(
+            "per_layer_token_embd.weight".to_string(),
+            TensorInfo {
+                ggml_dtype: GgmlDType::Q8_0,
+                shape: (rows, 160).into(),
+                offset: 0,
+            },
+        );
+        Content {
+            magic: VersionedMagic::GgufV3,
+            metadata: HashMap::new(),
+            tensor_infos,
+            tensor_data_offset: 0,
+        }
+    }
+
+    /// The released table: 320,001,536 rows × 160 at `Q8_0` (34 bytes per 32
+    /// values, so 170 bytes a row) is 54,400,261,120 bytes; the row cache keeps
+    /// its 2 GiB arena, so 52,252,777,472 bytes are the cache's to serve.
+    #[test]
+    fn the_released_table_offloads_all_but_the_row_cache() {
+        let c = content_with_ple(320_001_536);
+        assert_eq!(offloaded_bytes(&c).unwrap(), 52_252_777_472);
+    }
+
+    /// A table smaller than the cache offloads nothing: every byte of it can sit
+    /// in the arena, which is RAM the budget must still see.
+    #[test]
+    fn a_table_under_the_cache_offloads_nothing() {
+        let c = content_with_ple(1_000);
+        assert_eq!(offloaded_bytes(&c).unwrap(), 0);
+    }
+
+    /// Every dense tensor goes to the card at load and is never read from the
+    /// file again, so it is offloaded in full; the expert slabs are not — the
+    /// expert cache accounts for those itself. A `[2048, 2560]` Q8_0 head is
+    /// 5,570,560 bytes; a `[512, 64, 2560]` Q8_0 slab is 89,128,960 and must not
+    /// appear.
+    #[test]
+    fn dense_tensors_are_offloaded_and_expert_slabs_are_not() {
+        let mut c = content_with_ple(320_001_536);
+        c.tensor_infos.insert(
+            "output.weight".to_string(),
+            TensorInfo {
+                ggml_dtype: GgmlDType::Q8_0,
+                shape: (2048, 2560).into(),
+                offset: 0,
+            },
+        );
+        c.tensor_infos.insert(
+            "blk.0.ffn_gate_exps.weight".to_string(),
+            TensorInfo {
+                ggml_dtype: GgmlDType::Q8_0,
+                shape: (512, 64, 2560).into(),
+                offset: 0,
+            },
+        );
+        assert_eq!(offloaded_bytes(&c).unwrap(), 52_252_777_472 + 5_570_560);
+    }
+
+    /// The load's headroom is bounded by the largest tensor the load reads, and
+    /// the n-gram table is never one of them: a `[2048, 2560]` Q8_0 head
+    /// (5,570,560 bytes at 34 per 32 values) bounds it, whatever the table's
+    /// size, plus the repack's two bands.
+    #[test]
+    fn the_load_headroom_ignores_the_ngram_table() {
+        let mut c = content_with_ple(320_001_536);
+        c.tensor_infos.insert(
+            "output.weight".to_string(),
+            TensorInfo {
+                ggml_dtype: GgmlDType::Q8_0,
+                shape: (2048, 2560).into(),
+                offset: 0,
+            },
+        );
+        assert_eq!(
+            load_headroom_bytes(&c),
+            5_570_560 + 2 * candle::quantized::cuda::REPACK_BAND_BYTES
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_without_the_table_is_refused() {
+        let mut c = content_with_ple(1);
+        c.tensor_infos.clear();
+        assert!(offloaded_bytes(&c).is_err());
+    }
 }

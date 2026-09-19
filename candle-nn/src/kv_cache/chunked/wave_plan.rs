@@ -88,6 +88,9 @@ use strum_macros::EnumIter;
 /// (`blocks.cuh`). Named rather than inlined because a reader checking this
 /// arithmetic against the kernel should find both numbers in one place.
 const Q8A128_TILE_ELEMS: usize = 128;
+/// The int8 matmul's N tile: a KO weight's row count is a multiple of it
+/// (`ko_tileable`), so a projection padded to tile emits that many columns.
+const KO_N_TILE: usize = 32;
 const Q8A128_TILES_PER_BLOCK: usize = 8;
 const Q8A128_BLOCK_BYTES: usize = 1152;
 
@@ -305,6 +308,23 @@ pub struct SharedExpertWidths {
     pub gate_cols: usize,
 }
 
+/// The Gated Residual's widths, as [`ModelGeometry::hyper`] carries them.
+///
+/// A stack that carries its residual as several parallel streams and has no
+/// layer norms (Qwen3.8-Flash-Next): each layer phase opens with a **pre-mix**
+/// that collapses the wide residual to the block input — a grouped norm over
+/// every stream, a low-rank read gate, and the gated mean — and that pre-mix is
+/// the phase's seed, so everything it carves lands on the span. It runs in F32
+/// whatever the session's dtype: the residual it reads is F32 the whole way
+/// round the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HyperWidths {
+    /// Parallel residual streams.
+    pub streams: usize,
+    /// The read gate's bottleneck rank.
+    pub low_rank: usize,
+}
+
 /// Which generation a buffer lives in.
 ///
 /// Named `LayerPhase` rather than `WavePhase` because
@@ -476,6 +496,14 @@ pub struct ModelGeometry {
     /// (`RotaryLayout::permute_last_dim_live`) — one `attn_cols`-wide and one
     /// `kv_cols`-wide copy per layer. Full-width-rotary models leave it false.
     pub partial_rotary: bool,
+    /// The Gated Residual's pre-mix widths, on a multi-stream stack — `None`
+    /// on every stack with ordinary layer norms. See [`HyperWidths`].
+    ///
+    /// Where it is set, the pre-mix **is** each phase's norm: it carves the
+    /// block input the mixer and the FFN read, so the float norms
+    /// ([`WaveBuffer::AttnNorm`] on a float session, [`WaveBuffer::DeltaNetNorm`],
+    /// [`WaveBuffer::FfnNorm`]) carve nothing of their own.
+    pub hyper: Option<HyperWidths>,
 }
 
 impl ModelGeometry {
@@ -544,6 +572,30 @@ impl ModelGeometry {
 /// reader can check the list against the code that produced it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 pub enum WaveBuffer {
+    // ── The Gated Residual pre-mix, ahead of the attention phase's mixer ────
+    // Five carves, in carve order, all F32 and all at the wave's full width —
+    // the pre-mix runs once over every row before the groups split. The FFN
+    // phase opens with the same five (`HyperFfn*`). Priced zero on a stack
+    // without hyper-connections.
+    /// The grouped norm over every stream: `[rows, streams · hidden]`.
+    HyperAttnNorm,
+    /// The norm quantized to q8a128 for the KO down projection — int8
+    /// sessions only.
+    HyperAttnNormOperand,
+    /// The stacked down projection — the read gate's columns (the rank padded
+    /// to the int8 K tile) with the `streams` inject columns beneath them, the
+    /// whole padded to the matmul's N tile. The inject is read from here as a
+    /// strided view by the combine; it carves nothing of its own.
+    HyperAttnLowRank,
+    /// `silu` over the (padded) gate columns, which is also their compaction
+    /// for the up projection.
+    HyperAttnGateAct,
+    /// That SiLU quantized for the KO up projection — int8 sessions only.
+    HyperAttnGateOperand,
+    /// The up projection's raw gate, `[rows, streams · hidden]`.
+    HyperAttnGateRaw,
+    /// The gated mean over streams — the block input, `hidden` wide.
+    HyperAttnMixed,
     /// Attention RMSNorm, in the encoding the QKV matmul consumes — q8a128 on
     /// an int8 session, `act_dtype` on a float one, per
     /// [`ModelGeometry::packed_norm`]. Both chains.
@@ -665,6 +717,42 @@ pub enum WaveBuffer {
     /// `alpha`, the same shape as [`Self::DeltaNetBetaProj`].
     DeltaNetAlphaProj,
 
+    // ── The live DeltaNet mixer on the Gated Residual stack ─────────────────
+    // Under the pre-mix the mixer's input is F32 on the span and the
+    // projections' activation quantize inherits it, so the whole mixer lands on
+    // the span — nothing breaks provenance. Measured on Qwen3.8-Flash-Next at
+    // 515 rows, in carve order: the operand, the stacked `[qkv | z | β | α]`
+    // projection and its split, the two span tables, the conv, the scan's two
+    // outputs and the decay, then the norm-gate and `w_out` — the last three
+    // overflowed an attention span priced without them. Priced zero elsewhere:
+    // the qwen35 stack's live chain has not been re-measured.
+    /// The four projections' q8a128 operand: the mix output quantized once.
+    DeltaNetLiveOperand,
+    /// The stacked projection, `conv_dim + value_dim + 2 · n_v_heads` wide, F32.
+    DeltaNetLiveProjection,
+    /// Its ragged split into the four parts — one carve the same width.
+    DeltaNetLiveSplit,
+    /// The per-span pointer table the mixer builds beside its operands: four
+    /// device pointers a span. Priced at a span per row, the bound a row count
+    /// can give — tens of bytes a sequence either way.
+    DeltaNetLiveSpanPtrs,
+    /// The per-span extents: two `u32` a span, bounded as above.
+    DeltaNetLiveSpanExtents,
+    /// The causal conv's output, `conv_dim` wide.
+    DeltaNetLiveConv,
+    /// The recurrence's output, `value_dim` wide.
+    DeltaNetLiveScanOut,
+    /// The scan's second `value_dim`-wide carve.
+    DeltaNetLiveScanAux,
+    /// The per-head decay, one F32 per V head per row.
+    DeltaNetLiveDecay,
+    /// `norm(out) ⊙ gate(z)`, `value_dim` wide — what `w_out` reads.
+    DeltaNetLiveNormGate,
+    /// `w_out`'s q8a128 operand.
+    DeltaNetLiveOutOperand,
+    /// `w_out`'s result, `hidden` wide in the activation dtype.
+    DeltaNetLiveOut,
+
     // ── A speculative replay's staged operands ──────────────────────────────
     // Measured on the 9B at 30 staged rows over 6 spans: six carves totalling
     // 1,482,480 B, every one of them `wave_empty` or a table built beside it.
@@ -684,6 +772,21 @@ pub enum WaveBuffer {
     /// The span table's extents: two `u32` per span.
     ReplaySpanExtents,
 
+    /// The FFN phase's Gated Residual pre-mix — the same five carves as
+    /// [`Self::HyperAttnNorm`] and its siblings, in the same order.
+    HyperFfnNorm,
+    /// See [`Self::HyperAttnNormOperand`].
+    HyperFfnNormOperand,
+    /// See [`Self::HyperAttnLowRank`].
+    HyperFfnLowRank,
+    /// See [`Self::HyperAttnGateAct`].
+    HyperFfnGateAct,
+    /// See [`Self::HyperAttnGateOperand`].
+    HyperFfnGateOperand,
+    /// See [`Self::HyperAttnGateRaw`].
+    HyperFfnGateRaw,
+    /// See [`Self::HyperAttnMixed`].
+    HyperFfnMixed,
     /// FFN RMSNorm, in whatever encoding the expert GEMMs consume. Both
     /// dispatch paths, and priced dense for the reason given on
     /// [`Self::AttnNorm`].
@@ -794,6 +897,24 @@ pub enum WaveBuffer {
     // composes waves of up to 64, where the phase needs 31.9 MiB and the
     // reservation would have been overrun by a forward that had already
     // launched every layer.
+    /// The head's Gated Residual pre-mix — the output mix that IS the final
+    /// norm on a multi-stream stack — over the **scored** rows only: they are
+    /// selected before it, since the mix is row-wise. The same five carves as
+    /// [`Self::HyperAttnNorm`] and its siblings, except that the head's module
+    /// injects nothing, so its down projection is `low_rank` wide.
+    HyperHeadNorm,
+    /// See [`Self::HyperHeadNorm`].
+    HyperHeadNormOperand,
+    /// See [`Self::HyperHeadNorm`].
+    HyperHeadLowRank,
+    /// See [`Self::HyperHeadNorm`].
+    HyperHeadGateAct,
+    /// See [`Self::HyperHeadNorm`].
+    HyperHeadGateOperand,
+    /// See [`Self::HyperHeadNorm`].
+    HyperHeadGateRaw,
+    /// See [`Self::HyperHeadNorm`].
+    HyperHeadMixed,
     /// The final norm, in the encoding the head's matmul consumes.
     HeadNorm,
     /// The float head-norm's F32 working copy, beside its `act_dtype` result.
@@ -865,8 +986,20 @@ pub enum WaveBuffer {
 /// the *FFN* phase — which a DeltaNet layer runs identically to an attention
 /// layer, and where its mixer carves nothing. That is 49.1 MiB of a 139.3 MiB
 /// FFN span on the 0.8B, charged in a phase the buffer never appears in.
+///
+/// **A prelude is neither.** The Gated Residual's pre-mix runs at the head of
+/// the attention phase whichever mixer the layer has, and at the head of the
+/// FFN phase — so it is not an alternative to the mixers but the ground each of
+/// them starts from. A phase therefore costs its preludes, walked first, plus
+/// the largest of its other chains walked on from there ([`Chain::is_prelude`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 pub enum Chain {
+    /// The attention phase's Gated Residual pre-mix — a prelude.
+    HyperAttn,
+    /// The FFN phase's Gated Residual pre-mix — a prelude.
+    HyperFfn,
+    /// The head's Gated Residual output mix, in the forward phase — a prelude.
+    HyperHead,
     /// An attention layer's mixer: norm through `o_proj`.
     Attention,
     /// A DeltaNet layer's mixer: the four projections through `w_out`. Shares
@@ -906,10 +1039,18 @@ impl Chain {
     /// The generation this chain allocates from.
     pub fn phase(&self) -> LayerPhase {
         match self {
-            Self::Attention | Self::DeltaNet | Self::DeltaNetReplay => LayerPhase::Attention,
-            Self::Ffn | Self::DenseFfn => LayerPhase::Ffn,
-            Self::Forward => LayerPhase::Forward,
+            Self::HyperAttn | Self::Attention | Self::DeltaNet | Self::DeltaNetReplay => {
+                LayerPhase::Attention
+            }
+            Self::HyperFfn | Self::Ffn | Self::DenseFfn => LayerPhase::Ffn,
+            Self::HyperHead | Self::Forward => LayerPhase::Forward,
         }
+    }
+
+    /// Whether this chain runs ahead of every other chain in its phase rather
+    /// than instead of them — see the type's docs.
+    pub fn is_prelude(&self) -> bool {
+        matches!(self, Self::HyperAttn | Self::HyperFfn | Self::HyperHead)
     }
 }
 
@@ -917,11 +1058,44 @@ impl WaveBuffer {
     /// Which run of buffers this one belongs to.
     pub fn chain(&self) -> Chain {
         match self {
+            Self::HyperAttnNorm
+            | Self::HyperAttnNormOperand
+            | Self::HyperAttnLowRank
+            | Self::HyperAttnGateAct
+            | Self::HyperAttnGateOperand
+            | Self::HyperAttnGateRaw
+            | Self::HyperAttnMixed => Chain::HyperAttn,
+            Self::HyperFfnNorm
+            | Self::HyperFfnNormOperand
+            | Self::HyperFfnLowRank
+            | Self::HyperFfnGateAct
+            | Self::HyperFfnGateOperand
+            | Self::HyperFfnGateRaw
+            | Self::HyperFfnMixed => Chain::HyperFfn,
+            Self::HyperHeadNorm
+            | Self::HyperHeadNormOperand
+            | Self::HyperHeadLowRank
+            | Self::HyperHeadGateAct
+            | Self::HyperHeadGateOperand
+            | Self::HyperHeadGateRaw
+            | Self::HyperHeadMixed => Chain::HyperHead,
             Self::DeltaNetNorm
             | Self::DeltaNetBetaOperand
             | Self::DeltaNetBetaProj
             | Self::DeltaNetAlphaOperand
-            | Self::DeltaNetAlphaProj => Chain::DeltaNet,
+            | Self::DeltaNetAlphaProj
+            | Self::DeltaNetLiveOperand
+            | Self::DeltaNetLiveProjection
+            | Self::DeltaNetLiveSplit
+            | Self::DeltaNetLiveSpanPtrs
+            | Self::DeltaNetLiveSpanExtents
+            | Self::DeltaNetLiveConv
+            | Self::DeltaNetLiveScanOut
+            | Self::DeltaNetLiveScanAux
+            | Self::DeltaNetLiveDecay
+            | Self::DeltaNetLiveNormGate
+            | Self::DeltaNetLiveOutOperand
+            | Self::DeltaNetLiveOut => Chain::DeltaNet,
             Self::ReplayQkv
             | Self::ReplayZ
             | Self::ReplayBeta
@@ -948,12 +1122,31 @@ impl WaveBuffer {
             | Self::DeltaNetBetaProj
             | Self::DeltaNetAlphaOperand
             | Self::DeltaNetAlphaProj
+            | Self::DeltaNetLiveOperand
+            | Self::DeltaNetLiveProjection
+            | Self::DeltaNetLiveSplit
+            | Self::DeltaNetLiveSpanPtrs
+            | Self::DeltaNetLiveSpanExtents
+            | Self::DeltaNetLiveConv
+            | Self::DeltaNetLiveScanOut
+            | Self::DeltaNetLiveScanAux
+            | Self::DeltaNetLiveDecay
+            | Self::DeltaNetLiveNormGate
+            | Self::DeltaNetLiveOutOperand
+            | Self::DeltaNetLiveOut
             | Self::ReplayQkv
             | Self::ReplayZ
             | Self::ReplayBeta
             | Self::ReplayAlpha
             | Self::ReplaySpanPtrs
-            | Self::ReplaySpanExtents => LayerPhase::Attention,
+            | Self::ReplaySpanExtents
+            | Self::HyperAttnNorm
+            | Self::HyperAttnNormOperand
+            | Self::HyperAttnLowRank
+            | Self::HyperAttnGateAct
+            | Self::HyperAttnGateOperand
+            | Self::HyperAttnGateRaw
+            | Self::HyperAttnMixed => LayerPhase::Attention,
             Self::AttnNorm
             | Self::QkvProjection
             | Self::QSplit
@@ -976,7 +1169,14 @@ impl WaveBuffer {
             | Self::AttnOutput
             | Self::DecodeContext
             | Self::OProjOutput => LayerPhase::Attention,
-            Self::FfnNorm
+            Self::HyperFfnNorm
+            | Self::HyperFfnNormOperand
+            | Self::HyperFfnLowRank
+            | Self::HyperFfnGateAct
+            | Self::HyperFfnGateOperand
+            | Self::HyperFfnGateRaw
+            | Self::HyperFfnMixed
+            | Self::FfnNorm
             | Self::SharedGateUp
             | Self::SharedAct
             | Self::SharedGated
@@ -1005,7 +1205,16 @@ impl WaveBuffer {
             | Self::DenseGateUp
             | Self::DenseSilu
             | Self::DenseSwiglu => LayerPhase::Ffn,
-            Self::HeadNorm | Self::HeadNormF32 | Self::HeadLogits => LayerPhase::Forward,
+            Self::HyperHeadNorm
+            | Self::HyperHeadNormOperand
+            | Self::HyperHeadLowRank
+            | Self::HyperHeadGateAct
+            | Self::HyperHeadGateOperand
+            | Self::HyperHeadGateRaw
+            | Self::HyperHeadMixed
+            | Self::HeadNorm
+            | Self::HeadNormF32
+            | Self::HeadLogits => LayerPhase::Forward,
         }
     }
 
@@ -1051,7 +1260,55 @@ impl WaveBuffer {
                 dense(rows, g.hidden, g.act_dtype)
             }
         };
+        // The pre-mix's widths, zero where the stack has none — which prices
+        // both preludes at nothing and leaves every other stack's spans alone.
+        let hyper = g.hyper.unwrap_or(HyperWidths {
+            streams: 0,
+            low_rank: 0,
+        });
+        let hyper_rows = if g.hyper.is_some() { rows } else { 0 };
+        let hyper_scored = if g.hyper.is_some() { w.scored_rows } else { 0 };
+        // The KO projections' padded widths (`HcWeightsKo`): the rank to the
+        // int8 K tile, the down projection's rows to the matmul's N tile. The
+        // two q8a128 operands exist only where the matmul is int8.
+        let gate_cols = hyper.low_rank.div_ceil(Q8A128_TILE_ELEMS) * Q8A128_TILE_ELEMS;
+        let down_cols = |inject: usize| (gate_cols + inject).div_ceil(KO_N_TILE) * KO_N_TILE;
+        let operand_rows = |r: usize| if g.packed_norm { r } else { 0 };
+        let hc_dim = hyper.streams * g.hidden;
         match self {
+            Self::HyperAttnNorm
+            | Self::HyperAttnGateRaw
+            | Self::HyperFfnNorm
+            | Self::HyperFfnGateRaw => dense(hyper_rows, hc_dim, DType::F32),
+            Self::HyperAttnNormOperand | Self::HyperFfnNormOperand => {
+                q8(operand_rows(hyper_rows), hc_dim)
+            }
+            Self::HyperAttnLowRank | Self::HyperFfnLowRank => {
+                dense(hyper_rows, down_cols(hyper.streams), DType::F32)
+            }
+            Self::HyperAttnGateAct | Self::HyperFfnGateAct => {
+                dense(hyper_rows, gate_cols, DType::F32)
+            }
+            Self::HyperAttnGateOperand | Self::HyperFfnGateOperand => {
+                q8(operand_rows(hyper_rows), gate_cols)
+            }
+            Self::HyperAttnMixed | Self::HyperFfnMixed => dense(hyper_rows, g.hidden, DType::F32),
+            // The head's mix, over the scored rows, with no inject columns.
+            Self::HyperHeadNorm | Self::HyperHeadGateRaw => dense(hyper_scored, hc_dim, DType::F32),
+            Self::HyperHeadNormOperand => q8(operand_rows(hyper_scored), hc_dim),
+            Self::HyperHeadLowRank => dense(hyper_scored, down_cols(0), DType::F32),
+            Self::HyperHeadGateAct => dense(hyper_scored, gate_cols, DType::F32),
+            Self::HyperHeadGateOperand => q8(operand_rows(hyper_scored), gate_cols),
+            Self::HyperHeadMixed => dense(hyper_scored, g.hidden, DType::F32),
+            // Under the pre-mix a float head's "norm" is a wrap of the mix
+            // output and carves nothing; a packed one still quantizes it.
+            Self::HeadNorm | Self::HeadNormF32 if g.hyper.is_some() && !g.packed_head => {
+                dense(0, 0, g.act_dtype)
+            }
+            // A float session's attention "norm" under the pre-mix is a wrap of
+            // the mix output, which carves nothing; an int8 one still quantizes
+            // it into q8a128 on the span.
+            Self::AttnNorm if g.hyper.is_some() && !g.packed_norm => dense(0, 0, g.act_dtype),
             Self::AttnNorm => norm(rows),
             Self::QkvProjection => dense(rows, g.qkv_cols(), g.act_dtype),
             // A bias add reads the narrowed view directly and writes its own
@@ -1139,17 +1396,76 @@ impl WaveBuffer {
             // The DeltaNet chain prices zero on a stack with no DeltaNet
             // layers, which makes `Chain::DeltaNet` sum to zero and drop out of
             // the phase's max — no all-attention model's span moves.
+            // Under the pre-mix the mixer's input is the mix output, already
+            // carved by the prelude — no norm of its own.
             Self::DeltaNetNorm => {
-                let cols = if g.delta_net.is_some() { g.hidden } else { 0 };
+                let cols = if g.delta_net.is_some() && g.hyper.is_none() {
+                    g.hidden
+                } else {
+                    0
+                };
                 dense(rows, cols, g.act_dtype)
             }
+            // The upcast to F32 is a no-op on an operand that is already F32,
+            // and carves nothing.
             Self::DeltaNetBetaOperand | Self::DeltaNetAlphaOperand => {
-                let cols = if g.delta_net.is_some() { g.hidden } else { 0 };
+                let cols = if g.delta_net.is_some() && g.act_dtype != DType::F32 {
+                    g.hidden
+                } else {
+                    0
+                };
                 dense(rows, cols, DType::F32)
+            }
+            // Under the pre-mix β and α ride the stacked projection instead.
+            Self::DeltaNetBetaProj | Self::DeltaNetAlphaProj if g.hyper.is_some() => {
+                dense(0, 0, DType::F32)
             }
             Self::DeltaNetBetaProj | Self::DeltaNetAlphaProj => {
                 dense(rows, g.delta_net.map_or(0, |d| d.n_v_heads), DType::F32)
             }
+            // The live chain: only a Gated Residual stack with DeltaNet layers.
+            Self::DeltaNetLiveOperand
+            | Self::DeltaNetLiveProjection
+            | Self::DeltaNetLiveSplit
+            | Self::DeltaNetLiveSpanPtrs
+            | Self::DeltaNetLiveSpanExtents
+            | Self::DeltaNetLiveConv
+            | Self::DeltaNetLiveScanOut
+            | Self::DeltaNetLiveScanAux
+            | Self::DeltaNetLiveDecay
+            | Self::DeltaNetLiveNormGate
+            | Self::DeltaNetLiveOutOperand
+            | Self::DeltaNetLiveOut
+                if g.hyper.is_none() || g.delta_net.is_none() =>
+            {
+                dense(0, 0, DType::F32)
+            }
+            Self::DeltaNetLiveOperand => q8(rows, g.hidden),
+            Self::DeltaNetLiveProjection | Self::DeltaNetLiveSplit => {
+                let d = g.delta_net.expect("guarded above");
+                dense(rows, d.conv_dim + d.value_dim + 2 * d.n_v_heads, DType::F32)
+            }
+            Self::DeltaNetLiveSpanPtrs => dense(rows, 4, DType::I64),
+            Self::DeltaNetLiveSpanExtents => dense(rows, 2, DType::U32),
+            Self::DeltaNetLiveConv => dense(
+                rows,
+                g.delta_net.expect("guarded above").conv_dim,
+                DType::F32,
+            ),
+            Self::DeltaNetLiveScanOut | Self::DeltaNetLiveScanAux | Self::DeltaNetLiveNormGate => {
+                dense(
+                    rows,
+                    g.delta_net.expect("guarded above").value_dim,
+                    DType::F32,
+                )
+            }
+            Self::DeltaNetLiveDecay => dense(
+                rows,
+                g.delta_net.expect("guarded above").n_v_heads,
+                DType::F32,
+            ),
+            Self::DeltaNetLiveOutOperand => q8(rows, g.delta_net.expect("guarded above").value_dim),
+            Self::DeltaNetLiveOut => dense(rows, g.hidden, g.act_dtype),
             // Sized by the **staged** rows and spans, which are zero on every
             // forward but a replay — so this chain drops out of the attention
             // phase's `max` everywhere else.
@@ -1221,6 +1537,10 @@ impl WaveBuffer {
             {
                 dense(0, 0, g.act_dtype)
             }
+            // Under the pre-mix the FFN's "norm" is the mix output quantized
+            // once for every consumer — a carve on an int8 session, a wrap on a
+            // float one.
+            Self::FfnNorm if g.hyper.is_some() && !g.packed_norm => dense(0, 0, g.act_dtype),
             Self::FfnNorm => norm(rows),
             Self::RouterLogits => dense(rows, g.n_experts, g.act_dtype),
             Self::RouteWeights => dense(rows, g.experts_per_tok, DType::F32),
@@ -1335,12 +1655,20 @@ impl WavePlan {
     /// by more than one kind of layer — on a hybrid, an attention mixer or a
     /// DeltaNet one — and a generation holds exactly one of them, so the span is
     /// sized by the largest rather than by their total. See [`Chain`].
+    ///
+    /// **Preludes first.** A prelude chain runs ahead of whichever other chain
+    /// the layer opens the phase for, so the cursor walks the preludes and then
+    /// each alternative from where they left it; the phase costs the largest of
+    /// those walks.
     pub fn phase_bytes(&self, phase: LayerPhase, w: WaveWidth) -> usize {
+        let prelude = Chain::iter()
+            .filter(|c| c.phase() == phase && c.is_prelude())
+            .fold(0usize, |cursor, c| self.walk_chain(cursor, c, w));
         Chain::iter()
-            .filter(|c| c.phase() == phase)
-            .map(|c| self.chain_bytes(c, w))
+            .filter(|c| c.phase() == phase && !c.is_prelude())
+            .map(|c| self.walk_chain(prelude, c, w))
             .max()
-            .unwrap_or(0)
+            .unwrap_or(prelude)
     }
 
     /// What one chain's buffers cost, summed — see [`Self::phase_bytes`] for
@@ -1362,11 +1690,16 @@ impl WavePlan {
     /// replay's two span tables are 64 B and 16 B: charged rounded they cost
     /// 512, and the cursor spends 272.
     pub fn chain_bytes(&self, chain: Chain, w: WaveWidth) -> usize {
+        self.walk_chain(0, chain, w)
+    }
+
+    /// The bump cursor after `chain`'s buffers are carved starting at `cursor`.
+    fn walk_chain(&self, cursor: usize, chain: Chain, w: WaveWidth) -> usize {
         WaveBuffer::iter()
             .filter(|b| b.chain() == chain)
             .map(|b| b.bytes(&self.geometry, w))
             .filter(|&len| len > 0)
-            .fold(0usize, |cursor, len| {
+            .fold(cursor, |cursor, len| {
                 cursor.div_ceil(BUMP_ALIGNMENT) * BUMP_ALIGNMENT + len
             })
     }
@@ -1580,6 +1913,130 @@ mod tests {
         WaveWidth::prefill(0, 1)
     }
 
+    /// Qwen3.8-Flash-Next's pre-mix geometry: 4 streams over `hidden` 2560
+    /// through a rank-320 gate, on the MoE geometry, with F32 activations.
+    fn hyper_moe() -> ModelGeometry {
+        ModelGeometry {
+            hidden: 2560,
+            act_dtype: DType::F32,
+            accum_dtype: DType::F32,
+            hyper: Some(HyperWidths {
+                streams: 4,
+                low_rank: 320,
+            }),
+            ..moe()
+        }
+    }
+
+    /// The pre-mix at 100 rows on an int8 session, carve by carve, with the KO
+    /// projections' padding (rank 320 → 384, down rows 388 → 416): the grouped
+    /// norm (100 × 10240 × 4 = 4,096,000), its q8a128 operand (8,000 tiles →
+    /// 1,000 blocks × 1,152 = 1,152,000), the down projection
+    /// (100 × 416 × 4 = 166,400), the SiLU (100 × 384 × 4 = 153,600), its
+    /// operand (300 tiles → 38 blocks × 1,152 = 43,776), the raw gate
+    /// (4,096,000) and the mix (1,024,000). Every carve starts on a 256
+    /// boundary here, so the walk is their sum.
+    #[test]
+    fn the_hyper_prelude_prices_its_carves_as_the_cursor_walks() {
+        let p = WavePlan::new(hyper_moe());
+        let wide = WaveWidth::prefill(100, 1);
+        assert_eq!(p.chain_bytes(Chain::HyperAttn, wide), 10_731_776);
+        assert_eq!(p.chain_bytes(Chain::HyperFfn, wide), 10_731_776);
+        // A float session has no operands: 4,096,000 + 166,400 + 153,600 +
+        // 4,096,000 + 1,024,000.
+        let float = WavePlan::new(ModelGeometry {
+            packed_norm: false,
+            ..hyper_moe()
+        });
+        assert_eq!(float.chain_bytes(Chain::HyperAttn, wide), 9_536_000);
+        // Absent on every stack without hyper-connections.
+        let plain = WavePlan::new(moe());
+        assert_eq!(plain.chain_bytes(Chain::HyperAttn, wide), 0);
+        assert_eq!(plain.chain_bytes(Chain::HyperFfn, wide), 0);
+    }
+
+    /// A prelude runs AHEAD of the phase's mixer, not instead of it: the phase
+    /// walks the pre-mix and then the largest alternative on from its end.
+    #[test]
+    fn a_phase_with_a_prelude_walks_it_before_the_mixer() {
+        let p = WavePlan::new(hyper_moe());
+        let wide = WaveWidth::prefill(100, 1);
+        assert_eq!(
+            p.phase_bytes(LayerPhase::Ffn, wide),
+            p.walk_chain(10_731_776, Chain::Ffn, wide)
+        );
+        let attn = p
+            .walk_chain(10_731_776, Chain::Attention, wide)
+            .max(p.walk_chain(10_731_776, Chain::DeltaNet, wide));
+        assert_eq!(p.phase_bytes(LayerPhase::Attention, wide), attn);
+        // And a stack with no prelude prices exactly as it did.
+        let plain = WavePlan::new(moe());
+        assert_eq!(
+            plain.phase_bytes(LayerPhase::Ffn, wide),
+            plain.chain_bytes(Chain::Ffn, wide)
+        );
+    }
+
+    /// Flash-Next's DeltaNet geometry on the pre-mix stack: 16 K heads and 48 V
+    /// heads of 128, so `conv_dim` 10240 and `value_dim` 6144.
+    fn hyper_hybrid() -> ModelGeometry {
+        ModelGeometry {
+            delta_net: Some(DeltaNetWidths {
+                conv_dim: 10240,
+                value_dim: 6144,
+                n_v_heads: 48,
+            }),
+            ..hyper_moe()
+        }
+    }
+
+    /// Pinned to the `wave-census-labels` itemisation of a DeltaNet layer's
+    /// attention-phase generation on Qwen3.8-Flash-Next at 515 rows: the
+    /// pre-mix's full-width carves, then the live mixer's, byte for byte. The
+    /// pre-mix's two projection outputs are pinned by
+    /// [`the_hyper_prelude_prices_its_carves_as_the_cursor_walks`], whose widths
+    /// the KO padding sets.
+    #[test]
+    fn the_pre_mix_and_live_delta_net_match_the_census() {
+        let g = hyper_hybrid();
+        let w = WaveWidth::prefill(515, 1);
+        let measured = [
+            (WaveBuffer::HyperAttnNorm, 21_094_400),
+            (WaveBuffer::HyperAttnGateRaw, 21_094_400),
+            (WaveBuffer::HyperAttnMixed, 5_273_600),
+            (WaveBuffer::DeltaNetLiveOperand, 1_483_776),
+            (WaveBuffer::DeltaNetLiveProjection, 33_948_800),
+            (WaveBuffer::DeltaNetLiveSplit, 33_948_800),
+            (WaveBuffer::DeltaNetLiveConv, 21_094_400),
+            (WaveBuffer::DeltaNetLiveScanOut, 12_656_640),
+            (WaveBuffer::DeltaNetLiveScanAux, 12_656_640),
+            (WaveBuffer::DeltaNetLiveDecay, 98_880),
+        ];
+        for (b, bytes) in measured {
+            assert_eq!(b.bytes(&g, w), bytes, "{b:?}");
+        }
+    }
+
+    /// Under the pre-mix a float session's norms carve nothing: the mix output
+    /// IS the block input the mixer and the experts read.
+    #[test]
+    fn the_pre_mix_replaces_the_float_norms() {
+        let g = ModelGeometry {
+            packed_norm: false,
+            ..hyper_moe()
+        };
+        let wide = WaveWidth::prefill(100, 1);
+        for b in [
+            WaveBuffer::AttnNorm,
+            WaveBuffer::FfnNorm,
+            WaveBuffer::DeltaNetNorm,
+            WaveBuffer::DeltaNetBetaOperand,
+            WaveBuffer::DeltaNetAlphaOperand,
+        ] {
+            assert_eq!(b.bytes(&g, wide), 0, "{b:?}");
+        }
+    }
+
     /// **The tier costs the SUM of the phases, not the largest of them.**
     ///
     /// This is the defect the tier bound exists to fix, and nothing else would
@@ -1679,6 +2136,7 @@ mod tests {
             packed_head: true,
             gated_qkv: false,
             partial_rotary: false,
+            hyper: None,
             shared_expert: None,
             qkv_bias: false,
             decode_q8_context: true,
@@ -1721,6 +2179,7 @@ mod tests {
             packed_head: true,
             gated_qkv: true,
             partial_rotary: true,
+            hyper: None,
             shared_expert: None,
             qkv_bias: false,
             decode_q8_context: true,
@@ -1757,6 +2216,7 @@ mod tests {
             packed_head: true,
             gated_qkv: false,
             partial_rotary: false,
+            hyper: None,
             shared_expert: None,
             qkv_bias: false,
             decode_q8_context: true,
@@ -1861,7 +2321,43 @@ mod tests {
                             || b.chain() == Chain::DeltaNetReplay)
                             && g.delta_net.is_none())
                         || (b.chain() == Chain::Ffn && !g.is_moe())
-                        || (b.chain() == Chain::DenseFfn && g.is_moe());
+                        || (b.chain() == Chain::DenseFfn && g.is_moe())
+                        // The Gated Residual pre-mix, on a stack that has one.
+                        || (matches!(
+                            b.chain(),
+                            Chain::HyperAttn | Chain::HyperFfn | Chain::HyperHead
+                        ) && g.hyper.is_none())
+                        // A float head under the pre-mix: its norm is the mix.
+                        || (matches!(b, WaveBuffer::HeadNorm | WaveBuffer::HeadNormF32)
+                            && g.hyper.is_some()
+                            && !g.packed_head)
+                        // The live DeltaNet chain: a Gated Residual stack with
+                        // DeltaNet layers only — where β and α ride its stacked
+                        // projection instead of their own.
+                        || (matches!(
+                            b,
+                            WaveBuffer::DeltaNetLiveOperand
+                                | WaveBuffer::DeltaNetLiveProjection
+                                | WaveBuffer::DeltaNetLiveSplit
+                                | WaveBuffer::DeltaNetLiveSpanPtrs
+                                | WaveBuffer::DeltaNetLiveSpanExtents
+                                | WaveBuffer::DeltaNetLiveConv
+                                | WaveBuffer::DeltaNetLiveScanOut
+                                | WaveBuffer::DeltaNetLiveScanAux
+                                | WaveBuffer::DeltaNetLiveDecay
+                                | WaveBuffer::DeltaNetLiveNormGate
+                                | WaveBuffer::DeltaNetLiveOutOperand
+                                | WaveBuffer::DeltaNetLiveOut
+                        ) && (g.hyper.is_none() || g.delta_net.is_none()))
+                        || (matches!(
+                            b,
+                            WaveBuffer::DeltaNetBetaProj | WaveBuffer::DeltaNetAlphaProj
+                        ) && g.hyper.is_some())
+                        // DeltaNet's F32 upcasts are no-ops on an F32 session.
+                        || (matches!(
+                            b,
+                            WaveBuffer::DeltaNetBetaOperand | WaveBuffer::DeltaNetAlphaOperand
+                        ) && g.act_dtype == DType::F32);
                     // Every unit non-zero, so a buffer sized by any of the three
                     // is exercised and a zero is a defect rather than a width
                     // this case happened not to supply.

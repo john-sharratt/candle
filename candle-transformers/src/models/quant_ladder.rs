@@ -99,12 +99,39 @@ pub fn below_narrowest_rung(vram_gib: u64) -> bool {
 /// This device's total VRAM in gibibytes, for feeding the functions above.
 pub fn device_vram_gib(device: &Device) -> Result<u64> {
     let (_free, total) = device.mem_get_info()?;
-    Ok(total as u64 / (1024 * 1024 * 1024))
+    Ok(nominal_gib(total as u64))
+}
+
+/// A card's nominal size in GiB from the total the driver reports.
+///
+/// **Rounded, not floored.** The driver reports a little under the nominal
+/// size — the RTX 4090 Mobile reads 16,375.5 MiB of its 16 GiB — so flooring
+/// puts every card one GiB below its own rung: a 32 GiB card would read 31 and
+/// fall to the `Q2_KO` rung the ladder gives 24 GiB cards.
+pub fn nominal_gib(total_bytes: u64) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    (total_bytes + GIB / 2) / GIB
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// Reported totals from the fleet land on their nominal sizes.
+    #[test]
+    fn reported_totals_round_to_the_card() {
+        // RTX 4090 Mobile: 16,375.5 MiB reported.
+        assert_eq!(nominal_gib(16_375 * MIB + MIB / 2), 16);
+        // A card reading just under 24 GiB, and one just under 32.
+        assert_eq!(nominal_gib(24_100 * MIB), 24);
+        assert_eq!(nominal_gib(32_600 * MIB), 32);
+        // Exactly on a size, and just past the half-way point below it.
+        assert_eq!(nominal_gib(16 * 1024 * MIB), 16);
+        assert_eq!(nominal_gib(15 * 1024 * MIB + 512 * MIB), 16);
+        assert_eq!(nominal_gib(15 * 1024 * MIB + 511 * MIB), 15);
+    }
 
     /// The fleet, by the machine each figure belongs to — the sizing table in
     /// CLAUDE.md names its machine per row for exactly this reason.

@@ -19,7 +19,7 @@
 //!   this module returns `None` and the layer attends densely — the same
 //!   arithmetic, skipping the scoring launch.
 
-use candle::{Result, Tensor};
+use candle::{LiveTensor, Result, Tensor};
 
 use super::config::IndexerConfig;
 use super::qsa_select::{
@@ -69,7 +69,11 @@ impl IndexState {
 /// oracle-vs-engine comparison have to normalise the same way for the
 /// comparison to mean anything, and neither tensor is large enough for the
 /// fused kernel to matter.
-pub(crate) fn rms_norm_last(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+pub(crate) fn rms_norm_last<'w>(
+    x: &LiveTensor<'w>,
+    weight: &Tensor,
+    eps: f64,
+) -> Result<LiveTensor<'w>> {
     let ms = x.sqr()?.mean_keepdim(candle::D::Minus1)?;
     x.broadcast_div(&(ms + eps)?.sqrt()?)?.broadcast_mul(weight)
 }

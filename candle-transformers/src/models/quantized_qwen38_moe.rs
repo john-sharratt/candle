@@ -15,8 +15,13 @@
 //! `qwen35` lineage. Both carry "Qwen3.8" branding; the `_moe` suffix is the
 //! same split the 3.5/3.6 siblings use.
 
+use std::path::PathBuf;
+
+use candle::quantized::GgmlDType;
 use candle::{Device, Result};
 
+use super::quant_ladder;
+use super::qwen4exp::prepare::{ExpertSource, Recipe, SourceFile, SourceRole};
 use super::qwen4exp::{load_oracle_model, Qwen4ExpModel};
 
 /// The tokenizer, pinned to the canonical base repo.
@@ -33,9 +38,56 @@ pub const TOKENIZER_REV: &str = "de4b8e4d43b917e7706784d8bb445c9af86a3540";
 /// per-machine expert formats are produced by requantizing locally from this
 /// file. Six shards; shard 1 is metadata-only, shard 3 is the isolated PLE
 /// table.
+///
+/// The revision is the one that also carries the MTP draft head (`MTP/`). The
+/// six `Q8_0` shards are byte-identical to the earlier `c8b5954a` pin — the same
+/// LFS object ids — so moving the pin changed no weight.
 pub const QWEN4EXP_REPO: &str = "unsloth/Qwen3.8-Flash-Next-GGUF";
-pub const QWEN4EXP_REV: &str = "c8b5954a88c2775c546b92593eda40ea041d3176";
+pub const QWEN4EXP_REV: &str = "38bb39ee97821de2c9009abb7e93950eec396e66";
 pub const QWEN4EXP_Q8_0_SHARDS: usize = 6;
+
+/// The six `Q8_0` shards at [`QWEN4EXP_REV`]: `(path, bytes, LFS SHA-256)`.
+pub const QWEN4EXP_Q8_0_FILES: [(&str, u64, &str); QWEN4EXP_Q8_0_SHARDS] = [
+    (
+        "Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf",
+        10_946_624,
+        "2dabcbb53ca537a7947bc7d20414fd464eeaf4d66d43021b5b2556cc87544ad2",
+    ),
+    (
+        "Q8_0/Qwen3.8-Flash-Next-Q8_0-00002-of-00006.gguf",
+        682_434_912,
+        "494ca4ed3dbf97bc28da88af3890b8877b9032f909812d00c0526a9ca5e91d2e",
+    ),
+    (
+        "Q8_0/Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf",
+        54_400_261_312,
+        "34efd79a80a1ce540a517a5d56171924b66ce1c38b04c904f17ad6d8ef17cf20",
+    ),
+    (
+        "Q8_0/Qwen3.8-Flash-Next-Q8_0-00004-of-00006.gguf",
+        49_446_841_216,
+        "bfa634025fabbd2658bf7694bc80b90e571699c768723f844c934c7ef06c691a",
+    ),
+    (
+        "Q8_0/Qwen3.8-Flash-Next-Q8_0-00005-of-00006.gguf",
+        49_668_930_400,
+        "232a8f14cc0fa4262e7efe8593774b136fe40909e39c7a020342ddaa27259a97",
+    ),
+    (
+        "Q8_0/Qwen3.8-Flash-Next-Q8_0-00006-of-00006.gguf",
+        34_015_618_784,
+        "538a93bca918064983409a41187ad4c68640f9aced6f29564da8f551bf86d7a5",
+    ),
+];
+
+/// The MTP draft head at [`QWEN4EXP_REV`], at `Q8_0`: `(path, bytes, LFS SHA-256)`.
+/// Its dense weights stay `Q8_0` in the engine artifact; its experts take the
+/// trunk's width (`quant_ladder::drafter_format`).
+pub const QWEN4EXP_MTP_FILE: (&str, u64, &str) = (
+    "MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf",
+    4_137_429_120,
+    "cd87e5d1a4dadaeed63e35929f3b2f28d13e081b4cd32e00f2835095ec09351e",
+);
 
 /// Shard `i` (1-based) of the pinned Q8_0 split.
 pub fn q8_0_shard_name(i: usize) -> String {
@@ -55,6 +107,113 @@ pub const QWEN4EXP_W4A16_EXPERT_SHARDS: [usize; 4] = [2, 3, 4, 5];
 /// Safetensors shard `i` of the W4A16 release.
 pub fn w4a16_shard_name(i: usize) -> String {
     format!("model-{i:05}-of-00005.safetensors")
+}
+
+/// The W4A16 expert shards ([`QWEN4EXP_W4A16_EXPERT_SHARDS`]) at
+/// [`QWEN4EXP_W4A16_REV`]: `(path, bytes, LFS SHA-256)`.
+pub const QWEN4EXP_W4A16_FILES: [(&str, u64, &str); 4] = [
+    (
+        "model-00002-of-00005.safetensors",
+        20_007_503_112,
+        "dcb830243a6f1f56f8849cdc829724383c3fa104ba793e7f879a19927d4e8a32",
+    ),
+    (
+        "model-00003-of-00005.safetensors",
+        19_960_933_248,
+        "00b849022ecb3fae6c8d6cdde768da899abb47c25bfc44d87e8c931f11b124cb",
+    ),
+    (
+        "model-00004-of-00005.safetensors",
+        20_008_579_224,
+        "af83800aeef9ee47e49fc0a9769f67617108934626e79a2e30051ef48f338a7d",
+    ),
+    (
+        "model-00005-of-00005.safetensors",
+        13_134_032_728,
+        "b4e2d8c38b466774703b831ccbfc89f1c78e726d2296bb7eaaf2d3b31933fadd",
+    ),
+];
+
+/// The version of the engine build's output bytes. Part of the recipe, so a
+/// change to what the build writes for an unchanged set of sources names a new
+/// artifact and every machine rebuilds.
+pub const ENGINE_CONVERTER_VERSION: u32 = 1;
+
+/// The engine artifact's recipe for a card of `vram_gib`.
+///
+/// The expert width is [`quant_ladder::expert_format`]'s: `Q4_KO` is the
+/// bit-exact W4A16 import, a narrower KO rung is requantized from the `Q8_0`
+/// split, and above every rung the split's own `Q8_0` stands. The trunk, the
+/// n-gram table and the draft head's dense weights are `Q8_0` on every rung.
+pub fn engine_recipe(vram_gib: u64) -> Recipe {
+    engine_recipe_at(quant_ladder::expert_format(vram_gib))
+}
+
+/// The engine artifact's recipe with its routed experts at `experts` — the
+/// rung named directly rather than through a card's VRAM, for a caller that
+/// already knows which artifact it wants (a preset naming its expert width).
+/// `None` leaves the experts at the split's own `Q8_0`.
+pub fn engine_recipe_at(experts: Option<GgmlDType>) -> Recipe {
+    let pinned =
+        |role, repo, revision, (path, bytes, sha256): (&'static str, u64, &'static str)| {
+            SourceFile {
+                role,
+                repo,
+                revision,
+                path,
+                bytes,
+                sha256,
+            }
+        };
+    let mut sources: Vec<SourceFile> = QWEN4EXP_Q8_0_FILES
+        .into_iter()
+        .map(|f| pinned(SourceRole::Trunk, QWEN4EXP_REPO, QWEN4EXP_REV, f))
+        .collect();
+    sources.push(pinned(
+        SourceRole::DraftHead,
+        QWEN4EXP_REPO,
+        QWEN4EXP_REV,
+        QWEN4EXP_MTP_FILE,
+    ));
+    let (experts, expert_source) = match experts {
+        Some(GgmlDType::Q4_KO) => {
+            sources.extend(QWEN4EXP_W4A16_FILES.into_iter().map(|f| {
+                pinned(
+                    SourceRole::ExpertImport,
+                    QWEN4EXP_W4A16_REPO,
+                    QWEN4EXP_W4A16_REV,
+                    f,
+                )
+            }));
+            (GgmlDType::Q4_KO, ExpertSource::AwqImport)
+        }
+        Some(ko) => (ko, ExpertSource::Requantized),
+        None => (GgmlDType::Q8_0, ExpertSource::Verbatim),
+    };
+    Recipe {
+        sources,
+        trunk: GgmlDType::Q8_0,
+        head_dense: GgmlDType::Q8_0,
+        experts,
+        expert_source,
+        // The drafter's experts take the trunk's width on every rung
+        // (`quant_ladder::drafter_format`): slots are sized to the widest layer.
+        head_experts: experts,
+        converter_version: ENGINE_CONVERTER_VERSION,
+    }
+}
+
+/// Where engine artifacts live: zend's model cache, under this repo's folder —
+/// the directory `zend`'s prepared-artifact resolution reads.
+pub fn engine_artifact_dir() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("zend")
+        .join("models")
+        .join(QWEN4EXP_REPO.replace('/', "--"))
 }
 
 /// Load the reference (oracle) model from the pinned split's first shard
@@ -90,9 +249,11 @@ mod tests {
     use super::*;
     use crate::models::batch_test::test_helpers::hf_get;
     use crate::models::batch_test::utils::{account_model_load, TestConfig, TestMode};
+    use candle::quantized::gguf_file::Content;
     use candle::Tensor;
     use hf_hub::RepoType;
-    use std::path::PathBuf;
+    use std::collections::HashSet;
+    use std::fs::File;
 
     fn pinned_shards() -> Result<Vec<PathBuf>> {
         (1..=QWEN4EXP_Q8_0_SHARDS)
@@ -105,6 +266,68 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// This card's engine artifact: resolved from zend's model cache, or built
+    /// there from the pinned sources ([`prepare_engine_artifact`]).
+    fn engine_gguf() -> Result<PathBuf> {
+        use crate::models::batch_test::test_helpers::HfSourceStore;
+        use crate::models::qwen4exp::prepare::prepare_engine;
+        let device = Device::new_cuda(0)?;
+        let recipe = engine_recipe(quant_ladder::device_vram_gib(&device)?);
+        prepare_engine(&recipe, &engine_artifact_dir(), &HfSourceStore, &device)
+    }
+
+    /// The pin table and the shard-name function describe the same six files.
+    #[test]
+    fn the_q8_0_pins_name_the_split() {
+        for (i, (path, _, sha)) in QWEN4EXP_Q8_0_FILES.iter().enumerate() {
+            assert_eq!(*path, q8_0_shard_name(i + 1));
+            assert_eq!(sha.len(), 64);
+        }
+        for (&i, (path, _, _)) in QWEN4EXP_W4A16_EXPERT_SHARDS
+            .iter()
+            .zip(QWEN4EXP_W4A16_FILES.iter())
+        {
+            assert_eq!(*path, w4a16_shard_name(i));
+        }
+    }
+
+    /// Each card in the fleet gets the rung `quant_ladder` names, the sources
+    /// that rung needs, and a distinct artifact.
+    #[test]
+    fn each_rung_has_its_own_recipe() {
+        let laptop = engine_recipe(16);
+        assert_eq!(laptop.experts, GgmlDType::Q2_KO);
+        assert_eq!(laptop.head_experts, GgmlDType::Q2_KO);
+        assert_eq!(laptop.expert_source, ExpertSource::Requantized);
+        assert_eq!(laptop.trunk, GgmlDType::Q8_0);
+        assert_eq!(laptop.head_dense, GgmlDType::Q8_0);
+        assert_eq!(laptop.sources_of(SourceRole::Trunk).len(), 6);
+        assert_eq!(laptop.sources_of(SourceRole::DraftHead).len(), 1);
+        assert!(laptop.sources_of(SourceRole::ExpertImport).is_empty());
+
+        let workstation = engine_recipe(32);
+        assert_eq!(workstation.experts, GgmlDType::Q3_KO);
+        assert_eq!(workstation.expert_source, ExpertSource::Requantized);
+
+        let blackwell = engine_recipe(72);
+        assert_eq!(blackwell.experts, GgmlDType::Q4_KO);
+        assert_eq!(blackwell.expert_source, ExpertSource::AwqImport);
+        assert_eq!(blackwell.sources_of(SourceRole::ExpertImport).len(), 4);
+
+        let above = engine_recipe(96);
+        assert_eq!(above.experts, GgmlDType::Q8_0);
+        assert_eq!(above.expert_source, ExpertSource::Verbatim);
+
+        let names: HashSet<String> = [&laptop, &workstation, &blackwell, &above]
+            .iter()
+            .map(|r| r.artifact_name())
+            .collect();
+        assert_eq!(names.len(), 4, "two rungs share an artifact name");
+        assert!(laptop
+            .artifact_name()
+            .starts_with("Qwen3.8-Flash-Next-Q2_KOEXP-"));
     }
 
     /// Does this checkpoint carry a NextN / MTP draft head?
@@ -122,11 +345,7 @@ mod tests {
     #[ignore = "reads the merged engine GGUF's header"]
     fn the_checkpoint_draft_head_inventory() -> Result<()> {
         use crate::models::latent_moe::GgufModel;
-        let merged =
-            PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-        if !merged.exists() {
-            candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-        }
+        let merged = engine_gguf()?;
         let gguf = GgufModel::open(&[merged])?;
         let mut meta: Vec<String> = gguf
             .metadata
@@ -158,7 +377,7 @@ mod tests {
         // With shapes: the head's own geometry is what decides how it wires to
         // a stack whose residual is `hc` streams wide. `hnorm` spanning
         // `hc_dim` rather than `n_embd` is what says it norms the WIDE residual
-        // and the head's mixer narrows it afterwards, and `shared_head_norm`'s
+        // and the head's mixer narrows it afterwards, and `nextn.hc_head_norm`'s
         // width says the same about the output side.
         for h in heads.iter().take(24) {
             match gguf.info(h) {
@@ -216,6 +435,35 @@ mod tests {
         Ok(())
     }
 
+    /// **The prepared artifact's head block and top-level tensors**, from its
+    /// header alone — no source is read, so this runs on a machine whose
+    /// sources were released after the build.
+    ///
+    ///   cargo test -p candle-transformers --features cuda --release --lib \
+    ///     the_engine_artifact_head_inventory -- --ignored --nocapture
+    #[test]
+    #[ignore = "reads the prepared engine artifact's header"]
+    fn the_engine_artifact_head_inventory() -> Result<()> {
+        use crate::models::qwen4exp::prepare::prepared;
+        let device = Device::new_cuda(0)?;
+        let recipe = engine_recipe(quant_ladder::device_vram_gib(&device)?);
+        let path = prepared(&recipe, &engine_artifact_dir())?.ok_or_else(|| {
+            candle::Error::Msg(format!("{} is not prepared", recipe.artifact_name()))
+        })?;
+        let content = Content::read(&mut File::open(&path)?)?;
+        let mut names: Vec<&String> = content
+            .tensor_infos
+            .keys()
+            .filter(|n| n.starts_with("blk.48.") || !n.starts_with("blk."))
+            .collect();
+        names.sort();
+        for n in names {
+            let i = &content.tensor_infos[n];
+            println!("  {n:<44} {:?} {:?}", i.shape.dims(), i.ggml_dtype);
+        }
+        Ok(())
+    }
+
     /// The MTP draft-head sidecar, read through **our own loader**.
     ///
     /// The release's GGUF lineage carries no head
@@ -232,10 +480,12 @@ mod tests {
     #[ignore = "reads the MTP sidecar GGUF's header"]
     fn the_mtp_sidecar_is_loadable() -> Result<()> {
         use crate::models::latent_moe::GgufModel;
-        let path = PathBuf::from(r"D:\models\qwen38-flash-next\mtp-Qwen3.8-Flash-Next-Q8_0.gguf");
-        if !path.exists() {
-            candle::bail!("MTP sidecar absent at {path:?}");
-        }
+        let path = hf_get(
+            QWEN4EXP_REPO,
+            RepoType::Model,
+            QWEN4EXP_REV,
+            QWEN4EXP_MTP_FILE.0,
+        )?;
         let mut gguf = GgufModel::open(&[path])?;
         let arch = gguf.metadata.get("general.architecture");
         println!("architecture: {arch:?}");
@@ -262,28 +512,14 @@ mod tests {
             println!("  {n:<44} {dims:?} {dt:?}");
         }
 
-        // **Is `output_hc_*` the trunk's, or the head's own?**
+        // **Are the head's `token_embd` / `output` the trunk's?**
         //
-        // The sidecar carries `token_embd` / `output` / `output_hc_*` so it can
-        // run standalone, and `mtp_use_dedicated_embeddings: false` says the
-        // first two ARE the trunk's — safe to drop when merging. `output_hc_*`
-        // is not covered by that flag, and the safetensors index lists a
-        // *separate* `mtp.hyper_connection_mixer.{hc_norm,input_mix_weight_up,
-        // input_mix_weight_down}` — a mixer with no inject, exactly this shape.
-        // If the converter mapped that to `output_hc_*`, these are the head's
-        // own weights under a colliding name, and dropping them as duplicates
-        // would silently delete a required tensor.
-        //
-        // Bytes decide it.
+        // The self-contained head carries both so it can run standalone, and
+        // `mtp_use_dedicated_embeddings: false` says they ARE the trunk's —
+        // which is what makes dropping them at merge safe. Bytes decide it.
         let device = Device::new_cuda(0)?;
         let mut trunk = GgufModel::open(&pinned_shards()?)?;
-        for name in [
-            "output_hc_norm.weight",
-            "output_hc_down.weight",
-            "output_hc_up.weight",
-            "token_embd.weight",
-            "output.weight",
-        ] {
+        for name in ["token_embd.weight", "output.weight"] {
             let a = gguf.qtensor(name, &device)?.dequantize(&device)?;
             let b = trunk.qtensor(name, &device)?.dequantize(&device)?;
             if a.dims() != b.dims() {
@@ -307,78 +543,32 @@ mod tests {
         Ok(())
     }
 
-    /// Merge the Q4KOEXP split into the ONE engine GGUF the production loader
-    /// consumes (single `Content` + mmap for the expert cache — the same
-    /// prepare step DeepSeek's merged MXFP4_KO file is). Resumable; a final
-    /// name is always a complete file.
+    /// **Build this card's engine artifact**, or confirm the one on disk.
+    ///
+    /// The recipe is [`engine_recipe`] for the card's VRAM: the `Q8_0` trunk
+    /// and n-gram table verbatim, the MTP head folded in as the block past the
+    /// trunk (`docs/qwen38_flash_next.md` §14 — a NextN head "is a layer of the
+    /// model, not a sidecar", and its 512 experts join the same grid), and the
+    /// routed experts at the rung's width. A present artifact whose stamp
+    /// matches is used as it stands; otherwise the pinned sources are fetched,
+    /// verified, built from and then deleted.
     #[test]
-    #[ignore = "streams ~124 GB from the converted split into D:\\models; needs the \
-                Q4KOEXP split (run test_forward_batched_oracle_q4ko_experts first)"]
-    fn prepare_engine_gguf() -> Result<()> {
-        use crate::models::qwen4exp::convert::{convert_mtp_sidecar, merge_gguf_files};
-        use candle::quantized::gguf_file::Value;
-        let q8 = pinned_shards()?;
-        let dir = q8[0]
-            .parent()
-            .ok_or_else(|| candle::Error::Msg("q8 shard has no parent dir".into()))?;
-        let splits: Vec<PathBuf> = (1..=QWEN4EXP_Q8_0_SHARDS)
-            .map(|i| {
-                dir.join(format!(
-                    "Qwen3.8-Flash-Next-Q4KOEXP-{i:05}-of-{QWEN4EXP_Q8_0_SHARDS:05}.gguf"
-                ))
-            })
-            .collect();
-        for s in &splits {
-            if !s.exists() {
-                candle::bail!("missing converted shard {s:?} — run the q4ko oracle gate first");
-            }
-        }
-        let out_dir = PathBuf::from(r"D:\models\qwen38-flash-next");
-        std::fs::create_dir_all(&out_dir)?;
-        let dst = out_dir.join("Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-
-        // ── The MTP draft head, folded in as the block past the trunk ──
-        //
-        // The release's own GGUF lineage carries no head; the published weights
-        // do, and a community conversion ships them as this sidecar
-        // (`docs/qwen38_flash_next.md` §14). It goes in as `blk.{num_layers}`
-        // rather than staying a sidecar for the reason `qwen35::mtp` gives — a
-        // NextN head "is a layer of the model, not a sidecar" — which matters
-        // more here than there, because this head carries its own 512-expert
-        // MoE: as a block of the merged file those experts join the same grid
-        // and stream through the same three tiers, instead of the expert cache
-        // having to learn about a second source.
-        let mut splits = splits;
-        let sidecar = out_dir.join("mtp-Qwen3.8-Flash-Next-Q8_0.gguf");
-        let overrides = if sidecar.exists() {
-            let device = Device::new_cuda(0)?;
-            let converted = out_dir.join("mtp-Qwen3.8-Flash-Next-Q4KOEXP.gguf");
-            let t = std::time::Instant::now();
-            let n = convert_mtp_sidecar(&sidecar, &converted, &device)?;
-            println!(
-                "✓ MTP head converted ({:.0}s): {n} expert tensors re-emitted at the trunk's width",
-                t.elapsed().as_secs_f32()
-            );
-            splits.push(converted);
-            // The trunk's shards declare 48 blocks and no head; the merged file
-            // is 49 with one. This is what makes the shared config parser split
-            // them (`num_layers = block_count − nextn_predict_layers`).
-            vec![
-                ("qwen4exp.block_count".to_string(), Value::U32(49)),
-                ("qwen4exp.nextn_predict_layers".to_string(), Value::U32(1)),
-            ]
-        } else {
-            println!("· no MTP sidecar at {sidecar:?} — merging the trunk alone, no draft head");
-            Vec::new()
-        };
-
+    #[ignore = "downloads the pinned sources (~192 GB on a requant rung) and writes the \
+                engine artifact (~95 GB at Q2_KO) into zend's model cache, then deletes the \
+                sources. Run with: cargo test --release --features cuda -p candle-transformers \
+                --lib quantized_qwen38_moe::tests::prepare_engine_artifact \
+                -- --ignored --nocapture --test-threads=1"]
+    fn prepare_engine_artifact() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let recipe = engine_recipe(quant_ladder::device_vram_gib(&device)?);
+        println!("recipe {}:\n{}", recipe.digest(), recipe.canonical());
         let t = std::time::Instant::now();
-        let out = merge_gguf_files(&splits, &dst, &overrides)?;
+        let path = engine_gguf()?;
         println!(
-            "✓ engine GGUF ready ({:.0}s): {:?} ({} GiB)",
+            "✓ engine artifact ready ({:.0}s): {} ({} GiB)",
             t.elapsed().as_secs_f32(),
-            out,
-            std::fs::metadata(&out)?.len() >> 30
+            path.display(),
+            std::fs::metadata(&path)?.len() >> 30
         );
         Ok(())
     }
@@ -397,11 +587,7 @@ mod tests {
         use candle::quantized::Int8Mode;
         use candle::IndexOp;
 
-        let merged =
-            PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-        if !merged.exists() {
-            candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-        }
+        let merged = engine_gguf()?;
         let device = Device::new_cuda(0)?;
         let t0 = std::time::Instant::now();
         let gpu = Qwen4ExpGpu::load(&merged, &device, Int8Mode::auto(&device))?;
@@ -529,11 +715,7 @@ mod tests {
         use candle::quantized::Int8Mode;
         use candle::IndexOp;
 
-        let merged =
-            PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-        if !merged.exists() {
-            candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-        }
+        let merged = engine_gguf()?;
         let device = Device::new_cuda(0)?;
         let gpu = Qwen4ExpGpu::load(&merged, &device, Int8Mode::auto(&device))?;
         let model = Qwen4ExpBatched::new(gpu)?;
@@ -672,11 +854,7 @@ mod tests {
         /// is not mistaken for one that stopped.
         const MAX_NEW: usize = 48;
 
-        let merged =
-            PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-        if !merged.exists() {
-            candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-        }
+        let merged = engine_gguf()?;
         let device = Device::new_cuda(0)?;
         let gpu = Qwen4ExpGpu::load(&merged, &device, Int8Mode::auto(&device))?;
         let model = Qwen4ExpBatched::new(gpu)?;
@@ -836,11 +1014,7 @@ mod tests {
         use candle::quantized::Int8Mode;
         use candle::IndexOp;
 
-        let merged =
-            PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-        if !merged.exists() {
-            candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-        }
+        let merged = engine_gguf()?;
         let device = Device::new_cuda(0)?;
         let t0 = std::time::Instant::now();
         let mut gpu = Qwen4ExpGpu::load(&merged, &device, Int8Mode::auto(&device))?;
@@ -1085,8 +1259,7 @@ mod tests {
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
 
-        let merged =
-            PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
+        let merged = engine_gguf()?;
         let device = Device::new_cuda(0)?;
         let gpu = Qwen4ExpGpu::load(&merged, &device, Int8Mode::auto(&device))?;
         let model = Qwen4ExpBatched::new(gpu)?;
@@ -1183,12 +1356,34 @@ mod tests {
     /// is what shows the top rung holding as the cohort grows, which is exactly
     /// where a row tuned at a single width quietly stops covering the next (the
     /// 3.5 sibling needed a retune for precisely that).
-    fn gate_ladder() -> Vec<TestConfig> {
+    ///
+    /// **The ×16 rung is gated on VRAM.** What bounds width here is per-session
+    /// state, not the checkpoint: 36 GDN layers carry 256 MiB of recurrent state
+    /// a sequence (both halves of the store), so sixteen want 4 GiB before any
+    /// K/V or the 3.3 GiB tier a sixteen-wide decode stands. On the 16 GB card the
+    /// dense trunk plus an expert zone on its floor leave 221 regions against the
+    /// 275 that needs — measured, and refused by the weight side on its floor.
+    /// Twenty-four GiB is the smallest card in the fleet with that room; below it
+    /// the rung is skipped and says so, because a narrower run is still a green
+    /// run and silence would let reduced coverage read as a pass.
+    fn gate_ladder(vram_gib: u64) -> Vec<TestConfig> {
         use crate::models::batched_inference::InferenceMode;
 
-        let mut configs: Vec<TestConfig> = [1usize, 4, 8, 16, 1]
-            .into_iter()
-            .map(|n| TestConfig {
+        let wide = vram_gib >= 24;
+        if !wide {
+            println!(
+                "  - BF16 ×16 skipped: a {vram_gib} GiB card, under the 24 GiB gate — sixteen \
+                 sequences' recurrent state does not fit beside the trunk"
+            );
+        }
+        let widths: &[usize] = if wide {
+            &[1, 4, 8, 16, 1]
+        } else {
+            &[1, 4, 8, 1]
+        };
+        let mut configs: Vec<TestConfig> = widths
+            .iter()
+            .map(|&n| TestConfig {
                 mode: InferenceMode::BF16,
                 use_batched: true,
                 num_contexts: n,
@@ -1353,11 +1548,7 @@ mod tests {
         use candle::quantized::Int8Mode;
 
         println!("\n=== Qwen3.8-Flash-Next: speculative ladder (production budget) ===\n");
-        let merged =
-            PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-        if !merged.exists() {
-            candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-        }
+        let merged = engine_gguf()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
 
@@ -1423,11 +1614,7 @@ mod tests {
         use candle::quantized::Int8Mode;
         use candle_nn::kv_cache::QuantFormat;
 
-        let merged =
-            PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-        if !merged.exists() {
-            candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-        }
+        let merged = engine_gguf()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         let tok = tokenizer_json()?;
@@ -1510,11 +1697,7 @@ mod tests {
         use candle::quantized::Int8Mode;
         use candle::IndexOp;
 
-        let merged =
-            PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-        if !merged.exists() {
-            candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-        }
+        let merged = engine_gguf()?;
         let device = Device::new_cuda(0)?;
         let gpu = Qwen4ExpGpu::load(&merged, &device, Int8Mode::auto(&device))?;
         let model = Qwen4ExpBatched::new(gpu)?;
@@ -1700,11 +1883,7 @@ mod tests {
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
 
-        let merged =
-            PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-        if !merged.exists() {
-            candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-        }
+        let merged = engine_gguf()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         let tok = tokenizer_json()?;
@@ -1784,11 +1963,7 @@ mod tests {
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
 
-        let merged =
-            PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-        if !merged.exists() {
-            candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-        }
+        let merged = engine_gguf()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         let tok = tokenizer_json()?;
@@ -1828,11 +2003,7 @@ mod tests {
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
 
-        let merged =
-            PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-        if !merged.exists() {
-            candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-        }
+        let merged = engine_gguf()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         let tok = tokenizer_json()?;
@@ -1891,11 +2062,7 @@ mod tests {
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
 
-        let merged =
-            PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-        if !merged.exists() {
-            candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-        }
+        let merged = engine_gguf()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         let tok = tokenizer_json()?;
@@ -1950,11 +2117,7 @@ mod tests {
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
 
-        let merged =
-            PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-        if !merged.exists() {
-            candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-        }
+        let merged = engine_gguf()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         let tok = tokenizer_json()?;
@@ -1985,6 +2148,53 @@ mod tests {
         )
     }
 
+    /// The token-rate probe: the gate's harness over the three rungs that
+    /// decide whether a change helped — one sequence, the widest BF16 fleet
+    /// this card runs, and the compressed pair — and its performance table,
+    /// in a few minutes rather than the full ladder's fifteen.
+    ///
+    /// **Rates only.** The transient tier's exactness is the gate's verdict
+    /// ([`test_parallel_batched_forwarding`]), judged over every rung; asserted
+    /// here it would fail on a slack no rate depends on and take the table with
+    /// it, which is the one thing this run exists to print.
+    #[test]
+    #[ignore = "loads the ~124 GB merged engine GGUF and needs a GPU. Run with: \
+                cargo test --release --features cuda -p candle-transformers --lib \
+                quantized_qwen38_moe::tests::profile_token_rate \
+                -- --ignored --nocapture --test-threads=1"]
+    fn profile_token_rate() -> Result<()> {
+        use crate::models::batch_test::utils::TestParams;
+        use crate::models::batched_inference::InferenceMode;
+        use crate::models::dialect::Dialect;
+        use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
+        use candle::quantized::Int8Mode;
+
+        let merged = engine_gguf()?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+        let params = TestParams::new(64, &tokenizer_json()?, Dialect::qwen35())
+            .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
+            .with_suppress_thinking(true)
+            .with_int8mode(int8mode)
+            .with_exact_tier(false)
+            .with_timeout_secs(1800);
+        let rung = |mode, n| TestConfig {
+            mode,
+            use_batched: true,
+            num_contexts: n,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        };
+        let configs = vec![
+            rung(InferenceMode::BF16, 1),
+            rung(InferenceMode::BF16, 8),
+            rung(InferenceMode::C5, 2),
+        ];
+        params.run(configs, || {
+            Qwen4ExpBatched::new(Qwen4ExpGpu::load(&merged, &device, int8mode)?)
+        })
+    }
+
     #[test]
     #[ignore = "loads the ~124 GB merged engine GGUF and needs a GPU. Run with: \
                 cargo test --release --features cuda -p candle-transformers --lib \
@@ -1997,11 +2207,7 @@ mod tests {
         use candle::quantized::Int8Mode;
 
         println!("\n=== Qwen3.8-Flash-Next (qwen4exp) batched forwarding ===\n");
-        let merged =
-            PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-        if !merged.exists() {
-            candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-        }
+        let merged = engine_gguf()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
 
@@ -2012,7 +2218,7 @@ mod tests {
             .with_int8mode(int8mode)
             .with_timeout_secs(3600);
 
-        let configs = gate_ladder();
+        let configs = gate_ladder(quant_ladder::device_vram_gib(&device)?);
 
         let load = || {
             let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
@@ -2160,7 +2366,7 @@ mod tests {
             text_a.contains("Paris"),
             "the model did not complete {prompt_a:?} with Paris — got {text_a:?}"
         );
-        let distinct: std::collections::HashSet<u32> = out[0].iter().copied().collect();
+        let distinct: HashSet<u32> = out[0].iter().copied().collect();
         assert!(distinct.len() >= 4, "degenerate continuation: {:?}", out[0]);
         println!("\n=== oracle gate green ===");
         Ok(())

@@ -63,7 +63,6 @@ use crate::models::delta_net::SeqSpan;
 use crate::models::kv_cache_utils::SequenceContext;
 use crate::models::lora::LayerLora;
 use crate::models::operand_guard::expect_dtype;
-use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_buffers::wave_root;
 
 /// Everything the head's wave pass needs from the sweep that just ran.
@@ -128,10 +127,9 @@ pub fn head_wave_pass(
     // interior of a prefill span.
     //
     // Off the pool rather than a wave span, like the residual stream it is
-    // computed from: what consumes it is `forward_attn_batched`, whose input is
-    // a [`TensorCat`], and a `TensorCat` holds an owned tensor. The head's own
-    // transients — its projections, its context — do run on the span the pass
-    // opens below.
+    // computed from: it is consumed by the capture and the shift below, both of
+    // which run before the pass opens its phase. The head's own transients —
+    // its projections, its context — run on the span the pass opens.
     let h_all = q.final_norm.forward_live(x_flat)?;
 
     // Hand the armed sequences their rows before the shift consumes `h_all`.
@@ -213,7 +211,7 @@ pub fn head_wave_pass(
     embed.assert("mtp.wave.embed");
     let x = head.input.forward(&embed, &shifted)?;
     x.assert("mtp.wave.input");
-    let xt = TensorCat::from_cat_tensor(x.reshape((1, rows, hidden))?, 0)?;
+    let xt = x.reshape((1, rows, hidden))?;
 
     let layer = Qwen35AttentionLayer {
         layer: &head.block,
@@ -255,11 +253,11 @@ pub fn head_wave_pass(
     }
     let mut row0 = 0usize;
     for g in groups.iter_mut() {
-        let slice = xt.as_cat_tensor().narrow(1, row0, g.rows)?;
+        let slice = xt.narrow(1, row0, g.rows)?;
         let x_g = if g.decode_layout {
-            TensorCat::from_cat_tensor(slice.reshape((g.rows, 1, hidden))?.contiguous()?, 0)?
+            slice.reshape((g.rows, 1, hidden))?.contiguous()?
         } else {
-            TensorCat::from_cat_tensor(slice.contiguous()?, 0)?
+            slice.contiguous()?
         };
         // Dropped where it lands: see the note above on why the FFN half of the
         // block does not run here.

@@ -99,3 +99,37 @@ fn how_much_will_the_os_actually_pin() -> Result<()> {
     drop(held);
     Ok(())
 }
+
+/// Whether the driver's page-lock limit is on one **allocation** or on the
+/// **total**: the largest single `cuMemAllocHost` that succeeds, found by
+/// trying each size alone and freeing it before the next. The warm tier is one
+/// allocation, so a per-allocation limit below the chunked total means the tier
+/// should be several allocations.
+#[test]
+#[ignore = "takes most of the machine's free RAM; run alone"]
+fn the_largest_single_pinned_allocation() -> Result<()> {
+    let _dev = Device::new_cuda(0)?;
+    let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    let step = 512 * 1024 * 1024;
+    let cap = candle_core::vram::total_physical_ram().expect("total RAM probe") as usize / 2;
+    let mut size = 8 * 1024 * 1024 * 1024;
+    let mut largest = 0;
+    while size <= cap {
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let rc = unsafe { cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, size) };
+        let ok = rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS;
+        println!(
+            "  one allocation of {:>6.2} GiB: {}",
+            gib(size),
+            if ok { "ok" } else { "REFUSED" }
+        );
+        if !ok {
+            break;
+        }
+        drop(Pinned(ptr));
+        largest = size;
+        size += step;
+    }
+    println!("LARGEST SINGLE   {:>8.2} GiB", gib(largest));
+    Ok(())
+}

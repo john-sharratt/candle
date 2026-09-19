@@ -6003,7 +6003,7 @@ pub fn quantize_acts_q8a128<'w>(
 /// multiple of 128 and ≤ 8192 (the row is cached in shared memory). Leading dims are preserved on
 /// the operand so the int8 matmul rebuilds the output rank like the float path.
 pub fn rms_norm_q8a128<'w>(
-    xs: &crate::Tensor,
+    xs: &crate::LiveTensor<'_>,
     alpha: &crate::Tensor,
     eps: f32,
     device: &CudaDevice,
@@ -7166,10 +7166,11 @@ pub fn moe_route<'w>(
     Ok((weights, indices))
 }
 
-/// B3: gather pre-quantized q8a1024 activations by token id into a stacked q8a1024 operand the
-/// experts consume directly. The q8a1024 layout is token-contiguous (`hidden % 1024 == 0`), so
-/// this is a byte-row copy of each token's `hidden/1024 · 1152` bytes — no gather-then-quantize.
-/// Mirrors [`fused_moe_gather`] for the int8 path; pairs with [`rms_norm_q8a128`]-fused ln2.
+/// B3: gather pre-quantized q8a128 activations by token id into a stacked q8a128 operand the
+/// experts consume directly — no gather-then-quantize. Tile by tile: output tile `(r, t)` is
+/// source tile `(ids[r], t)`, quants and scale, so any `hidden` that is a multiple of 128 works,
+/// including widths whose rows straddle super-blocks (2560 is 20 tiles). Mirrors
+/// [`fused_moe_gather`] for the int8 path; pairs with a once-quantized FFN input.
 pub fn fused_moe_gather_q8a128<'w>(
     xs_q8: &Q8a128Operand<'_>,
     ids_dev: &CudaSlice<u32>,
@@ -7178,14 +7179,11 @@ pub fn fused_moe_gather_q8a128<'w>(
     origin: Backing,
 ) -> Result<Q8a128Operand<'w>> {
     let hidden = xs_q8.cols;
-    if !hidden.is_multiple_of(1024) {
-        crate::bail!(
-            "fused_moe_gather_q8a128: hidden={hidden} must be a multiple of 1024 (token-contiguous \
-             q8a1024)"
-        );
+    if !hidden.is_multiple_of(128) {
+        crate::bail!("fused_moe_gather_q8a128: hidden={hidden} must be a multiple of 128");
     }
-    let row_bytes = (hidden / 1024) * 1152;
-    let out_bytes = total_rows * row_bytes;
+    let tiles_per_row = hidden / 128;
+    let out_bytes = q8a1024_byte_len(total_rows, hidden);
     let (out_ptr_planned, owned, out_backing) = resolve_u8_out(origin, device, out_bytes)?;
     {
         let stream = device.cuda_stream();
@@ -7194,12 +7192,12 @@ pub fn fused_moe_gather_q8a128<'w>(
         xs_q8.with_device_ptr(device, |src_ptr| {
             unsafe {
                 candle_kernels::simple::moe_scatter::run_moe_gather(
-                    3, // u8 (q8a1024 byte-row)
+                    3, // q8a128 tile gather
                     out_ptr as *mut std::ffi::c_void,
                     src_ptr as *const std::ffi::c_void,
                     ids_ptr as *const u32,
                     total_rows,
-                    row_bytes,
+                    tiles_per_row,
                 );
             }
             Ok(())

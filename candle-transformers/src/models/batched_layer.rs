@@ -338,9 +338,13 @@ pub trait BatchedAttentionLayer {
     /// projections, the context and o_proj after it all inherit from their
     /// operands. `'w` comes from the guard, which is what stops the activation
     /// outliving the span it was carved from.
+    ///
+    /// `x` may itself be wave-scoped: a layer whose pre-attention transform
+    /// runs outside this hook (the Gated Residual's pre-mix) hands its result in
+    /// already carved from the phase, and the projections inherit from it.
     fn attention_norm<'w>(
         &self,
-        x: &Tensor,
+        x: &LiveTensor<'w>,
         mode: Int8Mode,
         wave: WaveRef<'w>,
     ) -> Result<DynamicActs<'w>>;
@@ -519,9 +523,9 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
             }
             let slice = xt.narrow(1, row0, g.rows)?;
             let x_g = if g.decode_layout {
-                TensorCat::from_cat_tensor(slice.reshape((g.rows, 1, hidden))?.contiguous()?, 0)?
+                slice.reshape((g.rows, 1, hidden))?.contiguous()?
             } else {
-                TensorCat::from_cat_tensor(slice.contiguous()?, 0)?
+                slice.contiguous()?
             };
             let h = forward_attn_batched(
                 layer,
@@ -631,11 +635,15 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
 /// `qsa` is this LAYER's block-sparse selection for these rows, which is why
 /// it is an argument rather than a field of the wave-invariant `params`: a
 /// hybrid stack's indexer produces a new one at every full-attention layer.
+///
+/// `x` is the group's activation — `[n, 1, hidden]` for decode, the flat
+/// `[1, rows, hidden]` for prefill — and may be wave-scoped (see
+/// [`BatchedAttentionLayer::attention_norm`]).
 #[allow(clippy::too_many_arguments)]
 pub fn forward_attn_batched<'w, L: BatchedAttentionLayer>(
     layer: &L,
     caches: &mut [&mut KvCache],
-    x: &TensorCat,
+    x: &LiveTensor<'w>,
     offsets: &[usize],
     params: &BatchedAttentionParams<'_>,
     layer_idx: usize,
@@ -704,7 +712,7 @@ pub fn forward_attn_batched<'w, L: BatchedAttentionLayer>(
 fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
     layer: &L,
     caches: &mut [&mut KvCache],
-    x: &TensorCat,
+    x_tensor: &LiveTensor<'w>,
     offsets: &[usize],
     cos: &Tensor,
     sin: &Tensor,
@@ -716,11 +724,9 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
     #[allow(unused_variables)] qsa: Option<&QsaSelection>,
     wave: WaveRef<'w>,
 ) -> Result<LiveTensor<'w>> {
-    validate_batch_sizes(caches.len(), offsets.len(), x.len())?;
-
     // `x` is the PRE-norm activation; B1 fuses ln1 → q/k/v here. Shapes are norm-invariant.
-    let x_tensor = x.as_cat_tensor();
     let (b_sz, seq_len, _n_embd) = x_tensor.dims3()?;
+    validate_batch_sizes(caches.len(), offsets.len(), b_sz)?;
     debug_assert_eq!(seq_len, 1);
 
     // Project Q/K/V over the fused attention_norm (q8a128 on int8, FP on Off / non-CUDA).
@@ -944,7 +950,7 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
 fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     layer: &L,
     caches: &mut [&mut KvCache],
-    x: &TensorCat,
+    x_tensor: &LiveTensor<'w>,
     offsets: &[usize],
     q_lens: &[usize],
     cos: &Tensor,
@@ -966,7 +972,6 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     // (prefill_meta). `n_seqs` is the sequence count (= caches.len()), NOT the
     // leading tensor dim (which is 1 for the flat batch-of-one layout).
     let n_seqs = caches.len();
-    let x_tensor = x.as_cat_tensor();
     let (_one, total_q, _n_embd) = x_tensor.dims3()?;
 
     // Project Q/K/V over the fused attention_norm (B1). Prefill is high-M (compute-bound), so
@@ -1222,7 +1227,7 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
         // the projection's store performs the conversion instead of a
         // full-tensor pass rewriting the residual to meet the attention output
         // (hot-path invariant 1).
-        layer.output_projection(DynamicActs::Float(gated), x.dtype())?
+        layer.output_projection(DynamicActs::Float(gated), x_tensor.dtype())?
     };
     g_out_proj.end();
     // Restore the flat-packed [1, total_q, hidden_out] activation.

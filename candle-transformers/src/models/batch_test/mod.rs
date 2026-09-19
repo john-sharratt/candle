@@ -6,6 +6,8 @@
 //! shared fixtures — `story.md`/`system.md` prompt bodies and a captured
 //! Qwen3-30B-A3B expert routing trace (`fixtures/`) — for exercising the
 //! batched decode/prefill/glue path end to end under `#[test]`.
+#[cfg(test)]
+pub mod host_ram_report;
 /// The depth ladder: the batched forward at 32K–128K of KV, and the filler
 /// that gets it there without the degenerate repetition a tiled corpus gives.
 ///
@@ -17,3 +19,5 @@ pub mod ruler_gen;
 pub mod test_helpers;
 #[cfg(test)]
 pub mod utils;
+#[cfg(test)]
+pub mod vram_snapshot;

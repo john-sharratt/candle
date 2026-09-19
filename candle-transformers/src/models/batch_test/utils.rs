@@ -19,12 +19,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokenizers::Tokenizer;
 
+use crate::models::batch_test::host_ram_report::{print_host_ram, print_host_ram_line};
+use crate::models::batch_test::vram_snapshot::{print_table as print_vram_table, SpanSnapshot};
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, InferenceMode, ManagedBatchedModel,
 };
 use crate::models::dialect::Dialect;
 use crate::models::expert_lre::PipelineStats;
 use crate::models::speculative_choice::GreedyChooser;
+use candle::vram::process_ram::ProcessRam;
 
 /// How a run decides its draft budget.
 ///
@@ -490,6 +493,13 @@ pub struct TestResults {
     pub pipeline_profile: ProfileSnapshot, // Pipeline spans, decode (single/generate) phase only
     /// Effective test mode used for this config (may override the global `TestParams::test_mode`).
     pub effective_test_mode: TestMode,
+    /// The card's split by tenant at the end of this config's prefill, and at
+    /// the end of its decode. `None` without a span.
+    pub vram_after_prefill: Option<SpanSnapshot>,
+    pub vram_after_decode: Option<SpanSnapshot>,
+    /// This process's host RAM at the end of the decode. `None` where the
+    /// platform has no address-space walk.
+    pub host_after_decode: Option<ProcessRam>,
 }
 
 /// **Is greedy decode reproducible, run to run?**
@@ -996,6 +1006,7 @@ pub fn account_model_load<M>(device: &Device, load: impl FnOnce() -> Result<M>) 
     let _ = candle::gpu_memory::snapshot("before_model_load", device);
     let model = load()?;
     let _ = candle::gpu_memory::snapshot("after_model_load", device);
+    print_host_ram_line("after model load");
     let free_after = device.mem_get_info().map(|(f, _)| f).unwrap_or(0);
     candle::gpu_memory::register("model weights", free_before.saturating_sub(free_after));
     Ok(model)
@@ -1689,6 +1700,11 @@ impl TestParams {
         self.device.synchronize()?;
         let prompt_start = std::time::Instant::now();
         let t_prompt_total = profile_now();
+        // The prompt's waves are the widest this config runs, so they are where
+        // a forward's transients peak — and where one taken from the CUDA pool
+        // instead of the tier costs the most. Watched with its own report so the
+        // prefill's sites are not mixed into the decode loop's.
+        let prefill_detector = forbidden_alloc::armed();
         let mut repeat_base_logits: Option<Vec<Tensor>> = None;
         for repeat in 0..config.num_repeats.max(1) {
             if repeat > 0 {
@@ -1851,7 +1867,20 @@ impl TestParams {
             }
         }
         self.device.synchronize()?;
+        drop(prefill_detector);
+        let forbidden = forbidden_alloc::take_report();
+        if !forbidden.is_clean() {
+            eprintln!("[{:?} prefill] {}", config.mode, forbidden);
+        }
         pipeline_record("bench:bulk_total", t_prompt_total);
+        // The card's split the moment prefill ends: the stream is idle (just
+        // synchronised) and the tier is standing, so this is the prefill peak's
+        // ground as the boundary left it.
+        let vram_after_prefill = SpanSnapshot::capture(&self.device)?;
+        print_host_ram_line(&format!(
+            "{:?}×{} after prefill",
+            config.mode, config.num_contexts
+        ));
         let prompt_duration = prompt_start.elapsed();
         let prompt_tokens = user_lens.iter().sum::<usize>() * config.num_repeats.max(1);
         let prompt_tokens_per_sec = (prompt_tokens as f64) / prompt_duration.as_secs_f64();
@@ -1878,6 +1907,22 @@ impl TestParams {
             session.quantize_and_seal_sequences(&sequence_indices, true)?;
             self.device.synchronize()?;
         }
+
+        // The prefill has landed: hold only what the decode still needs — its
+        // own K/V and its widest forward, a verify step of every sequence's
+        // block — so the weight side may grow into the rest, exactly as it does
+        // under the scheduler. See `hold_ground_for_decode`.
+        let draft_budget = self
+            .speculative_max_draft
+            .resolve(model, sequence_indices.len());
+        let held = model.hold_ground_for_decode(
+            config.num_contexts,
+            self.generate_token_count,
+            draft_budget + 1,
+            session.activation_dtype(),
+            session.live_kv_block_bytes(),
+        );
+        println!("  [ground] decode holds {} MiB", held >> 20);
 
         // Generate phase. Budget and early-stop live inside the driver's per
         // sequence emit sinks now, so there is nothing to track out here.
@@ -1911,9 +1956,11 @@ impl TestParams {
         )?;
         self.device.synchronize()?;
         drop(detector);
+        let vram_after_decode = SpanSnapshot::capture(&self.device)?;
+        let host_after_decode = ProcessRam::capture();
         let forbidden = forbidden_alloc::take_report();
         if !forbidden.is_clean() {
-            eprintln!("[{:?}] {}", config.mode, forbidden);
+            eprintln!("[{:?} decode] {}", config.mode, forbidden);
         }
         // The other half of the picture: the detector says what did NOT come
         // from an arena, this says how much did. A phase whose peak is zero has
@@ -2133,6 +2180,9 @@ impl TestParams {
                 pipeline_snapshot_and_reset()
             },
             effective_test_mode: effective_mode,
+            vram_after_prefill,
+            vram_after_decode,
+            host_after_decode,
         })
     }
 
@@ -2819,6 +2869,32 @@ impl TestParams {
         }
 
         println!("└──────────┴──────┴─────────┴──────────┴───────┴────────────┴──────────────┴─────────────┴───────────────┴───────────┴──────────┴────────────┘");
+        // Where the card's memory stood as each config's prefill and decode
+        // ended, side by side, so a quant's rate reads against the expert zone
+        // and KV ground it ran on.
+        let columns: Vec<(String, Option<SpanSnapshot>)> = results
+            .iter()
+            .enumerate()
+            .flat_map(|(i, r)| {
+                let tag = format!("#{} {:?}×{}", i + 1, r.config.mode, r.config.num_contexts);
+                [
+                    (format!("{tag} prefill"), r.vram_after_prefill),
+                    (format!("{tag} decode"), r.vram_after_decode),
+                ]
+            })
+            .collect();
+        print_vram_table("VRAM by tenant, at the end of each phase", &columns);
+        let host: Vec<(String, Option<ProcessRam>)> = results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                (
+                    format!("#{} {:?}×{}", i + 1, r.config.mode, r.config.num_contexts),
+                    r.host_after_decode.clone(),
+                )
+            })
+            .collect();
+        print_host_ram(&host);
         // **Here, not after the expert table.** The pinned-RAM report carries the
         // boundary's `Spare calc:` attribution — which of the four gates refused
         // the weight side ground — and it used to hang off
@@ -2895,6 +2971,10 @@ impl TestParams {
                         )
                     }
                 }),
+            ),
+            (
+                "  of which pageable",
+                Box::new(|s: &PipelineStats| format!("{}", s.warm_paged_slots)),
             ),
             // Which path the MoE dispatched on. `device` means the grid is
             // fully resident and routing never leaves the card; `host (readback)`

@@ -23,7 +23,8 @@ extern "C" {
     /// - `xs`: device pointer to input [num_tokens, hidden_dim]
     /// - `token_ids`: device pointer to u32 index array [total_rows]
     /// - `total_rows`: number of rows to gather
-    /// - `hidden_dim`: column count
+    /// - `hidden_dim`: column count — or, for `dtype` 3 (the q8a128 tile gather), the
+    ///   128-element tiles per row
     pub fn run_moe_gather(
         dtype: i32,
         out: *mut c_void,

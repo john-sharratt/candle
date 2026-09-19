@@ -63,7 +63,6 @@ use crate::models::delta_net::SeqSpan;
 use crate::models::draft_walk::{draft_reserve, draft_rope_depth, draft_walk};
 use crate::models::kv_cache_utils::SequenceContext;
 use crate::models::qwen35::attention::RopeTables;
-use crate::models::tensor_cat::TensorCat;
 use candle::quantized::cuda::to_dynamic;
 use candle_nn::kv_cache::KvCache;
 
@@ -180,7 +179,7 @@ impl Qwen4ExpBatched {
             );
         };
 
-        let (h, _) = hc_mix(&x_head, &head.block.hc_attn, eps)?;
+        let (h, _) = hc_mix(&x_head, &head.block.hc_attn, eps, None)?;
 
         // QSA over the head's OWN cache. The head selects exactly as a trunk
         // attention layer does — same indexer weights, same budget — because a
@@ -226,12 +225,9 @@ impl Qwen4ExpBatched {
         // The output is dropped on both arms: this pass owes the K/V it just
         // wrote and nothing else (see the module docs).
         if w.n_decode > 0 {
-            let x_g = TensorCat::from_cat_tensor(
-                h.narrow(0, 0, w.n_decode)?
-                    .reshape((w.n_decode, 1, n_embd))?
-                    .contiguous()?,
-                0,
-            )?;
+            let x_g = h
+                .narrow(0, 0, w.n_decode)?
+                .reshape((w.n_decode, 1, n_embd))?;
             forward_attn_batched(
                 &alayer,
                 dec_c,
@@ -244,12 +240,9 @@ impl Qwen4ExpBatched {
             )?;
         }
         if w.pre_rows > 0 {
-            let x_g = TensorCat::from_cat_tensor(
-                h.narrow(0, w.n_decode, w.pre_rows)?
-                    .reshape((1, w.pre_rows, n_embd))?
-                    .contiguous()?,
-                0,
-            )?;
+            let x_g = h
+                .narrow(0, w.n_decode, w.pre_rows)?
+                .reshape((1, w.pre_rows, n_embd))?;
             forward_attn_batched(
                 &alayer,
                 pre_c,
@@ -352,7 +345,7 @@ impl Qwen4ExpBatched {
         let mut res = head.block_input(embeds, prev_wide, eps)?;
 
         // ── Attention half. ──
-        let (h, inject) = hc_mix(&res, &head.block.hc_attn, eps)?;
+        let (h, inject) = hc_mix(&res, &head.block.hc_attn, eps, None)?;
         let inject = inject.expect("a block's HC modules carry an inject");
         // One decode row per sequence, so the spans are one row each. The span
         // names the SEQUENCE, not the row: `layer_selection` keys each
@@ -388,7 +381,7 @@ impl Qwen4ExpBatched {
             head_dim: cfg.attn_head_dim,
             rotary: &m.rotary,
         };
-        let x_g = TensorCat::from_cat_tensor(h.reshape((n, 1, n_embd))?.contiguous()?, 0)?;
+        let x_g = h.reshape((n, 1, n_embd))?;
         // **Layer index `0`, not `kv_layer` — the two indices mean different
         // things and only coincide when the group starts at layer 0.**
         //
@@ -405,22 +398,22 @@ impl Qwen4ExpBatched {
         let y = forward_attn_batched(&alayer, caches, &x_g, at, params, 0, sel.as_ref(), None)?
             .to_owned_tensor()?
             .reshape((n, n_embd))?;
-        res = hc_combine(&res, &y, &inject)?;
+        hc_combine(&mut res, &y, &inject)?;
 
         // ── MoE half. ──
-        let (h2, inject2) = hc_mix(&res, &head.block.hc_ffn, eps)?;
+        let (h2, inject2) = hc_mix(&res, &head.block.hc_ffn, eps, None)?;
         let inject2 = inject2.expect("a block's HC modules carry an inject");
         let candle::Device::Cuda(cuda) = dev else {
             candle::bail!("qwen4exp draft runs on CUDA");
         };
-        // Float activations for the same reason the trunk's MoE uses them: the
-        // int8 expert gather tiles at 1024 and this stack's hidden is 2560.
+        // Quantized once for every consumer of the FFN input, as the trunk's
+        // MoE does.
         let acts = to_dynamic(
             &h2.reshape((1, n, n_embd))?,
-            candle::quantized::Int8Mode::Off,
+            m.lm_head.int8mode(),
             cuda,
             // Raw Σx — a language model's block sums stay far below f16's
-            // ceiling. (`Off` produces no q8a128 here anyway.)
+            // ceiling.
             candle::quantized::SumScale::Raw,
         )?;
         let y2 = head
@@ -429,7 +422,7 @@ impl Qwen4ExpBatched {
             .forward_dynamic(acts, DType::F32, None)?
             .to_owned_tensor()?
             .reshape((n, n_embd))?;
-        res = hc_combine(&res, &y2, &inject2)?;
+        hc_combine(&mut res, &y2, &inject2)?;
 
         // ── The shared head. ──
         let narrow = head.to_shared_head(&res, eps)?;

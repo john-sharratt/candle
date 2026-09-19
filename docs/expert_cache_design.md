@@ -812,16 +812,36 @@ page-cache-bypassing NVMe read near a millisecond. An eviction policy blind to
 that difference is choosing at random between outcomes an order of magnitude
 apart.
 
-So `slot_eviction_score` is now `frequency × position × reload_cost`, with
-`reload_cost` ∈ {1, 4} by whether the warm tier holds the expert. The cache then
-converges on the right shape without anyone specifying it: **VRAM drifts toward
-holding what is expensive to re-acquire, the warm tier covers what is cheap, and
-the experts that churn are the ones whose churn costs least.**
+So every eviction now runs its `frequency × position` policy **once per reload
+tier**: over the experts the warm tier holds first, and over the pack-only
+experts only for whatever that pass could not free. A concession inverts the
+same order — pack-only experts are the ones worth relocating. **VRAM holds what
+is expensive to re-acquire, the warm tier covers what is cheap, and the experts
+that churn are the ones whose churn costs least.**
 
-The 4 is measured, not derived. The cost ratio is nearer 8, and at 8 the term
-stops tilting the ordering and starts replacing it — cold-only experts are held
-past the point their temperature justifies, hit rate falls (44.8 % → 44.3 % on
-Q8_0 × 20), and every config was slower than at 4.
+Measured on Flash-Next at 16 GB against the single-pass policy: pack share of
+loads 68 % → 61 / 63 / 50 % (BF16×1 / BF16×8 / C5×2) and decode 16.2 / 72.1 /
+30.1 → 16.2 / 74.4 / 32.1 t/s, for a hit rate 2–3 points lower. A variant that
+protected the hottest 20 % or 40 % of residents from the first pass recovered
+under a point of that hit rate, gave back the pack saving about as fast, and
+decoded no faster: the frequency signal is spread across the warm-backed
+experts rather than concentrated at the top, and a warm miss is cheap enough
+that the extra ones cost less than the pack reads they replace.
+
+The reason for passes rather than a weight is that the warm tier and the pack
+hold disjoint experts and the model's routing is trained balanced. Which experts
+VRAM holds then does not move its hit rate; it only decides where the misses
+land. Every slot VRAM spends on a warm-backed expert leaves one more pack-only
+expert to miss on disk: on Qwen3.8-Flash-Next at 16 GB the warm tier covers 30 %
+of the experts and caught 32 % of the misses, with 68 % of loads reading the
+pack. With no warm tier, or one that holds every expert, there is a single tier
+and the policy is exactly frequency × position.
+
+The first form of this was a multiplier, `reload_cost` ∈ {1, 4}. On a model
+whose warm tier covered most of the experts (Q8_0 × 20) a multiplier of 8 held
+cold-only experts past what their temperature justified and cost hit rate
+(44.8 % → 44.3 %); the tier passes are measured on Flash-Next, where the pack
+holds the majority.
 
 ### 12.7 What the code review found
 

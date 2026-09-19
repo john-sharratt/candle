@@ -18,7 +18,7 @@
 //!   only when a multimodal caller supplies distinct per-axis positions.)
 //! - Attention is causal softmax GQA, scale `1/sqrt(head_dim)`.
 
-use candle::{Device, Result, Tensor};
+use candle::{Device, LiveTensor, Result, Tensor};
 
 /// Weights of one gated-attention layer (reference path, F32).
 #[derive(Debug, Clone)]
@@ -130,7 +130,14 @@ impl RopeTables {
     /// Apply with an explicit position per row — the QSA indexer ropes each
     /// pooled block key at its block's **first** position, which is a
     /// stride-`ratio` walk rather than a contiguous range.
-    pub fn apply_at_positions(&self, x: &Tensor, positions: &[usize]) -> Result<Tensor> {
+    ///
+    /// The result lives where `x` does, so a wave-scoped query stays on its
+    /// wave.
+    pub fn apply_at_positions<'w>(
+        &self,
+        x: &LiveTensor<'w>,
+        positions: &[usize],
+    ) -> Result<LiveTensor<'w>> {
         let t = x.dim(0)?;
         if positions.len() != t {
             candle::bail!("rope: {} positions for {t} rows", positions.len());
@@ -151,7 +158,7 @@ impl RopeTables {
 
     /// The NeoX half-split rotation shared by both position forms; `cos`/`sin`
     /// are `[T, rope_dim/2]`, one row per row of `x`.
-    fn rotate(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    fn rotate<'w>(&self, x: &LiveTensor<'w>, cos: &Tensor, sin: &Tensor) -> Result<LiveTensor<'w>> {
         let (t, _h, d) = x.dims3()?;
         if d < self.rope_dim {
             candle::bail!(
@@ -167,10 +174,10 @@ impl RopeTables {
         let r1 = x1.broadcast_mul(&cos)?.sub(&x2.broadcast_mul(&sin)?)?;
         let r2 = x2.broadcast_mul(&cos)?.add(&x1.broadcast_mul(&sin)?)?;
         if d == self.rope_dim {
-            return Tensor::cat(&[r1, r2], 2);
+            return LiveTensor::cat(&[r1, r2], 2);
         }
         let tail = x.narrow(2, self.rope_dim, d - self.rope_dim)?;
-        Tensor::cat(&[r1, r2, tail], 2)
+        LiveTensor::cat(&[r1, r2, tail], 2)
     }
 }
 

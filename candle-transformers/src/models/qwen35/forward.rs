@@ -870,7 +870,7 @@ impl WaveSweep for HybridBatched {
 /// read. Every decode row is scored, the last token of each prefill sequence
 /// is, and a *verifying* span scores all of its rows — each is a prediction to
 /// compare a proposal against.
-fn wave_width(
+pub(crate) fn wave_width(
     n_decode: usize,
     pre_rows: usize,
     pre_q: &[usize],

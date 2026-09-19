@@ -88,17 +88,45 @@ extern "C" __global__ void moe_gather_f32(
     moe_gather_impl(out, xs, token_ids, total_rows, hidden_dim);
 }
 
-// B3: byte-row gather for pre-quantized q8a1024 activations. The q8a1024 layout is
-// token-contiguous when hidden % 1024 == 0 (each token occupies hidden/1024 super-blocks of
-// 1152 B), so gathering quantized tokens is a plain byte copy: `hidden_dim` here is the
-// per-token byte count (hidden/1024 * 1152), `xs`/`out` are the q8a1024 byte buffers. Lets the
-// experts consume the already-quantized router input directly — no gather-then-quantize.
-extern "C" __global__ void moe_gather_u8(
-    uint8_t* out, const uint8_t* xs,
-    const uint32_t* token_ids,
-    size_t total_rows, size_t row_bytes
+// B3: TILE gather for pre-quantized q8a128 activations, so the experts consume the
+// already-quantized FFN input directly — no gather-then-quantize.
+//
+// Tile-granular rather than row-granular because a row is not a byte range in general. The
+// flat layout packs eight 128-element tiles to a 1152-byte super-block (qs de-interleaved from
+// the per-tile ds slots — blocks.cuh), so a row is whole super-blocks only when hidden % 1024
+// == 0; at 2560 a row is 20 tiles and straddles blocks. Output tile (r, t) is source tile
+// (token_ids[r], t), copied quants and scale slot alike — which at hidden % 1024 == 0 is
+// exactly the byte-row copy, and at every other multiple of 128 is the only correct one.
+//
+// One warp per output tile, grid-strided: the 32 lanes move the 128 quants as one int32 each
+// (a tile's qs run is 128-byte aligned), lane 0 the 16-byte ds slot. A padding row
+// (0xFFFFFFFF, see moe_gather_impl) is written as zeros, scale included.
+#include "../blocks.cuh"
+
+extern "C" __global__ void moe_gather_q8a128_tiles(
+    uint8_t* __restrict__ out, const uint8_t* __restrict__ xs,
+    const uint32_t* __restrict__ token_ids,
+    size_t total_rows, size_t tiles_per_row
 ) {
-    moe_gather_impl(out, xs, token_ids, total_rows, row_bytes);
+    const int64_t total_tiles = (int64_t)total_rows * (int64_t)tiles_per_row;
+    const int64_t total_warps = ((int64_t)gridDim.x * blockDim.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    for (int64_t tile = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+         tile < total_tiles; tile += total_warps) {
+        const int64_t r = tile / (int64_t)tiles_per_row;
+        const int64_t t = tile - r * (int64_t)tiles_per_row;
+        const uint32_t src_row = token_ids[r];
+        int32_t* dq = reinterpret_cast<int32_t*>(out + q8a1024_qs_off(tile));
+        uint4* dds = reinterpret_cast<uint4*>(out + q8a1024_ds_off(tile));
+        if (src_row == 0xFFFFFFFFu) {
+            dq[lane] = 0;
+            if (lane == 0) *dds = make_uint4(0u, 0u, 0u, 0u);
+            continue;
+        }
+        const int64_t src = (int64_t)src_row * (int64_t)tiles_per_row + t;
+        dq[lane] = reinterpret_cast<const int32_t*>(xs + q8a1024_qs_off(src))[lane];
+        if (lane == 0) *dds = *reinterpret_cast<const uint4*>(xs + q8a1024_ds_off(src));
+    }
 }
 
 // =============================================================================

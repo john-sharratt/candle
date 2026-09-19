@@ -317,7 +317,7 @@ impl Qwen4ExpModel {
             }
 
             // ── Token mixer under the first HC module ────────────────────
-            let (h, inject) = hc_mix(&res_hc, &layer.hc_attn, eps)?;
+            let (h, inject) = hc_mix(&res_hc, &layer.hc_attn, eps, None)?;
             let inject = inject.expect("layer HC modules carry an inject");
 
             let y = match &layer.mix {
@@ -396,18 +396,18 @@ impl Qwen4ExpModel {
                     Tensor::cat(&parts, 0)?.matmul(&attn.wo.t()?)?
                 }
             };
-            res_hc = hc_combine(&res_hc, &y, &inject)?;
+            hc_combine(&mut res_hc, &y, &inject)?;
 
             // ── MoE under the second HC module ───────────────────────────
-            let (h2, inject2) = hc_mix(&res_hc, &layer.hc_ffn, eps)?;
+            let (h2, inject2) = hc_mix(&res_hc, &layer.hc_ffn, eps, None)?;
             let inject2 = inject2.expect("layer HC modules carry an inject");
             let y2 = self.moe_forward(li, &h2)?;
-            res_hc = hc_combine(&res_hc, &y2, &inject2)?;
+            hc_combine(&mut res_hc, &y2, &inject2)?;
         }
 
         // The head mix IS the output norm; logits over packed rows, then
         // split back per session.
-        let (mixed, _) = hc_mix(&res_hc, &self.out_hc, eps)?;
+        let (mixed, _) = hc_mix(&res_hc, &self.out_hc, eps, None)?;
         let logits = mixed.matmul(&self.lm_head.t()?)?;
         spans
             .iter()
@@ -525,14 +525,18 @@ mod tests {
 
         // `down` carries the inject rows stacked beneath the gate's, which is
         // the layout both loaders build — see `HcWeights::down`.
-        let hcw = |seed: u64, inject: bool| HcWeights {
-            norm: norm1(hc_dim, seed),
-            down: sc(lcg_tensor(
-                &[hcc.low_rank + if inject { hcc.count } else { 0 }, hc_dim],
-                seed + 1,
-                dev,
-            )),
-            up: sc(lcg_tensor(&[hc_dim, hcc.low_rank], seed + 2, dev)),
+        let hcw = |seed: u64, inject: bool| {
+            HcWeights::from_checkpoint(
+                norm1(hc_dim, seed),
+                sc(lcg_tensor(
+                    &[hcc.low_rank + if inject { hcc.count } else { 0 }, hc_dim],
+                    seed + 1,
+                    dev,
+                )),
+                sc(lcg_tensor(&[hc_dim, hcc.low_rank], seed + 2, dev)),
+                hcc.count,
+            )
+            .unwrap()
         };
         let dn = |seed: u64| DeltaNetWeights {
             wqkv: sc(lcg_tensor(&[dims.conv_dim(), hidden], seed, dev)),

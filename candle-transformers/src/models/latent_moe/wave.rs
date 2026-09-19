@@ -913,6 +913,9 @@ impl ManagedBatchedModel for BatchedEngine {
             accum_dtype: DType::F32,
             gated_qkv: false,
             partial_rotary: false,
+            // DeepSeek-V4's mHC runs off the span, as the rest of this
+            // forward does — nothing for the plan to price.
+            hyper: None,
             // The same reason as the attention flags above: this forward's
             // transients come off the CUDA pool, so its shared experts carve
             // nothing from a wave arena.

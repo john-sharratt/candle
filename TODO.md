@@ -89,7 +89,8 @@ run5 was stopped after 12 directories, which is too small a sample to judge by.
    compaction holds, rebuilds, weights_mib), and compare against repro2 and main.
 6. **`wave_decode_set` is never cleared.** Noted and deliberately left alone. Confirm whether
    it matters once 1–4 are done.
-7. **Clippy.** `windowed_ingest_ranges_impl` is dead code and fails
-   `clippy -D warnings`. The design doc lists it as dormant. Decide whether to delete it or
-   wire it in.
-8. **The remaining /bed tail.** Full `/fast-test` chain, `/sweep`, then the report.
+7. **The remaining /bed tail.** Full `/fast-test` chain, `/sweep`, then the report.
+
+(The dead `windowed_ingest_ranges_impl` that failed clippy was removed: its only caller
+had been deleted and the bounded ingest is done by per-unit conversations, per
+`docs/unified_wave_inference_engine.md` §7 step 0.)

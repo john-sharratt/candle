@@ -312,7 +312,7 @@ impl RmsNorm {
     #[cfg(feature = "cuda")]
     fn forward_with_ticket<'w>(
         &self,
-        x: &Tensor,
+        x: &LiveTensor<'w>,
         root: Option<WaveTicket>,
     ) -> Result<LiveTensor<'w>> {
         let _enter = self.span.enter();
@@ -336,7 +336,7 @@ impl RmsNorm {
     #[cfg(feature = "cuda")]
     pub fn forward_dynamic<'w>(
         &self,
-        x: &Tensor,
+        x: &LiveTensor<'w>,
         mode: candle::quantized::Int8Mode,
         root: candle::cuda_backend::Backing,
     ) -> Result<candle::quantized::cuda::DynamicActs<'w>> {

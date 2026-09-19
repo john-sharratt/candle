@@ -35,6 +35,8 @@
 //! sampler.
 
 #[cfg(feature = "cuda")]
+use super::page_pressure::{press, PAGE_PRESSURE_BYTES};
+#[cfg(feature = "cuda")]
 use candle::Result;
 
 /// Per-layer geometry: shapes, dtypes, and repacked byte sizes.
@@ -321,6 +323,30 @@ pub(crate) struct WarmPool {
 }
 
 #[cfg(feature = "cuda")]
+/// How far a refused warm-tier allocation steps down before retrying.
+const REFUSAL_STEP_BYTES: usize = 512 * 1024 * 1024;
+
+/// Slots in one [`REFUSAL_STEP_BYTES`] step of `slot_size`-byte slots, rounded
+/// up, and never zero so every retry loop makes progress.
+#[cfg(feature = "cuda")]
+fn step_slots(slot_size: usize) -> usize {
+    REFUSAL_STEP_BYTES.div_ceil(slot_size.max(1)).max(1)
+}
+
+/// The slot count to try after `slots` of `slot_size` bytes was refused:
+/// one step fewer, and always at least one fewer so the retry loop terminates.
+#[cfg(feature = "cuda")]
+fn step_down(slots: usize, slot_size: usize) -> usize {
+    slots.saturating_sub(step_slots(slot_size))
+}
+
+/// The slot count to grow to from `held` after a round of page pressure: one
+/// step more, never past `want`.
+#[cfg(feature = "cuda")]
+fn step_up(held: usize, want: usize, slot_size: usize) -> usize {
+    held.saturating_add(step_slots(slot_size)).min(want)
+}
+
 impl WarmPool {
     /// Allocate as much of `want_slots` as the machine will give.
     ///
@@ -332,30 +358,74 @@ impl WarmPool {
     /// refusal is a real answer about the machine and not a hint, but it is an
     /// answer about *this size*, and the next size down is still worth having.
     ///
-    /// # The step is 1/8, not a half
+    /// # The step is 512 MiB, not a fraction
     ///
     /// `want_slots` is already the policy answer — three host-RAM ceilings, one
     /// of which is a hard cap on how much of the machine may be page-locked
     /// (`handle::warm_sizing_from`). The allocator refusing is a *fourth* limit
     /// that the policy cannot see, and the only thing this loop is doing is
-    /// finding it. Halving overshoots it wildly: measured on the 27B, a budget of
-    /// 50 slots was refused and the tier dropped to **25** — 6.5 GiB of pinning
-    /// the policy had already found affordable, discarded on one refusal, and
-    /// worth 23 synchronous NVMe reads per forward in the layers it could no
-    /// longer hold.
+    /// finding it. A proportional step overshoots it: halving took a 27B budget
+    /// of 50 slots to **25**, and an eighth took Flash-Next's 14.81 GiB request
+    /// to 12.96 GiB — 1,436 experts of pinning the policy had found affordable,
+    /// on a machine whose driver pins 15.5 GiB in one allocation when idle.
     ///
-    /// Stepping down by an eighth converges on the true ceiling from above in a
-    /// handful of tries — a refused `cuMemAllocHost` is cheap — and can never
-    /// exceed the budget, so the over-pinning guard the ceilings exist for still
-    /// holds. `min(slots - 1)` keeps it strictly decreasing so the loop
-    /// terminates at small sizes where `7/8` would round to a fixed point.
+    /// A fixed [`REFUSAL_STEP_BYTES`] converges on the ceiling from above to
+    /// within one step, whatever the tier's size — a refused `cuMemAllocHost`
+    /// is cheap — and can never exceed the budget, so the over-pinning guard the
+    /// ceilings exist for still holds.
+    ///
+    /// # Then it grows back under page pressure
+    ///
+    /// A refusal mid-load is usually not the driver's ceiling but the machine's
+    /// state: the pages are held by other processes' idle working sets and the
+    /// file cache (Flash-Next's 14.81 GiB request was refused mid-load on a box
+    /// whose driver pins 15.5 GiB in one allocation when idle). So once a size is
+    /// granted short of `want_slots`, each round writes through
+    /// [`PAGE_PRESSURE_BYTES`] of pageable memory — making the OS page others
+    /// out — frees it, releases the pool and asks for one step more. It stops
+    /// at `want_slots`, or at the first size refused even after pressure, in
+    /// which case it takes back the size it held.
     pub(crate) fn new(want_slots: usize, slot_size: usize, use_: candle::vram::PinnedUse) -> Self {
+        let Some(mut pool) = Self::stepping_down(want_slots, slot_size, use_) else {
+            return Self::empty(use_);
+        };
+        while pool.num_slots < want_slots {
+            let held = pool.num_slots;
+            let target = step_up(held, want_slots, slot_size);
+            press(PAGE_PRESSURE_BYTES);
+            // One pool at a time: holding both would need the old pool's RAM
+            // twice over, which is exactly what is not free.
+            drop(pool);
+            match Self::try_alloc(target, slot_size, use_) {
+                Some(grown) => pool = grown,
+                None => {
+                    tracing::info!(
+                        target: "candle_transformers::expert_lre",
+                        held,
+                        refused = target,
+                        "warm tier: refused even after page pressure; keeping the held size"
+                    );
+                    return Self::stepping_down(held, slot_size, use_)
+                        .unwrap_or_else(|| Self::empty(use_));
+                }
+            }
+        }
+        pool
+    }
+
+    /// The largest pool at or below `want_slots` the driver grants, stepping
+    /// down by [`REFUSAL_STEP_BYTES`] per refusal; `None` if not even one slot.
+    fn stepping_down(
+        want_slots: usize,
+        slot_size: usize,
+        use_: candle::vram::PinnedUse,
+    ) -> Option<Self> {
         let mut slots = want_slots;
         while slots > 0 && slot_size > 0 {
             match Self::try_alloc(slots, slot_size, use_) {
-                Some(pool) => return pool,
+                Some(pool) => return Some(pool),
                 None => {
-                    let next = (slots * 7 / 8).min(slots - 1);
+                    let next = step_down(slots, slot_size);
                     tracing::warn!(
                         target: "candle_transformers::expert_lre",
                         slots,
@@ -367,7 +437,7 @@ impl WarmPool {
                 }
             }
         }
-        Self::empty(use_)
+        None
     }
 
     fn try_alloc(
@@ -556,9 +626,36 @@ unsafe impl Sync for WarmPool {}
 #[cfg(test)]
 mod tests {
     use super::stratified_membership;
-    use super::WarmPool;
+    use super::{step_down, step_up, WarmPool};
     use cudarc::driver::DevicePtr;
     use std::collections::HashSet;
+
+    /// A refusal costs 512 MiB of slots, rounded up to whole slots: 388 slots
+    /// of Flash-Next's 1,384,448-byte stride (536,870,912 / 1,384,448 =
+    /// 387.8), and exactly 512 slots of 1 MiB.
+    #[test]
+    fn a_refusal_steps_down_by_512_mib_of_slots() {
+        assert_eq!(step_down(11_484, 1_384_448), 11_096);
+        assert_eq!(step_down(1_000, 1 << 20), 488);
+    }
+
+    /// Growth under page pressure takes the same 512 MiB step, capped at the
+    /// size the policy asked for.
+    #[test]
+    fn page_pressure_grows_by_512_mib_up_to_the_want() {
+        assert_eq!(step_up(11_096, 11_484, 1_384_448), 11_484);
+        assert_eq!(step_up(10_000, 11_484, 1_384_448), 10_388);
+        assert_eq!(step_up(5, 5, 1 << 20), 5);
+    }
+
+    /// Always at least one slot fewer, and never below zero, so the retry loop
+    /// terminates at any size.
+    #[test]
+    fn a_refusal_always_makes_progress() {
+        assert_eq!(step_down(10, 1 << 30), 9);
+        assert_eq!(step_down(100, 1 << 20), 0);
+        assert_eq!(step_down(0, 1 << 20), 0);
+    }
 
     fn per_layer_counts(m: &[(usize, usize)], num_layers: usize) -> Vec<usize> {
         let mut counts = vec![0usize; num_layers];

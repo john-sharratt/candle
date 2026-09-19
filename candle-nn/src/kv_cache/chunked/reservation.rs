@@ -499,6 +499,47 @@ mod tests {
         }
     }
 
+    /// **Mapping device granules costs no host RAM.** Every granule is device
+    /// memory; a host-side shadow per granule would charge the span's size a
+    /// second time against a 31.5 GiB machine, invisibly to the warm-tier
+    /// budget. Measured as private resident bytes of the process, before and
+    /// after mapping (and writing) a 512 MiB span.
+    #[cfg(windows)]
+    #[test]
+    fn mapping_granules_costs_no_host_ram() -> Result<()> {
+        use candle::vram::process_ram::{ProcessRam, RegionKind};
+        let Some((s, _gpu)) = stream() else {
+            return Ok(());
+        };
+        let private = || {
+            ProcessRam::capture()
+                .expect("the walk runs on Windows")
+                .total(RegionKind::Private)
+        };
+        let span = 512 << 20;
+        let mut r = Reservation::reserve(&s, span)?;
+        s.synchronize().map_err(candle::Error::wrap)?;
+        let before = private();
+        let mapped = r.map_range(0, span)?;
+        s.synchronize().map_err(candle::Error::wrap)?;
+        let after = private();
+        let grew = after.resident.saturating_sub(before.resident);
+        let committed = after.committed.saturating_sub(before.committed);
+        println!(
+            "mapped {} MiB of device granules: host private resident +{} MiB, committed +{} MiB",
+            mapped >> 20,
+            grew >> 20,
+            committed >> 20
+        );
+        assert!(
+            grew < 16 << 20,
+            "mapping {} MiB of device memory grew host-resident private memory by {} MiB",
+            mapped >> 20,
+            grew >> 20
+        );
+        Ok(())
+    }
+
     /// The allocator has no second path, so VMM support is a hard requirement
     /// of the machine rather than a preference. Asserting it here means an
     /// unsupported target says so in the test suite instead of at the first KV

@@ -34,23 +34,26 @@
 //!   eh_proj([enorm ; mixed])         [n_embd]     the block's input
 //! ```
 //!
-//! The `mixer` step is why this is not qwen35's head verbatim: there, `hnorm`
-//! is over the narrow hidden and `eh_proj` takes their plain concat. Here
-//! `hnorm` is `[hc_dim]` — 10240 — while `eh_proj` is `[n_embd, 2·n_embd]`, so
-//! something has to collapse the wide residual first. That something is the
-//! head's own hyper-connection mixer, which the converter emitted under the
-//! trunk's `output_hc_*` names because a standalone head has only one mixer.
-//! Merged, that name is taken, so it is renamed into the head's own block
-//! (`convert_mtp_sidecar`). It is **not** a copy of the trunk's output mix:
-//! compared against the pinned source it differs by 9.8 / 2.6 / 14.2, while
-//! `token_embd` and `output` are bit-identical — which is what
-//! `mtp_use_dedicated_embeddings: false` promises and what makes the shared
-//! embedding and LM head safe to drop.
+//! This is not qwen35's head verbatim: there, `hnorm` is over the narrow
+//! hidden and `eh_proj` takes their plain concat. Here `hnorm` is `[hc_dim]` —
+//! 10240 — and `eh_proj` runs once per hyper-connection stream, so the input
+//! stays wide (see [`MtpHead::assemble`]).
+//!
+//! On the way out the head collapses its block's wide residual with its own
+//! hyper-connection mixer, `blk.N.nextn.hc_head_{norm,down,up}` — a mix with no
+//! inject, structurally the trunk's `output_hc_*`, and like the trunk's it *is*
+//! the output norm: there is no separate one (the reference graph, llama.cpp
+//! #28243's `graph_mtp`, feeds `hc_mix(res, nextn.hc_head_*)` straight to the LM
+//! head). The head borrows `token_embd` and `output` from the trunk —
+//! `mtp_use_dedicated_embeddings: false` — which is what makes the head file's
+//! own copies safe to drop at merge.
 
+use candle::quantized::Int8Mode;
 use candle::{Device, Result, Tensor};
 
 use super::config::Qwen4ExpConfig;
 use super::engine::GpuLayer;
+use super::hyper::ko::HcWeightsKo;
 use super::hyper::{hc_grouped_norm, hc_mix, HcWeights};
 use crate::models::latent_moe::GgufModel;
 use crate::models::quantized_matmul::QMatMul;
@@ -71,8 +74,8 @@ pub struct MtpInput {
     /// flat — so a plain RMSNorm here would reduce over all 10240 and hand the
     /// head a differently-scaled input than the one it was trained on. Every
     /// `[hc_dim]` weight in the checkpoint (`hc_attn_norm`, `hc_ffn_norm`,
-    /// `hc_mixer_norm`, and this) is the grouped kind; `enorm` is `[n_embd]`
-    /// and is the plain kind.
+    /// `nextn.hc_head_norm`, and this) is the grouped kind; `enorm` is
+    /// `[n_embd]` and is the plain kind.
     pub hnorm: Tensor,
     /// `[n_embd, 2·n_embd]` over the concat.
     pub eh_proj: QMatMul,
@@ -84,16 +87,12 @@ pub struct MtpHead {
     /// The head's block — the same type, and the same production path, as a
     /// trunk attention layer.
     pub block: GpuLayer,
-    /// The head's own output hyper-connection mix, collapsing its block's wide
-    /// residual to `n_embd` for the shared LM head — structurally identical to
-    /// the trunk's `out_hc` (`{norm, down, up}`, no inject), which is what it
-    /// is: the converter emitted it as `output_hc_*`, and a standalone head
-    /// file carries exactly one because it has exactly one output.
-    pub mixer: HcWeights,
-    /// `[hc_dim]` — grouped-norm gain before that mix. Named for what follows
-    /// it: the **shared** head, whose LM projection this checkpoint shares with
-    /// the trunk along with the embedding table.
-    pub head_norm: Tensor,
+    /// The head's own output hyper-connection mix (`nextn.hc_head_*`),
+    /// collapsing its block's wide residual to `n_embd` for the shared LM head —
+    /// structurally identical to the trunk's `out_hc` (`{norm, down, up}`, no
+    /// inject), and like it, the output norm itself — KO-quantized as the
+    /// trunk's modules are.
+    pub mixer: HcWeightsKo,
     /// Trunk block index the head sits at, which is also its tensor prefix.
     pub layer_index: usize,
 }
@@ -104,15 +103,14 @@ pub struct MtpHead {
 /// The engine's load order is load-bearing: every dense tensor resident first,
 /// then the expert cache sized from a live measurement of what they left behind
 /// (`docs/archived/elastic_vram_partition.md` §4). The head's dense side is ~30 MB —
-/// `hc_mixer_down` and `hc_mixer_up` are `[320, 10240]` and `[10240, 320]` F32,
-/// 13.1 MB each, plus `eh_proj` and three norms, each with a transient F32
-/// dequant buffer on top — so reading it after that measurement takes ground
-/// the expert zone has already been told it owns. Loading it with the rest of
-/// the dense stack keeps the measurement honest.
+/// `nextn.hc_head_down` and `nextn.hc_head_up` are `[320, 10240]` and
+/// `[10240, 320]` F32, 13.1 MB each, plus `eh_proj` and three norms, each with a
+/// transient F32 dequant buffer on top — so reading it after that measurement
+/// takes ground the expert zone has already been told it owns. Loading it with
+/// the rest of the dense stack keeps the measurement honest.
 pub struct MtpDense {
     input: MtpInput,
-    mixer: HcWeights,
-    head_norm: Tensor,
+    mixer: HcWeightsKo,
     layer_index: usize,
 }
 
@@ -123,7 +121,6 @@ impl MtpDense {
             input: self.input,
             block,
             mixer: self.mixer,
-            head_norm: self.head_norm,
             layer_index: self.layer_index,
         }
     }
@@ -138,6 +135,7 @@ impl MtpDense {
         g: &mut GgufModel,
         cfg: &Qwen4ExpConfig,
         eps: f64,
+        int8mode: Int8Mode,
         device: &Device,
     ) -> Result<Self> {
         let li = cfg.num_layers;
@@ -155,16 +153,18 @@ impl MtpDense {
                 g.qtensor(&format!("{p}.nextn.eh_proj.weight"), device)?,
             )?,
         };
-        let mixer = HcWeights {
-            norm: f32t(g, &format!("{p}.hc_mixer_norm.weight"))?,
-            down: f32t(g, &format!("{p}.hc_mixer_down.weight"))?,
-            up: f32t(g, &format!("{p}.hc_mixer_up.weight"))?,
-        };
-        let head_norm = f32t(g, &format!("{p}.nextn.shared_head_norm.weight"))?;
+        let mixer = HcWeightsKo::from_weights(
+            &HcWeights::from_checkpoint(
+                f32t(g, &format!("{p}.nextn.hc_head_norm.weight"))?,
+                f32t(g, &format!("{p}.nextn.hc_head_down.weight"))?,
+                f32t(g, &format!("{p}.nextn.hc_head_up.weight"))?,
+                cfg.hc.count,
+            )?,
+            int8mode,
+        )?;
         Ok(Self {
             input,
             mixer,
-            head_norm,
             layer_index: li,
         })
     }
@@ -201,7 +201,8 @@ impl MtpHead {
         // state; if you do mean pooling first, the acceptance rate drops
         // catastrophically" (llama.cpp#27836) — and measured here it did
         // exactly that: plausible tokens that were never the trunk's.
-        let hn = hc_grouped_norm(residual, &self.input.hnorm, eps)?.reshape((n * hc, n_embd))?;
+        let hn =
+            hc_grouped_norm(residual, &self.input.hnorm, eps, None)?.reshape((n * hc, n_embd))?;
         // **Embedding first, hidden second**: `eh_proj` fuses the checkpoint's
         // `fc_embedding` and `fc_hidden` side by side, so the one matmul
         // computes `fc_embedding @ e + fc_hidden @ h`. One `[n_embd, 2·n_embd]`
@@ -224,14 +225,11 @@ impl MtpHead {
     /// Collapse the head's block output to the width the **shared** LM head
     /// takes.
     ///
-    /// `shared_head_norm` is `[hc_dim]`, so it is a grouped norm over the wide
-    /// residual like every other `[hc_dim]` weight here — and its name says
-    /// what it precedes: the shared head, which on this stack is the trunk's
-    /// own output mix followed by the shared `lm_head`. The head carries the
-    /// norm and borrows the rest, exactly as it borrows the embedding table.
+    /// The head's mixer is its output norm — `hc_mix` opens with the grouped
+    /// norm over `nextn.hc_head_norm` — so nothing precedes it, exactly as
+    /// nothing precedes the trunk's `out_hc`.
     pub fn to_shared_head(&self, block_out: &Tensor, eps: f64) -> Result<Tensor> {
-        let normed = hc_grouped_norm(block_out, &self.head_norm, eps)?;
-        let (narrow, _) = hc_mix(&normed, &self.mixer, eps)?;
+        let (narrow, _) = hc_mix(block_out, &self.mixer, eps, None)?;
         Ok(narrow)
     }
 

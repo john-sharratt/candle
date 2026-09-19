@@ -11233,6 +11233,7 @@ mod tests {
                 head_qk_norm: false,
                 head_norm_reshapes: false,
                 partial_rotary: false,
+                hyper: None,
                 shared_expert: None,
                 qkv_bias: false,
                 decode_q8_context: false,

@@ -165,7 +165,7 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
     #[cfg(feature = "cuda")]
     fn attention_norm<'w>(
         &self,
-        x: &Tensor,
+        x: &LiveTensor<'w>,
         mode: Int8Mode,
         wave: WaveRef<'w>,
     ) -> Result<DynamicActs<'w>> {

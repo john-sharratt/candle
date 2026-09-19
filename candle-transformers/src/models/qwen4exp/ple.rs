@@ -226,8 +226,8 @@ pub fn ple_apply(
     let key = emb.matmul(&w.key.t()?)?.reshape((t, hc, n_embd))?;
     let value = emb.matmul(&w.value.t()?)?; // [T, n_embd]
 
-    let key = hc_grouped_norm(&key, &w.norm_key, eps)?;
-    let query = hc_grouped_norm(res_hc, &w.norm_query, eps)?;
+    let key = hc_grouped_norm(&key, &w.norm_key, eps, None)?;
+    let query = hc_grouped_norm(res_hc, &w.norm_query, eps, None)?;
 
     // Per-stream dot, then a signed square root before the sigmoid.
     let s = (key.mul(&query)?.sum_keepdim(candle::D::Minus1)? * (1.0 / (n_embd as f64).sqrt()))?;
@@ -247,7 +247,7 @@ pub fn ple_apply(
     // Depthwise causal conv over time, dilated by the n-gram size, over the
     // grouped-normed gated value. History rows prepend so a chunked forward
     // matches a one-shot one.
-    let normalized = hc_grouped_norm(&gated, &w.norm_conv, eps)?.reshape((t, hc_dim))?;
+    let normalized = hc_grouped_norm(&gated, &w.norm_conv, eps, None)?.reshape((t, hc_dim))?;
     if let Some(out) = capture {
         // **`to_owned_tensor`, not `contiguous`.** These outlive the wave whose
         // arena produced them — `spec.rs`'s rewind reads them after it has

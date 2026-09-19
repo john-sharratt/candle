@@ -286,6 +286,8 @@ pub trait BatchedModelCore {
             },
             gated_qkv: false,
             partial_rotary: false,
+            // No stack on this path carries a multi-stream residual.
+            hyper: None,
             // No stack on this path has one: Qwen3-MoE routes every token
             // through its top-k experts and nothing else.
             shared_expert: None,
