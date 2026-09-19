@@ -45,10 +45,12 @@ Every tool group should have tests for:
 3. **Validation failures** — missing required field, out-of-range value
 4. **Lifecycle tests** — for session tools: open → use → close in the same context
 
-For lifecycle tests, share a `ToolContext` explicitly:
+For lifecycle tests, share a context explicitly. `harness::granted()` is a
+fresh context holding every capability — these tests exercise what a tool
+does; the refusals without a grant are tested in `src/` beside the grants:
 
 ```rust
-let ctx = ToolContext::new();
+let ctx = harness::granted();
 let saved = harness::expect_success(harness::invoke_with_ctx(
     "credential_save",
     json!({"name": "key", "type": "api_key", "secret": "s1"}),
@@ -59,7 +61,7 @@ let list = harness::expect_success(harness::invoke_with_ctx(
 ));
 ```
 
-For stateless tools, `harness::invoke` creates a fresh context per call — fine
+For stateless tools, `harness::invoke` creates a fresh granted context per call — fine
 for unit testing a single tool call in isolation.
 
 ## Test files

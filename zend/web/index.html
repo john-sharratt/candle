@@ -377,6 +377,23 @@ import { estateSwitcher } from './common/lib/estate.js';
   function saveDialPref(key, value) {
     try { localStorage.setItem(key, String(value)); } catch (_) {}
   }
+  // The tools modes, by wire id, in dial order — a mode's level is its index.
+  const TOOL_MODE_IDS = ['none', 'restricted', 'comprehensive', 'mutable'];
+  // Which of those this caller may use, and the one it starts at: from
+  // GET /v1/me (`loadAccess`). Until that answers the page assumes the least —
+  // the daemon holds a mode above the caller's role to Restricted regardless,
+  // so this only decides what the dial offers.
+  const ACCESS = { modes: ['none', 'restricted'], dflt: 'restricted' };
+  function toolsAllowed(level) { return ACCESS.modes.indexOf(TOOL_MODE_IDS[level]) !== -1; }
+  function toolsDefaultLevel() { return Math.max(0, TOOL_MODE_IDS.indexOf(ACCESS.dflt)); }
+  // The tools level a turn actually uses: the one asked for when this caller
+  // may use it, else the caller's default. `S.toolsLevel` holds what was ASKED
+  // for — a saved preference, a conversation's recorded dial, or null for none
+  // — unclamped, because the role arrives after the first render: clamping on
+  // the way in would pin an admin's saved choice to the anonymous default.
+  // Everything that shows or sends the level reads it through here.
+  function clampTools(level) { return (typeof level === 'number' && toolsAllowed(level)) ? level : toolsDefaultLevel(); }
+  function toolsPref() { return dialPref('zend.tools', null); }
   // The dials a conversation was last run at, adopted when it opens so the
   // composer shows what its next turn will actually use. Deliberately NOT
   // written to localStorage: that preference is the starting point for NEW
@@ -389,7 +406,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     if (!d) {
       S.effortLevel = dialPref('zend.effort', 2);
       S.verbosityLevel = dialPref('zend.verbosity', 2);
-      S.toolsLevel = dialPref('zend.tools', 2);
+      S.toolsLevel = toolsPref();
       return;
     }
     if (typeof d.effort === 'number') S.effortLevel = d.effort;
@@ -422,7 +439,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     // with the user's last-chosen settings rather than a hardcoded default.
     effortLevel: dialPref('zend.effort', 2),
     verbosityLevel: dialPref('zend.verbosity', 2),
-    toolsLevel: dialPref('zend.tools', 2),
+    toolsLevel: toolsPref(),
     openMenu: null,
     theme: (function () { try { return localStorage.getItem('zend.theme') || 'dark'; } catch (_) { return 'dark'; } })(),
     themeMenuOpen: false,
@@ -1050,7 +1067,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     // conversation they just closed was held at.
     S.effortLevel = dialPref('zend.effort', 2);
     S.verbosityLevel = dialPref('zend.verbosity', 2);
-    S.toolsLevel = dialPref('zend.tools', 2);
+    S.toolsLevel = toolsPref();
     writeHashConv(null);
     setState({ activeId: null, promptValue: '', sidebarDrawer: false, convMenuOpen: false }, focusPrompt);
   }
@@ -1201,7 +1218,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     // conversation — putting us back to a blank failure.
     let failed = false;
     const conv = S.conversations.find((c) => c.id === convId);
-    const opts = { think: S.effortLevel !== 0, effort: S.effortLevel, verbosity: S.verbosityLevel, tools: ['none', 'restricted', 'comprehensive'][S.toolsLevel] };
+    const opts = { think: S.effortLevel !== 0, effort: S.effortLevel, verbosity: S.verbosityLevel, tools: TOOL_MODE_IDS[clampTools(S.toolsLevel)] };
     stream = API.streamChatCompletion(conv, userText, opts, {
       onStatus: (s) => patchStream(convId, (m) => { m.status = s; }),
       onToken: (delta) => { patchStream(convId, (m) => { m.content += delta; m.status = ''; m.prefill = null; }); },
@@ -2195,11 +2212,13 @@ import { estateSwitcher } from './common/lib/estate.js';
   const DIALS = {
     effort: { label: 'Thinking effort', names: ['Off', 'Quick', 'Balanced', 'Deep', 'Exhaustive'], subs: ['no thinking', 'a moment', 'default pace', 'careful reasoning', 'leave nothing out'], key: 'effortLevel', pref: 'zend.effort', ticksGrow: true, glyph: GLYPH_BRAIN },
     verbosity: { label: 'Response length', names: ['Terse', 'Concise', 'Standard', 'Detailed', 'Comprehensive'], subs: ['a line or two', 'just essentials', 'balanced detail', 'full explanation', 'exhaustive depth'], key: 'verbosityLevel', pref: 'zend.verbosity', ticksGrow: false, glyph: GLYPH_LINES },
-    tools: { label: 'Tools', names: ['None', 'Restricted', 'Comprehensive'], subs: ['no tools', 'safe tools only', 'every tool'], key: 'toolsLevel', pref: 'zend.tools', ticksGrow: false, icon: HAMMER_SVG, glyph: HAMMER_SVG, zeroable: true },
+    // `allowed` limits the menu to the levels this caller may use, and `clamp`
+    // turns the level asked for into the one a turn will use (GET /v1/me).
+    tools: { label: 'Tools', names: ['None', 'Restricted', 'Comprehensive', 'Mutable'], subs: ['no tools', 'safe tools only', 'every tool', 'every tool, edits files on disk'], key: 'toolsLevel', pref: 'zend.tools', ticksGrow: false, icon: HAMMER_SVG, glyph: HAMMER_SVG, zeroable: true, allowed: toolsAllowed, clamp: clampTools },
   };
   function buildDial(which) {
     const d = DIALS[which];
-    const lvl = S[d.key];
+    const lvl = d.clamp ? d.clamp(S[d.key]) : S[d.key];
     const open = S.openMenu === which;
     const onToggle = () => setState({ openMenu: open ? null : which });
     let btn;
@@ -2229,7 +2248,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     if (open) {
       wrap.appendChild(h('div', { style: 'position:absolute; bottom:calc(100% + 7px); left:0; min-width:200px; background:#26231f; border:1px solid #4a443e; border-radius:10px; box-shadow:0 -10px 30px rgba(0,0,0,0.55); padding:5px;' },
         h('div', { style: 'font-size:0.62rem; text-transform:uppercase; letter-spacing:0.07em; color:#7c736a; padding:5px 8px 4px;' }, d.label),
-        d.names.map((name, i) => h('button', { onClick: () => { saveDialPref(d.pref, i); setState({ ['' + d.key]: i, openMenu: null }); }, style: 'display:flex; align-items:center; gap:9px; width:100%; padding:7px 9px; border:none; background:' + (i === lvl ? 'rgba(201,138,62,0.16)' : 'transparent') + '; color:' + (i === lvl ? ACCENT : '#cfc8c0') + '; border-radius:6px; cursor:pointer; font:inherit; font-size:0.78rem; text-align:left; white-space:nowrap;' },
+        d.names.map((name, i) => (d.allowed && !d.allowed(i)) ? null : h('button', { onClick: () => { saveDialPref(d.pref, i); setState({ ['' + d.key]: i, openMenu: null }); }, style: 'display:flex; align-items:center; gap:9px; width:100%; padding:7px 9px; border:none; background:' + (i === lvl ? 'rgba(201,138,62,0.16)' : 'transparent') + '; color:' + (i === lvl ? ACCENT : '#cfc8c0') + '; border-radius:6px; cursor:pointer; font:inherit; font-size:0.78rem; text-align:left; white-space:nowrap;' },
           h('span', { style: 'width:7px; height:7px; border-radius:50%; background:' + (i === lvl ? ACCENT : '#3a352f') + ';' }),
           h('span', { style: 'flex:1;' }, name),
           h('span', { style: 'font-size:0.66rem; color:#7c736a;' }, d.subs[i])))));
@@ -3292,6 +3311,19 @@ import { estateSwitcher } from './common/lib/estate.js';
       render();
     }).catch(() => {});
   }
+
+  // What this caller may do (GET /v1/me): which tools modes the dial offers and
+  // where it starts. `/v1/me` needs no loaded model, so this runs at boot. The
+  // held tools level is left as asked; the redraw shows it clamped to the role.
+  function loadAccess() {
+    Promise.resolve(API.getMe()).then((me) => {
+      if (!me || !Array.isArray(me.tool_modes)) return;
+      ACCESS.modes = me.tool_modes;
+      ACCESS.dflt = me.default_tools || 'restricted';
+      render();
+    }).catch(() => {});
+  }
+  loadAccess();
 
   // Boot/reload state. `reloadPolling` is true while pollStatus owns the screen
   // (initial load OR a detected daemon reload), so periodicSync stays out of the

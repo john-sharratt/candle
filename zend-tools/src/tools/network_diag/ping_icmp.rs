@@ -4,7 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::DiagError;
+use super::{host_argument, DiagError};
+use crate::{exec, net};
 use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
@@ -50,39 +51,33 @@ impl Tool for PingIcmp {
     type Response = PingResponse;
     type Error = DiagError;
 
-    fn run(_ctx: &ToolContext, req: PingRequest) -> Result<PingResponse, DiagError> {
+    fn run(ctx: &ToolContext, req: PingRequest) -> Result<PingResponse, DiagError> {
         let count = req.count.unwrap_or(4);
         let timeout = req.timeout_sec.unwrap_or(5);
+        let grants = ctx.grants();
+        let host = host_argument(&req.host)?;
 
-        let resolved_ip = dns_lookup::lookup_host(&req.host)
-            .ok()
-            .and_then(|ips| ips.into_iter().next())
+        let resolved_ip = net::lookup_host(grants, host)
+            .map_err(|e| DiagError::HostNotFound(format!("{host}: {e}")))?
+            .into_iter()
+            .next()
             .map(|ip| ip.to_string())
-            .unwrap_or_else(|| req.host.clone());
+            .unwrap_or_else(|| host.to_string());
 
+        let mut cmd =
+            exec::command(grants, "ping").map_err(|e| DiagError::Failed(e.to_string()))?;
         #[cfg(target_os = "windows")]
-        let output = std::process::Command::new("ping")
-            .args([
-                "-n",
-                &count.to_string(),
-                "-w",
-                &(timeout * 1000).to_string(),
-                &req.host,
-            ])
-            .output();
-
+        cmd.args([
+            "-n",
+            &count.to_string(),
+            "-w",
+            &(timeout * 1000).to_string(),
+            host,
+        ]);
         #[cfg(not(target_os = "windows"))]
-        let output = std::process::Command::new("ping")
-            .args([
-                "-c",
-                &count.to_string(),
-                "-W",
-                &timeout.to_string(),
-                &req.host,
-            ])
-            .output();
+        cmd.args(["-c", &count.to_string(), "-W", &timeout.to_string(), host]);
 
-        let output = output.map_err(|e| DiagError::Failed(e.to_string()))?;
+        let output = cmd.output().map_err(|e| DiagError::Failed(e.to_string()))?;
         let raw = String::from_utf8_lossy(&output.stdout).into_owned();
 
         let (packets_received, rtt_min, rtt_avg, rtt_max) = parse_ping_output(&raw);

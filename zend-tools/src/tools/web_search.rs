@@ -91,7 +91,8 @@ impl Tool for WebSearchTool {
         });
 
         let resp = ctx
-            .http_client
+            .http()
+            .map_err(|e| SearchError::SearchUnavailable(e.to_string()))?
             .post("https://api.tavily.com/search")
             .json(&body)
             .send()

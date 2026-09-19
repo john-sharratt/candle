@@ -232,6 +232,27 @@ test.describe('1.5b dials follow the conversation', () => {
   });
 });
 
+test.describe('1.5c the tools dial follows the caller role', () => {
+  const toolsMenu = async (page) => {
+    await page.getByTitle('Tools').click();
+    return page.evaluate(() => [...document.querySelectorAll('button span')]
+      .map((s) => s.textContent.trim())
+      .filter((t) => ['None', 'Restricted', 'Comprehensive', 'Mutable'].includes(t)));
+  };
+
+  test('an admin is offered every mode, Mutable included', async ({ page }) => {
+    await boot(page);
+    await expect.poll(() => toolsMenu(page)).toEqual(['None', 'Restricted', 'Comprehensive', 'Mutable']);
+  });
+
+  test('a non-admin is offered None and Restricted, and starts at Restricted', async ({ page }) => {
+    await page.addInitScript(() => { window.__ZEND_MOCK_ROLE__ = 'user'; });
+    await boot(page);
+    await expect(page.getByTitle('Tools')).toContainText('Restricted');
+    await expect.poll(() => toolsMenu(page)).toEqual(['None', 'Restricted']);
+  });
+});
+
 test.describe('1.4 thinking block', () => {
   test('think block is collapsed by default', async ({ page }) => {
     await boot(page, { conv: '1' });

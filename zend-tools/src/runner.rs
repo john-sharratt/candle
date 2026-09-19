@@ -41,7 +41,7 @@ pub fn run(tool_name: &str, tool_call_id: &str, args: &Value, ctx: &ToolContext)
     };
 
     tracing::debug!("dispatch start");
-    let mut result = (tool.run)(ctx, args);
+    let mut result = tool.call(ctx, args);
     tracing::debug!(success = !is_error_response(&result), "dispatch complete");
     // Annotate large/tiny numeric fields with `<key>_display` renderings
     // (digit-grouped, magnitude-tagged) so the model quotes magnitudes instead

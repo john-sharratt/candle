@@ -125,8 +125,10 @@ impl Tool for WeatherTool {
             "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=en&format=json",
             urlencoding::encode(&req.location)
         );
-        let geo_resp = ctx
-            .http_client
+        let http = ctx
+            .http()
+            .map_err(|e| WeatherError::WeatherUnavailable(e.to_string()))?;
+        let geo_resp = http
             .get(&geo_url)
             .send()
             .map_err(|e| WeatherError::WeatherUnavailable(e.to_string()))?;
@@ -166,8 +168,7 @@ impl Tool for WeatherTool {
              &temperature_unit={temp_unit}"
         );
 
-        let w_resp = ctx
-            .http_client
+        let w_resp = http
             .get(&weather_url)
             .send()
             .map_err(|e| WeatherError::WeatherUnavailable(e.to_string()))?;

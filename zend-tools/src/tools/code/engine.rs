@@ -10,6 +10,8 @@
 use boa_engine::gc::{Gc, GcRefCell};
 use boa_engine::{js_string, Context, JsValue, NativeFunction, Source};
 
+use crate::grants::{Capability, Grants, NotPermitted};
+
 /// Loop-iteration ceiling before the VM aborts a script. Generous for real
 /// computation (~sub-second to a few seconds) while still killing `while(true)`.
 const LOOP_ITERATION_LIMIT: u64 = 100_000_000;
@@ -69,7 +71,12 @@ fn sink(buf: Gc<GcRefCell<String>>) -> NativeFunction {
 /// (a session's accumulated prior source — used to rebuild variable/function
 /// state). Output produced by the prelude is discarded; only `code`'s console
 /// output and final value are captured.
-pub fn run_js(prelude: &str, code: &str) -> JsOutcome {
+///
+/// Refused without [`Capability::Exec`]: running model-written code is
+/// execution whatever the sandbox, so no VM is created for a context that may
+/// not run programs.
+pub fn run_js(grants: Grants, prelude: &str, code: &str) -> Result<JsOutcome, NotPermitted> {
+    grants.require(Capability::Exec)?;
     let mut context = Context::default();
     context
         .runtime_limits_mut()
@@ -90,12 +97,12 @@ pub fn run_js(prelude: &str, code: &str) -> JsOutcome {
         context.eval(Source::from_bytes(CONSOLE_PRELUDE))?;
         Ok(())
     })() {
-        return JsOutcome {
+        return Ok(JsOutcome {
             stdout: String::new(),
             stderr: String::new(),
             result: None,
             error: Some(format!("engine init failed: {e}")),
-        };
+        });
     }
 
     // Replay session history to rebuild state, then drop whatever it printed so
@@ -125,10 +132,25 @@ pub fn run_js(prelude: &str, code: &str) -> JsOutcome {
 
     let stdout = out.borrow().clone();
     let stderr = err.borrow().clone();
-    JsOutcome {
+    Ok(JsOutcome {
         stdout,
         stderr,
         result,
         error,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_script_runs_without_the_exec_capability() {
+        assert_eq!(
+            run_js(Grants::NONE, "", "1 + 1").err(),
+            Some(NotPermitted(Capability::Exec))
+        );
+        let ran = run_js(Grants::NONE.with(Capability::Exec), "", "1 + 1").unwrap();
+        assert_eq!(ran.result.as_deref(), Some("2"));
     }
 }

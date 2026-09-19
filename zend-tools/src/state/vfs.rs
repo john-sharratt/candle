@@ -69,12 +69,28 @@
 //! The upper layer is capped at 10 MiB per store (enforced on each `write`).
 //! Reading through to the workspace costs nothing against the cap because nothing
 //! is retained; a copy-up does, and returns [`VfsError::Full`] if it would not fit.
+//!
+//! # Direct mode
+//!
+//! [`VfsStore::direct`] is the same store with no upper layer: a write lands in
+//! the workspace on disk, a delete removes the file, and every read therefore
+//! sees what is on disk. It backs the daemon's Mutable tools mode, for a caller
+//! entitled to change the project itself rather than a session copy of it.
+//! Everything else holds unchanged — path normalisation (so `..` still cannot
+//! leave the root) and the protected-path refusal in particular, which in this
+//! mode is what stops a tool overwriting a deployment's secrets.
+//!
+//! A direct write goes to a sibling temporary file first and is renamed over
+//! the target, so a write interrupted partway leaves the old file whole rather
+//! than truncated.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use ignore::WalkBuilder;
+
+use crate::grants::DiskWriteGrant;
 
 const MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
@@ -105,6 +121,9 @@ pub enum VfsError {
     /// not it exists: saying "not found" for a real file and "forbidden" for a
     /// missing one would turn the error into an oracle for what is there.
     Forbidden(String),
+    /// A [`VfsStore::direct`] write could not reach the disk — a permission, a
+    /// full volume, a path that names a directory.
+    Unwritable(String),
 }
 
 impl std::fmt::Display for VfsError {
@@ -117,6 +136,7 @@ impl std::fmt::Display for VfsError {
                 "{path} is under a {PROTECTED_SEGMENT}/ directory and cannot be \
                  read, written or listed by tools"
             ),
+            VfsError::Unwritable(why) => write!(f, "{why}"),
         }
     }
 }
@@ -172,12 +192,24 @@ struct Upper {
     whiteouts: HashSet<String>,
 }
 
-/// Union-mount of a session-private in-memory layer over the read-only workspace.
+/// Where a store's writes land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Layering {
+    /// In the in-memory upper layer, over a read-only workspace.
+    #[default]
+    Overlay,
+    /// On disk, in the workspace itself — see the module's "Direct mode".
+    Direct,
+}
+
+/// Union-mount of a session-private in-memory layer over the read-only workspace
+/// — or, built with [`VfsStore::direct`], the workspace itself.
 #[derive(Default)]
 pub struct VfsStore {
     upper: RwLock<Upper>,
     /// Lower layer root. `None` leaves the store upper-only.
     workspace: Option<PathBuf>,
+    layering: Layering,
 }
 
 impl VfsStore {
@@ -191,7 +223,27 @@ impl VfsStore {
         Self {
             upper: RwLock::new(Upper::default()),
             workspace: Some(root.into()),
+            layering: Layering::Overlay,
         }
+    }
+
+    /// The workspace at `root` with no overlay: writes and deletes change the
+    /// files on disk. See the module's "Direct mode".
+    ///
+    /// Takes the [`DiskWriteGrant`] only [`Grants::disk_write`](crate::Grants::disk_write)
+    /// makes, so a store that writes the disk exists only where that capability
+    /// was granted.
+    pub fn direct(root: impl Into<PathBuf>, _grant: DiskWriteGrant) -> Self {
+        Self {
+            upper: RwLock::new(Upper::default()),
+            workspace: Some(root.into()),
+            layering: Layering::Direct,
+        }
+    }
+
+    /// Whether writes and deletes change the workspace on disk.
+    pub fn is_direct(&self) -> bool {
+        self.layering == Layering::Direct
     }
 
     /// The configured lower-layer root, if any.
@@ -204,12 +256,19 @@ impl VfsStore {
     /// workspace file for the first time counts as an overwrite, not a creation,
     /// because the path already resolved before the call. Writing over a whiteout
     /// *is* a creation: the path did not resolve while the whiteout stood.
+    ///
+    /// On a [`direct`](Self::direct) store the file is written on disk instead,
+    /// and `true` means it did not exist there before.
     pub fn write(&self, path: &str, content: String) -> Result<bool, VfsError> {
         let norm = Self::normalize(path);
-        // Writes never reach disk, so this cannot overwrite a secret — it is
-        // refused so that a session cannot plant a decoy at a protected path and
-        // have later reads of that path start succeeding.
+        // Refused in both modes. On an overlay nothing reaches disk, so this
+        // stops a session planting a decoy at a protected path that later reads
+        // would then find; on a direct store it is what keeps a tool from
+        // overwriting the deployment's secrets.
         Self::guard(&norm)?;
+        if self.is_direct() {
+            return self.write_disk(&norm, &content);
+        }
         let in_lower = self.lower_exists(&norm);
         let mut guard = self.upper.write().unwrap();
         let whiteouted = guard.whiteouts.contains(&norm);
@@ -286,10 +345,18 @@ impl VfsStore {
     /// Remove a path from the overlay. An upper-layer file is dropped; a
     /// workspace-backed file gets a whiteout so it stops resolving. Returns
     /// whether the path resolved before the call. The workspace is never touched.
+    ///
+    /// On a [`direct`](Self::direct) store the file is removed from disk, and the
+    /// result is whether it existed and was removed.
     pub fn delete(&self, path: &str) -> bool {
         let norm = Self::normalize(path);
         if Self::is_protected(&norm) {
             return false;
+        }
+        if self.is_direct() {
+            return self
+                .lower_path(&norm)
+                .is_some_and(|abs| abs.is_file() && std::fs::remove_file(abs).is_ok());
         }
         let in_lower = self.lower_exists(&norm);
         let mut guard = self.upper.write().unwrap();
@@ -325,6 +392,41 @@ impl VfsStore {
         }
         upper.files.insert(norm, content);
         Ok(())
+    }
+
+    // ── Direct-mode helpers ──────────────────────────────────────────────────
+
+    /// Write `content` to `norm` on disk, creating its parent directories.
+    /// Returns whether the file did not exist before.
+    ///
+    /// Through a sibling temporary file renamed over the target: a rename
+    /// replaces the file in one step, so a write cut short leaves the old
+    /// content whole rather than a truncated file.
+    fn write_disk(&self, norm: &str, content: &str) -> Result<bool, VfsError> {
+        let abs = self.lower_path(norm).ok_or_else(|| {
+            VfsError::Unwritable(format!("{norm:?} does not name a file in the workspace"))
+        })?;
+        let fail = |what: &str, e: std::io::Error| {
+            VfsError::Unwritable(format!("{norm} could not be written ({what}: {e})"))
+        };
+        let existed = abs.is_file();
+        if abs.is_dir() {
+            return Err(VfsError::Unwritable(format!("{norm} is a directory")));
+        }
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| fail("creating its directory", e))?;
+        }
+        let file_name = abs
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let temp = abs.with_file_name(format!(".{file_name}.zend-write"));
+        std::fs::write(&temp, content).map_err(|e| fail("writing", e))?;
+        if let Err(e) = std::fs::rename(&temp, &abs) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(fail("replacing the file", e));
+        }
+        Ok(!existed)
     }
 
     // ── Lower-layer helpers ──────────────────────────────────────────────────
@@ -624,6 +726,8 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::grants::Grants;
+
     fn store_with_tree() -> (TempDir, VfsStore) {
         let dir = tempfile::tempdir().unwrap();
         put(dir.path(), "README.md", "# project\n");
@@ -641,6 +745,116 @@ mod tests {
 
     fn listed(store: &VfsStore, prefix: &str) -> Vec<String> {
         store.list(prefix).into_iter().map(|e| e.path).collect()
+    }
+
+    // ── direct mode ──────────────────────────────────────────────────────────
+
+    fn granted() -> DiskWriteGrant {
+        Grants::ALL.disk_write().unwrap()
+    }
+
+    /// **A direct write is a file on disk**, created with its directories, and
+    /// every read — this store's and the filesystem's — sees it.
+    #[test]
+    fn a_direct_write_lands_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = VfsStore::direct(dir.path(), granted());
+        assert!(s.is_direct());
+
+        assert!(
+            s.write("docs/new/note.md", "hello\n".into()).unwrap(),
+            "created"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("docs/new/note.md")).unwrap(),
+            "hello\n"
+        );
+        assert_eq!(
+            s.read("docs/new/note.md").unwrap().as_deref(),
+            Some("hello\n")
+        );
+        assert_eq!(s.total_bytes(), 0, "nothing is held in memory");
+
+        // Overwriting is not a creation, and replaces the content.
+        assert!(!s
+            .write("/workspace/docs/new/note.md", "bye\n".into())
+            .unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("docs/new/note.md")).unwrap(),
+            "bye\n"
+        );
+        // No temporary file is left beside it.
+        let names: Vec<String> = std::fs::read_dir(dir.path().join("docs/new"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["note.md"]);
+    }
+
+    /// A direct delete removes the file from disk; a missing one reports false.
+    #[test]
+    fn a_direct_delete_removes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "gone.txt", "x");
+        let s = VfsStore::direct(dir.path(), granted());
+        assert!(s.delete("gone.txt"));
+        assert!(!dir.path().join("gone.txt").exists());
+        assert!(!s.delete("gone.txt"), "nothing left to delete");
+    }
+
+    /// **The guards hold on disk.** A protected path is refused and left
+    /// untouched, and `..` cannot climb out of the workspace — normalisation
+    /// pins it to the root, so the write lands inside it.
+    #[test]
+    fn a_direct_store_cannot_touch_secrets_or_leave_the_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("ws");
+        put(&root, "secrets/tools.yaml", "key: real\n");
+        let s = VfsStore::direct(&root, granted());
+
+        assert!(matches!(
+            s.write("secrets/tools.yaml", "key: planted\n".into()),
+            Err(VfsError::Forbidden(_))
+        ));
+        assert!(!s.delete("secrets/tools.yaml"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("secrets/tools.yaml")).unwrap(),
+            "key: real\n"
+        );
+
+        s.write("../../escaped.txt", "x".into()).unwrap();
+        assert!(!outer.path().join("escaped.txt").exists());
+        assert!(root.join("escaped.txt").exists());
+    }
+
+    /// Writing where a directory stands is an error the model can read, not a
+    /// silent success.
+    #[test]
+    fn a_direct_write_over_a_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "src/main.rs", "fn main() {}\n");
+        let s = VfsStore::direct(dir.path(), granted());
+        assert!(matches!(
+            s.write("src", "x".into()),
+            Err(VfsError::Unwritable(_))
+        ));
+    }
+
+    /// The overlay, by contrast, never touches the disk — the property Mutable
+    /// is the explicit exception to.
+    #[test]
+    fn an_overlay_write_never_reaches_disk() {
+        let (dir, s) = store_with_tree();
+        assert!(!s.is_direct());
+        s.write("new.txt", "x".into()).unwrap();
+        s.write("README.md", "changed".into()).unwrap();
+        assert!(s.delete("src/main.rs"));
+        assert!(!dir.path().join("new.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("README.md")).unwrap(),
+            "# project\n"
+        );
+        assert!(dir.path().join("src/main.rs").exists());
     }
 
     // ── normalize ────────────────────────────────────────────────────────────

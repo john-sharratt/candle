@@ -36,12 +36,13 @@
 //! | `interpreter_not_found` | requested a language other than JavaScript |
 //! | `execution_failed` | engine setup failed (should not occur) |
 //! | `session_not_found` | session ID not in registry |
+//! | `not_permitted` | the context lacks the `exec` capability; no VM was created |
 //!
 //! A thrown JS exception or a hit VM limit is **not** an error envelope: the
 //! call succeeds with `ok: false` and the message in `error`, mirroring how a
 //! REPL reports a runtime fault.
 
-use crate::ToolError;
+use crate::{NotPermitted, ToolError};
 use thiserror::Error;
 
 pub mod engine;
@@ -74,6 +75,8 @@ pub enum CodeError {
     ExecutionFailed(String),
     #[error("session not found: {0}")]
     SessionNotFound(String),
+    #[error(transparent)]
+    NotPermitted(#[from] NotPermitted),
 }
 
 impl ToolError for CodeError {
@@ -82,6 +85,7 @@ impl ToolError for CodeError {
             CodeError::InterpreterNotFound(_) => "interpreter_not_found",
             CodeError::ExecutionFailed(_) => "execution_failed",
             CodeError::SessionNotFound(_) => "session_not_found",
+            CodeError::NotPermitted(_) => NotPermitted::CODE,
         }
     }
 }

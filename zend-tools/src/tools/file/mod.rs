@@ -165,6 +165,9 @@ pub enum FileError {
     /// rather than as "wrong path" and tries six more spellings.
     #[error("{0}")]
     Forbidden(String),
+    /// A write to the workspace on disk (the Mutable tools mode) failed.
+    #[error("{0}")]
+    Unwritable(String),
 }
 
 impl ToolError for FileError {
@@ -177,6 +180,7 @@ impl ToolError for FileError {
             FileError::Unreadable(_) => "unreadable",
             FileError::InvalidArguments(_) => "invalid_arguments",
             FileError::Forbidden(_) => "forbidden",
+            FileError::Unwritable(_) => "unwritable",
         }
     }
 }
@@ -192,6 +196,7 @@ impl From<VfsError> for FileError {
             VfsError::Forbidden(path) => {
                 FileError::Forbidden(VfsError::Forbidden(path).to_string())
             }
+            VfsError::Unwritable(why) => FileError::Unwritable(why),
         }
     }
 }

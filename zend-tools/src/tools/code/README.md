@@ -3,7 +3,9 @@
 Run **JavaScript** on the embedded, pure-Rust [`boa_engine`](https://github.com/boa-dev/boa)
 VM. No external interpreter, no subprocess, no `node` on PATH. The VM is
 sandboxed by construction — no filesystem, network, or process access — and
-runaway scripts are bounded by loop / recursion limits.
+runaway scripts are bounded by loop / recursion limits. `run_js()` also refuses
+to create a VM unless the context holds the `exec` capability, so running code
+needs that grant even if the dispatch-level check in the registry were bypassed.
 
 ## Files
 
@@ -55,6 +57,7 @@ reports an `ok` flag with the thrown message in `error`.
 | `interpreter_not_found` | a language other than JavaScript was requested |
 | `execution_failed` | engine setup failed (should not occur) |
 | `session_not_found` | session ID not in registry |
+| `not_permitted` | the context lacks the `exec` capability; no VM was created |
 
 A thrown JS exception or a hit VM limit is **not** one of these error codes — the
 call succeeds and reports the fault via `ok: false` / `exit_code: 1` and the

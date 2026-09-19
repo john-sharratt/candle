@@ -55,7 +55,7 @@ impl Tool for CodeSessionExec {
 
         // Replay accumulated history (silently) to rebuild state, then run the
         // new snippet.
-        let outcome = run_js(&guard.history, &req.code);
+        let outcome = run_js(ctx.grants(), &guard.history, &req.code)?;
         let ok = outcome.error.is_none();
 
         // Only successful snippets join the history — a throwing snippet must not

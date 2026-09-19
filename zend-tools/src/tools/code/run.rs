@@ -60,7 +60,7 @@ impl Tool for CodeRun {
     type Response = RunResponse;
     type Error = CodeError;
 
-    fn run(_ctx: &ToolContext, req: RunRequest) -> Result<RunResponse, CodeError> {
+    fn run(ctx: &ToolContext, req: RunRequest) -> Result<RunResponse, CodeError> {
         if !is_javascript(&req.language) {
             return Err(CodeError::InterpreterNotFound(req.language));
         }
@@ -80,7 +80,7 @@ impl Tool for CodeRun {
         }
 
         let start = Instant::now();
-        let outcome = run_js(&prelude, &req.code);
+        let outcome = run_js(ctx.grants(), &prelude, &req.code)?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         // A thrown JS error is a script fault, not a tool error: report it via

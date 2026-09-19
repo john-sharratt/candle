@@ -4,7 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::{extract_ip, extract_rtt, DiagError};
+use super::{extract_ip, extract_rtt, host_argument, DiagError};
+use crate::exec;
 use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
@@ -46,32 +47,39 @@ impl Tool for TraceRoute {
     type Response = TraceResponse;
     type Error = DiagError;
 
-    fn run(_ctx: &ToolContext, req: TraceRequest) -> Result<TraceResponse, DiagError> {
+    fn run(ctx: &ToolContext, req: TraceRequest) -> Result<TraceResponse, DiagError> {
         let max_hops = req.max_hops.unwrap_or(30);
+        let host = host_argument(&req.host)?;
 
         // tracert takes the per-hop wait in milliseconds (-w); traceroute takes it
         // in seconds (-w). Only pass it when the caller specified one.
         #[cfg(target_os = "windows")]
-        let output = {
-            let mut cmd = std::process::Command::new("tracert");
+        let cmd = {
+            let mut cmd = exec::command(ctx.grants(), "tracert")
+                .map_err(|e| DiagError::Failed(e.to_string()))?;
             cmd.args(["-h", &max_hops.to_string()]);
             if let Some(t) = req.timeout_sec {
                 cmd.args(["-w", &(t * 1000).to_string()]);
             }
-            cmd.arg(&req.host).output()
+            cmd
         };
 
         #[cfg(not(target_os = "windows"))]
-        let output = {
-            let mut cmd = std::process::Command::new("traceroute");
+        let cmd = {
+            let mut cmd = exec::command(ctx.grants(), "traceroute")
+                .map_err(|e| DiagError::Failed(e.to_string()))?;
             cmd.args(["-m", &max_hops.to_string()]);
             if let Some(t) = req.timeout_sec {
                 cmd.args(["-w", &t.to_string()]);
             }
-            cmd.arg(&req.host).output()
+            cmd
         };
 
-        let output = output.map_err(|e| DiagError::Failed(e.to_string()))?;
+        let mut cmd = cmd;
+        let output = cmd
+            .arg(host)
+            .output()
+            .map_err(|e| DiagError::Failed(e.to_string()))?;
         let raw = String::from_utf8_lossy(&output.stdout).into_owned();
 
         let hops = parse_traceroute(&raw);

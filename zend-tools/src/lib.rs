@@ -14,7 +14,10 @@
 //! - [`runner`] — [`run`], [`confirmation`] and [`replay`], the three dispatch
 //!   entry points used by the orchestrator
 //! - [`context`] — [`ToolContext`], the `Arc`-shared bundle of state stores passed
-//!   into every tool invocation
+//!   into every tool invocation, and the [`Grants`] its calls run under
+//! - [`grants`] — the capabilities a call may use; [`net`], [`exec`] and
+//!   [`disk`] are the only ways tool code reaches the network, starts a program
+//!   or opens a database, and each refuses without its capability
 //! - [`state`] — the individual stores: [`state::VfsStore`], [`state::CredentialStore`],
 //!   [`state::NotesStore`], [`state::SessionRegistry`], [`state::HashStateStore`],
 //!   [`state::ToolSecrets`]
@@ -68,14 +71,21 @@
 //! ```
 
 pub mod context;
+pub mod disk;
+pub mod exec;
+pub mod grants;
+pub mod net;
 mod numfmt;
 pub mod registry;
 pub mod runner;
+#[cfg(test)]
+mod source_scan;
 pub mod state;
 pub mod tool;
 pub mod tools;
 
 pub use context::ToolContext;
+pub use grants::{Capability, Grants, NotPermitted};
 pub use registry::RegisteredTool;
 pub use runner::{confirmation, replay, run};
 pub use tool::{

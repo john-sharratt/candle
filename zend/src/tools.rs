@@ -41,10 +41,13 @@ use serde_json::Value;
 use zend_tools::state::ToolSecrets;
 use zend_tools::{registry, replay, Replay, ToolContext};
 
-/// The names of every tool that is **not** high-risk — the subset projected in
-/// "Restricted" tools mode. Derived from the registry's `.risky()` policy (see
-/// [`zend_tools::registry`]); "None" mode projects no tools, "Comprehensive"
-/// projects all of them.
+use crate::access;
+use crate::types::ToolMode;
+
+/// The names of the tools projected in "Restricted" tools mode: those neither
+/// marked high-risk nor needing any capability — see
+/// [`crate::tool_def::safe_names`]. "None" mode projects no tools,
+/// "Comprehensive" projects all of them.
 pub fn safe_tool_names() -> HashSet<String> {
     crate::tool_def::safe_names()
 }
@@ -531,7 +534,7 @@ impl RawCall {
 /// `{"error":"unknown_tool","detail":"..."}`.
 pub fn run_tool(ctx: &ToolContext, call: &ToolCall) -> Value {
     match registry::find(&call.name) {
-        Some(t) => (t.run)(ctx, &call.arguments),
+        Some(t) => t.call(ctx, &call.arguments),
         None => serde_json::json!({
             "error": "unknown_tool",
             "detail": format!("no tool named {:?}", call.name),
@@ -706,9 +709,15 @@ pub fn tool_round_text(text: &str) -> TurnText {
 /// One host serves the whole daemon, so the `file_*` overlay's session layer is
 /// shared across conversations: a file written in one chat is visible in the
 /// next. The lower layer is the daemon's working directory, read-only.
+///
+/// It holds one context per tools mode. They share every store and differ only
+/// in their [`Grants`](zend_tools::Grants) ([`access::grants`]) and, for
+/// Mutable, in a file store that writes the disk — so what a round may do is
+/// fixed by the context it is handed, not by which tools its prompt offered.
 #[derive(Clone)]
 pub struct ToolHost {
-    pub ctx: Arc<ToolContext>,
+    /// Indexed by [`ToolMode::level`].
+    contexts: [Arc<ToolContext>; 4],
 }
 
 impl ToolHost {
@@ -719,9 +728,24 @@ impl ToolHost {
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         let workspace = workspace.into();
         let secrets = load_tool_secrets(&workspace);
-        Self {
-            ctx: Arc::new(ToolContext::with_workspace(workspace).with_secrets(secrets)),
-        }
+        let base = ToolContext::with_workspace(workspace).with_secrets(secrets);
+        let contexts = ToolMode::ALL.map(|mode| {
+            let ctx = base.clone().granting(access::grants(mode));
+            let ctx = if mode.writes_disk() {
+                ctx.with_direct_files()
+                    .expect("the mode that writes the disk is granted it")
+                    .expect("a context built on a workspace has one to work on directly")
+            } else {
+                ctx
+            };
+            Arc::new(ctx)
+        });
+        Self { contexts }
+    }
+
+    /// The context a round of tools in `mode` runs in.
+    pub fn context_for(&self, mode: ToolMode) -> &Arc<ToolContext> {
+        &self.contexts[mode.level() as usize]
     }
 }
 
@@ -779,11 +803,50 @@ mod tests {
         std::fs::write(&path, "tavily_api_key: tvly-wired-through\n").unwrap();
 
         let host = ToolHost::new(dir.path());
-        assert_eq!(
-            host.ctx.secrets.tavily_api_key(),
-            Some("tvly-wired-through"),
-            "the daemon must read secrets/tools.yaml from its working directory"
-        );
+        for mode in ToolMode::ALL {
+            assert_eq!(
+                host.context_for(mode).secrets.tavily_api_key(),
+                Some("tvly-wired-through"),
+                "the daemon must read secrets/tools.yaml from its working directory ({})",
+                mode.id()
+            );
+        }
+    }
+
+    /// **Each mode's context carries that mode's grants, and only Mutable's
+    /// file store writes the disk.** A Restricted round handed a gated call
+    /// refuses it at dispatch, whatever the prompt offered.
+    #[test]
+    fn each_modes_context_carries_its_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(dir.path());
+        for mode in ToolMode::ALL {
+            let ctx = host.context_for(mode);
+            assert_eq!(ctx.grants(), access::grants(mode), "{}", mode.id());
+            assert_eq!(ctx.vfs.is_direct(), mode.writes_disk(), "{}", mode.id());
+        }
+        let restricted = host.context_for(ToolMode::Restricted);
+        for (name, arguments) in [
+            (
+                "web_fetch",
+                serde_json::json!({ "url": "https://example.com" }),
+            ),
+            (
+                "code_run",
+                serde_json::json!({ "language": "js", "code": "1" }),
+            ),
+            ("sql_session_open", serde_json::json!({})),
+        ] {
+            let call = ToolCall {
+                name: name.to_string(),
+                arguments,
+            };
+            assert_eq!(
+                run_tool(restricted, &call)["error"],
+                "not_permitted",
+                "{name} ran in Restricted"
+            );
+        }
     }
 
     /// A workspace with no document leaves every secret unset and the daemon
@@ -792,7 +855,12 @@ mod tests {
     fn a_workspace_without_secrets_still_builds_a_host() {
         let dir = tempfile::tempdir().unwrap();
         let host = ToolHost::new(dir.path());
-        assert_eq!(host.ctx.secrets.tavily_api_key(), None);
+        assert_eq!(
+            host.context_for(ToolMode::Restricted)
+                .secrets
+                .tavily_api_key(),
+            None
+        );
     }
 
     // ── Resuming a tool round after a restart ───────────────────────────────

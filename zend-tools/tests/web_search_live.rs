@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 use zend_tools::state::ToolSecrets;
-use zend_tools::ToolContext;
+use zend_tools::{Grants, ToolContext};
 
 /// The repository root: `zend-tools` sits one level below it, and it is the
 /// daemon's working directory, so `secrets/tools.yaml` resolves under it.
@@ -45,7 +45,9 @@ fn ctx_with_real_key() -> ToolContext {
         "no tavily_api_key in {} — this live test needs the deployment's key",
         path.display(),
     );
-    ToolContext::with_workspace(&root).with_secrets(secrets)
+    ToolContext::with_workspace(&root)
+        .with_secrets(secrets)
+        .granting(Grants::ALL)
 }
 
 /// **The configured key works against the live API.**
@@ -116,12 +118,11 @@ fn a_live_question_style_query_also_returns_results() {
 ///
 /// Not ignored: it reaches no network. A context built without secrets is what
 /// every test and every non-daemon caller gets, so this is also the assertion
-/// that such a caller cannot accidentally spend quota.
+/// that such a caller cannot accidentally spend quota — even granted the
+/// network, as this one is.
 #[test]
 fn without_a_key_the_tool_reports_itself_unconfigured() {
-    let resp = harness::invoke_with_ctx("web_search", json!({"query": "anything"}), &{
-        ToolContext::new()
-    });
+    let resp = harness::invoke("web_search", json!({"query": "anything"}));
     let detail = harness::expect_error(&resp, "search_unavailable");
     assert!(
         detail.contains(ToolSecrets::RELATIVE_PATH),

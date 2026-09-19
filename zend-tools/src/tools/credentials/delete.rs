@@ -39,7 +39,7 @@ impl Tool for CredentialDelete {
     type Error = CredError;
 
     fn run(ctx: &ToolContext, req: DeleteRequest) -> Result<DeleteResponse, CredError> {
-        let deleted = ctx.credentials.delete(&req.name);
+        let deleted = ctx.credentials()?.delete(&req.name);
         if !deleted {
             return Err(CredError::NotFound(req.name));
         }

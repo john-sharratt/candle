@@ -133,6 +133,16 @@
       return Promise.resolve({ state: 'ready', started_at_ms: 0, detail: '', loading: null, build: 'mock' });
     },
 
+    // GET /v1/me — the mock is an admin, so every tools mode is on the dial. A
+    // test sets `window.__ZEND_MOCK_ROLE__ = 'user'` before boot to see the page
+    // as a non-admin does.
+    getMe() {
+      const admin = window.__ZEND_MOCK_ROLE__ !== 'user';
+      return Promise.resolve(admin
+        ? { role: 'creator', tool_modes: ['none', 'restricted', 'comprehensive', 'mutable'], default_tools: 'comprehensive' }
+        : { role: 'user', tool_modes: ['none', 'restricted'], default_tools: 'restricted' });
+    },
+
     // GET /v1/substrate/tools — argument schemas for the tools the seeded
     // conversations call.
     getToolSchemas() {

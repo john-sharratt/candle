@@ -51,7 +51,7 @@ impl Tool for SignatureSign {
 
     fn run(ctx: &ToolContext, req: SigSignRequest) -> Result<SigSignResponse, CryptoError> {
         let cred = ctx
-            .credentials
+            .credentials()?
             .get_by_name(&req.credential_name)
             .ok_or_else(|| CryptoError::CredentialNotFound(req.credential_name.clone()))?;
 

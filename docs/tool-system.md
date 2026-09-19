@@ -10,7 +10,29 @@ The remote-filesystem tools deliberately collapse what would otherwise be four p
 
 The transport-layer surface deliberately offers two paths to encryption. `tls_session_*` is for the common case — TLS-protected non-HTTP services (LDAPS, IMAPS, SMTPS, MQTTS, custom application protocols over TLS) where the model wants to talk to the application above the encryption. `tcp_session_*` plus the cryptographic primitives, hash-state, and byte-packing tools is for the protocol-archaeology case — investigating TLS handshake bugs, off-spec counterparty behaviour, or any situation where the model needs byte-level control over the encrypted layer itself. The TCP path is slower and more work; it earns its slot when the encrypted layer is what's broken.
 
-`subagent_run` and the code execution tools are qualitatively different from the rest of the surface. `subagent_run` spawns a nested agent loop with its own context, message history, and tool subset, optionally targeting a remote OpenAI-compatible inference endpoint. The code execution tools (`code_run`, `code_session_*`) run code in a sandboxed Firecracker microVM or gVisor container — fully isolated from the orchestrator's network, credentials, and other sessions, with optional VFS mounting at `/work` for artefact flow. Both are individual tools (or small groups) with substantial orchestrator infrastructure behind them.
+`subagent_run` and the code execution tools are qualitatively different from the rest of the surface. `subagent_run` spawns a nested agent loop with its own context, message history, and tool subset, optionally targeting a remote OpenAI-compatible inference endpoint. The code execution tools (`code_run`, `code_session_*`) run JavaScript on the embedded `boa_engine` VM — no subprocess, no filesystem, network or credential access from the script, and loop/recursion limits on runaway code. Both are individual tools (or small groups) with substantial orchestrator infrastructure behind them.
+
+## Capabilities and grants
+
+Every tool call runs in a `ToolContext` that carries **grants** — a subset of four capabilities, set by the daemon from the caller's tools mode and never by the call itself (`zend-tools/src/grants.rs`):
+
+| Capability | Covers |
+|---|---|
+| `disk_write` | changing files on the host's disk — the direct file store and SQLite connections |
+| `network` | any outbound connection — HTTP, sockets, DNS, ICMP |
+| `exec` | running code or programs — the JS VM, subprocesses, remote shells, sub-agents |
+| `secrets` | reading or changing stored credentials |
+
+A context grants nothing unless its builder grants it, and the check is made twice, independently:
+
+1. **At dispatch.** Each registered tool declares what it needs (`registry::register_all`), and `RegisteredTool::call` refuses a call whose context lacks it before the arguments are parsed.
+2. **At the primitive.** Tools reach sockets, name resolution and HTTP clients only through `zend_tools::net`, subprocesses only through `zend_tools::exec`, SQLite only through `zend_tools::disk`, the credential store only through `ToolContext::credentials`, the shared HTTP client only through `ToolContext::http`, and the JS VM only through a `run_js` that takes the grants. A disk-writing file store can only be built from a `DiskWriteGrant`, which only a context holding `disk_write` can produce. Source-scanning tests fail the build if a tool module names a raw socket, process, HTTP-client, database or file-writing constructor.
+
+So a tool whose declaration is wrong, or a call the model makes for a tool its mode never offered, still cannot act. The refusal is an ordinary tool error the model reads: `{"error":"not_permitted","detail":"this action needs the `network` permission, which this conversation does not have; nothing was done"}`.
+
+In `zend` the grants follow the tools mode (`zend/src/access.rs`): `none` and `restricted` grant nothing, `comprehensive` grants `network`, `exec` and `secrets`, and `mutable` grants everything. Restricted mode offers only tools that are neither high-risk nor in need of a grant.
+
+`web_fetch` additionally refuses private and local addresses — literal, resolved, and redirect targets — and connects through a resolver that applies the same rule, so a name cannot pass the check with a public address and connect with a private one.
 
 Ninety-five tools is more than fits comfortably in a single static prompt. Selection at this scale is handled by the inference engine's dynamic tool surface, which presents the model with a tiered view — full schema for the tool currently being constructed, descriptions for nearby candidates, names only for everything else — that adapts during decode. The mechanism is specified separately; from the tool author's perspective, what matters is that each tool has three description forms (name, description, full), covered in the Tool Description Format subsection under System Prompt Format below. Tool descriptions also include explicit cross-references where overlap is most likely (`web_search` → `dns_lookup` / `web_fetch`; `web_fetch` → `http_session_*`; `tcp_session_*` → `tls_session_*` / `http_session_*`; `aead_encrypt` → `tls_session_*`; `hash_compute` → `hash_scan` / `hash_state_init`; `ssh_session_exec` → `ssh_session_exec_async`; VFS file tools → `notes_*` for persistence; `file_list` → `file_search` / `file_grep` for *finding* rather than enumerating, and `file_grep` → `file_read` for the surrounding lines of a hit) so the description tier carries the disambiguation anchors the surface needs.
 

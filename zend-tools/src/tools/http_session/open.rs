@@ -9,6 +9,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::HttpSessionError;
+use crate::net;
 use crate::state::sessions::{HttpEntry, SessionMeta};
 use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
@@ -60,7 +61,8 @@ impl Tool for HttpSessionOpen {
     }
 
     fn run(ctx: &ToolContext, req: OpenRequest) -> Result<OpenResponse, HttpSessionError> {
-        let mut builder = reqwest::blocking::Client::builder()
+        let mut builder = net::http_client_builder(ctx.grants())
+            .map_err(|e| HttpSessionError::ConnectionFailed(e.to_string()))?
             .cookie_store(true)
             .timeout(std::time::Duration::from_secs(
                 req.timeout_sec.unwrap_or(30) as u64,
@@ -85,7 +87,7 @@ impl Tool for HttpSessionOpen {
         let mut credential_name = None;
         if let Some(cred_name) = &req.credential_name {
             let cred = ctx
-                .credentials
+                .credentials()?
                 .get_by_name(cred_name)
                 .ok_or_else(|| HttpSessionError::CredentialNotFound(cred_name.clone()))?;
             credential_name = Some(cred.name.clone());

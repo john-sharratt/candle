@@ -37,7 +37,9 @@ use candle_conversation::{
     SelectionState, Sequence, ThinkSteering, TokenDecoder, TurnEvent, TurnHandle, TurnResponse,
 };
 use serde_json::Value;
+use web::auth::Roles;
 
+use crate::access::Gateways;
 use crate::api::chat::{
     apply_tools_dial, dial_selection, tool_round_selection, EFFORT_OPTIONS,
     RESPONSE_LENGTH_OPTIONS, TOOL_EXAMPLE_SELECTOR,
@@ -204,25 +206,6 @@ const DIAL_TOOLS_KEY: &str = "dial_tools";
 /// the conversation's lock and the card with nobody waiting on the result.
 const MAX_TOOL_ROUNDS: usize = 32;
 
-/// The tools dial as the metadata bag stores it.
-fn tools_mode_id(mode: ToolMode) -> &'static str {
-    match mode {
-        ToolMode::None => "none",
-        ToolMode::Restricted => "restricted",
-        ToolMode::Comprehensive => "comprehensive",
-    }
-}
-
-/// The tools dial back from the level the bag stored — the inverse of
-/// [`tools_mode_id`], in the order [`ZendSession::conversation_dials`] reports.
-fn tools_mode_from_level(level: u8) -> ToolMode {
-    match level {
-        0 => ToolMode::None,
-        1 => ToolMode::Restricted,
-        _ => ToolMode::Comprehensive,
-    }
-}
-
 /// The dials `selection` and `tools_mode` express, as the metadata bag stores
 /// them. A selector the turn left unset is stored empty, so "ran without this
 /// dial" stays distinguishable from "never recorded".
@@ -252,10 +235,7 @@ fn dials_metadata(
                 .to_string(),
         ),
         (DIAL_THINK_KEY.to_string(), think.to_string()),
-        (
-            DIAL_TOOLS_KEY.to_string(),
-            tools_mode_id(tools_mode).to_string(),
-        ),
+        (DIAL_TOOLS_KEY.to_string(), tools_mode.id().to_string()),
     ])
 }
 
@@ -2625,8 +2605,8 @@ fn build_mode_builder(
     mode: ToolMode,
 ) -> anyhow::Result<Arc<Builder>> {
     let mut b = base.clone();
-    match mode {
-        ToolMode::Comprehensive => {}
+    match mode.catalog() {
+        ToolMode::Comprehensive | ToolMode::Mutable => {}
         ToolMode::Restricted => {
             // Drop the high-risk tools; the summary association below points this
             // mode at the restricted catalog listing.
@@ -2647,8 +2627,8 @@ fn build_mode_builder(
     // emits it whenever the selection is a proper subset (§ `record` in
     // `emit_system_prompt_items`), which for a 93-tool catalog is every turn.
     // `None` mode has no tools block, so no summary.
-    let summary = match mode {
-        ToolMode::Comprehensive => Some(Reserved::ToolSummary),
+    let summary = match mode.catalog() {
+        ToolMode::Comprehensive | ToolMode::Mutable => Some(Reserved::ToolSummary),
         ToolMode::Restricted => Some(Reserved::ToolSummaryRestricted),
         ToolMode::None => None,
     };
@@ -2702,12 +2682,13 @@ impl ModeBuilders {
         })
     }
 
-    /// The prebuilt projection for `mode` (a cheap `Arc` clone).
+    /// The prebuilt projection for `mode` (a cheap `Arc` clone). Mutable
+    /// projects Comprehensive's catalog — see [`ToolMode::catalog`].
     fn get(&self, mode: ToolMode) -> Arc<Builder> {
-        match mode {
+        match mode.catalog() {
             ToolMode::None => Arc::clone(&self.none),
             ToolMode::Restricted => Arc::clone(&self.restricted),
-            ToolMode::Comprehensive => Arc::clone(&self.comprehensive),
+            ToolMode::Comprehensive | ToolMode::Mutable => Arc::clone(&self.comprehensive),
         }
     }
 }
@@ -3143,7 +3124,9 @@ fn run_inference_stream(
                 resume::clear_call_turn(&state.engine.lock().unwrap(), timeline);
                 return;
             }
-            let ctx = Arc::clone(&state.tool_host.ctx);
+            // The round is finished where it was started: on disk when the
+            // conversation was held at Mutable.
+            let ctx = Arc::clone(state.tool_host.context_for(tools_mode));
             let dispatched =
                 tokio::task::spawn_blocking(move || run_tool_calls(&ctx, calls, Dispatch::Resumed))
                     .await;
@@ -3615,7 +3598,7 @@ fn run_inference_stream(
             let n_calls = round.len();
             let tool_state = Arc::clone(&state);
             let results = match tokio::task::spawn_blocking(move || {
-                tool_round::run(&tool_state.tool_host.ctx, round)
+                tool_round::run(tool_state.tool_host.context_for(tools_mode), round)
             })
             .await
             {
@@ -3748,7 +3731,7 @@ fn resume_dials(dials: Option<ConversationDials>) -> (SelectionState, ToolMode) 
         None => resume::DEFAULT_DIALS,
     };
     let mut selection = dial_selection(Some(effort), Some(verbosity), Some(think));
-    let tools_mode = tools_mode_from_level(tools);
+    let tools_mode = ToolMode::from_level(tools);
     apply_tools_dial(&mut selection, tools_mode);
     (selection, tools_mode)
 }
@@ -4289,6 +4272,17 @@ pub struct ConvEntry {
 }
 
 impl ZendSession {
+    /// Who is an admin — see [`crate::access`].
+    pub fn roles(&self) -> &Roles {
+        &self.config.roles
+    }
+
+    /// The peers whose identity headers are believed — see
+    /// [`crate::access::Gateways`].
+    pub fn gateways(&self) -> &Gateways {
+        &self.config.gateways
+    }
+
     pub fn new(config: DaemonConfig, log: Arc<LogBus>) -> Self {
         let projection_builder = build_projection_builder(&config.workspace);
         tracing::info!(workspace = %config.workspace.display(), "session initialised");
@@ -5116,7 +5110,8 @@ impl ZendSession {
         };
         let effort = level(DIAL_EFFORT_KEY, &EFFORT_OPTIONS);
         let verbosity = level(DIAL_LENGTH_KEY, &RESPONSE_LENGTH_OPTIONS);
-        let tools = level(DIAL_TOOLS_KEY, &["none", "restricted", "comprehensive"]);
+        let tool_ids = ToolMode::ALL.map(ToolMode::id);
+        let tools = level(DIAL_TOOLS_KEY, &tool_ids);
         let think = meta.get(DIAL_THINK_KEY).map(|v| v != "off");
         // Nothing recorded at all: the conversation predates the dial record, or
         // has never taken a turn. Say so rather than inventing levels.
@@ -5143,7 +5138,7 @@ impl ZendSession {
             effort: effort.unwrap_or(2),
             verbosity: verbosity.unwrap_or(2),
             think: think.unwrap_or(true),
-            tools: tools.unwrap_or(2),
+            tools: tools.unwrap_or(ToolMode::Comprehensive.level()),
         })
     }
 
@@ -5328,11 +5323,11 @@ impl ZendSession {
             .unwrap()
             .get(conv_id)
             .copied()
-            .unwrap_or_default();
-        let restricted = match mode {
+            .unwrap_or(ToolMode::Comprehensive);
+        let restricted = match mode.catalog() {
             ToolMode::None => return Some(out),
             ToolMode::Restricted => true,
-            ToolMode::Comprehensive => false,
+            ToolMode::Comprehensive | ToolMode::Mutable => false,
         };
         // The tools-collection summary is assembled deterministically from the
         // catalog (the same text the startup seals); rebuild the mode-appropriate

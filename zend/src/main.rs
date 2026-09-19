@@ -31,6 +31,7 @@ use candle_conversation::relief_trace;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
+use zend::access;
 use zend::api;
 use zend::config::{layer_flag_sets, DaemonConfig, ModelChoice};
 use zend::download;
@@ -185,6 +186,13 @@ struct Cli {
     /// tool round waits behind it.
     #[arg(long)]
     summarize: bool,
+
+    /// Address of a gateway whose `x-tokera-*` identity headers are believed,
+    /// in addition to loopback and the `--host` address (repeatable). Identity
+    /// from any other peer is ignored and the caller is anonymous — so a
+    /// machine that reaches the port directly cannot claim to be an admin.
+    #[arg(long, value_name = "IP")]
+    gateway: Vec<IpAddr>,
 }
 
 /// A `--model` value: the preset whose variant name it is.
@@ -404,6 +412,20 @@ async fn main() -> anyhow::Result<()> {
         ingest_dirs.insert(layer.trim().to_string(), path.to_string());
     }
 
+    let bind_ip: IpAddr = match cli.host.as_str() {
+        "localhost" => IpAddr::from([127, 0, 0, 1]),
+        h => h.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "invalid --host {h:?}: expected an IP address, e.g. 127.0.0.1 or 0.0.0.0"
+            )
+        })?,
+    };
+    let gateways = access::Gateways::new(bind_ip, &cli.gateway);
+    tracing::info!(
+        trusted = %gateways,
+        "identity headers are believed only from these peers; every other caller is anonymous",
+    );
+
     let config = DaemonConfig {
         workspace: workspace.clone(),
         port: cli.port,
@@ -418,6 +440,8 @@ async fn main() -> anyhow::Result<()> {
         }),
         qsa_selection_budget: cli.qsa_selection_budget,
         summarize: cli.summarize,
+        roles: access::roles(),
+        gateways,
     };
 
     if !disabled_layers.is_empty() {
@@ -471,14 +495,6 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Bind ──────────────────────────────────────────────────────────────────
 
-    let bind_ip: IpAddr = match cli.host.as_str() {
-        "localhost" => IpAddr::from([127, 0, 0, 1]),
-        h => h.parse().map_err(|_| {
-            anyhow::anyhow!(
-                "invalid --host {h:?}: expected an IP address, e.g. 127.0.0.1 or 0.0.0.0"
-            )
-        })?,
-    };
     let addr = SocketAddr::new(bind_ip, config.port);
     if !bind_ip.is_loopback() {
         tracing::warn!(
@@ -511,9 +527,14 @@ async fn main() -> anyhow::Result<()> {
     // in-flight requests; then the substrate redo log is checkpointed so the
     // last turn — including a partial in-flight tail — is durable on disk.
     let shutdown_session = Arc::clone(&session);
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // With the peer's address, so `access::role` can tell the gateway from
+    // anything else that reaches the port.
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     tracing::info!("draining complete — flushing substrate…");
     shutdown_session.shutdown().await;

@@ -161,10 +161,14 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
-/// Which slice of the tool catalog a conversation projects. Maps to the GUI
-/// "tools" dial. Drives both projection (which tool sections materialise) and
-/// which tool summary is injected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
+/// Which slice of the tool catalog a conversation projects, and where its file
+/// tools work. Maps to the GUI "tools" dial. Drives projection (which tool
+/// sections materialise), which tool summary is injected, and — for
+/// [`ToolMode::Mutable`] alone — whether files are changed on disk.
+///
+/// Declared in dial order: the GUI's level for a mode is its position in
+/// [`ToolMode::ALL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolMode {
     /// No tools: every tool section and the tool summary are omitted.
@@ -172,9 +176,61 @@ pub enum ToolMode {
     /// Safe tools only: high-risk tool sections are omitted; the restricted
     /// summary is injected.
     Restricted,
-    /// Every tool; the comprehensive summary is injected.
-    #[default]
+    /// Every tool; the comprehensive summary is injected. File writes and
+    /// deletes land in the session's in-memory overlay, never on disk.
     Comprehensive,
+    /// Comprehensive's catalog, with the file tools working on the workspace on
+    /// disk: a write or delete changes the project itself.
+    Mutable,
+}
+
+impl ToolMode {
+    /// Every mode, in dial order.
+    pub const ALL: [ToolMode; 4] = [
+        ToolMode::None,
+        ToolMode::Restricted,
+        ToolMode::Comprehensive,
+        ToolMode::Mutable,
+    ];
+
+    /// The wire and stored spelling — what the request's `tools` field and the
+    /// conversation's recorded dial carry.
+    pub fn id(self) -> &'static str {
+        match self {
+            ToolMode::None => "none",
+            ToolMode::Restricted => "restricted",
+            ToolMode::Comprehensive => "comprehensive",
+            ToolMode::Mutable => "mutable",
+        }
+    }
+
+    /// The GUI dial level for this mode.
+    pub fn level(self) -> u8 {
+        Self::ALL.iter().position(|m| *m == self).unwrap_or(0) as u8
+    }
+
+    /// The mode at a GUI dial level. An out-of-range level is the least
+    /// capable mode, never the most.
+    pub fn from_level(level: u8) -> ToolMode {
+        Self::ALL
+            .get(level as usize)
+            .copied()
+            .unwrap_or(ToolMode::None)
+    }
+
+    /// The mode whose tool catalog this one projects. Mutable offers the same
+    /// tools as Comprehensive; only where their file changes land differs.
+    pub fn catalog(self) -> ToolMode {
+        match self {
+            ToolMode::Mutable => ToolMode::Comprehensive,
+            other => other,
+        }
+    }
+
+    /// Whether the file tools change the workspace on disk.
+    pub fn writes_disk(self) -> bool {
+        self == ToolMode::Mutable
+    }
 }
 
 /// The request's `tools` field, in either shape it arrives in.
@@ -184,8 +240,9 @@ pub enum RequestTools {
     /// The composer "tools" dial. Selects which tool sections the projection
     /// materialises for this conversation: `None` omits every tool section,
     /// `Restricted` omits the high-risk tools (and uses the restricted tool
-    /// summary), `Comprehensive` keeps the full catalog. Absent → server
-    /// default (`Comprehensive`).
+    /// summary), `Comprehensive` keeps the full catalog, and `Mutable` keeps it
+    /// with the file tools working on disk. Absent → the caller's role default,
+    /// and a mode above the role runs as `Restricted` (see `crate::access`).
     Mode(ToolMode),
     /// OpenAI function definitions, each `{"type": "function", "function": {…}}`
     /// — a client that runs its own tools. The passthrough offers them to the

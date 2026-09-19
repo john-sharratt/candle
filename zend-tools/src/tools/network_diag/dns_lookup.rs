@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::DiagError;
+use crate::net;
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
@@ -50,12 +51,12 @@ impl Tool for DnsLookup {
         Replay::Safe
     }
 
-    fn run(_ctx: &ToolContext, req: DnsRequest) -> Result<DnsResponse, DiagError> {
+    fn run(ctx: &ToolContext, req: DnsRequest) -> Result<DnsResponse, DiagError> {
         let record_type = req.record_type.as_deref().unwrap_or("A").to_uppercase();
 
         match record_type.as_str() {
             "A" | "AAAA" => {
-                let ips = dns_lookup::lookup_host(&req.host)
+                let ips = net::lookup_host(ctx.grants(), &req.host)
                     .map_err(|e| DiagError::HostNotFound(format!("{}: {}", req.host, e)))?;
                 let records: Vec<String> = ips
                     .into_iter()
@@ -78,7 +79,7 @@ impl Tool for DnsLookup {
                 let ip: IpAddr = req.host.parse().map_err(|_| {
                     DiagError::HostNotFound(format!("{} is not an IP address", req.host))
                 })?;
-                let name = dns_lookup::lookup_addr(&ip)
+                let name = net::lookup_addr(ctx.grants(), &ip)
                     .map_err(|e| DiagError::HostNotFound(e.to_string()))?;
                 Ok(DnsResponse {
                     host: req.host,

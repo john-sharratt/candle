@@ -222,12 +222,16 @@ pub fn find(name: &str) -> Option<&'static ToolDef> {
     all().iter().find(|d| d.name == name)
 }
 
-/// The names of every non-high-risk tool — the subset projected in "Restricted"
-/// tools mode.
+/// The names of the tools projected in "Restricted" tools mode: not marked
+/// high-risk, and needing no capability. Restricted runs with no grants
+/// ([`crate::access::grants`]), so a tool that needs one would only ever answer
+/// `not_permitted` there — offering it would spend a projection slot on a
+/// refusal.
 pub fn safe_names() -> HashSet<String> {
     all()
         .iter()
         .filter(|d| !d.high_risk)
+        .filter(|d| zend_tools::registry::find(&d.name).is_some_and(|t| t.requires.is_empty()))
         .map(|d| d.name.clone())
         .collect()
 }
@@ -475,6 +479,30 @@ mod tests {
         let safe = safe_names();
         assert!(safe.contains("datetime"), "datetime is safe");
         assert!(!safe.contains("code_run"), "code_run is high-risk");
+    }
+
+    /// **Restricted offers nothing it would refuse.** Every tool it projects
+    /// runs under no grants, and the file tools a coding turn needs are there.
+    #[test]
+    fn safe_names_need_no_capability() {
+        let safe = safe_names();
+        for name in &safe {
+            let tool = zend_tools::registry::find(name).expect("defined tools execute");
+            assert!(
+                tool.requires.is_empty(),
+                "{name} is offered in Restricted but needs {:?}",
+                tool.requires
+            );
+        }
+        for name in ["web_search", "web_fetch", "dns_lookup", "sql_session_open"] {
+            assert!(!safe.contains(name), "{name} needs a capability");
+        }
+        for name in ["file_read", "file_list", "file_grep", "calculator"] {
+            assert!(
+                safe.contains(name),
+                "{name} should be offered in Restricted"
+            );
+        }
     }
 
     /// Every definition carries a real category (never the `"Other"` fallback the

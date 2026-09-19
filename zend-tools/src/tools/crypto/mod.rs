@@ -50,7 +50,7 @@
 //! | `derivation_failed` | KDF parameter error |
 //! | `expand_failed` | HKDF expand error |
 
-use crate::ToolError;
+use crate::{NotPermitted, ToolError};
 use schemars::JsonSchema;
 use serde::Serialize;
 use thiserror::Error;
@@ -99,6 +99,8 @@ pub enum CryptoError {
     DerivationFailed(String),
     #[error("expand failed: {0}")]
     ExpandFailed(String),
+    #[error(transparent)]
+    NotPermitted(#[from] NotPermitted),
 }
 
 impl ToolError for CryptoError {
@@ -116,6 +118,7 @@ impl ToolError for CryptoError {
             CryptoError::InvalidCredentialType(_) => "invalid_credential_type",
             CryptoError::DerivationFailed(_) => "derivation_failed",
             CryptoError::ExpandFailed(_) => "expand_failed",
+            CryptoError::NotPermitted(_) => NotPermitted::CODE,
         }
     }
 }

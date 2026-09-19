@@ -55,6 +55,7 @@ All routes are served from one axum `Router` (`src/api/mod.rs`):
 ```
 POST   /v1/chat/completions              OpenAI-compatible chat endpoint (streaming SSE or single JSON body)
 GET    /v1/models                        OpenAI-shaped model list (Continue queries this on startup)
+GET    /v1/me                            The caller's role, the tools modes it may choose, and its default
 GET    /v1/status                        Loading-state snapshot for the frontend loading overlay
 GET    /v1/telemetry                     Live perf-dashboard telemetry
 GET    /v1/phases                        Per-wave phase-timing ring (scheduler wave breakdown)
@@ -77,7 +78,24 @@ GET    /ws/logs                          WebSocket log tail (backlog replay + li
 
 Anything not matched falls back to the embedded `web/` frontend (`GET /`, `/perf`, `/substrate`, `/project`, resolved to their `.html` files).
 
-`POST /v1/chat/completions` accepts the standard OpenAI `messages`/`stream`/`max_tokens` fields plus `zend` extensions: `conv_id`, `tools` (a `ToolMode` dial — `None`/`Restricted`/`Comprehensive`), `identity`, `effort`, `verbosity`, `think`, `assistant_prefill`, `force_high_resolution`, `lossless_kv`.
+`POST /v1/chat/completions` accepts the standard OpenAI `messages`/`stream`/`max_tokens` fields plus `zend` extensions: `conv_id`, `tools` (a `ToolMode` dial — `none`/`restricted`/`comprehensive`/`mutable`), `identity`, `effort`, `verbosity`, `think`, `assistant_prefill`, `force_high_resolution`, `lossless_kv`.
+
+### Tools modes and who may use them
+
+| Mode | Tools | File writes and deletes | Grants |
+|---|---|---|---|
+| `none` | none | — | none |
+| `restricted` | the safe subset: not high-risk, needing no grant | the session's in-memory overlay | none |
+| `comprehensive` | every tool | the session's in-memory overlay | network, exec, secrets |
+| `mutable` | every tool | **the workspace on disk** | all, disk write included |
+
+`comprehensive` and `mutable` are for admins. The caller's role comes from the gateway's `x-tokera-*` identity headers, resolved against `zend.roles.yaml` (embedded at build time; same shape as `npcd/npcd.web.yaml`'s `roles`). An admin defaults to `comprehensive`; everyone else — signed in or not — defaults to `restricted`, and a request asking for a mode above its role runs as `restricted` rather than failing (`src/access.rs`). The GUI asks `GET /v1/me` and offers only the allowed modes.
+
+The identity headers are believed only from a trusted peer: loopback, the `--host` address (the gateway on this box connects from it), and each `--gateway <ip>`. From any other peer they are ignored and the caller is anonymous, so a machine that reaches zend's port directly cannot claim to be an admin.
+
+**What a mode may do is enforced below the prompt.** Each mode's tool round runs in a `ToolContext` carrying that mode's grants (`access::grants`), and `zend-tools` refuses a call twice over when the grant is missing: at dispatch, from the tool's declared capabilities, and again at the primitive — every socket, DNS lookup, HTTP client, subprocess, JS VM, SQLite connection, credential read and disk-writing file store is reached only through a function that checks the grant. A call the model makes for a tool its mode never offered is answered `{"error":"not_permitted"}` and nothing is done. See `zend-tools/src/grants.rs`.
+
+In `mutable` mode the file tools run against `VfsStore::direct`: writes go to disk (via a temporary file renamed over the target), deletes remove the file, and the `secrets/` refusal and `..` normalisation still apply.
 
 ## Running it
 
@@ -96,7 +114,8 @@ CLI flags (`src/main.rs`, `clap`-derived):
 | `workspace` (positional, default `.`) | Root of the project to analyse |
 | `--working-dir <path>` | Overrides the workspace: where `.substrate/` and an optional `projection.yaml` live, without `chdir`-ing the process. Takes precedence over the positional path. Use it to run a separate "mind" (its own substrate + tuned schema) alongside a normal coding workspace |
 | `--port <u16>` (default `8080`) | TCP port |
-| `--host <ip>` (default `127.0.0.1`) | Bind address; the daemon is **unauthenticated**, so binding non-loopback (e.g. `0.0.0.0`) logs a warning |
+| `--host <ip>` (default `127.0.0.1`) | Bind address; the daemon is **unauthenticated**, so binding non-loopback (e.g. `0.0.0.0`) logs a warning. Identity headers from this address (and loopback) are believed |
+| `--gateway <ip>` (repeatable) | Another peer whose `x-tokera-*` identity headers are believed — a gateway on a different machine. Every other peer is anonymous |
 | `-v` / `-vv` | DEBUG / TRACE logging |
 | `--disable-layer <NAME>` (repeatable) | Take a projection layer (or section collection) **out of service** by schema name: not populated at boot, not refreshed by the watcher, excluded from the provenance gather, not normalization-warmed, not swept for crashed partials. Its turns stay in the substrate untouched — dropping the flag restores them — but while it is set they cannot be selected into any projection. An explicit upload into a disabled per-file layer is the one exception and still reads |
 | `--skip-layer <NAME>` (repeatable) | Keep a turn-sink layer fully **in service** — gathered, warmed, and swept for crashed partials — but read nothing from disk for it this boot (no startup ingest, no watcher-driven refresh). The flag for "the corpus is built, stop re-reading the disk". A layer named by both flags is simply disabled |

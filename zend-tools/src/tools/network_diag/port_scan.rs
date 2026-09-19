@@ -1,6 +1,6 @@
 //! port_scan tool.
 
-use std::net::TcpStream;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use schemars::JsonSchema;
@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::DiagError;
+use crate::net;
 use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
@@ -51,28 +52,18 @@ impl Tool for PortScan {
     type Response = PortScanResponse;
     type Error = DiagError;
 
-    fn run(_ctx: &ToolContext, req: PortScanRequest) -> Result<PortScanResponse, DiagError> {
+    fn run(ctx: &ToolContext, req: PortScanRequest) -> Result<PortScanResponse, DiagError> {
         let timeout = Duration::from_millis(req.timeout_ms.unwrap_or(500));
+        let grants = ctx.grants();
+        // Resolved once, up front: a refusal or an unknown host is an error the
+        // model reads, not a column of "closed" ports it would believe.
+        let target = net::resolve(grants, &format!("{}:0", req.host))
+            .map_err(|e| DiagError::HostNotFound(format!("{}: {e}", req.host)))?;
         let mut results = Vec::new();
 
         for port in &req.ports {
-            let addr = format!("{}:{}", req.host, port);
-            let open = match addr.parse::<std::net::SocketAddr>() {
-                Ok(sa) => TcpStream::connect_timeout(&sa, timeout).is_ok(),
-                Err(_) => {
-                    use std::net::ToSocketAddrs;
-                    match addr.to_socket_addrs() {
-                        Ok(mut addrs) => {
-                            if let Some(sa) = addrs.next() {
-                                TcpStream::connect_timeout(&sa, timeout).is_ok()
-                            } else {
-                                false
-                            }
-                        }
-                        Err(_) => false,
-                    }
-                }
-            };
+            let sa = SocketAddr::new(target.ip(), *port);
+            let open = net::tcp_connect(grants, &sa, Some(timeout)).is_ok();
             results.push(PortResult { port: *port, open });
         }
 

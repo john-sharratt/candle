@@ -9,6 +9,7 @@
 //! `turn_sink`); tool orchestration (`tools`, `tool_def`, `tool_summary`);
 //! conversation-attached files (`conv_files`, `conv_file_store`); and shared
 //! wire types (`types`, `response_section`).
+pub mod access;
 pub mod api;
 pub mod chatml;
 pub mod code_read;

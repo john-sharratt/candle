@@ -1,6 +1,5 @@
 //! tcp_session_open tool.
 
-use std::net::TcpStream;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -10,6 +9,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::TcpError;
+use crate::net;
 use crate::state::sessions::{SessionMeta, TcpEntry};
 use crate::tools::web_fetch::is_private_ip;
 use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
@@ -53,26 +53,23 @@ impl Tool for TcpSessionOpen {
     }
 
     fn run(ctx: &ToolContext, req: OpenRequest) -> Result<OpenResponse, TcpError> {
-        if let Ok(ip) = req.host.parse::<std::net::IpAddr>() {
-            if is_private_ip(ip) && req.host != "127.0.0.1" {
-                return Err(TcpError::UrlBlocked(format!(
-                    "{} is a private IP",
-                    req.host
-                )));
-            }
-        }
-
         let addr = format!("{}:{}", req.host, req.port);
         let timeout = Duration::from_millis(req.timeout_ms.unwrap_or(5000));
-        let addr_parsed = addr
-            .parse::<std::net::SocketAddr>()
-            .or_else(|_| {
-                use std::net::ToSocketAddrs;
-                addr.to_socket_addrs().map(|mut a| a.next().unwrap())
-            })
+        let addr_parsed = net::resolve(ctx.grants(), &addr)
             .map_err(|e| TcpError::ConnectionFailed(e.to_string()))?;
+        // Judged on the address the connection will actually use, so a name
+        // that resolves onto the local network is refused like the literal
+        // address it resolves to. Loopback stays reachable — a local test
+        // service is the ordinary use of a raw socket.
+        let ip = addr_parsed.ip();
+        if is_private_ip(ip) && !ip.is_loopback() {
+            return Err(TcpError::UrlBlocked(format!(
+                "{} resolves to {ip}, a private IP",
+                req.host
+            )));
+        }
 
-        let stream = TcpStream::connect_timeout(&addr_parsed, timeout)
+        let stream = net::tcp_connect(ctx.grants(), &addr_parsed, Some(timeout))
             .map_err(|e| TcpError::ConnectionFailed(e.to_string()))?;
         let peer_addr = stream
             .peer_addr()

@@ -2,6 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use candle_conversation::models::Model;
+use web::auth::Roles;
+
+use crate::access::Gateways;
 
 /// Runtime configuration for the zend daemon.
 #[derive(Clone, Debug, Default)]
@@ -85,6 +88,13 @@ pub struct DaemonConfig {
     /// the user's next tool round waited behind it — 18 s on one conversation,
     /// most of a minute on another.
     pub summarize: bool,
+    /// Who is an admin — the table [`crate::access`] resolves a caller's tools
+    /// modes from. Empty (nobody) unless the daemon supplies one, so a harness
+    /// that builds a default config grants no admin mode over HTTP.
+    pub roles: Roles,
+    /// The peers whose identity headers are believed — see
+    /// [`crate::access::Gateways`]. Loopback only unless the daemon names more.
+    pub gateways: Gateways,
 }
 
 /// Which model a daemon runs.
