@@ -945,6 +945,14 @@ pub const TOOLS_ENABLED_SELECTOR: &str = "tools_enabled";
 /// Unset ⇒ ordinary belief selection. Kept here so the string can't drift.
 pub const FORCE_TOOL_SELECTOR: &str = "force_tool";
 
+/// Selector marking a projection for a **tool round** — a turn whose user
+/// message is the results of the calls the turn before it made.
+/// [`OptionalState::Present`] leaves out every non-target layer that declares
+/// `in_tool_rounds: false` (see [`LayerSchema::in_tool_rounds`]); unset or
+/// [`OptionalState::Absent`] is an ordinary turn. Kept here so the string can't
+/// drift between the host that sets it and the assembly that reads it.
+pub const TOOL_ROUND_SELECTOR: &str = "tool_round";
+
 /// Separator between member names in a [`FORCE_TOOL_SELECTOR`] value. A pin may
 /// name several tools when one ingest turn prefills calls to more than one.
 pub const FORCE_TOOL_SEPARATOR: char = ',';
@@ -1236,6 +1244,7 @@ pub fn run_with_sink<R: ContentResolver>(
     // so "is anything disabled?" has one answer for the whole assembly. Asking it
     // per layer made this the second-hottest resolved symbol in an ingest profile.
     let any_layer_disabled = super::layer_toggle::any_layer_disabled();
+    let tool_round = selection.optional(TOOL_ROUND_SELECTOR) == Some(OptionalState::Present);
 
     for (li, layer) in visible_layers.iter().enumerate() {
         let layer_is_target = layer.id == target.layer;
@@ -1263,6 +1272,11 @@ pub fn run_with_sink<R: ContentResolver>(
             && any_layer_disabled
             && super::layer_toggle::is_layer_disabled(&layer.name)
         {
+            continue;
+        }
+        // A tool round leaves out the layers whose turns would compete with
+        // the user's question — see `LayerSchema::in_tool_rounds`.
+        if !layer_is_target && tool_round && !layer.in_tool_rounds {
             continue;
         }
         for group in &layer.groups {

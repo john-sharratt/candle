@@ -13,7 +13,9 @@ use std::collections::{HashMap, HashSet};
 
 use super::builder::Builder;
 use super::ids::{GroupId, Reserved, SectionId, TimelineId, TurnIndex, TurnKey};
-use super::project::ProjectionTarget;
+use super::project::{
+    OptionalState, ProjectionMode, ProjectionTarget, SelectionState, TOOL_ROUND_SELECTOR,
+};
 use super::schema::{Content, CorruptTurnPolicy, DecodePriority, GatherScope, SelectionRule};
 use crate::substrate::ContentResolver;
 use crate::summary_tree::exchange::{exchanges, over_normals};
@@ -815,6 +817,58 @@ fn a_disabled_layer_contributes_nothing_to_the_projection() {
         groups.contains(&conv),
         "disabling one layer must not disturb the target layer",
     );
+}
+
+/// **A layer that sits out tool rounds is projected into every other turn.**
+/// `in_tool_rounds: false` on `ground`: an ordinary turn sees its facts, a turn
+/// marked with [`TOOL_ROUND_SELECTOR`] does not, and the target layer is
+/// untouched either way. The repo_map layer declares this so its
+/// summarize-this-folder requests cannot become the question a tool round
+/// answers.
+#[test]
+fn a_layer_out_of_tool_rounds_is_left_out_only_there() {
+    let yaml = SIMPLE_YAML.replace(
+        "  - name: ground\n    window: 8000\n",
+        "  - name: ground\n    window: 8000\n    in_tool_rounds: false\n",
+    );
+    assert_ne!(yaml, SIMPLE_YAML, "the fixture must carry the flag");
+    let b = Builder::from_yaml(&yaml).unwrap();
+    let facts = b.id_for_group("facts").unwrap();
+    let conv = b.id_for_group("conversation").unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+
+    let mut resolver = MockResolver::new();
+    resolver.append(facts);
+    resolver.append(conv);
+    let target = ProjectionTarget {
+        layer: dialogue,
+        group: conv,
+        timeline: TimelineId::for_test(1),
+    };
+    let groups_for = |selection: &SelectionState| -> Vec<GroupId> {
+        let proj = b.project_with_selection(target, &resolver, ProjectionMode::Decode, selection);
+        groups_in_order(proj.sealed_turns())
+    };
+
+    let ordinary = groups_for(&SelectionState::new());
+    assert!(
+        ordinary.contains(&facts),
+        "an ordinary turn sees the layer: {ordinary:?}"
+    );
+
+    let mut round = SelectionState::new();
+    round.set_optional(TOOL_ROUND_SELECTOR, OptionalState::Present);
+    let in_round = groups_for(&round);
+    assert!(
+        !in_round.contains(&facts),
+        "a tool round must leave it out: {in_round:?}"
+    );
+    assert!(in_round.contains(&conv), "the target layer is untouched");
+
+    // A layer that does not declare the flag stays in tool rounds.
+    let plain = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    let proj = plain.project_with_selection(target, &resolver, ProjectionMode::Decode, &round);
+    assert!(groups_in_order(proj.sealed_turns()).contains(&facts));
 }
 
 /// The target layer is exempt from its own disablement. Disabling the layer you
