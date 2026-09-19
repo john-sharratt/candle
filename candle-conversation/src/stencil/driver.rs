@@ -104,11 +104,19 @@ pub struct PathStats {
     pub bailed: bool,
 }
 
+/// One arm the walk is held to, token by token — see
+/// [`StencilDriver::steer_first_branch`].
+struct ArmSteer {
+    tokens: Vec<TokenId>,
+    next: usize,
+}
+
 /// A live walk of one tree attached to a decoding sequence.
 pub struct StencilDriver {
     session: StencilSession,
     done: bool,
     stats: PathStats,
+    steer: Option<ArmSteer>,
 }
 
 impl StencilDriver {
@@ -118,6 +126,24 @@ impl StencilDriver {
             session: StencilSession::new(tree),
             done: false,
             stats: PathStats::default(),
+            steer: None,
+        }
+    }
+
+    /// Hold the tree's first branch ([`StencilTree::first_branch`]) to `arm`,
+    /// one of its arms' token sequences: each masked step narrows to the arm's
+    /// next token, so the branch completes on exactly that arm.
+    ///
+    /// For a tool call this writes the tool the reasoning named
+    /// ([`named_arm`](super::named_arm)). A frontier that does not hold the
+    /// arm's next token — an arm this branch does not have — releases the
+    /// steer, and the step is masked to the whole frontier as usual.
+    pub fn steer_first_branch(&mut self, arm: Vec<TokenId>) {
+        if !arm.is_empty() {
+            self.steer = Some(ArmSteer {
+                tokens: arm,
+                next: 0,
+            });
         }
     }
 
@@ -187,6 +213,13 @@ impl StencilDriver {
                 }
                 StencilAction::MaskedDecode(set) => {
                     self.stats.branch_tokens += 1;
+                    if let Some(steer) = &self.steer {
+                        let want = steer.tokens[steer.next];
+                        if set.contains(want) {
+                            return StepMask::Branch(AllowedSet::from_tokens(vec![want]));
+                        }
+                        self.steer = None;
+                    }
                     return StepMask::Branch(set);
                 }
                 StencilAction::FreeDecode { close_boost } => {
@@ -215,6 +248,12 @@ impl StencilDriver {
     /// lookahead value ended on a delimiter the grammar does not continue with,
     /// and when a repair leaves the token nothing to contribute.
     pub fn accept(&mut self, token: TokenId, bytes: &[u8]) -> Healed {
+        if let Some(steer) = &mut self.steer {
+            steer.next += 1;
+            if token != steer.tokens[steer.next - 1] || steer.next == steer.tokens.len() {
+                self.steer = None;
+            }
+        }
         let observed = self.session.observe(token, bytes);
         let rewrite = self.session.take_rewrite();
         let Ok(observe) = observed else {
@@ -263,6 +302,7 @@ pub(super) fn healing(observe: Observe, rewrite: Option<Vec<u8>>, bytes: &[u8]) 
 mod tests {
     use super::*;
     use crate::stencil::compile::compile;
+    use crate::stencil::named_arm::{arm_name, named_arm};
     use crate::stencil::tool_call::{compile_tool_call_tree, parse_tools, ToolCallEnvelope};
     use crate::stencil::vocab::{TestVocab, Vocab};
 
@@ -905,6 +945,62 @@ mod tests {
             !set.contains(b'l' as TokenId),
             "a name outside the catalog — `look` — must be unreachable"
         );
+    }
+
+    const THREE_TOOLS: &str = r#"[
+        {"name":"list_dir","params":[{"name":"path","type":"string","required":true}]},
+        {"name":"read_file","params":[{"name":"path","type":"string","required":true}]},
+        {"name":"write_file","params":[{"name":"path","type":"string","required":true}]}]"#;
+
+    /// Walk to the first value, answering every branch with the lowest token
+    /// the mask allows; returns the text written.
+    fn lowest_until_value(driver: &mut StencilDriver, v: &TestVocab) -> String {
+        let mut text: Vec<u8> = Vec::new();
+        loop {
+            match driver.step() {
+                StepMask::Prefill(run) => text.extend_from_slice(&v.decode(&run)),
+                StepMask::Branch(set) => {
+                    let t = set.tokens()[0];
+                    text.extend_from_slice(&v.token_bytes(t));
+                    driver.accept(t, &v.token_bytes(t));
+                }
+                StepMask::Free { .. } | StepMask::Done => break,
+            }
+        }
+        String::from_utf8(text).unwrap()
+    }
+
+    /// **The tool the reasoning named is the tool written.** Unsteered, a
+    /// sampler that takes the lowest token writes `list_dir`; steered to the
+    /// arm `named_arm` picks from the reasoning, it writes `write_file`.
+    #[test]
+    fn the_first_branch_is_steered_to_the_named_arm() {
+        let v = TestVocab::new();
+        let tree = tool_tree(THREE_TOOLS);
+        let unsteered = lowest_until_value(&mut StencilDriver::new(Arc::clone(&tree)), &v);
+        assert!(unsteered.contains("\"list_dir\""), "{unsteered:?}");
+
+        let arms = tree.first_branch().expect("the name is a branch").arms();
+        let decoded: Vec<Vec<u8>> = arms.iter().map(|a| v.decode(a)).collect();
+        let names: Vec<&str> = decoded.iter().map(|b| arm_name(b)).collect();
+        let reasoning = "The file is new, so I will call write_file with the path.";
+        let pick = named_arm(reasoning, &names).expect("one tool is named");
+
+        let mut driver = StencilDriver::new(tree);
+        driver.steer_first_branch(arms[pick].clone());
+        let steered = lowest_until_value(&mut driver, &v);
+        assert!(steered.contains("\"write_file\""), "{steered:?}");
+        assert!(!driver.stats().bailed);
+    }
+
+    /// An arm the branch does not have steers nothing: the frontier stays whole.
+    #[test]
+    fn an_arm_outside_the_branch_releases_the_steer() {
+        let v = TestVocab::new();
+        let mut driver = StencilDriver::new(tool_tree(THREE_TOOLS));
+        driver.steer_first_branch(v.encode("zebra\""));
+        let text = lowest_until_value(&mut driver, &v);
+        assert!(text.contains("\"list_dir\""), "{text:?}");
     }
 
     /// Replaying the walk gives the same scaffold and the same frontier. The

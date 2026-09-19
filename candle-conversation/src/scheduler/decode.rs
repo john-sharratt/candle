@@ -1,3 +1,4 @@
+use super::named_tool::steer_to_named_tool;
 use super::spec_chooser::SpecChooser;
 use super::*;
 use crate::recorded_reply::{departure, replayed_step};
@@ -1112,7 +1113,7 @@ impl Scheduler {
                         }
                     }
                     None => {
-                        if let Some(driver) = state.triggers.driver_for(token) {
+                        if let Some(mut driver) = state.triggers.driver_for(token) {
                             // A trigger token (e.g. `<tool_call>`) opened a grammar:
                             // steer the rest of this call to the catalog's shape.
                             // A once-trigger (the think block) is spent by firing,
@@ -1127,6 +1128,21 @@ impl Scheduler {
                                 trigger = token,
                                 "stencil steering started (trigger token decoded)",
                             );
+                            // The call writes the tool its reasoning named.
+                            if driver.tree().label() == TOOL_CALL_TREE_LABEL {
+                                if let Some(name) = steer_to_named_tool(
+                                    &self.tokenizer,
+                                    &state.generated_tokens,
+                                    &mut driver,
+                                ) {
+                                    tracing::debug!(
+                                        target: "candle_conversation::stencil",
+                                        seq_id = seq_id.0,
+                                        tool = %name,
+                                        "tool name steered to the tool the reasoning named",
+                                    );
+                                }
+                            }
                             state.stencil = Some(driver);
                         }
                     }

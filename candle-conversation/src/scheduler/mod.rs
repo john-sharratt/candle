@@ -22,6 +22,7 @@ mod guest_room;
 #[cfg(feature = "kv-zero-check")]
 pub(crate) mod kv_zero_check;
 pub mod memory_report;
+mod named_tool;
 pub mod phase_ring;
 mod prefill;
 pub(crate) mod profile;

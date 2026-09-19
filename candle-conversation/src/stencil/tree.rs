@@ -199,6 +199,20 @@ impl StencilTree {
     pub fn node(&self, id: NodeId) -> &StencilNode {
         &self.nodes[id.0 as usize]
     }
+
+    /// The first choice a walk from the root meets — the branch reached through
+    /// static runs alone. For a tool-call tree this is the tool name. `None`
+    /// when a free-text span or the end comes first.
+    pub fn first_branch(&self) -> Option<&TokenTrie> {
+        let mut cur = self.root;
+        loop {
+            match self.node(cur) {
+                StencilNode::Static { next, .. } => cur = *next,
+                StencilNode::Branch { trie } => return Some(trie),
+                StencilNode::FreeText(_) | StencilNode::End => return None,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
