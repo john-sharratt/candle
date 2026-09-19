@@ -1363,7 +1363,19 @@ impl Conversation {
         schema: &Schema,
         arena: Option<&GalleryArena>,
     ) -> CollectionWarm {
-        warm_pool::run(|| self.warm_collection_normalization_on_pool(schema, arena))
+        // How long the job waited for the warm pool, logged as it starts: one
+        // post-recalibration boot sat in this step for over half an hour with
+        // every pool thread busy and the GPU idle, and the line says whether a
+        // recurrence is the queue or the work.
+        let queued_at = Instant::now();
+        warm_pool::run(|| {
+            tracing::info!(
+                target: "candle_conversation::provenance",
+                queued_ms = queued_at.elapsed().as_millis() as u64,
+                "normalization warm-up: started on the warm pool",
+            );
+            self.warm_collection_normalization_on_pool(schema, arena)
+        })
     }
 
     /// [`Self::warm_collection_normalization`]'s body, run on the warm pool.
@@ -1390,6 +1402,7 @@ impl Conversation {
             // the same derivation the gallery itself uses to map turn → slot.
             let member_names: HashSet<&str> =
                 coll.sections.iter().map(|s| s.name.as_str()).collect();
+            let planned_at = Instant::now();
             // Plan first (cheap, from declarations only), then fetch signatures for
             // exactly the turns the plan keeps — the cap does not pay to decode
             // signatures it discards.
@@ -1425,6 +1438,14 @@ impl Conversation {
                     .filter(|(_, sig)| !sig.is_empty())
                     .collect()
             };
+            tracing::info!(
+                target: "candle_conversation::provenance",
+                collection = %coll.name,
+                members = plan.len(),
+                probes = probes.len(),
+                plan_and_fetch_ms = planned_at.elapsed().as_millis() as u64,
+                "normalization warm-up: probes planned and fetched",
+            );
             if probes.is_empty() {
                 continue;
             }
@@ -1477,8 +1498,18 @@ impl Conversation {
     ) -> Option<bool> {
         let n = taught.sections.len();
         let slot_of = |name: &str| taught.sections.iter().position(|s| s.name == name);
+        let gallery_started = Instant::now();
         let (windows, slots, sids) =
             self.belief_gallery(&taught.name, &taught.policy.tags, slot_of);
+        tracing::info!(
+            target: "candle_conversation::provenance",
+            collection = %taught.name,
+            windows = windows.len(),
+            probes = probes.len(),
+            gallery_ms = gallery_started.elapsed().as_millis() as u64,
+            gpu = arena.is_some() && taught.policy.scan.fusion == FusionMode::Additive,
+            "normalization warm-up: gallery assembled, scoring probes",
+        );
         if windows.is_empty() {
             return Some(false);
         }
