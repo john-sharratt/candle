@@ -1355,7 +1355,9 @@ mod tests {
     /// two rungs either side of it. C10 at two widths rather than one: the pair
     /// is what shows the top rung holding as the cohort grows, which is exactly
     /// where a row tuned at a single width quietly stops covering the next (the
-    /// 3.5 sibling needed a retune for precisely that).
+    /// 3.5 sibling needed a retune for precisely that). A closing C10 ×1 sets
+    /// the top rung's single-sequence rates beside BF16 ×1's, so the cost of
+    /// maximum compression reads straight off the table.
     ///
     /// **The ×16 rung is gated on VRAM.** What bounds width here is per-session
     /// state, not the checkpoint: 36 GDN layers carry 256 MiB of recurrent state
@@ -1402,7 +1404,7 @@ mod tests {
             num_repeats: 1,
             test_mode: Some(TestMode::StoryRewrite),
         }));
-        configs.extend([2usize, 8].map(|n| TestConfig {
+        configs.extend([2usize, 8, 1].map(|n| TestConfig {
             mode: InferenceMode::C10,
             use_batched: true,
             num_contexts: n,
@@ -2189,6 +2191,54 @@ mod tests {
             rung(InferenceMode::BF16, 1),
             rung(InferenceMode::BF16, 8),
             rung(InferenceMode::C5, 2),
+        ];
+        params.run(configs, || {
+            Qwen4ExpBatched::new(Qwen4ExpGpu::load(&merged, &device, int8mode)?)
+        })
+    }
+
+    /// The cost of compression alone: BF16 ×1 and C10 ×1 **interleaved**, twice
+    /// over, so neither mode always runs later in the process than the other.
+    ///
+    /// The gate runs its compressed rungs after its BF16 ones, ten minutes into
+    /// a hot card, and there every kernel slows — the expert GEMMs, which never
+    /// read K/V, by as much as the attention that does. Alternating the two
+    /// modes puts each at both an early and a late position, so a gap that
+    /// survives the interleave is compression's and one that follows position
+    /// is the card's.
+    #[test]
+    #[ignore = "loads the ~124 GB merged engine GGUF and needs a GPU. Run with: \
+                cargo test --release --features cuda -p candle-transformers --lib \
+                quantized_qwen38_moe::tests::compression_rate_interleaved \
+                -- --ignored --nocapture --test-threads=1"]
+    fn compression_rate_interleaved() -> Result<()> {
+        use crate::models::batch_test::utils::TestParams;
+        use crate::models::batched_inference::InferenceMode;
+        use crate::models::dialect::Dialect;
+        use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
+        use candle::quantized::Int8Mode;
+
+        let merged = engine_gguf()?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+        let params = TestParams::new(64, &tokenizer_json()?, Dialect::qwen35())
+            .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
+            .with_suppress_thinking(true)
+            .with_int8mode(int8mode)
+            .with_exact_tier(false)
+            .with_timeout_secs(1800);
+        let rung = |mode| TestConfig {
+            mode,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        };
+        let configs = vec![
+            rung(InferenceMode::BF16),
+            rung(InferenceMode::C10),
+            rung(InferenceMode::BF16),
+            rung(InferenceMode::C10),
         ];
         params.run(configs, || {
             Qwen4ExpBatched::new(Qwen4ExpGpu::load(&merged, &device, int8mode)?)

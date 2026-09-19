@@ -1104,12 +1104,18 @@ pub const QWEN4EXP_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors
 ///
 /// The failures are early — the first divergent character is at 8–84 of ~350
 /// — which is what a row past the edge looks like here, not a slow drift. At
-/// the shipped row the whole ladder (BF16 ×1/×4/×8, C0/C5/C8/C10×2/C10×8)
-/// passes, and C5 — the level zend runs — gives up 3.8% of its ratio against
+/// the bracketed row the whole ladder (BF16 ×1/×4/×8, C0/C5/C8/C10×2/C10×8)
+/// passed, and C5 — the level zend runs — gave up 3.8% of its ratio against
 /// the `Q4_KO` row, the price of the narrower experts' margin.
+///
+/// **Re-derived 2026-09-20: v 2.2 → 2.1.** At 1.5 / 2.2 a later gate run
+/// passed C10×2 (6.37×) but failed C10×8 at 7/8 — one session dropped a word at
+/// character 83, the early-divergence shape of a row on the edge. V is the axis
+/// that gives way first at the top rung, so only V moves, by the smallest step
+/// the bracket above resolves.
 pub const QWEN4EXP_Q2KO_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
     k_hi: 1.5,
     k_low: 1.5,
-    v_hi: 2.2,
-    v_low: 2.2,
+    v_hi: 2.1,
+    v_low: 2.1,
 };
