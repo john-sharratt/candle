@@ -10,7 +10,7 @@ The remote-filesystem tools deliberately collapse what would otherwise be four p
 
 The transport-layer surface deliberately offers two paths to encryption. `tls_session_*` is for the common case — TLS-protected non-HTTP services (LDAPS, IMAPS, SMTPS, MQTTS, custom application protocols over TLS) where the model wants to talk to the application above the encryption. `tcp_session_*` plus the cryptographic primitives, hash-state, and byte-packing tools is for the protocol-archaeology case — investigating TLS handshake bugs, off-spec counterparty behaviour, or any situation where the model needs byte-level control over the encrypted layer itself. The TCP path is slower and more work; it earns its slot when the encrypted layer is what's broken.
 
-`subagent_run` and the code execution tools are qualitatively different from the rest of the surface. `subagent_run` spawns a nested agent loop with its own context, message history, and tool subset, optionally targeting a remote OpenAI-compatible inference endpoint. The code execution tools (`code_run`, `code_session_*`) run JavaScript on the embedded `boa_engine` VM — no subprocess, no filesystem, network or credential access from the script, and loop/recursion limits on runaway code. Both are individual tools (or small groups) with substantial orchestrator infrastructure behind them.
+`subagent_run` and the code execution tools are qualitatively different from the rest of the surface. `subagent_run` spawns a nested agent loop with its own context, message history, and tool subset, optionally targeting a remote OpenAI-compatible inference endpoint. The code execution tools (`code_run`, `code_session_*`) run JavaScript on the embedded `boa_engine` VM — no subprocess, network or credential access from the script, files only through a `vfs` global over the conversation's file store, and loop/recursion limits on runaway code. Both are individual tools (or small groups) with substantial orchestrator infrastructure behind them.
 
 ## Capabilities and grants
 
@@ -20,7 +20,8 @@ Every tool call runs in a `ToolContext` that carries **grants** — a subset of 
 |---|---|
 | `disk_write` | changing files on the host's disk — the direct file store and SQLite connections |
 | `network` | any outbound connection — HTTP, sockets, DNS, ICMP |
-| `exec` | running code or programs on this host — the JS VM, subprocesses, sub-agents |
+| `exec` | running programs on this host — subprocesses, sub-agents |
+| `sandbox` | running model-written JavaScript in the embedded boa VM, whose only filesystem is the context's file store (`vfs.read` / `vfs.write` / `vfs.list`) |
 | `secrets` | reading or changing stored credentials |
 
 A context grants nothing unless its builder grants it, and the check is made twice, independently:
@@ -30,7 +31,7 @@ A context grants nothing unless its builder grants it, and the check is made twi
 
 So a tool whose declaration is wrong, or a call the model makes for a tool its mode never offered, still cannot act. The refusal is an ordinary tool error the model reads: `{"error":"not_permitted","detail":"this action needs the `network` permission, which this conversation does not have; nothing was done"}`.
 
-In `zend` the grants follow the tools mode (`zend/src/access.rs`): `none` and `restricted` grant nothing, `comprehensive` grants `network` and `secrets`, and `mutable` grants everything. Code execution on this host (`exec`) is Mutable-only, because the overlay that keeps Comprehensive's file changes off the disk cannot stand in front of a script or a program; SSH and telnet run their commands on the remote host and need only `network`. Each mode offers exactly the tools its grants cover, and Restricted also drops the high-risk ones.
+In `zend` the grants follow the tools mode (`zend/src/access.rs`): `none` and `restricted` grant nothing, `comprehensive` grants `network`, `sandbox` and `secrets`, and `mutable` grants everything. Host execution (`exec`) is Mutable-only, because the overlay that keeps Comprehensive's file changes off the disk cannot stand in front of a program; the JS sandbox can, since the overlay is the only filesystem it has. SSH and telnet run their commands on the remote host and need only `network`. Each mode offers exactly the tools its grants cover, and Restricted also drops the high-risk ones.
 
 `web_fetch` additionally refuses private and local addresses — literal, resolved, and redirect targets — and connects through a resolver that applies the same rule, so a name cannot pass the check with a public address and connect with a private one.
 

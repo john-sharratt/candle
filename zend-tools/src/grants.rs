@@ -1,14 +1,15 @@
 //! What a tool call is allowed to do to the world outside the daemon.
 //!
 //! A [`ToolContext`](crate::ToolContext) carries [`Grants`], set by whoever
-//! built it and never by the tool call it runs. Four capabilities cover the
+//! built it and never by the tool call it runs. Five capabilities cover the
 //! actions with effects beyond the conversation:
 //!
 //! | Capability | Covers |
 //! |---|---|
 //! | [`Capability::DiskWrite`] | changing files on the host's disk |
 //! | [`Capability::Network`] | any outbound connection — HTTP, sockets, DNS, ICMP |
-//! | [`Capability::Exec`] | running code or programs on this host — the JS VM, subprocesses, sub-agents. A remote shell (SSH, telnet) runs on the remote host and is [`Capability::Network`] |
+//! | [`Capability::Exec`] | running programs on this host — subprocesses, sub-agents. A remote shell (SSH, telnet) runs on the remote host and is [`Capability::Network`] |
+//! | [`Capability::Sandbox`] | running model-written code in the embedded JS VM, whose only filesystem is the context's file store and which has no network or process access |
 //! | [`Capability::Secrets`] | reading or changing stored credentials |
 //!
 //! # Deny by default, checked where the action happens
@@ -20,7 +21,7 @@
 //!    [`RegisteredTool::call`](crate::RegisteredTool::call) refuses a call whose
 //!    context lacks it before the tool's code runs at all.
 //! 2. **At the primitive** — opening a socket, resolving a name, building an
-//!    HTTP client, spawning a process, starting the JS VM, opening a database,
+//!    HTTP client, spawning a process, starting the JS sandbox, opening a database,
 //!    reading a stored credential, and writing the disk each go through a
 //!    function that takes the grants and refuses without the capability
 //!    ([`crate::net`], [`crate::exec`], [`crate::disk`],
@@ -45,14 +46,16 @@ pub enum Capability {
     DiskWrite,
     Network,
     Exec,
+    Sandbox,
     Secrets,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 4] = [
+    pub const ALL: [Capability; 5] = [
         Capability::DiskWrite,
         Capability::Network,
         Capability::Exec,
+        Capability::Sandbox,
         Capability::Secrets,
     ];
 
@@ -62,6 +65,7 @@ impl Capability {
             Capability::Network => 2,
             Capability::Exec => 4,
             Capability::Secrets => 8,
+            Capability::Sandbox => 16,
         }
     }
 
@@ -71,6 +75,7 @@ impl Capability {
             Capability::DiskWrite => "disk_write",
             Capability::Network => "network",
             Capability::Exec => "exec",
+            Capability::Sandbox => "sandbox",
             Capability::Secrets => "secrets",
         }
     }
@@ -92,8 +97,17 @@ impl Grants {
     /// Nothing outside the conversation.
     pub const NONE: Grants = Grants { bits: 0 };
 
-    /// Every capability.
-    pub const ALL: Grants = Grants { bits: 0b1111 };
+    /// Every capability — derived from [`Capability::ALL`], so a capability
+    /// added there is in it without a second edit here.
+    pub const ALL: Grants = {
+        let mut grants = Grants::NONE;
+        let mut i = 0;
+        while i < Capability::ALL.len() {
+            grants = grants.with(Capability::ALL[i]);
+            i += 1;
+        }
+        grants
+    };
 
     /// These grants and `cap`.
     pub const fn with(self, cap: Capability) -> Grants {
@@ -201,5 +215,21 @@ mod tests {
         );
         assert!(g.require_all(&[Capability::Network]).is_ok());
         assert!(g.require_all(&[]).is_ok());
+    }
+
+    /// `ALL` is exactly the capabilities there are: no stray bit, no missing
+    /// one, and every capability its own bit.
+    #[test]
+    fn all_is_exactly_the_capabilities() {
+        assert_eq!(Grants::ALL.bits, (1 << Capability::ALL.len()) - 1);
+        let mut bits: Vec<u8> = Capability::ALL.iter().map(|c| c.bit()).collect();
+        bits.sort();
+        bits.dedup();
+        assert_eq!(
+            bits.len(),
+            Capability::ALL.len(),
+            "two capabilities share a bit"
+        );
+        assert!(bits.iter().all(|b| b.is_power_of_two()));
     }
 }

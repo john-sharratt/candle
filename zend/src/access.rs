@@ -144,16 +144,18 @@ pub fn default_mode(role: Role) -> ToolMode {
 ///
 /// - None and Restricted grant nothing: their tools answer from the
 ///   conversation, the overlay and the workspace as read.
-/// - Comprehensive grants the network and stored credentials. Its file changes
-///   stay in the overlay, so it grants neither the disk nor execution on this
-///   host: code or a program that runs here reaches the real filesystem,
-///   which no overlay can stand in front of.
+/// - Comprehensive grants the network, stored credentials and the JS sandbox.
+///   Its file changes stay in the overlay, so it grants neither the disk nor
+///   execution on this host: a program that runs here reaches the real
+///   filesystem, which no overlay can stand in front of. The sandbox can —
+///   its only filesystem is the context's file store, the overlay itself.
 /// - Mutable grants everything, the disk and execution included.
 pub fn grants(mode: ToolMode) -> Grants {
     match mode {
         ToolMode::None | ToolMode::Restricted => Grants::NONE,
         ToolMode::Comprehensive => Grants::NONE
             .with(Capability::Network)
+            .with(Capability::Sandbox)
             .with(Capability::Secrets),
         ToolMode::Mutable => Grants::ALL,
     }
@@ -239,7 +241,11 @@ mod tests {
         for cap in [Capability::DiskWrite, Capability::Exec] {
             assert!(!comprehensive.has(cap), "comprehensive holds {cap}");
         }
-        for cap in [Capability::Network, Capability::Secrets] {
+        for cap in [
+            Capability::Network,
+            Capability::Sandbox,
+            Capability::Secrets,
+        ] {
             assert!(comprehensive.has(cap), "comprehensive lacks {cap}");
         }
         assert_eq!(grants(ToolMode::Mutable), Grants::ALL);

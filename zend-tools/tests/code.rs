@@ -1,6 +1,7 @@
 mod harness;
 
 use serde_json::json;
+use zend_tools::tools::code::session_exec::MAX_SESSION_SNIPPETS;
 use zend_tools::ToolContext;
 
 fn ctx() -> ToolContext {
@@ -152,6 +153,64 @@ fn code_session_state_persists_across_execs() {
     );
 
     harness::invoke_with_ctx("code_session_close", json!({"session_id": sid}), &ctx);
+}
+
+/// State passes through *replayed* snippets, not only from the last one into
+/// the new code: each earlier snippet replays as its own script, in order.
+#[test]
+fn code_session_state_chains_through_replayed_snippets() {
+    let ctx = ctx();
+    let sid = harness::expect_success(harness::invoke_with_ctx(
+        "code_session_open",
+        json!({"language": "javascript"}),
+        &ctx,
+    ))["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for code in ["let a = 1;", "const b = a + 1;"] {
+        harness::expect_success(harness::invoke_with_ctx(
+            "code_session_exec",
+            json!({"session_id": sid, "code": code}),
+            &ctx,
+        ));
+    }
+    let exec = harness::expect_success(harness::invoke_with_ctx(
+        "code_session_exec",
+        json!({"session_id": sid, "code": "b * 10"}),
+        &ctx,
+    ));
+    assert_eq!(exec["ok"], true);
+    assert_eq!(exec["result"], "20");
+}
+
+/// A session holds at most `MAX_SESSION_SNIPPETS`; the next exec is refused
+/// with a code that says to open a new session.
+#[test]
+fn a_full_session_is_refused() {
+    let ctx = ctx();
+    let sid = harness::expect_success(harness::invoke_with_ctx(
+        "code_session_open",
+        json!({"language": "javascript"}),
+        &ctx,
+    ))["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for i in 0..MAX_SESSION_SNIPPETS {
+        harness::expect_success(harness::invoke_with_ctx(
+            "code_session_exec",
+            json!({"session_id": sid, "code": format!("globalThis.n = {i};")}),
+            &ctx,
+        ));
+    }
+    let full = harness::invoke_with_ctx(
+        "code_session_exec",
+        json!({"session_id": sid, "code": "n"}),
+        &ctx,
+    );
+    let detail = harness::expect_error(&full, "session_full");
+    assert!(detail.contains("code_session_open"), "{detail}");
 }
 
 #[test]

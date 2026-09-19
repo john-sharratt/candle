@@ -85,7 +85,7 @@
 //! than truncated.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::RwLock;
 
 use ignore::WalkBuilder;
@@ -445,12 +445,61 @@ impl VfsStore {
         if Self::is_protected(norm) {
             return None;
         }
+        Self::under(root, norm)
+    }
+
+    /// `root.join(norm)`, only when the result stays under `root`.
+    ///
+    /// Normalisation removes `..` and leading separators, but not a Windows
+    /// drive or device prefix: `C:/Users/x/.ssh/id_rsa` normalises to itself,
+    /// and joining a path that carries a prefix *replaces* the root — so a
+    /// `file_read`, a script's `vfs.read`, or a direct write reached any file on
+    /// the host. A segment with a `:` in it is a drive (`C:`), a device path
+    /// (`\\?\C:\`), or an NTFS alternate stream (`notes.txt:hidden`), and none
+    /// of those names a workspace file; the component check refuses anything
+    /// else that is not a plain name.
+    ///
+    /// So is any other spelling Windows would resolve to a different name: a
+    /// segment ending in a dot or a space (both dropped when the name is
+    /// opened), and an 8.3 short name (`SECRET~1`), which opens the long name
+    /// it abbreviates — `secrets/` included — past every check made on the
+    /// spelling.
+    fn under(root: &Path, norm: &str) -> Option<PathBuf> {
+        if !Self::addressable(norm) {
+            return None;
+        }
+        if !Path::new(norm)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+        {
+            return None;
+        }
         Some(root.join(norm))
     }
 
+    /// Whether every segment of `norm` is a name [`Self::under`] accepts — no
+    /// `:`, no trailing `.` or space, no 8.3 short-name tail.
+    ///
+    /// The workspace walks apply it too, so a listing never shows a file the
+    /// store cannot open. A Linux workspace can hold `logs/12:00.txt` or
+    /// `notes~2.md`; listed but refused by every read, the model was shown a
+    /// file it could name and never read.
+    fn addressable(norm: &str) -> bool {
+        !norm
+            .split('/')
+            .any(|s| s.contains(':') || s.ends_with('.') || s.ends_with(' ') || is_short_name(s))
+    }
+
     /// Whether a normalised key names something under a protected directory.
+    ///
+    /// Compared the way Windows resolves a name — case-insensitively, with
+    /// trailing dots and spaces dropped — so `Secrets/`, `SECRETS/` and
+    /// `secrets./` are the directory they open, not three unprotected ones.
     pub fn is_protected(norm: &str) -> bool {
-        norm.split('/').any(|s| s == PROTECTED_SEGMENT)
+        norm.split('/').any(|s| {
+            s.trim_end_matches(['.', ' '])
+                .eq_ignore_ascii_case(PROTECTED_SEGMENT)
+        })
     }
 
     /// `Err(Forbidden)` for a protected key, `Ok(())` otherwise.
@@ -506,6 +555,21 @@ impl VfsStore {
             .build()
     }
 
+    /// Where a lower-layer walk for `norm_prefix` starts, and the prefix filter
+    /// its keys still need.
+    ///
+    /// Walking from the prefix directory (when it is one under the root) keeps
+    /// a narrow listing cheap on a large repository; otherwise the walk covers
+    /// the root and filters, which is what a partial-segment prefix like
+    /// `src/ma` needs — and what a prefix naming somewhere outside the root
+    /// gets, so it lists nothing rather than walking another drive.
+    fn walk_start<'p>(root: &Path, norm_prefix: &'p str) -> (PathBuf, Option<&'p str>) {
+        match Self::under(root, norm_prefix) {
+            Some(dir) if !norm_prefix.is_empty() && dir.is_dir() => (dir, None),
+            _ => (root.to_path_buf(), Some(norm_prefix)),
+        }
+    }
+
     /// Normalised keys of the workspace files under `norm_prefix`.
     ///
     /// Deliberately stats nothing and reads nothing: this backs path search and
@@ -514,12 +578,7 @@ impl VfsStore {
         let Some(root) = self.workspace.as_ref() else {
             return Vec::new();
         };
-        let prefix_dir = root.join(norm_prefix);
-        let (walk_root, filter) = if !norm_prefix.is_empty() && prefix_dir.is_dir() {
-            (prefix_dir, None)
-        } else {
-            (root.clone(), Some(norm_prefix))
-        };
+        let (walk_root, filter) = Self::walk_start(root, norm_prefix);
 
         let mut out = Vec::new();
         for entry in Self::lower_walker(&walk_root).flatten() {
@@ -534,7 +593,7 @@ impl VfsStore {
                 .map(|c| c.as_os_str().to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
-            if Self::is_protected(&key) {
+            if Self::is_protected(&key) || !Self::addressable(&key) {
                 continue;
             }
             if let Some(p) = filter {
@@ -559,15 +618,7 @@ impl VfsStore {
         let Some(root) = self.workspace.as_ref() else {
             return Vec::new();
         };
-        // Walking from the prefix directory (when it is one) keeps a narrow
-        // listing cheap on a large repository; otherwise walk the root and filter,
-        // which is what a partial-segment prefix like `src/ma` needs.
-        let prefix_dir = root.join(norm_prefix);
-        let (walk_root, filter) = if !norm_prefix.is_empty() && prefix_dir.is_dir() {
-            (prefix_dir, None)
-        } else {
-            (root.clone(), Some(norm_prefix))
-        };
+        let (walk_root, filter) = Self::walk_start(root, norm_prefix);
 
         let mut out = Vec::new();
         for entry in Self::lower_walker(&walk_root).flatten() {
@@ -582,7 +633,7 @@ impl VfsStore {
                 .map(|c| c.as_os_str().to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
-            if Self::is_protected(&key) {
+            if Self::is_protected(&key) || !Self::addressable(&key) {
                 continue;
             }
             if let Some(p) = filter {
@@ -716,6 +767,15 @@ impl VfsStore {
     }
 }
 
+/// Whether `segment` has the shape of a Windows 8.3 short name's tilde tail —
+/// a `~` followed by a digit (`SECRET~1`, `PROGRA~2.TXT`).
+fn is_short_name(segment: &str) -> bool {
+    segment
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0] == b'~' && w[1].is_ascii_digit())
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -825,6 +885,101 @@ mod tests {
         s.write("../../escaped.txt", "x".into()).unwrap();
         assert!(!outer.path().join("escaped.txt").exists());
         assert!(root.join("escaped.txt").exists());
+    }
+
+    /// **A host path is not a workspace path.** An absolute path to a file
+    /// outside the workspace — on Windows a drive-prefixed one, which a join
+    /// would have taken in place of the root — reads nothing and writes nothing
+    /// there, and neither does a drive-relative path or an alternate stream.
+    #[test]
+    fn a_host_path_cannot_reach_outside_the_workspace() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        put(outer.path(), "outside.txt", "host secret\n");
+        let outside = outer.path().join("outside.txt");
+        let planted = outer.path().join("planted.txt");
+
+        let overlay = VfsStore::with_workspace(&root);
+        assert_eq!(
+            overlay.read(&outside.to_string_lossy()).unwrap(),
+            None,
+            "an absolute host path reads nothing"
+        );
+        assert!(listed(&overlay, &outer.path().to_string_lossy()).is_empty());
+
+        let direct = VfsStore::direct(&root, granted());
+        assert_eq!(direct.read(&outside.to_string_lossy()).unwrap(), None);
+        let _ = direct.write(&planted.to_string_lossy(), "x".into());
+        assert!(!planted.exists(), "a direct write left the workspace");
+        for path in [
+            "C:x.txt",
+            "C:/x.txt",
+            r"\\?\C:\x.txt",
+            "notes.txt:hidden",
+            "SECRET~1/tools.yaml",
+            "docs~2/x.md",
+        ] {
+            assert!(
+                matches!(direct.write(path, "x".into()), Err(VfsError::Unwritable(_))),
+                "{path:?} was written"
+            );
+        }
+    }
+
+    /// **Another spelling of `secrets/` is still `secrets/`.** Windows opens a
+    /// name case-insensitively and drops trailing dots and spaces, so each of
+    /// these reaches the protected directory there and is refused everywhere.
+    #[test]
+    fn every_spelling_of_the_protected_directory_is_protected() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("ws");
+        put(&root, "secrets/tools.yaml", "key: real\n");
+        let s = VfsStore::direct(&root, granted());
+        for path in [
+            "Secrets/tools.yaml",
+            "SECRETS/tools.yaml",
+            "secrets./tools.yaml",
+            "secrets /tools.yaml",
+        ] {
+            assert!(
+                VfsStore::is_protected(&VfsStore::normalize(path)),
+                "{path:?}"
+            );
+            assert!(s.write(path, "key: planted\n".into()).is_err(), "{path:?}");
+            assert!(
+                !matches!(s.read(path), Ok(Some(_))),
+                "{path:?} read the protected file"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("secrets/tools.yaml")).unwrap(),
+            "key: real\n"
+        );
+        assert!(!VfsStore::is_protected("docs/secretsauce.md"));
+    }
+
+    /// **A listing shows only files a read can open.** `notes~2.md` has the
+    /// shape of a Windows short name, so reads refuse it — and the listing,
+    /// the path search and grep leave it out rather than show a file that
+    /// cannot be read.
+    #[test]
+    fn a_file_the_store_cannot_open_is_not_listed() {
+        let (dir, store) = store_with_tree();
+        put(dir.path(), "notes~2.md", "tilde\n");
+        assert_eq!(store.read("notes~2.md").unwrap(), None);
+        assert!(!listed(&store, "").contains(&"notes~2.md".to_string()));
+        assert!(!store.paths("").contains(&"notes~2.md".to_string()));
+        assert!(store.paths("").contains(&"src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn a_short_name_is_a_tilde_and_a_digit() {
+        assert!(is_short_name("SECRET~1"));
+        assert!(is_short_name("PROGRA~2.TXT"));
+        assert!(!is_short_name("notes~"));
+        assert!(!is_short_name("~draft.md"));
+        assert!(!is_short_name("plain.rs"));
     }
 
     /// Writing where a directory stands is an error the model can read, not a

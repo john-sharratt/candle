@@ -49,12 +49,15 @@ pub struct CodeRun;
 impl Tool for CodeRun {
     const NAME: &'static str = "code_run";
     const DESCRIPTION: &'static str =
-        "Execute a JavaScript snippet in an embedded, sandboxed engine (no filesystem, network, \
-         or process access). Runs in-process on a pure-Rust VM — no Node or external interpreter \
+        "Execute a JavaScript snippet in an embedded, sandboxed engine (no network or process \
+         access; files only through the `vfs` global: vfs.read(path), vfs.write(path, text), \
+         vfs.list(prefix)). Runs in-process on a pure-Rust VM — no Node or external interpreter \
          required. Use for arithmetic/logic the model would get wrong, data transformation, \
-         string processing, JSON manipulation, and quick algorithms. `console.log` output is \
-         returned in stdout; the final expression's value in result. Returns stdout, stderr, \
-         exit_code (0 on success, 1 if the script throws), duration, and result.";
+         string processing, JSON manipulation, quick algorithms, and testing JavaScript just \
+         written to a file (`require('./path.js')` loads a CommonJS module from the files; \
+         Node built-ins are not available). `console.log` output is returned in \
+         stdout; the final expression's value in result. Returns stdout, stderr, exit_code (0 on \
+         success, 1 if the script throws), duration, and result.";
 
     type Request = RunRequest;
     type Response = RunResponse;
@@ -80,7 +83,7 @@ impl Tool for CodeRun {
         }
 
         let start = Instant::now();
-        let outcome = run_js(ctx.grants(), &prelude, &req.code)?;
+        let outcome = run_js(ctx.grants(), &ctx.vfs, &[prelude], &req.code)?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         // A thrown JS error is a script fault, not a tool error: report it via

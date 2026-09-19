@@ -15,7 +15,7 @@
 //! |--------|-------|-------|
 //! | `bytes` | `bytes_{transcode,pack,unpack,xor}` | struct.pack/unpack semantics |
 //! | `calculator` | `calculator` | evalexpr; no eval code path |
-//! | `code` | `code_run`, `code_session_*` | Python/Node REPL via subprocess |
+//! | `code` | `code_run`, `code_session_*` | JavaScript on the embedded boa VM; files via the store |
 //! | `credentials` | `credential_{save,list,delete}` | In-memory typed credential store |
 //! | `crypto` | `aead_*`, `hmac_compute`, `signature_*`, `kdf_derive`, `hkdf_*` | RustCrypto |
 //! | `datetime` | `datetime` | chrono + chrono-tz; stateless |

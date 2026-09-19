@@ -199,6 +199,15 @@ pub fn find(name: &str) -> Option<&'static RegisteredTool> {
     all_tools().iter().find(|t| t.name == canon)
 }
 
+/// The alternate names `canonical` answers to — empty for a tool with none,
+/// or a name that is not a registered tool.
+pub fn aliases(canonical: &str) -> &'static [&'static str] {
+    ALIAS_GROUPS
+        .iter()
+        .find(|(c, _)| *c == canonical)
+        .map_or(&[], |(_, aliases)| *aliases)
+}
+
 /// Alternate names the model may emit for a tool, beyond its canonical
 /// [`Tool::NAME`]. Drawn from prior-training conventions, other models'/agents'
 /// tool names (e.g. Qwen-Agent's `code_interpreter`), and common abbreviations.
@@ -851,7 +860,7 @@ use crate::tools::{
 };
 
 fn register_all() -> &'static [RegisteredTool] {
-    use Capability::{DiskWrite, Exec, Network, Secrets};
+    use Capability::{DiskWrite, Exec, Network, Sandbox, Secrets};
     // What each family needs from the context — see `crate::grants`. A tool
     // with no entry needs nothing: it computes, or works on the in-memory
     // stores. The file tools need nothing here because the disk guard is the
@@ -860,6 +869,7 @@ fn register_all() -> &'static [RegisteredTool] {
     const NET_EXEC: &[Capability] = &[Network, Exec];
     const NET_SECRETS: &[Capability] = &[Network, Secrets];
     const EXEC: &[Capability] = &[Exec];
+    const SANDBOX: &[Capability] = &[Sandbox];
     const SECRETS: &[Capability] = &[Secrets];
     // SQLite opens any path it is given, and `ATTACH` or `VACUUM INTO` create
     // files from any session, `:memory:` included — so the whole family is a
@@ -980,12 +990,13 @@ fn register_all() -> &'static [RegisteredTool] {
         BYTES_PACK,
         BYTES_UNPACK,
         BYTES_XOR,
-        // Code execution (5) — JavaScript on the embedded sandboxed engine
-        CODE_RUN.requires(EXEC),
-        CODE_SESSION_OPEN.requires(EXEC),
-        CODE_SESSION_EXEC.requires(EXEC),
-        CODE_SESSION_LIST.requires(EXEC),
-        CODE_SESSION_CLOSE.requires(EXEC),
+        // Code execution (5) — JavaScript on the embedded sandboxed engine,
+        // whose only filesystem is the context's file store
+        CODE_RUN.requires(SANDBOX),
+        CODE_SESSION_OPEN.requires(SANDBOX),
+        CODE_SESSION_EXEC.requires(SANDBOX),
+        CODE_SESSION_LIST.requires(SANDBOX),
+        CODE_SESSION_CLOSE.requires(SANDBOX),
         // Subagent (1) — high-risk (delegated agency)
         SUBAGENT.requires(EXEC),
     ];
@@ -1057,15 +1068,13 @@ mod capability_tests {
         ] {
             assert!(needs(name).contains(&Capability::Network), "{name}");
         }
-        // Exec is code or a program running on this host.
-        for name in [
-            "code_run",
-            "code_session_exec",
-            "ping_icmp",
-            "trace_route",
-            "sub_run",
-        ] {
+        // Exec is a program running on this host.
+        for name in ["ping_icmp", "trace_route", "sub_run"] {
             assert!(needs(name).contains(&Capability::Exec), "{name}");
+        }
+        // Model-written code runs in the sandbox, not as a host program.
+        for name in ["code_run", "code_session_exec", "code_session_open"] {
+            assert_eq!(needs(name), [Capability::Sandbox], "{name}");
         }
         // A remote shell runs on the remote host.
         for name in ["ssh_session_exec", "telnet_send"] {
