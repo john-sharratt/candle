@@ -39,25 +39,31 @@ mod tests {
     /// exception is a key credential handed to an SSH/SFTP library that takes
     /// a key *file*: it is written to the temp directory and removed after the
     /// handshake, and both tools are declared `network` + `secrets`.
+    ///
+    /// The exemption names each file by its exact path under `src/tools`: a
+    /// suffix match would also exempt a new `evil_ssh/open.rs`.
     #[test]
     fn tools_write_the_disk_only_through_the_file_store() {
         const KEY_FILE_WRITERS: [&str; 2] = ["ssh/open.rs", "remote_fs/open.rs"];
         let offenders: Vec<_> = tool_sources_containing(&[
             "fs::write",
             "File::create",
+            // `File::options()` builds an `OpenOptions` without naming it.
+            "File::options",
             "OpenOptions",
             "remove_file",
             "remove_dir",
             "create_dir",
+            "DirBuilder",
             "fs::rename",
             "fs::copy",
+            "hard_link",
+            "symlink",
+            "set_permissions",
+            "set_len",
         ])
         .into_iter()
-        .filter(|(file, _, _)| {
-            !KEY_FILE_WRITERS
-                .iter()
-                .any(|k| file.replace('\\', "/").ends_with(k))
-        })
+        .filter(|(file, _, _)| !KEY_FILE_WRITERS.contains(&file.replace('\\', "/").as_str()))
         .collect();
         assert!(
             offenders.is_empty(),

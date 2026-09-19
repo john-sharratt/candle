@@ -11,11 +11,13 @@ use crate::{RegisteredTool, Tool, ToolContext};
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct TraceRequest {
     /// Hostname or IP address to trace the route to.
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1, max = 253))]
     pub host: String,
-    /// Maximum number of hops to probe. Defaults to 30.
+    /// Maximum number of hops to probe (1-64). Defaults to 30.
+    #[validate(range(min = 1, max = 64))]
     pub max_hops: Option<u32>,
-    /// Per-hop probe timeout in seconds. Uses the OS default if omitted.
+    /// Per-hop probe timeout in seconds (1-60). Uses the OS default if omitted.
+    #[validate(range(min = 1, max = 60))]
     pub timeout_sec: Option<u32>,
 }
 
@@ -116,3 +118,29 @@ fn parse_traceroute(output: &str) -> Vec<HopInfo> {
 }
 
 pub const TRACE_ROUTE: RegisteredTool = RegisteredTool::new::<TraceRoute>();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(host: &str, max_hops: Option<u32>, timeout_sec: Option<u32>) -> TraceRequest {
+        TraceRequest {
+            host: host.to_string(),
+            max_hops,
+            timeout_sec,
+        }
+    }
+
+    /// The hop count and per-hop wait stay inside what the OS tools accept, and
+    /// `timeout_sec × 1000` (tracert's milliseconds) cannot overflow.
+    #[test]
+    fn hops_and_timeout_are_bounded() {
+        assert!(req("1.1.1.1", Some(64), Some(60)).validate().is_ok());
+        assert!(req("1.1.1.1", Some(65), None).validate().is_err());
+        assert!(req("1.1.1.1", Some(0), None).validate().is_err());
+        assert!(req("1.1.1.1", None, Some(61)).validate().is_err());
+        assert!(req("1.1.1.1", None, Some(0)).validate().is_err());
+        assert!(req("1.1.1.1", None, Some(4_294_968)).validate().is_err());
+        assert!(req(&"a".repeat(254), None, None).validate().is_err());
+    }
+}

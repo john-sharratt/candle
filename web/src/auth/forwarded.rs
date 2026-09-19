@@ -36,11 +36,14 @@ pub struct NotSignedIn;
 /// reassigned and a display name can be anything, so neither is ever used to
 /// look an account up.
 pub fn identify(headers: &HeaderMap) -> Result<Identity, NotSignedIn> {
+    // Trimmed, so a value of only whitespace reads as the blank it is — a
+    // subject of `" "` must not become an account.
     let get = |name: &str| {
         headers
             .get(name)
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
+            .trim()
             .to_owned()
     };
 
@@ -130,6 +133,15 @@ mod tests {
         );
         assert_eq!(
             identify(&headers(&[(EMAIL, "admin@tokera.com"), (NAME, "Admin")])),
+            Err(NotSignedIn)
+        );
+        // Whitespace is blank too, in the subject and in its issuer.
+        assert_eq!(
+            identify(&headers(&[(USER, "   "), (PROVIDER, "google")])),
+            Err(NotSignedIn)
+        );
+        assert_eq!(
+            identify(&headers(&[(USER, "google-1"), (PROVIDER, " ")])),
             Err(NotSignedIn)
         );
     }

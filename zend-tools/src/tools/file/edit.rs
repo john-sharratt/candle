@@ -65,7 +65,7 @@ impl Tool for FileEdit {
         let content = ctx
             .vfs
             .read(&req.path)?
-            .ok_or_else(|| FileError::NotFound(req.path.clone()))?;
+            .ok_or_else(|| FileError::NothingToEdit(req.path.clone()))?;
 
         let patched = apply(&content, &req.patch)?;
         let bytes = patched.content.len();

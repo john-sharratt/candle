@@ -6,6 +6,7 @@
 //! process environment: the key would then have to be exported by whatever
 //! launches the daemon, and every child process would inherit it.
 
+use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -34,7 +35,20 @@ pub struct SearchResult {
 
 #[derive(Serialize)]
 pub struct Response {
+    /// Today's date (UTC, `YYYY-MM-DD`) — the day the search ran.
+    ///
+    /// The model has no clock of its own and dates the world by its training:
+    /// asked for the latest Rust release it searched "latest stable Rust
+    /// release 2025" a year late, and reported a release the results
+    /// themselves showed had been superseded. Carried on every search so
+    /// "latest" is judged against today, not against what the model remembers.
+    pub searched_on: String,
     pub results: Vec<SearchResult>,
+}
+
+/// `now` as the `YYYY-MM-DD` date [`Response::searched_on`] carries.
+fn search_date(now: DateTime<Utc>) -> String {
+    now.format("%Y-%m-%d").to_string()
 }
 
 #[derive(Debug, Error)]
@@ -61,7 +75,9 @@ impl Tool for WebSearchTool {
          finding articles or documentation, researching a topic, locating a URL when only the \
          topic is known, getting recent news, identifying who or what something is. Triggered \
          by \"search for\", \"look up\", \"find information about\", \"what is X\", \"who is\", \
-         \"recent news on\", \"google\", \"search the web\". Returns up to 10 ranked results. \
+         \"recent news on\", \"google\", \"search the web\". Returns up to 10 ranked results \
+         and searched_on, today's date: judge \"latest\" against it, prefer the newest \
+         result, and put no year in a query the user did not give one. \
          For DNS records use dns_lookup; for fetching a specific URL already known, use \
          web_fetch; for authenticated API calls use http_session_*.";
 
@@ -123,8 +139,38 @@ impl Tool for WebSearchTool {
             })
             .unwrap_or_default();
 
-        Ok(Response { results })
+        Ok(Response {
+            searched_on: search_date(Utc::now()),
+            results,
+        })
     }
 }
 
 pub const REGISTRATION: RegisteredTool = RegisteredTool::new::<WebSearchTool>();
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone;
+
+    use super::*;
+
+    /// The date leads the response, so it is read before the results it dates.
+    #[test]
+    fn a_response_says_what_day_it_is_before_its_results() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 23, 59, 0).unwrap();
+        let resp = Response {
+            searched_on: search_date(now),
+            results: vec![SearchResult {
+                title: "Announcing Rust 1.98.1".into(),
+                url: "https://blog.rust-lang.org/".into(),
+                snippet: "…".into(),
+                score: 0.9,
+            }],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            json.starts_with(r#"{"searched_on":"2026-09-03","results":["#),
+            "{json}"
+        );
+    }
+}

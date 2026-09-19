@@ -79,6 +79,10 @@ impl Tool for FileRead {
     }
 
     fn run(ctx: &ToolContext, req: ReadRequest) -> Result<String, FileError> {
+        let lower = req.path.trim_start().to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            return Err(FileError::IsUrl(req.path));
+        }
         let content = ctx
             .vfs
             .read(&req.path)?

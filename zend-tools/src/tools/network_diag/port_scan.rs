@@ -14,7 +14,7 @@ use crate::{RegisteredTool, Tool, ToolContext};
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct PortScanRequest {
     /// Hostname or IP address to scan.
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1, max = 253))]
     pub host: String,
     /// TCP ports to check (1-100 ports per call).
     #[validate(length(min = 1, max = 100))]

@@ -42,9 +42,10 @@ parameters:
       minLength: 1
       type: string
     timeout_sec:
-      description: 'Per-reply timeout in seconds. Default: 5.'
+      description: 'Per-reply timeout in seconds (1-60). Default: 5.'
       format: uint32
-      minimum: 0.0
+      maximum: 60.0
+      minimum: 1.0
       type:
       - integer
       - 'null'

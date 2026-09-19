@@ -46,7 +46,26 @@ fn file_edit_not_found() {
         "file_edit",
         json!({"path": "nonexistent.txt", "patch": "@@ -1 +1 @@\n-x\n+y\n"}),
     );
-    harness::expect_error(&resp, "not_found");
+    let detail = harness::expect_error(&resp, "not_found");
+    // The refusal names the way to create the file, not only the fault.
+    assert!(detail.contains("nonexistent.txt"), "{detail}");
+    assert!(detail.contains("call `write`"), "{detail}");
+}
+
+/// A URL is not a file: the refusal names `web_fetch` rather than reporting a
+/// missing path the model would retry under other spellings.
+#[test]
+fn file_read_of_a_url_points_to_web_fetch() {
+    let resp = harness::invoke(
+        "file_read",
+        json!({"path": "https://docs.rs/serde/latest/serde/", "start_line": 1, "end_line": 50}),
+    );
+    let detail = harness::expect_error(&resp, "invalid_arguments");
+    assert!(
+        detail.contains("https://docs.rs/serde/latest/serde/"),
+        "{detail}"
+    );
+    assert!(detail.contains("`web_fetch`"), "{detail}");
 }
 
 #[test]

@@ -57,7 +57,7 @@
 //! | `ambiguous` | A `file_edit` hunk matches in more than one place |
 //! | `no_files_found` | All requested paths are missing (`file_present`) |
 //! | `unreadable` | Workspace file is above the read limit or is not UTF-8 text |
-//! | `invalid_arguments` | The `file_edit` patch is not a readable unified diff, or a `file_grep` pattern is not a valid regex |
+//! | `invalid_arguments` | The `file_edit` patch is not a readable unified diff, a `file_grep` pattern is not a valid regex, or a `file_read` path is a web address |
 //! | `forbidden` | The path is under a `secrets/` directory — see [`crate::state::vfs`] |
 
 use serde::Serialize;
@@ -142,6 +142,22 @@ pub use write::FILE_WRITE;
 pub enum FileError {
     #[error("file not found: {0}")]
     NotFound(String),
+    /// `file_edit` named a file that does not exist. Worded as the way out, not
+    /// only the fault: a model told "not found" alone rewrote its patch as an
+    /// add-file diff ten times over instead of calling `write`.
+    #[error(
+        "file not found: {0} — file_edit only changes a file that exists; to create \
+         it, call `write` with `path` and the whole file as `content`"
+    )]
+    NothingToEdit(String),
+    /// `file_read` was given a web address. A model that read a URL as a path
+    /// got `not_found` and tried the next spelling of the same URL; this names
+    /// the tool that reads it.
+    #[error(
+        "{0} is a web address, not a file — file_read reads files in the project; \
+         to read a web page, call `web_fetch` with it as `url`"
+    )]
+    IsUrl(String),
     #[error("VFS storage limit exceeded")]
     VfsFull,
     /// A `file_edit` hunk matched nowhere in the file. It shares the
@@ -173,12 +189,14 @@ pub enum FileError {
 impl ToolError for FileError {
     fn code(&self) -> &'static str {
         match self {
-            FileError::NotFound(_) | FileError::HunkUnmatched(_) => "not_found",
+            FileError::NotFound(_) | FileError::NothingToEdit(_) | FileError::HunkUnmatched(_) => {
+                "not_found"
+            }
             FileError::VfsFull => "vfs_full",
             FileError::Ambiguous(_) => "ambiguous",
             FileError::NoFilesFound => "no_files_found",
             FileError::Unreadable(_) => "unreadable",
-            FileError::InvalidArguments(_) => "invalid_arguments",
+            FileError::InvalidArguments(_) | FileError::IsUrl(_) => "invalid_arguments",
             FileError::Forbidden(_) => "forbidden",
             FileError::Unwritable(_) => "unwritable",
         }

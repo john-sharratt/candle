@@ -36,7 +36,15 @@ impl Display for NetError {
     }
 }
 
-impl Error for NetError {}
+impl Error for NetError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            NetError::NotPermitted(e) => Some(e),
+            NetError::Io(e) => Some(e),
+            NetError::Unresolved(_) => None,
+        }
+    }
+}
 
 impl From<NotPermitted> for NetError {
     fn from(e: NotPermitted) -> Self {
@@ -133,6 +141,23 @@ mod tests {
             lookup_addr(none, &"127.0.0.1".parse().unwrap()).unwrap_err()
         ));
         assert!(http_client_builder(none).is_err());
+    }
+
+    /// The refusal and the I/O failure stay reachable through `source`, so a
+    /// caller walking the error chain sees what actually went wrong.
+    #[test]
+    fn the_cause_is_on_the_error_chain() {
+        let denied = resolve(Grants::NONE, "127.0.0.1:1").unwrap_err();
+        assert_eq!(
+            denied.source().map(|s| s.to_string()),
+            Some(NotPermitted(Capability::Network).to_string())
+        );
+        let io = NetError::Io(io::Error::other("refused"));
+        assert_eq!(
+            io.source().map(|s| s.to_string()).as_deref(),
+            Some("refused")
+        );
+        assert!(NetError::Unresolved("x:1".into()).source().is_none());
     }
 
     /// With it, the primitives work — a loopback bind needs no outside network.
