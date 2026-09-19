@@ -1943,16 +1943,77 @@ craft-library, and the raw `bench_`/`file_` surface** reach the mind folder — 
    route through `bench`; or persist `Sim`.
 2. **The projected store is never written by a station handler.** §9.2/C.11/C.21 require
    `orders_`/`plan_` to write the substrate **agency** layer (`AuthoredStrategy`) and re-project
-   into the system prompt. Today `orders_*` write `Sim.ledger` and `plan_*` has no handler. The
-   authoring plane exists (`engine/authoring.rs`) but is wired only for lifegen — a bridge from
-   `work.rs` to it must be built.
+   into the system prompt. Today `orders_*` write `Sim.ledger` and `plan_*` has no handler. **The
+   write API is `Npcs::put_strategy` (`npcs.rs:745`), not `engine/authoring.rs`** (which is only a
+   life-document parser with no substrate side effect). A bridge from the turn loop to the shared
+   `Npcs` handle must be built (Appendix E). Once it writes, the change projects automatically via
+   the `agency` collection (`projection.yaml:437`) and `persona::intent` (`persona.rs:98`).
 3. **Git is a repository but not a runtime store.** The mind folder is a git repo, yet the
    daemon never runs git. `bench_commit` writes with `std::fs::rename`; `bench_blame`/`log`
-   answer from in-RAM state that resets on restart. Custody-as-blame and real history need the
-   daemon plumbed to `git add`/`commit` and to read `git log`/`blame` back — none exists.
+   answer from in-RAM state that resets on restart. **v1 closes this** (Appendix E): the daemon is
+   plumbed to commit as the acting body at `bench_commit` and to read `git log`/`git blame` back,
+   so custody and history survive a restart.
 
 Also missing, lower-stakes: the **effector router/token surface itself** (all of Appendix C's
 routing is future work — the handlers are still reached through the old `Tool`/`enact`/`work`
 path, §14 "New"); an **image store** for portrait plates; **canon (`layers/world/`)
 writability from a station** (only the console reaches it); and **document metadata as front
 matter** (provenance/condition live in `Sim.record`, not on the `.md` files).
+
+---
+
+# Appendix E — Resolved implementation decisions
+
+*Every decision needed to implement the migration without further input, settled either with
+the author (lore/product) or by the pre-implementation code investigation (engineering). The
+build follows Part F's order; this is the decision record it is built against.*
+
+## Lore / product (settled with the author)
+
+- **Character authoring.** `character_write_identity` → the `anchor` field of
+  `personalities/<who>.yaml` via `bench.write_field(["anchor"], …)` (the `portrait_draw`
+  pattern, `work.rs:239`); `character_write_wants` → a **new top-level `wants` field** on the
+  sheet; `character_write_memories` → **append to `layers/memory/<who>/*.md`**.
+  `character_write_beliefs` is **not exposed** — beliefs form on the sleep clock and
+  belief-writes stay operator-only (the §9.2 invariant). So C.8 adds no belief route.
+- **Place authoring.** `place_write_entry` → `layers/world/locations/<slug>.md`;
+  `place_write_local_history` → `layers/world/geography/*.md`. Both are already in the bench
+  allow-list (`bench.rs:666`).
+- **New-part placement** (map YAML edits — Step 2). **standards board** in every level's `core`
+  node (reachable everywhere, audit §3.4); **planning board** in command → command-room (beside
+  the order table); **trials shelf** in chronicle → sorting-room (beside the appraisal bench).
+- **Git custody is in v1, not deferred.** `bench_commit` commits the changed files as the acting
+  body; `bench_blame`/`bench_log` read real `git blame`/`git log`, so custody and history survive
+  a restart. This closes D.6 #3 within v1. (libgit2 via the `git2` crate vs shelling `git` is the
+  one engineering sub-choice left, decided at implementation for testability — no external `git`
+  binary dependency preferred.)
+
+## Engineering (settled by investigation)
+
+- **Agency writer = `Npcs::put_strategy`** (`npcs.rs:745`), not `engine/authoring.rs`.
+  `plan_break_down`/`order`/`reorder`/`scope` and `orders_*` write `AuthoredStrategy` (a tree via
+  `parent_id`) into the `agency` layer, which projects automatically (`projection.yaml:437`,
+  `persona::intent` `persona.rs:98`) — no extra projection wiring.
+- **The bridge.** Wrap the cast as `Arc<tokio::RwLock<Npcs>>` and install it on `Runtime` (the
+  installed-after-construction pattern, `runtime.rs:291-319`), reusing the *existing* `Npcs`/
+  substrate handle — never a second (the one-writable-handle guard, `npcs.rs:16-23`). Projected
+  writes (`plan_*`/`orders_*`) run at the **async turn-loop layer**, split out of the sync
+  `&Hosted`-only `work::perform`; `npc_id` parses from `body` (`"npc-{id}"`, `runtime.rs:763`); a
+  new **owner-blind self-write** method resolves `owner` from `Npcs::payload(npc_id).owner`.
+- **Token store.** A git-ignored `tokens/` `Registry` at the mind root keyed `npc_id → {token,
+  scope}` (parallel to `accounts/`), a real secret never derived from `body_id`; a `token →
+  npc_id → body` lookup built at startup. Scope ∈ {`as-npc` (default, proximity-gated), `direct`
+  (by-id, §7/§8.3)}.
+- **Character/place persistence.** Extend `Record::settle_path` (`record.rs:343`) with a
+  `Kind::Place` arm (locations|geography per the write) and `index_canon` (`record.rs:379`)
+  adoption of those dirs, so place writes route through `bench`→commit→disk like eras/stories.
+  Character writes use `bench.write_field` on the sheet (persisting through commit). This closes
+  D.6 #1 for character and place; `record_*`/`structure_*` verdicts that remain RAM-only get a
+  durability pass as their namespaces migrate.
+- **Grammar migration.** `query`/`invoke` join the fixed frame as `Availability::Always` tools
+  with a **free-string `url`** (`FreeText{Balanced}`), coexisting with unmigrated world/station
+  tools; migrate namespace-by-namespace, deleting each namespace's `Tool`/`Choices`/`LIVE`/
+  `Within` field as it moves (the `Within` shrink trails each move, §15). The `url` enum arrives
+  only after the shrink.
+
+With these settled, implementation proceeds per Part F with no further design input required.
