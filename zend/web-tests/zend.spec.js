@@ -615,3 +615,51 @@ test.describe('1.10 cross-cutting', () => {
     expect(await page.evaluate(() => document.activeElement && document.activeElement.id)).toBe('zend-prompt');
   });
 });
+
+test.describe('1.14 background ingest bar', () => {
+  // window.__ZEND_MOCK_INGEST_BACKLOG__ (zend-api.mock.js) simulates a
+  // draining backlog: total 5, bumps to 7 on the 3rd status poll (a file
+  // changed mid-drain — more work, not a bug), then clears to null once
+  // processed catches up — mirroring the real daemon's `IngestBacklog`,
+  // which resets to zero at that exact instant rather than reporting a
+  // `processed === total` frame.
+  test('appears under the chat, grows past a mid-drain bump, then disappears', async ({ page }) => {
+    await page.addInitScript(() => { window.__ZEND_MOCK_INGEST_BACKLOG__ = true; });
+    await boot(page, { conv: '1' });
+
+    const bar = page.locator('#zend-ingest');
+    await expect(bar).toBeVisible();
+    const track = bar.locator('.z-ingest-track');
+    const fill = bar.locator('.z-ingest-fill');
+
+    const fillPct = async () => parseInt(await fill.evaluate((el) => el.style.width), 10);
+    const firstPct = await fillPct();
+
+    // Wait past the 3rd poll's total bump (5 -> 7): the fill must not simply
+    // climb monotonically to 100% — it should read a lower percentage once
+    // the total grows, proving `total` is re-read every poll, not cached.
+    await expect.poll(() => track.getAttribute('aria-valuemax'), { timeout: 8000 }).toBe('7');
+    const afterBumpPct = await fillPct();
+    expect(afterBumpPct).toBeLessThan(100);
+
+    // It keeps draining and eventually disappears once processed catches total.
+    await expect(bar).toHaveCount(0, { timeout: 15000 });
+    expect(firstPct).toBeGreaterThanOrEqual(0); // sanity: the first read wasn't NaN
+  });
+
+  test('mobile shows the count without the last-file label; desktop shows both', async ({ page }) => {
+    await page.addInitScript(() => { window.__ZEND_MOCK_INGEST_BACKLOG__ = true; });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await boot(page, { conv: '1' });
+    const bar = page.locator('#zend-ingest');
+    await expect(bar).toBeVisible();
+    await expect(bar.locator('.z-ingest-item')).toHaveCount(0);
+    await expect(bar.locator('.z-ingest-label')).toHaveCount(0);
+    await expect(bar.locator('.z-ingest-count')).toBeVisible();
+
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.waitForFunction(() => window.innerWidth >= 1100);
+    await expect(bar.locator('.z-ingest-item')).toBeVisible();
+    await expect(bar.locator('.z-ingest-label')).toBeVisible();
+  });
+});

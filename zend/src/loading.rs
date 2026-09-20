@@ -5,10 +5,12 @@
 //! 1. **Model** — fetch and load the GGUF weights.
 //! 2. **Substrate** — replay the redo log into the in-RAM substrate.
 //! 3. **Sections** — prefill the projection schema's pinned sections.
-//! 4. **Ingesting** — run the schema-declared ingest passes (one per projection
-//!    layer that carries an `ingest:` descriptor — folder scans, per-file reads).
-//!    Each layer's human label rides the `detail` sub-status; a schema with no
-//!    ingest layers transitions through this step instantly.
+//! 4. **Ingesting** — run the schema-declared `raw` (ChatML) ingest passes, the
+//!    only kind still on this blocking path. Folder-scan (`repo_map`) and
+//!    per-file (`code_reading`) layers are seeded from the substrate at boot
+//!    and handed to `crate::ingest_worker`'s background worker instead — their
+//!    walk and pool work never gates `ready`. A schema with no `raw` layers
+//!    transitions through this step instantly.
 //!
 //! `LoadProgress` is the single source of truth; the daemon advances it
 //! via [`Self::set_step`], reports intra-step progress via
@@ -28,11 +30,12 @@ pub enum LoadStep {
     Compacting,
     Sections,
     CalibratingSections,
-    /// The schema-driven ingest phase: every projection layer that declares an
-    /// `ingest:` descriptor is populated here, in schema order. The specific
-    /// layer's display label ("Scanning repository", "Reading code", …) is
-    /// surfaced through the `detail` sub-status, so this one step covers an
-    /// arbitrary number of ingest layers.
+    /// The schema-driven `raw` (ChatML) ingest phase — the only ingest mode
+    /// still blocking here. Folder-scan and per-file layers are seeded from
+    /// the substrate in the pre-loop and ingested entirely off this path by
+    /// `crate::ingest_worker`'s background worker after `ready`. A `raw`
+    /// layer's display label ("Loading responses", …) is surfaced through the
+    /// `detail` sub-status.
     Ingesting,
     /// The tool catalog's score-normalization hit levels, relearned from its
     /// corpus. They are runtime-only, so every start pays this — last, once the

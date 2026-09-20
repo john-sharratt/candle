@@ -104,6 +104,23 @@ struct Cli {
     #[arg(long = "skip-layer", value_name = "NAME")]
     skip_layer: Vec<String>,
 
+    /// Tombstone EVERY conversation in a turn-sink layer, by its schema name
+    /// (e.g. `repo_map`, `code_reading`), before this load's registry is
+    /// seeded from the substrate. Repeatable.
+    ///
+    /// Unlike `--wipe-substrate`, this is targeted: only the named layer's
+    /// content is destroyed — the live dialogue, any other ingest layer, and
+    /// uploads all survive untouched. Once wiped, the background ingest
+    /// worker's first pass reads the whole layer as new and rebuilds it from
+    /// disk. Exists for exercising a full background-ingest run without
+    /// paying for (or losing) a whole-substrate wipe.
+    ///
+    /// A layer named by `--disable-layer` is not wiped — a disabled layer gets
+    /// no cleanup of any kind. Raw (ChatML) layers are not wipeable this way;
+    /// delete their content folder by hand, or use `--wipe-substrate`.
+    #[arg(long = "wipe-layer", value_name = "NAME")]
+    wipe_layer: Vec<String>,
+
     /// Override the content root a derived ingest layer reads from, as
     /// `<layer>=<path>`. Repeatable (e.g. `--ingest-dir code_reading=zend/src
     /// --ingest-dir repo_map=zend`). The path is relative to the workspace, or
@@ -454,6 +471,7 @@ async fn main() -> anyhow::Result<()> {
         port: cli.port,
         disabled_layers: disabled_layers.clone(),
         skipped_layers: skipped_layers.clone(),
+        wiped_layers: cli.wipe_layer.iter().cloned().collect(),
         ingest_dirs: ingest_dirs.clone(),
         max_depth: cli.max_depth.map(|d| d as usize),
         compact_substrate: cli.compact_substrate,
@@ -484,6 +502,15 @@ async fn main() -> anyhow::Result<()> {
             layers = %names.join(", "),
             "--skip-layer: these layers stay IN SERVICE — gathered, warmed and cleaned \
              up — but nothing is read from disk for them this boot",
+        );
+    }
+    if !cli.wipe_layer.is_empty() {
+        let mut names: Vec<&str> = cli.wipe_layer.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        tracing::warn!(
+            layers = %names.join(", "),
+            "--wipe-layer: DESTRUCTIVE — every conversation in these layers is being \
+             tombstoned before load; the background ingest worker rebuilds them from disk",
         );
     }
     if !ingest_dirs.is_empty() {

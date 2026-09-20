@@ -1615,19 +1615,27 @@ impl Conversation {
         let t_warm = Instant::now();
         let mut warmed_timelines = 0usize;
         for layer in &schema.layers {
-            // Out of retrieval ⇒ nothing to warm. A hit level is a denominator
-            // for candidates this layer might return, and a non-gathered layer
-            // returns none, so warming it would spend the probe budget learning
-            // levels that can never be read. (`score_belief_groups` declines the
-            // same layer, so `warm_normalization_from_substrate` needs no guard
-            // of its own — it warms THROUGH that call.)
-            if !layer.gathered {
-                continue;
-            }
+            // This function only ever warms an append-only ingest layer — the
+            // loop body below is unreached otherwise, so this is the real
+            // filter; a leftover `!layer.gathered` check used to sit ahead of
+            // it and is deliberately gone (see below).
             let is_ingest = self.inner.read().unwrap().is_append_only_layer(layer.id);
             if !is_ingest {
                 continue;
             }
+            // `gathered = false` promises "no OTHER conversation draws from
+            // this layer" — it does NOT mean nothing reads it at all. An
+            // append-only layer's own conversations score self-local
+            // (`score_belief_groups` exempts a layer scoring its own target
+            // regardless of `gathered`, for the same reason this warm still
+            // has a reader to serve). A `!layer.gathered` skip here used to
+            // run ahead of the `is_ingest` check above, so it silently
+            // matched exactly the ingest layers this loop exists to warm —
+            // the moment one was taken out of cross-layer gather (`zend`'s
+            // provenance-injection exclusion for `code_reading`/`repo_map`),
+            // its own turns went cold forever: no later pass ever warmed
+            // them, so a conversation several turns into its own history
+            // could no longer retrieve its own earlier turns.
             for group in layer.groups.iter().filter(|g| is_warmable(g)) {
                 warmed_timelines += self.warm_group(layer, group);
             }
@@ -1796,7 +1804,24 @@ impl Conversation {
         // declines to score them, so they cannot be selected, which is the whole
         // of what the flag promises. Re-enabling restores them immediately; the
         // flag is a read-time filter, not a deletion.
-        if !layer.gathered {
+        //
+        // Exempt when `layer` IS the projection's own target — mirroring the
+        // assembly loop's `layer_is_target` exemption in `project.rs` ("the
+        // target layer is never skipped — that would leave the projection with
+        // nothing to emit"). `gathered = false` promises "no OTHER conversation
+        // draws from this layer"; it was never meant to promise "this layer's
+        // own conversations can't see their own history" too. An append-only
+        // ingest layer (`code_reading`, `repo_map`) scores self-local here —
+        // candidates scoped to `target.timeline` alone, never another
+        // conversation's — so honouring `!gathered` unconditionally silently
+        // zeroed every such layer's OWN turn-group candidates the moment it was
+        // taken out of cross-layer gather, with no way back in: a later turn
+        // in the very conversation that owns this layer could never again see
+        // turns from earlier in itself. Measured: a `code_reading` per-file
+        // conversation's closing turn, several `file_read` rounds deep, lost
+        // every earlier round in the same conversation and could not tell it
+        // had already read the whole file.
+        if !layer.gathered && layer.id != target.layer {
             return per_group;
         }
         // The substrate read guard is scoped to Phase A, never held across Phase
@@ -4773,8 +4798,14 @@ layers:
         assert!(warmable(b.schema(), dialogue, conversation).is_none());
     }
 
-    /// **A layer out of retrieval is not warmed**, whichever warm-up asks —
-    /// the single-group and single-timeline ones as well as the ingest one.
+    /// **A layer out of retrieval is not warmed** through `warmable()` — the
+    /// single-group and single-timeline warm-ups this gates. The BULK ingest
+    /// warm-up (`warm_ingest_normalization`) does NOT go through `warmable()`
+    /// and does not honour this flag for an append-only layer: see
+    /// `turn_belief_scan.rs`'s `warm_ingest_normalization_still_warms_an_append_only_layer_when_not_gathered`
+    /// for why — a `code_reading`/`repo_map`-shaped layer scores itself
+    /// regardless of `gathered`, since that flag promises only that no OTHER
+    /// conversation draws from it.
     #[test]
     fn a_group_in_a_layer_out_of_retrieval_is_not_warmable() {
         let mut b = Builder::from_yaml(WARM_YAML).unwrap();

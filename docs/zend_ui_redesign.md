@@ -66,7 +66,7 @@ Router in `zend/src/api/mod.rs` serves the embedded `web/` dir (fallback) plus:
 | `POST /v1/conversations/:id/archive` | `conversations::archive` | `204` |
 | `POST /v1/conversations/:id/unarchive` | `conversations::unarchive` | `204` |
 | `GET /v1/models` | `models::list` | model list |
-| `GET /v1/status` | `status::status` | `{ state: "loading"\|"ready", started_at_ms, detail, loading? }` |
+| `GET /v1/status` | `status::status` | `{ state: "loading"\|"ready", started_at_ms, detail, loading?, maintenance?, ingest_backlog? }` — `ingest_backlog: { processed, total, last_item } \| null` is the background repo_map/code_reading (+ upload) ingest queue, `null` when nothing is pending |
 | `POST /v1/chat/completions` | `chat::completions` | SSE (`status` events + OpenAI chunk deltas + stop chunk + `[DONE]`) or one JSON body |
 | `GET /ws/logs` | `ws_logs::handler` | WebSocket: replays `session.log.recent()` backlog, then live lines |
 
@@ -172,7 +172,9 @@ getProjectionDetail(convId, turn, event) -> Promise<{span, glue, sectionContent,
                                                     // one recorded point in full + the panel context (live: GET :id/projections/:turn/:event)
 getProjectionContext(convId, turns) -> Promise<{glue, sectionContent, turnContent, targetLayer}>
                                                     // the panel context for a point streamed live (live: POST :id/projection-context)
-getStatus() -> Promise<{state:"loading"|"ready", started_at_ms, detail, loading?, build}>  // GET /v1/status; gates the startup overlay; `build` (assets hash) drives the hot-reload check
+getStatus() -> Promise<{state:"loading"|"ready", started_at_ms, detail, loading?, maintenance?, ingest_backlog?, build}>
+                                                    // GET /v1/status; gates the startup overlay; `build` (assets hash) drives the hot-reload check;
+                                                    // `ingest_backlog: {processed,total,last_item}|null` drives the under-chat background-ingest bar
 getToolSchemas() -> Promise<{[tool]: JSONSchema|null}>  // GET /v1/substrate/tools; tool-call cards list every parameter from it, defaults included
 archiveConversation(id) / unarchiveConversation(id) -> Promise<void>
 streamChatCompletion(conv, text, opts, handlers) -> { cancel() }

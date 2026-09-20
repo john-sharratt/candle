@@ -7,10 +7,12 @@
 //! walked map, prior state, old timeline id, progress sink) remain
 //! explicit parameters because they vary per call.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use candle_conversation::projection::Builder;
+use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{ConversationEngine, SequenceConfig};
+use zend_tools::ToolContext;
 
 /// Refresh-time context.  Borrows the engine's `Mutex` so the
 /// refresh helpers can lock it briefly for the two engine API calls
@@ -24,4 +26,22 @@ pub struct RefreshContext<'a> {
     pub engine: &'a Mutex<ConversationEngine>,
     pub proj_builder: Builder,
     pub config: SequenceConfig,
+    /// The dialect-formatted system-prompt prelude every REAL conversation
+    /// primes on — the same text `base_conv` (the live dialogue's shared
+    /// prefix) was built from. `code_reading`'s hidden per-file conversations
+    /// use this instead of a bespoke ingest-only prompt, so they frame
+    /// identically to a live dialogue turn (`InferenceState::load`'s
+    /// `formatted_prompt`).
+    pub formatted_prompt: &'a str,
+    /// Tool-call grammar + `<think>` steering for `ThinkMode::Quick` — the
+    /// lowest thinking level, not fully off: a hidden ingest conversation with
+    /// no room to reason at all was measured skipping its `file_read` call
+    /// entirely and guessing a summary from the filename. Compiled from the
+    /// REAL tool catalog (not an empty placeholder) — see `turn_triggers`.
+    pub think_triggers: Arc<TriggerRegistry>,
+    /// Tool-execution context a hidden ingest conversation's real `file_read`
+    /// calls run against — read-only grants, the daemon's own workspace
+    /// (`ToolMode::Restricted`'s context, the same one an unprivileged live
+    /// dialogue turn runs tools in).
+    pub tool_ctx: Arc<ToolContext>,
 }

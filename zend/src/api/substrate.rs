@@ -8,6 +8,10 @@
 //! - `GET /v1/substrate/tools`               — the live tool catalog.
 //! - `GET /v1/substrate/layer/{name}`        — the conversations in one layer.
 //! - `GET /v1/substrate/timeline/{tl}`       — one conversation's summary forest.
+//! - `GET /v1/substrate/timeline/{tl}/selection` — its most recent score-density
+//!   selection: which nodes made the slot, why, and the pending/token/budget
+//!   counters around it. Unlike the other routes this is NOT a substrate read —
+//!   it is in-memory, last-write-wins per timeline, and empties on restart.
 //!
 //! All read the daemon's live `Substrate` through a cloned `Conversation` handle
 //! (engine lock released immediately, only the substrate read guard held for the
@@ -24,6 +28,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use candle_conversation::summary_tree::SelectionOrigin;
 use candle_conversation::turn_layout::TurnLayout;
 
 use crate::session::ZendSession;
@@ -107,6 +112,20 @@ pub async fn timeline(
         .substrate_timeline(raw)
         // Model not loaded, or no such timeline — either way there's nothing to
         // show; the viewer only requests this after a successful overview.
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// `GET /v1/substrate/timeline/{tl}/selection` — see the module doc.
+pub async fn selection(
+    State(session): State<Arc<ZendSession>>,
+    Path(tl): Path<String>,
+) -> Result<Json<SelectionView>, StatusCode> {
+    let raw: u64 = tl.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    session
+        .substrate_selection(raw)
+        // Model not loaded, unknown timeline, or no projection has run for it
+        // yet (or it used the rule-based path, which records no diagnostic).
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -333,6 +352,31 @@ pub struct TurnView {
     /// present for normal turns, letting the viewer colorize the exact segments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layout: Option<TurnLayout>,
+}
+
+/// `GET /v1/substrate/timeline/{tl}/selection` body — the most recent
+/// score-density selection recorded for this timeline.
+#[derive(Serialize)]
+pub struct SelectionView {
+    /// In selection order — oldest first, most recent last.
+    pub selected: Vec<SelectedNodeView>,
+    /// Pending turns at the moment of selection (bigger pending ⇒ smaller
+    /// selection region).
+    pub pending_count: usize,
+    /// Total token cost of the selected set (excludes pending).
+    pub selected_tokens: u32,
+    /// Layer window budget used, for scale.
+    pub budget: u32,
+}
+
+/// One selected node: which turn/summary, why it was chosen, and the score
+/// that won it the slot (`None` for a node selection never scored, such as a
+/// `Pending` or `HardAnchor` origin).
+#[derive(Serialize)]
+pub struct SelectedNodeView {
+    pub node_id: u32,
+    pub origin: SelectionOrigin,
+    pub effective_score: Option<f32>,
 }
 
 /// `POST /v1/substrate/project` request — the typed query to project.
