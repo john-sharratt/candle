@@ -1437,7 +1437,7 @@ fn sweep_layers(
                     &[],
                     capture_dev,
                 )?;
-                quantized_delta_net_ffn(&layer, &mut x, embed_dtype, orig, layer_lora)?;
+                quantized_delta_net_ffn(&layer, &mut x, embed_dtype, orig, layer_lora, n_decode)?;
             }
         }
         // The layer's result. Reaching this on a bad value means the mixer's

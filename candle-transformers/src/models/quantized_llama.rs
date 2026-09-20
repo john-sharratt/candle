@@ -472,6 +472,9 @@ impl BatchedAttentionLayer for LayerWeights {
         acts: DynamicActs<'w>,
         work_dtype: DType,
         out_dtype: DType,
+        // This model's MoE arm is the plain `Module`-based fallback, not the
+        // expert-cache-backed pipeline — nothing here reads the split.
+        _decode_tokens: usize,
         // A dense MLP allocates its own output, so nothing here is
         // wave-scoped; the parameter is the trait's, for the MoE case.
         _wave: Option<&'w WaveGeneration>,

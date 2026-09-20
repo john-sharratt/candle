@@ -383,6 +383,20 @@ pub struct MoeWorkRequest {
     /// Flat assignment array sorted by expert ID.
     /// Each entry: `(expert_id, token_idx, flat_weight_idx)`.
     pub assignments: Vec<(u32, u32, u32)>,
+    /// Count of leading rows, in this request's token order, that are
+    /// decode-attributed (decode rows plus any single-token prefills folded
+    /// into the decode group — see `WaveAttnGroup::decode_layout`). The rest
+    /// are prefill/glue rows.
+    ///
+    /// Used only to weight cache residency scoring
+    /// (`ExpertCacheInner::record_hit` vs `record_prefill_hit` /
+    /// `record_prefill_elevate`): a decode row's reuse of a specific expert is
+    /// near-certain from one step to the next, while a prefill row's is close
+    /// to zero, so the two must not compete for residency on equal footing.
+    /// `num_tokens` (every row decode-attributed) reproduces today's
+    /// undifferentiated scoring exactly, which is the right default for a
+    /// caller that has not been taught its own decode/prefill split yet.
+    pub decode_tokens: usize,
     /// The wave generation the submitting layer has open, if any.
     ///
     /// A [`WaveTicket`] is a `Copy` coordinate rather than a borrow, which is

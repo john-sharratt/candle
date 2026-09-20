@@ -556,6 +556,14 @@ impl Engine {
             DType::F32,
             &weights_flat,
             assignments,
+            // `nt`: every row counts as decode-attributed, reproducing this
+            // family's scoring exactly as it stood before the decode/prefill
+            // split existed. DeepSeek-V4-Flash doesn't yet thread its own
+            // wave's decode-row count through to this call site — its wave
+            // engine (`latent_moe/wave.rs`) is a separate path from the
+            // `batched_layer.rs` one that derives it for the Qwen3-family
+            // models this change was measured against.
+            nt,
             None,
         )?; // [nt, dim] F32
         s_submit.end();

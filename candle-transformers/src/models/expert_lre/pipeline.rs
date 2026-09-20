@@ -1400,6 +1400,7 @@ impl PipelineState {
         &mut self,
         moe_idx: usize,
         expert_ids: &[usize],
+        decode_experts: &std::collections::HashSet<usize>,
     ) -> Result<ClassifiedExperts> {
         if expert_ids.is_empty() {
             return Ok(ClassifiedExperts {
@@ -1441,7 +1442,11 @@ impl PipelineState {
             if let Some(&slot_idx) = self.inner.key_to_slot.get(&(moe_idx, expert_idx)) {
                 if self.inner.slots[slot_idx].is_some() {
                     self.inner.promote(slot_idx);
-                    self.inner.record_hit(moe_idx, expert_idx);
+                    if decode_experts.contains(&expert_idx) {
+                        self.inner.record_hit(moe_idx, expert_idx);
+                    } else {
+                        self.inner.record_prefill_hit(moe_idx, expert_idx);
+                    }
                     hits.push((expert_idx, slot_idx));
                     continue;
                 }
@@ -1570,6 +1575,14 @@ impl PipelineState {
         let mut loaded: Vec<(usize, usize)> = Vec::with_capacity(loaded_slots.len());
         for (expert_idx, slot_idx, slot) in loaded_slots {
             self.inner.install(slot_idx, moe_idx, expert_idx, slot);
+            // A prefill-only elevation earns no benefit of the doubt: bias it
+            // toward the very next eviction scan rather than leaving its score
+            // at whatever an earlier, unrelated occupancy left behind. A
+            // decode-attributed elevation is unchanged — the expert it just
+            // paid to load is the one decode is about to keep needing.
+            if !decode_experts.contains(&expert_idx) {
+                self.inner.record_prefill_elevate(moe_idx, expert_idx);
+            }
             loaded.push((expert_idx, slot_idx));
 
             // A device copy now exists. Whether a host one also does is a
@@ -2321,8 +2334,23 @@ impl PipelineState {
         #[cfg(not(feature = "cuda"))]
         let streamed = 0usize;
 
+        // Which of this request's experts a DECODE-attributed row touched —
+        // the rest are prefill/glue-only. Derived from `assignments` rather
+        // than threaded separately, since it is already the one place a
+        // request ties an expert id back to the token that asked for it.
+        // Drives `classify_and_load`'s residency scoring
+        // (`ExpertCacheInner::record_hit` vs `record_prefill_hit` /
+        // `record_prefill_elevate`) — see `MoeWorkRequest::decode_tokens`.
+        let decode_experts: std::collections::HashSet<usize> = req
+            .assignments
+            .iter()
+            .filter(|&&(_, tok, _)| (tok as usize) < req.decode_tokens)
+            .map(|&(eid, _, _)| eid as usize)
+            .collect();
+
         let t = profile_now();
-        let classified = self.classify_and_load(req.moe_layer_idx, &req.expert_ids)?;
+        let classified =
+            self.classify_and_load(req.moe_layer_idx, &req.expert_ids, &decode_experts)?;
         self.profile.record("pipe_classify_load", t);
 
         // ── Whole-layer streaming for the NEXT layer, issued HERE — after

@@ -236,6 +236,7 @@ impl SparseMoeBlock {
         &self,
         acts: DynamicActs<'w>,
         out_dtype: DType,
+        decode_tokens: usize,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         let (b_size, seq_len, hidden_dim) = match &acts {
@@ -334,6 +335,7 @@ impl SparseMoeBlock {
             k,
             num_experts,
             t,
+            decode_tokens,
             wave.map(|g| g.ticket()),
         )
     }
@@ -796,6 +798,7 @@ impl SparseMoeBlock {
         k: usize,
         num_experts: usize,
         _routing_start: ProfileMark,
+        decode_tokens: usize,
         wave: Option<WaveTicket>,
     ) -> Result<Tensor> {
         // ── 2. Group assignments by expert — the shared grouped-GEMM dispatch
@@ -842,6 +845,7 @@ impl SparseMoeBlock {
             out_dtype,
             &weights_flat,
             assignments,
+            decode_tokens,
             wave,
         )?;
 
@@ -1049,6 +1053,7 @@ impl BatchedAttentionLayer for LayerWeights {
         acts: DynamicActs<'w>,
         work_dtype: DType,
         out_dtype: DType,
+        decode_tokens: usize,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         match &self.ffn {
@@ -1062,7 +1067,7 @@ impl BatchedAttentionLayer for LayerWeights {
                 // router logits and the device dispatch share that one dtype —
                 // so this path narrows on return. Giving the combine its own
                 // store width is the same change one level down.
-                let mut out = m.forward_dynamic(acts, work_dtype, wave)?;
+                let mut out = m.forward_dynamic(acts, work_dtype, decode_tokens, wave)?;
                 out.to_dtype_mut(out_dtype)?;
                 Ok(out)
             }

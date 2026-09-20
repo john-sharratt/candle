@@ -34,7 +34,13 @@
 //! lightly-decayed access frequency: higher = more valuable = evicted last.
 //! Updated by pipeline events:
 //!
-//! - **Cache hit**: +1.0
+//! - **Cache hit (decode-attributed)**: +1.0
+//! - **Cache hit (prefill-attributed)**: +0.1 — a decode row's hit is a strong
+//!   repeat-reuse signal (decode routes the same small set nearly every step);
+//!   a prefill row's hit on something already resident earns only a token
+//!   credit, since the expert being warm is someone else's doing.
+//! - **Prefill-attributed elevation** (a fresh cold load streamed in to serve a
+//!   prefill row): −0.1 — see [`PREFILL_ELEVATE_PENALTY`].
 //! - **Prediction hit**: +0.3 (a speculative load the layer actually routed to)
 //! - **End-of-pass decay**: ×0.85 (recency-weighting of the frequency)
 
@@ -70,6 +76,36 @@ use std::sync::Arc;
 /// [`minimum_resident_slots`] prices the pinned set plus a full working layer,
 /// and the zone may never retract below it.
 pub const PINNED_LAYERS: usize = 2;
+
+/// Score credit for a prefill-attributed hit on an already-resident expert.
+///
+/// Far below [`ExpertCacheInner::record_hit`]'s +1.0: a prefill row's own
+/// reuse of a specific expert across waves is close to zero (a long prefill
+/// sweep touches most of the table roughly once each), so treating a prefill
+/// hit as equally valuable as a decode hit let a diverse enough prefill
+/// out-bid decode's genuinely-reused residents for warm/hot slots — decode
+/// then had to re-earn its own working set from a cache full of prefill's
+/// one-shot leftovers. This still lets an expert that prefill itself reuses
+/// often (a broadly-useful "generalist") earn some protection, just far less
+/// than a resident decode actually depends on.
+pub const PREFILL_HIT_SCORE: f32 = 0.1;
+
+/// Score penalty applied when a prefill row causes a *fresh* elevation (a
+/// cold miss that streams an expert in), as opposed to a hit on something
+/// already resident.
+///
+/// Negative, not merely small: the expert a prefill row just paid a full DMA
+/// to load is, on the evidence, the LEAST likely thing in the zone to be
+/// touched again before the pass wraps — the layer it serves has just been
+/// left behind, and prefill's own within-sweep reuse of one specific expert
+/// is close to zero. Pushing its score negative (rather than leaving it at
+/// whatever it decayed to from an earlier, unrelated occupancy) makes it the
+/// eviction scan's preferred victim immediately, freeing the slot for the
+/// layer about to run instead of leaving it to be found by the normal
+/// low-score-first scan. `slot_eviction_score`'s `position_factor` stays
+/// positive ([0.5, 1.0]), so a negative `base_score` only ever lowers the
+/// product — nothing here can invert eviction order for a non-negative score.
+pub const PREFILL_ELEVATE_PENALTY: f32 = -0.1;
 
 /// How many layers this model actually pins.
 ///
@@ -538,6 +574,24 @@ impl ExpertCacheInner {
     pub(crate) fn record_hit(&mut self, layer: usize, expert: usize) {
         let idx = self.score_idx(layer, expert);
         self.expert_scores[idx] += 1.0;
+    }
+
+    /// Record a prefill-attributed hit on an already-resident expert:
+    /// [`PREFILL_HIT_SCORE`] (+0.1) rather than the full decode weight.
+    #[inline]
+    pub(crate) fn record_prefill_hit(&mut self, layer: usize, expert: usize) {
+        let idx = self.score_idx(layer, expert);
+        self.expert_scores[idx] += PREFILL_HIT_SCORE;
+    }
+
+    /// Record a prefill-attributed elevation (a fresh cold load, not a hit):
+    /// [`PREFILL_ELEVATE_PENALTY`] (−0.1), biasing it toward the next
+    /// eviction scan rather than leaving its score at whatever an earlier,
+    /// unrelated occupancy left behind.
+    #[inline]
+    pub(crate) fn record_prefill_elevate(&mut self, layer: usize, expert: usize) {
+        let idx = self.score_idx(layer, expert);
+        self.expert_scores[idx] += PREFILL_ELEVATE_PENALTY;
     }
 
     /// Record a successful speculative prediction: +0.3.
@@ -1061,6 +1115,55 @@ mod tests {
         let (slot, evicted_key) = inner.allocate_slot(20, &Default::default()).unwrap();
         assert_eq!(evicted_key, Some((10, 102)));
         assert_eq!(slot, 2);
+    }
+
+    #[test]
+    fn record_prefill_hit_bumps_by_the_small_credit_only() {
+        let mut inner = cache(1);
+        occupy(&mut inner, 0, 10, 100, 1, 0.0);
+        inner.record_prefill_hit(10, 100);
+        assert_eq!(inner.score(10, 100), 0.1);
+        inner.record_prefill_hit(10, 100);
+        assert_eq!(inner.score(10, 100), 0.2);
+    }
+
+    #[test]
+    fn record_hit_still_bumps_by_the_full_decode_credit() {
+        let mut inner = cache(1);
+        occupy(&mut inner, 0, 10, 100, 1, 0.0);
+        inner.record_hit(10, 100);
+        assert_eq!(inner.score(10, 100), 1.0);
+    }
+
+    #[test]
+    fn record_prefill_elevate_pushes_the_score_negative() {
+        let mut inner = cache(1);
+        occupy(&mut inner, 0, 10, 100, 1, 0.0);
+        inner.record_prefill_elevate(10, 100);
+        assert_eq!(inner.score(10, 100), -0.1);
+        // A second, unrelated occupancy's stale positive score is not a
+        // floor: the penalty still lands as a plain addition.
+        let idx = inner.score_idx(10, 100);
+        inner.expert_scores[idx] = 0.05;
+        inner.record_prefill_elevate(10, 100);
+        assert!((inner.score(10, 100) - (-0.05)).abs() < 1e-6);
+    }
+
+    /// **A prefill-elevated expert is evicted before any hit, decode or
+    /// prefill, once the pass has moved past its layer.** This is the whole
+    /// point of the negative score: a fresh prefill load at layer 10 must not
+    /// out-survive genuinely reused experts once the sweep is at layer 20.
+    #[test]
+    fn prefill_elevated_expert_is_the_preferred_victim_over_any_hit() {
+        let mut inner = cache(3);
+        occupy(&mut inner, 0, 10, 100, 1, 0.0); // freshly prefill-elevated
+        inner.record_prefill_elevate(10, 100);
+        occupy(&mut inner, 1, 10, 101, 2, 0.1); // one prefill hit
+        occupy(&mut inner, 2, 10, 102, 3, 1.0); // one decode hit
+
+        let (slot, evicted_key) = inner.allocate_slot(20, &Default::default()).unwrap();
+        assert_eq!(evicted_key, Some((10, 100)));
+        assert_eq!(slot, 0);
     }
 
     #[test]

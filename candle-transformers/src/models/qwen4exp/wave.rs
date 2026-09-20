@@ -2935,7 +2935,7 @@ impl Qwen4ExpBatched {
             }
             let y2 = layer
                 .moe
-                .forward_dynamic(acts, DType::F32, Some(&ffn_wave))?
+                .forward_dynamic(acts, DType::F32, n_decode, Some(&ffn_wave))?
                 .reshape((total_rows, n_embd))?;
             #[cfg(feature = "tensor-assert")]
             probe(li, "moe.y2", &y2);

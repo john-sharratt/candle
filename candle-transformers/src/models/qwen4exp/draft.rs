@@ -419,7 +419,10 @@ impl Qwen4ExpBatched {
         let y2 = head
             .block
             .moe
-            .forward_dynamic(acts, DType::F32, None)?
+            // Every row here is a speculative continuation of an existing
+            // decode step — there is no prefill/prompt traffic through a
+            // draft head — so all `n` rows are decode-attributed.
+            .forward_dynamic(acts, DType::F32, n, None)?
             .to_owned_tensor()?
             .reshape((n, n_embd))?;
         hc_combine(&mut res, &y2, &inject2)?;

@@ -378,11 +378,18 @@ pub trait BatchedAttentionLayer {
     /// from [`Self::ffn_norm`], which allocates, while the MoE combine target is
     /// taken from the wave. A dense MLP hands its activations to a `Module` and
     /// so could not accept a wave-scoped operand anyway.
+    ///
+    /// `decode_tokens` is the count of leading rows (of this call's combined
+    /// buffer) that are decode-attributed — threaded through to the expert
+    /// cache's residency scoring for a MoE FFN (`expert_lre::MoeWorkRequest`'s
+    /// field of the same name). A dense MLP has no expert cache to weight and
+    /// ignores it.
     fn ffn_forward<'w>(
         &self,
         acts: DynamicActs<'w>,
         work_dtype: DType,
         out_dtype: DType,
+        decode_tokens: usize,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>>;
 
@@ -609,9 +616,25 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
     // the residual add takes the result as it stands. Narrowing here instead
     // cost a full-tensor pass per layer per wave to undo the widening only the
     // SwiGLU intermediates needed.
+    // Decode rows (plus any single-token prefills folded into the decode
+    // group) sit first in the combined buffer — see `WaveAttnGroup::rows`'s
+    // accumulation above. `take_while` rather than an unconditional filter+sum
+    // so a future group order that broke that contiguity would undercount
+    // rather than silently attribute a later prefill group's rows to decode.
+    let decode_tokens: usize = groups
+        .iter()
+        .take_while(|g| g.decode_layout)
+        .map(|g| g.rows)
+        .sum();
     let h2 = {
         let acts = layer.ffn_norm(x.as_cat_tensor(), layer.int8mode(), ffn_wave.as_ref())?;
-        layer.ffn_forward(acts, mlp_dtype, orig_dtype, ffn_wave.as_ref())?
+        layer.ffn_forward(
+            acts,
+            mlp_dtype,
+            orig_dtype,
+            decode_tokens,
+            ffn_wave.as_ref(),
+        )?
     };
     // Same contract as the attention residual above: `ffn_forward` stores
     // `orig_dtype`, and the residual never left it, so this is an assertion.

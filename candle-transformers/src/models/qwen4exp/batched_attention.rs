@@ -92,6 +92,7 @@ impl BatchedAttentionLayer for Qwen4ExpAttentionLayer<'_> {
         _acts: DynamicActs<'w>,
         _work_dtype: DType,
         _out_dtype: DType,
+        _decode_tokens: usize,
         _wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         candle::bail!(

@@ -121,12 +121,15 @@ impl Qwen35MoeBlock {
         &self,
         acts: DynamicActs<'w>,
         out_dtype: DType,
+        decode_tokens: usize,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         // Shared expert first — see the module note on ownership.
         let shared = shared_expert_contribution(&self.shared, &self.shared_gate, &acts, out_dtype)?;
         let gated = shared.gated;
-        let routed = self.routed.forward_dynamic(acts, out_dtype, wave)?;
+        let routed = self
+            .routed
+            .forward_dynamic(acts, out_dtype, decode_tokens, wave)?;
         // The three values the layer's output is made of, checked where they
         // are still separable.
         //

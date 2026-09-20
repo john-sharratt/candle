@@ -1192,6 +1192,8 @@ impl ExpertCache {
     /// * `xs` — input hidden states `[num_tokens, hidden_dim]`
     /// * `weights_flat` — flattened routing weights `[num_tokens * k]`
     /// * `assignments` — flat sorted `(expert_id, token_idx, weight_idx)` array
+    /// * `decode_tokens` — count of leading rows (in `assignments`' token
+    ///   order) that are decode-attributed; see [`MoeWorkRequest::decode_tokens`]
     ///
     /// # Returns
     ///
@@ -1205,6 +1207,7 @@ impl ExpertCache {
         out_dtype: DType,
         weights_flat: &Tensor,
         assignments: Vec<(u32, u32, u32)>,
+        decode_tokens: usize,
         wave: Option<WaveTicket>,
     ) -> Result<Tensor> {
         match &self.mode {
@@ -1221,6 +1224,7 @@ impl ExpertCache {
                     out_dtype,
                     weights_flat: weights_flat.clone(),
                     assignments,
+                    decode_tokens,
                     // Captured right before `send` so the worker can split the inbound handoff
                     // (channel wakeup) out of the actual work.
                     wave,
