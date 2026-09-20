@@ -6,7 +6,7 @@
 //!
 //! Source: <https://huggingface.co/NousResearch/Hermes-3-Llama-3.1-8B/raw/main/generation_config.json>
 
-use super::{ModelArch, ModelSpec};
+use super::{ModelArch, ModelSpec, RopePreset};
 use crate::{config::SamplingConfig, models::DialectType};
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -36,6 +36,8 @@ pub(super) fn hermes3_3b_q6() -> ModelSpec {
         tokenizer_rev: String::new(),
         default_system_prompt: "You are a helpful assistant.".into(),
         max_seq_len: 8192,
+        // Llama 3 scaling, stated by the file's `rope_freqs.weight`.
+        rope: RopePreset::FileStated,
         default_sampling: SamplingConfig::for_gguf_architecture("llama"),
         supports_thinking: false,
         non_thinking_sampling: None,
@@ -67,6 +69,8 @@ pub(super) fn hermes3_70b_q4() -> ModelSpec {
         tokenizer_rev: String::new(),
         default_system_prompt: "You are a helpful assistant.".into(),
         max_seq_len: 8192,
+        // Llama 3 scaling, stated by the file's `rope_freqs.weight`.
+        rope: RopePreset::FileStated,
         default_sampling: SamplingConfig::for_gguf_architecture("llama"),
         supports_thinking: false,
         non_thinking_sampling: None,

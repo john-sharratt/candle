@@ -1,6 +1,5 @@
 //! tls_session_open tool.
 
-use std::net::TcpStream;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -11,6 +10,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::TlsError;
+use crate::net;
 use crate::state::sessions::{SessionMeta, TlsEntry};
 use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
@@ -61,15 +61,7 @@ impl Tool for TlsSessionOpen {
     fn run(ctx: &ToolContext, req: OpenRequest) -> Result<OpenResponse, TlsError> {
         let addr = format!("{}:{}", req.host, req.port);
         let timeout = Duration::from_millis(req.timeout_ms.unwrap_or(5000));
-        let addr_parsed: std::net::SocketAddr = addr
-            .parse()
-            .or_else(|_| {
-                use std::net::ToSocketAddrs;
-                addr.to_socket_addrs().map(|mut a| a.next().unwrap())
-            })
-            .map_err(|e| TlsError::ConnectionFailed(e.to_string()))?;
-
-        let stream = TcpStream::connect_timeout(&addr_parsed, timeout)
+        let stream = net::tcp_connect_to(ctx.grants(), &addr, Some(timeout))
             .map_err(|e| TlsError::ConnectionFailed(e.to_string()))?;
         let local_addr = stream
             .local_addr()

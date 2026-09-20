@@ -12,12 +12,12 @@ use super::tool_call::{compile_tool_call_tree, parse_tools, ToolCallEnvelope};
 use super::vocab::{TestVocab, TokenId, Vocab};
 
 /// Decode-step tokens for a byte string (one token per byte).
-fn bytes_of(s: &str) -> Vec<TokenId> {
+pub(super) fn bytes_of(s: &str) -> Vec<TokenId> {
     s.bytes().map(|b| b as TokenId).collect()
 }
 
 /// The JSON body of a `<tool_call>…</tool_call>` envelope.
-fn json_body(text: &str) -> &str {
+pub(super) fn json_body(text: &str) -> &str {
     text.trim_start_matches("<tool_call>\n")
         .trim_end_matches("\n</tool_call>")
 }
@@ -40,7 +40,10 @@ fn three_tool_catalog() -> Vec<super::tool_call::ToolSpec> {
 
 /// Compile a catalog into a walkable tool-call tree under the Qwen3 envelope —
 /// the one-liner every full-walk test starts from.
-fn tree_of(catalog: &[super::tool_call::ToolSpec], v: &TestVocab) -> Arc<super::tree::StencilTree> {
+pub(super) fn tree_of(
+    catalog: &[super::tool_call::ToolSpec],
+    v: &TestVocab,
+) -> Arc<super::tree::StencilTree> {
     Arc::new(
         compile(
             &compile_tool_call_tree(catalog, &ToolCallEnvelope::qwen3()).unwrap(),
@@ -56,9 +59,10 @@ fn tree_of(catalog: &[super::tool_call::ToolSpec], v: &TestVocab) -> Arc<super::
 fn read_file_minimal_call() {
     let v = TestVocab::new();
     let tree = tree_of(&three_tool_catalog(), &v);
-    // Decode steps: tool name, then the path value + closing quote.
+    // Decode steps: tool name, then the path value with both its quotes — the
+    // opening one is the model's, as it is for every value.
     let mut script = bytes_of("read_file\"");
-    script.extend(bytes_of("src/main.rs\""));
+    script.extend(bytes_of(" \"src/main.rs\""));
     let run = simulate(tree, &v, Oracle::Scripted(script), 1000).unwrap();
     let text = run.text(&v);
     assert_eq!(
@@ -81,7 +85,7 @@ fn write_file_with_optional_included() {
     // byte vocab ` true`/` false` share their space, which the compiler
     // prefills; a real vocab has each as one token.
     let mut script = bytes_of("write_file\"");
-    script.extend(bytes_of("a.txt\"")); // path value + close quote
+    script.extend(bytes_of(" \"a.txt\"")); // path value, both quotes the model's
     script.extend(bytes_of(", \"create\":")); // walk the gate arm trie
     script.extend(bytes_of("true")); // boolean branch, after the shared space
     let run = simulate(tree, &v, Oracle::Scripted(script), 2000).unwrap();
@@ -97,7 +101,7 @@ fn write_file_with_optional_skipped() {
     let v = TestVocab::new();
     let tree = tree_of(&three_tool_catalog(), &v);
     let mut script = bytes_of("write_file\"");
-    script.extend(bytes_of("a.txt\""));
+    script.extend(bytes_of(" \"a.txt\""));
     // optional gate: choose the close arm "}}\n</tool_call>" (starts with '}').
     script.extend(bytes_of("}}\n</tool_call>"));
     let run = simulate(tree, &v, Oracle::Scripted(script), 2000).unwrap();
@@ -175,7 +179,7 @@ fn calculator_passes_sqrt_expression_verbatim() {
     let v = TestVocab::new();
     let tree = calc_tree(&v);
     let mut script = bytes_of("calculator\""); // name branch + closing quote
-    script.extend(bytes_of("sqrt(324523452345)\"")); // free expression value + close
+    script.extend(bytes_of(" \"sqrt(324523452345)\"")); // the value, both quotes the model's
     let run = simulate(tree, &v, Oracle::Scripted(script), 2000).unwrap();
     let text = run.text(&v);
     let parsed: serde_json::Value = serde_json::from_str(json_body(&text)).unwrap();
@@ -197,7 +201,7 @@ fn calculator_reflects_model_value_verbatim_even_when_garbage() {
     let v = TestVocab::new();
     let tree = calc_tree(&v);
     let mut script = bytes_of("calculator\"");
-    script.extend(bytes_of(" , \"")); // the exact garbage the daemon emitted, + close
+    script.extend(bytes_of(" \" , \"")); // the exact garbage the daemon emitted, quoted
     let run = simulate(tree, &v, Oracle::Scripted(script), 2000).unwrap();
     let text = run.text(&v);
     let parsed: serde_json::Value = serde_json::from_str(json_body(&text)).unwrap();
@@ -256,6 +260,181 @@ fn array_value_via_pushback() {
     );
 }
 
+// ── Guided arrays and objects (Cline's native tool shapes) ──────────────────
+
+/// Cline 4.1.17's `read_files` and `run_commands`, as its zod schemas arrive in
+/// a request's `tools` array: an array of objects with optional nullable line
+/// bounds, and an array of strings.
+pub(super) fn cline_catalog() -> Vec<super::tool_call::ToolSpec> {
+    use super::tool_call::ToolSpec;
+    let read_files: serde_json::Value = serde_json::from_str(
+        r#"{
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "start_line": {"type": ["number", "null"]},
+                            "end_line": {"type": ["number", "null"]}
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            "required": ["files"]
+        }"#,
+    )
+    .unwrap();
+    let run_commands: serde_json::Value = serde_json::from_str(
+        r#"{
+            "type": "object",
+            "properties": {
+                "commands": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["commands"]
+        }"#,
+    )
+    .unwrap();
+    vec![
+        ToolSpec::from_json_schema("read_files", &read_files),
+        ToolSpec::from_json_schema("run_commands", &run_commands),
+    ]
+}
+
+/// **The grammar writes an array of objects' brackets, braces and separators**;
+/// the model writes the names it chooses and the values.
+#[test]
+fn an_array_of_objects_is_written_by_the_grammar() {
+    let v = TestVocab::new();
+    let tree = tree_of(&cline_catalog(), &v);
+    let script = [
+        // Both names start with `r`, which the compiler prefills; the branch
+        // decides from the second byte.
+        bytes_of("ead_files\""),
+        bytes_of("{"),         // the first element, not the empty array
+        bytes_of(" \"a.rs\""), // a plain string's opening quote is the model's
+        bytes_of("}"),         // no bounds: close the element
+        bytes_of(", {"),
+        bytes_of(" \"b.rs\""),
+        bytes_of(", \"start_line\":"),
+        bytes_of(" 10"),
+        bytes_of(","), // lookahead delimiter, pushed back into the next gate
+        bytes_of(" \"end_line\":"),
+        bytes_of(" 20"),
+        bytes_of("}"), // pushed back into the element's close
+        bytes_of("]"),
+    ]
+    .concat();
+    let run = simulate(tree, &v, Oracle::Scripted(script), 4000).unwrap();
+    let text = run.text(&v);
+    assert_eq!(
+        text,
+        "<tool_call>\n{\"name\": \"read_files\", \"arguments\": {\"files\": \
+         [{\"path\": \"a.rs\"}, {\"path\": \"b.rs\", \"start_line\": 10, \"end_line\": 20}]}}\
+         \n</tool_call>"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(json_body(&text)).unwrap();
+    assert_eq!(parsed["arguments"]["files"][1]["end_line"], 20);
+    assert!(run.dropped.is_empty());
+}
+
+/// **The live failure, repaired.** The model closed the array where the
+/// element's `}` belonged — `"end_line": 3420]}}}`. The `]` does not continue
+/// the grammar there, so it is dropped rather than committed and bailed on;
+/// the grammar writes the `}`, and the model's `]` is legal at the next choice.
+#[test]
+fn a_bracket_where_the_element_closes_is_dropped_and_the_brace_written() {
+    let v = TestVocab::new();
+    let tree = tree_of(&cline_catalog(), &v);
+    let script = [
+        bytes_of("ead_files\""), // the shared `r` is prefilled
+        bytes_of("{"),
+        bytes_of(" \"src/main.rs\""),
+        bytes_of(", \"start_line\":"),
+        bytes_of(" 3380"),
+        bytes_of(","),
+        bytes_of(" \"end_line\":"),
+        bytes_of(" 3420"),
+        bytes_of("]"), // wrong: the element is still open
+        bytes_of("]"), // at the array's choice, legal
+    ]
+    .concat();
+    let run = simulate(tree, &v, Oracle::Scripted(script), 4000).unwrap();
+    let text = run.text(&v);
+    assert!(
+        !run.observes.contains(&Observe::Bailed),
+        "the walk bailed: {text:?}"
+    );
+    assert!(run.observes.contains(&Observe::DelimiterDropped));
+    assert_eq!(run.dropped, vec![b']' as TokenId]);
+    assert_eq!(
+        text,
+        "<tool_call>\n{\"name\": \"read_files\", \"arguments\": {\"files\": \
+         [{\"path\": \"src/main.rs\", \"start_line\": 3380, \"end_line\": 3420}]}}\
+         \n</tool_call>"
+    );
+    serde_json::from_str::<serde_json::Value>(json_body(&text)).unwrap();
+}
+
+/// An array of strings: the grammar writes each opening quote with its
+/// separator, and the empty array is a choice at the first element.
+#[test]
+fn an_array_of_strings_is_written_by_the_grammar_and_may_be_empty() {
+    let v = TestVocab::new();
+    let tree = tree_of(&cline_catalog(), &v);
+    let script = [
+        bytes_of("un_commands\""), // the shared `r` is prefilled
+        bytes_of("\""),
+        bytes_of("cargo check\""),
+        bytes_of(", \""),
+        bytes_of("ls\""),
+        bytes_of("]"),
+    ]
+    .concat();
+    let run = simulate(Arc::clone(&tree), &v, Oracle::Scripted(script), 4000).unwrap();
+    let text = run.text(&v);
+    assert_eq!(
+        text,
+        "<tool_call>\n{\"name\": \"run_commands\", \"arguments\": \
+         {\"commands\": [\"cargo check\", \"ls\"]}}\n</tool_call>"
+    );
+
+    let script = [bytes_of("un_commands\""), bytes_of("]")].concat();
+    let run = simulate(tree, &v, Oracle::Scripted(script), 4000).unwrap();
+    assert_eq!(
+        run.text(&v),
+        "<tool_call>\n{\"name\": \"run_commands\", \"arguments\": \
+         {\"commands\": []}}\n</tool_call>"
+    );
+}
+
+/// **The bound closes the array.** A model that never stops adding elements
+/// gets [`MAX_ARRAY_ELEMENTS`] of them and then the `]` it was not choosing,
+/// rather than a loop the grammar cannot see the end of.
+#[test]
+fn an_array_closes_at_its_bound() {
+    use super::sim::lowest_arm_policy;
+    use super::tool_call::MAX_ARRAY_ELEMENTS;
+
+    let v = TestVocab::new();
+    // `run_commands` alone: its elements open on `"`, which like `,` sorts
+    // below `]`, so the lowest byte at every choice continues the array. In
+    // free text a `"` closes each string at once.
+    let tree = tree_of(&cline_catalog()[1..], &v);
+    let run = simulate(tree, &v, lowest_arm_policy(b'"' as TokenId), 100_000).unwrap();
+    let text = run.text(&v);
+    let parsed: serde_json::Value = serde_json::from_str(json_body(&text))
+        .unwrap_or_else(|e| panic!("not JSON: {text:?}: {e}"));
+    assert_eq!(
+        parsed["arguments"]["commands"].as_array().map(Vec::len),
+        Some(MAX_ARRAY_ELEMENTS),
+        "{text}"
+    );
+}
+
 // ── Adversarial value contents ──────────────────────────────────────────────
 
 #[test]
@@ -264,11 +443,50 @@ fn string_value_with_escaped_quote() {
     let tree = tree_of(&three_tool_catalog(), &v);
     // path value contains an escaped quote: a\"b  — must not close early.
     let mut script = bytes_of("read_file\"");
-    script.extend(bytes_of("a\\\"b\"")); // a \ " b "  → closes only at the final "
+    script.extend(bytes_of(" \"a\\\"b\"")); // " a \ " b "  → closes only at the final "
     let run = simulate(tree, &v, Oracle::Scripted(script), 2000).unwrap();
     let text = run.text(&v);
     let parsed: serde_json::Value = serde_json::from_str(json_body(&text)).unwrap();
     assert_eq!(parsed["arguments"]["path"], "a\"b");
+}
+
+/// **A skipped string value becomes an empty one, and the call stays JSON.**
+///
+/// The live failure: asked for an empty `prefix`, the model wrote the object's
+/// closer `}}` where the value belonged. That was swallowed as string content
+/// with the call's own close after it, the block did not parse, and the turn
+/// ended silently. Now the closer is dropped, the grammar writes ` ""`, and the
+/// model decides again at the optional gate — where it closes the call.
+#[test]
+fn a_skipped_string_value_is_written_empty() {
+    let v = TestVocab::new();
+    let tree = tree_of(&three_tool_catalog(), &v);
+    let mut script = bytes_of("write_file\"");
+    script.extend(bytes_of("}")); // where the value belonged — dropped
+    script.extend(bytes_of("}}\n</tool_call>")); // the gate: close the call
+    let run = simulate(tree, &v, Oracle::Scripted(script), 2000).unwrap();
+    let text = run.text(&v);
+    let parsed: serde_json::Value = serde_json::from_str(json_body(&text))
+        .unwrap_or_else(|e| panic!("not JSON ({e}): {text:?}"));
+    assert_eq!(parsed["arguments"]["path"], "");
+}
+
+/// **The empty string Qwen writes as one token drives to `""`.** With the
+/// opening quote the model's, ` ""` is an ordinary value rather than a token
+/// the grammar has already ruled out.
+#[test]
+fn an_empty_string_token_yields_an_empty_value() {
+    let v = TestVocab::new().with_special(" \"\"", 300);
+    let tree = tree_of(&three_tool_catalog(), &v);
+    let mut script = bytes_of("write_file\"");
+    script.push(300); // ` ""`
+    script.extend(bytes_of("}}\n</tool_call>"));
+    let run = simulate(tree, &v, Oracle::Scripted(script), 2000).unwrap();
+    let text = run.text(&v);
+    let parsed: serde_json::Value = serde_json::from_str(json_body(&text))
+        .unwrap_or_else(|e| panic!("not JSON ({e}): {text:?}"));
+    assert_eq!(parsed["arguments"]["path"], "");
+    assert_eq!(run.healed_bytes, 0, "a clean exit, not a repair");
 }
 
 // ── Construction equivalence (builder == yaml for the same grammar) ──────────
@@ -340,12 +558,12 @@ fn every_tool_path_yields_valid_json() {
 
     let mut scripts: Vec<Vec<TokenId>> = Vec::new();
     // read_file
-    scripts.push([bytes_of("read_file\""), bytes_of("x\"")].concat());
+    scripts.push([bytes_of("read_file\""), bytes_of(" \"x\"")].concat());
     // write_file, create skipped
     scripts.push(
         [
             bytes_of("write_file\""),
-            bytes_of("y\""),
+            bytes_of(" \"y\""),
             bytes_of("}}\n</tool_call>"),
         ]
         .concat(),
@@ -354,7 +572,7 @@ fn every_tool_path_yields_valid_json() {
     scripts.push(
         [
             bytes_of("write_file\""),
-            bytes_of("y\""),
+            bytes_of(" \"y\""),
             bytes_of(", \"create\":"),
             bytes_of("false"),
             bytes_of("}}\n</tool_call>"),

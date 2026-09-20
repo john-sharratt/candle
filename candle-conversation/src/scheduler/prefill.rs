@@ -1657,6 +1657,27 @@ impl Scheduler {
         // never be placed and failed identically on every retry, after first
         // stripping the expert cache to its floor trying.
         let cap = self.max_prefill_pass_tokens;
+        // ── A prompt past the model's RoPE reach fails alone ─────────────────
+        //
+        // Its headers would be refused, and the refusal would fail every other
+        // member of the forward with it. Refused here instead, before it joins.
+        let reach = self.session.rope_reach();
+        for p in self.active_prefills.iter_mut() {
+            if p.error.is_some() || p.final_logits.is_some() {
+                continue;
+            }
+            let at = self
+                .session
+                .sequence_offset(p.work.sequence_id.0)
+                .unwrap_or(0);
+            let end = at + p.work.tokens.len().saturating_sub(p.offset);
+            if end > reach {
+                p.error = Some(ConversationError::Other(format!(
+                    "this turn's prompt reaches position {end}, past the {reach} the model's \
+                     RoPE schedule supports"
+                )));
+            }
+        }
         let mut members: Vec<WaveMember> = Vec::new();
         let mut prefill_tokens = 0usize;
         for p in &self.active_prefills {
@@ -2647,6 +2668,28 @@ impl Scheduler {
             .sequence_offset(work.sequence_id.0)
             .unwrap_or(token_count);
 
+        // **The turn decodes no further than the model's RoPE reaches.** Its
+        // N generated tokens and the trailing structural tokens forwarded at
+        // the seal all take positions past `context_depth`, and a header past
+        // the schedule's last ceiling is refused — for the whole wave it rides
+        // in. So a turn that would outgrow the reach ends where it runs out, as
+        // one that spent its budget, and the rest of the wave never sees it.
+        let room = self
+            .session
+            .rope_reach()
+            .saturating_sub(context_depth + work.post_decode_tokens.len());
+        if work.max_decode_tokens > room {
+            tracing::warn!(
+                seq_id = work.sequence_id.0,
+                context_depth,
+                budget = work.max_decode_tokens,
+                room,
+                reach = self.session.rope_reach(),
+                "turn budget capped at the model's RoPE reach",
+            );
+            work.max_decode_tokens = room;
+        }
+
         // Decode-start line: the effective sampling config this conversation turn
         // will decode under. Confirms empirically whether a turn is stochastic
         // (temp>0 + top_k/top_p) or greedy (temp≈0 → argmax), and at what context
@@ -3458,6 +3501,46 @@ mod wave_chunk_tests {
             seqs,
             vec![a.0, b.0],
             "the third would carry the pass past the cap"
+        );
+    }
+
+    /// **A prompt past the model's RoPE reach fails alone.** Its headers would
+    /// be refused and take the whole forward with them; instead it is errored
+    /// before the group forms, and a prompt that fits rides as usual.
+    #[test]
+    fn a_prompt_past_the_rope_reach_fails_alone() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        scheduler
+            .session
+            .set_rope_ceilings(vec![64])
+            .expect("ceilings");
+        let fits = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let over = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(fits, vec![1; 64]));
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(over, vec![1; 65]));
+
+        scheduler.form_wave_group(false);
+        let seqs: Vec<usize> = scheduler
+            .wave_prefill_members
+            .iter()
+            .map(|m| m.seq_id())
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![fits.0],
+            "only the prompt that fits joins the group"
+        );
+        assert!(scheduler.active_prefills[0].error.is_none());
+        assert!(
+            matches!(
+                &scheduler.active_prefills[1].error,
+                Some(ConversationError::Other(m)) if m.contains("65") && m.contains("64")
+            ),
+            "the prompt past the reach carries its own error"
         );
     }
 }

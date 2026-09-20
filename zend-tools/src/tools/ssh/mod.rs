@@ -51,7 +51,7 @@ use std::io::Read;
 
 use thiserror::Error;
 
-use crate::ToolError;
+use crate::{NotPermitted, ToolError};
 
 pub mod close;
 pub mod exec;
@@ -93,6 +93,8 @@ pub enum SshError {
     DeniedByUser,
     #[error("concurrency cap exceeded")]
     ConcurrencyCapExceeded,
+    #[error(transparent)]
+    NotPermitted(#[from] NotPermitted),
 }
 
 impl ToolError for SshError {
@@ -109,6 +111,7 @@ impl ToolError for SshError {
             SshError::SessionLimitExceeded => "session_limit_exceeded",
             SshError::DeniedByUser => "denied_by_user",
             SshError::ConcurrencyCapExceeded => "concurrency_cap_exceeded",
+            SshError::NotPermitted(_) => NotPermitted::CODE,
         }
     }
 }

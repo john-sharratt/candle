@@ -210,6 +210,7 @@ mod resolver;
 mod schema;
 mod score;
 mod selection;
+pub mod warm_pool;
 mod yaml;
 
 #[cfg(test)]
@@ -241,7 +242,7 @@ pub use project::{
     GeneratedIdentity, GroupKey, OptionalState, PriorBelief, Projection, ProjectionMode,
     ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedSelection, ResolvedTurn,
     SealedKind, SelectionState, FORCE_TOOL_SELECTOR, FORCE_TOOL_SEPARATOR, NO_THINK_SELECTOR,
-    TOOLS_ENABLED_SELECTOR,
+    TOOLS_ENABLED_SELECTOR, TOOL_ROUND_SELECTOR,
 };
 pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};
 pub use resolver::{CollectionWarm, Conversation, Observe, SectionLoads, TargetedRead};

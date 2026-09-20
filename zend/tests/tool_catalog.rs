@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use candle_conversation::projection::{self, SystemPromptItem};
 use zend::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool, run_tool_calls,
-    ToolCall, ToolResult,
+    Dispatch, ToolCall, ToolResult,
 };
 use zend_tools::{registry, ToolContext};
 
@@ -136,8 +136,13 @@ fn install_tool_catalog_returns_section_ids_in_registry_order() {
     );
 }
 
-/// `file_read` and `file_list` are marked mandatory on the `tools` collection,
-/// so they project on every turn on top of the belief top-k.
+/// The file tools — `file_search`, `file_grep`, `file_read`, `file_list` and
+/// `write` — and the two web tools are marked mandatory on the `tools`
+/// collection, so they project on every turn on top of the belief top-k.
+/// Finding is in the set alongside reading because a turn holding only the read
+/// pair answers "where is this" by guessing, `write` because the edit tool
+/// cannot create a file, and the web pair because a tool shown only by name is
+/// one the model concludes it does not have.
 #[test]
 fn install_tool_catalog_marks_the_mandatory_tools() {
     let mut builder = build_test_projection();
@@ -149,7 +154,18 @@ fn install_tool_catalog_marks_the_mandatory_tools() {
         .map(|(n, _, _)| n.as_str())
         .collect();
     names.sort();
-    assert_eq!(names, ["file_list", "file_read"]);
+    assert_eq!(
+        names,
+        [
+            "file_grep",
+            "file_list",
+            "file_read",
+            "file_search",
+            "web_fetch",
+            "web_search",
+            "write"
+        ]
+    );
 }
 
 #[test]
@@ -386,7 +402,7 @@ fn run_tool_calls_dispatches_each_in_order() {
             arguments: json!({"expression": "1 + 1"}),
         },
     ];
-    let results = run_tool_calls(&ctx, calls);
+    let results = run_tool_calls(&ctx, calls, Dispatch::Live);
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].call.name, "datetime");
     assert_eq!(results[1].call.name, "calculator");

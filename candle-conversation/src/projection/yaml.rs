@@ -569,6 +569,10 @@ struct YamlLayer {
     /// default in the ingest driver; non-ingest layers ignore it.
     #[serde(default)]
     ingest_unit: Option<String>,
+    /// Whether the layer's turns project into tool rounds — see
+    /// [`LayerSchema::in_tool_rounds`]. Omitted → `true`.
+    #[serde(default)]
+    in_tool_rounds: Option<bool>,
     /// The layer's place in the visibility stack — see [`LayerSchema::rank`].
     /// Omitted → its declaration index.
     #[serde(default)]
@@ -1065,6 +1069,7 @@ fn build(
             decode_priority: yl.decode_priority.into(),
             on_corrupt_turn: yl.on_corrupt_turn.into(),
             ingest_unit: yl.ingest_unit.clone(),
+            in_tool_rounds: yl.in_tool_rounds.unwrap_or(true),
             // Its declaration index unless it says otherwise — the stack every
             // schema had before a layer could declare its place in it.
             rank: yl.rank.unwrap_or(layers.len() as i32),

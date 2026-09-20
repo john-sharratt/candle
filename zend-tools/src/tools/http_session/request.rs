@@ -8,7 +8,7 @@ use validator::Validate;
 
 use super::HttpSessionError;
 use crate::tools::web_fetch::is_private_url;
-use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
+use crate::{ConfirmationDetails, RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ReqRequest {
@@ -66,6 +66,17 @@ impl Tool for HttpSessionRequest {
     type Request = ReqRequest;
     type Response = ReqResponse;
     type Error = HttpSessionError;
+
+    /// The retrieving verbs may be re-issued; the rest would do a second time
+    /// whatever the first request did at the far end. The same split
+    /// [`Self::confirmation`] makes, for the same reason.
+    fn replay(req: &ReqRequest) -> Replay {
+        let method = req.method.as_deref().unwrap_or("GET").to_uppercase();
+        match method.as_str() {
+            "GET" | "HEAD" | "OPTIONS" => Replay::Safe,
+            _ => Replay::Unsafe,
+        }
+    }
 
     fn confirmation(req: &ReqRequest) -> Option<ConfirmationDetails> {
         let method = req.method.as_deref().unwrap_or("GET").to_uppercase();

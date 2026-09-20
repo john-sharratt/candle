@@ -87,7 +87,6 @@ using fused_attn::load_b_frag_n8k32_ldmatrix;
 using fused_attn::mma_int8_m16n8k32;
 
 // Per-element staging/decoding helpers shared with the INT8 tile decode kernel.
-using int8_elem::i8_rope_cs;
 using int8_elem::i8_apply_rope;
 using int8_elem::qt_to_f32;
 using int8_elem::qt_from_f32;
@@ -175,8 +174,7 @@ paged_prefill_int8_kernel(
     int n_head,
     int n_kv_head,
     float softmax_scale,
-    const uint32_t* __restrict__ rope_offsets,
-    const float* __restrict__ rope_cs,
+    const RopeRungs rungs,
     int rope_interleaved,               // 0 = half-split pairing, 1 = interleaved (LLaMA)
     // Split-KV: grid.z = batch_size × num_splits. Shard s of a sequence
     // processes tiles (sealed AND fresh — one shared ordinal space) with
@@ -218,6 +216,9 @@ paged_prefill_int8_kernel(
     if (batch_idx >= batch_size || kv_head_idx >= n_kv_head) return;
 
     const SlotHeader& slot_hdr = get_slot_header(headers_ptr, batch_idx);
+    // The sequence's own rung: a block never spans two sequences, so nothing
+    // rung-dependent here is shared with another sequence's rows.
+    const RopeView rope = rope_view(rungs, slot_hdr.rope_rung);
 
     const int q_start = (int)cu_seqlens_q[batch_idx];
     const int q_len = (int)q_lens[batch_idx];
@@ -232,7 +233,6 @@ paged_prefill_int8_kernel(
     const int rows_used = block_m_tok * hpg; // ≤ I8_M_ROWS; rows beyond are idle
     const int t0 = (int)blockIdx.x * block_m_tok;
     if (t0 >= q_len) return;
-    const uint32_t rope_base = rope_offsets[batch_idx];
     const int first_q_head = kv_head_idx * hpg;
 
     // ------------------------------------------------------------------
@@ -362,8 +362,8 @@ paged_prefill_int8_kernel(
             const QT* qrow = q + ((int64_t)(q_start + tok) * n_head + head) * HEAD_DIM;
             #pragma unroll
             for (int w = 0; w < N_WIN; ++w) x[w] = qt_to_f32<QT>(qrow[lane + 32 * w]);
-            int pos = prefix_len + tok + (int)rope_base;
-            i8_apply_rope<HEAD_DIM, N_WIN>(x, pos, lane, rope_interleaved, rope_cs);
+            int pos = prefix_len + tok;
+            i8_apply_rope<HEAD_DIM, N_WIN>(x, pos, lane, rope_interleaved, rope.for_q());
         } else {
             #pragma unroll
             for (int w = 0; w < N_WIN; ++w) x[w] = 0.f;
@@ -603,7 +603,7 @@ paged_prefill_int8_kernel(
                 }
             }
             if (pos < kv_len)
-                i8_apply_rope<HEAD_DIM, N_WIN>(x, pos + (int)rope_base, lane, rope_interleaved, rope_cs);
+                i8_apply_rope<HEAD_DIM, N_WIN>(x, pos, lane, rope_interleaved, rope);
             #pragma unroll
             for (int w = 0; w < N_WIN; ++w) {
                 float a = fabsf(x[w]);
@@ -919,8 +919,7 @@ inline void launch_paged_prefill_int8(
     int32_t n_kv_head,
     int32_t max_q_len,
     float softmax_scale,
-    const uint32_t* rope_offsets,
-    const float* rope_cs,
+    const RopeRungs rungs,
     int32_t rope_interleaved,
     cudaStream_t stream,
     QsaSel sel = {nullptr, nullptr, nullptr, nullptr, 0, 1}
@@ -1006,7 +1005,7 @@ inline void launch_paged_prefill_int8(
         (const QT*)q_ptr, (const QT*)k_ptr, (const QT*)v_ptr,
         headers_ptr, cu_seqlens_q, q_lens, kv_lens,
         (QT*)o_ptr, (int)batch_size, (int)n_head, (int)n_kv_head,
-        softmax_scale, rope_offsets, rope_cs, (int)rope_interleaved,
+        softmax_scale, rungs, (int)rope_interleaved,
         num_splits, partials, sel);
 
     if (num_splits > 1) {

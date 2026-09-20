@@ -1,7 +1,7 @@
 //! Replay + benchmark of a captured paged-prefill kernel call.
 //!
-//! Loads a bincode `PrefillCapture` fixture (produced by `ZEND_PREFILL_CAPTURE`
-//! and trimmed to its largest slot via the `trim_prefill_fixture` example),
+//! Loads a bincode `PrefillCapture` fixture (trimmed to its largest slot via
+//! the `trim_prefill_fixture` example),
 //! rebuilds the cached KV prefix into a fresh `ChunkedKvBacking`, and replays
 //! the exact `paged_prefill_batched` call — then NaN/inf-checks the output and
 //! benchmarks the kernel under a bounded wall-time budget (multiple runs to
@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 use candle::quantized::pinned_staging::PinnedStager;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{ChunkedKvBacking, HostSealedChunk, KvCache, KvFormat};
-use candle_transformers::models::prefill_capture::PrefillCapture;
+use candle_transformers::models::prefill_capture::{PrefillCapture, SlotCapture};
 use candle_transformers::models::prefill_utils::paged_prefill_batched;
+use candle_transformers::models::rope_schedule::{RopeRungs, RopeSchedule};
 
 fn qkv_dtype(tag: u8) -> DType {
     match tag {
@@ -33,9 +34,7 @@ fn qkv_dtype(tag: u8) -> DType {
 /// new tokens; we drop those so `paged_prefill_batched` allocates + writes its
 /// own writer region (matching the real forward), rather than re-injecting
 /// empty chunks as sealed.
-fn prefix_host_chunks(
-    slot: &candle_transformers::models::prefill_capture::SlotCapture,
-) -> Vec<HostSealedChunk> {
+fn prefix_host_chunks(slot: &SlotCapture) -> Vec<HostSealedChunk> {
     slot.chunks
         .iter()
         .filter(|c| c.token_count > 0)
@@ -192,7 +191,7 @@ fn prefill_replay_runs_and_benchmarks() -> Result<()> {
         )?
     };
 
-    // ── Rebuild q/k/v + RoPE tensors ───────────────────────────────────────
+    // ── Rebuild q/k/v + RoPE rungs ─────────────────────────────────────────
     let total_q: usize = cap.slots.iter().map(|s| s.q_len).sum();
     let q = Tensor::from_vec(cap.q.clone(), (total_q, n_head, head_dim), &device)?
         .to_dtype(qkv_dt)?
@@ -203,8 +202,7 @@ fn prefill_replay_runs_and_benchmarks() -> Result<()> {
     let v = Tensor::from_vec(cap.v.clone(), (total_q, n_kv_head, head_dim), &device)?
         .to_dtype(qkv_dt)?
         .contiguous()?;
-    let rope_offsets = Tensor::from_vec(cap.rope_offsets.clone(), b_sz, &device)?;
-    let rope_cs = Tensor::from_vec(cap.rope_cs.clone(), (cap.rope_cs_rows, head_dim), &device)?;
+    let rope = RopeRungs::new(&RopeSchedule::stated(cap.inv_freq(), usize::MAX)?, &device)?;
 
     let offsets: Vec<usize> = cap.slots.iter().map(|s| s.offset).collect();
     let q_lens: Vec<usize> = cap.slots.iter().map(|s| s.q_len).collect();
@@ -236,8 +234,7 @@ fn prefill_replay_runs_and_benchmarks() -> Result<()> {
             n_kv_head,
             head_dim,
             None,
-            &rope_offsets,
-            &rope_cs,
+            &rope,
             cap.rope_interleaved,
             &generation,
             &RefCell::new(None),

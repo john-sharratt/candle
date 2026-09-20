@@ -35,7 +35,10 @@ use crate::models::delta_net::LayerKind;
 use crate::models::delta_net::RecurrentStateStore;
 use crate::models::draft_ladder::DraftLadder;
 use crate::models::lora::Adapter;
+use crate::models::rope_schedule::{RopeRungs, RopeSchedule};
 use crate::models::rotary_layout::RotaryLayout;
+
+use super::rope::lineage_schedule;
 
 /// A loaded hybrid model of this lineage, ready to be driven by the scheduler.
 ///
@@ -69,20 +72,11 @@ pub struct HybridBatched {
     draft: DraftLadder,
     kv_map: KvLayerMap,
     rotary: RotaryLayout,
-    /// Inverse frequencies over the **rotary** width, not the head width.
-    ///
-    /// Carried because the attention parameters take one; the CUDA paged path
-    /// reads the interleaved table instead and never touches it, but a table
-    /// sized for the whole head would be a standing invitation to rotate 256
-    /// dims where only 64 turn.
-    inv_freq: Tensor,
-    /// The interleaved `[pos, head_dim]` `(cos, sin)` table the paged kernels
-    /// index, keyed by the arena's block count.
-    ///
-    /// Built once per geometry rather than per wave: it spans the whole
-    /// addressable context, so rebuilding it every forward would cost more
-    /// than the attention it feeds.
-    rope_cs: Mutex<Option<(usize, Tensor)>>,
+    /// The lineage's RoPE rungs (`super::rope`) over the **rotary** width: the
+    /// kernels read frequency `f < rope_dim / 2` from a slot's rung and treat
+    /// every later one as pass-through, which is where [`RotaryLayout`] puts
+    /// the head's non-rotary dims.
+    rope: RopeRungs,
     /// Provenance capture depths, snapped onto layers that actually attend.
     provenance: ProvenanceLayerIndices,
     /// Per-sequence recurrent state, keyed by the scheduler's sequence id.
@@ -148,12 +142,7 @@ impl HybridBatched {
             );
         }
         let rotary = RotaryLayout::new(model.cfg.attn_head_dim, model.cfg.rope_dim, &model.device)?;
-        let theta = model.cfg.rope_theta;
-        let rope_dim = model.cfg.rope_dim;
-        let inv: Vec<f32> = (0..rope_dim / 2)
-            .map(|j| 1f32 / theta.powf(2.0 * j as f32 / rope_dim as f32))
-            .collect();
-        let inv_freq = Tensor::from_vec(inv, (rope_dim / 2,), &model.device)?;
+        let rope = RopeRungs::new(&lineage_schedule(&model.cfg)?, &model.device)?;
         let provenance = provenance_layer_indices(&model.cfg, &kv_map).ok_or_else(|| {
             candle::Error::Msg(
                 "qwen35: no attention layers, so no provenance can be captured".into(),
@@ -166,8 +155,7 @@ impl HybridBatched {
             draft,
             kv_map,
             rotary,
-            inv_freq,
-            rope_cs: Mutex::new(None),
+            rope,
             provenance,
             recurrent: Mutex::new(HashMap::new()),
             verify_rows: Mutex::new(Vec::new()),
@@ -350,31 +338,25 @@ impl HybridBatched {
         }
     }
 
-    /// Inverse frequencies over the rotary width.
-    pub fn inv_freq_device(&self) -> &Tensor {
-        &self.inv_freq
+    /// The lineage's RoPE rungs, which every paged kernel rotates from.
+    pub fn rope(&self) -> &RopeRungs {
+        &self.rope
     }
 
-    /// The interleaved `(cos, sin)` table covering `max_blocks × CHUNK_SIZE`
-    /// positions, built once and reused while the geometry holds.
-    pub fn rope_cs(&self, max_blocks: usize) -> Result<Tensor> {
-        let mut slot = self
-            .rope_cs
-            .lock()
-            .map_err(|_| candle::Error::Msg("qwen35: rope_cs lock poisoned".into()))?;
-        if let Some((blocks, table)) = slot.as_ref() {
-            if *blocks == max_blocks {
-                return Ok(table.clone());
-            }
+    /// Run `schedule` in place of the lineage's — the control a long-context
+    /// gate measures the lineage's rungs against (`docs/progressive_yarn.md`
+    /// §10). Nothing stored depends on a rung (I1), so a session opened after
+    /// this simply reads the new tables. The rotary width must be the model's.
+    pub fn set_rope_schedule(&mut self, schedule: &RopeSchedule) -> Result<()> {
+        if schedule.pairs() != self.rope.pairs() {
+            candle::bail!(
+                "qwen35: a {}-pair schedule on a {}-pair rotary width",
+                schedule.pairs(),
+                self.rope.pairs()
+            );
         }
-        let table = self.rotary.rope_table(
-            max_blocks * candle_nn::CHUNK_SIZE,
-            self.model.cfg.rope_theta,
-            DType::F32,
-            &self.model.device,
-        )?;
-        *slot = Some((max_blocks, table.clone()));
-        Ok(table)
+        self.rope = RopeRungs::new(schedule, &self.model.device)?;
+        Ok(())
     }
 
     /// Let the elastic boundary grow into ground the weight side is no longer
@@ -1267,7 +1249,8 @@ impl HybridBatched {
         // per-model property added to that struct lands there and is silently
         // dropped here — a new field looks wired, builds clean, and simply never
         // reaches this model. Extend both when adding one.
-        let session = create_session(&self.model.cfg, &self.model.device, config)?;
+        let mut session = create_session(&self.model.cfg, &self.model.device, config)?;
+        session.set_rope_ceilings(self.rope.ceilings().to_vec())?;
         self.maybe_change_dtype(session.activation_dtype(), session.kv_live_dtype())?;
         Ok(session)
     }

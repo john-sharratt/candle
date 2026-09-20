@@ -6,8 +6,14 @@ whenever what is actually running differs from what is written here. If this fil
 running process disagree, the process is the fact and this file is corrected.
 
 Secrets are not in this file and never go in it: the gateway's sign-in config is
-`web/secrets/auth.yaml` (gitignored, on the gateway only) and the DNS updater's Cloudflare
-token is `D:\prog\cf-ddns\.env`.
+`web/secrets/auth.yaml` (gitignored, on the gateway only), zend's tool API keys are
+`secrets/tools.yaml` at the repository root (gitignored; the Tavily key for `web_search`),
+and the DNS updater's Cloudflare token is `D:\prog\cf-ddns\.env`.
+
+Every one of those paths has a `secrets` segment, and that is load-bearing rather than
+tidy: zend's `file_*` tools resolve a path straight to disk and never consult `.gitignore`,
+so `VfsStore` refuses any path containing that segment. A secret kept anywhere else in the
+workspace is readable by the model.
 
 ## Topology
 

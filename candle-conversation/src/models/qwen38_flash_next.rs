@@ -35,7 +35,7 @@
 //! and reports the prepare step instead of asking the hub for a filename nobody
 //! published.
 
-use super::{ModelArch, ModelSpec};
+use super::{ModelArch, ModelSpec, RopePreset};
 use crate::{config::SamplingConfig, models::DialectType};
 use candle_transformers::models::quantized_qwen38_moe;
 
@@ -91,6 +91,7 @@ pub(super) fn qwen38_flash_next_q4ko() -> ModelSpec {
         // `qwen4exp.context_length` in the merged engine GGUF, and backed:
         // the depth gate runs 32K and 128K at the same bulk rate.
         max_seq_len: 262_144,
+        rope: RopePreset::Lineage,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen2moe"),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen2moe"),

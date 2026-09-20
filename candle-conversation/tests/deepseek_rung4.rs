@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use candle_conversation::models::{Model, ModelArch, ModelSpec};
+use candle_conversation::models::{Model, ModelArch, ModelSpec, RopePreset};
 use candle_conversation::SamplingConfig;
 use candle_transformers::models::dialect::{Dialect, DialectType};
 
@@ -82,6 +82,7 @@ fn deepseek_spec(model_path: &std::path::Path) -> ModelSpec {
         tokenizer_rev: String::new(),
         default_system_prompt: "You are a concise, factual assistant.".to_string(),
         max_seq_len: 4096,
+        rope: RopePreset::Lineage,
         default_sampling: SamplingConfig::argmax(),
         supports_thinking: true,
         non_thinking_sampling: None,

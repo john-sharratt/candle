@@ -25,7 +25,8 @@ questions:
 - create an empty module file for me
 - overwrite the existing file with this version
 category: Files
-description: 'Create a new file or overwrite an existing one. The result is held in this session only — a project file of the same path is shadowed, never modified on disk. Use for: drafting code, writing notes, saving intermediate output the model wants to reference later, creating files the user will download or transfer, replacing a file''s full content. Triggered by "create a file", "save this as", "write to", "put this in a file called", "make a file with". Returns path, byte count, and whether the file was newly created vs overwritten. For partial edits use file_edit; for pushing files to a real remote system use remote_fs_session_put.'
+mandatory: true
+description: 'Create a new file or overwrite an existing one — the tool for any file that does not exist yet. Unless the conversation''s tools mode writes to disk, the result is held in this session: a project file of the same path is shadowed, not modified. Use for: drafting code, writing notes, saving intermediate output the model wants to reference later, creating files the user will download or transfer, replacing a file''s full content. Triggered by "create a file", "save this as", "write to", "put this in a file called", "make a file with". Returns path, byte count, and whether the file was newly created vs overwritten. For partial edits use file_edit; for pushing files to a real remote system use remote_fs_session_put.'
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -34,7 +35,7 @@ parameters:
       description: Full file content to write, replacing any existing content. Required.
       type: string
     path:
-      description: Path to create or overwrite (e.g. `src/main.rs`). The result is held in this session; a project file of the same path is shadowed, never modified on disk. Required.
+      description: Path to create or overwrite (e.g. `src/main.rs`). Missing parent directories are created. Required.
       minLength: 1
       type: string
   required:

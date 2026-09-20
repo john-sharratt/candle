@@ -12,7 +12,7 @@
 //! the Qwen3.5 architecture and shares its metadata keys and tensor schema, so
 //! both load through the same [`ModelArch::Qwen35Hybrid`] arm.
 
-use super::{ModelArch, ModelSpec, TensorOverrideSpec};
+use super::{ModelArch, ModelSpec, RopePreset, TensorOverrideSpec};
 use crate::config::{ModeSampling, SamplingConfig};
 use crate::models::DialectType;
 use candle_transformers::models::quantized_qwen36_moe;
@@ -71,6 +71,7 @@ pub(super) fn qwen36_35b_a3b_q4() -> ModelSpec {
         tokenizer_rev: quantized_qwen36_moe::TOKENIZER_REV.into(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 4096,
+        rope: RopePreset::Lineage,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen2moe"),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen2moe"),
@@ -159,6 +160,7 @@ pub(super) fn qwen36_35b_a3b_antiloop_styletune() -> ModelSpec {
         // Room for a character's history: the assembled prompt is large before
         // any of it, as it is for the dense 9B.
         max_seq_len: 8192,
+        rope: RopePreset::Lineage,
         default_sampling: SamplingConfig::for_gguf_architecture(ARCH).with_mode_sampling(modes),
         supports_thinking: true,
         // The think-off config keeps its mode, so taking the pair adopts the instruct half.

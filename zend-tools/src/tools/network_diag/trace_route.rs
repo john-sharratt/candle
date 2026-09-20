@@ -4,17 +4,20 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::{extract_ip, extract_rtt, DiagError};
+use super::{extract_ip, extract_rtt, host_argument, DiagError};
+use crate::exec;
 use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct TraceRequest {
     /// Hostname or IP address to trace the route to.
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1, max = 253))]
     pub host: String,
-    /// Maximum number of hops to probe. Defaults to 30.
+    /// Maximum number of hops to probe (1-64). Defaults to 30.
+    #[validate(range(min = 1, max = 64))]
     pub max_hops: Option<u32>,
-    /// Per-hop probe timeout in seconds. Uses the OS default if omitted.
+    /// Per-hop probe timeout in seconds (1-60). Uses the OS default if omitted.
+    #[validate(range(min = 1, max = 60))]
     pub timeout_sec: Option<u32>,
 }
 
@@ -46,32 +49,39 @@ impl Tool for TraceRoute {
     type Response = TraceResponse;
     type Error = DiagError;
 
-    fn run(_ctx: &ToolContext, req: TraceRequest) -> Result<TraceResponse, DiagError> {
+    fn run(ctx: &ToolContext, req: TraceRequest) -> Result<TraceResponse, DiagError> {
         let max_hops = req.max_hops.unwrap_or(30);
+        let host = host_argument(&req.host)?;
 
         // tracert takes the per-hop wait in milliseconds (-w); traceroute takes it
         // in seconds (-w). Only pass it when the caller specified one.
         #[cfg(target_os = "windows")]
-        let output = {
-            let mut cmd = std::process::Command::new("tracert");
+        let cmd = {
+            let mut cmd = exec::command(ctx.grants(), "tracert")
+                .map_err(|e| DiagError::Failed(e.to_string()))?;
             cmd.args(["-h", &max_hops.to_string()]);
             if let Some(t) = req.timeout_sec {
                 cmd.args(["-w", &(t * 1000).to_string()]);
             }
-            cmd.arg(&req.host).output()
+            cmd
         };
 
         #[cfg(not(target_os = "windows"))]
-        let output = {
-            let mut cmd = std::process::Command::new("traceroute");
+        let cmd = {
+            let mut cmd = exec::command(ctx.grants(), "traceroute")
+                .map_err(|e| DiagError::Failed(e.to_string()))?;
             cmd.args(["-m", &max_hops.to_string()]);
             if let Some(t) = req.timeout_sec {
                 cmd.args(["-w", &t.to_string()]);
             }
-            cmd.arg(&req.host).output()
+            cmd
         };
 
-        let output = output.map_err(|e| DiagError::Failed(e.to_string()))?;
+        let mut cmd = cmd;
+        let output = cmd
+            .arg(host)
+            .output()
+            .map_err(|e| DiagError::Failed(e.to_string()))?;
         let raw = String::from_utf8_lossy(&output.stdout).into_owned();
 
         let hops = parse_traceroute(&raw);
@@ -108,3 +118,29 @@ fn parse_traceroute(output: &str) -> Vec<HopInfo> {
 }
 
 pub const TRACE_ROUTE: RegisteredTool = RegisteredTool::new::<TraceRoute>();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(host: &str, max_hops: Option<u32>, timeout_sec: Option<u32>) -> TraceRequest {
+        TraceRequest {
+            host: host.to_string(),
+            max_hops,
+            timeout_sec,
+        }
+    }
+
+    /// The hop count and per-hop wait stay inside what the OS tools accept, and
+    /// `timeout_sec × 1000` (tracert's milliseconds) cannot overflow.
+    #[test]
+    fn hops_and_timeout_are_bounded() {
+        assert!(req("1.1.1.1", Some(64), Some(60)).validate().is_ok());
+        assert!(req("1.1.1.1", Some(65), None).validate().is_err());
+        assert!(req("1.1.1.1", Some(0), None).validate().is_err());
+        assert!(req("1.1.1.1", None, Some(61)).validate().is_err());
+        assert!(req("1.1.1.1", None, Some(0)).validate().is_err());
+        assert!(req("1.1.1.1", None, Some(4_294_968)).validate().is_err());
+        assert!(req(&"a".repeat(254), None, None).validate().is_err());
+    }
+}

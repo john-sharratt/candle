@@ -33,7 +33,7 @@ use candle_conversation::persistence::transfer::load_turn_into_hot;
 use candle_conversation::persistence::SubstratePersistence;
 use candle_conversation::substrate::Substrate;
 use candle_nn::kv_cache::ChunkedKvBacking;
-use candle_transformers::models::prefill_utils::compute_rope_cs;
+use candle_transformers::models::rope_schedule::{RopeRungs, RopeSchedule};
 
 /// Directory containing `substrate.log`, or `None` to skip.
 pub fn substrate_dir() -> Option<std::path::PathBuf> {
@@ -153,19 +153,12 @@ pub fn case_for_layer(
         .map(|c| c.len())
         .unwrap_or(0);
 
-    // Production-like RoPE table sized to cover prefix + q.
+    // Production-like RoPE: plain θ = 1e6, one rung at every length.
     let theta = 1e6f64;
     let inv_freq: Vec<f32> = (0..HEAD_DIM / 2)
         .map(|i| (1.0 / theta.powf(2.0 * i as f64 / HEAD_DIM as f64)) as f32)
         .collect();
-    let inv_freq = Tensor::from_vec(inv_freq, HEAD_DIM / 2, device)?;
-    let blocks = (rec.prefix_len + q_len).div_ceil(32) + 2;
-    let rope_cs = compute_rope_cs(&inv_freq, blocks, HEAD_DIM, device)?;
-    let rope_cs_host = rope_cs
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()?;
-    let rope_offsets = Tensor::zeros(1, DType::U32, device)?;
+    let rope = RopeRungs::new(&RopeSchedule::stated(inv_freq, usize::MAX)?, device)?;
 
     let mut rng = Rng::new(seed);
     let spec = Scenario {
@@ -207,9 +200,7 @@ pub fn case_for_layer(
         new_q,
         new_k,
         new_v,
-        rope_cs_host,
-        rope_cs,
-        rope_offsets,
+        rope,
         q_dev,
         k_dev,
         v_dev,

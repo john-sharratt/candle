@@ -1,6 +1,6 @@
 //! ip_scan tool.
 
-use std::net::TcpStream;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use schemars::JsonSchema;
@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::DiagError;
+use crate::net::{self, NetError};
 use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
@@ -45,14 +46,15 @@ impl Tool for IpScan {
     type Response = IpScanResponse;
     type Error = DiagError;
 
-    fn run(_ctx: &ToolContext, req: IpScanRequest) -> Result<IpScanResponse, DiagError> {
+    fn run(ctx: &ToolContext, req: IpScanRequest) -> Result<IpScanResponse, DiagError> {
         let timeout = Duration::from_millis(req.timeout_ms.unwrap_or(200));
+        let grants = ctx.grants();
 
         let parts: Vec<&str> = req.subnet.split('/').collect();
         if parts.len() != 2 {
             return Err(DiagError::Failed("invalid CIDR notation".to_string()));
         }
-        let base_ip: std::net::Ipv4Addr = parts[0]
+        let base_ip: Ipv4Addr = parts[0]
             .parse()
             .map_err(|e| DiagError::Failed(format!("invalid IP: {e}")))?;
         let prefix_len: u8 = parts[1]
@@ -65,15 +67,24 @@ impl Tool for IpScan {
             ));
         }
 
-        let host_bits = 32u32.saturating_sub(prefix_len as u32);
-        let num_hosts = (1u32 << host_bits).min(254);
-        let base_u32 = u32::from(base_ip) & !((1u32 << host_bits) - 1);
+        if prefix_len > 32 {
+            return Err(DiagError::Failed("prefix length is above 32".to_string()));
+        }
+        // In u64: a /0 prefix is 32 host bits, and `1u32 << 32` overflows.
+        let host_bits = 32 - u32::from(prefix_len);
+        let span = 1u64 << host_bits;
+        let num_hosts = span.min(254) as u32;
+        let base_u32 = (u64::from(u32::from(base_ip)) & !(span - 1)) as u32;
 
         let mut hosts = Vec::new();
         for i in 1..num_hosts {
-            let ip = std::net::Ipv4Addr::from(base_u32 + i);
-            let addr: std::net::SocketAddr = format!("{}:80", ip).parse().unwrap();
-            let alive = TcpStream::connect_timeout(&addr, timeout).is_ok();
+            let ip = Ipv4Addr::from(base_u32.wrapping_add(i));
+            let addr = SocketAddr::new(ip.into(), 80);
+            let alive = match net::tcp_connect(grants, &addr, Some(timeout)) {
+                Ok(_) => true,
+                Err(NetError::NotPermitted(e)) => return Err(DiagError::Failed(e.to_string())),
+                Err(_) => false,
+            };
             hosts.push(HostAlive {
                 ip: ip.to_string(),
                 alive,

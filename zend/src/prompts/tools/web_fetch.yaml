@@ -25,6 +25,7 @@ questions:
 - retrieve the README from this GitHub URL
 - fetch and clean up the content at this address
 category: Utilities & web
+mandatory: true
 description: 'Fetch a single public web page or document by URL and return its main content as cleaned text. Use for: reading a specific article the user linked, retrieving documentation pages, pulling content from a known URL, getting context about a page the user mentioned. Triggered by "read this page", "fetch the article at", "what does this URL say", "open this link", "get me the content of", "summarise this page", or the user pasting a URL. Returns title, cleaned body text, final URL after redirects, and a truncated flag. Use web_search when the URL is not yet known. Use http_session_* for authenticated API calls or operations needing cookies/auth state.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

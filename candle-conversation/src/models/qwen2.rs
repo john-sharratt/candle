@@ -6,7 +6,7 @@
 //!
 //! Source: <https://huggingface.co/Qwen/Qwen2-0.5B-Instruct/raw/main/generation_config.json>
 
-use super::{ModelArch, ModelSpec};
+use super::{ModelArch, ModelSpec, RopePreset};
 use crate::{config::SamplingConfig, models::DialectType};
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -36,6 +36,7 @@ pub(super) fn qwen2_0_5b() -> ModelSpec {
         tokenizer_rev: String::new(),
         default_system_prompt: "You are a helpful assistant.".into(),
         max_seq_len: 4096,
+        rope: RopePreset::FileStated,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen2"),
         supports_thinking: false,
         non_thinking_sampling: None,

@@ -48,6 +48,7 @@
 //! - Fork supported from day 1 (CoW pages via `fork_sequence`)
 //! - Append-only cold store for persistence
 
+mod banned_rows;
 mod batched_sampler;
 mod cancel;
 mod config;
@@ -59,6 +60,7 @@ mod error;
 pub mod guest;
 mod handle;
 pub mod index_pages;
+mod line_ends;
 pub mod models;
 pub mod narrator;
 pub mod normalization;
@@ -107,7 +109,8 @@ pub use engine::{ConversationEngine, SubstrateReloadStatus, ThinkSteering};
 pub use error::ConversationError;
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
 pub use projection::{
-    BucketKind, OptionalState, ProjectionBucket, ProjectionEvent, SelectionState, NO_THINK_SELECTOR,
+    BucketKind, OptionalState, ProjectionBucket, ProjectionEvent, SelectionState,
+    NO_THINK_SELECTOR, TOOL_ROUND_SELECTOR,
 };
 pub use recovered_message::RecoveredMessage;
 pub use scheduler::branch_checkpoint_counts;

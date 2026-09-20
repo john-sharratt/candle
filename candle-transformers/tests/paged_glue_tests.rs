@@ -29,7 +29,8 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
     quantize_sealed_in_place, ChunkedKvBacking, CompressionPolicy, KvCache, KvFormat, CHUNK_SIZE,
 };
-use candle_transformers::models::prefill_utils::compute_rope_cs;
+use candle_transformers::models::rope_schedule::{RopeRungs, RopeSchedule};
+use candle_transformers::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
 use candle_transformers::models::slot_state::{
     tensor_u8_device_ptr, SlotStateHost, TokenSliceHost,
 };
@@ -88,6 +89,15 @@ fn make_qkv(n_tokens: usize, seed: u64, device: &Device) -> Result<(Tensor, Tens
     let k = Tensor::from_vec(k, (n_tokens, N_KV_HEAD, HEAD_DIM), device)?;
     let v = Tensor::from_vec(v, (n_tokens, N_KV_HEAD, HEAD_DIM), device)?;
     Ok((q, k, v))
+}
+
+/// Identity RoPE: one rung of all-zero frequencies, so every position rotates
+/// by `(cos, sin) = (1, 0)` and the kernel's re-RoPE at read is a no-op.
+fn identity_rope(device: &Device) -> Result<RopeRungs> {
+    RopeRungs::new(
+        &RopeSchedule::stated(vec![0.0f32; HEAD_DIM / 2], usize::MAX)?,
+        device,
+    )
 }
 
 /// Pure-tensor f32 reference: plain causal GQA attention of the glue queries
@@ -307,7 +317,7 @@ fn run_glue(
     k: &Tensor,
     v: &Tensor,
     glue: usize,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
     device: &Device,
     // Per glue token: forward bridge window (tokens). `0` == backward-only
@@ -405,12 +415,15 @@ fn run_glue(
     let kv_lens = Tensor::from_vec(vec![kv_len as u32], 1, device)?;
     let fwd_ahead_t = Tensor::from_vec(fwd_ahead.to_vec(), glue.max(1), device)?;
 
-    // 24-byte SlotHeader.
-    let mut hdr = Vec::with_capacity(24);
-    hdr.extend_from_slice(&(slot.slices.len() as u32).to_le_bytes());
-    hdr.extend_from_slice(&slot.write_slice.to_le_bytes());
-    hdr.extend_from_slice(&slices_ptr.to_le_bytes());
-    hdr.extend_from_slice(&pm_ptr.to_le_bytes());
+    let mut hdr = Vec::with_capacity(SLOT_HEADER_BYTES);
+    SlotHeaderHost {
+        n_slices: slot.slices.len() as u32,
+        write_slice: slot.write_slice,
+        slices_ptr,
+        position_map_ptr: pm_ptr,
+        rope_rung: 0,
+    }
+    .write(&mut hdr);
     let generation = stager.begin_generation();
     let mut pinned = generation.alloc(hdr.len())?;
     pinned.copy_from_slice(&hdr);
@@ -429,6 +442,7 @@ fn run_glue(
         _ => candle::bail!("cuda only"),
     };
     let stream_ptr = stream.cu_stream() as *mut std::ffi::c_void;
+    let rungs = rope.ffi()?;
 
     device.synchronize()?;
     let t_kernel = std::time::Instant::now();
@@ -447,16 +461,7 @@ fn run_glue(
             softmax_scale,
             dev_ptr_f16(&kf)? as *const std::ffi::c_void,
             dev_ptr_f16(&vf)? as *const std::ffi::c_void,
-            {
-                let (s, l) = rope_cs.storage_and_layout();
-                let c = match &*s {
-                    candle::Storage::Cuda(c) => c,
-                    _ => candle::bail!("cuda"),
-                };
-                let sl = c.as_cuda_slice::<f32>()?.slice(l.start_offset()..);
-                let (p, _g) = sl.device_ptr(&stream);
-                p as *const f32
-            },
+            rungs,
             0,
             dev_ptr_u32(&cu_seqlens_q)? as *const u32,
             dev_ptr_u32(&q_lens)? as *const u32,
@@ -574,8 +579,7 @@ fn paged_glue_matches_normal_prefill_f16() -> Result<()> {
         }
     };
     let stager = PinnedStager::new_from_device(&device);
-    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, &device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, &device)?;
+    let rope = identity_rope(&device)?;
 
     let cases: &[(usize, usize)] = &[(4, 1), (20, 8), (32, 5), (7, 12), (64, 16), (100, 20)];
     let mut failures = Vec::new();
@@ -603,7 +607,7 @@ fn paged_glue_matches_normal_prefill_f16() -> Result<()> {
             &k_glue,
             &v_glue,
             glue,
-            &rope_cs,
+            &rope,
             &stager,
             &device,
             &vec![0u32; glue],
@@ -643,8 +647,7 @@ fn paged_glue_fwd_ahead_f16() -> Result<()> {
         }
     };
     let stager = PinnedStager::new_from_device(&device);
-    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, &device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, &device)?;
+    let rope = identity_rope(&device)?;
 
     // (sealed, glue, fwd_ahead). Contiguous positions: sealed [0,sealed), glue
     // [sealed, sealed+glue). Token `t` (pos sealed+t) with window `w` attends
@@ -671,7 +674,7 @@ fn paged_glue_fwd_ahead_f16() -> Result<()> {
         let mut cache = bind_cache(&backing, 0)?;
         build_sealed_arena(&backing, &mut cache, &k_seal, &v_seal, sealed)?;
         let (out, _ms) = run_glue(
-            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device, fwd,
+            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope, &stager, &device, fwd,
         )?;
 
         let diff = max_abs_diff(&out, &out_ref)?;
@@ -710,8 +713,7 @@ fn paged_glue_kernel_timing() -> Result<()> {
         }
     };
     let stager = PinnedStager::new_from_device(&device);
-    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, &device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, &device)?;
+    let rope = identity_rope(&device)?;
     let policy = CompressionPolicy::new(5); // mid compression (realistic reproject)
     let hpg = N_HEAD / N_KV_HEAD;
 
@@ -730,7 +732,7 @@ fn paged_glue_kernel_timing() -> Result<()> {
             &k_glue,
             &v_glue,
             glue,
-            &rope_cs,
+            &rope,
             &stager,
             &device,
             &vec![0u32; glue],
@@ -780,8 +782,7 @@ fn paged_glue_matches_golden_quant() -> Result<()> {
         }
     };
     let stager = PinnedStager::new_from_device(&device);
-    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, &device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, &device)?;
+    let rope = identity_rope(&device)?;
     let policy = CompressionPolicy::new(0); // near-lossless (C0)
     const QUANT_TOL: f32 = 6e-2;
 
@@ -806,7 +807,7 @@ fn paged_glue_matches_golden_quant() -> Result<()> {
             &k_glue,
             &v_glue,
             glue,
-            &rope_cs,
+            &rope,
             &stager,
             &device,
             &vec![0u32; glue],
@@ -951,7 +952,7 @@ fn run_glue_batched(
         usize,
         Vec<u32>,
     )],
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<Vec<Tensor>> {
@@ -961,7 +962,7 @@ fn run_glue_batched(
         builds.push(build_glue_slot(backing, cache, *glue, device)?);
     }
 
-    let mut hdr = Vec::with_capacity(b * 24);
+    let mut hdr = Vec::with_capacity(b * SLOT_HEADER_BYTES);
     let mut cu = vec![0u32];
     let mut q_lens_v: Vec<u32> = Vec::with_capacity(b);
     let mut kv_lens_v: Vec<u32> = Vec::with_capacity(b);
@@ -970,10 +971,14 @@ fn run_glue_batched(
     let mut fwd_v: Vec<u32> = Vec::new();
     let mut acc = 0u32;
     for (i, sb) in builds.iter().enumerate() {
-        hdr.extend_from_slice(&sb.n_slices.to_le_bytes());
-        hdr.extend_from_slice(&sb.write_slice.to_le_bytes());
-        hdr.extend_from_slice(&sb.slices_ptr.to_le_bytes());
-        hdr.extend_from_slice(&sb.pm_ptr.to_le_bytes());
+        SlotHeaderHost {
+            n_slices: sb.n_slices,
+            write_slice: sb.write_slice,
+            slices_ptr: sb.slices_ptr,
+            position_map_ptr: sb.pm_ptr,
+            rope_rung: 0,
+        }
+        .write(&mut hdr);
         acc += sb.glue as u32;
         cu.push(acc);
         q_lens_v.push(sb.glue as u32);
@@ -1015,6 +1020,7 @@ fn run_glue_batched(
         _ => candle::bail!("cuda only"),
     };
     let stream_ptr = stream.cu_stream() as *mut std::ffi::c_void;
+    let rungs = rope.ffi()?;
     device.synchronize()?;
     unsafe {
         candle_kernels::paged_glue::run_paged_glue_fp16(
@@ -1031,16 +1037,7 @@ fn run_glue_batched(
             softmax_scale,
             dev_ptr_f16(&kf)? as *const std::ffi::c_void,
             dev_ptr_f16(&vf)? as *const std::ffi::c_void,
-            {
-                let (s, l) = rope_cs.storage_and_layout();
-                let c = match &*s {
-                    candle::Storage::Cuda(c) => c,
-                    _ => candle::bail!("cuda"),
-                };
-                let sl = c.as_cuda_slice::<f32>()?.slice(l.start_offset()..);
-                let (pp, _g) = sl.device_ptr(&stream);
-                pp as *const f32
-            },
+            rungs,
             0,
             dev_ptr_u32(&cu_seqlens_q)? as *const u32,
             dev_ptr_u32(&q_lens)? as *const u32,
@@ -1081,8 +1078,7 @@ fn paged_glue_batched_isolation_f16() -> Result<()> {
         }
     };
     let stager = PinnedStager::new_from_device(&device);
-    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, &device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, &device)?;
+    let rope = identity_rope(&device)?;
 
     let conv: &[(usize, usize, Vec<u32>, u64)] = &[
         (20, 6, vec![0, 2, 0, 0, 1, 0], 0xA11CE),
@@ -1097,7 +1093,7 @@ fn paged_glue_batched_isolation_f16() -> Result<()> {
         let mut cache = bind_cache(&backing, 0)?;
         build_sealed_arena(&backing, &mut cache, &k_seal, &v_seal, sealed)?;
         let (out, _) = run_glue(
-            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device, fwd,
+            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope, &stager, &device, fwd,
         )?;
         alone.push(out);
     }
@@ -1131,7 +1127,7 @@ fn paged_glue_batched_isolation_f16() -> Result<()> {
         .iter_mut()
         .map(|(b, c, q, k, v, g, f)| (&*b, c, q.clone(), k.clone(), v.clone(), *g, f.clone()))
         .collect();
-    let batched = run_glue_batched(&mut refs, &rope_cs, &stager, &device)?;
+    let batched = run_glue_batched(&mut refs, &rope, &stager, &device)?;
 
     let mut failures = Vec::new();
     for (i, (a, bt)) in alone.iter().zip(batched.iter()).enumerate() {
@@ -1170,8 +1166,7 @@ fn paged_glue_split_kv_matches_reference_f16() -> Result<()> {
         }
     };
     let stager = PinnedStager::new_from_device(&device);
-    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, &device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, &device)?;
+    let rope = identity_rope(&device)?;
 
     let cases: &[(usize, usize, &[u32])] = &[
         // 2206 columns -> 3 windows; mixed causal + bridging rows.
@@ -1195,7 +1190,7 @@ fn paged_glue_split_kv_matches_reference_f16() -> Result<()> {
         let mut cache = bind_cache(&backing, 0)?;
         build_sealed_arena(&backing, &mut cache, &k_seal, &v_seal, sealed)?;
         let (out, _ms) = run_glue(
-            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device, fwd,
+            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope, &stager, &device, fwd,
         )?;
 
         let diff = max_abs_diff(&out, &out_ref)?;
@@ -1239,8 +1234,7 @@ fn paged_glue_split_kv_batched_isolation_f16() -> Result<()> {
         }
     };
     let stager = PinnedStager::new_from_device(&device);
-    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, &device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, &device)?;
+    let rope = identity_rope(&device)?;
 
     let conv: &[(usize, usize, Vec<u32>, u64)] = &[
         (2200, 5, vec![0, 2, 0, 1, 0], 0xDEE9),
@@ -1255,7 +1249,7 @@ fn paged_glue_split_kv_batched_isolation_f16() -> Result<()> {
         let mut cache = bind_cache(&backing, 0)?;
         build_sealed_arena(&backing, &mut cache, &k_seal, &v_seal, sealed)?;
         let (out, _) = run_glue(
-            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device, fwd,
+            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope, &stager, &device, fwd,
         )?;
         alone.push(out);
     }
@@ -1289,7 +1283,7 @@ fn paged_glue_split_kv_batched_isolation_f16() -> Result<()> {
         .iter_mut()
         .map(|(b, c, q, k, v, g, f)| (&*b, c, q.clone(), k.clone(), v.clone(), *g, f.clone()))
         .collect();
-    let batched = run_glue_batched(&mut refs, &rope_cs, &stager, &device)?;
+    let batched = run_glue_batched(&mut refs, &rope, &stager, &device)?;
 
     let mut failures = Vec::new();
     for (i, (a, bt)) in alone.iter().zip(batched.iter()).enumerate() {

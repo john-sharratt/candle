@@ -9,6 +9,7 @@
 //! `turn_sink`); tool orchestration (`tools`, `tool_def`, `tool_summary`);
 //! conversation-attached files (`conv_files`, `conv_file_store`); and shared
 //! wire types (`types`, `response_section`).
+pub mod access;
 pub mod api;
 pub mod chatml;
 pub mod code_read;
@@ -30,14 +31,18 @@ pub mod projection_event;
 pub mod raw_read;
 pub mod reasoning_split;
 pub mod refresh_ctx;
+pub mod repeat_guard;
 pub mod repo_scan;
 pub mod response_section;
+pub mod resume;
 pub mod session;
 pub mod think_budget;
 pub mod think_gate;
 pub mod think_progress;
 pub mod tool_call_split;
 pub mod tool_def;
+pub mod tool_guidance;
+pub mod tool_round;
 pub mod tool_summary;
 pub mod tools;
 pub mod turn_sink;

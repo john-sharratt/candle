@@ -24,9 +24,9 @@ use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
 use super::batched_model::{BatchedModelCore, WaveShapes};
 use super::dense_span;
 use super::kv_cache_utils::{new_kv_caches, KvCaches, SequenceContext};
-use super::llama_rope::llama_inv_freq;
 use super::profile::gpu_span_phase;
 use super::quantized_mlp::QuantizedMlp;
+use super::rope_schedule::{from_rope_freqs, llama_inv_freq};
 use super::rope_tables::CisPrecomputations;
 use super::{decode_utils, quantized_matmul::QMatMul};
 use crate::models::batched_layer::WaveRef;
@@ -61,6 +61,35 @@ pub const MAX_ROPE_SEQ_LEN: usize = 0;
 pub const ROPE_EXTEND_CHUNK: usize = 1024;
 
 type SharedCis = Arc<RwLock<CisPrecomputations>>;
+
+/// The tensor in which llama.cpp's converter writes Llama3 RoPE scaling: one
+/// divisor per rotary pair.
+const ROPE_FREQS: &str = "rope_freqs.weight";
+
+/// The RoPE frequencies this file states.
+///
+/// **`rope_freqs.weight` first.** llama.cpp writes Llama3 scaling only as that
+/// tensor, never as metadata keys, so a loader reading the keys alone runs a
+/// Llama3-scaled model on plain RoPE — wrong at every position, since the
+/// scaling divides the low-frequency pairs everywhere. Without the tensor, the
+/// scaling keys, when all four are present, and plain RoPE otherwise.
+fn stated_inv_freq(
+    rope_dim: usize,
+    freq_base: f32,
+    scaling_keys: Option<Llama3RopeConfig>,
+    rope_freqs: Option<QTensor>,
+) -> Result<Vec<f32>> {
+    match rope_freqs {
+        Some(t) => {
+            let factors = t
+                .dequantize(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            from_rope_freqs(rope_dim, freq_base, &factors)
+        }
+        None => Ok(llama_inv_freq(rope_dim, freq_base, scaling_keys)),
+    }
+}
 
 // One per layer for the model's lifetime, and matched on in the forward path —
 // a `Box` would add a pointer chase to every FFN to save a few hundred bytes.
@@ -867,7 +896,11 @@ impl ModelWeights {
             }
         };
 
-        let inv_freq = llama_inv_freq(rope_dim, rope_freq_base, rope_scaling);
+        let rope_freqs = match ct.tensor_infos.contains_key(ROPE_FREQS) {
+            true => Some(ct.tensor(reader, ROPE_FREQS, &Device::Cpu)?),
+            false => None,
+        };
+        let inv_freq = stated_inv_freq(rope_dim, rope_freq_base, rope_scaling, rope_freqs)?;
         let cis: SharedCis = Arc::new(RwLock::new(CisPrecomputations::new_growable_with_inv_freq(
             inv_freq,
             MAX_ROPE_SEQ_LEN,
@@ -1125,7 +1158,11 @@ impl ModelWeights {
             }
         };
 
-        let inv_freq = llama_inv_freq(rope_dim, rope_freq_base, rope_scaling);
+        let rope_freqs = match ct.tensor_infos.get(ROPE_FREQS) {
+            Some(info) => Some(info.read_from_mmap(&mmap, ct.tensor_data_offset, &Device::Cpu)?),
+            None => None,
+        };
+        let inv_freq = stated_inv_freq(rope_dim, rope_freq_base, rope_scaling, rope_freqs)?;
         let cis: SharedCis = Arc::new(RwLock::new(CisPrecomputations::new_growable_with_inv_freq(
             inv_freq,
             MAX_ROPE_SEQ_LEN,
@@ -1252,7 +1289,7 @@ impl ModelWeights {
     /// Get the RoPE inv_freq values for use with BatchedInference wrapper.
     ///
     /// This returns the custom inv_freq computed during model loading (which may include
-    /// rope scaling). Use this with `BatchedInference::new_with_inv_freq()`.
+    /// rope scaling) — the file-stated frequencies a `RopeSchedule` is built over.
     pub fn rope_inv_freq(&self) -> Option<Vec<f32>> {
         self.layers
             .first()
@@ -1438,9 +1475,33 @@ mod tests {
     use crate::model_overrides::{self, Checkpoint};
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
     use crate::models::batched_inference::InferenceMode;
+    use crate::models::batched_model::BatchedInference;
     use crate::models::dialect::Dialect;
+    use crate::models::rope_schedule::RopeSchedule;
     #[allow(unused_imports)]
     use candle_nn::kv_cache::CacheIntegrityResult;
+
+    /// Llama 3's declared window, which its `rope_freqs.weight` scaling reaches.
+    const LLAMA3_CONTEXT: usize = 131_072;
+
+    /// A Llama checkpoint wrapped for batched inference on the frequencies its
+    /// file states — Llama 3 scaling from `rope_freqs.weight`, plain for Llama
+    /// 2 — to its declared `context_length`.
+    fn batched(
+        model: ModelWeights,
+        context_length: usize,
+        device: &Device,
+    ) -> Result<BatchedInference<ModelWeights>> {
+        let inv = model
+            .rope_inv_freq()
+            .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
+        BatchedInference::new_with_schedule(
+            model,
+            &RopeSchedule::stated(inv, context_length)?,
+            4096,
+            device,
+        )
+    }
 
     /// The Llama-3.2-3B checkpoint these gates run against.
     ///
@@ -1505,7 +1566,6 @@ mod tests {
     #[ignore]
     fn llama_decode_is_reproducible() -> Result<()> {
         use crate::models::batch_test::utils::decode_reproducibility;
-        use crate::models::batched_model::BatchedInference;
 
         let Ok(device) = Device::new_cuda(0) else {
             eprintln!("[skip] no CUDA device");
@@ -1524,10 +1584,7 @@ mod tests {
             }
         };
         let weights = ModelWeights::from_gguf_by_path_v3(&model_path, &device)?;
-        let inv_freq = weights
-            .rope_inv_freq()
-            .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-        let model = BatchedInference::new_with_inv_freq(weights, inv_freq, 4096, &device)?;
+        let model = batched(weights, LLAMA3_CONTEXT, &device)?;
 
         // Fixed pseudo-token ids: only identical input across passes matters.
         let ids: Vec<u32> = (0..24u32).map(|i| (i * 37 + 11) % 2000 + 5).collect();
@@ -2117,12 +2174,7 @@ mod tests {
             },
         ];
 
-        // Create a logits processor for sampling
-        // Use BatchedInference wrapper type
-        use crate::models::batched_model::BatchedInference;
-
         // Sequential (non-batched) callbacks - access inner model via .model()
-        // Loads the model wrapped in BatchedInference with proper inv_freq
         // Default to the production weight-twin selection (`Int8Mode::auto` —
         // Precision on int8-MMA GPUs): the C-ladder validates KV-cache
         // compression, so the weight error must not consume the error budget.
@@ -2143,12 +2195,7 @@ mod tests {
             let model =
                 ModelWeights::from_gguf_by_path_with_int8_v3(&model_path, &device, int8mode)?;
             println!("✓ Model loaded\n");
-            // Get the custom inv_freq (includes rope scaling if configured)
-            let inv_freq = model
-                .rope_inv_freq()
-                .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-            // Wrap with BatchedInference using the model's actual inv_freq
-            BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+            batched(model, LLAMA3_CONTEXT, &device)
         };
 
         params.with_int8mode(int8mode).run(configs, load_model)?;
@@ -2156,20 +2203,77 @@ mod tests {
         Ok(())
     }
 
-    /// **Depth on Llama-3.2-3B**: the batched forward at 8K of KV.
+    /// **Each Llama-3.2 file states its Llama3 scaling as `rope_freqs.weight`,
+    /// and the tensor is the published formula.** Llama 3.2 is trained with
+    /// factor 32 over a base window of 8,192 (low 1, high 4, θ 5e5); llama.cpp
+    /// writes that only as the tensor. Headers only — no weights, no device.
+    #[test]
+    #[ignore = "reads the cached Llama-3.2-3B GGUF headers (bartowski and Nidum). Run with: \
+                cargo test -p candle-transformers --lib \
+                quantized_llama::tests::llama3_files_state_their_scaling -- --ignored --nocapture"]
+    fn llama3_files_state_their_scaling() -> Result<()> {
+        let api = crate::models::batch_test::test_helpers::api()
+            .map_err(|e| candle::Error::Msg(format!("HF API: {e}")))?;
+        let files = [
+            (
+                "bartowski/Llama-3.2-3B-Instruct-GGUF",
+                "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+            ),
+            (
+                "VibeStudio/Nidum-Llama-3.2-3B-Uncensored-GGUF",
+                "model-Q4_K_M.gguf",
+            ),
+        ];
+        let published = Llama3RopeConfig {
+            factor: 32.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position_embeddings: 8192,
+            rope_type: Llama3RopeType::Llama3,
+        };
+        for (repo, file) in files {
+            let path = api
+                .model(repo.to_string())
+                .get(file)
+                .map_err(|e| candle::Error::Msg(format!("{repo}/{file}: {e}")))?;
+            let mut reader = std::fs::File::open(&path)?;
+            let ct = gguf_file::Content::read(&mut reader)?;
+            let rope_dim = ct.metadata["llama.rope.dimension_count"].to_u32()? as usize;
+            let base = ct.metadata["llama.rope.freq_base"].to_f32()?;
+            let t = ct
+                .tensor(&mut reader, ROPE_FREQS, &Device::Cpu)
+                .map_err(|e| {
+                    candle::Error::Msg(format!("{repo}/{file} carries no {ROPE_FREQS}: {e}"))
+                })?;
+            let got = stated_inv_freq(rope_dim, base, None, Some(t))?;
+            let want = llama_inv_freq(rope_dim, base, Some(published.clone()));
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= w * 1e-5,
+                    "{repo}/{file}: pair {i} states {g}, the published formula gives {w}"
+                );
+            }
+            println!(
+                "{repo}/{file}: {ROPE_FREQS} present, matches factor 32 / low 1 / high 4 / 8,192"
+            );
+        }
+        Ok(())
+    }
+
+    /// **Depth on Llama-3.2-3B**: the batched forward at 8K and 32K of KV.
     ///
     /// The non-Qwen control in the fleet — a different tokenizer, a different
-    /// rope configuration and classic GQA attention. Shallow because this
-    /// conversion ships no rope scaling, so 8,192 is the whole of what it can
-    /// address; see the note on the window argument below.
+    /// rope configuration and classic GQA attention. 32K is past Llama 3.2's
+    /// base window of 8,192, so it is reachable only through the Llama3 scaling
+    /// this file states as `rope_freqs.weight`
+    /// (`llama3_files_state_their_scaling`).
     #[test]
-    #[ignore = "downloads the Nidum-Llama-3.2-3B Q4_K_M GGUF and prefills its 8K window. \
+    #[ignore = "downloads the Nidum-Llama-3.2-3B Q4_K_M GGUF and prefills 8K and 32K. \
                 Run with: cargo test --release --features cuda -p candle-transformers --lib \
                 quantized_llama::tests::long_context_llama3 \
                 -- --ignored --nocapture --test-threads=1"]
     fn long_context_llama3() -> Result<()> {
         use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
-        use crate::models::batched_model::BatchedInference;
 
         let tokenizer_json = include_str!("quantized_llama_tokenizer.json");
         let api = crate::models::batch_test::test_helpers::api()
@@ -2185,23 +2289,20 @@ mod tests {
             int8mode,
             tokenizer_json,
             Dialect::llama3(),
-            // **Not** the 131,072 this GGUF's `llama.context_length` advertises.
-            // Llama 3.2 reaches 128K only through llama3 rope scaling — factor
-            // 32 over a base window of 8,192 — and this conversion ships none
-            // of it: no `rope.scaling.type`, no `factor`, no
-            // `original_context_length`. `from_gguf_by_path_with_int8_v3` reads
-            // exactly those keys, finds nothing, and builds plain RoPE at
-            // theta=500,000, whose trained extent is the base window. So the
-            // file declares 131,072 and supplies the machinery for 8,192; the
-            // smaller number is the one that describes what actually runs.
-            //
-            // Measured, not inferred: at 32K this checkpoint emits ". \n\n"
-            // repeated to the token limit, identically under BF16, C5 and C10.
-            8_192,
-            &[(
-                8_192,
-                &[InferenceMode::BF16, InferenceMode::C5, InferenceMode::C10][..],
-            )],
+            // The 131,072 this GGUF's `llama.context_length` declares. Llama 3.2
+            // reaches it through Llama3 scaling — factor 32 over a base window
+            // of 8,192 — which llama.cpp writes only as `rope_freqs.weight`.
+            // Read from the scaling keys alone, this file ran plain RoPE and at
+            // 32K emitted ". \n\n" to the token limit under BF16, C5 and C10;
+            // the 32K rung is the check that the tensor is what runs now.
+            LLAMA3_CONTEXT,
+            &[
+                (
+                    8_192,
+                    &[InferenceMode::BF16, InferenceMode::C5, InferenceMode::C10][..],
+                ),
+                (32_768, &[InferenceMode::BF16, InferenceMode::C5][..]),
+            ],
             1,
             64,
             DepthTask::Coherence,
@@ -2209,10 +2310,7 @@ mod tests {
             || {
                 let model =
                     ModelWeights::from_gguf_by_path_with_int8_v3(&model_path, &device, int8mode)?;
-                let inv_freq = model
-                    .rope_inv_freq()
-                    .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-                BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+                batched(model, LLAMA3_CONTEXT, &device)
             },
         )
     }
@@ -2377,12 +2475,7 @@ mod tests {
             },
         ];
 
-        // Create a logits processor for sampling
-        // Use BatchedInference wrapper type
-        use crate::models::batched_model::BatchedInference;
-
         // Sequential (non-batched) callbacks - access inner model via .model()
-        // Load the model wrapped in BatchedInference with proper inv_freq
         let int8mode = match std::env::var("INT8MODE").ok().as_deref() {
             Some("off") => candle::quantized::Int8Mode::Off,
             Some("prec") | Some("precision") => candle::quantized::Int8Mode::Precision,
@@ -2396,12 +2489,7 @@ mod tests {
             let model =
                 ModelWeights::from_gguf_by_path_with_int8_v2(&model_path, &device, int8mode)?;
             println!("✓ Llama 2 7B Chat model loaded\n");
-            // Get the custom inv_freq (includes rope scaling if configured)
-            let inv_freq = model
-                .rope_inv_freq()
-                .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-            // Wrap with BatchedInference using the model's actual inv_freq
-            BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+            batched(model, 4_096, &device)
         };
 
         params.with_int8mode(int8mode).run(configs, load_model)?;
@@ -2424,7 +2512,6 @@ mod tests {
                 -- --ignored --nocapture --test-threads=1"]
     fn long_context_llama2() -> Result<()> {
         use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
-        use crate::models::batched_model::BatchedInference;
 
         let api = crate::models::batch_test::test_helpers::api()
             .map_err(|e| candle::Error::Msg(format!("HF API: {e}")))?;
@@ -2465,10 +2552,7 @@ mod tests {
             || {
                 let model =
                     ModelWeights::from_gguf_by_path_with_int8_v3(&model_path, &device, int8mode)?;
-                let inv_freq = model
-                    .rope_inv_freq()
-                    .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-                BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+                batched(model, 4_096, &device)
             },
         )
     }
@@ -2481,7 +2565,6 @@ mod tests {
     mod kv_dump {
         use super::*;
         use crate::models::batched_inference::{BatchedConfig, ManagedBatchedModel};
-        use crate::models::batched_model::BatchedInference;
         use std::io::Write;
 
         /// Dump real KV cache data (K, V, Q) from Llama-3.2-3B for offline analysis.
@@ -2532,10 +2615,7 @@ mod tests {
             println!("Model path: {:?}", model_path);
 
             let raw = ModelWeights::from_gguf_by_path_v3(&model_path, &device)?;
-            let inv_freq = raw
-                .rope_inv_freq()
-                .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-            let model = BatchedInference::new_with_inv_freq(raw, inv_freq, 4096, &device)?;
+            let model = batched(raw, LLAMA3_CONTEXT, &device)?;
 
             let n_kv_head = model.n_kv_head();
             let head_dim = model.head_dim();
@@ -2707,7 +2787,6 @@ mod tests {
     #[ignore]
     fn test_r16_vs_f16_logits_comparison() -> Result<()> {
         use crate::models::batched_inference::{BatchedConfig, ManagedBatchedModel};
-        use crate::models::batched_model::BatchedInference;
 
         let device =
             Device::new_cuda(0).map_err(|e| candle::Error::Msg(format!("CUDA required: {}", e)))?;
@@ -2716,10 +2795,7 @@ mod tests {
         let model_path = llama3_2_3b_path()?;
 
         let raw = ModelWeights::from_gguf_by_path_v3(&model_path, &device)?;
-        let inv_freq = raw
-            .rope_inv_freq()
-            .ok_or_else(|| candle::Error::Msg("no inv_freq".into()))?;
-        let model = BatchedInference::new_with_inv_freq(raw, inv_freq, 4096, &device)?;
+        let model = batched(raw, LLAMA3_CONTEXT, &device)?;
         println!(
             "Model loaded: {} layers, {} kv-heads, hdim={}",
             model.num_layers(),

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::{normalize_algorithm, CryptoError};
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct HkdfExpandLabelRequest {
@@ -45,6 +45,11 @@ impl Tool for HkdfExpandLabel {
     type Request = HkdfExpandLabelRequest;
     type Response = HkdfExpandLabelResponse;
     type Error = CryptoError;
+
+    /// Pure cryptography over its arguments — no state and no I/O.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(
         _ctx: &ToolContext,

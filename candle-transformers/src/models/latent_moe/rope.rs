@@ -8,6 +8,8 @@
 
 use candle::{DType, Device, Result, Tensor, D};
 
+use crate::models::rope_schedule::yarn_freqs;
+
 /// Host-side RoPE for one `(rope_dim, theta, original_seq_len)` setting.
 ///
 /// Holds ONLY the YaRN-adjusted frequencies — `cos`/`sin` are computed per
@@ -22,37 +24,6 @@ pub struct RotaryCache {
     freqs: Vec<f64>,
     rope_dim: usize,
     device: Device,
-}
-
-/// The YaRN-adjusted inverse frequencies (`rope_dim / 2` values). When
-/// `original_seq_len == 0` YaRN is disabled and these are the plain RoPE
-/// frequencies `1 / theta^(2i/dim)`. This is the single source of truth — the
-/// [`RotaryCache`] tables and the paged kernels' in-kernel RoPE both derive
-/// from it.
-pub fn yarn_freqs(
-    rope_dim: usize,
-    theta: f64,
-    original_seq_len: usize,
-    factor: f64,
-    beta_fast: f64,
-    beta_slow: f64,
-) -> Vec<f64> {
-    let half = rope_dim / 2;
-    let mut freqs: Vec<f64> = (0..half)
-        .map(|i| 1.0 / theta.powf((2 * i) as f64 / rope_dim as f64))
-        .collect();
-
-    if original_seq_len > 0 {
-        let (low, high) =
-            RotaryCache::correction_range(beta_fast, beta_slow, rope_dim, theta, original_seq_len);
-        for (i, f) in freqs.iter_mut().enumerate() {
-            // smooth = 1 - ramp; interpolate between scaled (/factor) and raw freqs.
-            let ramp = RotaryCache::ramp(low, high, i);
-            let smooth = 1.0 - ramp;
-            *f = *f / factor * (1.0 - smooth) + *f * smooth;
-        }
-    }
-    freqs
 }
 
 impl RotaryCache {
@@ -101,29 +72,6 @@ impl RotaryCache {
         let cos = Tensor::from_vec(cos, (n, half), &self.device)?;
         let sin = Tensor::from_vec(sin, (n, half), &self.device)?;
         Ok((cos, sin))
-    }
-
-    fn correction_dim(num_rotations: f64, dim: usize, base: f64, max_seq: usize) -> f64 {
-        dim as f64 * ((max_seq as f64) / (num_rotations * 2.0 * std::f64::consts::PI)).ln()
-            / (2.0 * base.ln())
-    }
-
-    fn correction_range(
-        low_rot: f64,
-        high_rot: f64,
-        dim: usize,
-        base: f64,
-        max_seq: usize,
-    ) -> (f64, f64) {
-        let low = Self::correction_dim(low_rot, dim, base, max_seq).floor();
-        let high = Self::correction_dim(high_rot, dim, base, max_seq).ceil();
-        (low.max(0.0), high.min((dim - 1) as f64))
-    }
-
-    /// `linear_ramp_factor(min, max, dim)[i]`, clamped to `[0, 1]`.
-    fn ramp(min: f64, max: f64, i: usize) -> f64 {
-        let max = if min == max { max + 0.001 } else { max };
-        (((i as f64) - min) / (max - min)).clamp(0.0, 1.0)
     }
 
     /// Apply the rotation to the trailing `rope_dim` dims of `x` at the given contiguous

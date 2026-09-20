@@ -48,7 +48,6 @@ use crate::models::batched_inference::BatchedInferenceSession;
 use crate::models::delta_net::{
     DeltaNetConstants, DeltaNetDims, LayerKind, RecurrentStateStore, SpanOperands,
 };
-use crate::models::qwen35::attention::RopeTables;
 use crate::models::qwen35::spec::{replay_accepted_prefixes, ReplayLayer, StashSpan, VerifyStash};
 use candle_nn::kv_cache::vram_budget_available;
 
@@ -356,13 +355,6 @@ impl Qwen4ExpBatched {
                     indexer.push(i);
                 }
             }
-            let depth = idx_map
-                .values()
-                .flat_map(|c| c.iter())
-                .map(|c| c.capacity_blocks())
-                .max()
-                .unwrap_or(0);
-            let rope = self.index_rope_for(depth)?;
             for &(seq, kept) in &jobs {
                 let Some(stash) = cap.seqs.get(&seq) else {
                     continue;
@@ -378,7 +370,6 @@ impl Qwen4ExpBatched {
                     caches,
                     &ratios,
                     &indexer,
-                    &rope,
                     cfg.ple.conv_history(),
                     cfg.ple.ngram_size,
                     cfg.rms_norm_eps,
@@ -437,9 +428,9 @@ impl Qwen4ExpBatched {
 /// handled by the caller in one batched pass over the whole cohort — this is
 /// the per-sequence bookkeeping the other two need.
 // The rewind needs the stash, the cut, and then every piece of per-layer state
-// the replay has to advance again — PLE, index caches, ratios, indexer weights,
-// rope tables — plus the two window scalars. They are independent inputs to one
-// operation, not a bundle that travels together anywhere else.
+// the replay has to advance again — PLE, index caches, ratios, indexer weights —
+// plus the window scalars. They are independent inputs to one operation, not a
+// bundle that travels together anywhere else.
 #[allow(clippy::too_many_arguments)]
 pub fn rewind_row_state(
     stash: &SeqStash,
@@ -448,7 +439,6 @@ pub fn rewind_row_state(
     caches: &mut [IndexCache],
     ratios: &[usize],
     indexer: &[&IndexerWeights],
-    rope: &RopeTables,
     hist: usize,
     ngram: usize,
     eps: f64,
@@ -538,7 +528,7 @@ pub fn rewind_row_state(
                 start: 0,
                 rows: kept,
             }];
-            append_wave(&mut one, keys, w, rope, ratio, eps)?;
+            append_wave(&mut one, keys, w, ratio, eps)?;
         }
     }
     Ok(())

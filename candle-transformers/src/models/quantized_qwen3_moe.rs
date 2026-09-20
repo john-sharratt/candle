@@ -30,6 +30,7 @@ use super::kv_cache_utils::{new_kv_caches, KvCaches};
 use super::profile::{gpu_span, profile_now, ProfileMark};
 use super::quantized_matmul::QMatMul;
 use super::quantized_mlp::QuantizedMlp;
+use super::rope_schedule::DeclaredScaling;
 use super::rope_tables::CisPrecomputations;
 use crate::models::batched_layer::WaveRef;
 use crate::models::routing_capture;
@@ -67,14 +68,6 @@ pub const MAX_ROPE_SEQ_LEN: usize = 0;
 pub const ROPE_EXTEND_CHUNK: usize = 1024;
 
 type SharedCis = Arc<RwLock<CisPrecomputations>>;
-
-fn qwen_inv_freq(head_dim: usize, rope_theta: f32, rope_scaling_factor: Option<f32>) -> Vec<f32> {
-    let factor = rope_scaling_factor.unwrap_or(1.0);
-    (0..head_dim)
-        .step_by(2)
-        .map(|i| 1f32 / (factor * rope_theta.powf(i as f32 / head_dim as f32)))
-        .collect()
-}
 
 // ============================================================================
 // GGUF Reader Helper
@@ -120,15 +113,17 @@ struct RotaryEmbedding {
 }
 
 impl RotaryEmbedding {
+    /// The file's own RoPE: only a scaling it declares
+    /// (`docs/progressive_yarn.md` §2).
     fn new(
         _dtype: DType,
         head_dim: usize,
         _max_position_embeddings: usize,
         rope_theta: f64,
-        rope_scaling_factor: Option<f32>,
+        declared: DeclaredScaling,
         dev: &Device,
     ) -> Result<Self> {
-        let inv_freq = qwen_inv_freq(head_dim, rope_theta as f32, rope_scaling_factor);
+        let inv_freq = declared.inv_freq(head_dim, rope_theta as f32)?;
         Ok(Self {
             cis: Arc::new(RwLock::new(CisPrecomputations::new_growable_with_inv_freq(
                 inv_freq,
@@ -1456,8 +1451,7 @@ impl ModelWeights {
         let rope_freq_base =
             md_opt_f32(&format!("{p}.rope.freq_base")).unwrap_or(1_000_000f32) as f64;
 
-        let rope_scaling_factor =
-            md_opt_f32(&format!("{p}.rope.scaling.factor")).filter(|f| *f > 0.0 && *f != 1.0);
+        let declared = DeclaredScaling::from_gguf(gg.metadata(), &p)?;
 
         let n_expert = md_opt_u32(&format!("{p}.expert_count")).unwrap_or(1) as usize;
         let n_expert_used = md_opt_u32(&format!("{p}.expert_used_count")).unwrap_or(1) as usize;
@@ -1481,7 +1475,7 @@ impl ModelWeights {
             head_dim,
             max_position_embeddings,
             rope_freq_base,
-            rope_scaling_factor,
+            declared,
             device,
         )?);
 
@@ -1759,8 +1753,7 @@ impl ModelWeights {
             .or(hf_cfg.rope_theta)
             .unwrap_or(1_000_000.0);
 
-        let rope_scaling_factor =
-            md_opt_f32(&format!("{p}.rope.scaling.factor")).filter(|f| *f > 0.0 && *f != 1.0);
+        let declared = DeclaredScaling::from_gguf(&ct.metadata, &p)?;
 
         let n_expert = md_opt_u32(&format!("{p}.expert_count")).unwrap_or(1) as usize;
         let n_expert_used = md_opt_u32(&format!("{p}.expert_used_count")).unwrap_or(1) as usize;
@@ -1927,7 +1920,7 @@ impl ModelWeights {
             head_dim,
             max_position_embeddings,
             rope_freq_base,
-            rope_scaling_factor,
+            declared,
             device,
         )?);
 
@@ -2444,7 +2437,37 @@ mod tests {
     use super::*;
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
     use crate::models::batched_inference::InferenceMode;
+    #[cfg(feature = "cuda")]
+    use crate::models::batched_model::BatchedInference;
     use crate::models::dialect::Dialect;
+    #[cfg(feature = "cuda")]
+    use crate::models::rope_schedule::RopeSchedule;
+
+    /// The 2507 refresh's declared window, native to its θ = 10⁷.
+    #[cfg(feature = "cuda")]
+    const INSTRUCT_2507_CONTEXT: usize = 262_144;
+
+    /// A 30B-A3B checkpoint wrapped for batched inference on the frequencies
+    /// its file states, to `context_length`. The tests here stay inside the
+    /// trained window of whichever release they load, where every schedule is
+    /// the file's own RoPE.
+    #[cfg(feature = "cuda")]
+    fn batched(
+        model: ModelWeights,
+        context_length: usize,
+        max_seq_len: usize,
+        device: &Device,
+    ) -> Result<BatchedInference<ModelWeights>> {
+        let inv = model
+            .rope_inv_freq()
+            .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
+        BatchedInference::new_with_schedule(
+            model,
+            &RopeSchedule::stated(inv, context_length)?,
+            max_seq_len,
+            device,
+        )
+    }
 
     /// **Does Qwen3-MoE decode reproduce itself, run to run?**
     ///
@@ -2464,7 +2487,6 @@ mod tests {
     fn qwen3_moe_decode_is_reproducible() -> Result<()> {
         use crate::models::batch_test::test_helpers::hf_get;
         use crate::models::batch_test::utils::decode_reproducibility;
-        use crate::models::batched_model::BatchedInference;
 
         let Ok(device) = Device::new_cuda(0) else {
             eprintln!("[skip] no CUDA device");
@@ -2494,10 +2516,7 @@ mod tests {
                 expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
             },
         )?;
-        let inv_freq = weights
-            .rope_inv_freq()
-            .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-        let model = BatchedInference::new_with_inv_freq(weights, inv_freq, 4096, &device)?;
+        let model = batched(weights, INSTRUCT_2507_CONTEXT, 4096, &device)?;
 
         // Fixed pseudo-token ids: the text is irrelevant, only that every pass
         // sees the identical input, so no tokenizer download is needed.
@@ -2528,7 +2547,6 @@ mod tests {
     fn qwen3_moe_decode_replay_is_bitwise_repeatable() -> Result<()> {
         use crate::models::batch_test::test_helpers::hf_get;
         use crate::models::batch_test::utils::{decode_replay_probe, prefill_replay_probe};
-        use crate::models::batched_model::BatchedInference;
 
         let Ok(device) = Device::new_cuda(0) else {
             eprintln!("[skip] no CUDA device");
@@ -2555,10 +2573,7 @@ mod tests {
                 expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
             },
         )?;
-        let inv_freq = weights
-            .rope_inv_freq()
-            .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-        let model = BatchedInference::new_with_inv_freq(weights, inv_freq, 4096, &device)?;
+        let model = batched(weights, INSTRUCT_2507_CONTEXT, 4096, &device)?;
 
         let ids: Vec<u32> = (0..24u32).map(|i| (i * 37 + 11) % 2000 + 5).collect();
         let dirty_prefill = prefill_replay_probe(&model, &device, &ids, 6, "qwen3-moe")?;
@@ -2813,8 +2828,6 @@ mod tests {
             },
         ];
 
-        use crate::models::batched_model::BatchedInference;
-
         // Inference numeric mode for the whole model — dense projections AND MoE experts (KO
         // twins) — selected by the INT8MODE env var so a run picks a mode without recompiling.
         // Defaults to Performance (same-width KO int8); override with "off" (FP16 reference) or
@@ -2842,10 +2855,7 @@ mod tests {
                 },
             )?;
             println!("✓ Model loaded\n");
-            let inv_freq = model
-                .rope_inv_freq()
-                .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-            BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+            batched(model, INSTRUCT_2507_CONTEXT, 4096, &device)
         };
 
         params.with_int8mode(int8mode).run(configs, load_model)?;
@@ -2866,7 +2876,6 @@ mod tests {
     fn long_context_30b_a3b() -> Result<()> {
         use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
         use crate::models::batch_test::test_helpers::hf_get;
-        use crate::models::batched_model::BatchedInference;
 
         let tokenizer_path = hf_get(
             "Qwen/Qwen3-30B-A3B-Instruct-2507",
@@ -2893,7 +2902,7 @@ mod tests {
             Dialect::chat_ml(),
             // `qwen3moe.context_length` in the GGUF — the 2507 release is native
             // 262K, unlike the 32K original.
-            262_144,
+            INSTRUCT_2507_CONTEXT,
             // One shallow rung even though the window is wide: this is the
             // Qwen3-generation MoE, kept as the architectural comparison for
             // the Qwen3.5+ MoEs rather than as a depth subject of its own.
@@ -2915,10 +2924,7 @@ mod tests {
                         expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
                     },
                 )?;
-                let inv_freq = model
-                    .rope_inv_freq()
-                    .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-                BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+                batched(model, INSTRUCT_2507_CONTEXT, 4096, &device)
             },
         )
     }
@@ -2947,7 +2953,6 @@ mod tests {
             use crate::models::batched_inference::{
                 BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveResult,
             };
-            use crate::models::batched_model::BatchedInference;
 
             let device = match Device::new_cuda(0) {
                 Ok(d) => d,
@@ -2964,10 +2969,7 @@ mod tests {
             )
             .map_err(|e| candle::Error::Msg(format!("model download: {e}")))?;
             let raw = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
-            let inv_freq = raw
-                .rope_inv_freq()
-                .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-            let model = BatchedInference::new_with_inv_freq(raw, inv_freq, 4096, &device)?;
+            let model = batched(raw, INSTRUCT_2507_CONTEXT, 4096, &device)?;
             let mut session = model.create_batched_session(BatchedConfig::default())?;
             let n = model.num_layers();
 
@@ -3435,7 +3437,6 @@ mod tests {
         {
             use crate::models::batch_test::test_helpers::hf_get;
             use crate::models::batched_inference::{BatchedConfig, ManagedBatchedModel};
-            use crate::models::batched_model::BatchedInference;
 
             let device = match Device::new_cuda(0) {
                 Ok(d) => d,
@@ -3452,10 +3453,7 @@ mod tests {
             )
             .map_err(|e| candle::Error::Msg(format!("model download: {e}")))?;
             let raw = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
-            let inv_freq = raw
-                .rope_inv_freq()
-                .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-            let model = BatchedInference::new_with_inv_freq(raw, inv_freq, 4096, &device)?;
+            let model = batched(raw, INSTRUCT_2507_CONTEXT, 4096, &device)?;
             let mut session = model.create_batched_session(BatchedConfig::default())?;
             let mk = |t: &[u32]| -> Result<Tensor> { Tensor::new(t, &device)?.unsqueeze(0) };
 
@@ -3666,14 +3664,9 @@ mod tests {
                 })
                 .collect();
 
-            use crate::models::batched_model::BatchedInference;
-
             let load_model = || {
                 let model = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
-                let inv_freq = model
-                    .rope_inv_freq()
-                    .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-                BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+                batched(model, INSTRUCT_2507_CONTEXT, 4096, &device)
             };
 
             // Capture every config (each is a distinct prompt, tagged by index).
@@ -3729,7 +3722,6 @@ mod tests {
     mod kv_dump {
         use super::*;
         use crate::models::batched_inference::{BatchedConfig, ManagedBatchedModel};
-        use crate::models::batched_model::BatchedInference;
         use std::io::Write;
 
         /// Dump real KV cache data (K, V, Q) from Qwen3-30B-A3B MoE.
@@ -3794,10 +3786,7 @@ mod tests {
             println!("Model path: {:?}", model_path);
 
             let raw = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
-            let inv_freq = raw
-                .rope_inv_freq()
-                .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-            let model = BatchedInference::new_with_inv_freq(raw, inv_freq, 4096, &device)?;
+            let model = batched(raw, INSTRUCT_2507_CONTEXT, 4096, &device)?;
 
             let n_kv_head = model.n_kv_head();
             let head_dim = model.head_dim();
@@ -3975,8 +3964,6 @@ mod tests {
             run_ruler_benchmark, RulerBenchConfig, RulerDataSource, RulerTask, QWEN3_EOS_IDS,
         };
         use crate::models::batch_test::test_helpers::{download_hf_gguf, load_hf_tokenizer};
-        use crate::models::batched_inference::InferenceMode;
-        use crate::models::batched_model::BatchedInference;
 
         let tokenizer = load_hf_tokenizer("Qwen/Qwen3-30B-A3B-Instruct-2507")?;
         let device =
@@ -3988,10 +3975,7 @@ mod tests {
         )?;
         println!("Model path: {model_path:?}");
         let weights = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
-        let inv_freq = weights
-            .rope_inv_freq()
-            .ok_or_else(|| candle::Error::Msg("no inv_freq".into()))?;
-        let model = BatchedInference::new_with_inv_freq(weights, inv_freq, 32_768, &device)?;
+        let model = batched(weights, INSTRUCT_2507_CONTEXT, 32_768, &device)?;
         println!("✓ Model loaded");
 
         let cfg = RulerBenchConfig {

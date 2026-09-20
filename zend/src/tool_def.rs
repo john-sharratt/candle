@@ -6,7 +6,7 @@
 //! selection-calibration `examples`, and the plain-question `questions` seeds.
 //! These drive everything the prompt and calibration need — the tool catalog
 //! surfaced into the `tools` collection, the constrained-decode stencil, the
-//! safe-subset for Restricted mode, and the per-tool trajectories.
+//! subset each tools mode offers ([`names_for`]), and the per-tool trajectories.
 //!
 //! This is the definition half of the tool system, and the only half the model
 //! ever sees: the `description` and `parameters` here are what get rendered into
@@ -23,6 +23,10 @@ use std::sync::OnceLock;
 use include_dir::{include_dir, Dir};
 use serde::Deserialize;
 use serde_json::Value;
+use zend_tools::registry;
+
+use crate::access;
+use crate::types::ToolMode;
 
 /// The tool definitions, embedded at compile time. The `tools` collection in
 /// `prompts/projection.yaml` is filled from here.
@@ -46,7 +50,29 @@ pub struct ToolDef {
     /// Projected on every turn, outside the `tools` collection's top-k:
     /// provenance still selects its usual number of tools, and a mandatory one
     /// is added on top rather than taking a slot. For the tools a coding turn
-    /// needs whatever the question — reading and listing files.
+    /// needs whatever the question — finding a file, finding code inside one,
+    /// reading and listing, and creating one.
+    ///
+    /// `write` is in the set because the edit tool cannot create a file: a
+    /// "create scratch/x.py" turn that was projected `file_edit` but not `write`
+    /// spent ten calls patching a file that did not exist, then printed the code
+    /// and gave up.
+    ///
+    /// `web_search` and `web_fetch` are in it because a tool shown only by name
+    /// in the catalog listing is, to the model, not really there: asked to
+    /// "search the web and cite your source", a turn projected without
+    /// `web_search` reasoned that the tool was "only in the descriptions, not my
+    /// actual tool list" and answered that it could not search. Looking something
+    /// up is as ordinary a coding-assistant step as reading a file. A mode that
+    /// does not grant the network drops them with the rest of its exclusions.
+    ///
+    /// The find tools are there with reading and listing, not left out. A turn
+    /// that can only enumerate and read answers "where is this" by guessing a
+    /// directory at `file_list` and reading whole files to check, which is what
+    /// `file_search` and `file_grep` were added to stop; leaving them to win a
+    /// belief slot meant the turns that most needed them — the ones with no
+    /// path in the question to score against — were exactly the turns that did
+    /// not get them.
     #[serde(default)]
     pub mandatory: bool,
     /// JSON Schema for the call arguments (the tool's Request type).
@@ -213,12 +239,15 @@ pub fn find(name: &str) -> Option<&'static ToolDef> {
     all().iter().find(|d| d.name == name)
 }
 
-/// The names of every non-high-risk tool — the subset projected in "Restricted"
-/// tools mode.
-pub fn safe_names() -> HashSet<String> {
+/// The names of the tools projected in `mode` — those [`access::offers`]
+/// admits. A mode never offers a tool its grants would refuse: offering it
+/// would spend a projection slot on a `not_permitted`.
+pub fn names_for(mode: ToolMode) -> HashSet<String> {
     all()
         .iter()
-        .filter(|d| !d.high_risk)
+        .filter(|d| {
+            registry::find(&d.name).is_some_and(|t| access::offers(mode, t.requires, d.high_risk))
+        })
         .map(|d| d.name.clone())
         .collect()
 }
@@ -443,25 +472,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Reading and listing files project on every turn; nothing else does. A
-    /// mandatory tool rides on top of the belief top-k, so adding one here
-    /// widens every prompt — the set is pinned so that is a deliberate change.
+    /// The file tools a coding turn needs whatever the question, and the two web
+    /// tools, project on every turn; nothing else does. A mandatory tool rides on top of the
+    /// belief top-k, so adding one here widens every prompt — the set is pinned
+    /// so that is a deliberate change.
     #[test]
-    fn only_file_read_and_file_list_are_mandatory() {
+    fn the_file_tools_a_coding_turn_needs_are_mandatory() {
         let mut mandatory: Vec<&str> = all()
             .iter()
             .filter(|d| d.mandatory)
             .map(|d| d.name.as_str())
             .collect();
         mandatory.sort();
-        assert_eq!(mandatory, ["file_list", "file_read"]);
+        assert_eq!(
+            mandatory,
+            [
+                "file_grep",
+                "file_list",
+                "file_read",
+                "file_search",
+                "web_fetch",
+                "web_search",
+                "write"
+            ]
+        );
     }
 
     #[test]
-    fn safe_names_excludes_high_risk() {
-        let safe = safe_names();
+    fn restricted_excludes_high_risk() {
+        let safe = names_for(ToolMode::Restricted);
         assert!(safe.contains("datetime"), "datetime is safe");
-        assert!(!safe.contains("code_run"), "code_run is high-risk");
+        assert!(!safe.contains("write"), "write is high-risk");
+    }
+
+    /// **No mode offers what it would refuse.** Every tool a mode projects
+    /// runs under that mode's grants, and the file tools a coding turn needs
+    /// are in every mode that has tools.
+    #[test]
+    fn every_mode_offers_only_what_its_grants_cover() {
+        for mode in ToolMode::ALL {
+            let names = names_for(mode);
+            for name in &names {
+                let tool = registry::find(name).expect("defined tools execute");
+                assert!(
+                    access::grants(mode).require_all(tool.requires).is_ok(),
+                    "{name} is offered in {} but needs {:?}",
+                    mode.id(),
+                    tool.requires
+                );
+            }
+            if mode != ToolMode::None {
+                for name in ["file_read", "file_list", "file_grep", "calculator"] {
+                    assert!(names.contains(name), "{name} missing from {}", mode.id());
+                }
+            }
+        }
+        assert!(names_for(ToolMode::None).is_empty());
+        let restricted = names_for(ToolMode::Restricted);
+        for name in ["web_search", "web_fetch", "dns_lookup", "sql_session_open"] {
+            assert!(!restricted.contains(name), "{name} needs a capability");
+        }
+    }
+
+    /// **Programs run on the host only in Mutable.** The overlay cannot stand
+    /// in front of a program, so no overlay mode offers one; the JS sandbox,
+    /// whose only filesystem is the overlay, and the network and remote-shell
+    /// tools stay in Comprehensive.
+    #[test]
+    fn host_execution_is_offered_only_in_mutable() {
+        let comprehensive = names_for(ToolMode::Comprehensive);
+        let mutable = names_for(ToolMode::Mutable);
+        for name in ["ping_icmp", "trace_route", "sub_run"] {
+            assert!(
+                !comprehensive.contains(name),
+                "{name} offered in comprehensive"
+            );
+            assert!(mutable.contains(name), "{name} missing from mutable");
+        }
+        for name in [
+            "code_run",
+            "code_session_exec",
+            "web_fetch",
+            "web_search",
+            "ssh_session_exec",
+            "write",
+        ] {
+            assert!(
+                comprehensive.contains(name),
+                "{name} missing from comprehensive"
+            );
+        }
+        assert_eq!(mutable.len(), all().len(), "mutable offers every tool");
     }
 
     /// Every definition carries a real category (never the `"Other"` fallback the

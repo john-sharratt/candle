@@ -19,8 +19,7 @@ extern "C" void run_paged_prefill_int8_bf16(
     int32_t head_dim,
     int32_t max_q_len,
     float softmax_scale,
-    const uint32_t* rope_offsets,
-    const float* rope_cs,
+    const RopeRungs rungs,
     int32_t rope_interleaved,
     cudaStream_t stream,
     const uint32_t* sel_entries,
@@ -37,19 +36,19 @@ extern "C" void run_paged_prefill_int8_bf16(
             launch_paged_prefill_int8<__nv_bfloat16, 64>(
                 q_ptr, k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
                 o_ptr, total_q, batch_size, n_head, n_kv_head, max_q_len,
-                softmax_scale, rope_offsets, rope_cs, rope_interleaved, stream, sel);
+                softmax_scale, rungs, rope_interleaved, stream, sel);
             break;
         case 128:
             launch_paged_prefill_int8<__nv_bfloat16, 128>(
                 q_ptr, k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
                 o_ptr, total_q, batch_size, n_head, n_kv_head, max_q_len,
-                softmax_scale, rope_offsets, rope_cs, rope_interleaved, stream, sel);
+                softmax_scale, rungs, rope_interleaved, stream, sel);
             break;
         case 256:
             launch_paged_prefill_int8<__nv_bfloat16, 256>(
                 q_ptr, k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
                 o_ptr, total_q, batch_size, n_head, n_kv_head, max_q_len,
-                softmax_scale, rope_offsets, rope_cs, rope_interleaved, stream, sel);
+                softmax_scale, rungs, rope_interleaved, stream, sel);
             break;
         default:
             fprintf(stderr, "run_paged_prefill_int8_bf16: unsupported head_dim %d\n", head_dim);

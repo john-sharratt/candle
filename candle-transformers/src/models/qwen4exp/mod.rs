@@ -45,6 +45,7 @@ pub mod ple;
 pub mod ple_cache;
 pub mod qsa;
 pub mod qsa_select;
+pub mod rope;
 pub mod spec;
 #[cfg(feature = "cuda")]
 pub mod wave;

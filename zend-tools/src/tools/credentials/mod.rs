@@ -41,7 +41,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::ToolError;
+use crate::{NotPermitted, ToolError};
 
 pub mod delete;
 pub mod list;
@@ -84,6 +84,8 @@ pub enum CredError {
     InvalidType(String),
     #[error("invalid key material: {0}")]
     InvalidKey(String),
+    #[error(transparent)]
+    NotPermitted(#[from] NotPermitted),
 }
 
 impl ToolError for CredError {
@@ -94,6 +96,7 @@ impl ToolError for CredError {
             CredError::MissingField(_) => "missing_field",
             CredError::InvalidType(_) => "invalid_credential_type",
             CredError::InvalidKey(_) => "invalid_key",
+            CredError::NotPermitted(_) => NotPermitted::CODE,
         }
     }
 }

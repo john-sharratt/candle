@@ -1,0 +1,11 @@
+# Who is an admin on this zend deployment.
+#
+# Admins may use the Comprehensive and Mutable tools modes (every tool, and file
+# tools that change the project on disk); everyone else gets Restricted. Read at
+# build time — there is no API that grants a role. See `src/access.rs`.
+#
+# Same table shape and the same principal as `npcd/npcd.web.yaml`: an entry names
+# `sub` or `email`, never both. The email is already public (it is the author
+# address on every commit here), so naming it costs nothing.
+creators:
+  - email: johnathan.sharratt@gmail.com

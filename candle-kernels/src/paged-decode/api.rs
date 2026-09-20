@@ -11,6 +11,8 @@
 
 use core::ffi::c_void;
 
+use crate::rope::RopeRungsFfi;
+
 extern "C" {
     // ========================================================================
     // Per-dtype dispatchers — persistent slot buffer API
@@ -31,7 +33,7 @@ extern "C" {
         softmax_scale: f32,
         k_new: *const c_void,
         v_new: *const c_void,
-        rope_cs: *const f32,
+        rungs: RopeRungsFfi,
         rope_interleaved: i32,
         stream: *mut c_void,
         sel_entries: *const u32,
@@ -54,7 +56,7 @@ extern "C" {
         softmax_scale: f32,
         k_new: *const c_void,
         v_new: *const c_void,
-        rope_cs: *const f32,
+        rungs: RopeRungsFfi,
         rope_interleaved: i32,
         stream: *mut c_void,
         sel_entries: *const u32,
@@ -87,7 +89,7 @@ extern "C" {
         softmax_scale: f32,
         k_new: *const c_void,
         v_new: *const c_void,
-        rope_cs: *const f32,
+        rungs: RopeRungsFfi,
         rope_interleaved: i32,
         stream: *mut c_void,
         sel_entries: *const u32,
@@ -112,7 +114,7 @@ extern "C" {
         softmax_scale: f32,
         k_new: *const c_void,
         v_new: *const c_void,
-        rope_cs: *const f32,
+        rungs: RopeRungsFfi,
         rope_interleaved: i32,
         stream: *mut c_void,
         sel_entries: *const u32,

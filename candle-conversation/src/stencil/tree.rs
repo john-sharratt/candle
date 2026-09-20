@@ -46,27 +46,6 @@ pub struct FreeTextSpan {
     /// close token is kept (committed normally).  Only meaningful with
     /// `close_token`.
     pub suppress_close: bool,
-    /// The structural text that closes this span, injected when the span ends
-    /// **without its terminator firing** — an intercepted EOS.
-    ///
-    /// # Why the grammar has to own its own closing tag
-    ///
-    /// A consuming terminator (`JsonString`'s `"`, `Until`'s `</parameter>`)
-    /// leaves the closing text in the output only because the *model* wrote it.
-    /// That is fine on the path where the model reaches it and wrong on every
-    /// other path: a span cut short by EOS closed with no tag at all, so the
-    /// element ran straight into whatever the tree emitted next.
-    ///
-    /// Measured live: a `reflect` whose last argument was cut short arrived as
-    /// `<parameter=my_reflections>\ntext</function>`, and the argument was
-    /// dropped — taking the two the character *had* written down with it, as
-    /// "needed `my_reflections` and did not have it".
-    ///
-    /// With this, the tag is structural on every path: written by the model
-    /// when it gets there, injected by the tree when it does not. Empty for
-    /// spans whose terminator emits nothing of its own (lookahead terminators,
-    /// where the delimiter belongs to the successor anyway).
-    pub close_run: Vec<TokenId>,
     pub next: NodeId,
 }
 
@@ -84,15 +63,28 @@ pub struct FreeTextLimits {
     pub forced_after: u32,
 }
 
+/// The most tokens one JSON string value in a tool call may run to before the
+/// grammar closes it — the [`FreeTextLimits::json_string`] runaway guard.
+///
+/// **Sized for a whole file, not a path.** A string argument is as often the
+/// content of a file being written as it is a name, and a guard sized for names
+/// cuts the file: at 512 a `write` of a design document stopped mid-section,
+/// the value was closed where it stood, and the call carried a truncated file.
+/// 32k tokens is on the order of 100 KB of source — larger than any one file a
+/// turn should write — and the guard's only other job, stopping a value that
+/// never closes, is still done: a runaway ends here rather than at the turn's
+/// length cap.
+pub const MAX_STRING_VALUE_TOKENS: u32 = 32_768;
+
 impl FreeTextLimits {
-    /// A plain JSON string value: a high runaway guard, no soft pressure (the
-    /// model reliably emits its own closing quote).
+    /// A plain JSON string value: the [`MAX_STRING_VALUE_TOKENS`] runaway guard,
+    /// no soft pressure (the model reliably emits its own closing quote).
     pub fn json_string() -> Self {
         FreeTextLimits {
             ramp_start: None,
             ramp_len: 0,
             boost: 0.0,
-            forced_after: 512,
+            forced_after: MAX_STRING_VALUE_TOKENS,
         }
     }
 
@@ -207,6 +199,20 @@ impl StencilTree {
     pub fn node(&self, id: NodeId) -> &StencilNode {
         &self.nodes[id.0 as usize]
     }
+
+    /// The first choice a walk from the root meets — the branch reached through
+    /// static runs alone. For a tool-call tree this is the tool name. `None`
+    /// when a free-text span or the end comes first.
+    pub fn first_branch(&self) -> Option<&TokenTrie> {
+        let mut cur = self.root;
+        loop {
+            match self.node(cur) {
+                StencilNode::Static { next, .. } => cur = *next,
+                StencilNode::Branch { trie } => return Some(trie),
+                StencilNode::FreeText(_) | StencilNode::End => return None,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -233,7 +239,7 @@ mod tests {
         let l = FreeTextLimits::json_string();
         assert_eq!(l.boost_at(0), 0.0);
         assert_eq!(l.boost_at(1000), 0.0);
-        assert_eq!(l.forced_after, 512);
+        assert_eq!(l.forced_after, MAX_STRING_VALUE_TOKENS);
     }
 
     #[test]

@@ -6,7 +6,9 @@
 //!
 //! State (token counts, recent history) is owned by the caller (DecodeState).
 
+use crate::banned_rows::banned_buffer;
 use crate::config::SamplingConfig;
+use crate::line_ends::ends_a_line;
 use crate::stencil::ban;
 use crate::token_buffer::TokenBuffer;
 use candle::cuda_backend::CudaStorageSlice;
@@ -79,6 +81,19 @@ pub struct SequenceSamplingState {
     /// retains full repetition control.
     pub in_tool_call: bool,
 
+    /// True while the tool-call stencil is steering this sequence — it is
+    /// writing a call — whatever `in_tool_call`'s penalty policy says. Synced
+    /// from the stencil each decode step.
+    ///
+    /// **The turn's length budget does not apply while it is set**: the EOS
+    /// boost ramp sees a length of 0 and the graceful and forced EOS failsafes
+    /// stand down. Those budgets size a prose answer, and inside a call an EOS
+    /// is not an ending — the stencil intercepts it and closes the value where
+    /// it stands. A `write` whose content outran the answer budget came out as
+    /// a file cut mid-sentence. The call is bounded by its own grammar instead
+    /// (each value's `forced_after`), and the turn by `max_tokens`.
+    pub writing_call: bool,
+
     /// Next index into [`crate::SamplingConfig::segment_close_script`] while the
     /// hard-cap closer script is playing; `None` when no script is in flight.
     /// The script overrides sampling until every phrase token has played, then
@@ -117,6 +132,7 @@ impl SequenceSamplingState {
             dry_span_len: 0,
             dry_suppressed: false,
             in_tool_call: false,
+            writing_call: false,
             close_script_pos: None,
             close_would_continue: false,
             degenerate_run: 0,
@@ -191,6 +207,7 @@ impl SequenceSamplingState {
         self.dry_span_len = 0;
         self.dry_suppressed = false;
         self.in_tool_call = false;
+        self.writing_call = false;
         self.close_script_pos = None;
         self.close_would_continue = false;
         self.rng_offset = 0;
@@ -242,6 +259,7 @@ impl SequenceSamplingState {
         // segment, or in-flight closer script from the prior turn is cleared.
         self.dry_span_len = 0;
         self.dry_suppressed = false;
+        self.writing_call = false;
         self.in_segment = false;
         self.segment_len = 0;
         self.close_script_pos = None;
@@ -310,14 +328,22 @@ impl SequenceSamplingState {
         }
     }
 
-    /// True when the most recent token ends a sentence (`.`, `!`, `?`, `\n`).
-    /// Used by the graceful segment close and the graceful EOS failsafe to let
-    /// the current sentence complete before terminating.
+    /// True when the most recent token ends a sentence (`.`, `!`, `?`) or a
+    /// line. The graceful EOS waits for this, so an answer is not cut
+    /// mid-sentence.
     fn at_sentence_end(&self, config: &SamplingConfig) -> bool {
+        self.recent_tokens.last().is_some_and(|&t| {
+            config.sentence_end_token_ids.contains(&t) || ends_a_line(&config.line_end_token_ids, t)
+        })
+    }
+
+    /// True when the most recent token ends a line. The segment closes wait
+    /// for this — see [`SamplingConfig::line_end_token_ids`] for why a line
+    /// rather than a sentence.
+    fn at_line_end(&self, config: &SamplingConfig) -> bool {
         self.recent_tokens
             .last()
-            .map(|&t| config.sentence_end_token_ids.contains(&t))
-            .unwrap_or(false)
+            .is_some_and(|&t| ends_a_line(&config.line_end_token_ids, t))
     }
 }
 
@@ -329,7 +355,7 @@ impl SequenceSamplingState {
 ///   phrase to its end, then emits the segment-close token itself (the close
 ///   is appended by this function, not stored in the script, so a played
 ///   script can never fail to close the segment);
-/// - the GRACEFUL cap closes with the bare token at a completed sentence — no
+/// - the GRACEFUL cap closes with the bare token at the end of a line — no
 ///   rescue needed;
 /// - the HARD cap starts the configured closer script (a canned
 ///   self-interruption that turns the mid-sentence amputation into sensible
@@ -399,20 +425,17 @@ fn segment_close_override(
             config.segment_close_token_id as u32
         });
     }
-    let at_sentence_end = state.at_sentence_end(config);
+    let at_line_end = state.at_line_end(config);
     if config.graceful_segment_close_after > 0
         && state.segment_len >= config.graceful_segment_close_after
-        && at_sentence_end
+        && at_line_end
     {
         return Some(config.segment_close_token_id as u32);
     }
     if config.force_segment_close_after > 0 && state.segment_len >= config.force_segment_close_after
     {
         return Some(
-            if config.segment_close_script.is_empty()
-                || at_sentence_end
-                || state.close_would_continue
-            {
+            if config.segment_close_script.is_empty() || at_line_end || state.close_would_continue {
                 config.segment_close_token_id as u32
             } else {
                 state.close_script_pos = Some(1);
@@ -550,9 +573,10 @@ impl BatchedSampler {
         }
 
         // **The kernel's scalar parameters are shared across the launch.**
-        // Temperature, top-k/top-p, the repetition and DRY penalties, the EOS ramp
-        // and the banned-token list are passed once per launch and applied to
-        // every row; `sample_batch_cuda` reads them from `configs[0]`. A wave that
+        // Temperature, top-k/top-p, the repetition and DRY penalties and the EOS
+        // ramp are passed once per launch and applied to every row;
+        // `sample_batch_cuda` reads them from `configs[0]`. (Banned tokens are
+        // the exception — per row, see `banned_rows`.) A wave that
         // mixes dials — a `ThinkMode::Off` ingest summary at
         // `SamplingConfig::compression()` beside a dialogue turn — therefore
         // samples every row at whichever config sorts first.
@@ -752,6 +776,12 @@ impl BatchedSampler {
             return eos_token_id;
         }
 
+        // A call being written is bounded by its grammar, not by the answer's
+        // length budget — see `SequenceSamplingState::writing_call`.
+        if state.writing_call {
+            return sampled;
+        }
+
         if config.forced_eos_after > 0 && state.current_len >= config.forced_eos_after {
             // Hard stop: unconditionally force EOS regardless of sentence position.
             tracing::debug!(
@@ -765,7 +795,7 @@ impl BatchedSampler {
         }
 
         if config.graceful_eos_after > 0 && state.current_len >= config.graceful_eos_after {
-            if config.sentence_end_token_ids.is_empty() {
+            if config.sentence_end_token_ids.is_empty() && config.line_end_token_ids.is_empty() {
                 // No sentence-end tokens resolved (e.g. model loaded without
                 // tokenizer resolution): fall back to hard stop at the graceful
                 // threshold.
@@ -778,8 +808,8 @@ impl BatchedSampler {
                 );
                 return eos_token_id;
             }
-            // Graceful stop: emit EOS only when the last token was a
-            // sentence-ending token (`.`, `!`, `?`, `\n`).  This lets the current
+            // Graceful stop: emit EOS only when the last token ended a sentence
+            // (`.`, `!`, `?`) or a line.  This lets the current
             // sentence complete before termination, preventing mid-sentence
             // truncation.  `forced_eos_after` is the hard backstop if no boundary
             // is ever seen.
@@ -961,39 +991,21 @@ impl BatchedSampler {
         // Get EOS token
         let eos_token_id = self.eos_tokens.iter().copied().next().unwrap_or(0);
 
-        // Build banned tokens buffer.
-        //
-        // Per-sequence when any row carries the structural think-close ban
+        // Build banned tokens buffer — each row's OWN deny-list, plus the
+        // structural think-close ban for rows outside a block
         // (`think_close_ban_active` — a `</think>` outside a think block is
-        // never valid output): each row gets the shared deny-list plus, for
-        // rows outside a block, the close id; `-1` is the kernel's "empty
-        // slot" sentinel. The kernel has carried this per-seq mode from the
-        // start (`banned_tokens_per_seq > 0`); this is its first caller.
-        // With no row needing the ban, the shared list goes down the legacy
-        // global path untouched.
-        let think_ban_rows = states
+        // never valid output). Unlike the scalar dials above, a ban is
+        // row-specific: the answer that closes a stuck tool loop bans
+        // `<tool_call>` for itself alone. See `banned_rows`.
+        let rows: Vec<(&[i32], Option<i32>)> = states
             .iter()
             .zip(configs.iter())
-            .any(|(s, c)| think_close_ban_active(c, s));
-        let (banned_tokens, num_banned, banned_per_seq) = if think_ban_rows {
-            let stride = config.banned_tokens.len() + 1;
-            let mut flat: Vec<i32> = Vec::with_capacity(states.len() * stride);
-            for (s, c) in states.iter().zip(configs.iter()) {
-                flat.extend_from_slice(&config.banned_tokens);
-                flat.push(if think_close_ban_active(c, s) {
-                    c.segment_close_token_id
-                } else {
-                    -1
-                });
-            }
-            (flat, 0, stride as i32)
-        } else {
-            (
-                config.banned_tokens.clone(),
-                config.banned_tokens.len() as i32,
-                0,
-            )
-        };
+            .map(|(s, c)| {
+                let close = think_close_ban_active(c, s).then_some(c.segment_close_token_id);
+                (c.banned_tokens.as_slice(), close)
+            })
+            .collect();
+        let (banned_tokens, num_banned, banned_per_seq) = banned_buffer(&rows);
         let banned_tokens = &banned_tokens;
 
         // No stencil here — constrained rows were resolved before the kernel.
@@ -1239,8 +1251,13 @@ impl BatchedSampler {
             recent_tokens.extend(std::iter::repeat_n(0, self.max_recent_len - window));
         }
 
-        // Current generated lengths (for dynamic EOS ramp)
-        let current_lens: Vec<i32> = states.iter().map(|s| s.current_len).collect();
+        // Current generated lengths (for dynamic EOS ramp). A sequence writing
+        // a tool call reports 0, which holds its ramp at zero boost — see
+        // `SequenceSamplingState::writing_call`.
+        let current_lens: Vec<i32> = states
+            .iter()
+            .map(|s| if s.writing_call { 0 } else { s.current_len })
+            .collect();
 
         Ok((
             token_counts,
@@ -1735,6 +1752,8 @@ mod tests {
     // even though it is constant-valued at any given commit.
     #![allow(clippy::assertions_on_constants)]
 
+    use std::sync::Arc;
+
     use super::*;
     use crate::config::SamplingConfig;
 
@@ -1897,6 +1916,48 @@ mod tests {
         assert_eq!(sampler.resolve_final_token(0, 7, &mut state, &config), 7);
     }
 
+    /// **A call being written is not cut by the answer's length budget.** Past
+    /// both EOS thresholds a prose turn is ended; the same length inside a tool
+    /// call keeps the model's own token, and the EOS ramp sees a length of 0.
+    /// The call's own grammar and the turn's `max_tokens` bound it instead.
+    #[test]
+    fn writing_a_call_stands_the_length_budget_down() {
+        let sampler = make_sampler();
+        let mut config = SamplingConfig::argmax();
+        config.graceful_eos_after = 10;
+        config.forced_eos_after = 20;
+        let mut state = make_state();
+        for _ in 0..25 {
+            state.record_token(42, MAX_RECENT);
+        }
+        assert_eq!(
+            sampler.resolve_final_token(0, 7, &mut state, &config),
+            EOS_TOKEN,
+            "a prose turn past its budget is ended"
+        );
+
+        state.writing_call = true;
+        assert_eq!(
+            sampler.resolve_final_token(0, 7, &mut state, &config),
+            7,
+            "a call past the same budget keeps its token"
+        );
+        let (_, _, _, _, current_lens) = sampler
+            .build_penalty_buffers_from_states(&[&mut state], 0.0, 16, 0)
+            .unwrap();
+        assert_eq!(current_lens, vec![0], "the EOS ramp sees no length");
+
+        // The degenerate-decode guard is a fault check, not a budget: it still
+        // fires inside a call.
+        for _ in 0..DEGENERATE_TOKEN_RUN {
+            state.record_token(0, MAX_RECENT);
+        }
+        assert_eq!(
+            sampler.resolve_final_token(0, 7, &mut state, &config),
+            EOS_TOKEN
+        );
+    }
+
     fn make_sampler() -> BatchedSampler {
         BatchedSampler::new(
             candle::Device::Cpu,
@@ -1913,16 +1974,18 @@ mod tests {
 
     // ── Hard-cap closer script (segment_close_override tiers) ──────────
 
-    /// Config with segment tracking on: close=90, graceful after 4 at sentence
-    /// end (token 7), hard cap at 8, closer phrase "A B C" (the sampler
-    /// appends the close token 90 itself).
+    /// Config with segment tracking on: close=90, graceful after 4 at a line
+    /// end (token 7), a sentence end that is not a line end (token 8, `.`),
+    /// hard cap at 8, closer phrase "A B C" (the sampler appends the close
+    /// token 90 itself).
     fn closer_config() -> SamplingConfig {
         let mut c = SamplingConfig::argmax();
         c.segment_close_token_id = 90;
         c.segment_open_token_id = 89;
         c.graceful_segment_close_after = 4;
         c.force_segment_close_after = 8;
-        c.sentence_end_token_ids = vec![7];
+        c.sentence_end_token_ids = vec![8];
+        c.line_end_token_ids = Arc::from([7]);
         c.segment_close_script = vec![100, 101, 102];
         c
     }
@@ -1956,16 +2019,41 @@ mod tests {
     }
 
     #[test]
-    fn graceful_close_at_sentence_end_skips_the_script() {
+    fn graceful_close_at_line_end_skips_the_script() {
         let config = closer_config();
-        // Past graceful (not force), last token IS a sentence end.
+        // Past graceful (not force), last token IS a line end.
         let mut state = in_segment_state(5, 7);
         assert_eq!(
             segment_close_override(&config, &mut state),
             Some(90),
-            "soft cut closes bare — a completed sentence needs no rescue"
+            "soft cut closes bare — a completed line needs no rescue"
         );
         assert_eq!(state.close_script_pos, None);
+    }
+
+    /// **A `.` is not where a thought ends.** Past the graceful cap, a period
+    /// that is not a line end — the one in `169.254` — leaves the block open;
+    /// the close waits for the line to end.
+    #[test]
+    fn graceful_close_does_not_fire_at_a_period_mid_line() {
+        let config = closer_config();
+        let mut state = in_segment_state(5, 8);
+        assert_eq!(segment_close_override(&config, &mut state), None);
+    }
+
+    /// The graceful EOS still accepts a sentence end: an answer that is one
+    /// paragraph must not wait for a newline it will never write.
+    #[test]
+    fn the_answer_ends_at_a_sentence_or_a_line() {
+        let config = closer_config();
+        for last in [7, 8] {
+            let mut state = make_state();
+            state.record_token(last, MAX_RECENT);
+            assert!(state.at_sentence_end(&config), "token {last}");
+        }
+        let mut mid = make_state();
+        mid.record_token(42, MAX_RECENT);
+        assert!(!mid.at_sentence_end(&config));
     }
 
     #[test]
@@ -2334,6 +2422,45 @@ mod tests {
             .sample_batch(&logits, &mut [&mut state], &[&config])
             .expect("sample");
         assert_eq!(tokens[0], 60, "banned best token → next best");
+    }
+
+    /// **A row's ban is its own inside a shared launch.** One row bans nothing;
+    /// the other — the answer closing a stuck tool loop — bans 50. Both logit
+    /// rows peak at 50: the free row takes it, the banning row its next best.
+    /// Both orderings, because the kernel read the ban from `configs[0]`: with
+    /// the banning row second its ban vanished, with it first the free row lost
+    /// its token. On CUDA when a card is present — the path that had the defect
+    /// — and on the CPU path always.
+    #[test]
+    fn a_row_s_ban_stays_in_its_row_in_a_shared_launch() {
+        let mut devices = vec![Device::Cpu];
+        devices.extend(Device::new_cuda(0).ok());
+        let free = SamplingConfig::argmax();
+        let mut closing = SamplingConfig::argmax();
+        closing.banned_tokens = vec![50];
+        for device in devices {
+            let sampler = BatchedSampler::new(
+                device.clone(),
+                VOCAB_SIZE,
+                MAX_RECENT,
+                vec![EOS_TOKEN].into(),
+                None,
+            );
+            for (configs, expected) in [
+                ([&free, &closing], vec![50, 60]),
+                ([&closing, &free], vec![60, 50]),
+            ] {
+                let (mut a, mut b) = (make_state(), make_state());
+                let logits =
+                    logits_from_rows(&[&[(50, 100.0), (60, 50.0)], &[(50, 100.0), (60, 50.0)]])
+                        .to_device(&device)
+                        .expect("logits");
+                let tokens = sampler
+                    .sample_batch(&logits, &mut [&mut a, &mut b], &configs)
+                    .expect("sample");
+                assert_eq!(tokens, expected, "{device:?}");
+            }
+        }
     }
 
     // ── Structural think-close ban ─────────────────────────────────────

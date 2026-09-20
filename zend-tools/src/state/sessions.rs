@@ -184,9 +184,10 @@ pub struct RemoteFsEntry {
 pub struct CodeEntry {
     pub meta: SessionMeta,
     pub language: String,
-    /// Concatenated source of every successful exec, newline-separated, replayed
-    /// to rebuild variable / function state before each new snippet.
-    pub history: String,
+    /// The source of every successful exec, one entry per snippet, replayed in
+    /// order to rebuild variable / function state before each new snippet.
+    /// Kept apart so each replays under its own call budget, as it first ran.
+    pub history: Vec<String>,
 }
 
 // ── Registry ─────────────────────────────────────────────────────────────────

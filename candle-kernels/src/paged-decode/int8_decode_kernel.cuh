@@ -78,7 +78,7 @@ __device__ __forceinline__ void int8_decode_attn_impl(
     float softmax_scale,
     const T* __restrict__ k_new,
     const T* __restrict__ v_new,
-    const float* __restrict__ rope_cs,
+    const RopeRungs rungs,
     float* __restrict__ partial_acc,   // split-KV: [slot*n_q_head+qh][split][HEAD_DIM] un-normalized ΣwV; nullptr → write final
     float* __restrict__ partial_ml,    // split-KV: [slot*n_q_head+qh][split][2] = (m, l)
     QsaSel sel                         // QSA: one selection row per SLOT (decode is one query per slot)
@@ -123,6 +123,9 @@ __device__ __forceinline__ void int8_decode_attn_impl(
     const uint32_t n_slices  = slot.n_slices;
     const uint32_t write_slice_idx = slot.write_slice;
     const uint64_t slices_ptr = slot.slices_ptr;
+    // This slot's rung, from its own header: nothing rung-dependent is shared
+    // with another slot's CTA.
+    const RopeView rope = rope_view(rungs, slot.rope_rung);
 
     if (n_slices == 0) {
         int heads_per_group = n_q_head / n_kv_head;
@@ -224,9 +227,9 @@ __device__ __forceinline__ void int8_decode_attn_impl(
     {
         uint32_t q_rope_pos = (uint32_t)ws_rope + (uint32_t)ws_len;
         if constexpr (ROPE_INTERLEAVED && (VEC == 1 || VEC % 2 == 0)) {
-            apply_rope_interleaved_f32<VEC, HEAD_DIM>(q_reg, lane, (int)q_rope_pos, rope_cs);
+            apply_rope_interleaved_f32<VEC, HEAD_DIM>(q_reg, lane, (int)q_rope_pos, rope.for_q());
         } else {
-            apply_rope_rotary_f32<VEC, HEAD_DIM>(q_reg, lane, (int)q_rope_pos, rope_cs);
+            apply_rope_rotary_f32<VEC, HEAD_DIM>(q_reg, lane, (int)q_rope_pos, rope.for_q());
         }
     }
 
@@ -490,9 +493,9 @@ __device__ __forceinline__ void int8_decode_attn_impl(
                 for (int j = 0; j < VEC; ++j)
                     k_regs[j] = to_f32<T>(k_dst[ki[j]]);
                 if constexpr (ROPE_INTERLEAVED && (VEC == 1 || VEC % 2 == 0)) {
-                    apply_rope_interleaved_f32<VEC, HEAD_DIM>(k_regs, lane, rope_pos, rope_cs);
+                    apply_rope_interleaved_f32<VEC, HEAD_DIM>(k_regs, lane, rope_pos, rope);
                 } else {
-                    apply_rope_rotary_f32<VEC, HEAD_DIM>(k_regs, lane, rope_pos, rope_cs);
+                    apply_rope_rotary_f32<VEC, HEAD_DIM>(k_regs, lane, rope_pos, rope);
                 }
                 __syncwarp();
                 #pragma unroll
@@ -836,7 +839,7 @@ int8_decode_kernel(
     float softmax_scale,
     const T* k_new,
     const T* v_new,
-    const float* rope_cs,
+    const RopeRungs rungs,
     float* partial_acc,
     float* partial_ml,
     QsaSel sel
@@ -863,7 +866,7 @@ int8_decode_kernel(
     constexpr int STAGES = (HEAD_DIM >= 256) ? 1 : (IS_HALF_TYPE ? 3 : 2);
     int8_decode_attn_impl<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, 32, STAGES, true, ROPE_INTERLEAVED>(
         q, headers_ptr, out, num_active_slots, n_q_head, n_kv_head, softmax_scale,
-        k_new, v_new, rope_cs, partial_acc, partial_ml, sel);
+        k_new, v_new, rungs, partial_acc, partial_ml, sel);
 }
 
 // =============================================================================
@@ -964,7 +967,7 @@ struct StripeCellCtx {
     const float (*shared_q)[HEAD_DIM];   // [HPG][HEAD_DIM]
     T (*k_stage)[HEAD_DIM];              // [2][HEAD_DIM]
     T (*v_stage)[HEAD_DIM];              // [2][HEAD_DIM]
-    const float* __restrict__ rope_cs;
+    RopeView rope;                       // the slot's rung, for K
     float softmax_scale;
     int kv_head_idx;
     int pair;
@@ -1048,9 +1051,9 @@ __device__ __forceinline__ void stripe_process_cell(
         for (int j = 0; j < VEC; ++j) k_regs[j] = to_f32<T>(k_stage[st.ki[j]]);
         const int32_t rope_pos = (int32_t)slice_rope(sl) + (within - (int)slice_offset(sl));
         if constexpr (ROPE_INTERLEAVED && (VEC == 1 || VEC % 2 == 0))
-            apply_rope_interleaved_f32<VEC, HEAD_DIM>(k_regs, c.lane, rope_pos, c.rope_cs);
+            apply_rope_interleaved_f32<VEC, HEAD_DIM>(k_regs, c.lane, rope_pos, c.rope);
         else
-            apply_rope_rotary_f32<VEC, HEAD_DIM>(k_regs, c.lane, rope_pos, c.rope_cs);
+            apply_rope_rotary_f32<VEC, HEAD_DIM>(k_regs, c.lane, rope_pos, c.rope);
         #pragma unroll
         for (int hh = 0; hh < WARP_HEADS; ++hh) {
             const int h = c.head_lo + hh;
@@ -1115,7 +1118,7 @@ __device__ __forceinline__ void int8_decode_stripe_impl(
     float softmax_scale,
     const T* __restrict__ k_new,
     const T* __restrict__ v_new,
-    const float* __restrict__ rope_cs,
+    const RopeRungs rungs,
     float* __restrict__ partial_acc,
     float* __restrict__ partial_ml,
     QsaSel sel
@@ -1167,6 +1170,7 @@ __device__ __forceinline__ void int8_decode_stripe_impl(
     const uint32_t n_slices = slot.n_slices;
     const uint32_t write_slice_idx = slot.write_slice;
     const uint64_t slices_ptr = slot.slices_ptr;
+    const RopeView rope = rope_view(rungs, slot.rope_rung);
 
     if (n_slices == 0) {
         emit_block();  // null partials
@@ -1242,9 +1246,9 @@ __device__ __forceinline__ void int8_decode_stripe_impl(
         #pragma unroll
         for (int j = 0; j < VEC; ++j) qr[j] = to_f32<Q_T>(q_ptr[lane * VEC + j]);
         if constexpr (ROPE_INTERLEAVED && (VEC == 1 || VEC % 2 == 0))
-            apply_rope_interleaved_f32<VEC, HEAD_DIM>(qr, lane, (int)q_rope_pos, rope_cs);
+            apply_rope_interleaved_f32<VEC, HEAD_DIM>(qr, lane, (int)q_rope_pos, rope.for_q());
         else
-            apply_rope_rotary_f32<VEC, HEAD_DIM>(qr, lane, (int)q_rope_pos, rope_cs);
+            apply_rope_rotary_f32<VEC, HEAD_DIM>(qr, lane, (int)q_rope_pos, rope.for_q());
         #pragma unroll
         for (int j = 0; j < VEC; ++j) shared_q[h][lane * VEC + j] = qr[j];
     }
@@ -1286,7 +1290,7 @@ __device__ __forceinline__ void int8_decode_stripe_impl(
     StripeWarpState<VEC, HEAD_DIM, WARP_HEADS> st;
     st.cur_slice = -1;
     const StripeCellCtx<T, HEAD_DIM, HPG> ctx{
-        shared_q, sk[pair], sv[pair], rope_cs, softmax_scale,
+        shared_q, sk[pair], sv[pair], rope, softmax_scale,
         kv_head_idx, pair, half, head_lo, lane };
 
     // Global stripe id: pair `pair` of split `split_idx`, out of `n_stripes`.
@@ -1468,14 +1472,14 @@ int8_decode_stripe_kernel(
     float softmax_scale,
     const T* k_new,
     const T* v_new,
-    const float* rope_cs,
+    const RopeRungs rungs,
     float* partial_acc,
     float* partial_ml,
     QsaSel sel
 ) {
     int8_decode_stripe_impl<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, ROPE_INTERLEAVED, HPG>(
         q, headers_ptr, num_active_slots, n_q_head, n_kv_head, softmax_scale,
-        k_new, v_new, rope_cs, partial_acc, partial_ml, sel);
+        k_new, v_new, rungs, partial_acc, partial_ml, sel);
 }
 
 // =============================================================================
@@ -1498,7 +1502,7 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
     float softmax_scale,
     const T* __restrict__ k_new,
     const T* __restrict__ v_new,
-    const float* __restrict__ rope_cs,
+    const RopeRungs rungs,
     float* __restrict__ partial_acc,
     float* __restrict__ partial_ml,
     QsaSel sel
@@ -1544,6 +1548,7 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
     const uint32_t n_slices = slot.n_slices;
     const uint32_t write_slice_idx = slot.write_slice;
     const uint64_t slices_ptr = slot.slices_ptr;
+    const RopeView rope = rope_view(rungs, slot.rope_rung);
     if (n_slices == 0) { emit_block(); return; }
 
     uint8_t* write_slice_ptr = get_slice_mut<HEAD_DIM>(slices_ptr, (int)write_slice_idx, n_kv_head);
@@ -1618,9 +1623,9 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
                 #pragma unroll
                 for (int j = 0; j < VEC; ++j) qr[j] = to_f32<Q_T>(q_ptr[lane * VEC + j]);
                 if constexpr (ROPE_INTERLEAVED && (VEC == 1 || VEC % 2 == 0))
-                    apply_rope_interleaved_f32<VEC, HEAD_DIM>(qr, lane, (int)q_rope_pos, rope_cs);
+                    apply_rope_interleaved_f32<VEC, HEAD_DIM>(qr, lane, (int)q_rope_pos, rope.for_q());
                 else
-                    apply_rope_rotary_f32<VEC, HEAD_DIM>(qr, lane, (int)q_rope_pos, rope_cs);
+                    apply_rope_rotary_f32<VEC, HEAD_DIM>(qr, lane, (int)q_rope_pos, rope.for_q());
                 // per-palette quant (palette = lane/8, within-palette pos = (lane%8)*4+j)
                 float my_max = 0.f;
                 #pragma unroll
@@ -1772,9 +1777,9 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
             for (int j = 0; j < VEC; ++j) k_regs[j] = to_f32<T>(skt[t & 1][warp][ki[j]]);
             int32_t rope_pos = rope_base + (tok_within[t] - (int)off);
             if constexpr (ROPE_INTERLEAVED && (VEC == 1 || VEC % 2 == 0))
-                apply_rope_interleaved_f32<VEC, HEAD_DIM>(k_regs, lane, rope_pos, rope_cs);
+                apply_rope_interleaved_f32<VEC, HEAD_DIM>(k_regs, lane, rope_pos, rope);
             else
-                apply_rope_rotary_f32<VEC, HEAD_DIM>(k_regs, lane, rope_pos, rope_cs);
+                apply_rope_rotary_f32<VEC, HEAD_DIM>(k_regs, lane, rope_pos, rope);
             float my_max = 0.f;
             #pragma unroll
             for (int j = 0; j < VEC; ++j) my_max = fmaxf(my_max, fabsf(k_regs[j]));
@@ -1900,12 +1905,12 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * WARP_SIZE,
 int8_decode_bmma_kernel(
     const Q_T* q, const uint8_t* headers_ptr, int num_active_slots,
     int n_q_head, int n_kv_head, float softmax_scale,
-    const T* k_new, const T* v_new, const float* rope_cs,
+    const T* k_new, const T* v_new, const RopeRungs rungs,
     float* partial_acc, float* partial_ml, QsaSel sel
 ) {
     int8_decode_bmma_impl<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, ROPE_INTERLEAVED, HPG>(
         q, headers_ptr, num_active_slots, n_q_head, n_kv_head, softmax_scale,
-        k_new, v_new, rope_cs, partial_acc, partial_ml, sel);
+        k_new, v_new, rungs, partial_acc, partial_ml, sel);
 }
 
 // -----------------------------------------------------------------------------
@@ -2135,7 +2140,7 @@ int launch_int8_decode_attn(
     float softmax_scale,
     const T* k_new,
     const T* v_new,
-    const float* rope_cs,
+    const RopeRungs rungs,
     int rope_interleaved,
     cudaStream_t stream = nullptr,
     uint8_t* q8_out = nullptr,  // non-null → B2 fused q8a128 context (combine path, HEAD_DIM % 128 == 0)
@@ -2239,11 +2244,11 @@ int launch_int8_decode_attn(
             if (rope_interleaved) {
                 int8_decode_tile_kernel<Q_T, T, HEAD_DIM, true><<<grid, block, 0, stream>>>(
                     q, headers_ptr, num_active_slots, n_q_head, n_kv_head,
-                    softmax_scale, k_new, v_new, rope_cs, pa, pm, sel);
+                    softmax_scale, k_new, v_new, rungs, pa, pm, sel);
             } else {
                 int8_decode_tile_kernel<Q_T, T, HEAD_DIM, false><<<grid, block, 0, stream>>>(
                     q, headers_ptr, num_active_slots, n_q_head, n_kv_head,
-                    softmax_scale, k_new, v_new, rope_cs, pa, pm, sel);
+                    softmax_scale, k_new, v_new, rungs, pa, pm, sel);
             }
             const int num_rows = num_active_slots * n_q_head;
             const int64_t g_stride =
@@ -2325,13 +2330,13 @@ int launch_int8_decode_attn(
                                         ROPE_INTERLEAVED, H>                               \
                     <<<grid, block, 0, stream>>>(                                          \
                         q, headers_ptr, num_active_slots, n_q_head, n_kv_head,             \
-                        softmax_scale, k_new, v_new, rope_cs, pa, pm, sel)
+                        softmax_scale, k_new, v_new, rungs, pa, pm, sel)
             #define STRIPE_LAUNCH(H)                                                       \
                 int8_decode_stripe_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK,            \
                                           ROPE_INTERLEAVED, H>                             \
                     <<<grid, block, 0, stream>>>(                                          \
                         q, headers_ptr, num_active_slots, n_q_head, n_kv_head,             \
-                        softmax_scale, k_new, v_new, rope_cs, pa, pm, sel)
+                        softmax_scale, k_new, v_new, rungs, pa, pm, sel)
             if constexpr (HEAD_DIM == 128 && WARPS_PER_BLOCK <= 8) {
                 // batched-M's per-warp tile smem fits at WARPS<=8 (~29 KB);
                 // WARPS=16 (the hpg>8 wide path) never reaches use_stripe, so it
@@ -2374,7 +2379,7 @@ int launch_int8_decode_attn(
             int8_decode_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, ROPE_INTERLEAVED>
                 <<<grid, block, 0, stream>>>(
                     q, headers_ptr, out, num_active_slots, n_q_head, n_kv_head,
-                    softmax_scale, k_new, v_new, rope_cs, pa, pm, sel);
+                    softmax_scale, k_new, v_new, rungs, pa, pm, sel);
         }
 
         // The write-slice commit rides in the combine when there is one; the

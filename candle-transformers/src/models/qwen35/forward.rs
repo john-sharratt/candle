@@ -19,9 +19,10 @@
 //!   carries `S` and a conv tail across a sequence's tokens, so the state is
 //!   lifted out of the model's map for the sweep and every wave that begins
 //!   must commit or roll back — "did not commit" is not "did not happen".
-//! * **The rotary table is partial.** Only `rope_dim` of `head_dim` dims
-//!   rotate, so `rope_cs` comes from [`RotaryLayout`] rather than the uniform
-//!   `compute_rope_cs`, which would rotate the whole head.
+//! * **The rotary width is partial.** Only `rope_dim` of `head_dim` dims
+//!   rotate: [`RotaryLayout`] permutes them into the kernels' leading
+//!   frequencies, and the lineage's rungs cover exactly those, so every later
+//!   frequency is a pass-through.
 //! * **Glue is refused.** The gap-fill kernel is compiled for `head_dim 128`
 //!   and this family attends at 256, so a wave carrying glue rows fails at the
 //!   top rather than silently running them as ordinary prefill against the
@@ -143,6 +144,10 @@ impl ManagedBatchedModel for HybridBatched {
         HybridBatched::create_batched_session(self, config)
     }
 
+    fn rope_ceilings(&self) -> Vec<usize> {
+        self.rope().ceilings().to_vec()
+    }
+
     fn forward_wave(
         &self,
         session: &mut BatchedInferenceSession,
@@ -156,6 +161,7 @@ impl ManagedBatchedModel for HybridBatched {
         layer_end: usize,
         residual_in: Option<Tensor>,
     ) -> Result<WaveResult> {
+        session.expect_rope_ceilings(self.rope().ceilings())?;
         drive_wave(
             self,
             session,
@@ -948,21 +954,8 @@ fn sweep_layers(
     };
     g_embed.end();
 
-    // The interleaved `(cos, sin)` table the paged kernels index by position.
-    // Partial rotary, so it is the model's own table — `compute_rope_cs` would
-    // rotate all 256 dims where only 64 turn.
-    let max_blocks = contexts
-        .first()
-        .and_then(|c| {
-            c.kv_caches
-                .caches
-                .first()
-                .map(|k| k.k_cache().chunked_max_blocks())
-        })
-        .unwrap_or(0);
-    let rope_cs = model.rope_cs(max_blocks)?;
-
-    // Per-group split cos/sin over this wave's own positions.
+    // Per-group split cos/sin over this wave's own positions, for the
+    // non-paged paths; the paged kernels rotate from `model.rope()`.
     let theta = q.cfg.rope_theta;
     let rot = model.rotary();
     let dec_pos: Vec<u32> = dec_off.iter().map(|&o| o as u32).collect();
@@ -992,13 +985,11 @@ fn sweep_layers(
     // NeoX half-split within the rotary width — the layout `RotaryLayout`
     // permutes the head dims into, never the interleaved GPT-J form.
     let interleaved = false;
-    let inv_freq = model.inv_freq_device();
     let dec_params = BatchedAttentionParams::new(
         &dec_rope.0,
         &dec_rope.1,
         interleaved,
-        inv_freq,
-        &rope_cs,
+        model.rope(),
         decode_headers,
         dec_q,
         generation,
@@ -1008,8 +999,7 @@ fn sweep_layers(
         &pre_rope.0,
         &pre_rope.1,
         interleaved,
-        inv_freq,
-        &rope_cs,
+        model.rope(),
         prefill_headers,
         pre_q,
         generation,

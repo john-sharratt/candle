@@ -18,16 +18,21 @@ use super::tree::StencilTree;
 use super::vocab::TokenId;
 
 /// What [`StencilDriver::accept`] decided about the sampled token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Healed {
     /// The token was accepted as-is — commit it normally.
     No,
-    /// A consumed-close free-text span ended *inside* this token: the trailing
-    /// `bytes.len() - consumed` bytes are the next node's delimiter, emitted as
-    /// part of this token.  The decode loop must commit only the re-tokenized
-    /// first `consumed` bytes and drop the rest; the successor re-emits the
-    /// delimiter.
-    Exit { consumed: usize },
+    /// Commit the re-tokenized `bytes` in place of the sampled token.
+    ///
+    /// A free-text span ended *inside* this token (the model merged the value's
+    /// close with the next node's delimiter — `",` — and `bytes` is the part
+    /// that belongs to the value); or the token could not be committed as
+    /// written, and `bytes` is its repair — a character escaped, a malformed
+    /// value completed, an EOS inside a value replaced by the text that closes
+    /// it, a value at its hard limit completed after the token. The session has
+    /// already moved on as if the model had written `bytes`. Never empty: a
+    /// token that contributes nothing is [`Healed::Drop`].
+    Rewrite { bytes: Vec<u8> },
     /// Drop this sampled token entirely: it must NOT be committed to the
     /// sequence's KV.  A token-closed free-text span with `suppress_close` ended
     /// on this exact token (the close token, e.g. `</think>`), and the span
@@ -87,8 +92,23 @@ pub struct PathStats {
     /// being true when EOS interception was extended to every span — the
     /// counter kept its name and quietly began totalling both.
     pub intercepted_closes: u32,
+    /// Delimiters dropped at the end of a lookahead value because the grammar
+    /// does not continue with them (a `]` where the element's `}` comes next);
+    /// the grammar wrote the structure in their place.
+    pub dropped_delimiters: u32,
+    /// Free-span tokens committed as a repair instead of as written: a
+    /// character escaped inside a string, or a malformed value ended and
+    /// completed.
+    pub repairs: u32,
     /// An out-of-grammar token escaped the mask and forced the bail failsafe.
     pub bailed: bool,
+}
+
+/// One arm the walk is held to, token by token — see
+/// [`StencilDriver::steer_first_branch`].
+struct ArmSteer {
+    tokens: Vec<TokenId>,
+    next: usize,
 }
 
 /// A live walk of one tree attached to a decoding sequence.
@@ -96,6 +116,7 @@ pub struct StencilDriver {
     session: StencilSession,
     done: bool,
     stats: PathStats,
+    steer: Option<ArmSteer>,
 }
 
 impl StencilDriver {
@@ -105,6 +126,24 @@ impl StencilDriver {
             session: StencilSession::new(tree),
             done: false,
             stats: PathStats::default(),
+            steer: None,
+        }
+    }
+
+    /// Hold the tree's first branch ([`StencilTree::first_branch`]) to `arm`,
+    /// one of its arms' token sequences: each masked step narrows to the arm's
+    /// next token, so the branch completes on exactly that arm.
+    ///
+    /// For a tool call this writes the tool the reasoning named
+    /// ([`named_arm`](super::named_arm)). A frontier that does not hold the
+    /// arm's next token — an arm this branch does not have — releases the
+    /// steer, and the step is masked to the whole frontier as usual.
+    pub fn steer_first_branch(&mut self, arm: Vec<TokenId>) {
+        if !arm.is_empty() {
+            self.steer = Some(ArmSteer {
+                tokens: arm,
+                next: 0,
+            });
         }
     }
 
@@ -174,6 +213,13 @@ impl StencilDriver {
                 }
                 StencilAction::MaskedDecode(set) => {
                     self.stats.branch_tokens += 1;
+                    if let Some(steer) = &self.steer {
+                        let want = steer.tokens[steer.next];
+                        if set.contains(want) {
+                            return StepMask::Branch(AllowedSet::from_tokens(vec![want]));
+                        }
+                        self.steer = None;
+                    }
                     return StepMask::Branch(set);
                 }
                 StencilAction::FreeDecode { close_boost } => {
@@ -193,36 +239,62 @@ impl StencilDriver {
     /// by free-text terminators).  An out-of-grammar token makes the session bail
     /// — its closing run is then returned as a `Prefill` on the next `step`.
     ///
-    /// Returns [`Healed::Exit`] when a consumed-close span ended strictly inside
-    /// this token (the model merged the closing char with the next delimiter);
-    /// the caller heals by committing only the valid prefix.  Returns
-    /// [`Healed::Drop`] when a `suppress_close` token-closed span ended on this
-    /// token (the close token is dropped and the successor prefills a steering
-    /// continuation).
+    /// Returns [`Healed::Rewrite`] when the token is committed as other bytes —
+    /// a span that closed strictly inside it, or a repair (see
+    /// [`StencilSession::take_rewrite`]). Returns [`Healed::Drop`] when a
+    /// `suppress_close` token-closed span ended on this token (the close token
+    /// is dropped and the successor prefills a steering continuation), when an
+    /// EOS was intercepted inside a span with nothing to close, when a
+    /// lookahead value ended on a delimiter the grammar does not continue with,
+    /// and when a repair leaves the token nothing to contribute.
     pub fn accept(&mut self, token: TokenId, bytes: &[u8]) -> Healed {
-        match self.session.observe(token, bytes) {
-            Ok(Observe::SpanClosed { leftover }) if leftover > 0 && leftover < bytes.len() => {
-                self.stats.heals += 1;
-                Healed::Exit {
-                    consumed: bytes.len() - leftover,
-                }
+        if let Some(steer) = &mut self.steer {
+            steer.next += 1;
+            if token != steer.tokens[steer.next - 1] || steer.next == steer.tokens.len() {
+                self.steer = None;
             }
-            // A close signal the span keeps to itself: drop the token so it
-            // never reaches the sequence, and let the successor prefill
-            // whatever the tree owes — a steering phrase, or the structure the
-            // EOS would otherwise have cut short.
-            Ok(Observe::TokenClosedDrop) => {
-                self.stats.intercepted_closes += 1;
-                Healed::Drop
-            }
-            // A kept token close (the real, final close): commit it normally.
-            Ok(Observe::TokenClosedKeep) => Healed::No,
-            Ok(Observe::Bailed) => {
-                self.stats.bailed = true;
-                Healed::No
-            }
-            _ => Healed::No,
         }
+        let observed = self.session.observe(token, bytes);
+        let rewrite = self.session.take_rewrite();
+        let Ok(observe) = observed else {
+            return Healed::No;
+        };
+        match observe {
+            Observe::SpanClosed { leftover } if leftover > 0 && leftover < bytes.len() => {
+                self.stats.heals += 1
+            }
+            // A close signal the span keeps to itself: the token never reaches
+            // the sequence, and the tree writes whatever it owes — a steering
+            // phrase, or the structure the EOS would otherwise have cut short.
+            Observe::TokenClosedDrop => self.stats.intercepted_closes += 1,
+            // A wrong delimiter after a value: dropped, and the successor
+            // writes the right one.
+            Observe::DelimiterDropped => self.stats.dropped_delimiters += 1,
+            Observe::Repaired { .. } => self.stats.repairs += 1,
+            Observe::Bailed => self.stats.bailed = true,
+            _ => {}
+        }
+        healing(observe, rewrite, bytes)
+    }
+}
+
+/// How a sampled token is committed, given what the session observed of it and
+/// the rewrite it left.
+///
+/// Shared by [`StencilDriver::accept`] and the simulator, so the simulator
+/// commits exactly what the decode loop does — a test that judged the session
+/// on committing whole tokens would pass output the decode loop never produces.
+pub(super) fn healing(observe: Observe, rewrite: Option<Vec<u8>>, bytes: &[u8]) -> Healed {
+    match (observe, rewrite) {
+        (_, Some(bytes)) if bytes.is_empty() => Healed::Drop,
+        (_, Some(bytes)) => Healed::Rewrite { bytes },
+        (Observe::SpanClosed { leftover }, None) if leftover > 0 && leftover < bytes.len() => {
+            Healed::Rewrite {
+                bytes: bytes[..bytes.len() - leftover].to_vec(),
+            }
+        }
+        (Observe::TokenClosedDrop | Observe::DelimiterDropped, None) => Healed::Drop,
+        _ => Healed::No,
     }
 }
 
@@ -230,6 +302,7 @@ impl StencilDriver {
 mod tests {
     use super::*;
     use crate::stencil::compile::compile;
+    use crate::stencil::named_arm::{arm_name, named_arm};
     use crate::stencil::tool_call::{compile_tool_call_tree, parse_tools, ToolCallEnvelope};
     use crate::stencil::vocab::{TestVocab, Vocab};
 
@@ -322,6 +395,47 @@ mod tests {
         }
         let text = String::from_utf8(text).unwrap();
         assert!(text.ends_with("{\"commands\":"), "{text:?}");
+    }
+
+    /// **A delimiter the grammar does not continue with reaches the decode loop
+    /// as a drop**, so it is never committed, and the grammar's own structure is
+    /// the next thing written. Here the model ends a number with `]` inside an
+    /// object whose `}` comes next.
+    #[test]
+    fn a_misplaced_delimiter_after_a_value_is_dropped() {
+        let v = TestVocab::new();
+        let tree = tool_tree(
+            r#"[{"name":"seek","params":[{"name":"at","type":"integer","required":true}]}]"#,
+        );
+        let mut driver = StencilDriver::new(tree);
+        let mut text: Vec<u8> = Vec::new();
+        let mut script = b" 7]".iter();
+        let healed = loop {
+            match driver.step() {
+                StepMask::Prefill(run) => text.extend_from_slice(&v.decode(&run)),
+                StepMask::Free { .. } => {
+                    let b = *script.next().expect("script ran out");
+                    match driver.accept(b as TokenId, &[b]) {
+                        Healed::No => text.push(b),
+                        other => break other,
+                    }
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        assert_eq!(healed, Healed::Drop);
+        assert_eq!(driver.stats().dropped_delimiters, 1);
+        assert!(!driver.stats().bailed);
+        // The grammar writes the close the model did not.
+        let StepMask::Prefill(run) = driver.step() else {
+            panic!("the close is prefilled after the drop");
+        };
+        text.extend_from_slice(&v.decode(&run));
+        assert_eq!(driver.step(), StepMask::Done);
+        assert_eq!(
+            String::from_utf8(text).unwrap(),
+            "<tool_call>\n{\"name\": \"seek\", \"arguments\": {\"at\": 7}}\n</tool_call>"
+        );
     }
 
     #[test]
@@ -428,13 +542,36 @@ mod tests {
         assert!(!driver.in_terminal_close_span());
     }
 
+    /// Write a string value's opening ` "` — the model's, not the grammar's.
+    fn open_string(d: &mut StencilDriver) {
+        assert_eq!(d.accept(b' ' as TokenId, b" "), Healed::No);
+        assert_eq!(d.accept(b'"' as TokenId, b"\""), Healed::No);
+    }
+
     #[test]
     fn clean_string_close_does_not_heal() {
         // Closing quote is its own byte token — a clean boundary, no heal.
         let v = TestVocab::new();
         let mut d = driver_at_first_value(STR_OPT, &v);
+        open_string(&mut d);
         assert_eq!(d.accept(b'a' as TokenId, b"a"), Healed::No);
         assert_eq!(d.accept(b'"' as TokenId, b"\""), Healed::No);
+    }
+
+    /// **Bare text where the opening quote belonged is not the string's.** Let
+    /// through, its first later `"` would open the string and the call's own
+    /// close would be swallowed as content; instead it is replaced by a whole
+    /// empty value, like any other skipped value.
+    #[test]
+    fn bare_text_before_the_opening_quote_is_written_empty() {
+        let v = TestVocab::new();
+        let mut d = driver_at_first_value(STR_OPT, &v);
+        assert_eq!(
+            d.accept(b'a' as TokenId, b"a"),
+            Healed::Rewrite {
+                bytes: b" \"\"".to_vec()
+            }
+        );
     }
 
     #[test]
@@ -442,8 +579,14 @@ mod tests {
         // `",` — quote exits at byte 0, the comma is leftover.
         let v = TestVocab::new().with_special("\",", 300);
         let mut d = driver_at_first_value(STR_OPT, &v);
+        open_string(&mut d);
         assert_eq!(d.accept(b'a' as TokenId, b"a"), Healed::No);
-        assert_eq!(d.accept(300, b"\","), Healed::Exit { consumed: 1 });
+        assert_eq!(
+            d.accept(300, b"\","),
+            Healed::Rewrite {
+                bytes: b"\"".to_vec()
+            }
+        );
     }
 
     #[test]
@@ -452,8 +595,14 @@ mod tests {
         // closes the string merged with the first `}` (`"}`).
         let v = TestVocab::new().with_special("\"}", 300);
         let mut d = driver_at_first_value(STR_ONLY, &v);
+        open_string(&mut d);
         assert_eq!(d.accept(b'a' as TokenId, b"a"), Healed::No);
-        assert_eq!(d.accept(300, b"\"}"), Healed::Exit { consumed: 1 });
+        assert_eq!(
+            d.accept(300, b"\"}"),
+            Healed::Rewrite {
+                bytes: b"\"".to_vec()
+            }
+        );
     }
 
     #[test]
@@ -462,7 +611,40 @@ mod tests {
         // (the `h` value byte + the closing quote), `,` leftover.
         let v = TestVocab::new().with_special("h\",", 300);
         let mut d = driver_at_first_value(STR_OPT, &v);
-        assert_eq!(d.accept(300, b"h\","), Healed::Exit { consumed: 2 });
+        open_string(&mut d);
+        assert_eq!(
+            d.accept(300, b"h\","),
+            Healed::Rewrite {
+                bytes: b"h\"".to_vec()
+            }
+        );
+    }
+
+    /// **The empty string Qwen actually writes — ` ""`, one token — closes the
+    /// value cleanly.** This is the token a prefilled opening quote made
+    /// unreachable; with the quote the model's, it is an ordinary exit.
+    #[test]
+    fn the_empty_string_token_closes_the_value() {
+        let v = TestVocab::new().with_special(" \"\"", 300);
+        let mut d = driver_at_first_value(STR_OPT, &v);
+        assert_eq!(d.accept(300, b" \"\""), Healed::No);
+    }
+
+    /// **The failure that motivated all of this no longer swallows the call.**
+    /// A model that writes `}}` where the value belonged had it taken as string
+    /// content, with the call's own close after it. Before any opening quote it
+    /// is replaced by a whole empty value and the grammar carries on.
+    #[test]
+    fn a_closer_where_the_value_belonged_is_not_string_content() {
+        let v = TestVocab::new().with_special("}}", 300);
+        let mut d = driver_at_first_value(STR_OPT, &v);
+        assert_eq!(
+            d.accept(300, b"}}"),
+            Healed::Rewrite {
+                bytes: b" \"\"".to_vec()
+            },
+            "`}}` before the opening quote is replaced by an empty value"
+        );
     }
 
     #[test]
@@ -470,6 +652,7 @@ mod tests {
         // An escaped quote mid-value must not be treated as the close.
         let v = TestVocab::new();
         let mut d = driver_at_first_value(STR_OPT, &v);
+        open_string(&mut d);
         assert_eq!(d.accept(b'\\' as TokenId, b"\\"), Healed::No);
         assert_eq!(d.accept(b'"' as TokenId, b"\""), Healed::No); // escaped — not a close
         assert_eq!(d.accept(b'b' as TokenId, b"b"), Healed::No);
@@ -482,7 +665,12 @@ mod tests {
         // is the value (consumed=2), the `}` is the lookahead delimiter.
         let v = TestVocab::new().with_special("30}", 300);
         let mut d = driver_at_first_value(INT_ONLY, &v);
-        assert_eq!(d.accept(300, b"30}"), Healed::Exit { consumed: 2 });
+        assert_eq!(
+            d.accept(300, b"30}"),
+            Healed::Rewrite {
+                bytes: b"30".to_vec()
+            }
+        );
     }
 
     #[test]
@@ -594,9 +782,16 @@ mod tests {
                             continue;
                         }
                     }
+                    // Intercepted: the EOS is never committed. What replaces it
+                    // is the string's closing quote, which the decode loop
+                    // commits in its place.
                     let eos = tree.eos();
-                    dropped = matches!(driver.accept(eos, b""), Healed::Drop);
-                    assert!(dropped, "EOS in a byte-terminated span was not intercepted");
+                    match driver.accept(eos, b"") {
+                        Healed::Rewrite { bytes } => out.extend_from_slice(&bytes),
+                        Healed::Drop => {}
+                        Healed::No => panic!("EOS in a byte-terminated span was not intercepted"),
+                    }
+                    dropped = true;
                 }
                 StepMask::Done => break,
             }
@@ -647,9 +842,12 @@ mod tests {
                     }
                     None => panic!("branch after the name was exhausted: {out:?}"),
                 },
-                StepMask::Free { .. } => {
-                    driver.accept(tree.eos(), b"");
-                }
+                StepMask::Free { .. } => match driver.accept(tree.eos(), b"") {
+                    // What the decode loop commits in the EOS's place.
+                    Healed::Rewrite { bytes } => out.extend_from_slice(&bytes),
+                    Healed::Drop => {}
+                    Healed::No => panic!("EOS was committed: {out:?}"),
+                },
                 StepMask::Done => break,
             }
         }
@@ -747,6 +945,62 @@ mod tests {
             !set.contains(b'l' as TokenId),
             "a name outside the catalog — `look` — must be unreachable"
         );
+    }
+
+    const THREE_TOOLS: &str = r#"[
+        {"name":"list_dir","params":[{"name":"path","type":"string","required":true}]},
+        {"name":"read_file","params":[{"name":"path","type":"string","required":true}]},
+        {"name":"write_file","params":[{"name":"path","type":"string","required":true}]}]"#;
+
+    /// Walk to the first value, answering every branch with the lowest token
+    /// the mask allows; returns the text written.
+    fn lowest_until_value(driver: &mut StencilDriver, v: &TestVocab) -> String {
+        let mut text: Vec<u8> = Vec::new();
+        loop {
+            match driver.step() {
+                StepMask::Prefill(run) => text.extend_from_slice(&v.decode(&run)),
+                StepMask::Branch(set) => {
+                    let t = set.tokens()[0];
+                    text.extend_from_slice(&v.token_bytes(t));
+                    driver.accept(t, &v.token_bytes(t));
+                }
+                StepMask::Free { .. } | StepMask::Done => break,
+            }
+        }
+        String::from_utf8(text).unwrap()
+    }
+
+    /// **The tool the reasoning named is the tool written.** Unsteered, a
+    /// sampler that takes the lowest token writes `list_dir`; steered to the
+    /// arm `named_arm` picks from the reasoning, it writes `write_file`.
+    #[test]
+    fn the_first_branch_is_steered_to_the_named_arm() {
+        let v = TestVocab::new();
+        let tree = tool_tree(THREE_TOOLS);
+        let unsteered = lowest_until_value(&mut StencilDriver::new(Arc::clone(&tree)), &v);
+        assert!(unsteered.contains("\"list_dir\""), "{unsteered:?}");
+
+        let arms = tree.first_branch().expect("the name is a branch").arms();
+        let decoded: Vec<Vec<u8>> = arms.iter().map(|a| v.decode(a)).collect();
+        let names: Vec<&str> = decoded.iter().map(|b| arm_name(b)).collect();
+        let reasoning = "The file is new, so I will call write_file with the path.";
+        let pick = named_arm(reasoning, &names).expect("one tool is named");
+
+        let mut driver = StencilDriver::new(tree);
+        driver.steer_first_branch(arms[pick].clone());
+        let steered = lowest_until_value(&mut driver, &v);
+        assert!(steered.contains("\"write_file\""), "{steered:?}");
+        assert!(!driver.stats().bailed);
+    }
+
+    /// An arm the branch does not have steers nothing: the frontier stays whole.
+    #[test]
+    fn an_arm_outside_the_branch_releases_the_steer() {
+        let v = TestVocab::new();
+        let mut driver = StencilDriver::new(tool_tree(THREE_TOOLS));
+        driver.steer_first_branch(v.encode("zebra\""));
+        let text = lowest_until_value(&mut driver, &v);
+        assert!(text.contains("\"list_dir\""), "{text:?}");
     }
 
     /// Replaying the walk gives the same scaffold and the same frontier. The

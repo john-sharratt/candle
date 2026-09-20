@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::{compute_hash, decode_data, HashError};
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ScanRequest {
@@ -43,6 +43,11 @@ impl Tool for HashScan {
     type Request = ScanRequest;
     type Response = ScanResponse;
     type Error = HashError;
+
+    /// Reads files and digests them; writes nothing.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(_ctx: &ToolContext, req: ScanRequest) -> Result<ScanResponse, HashError> {
         let data_enc = req.data_encoding.as_deref().unwrap_or("text");

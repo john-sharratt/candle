@@ -126,6 +126,27 @@ impl TokenTrie {
         }
     }
 
+    /// Every arm's token sequence, in token order — the choices this trie can
+    /// complete, as `build` received them (up to order).
+    pub fn arms(&self) -> Vec<Vec<TokenId>> {
+        let mut out = Vec::new();
+        let mut path = Vec::new();
+        self.collect_arms(self.root, &mut path, &mut out);
+        out
+    }
+
+    fn collect_arms(&self, pos: TrieNodeId, path: &mut Vec<TokenId>, out: &mut Vec<Vec<TokenId>>) {
+        let node = &self.nodes[pos.0 as usize];
+        if node.accept.is_some() {
+            out.push(path.clone());
+        }
+        for &(tok, child) in &node.edges {
+            path.push(tok);
+            self.collect_arms(child, path, out);
+            path.pop();
+        }
+    }
+
     /// Number of distinct arms (accepting nodes) — used by the compiler to fold
     /// single-arm branches.
     pub fn arm_count(&self) -> usize {
@@ -161,6 +182,24 @@ mod tests {
         f.sort();
         assert_eq!(f, vec![b'b' as u32, b'c' as u32]);
         assert_eq!(trie.step(after_a, b'c' as u32), Some(Step::Accept(nid(11))));
+    }
+
+    #[test]
+    fn arms_lists_every_arm_in_token_order() {
+        let trie = TokenTrie::build(&[
+            (vec![b'a' as u32, b'c' as u32], nid(11)),
+            (vec![b'a' as u32, b'b' as u32], nid(10)),
+            (vec![b'z' as u32], nid(12)),
+        ])
+        .unwrap();
+        assert_eq!(
+            trie.arms(),
+            vec![
+                vec![b'a' as u32, b'b' as u32],
+                vec![b'a' as u32, b'c' as u32],
+                vec![b'z' as u32],
+            ]
+        );
     }
 
     #[test]

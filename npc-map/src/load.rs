@@ -410,7 +410,27 @@ fn ways(areas: &BTreeMap<String, Area>) -> BTreeMap<Where, Vec<Where>> {
     out
 }
 
-/// Every `.yaml` directly in a directory, parsed. Subdirectories are left
+/// Whether a file in a map directory is part of the map at all.
+///
+/// `.yaml` alone is not enough. The Zen Code daemon's repo-map ingest writes a
+/// `.substrate.yaml` summary into every folder it reads, `maps/` and `maps/parts/`
+/// among them, and parsing that as an area failed every world load — every npcd
+/// test that stands a body in the vault, after one daemon run over this checkout.
+///
+/// A dotfile is never an area or a part: each is named after what it defines,
+/// and nothing that starts with `.` can be. Filtering on that rather than on
+/// `.substrate.yaml` by name covers editor swapfiles and the next generated
+/// artefact too — the same rule zend's tool catalog applies for the same reason.
+fn is_map_file(path: &Path) -> bool {
+    if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+        return false;
+    }
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| !n.starts_with('.'))
+}
+
+/// Every map `.yaml` directly in a directory, parsed. Subdirectories are left
 /// alone, which is what keeps the part catalogue out of the area listing.
 fn read_yaml<T: serde::de::DeserializeOwned>(dir: &Path) -> Result<Vec<T>> {
     let mut out = Vec::new();
@@ -418,7 +438,7 @@ fn read_yaml<T: serde::de::DeserializeOwned>(dir: &Path) -> Result<Vec<T>> {
         .with_context(|| format!("reading map directory {}", dir.display()))?;
     for entry in entries {
         let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+        if !is_map_file(&path) {
             continue;
         }
         let text = std::fs::read_to_string(&path)
@@ -439,6 +459,19 @@ fn join(map: &mut BTreeMap<String, BTreeSet<String>>, a: &str, b: &str) {
 mod tests {
     use super::*;
     use crate::schema::{AreaKind, Node, NodeKind, Spine};
+
+    #[test]
+    fn only_a_named_yaml_is_part_of_the_map() {
+        assert!(is_map_file(Path::new("maps/creators-vault.yaml")));
+        assert!(is_map_file(Path::new("maps/parts/casting.yaml")));
+        // The daemon's folder metadata, which broke every world load.
+        assert!(!is_map_file(Path::new("maps/.substrate.yaml")));
+        assert!(!is_map_file(Path::new("maps/parts/.substrate.yaml")));
+        // An editor swapfile, and anything that is not YAML.
+        assert!(!is_map_file(Path::new("maps/.creators-vault.yaml.swp")));
+        assert!(!is_map_file(Path::new("maps/README.md")));
+        assert!(!is_map_file(Path::new("maps/creators-vault.yml")));
+    }
 
     fn node(id: &str, kind: NodeKind, off: &[&str]) -> Node {
         Node {

@@ -43,12 +43,14 @@ use super::kernel_attention::{
 };
 use super::linear::shared_int8_pair;
 use super::paged::{GlueRun, HEAD_DIM, NOPE_BANDS, NOPE_DIM, ROPE_DIM};
+use super::rope_tables::LatentRopeTables;
 use crate::models::expert_lre::PipelineStats;
 use crate::models::profile::{span, span_if, ProfileSnapshot};
 
 use super::compressor::{assemble_groups_batched, Compressor, GroupPool, SeqAssemble};
 use super::desc;
 use super::rope::RotaryCache;
+use crate::models::slot_header::SLOT_HEADER_BYTES;
 
 /// A wave's pooled compressor entries: ONE `[ΣG, d]` block holding every slot's
 /// completed groups in slot order, plus where each slot's run sits in it.
@@ -367,15 +369,20 @@ impl BatchedEngine {
         let ws = std::sync::Arc::new(super::paged::LatentWorkspace::build(
             engine.engine_device(),
         )?);
+        let mut tables = LatentRopeTables::default();
         for l in 0..cfg.n_layers {
             let (theta, orig) = cfg.rope_params(l);
-            layer_static.push(KernelLayerStatic::new(
-                &engine.engine_layer(l).attn,
+            let rope_tab = tables.for_layer(
                 theta,
                 orig,
                 cfg.rope_factor,
                 cfg.beta_fast,
                 cfg.beta_slow,
+                engine.engine_device(),
+            )?;
+            layer_static.push(KernelLayerStatic::new(
+                &engine.engine_layer(l).attn,
+                rope_tab,
                 ws.clone(),
                 engine.engine_device(),
             )?);
@@ -1892,7 +1899,7 @@ impl BatchedEngine {
         };
         let hdr_of = |layer: usize, seq_slot: usize| -> u64 {
             let (headers, stride) = &std_meta;
-            headers.dev_ptr() + (layer as u64) * stride + (seq_slot as u64) * 24
+            headers.dev_ptr() + (layer as u64) * stride + (seq_slot * SLOT_HEADER_BYTES) as u64
         };
         // Per-group scatter header: a group's positions share IDENTICAL
         // headers (committed block write length), so its FIRST row's header

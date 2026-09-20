@@ -74,6 +74,7 @@ pub mod ple_gather_dequant;
 // paged attention kernels read.
 pub mod qsa_index_append;
 pub mod qsa_page_place;
+pub mod qsa_rope_rows;
 pub mod qsa_score_paged;
 pub mod qsa_topk;
 // The Gated Residual's fused pre-mix / combine (Qwen3.8-Flash-Next).

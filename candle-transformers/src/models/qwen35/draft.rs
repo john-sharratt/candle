@@ -47,7 +47,7 @@
 use candle::quantized::pinned_staging::{Generation, GpuBuf};
 use candle::{DType, Device, Result, Tensor};
 
-use crate::models::draft_walk::{draft_reserve, draft_rope_depth, draft_walk};
+use crate::models::draft_walk::{draft_reserve, draft_walk};
 use candle_nn::kv_cache::{begin_wave, KvCache, LayerPhase};
 
 use std::cell::RefCell;
@@ -331,16 +331,9 @@ pub fn draft_cohort(
     let act_dtype = session.activation_dtype();
     // Allocate every drafted position's write chunk before the walk begins —
     // `draft_walk`'s module docs carry why that is load-bearing rather than
-    // tidy, and the walk does it itself. It is forced here because `max_blocks`
-    // below must be read after it.
+    // tidy, and the walk does it itself.
     draft_reserve(session, seqs, kv_layer, max_len)?;
 
-    // The rope table spans the arena's whole addressable context, so it is read
-    // from the head's own layer rather than assumed — and only after the
-    // reserve above, which can grow it.
-    let max_blocks = draft_rope_depth(session, seqs, kv_layer)?;
-    let rope_cs = model.rope_cs(max_blocks)?;
-    let inv_freq = model.inv_freq_device().clone();
     let theta = q.cfg.rope_theta;
     let rope_dtype = if act_dtype == DType::F8E4M3 {
         DType::BF16
@@ -388,8 +381,7 @@ pub fn draft_cohort(
             &cos,
             &sin,
             false,
-            &inv_freq,
-            &rope_cs,
+            model.rope(),
             DecodeHeaders::Decode {
                 buf: Some(headers.0.clone()),
                 stride: headers.1,

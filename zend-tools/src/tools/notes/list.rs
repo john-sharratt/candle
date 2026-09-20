@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::NotesError;
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ListRequest {
@@ -44,6 +44,11 @@ impl Tool for NotesList {
     type Request = ListRequest;
     type Response = ListResponse;
     type Error = NotesError;
+
+    /// Lists the note store; writes nothing.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(ctx: &ToolContext, req: ListRequest) -> Result<ListResponse, NotesError> {
         let prefix = req.prefix.as_deref().unwrap_or("");

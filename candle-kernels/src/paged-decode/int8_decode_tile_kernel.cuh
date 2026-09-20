@@ -1210,17 +1210,16 @@ __device__ __forceinline__ void tile_quads_vec_staged(
 // One group's K rows into the tile's K slab: warp = group `kg`, lane = quad.
 // A lane's two quads are its four RoPE pairs — half-split: dims 4q..4q+3 with
 // 128+4q..; interleaved: dims 8q..8q+7 as (8q+2i, 8q+2i+1) — and both
-// pairings read the same four frequencies 4q..4q+3. The table gives
-// (cos, sin) of p·θ_d at row p, so row 1 is each frequency's per-position
-// step: the lane reads the row of the group's first live token and row 1
-// (two float4 each), and the later tokens' angles follow by rotating the
-// pair in-register — a token's angle is never further than three steps from
-// a table row, so the drift is a few ulp, far under the int8 quantisation
-// the row is about to take. A pass-through dim's step is (1, 0) and stays
-// exact. On the vector path the rope rows issue ahead of the quad loads so
-// every load of the group is in flight together; on the block path they
-// issue after the decode, so the 16 rope values are not live across its
-// format bodies.
+// pairings read the same four frequencies 4q..4q+3. The lane looks up the
+// rotation at the group's first live token in the slot's rung table
+// (`rope_table.cuh`) and the per-position step, that table's `LO` row 1, and
+// the later tokens' angles follow by rotating the pair in-register — a
+// token's angle is never further than three steps from a lookup, so the drift
+// is a few ulp, far under the int8 quantisation the row is about to take. A
+// pass-through frequency's rotation and step are exactly (1, 0). On the vector
+// path the rope values load ahead of the quad loads so every load of the
+// group is in flight together; on the block path they load after the decode,
+// so the 16 rope values are not live across its format bodies.
 // Scale windows: half-split, a lane's quad A lies in window q>>3 and quad B
 // in 4 + (q>>3), so the window absmax is a reduce over the 8 lanes sharing
 // q>>3; interleaved, the eight dims lie in window q>>2, a reduce over 4
@@ -1243,7 +1242,7 @@ template <int HEAD_DIM, bool ROPE_INTERLEAVED>
 __device__ __forceinline__ void tile_k_decode(
     const TileExt& ext, const TileGroups& tg, const uint8_t* s_tbl, const uint8_t* s_inv,
     uint8_t* s_kstg, int span, int8_t* s_k8, __half (*s_k_scale)[HEAD_DIM / 32],
-    const float* __restrict__ rope_cs, int kg, int lane, const uint8_t* k_raw)
+    const RopeView& rope, int kg, int lane, const uint8_t* k_raw)
 {
     const uint32_t klive = grp_mask(tg.desc[kg]);
     if (klive == 0u) return;
@@ -1255,16 +1254,15 @@ __device__ __forceinline__ void tile_k_decode(
     const int dA0 = ROPE_INTERLEAVED ? 8 * lane : 4 * lane;
     const int dB0 = ROPE_INTERLEAVED ? dA0 + 4 : dA0 + HEAD_DIM / 2;
     float rc[4], rs[4], dc[4], ds[4];
+    // A lane's four rotary frequencies are 4·lane + i in both pairings: the
+    // rotation at the group's first live token from the slot's rung table,
+    // and the unit step (its `LO` row 1) the token loop below walks by.
     auto load_rope = [&]() {
-        const float4* e = reinterpret_cast<const float4*>(
-            rope_cs + (int64_t)rope0 * HEAD_DIM + 8 * lane);
-        const float4* d = reinterpret_cast<const float4*>(rope_cs + HEAD_DIM + 8 * lane);
-        const float4 c0 = __ldg(e), c1 = __ldg(e + 1);
-        const float4 s0 = __ldg(d), s1 = __ldg(d + 1);
-        rc[0] = c0.x; rs[0] = c0.y; rc[1] = c0.z; rs[1] = c0.w;
-        rc[2] = c1.x; rs[2] = c1.y; rc[3] = c1.z; rs[3] = c1.w;
-        dc[0] = s0.x; ds[0] = s0.y; dc[1] = s0.z; ds[1] = s0.w;
-        dc[2] = s1.x; ds[2] = s1.y; dc[3] = s1.z; ds[3] = s1.w;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            rope_cs_at(rope, rope0, 4 * lane + i, rc[i], rs[i]);
+            rope_cs_step(rope, 4 * lane + i, dc[i], ds[i]);
+        }
     };
     const int kgi[2] = { kg, kg };
     const int kd0[2] = { dA0, dB0 };
@@ -1439,7 +1437,7 @@ int8_decode_tile_kernel(
     float softmax_scale,
     const T* __restrict__ k_new,               // [slots, n_kv_head, HD], unrotated
     const T* __restrict__ v_new,
-    const float* __restrict__ rope_cs,
+    const RopeRungs rungs,
     float* __restrict__ partial_acc,           // [slot·n_q_head + qh][split][HD]
     float* __restrict__ partial_ml,            // [slot·n_q_head + qh][split][2]
     QsaSel sel
@@ -1591,6 +1589,8 @@ int8_decode_tile_kernel(
     const int n_slices = (int)slot.n_slices;
     const int write_slice_idx = (int)slot.write_slice;
     const uint64_t slices_ptr = slot.slices_ptr;
+    // The slot's own rung: its table for K and the unit step, its m² for Q.
+    const RopeView rope = rope_view(rungs, slot.rope_rung);
 
     const bool qsa_on = qsa_active(sel) && !qsa_row_dense(sel, slot_idx);
     const int sel_cnt = qsa_on ? (int)sel.cnt[slot_idx] : 0;
@@ -2165,7 +2165,7 @@ int8_decode_tile_kernel(
             const Q_T* qrow = q + ((int64_t)slot_idx * n_q_head + first_q_head + r) * HEAD_DIM;
             #pragma unroll
             for (int w = 0; w < N_WIN; ++w) x[w] = to_f32<Q_T>(qrow[lane + 32 * w]);
-            i8_apply_rope<HEAD_DIM, N_WIN>(x, q_pos, lane, ROPE_INTERLEAVED ? 1 : 0, rope_cs);
+            i8_apply_rope<HEAD_DIM, N_WIN>(x, q_pos, lane, ROPE_INTERLEAVED ? 1 : 0, rope.for_q());
             #pragma unroll
             for (int w = 0; w < N_WIN; ++w) {
                 float a = fabsf(x[w]);
@@ -2404,7 +2404,7 @@ int8_decode_tile_kernel(
         for (int p = 0; p < n_pass; ++p) {
             if (n_pass > 1) publish(p);
             tile_k_decode<HEAD_DIM, ROPE_INTERLEAVED>(ext, tg, s_tbl, s_inv, s_arena + OFF_KSTG,
-                                                      warp, s_k8, s_k_scale, rope_cs, warp, lane,
+                                                      warp, s_k8, s_k_scale, rope, warp, lane,
                                                       k_raw);
             // The ninth quad (slot TILE_GROUPS, live only on a single-pass
             // nine-quad window): warp 0's second round, through its own
@@ -2412,7 +2412,7 @@ int8_decode_tile_kernel(
             // once.
             if (warp == 0 && n_pass == 1 && has8)
                 tile_k_decode<HEAD_DIM, ROPE_INTERLEAVED>(ext, tg, s_tbl, s_inv, s_arena + OFF_KSTG,
-                                                          0, s_k8, s_k_scale, rope_cs, TILE_GROUPS,
+                                                          0, s_k8, s_k_scale, rope, TILE_GROUPS,
                                                           lane, nullptr);
             if (n_pass > 1) {
                 if (warp >= TILE_SM_WARPS) {

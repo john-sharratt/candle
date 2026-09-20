@@ -13,6 +13,7 @@
  *   - streamChatCompletion (token + status + think + prefill)  POST /v1/chat/completions (SSE)
  *   - subscribeLogs / seedLogs               WS /ws/logs (structured JSON frames)
  *   - getToolSchemas                         GET /v1/substrate/tools
+ *   - getMe                                  GET /v1/me
  *
  * A conversation's history carries its projection points light (the fields
  * the timeline draws, plus each point's `turn`/`event` address). The projection
@@ -62,6 +63,9 @@
         // keeps one per think block, in order.
         history: (body.messages || []).map((m) => ({ role: m.role, content: m.content, no_think: !!m.no_think, thinking: m.thinking ? [m.thinking] : [], tool_tokens: m.tool_tokens || [], spans: m.spans || [], files: m.files || [] })),
         uploads: body.uploads || [],
+        // The composer dials this conversation last ran at, as levels. Absent
+        // for one that has never taken a turn — the composer keeps its own.
+        dials: body.dials || null,
       };
     },
     archiveConversation(id) { return postVoid('/v1/conversations/' + enc(id) + '/archive'); },
@@ -92,6 +96,17 @@
         started_at_ms: 0,
         detail: 'connecting to daemon…',
         loading: { current: 'Connecting', progress: 0, completed: [] },
+      }));
+    },
+
+    // GET /v1/me — the caller's role, the tools modes it may choose, and the one
+    // it starts at. The gateway's sign-in decides the role; a caller the
+    // daemon cannot place gets the least.
+    getMe() {
+      return getJSON('/v1/me').catch(() => ({
+        role: 'unauthenticated',
+        tool_modes: ['none', 'restricted'],
+        default_tools: 'restricted',
       }));
     },
 

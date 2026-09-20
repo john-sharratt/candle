@@ -2,7 +2,7 @@
 //!
 //! The live [`IndexCache`](super::indexer::IndexCache) is one growing buffer,
 //! which is right while a sequence decodes: rows are appended in order and the
-//! scorer hands the whole live prefix to cuBLAS as one transposed operand.
+//! scorer reads the whole live prefix as one more page.
 //!
 //! A resumed conversation has no such buffer. Its index arrives as the sealed
 //! pieces of the turns the projection selected — separately allocated, in
@@ -34,30 +34,20 @@ use super::indexer::IndexCache;
 #[cfg(feature = "cuda")]
 use super::place::{PlacePage, Placement, PLACE_TILE_R};
 #[cfg(feature = "cuda")]
-use crate::models::qwen35::attention::RopeTables;
+use crate::models::operand_guard::expect_dense;
+#[cfg(feature = "cuda")]
+use crate::models::rope_schedule::FactoredRope;
 
 /// One page of a reconstructed index — a single turn's sealed rows.
 ///
 /// **A page is position-free, and that is what makes it injectable.** Its rows
-/// are the pooled, normed, roped block keys of one sealed unit; the rotation
-/// they carry is the frame they were prepared in ([`Self::roped_base`]), not the
-/// position they will be read at. A cache placing the page turns it through the
-/// difference — see `IndexCache::push_page` and `models::qwen4exp::place`.
+/// are the pooled, normed, **un-rotated** block keys of one sealed unit — the
+/// index's counterpart to K stored without RoPE. The position is the placement,
+/// and the scorer rotates each row at it as it reads the row.
 #[derive(Debug, Clone)]
 pub struct IndexPage {
-    /// `[rows, head_dim]` F32, the turn's prepared block keys.
+    /// `[rows, head_dim]` F32, the turn's pooled, normed block keys.
     pub keys: Tensor,
-    /// The absolute position [`Self::keys`] were **roped at**.
-    ///
-    /// Zero for a sealed page: the seal normalises it, so a record on disk holds
-    /// no position at all and can be placed anywhere. Non-zero only while a page
-    /// is still sitting in the cache that closed it, where it was roped at the
-    /// place it already occupies and the placement rotation is the identity.
-    ///
-    /// This is the index's counterpart to a KV chunk's `rope_base`, and it is
-    /// the whole of the difference between a page that can move and one that
-    /// cannot.
-    pub roped_base: usize,
     /// Tokens the page's LAST row covers, in `1..=ratio`. Every earlier row
     /// covers `ratio`. This is the whole of the ragged case: a turn of `T`
     /// tokens seals `ceil(T / ratio)` rows whose last one is `T - (rows-1)·ratio`
@@ -66,24 +56,10 @@ pub struct IndexPage {
 }
 
 impl IndexPage {
-    /// A **position-free** page over `keys` (`[rows, head_dim]`) whose last row
-    /// covers `last_cells` tokens — the sealed form, and what a record holds.
+    /// A page over `keys` (`[rows, head_dim]`) whose last row covers
+    /// `last_cells` tokens.
     pub fn new(keys: Tensor, last_cells: usize) -> Self {
-        Self {
-            keys,
-            roped_base: 0,
-            last_cells,
-        }
-    }
-
-    /// A page whose rows were roped at `roped_base` rather than at zero — the
-    /// live tail of a cache, lifted into a page where it already sits.
-    pub fn at_frame(keys: Tensor, roped_base: usize, last_cells: usize) -> Self {
-        Self {
-            keys,
-            roped_base,
-            last_cells,
-        }
+        Self { keys, last_cells }
     }
 
     pub fn rows(&self) -> Result<usize> {
@@ -117,22 +93,17 @@ pub struct PagedIndex {
     ratio: usize,
     device: Device,
     /// Device copies of the descriptor table, built once per window.
-    keys_tbl: Option<Tensor>,
+    pages_tbl: Option<Tensor>,
     first_tbl: Option<Tensor>,
-    /// Every page rotated into the frame of the position it sits at and written
-    /// in the layout the scorer reads: `[head_dim/4, rows, 4]` — channel-
-    /// blocked, so a warp scoring `n` consecutive candidates reads `n × 16`
-    /// contiguous bytes per step.
+    /// Every page written in the layout the scorer reads: `[head_dim/4, rows,
+    /// 4]` — channel-blocked, so a warp scoring `n` consecutive candidates reads
+    /// `n × 16` contiguous bytes per step.
     ///
     /// **The blocking is the difference between 4 memory transactions and 32.**
     /// The record's layout is `[rows, head_dim]`, which is what a row means and
     /// what [`IndexCache::from_rows`] consumes, and in it consecutive
     /// candidates' keys are `head_dim × 4` bytes apart — so the warp's `float4`
     /// load scatters across 32 cache lines and the L1 hit rate measured **2%**.
-    ///
-    /// **The rotation is what makes the page placeable.** Its rows carry the
-    /// frame they were roped in; this staging carries the frame they are read
-    /// in. Both happen in the one pass the staging costs anyway.
     placed: Option<Placement>,
 }
 
@@ -205,7 +176,7 @@ impl PagedIndex {
             end,
             ratio,
             device: device.clone(),
-            keys_tbl: None,
+            pages_tbl: None,
             first_tbl: None,
             placed: None,
         })
@@ -266,40 +237,37 @@ impl PagedIndex {
         base_rows + all
     }
 
-    /// Rotate every page into the frame of the position it sits at, write the
-    /// scorer's channel-blocked staging, and materialise the descriptor table.
-    /// Idempotent.
-    ///
-    /// Both jobs are the one pass — see [`Self::placed`].
+    /// Write every page in the scorer's channel-blocked layout and materialise
+    /// the descriptor table. Idempotent.
     #[cfg(feature = "cuda")]
-    pub fn build_tables(&mut self, rope: &RopeTables) -> Result<()> {
-        if self.keys_tbl.is_some() {
+    pub fn build_tables(&mut self) -> Result<()> {
+        use candle_kernels::simple::qsa_score_paged::PAGE_WORDS;
+
+        if self.pages_tbl.is_some() {
             return Ok(());
         }
         let jobs: Vec<PlacePage<'_>> = self
             .pages
             .iter()
-            .zip(&self.bases)
-            .map(|(p, &base)| PlacePage {
-                keys: &p.keys,
-                delta: base as isize - p.roped_base as isize,
-            })
+            .map(|p| PlacePage { keys: &p.keys })
             .collect();
         let placement = Placement::plan(&jobs)?;
-        placement.run(rope, PLACE_TILE_R)?;
-        let mut ptrs: Vec<i64> = Vec::with_capacity(self.pages.len());
-        for t in placement.staged() {
-            ptrs.push(super::indexer::tensor_ptr(t)? as i64);
+        placement.run(PLACE_TILE_R)?;
+        let mut desc: Vec<i64> = Vec::with_capacity(self.pages.len().max(1) * PAGE_WORDS);
+        for (i, t) in placement.staged().iter().enumerate() {
+            let rows = self.page_first[i + 1] - self.page_first[i];
+            desc.push(super::indexer::tensor_ptr(t)? as i64);
+            // Channel-blocked: group `c` of row `j` at `c·rows + j` float4s.
+            desc.push(rows as i64);
+            desc.push(1);
+            desc.push(self.bases[i] as i64 - self.page_first[i] as i64 * self.ratio as i64);
         }
         self.placed = Some(placement);
-        if ptrs.is_empty() {
-            ptrs.push(0);
+        if desc.is_empty() {
+            desc.extend([0, 0, 0, 0]);
         }
-        self.keys_tbl = Some(Tensor::from_vec(
-            ptrs,
-            (self.pages.len().max(1),),
-            &self.device,
-        )?);
+        let n = desc.len();
+        self.pages_tbl = Some(Tensor::from_vec(desc, (n,), &self.device)?);
         self.first_tbl = Some(Tensor::from_vec(
             self.page_first.clone(),
             (self.page_first.len(),),
@@ -310,8 +278,11 @@ impl PagedIndex {
 
     /// Score `q` against this window, writing `[rows, total_rows()]` into `out`.
     ///
-    /// `qpos` are the queries' absolute token positions; the per-row candidate
-    /// prefix is derived from them here so the kernel stays width-agnostic.
+    /// `q` is already rotated at each row's position (`indexer::rotate_rows`);
+    /// the kernel rotates every key at its own position from `rope`'s rung
+    /// `rung`, the window's sequence's. `qpos` are
+    /// the queries' absolute token positions; the per-row candidate prefix is
+    /// derived from them here so the kernel stays width-agnostic.
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     pub fn score_rows(
@@ -323,7 +294,8 @@ impl PagedIndex {
         out: &Tensor,
         out_stride: usize,
         row_base: usize,
-        rope: &RopeTables,
+        rope: &FactoredRope,
+        rung: u32,
     ) -> Result<Vec<u32>> {
         use candle_kernels::simple::qsa_score_paged::run_qsa_score_paged;
 
@@ -340,9 +312,11 @@ impl PagedIndex {
         if t == 0 || self.total_rows() == 0 {
             return Ok(cand);
         }
-        self.build_tables(rope)?;
-        let q = q.reshape((t * n_heads, head_dim))?.contiguous()?;
+        self.build_tables()?;
+        let q = q.reshape((t * n_heads, head_dim))?;
+        expect_dense(&q, "paged score queries")?;
         let cnt = Tensor::from_vec(cand.clone(), (t,), &self.device)?;
+        let table = rope.table(rung)?;
 
         let Device::Cuda(cuda) = &self.device else {
             candle::bail!("paged score: runs on CUDA");
@@ -353,15 +327,19 @@ impl PagedIndex {
         unsafe {
             run_qsa_score_paged(
                 super::indexer::tensor_ptr(&q)? as *const f32,
-                super::indexer::i64_ptr(self.keys_tbl.as_ref().unwrap())? as *const u64,
+                super::indexer::i64_ptr(self.pages_tbl.as_ref().unwrap())? as *const i64,
                 super::indexer::u32_ptr(self.first_tbl.as_ref().unwrap())? as *const u32,
                 super::indexer::u32_ptr(&cnt)? as *const u32,
+                super::indexer::tensor_ptr(&table)? as *const f32,
+                super::indexer::tensor_ptr(rope.steps(rung, self.ratio)?)? as *const f32,
                 super::indexer::tensor_ptr(out)? as *mut f32,
                 t as i32,
                 n_heads as i32,
                 head_dim as i32,
                 self.total_rows() as i32,
                 self.pages.len() as i32,
+                rope.pairs() as i32,
+                self.ratio as i32,
                 out_stride as i64,
                 row_base as i64,
                 raw,
@@ -370,48 +348,55 @@ impl PagedIndex {
         Ok(cand)
     }
 
-    /// The CPU oracle: the same expression, evaluated eagerly.
+    /// The CPU oracle: the same expression, evaluated eagerly in f64.
     ///
-    /// Deliberately the naive form — one dot product at a time, in row order —
-    /// so it agrees with the kernel only if the kernel is right, rather than by
-    /// sharing an implementation with it.
-    #[cfg(feature = "cuda")]
+    /// Deliberately the naive form — each key rotated at its own position from
+    /// the f64 sine and cosine of the exact angle, then one dot product at a
+    /// time, in row order — so it agrees with the kernel only if the kernel is
+    /// right, rather than by sharing an implementation with it. `q` is the
+    /// same rotated queries the kernel takes; `inv_freq` are the frequencies
+    /// the kernel's table was built from.
     pub fn score_reference(
         &self,
         q: &Tensor,
         qpos: &[usize],
         n_heads: usize,
         head_dim: usize,
-        rope: &RopeTables,
-    ) -> Result<Vec<f32>> {
+        inv_freq: &[f32],
+    ) -> Result<Vec<f64>> {
         let t = qpos.len();
         let n = self.total_rows();
+        let pairs = inv_freq.len();
         let qv = q.flatten_all()?.to_vec1::<f32>()?;
-        // **Placed, like the kernel's operand.** The scorer reads each page in
-        // the frame of the position it sits at, so an oracle reading the record
-        // frame would be comparing two different tensors and calling the
-        // difference a kernel bug. Rotated here with the HOST rope — a different
-        // implementation from the kernel's, which is the whole point of an
-        // oracle.
-        let mut keys: Vec<f32> = Vec::with_capacity(n * head_dim);
+        // Every key rotated at its own position: row `j` of a page at
+        // `base + j·ratio`.
+        let mut keys: Vec<f64> = Vec::with_capacity(n * head_dim);
         for (p, &base) in self.pages.iter().zip(&self.bases) {
             let rows = p.rows()?;
-            let delta = base.saturating_sub(p.roped_base);
-            let placed = rope
-                .apply_at_positions(&p.keys.reshape((rows, 1, head_dim))?, &vec![delta; rows])?
-                .reshape((rows, head_dim))?;
-            keys.extend(placed.flatten_all()?.to_vec1::<f32>()?);
+            let kv = p.keys.flatten_all()?.to_vec1::<f32>()?;
+            for j in 0..rows {
+                let pos = (base + j * self.ratio) as f64;
+                let row = &kv[j * head_dim..(j + 1) * head_dim];
+                let mut out: Vec<f64> = row.iter().map(|&x| x as f64).collect();
+                for (i, &w) in inv_freq.iter().enumerate() {
+                    let (s, c) = (pos * w as f64).sin_cos();
+                    let (lo, hi) = (row[i] as f64, row[i + pairs] as f64);
+                    out[i] = lo * c - hi * s;
+                    out[i + pairs] = hi * c + lo * s;
+                }
+                keys.extend(out);
+            }
         }
-        let mut out = vec![-1e30f32; t * n];
+        let mut out = vec![-1e30f64; t * n];
         for (r, &pos) in qpos.iter().enumerate() {
             let valid = self.candidates_at(pos);
             for g in 0..valid.min(n) {
-                let mut s = 0f32;
+                let mut s = 0f64;
                 for h in 0..n_heads {
                     let qb = (r * n_heads + h) * head_dim;
-                    let mut d = 0f32;
+                    let mut d = 0f64;
                     for c in 0..head_dim {
-                        d += qv[qb + c] * keys[g * head_dim + c];
+                        d += qv[qb + c] as f64 * keys[g * head_dim + c];
                     }
                     s += d.max(0.0);
                 }
@@ -500,10 +485,13 @@ impl SealedIndex {
     }
 }
 
-/// Wire version of the carried-state container. Version 2 carries each layer's
-/// open block beside its completed rows.
-const AUX_VERSION: u32 = 2;
-
+/// Wire version of the carried-state container.
+///
+/// Version 3: each layer's completed rows are **un-rotated**, as the index
+/// stores them, beside its open block. A record of an earlier version held rows
+/// rotated relative to its page's start, which this build cannot read, so it is
+/// refused rather than scored in the wrong frame.
+const AUX_VERSION: u32 = 3;
 /// Everything this architecture carries that is not a DeltaNet layer stack,
 /// as one opaque blob for the turn record's auxiliary slot.
 ///
@@ -616,9 +604,8 @@ pub fn decode_page(blob: &[u8], dev: &Device) -> Result<SealedIndex> {
         open_vals.push(f32::from_bits(u32_at(16 + (n + i) * 4)?));
     }
     Ok(SealedIndex {
-        // A decoded page is position-free by construction: the seal normalised
-        // it before writing, so `roped_base` is zero and its placement rotation
-        // is exactly the base it is placed at.
+        // A decoded page is position-free by construction: its rows are
+        // un-rotated, and the scorer rotates them at wherever it is placed.
         page: IndexPage::new(
             Tensor::from_vec(vals, (rows, dim), dev)?.to_dtype(DType::F32)?,
             last_cells,

@@ -25,7 +25,7 @@ questions:
 - execute this loop and give me the result
 - try this javascript and tell me if it throws
 category: Code execution
-description: Execute a JavaScript snippet in an embedded, sandboxed engine (no filesystem, network, or process access). Runs in-process on a pure-Rust VM — no Node or external interpreter required. Use for arithmetic/logic the model would get wrong, data transformation, string processing, JSON manipulation, and quick algorithms. `console.log` output is returned in stdout; the final expression's value in result. Returns stdout, stderr, exit_code (0 on success, 1 if the script throws), duration, and result.
+description: 'Execute a JavaScript snippet in an embedded, sandboxed engine (no network or process access; files only through the `vfs` global: vfs.read(path), vfs.write(path, text), vfs.list(prefix)). Runs in-process on a pure-Rust VM — no Node or external interpreter required. Use for arithmetic/logic the model would get wrong, data transformation, string processing, JSON manipulation, quick algorithms, and testing JavaScript just written to a file — `const f = require(''./scratch/lib.js'')` loads a CommonJS module from the files (Node built-ins are not available). Only JavaScript runs here; code in another language cannot be executed. `console.log` output is returned in stdout; the final expression''s value in result. Returns stdout, stderr, exit_code (0 on success, 1 if the script throws), duration, and result.'
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

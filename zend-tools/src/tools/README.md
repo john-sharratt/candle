@@ -31,18 +31,20 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 | `calculator` | `calculator.rs` | evalexpr; no eval code path |
 | `unit_convert` | `unit_convert.rs` | Static dimension table; affine temperature |
 | `random` | `random.rs` | rand crate; integer/float/choice/shuffle/dice |
-| `web_search` | `web_search.rs` | Tavily API; 1-hour cache |
+| `web_search` | `web_search.rs` | Tavily API; key from `secrets/tools.yaml` |
 | `web_fetch` | `web_fetch.rs` | reqwest + readability extractor; SSRF guard |
 | `weather` | `weather.rs` | Open-Meteo geocoding + forecast APIs |
 
-### Virtual filesystem (6 tools) — web chat only
+### Virtual filesystem (8 tools) — web chat only
 
 | Tool | File | Notes |
 |------|------|-------|
 | `write` | `file/write.rs` | Create or overwrite; 10 MiB VFS cap |
 | `file_read` | `file/read.rs` | Numbered excerpt of the whole file, or of a line range; only `path` required |
-| `file_edit` | `file/edit.rs` | Unique-substring replacement |
+| `file_edit` | `file/edit.rs` | Unified-diff patch, located by context |
 | `file_list` | `file/list.rs` | Path prefix filter; sorted |
+| `file_search` | `file/search.rs` | Find files by name/path; substring or `*` glob, whole project |
+| `file_grep` | `file/grep.rs` | Regex over file contents; path + line number per hit |
 | `file_delete` | `file/delete.rs` | Idempotent; returns `deleted` flag |
 | `file_present` | `file/present.rs` | Foreground presentation gesture |
 

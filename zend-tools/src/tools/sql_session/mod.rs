@@ -26,8 +26,9 @@
 //! | `connection_failed` | Could not open the database file |
 //! | `query_failed` | SQL execution error (syntax, constraint, etc.) |
 //! | `session_limit_exceeded` | 5-session-per-user cap reached |
+//! | `not_permitted` | the context lacks the `disk_write` capability |
 
-use crate::ToolError;
+use crate::{NotPermitted, ToolError};
 use thiserror::Error;
 
 pub mod close;
@@ -56,6 +57,8 @@ pub enum SqlError {
     QueryFailed(String),
     #[error("session limit exceeded")]
     SessionLimitExceeded,
+    #[error(transparent)]
+    NotPermitted(#[from] NotPermitted),
 }
 
 impl ToolError for SqlError {
@@ -68,6 +71,7 @@ impl ToolError for SqlError {
             SqlError::ConnectionFailed(_) => "connection_failed",
             SqlError::QueryFailed(_) => "query_failed",
             SqlError::SessionLimitExceeded => "session_limit_exceeded",
+            SqlError::NotPermitted(_) => NotPermitted::CODE,
         }
     }
 }

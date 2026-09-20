@@ -1325,6 +1325,7 @@ impl Builder {
                 decode_priority: DecodePriority::High,
                 on_corrupt_turn: CorruptTurnPolicy::DropTurn,
                 ingest_unit: None,
+                in_tool_rounds: true,
             }],
         };
         validate(&schema).expect("synthetic schema must always be valid");

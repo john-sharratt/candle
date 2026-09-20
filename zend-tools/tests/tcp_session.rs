@@ -1,7 +1,6 @@
 mod harness;
 
 use serde_json::json;
-use zend_tools::ToolContext;
 
 #[test]
 fn tcp_session_list_empty() {
@@ -62,7 +61,7 @@ fn tcp_session_close_returns_session_id() {
 
 #[test]
 fn tcp_session_list_empty_after_context_create() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let list = harness::expect_success(harness::invoke_with_ctx(
         "tcp_session_list",
         json!({}),

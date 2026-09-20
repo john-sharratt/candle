@@ -48,12 +48,30 @@ pub enum Observe {
     /// committed) and the cursor advances so the successor prefills the
     /// continuation in its place (the steering retry).
     TokenClosedDrop,
-    /// A free-text span hit its hard limit and was force-closed. The tree then
-    /// writes the span's `close_run` — the text its terminator would have
-    /// consumed — before moving on, exactly as for an intercepted EOS.
+    /// A free-text span hit its hard limit and was force-closed. The token is
+    /// committed with the span's completion after it — the text that finishes
+    /// the value as written ([`TerminatorState::completion`]) — exactly as for
+    /// an intercepted EOS, which is replaced by that text.
     SpanForcedClosed,
     /// A free-text span ended via an EOS sample (`eos_ends`).
     SpanEos,
+    /// A lookahead span closed on a delimiter token its successor does not
+    /// continue with — a `]` where the element's `}` comes next. The token is
+    /// DROPPED (not committed) and the cursor advances, so the successor writes
+    /// the structure in its place.
+    ///
+    /// Pushed back instead, the token is out of grammar at the successor and
+    /// the walk bails with it already committed: live, a Cline `read_files`
+    /// call ended `"end_line": 3420]}}}` and was not JSON. Dropped, the
+    /// grammar writes the element's `}` and the model chooses again from
+    /// what is legal there.
+    DelimiterDropped,
+    /// A free-text span's token could not be committed as written, and the
+    /// session has the bytes to commit in its place
+    /// ([`StencilSession::take_rewrite`]): a character escaped inside a string
+    /// (`closed: false`), or a value ended at the first byte that could not
+    /// continue it and completed as written (`closed: true`).
+    Repaired { closed: bool },
     /// An out-of-grammar token was decoded (it escaped the mask).  The session
     /// logged it and entered the bail failsafe — the next actions emit the
     /// tree's bail tokens and exit.
@@ -71,15 +89,6 @@ enum Cursor {
         term: TerminatorState,
         emitted: u32,
     },
-    /// A span ended without its terminator firing — emit the closing text it
-    /// therefore never wrote, then carry on at `then`.
-    ///
-    /// Distinct from [`Cursor::Bailing`], which abandons the walk: this one
-    /// *resumes* it. See [`crate::stencil::tree::FreeTextSpan::close_run`].
-    Closing {
-        run: Vec<TokenId>,
-        then: NodeId,
-    },
     /// The failsafe fired — emit the tree's bail tokens, then finish.
     Bailing,
     Done,
@@ -92,6 +101,9 @@ pub struct StencilSession {
     /// A lookahead terminator's delimiter, decoded but belonging to the next
     /// node — applied on the following `next_action` (§ push-back).
     pushback: Option<TokenId>,
+    /// The bytes to commit in place of the token `observe` just saw, when it
+    /// could not be committed as written — see [`Self::take_rewrite`].
+    rewrite: Option<Vec<u8>>,
 }
 
 impl StencilSession {
@@ -102,7 +114,21 @@ impl StencilSession {
             tree,
             cursor: Cursor::At(root),
             pushback: None,
+            rewrite: None,
         }
+    }
+
+    /// The bytes to commit in place of the token the last `observe` saw, if it
+    /// cannot be committed as written. Empty bytes mean it contributes nothing
+    /// and is dropped.
+    ///
+    /// Set by a free-text span that had to escape a character, end a malformed
+    /// value, complete a value cut short by EOS (replacing the EOS), or complete
+    /// one at its hard limit (after the token). The caller re-tokenizes these
+    /// bytes and commits them in the token's place; the walk has already moved
+    /// on as if the model had written them.
+    pub fn take_rewrite(&mut self) -> Option<Vec<u8>> {
+        self.rewrite.take()
     }
 
     pub fn is_done(&self) -> bool {
@@ -190,14 +216,6 @@ impl StencilSession {
                 let span = self.free_span(node);
                 Self::free_decode_action(span, emitted)
             }
-            Cursor::Closing { ref run, then } => {
-                let run = run.clone();
-                self.cursor = Cursor::At(then);
-                match run.is_empty() {
-                    true => self.next_action(),
-                    false => StencilAction::Prefill(run),
-                }
-            }
             Cursor::Bailing => {
                 self.cursor = Cursor::Done;
                 let bail = self.tree.bail();
@@ -259,10 +277,9 @@ impl StencilSession {
         }
         let out = match self.tree.node(node) {
             // The delimiter must be the static's first token for the rest to
-            // follow cleanly.  With a real tokenizer the model's delimiter token
-            // can differ from the successor's canonical first token (e.g. it
-            // emits `}` where the successor opens `}}`); rather than silently
-            // miscount bytes, treat that as out-of-grammar and bail.
+            // follow cleanly. `observe` pushes back only a token that is —
+            // anything else it drops — so the bail below is the failsafe it
+            // would take to reach it.
             StencilNode::Static { tokens, next } if tokens.first() == Some(&tok) => Out::Static {
                 rest: tokens.iter().skip(1).copied().collect(),
                 next: *next,
@@ -312,6 +329,7 @@ impl StencilSession {
     /// Consume a decoded token.  `bytes` are the token's decoded bytes (only
     /// used in a free-text span).
     pub fn observe(&mut self, token: TokenId, bytes: &[u8]) -> Result<Observe, WalkError> {
+        self.rewrite = None;
         match std::mem::replace(&mut self.cursor, Cursor::Done) {
             Cursor::InBranch { node, pos } => {
                 let step = self.branch_trie(node).step(pos, token);
@@ -364,25 +382,24 @@ impl StencilSession {
                 // seals on any of them, and one this missed ended a reply from
                 // inside an open think block mid-sentence.
                 if self.tree.is_end(token) {
-                    // The span's terminator never fired, so whatever closing
-                    // text it would have consumed was never written. The tree
-                    // writes it now, then carries on — the element is closed
-                    // properly rather than running into whatever follows.
-                    self.cursor = match span.close_run.is_empty() {
-                        true => Cursor::At(span.next),
-                        false => Cursor::Closing {
-                            run: span.close_run.clone(),
-                            then: span.next,
-                        },
-                    };
+                    self.cursor = Cursor::At(span.next);
                     return Ok(match span.eos_ends {
                         // The span is allowed to end this way — the think-steer
                         // tree's final span, whose whole job is to run to EOS.
                         true => Observe::SpanEos,
-                        // It is not. Swallow the token so it never reaches the
-                        // sequence (and never seals it) and let the tree close
-                        // the structure itself.
-                        false => Observe::TokenClosedDrop,
+                        // It is not. The span's terminator never fired, so
+                        // whatever finishes the value was never written: the
+                        // EOS is replaced by that text — the element is closed
+                        // properly rather than running into whatever follows —
+                        // or, with nothing to write, swallowed so it never
+                        // reaches the sequence (and never seals it).
+                        false => {
+                            let completion = term.completion();
+                            if !completion.is_empty() {
+                                self.rewrite = Some(completion);
+                            }
+                            Observe::TokenClosedDrop
+                        }
                     });
                 }
                 // A close *token* ends the span before any byte terminator runs.
@@ -405,46 +422,35 @@ impl StencilSession {
                         // A lookahead terminator's delimiter belongs to the next
                         // node.  When it is its own token (consumed == 0, the
                         // byte-level / clean case), push it back so the next node
-                        // consumes it instead of re-emitting it.
+                        // consumes it instead of re-emitting it — if the next
+                        // node continues with it. If not, drop it and let the
+                        // next node write what belongs there.
                         if span.term.is_lookahead() && consumed == 0 {
+                            if !self.continues_with(span.next, token) {
+                                return Ok(Observe::DelimiterDropped);
+                            }
                             self.pushback = Some(token);
                         }
                         Ok(Observe::SpanClosed {
                             leftover: bytes.len() - consumed,
                         })
                     }
+                    // The value ended at a byte that could not continue it, and
+                    // was completed as written.
+                    Feed::Rewrite {
+                        bytes: out,
+                        closed: true,
+                    } => {
+                        self.cursor = Cursor::At(span.next);
+                        self.rewrite = Some(out);
+                        Ok(Observe::Repaired { closed: true })
+                    }
+                    Feed::Rewrite {
+                        bytes: out,
+                        closed: false,
+                    } => Ok(self.continue_span(node, &span, term, emitted, bytes, Some(out))),
                     Feed::Continue => {
-                        if emitted >= span.limits.forced_after {
-                            // **Cut short is interrupted too**, and closes the
-                            // same way the EOS path above does: the terminator
-                            // never fired, so the text it would have consumed
-                            // was never written, and the tree writes it.
-                            //
-                            // This went straight to the successor, which for a
-                            // function-block value is the next `<parameter=…>`
-                            // — so a value that ran to the limit left its
-                            // element open, and a reader bounding it by the
-                            // first `</parameter>` took the *next* argument's
-                            // close as its own. A `reflect` whose thoughts ran
-                            // on came back missing `feeling`, a required
-                            // argument the grammar had in fact forced, with the
-                            // feeling itself swallowed into the thoughts.
-                            self.cursor = match span.close_run.is_empty() {
-                                true => Cursor::At(span.next),
-                                false => Cursor::Closing {
-                                    run: span.close_run.clone(),
-                                    then: span.next,
-                                },
-                            };
-                            Ok(Observe::SpanForcedClosed)
-                        } else {
-                            self.cursor = Cursor::InFreeText {
-                                node,
-                                term,
-                                emitted,
-                            };
-                            Ok(Observe::Continue)
-                        }
+                        Ok(self.continue_span(node, &span, term, emitted, bytes, None))
                     }
                 }
             }
@@ -452,6 +458,64 @@ impl StencilSession {
                 self.cursor = other;
                 Err(WalkError::NotDecoding)
             }
+        }
+    }
+
+    /// A span token that did not close the span: stay in it, unless this token
+    /// reached the hard limit. `rewritten` is what the token commits in place
+    /// of its own `bytes`, when it cannot be committed as written.
+    fn continue_span(
+        &mut self,
+        node: NodeId,
+        span: &FreeTextSpan,
+        term: TerminatorState,
+        emitted: u32,
+        bytes: &[u8],
+        rewritten: Option<Vec<u8>>,
+    ) -> Observe {
+        if emitted >= span.limits.forced_after {
+            // **Cut short is interrupted too**, and closes the same way the EOS
+            // path does: the terminator never fired, so the text that finishes
+            // the value was never written, and the tree writes it after the
+            // token.
+            //
+            // This went straight to the successor, which for a function-block
+            // value is the next `<parameter=…>` — so a value that ran to the
+            // limit left its element open, and a reader bounding it by the
+            // first `</parameter>` took the *next* argument's close as its own.
+            // A `reflect` whose thoughts ran on came back missing `feeling`, a
+            // required argument the grammar had in fact forced, with the
+            // feeling itself swallowed into the thoughts.
+            let completion = term.completion();
+            if rewritten.is_some() || !completion.is_empty() {
+                let mut written = rewritten.unwrap_or_else(|| bytes.to_vec());
+                written.extend(completion);
+                self.rewrite = Some(written);
+            }
+            self.cursor = Cursor::At(span.next);
+            return Observe::SpanForcedClosed;
+        }
+        self.cursor = Cursor::InFreeText {
+            node,
+            term,
+            emitted,
+        };
+        match rewritten {
+            Some(written) => {
+                self.rewrite = Some(written);
+                Observe::Repaired { closed: false }
+            }
+            None => Observe::Continue,
+        }
+    }
+
+    /// Whether `node` can take `tok` as its first token: a static that opens on
+    /// it, or a branch with an arm that does.
+    fn continues_with(&self, node: NodeId, tok: TokenId) -> bool {
+        match self.tree.node(node) {
+            StencilNode::Static { tokens, .. } => tokens.first() == Some(&tok),
+            StencilNode::Branch { trie } => trie.step(trie.root(), tok).is_some(),
+            StencilNode::FreeText(_) | StencilNode::End => false,
         }
     }
 

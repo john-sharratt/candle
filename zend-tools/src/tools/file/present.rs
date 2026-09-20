@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::FileError;
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct PresentRequest {
@@ -37,6 +37,11 @@ impl Tool for FilePresent {
     type Request = PresentRequest;
     type Response = PresentResponse;
     type Error = FileError;
+
+    /// Tests for a file; writes nothing.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(ctx: &ToolContext, req: PresentRequest) -> Result<PresentResponse, FileError> {
         let mut presented = Vec::new();

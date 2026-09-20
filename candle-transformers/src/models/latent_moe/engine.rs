@@ -31,11 +31,13 @@ use candle_nn::kv_cache::WeightZone;
 use super::arch::{Arch, Ffn, Global, Hyper as HyperSite, Weight};
 use super::config::Config;
 use super::hyper::{HyperConnection, HyperParams};
+use super::kernel_attention::KernelAttnLayer;
 use super::linear::QLinear;
 use super::loader::{self, GgufModel};
 use super::moe::{Expert, Gate, ScoreFunc};
 use super::paged;
 use super::rope::RotaryCache;
+use super::rope_tables::LatentRopeTables;
 
 /// One transformer layer's resident (non-routed-expert) weights. The routed experts for this
 /// layer live in the shared [`ExpertCache`], indexed by `moe_layer_idx`.
@@ -671,15 +673,20 @@ impl Engine {
 
         let mut layers = Vec::with_capacity(self.cfg.n_layers);
         let ws = std::sync::Arc::new(super::paged::LatentWorkspace::build(&self.device)?);
+        let mut tables = LatentRopeTables::default();
         for (l, layer) in self.layers.iter().enumerate() {
             let (theta, orig) = self.cfg.rope_params(l);
-            layers.push(super::kernel_attention::KernelAttnLayer::new(
-                &layer.attn,
+            let rope_tab = tables.for_layer(
                 theta,
                 orig,
                 self.cfg.rope_factor,
                 self.cfg.beta_fast,
                 self.cfg.beta_slow,
+                &self.device,
+            )?;
+            layers.push(KernelAttnLayer::new(
+                &layer.attn,
+                rope_tab,
                 self.cfg.index_head_dim,
                 ws.clone(),
                 &self.device,
@@ -723,7 +730,7 @@ pub struct KernelSession<'a> {
     /// commit (`set_len`) runs on each before the slot headers serialize.
     backings: Vec<candle_nn::kv_cache::ChunkedKvBacking>,
     seq: usize,
-    layers: Vec<super::kernel_attention::KernelAttnLayer>,
+    layers: Vec<KernelAttnLayer>,
     pos: usize,
 }
 
@@ -758,7 +765,7 @@ impl KernelSession<'_> {
         }
         let resident = self.pos - evicted as usize;
 
-        // Per-step slot metadata for ALL layers (24-byte SlotHeader each,
+        // Per-step slot metadata for ALL layers (one SlotHeader each,
         // one pinned upload). Kept alive through the layer loop. The CPU-side
         // chunk usage must mirror the RESIDENT tokens the GPU commits have
         // written (absolute `self.pos` minus the evicted front) — `set_len`

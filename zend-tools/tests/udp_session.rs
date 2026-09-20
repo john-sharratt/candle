@@ -1,11 +1,10 @@
 mod harness;
 
 use serde_json::json;
-use zend_tools::ToolContext;
 
 #[test]
 fn udp_session_open_close() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let open = harness::expect_success(harness::invoke_with_ctx(
         "udp_session_open",
         json!({}),
@@ -24,7 +23,7 @@ fn udp_session_open_close() {
 
 #[test]
 fn udp_session_list_after_open() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     harness::invoke_with_ctx("udp_session_open", json!({}), &ctx);
     let list = harness::expect_success(harness::invoke_with_ctx(
         "udp_session_list",
@@ -36,7 +35,7 @@ fn udp_session_list_after_open() {
 
 #[test]
 fn udp_session_list_empty_initially() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let list = harness::expect_success(harness::invoke_with_ctx(
         "udp_session_list",
         json!({}),
@@ -56,7 +55,7 @@ fn udp_session_close_nonexistent() {
 
 #[test]
 fn udp_session_open_multiple_independent() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let s1 = harness::expect_success(harness::invoke_with_ctx(
         "udp_session_open",
         json!({}),
@@ -78,7 +77,7 @@ fn udp_session_open_multiple_independent() {
 
 #[test]
 fn udp_session_session_id_starts_with_sess() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let open = harness::expect_success(harness::invoke_with_ctx(
         "udp_session_open",
         json!({}),

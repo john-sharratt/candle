@@ -61,10 +61,10 @@ use super::wave::Qwen4ExpBatched;
 use crate::models::batched_inference::BatchedInferenceSession;
 use crate::models::batched_layer::{forward_attn_batched, BatchedAttentionParams, DecodeHeaders};
 use crate::models::delta_net::SeqSpan;
-use crate::models::draft_walk::{draft_reserve, draft_rope_depth, draft_walk};
+use crate::models::draft_walk::{draft_reserve, draft_walk};
 use crate::models::kv_cache_utils::SequenceContext;
 use crate::models::prefill_utils::SharedPm;
-use crate::models::qwen35::attention::RopeTables;
+use crate::models::rope_schedule::FactoredRope;
 use crate::models::tensor_cat::TensorCat;
 use candle::quantized::cuda::to_dynamic;
 use candle_nn::kv_cache::KvCache;
@@ -94,8 +94,8 @@ pub struct HeadWave<'a> {
     pub spans: &'a [SeqSpan],
     /// Every row's sequence position, decode rows then prefill rows.
     pub offsets_all: &'a [usize],
-    /// The indexer's RoPE tables, built for this wave's depth.
-    pub index_rope: &'a RopeTables,
+    /// The indexer's factored RoPE table.
+    pub index_rope: &'a FactoredRope,
     /// The head's KV layer, which is also its index into a sequence's index
     /// caches — past every trunk attention layer.
     pub kv_layer: usize,
@@ -332,7 +332,7 @@ impl Qwen4ExpBatched {
         at: &[usize],
         params: &BatchedAttentionParams<'_>,
         idx_map: &mut HashMap<usize, Vec<IndexCache>>,
-        index_rope: &RopeTables,
+        index_rope: &FactoredRope,
         kv_layer: usize,
         eps: f64,
     ) -> Result<(Tensor, Tensor)> {
@@ -598,11 +598,7 @@ impl Qwen4ExpBatched {
             })
             .collect::<Result<_>>()?;
 
-        let depth = draft_rope_depth(session, seqs, kv_layer)?;
-        let rope_cs = self.rope_cs_for(depth)?;
-        // Hoisted: the indexer's tables are wave-invariant, and building them
-        // per drafted position would take a lock and rebuild a table per token.
-        let index_rope = self.index_rope_for(depth)?;
+        let index_rope = self.index_rope().clone();
 
         let mut step = |ids: &Tensor,
                         h: &Tensor,
@@ -618,8 +614,7 @@ impl Qwen4ExpBatched {
                 &cos,
                 &sin,
                 false,
-                &self.inv_freq,
-                &rope_cs,
+                &self.rope,
                 DecodeHeaders::Decode {
                     buf: Some(headers.0.clone()),
                     stride: headers.1,

@@ -879,6 +879,20 @@ pub struct LayerSchema {
     /// "N / M <unit>" while the layer ingests. `None` falls back to a mode-derived
     /// default in [`crate`]'s ingest driver; non-ingest layers ignore it.
     pub ingest_unit: Option<String>,
+    /// Whether this layer's turns are projected into a **tool round** — a turn
+    /// whose user message is the results of calls the turn before made, marked
+    /// by [`super::TOOL_ROUND_SELECTOR`] (`in_tool_rounds:` in YAML, default
+    /// `true`).
+    ///
+    /// A tool round's last user turn is a tool response, so the model looks back
+    /// through the context for the question it is answering. An ingest layer's
+    /// turns are requests too — "Summarize the root folder of this project in
+    /// one or two complete sentences" — and a round that found one nearer than
+    /// the user's answered it instead: a chat asked to list a crate's modules
+    /// fetched the page and then described the workspace. `false` keeps such a
+    /// layer out of every tool round; the turn that opened the round, where the
+    /// question is the user's own last message, still sees it.
+    pub in_tool_rounds: bool,
     /// Where this layer sits in the stack a projection sees down through
     /// (`rank:` in YAML): a projection targeting a layer sees every layer of
     /// **lower** rank, and none of equal or higher rank but its own.

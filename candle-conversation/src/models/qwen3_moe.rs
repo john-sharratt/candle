@@ -5,7 +5,7 @@
 //!
 //! Source: <https://huggingface.co/Qwen/Qwen3-30B-A3B/blob/main/generation_config.json>
 
-use super::{ModelArch, ModelSpec};
+use super::{ModelArch, ModelSpec, RopePreset};
 use crate::{config::SamplingConfig, models::DialectType};
 
 const PROMPT: &str = "You are a helpful, accurate, and concise assistant.";
@@ -42,6 +42,9 @@ pub(super) fn qwen3_30b_a3b_q6() -> ModelSpec {
         tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 4096,
+        // The original release is trained at 32K with Qwen's published YaRN
+        // factors past it; the 2507 refresh would be native to 262K.
+        rope: RopePreset::qwen3(),
         default_sampling: SamplingConfig::for_gguf_architecture("qwen2moe"),
         supports_thinking: true,
         // Sampling params for a thinking-off turn (effort=Off / `/no_think`); the

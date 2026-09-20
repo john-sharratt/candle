@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 // (`src/simple/quantized_dispatcher.cu` — the seal-time quantize/select
 // kernels — compiles in its own group under the bit-exact mirror contract
 // flags; see the `quantize_dispatch` group below.)
-const SIMPLE_KERNELS: [&str; 59] = [
+const SIMPLE_KERNELS: [&str; 60] = [
     "src/api.cu", // FFI wrapper functions for all simple kernels
     "src/simple/nvtx.cu",
     "src/simple/tensor_assert.cu",
@@ -44,6 +44,7 @@ const SIMPLE_KERNELS: [&str; 59] = [
     "src/simple/qsa_topk.cu",
     "src/simple/qsa_index_append.cu",
     "src/simple/qsa_page_place.cu",
+    "src/simple/qsa_rope_rows.cu",
     "src/simple/gr_hyper.cu",
     "src/simple/hyper_mhc.cu",
     "src/simple/compressor_pool.cu",

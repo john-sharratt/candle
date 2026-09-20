@@ -6,6 +6,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{now, RemoteFsError};
+use crate::net;
 use crate::state::sessions::{RemoteFsConn, RemoteFsEntry, SessionMeta, SshConn};
 use crate::{RegisteredTool, Tool, ToolContext};
 
@@ -69,12 +70,12 @@ impl Tool for RemoteFsSessionOpen {
         }
 
         let cred = ctx
-            .credentials
+            .credentials()?
             .get_by_name(&req.credential_name)
             .ok_or_else(|| RemoteFsError::CredentialNotFound(req.credential_name.clone()))?;
 
         let addr = format!("{host}:{port}");
-        let stream = std::net::TcpStream::connect(&addr)
+        let stream = net::tcp_connect_to(ctx.grants(), &addr, None)
             .map_err(|e| RemoteFsError::ConnectionFailed(e.to_string()))?;
 
         let mut session =

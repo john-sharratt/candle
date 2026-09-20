@@ -1,24 +1,14 @@
-//! Capture a single paged-prefill kernel call — its packed Q/K/V inputs, the
-//! cached KV chunks it attends, and the geometry/RoPE params — to a binary
-//! fixture, so the attention kernel can be replayed in isolation in a unit test
-//! (kernel-optimization work + a perf regression guard).
-//!
-//! Entirely gated behind `ZEND_PREFILL_CAPTURE=<path>`: a no-op unless that env
-//! var is set, and then it dumps exactly ONE call (the first whose summed
-//! `kv_len` exceeds `ZEND_PREFILL_CAPTURE_MIN_KV`, default 20000) per process.
-//! CUDA-only — the kernel and the KV gather are CUDA paths.
+//! The fixture format of one captured paged-prefill kernel call — its packed
+//! Q/K/V inputs, the cached KV chunks it attends, and the geometry/RoPE params —
+//! which `tests/prefill_replay.rs` replays in isolation (kernel-optimization
+//! work + a perf regression guard), and `examples/trim_prefill_fixture.rs`
+//! trims to its largest slot.
 //!
 //! What is NOT captured (regenerated on replay, never round-tripped): GPU
 //! pointers, slot headers, slices, the position_map, resident `meta` records.
 //! `build_slot_headers` rebuilds those from the chunk state every call.
 
-#[cfg(feature = "cuda")]
-use candle::{DType, Device, Result, Tensor};
-#[cfg(feature = "cuda")]
-use candle_nn::kv_cache::KvCache;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "cuda")]
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// One sealed chunk's portable host data (mirror of `candle_nn`'s
 /// `HostSealedChunk`, with serde). `kv_bytes` is the raw (possibly quantized)
@@ -64,7 +54,10 @@ pub struct PrefillCapture {
     pub v: Vec<f32>,
     /// Per-sequence RoPE base position, `[b_sz]`.
     pub rope_offsets: Vec<u32>,
-    /// RoPE cos/sin table `[rope_cs_rows, head_dim]`, flattened f32.
+    /// The RoPE `(cos, sin)` table the call rotated by, `[rope_cs_rows,
+    /// head_dim]` flattened, frequency `i` at `2i`. Its row 1 is the rotation
+    /// by one position, which is how a replay recovers the frequencies
+    /// ([`Self::inv_freq`]).
     pub rope_cs: Vec<f32>,
     pub rope_cs_rows: usize,
     /// One entry per sequence/slot, in batch order.
@@ -106,166 +99,52 @@ impl PrefillCapture {
             slots: vec![self.slots[idx].clone()],
         }
     }
-}
 
-#[cfg(feature = "cuda")]
-static CAPTURED: AtomicBool = AtomicBool::new(false);
-
-#[cfg(feature = "cuda")]
-fn dtype_tag(dt: DType) -> u8 {
-    match dt {
-        DType::F16 => 1,
-        DType::BF16 => 2,
-        _ => 3,
+    /// The RoPE frequencies the captured call rotated by, one per
+    /// `head_dim / 2` pairs: the angle of row 1, the rotation by one position.
+    /// A pass-through pair's `(1, 0)` recovers as frequency 0 — the identity at
+    /// every position, as it was.
+    pub fn inv_freq(&self) -> Vec<f32> {
+        let row1 = &self.rope_cs[self.head_dim..2 * self.head_dim];
+        (0..self.head_dim / 2)
+            .map(|i| row1[2 * i + 1].atan2(row1[2 * i]))
+            .collect()
     }
 }
 
-#[cfg(feature = "cuda")]
-fn tensor_f32(t: &candle::LiveTensor<'_>) -> Result<Vec<f32>> {
-    t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// If `ZEND_PREFILL_CAPTURE=<path>` is set and this call's summed `kv_len`
-/// exceeds the threshold, serialize it to `<path>` (once per process) via
-/// bincode. No-op otherwise — cheap env check on the hot path when disabled.
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-pub fn maybe_capture(
-    caches: &[&mut KvCache],
-    offsets: &[usize],
-    q_packed: &candle::LiveTensor<'_>,
-    k_packed: &candle::LiveTensor<'_>,
-    v_packed: &candle::LiveTensor<'_>,
-    q_lens: &[usize],
-    n_head: usize,
-    n_kv_head: usize,
-    head_dim: usize,
-    rope_offsets: &Tensor,
-    rope_cs: &Tensor,
-    rope_interleaved: bool,
-) {
-    let path = match std::env::var("ZEND_PREFILL_CAPTURE") {
-        Ok(p) if !p.is_empty() => p,
-        _ => return,
-    };
-    if CAPTURED.load(Ordering::Relaxed) {
-        return;
-    }
-    let min_kv: usize = std::env::var("ZEND_PREFILL_CAPTURE_MIN_KV")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20_000);
-    let sum_kv: usize = offsets
-        .iter()
-        .zip(q_lens.iter())
-        .map(|(&o, &l)| o + l)
-        .sum();
-    if sum_kv < min_kv {
-        return;
-    }
-    // Claim the single capture slot; only the first winner past the threshold
-    // proceeds (the per-layer hook fires many times — we want one layer).
-    if CAPTURED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
-    match build_and_write(
-        &path,
-        caches,
-        offsets,
-        q_packed,
-        k_packed,
-        v_packed,
-        q_lens,
-        n_head,
-        n_kv_head,
-        head_dim,
-        rope_offsets,
-        rope_cs,
-        rope_interleaved,
-    ) {
-        Ok(bytes) => tracing::info!(
-            target: "candle_transformers::prefill_capture",
-            path = %path,
-            sum_kv,
-            seqs = caches.len(),
-            bytes,
-            "captured prefill kernel fixture"
-        ),
-        Err(e) => tracing::warn!(
-            target: "candle_transformers::prefill_capture",
-            "prefill capture failed: {e}"
-        ),
-    }
-}
-
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-fn build_and_write(
-    path: &str,
-    caches: &[&mut KvCache],
-    offsets: &[usize],
-    q_packed: &candle::LiveTensor<'_>,
-    k_packed: &candle::LiveTensor<'_>,
-    v_packed: &candle::LiveTensor<'_>,
-    q_lens: &[usize],
-    n_head: usize,
-    n_kv_head: usize,
-    head_dim: usize,
-    rope_offsets: &Tensor,
-    rope_cs: &Tensor,
-    rope_interleaved: bool,
-) -> Result<usize> {
-    let device: &Device = q_packed.device();
-    let rope_cs_rows = rope_cs.dim(0)?;
-
-    let mut slots = Vec::with_capacity(caches.len());
-    for (i, cache) in caches.iter().enumerate() {
-        let host = match cache.k_cache().chunked_dump_sealed_to_host(device) {
-            Some(r) => r?,
-            None => Vec::new(),
+    /// Row 1's angle is each pair's frequency, and a pass-through pair's is 0.
+    #[test]
+    fn frequencies_come_back_from_row_one() {
+        let head_dim = 4;
+        let w = [0.5f32, 0.0];
+        let mut rope_cs = vec![0f32; 3 * head_dim];
+        for pos in 0..3 {
+            for (i, &f) in w.iter().enumerate() {
+                let a = pos as f32 * f;
+                rope_cs[pos * head_dim + 2 * i] = a.cos();
+                rope_cs[pos * head_dim + 2 * i + 1] = a.sin();
+            }
+        }
+        let cap = PrefillCapture {
+            n_head: 1,
+            n_kv_head: 1,
+            head_dim,
+            rope_interleaved: false,
+            qkv_dtype_tag: 3,
+            q: vec![],
+            k: vec![],
+            v: vec![],
+            rope_offsets: vec![],
+            rope_cs,
+            rope_cs_rows: 3,
+            slots: vec![],
         };
-        let chunks = host
-            .into_iter()
-            .map(|h| ChunkCapture {
-                offset: h.offset,
-                token_count: h.token_count,
-                k_formats: h.k_formats,
-                v_formats: h.v_formats,
-                k_pal: h.k_pal,
-                v_pal: h.v_pal,
-                k_scale: h.k_scale,
-                v_scale: h.v_scale,
-                kv_bytes: h.kv_bytes,
-            })
-            .collect();
-        slots.push(SlotCapture {
-            offset: offsets[i],
-            q_len: q_lens[i],
-            chunks,
-        });
+        let got = cap.inv_freq();
+        assert!((got[0] - 0.5).abs() < 1e-6, "{got:?}");
+        assert_eq!(got[1], 0.0);
     }
-
-    let cap = PrefillCapture {
-        n_head,
-        n_kv_head,
-        head_dim,
-        rope_interleaved,
-        qkv_dtype_tag: dtype_tag(q_packed.dtype()),
-        q: tensor_f32(q_packed)?,
-        k: tensor_f32(k_packed)?,
-        v: tensor_f32(v_packed)?,
-        rope_offsets: rope_offsets
-            .to_dtype(DType::U32)?
-            .flatten_all()?
-            .to_vec1::<u32>()?,
-        rope_cs: tensor_f32(rope_cs)?,
-        rope_cs_rows,
-        slots,
-    };
-
-    let bytes =
-        bincode::serialize(&cap).map_err(|e| candle::Error::Msg(format!("bincode: {e}")))?;
-    std::fs::write(path, &bytes).map_err(|e| candle::Error::Msg(format!("write {path}: {e}")))?;
-    Ok(bytes.len())
 }

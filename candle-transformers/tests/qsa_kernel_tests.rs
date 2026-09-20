@@ -42,11 +42,14 @@ use candle_nn::kv_cache::{
     quantize_sealed_in_place, ArenaFormatTag, ChunkedKvBacking, CompressionPolicy, KvCache,
     CHUNK_SIZE, N_PALETTE,
 };
-use candle_transformers::models::prefill_utils::{
-    compute_rope_cs, paged_decode_attn, paged_prefill_batched,
-};
+use candle_transformers::models::prefill_utils::{paged_decode_attn, paged_prefill_batched};
 use candle_transformers::models::qsa_selection::QsaSelection;
 use candle_transformers::models::qwen4exp::qsa_select::{entry_block, pack_entry, DENSE_ROW};
+use candle_transformers::models::rope_schedule::{RopeRungs, RopeSchedule};
+use candle_transformers::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
+use candle_transformers::models::slot_state::{
+    tensor_u8_device_ptr, SlotStateHost, TokenSliceHost,
+};
 use std::sync::{Mutex, MutexGuard};
 
 // One GPU, one process-global quantized arena table — same serialization rule
@@ -146,6 +149,15 @@ fn make_qkv_at(
     ))
 }
 
+/// Plain base-10000 RoPE over the full head as a single stated rung. The
+/// factored table covers every position, so no case sizes it by depth.
+fn rope_of(g: Geom, device: &Device) -> Result<RopeRungs> {
+    let inv_freq: Vec<f32> = (0..g.head_dim / 2)
+        .map(|i| 1f32 / 10000f32.powf(2.0 * i as f32 / g.head_dim as f32))
+        .collect();
+    RopeRungs::new(&RopeSchedule::stated(inv_freq, usize::MAX)?, device)
+}
+
 /// A prefilled slot of `history` tokens, with the K/V at `alt` positions drawn
 /// from a different seed.
 fn build_history_slot(
@@ -153,14 +165,14 @@ fn build_history_slot(
     history: usize,
     seed: u64,
     alt: &[bool],
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<(ChunkedKvBacking, KvCache)> {
     // Capacity from the history, not a fixed constant: [`MAX_BLOCKS`] is sized
-    // for the 100-token cases and holds 2,048 tokens, so a depth case silently
-    // ran off the end of both the backing and the rope table — reading garbage
-    // at 8K and faulting at 32K.
+    // for the 100-token cases and holds 2,048 tokens, so a depth case sized by
+    // it would run off the end of the backing — reading garbage at 8K and
+    // faulting at 32K.
     let blocks = MAX_BLOCKS.max(history.div_ceil(CHUNK_SIZE) + 2);
     let backing = ChunkedKvBacking::new(4, g.n_kv_head, g.head_dim, DType::BF16, device, blocks)?;
     let mut cache = KvCache::new(2, 64);
@@ -168,7 +180,6 @@ fn build_history_slot(
     cache.set_chunked_backing(&backing, 0, None)?;
 
     backing.ensure_for_batch_entries(&[(0, 0)], history)?;
-    let rope_offsets = Tensor::zeros(1, DType::U32, device)?;
 
     // One call, which caps the reachable depth: the query side of a prefill is
     // `history × n_head × head_dim`, so at 256K and this geometry it is a 2 GiB
@@ -197,8 +208,7 @@ fn build_history_slot(
             g.n_kv_head,
             g.head_dim,
             None,
-            &rope_offsets,
-            rope_cs,
+            rope,
             false,
             &generation,
             &std::cell::RefCell::new(None),
@@ -301,10 +311,6 @@ impl SlotHeaders {
         stager: &PinnedStager,
         device: &Device,
     ) -> Result<Self> {
-        use candle_transformers::models::slot_state::{
-            tensor_u8_device_ptr, SlotStateHost, TokenSliceHost,
-        };
-
         let seq_offset = cache.current_seq_len();
         let slot = cache
             .k_cache()
@@ -360,11 +366,15 @@ impl SlotHeaders {
 
         // Decode headers carry no position map (no decode kernel reads one),
         // exactly as `build_decode_metadata` serialises them.
-        let mut hdr = Vec::with_capacity(24);
-        hdr.extend_from_slice(&(slot.slices.len() as u32).to_le_bytes());
-        hdr.extend_from_slice(&slot.write_slice.to_le_bytes());
-        hdr.extend_from_slice(&slices_base_ptr.to_le_bytes());
-        hdr.extend_from_slice(&0u64.to_le_bytes());
+        let mut hdr = Vec::with_capacity(SLOT_HEADER_BYTES);
+        SlotHeaderHost {
+            n_slices: slot.slices.len() as u32,
+            write_slice: slot.write_slice,
+            slices_ptr: slices_base_ptr,
+            position_map_ptr: 0,
+            rope_rung: 0,
+        }
+        .write(&mut hdr);
 
         let generation = stager.begin_generation();
         let headers_dev = Tensor::from_slice(&hdr, hdr.len(), device)?;
@@ -389,7 +399,7 @@ impl SlotHeaders {
         q: &Tensor,
         k_new: &Tensor,
         v_new: &Tensor,
-        rope_cs: &Tensor,
+        rope: &RopeRungs,
         qsa: Option<&QsaSelection>,
     ) -> Result<Tensor> {
         paged_decode_attn(
@@ -403,7 +413,7 @@ impl SlotHeaders {
             1.0f32 / (g.head_dim as f32).sqrt(),
             k_new,
             v_new,
-            rope_cs,
+            rope,
             false,
             qsa,
         )
@@ -419,12 +429,12 @@ fn decode_one_slot(
     q: &Tensor,
     k_new: &Tensor,
     v_new: &Tensor,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     qsa: Option<&QsaSelection>,
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<Tensor> {
-    SlotHeaders::build(g, backing, cache, stager, device)?.decode(g, q, k_new, v_new, rope_cs, qsa)
+    SlotHeaders::build(g, backing, cache, stager, device)?.decode(g, q, k_new, v_new, rope, qsa)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -605,20 +615,7 @@ fn decode_case(g: Geom, history: usize, seed: u64, skip: usize) -> Result<()> {
         }
     };
     let stager = PinnedStager::new_from_device(&device);
-    let inv_freq = Tensor::from_vec(
-        (0..g.head_dim / 2)
-            .map(|i| 1f32 / 10000f32.powf(2.0 * i as f32 / g.head_dim as f32))
-            .collect::<Vec<f32>>(),
-        (g.head_dim / 2,),
-        &device,
-    )?;
-    // Sized from this case's own history — see `build_history_slot`.
-    let rope_cs = compute_rope_cs(
-        &inv_freq,
-        MAX_BLOCKS.max(history.div_ceil(CHUNK_SIZE) + 2),
-        g.head_dim,
-        &device,
-    )?;
+    let rope = rope_of(g, &device)?;
 
     // The decode step's own token; `visible` counts it.
     let (q1, k1, v1) = make_qkv(g, 1, seed ^ 0x55, &[], &device)?;
@@ -632,7 +629,7 @@ fn decode_case(g: Geom, history: usize, seed: u64, skip: usize) -> Result<()> {
     // `skip`.
     let build = |alt: &[bool]| -> Result<(ChunkedKvBacking, KvCache)> {
         let (backing, mut cache) =
-            build_history_slot(g, history, seed, alt, &rope_cs, &stager, &device)?;
+            build_history_slot(g, history, seed, alt, &rope, &stager, &device)?;
         if skip > 0 {
             backing.set_block_window(0, 0, skip as u16, (CHUNK_SIZE - skip) as u32)?;
             backing.invalidate_decode_slot(0);
@@ -658,7 +655,7 @@ fn decode_case(g: Geom, history: usize, seed: u64, skip: usize) -> Result<()> {
 
     let run = |sel: Option<&QsaSelection>, b: &ChunkedKvBacking, c: &KvCache| -> Result<Vec<f32>> {
         bits(&decode_one_slot(
-            g, b, c, &q, &k_new, &v_new, &rope_cs, sel, &stager, &device,
+            g, b, c, &q, &k_new, &v_new, &rope, sel, &stager, &device,
         )?)
     };
 
@@ -940,14 +937,7 @@ fn decode_paged_case(g: Geom, seed: u64) -> Result<()> {
     };
     let history = 100usize;
     let stager = PinnedStager::new_from_device(&device);
-    let inv_freq = Tensor::from_vec(
-        (0..g.head_dim / 2)
-            .map(|i| 1f32 / 10000f32.powf(2.0 * i as f32 / g.head_dim as f32))
-            .collect::<Vec<f32>>(),
-        (g.head_dim / 2,),
-        &device,
-    )?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, g.head_dim, &device)?;
+    let rope = rope_of(g, &device)?;
     let (q1, k1, v1) = make_qkv(g, 1, seed ^ 0x55, &[], &device)?;
     let q = q1.reshape((1, g.n_head, 1, g.head_dim))?;
     let k_new = k1.reshape((1, g.n_kv_head, 1, g.head_dim))?;
@@ -960,13 +950,13 @@ fn decode_paged_case(g: Geom, seed: u64) -> Result<()> {
         history,
         seed,
         &none_alt(history),
-        &rope_cs,
+        &rope,
         &stager,
         &device,
     )?;
     let run = |sel: Option<&QsaSelection>, b: &ChunkedKvBacking, c: &KvCache| -> Result<Vec<f32>> {
         bits(&decode_one_slot(
-            g, b, c, &q, &k_new, &v_new, &rope_cs, sel, &stager, &device,
+            g, b, c, &q, &k_new, &v_new, &rope, sel, &stager, &device,
         )?)
     };
 
@@ -994,8 +984,7 @@ fn decode_paged_case(g: Geom, seed: u64) -> Result<()> {
     );
     let alt: Vec<bool> = selected.iter().map(|&s| !s).collect();
     let sel = paged_selection(&GAPPED, &[entries], &device)?;
-    let (backing_b, cache_b) =
-        build_history_slot(g, history, seed, &alt, &rope_cs, &stager, &device)?;
+    let (backing_b, cache_b) = build_history_slot(g, history, seed, &alt, &rope, &stager, &device)?;
 
     let a = run(Some(&sel), &backing, &cache)?;
     let b = run(Some(&sel), &backing_b, &cache_b)?;
@@ -1059,14 +1048,7 @@ fn prefill_case(g: Geom, history: usize, q_len: usize, seed: u64) -> Result<()> 
         }
     };
     let stager = PinnedStager::new_from_device(&device);
-    let inv_freq = Tensor::from_vec(
-        (0..g.head_dim / 2)
-            .map(|i| 1f32 / 10000f32.powf(2.0 * i as f32 / g.head_dim as f32))
-            .collect::<Vec<f32>>(),
-        (g.head_dim / 2,),
-        &device,
-    )?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, g.head_dim, &device)?;
+    let rope = rope_of(g, &device)?;
     let (q, k, v) = make_qkv(g, q_len, seed ^ 0x77, &[], &device)?;
 
     // Per-query selections over each query's own visible range.
@@ -1100,9 +1082,8 @@ fn prefill_case(g: Geom, history: usize, q_len: usize, seed: u64) -> Result<()> 
 
     let run = |sel: Option<&QsaSelection>, alt: &[bool]| -> Result<Vec<f32>> {
         let (backing, mut cache) =
-            build_history_slot(g, history, seed, alt, &rope_cs, &stager, &device)?;
+            build_history_slot(g, history, seed, alt, &rope, &stager, &device)?;
         backing.ensure_for_batch_entries(&[(0, history)], q_len)?;
-        let rope_offsets = Tensor::zeros(1, DType::U32, &device)?;
         let generation = stager.begin_generation();
         let out = {
             let mut caches_arr: [&mut KvCache; 1] = [&mut cache];
@@ -1119,8 +1100,7 @@ fn prefill_case(g: Geom, history: usize, q_len: usize, seed: u64) -> Result<()> 
                 g.n_kv_head,
                 g.head_dim,
                 None,
-                &rope_offsets,
-                &rope_cs,
+                &rope,
                 false,
                 &generation,
                 &std::cell::RefCell::new(None),
@@ -1228,21 +1208,13 @@ fn prefill_paged_case(g: Geom, seed: u64) -> Result<()> {
     let history = 100usize;
     let q_len = 24usize;
     let stager = PinnedStager::new_from_device(&device);
-    let inv_freq = Tensor::from_vec(
-        (0..g.head_dim / 2)
-            .map(|i| 1f32 / 10000f32.powf(2.0 * i as f32 / g.head_dim as f32))
-            .collect::<Vec<f32>>(),
-        (g.head_dim / 2,),
-        &device,
-    )?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, g.head_dim, &device)?;
+    let rope = rope_of(g, &device)?;
     let (q, k, v) = make_qkv(g, q_len, seed ^ 0x77, &[], &device)?;
 
     let run = |sel: Option<&QsaSelection>, alt: &[bool]| -> Result<Vec<f32>> {
         let (backing, mut cache) =
-            build_history_slot(g, history, seed, alt, &rope_cs, &stager, &device)?;
+            build_history_slot(g, history, seed, alt, &rope, &stager, &device)?;
         backing.ensure_for_batch_entries(&[(0, history)], q_len)?;
-        let rope_offsets = Tensor::zeros(1, DType::U32, &device)?;
         let generation = stager.begin_generation();
         let out = {
             let mut caches_arr: [&mut KvCache; 1] = [&mut cache];
@@ -1259,8 +1231,7 @@ fn prefill_paged_case(g: Geom, seed: u64) -> Result<()> {
                 g.n_kv_head,
                 g.head_dim,
                 None,
-                &rope_offsets,
-                &rope_cs,
+                &rope,
                 false,
                 &generation,
                 &std::cell::RefCell::new(None),
@@ -1415,16 +1386,7 @@ fn prefill_walk_case(g: Geom, history: usize, q_len: usize, seed: u64) -> Result
         }
     };
     let stager = PinnedStager::new_from_device(&device);
-    let inv_freq = Tensor::from_vec(
-        (0..g.head_dim / 2)
-            .map(|i| 1f32 / 10000f32.powf(2.0 * i as f32 / g.head_dim as f32))
-            .collect::<Vec<f32>>(),
-        (g.head_dim / 2,),
-        &device,
-    )?;
-    let rope_blocks = MAX_BLOCKS.max((history + q_len).div_ceil(CHUNK_SIZE) + 2);
-    let rope_cs = compute_rope_cs(&inv_freq, rope_blocks, g.head_dim, &device)?;
-    let rope_offsets = Tensor::zeros(1, DType::U32, &device)?;
+    let rope = rope_of(g, &device)?;
 
     // The released checkpoint's indexer budget.
     const TOP_K: usize = 2048;
@@ -1523,7 +1485,7 @@ fn prefill_walk_case(g: Geom, history: usize, q_len: usize, seed: u64) -> Result
         history,
         seed,
         &none_alt(history),
-        &rope_cs,
+        &rope,
         &stager,
         &device,
     )?;
@@ -1554,8 +1516,7 @@ fn prefill_walk_case(g: Geom, history: usize, q_len: usize, seed: u64) -> Result
                 g.n_kv_head,
                 g.head_dim,
                 None,
-                &rope_offsets,
-                &rope_cs,
+                &rope,
                 false,
                 &generation,
                 &std::cell::RefCell::new(None),
@@ -1662,7 +1623,7 @@ fn prefill_walk_case(g: Geom, history: usize, q_len: usize, seed: u64) -> Result
         "every history position was selected"
     );
     let (backing_alt, mut cache_alt) =
-        build_history_slot(g, history, seed, &alt, &rope_cs, &stager, &device)?;
+        build_history_slot(g, history, seed, &alt, &rope, &stager, &device)?;
     let flipped = run(&backing_alt, &mut cache_alt, 0, &sparse, &q_flat)?;
     for t in 0..q_len {
         assert!(
@@ -1770,17 +1731,7 @@ fn bench_decode_cost_vs_depth() -> Result<()> {
     };
     let g = FLASH_NEXT;
     let stager = PinnedStager::new_from_device(&device);
-    let inv_freq = Tensor::from_vec(
-        (0..g.head_dim / 2)
-            .map(|i| 1f32 / 10000f32.powf(2.0 * i as f32 / g.head_dim as f32))
-            .collect::<Vec<f32>>(),
-        (g.head_dim / 2,),
-        &device,
-    )?;
-    // Rope table sized for the deepest case below, for the same reason the
-    // backing is: the 100-token constant covers 2,048 positions.
-    let rope_blocks = MAX_BLOCKS.max(262_144usize.div_ceil(CHUNK_SIZE) + 2);
-    let rope_cs = compute_rope_cs(&inv_freq, rope_blocks, g.head_dim, &device)?;
+    let rope = rope_of(g, &device)?;
     let (q1, k1, v1) = make_qkv(g, 1, 0x9001, &[], &device)?;
     let q = q1.reshape((1, g.n_head, 1, g.head_dim))?;
     let k_new = k1.reshape((1, g.n_kv_head, 1, g.head_dim))?;
@@ -1827,7 +1778,7 @@ fn bench_decode_cost_vs_depth() -> Result<()> {
         let visible = history + 1;
         let none_alt = vec![false; history];
         let (backing, cache) =
-            build_history_slot(g, history, 0x9001, &none_alt, &rope_cs, &stager, &device)?;
+            build_history_slot(g, history, 0x9001, &none_alt, &rope, &stager, &device)?;
         let (entries, selected) = budget_row(visible, TOP_K, 0);
         let n_sel = selected.iter().filter(|&&s| s).count();
         let sel = selection(&[entries], &device)?;
@@ -1836,12 +1787,12 @@ fn bench_decode_cost_vs_depth() -> Result<()> {
             let headers = SlotHeaders::build(g, &backing, c, &stager, &device)?;
             // Warm: the first launch pays module load.
             for _ in 0..WARM {
-                headers.decode(g, &q, &k_new, &v_new, &rope_cs, s)?;
+                headers.decode(g, &q, &k_new, &v_new, &rope, s)?;
             }
             device.synchronize()?;
             let t0 = Instant::now();
             for _ in 0..ITERS {
-                headers.decode(g, &q, &k_new, &v_new, &rope_cs, s)?;
+                headers.decode(g, &q, &k_new, &v_new, &rope, s)?;
             }
             device.synchronize()?;
             Ok(t0.elapsed().as_secs_f64() * 1000.0 / ITERS as f64)
@@ -1938,13 +1889,7 @@ fn bench_prefill_cost_vs_depth() -> Result<()> {
     };
     let g = FLASH_NEXT;
     let stager = PinnedStager::new_from_device(&device);
-    let inv_freq = Tensor::from_vec(
-        (0..g.head_dim / 2)
-            .map(|i| 1f32 / 10000f32.powf(2.0 * i as f32 / g.head_dim as f32))
-            .collect::<Vec<f32>>(),
-        (g.head_dim / 2,),
-        &device,
-    )?;
+    let rope = rope_of(g, &device)?;
     // One prompt chunk, at the width the engine prefills in.
     const Q_LEN: usize = 2048;
     // The released checkpoint's indexer budget.
@@ -1952,9 +1897,6 @@ fn bench_prefill_cost_vs_depth() -> Result<()> {
     const WARM: usize = 2;
     const ITERS: usize = 5;
     let deepest = 131_072usize;
-    let rope_blocks = MAX_BLOCKS.max((deepest + Q_LEN).div_ceil(CHUNK_SIZE) + 2);
-    let rope_cs = compute_rope_cs(&inv_freq, rope_blocks, g.head_dim, &device)?;
-    let rope_offsets = Tensor::zeros(1, DType::U32, &device)?;
 
     let mut first: Option<f64> = None;
     let mut worst = 0f64;
@@ -1968,7 +1910,7 @@ fn bench_prefill_cost_vs_depth() -> Result<()> {
             history,
             0x9002,
             &none_alt(history),
-            &rope_cs,
+            &rope,
             &stager,
             &device,
         )?;
@@ -2008,8 +1950,7 @@ fn bench_prefill_cost_vs_depth() -> Result<()> {
                     g.n_kv_head,
                     g.head_dim,
                     None,
-                    &rope_offsets,
-                    &rope_cs,
+                    &rope,
                     false,
                     &generation,
                     &std::cell::RefCell::new(None),

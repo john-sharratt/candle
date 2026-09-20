@@ -39,9 +39,9 @@
 use candle::quantized::pinned_staging::PinnedStager;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{ChunkedKvBacking, KvCache, KvFormat, QuantFormat, CHUNK_SIZE};
-use candle_transformers::models::prefill_utils::{
-    compute_rope_cs, paged_decode_attn, paged_prefill_batched,
-};
+use candle_transformers::models::prefill_utils::{paged_decode_attn, paged_prefill_batched};
+use candle_transformers::models::rope_schedule::{RopeRungs, RopeSchedule};
+use candle_transformers::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
 use std::sync::{Mutex, MutexGuard};
 
 static GPU_SERIAL: Mutex<()> = Mutex::new(());
@@ -195,31 +195,15 @@ fn run_case(
     let total: usize = segments.iter().sum();
     let seed = hash_str(name);
     let (q_all, k_all, v_all) = make_qkv(total, device, seed)?;
-    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, device)?;
-    let rope_offsets = Tensor::zeros(1, DType::U32, device)?;
-
-    let (backing_a, mut cache_a) = build_control_slot(
-        arena,
-        total,
-        &q_all,
-        &k_all,
-        &v_all,
-        &rope_cs,
-        &rope_offsets,
-        stager,
+    let rope = RopeRungs::new(
+        &RopeSchedule::stated(vec![0f32; HEAD_DIM / 2], usize::MAX)?,
         device,
     )?;
+
+    let (backing_a, mut cache_a) =
+        build_control_slot(arena, total, &q_all, &k_all, &v_all, &rope, stager, device)?;
     let (backing_b, mut cache_b) = build_segmented_slot(
-        arena,
-        segments,
-        &q_all,
-        &k_all,
-        &v_all,
-        &rope_cs,
-        &rope_offsets,
-        stager,
-        device,
+        arena, segments, &q_all, &k_all, &v_all, &rope, stager, device,
     )?;
     assert_layout(&cache_a, &cache_b, total, segments, name);
 
@@ -255,19 +239,19 @@ fn run_case(
         };
 
         let out_a = decode_one(
-            &backing_a, &cache_a, &q_dec, &k_new, &v_new, &rope_cs, stager, device,
+            &backing_a, &cache_a, &q_dec, &k_new, &v_new, &rope, stager, device,
         )?;
         let out_b = decode_one(
-            &backing_b, &cache_b, &q_dec, &k_new, &v_new, &rope_cs, stager, device,
+            &backing_b, &cache_b, &q_dec, &k_new, &v_new, &rope, stager, device,
         )?;
         // The same two slots through the PRODUCTION slot header — the
         // serializer the engine's decode and `decode_ab` build from — which
         // must describe the layout exactly as the test-side header does.
         let out_ap = decode_one_production(
-            &backing_a, &cache_a, &q_dec, &k_new, &v_new, &rope_cs, stager, device,
+            &backing_a, &cache_a, &q_dec, &k_new, &v_new, &rope, stager, device,
         )?;
         let out_bp = decode_one_production(
-            &backing_b, &cache_b, &q_dec, &k_new, &v_new, &rope_cs, stager, device,
+            &backing_b, &cache_b, &q_dec, &k_new, &v_new, &rope, stager, device,
         )?;
 
         // **Against a reference, not only against each other.** Two layouts
@@ -343,7 +327,7 @@ const STEPS: usize = 4;
 /// The decode attention in F32 over F16-rounded inputs, the way decode_ab's
 /// golden computes it: one query row per head over `ctx` prefill tokens plus
 /// the new one, GQA group `h / (N_HEAD / N_KV_HEAD)`. No RoPE — the harness's
-/// rope table is identity (zero frequencies), so positions do not rotate.
+/// rope rungs are the identity (zero frequencies), so positions do not rotate.
 fn reference_attention(
     q_dec: &Tensor,
     k_all: &Tensor,
@@ -470,14 +454,13 @@ fn build_control_slot(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
-    rope_cs: &Tensor,
-    rope_offsets: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<(ChunkedKvBacking, KvCache)> {
     let backing = fresh_backing(arena, device)?;
     let mut cache = bind(&backing, 0)?;
-    run_prefill(&mut cache, q, k, v, total, rope_cs, rope_offsets, stager)?;
+    run_prefill(&mut cache, q, k, v, total, rope, stager)?;
     Ok((backing, cache))
 }
 
@@ -490,8 +473,7 @@ fn build_segmented_slot(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
-    rope_cs: &Tensor,
-    rope_offsets: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<(ChunkedKvBacking, KvCache)> {
@@ -505,16 +487,7 @@ fn build_segmented_slot(
         let vs = v.narrow(2, start, len)?.contiguous()?;
         backing.truncate_sequence_to_blocks(1, 0)?;
         scratch.set_current_seq_len(0)?;
-        run_prefill(
-            &mut scratch,
-            &qs,
-            &ks,
-            &vs,
-            len,
-            rope_cs,
-            rope_offsets,
-            stager,
-        )?;
+        run_prefill(&mut scratch, &qs, &ks, &vs, len, rope, stager)?;
         // Drop the trailing empty chunk the prefill's decode-priming may have
         // appended, so it does not become a phantom slice in slot 0.
         backing.truncate_sequence_to_blocks(1, len.div_ceil(CHUNK_SIZE))?;
@@ -563,8 +536,7 @@ fn run_prefill(
     k: &Tensor,
     v: &Tensor,
     seq_len: usize,
-    rope_cs: &Tensor,
-    rope_offsets: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
 ) -> Result<()> {
     let offset = cache.current_seq_len();
@@ -588,8 +560,7 @@ fn run_prefill(
         N_KV_HEAD,
         HEAD_DIM,
         None,
-        rope_offsets,
-        rope_cs,
+        rope,
         false,
         &generation,
         &std::cell::RefCell::new(None),
@@ -607,7 +578,7 @@ fn decode_one(
     q: &Tensor,
     k_new: &Tensor,
     v_new: &Tensor,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<Tensor> {
@@ -682,11 +653,15 @@ fn decode_one(
         p
     };
 
-    let mut hdr = Vec::with_capacity(24);
-    hdr.extend_from_slice(&(slot.slices.len() as u32).to_le_bytes());
-    hdr.extend_from_slice(&slot.write_slice.to_le_bytes());
-    hdr.extend_from_slice(&slices_ptr.to_le_bytes());
-    hdr.extend_from_slice(&pm_ptr.to_le_bytes());
+    let mut hdr = Vec::with_capacity(SLOT_HEADER_BYTES);
+    SlotHeaderHost {
+        n_slices: slot.slices.len() as u32,
+        write_slice: slot.write_slice,
+        slices_ptr,
+        position_map_ptr: pm_ptr,
+        rope_rung: 0,
+    }
+    .write(&mut hdr);
     let generation = stager.begin_generation();
     let mut pinned = generation.alloc(hdr.len())?;
     pinned.copy_from_slice(&hdr);
@@ -703,7 +678,7 @@ fn decode_one(
         1.0 / (HEAD_DIM as f32).sqrt(),
         k_new,
         v_new,
-        rope_cs,
+        rope,
         false,
         None,
     )?;
@@ -726,7 +701,7 @@ fn decode_one_production(
     q: &Tensor,
     k_new: &Tensor,
     v_new: &Tensor,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<Tensor> {
@@ -767,11 +742,15 @@ fn decode_one_production(
         true,
     );
     expect.extend_for_write_region(1, CHUNK_SIZE);
-    let mut hdr = Vec::with_capacity(24);
-    hdr.extend_from_slice(&n_slices.to_le_bytes());
-    hdr.extend_from_slice(&write_slice.to_le_bytes());
-    hdr.extend_from_slice(&ptr.to_le_bytes());
-    hdr.extend_from_slice(&0u64.to_le_bytes());
+    let mut hdr = Vec::with_capacity(SLOT_HEADER_BYTES);
+    SlotHeaderHost {
+        n_slices,
+        write_slice,
+        slices_ptr: ptr,
+        position_map_ptr: 0,
+        rope_rung: 0,
+    }
+    .write(&mut hdr);
     let mut pinned = generation.alloc(hdr.len())?;
     pinned.copy_from_slice(&hdr);
     let headers = generation.submit_resident(pinned)?;
@@ -817,7 +796,7 @@ fn decode_one_production(
         1.0 / (HEAD_DIM as f32).sqrt(),
         k_new,
         v_new,
-        rope_cs,
+        rope,
         false,
         None,
     )?;

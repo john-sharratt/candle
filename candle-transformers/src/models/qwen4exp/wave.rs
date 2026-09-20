@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 
 use candle::quantized::cuda::to_dynamic;
 use candle::{DType, Device, Result, Tensor};
@@ -62,47 +62,23 @@ use crate::models::delta_net::{
 use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::qsa_selection::QsaSelection;
-use crate::models::qwen35::attention::RopeTables;
 use crate::models::qwen35::spec::split_block_rows;
+use crate::models::rope_schedule::{FactoredRope, RopeRungs, RopeSchedule};
+
+use super::rope::flash_next_schedule;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::verify_wave::VerifyPlan;
 use crate::models::wave_admit::admit_wave_kv;
 use crate::models::wave_driver::{assemble_wave_contexts, drive_wave, WaveGroups, WaveSweep};
 
-/// Seal `rows`, taken at absolute `frame`, into a **position-free** page.
+/// Seal `rows` into a **position-free** page.
 ///
-/// A live cache ropes its blocks at their absolute positions, so rows lifted
-/// straight out of one carry the place they came from and would score correctly
-/// only if they were put back exactly there. Rotating by `-frame` takes them to
-/// zero, which is what makes the record injectable at any offset in any
-/// conversation — the index's half of "compute once, inject anywhere".
-///
-/// Rows already in the zero frame come back untouched.
-fn seal_page(
-    rows: &Tensor,
-    frame: usize,
-    last_cells: usize,
-    rope: &RopeTables,
-) -> Result<IndexPage> {
-    let keys = super::place::rotate_rows(rows, -(frame as isize), rope)?;
-    Ok(IndexPage::new(keys, last_cells))
-}
-
-/// Positions the indexer's rope tables must span for `caches`.
-///
-/// **The whole sequence, not the tail.** Blocks used to rope at their ordinal
-/// within the live tail, so a table sized to the tail was exactly right; they
-/// now rope at their absolute position, and a seal turns pages back through the
-/// same magnitude in the other direction. The deepest of the two is one block
-/// past whatever the deepest cache accounts for.
-fn index_rope_depth(caches: &[IndexCache], ratios: &[usize]) -> usize {
-    caches
-        .iter()
-        .zip(ratios.iter())
-        .map(|(c, &r)| c.indexed_tokens(r).checked_div(r).map_or(0, |b| b + 1))
-        .max()
-        .unwrap_or(0)
-        .max(1)
+/// The rows are un-rotated, so they carry no position already — the record is
+/// injectable at any offset in any conversation, the index's half of "compute
+/// once, inject anywhere". Owned, because `rows` is typically a view into a
+/// live cache that the next append overwrites.
+fn seal_page(rows: &Tensor, last_cells: usize) -> Result<IndexPage> {
+    Ok(IndexPage::new(rows.to_owned_tensor()?, last_cells))
 }
 
 /// The deepest KV compression the draft head's own layer seals at, whatever
@@ -165,22 +141,22 @@ pub struct Qwen4ExpBatched {
     /// `None` on every plain decode, which is what keeps the capture sites a
     /// single `is_none` check rather than a cost.
     pub(super) verify: RwLock<Option<SpecCapture>>,
-    /// The indexer's rotation tables, keyed by the arena block count they
-    /// cover. Separate from `rope_cs` because the indexer ropes with the
-    /// oracle's [`RopeTables`] — the same rotation the reference applies to
-    /// its pooled block keys, at the same width.
-    index_rope: Mutex<Option<(usize, RopeTables)>>,
+    /// The tables the indexer rotates its queries and — as the scorer loads
+    /// them — its stored keys from: [`Self::rope`]'s rungs, shared, plus each
+    /// rung's step tables. The model's own schedule at its rotary width, rung
+    /// for rung, which is what the reference rotates the indexer with
+    /// (`docs/progressive_yarn.md` §12). Built once at load: it covers every
+    /// position below `ROPE_REACH`, so nothing ever rebuilds it.
+    index_rope: FactoredRope,
     /// Query rows for which a selection was built — QSA's engagement, summed
     /// over layers and waves. Zero says every row was inside the budget and
     /// the stack ran the dense arithmetic, which is what a short context
     /// should report.
     qsa_rows: AtomicU64,
-    /// Position-indexed interleaved (cos,sin) table for the paged kernels,
-    /// keyed by the arena block count it covers.
-    rope_cs: Mutex<Option<(usize, Tensor)>>,
-    /// `[head_dim/2]` F32 — full-width table with the pass-through pairs at
-    /// frequency zero, from the rotary layout (partial rotary 64/256).
-    pub(super) inv_freq: Tensor,
+    /// The schedule's rungs over the rotary width (`super::rope`), which every
+    /// paged attention kernel rotates from; the layout puts the head's
+    /// non-rotary dims past them, where the kernels treat them as pass-through.
+    pub(super) rope: RopeRungs,
 }
 
 /// The carried per-sequence state, and what persisting it costs.
@@ -452,12 +428,6 @@ impl Qwen4ExpBatched {
             );
             return Ok(None);
         };
-        // The flush ropes its block at its ABSOLUTE position, so the tables have
-        // to span the whole sequence, not just the tail. The normalisation below
-        // turns through the same magnitude in the other direction, so one span
-        // covers both.
-        let depth = index_rope_depth(caches, &ratios);
-        let rope = self.index_rope_for(depth)?;
         let mut pages = Vec::with_capacity(caches.len());
         for ((c, &ratio), w) in caches.iter_mut().zip(ratios.iter()).zip(indexers.iter()) {
             if ratio == 0 {
@@ -467,10 +437,9 @@ impl Qwen4ExpBatched {
                 });
                 continue;
             }
-            let frame = c.page_token_span();
-            let cells = c.flush_open_block(w, &rope, ratio, cfg.rms_norm_eps)?;
+            let cells = c.flush_open_block(w, ratio, cfg.rms_norm_eps)?;
             pages.push(SealedIndex {
-                page: seal_page(&c.live_rows()?, frame, cells.unwrap_or(ratio), &rope)?,
+                page: seal_page(&c.live_rows()?, cells.unwrap_or(ratio))?,
                 // The flush consumed the carried rows, so the page IS the whole
                 // piece and there is no open block to carry with it.
                 open: c.open_rows()?,
@@ -487,10 +456,6 @@ impl Qwen4ExpBatched {
     /// index one stream, so a cut on some of them would leave the rest
     /// addressing different blocks for the same position.
     ///
-    /// The flush ropes its block at position `n_blocks`, so the RoPE table has
-    /// to span one past the deepest cache here — the same reach
-    /// [`Self::seal_positional_state`] needs, for the same reason.
-    ///
     /// Returns the tokens the closed page covers — `0` when the tail was already
     /// empty, which is the common case and a legitimate no-op.
     #[cfg(feature = "cuda")]
@@ -505,13 +470,6 @@ impl Qwen4ExpBatched {
         let Some(caches) = map.get_mut(&seq) else {
             return Ok(0);
         };
-        let depth = caches
-            .iter()
-            .map(|c| c.live_blocks() + 1)
-            .max()
-            .unwrap_or(0)
-            .max(1);
-        let rope = self.index_rope_for(depth)?;
         // Every layer indexes the same stream, so they close the same width;
         // taken from whichever is walked last.
         let mut closed = 0usize;
@@ -519,7 +477,7 @@ impl Qwen4ExpBatched {
             if ratio == 0 {
                 continue;
             }
-            closed = c.close_tail_into_page(w, &rope, ratio, cfg.rms_norm_eps)?;
+            closed = c.close_tail_into_page(w, ratio, cfg.rms_norm_eps)?;
         }
         Ok(closed)
     }
@@ -550,8 +508,6 @@ impl Qwen4ExpBatched {
         let Some(caches) = map.get(&seq) else {
             return Ok(None);
         };
-        let depth = index_rope_depth(caches, &ratios);
-        let rope = self.index_rope_for(depth)?;
         let mut pages = Vec::with_capacity(caches.len());
         for ((c, &ratio), w) in caches.iter().zip(ratios.iter()).zip(indexers.iter()) {
             if ratio == 0 {
@@ -585,7 +541,7 @@ impl Qwen4ExpBatched {
                     .saturating_sub(c.page_row_span())
             };
             let mut fork = c.fork()?;
-            let cells = fork.flush_open_block(w, &rope, ratio, cfg.rms_norm_eps)?;
+            let cells = fork.flush_open_block(w, ratio, cfg.rms_norm_eps)?;
             let rows = fork.live_rows()?;
             let n = rows.dim(0)?;
             if first > n {
@@ -597,17 +553,8 @@ impl Qwen4ExpBatched {
                 );
             }
             let take = n - first;
-            // Row `first` of the tail sits at `tail_base + first · ratio`; that
-            // is the frame these rows carry and the one they are normalised out
-            // of.
-            let frame = c.page_token_span() + first * ratio;
             pages.push(SealedIndex {
-                page: seal_page(
-                    &rows.narrow(0, first, take)?,
-                    frame,
-                    cells.unwrap_or(ratio),
-                    &rope,
-                )?,
+                page: seal_page(&rows.narrow(0, first, take)?, cells.unwrap_or(ratio))?,
                 open: fork.open_rows()?,
             });
         }
@@ -704,7 +651,6 @@ impl Qwen4ExpBatched {
         // drops the pages covering a turn's reasoning, and the page COUNT is not
         // stable (a mid-decode reprojection closes an extra one). Position is.
         let mut blobs: Vec<(usize, Vec<u8>)> = Vec::new();
-        let seal_rope = self.index_rope_for(index_rope_depth(caches, &ratios))?;
         for pi in first_page..probe.page_count() {
             let mut layer_pages = Vec::with_capacity(caches.len());
             // Two descriptions of the same page travel together from here: the
@@ -731,10 +677,10 @@ impl Qwen4ExpBatched {
                     ),
                     Some(_) => {}
                 }
-                // A closed page carries the frame it was roped in; the record
-                // must carry none, so it is normalised on the way out.
+                // A closed page's rows are un-rotated and immutable, so the
+                // record is the page itself.
                 layer_pages.push(SealedIndex {
-                    page: seal_page(&p.keys, p.roped_base, p.last_cells, &seal_rope)?,
+                    page: p.clone(),
                     // A page is already closed; only the live tail carries an
                     // open block.
                     open: p.keys.narrow(0, 0, 0)?,
@@ -756,16 +702,10 @@ impl Qwen4ExpBatched {
                     });
                     continue;
                 }
-                let frame = c.page_token_span();
                 let mut fork = c.fork()?;
-                let cells = fork.flush_open_block(w, &seal_rope, ratio, cfg.rms_norm_eps)?;
+                let cells = fork.flush_open_block(w, ratio, cfg.rms_norm_eps)?;
                 layer_pages.push(SealedIndex {
-                    page: seal_page(
-                        &fork.live_rows()?,
-                        frame,
-                        cells.unwrap_or(ratio),
-                        &seal_rope,
-                    )?,
+                    page: seal_page(&fork.live_rows()?, cells.unwrap_or(ratio))?,
                     open: fork.open_rows()?,
                 });
             }
@@ -801,16 +741,6 @@ impl Qwen4ExpBatched {
         }
         let mut pushed = 0usize;
         let mut had_open_tail = None;
-        // The tables must span the placement, which is deeper than anything the
-        // caches hold yet — the page is about to be put at `next_base`.
-        let place_depth = caches
-            .iter()
-            .zip(ratios.iter())
-            .map(|(c, &r)| c.next_base().checked_div(r).map_or(0, |b| b + 1))
-            .max()
-            .unwrap_or(0)
-            .max(1);
-        let rope = self.index_rope_for(place_depth)?;
         for ((c, s), &ratio) in caches.iter_mut().zip(sealed.iter()).zip(ratios.iter()) {
             if ratio == 0 {
                 continue;
@@ -820,13 +750,14 @@ impl Qwen4ExpBatched {
                 had_open_tail = Some(blocks * ratio + open);
             }
             pushed = s.page.tokens(ratio)?;
-            // Abutting the last placement. The base is what the page is rotated
-            // to, so this is the one line that decides where the piece's rows
-            // actually sit — and, since it is recorded rather than accumulated,
-            // a preceding piece that carried no rows moves it and nothing else.
+            // Abutting the last placement. The base is where the scorer rotates
+            // the page's rows to, so this is the one line that decides where the
+            // piece's rows actually sit — and, since it is recorded rather than
+            // accumulated, a preceding piece that carried no rows moves it and
+            // nothing else.
             let base = c.next_base();
             c.push_page(s.page.clone(), base, ratio)?;
-            c.place_pending(&rope)?;
+            c.place_pending()?;
         }
         // **Only the pathological case is reported.** A page installed onto an
         // empty tail is the ordinary path and happens once per injected piece —
@@ -1028,23 +959,17 @@ impl Qwen4ExpBatched {
             match map.get(&seq) {
                 Some(caches) => {
                     let ratios = self.attention_ratios();
-                    let rope = self.index_rope_for(index_rope_depth(caches, &ratios))?;
                     let mut v = Vec::with_capacity(caches.len());
                     for (c, ratio) in caches.iter().zip(ratios.iter()) {
-                        // Normalised like every other index artifact: the rows
-                        // are roped at their absolute positions here, and
-                        // `import_aux_state` restores them into a cache whose
-                        // tail opens at zero. (The injected pages ahead of the
-                        // tail are not exported at all — a resume rebuilds them
-                        // from the projection, and `indexed_tokens` is what
-                        // reports the shortfall if one does not.)
+                        // The live tail's rows as they are stored — un-rotated,
+                        // so position-free — and `restore_aux_state` restores
+                        // them into a cache whose tail opens at zero. (The
+                        // injected pages ahead of the tail are not exported at
+                        // all — a resume rebuilds them from the projection, and
+                        // `indexed_tokens` is what reports the shortfall if one
+                        // does not.)
                         v.push(SealedIndex {
-                            page: seal_page(
-                                &c.live_rows()?,
-                                c.page_token_span(),
-                                (*ratio).max(1),
-                                &rope,
-                            )?,
+                            page: seal_page(&c.live_rows()?, (*ratio).max(1))?,
                             open: c.open_rows()?,
                         });
                     }
@@ -1136,15 +1061,11 @@ impl Qwen4ExpBatched {
     }
 
     pub fn new(model: Qwen4ExpGpu) -> Result<Self> {
-        // `[rope_dim/2]` inverse frequencies for the paged kernels — the
-        // rotated pairs only, exactly as the hybrid builds them; the layout's
-        // pass-through pairs are handled by the permutation + the `rope_cs`
-        // table's identity rows.
-        let (theta, rope_dim) = (model.cfg.rope_theta, model.cfg.rope_dim);
-        let inv: Vec<f32> = (0..rope_dim / 2)
-            .map(|j| 1f32 / theta.powf(2.0 * j as f32 / rope_dim as f32))
-            .collect();
-        let inv_freq = Tensor::from_vec(inv, (rope_dim / 2,), &model.device)?;
+        let schedule = flash_next_schedule(&model.cfg)?;
+        let rope = RopeRungs::new(&schedule, &model.device)?;
+        // The indexer rotates with the attention's own rungs at the same rotary
+        // width, as the reference does.
+        let index_rope = FactoredRope::over(&rope, &model.device)?;
         Ok(Self {
             model,
             recurrent: RwLock::new(HashMap::new()),
@@ -1153,10 +1074,9 @@ impl Qwen4ExpBatched {
             verify: RwLock::new(None),
             ple: RwLock::new(HashMap::new()),
             index: RwLock::new(HashMap::new()),
-            index_rope: Mutex::new(None),
+            index_rope,
             qsa_rows: AtomicU64::new(0),
-            rope_cs: Mutex::new(None),
-            inv_freq,
+            rope,
         })
     }
 
@@ -1399,53 +1319,34 @@ impl Qwen4ExpBatched {
         out
     }
 
-    /// The indexer's rotation tables, covering every position the arena can
-    /// address. Built at the same width the oracle builds them
-    /// (`cfg.rope_dim`), because the block keys it prepares must be the
-    /// reference's block keys.
-    pub(super) fn index_rope_for(&self, max_blocks: usize) -> Result<RopeTables> {
-        let mut slot = self
-            .index_rope
-            .lock()
-            .map_err(|_| candle::Error::Msg("index_rope lock poisoned".into()))?;
-        if let Some((blocks, table)) = slot.as_ref() {
-            if *blocks >= max_blocks {
-                return Ok(table.clone());
-            }
-        }
-        let cfg = &self.model.cfg;
-        let t = RopeTables::new(
-            cfg.rope_dim,
-            cfg.rope_theta,
-            (max_blocks * candle_nn::CHUNK_SIZE).max(1),
-            &self.model.device,
-        )?;
-        *slot = Some((max_blocks, t.clone()));
-        Ok(t)
+    /// The indexer's factored RoPE table, at the model's rotary width
+    /// (`cfg.rope_dim`) and frequencies.
+    pub(super) fn index_rope(&self) -> &FactoredRope {
+        &self.index_rope
     }
 
-    /// The interleaved `(cos, sin)` table the paged kernels index by position.
-    /// Partial rotary, so it is the LAYOUT's own table — the generic
-    /// `compute_rope_cs` would rotate all 256 dims where only 64 turn; the
-    /// layout fills the pass-through pairs with exact `(cos 1, sin 0)` rows.
-    pub(super) fn rope_cs_for(&self, max_blocks: usize) -> Result<Tensor> {
-        let mut slot = self
-            .rope_cs
-            .lock()
-            .map_err(|_| candle::Error::Msg("rope_cs lock poisoned".into()))?;
-        if let Some((blocks, table)) = slot.as_ref() {
-            if *blocks == max_blocks {
-                return Ok(table.clone());
-            }
+    /// The schedule's rungs, which every paged attention kernel rotates from.
+    pub fn rope(&self) -> &RopeRungs {
+        &self.rope
+    }
+
+    /// Run `schedule` in place of Flash-Next's own, for the attention and the
+    /// indexer alike — the control a long-context gate measures the model's
+    /// rungs against (`docs/progressive_yarn.md` §10). Nothing stored depends
+    /// on a rung (I1), so a session opened after this simply reads the new
+    /// tables. The rotary width must be the model's.
+    pub fn set_rope_schedule(&mut self, schedule: &RopeSchedule) -> Result<()> {
+        if schedule.pairs() != self.rope.pairs() {
+            candle::bail!(
+                "qwen4exp: a {}-pair schedule on a {}-pair rotary width",
+                schedule.pairs(),
+                self.rope.pairs()
+            );
         }
-        let t = self.model.rotary.rope_table(
-            max_blocks * candle_nn::CHUNK_SIZE,
-            self.model.cfg.rope_theta,
-            DType::F32,
-            &self.model.device,
-        )?;
-        *slot = Some((max_blocks, t.clone()));
-        Ok(t)
+        let rope = RopeRungs::new(schedule, &self.model.device)?;
+        self.index_rope = FactoredRope::over(&rope, &self.model.device)?;
+        self.rope = rope;
+        Ok(())
     }
 }
 
@@ -1621,7 +1522,6 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Qwen4ExpBatched::push_positional_state(self, seq, blob)?;
         Ok(true)
     }
-
     fn push_positional_gap(&self, seq: usize, tokens: usize) -> Result<()> {
         Qwen4ExpBatched::push_positional_gap(self, seq, tokens)
     }
@@ -1830,6 +1730,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         self.rewind_cohort(session, targets)
     }
 
+    fn rope_ceilings(&self) -> Vec<usize> {
+        self.rope.ceilings().to_vec()
+    }
+
     fn create_batched_session(&self, config: BatchedConfig) -> Result<BatchedInferenceSession> {
         let cfg = &self.model.cfg;
         // This model's KV threshold calibration, folded in here because this
@@ -1854,6 +1758,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             &self.model.device,
             config,
         )?;
+        session.set_rope_ceilings(self.rope.ceilings().to_vec())?;
         // **The draft head's layer is capped; the trunk's twelve take the
         // session's level unchanged.**
         //
@@ -1958,6 +1863,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         layer_end: usize,
         residual_in: Option<Tensor>,
     ) -> Result<WaveResult> {
+        session.expect_rope_ceilings(self.rope.ceilings())?;
         drive_wave(
             self,
             session,
@@ -2299,7 +2205,7 @@ impl Qwen4ExpBatched {
         kv: usize,
         compress_ratio: usize,
         indexer: &IndexerWeights,
-        rope: &RopeTables,
+        rope: &FactoredRope,
         h: &Tensor,
         spans: &[SeqSpan],
         offsets: &[usize],
@@ -2396,17 +2302,8 @@ impl Qwen4ExpBatched {
             .collect::<Result<Vec<_>>>()?;
         let spans = seq_spans(seq_ids, &q_lens)?;
 
-        // ── RoPE tables for the paged kernels. ──
-        let max_blocks = contexts
-            .first()
-            .and_then(|c| {
-                c.kv_caches
-                    .caches
-                    .first()
-                    .map(|k| k.k_cache().chunked_max_blocks())
-            })
-            .unwrap_or(0);
-        let rope_cs = self.rope_cs_for(max_blocks)?;
+        // ── Model-side RoPE for the non-paged paths; the paged kernels rotate
+        // from `self.rope`, each sequence at its own rung. ──
         let theta = cfg.rope_theta;
         let dec_pos: Vec<u32> = dec_off.iter().map(|&o| o as u32).collect();
         let mut pre_pos: Vec<u32> = Vec::with_capacity(pre_rows);
@@ -2428,8 +2325,7 @@ impl Qwen4ExpBatched {
             &dec_rope.0,
             &dec_rope.1,
             false,
-            &self.inv_freq,
-            &rope_cs,
+            &self.rope,
             decode_headers,
             dec_q,
             generation,
@@ -2439,18 +2335,17 @@ impl Qwen4ExpBatched {
             &pre_rope.0,
             &pre_rope.1,
             false,
-            &self.inv_freq,
-            &rope_cs,
+            &self.rope,
             prefill_headers,
             pre_q,
             generation,
             &pre_pm,
         );
 
-        // QSA: the indexer's rotation tables and this wave's index caches.
+        // QSA: the indexer's rotation table and this wave's index caches.
         // Absolute positions per row, in the wave's packed order — decode
         // rows first (one each), then each prefill sequence's span.
-        let index_rope = self.index_rope_for(max_blocks)?;
+        let index_rope = self.index_rope().clone();
         let mut offsets_all: Vec<usize> = Vec::with_capacity(total_rows);
         offsets_all.extend_from_slice(dec_off);
         offsets_all.extend_from_slice(pre_off);
