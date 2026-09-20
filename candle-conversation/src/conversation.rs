@@ -209,6 +209,35 @@ fn fork_inherits_history(parent: TimelineId, fork: TimelineId) -> InheritsHistor
     }
 }
 
+/// Whether [`Sequence::fork_onto`] should seed the fork's recurrent state from
+/// its system-prompt branch checkpoint (§4.6), as a free function for the same
+/// reason [`fork_inherits_history`] is one: asserted directly, because the
+/// end-to-end oracle costs a model load and nothing else can see the defect —
+/// a conversation given the wrong memory holds the right K/V, answers from it
+/// fluently, and passes every recall probe.
+///
+/// **Three conditions, all required:**
+/// - `inherits == No` — an `Yes` fork continues the parent's own live history,
+///   which `fork_recurrent` already carries across; a branch checkpoint is
+///   only for a fork that gets nothing from that path.
+/// - `carries_recurrent_state` — a plain transformer never computed a
+///   checkpoint in the first place (`build_branch_checkpoint`'s own gate at
+///   construction), so the lookup would only ever miss.
+/// - `timeline_turn_count == 0` — the timeline has never sealed a turn. A
+///   `No` fork can also mean resuming some OTHER conversation's timeline,
+///   which `create_sequence_seeded` already restores from that timeline's own
+///   recurrent snapshot; installing base's prompt-only checkpoint over that
+///   would silently discard a real conversation's accumulated memory. A
+///   timeline with turns already sealed is exactly the case that restore does
+///   NOT leave untouched, so it must be excluded here.
+fn fork_wants_branch_checkpoint(
+    inherits: InheritsHistory,
+    carries_recurrent_state: bool,
+    timeline_turn_count: u32,
+) -> bool {
+    matches!(inherits, InheritsHistory::No) && carries_recurrent_state && timeline_turn_count == 0
+}
+
 /// Keeps a drop-cancelled [`Sequence::send_turn_with_options_async`] from
 /// wedging its sequence.
 ///
@@ -3200,7 +3229,19 @@ impl Sequence {
         // A scope fork is a fresh timeline: it ingests its own scope against the
         // system prompt and holds none of the file conversation's dialogue, so
         // it must not inherit the file conversation's memory either.
-        self.fork_onto(fork_timeline)
+        //
+        // `seed_recurrent_from_branch: false` — NOT because a scope fork
+        // wouldn't benefit from it (it processes the same system prompt as any
+        // fresh conversation), but because `install_branch_states`'s own doc
+        // measures the round-trip at 157ms of 175ms, and `fork_scope`'s only
+        // caller (`zend`'s `ingest_scopes`) mints up to `SCOPE_PARALLELISM`
+        // forks in a sequential loop before running them concurrently. Seeding
+        // each one would serialise ~700ms into that loop, ahead of the
+        // parallel section it exists to feed — exactly the per-fork queue
+        // wait that function was built to batch away. A background
+        // summarisation pass over a couple of turns is a much smaller loss
+        // from starting at zero recurrent state than a user-facing reply is.
+        self.fork_onto(fork_timeline, false)
     }
 
     /// Splice a per-scope fork's two coupled turns onto THIS (file) timeline in
@@ -3920,7 +3961,7 @@ impl Sequence {
         let fork_timeline = self
             .substrate
             .mint_timeline(self.target.layer, self.target.group);
-        self.fork_onto(fork_timeline)
+        self.fork_onto(fork_timeline, true)
     }
 
     /// Fork onto a **specific** timeline rather than a freshly minted one —
@@ -3940,7 +3981,7 @@ impl Sequence {
         // forking its *base* conversation onto that client's timeline, and the
         // base holds a memory of turns the client never had. `fork_onto` takes
         // the parent's live state only when `timeline` is this sequence's own.
-        self.fork_onto(timeline)
+        self.fork_onto(timeline, true)
     }
 
     /// This conversation's **live** recurrent memory, right now, without sealing
@@ -4089,7 +4130,11 @@ impl Sequence {
     /// the parent's memory. A freshly minted one gives it nothing, so the
     /// parent's memory would be a recollection of turns the child's attention
     /// layers have never seen.
-    fn fork_onto(&self, fork_timeline: TimelineId) -> crate::Result<Sequence> {
+    fn fork_onto(
+        &self,
+        fork_timeline: TimelineId,
+        seed_recurrent_from_branch: bool,
+    ) -> crate::Result<Sequence> {
         // The parent's live memory describes the parent's own history. It is
         // therefore the child's memory exactly when the child continues that
         // history — when the fork lands back on the timeline the parent is
@@ -4173,6 +4218,43 @@ impl Sequence {
             // Forks start with a fresh scanner state — scoring will refresh
             // on the next provenance scan.  No need to clone the parent's scores.
         };
+
+        // Give a fork onto a genuinely fresh timeline the same recurrent head
+        // start a schema-built conversation gets: the branch checkpoint
+        // computed once for this exact system-prompt content (§4.6), copied
+        // device-to-device into the fork's own recurrent state. Never a share
+        // of the parent's live memory — `state_is_prompt_only: false` above
+        // already says this fork's state is real and starts diverging from
+        // the first token it decodes. See [`fork_wants_branch_checkpoint`]
+        // for why the timeline/recurrence conditions are required, and
+        // `fork_scope`'s call site for why `seed_recurrent_from_branch` exists.
+        //
+        // The two cheap checks gate the substrate lock + timeline lookup
+        // below, rather than the other way round: every fork of every plain
+        // transformer, and every same-timeline fork, would otherwise pay that
+        // read for a predicate that was always going to be `false` anyway.
+        if seed_recurrent_from_branch
+            && matches!(inherits, InheritsHistory::No)
+            && fork_conv.model_core.carries_recurrent_state
+        {
+            let turn_count = fork_conv.substrate.read().turn_count(fork_timeline);
+            if fork_wants_branch_checkpoint(
+                inherits,
+                fork_conv.model_core.carries_recurrent_state,
+                turn_count,
+            ) {
+                let (prefix, _tokens) =
+                    fork_conv.prompt_branch(&fork_conv.primed_prefix, &fork_conv.branch_spans);
+                if let Err(e) = fork_conv.restore_branch_checkpoint(prefix, None) {
+                    tracing::warn!(
+                        "fork onto a fresh timeline: branch checkpoint install failed ({e}) — \
+                         the fork starts with zero recurrent state, exactly as it did before \
+                         this existed"
+                    );
+                }
+            }
+        }
+
         Ok(fork_conv)
     }
 
@@ -5165,6 +5247,45 @@ mod fork_inherits_history_tests {
             fork_inherits_history(parent, TimelineId::for_test(1)),
             InheritsHistory::No
         );
+    }
+}
+
+/// See [`fork_wants_branch_checkpoint`]'s doc for why each of the three
+/// conditions is asserted independently: the failure mode a wrong one produces
+/// is either wasted compute (recomputing what `fork_recurrent` already carried)
+/// or silent corruption (discarding a real conversation's memory) — neither of
+/// which any end-to-end recall probe distinguishes from correct behaviour.
+#[cfg(test)]
+mod fork_wants_branch_checkpoint_tests {
+    use super::{fork_wants_branch_checkpoint, InheritsHistory};
+
+    #[test]
+    fn only_a_fresh_timeline_on_a_recurrent_model_with_no_turns_wants_it() {
+        assert!(fork_wants_branch_checkpoint(InheritsHistory::No, true, 0));
+    }
+
+    #[test]
+    fn a_fork_that_continues_the_parents_own_history_does_not() {
+        // `fork_recurrent` already carries the live parent's state across for
+        // this case — installing the checkpoint on top would just redo it.
+        assert!(!fork_wants_branch_checkpoint(InheritsHistory::Yes, true, 0));
+    }
+
+    #[test]
+    fn a_plain_transformer_never_wants_it() {
+        // No checkpoint was ever computed for this model, at any turn count —
+        // the lookup would only ever miss.
+        assert!(!fork_wants_branch_checkpoint(InheritsHistory::No, false, 0));
+    }
+
+    #[test]
+    fn resuming_a_timeline_that_already_has_turns_does_not() {
+        // This is the daemon's client-resume case: `InheritsHistory::No` (a
+        // fork onto some OTHER conversation's timeline) with real history
+        // already sealed there. `create_sequence_seeded` already restored
+        // that timeline's own recurrent snapshot; installing the prompt-only
+        // checkpoint on top would silently discard it.
+        assert!(!fork_wants_branch_checkpoint(InheritsHistory::No, true, 3));
     }
 }
 

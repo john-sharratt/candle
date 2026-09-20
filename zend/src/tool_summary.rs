@@ -35,7 +35,11 @@ pub fn build_tool_summary(tools: &[InstalledTool]) -> String {
         groups.get_mut(cat).unwrap().push(name.as_str());
     }
 
-    let mut out = String::new();
+    if order.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("All these tools are available for you to use:\n\n");
     for cat in order {
         if let Some(names) = groups.get(cat) {
             out.push_str(&format!("## {cat}\n  {}\n", names.join(", ")));
@@ -87,7 +91,8 @@ mod tests {
         let out = build_tool_summary(&tools);
         assert_eq!(
             out,
-            "## Utilities & web\n  datetime, calculator\n\
+            "All these tools are available for you to use:\n\n\
+             ## Utilities & web\n  datetime, calculator\n\
              ## Files\n  file_read\n\
              ## Byte encoding\n  bytes_xor"
         );
@@ -95,6 +100,10 @@ mod tests {
 
     #[test]
     fn build_empty_is_empty() {
+        // Zero tools is the real "tools are off" signal (see the module doc on
+        // `tools_open`/`tools_close`), so the intro line must not appear either
+        // — an empty catalog with a lead-in sentence would tell the model tools
+        // exist when the collection materialises no members at all.
         assert_eq!(build_tool_summary(&[]), "");
     }
 }
