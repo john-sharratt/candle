@@ -12,20 +12,21 @@
 //! # What the oracle is, and why it is not the dense kernel
 //!
 //! [`PagedIndex::score_reference`] is the naive expression evaluated eagerly on
-//! the host — one dot product at a time, in row order. Comparing against the
-//! dense GPU path instead would only prove the two agree, which is exactly the
-//! thing a shared bug would also produce. The tolerance is not laxity: the
-//! kernel accumulates in a different order (a `float4` body, heads folded after
-//! a per-head ReLU), so bit-equality is not available and asking for it would
-//! pin an implementation rather than a result.
+//! the host in f64 — every stored key rotated at its own position from the
+//! exact angle, then one dot product at a time, in row order. Comparing against
+//! the dense GPU path instead would only prove the two agree, which is exactly
+//! the thing a shared bug would also produce. The tolerance is not laxity: the
+//! kernel rotates from an f32 table and accumulates in a different order (a
+//! `float4` body, heads folded after a per-head ReLU), so bit-equality is not
+//! available and asking for it would pin an implementation rather than a result.
 
 #![cfg(feature = "cuda")]
 
 use candle::{DType, Device, Result, Tensor};
-use candle_transformers::models::qwen35::attention::RopeTables;
 use candle_transformers::models::qwen4exp::paged_index::{
     decode_page, encode_page, IndexPage, PagedIndex, SealedIndex,
 };
+use candle_transformers::models::rope_schedule::{plain_inv_freq, FactoredRope};
 
 /// The released checkpoint's indexer geometry.
 const HEAD_DIM: usize = 128;
@@ -80,10 +81,14 @@ fn window(rows_per_page: &[usize], last_cells: usize, seed: u64) -> Result<Paged
     PagedIndex::new(pages, RATIO, &d)
 }
 
-/// The rotation tables the placement uses. Deep enough for every base these
-/// tests place a page at.
-fn rope() -> Result<RopeTables> {
-    RopeTables::new(ROPE_DIM, ROPE_THETA, 1 << 16, &dev()?)
+/// The frequencies the scorer's table is built from, and the oracle's.
+fn inv_freq() -> Vec<f32> {
+    plain_inv_freq(ROPE_DIM, ROPE_THETA)
+}
+
+/// The factored table the scorer rotates every key from.
+fn rope() -> Result<FactoredRope> {
+    FactoredRope::new(&inv_freq(), &dev()?)
 }
 
 fn queries(t: usize, seed: u64) -> Result<Tensor> {
@@ -99,14 +104,14 @@ fn compare(idx: &mut PagedIndex, q: &Tensor, qpos: &[usize]) -> Result<f32> {
     let n = idx.total_rows();
     let t = qpos.len();
     let out = Tensor::zeros((t, n.max(1)), DType::F32, &d)?;
-    idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n.max(1), 0, &rope()?)?;
+    idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n.max(1), 0, &rope()?, 0)?;
     let got = out.flatten_all()?.to_vec1::<f32>()?;
-    let want = idx.score_reference(q, qpos, N_HEADS, HEAD_DIM, &rope()?)?;
+    let want = idx.score_reference(q, qpos, N_HEADS, HEAD_DIM, &inv_freq())?;
 
     let mut worst = 0f32;
     for r in 0..t {
         for g in 0..n {
-            let (a, b) = (got[r * n + g], want[r * n + g]);
+            let (a, b) = (got[r * n + g], want[r * n + g] as f32);
             let masked_a = a <= -1e29;
             let masked_b = b <= -1e29;
             assert_eq!(
@@ -469,9 +474,10 @@ fn bench_once(idx: &mut PagedIndex, q: &Tensor, qpos: &[usize], iters: usize) ->
         candle::bail!("bench runs on CUDA")
     };
     let stream = cuda.cuda_stream();
+    let rope = rope()?;
     // Warm: first launch pays module load and the descriptor upload.
     for _ in 0..5 {
-        idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n, 0, &rope()?)?;
+        idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n, 0, &rope, 0)?;
     }
     d.synchronize()?;
     let mut ms: Vec<f64> = Vec::with_capacity(iters);
@@ -479,7 +485,7 @@ fn bench_once(idx: &mut PagedIndex, q: &Tensor, qpos: &[usize], iters: usize) ->
         let start = stream
             .record_event(Some(CU_EVENT_DEFAULT))
             .map_err(|e| candle::Error::Msg(format!("event: {e}")))?;
-        idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n, 0, &rope()?)?;
+        idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n, 0, &rope, 0)?;
         let stop = stream
             .record_event(Some(CU_EVENT_DEFAULT))
             .map_err(|e| candle::Error::Msg(format!("event: {e}")))?;

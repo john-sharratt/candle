@@ -1,4 +1,4 @@
-//! One-time tool to trim a full `ZEND_PREFILL_CAPTURE` dump down to a small,
+//! One-time tool to trim a full `PrefillCapture` dump down to a small,
 //! committable kernel-replay fixture: keeps only the single largest-prefix slot
 //! (slicing the packed Q/K/V to its token range). CPU-only.
 //!

@@ -30,7 +30,7 @@
 //!
 //! // 2. Wrap with BatchedInference
 //! let model = MyModel::from_gguf(...)?;
-//! let batched = BatchedInference::new(model, 10000.0, 4096, &device)?;
+//! let batched = BatchedInference::new_with_schedule(model, &schedule, 4096, &device)?;
 //!
 //! // 3. Use batched inference
 //! let logits = batched.forward_batch(&mut contexts)?;
@@ -58,6 +58,7 @@ use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
 use super::prefill_utils::SharedPm;
 use super::quantized_matmul::QMatMul;
+use super::rope_schedule::{RopeRungs, RopeSchedule};
 use super::rope_tables::CisPrecomputations;
 use super::tensor_cat::TensorCat;
 use super::wave_admit::admit_wave_kv;
@@ -410,8 +411,6 @@ pub trait BatchedModelCore {
 // Batched Inference Wrapper
 // ============================================================================
 
-/// Default initial RoPE table size.
-const DEFAULT_ROPE_SEQ_LEN: usize = 4096;
 /// Chunk size for extending RoPE tables.
 const ROPE_EXTEND_CHUNK: usize = 1024;
 
@@ -439,14 +438,12 @@ const KV_FREE_SLACK_REGIONS: usize = 32;
 /// - Easy to add shared state (attention mask cache, etc.) in the future
 pub struct BatchedInference<M: BatchedModelCore> {
     model: M,
+    /// Rung 0's cos/sin by position, for the non-paged paths only; they refuse
+    /// a row past rung 0 (`batched_layer::refuse_rung_past_zero`).
     rope_cache: RwLock<CisPrecomputations>,
-    /// Per-dimension inverse frequencies for the CUDA paged-attention kernels.
-    /// Shape: [head_dim/2], dtype F32, stored on the model device.
-    inv_freq_device: Tensor,
-    /// Cached precomputed cos/sin table for decode RoPE.
-    /// Computed lazily on first decode call, keyed by max_blocks.
-    /// Shape: [max_pos, head_dim], dtype F32, on device.
-    rope_cs_cache: std::sync::Mutex<Option<(usize, Tensor)>>,
+    /// Every rung of the model's RoPE schedule, which the paged kernels rotate
+    /// from — built once at load, never rebuilt for a longer sequence.
+    rope: RopeRungs,
     /// When true, `forward_batch` projects ALL token positions through the LM head
     /// instead of only the last token. Used for perplexity evaluation.
     /// Default: false (near-zero cost when off).
@@ -454,54 +451,24 @@ pub struct BatchedInference<M: BatchedModelCore> {
 }
 
 impl<M: BatchedModelCore> BatchedInference<M> {
-    /// Create a new batched inference wrapper.
+    /// Wrap `model` with its RoPE `schedule`.
     ///
-    /// # Arguments
-    /// * `model` - The model to wrap
-    /// * `rope_theta` - RoPE base frequency (e.g., 10000.0 for LLaMA, 1000000.0 for Qwen3)
-    /// * `max_seq_len` - Initial RoPE table size (will auto-extend if needed)
-    /// * `device` - Device for RoPE tables
-    pub fn new(model: M, rope_theta: f32, max_seq_len: usize, device: &Device) -> Result<Self> {
-        let head_dim = model.head_dim();
-        let rope_cache = RwLock::new(CisPrecomputations::new_growable(
-            head_dim,
-            rope_theta,
-            max_seq_len,
-            ROPE_EXTEND_CHUNK,
-            device,
-        )?);
-        let half_dim = head_dim / 2;
-        let inv_freq_data: Vec<f32> = (0..half_dim)
-            .map(|i| 1.0f32 / rope_theta.powf(2.0 * i as f32 / head_dim as f32))
-            .collect();
-        let inv_freq_device = Tensor::from_vec(inv_freq_data, (half_dim,), device)?;
-        Ok(Self {
-            model,
-            rope_cache,
-            inv_freq_device,
-            rope_cs_cache: std::sync::Mutex::new(None),
-            all_logits: false,
-        })
-    }
-
-    /// Create with default RoPE table size.
-    pub fn new_default(model: M, rope_theta: f32, device: &Device) -> Result<Self> {
-        Self::new(model, rope_theta, DEFAULT_ROPE_SEQ_LEN, device)
-    }
-
-    /// Create with a custom inv_freq tensor for non-standard RoPE scaling.
-    ///
-    /// Use this for models with custom RoPE configurations (e.g., scaled RoPE).
-    pub fn new_with_inv_freq(
+    /// `max_seq_len` is the non-paged cos/sin table's initial size (it grows on
+    /// demand); the paged kernels' rungs cover the schedule's whole reach from
+    /// load.
+    pub fn new_with_schedule(
         model: M,
-        inv_freq: Vec<f32>,
+        schedule: &RopeSchedule,
         max_seq_len: usize,
         device: &Device,
     ) -> Result<Self> {
-        let half_dim = inv_freq.len();
-        let inv_freq_device = Tensor::from_vec(inv_freq.clone(), (half_dim,), device)?;
+        let rung0 = schedule
+            .rungs()
+            .into_iter()
+            .next()
+            .ok_or_else(|| candle::Error::Msg("rope schedule: no rungs".into()))?;
         let rope_cache = RwLock::new(CisPrecomputations::new_growable_with_inv_freq(
-            inv_freq,
+            rung0.inv_freq,
             max_seq_len,
             ROPE_EXTEND_CHUNK,
             device,
@@ -509,10 +476,14 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         Ok(Self {
             model,
             rope_cache,
-            inv_freq_device,
-            rope_cs_cache: std::sync::Mutex::new(None),
+            rope: RopeRungs::new(schedule, device)?,
             all_logits: false,
         })
+    }
+
+    /// The model's RoPE rungs.
+    pub fn rope(&self) -> &RopeRungs {
+        &self.rope
     }
 
     /// When true, `forward_batch` returns logits for ALL positions, not just last.
@@ -885,36 +856,6 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             Some(resume) => resume,
         };
 
-        // Shared decode rope_cs table (position-indexed lookup used by all groups).
-        let rope_cs = {
-            let max_blocks = contexts
-                .first()
-                .and_then(|c| {
-                    c.kv_caches
-                        .caches
-                        .first()
-                        .map(|k| k.k_cache().chunked_max_blocks())
-                })
-                .unwrap_or(0);
-            let mut cache = self
-                .rope_cs_cache
-                .lock()
-                .map_err(|_| candle::Error::Msg("poisoned rope_cs lock".into()))?;
-            match *cache {
-                Some((mb, ref t)) if mb == max_blocks => t.clone(),
-                _ => {
-                    let t = crate::models::prefill_utils::compute_rope_cs(
-                        &self.inv_freq_device,
-                        max_blocks,
-                        self.model.head_dim(),
-                        self.model.device(),
-                    )?;
-                    *cache = Some((max_blocks, t.clone()));
-                    t
-                }
-            }
-        };
-
         // Per-group RoPE (cos/sin) + prefill position-map caches, all alive for the
         // whole layer loop.
         let dec_rope = self.compute_rope_for_batch(dec_off, dec_q, embed_dtype)?;
@@ -928,8 +869,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             &dec_rope.0,
             &dec_rope.1,
             interleaved,
-            &self.inv_freq_device,
-            &rope_cs,
+            &self.rope,
             decode_headers,
             dec_q,
             generation,
@@ -939,8 +879,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             &pre_rope.0,
             &pre_rope.1,
             interleaved,
-            &self.inv_freq_device,
-            &rope_cs,
+            &self.rope,
             prefill_headers,
             pre_q,
             generation,
@@ -950,8 +889,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             &glue_rope.0,
             &glue_rope.1,
             interleaved,
-            &self.inv_freq_device,
-            &rope_cs,
+            &self.rope,
             glue_headers,
             glue_q,
             generation,

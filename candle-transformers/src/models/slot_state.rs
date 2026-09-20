@@ -564,9 +564,10 @@ impl TokenSliceHost {
 ///   every position in the slot's valid prefix range.  The kernel uses
 ///   this in place of `chunk_div`/`chunk_mod` so partial-tail slices
 ///   followed by additional slices read correctly.
-/// - A 24B header holds (n_slices, write_slice, slices_ptr,
-///   position_map_ptr) where the pointers are resolved device pointers
-///   into the slices / position_map tensors.
+/// - A 32-byte header ([`SlotHeaderHost`](super::slot_header::SlotHeaderHost))
+///   holds (n_slices, write_slice, slices_ptr, position_map_ptr, rope_rung)
+///   where the pointers are resolved device pointers into the slices /
+///   position_map tensors.
 #[derive(Clone)]
 pub struct SlotStateHost {
     /// Which slice the kernel scatters into.

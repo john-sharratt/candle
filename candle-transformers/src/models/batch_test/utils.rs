@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokenizers::Tokenizer;
 
+use crate::models::batch_test::story_normalize::normalize_story;
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, InferenceMode, ManagedBatchedModel,
 };
@@ -2112,7 +2113,8 @@ impl TestParams {
                 //
                 //  2. **Pronoun neutralisation** — gendered pronouns like
                 //     "his"/"her", "he"/"she" are replaced with bracketed
-                //     placeholders ("[his/her]", "[he/she]", etc.).  This
+                //     placeholders ("[his/her]", "[he/she]", etc.), whole
+                //     words at any boundary (`story_normalize`).  This
                 //     lets us compare sessions that use female names against
                 //     the original male-protagonist prompt without false
                 //     mismatches when the model correctly adapts pronouns.
@@ -2178,37 +2180,10 @@ impl TestParams {
                                 let expected_trimmed = session.expected.trim();
 
                                 // Normalize for comparison (see block comment above).
-                                let normalize = |text: &str| -> String {
-                                    let collapsed: String =
-                                        text.split_whitespace().collect::<Vec<_>>().join(" ");
-                                    let padded = format!(" {} ", collapsed);
-                                    padded
-                                        .replace(" his ", " [his/her] ")
-                                        .replace("His ", "[His/Her] ")
-                                        .replace(" her ", " [his/her] ")
-                                        .replace("Her ", "[His/Her] ")
-                                        .replace(" he ", " [he/she] ")
-                                        .replace(" He ", " [He/She] ")
-                                        .replace(" she ", " [he/she] ")
-                                        .replace("She ", "[He/She] ")
-                                        .replace(" him ", " [him/her] ")
-                                        .replace("Him ", "[Him/Her] ")
-                                        .replace(" wife ", " [wife/husband] ")
-                                        .replace(" husband ", " [wife/husband] ")
-                                        // Contraction normalization: the model may
-                                        // expand or contract these equivalently.
-                                        .replace("she'd ", "she had ")
-                                        .replace("She'd ", "She had ")
-                                        .replace("he'd ", "he had ")
-                                        .replace("He'd ", "He had ")
-                                        .trim()
-                                        .to_string()
-                                };
-
                                 let output_chars: Vec<char> =
-                                    normalize(output_trimmed).chars().collect();
+                                    normalize_story(output_trimmed).chars().collect();
                                 let expected_chars: Vec<char> =
-                                    normalize(expected_trimmed).chars().collect();
+                                    normalize_story(expected_trimmed).chars().collect();
 
                                 let common_prefix_len = output_chars
                                     .iter()

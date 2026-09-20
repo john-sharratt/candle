@@ -1776,6 +1776,19 @@ fn drive_prefill_and_capture(
     last_was_sealed: bool,
 ) -> Result<CapturedSpan, ConversationError> {
     let parent_id = ctx.parent_id;
+    // A prior windowed creep prefill on this slot can have left layers in a
+    // later window one empty writer chunk behind layers in an earlier one
+    // (`BatchedInferenceSession::reconcile_block_counts`). This forward and
+    // the snapshot below both trust every layer's block count as one number —
+    // `start_block`/`end_block` and the slot headers `forward_tokens` builds —
+    // so an unreconciled skew here is captured into `CapturedSpan` and
+    // re-injected into every future conversation that borrows this span,
+    // permanently: the exact "chunked decode layout diverged... on the first
+    // message of a new conversation" failure this reconciles away while the
+    // skew is still genuinely empty and padding it is lossless.
+    ctx.session
+        .reconcile_block_counts(parent_id.0)
+        .map_err(ConversationError::Model)?;
     push_empty_if_sealed(ctx, last_was_sealed)?;
     // Where this span's tokens start, so the index rows it is about to build can
     // be sealed back out of the cache as the span's own page. Taken before the
@@ -1867,6 +1880,20 @@ pub(super) fn fire_gap_fill_batch(
             write_in_blk: p.glue_write_in_blk.clone(),
             fwd_ahead: p.fwd_ahead.clone(),
         });
+    }
+    // Reconcile each slot's per-layer block count before this wave —
+    // `BatchedInferenceSession::reconcile_block_counts`. This wave's own
+    // invariant check below reads `sequence_backing_tokens`, which (like
+    // `sequence_block_count`) reports the MIN across layers and trusts that
+    // whatever sits past it on an ahead layer is empty writer-chunk
+    // structure, never real content. A prior windowed creep or borrowed
+    // section can leave that untrue; reconciling here while the excess is
+    // still genuinely empty is what keeps that trust honest for the check
+    // that follows.
+    for &p in &active {
+        session
+            .reconcile_block_counts(p.parent_id.0)
+            .map_err(ConversationError::Model)?;
     }
     // Stage each slot's per-token gap scatter target + forward bridge window,
     // aligned with `ids`. The forward routes the HD128 glue to the paged-glue

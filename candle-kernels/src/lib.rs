@@ -51,6 +51,9 @@ pub mod sampling;
 #[path = "provenance/api.rs"]
 pub mod provenance;
 
+#[path = "rope/api.rs"]
+pub mod rope;
+
 #[path = "paged-decode/api.rs"]
 pub mod paged_decode;
 

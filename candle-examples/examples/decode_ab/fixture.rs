@@ -19,9 +19,9 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
     quantize_sealed_in_place, ChunkedKvBacking, CompressionPolicy, KvCache, KvFormat, CHUNK_SIZE,
 };
-use candle_transformers::models::prefill_utils::{
-    compute_rope_cs, paged_decode_attn, paged_prefill_batched,
-};
+use candle_transformers::models::prefill_utils::{paged_decode_attn, paged_prefill_batched};
+use candle_transformers::models::rope_schedule::{RopeRungs, RopeSchedule};
+use candle_transformers::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
 
 use crate::formats::ArenaFmt;
 use crate::scenarios::Scenario;
@@ -65,7 +65,7 @@ pub struct Fixture {
     q_dec: Tensor,
     k_new: Tensor,
     v_new: Tensor,
-    rope_cs: Tensor,
+    rope_rungs: RopeRungs,
     arena_dtype: DType,
     softmax_scale: f32,
 }
@@ -142,9 +142,8 @@ impl Fixture {
             }
         };
 
-        let inv_freq = make_inv_freq(sc.head_dim, rope, device)?;
-        let rope_cs = compute_rope_cs(&inv_freq, max_blocks, sc.head_dim, device)?;
-        let rope_offsets = Tensor::zeros(1, DType::U32, device)?;
+        let inv_freq = make_inv_freq(sc.head_dim, rope);
+        let rope_rungs = RopeRungs::new(&RopeSchedule::stated(inv_freq, usize::MAX)?, device)?;
 
         let mut caches = Vec::with_capacity(sc.num_slots);
         for slot in 0..sc.num_slots {
@@ -157,17 +156,7 @@ impl Fixture {
                 // The prefill writes into the slot's write region, which the
                 // scheduler allocates before the pass; the harness does the same.
                 backing.ensure_for_batch_entries(&[(slot, 0)], sc.ctx_len)?;
-                run_prefill(
-                    &mut cache,
-                    &q,
-                    &k,
-                    &v,
-                    sc.ctx_len,
-                    sc,
-                    &rope_cs,
-                    &rope_offsets,
-                    stager,
-                )?;
+                run_prefill(&mut cache, &q, &k, &v, sc.ctx_len, sc, &rope_rungs, stager)?;
             } else {
                 // Segment by segment through the scratch slot: prefill it
                 // fresh, drop the empty writer chunk the prefill's decode
@@ -196,8 +185,7 @@ impl Fixture {
                         &vs,
                         len,
                         sc,
-                        &rope_cs,
-                        &rope_offsets,
+                        &rope_rungs,
                         stager,
                     )?;
                     backing.truncate_sequence_to_blocks(scratch, len.div_ceil(CHUNK_SIZE))?;
@@ -261,7 +249,7 @@ impl Fixture {
             q_dec,
             k_new,
             v_new,
-            rope_cs,
+            rope_rungs,
             arena_dtype,
             softmax_scale: 1.0f32 / (sc.head_dim as f32).sqrt(),
         })
@@ -310,13 +298,18 @@ impl Fixture {
         )?;
 
         // Decode headers carry no position map (the field is zero — the
-        // kernel derives positions from the slice walk).
-        let mut hdr_all: Vec<u8> = Vec::with_capacity(24 * sc.num_slots);
-        for &(ptr, n_slices, write_slice) in &seq_ptrs {
-            hdr_all.extend_from_slice(&n_slices.to_le_bytes());
-            hdr_all.extend_from_slice(&write_slice.to_le_bytes());
-            hdr_all.extend_from_slice(&ptr.to_le_bytes());
-            hdr_all.extend_from_slice(&0u64.to_le_bytes());
+        // kernel derives positions from the slice walk). Each slot's rung is
+        // the one its reach after this token falls on.
+        let mut hdr_all: Vec<u8> = Vec::with_capacity(SLOT_HEADER_BYTES * sc.num_slots);
+        for (&(slices_ptr, n_slices, write_slice), &(_, len)) in seq_ptrs.iter().zip(&entries) {
+            SlotHeaderHost {
+                n_slices,
+                write_slice,
+                slices_ptr,
+                position_map_ptr: 0,
+                rope_rung: self.rope_rungs.rung_for(len + 1)?,
+            }
+            .write(&mut hdr_all);
         }
 
         // Device-resident, as `build_decode_metadata_at` submits them: every
@@ -355,7 +348,7 @@ impl Fixture {
             self.softmax_scale,
             &self.k_new,
             &self.v_new,
-            &self.rope_cs,
+            &self.rope_rungs,
             sc.rope_interleaved,
             None,
         )?;
@@ -377,21 +370,18 @@ impl Fixture {
     }
 }
 
-/// RoPE inverse-frequency table for `head_dim` (theta = 10000), F32, shape
-/// `(head_dim/2,)`. [`Rope::Identity`] is all-zeros, so the rotation is the
-/// identity and the FP32 golden can be plain attention with no RoPE to
-/// replicate; the kernels still run their rotary path (cos=1, sin=0).
-fn make_inv_freq(head_dim: usize, rope: Rope, device: &Device) -> Result<Tensor> {
+/// RoPE inverse frequencies for `head_dim` (theta = 10000), `head_dim/2` of
+/// them. [`Rope::Identity`] is all-zeros, so the rotation is the identity and
+/// the FP32 golden can be plain attention with no RoPE to replicate; the
+/// kernels still run their rotary path (cos=1, sin=0).
+fn make_inv_freq(head_dim: usize, rope: Rope) -> Vec<f32> {
     let half = head_dim / 2;
     if rope == Rope::Identity {
-        return Tensor::zeros(half, DType::F32, device);
+        return vec![0.0; half];
     }
-    let mut v = Vec::with_capacity(half);
-    for i in 0..half {
-        let exp = (2 * i) as f32 / head_dim as f32;
-        v.push(1.0f32 / 10000f32.powf(exp));
-    }
-    Tensor::from_vec(v, half, device)
+    (0..half)
+        .map(|i| 1.0f32 / 10000f32.powf((2 * i) as f32 / head_dim as f32))
+        .collect()
 }
 
 /// FP32 ground-truth decode attention over the *same* synthetic K/V the fixture
@@ -563,8 +553,7 @@ fn run_prefill(
     v: &Tensor,
     n_tokens: usize,
     sc: &Scenario,
-    rope_cs: &Tensor,
-    rope_offsets: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
 ) -> Result<()> {
     let offset = cache.current_seq_len();
@@ -583,8 +572,7 @@ fn run_prefill(
         sc.n_kv_head,
         sc.head_dim,
         None,
-        rope_offsets,
-        rope_cs,
+        rope,
         sc.rope_interleaved,
         &generation,
         // No shared position-map cache in this one-shot fixture prefill.

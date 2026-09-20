@@ -5813,6 +5813,15 @@ impl Scheduler {
                 return;
             }
         };
+        // Reconcile a windowed creep's per-layer skew before this seal —
+        // see `perform_seal_and_write` and `BatchedInferenceSession::reconcile_block_counts`.
+        if let Err(e) = self.session.reconcile_block_counts(slot.0) {
+            let _ = pending.response_tx.send(Err(ProbeError::Soft(format!(
+                "SubmitSummaryProbe: reconcile before snapshot: {e}"
+            ))));
+            self.free_summary_slot(slot);
+            return;
+        }
         let block_count = self.session.sequence_block_count(slot.0).unwrap_or(0);
         let sealed_gpu = match self.session.snapshot_sequence_per_layer(slot.0) {
             Ok(snap) => slice_per_layer_sealed(&snap, 0, block_count),
@@ -7351,6 +7360,34 @@ impl Scheduler {
         close_unit_boundary(self.model.as_ref(), slot, unit, held);
     }
 
+    /// Install prefix section `prefix_id`'s index page on `seq`, ahead of the
+    /// `tokens` of its K/V the ingest borrows.
+    ///
+    /// **A section without a page the model takes is advanced over as a gap.**
+    /// Its span stays unindexed, which is the truth about it, and everything
+    /// after it still sits where its K/V does. Left short instead, the index
+    /// covers fewer tokens than the slot holds, every select of the ingest
+    /// refuses, and the wave step fails on each retry for as long as the daemon
+    /// runs — a startup wedged in "Prefilling tool sections".
+    fn push_prefix_section_index(&self, seq: SequenceId, prefix_id: SectionId, tokens: usize) {
+        let refused = match self.section_positional.get(&prefix_id) {
+            Some(blob) => match self.model.push_positional_state(seq.0, blob) {
+                Ok(_) => None,
+                Err(e) => Some(format!("index page refused: {e}")),
+            },
+            None if self.model.carries_positional_state() => Some("has no index page".to_string()),
+            None => None,
+        };
+        if let Some(why) = refused {
+            let advanced = self.model.push_positional_gap(seq.0, tokens);
+            tracing::warn!(
+                "prepare_section_ingest: prefix section {prefix_id:?} {why} — its {tokens} \
+                 token(s) stay unindexed (gap advanced: {})",
+                advanced.is_ok()
+            );
+        }
+    }
+
     /// CPU-only setup for a section ingest: truncate slot, inject prefix,
     /// capture `seal_block_from`, push writer chunk, pin tokens on substrate.
     /// Returns `seal_block_from` (the chunk index lower bound for the seal).
@@ -7440,25 +7477,12 @@ impl Scheduler {
                         }
                         // The one thing borrowing the chunks does not bring
                         // along. Pushed in prefix order, so the pages sit at
-                        // the positions their K/V does; a section without one
-                        // leaves this ingest's queries asking for blocks the
-                        // model does not hold, and the select refuses.
-                        if let Some(blob) = self.section_positional.get(&prefix_id) {
-                            if let Err(e) = self.model.push_positional_state(sequence_id.0, blob) {
-                                tracing::warn!(
-                                    "prepare_section_ingest: prefix section {:?} index page \
-                                     refused: {e}",
-                                    prefix_id
-                                );
-                            }
-                        } else if self.model.carries_positional_state() {
-                            tracing::warn!(
-                                "prepare_section_ingest: prefix section {:?} has no index \
-                                 page — this ingest will select against a prefix it never \
-                                 indexed",
-                                prefix_id
-                            );
-                        }
+                        // the positions their K/V does.
+                        self.push_prefix_section_index(
+                            sequence_id,
+                            prefix_id,
+                            sealed[0].token_count,
+                        );
                     }
                 }
                 let total_tokens = per_layer_token_count.first().copied().unwrap_or(0);
@@ -7998,6 +8022,17 @@ impl Scheduler {
         // lands) is read from `slot_targets` rather than threaded
         // through the request — see [`Self::slot_targets`].
         let seal_target = self.slot_targets.get(&seal_slot).copied();
+        // A windowed creep prefill can leave layers in a later window one
+        // empty writer chunk behind layers in an earlier one
+        // (`BatchedInferenceSession::reconcile_block_counts`). This is the
+        // seal that persists the slot's K/V to the substrate for every future
+        // reload and every future conversation that borrows it, so a skew
+        // reconciled here is fixed for good; left alone, it is what produces
+        // "chunked decode layout diverged... on the first message of a new
+        // conversation" on every subsequent replay of this exact record.
+        self.session
+            .reconcile_block_counts(seal_slot.0)
+            .map_err(ConversationError::Model)?;
         let snapshot = self
             .session
             .snapshot_sequence(seal_slot.0)
@@ -9986,6 +10021,15 @@ impl Scheduler {
         // user message" symptom that derails generation past the
         // first reproject.
         let tail_per_layer = {
+            // Reconcile a windowed creep's per-layer skew before this snapshot
+            // — see `perform_seal_and_write` and
+            // `BatchedInferenceSession::reconcile_block_counts`. This capture
+            // takes each layer's own `chunks.len()` rather than a shared
+            // min-based bound, so an unreconciled skew would carry a
+            // different tail length per layer into the rebuilt view.
+            self.session
+                .reconcile_block_counts(view_id.0)
+                .map_err(ConversationError::Model)?;
             let snapshot = self
                 .session
                 .snapshot_sequence_per_layer(view_id.0)
@@ -10976,7 +11020,23 @@ mod tests {
         /// survive exactly one `offset == 0` reset. The store-level `seeded`
         /// flag of §10 decision 2, modelled per sequence.
         seeded: Arc<Mutex<HashSet<usize>>>,
+        /// What the scheduler installed ahead of each sequence's borrowed K/V,
+        /// in order.
+        pushed: Arc<Mutex<HashMap<usize, Vec<Pushed>>>>,
     }
+
+    /// One piece installed ahead of borrowed K/V.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Pushed {
+        /// A page the model took.
+        Page(Vec<u8>),
+        /// Tokens advanced over unindexed.
+        Gap(usize),
+    }
+
+    /// The prefix of a page in the double's own format — the stand-in for a
+    /// container version the build reads.
+    const TOY_PAGE: &[u8] = b"TOYPAGE";
 
     impl RecurrentProbe {
         fn get(&self, seq: usize) -> Option<ToyState> {
@@ -11178,6 +11238,26 @@ mod tests {
         /// answer are actually entered by a CPU test.
         fn carries_positional_state(&self) -> bool {
             true
+        }
+
+        /// Takes a page only in its own format, and refuses anything else the
+        /// way the real model refuses a malformed page.
+        fn push_positional_state(&self, seq: usize, blob: &[u8]) -> candle::Result<bool> {
+            if !blob.starts_with(TOY_PAGE) {
+                candle::bail!("toy page: a format this double does not read");
+            }
+            let mut pushed = self.probe.pushed.lock().unwrap();
+            pushed
+                .entry(seq)
+                .or_default()
+                .push(Pushed::Page(blob.to_vec()));
+            Ok(true)
+        }
+
+        fn push_positional_gap(&self, seq: usize, tokens: usize) -> candle::Result<()> {
+            let mut pushed = self.probe.pushed.lock().unwrap();
+            pushed.entry(seq).or_default().push(Pushed::Gap(tokens));
+            Ok(())
         }
 
         /// Close the live tail into a page, returning the width it covered.
@@ -11393,6 +11473,42 @@ mod tests {
             Arc::new(crate::guest::Guests::new()),
         );
         (scheduler, tx, probe)
+    }
+
+    /// **A prefix section whose page the model will not take still advances
+    /// the index, as a gap of the section's width.** Pages in order where the
+    /// model reads them; the section with a stale page and the section with
+    /// none each become a gap of exactly their tokens, so every later piece
+    /// sits where its K/V does. Before, both only warned, left the index short
+    /// of the slot, and every select of the ingest refused for as long as the
+    /// daemon ran.
+    #[test]
+    fn a_prefix_section_the_model_cannot_index_is_advanced_over_as_a_gap() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let (good, stale, missing) = (SectionId::new(1), SectionId::new(2), SectionId::new(3));
+        let good_page = [TOY_PAGE, b"-good"].concat();
+        sched
+            .section_positional
+            .insert(good, Arc::new(good_page.clone()));
+        sched
+            .section_positional
+            .insert(stale, Arc::new(b"\x02\x00\x00\x00rotated".to_vec()));
+
+        let seq = SequenceId(5);
+        sched.push_prefix_section_index(seq, good, 40);
+        sched.push_prefix_section_index(seq, stale, 23);
+        sched.push_prefix_section_index(seq, missing, 17);
+
+        assert_eq!(
+            probe
+                .pushed
+                .lock()
+                .unwrap()
+                .get(&5)
+                .cloned()
+                .unwrap_or_default(),
+            vec![Pushed::Page(good_page), Pushed::Gap(23), Pushed::Gap(17)],
+        );
     }
 
     // ── Branch checkpoints (P6) ──────────────────────────────────────────────

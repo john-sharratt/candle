@@ -55,6 +55,8 @@ mod moe;
 mod paged;
 pub mod readback;
 mod rope;
+#[cfg(feature = "cuda")]
+mod rope_tables;
 /// The batched ragged row scatter. Public for the same reason as [`desc`]: it
 /// is a generic descriptor-table copy, and the projection split in
 /// `models::stacked_proj` is its second caller.
@@ -92,7 +94,6 @@ pub use loader::{config_from_gguf, GgufModel};
 pub use moe::{Expert, Gate, MoE, ScoreFunc};
 #[cfg(feature = "cuda")]
 pub use paged::{paged_latent_decode, paged_latent_decode_raw, CorpusCache, SyntheticSlots};
-pub use rope::yarn_freqs;
 pub use rope::RotaryCache;
 pub use streaming::StreamingModel;
 pub use transformer::{Block, Transformer};

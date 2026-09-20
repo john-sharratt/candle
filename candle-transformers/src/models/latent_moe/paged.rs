@@ -28,6 +28,9 @@ use candle::quantized::pinned_staging::Generation;
 use candle_kernels::paged_latent::GLUE_SCATTER_WORDS;
 
 #[cfg(feature = "cuda")]
+use crate::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
+
+#[cfg(feature = "cuda")]
 #[cfg(feature = "cuda")]
 use super::config::Config;
 use super::desc;
@@ -364,7 +367,7 @@ impl CorpusCache {
 #[cfg(feature = "cuda")]
 pub fn paged_latent_decode(
     q: &Tensor,          // [slots, H, 512] bf16
-    headers: &Tensor,    // [slots*24] u8 (SlotHeader array)
+    headers: &Tensor,    // [slots * SLOT_HEADER_BYTES] u8 (SlotHeader array)
     kv_new: &Tensor,     // [slots, 512] bf16
     cache: &CorpusCache, // persistent position-free int8 corpus
     comp_idx: &Tensor,   // [slots, max_sel] u32
@@ -1760,7 +1763,7 @@ pub struct SyntheticSlots {
     pub kvheads: Tensor,
     /// `[n_chunks_total * 16]` u8 — TokenSlice array (all slots concatenated).
     pub slices: Tensor,
-    /// `[num_slots * 24]` u8 — SlotHeader array.
+    /// `[num_slots * SLOT_HEADER_BYTES]` u8 — SlotHeader array.
     pub headers: Tensor,
     /// Per slot: (first chunk index, n_chunks, n_tokens).
     pub slot_meta: Vec<(usize, usize, usize)>,
@@ -1996,18 +1999,22 @@ impl SyntheticSlots {
         };
 
         // SlotHeaders.
-        let mut header_bytes = vec![0u8; windows.len() * 24];
+        let mut header_bytes = Vec::with_capacity(windows.len() * SLOT_HEADER_BYTES);
         for (slot, _) in windows.iter().enumerate() {
             let (first_chunk, n_chunks, _) = slot_meta[slot];
-            let rec = &mut header_bytes[slot * 24..slot * 24 + 24];
-            rec[0..4].copy_from_slice(&(n_chunks as u32).to_le_bytes());
-            rec[4..8].copy_from_slice(&((n_chunks - 1) as u32).to_le_bytes()); // writer = last
-            let sa = slices_addr + (first_chunk * 16) as u64;
-            rec[8..16].copy_from_slice(&sa.to_le_bytes());
-            // position_map_ptr unused by the DeepSeek kernel.
-            rec[16..24].copy_from_slice(&0u64.to_le_bytes());
+            SlotHeaderHost {
+                n_slices: n_chunks as u32,
+                write_slice: (n_chunks - 1) as u32, // writer = last
+                slices_ptr: slices_addr + (first_chunk * 16) as u64,
+                // Unused by the DeepSeek kernel, as is the rung: a latent
+                // layer's frequencies are chosen by its kind, per launch.
+                position_map_ptr: 0,
+                rope_rung: 0,
+            }
+            .write(&mut header_bytes);
         }
-        let headers = Tensor::from_vec(header_bytes, windows.len() * 24, dev)?;
+        let n = header_bytes.len();
+        let headers = Tensor::from_vec(header_bytes, n, dev)?;
 
         Ok(Self {
             bands,
@@ -2171,6 +2178,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::models::rope_schedule::yarn_freqs;
     use candle::Device;
 
     const H: usize = 64;
@@ -2416,7 +2424,7 @@ mod tests {
         let freqs: Vec<f32> = if case.zero_rope {
             vec![0.0; ROPE_DIM / 2]
         } else {
-            super::super::rope::yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
+            yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
                 .into_iter()
                 .map(|f| f as f32)
                 .collect()
@@ -3127,11 +3135,10 @@ mod tests {
             .map(|_| std::array::from_fn(|_| bf16_exact(&mut s)))
             .collect();
         let sinks_v: Vec<f32> = (0..H).map(|_| bf16_exact(&mut s) * 0.5).collect();
-        let freqs_v: Vec<f32> =
-            super::super::rope::yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
-                .into_iter()
-                .map(|f| f as f32)
-                .collect();
+        let freqs_v: Vec<f32> = yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
+            .into_iter()
+            .map(|f| f as f32)
+            .collect();
         let sinks = Tensor::from_vec(sinks_v, H, &dev)?;
         let freqs = Tensor::from_vec(freqs_v, ROPE_DIM / 2, &dev)?;
         let rope_tab = build_rope_table(&freqs)?;
@@ -3226,11 +3233,10 @@ mod tests {
             .map(|_| std::array::from_fn(|_| bf16_exact(&mut s)))
             .collect();
         let sinks_v: Vec<f32> = (0..H).map(|_| bf16_exact(&mut s) * 0.5).collect();
-        let freqs_v: Vec<f32> =
-            super::super::rope::yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
-                .into_iter()
-                .map(|f| f as f32)
-                .collect();
+        let freqs_v: Vec<f32> = yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
+            .into_iter()
+            .map(|f| f as f32)
+            .collect();
         let sinks = Tensor::from_vec(sinks_v.clone(), H, &dev)?;
         let freqs = Tensor::from_vec(freqs_v.clone(), ROPE_DIM / 2, &dev)?;
         let rope_tab = build_rope_table(&freqs)?;
@@ -3462,11 +3468,10 @@ mod tests {
             .map(|_| std::array::from_fn(|_| bf16_exact(&mut s)))
             .collect();
         let sinks_v: Vec<f32> = (0..H).map(|_| bf16_exact(&mut s) * 0.5).collect();
-        let freqs_v: Vec<f32> =
-            super::super::rope::yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
-                .into_iter()
-                .map(|f| f as f32)
-                .collect();
+        let freqs_v: Vec<f32> = yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
+            .into_iter()
+            .map(|f| f as f32)
+            .collect();
         let sinks = Tensor::from_vec(sinks_v.clone(), H, &dev)?;
         let freqs = Tensor::from_vec(freqs_v.clone(), ROPE_DIM / 2, &dev)?;
         let rope_tab = build_rope_table(&freqs)?;
@@ -3978,11 +3983,10 @@ mod tests {
             .map(|_| std::array::from_fn(|_| bf16_exact(&mut s)))
             .collect();
         let sinks = Tensor::from_vec((0..H).map(|_| bf16_exact(&mut s) * 0.5).collect(), H, &dev)?;
-        let freqs_v: Vec<f32> =
-            super::super::rope::yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
-                .into_iter()
-                .map(|f| f as f32)
-                .collect();
+        let freqs_v: Vec<f32> = yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
+            .into_iter()
+            .map(|f| f as f32)
+            .collect();
         let rope_tab = build_rope_table(&Tensor::from_vec(freqs_v, ROPE_DIM / 2, &dev)?)?;
         let ws = LatentWorkspace::build(&dev)?;
 
@@ -4123,7 +4127,7 @@ mod tests {
             _ => unreachable!(),
         };
         let stream = cuda.cuda_stream();
-        let freqs: Vec<f32> = super::super::rope::yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
+        let freqs: Vec<f32> = yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
             .into_iter()
             .map(|f| f as f32)
             .collect();
@@ -4194,11 +4198,10 @@ mod tests {
     #[ignore]
     fn rope_table_device_matches_mirror() -> Result<()> {
         let dev = Device::new_cuda(0)?;
-        let freqs_v: Vec<f32> =
-            super::super::rope::yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
-                .into_iter()
-                .map(|f| f as f32)
-                .collect();
+        let freqs_v: Vec<f32> = yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
+            .into_iter()
+            .map(|f| f as f32)
+            .collect();
         let freqs = Tensor::from_vec(freqs_v.clone(), ROPE_DIM / 2, &dev)?;
         let tab = build_rope_table(&freqs)?;
         dev.synchronize()?;
@@ -5028,11 +5031,10 @@ mod tests {
             .map(|_| std::array::from_fn(|_| bf16_exact(&mut s)))
             .collect();
         let sinks_v: Vec<f32> = (0..H).map(|_| bf16_exact(&mut s) * 0.5).collect();
-        let freqs_v: Vec<f32> =
-            super::super::rope::yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
-                .into_iter()
-                .map(|f| f as f32)
-                .collect();
+        let freqs_v: Vec<f32> = yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
+            .into_iter()
+            .map(|f| f as f32)
+            .collect();
 
         let q8 = |outer| BandSpec { fmt: 7, outer };
         let q4 = |outer| BandSpec { fmt: 15, outer };
@@ -5236,11 +5238,10 @@ mod tests {
             .collect();
         let kv_new: [f32; HEAD_DIM] = std::array::from_fn(|_| fp8_exact(&mut s));
         let sinks_v: Vec<f32> = (0..H).map(|_| bf16_exact(&mut s) * 0.5).collect();
-        let freqs_v: Vec<f32> =
-            super::super::rope::yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
-                .into_iter()
-                .map(|f| f as f32)
-                .collect();
+        let freqs_v: Vec<f32> = yarn_freqs(ROPE_DIM, 10000.0, 0, 1.0, 32.0, 1.0)
+            .into_iter()
+            .map(|f| f as f32)
+            .collect();
 
         let run = |window: &Vec<[f32; HEAD_DIM]>, scatter: bool| -> Result<Vec<f32>> {
             let slots = SyntheticSlots::build(&dev, std::slice::from_ref(window))?;

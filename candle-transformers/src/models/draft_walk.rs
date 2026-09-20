@@ -5,7 +5,7 @@
 //! *within* a sequence, but step `j` of one sequence is independent of step `j`
 //! of every other. So the walk is one batched pass per position, and what
 //! differs between models is only the arithmetic of a single step — the head's
-//! own block. Everything around it is the same for every drafter, and three
+//! own block. Everything around it is the same for every drafter, and two
 //! parts of it are load-bearing in ways that are invisible when they are wrong:
 //!
 //! * **Every drafted position's write chunk is allocated BEFORE the loop.**
@@ -25,12 +25,6 @@
 //!   each step before the next builds metadata, which is exactly what removes
 //!   the overlap. Ensuring the whole range up front adds no allocation; it only
 //!   moves it to a point where no kernel is reading.
-//! * **The rope table's depth is read from the head's own layer, and refused
-//!   rather than defaulted.** A zero-block table is not a small table, it is one
-//!   the paged kernel indexes straight past: silent wrong RoPE on every drafted
-//!   position. Speculation is lossless, so it could only ever surface as
-//!   acceptance quietly collapsing. It must also be read AFTER the ensure
-//!   above, which can grow the backing's block count.
 //! * **The walk's positions are rolled back whatever happens.** A proposal is
 //!   written into the head's KV as if real and then truncated away; the tokens
 //!   the target accepts are written again, properly, by the next wave. A walk
@@ -55,8 +49,9 @@ use super::operand_guard::expect_dtype;
 /// never looks inside it.
 ///
 /// `headers` is the head layer's slot-header buffer and its stride, already
-/// built for `at`. The rope tables belong to the step, not the walk — they are
-/// the one part of a position that is genuinely the model's own.
+/// built for `at`; each header names its sequence's RoPE rung. The model-side
+/// rotation belongs to the step, not the walk — it is the one part of a
+/// position that is genuinely the model's own.
 pub type DraftStep<'f> = dyn FnMut(
         &Tensor,
         &Tensor,
@@ -244,40 +239,11 @@ pub fn draft_walk<G>(
     Tensor::stack(&refs, 1)?.to_vec2::<u32>()
 }
 
-/// The arena depth a drafter's rope tables must cover, read from the head's own
-/// KV layer.
-///
-/// Refused rather than defaulted, for the reason the module docs give: a
-/// zero-block table is one the paged kernel indexes straight past. Call it
-/// AFTER [`draft_walk`]'s pre-ensure has run — which is why it is exposed
-/// separately rather than folded into the walk, since the step closure needs
-/// the answer before the walk begins.
-pub fn draft_rope_depth(
-    session: &BatchedInferenceSession,
-    seqs: &[usize],
-    kv_layer: usize,
-) -> Result<usize> {
-    let seq = *seqs
-        .first()
-        .ok_or_else(|| candle::Error::msg("draft rope depth: empty cohort"))?;
-    session
-        .sequence_caches(seq)
-        .and_then(|c| c.caches.get(kv_layer))
-        .map(|k| k.k_cache().chunked_max_blocks())
-        .ok_or_else(|| {
-            candle::Error::Msg(format!(
-                "draft walk: sequence {seq} has no live KV layer {kv_layer} to size the rope \
-                 table from — it was released after the cohort was formed"
-            ))
-        })
-}
-
 /// Pre-allocate the walk's write chunks without walking.
 ///
-/// [`draft_walk`] does this itself, but a caller that needs
-/// [`draft_rope_depth`] before building its step closure has to force the
-/// allocation first — the ensure can grow the backing's block count, and a rope
-/// table sized before it is a table the walk indexes past.
+/// [`draft_walk`] does this itself; a caller that reads the head layer's block
+/// structure before building its step closure forces the allocation first, so
+/// what it reads is the structure the walk will write into.
 pub fn draft_reserve(
     session: &BatchedInferenceSession,
     seqs: &[usize],

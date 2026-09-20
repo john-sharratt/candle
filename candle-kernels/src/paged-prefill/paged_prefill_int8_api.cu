@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <cuda_runtime.h>
 #include "../arena_table.cuh" // ArenaFormat dtype codes
+#include "../rope/rope_table.cuh" // RopeRungs
 
 // ============================================================================
 // INT8 Prefix-Attention Prefill API — Unified Dispatcher
@@ -13,14 +14,14 @@ extern "C" void run_paged_prefill_int8_fp16(
     const void*, const void*, const void*, const uint8_t*,
     const uint32_t*, const uint32_t*, const uint32_t*, void*,
     int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
-    float, const uint32_t*, const float*, int32_t, cudaStream_t,
+    float, const RopeRungs, int32_t, cudaStream_t,
     const uint32_t*, const uint32_t*, const uint2*, const uint2*, int32_t, int32_t);
 
 extern "C" void run_paged_prefill_int8_bf16(
     const void*, const void*, const void*, const uint8_t*,
     const uint32_t*, const uint32_t*, const uint32_t*, void*,
     int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
-    float, const uint32_t*, const float*, int32_t, cudaStream_t,
+    float, const RopeRungs, int32_t, cudaStream_t,
     const uint32_t*, const uint32_t*, const uint2*, const uint2*, int32_t, int32_t);
 
 extern "C" void run_paged_prefill_int8(
@@ -40,8 +41,7 @@ extern "C" void run_paged_prefill_int8(
     int32_t max_q_len,
     float softmax_scale,
     int32_t q_dtype,
-    const uint32_t* rope_offsets,
-    const float* rope_cs,
+    const RopeRungs rungs,
     int32_t rope_interleaved,
     void* stream_ptr,
     const uint32_t* sel_entries,
@@ -57,7 +57,7 @@ extern "C" void run_paged_prefill_int8(
             run_paged_prefill_int8_fp16(
                 q_ptr, k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
                 o_ptr, total_q, batch_size, n_head, n_kv_head, head_dim,
-                max_q_len, softmax_scale, rope_offsets, rope_cs,
+                max_q_len, softmax_scale, rungs,
                 rope_interleaved, stream, sel_entries, sel_cnt, sel_pages, sel_page_win,
                 sel_stride, sel_ratio);
             break;
@@ -65,7 +65,7 @@ extern "C" void run_paged_prefill_int8(
             run_paged_prefill_int8_bf16(
                 q_ptr, k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
                 o_ptr, total_q, batch_size, n_head, n_kv_head, head_dim,
-                max_q_len, softmax_scale, rope_offsets, rope_cs,
+                max_q_len, softmax_scale, rungs,
                 rope_interleaved, stream, sel_entries, sel_cnt, sel_pages, sel_page_win,
                 sel_stride, sel_ratio);
             break;

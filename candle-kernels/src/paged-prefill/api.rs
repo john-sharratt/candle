@@ -2,6 +2,8 @@
 
 use core::ffi::c_void;
 
+use crate::rope::RopeRungsFfi;
+
 extern "C" {
     // ========================================================================
     // INT8 prefix-attention prefill (docs/archived/prefill_optimization.md): GQA-packed
@@ -25,8 +27,7 @@ extern "C" {
         max_q_len: i32,
         softmax_scale: f32,
         q_dtype: i32,
-        rope_offsets: *const u32,
-        rope_cs: *const f32,
+        rungs: RopeRungsFfi,
         rope_interleaved: i32,
         stream: *mut c_void,
         // QSA selection, one row per PACKED QUERY (`cu_seqlens_q[b] + token`);

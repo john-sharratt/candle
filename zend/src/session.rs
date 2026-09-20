@@ -3387,9 +3387,25 @@ fn run_inference_stream(
                         TurnEvent::Error(e) => {
                             let msg = format!("{e}");
                             tracing::error!(conv_id = %conv_id, iteration, "scheduler error: {msg}");
+                            // A per-layer KV divergence the engine has already
+                            // decided it cannot trust a repair for
+                            // (`heal_tail_divergence`/`assert_sealed_layers_aligned`
+                            // in candle-nn) is not a transient hiccup — the
+                            // sequence's K/V is inconsistent across layers and
+                            // every future turn on it fails identically. Rather
+                            // than surface the internal diagnostic as if the
+                            // assistant said it, tell the user plainly and stop:
+                            // no retry here would do anything but repeat it.
+                            let shown = if msg.contains("no repair from here can be trusted") {
+                                "\n\n⚠ This conversation's memory has become corrupted and can't \
+                                 be recovered. Please start a new conversation."
+                                    .to_string()
+                            } else {
+                                format!("\n\n⚠ {msg}")
+                            };
                             // Send as text so the client shows the message rather
                             // than dropping the connection.
-                            let _ = tx.send(Ok(StreamItem::Token(format!("\n\n⚠ {msg}")))).await;
+                            let _ = tx.send(Ok(StreamItem::Token(shown))).await;
                             turn_error = Some(anyhow::anyhow!("{msg}"));
                             // Do not return — drain the iterator so the channel
                             // closes cleanly before we decide what to do with the

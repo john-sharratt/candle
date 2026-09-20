@@ -19,25 +19,17 @@
 #include <cuda_bf16.h>
 #include <stdint.h>
 #include "convert_all.cuh"
+#include "../rope/rope_table.cuh"
 
 namespace int8_elem {
 
-/// cos/sin lookup, same FREQUENCY-indexed table as the decode kernels:
-/// rope_cs[pos*HD + 2i] = cos_i, [.. + 2i + 1] = sin_i for frequency i in
-/// [0, HD/2). The table is pairing-agnostic — the half-split pairing
-/// (d, d + HD/2) reads frequency d, the interleaved pairing (2i, 2i + 1)
-/// reads frequency d >> 1.
-template <int HEAD_DIM>
-__device__ __forceinline__ void i8_rope_cs(
-    int pos, int d_idx, const float* __restrict__ rope_cs, float& c, float& s)
-{
-    const float* e = rope_cs + (int64_t)pos * HEAD_DIM + d_idx * 2;
-    c = __ldg(e);
-    s = __ldg(e + 1);
-}
-
 /// Apply RoPE in place over a register window `x[N_WIN]` where lane `l` holds
 /// dims {l + 32w : w in 0..N_WIN} of one head row.
+///
+/// `rope` is the sequence's view of its rung (`rope_table.cuh`), queried by
+/// FREQUENCY, as the decode kernels query it: the half-split pairing
+/// (d, d + HD/2) reads frequency d, the interleaved pairing (2i, 2i + 1)
+/// reads frequency d >> 1. A Q rotation passes `rope.for_q()`.
 ///
 /// Half-split (`rope_interleaved == 0`, Qwen/GPT-NeoX): pair (d, d + HD/2)
 /// lives IN-THREAD as windows (w, w + N_WIN/2) — pure register math.
@@ -51,7 +43,7 @@ __device__ __forceinline__ void i8_rope_cs(
 template <int HEAD_DIM, int N_WIN>
 __device__ __forceinline__ void i8_apply_rope(
     float (&x)[N_WIN], int pos, int lane, int rope_interleaved,
-    const float* __restrict__ rope_cs)
+    const RopeView& rope)
 {
     if (rope_interleaved) {
         const float sign = (lane & 1) ? 1.f : -1.f;
@@ -59,7 +51,7 @@ __device__ __forceinline__ void i8_apply_rope(
         for (int w = 0; w < N_WIN; ++w) {
             int d = lane + 32 * w;
             float c, s;
-            i8_rope_cs<HEAD_DIM>(pos, d >> 1, rope_cs, c, s);
+            rope_cs_at(rope, pos, d >> 1, c, s);
             float partner = __shfl_sync(0xffffffffu, x[w], lane ^ 1);
             x[w] = x[w] * c + sign * partner * s;
         }
@@ -67,7 +59,7 @@ __device__ __forceinline__ void i8_apply_rope(
         #pragma unroll
         for (int w = 0; w < N_WIN / 2; ++w) {
             float c, s;
-            i8_rope_cs<HEAD_DIM>(pos, lane + 32 * w, rope_cs, c, s);
+            rope_cs_at(rope, pos, lane + 32 * w, c, s);
             float lo = x[w], hi = x[w + N_WIN / 2];
             x[w] = lo * c - hi * s;
             x[w + N_WIN / 2] = lo * s + hi * c;

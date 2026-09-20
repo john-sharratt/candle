@@ -73,7 +73,7 @@ __global__ void paged_glue_kernel(
     float softmax_scale,
     const T* __restrict__ k_new,
     const T* __restrict__ v_new,
-    const float* __restrict__ rope_cs,
+    const RopeRungs rungs,
     bool rope_interleaved,
     const uint32_t* __restrict__ cu_seqlens_q,
     const uint32_t* __restrict__ q_lens,
@@ -150,6 +150,7 @@ __global__ void paged_glue_kernel(
     const SlotHeader& slot = get_slot_header(headers_ptr, slot_idx);
     const uint32_t n_slices = slot.n_slices;
     const uint64_t slices_ptr = slot.slices_ptr;
+    const RopeView rope = rope_view(rungs, slot.rope_rung);
 
     // ── Flash-state lives in REGISTERS, not smem ─────────────────────────
     // A row is owned by a whole warp (all 32 lanes; lane `l` owns head dims
@@ -254,9 +255,9 @@ __global__ void paged_glue_kernel(
             #pragma unroll
             for (int j = 0; j < VEC; ++j) q_reg[rl][j] = to_f32<Q_T>(q[qb + lane * VEC + j]);
             if (rope_interleaved)
-                apply_rope_interleaved_f32<VEC, HEAD_DIM>(q_reg[rl], lane, true_pos, rope_cs);
+                apply_rope_interleaved_f32<VEC, HEAD_DIM>(q_reg[rl], lane, true_pos, rope.for_q());
             else
-                apply_rope_rotary_f32<VEC, HEAD_DIM>(q_reg[rl], lane, true_pos, rope_cs);
+                apply_rope_rotary_f32<VEC, HEAD_DIM>(q_reg[rl], lane, true_pos, rope.for_q());
         }
 
         // ── Stream every column [0, kv_len) in TILES of WARPS columns, packed
@@ -336,9 +337,9 @@ __global__ void paged_glue_kernel(
                 #pragma unroll
                 for (int j = 0; j < VEC; ++j) vr[j] = to_f32<T>(v_st[vi[j]]);
                 if (rope_interleaved)
-                    apply_rope_interleaved_f32<VEC, HEAD_DIM>(kr, lane, col_pos, rope_cs);
+                    apply_rope_interleaved_f32<VEC, HEAD_DIM>(kr, lane, col_pos, rope);
                 else
-                    apply_rope_rotary_f32<VEC, HEAD_DIM>(kr, lane, col_pos, rope_cs);
+                    apply_rope_rotary_f32<VEC, HEAD_DIM>(kr, lane, col_pos, rope);
                 #pragma unroll
                 for (int j = 0; j < VEC; ++j) k_col[warp * HEAD_DIM + lane * VEC + j] = kr[j];
                 #pragma unroll
@@ -452,7 +453,7 @@ inline void launch_paged_glue_attn(
     float softmax_scale,
     const T* k_new,
     const T* v_new,
-    const float* rope_cs,
+    const RopeRungs rungs,
     int rope_interleaved,
     const uint32_t* cu_seqlens_q,
     const uint32_t* q_lens,
@@ -506,7 +507,7 @@ inline void launch_paged_glue_attn(
     dim3 block(WARPS_PER_BLOCK * 32);
     kern<<<grid, block, smem_bytes, stream>>>(
         q, headers_ptr, out, batch, n_q_head, n_kv_head, softmax_scale,
-        k_new, v_new, rope_cs, rope_interleaved != 0,
+        k_new, v_new, rungs, rope_interleaved != 0,
         cu_seqlens_q, q_lens, kv_lens,
         glue_write_slice, glue_write_in_blk, fwd_ahead,
         (num_splits > 1) ? pa : nullptr, (num_splits > 1) ? pm : nullptr,
