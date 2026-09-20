@@ -1497,21 +1497,42 @@ impl BatchedInferenceSession {
         Ok(())
     }
 
-    /// Reserve an in-place glue gap of `n_tokens` slots at the slot tail across
-    /// every layer, advance the session offset, and return the gap's block index
-    /// (identical across layers). The glue forward later fills the gap by
-    /// explicit `(slice, in_blk)` write target; until then its K/V is
-    /// uninitialised but never read (the kernel scatters before it streams).
+    /// Drop every layer's trailing empty (0-token) chunks from `seq_idx`, so
+    /// each layer ends flush with the last token it actually holds.
     ///
-    /// This is the interleaved-glue primitive: because the gap is a real chunk
-    /// with `usage = n_tokens` sitting at its logical position, the
-    /// cumulative-usage `rope_base` of every later chunk equals its true
-    /// sequence position — so decode and glue share one positional convention
-    /// (`slice_rope`) with no `col_actual_pos` side channel.
-    /// Reserve a full-by-construction glue gap across every layer's backing.
-    /// Returns `(gap_block_index, in_blk_base)` — the block index (identical
-    /// across layers) and the first valid slot of the gap's tail window, into
-    /// which the glue forward scatters the island's K/V.
+    /// The inverse of [`Self::reconcile_block_counts`], and the one the layers
+    /// need before anything is **appended**. Padding equalises the block count
+    /// of a slot that is about to be read as one uniform thing; it is the wrong
+    /// move before a write, because the pad then sits between the old content
+    /// and the new on exactly the layers that were short. Trimming is lossless
+    /// by the same argument that makes padding lossless — an empty chunk holds
+    /// no token, so no position moves — and it leaves every layer's next
+    /// append at the same block index by construction.
+    pub fn trim_empty_tail_chunks(&mut self, seq_idx: usize) -> Result<()> {
+        for backing in &self.backings {
+            let Some(blocks) = backing.sequence_block_count(seq_idx) else {
+                continue;
+            };
+            // `block_usage` is always exactly `max_blocks` wide, so a slot
+            // reporting more blocks than that is a real invariant violation
+            // — the sequence has outgrown the arena's own capacity — not a
+            // shape we can silently absorb by keeping everything.
+            let usage = backing.block_usage(seq_idx);
+            let Some(usage) = usage.get(..blocks) else {
+                candle::bail!(
+                    "trim_empty_tail_chunks: seq {seq_idx} reports {blocks} block(s) but its \
+                     backing's block_usage is only {} wide",
+                    usage.len()
+                );
+            };
+            let keep = usage.iter().rposition(|&u| u != 0).map_or(0, |i| i + 1);
+            if keep < blocks {
+                backing.truncate_sequence_to_blocks(seq_idx, keep)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Pad every lagging layer's block count up to the max with an empty
     /// (0-token) writer chunk, so every layer of `seq_idx` agrees on how many
     /// blocks it holds.
@@ -1533,35 +1554,6 @@ impl BatchedInferenceSession {
     /// blocks are still genuinely empty and padding is lossless. Padding
     /// (not truncating) the ahead layer is what's safe: truncating would drop
     /// a writer chunk a co-batched decode may target.
-    /// Drop every layer's trailing empty (0-token) chunks from `seq_idx`, so
-    /// each layer ends flush with the last token it actually holds.
-    ///
-    /// The inverse of [`Self::reconcile_block_counts`], and the one the layers
-    /// need before anything is **appended**. Padding equalises the block count
-    /// of a slot that is about to be read as one uniform thing; it is the wrong
-    /// move before a write, because the pad then sits between the old content
-    /// and the new on exactly the layers that were short. Trimming is lossless
-    /// by the same argument that makes padding lossless — an empty chunk holds
-    /// no token, so no position moves — and it leaves every layer's next
-    /// append at the same block index by construction.
-    pub fn trim_empty_tail_chunks(&mut self, seq_idx: usize) -> Result<()> {
-        for backing in &self.backings {
-            let Some(blocks) = backing.sequence_block_count(seq_idx) else {
-                continue;
-            };
-            // `block_usage` is `max_blocks` wide and zero-padded past the
-            // slot's own blocks, so bound it by the slot's count before
-            // looking for the last non-empty one.
-            let usage = backing.block_usage(seq_idx);
-            let usage = usage.get(..blocks).unwrap_or(&usage);
-            let keep = usage.iter().rposition(|&u| u != 0).map_or(0, |i| i + 1);
-            if keep < blocks {
-                backing.truncate_sequence_to_blocks(seq_idx, keep)?;
-            }
-        }
-        Ok(())
-    }
-
     pub fn reconcile_block_counts(&mut self, seq_idx: usize) -> Result<()> {
         let max_blocks = (0..self.backings.len())
             .filter_map(|li| self.backings[li].sequence_block_count(seq_idx))
@@ -1581,6 +1573,19 @@ impl BatchedInferenceSession {
         Ok(())
     }
 
+    /// Reserve a full-by-construction glue gap across every layer's backing.
+    /// Returns `(gap_block_index, in_blk_base)` — the block index (identical
+    /// across layers) and the first valid slot of the gap's tail window, into
+    /// which the glue forward scatters the island's K/V. The glue forward
+    /// later fills the gap by explicit `(slice, in_blk)` write target; until
+    /// then its K/V is uninitialised but never read (the kernel scatters
+    /// before it streams).
+    ///
+    /// This is the interleaved-glue primitive: because the gap is a real
+    /// chunk with `usage = n_tokens` sitting at its logical position, the
+    /// cumulative-usage `rope_base` of every later chunk equals its true
+    /// sequence position — so decode and glue share one positional
+    /// convention (`slice_rope`) with no `col_actual_pos` side channel.
     pub fn reserve_glue_gap(&mut self, seq_idx: usize, n_tokens: u32) -> Result<(usize, u32)> {
         // `reserve_glue_gap_chunk` MUTATES each layer (pushes a gap chunk + a writer
         // chunk). This loop must therefore be ATOMIC: if it bails mid-way — because a
@@ -5369,6 +5374,16 @@ fn assert_sealed_layers_aligned(
 /// on read — the same "truncate every layer to the shortest" a live
 /// divergence is already healed with, applied here so it never becomes a
 /// live divergence in the first place.
+/// Truncate a sealed sequence to exactly `target_tokens`, splitting the chunk
+/// straddling the boundary rather than dropping it whole.
+///
+/// A `SealedChunk` is already a *window* onto its physical chunk — `offset` +
+/// `token_count`, not a copy of the bytes — so shrinking `token_count` from
+/// the tail costs nothing and needs no re-rotation (`SealedChunk`'s own docs:
+/// RoPE is applied at read time, never stored). Dropping the straddling chunk
+/// instead of splitting it used to leave `running < target_tokens` whenever
+/// `target_tokens` didn't land on one of *this* layer's own chunk boundaries
+/// — manufacturing a fresh cross-layer skew out of the call meant to heal one.
 fn truncate_sealed_to_tokens(
     seq: &candle_nn::kv_cache::SealedSequence,
     target_tokens: usize,
@@ -5376,12 +5391,20 @@ fn truncate_sealed_to_tokens(
     let mut running = 0usize;
     let mut chunks = Vec::with_capacity(seq.chunks.len());
     for c in &seq.chunks {
-        let next = running + c.token_count as usize;
-        if next > target_tokens {
+        let remaining = target_tokens - running;
+        if remaining == 0 {
             break;
         }
-        running = next;
-        chunks.push(c.clone());
+        if c.token_count as usize <= remaining {
+            running += c.token_count as usize;
+            chunks.push(c.clone());
+        } else {
+            let mut partial = c.clone();
+            partial.token_count = remaining as u16;
+            chunks.push(partial);
+            running = target_tokens;
+            break;
+        }
     }
     candle_nn::kv_cache::SealedSequence {
         chunks,
@@ -5561,5 +5584,71 @@ mod slab_tests {
     fn slack_is_a_quarter_of_the_cap() {
         assert_eq!(prefill_slack_cap(8192), 10240);
         assert_eq!(prefill_slack_cap(100), 125);
+    }
+}
+
+#[cfg(test)]
+mod truncate_sealed_tests {
+    use super::truncate_sealed_to_tokens;
+    use candle_nn::kv_cache::{ArenaLocation, SealedChunk, SealedSequence};
+
+    fn sequence(chunks: Vec<SealedChunk>) -> SealedSequence {
+        let token_count = chunks.iter().map(|c| c.token_count as usize).sum();
+        SealedSequence {
+            chunks,
+            token_count,
+            chunk_size: 32,
+            location: ArenaLocation::Gpu,
+        }
+    }
+
+    /// The target falls inside the second chunk, not on either layer's own
+    /// chunk boundary — exactly the shape a shorter sibling layer produces.
+    /// The old whole-chunk-or-drop-it logic landed on 32, short of the 40
+    /// asked for; the fix must split the straddling chunk instead.
+    #[test]
+    fn target_inside_a_chunk_splits_it_instead_of_dropping_it() {
+        let seq = sequence(vec![
+            SealedChunk::for_test(0, 32),
+            SealedChunk::for_test(1, 32),
+            SealedChunk::for_test(2, 8),
+        ]);
+
+        let truncated = truncate_sealed_to_tokens(&seq, 40);
+
+        assert_eq!(truncated.token_count, 40);
+        let counts: Vec<u16> = truncated.chunks.iter().map(|c| c.token_count).collect();
+        assert_eq!(counts, vec![32, 8]);
+    }
+
+    /// A target that already lands on a chunk boundary is unaffected — no
+    /// split, no dropped chunk.
+    #[test]
+    fn target_on_a_chunk_boundary_is_unchanged() {
+        let seq = sequence(vec![
+            SealedChunk::for_test(0, 32),
+            SealedChunk::for_test(1, 8),
+        ]);
+
+        let truncated = truncate_sealed_to_tokens(&seq, 32);
+
+        assert_eq!(truncated.token_count, 32);
+        let counts: Vec<u16> = truncated.chunks.iter().map(|c| c.token_count).collect();
+        assert_eq!(counts, vec![32]);
+    }
+
+    /// Truncating to the sequence's own exact total keeps every chunk intact.
+    #[test]
+    fn target_at_full_length_keeps_every_chunk() {
+        let seq = sequence(vec![
+            SealedChunk::for_test(0, 32),
+            SealedChunk::for_test(1, 8),
+        ]);
+
+        let truncated = truncate_sealed_to_tokens(&seq, 40);
+
+        assert_eq!(truncated.token_count, 40);
+        let counts: Vec<u16> = truncated.chunks.iter().map(|c| c.token_count).collect();
+        assert_eq!(counts, vec![32, 8]);
     }
 }

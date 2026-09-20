@@ -65,12 +65,26 @@ pub enum SecretsError {
 ///
 /// Fields are private and reached through accessors so that a value can be
 /// normalised on the way out — see [`ToolSecrets::tavily_api_key`].
-#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ToolSecrets {
     /// Tavily API key for `web_search`. Obtained from tavily.com.
     #[serde(default)]
     tavily_api_key: Option<String>,
+}
+
+/// Redacts the key itself — a derived `Debug` would print it verbatim into
+/// any log line or panic message that formats this struct, which is exactly
+/// the exposure the type exists to prevent for `secrets/tools.yaml` on disk.
+impl std::fmt::Debug for ToolSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolSecrets")
+            .field(
+                "tavily_api_key",
+                &self.tavily_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl ToolSecrets {
@@ -238,6 +252,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let e = ToolSecrets::load(dir.path()).unwrap_err();
         assert!(matches!(e, SecretsError::Unreadable { .. }), "{e}");
+    }
+
+    /// `Debug` must never print the raw key — a log line or panic message
+    /// that formats a `ToolSecrets` would otherwise put a live Tavily
+    /// credential into the daemon's logs.
+    #[test]
+    fn debug_output_never_contains_the_key() {
+        let s = ToolSecrets::from_yaml("tavily_api_key: tvly-dev-abc123\n", "t.yaml").unwrap();
+        let debug = format!("{s:?}");
+        assert!(
+            !debug.contains("tvly-dev-abc123"),
+            "{debug:?} leaked the key"
+        );
+        assert!(
+            debug.contains("redacted"),
+            "{debug:?} should say the field is set"
+        );
     }
 
     /// **The document's path starts with the segment the VFS refuses.** The

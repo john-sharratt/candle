@@ -1164,11 +1164,18 @@ pub fn rotate_rows(
             rope.rope_dim()
         );
     }
+    // The kernel's own guard refuses to launch when `rows_per_pos == 0`
+    // (`row / rows_per_pos` would divide by zero) and returns without writing
+    // a single byte of `dst` — silently leaving it uninitialised rather than
+    // erroring. Catch it here, before `dst` is even allocated.
+    if rows_per_pos == 0 {
+        candle::bail!("qsa rope rows: rows_per_pos must be at least 1");
+    }
     let dst = Tensor::empty((n, d), DType::F32, src.device())?;
     if n == 0 {
         return Ok(dst);
     }
-    let groups = n / rows_per_pos.max(1);
+    let groups = n / rows_per_pos;
     let (pos_t, base, step) = match positions {
         RowPositions::PerGroup(p) => {
             if p.len() * rows_per_pos != n {
@@ -3374,6 +3381,27 @@ mod tests {
             heads,
             RowPositions::PerGroup(&pos),
             RowRungs::Uniform(3),
+            RotSide::Key,
+        )
+        .is_err());
+        Ok(())
+    }
+
+    /// `rows_per_pos == 0` would divide by zero inside the kernel, so the
+    /// guard there refuses to launch — but that guard also means `dst` never
+    /// gets a single byte written to it. This needs no GPU: the check runs
+    /// before `rotate_rows` ever asks whether `src`'s device is CUDA.
+    #[test]
+    fn rows_per_pos_zero_is_refused_before_dst_is_left_uninitialised() -> Result<()> {
+        let device = Device::Cpu;
+        let rope = FactoredRope::new(&plain_inv_freq(4, 1e6), &device)?;
+        let src = Tensor::from_vec(vec![0f32; 8], (1, 8), &device)?;
+        assert!(rotate_rows(
+            &src,
+            &rope,
+            0,
+            RowPositions::Affine { base: 0, step: 1 },
+            RowRungs::Uniform(0),
             RotSide::Key,
         )
         .is_err());

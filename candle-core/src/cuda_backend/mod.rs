@@ -2737,9 +2737,10 @@ impl CudaStorage {
                     );
                 }
                 let view = slice.slice(offset..offset + elem_count);
-                stream
-                    .memcpy_dtoh(&view, &mut dst[..elem_count])
-                    .map_err(crate::Error::wrap)?;
+                // `.w()`, not `Error::wrap` — see `CudaDevice::synchronize`'s
+                // comment: this is a real device round-trip and needs the same
+                // sticky/OOM-streak visibility as every other CUDA call.
+                stream.memcpy_dtoh(&view, &mut dst[..elem_count]).w()?;
                 Ok(())
             }
             _ => crate::bail!(

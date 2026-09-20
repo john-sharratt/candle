@@ -866,7 +866,7 @@ pub(super) fn apply_segments_build(
                     // sees this island. Mirrors the sealed-inject bookkeeping,
                     // the index page included: the wave not seeing the island is
                     // exactly why nothing would otherwise index it.
-                    inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &cached.kv)?;
+                    inject_arc_sealed(ctx.session, parent_id, &cached.kv)?;
                     push_captured_page(ctx, &cached, "cached glue island");
                     walker.logical_pos += tokens.len() as u32;
                     walker.last_was_sealed = true;
@@ -1226,7 +1226,7 @@ fn inject_sealed_section(
             return Ok(());
         }
     };
-    inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
+    inject_arc_sealed(ctx.session, parent_id, &sealed)?;
     // Unconditional, because the interesting case is the one that logs nothing.
     // A section reaching here with no blob takes the gap branch and says so; a
     // section that never reaches here at all is invisible, and telling those two
@@ -1433,7 +1433,7 @@ fn inject_sealed_turn(
         );
         return Ok(());
     }
-    inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
+    inject_arc_sealed(ctx.session, parent_id, &sealed)?;
     // The rows that go with those chunks. Borrowing the K/V is what makes a
     // reprojection cheap; the index cannot be borrowed the same way, because
     // its keys come from hidden states this slot never computed.
@@ -1582,7 +1582,7 @@ fn inject_sealed_turn_half(
             return Ok(());
         }
     };
-    inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
+    inject_arc_sealed(ctx.session, parent_id, &sealed)?;
     // **No page for a HALF, deliberately.** The stored page covers a whole
     // turn, and this borrows only its user half — handing the whole turn's rows
     // over would claim blocks for positions this slot does not hold, which is a
@@ -1609,10 +1609,22 @@ fn inject_sealed_turn_half(
     Ok(())
 }
 
+/// Inject a piece's already-sealed per-layer K/V onto `parent_id`'s slot.
+///
+/// Passes `sealed` straight through — no per-layer copy. An earlier version
+/// rebuilt a fresh `Vec<SealedSequence>` here solely to override `chunk_size`
+/// and `location`, which meant cloning every chunk's six palette/scale/format
+/// `Arc`s (`SealedChunk` derives `Clone`) for every layer of every piece, on
+/// every projection — work `ChunkedKvBacking::inject_sealed_at_tail` repeats a
+/// moment later when it builds its own `ChunkWindow`s from the same chunks.
+/// Neither `inject_sealed_at_tail` (here or in `candle-nn`) nor
+/// `truncate_sealed_to_tokens` (the one place that constructs a fresh
+/// `SealedSequence` on this path) ever reads a `SealedSequence`'s own
+/// `chunk_size` or `location` — both fields are copied through, never
+/// branched on — so the override was dead work from the moment it ran.
 fn inject_arc_sealed(
     session: &mut BatchedInferenceSession,
     parent_id: SequenceId,
-    chunk_size: usize,
     sealed: &Arc<Vec<SealedSequence>>,
 ) -> Result<(), ConversationError> {
     let _g = profile::span("inject:arc_sealed");
@@ -1625,17 +1637,8 @@ fn inject_arc_sealed(
         );
         return Ok(());
     }
-    let mut per_layer: Vec<SealedSequence> = Vec::with_capacity(n_layers);
-    for layer_seq in sealed.iter() {
-        per_layer.push(SealedSequence {
-            chunks: layer_seq.chunks.clone(),
-            token_count: layer_seq.token_count,
-            chunk_size,
-            location: candle_nn::kv_cache::ArenaLocation::Gpu,
-        });
-    }
     session
-        .inject_sealed_at_tail(parent_id.0, &per_layer)
+        .inject_sealed_at_tail(parent_id.0, sealed)
         .map_err(ConversationError::Model)?;
     Ok(())
 }
@@ -1686,7 +1689,7 @@ fn handle_new_user_message(
         // Mid-decode reproject path: the user's K/V was already
         // captured on an earlier apply.  Re-inject the cached bytes;
         // do not re-run the forward pass.
-        inject_arc_sealed(ctx.session, ctx.parent_id, ctx.chunk_size, &cached.kv)?;
+        inject_arc_sealed(ctx.session, ctx.parent_id, &cached.kv)?;
         // And the rows that go with them — `apply_segments_build` reset the
         // index before this walk, so nothing else puts them back.
         push_captured_page(ctx, &cached, "cached user message");

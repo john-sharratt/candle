@@ -21,6 +21,7 @@
 // `log_file` is the one genuinely bin-only module: the rotating on-disk log
 // is a property of the daemon process, not of the library.
 mod log_file;
+mod self_heal;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -209,6 +210,33 @@ fn parse_model(name: &str) -> Result<Model, String> {
     })
 }
 
+/// Bind the listener, retrying briefly on failure — a self-heal relaunch
+/// (`self_heal.rs`) can start before the process it replaces has fully
+/// released its socket. Not a general retry policy: once the attempts run
+/// out, the failure is real and fails the launch exactly as a single bind
+/// would have.
+async fn bind_with_retry(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
+    const ATTEMPTS: u32 = 10;
+    const DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+    for attempt in 1..=ATTEMPTS {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) if attempt < ATTEMPTS => {
+                tracing::warn!(
+                    %addr,
+                    attempt,
+                    of = ATTEMPTS,
+                    "bind failed ({e}) — a self-heal relaunch may still be releasing \
+                     the port; retrying",
+                );
+                tokio::time::sleep(DELAY).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    unreachable!("the loop above always returns on the last attempt")
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -229,6 +257,14 @@ async fn main() -> anyhow::Result<()> {
             "\n=== PANIC ===\n{info}\nLast CUDA kernel: {kernel}\n{relief}\n\n{bt}\n=============\n"
         );
     }));
+
+    // ── Self-heal: capture how THIS process was launched ─────────────────────
+    //
+    // As early as possible, before anything could plausibly change argv or the
+    // working directory (nothing here ever does — the daemon never `chdir`s —
+    // but a launch spec captured late is a launch spec that might not be this
+    // one). Used only if the GPU context is later poisoned; see `self_heal.rs`.
+    let launch_spec = self_heal::LaunchSpec::capture()?;
 
     // ── CLI (parsed first so we know verbosity before init) ──────────────────
 
@@ -302,9 +338,14 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(BusWriter(Arc::clone(&log)))
         .with_filter(filter.clone());
 
+    // Checked BEFORE `RotatingFileLog::new`, which consumes the marker — see
+    // `log_file::is_resuming`.
+    let substrate_dir = workspace.join(".substrate");
+    let resumed_after_self_heal = log_file::is_resuming(&substrate_dir);
+
     // None (open failure) degrades to the stdout + bus sinks rather than
     // aborting boot; `Option<Layer>` is itself a `Layer` (None = no-op).
-    let file_layer = log_file::RotatingFileLog::new(&workspace.join(".substrate")).map(|w| {
+    let file_layer = log_file::RotatingFileLog::new(&substrate_dir).map(|w| {
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
             .with_writer(w)
@@ -316,6 +357,13 @@ async fn main() -> anyhow::Result<()> {
         .with(ws_layer)
         .with(file_layer)
         .init();
+
+    if resumed_after_self_heal {
+        tracing::error!(
+            "=== resumed after a self-heal restart — see the GPU-poisoned error above this \
+             line in the preserved log for why =========================================="
+        );
+    }
 
     // ── `--download-deepseek`: fetch the model + DSpark drafter, then exit ─────
     //
@@ -352,37 +400,12 @@ async fn main() -> anyhow::Result<()> {
     // A sticky CUDA fault (illegal address, launch failure, device assert, ECC)
     // permanently kills the CUDA context — every later call returns the same
     // error, it can't be cleared on this context, and recreating it in-process is
-    // unreliable on WDDM. The CUDA backend flags `candle::gpu_poison` on the first
-    // such fault; this watchdog turns that into a clean, fast restart instead of
-    // an endless cascade of identical downstream errors: log the ONE root fault
-    // (with the recent-launch breadcrumb), then exit for a supervisor to relaunch.
-    // The substrate redo log is crash-safe, so nothing durable is lost.
-    //
-    // Exit code 75 (distinct from clean-shutdown 0 and Ctrl-C 130) tells a
-    // relaunch wrapper "GPU died — restart me".
-    const GPU_POISON_EXIT_CODE: i32 = 75;
-    std::thread::Builder::new()
-        .name("gpu-poison-watchdog".into())
-        .spawn(|| loop {
-            // Poll tightly so the window in which other threads can pile identical
-            // downstream errors onto the dead context stays small.
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            if candle::gpu_poison::is_gpu_poisoned() {
-                tracing::error!(
-                    root = %candle::gpu_poison::root_fault().unwrap_or_default(),
-                    "GPU context poisoned by an unrecoverable CUDA fault — exiting for \
-                     a clean restart (substrate redo log is durable, nothing lost)",
-                );
-                // Cross-thread VRAM-lifecycle interleaving around the fault —
-                // the attribution the per-thread kernel ring can't give.
-                eprintln!("{}", relief_trace::dump());
-                // Brief pause so the root log line reaches the file/console sinks
-                // before the hard exit, then go.
-                std::thread::sleep(std::time::Duration::from_millis(80));
-                std::process::exit(GPU_POISON_EXIT_CODE);
-            }
-        })
-        .expect("spawn gpu-poison-watchdog");
+    // unreliable on WDDM. An out-of-memory streak that never recovers for 60 s is
+    // treated the same way (`candle::gpu_poison`). Rather than exit for a
+    // supervisor to relaunch — none exists for zend (`docs/deployment.md`) — the
+    // watchdog relaunches an identical process itself before exiting. See
+    // `self_heal.rs`.
+    self_heal::spawn_watchdog(launch_spec, substrate_dir);
 
     // Disjoint by construction: `--disable-layer` subsumes `--skip-layer`. The
     // precedence lives in `layer_flag_sets`, where it is tested.
@@ -503,7 +526,7 @@ async fn main() -> anyhow::Result<()> {
              is now reachable from the network; only do this on a trusted network",
         );
     }
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = bind_with_retry(addr).await?;
 
     tracing::info!(
         addr = %addr,
