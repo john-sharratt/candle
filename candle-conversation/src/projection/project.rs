@@ -1489,6 +1489,7 @@ pub fn run_with_sink<R: ContentResolver>(
                     &all_turns,
                     None,
                     &tc,
+                    Some(target.timeline),
                 );
 
                 let selected: Vec<(TurnKey, f32)> = selected_indices
@@ -1883,6 +1884,7 @@ pub fn run_with_sink<R: ContentResolver>(
                     &gs.selected,
                     Some(group_budget),
                     &tc,
+                    Some(target.timeline),
                 )
             };
 

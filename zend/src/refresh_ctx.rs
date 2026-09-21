@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use candle_conversation::projection::Builder;
+use candle_conversation::projection::{Builder, TimelineId};
 use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{ConversationEngine, SequenceConfig};
 use zend_tools::ToolContext;
@@ -21,7 +21,10 @@ use zend_tools::ToolContext;
 /// minutes-long prefill + summary-decode window in between.
 ///
 /// `proj_builder` and `config` are `Clone` (schemas are `Arc`-backed)
-/// so the helpers clone what they consume per-call.
+/// so the helpers clone what they consume per-call. The whole context is
+/// `Clone` for the same reason: `priming_chain::build` re-points
+/// `priming_chain_end` per link while it constructs the chain itself.
+#[derive(Clone)]
 pub struct RefreshContext<'a> {
     pub engine: &'a Mutex<ConversationEngine>,
     pub proj_builder: Builder,
@@ -44,4 +47,12 @@ pub struct RefreshContext<'a> {
     /// (`ToolMode::Restricted`'s context, the same one an unprivileged live
     /// dialogue turn runs tools in).
     pub tool_ctx: Arc<ToolContext>,
+    /// The priming chain's final link (`priming_chain::build`'s result), or
+    /// `None` when no anchor file was found. Every unit a `refresh_*` pass
+    /// mints from now on records this conversation as its PARENT before its
+    /// own reading starts, so the anchor documents are already in its
+    /// projection (`Substrate::inherited_chain`) — the same starting point
+    /// `base_conv` itself is parented onto at boot. A durable metadata
+    /// pointer, not a copy: nothing is duplicated and nothing is pinned.
+    pub priming_chain_end: Option<TimelineId>,
 }

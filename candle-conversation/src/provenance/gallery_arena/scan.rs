@@ -290,6 +290,20 @@ impl GalleryArena {
         group_weights: &[f32],
         force: Option<PagedBackend>,
     ) -> Result<Vec<Vec<f32>>> {
+        // **Every scan path binds this arena's context first.**
+        //
+        // Below here are raw driver calls and FFI that read the *calling
+        // thread's* current device — `tensor_caps` says so explicitly. That
+        // used to be free, because scans only ever ran on threads that already
+        // held the context. The normalization warm-ups moved onto their own
+        // rayon pool, whose workers never bound it, and the whole path failed
+        // with `CUDA_ERROR_INVALID_CONTEXT` — an error that reads like a
+        // hardware fault and is really a thread that was never introduced to
+        // the device. Binding here makes the assumption true for any caller
+        // instead of documenting it and hoping.
+        if let Device::Cuda(dev) = &self.device {
+            dev.bind_to_thread()?;
+        }
         // Reuse the cached index if the same segment set is rescanned under an
         // unchanged residency generation (the common within-turn case) — this
         // pins the turns. Otherwise rebuild (which also pins) and cache it.

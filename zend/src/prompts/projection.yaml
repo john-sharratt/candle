@@ -1179,11 +1179,23 @@ layers:
   # `conversation` rule: most recent N turns are inviolate; a further K
   # historical turns are pulled in by score for older context.  Emission is
   # insertion order so the dialogue reads chronologically.
+  #
+  # The window must also seat the INHERITED lineage, which is inviolate: a
+  # conversation forked from another carries its ancestors' turns (the priming
+  # chain's documents), and those are never dropped by score — see
+  # `select_conversation`. The budget pass subtracts everything inviolate
+  # before the historical pool gets a seat, so a window sized only for the
+  # recent window would leave score-based recall with nothing at all.
+  #
+  # Sized as `Substrate::INHERITED_CHAIN_TOKEN_CAP` (100k, the ceiling on what
+  # the lineage may contribute) plus the 16k this layer used to have for its
+  # own recent turns and historical recall. Lower the cap and this can follow
+  # it down; the two numbers are a pair.
   - name: dialogue
     description: |
       The active developer conversation served to the VS Code extension or
       web chat.
-    window: 16000
+    window: 116000
     score_threshold: 0.0
     # Continuous-fair-wave: the interactive layer, so protect its decode latency
     # most — a co-running background prefill is throttled to 1 layer of progress

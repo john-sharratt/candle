@@ -528,11 +528,71 @@ pub fn refresh_repo_map(
     let plan = IngestPlan::new(ctx.engine, &ctx.proj_builder, &ctx.config, layer_name)?;
     let present: HashSet<&str> = units.iter().map(|u| u.dir.as_str()).collect();
     reconcile_deleted(ctx.engine, map, &present);
-    let report = run_dir_pool(ctx.engine, base, &plan, workspace, &units, progress);
+    let report = run_dir_pool(
+        ctx.engine,
+        base,
+        ctx.priming_chain_end,
+        &plan,
+        workspace,
+        &units,
+        progress,
+    );
     crate::ingest_report::publish(PASS_NAME, report);
     Ok(RefreshOutcome::Replaced {
         state: dir_state_from_substrate(ctx.engine),
     })
+}
+
+/// Ingest just the workspace root's own directory unit (`dir == "."`) —
+/// the priming chain's `root ls` link (`crate::priming_chain`). Resume-cache
+/// aware, exactly like a pool worker's own check: a "." conversation already
+/// tagged with the current content hash is reused as-is rather than
+/// re-ingested. `None` when the workspace has no top-level files at all, so
+/// there is no root unit to build.
+pub(crate) fn ingest_root_unit(
+    ctx: &RefreshContext<'_>,
+    workspace: &Path,
+    map: &RepoMap,
+    base: &Mutex<Sequence>,
+) -> anyhow::Result<Option<TimelineId>> {
+    let units = build_units(map, workspace);
+    let Some(root) = units.into_iter().find(|u| u.dir == ".") else {
+        return Ok(None);
+    };
+    let present_hashes = ctx
+        .engine
+        .lock()
+        .unwrap()
+        .conversation_metadata_values(HASH_KEY);
+    if !present_hashes.contains(&root.content_hash) {
+        let plan = IngestPlan::new(ctx.engine, &ctx.proj_builder, &ctx.config, "repo_map")?;
+        let tool_ctx = ToolContext::with_workspace(workspace);
+        let failures = Failures::new();
+        // Root ls is the HEAD of the chain — it has no parent of its own.
+        process_one_dir(ctx.engine, base, None, &plan, &tool_ctx, &root, &failures)?;
+        let report = failures.into_report(1);
+        if report.is_incomplete() {
+            anyhow::bail!(
+                "priming chain: root ls ingest failed: {}",
+                report
+                    .failures
+                    .first()
+                    .map(|f| f.error.as_str())
+                    .unwrap_or("unknown")
+            );
+        }
+    }
+    // The good (content_sha256-tagged) generation for "." — present whether
+    // this call just minted it or it was already there.
+    let e = ctx.engine.lock().unwrap();
+    let found = e
+        .find_conversations_by_metadata(DIR_KEY, ".")
+        .into_iter()
+        .find(|tl| {
+            e.conversation_metadata(*tl)
+                .is_some_and(|m| m.contains_key(HASH_KEY))
+        });
+    Ok(found)
 }
 
 /// The per-pass constants every worker needs to drive its unit's
@@ -773,6 +833,7 @@ pub fn dir_state_from_substrate(engine: &Mutex<ConversationEngine>) -> DirState 
 fn run_dir_pool(
     engine: &Mutex<ConversationEngine>,
     base: &Mutex<Sequence>,
+    parent: Option<TimelineId>,
     plan: &IngestPlan,
     workspace: &Path,
     units: &[DirUnit],
@@ -886,7 +947,7 @@ fn run_dir_pool(
                         // decide against this state, and an unwind cannot leak
                         // it from the process-global gauge.
                         let _slot = ScanSlot::reserve(&live_convs);
-                        process_one_dir(engine, base, plan, &ctx, &units[idx], &failures)
+                        process_one_dir(engine, base, parent, plan, &ctx, &units[idx], &failures)
                     };
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     progress.set_step_progress(d as u64, total as u64);
@@ -966,6 +1027,7 @@ fn run_dir_pool(
 fn process_one_dir(
     engine: &Mutex<ConversationEngine>,
     base: &Mutex<Sequence>,
+    parent: Option<TimelineId>,
     plan: &IngestPlan,
     ctx: &ToolContext,
     unit: &DirUnit,
@@ -1031,6 +1093,28 @@ fn process_one_dir(
             .unwrap()
             .fork()
             .map_err(|err| anyhow::anyhow!("repo_map conv create: {err}"))?;
+        // Record the priming chain as this conversation's parent BEFORE its
+        // own listing/summary starts, so its turns are projected with the
+        // anchor documents already in context — see
+        // `RefreshContext::priming_chain_end` and
+        // `Substrate::inherited_chain`. Metadata only: nothing is copied and
+        // the parent needs no residency of its own.
+        if let Some(parent) = parent {
+            engine
+                .lock()
+                .unwrap()
+                .set_forked_from(conv.timeline_id(), parent)
+                .map_err(|err| anyhow::anyhow!("repo_map priming-chain parent: {err}"))?;
+            // See the identical note in `code_read::process_one_file`: the slot
+            // was seeded before this pointer existed, so ask again.
+            if let Err(err) = conv.seed_recurrent_from_lineage() {
+                tracing::warn!(
+                    target: "zend::repo_scan",
+                    dir = %unit.dir,
+                    "seeding recurrent memory from the priming chain failed: {err:#}",
+                );
+            }
+        }
         let e = engine.lock().unwrap();
         // The folder's closing turn is its own decoded summary, so the AVL
         // summariser must not compress these turns into a second summary tree.

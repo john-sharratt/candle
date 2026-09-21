@@ -437,6 +437,13 @@ struct InferenceState {
     /// so they have no reasoning to protect and stay on their existing
     /// from-scratch construction (`raw_read::ingest_raw`).
     ingest_bases: HashMap<String, Mutex<Sequence>>,
+    /// The priming chain's final link (`priming_chain::build`, run once at
+    /// boot before `base_conv`/every `ingest_bases` entry is adopted onto
+    /// it) — `None` when no anchor file (root ls / README / ARCHITECTURE /
+    /// AGENTS / CLAUDE.md) was found. Every `RefreshContext` built from here
+    /// on carries the current value, so a background pass's units adopt
+    /// whatever the chain currently ends at.
+    priming_chain_end: Mutex<Option<TimelineId>>,
     /// Queue feeding the dedicated titler task. The request path enqueues a
     /// [`TitleJob`] (non-blocking, dropped if the task is backed up) instead
     /// of spawning per submit, so title generation runs in the background —
@@ -2214,6 +2221,58 @@ impl InferenceState {
                 IngestMode::Raw => {} // minted below — needs a live Sequence
             }
         }
+
+        // The priming chain — root ls, then README/ARCHITECTURE/AGENTS/
+        // CLAUDE.md in order, each recording the previous as its parent —
+        // built BEFORE `base_conv` (parented onto it below) and every
+        // `ingest_bases` entry is handed out, so the very first question
+        // ever asked already has it. `self.refresh_ctx()` isn't callable yet
+        // (no `self` exists), so this builds the equivalent by hand from the
+        // same locals `refresh_ctx()` reads once the struct exists. See
+        // `priming_chain` and `InferenceState::priming_chain_end`.
+        //
+        // Its own step: each link decodes a real summary, so this is minutes
+        // of visible work. Folded into the tail of `CalibratingSections` it
+        // left that bar reading 100% for 203 of its 210 seconds.
+        progress.set_step(LoadStep::Priming);
+        let priming_tool_host = ToolHost::new(&workspace);
+        let priming_ctx = RefreshContext {
+            engine: &engine,
+            proj_builder: proj_builder_refresh.clone(),
+            config: conv_config.clone(),
+            formatted_prompt: &formatted_prompt,
+            think_triggers: match &think_steering {
+                Some(ts) => ts.registry_for(&tool_stencil, ThinkMode::Quick),
+                None => Arc::clone(&tool_stencil),
+            },
+            tool_ctx: Arc::clone(priming_tool_host.context_for(ToolMode::Restricted)),
+            priming_chain_end: None,
+        };
+        let priming_chain_end = match (
+            ingest_bases.get("repo_map"),
+            ingest_bases.get("code_reading"),
+        ) {
+            (Some(repo_map_base), Some(code_reading_base)) => crate::priming_chain::build(
+                &priming_ctx,
+                &workspace,
+                repo_map_base,
+                code_reading_base,
+                &progress,
+            )?,
+            _ => None,
+        };
+        // Every dialogue forks `base_conv` (`ZendSession`'s `fork_resuming`),
+        // and a fork inherits its parent's lineage, so parenting the base onto
+        // the chain end is what puts the anchor documents in front of the very
+        // first question asked — without copying a single turn.
+        if let Some(chain_end) = priming_chain_end {
+            engine
+                .lock()
+                .unwrap()
+                .set_forked_from(base_conv.timeline_id(), chain_end)
+                .map_err(|e| anyhow::anyhow!("base_conv priming-chain parent: {e}"))?;
+        }
+
         progress.set_step(LoadStep::Ingesting);
         for il in &ingest_layers {
             // Cooperative shutdown: stop before the next layer if a Ctrl-C landed
@@ -2322,6 +2381,7 @@ impl InferenceState {
             tool_modes: Mutex::new(HashMap::new()),
             base_conv: Mutex::new(base_conv),
             ingest_bases,
+            priming_chain_end: Mutex::new(priming_chain_end),
             titler_tx,
             titler_worker: Mutex::new(None),
             titler_timeline,
@@ -2366,6 +2426,7 @@ impl InferenceState {
             // `opening_prompt` doc.
             think_triggers: turn_triggers(self, ThinkMode::Quick),
             tool_ctx: Arc::clone(self.tool_host.context_for(ToolMode::Restricted)),
+            priming_chain_end: *self.priming_chain_end.lock().unwrap(),
         }
     }
 
@@ -2968,6 +3029,10 @@ fn run_inference_stream(
             .and_then(|m| m.get("identity").cloned());
         // The map and base-conv guards live inside this block, fully released
         // before the error path's send await below.
+        //
+        // Set when this request is the one that actually mints the
+        // conversation, so its lineage is recorded once, after the guard drops.
+        let mut minted = false;
         let forked: anyhow::Result<Arc<ConvLock<ConvState>>> = {
             let mut map = state.conversations.lock().unwrap();
             if let Some(existing) = map.get(&conv_id) {
@@ -2986,12 +3051,36 @@ fn run_inference_stream(
                             identity: stored_identity.clone(),
                         }));
                         map.insert(conv_id.clone(), Arc::clone(&arc));
+                        minted = true;
                         Ok(arc)
                     }
                     Err(e) => Err(anyhow::anyhow!("{e}")),
                 }
             }
         };
+        // Record the fork's lineage — AFTER the map guard above is released,
+        // because the engine lock is never nested inside the map lock (see the
+        // ordering note above this block). `base_conv` is itself parented onto
+        // the priming chain, so this one hop is what puts the anchor documents
+        // in front of a brand new conversation — nothing is copied, and the
+        // pointer is persisted metadata, so it survives a restart.
+        //
+        // Best-effort: a conversation that answers without its inherited
+        // context is far better than one that refuses to open.
+        if minted {
+            let base_timeline = state.base_conv.lock().unwrap().timeline_id();
+            if let Err(e) = state
+                .engine
+                .lock()
+                .unwrap()
+                .set_forked_from(timeline, base_timeline)
+            {
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    "recording fork lineage failed, conversation starts unprimed: {e}",
+                );
+            }
+        }
         let conv_arc = match forked {
             Ok(arc) => arc,
             Err(e) => {
@@ -3000,6 +3089,30 @@ fn run_inference_stream(
                 return;
             }
         };
+        // The slot was seeded from this (fresh) timeline before the lineage
+        // above existed; ask again so the conversation opens with the priming
+        // chain's recurrent memory behind it rather than from nothing.
+        //
+        // On a blocking thread: the seed is a scheduler round-trip that waits
+        // on the queue behind whatever wave is running (measured in the
+        // hundreds of ms for its sibling `InstallRecurrentState`), and this
+        // task's contract is that every wait in it is an await — see the note
+        // where it is spawned. Blocking here would pin a runtime worker and
+        // stall every other stream sharing it.
+        if minted {
+            let arc = Arc::clone(&conv_arc);
+            let cid = conv_id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let guard = arc.blocking_lock();
+                if let Err(e) = guard.conv.seed_recurrent_from_lineage() {
+                    tracing::warn!(
+                        conv_id = %cid,
+                        "seeding recurrent memory from the priming chain failed: {e}",
+                    );
+                }
+            })
+            .await;
+        }
 
         // Persist the conv_id ↔ timeline mapping *after* `fork_resuming`
         // has registered the timeline in the substrate — otherwise
@@ -4827,6 +4940,12 @@ impl ZendSession {
             layer,
             group,
             total_tokens: s.total_token_count(tl),
+            custom: s.custom_of(tl).cloned().unwrap_or_default(),
+            inherited_chain: s
+                .inherited_chain(tl)
+                .into_iter()
+                .map(|t| t.raw().to_string())
+                .collect(),
             peaks: {
                 let mut p: Vec<u32> = peak_set.into_iter().collect();
                 p.sort_unstable();

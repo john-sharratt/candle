@@ -999,16 +999,21 @@ impl ModelBuilder {
             ModelArch::Qwen4Exp => {
                 use candle::quantized::Int8Mode;
                 use candle_transformers::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
-                // Per-layer progress not yet wired for this arch.
-                let _ = progress;
                 // KV is allocated per ATTENTION layer (12 of 48) and the window
                 // budget is config-derived, exactly as the hybrid's is.
                 let _ = max_seq;
                 // `model_path` is the merged KO artifact, not the vendor's
                 // split: the engine takes one mmap and one `Content`, and the
                 // expert pack is sized from a live span measurement at load.
-                let gpu = Qwen4ExpGpu::load(model_path, device, Int8Mode::auto(device))
-                    .map_err(ConversationError::Model)?;
+                // `progress` reports the expert repack, which is the bulk of a
+                // cold load's wall time.
+                let gpu = Qwen4ExpGpu::load_with_progress(
+                    model_path,
+                    device,
+                    Int8Mode::auto(device),
+                    progress,
+                )
+                .map_err(ConversationError::Model)?;
                 let mut model = Qwen4ExpBatched::new(gpu).map_err(ConversationError::Model)?;
                 if let Some(positions) = self.qsa_selection_budget {
                     model

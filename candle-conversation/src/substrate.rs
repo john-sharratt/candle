@@ -2840,6 +2840,109 @@ impl Substrate {
             })
     }
 
+    // ── fork lineage ────────────────────────────────────────────────────────
+
+    /// Metadata key under which a fork records the timeline it came from.
+    ///
+    /// A plain `custom` entry rather than a record type of its own: the Label
+    /// record carrying `custom` is already durable, already re-emitted by both
+    /// the full-compaction and incremental-maintenance live sets, and already
+    /// replayed into [`TimelineEntry`] on reload. A parent pointer kept here
+    /// therefore needs no new wire format and cannot be silently dropped by a
+    /// rewrite that has never heard of it — which is exactly how the in-memory
+    /// `splice_source_timelines` pin failed.
+    pub const FORKED_FROM_KEY: &'static str = "forked_from";
+
+    /// Ceiling on the tokens an inherited chain may contribute *above* the
+    /// target's own turns.
+    ///
+    /// The chain is walked child-upward and stops once the next ancestor would
+    /// cross this, so what gets dropped is the FRONT — the oldest, most
+    /// general documents — while the nearest, most specific ancestors survive.
+    pub const INHERITED_CHAIN_TOKEN_CAP: usize = 100_000;
+
+    /// The timeline `tl` was forked from, if it recorded one and that parent
+    /// is still usable.
+    ///
+    /// A tombstoned or archived parent reads as absent rather than as an
+    /// error: a chain link can be retired by its own layer's reconciliation
+    /// long after a child recorded it, and a dangling pointer must degrade to
+    /// "no inheritance" instead of failing the child.
+    pub fn parent_timeline(&self, tl: TimelineId) -> Option<TimelineId> {
+        let raw: u64 = self
+            .timelines
+            .get(&tl)?
+            .custom
+            .get(Self::FORKED_FROM_KEY)?
+            .parse()
+            .ok()?;
+        let parent = TimelineId::from_raw(raw)?;
+        if self.tombstoned_timelines.contains(&parent) {
+            return None;
+        }
+        if !self
+            .timelines
+            .get(&parent)
+            .map(|e| !e.archived)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        Some(parent)
+    }
+
+    /// `tl` together with the ancestors it inherits, **oldest first**.
+    ///
+    /// This is what "my own history" means once conversations fork from one
+    /// another: the turns of every ancestor, in the order they were read, then
+    /// the target's own. Oldest-first is what makes the concatenation
+    /// chronological — and it is also `TurnKey`'s own ordering, since an
+    /// ancestor is always minted before the child that forks from it.
+    ///
+    /// The target itself is always present, even when it alone exceeds the
+    /// budget: a conversation never loses its own turns to an inherited one.
+    pub fn inherited_chain(&self, tl: TimelineId) -> Vec<TimelineId> {
+        let mut chain = vec![tl];
+        let mut seen: HashSet<TimelineId> = HashSet::from([tl]);
+        let mut budget = Self::INHERITED_CHAIN_TOKEN_CAP;
+        let mut cursor = tl;
+        while let Some(parent) = self.parent_timeline(cursor) {
+            // A cycle is not reachable by construction (a fork's parent always
+            // predates it), but the pointer is durable, user-visible metadata
+            // and a walk that trusted it could hang the projection.
+            if !seen.insert(parent) {
+                tracing::warn!(
+                    timeline = tl.raw(),
+                    repeated = parent.raw(),
+                    "inherited chain revisits a timeline — cycle in `forked_from`, truncating",
+                );
+                break;
+            }
+            let cost = self
+                .timeline_token_totals
+                .get(&parent)
+                .copied()
+                .unwrap_or(0);
+            if cost > budget {
+                tracing::warn!(
+                    timeline = tl.raw(),
+                    dropped_at = parent.raw(),
+                    inherited = chain.len() - 1,
+                    cost,
+                    budget,
+                    cap = Self::INHERITED_CHAIN_TOKEN_CAP,
+                    "inherited chain hit its token cap — older ancestors dropped from the front",
+                );
+                break;
+            }
+            budget -= cost;
+            chain.push(parent);
+            cursor = parent;
+        }
+        chain.reverse();
+        chain
+    }
+
     // ── tool-round-trip couplings ───────────────────────────────────────────
 
     /// Couple `from_turn` to the tool response that follows it.
@@ -5945,6 +6048,124 @@ mod tests {
         // riding a default that no longer exists.
         sub.set_timeline_summarize(timeline, true);
         (layer, group, timeline, sub)
+    }
+
+    // ── fork lineage (`inherited_chain`) ────────────────────────────────────
+
+    /// Build `n` timelines in one group, each forked from the one before, every
+    /// turn costing `tokens_each`. Returns them oldest-first.
+    fn forked_line(n: usize, tokens_each: usize) -> (Substrate, Vec<TimelineId>) {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let mut sub = Substrate::new();
+        let mut tls = Vec::new();
+        for _ in 0..n {
+            let tl = alloc.next();
+            sub.register_timeline(tl, layer, group);
+            sub.append_with_blocks(tl, tokens_each, 0, 1);
+            if let Some(parent) = tls.last().copied() {
+                set_parent(&mut sub, tl, parent);
+            }
+            tls.push(tl);
+        }
+        (sub, tls)
+    }
+
+    fn set_parent(sub: &mut Substrate, child: TimelineId, parent: TimelineId) {
+        let mut kv = BTreeMap::new();
+        kv.insert(
+            Substrate::FORKED_FROM_KEY.to_string(),
+            parent.raw().to_string(),
+        );
+        sub.merge_custom(child, &kv);
+    }
+
+    #[test]
+    fn a_timeline_that_never_forked_inherits_only_itself() {
+        let (_layer, _group, tl, sub) = make_timeline();
+        assert_eq!(sub.inherited_chain(tl), vec![tl]);
+        assert_eq!(sub.parent_timeline(tl), None);
+    }
+
+    /// The whole point: the chain reads oldest-first, so concatenating each
+    /// timeline's turns yields the documents in the order they were read.
+    #[test]
+    fn an_inherited_chain_runs_oldest_ancestor_first_and_ends_at_the_target() {
+        let (sub, tls) = forked_line(4, 10);
+        let target = *tls.last().unwrap();
+        assert_eq!(sub.inherited_chain(target), tls);
+    }
+
+    #[test]
+    fn a_tombstoned_ancestor_ends_the_chain_instead_of_failing() {
+        let (mut sub, tls) = forked_line(3, 10);
+        sub.tombstone_timeline(tls[0]);
+        // tls[2] -> tls[1] still resolves; tls[1] -> tls[0] is now dangling.
+        assert_eq!(sub.inherited_chain(tls[2]), vec![tls[1], tls[2]]);
+    }
+
+    /// An ancestor a layer's own reconciliation has archived drops out the same
+    /// way — the child keeps working, it just inherits less.
+    #[test]
+    fn an_archived_ancestor_ends_the_chain() {
+        let (mut sub, tls) = forked_line(3, 10);
+        sub.set_archived(tls[0], true);
+        assert_eq!(sub.inherited_chain(tls[2]), vec![tls[1], tls[2]]);
+    }
+
+    /// The cap drops the FRONT — the oldest, most general ancestors — and keeps
+    /// the nearest ones, which are the most specific to the target.
+    #[test]
+    fn the_token_cap_drops_the_front_of_the_chain_and_keeps_the_nearest() {
+        // Four ancestors at 40k each: the target plus two ancestors fit inside
+        // the 100k ceiling (80k), a third would reach 120k.
+        let (sub, tls) = forked_line(5, 40_000);
+        let target = *tls.last().unwrap();
+        let chain = sub.inherited_chain(target);
+        assert_eq!(chain, vec![tls[2], tls[3], target]);
+    }
+
+    /// A conversation never loses its OWN turns to the inherited budget, however
+    /// large they are — the cap governs what it inherits, not what it is.
+    #[test]
+    fn the_target_survives_a_cap_its_own_turns_already_exceed() {
+        let (sub, tls) = forked_line(2, Substrate::INHERITED_CHAIN_TOKEN_CAP * 2);
+        let target = *tls.last().unwrap();
+        assert_eq!(sub.inherited_chain(target), vec![target]);
+    }
+
+    /// `forked_from` is durable, user-visible metadata, so the walk must not
+    /// trust it to be acyclic — a cycle would otherwise hang every projection.
+    #[test]
+    fn a_cycle_in_the_lineage_truncates_rather_than_hanging() {
+        let (mut sub, tls) = forked_line(3, 10);
+        set_parent(&mut sub, tls[0], tls[2]);
+        let chain = sub.inherited_chain(tls[2]);
+        assert_eq!(chain.len(), 3, "each timeline appears exactly once");
+        assert_eq!(*chain.last().unwrap(), tls[2]);
+    }
+
+    #[test]
+    fn a_parent_pointer_naming_an_unknown_timeline_is_ignored() {
+        let (_layer, _group, tl, mut sub) = make_timeline();
+        let mut kv = BTreeMap::new();
+        kv.insert(Substrate::FORKED_FROM_KEY.to_string(), "999999".to_string());
+        sub.merge_custom(tl, &kv);
+        assert_eq!(sub.parent_timeline(tl), None);
+        assert_eq!(sub.inherited_chain(tl), vec![tl]);
+    }
+
+    #[test]
+    fn an_unparseable_parent_pointer_is_ignored() {
+        let (_layer, _group, tl, mut sub) = make_timeline();
+        let mut kv = BTreeMap::new();
+        kv.insert(
+            Substrate::FORKED_FROM_KEY.to_string(),
+            "not-a-timeline".to_string(),
+        );
+        sub.merge_custom(tl, &kv);
+        assert_eq!(sub.parent_timeline(tl), None);
     }
 
     /// Regression: two conversations (timelines) in the SAME group is the case

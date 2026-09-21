@@ -920,6 +920,21 @@ impl ConversationEngine {
         self.conversation.conversation_metadata(timeline)
     }
 
+    /// Record that `child` continues `parent` — the durable fork lineage a
+    /// projection walks to treat an ancestor's turns as the child's own
+    /// opening (`Substrate::inherited_chain`).
+    ///
+    /// This is metadata only. Nothing is copied and nothing has to stay
+    /// resident: the ancestor's K/V is fetched from whatever tier it is on,
+    /// by the same working-set elevation every other selected turn uses.
+    pub fn set_forked_from(&self, child: TimelineId, parent: TimelineId) -> crate::Result<()> {
+        self.set_conversation_metadata(
+            child,
+            crate::substrate::Substrate::FORKED_FROM_KEY,
+            &parent.raw().to_string(),
+        )
+    }
+
     /// Every live conversation whose `custom` metadata contains `key == value`.
     /// The content-addressed lookup utility ingests use after substrate
     /// load to skip rebuilding units already present (tombstoned excluded).

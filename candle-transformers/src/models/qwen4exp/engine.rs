@@ -106,6 +106,22 @@ impl Qwen4ExpGpu {
     /// first, then the expert cache is sized from a live measurement of what
     /// they left behind.
     pub fn load(merged: &Path, device: &Device, int8mode: Int8Mode) -> Result<Self> {
+        Self::load_with_progress(merged, device, int8mode, None)
+    }
+
+    /// [`Self::load`] reporting `(experts_repacked, total_experts)` as the
+    /// expert pack is built.
+    ///
+    /// That repack is the dominant span of a load — measured at 127 s of a
+    /// 167 s boot — and it is the only phase here that reports anything, the
+    /// dense tensors being mounted in one pass. A caller that does not pass a
+    /// hook shows no movement for the whole of it.
+    pub fn load_with_progress(
+        merged: &Path,
+        device: &Device,
+        int8mode: Int8Mode,
+        progress: Option<&dyn Fn(usize, usize)>,
+    ) -> Result<Self> {
         // The KV span is sized from the governor's balloon-measured capacity;
         // without one it falls back to the small test constant and the expert
         // zone measures a floor-violating handful of slots.
@@ -408,6 +424,7 @@ impl Qwen4ExpGpu {
             mmap,
             int8mode,
             None,
+            progress,
         )?
         .ok_or_else(|| candle::Error::Msg("qwen4exp engine: no expert tensors found".into()))?;
         let mut layers: Vec<GpuLayer> = trunk

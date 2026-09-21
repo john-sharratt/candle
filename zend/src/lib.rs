@@ -30,6 +30,7 @@ pub mod log_line;
 pub mod model_choice;
 pub mod openai_tools;
 pub mod passthrough;
+pub mod priming_chain;
 pub mod projection_event;
 pub mod raw_read;
 pub mod reasoning_split;

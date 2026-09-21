@@ -250,6 +250,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         formatted_prompt: &formatted_prompt,
         think_triggers: std::sync::Arc::clone(&think_triggers),
         tool_ctx: std::sync::Arc::clone(&tool_ctx),
+        priming_chain_end: None,
     };
     let repo_map_state = match zend::repo_scan::refresh_repo_map(
         &repo_map_ctx,
@@ -277,6 +278,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         formatted_prompt: &formatted_prompt,
         think_triggers,
         tool_ctx,
+        priming_chain_end: None,
     };
     let code_read_state = match zend::code_read::refresh_code_reading(
         &code_read_ctx,

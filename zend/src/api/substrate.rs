@@ -18,6 +18,7 @@
 //! walk), never a rebuild from the multi-GB redo log, and return `503` until the
 //! model is loaded. They never mutate.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::{
@@ -319,6 +320,14 @@ pub struct TimelineDetail {
     pub layer: String,
     pub group: String,
     pub total_tokens: usize,
+    /// The conversation's persisted `custom` metadata — content hashes, source
+    /// path, and the `forked_from` lineage pointer.
+    pub custom: BTreeMap<String, String>,
+    /// The lineage this conversation actually projects with, oldest ancestor
+    /// first, ending in itself — what `Substrate::inherited_chain` resolves
+    /// `forked_from` to after dropping retired ancestors and applying the
+    /// token cap. A single entry means it inherits nothing.
+    pub inherited_chain: Vec<String>,
     /// Forest peaks — the orphan summary nodes that are the window entry points.
     pub peaks: Vec<u32>,
     /// Turn indices that open a coupled exchange (a tool-call turn joined with

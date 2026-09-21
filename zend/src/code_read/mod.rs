@@ -349,6 +349,92 @@ pub fn ingest_files(
     Ok((state, n_failed))
 }
 
+/// Ingest one file for the priming chain (`crate::priming_chain`) — the same
+/// scan/resume-cache/tag machinery [`process_one_file`] always uses, but
+/// called directly for one unit instead of through the worker pool, so the
+/// caller can pin exactly which conversation it adopts before this file's
+/// own reading starts. `None` when `rel_path` isn't a recognised code
+/// language, or the size guard / binary sniff drops it — nothing to chain.
+pub(crate) fn ingest_chain_file(
+    ctx: &RefreshContext<'_>,
+    workspace: &Path,
+    rel_path: &str,
+    predecessor: TimelineId,
+    base: &Mutex<Sequence>,
+) -> anyhow::Result<Option<TimelineId>> {
+    let ext = rel_path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let Some(language) = Language::from_extension(&ext) else {
+        return Ok(None);
+    };
+    let mut map = RepoMap::default();
+    map.files.push(FileEntry {
+        path: rel_path.to_string(),
+        line_count: 0,
+        language,
+        size_bytes: 0,
+        module_hint: None,
+    });
+    let (per_file, _state) = scan_workspace(workspace, &map);
+    let Some((file, file_hash)) = per_file.into_iter().next() else {
+        return Ok(None);
+    };
+    let present_hashes = ctx
+        .engine
+        .lock()
+        .unwrap()
+        .conversation_metadata_values("content_sha256");
+    // This link's parent is the chain so far, not whatever the daemon-wide
+    // chain end will be once it is finished being built.
+    let link_ctx = RefreshContext {
+        priming_chain_end: Some(predecessor),
+        ..ctx.clone()
+    };
+    if !present_hashes.contains(&file_hash) {
+        let failures = Failures::new();
+        process_one_file(
+            &link_ctx,
+            base,
+            &file,
+            &file_hash,
+            &present_hashes,
+            &failures,
+        )?;
+        let report = failures.into_report(1);
+        if report.is_incomplete() {
+            anyhow::bail!(
+                "priming chain: {rel_path} ingest failed: {}",
+                report
+                    .failures
+                    .first()
+                    .map(|f| f.error.as_str())
+                    .unwrap_or("unknown")
+            );
+        }
+    }
+    let e = ctx.engine.lock().unwrap();
+    let found = e
+        .find_conversations_by_metadata("path", rel_path)
+        .into_iter()
+        .find(|tl| {
+            e.conversation_metadata(*tl)
+                .is_some_and(|m| m.contains_key("content_sha256"))
+        });
+    // Idempotent on the fresh-build path (already recorded inside
+    // `process_one_file`). The path that NEEDS it here is a resume-cache hit,
+    // whose conversation was built in a prior run: its turns are reused as
+    // they are, but the chain it hangs off is re-asserted every boot, so a
+    // reordered or newly-present anchor still lands correctly.
+    if let Some(tl) = found {
+        e.set_forked_from(tl, predecessor)
+            .map_err(|err| anyhow::anyhow!("priming chain: {rel_path} parent: {err}"))?;
+    }
+    Ok(found)
+}
+
 /// Whether a workspace-relative `path` (with `/` separators) lives under the
 /// daemon's top-level `uploads/` dir. Matched on the FIRST segment only, and
 /// case-insensitively (the win32 FS is case-insensitive, so an existing
@@ -694,8 +780,35 @@ fn process_one_file(
             .unwrap()
             .fork()
             .map_err(|err| anyhow::anyhow!("code_reading conv create: {err}"))?;
-        let e = ctx.engine.lock().unwrap();
-        e.set_timeline_summarize(conv.timeline_id(), false);
+        // Record the priming chain as this conversation's parent BEFORE its
+        // own reading starts, so the projection for every turn below already
+        // carries the anchor documents (`Substrate::inherited_chain`). Nothing
+        // is copied and the parent needs no residency of its own: an ancestor
+        // sitting warm or cold is elevated by the ordinary projection
+        // working-set path when it is selected.
+        {
+            let e = ctx.engine.lock().unwrap();
+            if let Some(parent) = ctx.priming_chain_end {
+                e.set_forked_from(conv.timeline_id(), parent)
+                    .map_err(|err| anyhow::anyhow!("code_reading priming-chain parent: {err}"))?;
+            }
+            e.set_timeline_summarize(conv.timeline_id(), false);
+        }
+        // Now that the lineage is on record, take the recurrent memory of the
+        // conversation this one continues — the slot was seeded from its own
+        // (empty) timeline when the fork returned.
+        //
+        // OUTSIDE the engine lock: this waits on a scheduler round-trip, and
+        // every other worker in the pool wants that lock for its own mint.
+        if ctx.priming_chain_end.is_some() {
+            if let Err(err) = conv.seed_recurrent_from_lineage() {
+                tracing::warn!(
+                    target: "zend::code_read::ingest",
+                    file = %file.path,
+                    "seeding recurrent memory from the priming chain failed: {err:#}",
+                );
+            }
+        }
         (conv, superseded)
     };
 

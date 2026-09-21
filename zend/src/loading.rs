@@ -5,7 +5,9 @@
 //! 1. **Model** — fetch and load the GGUF weights.
 //! 2. **Substrate** — replay the redo log into the in-RAM substrate.
 //! 3. **Sections** — prefill the projection schema's pinned sections.
-//! 4. **Ingesting** — run the schema-declared `raw` (ChatML) ingest passes, the
+//! 4. **Priming** — read the foundational documents the whole substrate
+//!    descends from, in order (`crate::priming_chain`).
+//! 5. **Ingesting** — run the schema-declared `raw` (ChatML) ingest passes, the
 //!    only kind still on this blocking path. Folder-scan (`repo_map`) and
 //!    per-file (`code_reading`) layers are seeded from the substrate at boot
 //!    and handed to `crate::ingest_worker`'s background worker instead — their
@@ -30,6 +32,12 @@ pub enum LoadStep {
     Compacting,
     Sections,
     CalibratingSections,
+    /// The priming chain — the foundational documents every later conversation
+    /// descends from, read in order (`crate::priming_chain`). Each link is a
+    /// real conversation doing real tool calls and decoding its own summary, so
+    /// this is minutes of work, not bookkeeping: it gets its own step rather
+    /// than running invisibly under the tail of another one.
+    Priming,
     /// The schema-driven `raw` (ChatML) ingest phase — the only ingest mode
     /// still blocking here. Folder-scan and per-file layers are seeded from
     /// the substrate in the pre-loop and ingested entirely off this path by
@@ -53,6 +61,7 @@ impl LoadStep {
         LoadStep::Compacting,
         LoadStep::Sections,
         LoadStep::CalibratingSections,
+        LoadStep::Priming,
         LoadStep::Ingesting,
         LoadStep::Normalizing,
     ];
@@ -65,6 +74,7 @@ impl LoadStep {
             LoadStep::Compacting => "Compacting substrate",
             LoadStep::Sections => "Prefilling tool sections",
             LoadStep::CalibratingSections => "Calibrating sections",
+            LoadStep::Priming => "Reading project documents",
             LoadStep::Ingesting => "Ingesting workspace",
             LoadStep::Normalizing => "Normalizing scores",
         }
@@ -78,11 +88,17 @@ impl LoadStep {
     /// sections vs files) and is set explicitly via [`LoadProgress::set_step_unit`].
     pub fn unit(self) -> &'static str {
         match self {
-            LoadStep::Model => "layers",
+            // No absolute readout: what the model step counts depends on the
+            // architecture. A MoE checkpoint reports experts repacked into the
+            // expert pack (25,088 of them on Flash-Next, and the bulk of a cold
+            // load's wall time), a dense one reports transformer blocks mounted.
+            // One static noun cannot name both, so only the bar shows.
+            LoadStep::Model => "",
             LoadStep::Substrate => "turns",
             LoadStep::Compacting => "",
             LoadStep::Sections => "",
             LoadStep::CalibratingSections => "",
+            LoadStep::Priming => "documents",
             LoadStep::Ingesting => "",
             LoadStep::Normalizing => "",
         }
@@ -407,14 +423,28 @@ mod tests {
         assert_eq!(p.snapshot().unwrap().progress, 0.0);
     }
 
+    /// The model step counts different things per architecture (experts on a
+    /// MoE repack, blocks on a dense mount), so it carries no unit noun — the
+    /// absolute counters are still exposed, only the "N / M <unit>" readout is
+    /// suppressed.
     #[test]
-    fn snapshot_exposes_absolute_counts_and_step_default_unit() {
-        let p = LoadProgress::new(); // Model step: unit "layers"
+    fn snapshot_exposes_absolute_counts_and_the_model_step_has_no_unit() {
+        let p = LoadProgress::new();
         p.set_step_progress(3, 12);
         let snap = p.snapshot().unwrap();
         assert_eq!(snap.progressed, 3);
         assert_eq!(snap.total, 12);
-        assert_eq!(snap.unit, "layers");
+        assert_eq!(snap.unit, "");
+    }
+
+    /// A step that does name a discrete unit still reports it — the counterpart
+    /// to the model step's empty noun above.
+    #[test]
+    fn a_step_with_a_discrete_unit_reports_it() {
+        let p = LoadProgress::new();
+        p.set_step(LoadStep::Substrate);
+        p.set_step_progress(40, 100);
+        assert_eq!(p.snapshot().unwrap().unit, "turns");
     }
 
     #[test]
