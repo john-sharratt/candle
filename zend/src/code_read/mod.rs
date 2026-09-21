@@ -207,7 +207,7 @@ fn parallelism() -> usize {
 /// path), so a single hash per file serves both the resume cache and
 /// refresh. Path-qualified, so a move/rename re-ingests and the per-path
 /// invalidation scan is exact.
-fn file_content_hash(path: &str, bytes: &[u8]) -> String {
+pub(crate) fn file_content_hash(path: &str, bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(path.as_bytes());
     h.update(bytes);

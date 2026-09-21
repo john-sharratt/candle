@@ -474,15 +474,20 @@ fn assert_same_bits(label: &str, got: &Tensor, want: &Tensor) -> Result<()> {
     }
     let mut n_diff = 0usize;
     let mut max_abs = 0f32;
-    for (x, y) in a.iter().zip(&b) {
+    let mut first = usize::MAX;
+    let mut last = 0usize;
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
         if x != y {
             n_diff += 1;
+            first = first.min(i);
+            last = i;
             max_abs = max_abs.max((f32::from_bits(*x) - f32::from_bits(*y)).abs());
         }
     }
     if n_diff != 0 {
         bail!(
-            "{label}: {n_diff} of {} elements differ (max |d| = {max_abs:.3e})",
+            "{label}: {n_diff} of {} elements differ, element {first} to {last} \
+             (max |d| = {max_abs:.3e})",
             a.len()
         );
     }
@@ -654,6 +659,86 @@ fn decode_no_bleed(path: &DecodePath) -> Result<()> {
         &sole,
     )?;
     Ok(())
+}
+
+/// The 16-warp decode kernel scores every token of its 16-token tile. Its
+/// int8 tensor-core QK^T computes eight tokens per instruction, so a tile is two
+/// instructions' worth; scoring only the first eight left the other eight
+/// logits as whatever the block's shared memory last held, and the output
+/// changed with the launch that ran before it. Twelve query heads over one KV
+/// head (the geometry that selects this kernel), decoded at rung 2 against the
+/// f64 reference of `q_scale_applies_to_q_rotary_pairs_only`, whose band is
+/// narrow enough that one wrong logit in a 49-token history falls outside it.
+#[test]
+fn warp_per_head_decode_matches_the_host_reference() -> Result<()> {
+    let _serial = gpu_serial();
+    let Some(device) = cuda_device() else {
+        eprintln!("skipping: CUDA device required");
+        return Ok(());
+    };
+    let stager = PinnedStager::new_from_device(&device);
+    let g = HD128_WIDE;
+    let rope = RopeRungs::new(
+        &RopeSchedule::yarn(
+            Q4_ROPE_DIM,
+            Q4_THETA,
+            Q4_L0,
+            vec![
+                Rung {
+                    ceiling: Q4_L0,
+                    factor: 1.0,
+                },
+                Rung {
+                    ceiling: 2 * Q4_L0,
+                    factor: 2.0,
+                },
+                Rung {
+                    ceiling: 8 * Q4_L0,
+                    factor: Q4_FACTOR as f32,
+                },
+            ],
+            true,
+        )?,
+        &device,
+    )?;
+    let inp = q4_inputs(g, &device)?;
+    let backing = fresh_backing(g, &device)?;
+    let mut cache = bind(&backing, 0)?;
+    prefill(
+        g,
+        &mut [&mut cache],
+        &inp.q_history,
+        &inp.k_history,
+        &inp.v_history,
+        &[Q4_HISTORY],
+        &rope,
+        &stager,
+    )?;
+    let slot = decode_slot(g, &backing, &cache, 0, &device)?;
+    let out = decode_launch(
+        g,
+        &[(&slot, Q4_RUNG)],
+        &inp.q,
+        &inp.k_new,
+        &inp.v_new,
+        &rope,
+        &stager,
+    )?;
+    let m2 = rope.q_scale(Q4_RUNG) as f64;
+    let want = reference_decode(
+        g,
+        &rope,
+        Q4_RUNG,
+        QScale {
+            rotary: m2,
+            pass: 1.0,
+        },
+        true,
+        &inp.q_host,
+        &inp.keys_host,
+        &inp.values_host,
+    )?;
+    assert_within("warp-per-head decode, rung 2", &out, &want)
 }
 
 /// HD 128 at two heads per group: `int8_decode_bmma_kernel`.
@@ -1236,6 +1321,7 @@ fn reference_decode(
     rope: &RopeRungs,
     rung: u32,
     qs: QScale,
+    v_int8: bool,
     q: &[f32],
     keys: &[f32],
     values: &[f32],
@@ -1274,7 +1360,21 @@ fn reference_decode(
             let o: f64 = (0..n).map(|j| w[j] * v(j)).sum::<f64>() / sum;
             let dev = (0..n).map(|j| (v(j) - o).abs()).fold(0f64, f64::max);
             let vmax = (0..n).map(|j| v(j).abs()).fold(0f64, f64::max);
-            let b = spread * dev + 8.0 * (n as f64 + 2.0) * F32_UNIT_ROUNDOFF * vmax;
+            let mut b = spread * dev + 8.0 * (n as f64 + 2.0) * F32_UNIT_ROUNDOFF * vmax;
+            if v_int8 {
+                // The kernel quantises each V token to int8 under ONE scale,
+                // `max_d |v| / 127`, so each element moves by at most half a step
+                // and the output, a convex combination, by at most the largest
+                // half step of any token.
+                b += (0..n)
+                    .map(|j| {
+                        (0..hd)
+                            .map(|e| values[(j * g.n_kv_head + kv) * hd + e].abs() as f64)
+                            .fold(0f64, f64::max)
+                    })
+                    .fold(0f64, f64::max)
+                    / 254.0;
+            }
             out[h * hd + d] = o;
             band[h * hd + d] = b + F16_HALF_ULP_REL * (o.abs() + b) + F16_SUBNORMAL_HALF_ULP;
         }
@@ -1294,18 +1394,22 @@ fn assert_within(label: &str, got: &Tensor, reference: &Reference) -> Result<()>
     }
     let mut worst = 0f64;
     let mut outside = 0usize;
-    for ((g, o), b) in got.iter().zip(&reference.out).zip(&reference.band) {
+    let mut first = usize::MAX;
+    let mut last = 0usize;
+    for (i, ((g, o), b)) in got.iter().zip(&reference.out).zip(&reference.band).enumerate() {
         let e = (*g as f64 - o).abs();
         // A NaN output is outside every band.
         if e.is_nan() || e > *b {
             outside += 1;
+            first = first.min(i);
+            last = i;
         }
         worst = worst.max(e / b);
     }
     if outside != 0 {
         bail!(
-            "{label}: {outside} of {} elements outside the reference band (worst at {worst:.2}× \
-             the band)",
+            "{label}: {outside} of {} elements outside the reference band, element {first} to \
+             {last} (worst at {worst:.2}× the band)",
             got.len()
         );
     }
@@ -1492,7 +1596,7 @@ fn q_scale_applies_to_q_rotary_pairs_only() -> Result<()> {
         )
     };
     let reference = |rope: &RopeRungs, qs: QScale, q: &[f32]| {
-        reference_decode(g, rope, Q4_RUNG, qs, q, &inp.keys_host, &inp.values_host)
+        reference_decode(g, rope, Q4_RUNG, qs, false, q, &inp.keys_host, &inp.values_host)
     };
 
     // With the temperature: m² on the rotary pairs, nothing on the pass-through.

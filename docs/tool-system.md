@@ -164,7 +164,7 @@ The example is shown as a flat enumeration for documentation clarity. At runtime
 
 ### Several calls in one turn
 
-One assistant turn may make up to `MAX_TOOL_CALLS_PER_TURN` (4) calls — OpenAI's *parallel function calling* expressed in the Hermes text format: one `<tool_call>` block per call, in one reply, with nothing but calls in it.
+One assistant turn may make up to `MAX_TOOL_CALLS_PER_TURN` (5) calls — OpenAI's *parallel function calling* expressed in the Hermes text format: one `<tool_call>` block per call, in one reply, with nothing but calls in it.
 
 ```
 <tool_call>

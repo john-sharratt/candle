@@ -529,6 +529,11 @@ struct YamlLayer {
     description: String,
     /// Total turn-budget when this layer is the projection target.
     window: usize,
+    /// Tokens of THIS layer's conversations a fast-path tool read may inject
+    /// into another conversation. `0` (the default) keeps the layer out of the
+    /// fast path entirely, so a tool read of its content always runs for real.
+    #[serde(default)]
+    fast_path_window: usize,
     #[serde(default)]
     score_threshold: f32,
     #[serde(default)]
@@ -1057,6 +1062,7 @@ fn build(
             description: yl.description.clone(),
             score_threshold: yl.score_threshold,
             window: yl.window,
+            fast_path_window: yl.fast_path_window,
             budget: layer_budget,
             dials,
             summary: layer_summary,

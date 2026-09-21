@@ -3112,6 +3112,27 @@ fn run_inference_stream(
                 }
             })
             .await;
+            // A conversation recovered from the substrate still holds the reads
+            // it asked for, but the set that says so is in-memory and did not
+            // survive. Replay its own calls so it knows what it is carrying —
+            // otherwise it re-reads every file it had already been given.
+            let rebuild_state = Arc::clone(&state);
+            let _ = tokio::task::spawn_blocking(move || {
+                let budget = rebuild_state
+                    .refresh_builder
+                    .schema()
+                    .layers
+                    .iter()
+                    .find(|l| l.name == "code_reading")
+                    .map_or(0, |l| l.fast_path_window);
+                crate::fast_path::rebuild(
+                    &rebuild_state.engine,
+                    timeline,
+                    &rebuild_state.workspace,
+                    budget,
+                );
+            })
+            .await;
         }
 
         // Persist the conv_id ↔ timeline mapping *after* `fork_resuming`
@@ -3780,6 +3801,54 @@ fn run_inference_stream(
             if is_final {
                 break;
             }
+
+            // Answer what the corpus has already read before dispatching the
+            // rest. A `file_read` whose bytes hash to an existing `code_reading`
+            // conversation is served by carrying that conversation into this
+            // projection — the K/V exists, so it costs an elevation rather than
+            // a prefill and a decode. Anything unsure (file unreadable, no
+            // conversation, over budget) is left in the round and runs for real.
+            // On the blocking pool, like the dispatch below: it hashes each
+            // candidate file from disk, and this task's every wait is an await.
+            let screen_state = Arc::clone(&state);
+            let unscreened = round.clone();
+            let round = match tokio::task::spawn_blocking(move || {
+                let budget = screen_state
+                    .refresh_builder
+                    .schema()
+                    .layers
+                    .iter()
+                    .find(|l| l.name == "code_reading")
+                    .map_or(0, |l| l.fast_path_window);
+                crate::fast_path::screen(
+                    &screen_state.engine,
+                    timeline,
+                    &screen_state.workspace,
+                    budget,
+                    round,
+                )
+            })
+            .await
+            {
+                Ok((screened, served)) => {
+                    for hit in &served {
+                        tracing::info!(
+                            conv_id = %conv_id,
+                            iteration,
+                            path = %hit.path,
+                            timeline = hit.timeline.raw(),
+                            "file_read served from the corpus — no re-read",
+                        );
+                    }
+                    screened
+                }
+                Err(e) => {
+                    // The fast path is an optimisation; losing it costs reads,
+                    // not correctness. Dispatch the round as the model wrote it.
+                    tracing::warn!(conv_id = %conv_id, "fast-path screen panicked: {e}");
+                    unscreened
+                }
+            };
 
             tracing::info!(
                 conv_id = %conv_id,

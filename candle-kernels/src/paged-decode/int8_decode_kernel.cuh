@@ -616,48 +616,57 @@ __device__ __forceinline__ void int8_decode_attn_impl(
         // ── QK^T: precompute the INT8 logits, broadcast via tile_logits[].
         if constexpr (USE_MMA_QK) {
             if (warp_active) {
-                float acc_lo = 0.f;
-                float acc_hi = 0.f;
+                // One m16n8k32 scores 8 tokens (its N), so a tile of
+                // WARPS_PER_BLOCK tokens takes WARPS_PER_BLOCK / 8 groups. The
+                // tile is 16 tokens wide at 16 warps; scoring only the first 8
+                // would leave the rest of tile_logits[] as whatever the block's
+                // shared memory last held.
+                static_assert(WARPS_PER_BLOCK % 8 == 0, "the MMA scores tokens 8 at a time");
                 #pragma unroll
-                for (int p = 0; p < N_PALETTE; ++p) {
-                    uint32_t a_frag[4];
-                    int src0 = p * 8 + (lane & 3);
-                    int src1 = p * 8 + 4 + (lane & 3);
-                    a_frag[0] = __shfl_sync(0xffffffff, q_packed, src0);
-                    a_frag[1] = 0;
-                    a_frag[2] = __shfl_sync(0xffffffff, q_packed, src1);
-                    a_frag[3] = 0;
+                for (int tg = 0; tg < WARPS_PER_BLOCK; tg += 8) {
+                    float acc_lo = 0.f;
+                    float acc_hi = 0.f;
+                    #pragma unroll
+                    for (int p = 0; p < N_PALETTE; ++p) {
+                        uint32_t a_frag[4];
+                        int src0 = p * 8 + (lane & 3);
+                        int src1 = p * 8 + 4 + (lane & 3);
+                        a_frag[0] = __shfl_sync(0xffffffff, q_packed, src0);
+                        a_frag[1] = 0;
+                        a_frag[2] = __shfl_sync(0xffffffff, q_packed, src1);
+                        a_frag[3] = 0;
 
-                    uint32_t b_frag[2];
-                    {
-                        // PTX m16n8k32 .s8 col-major B layout:
-                        //   lane t covers N-row = t/4 (0..7), K-col base = (t%4)*4 (0,4,8,12).
-                        //   b[0]: row t/4, cols (t%4)*4..(t%4)*4+3
-                        //   b[1]: row t/4, cols (t%4)*4+16..(t%4)*4+19
-                        // shared_k_int8 is [stage][token=N-row][dim=K-col].
-                        const int8_t* k_base_p = &shared_k_int8[stage][lane >> 2][p * SUB_HEAD_DIM + (lane & 3) * 4];
-                        b_frag[0] = *reinterpret_cast<const uint32_t*>(k_base_p);
-                        b_frag[1] = *reinterpret_cast<const uint32_t*>(k_base_p + 16);
+                        uint32_t b_frag[2];
+                        {
+                            // PTX m16n8k32 .s8 col-major B layout:
+                            //   lane t covers N-row = t/4 (0..7), K-col base = (t%4)*4 (0,4,8,12).
+                            //   b[0]: row t/4, cols (t%4)*4..(t%4)*4+3
+                            //   b[1]: row t/4, cols (t%4)*4+16..(t%4)*4+19
+                            // shared_k_int8 is [stage][token=N-row][dim=K-col].
+                            const int8_t* k_base_p = &shared_k_int8[stage][tg + (lane >> 2)][p * SUB_HEAD_DIM + (lane & 3) * 4];
+                            b_frag[0] = *reinterpret_cast<const uint32_t*>(k_base_p);
+                            b_frag[1] = *reinterpret_cast<const uint32_t*>(k_base_p + 16);
+                        }
+
+                        int32_t c_p[4] = {0, 0, 0, 0};
+                        mma_int8_m16n8k32(c_p, a_frag, b_frag, c_p);
+
+                        if ((lane >> 2) == 0) {
+                            int tok0 = tg + (lane & 3) * 2;
+                            int tok1 = tok0 + 1;
+                            float s_q = scale_Q[p];
+                            float s_k0 = shared_k_scale[stage][tok0][p];
+                            float s_k1 = shared_k_scale[stage][tok1][p];
+                            acc_lo += (float)c_p[0] * s_q * s_k0;
+                            acc_hi += (float)c_p[1] * s_q * s_k1;
+                        }
                     }
 
-                    int32_t c_p[4] = {0, 0, 0, 0};
-                    mma_int8_m16n8k32(c_p, a_frag, b_frag, c_p);
-
-                    if ((lane >> 2) == 0) {
-                        int tok0 = (lane & 3) * 2;
-                        int tok1 = tok0 + 1;
-                        float s_q = scale_Q[p];
-                        float s_k0 = shared_k_scale[stage][tok0][p];
-                        float s_k1 = shared_k_scale[stage][tok1][p];
-                        acc_lo += (float)c_p[0] * s_q * s_k0;
-                        acc_hi += (float)c_p[1] * s_q * s_k1;
+                    if ((lane >> 2) == 0 && (lane & 3) < 4) {
+                        int t0 = tg + (lane & 3) * 2;
+                        tile_logits[stage][warp][t0]     = acc_lo;
+                        tile_logits[stage][warp][t0 + 1] = acc_hi;
                     }
-                }
-
-                if ((lane >> 2) == 0 && (lane & 3) < 4) {
-                    int t0 = (lane & 3) * 2;
-                    tile_logits[stage][warp][t0]     = acc_lo;
-                    tile_logits[stage][warp][t0 + 1] = acc_hi;
                 }
                 __syncwarp();
 

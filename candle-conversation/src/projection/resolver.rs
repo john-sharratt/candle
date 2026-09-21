@@ -4417,12 +4417,28 @@ impl<'a> ContentResolver for TargetedRead<'a> {
             // already multi-timeline and need no change — and an ancestor
             // sitting warm or cold is elevated by the ordinary projection
             // working-set path, which is why nothing has to be pinned hot.
-            return self
+            //
+            // Fast-path reads join them: a tool call that resolved to content
+            // the corpus had already read injected that conversation instead of
+            // re-reading the file, and it belongs in the same place the read it
+            // stands in for would have gone. Oldest first for the same reason —
+            // a read the conversation did earlier reads as earlier.
+            //
+            // Ahead of the lineage, because the lineage is what the conversation
+            // was founded on and these are things it went and looked at since.
+            let mut keys: Vec<TurnKey> = self
                 .read
                 .inherited_chain(self.target.timeline)
                 .into_iter()
                 .flat_map(turns_of)
                 .collect();
+            let mut injected: Vec<TimelineId> = self
+                .read
+                .fast_path_injections(self.target.timeline)
+                .to_vec();
+            injected.reverse();
+            keys.extend(injected.into_iter().flat_map(turns_of));
+            return keys;
         }
         self.read
             .active_timelines_for_group(group)

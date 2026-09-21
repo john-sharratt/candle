@@ -553,13 +553,13 @@ pub const TOOL_CALL_TREE_LABEL: &str = "tool_call";
 /// clock while the calls themselves ran in milliseconds. Batching what the model
 /// already knows it needs collapses those round-trips into one.
 ///
-/// Four is a starting point, not a tuned constant: it covers the common fan-out
-/// (list a directory, read the two or three files it names) without letting one
-/// turn commit to a long speculative run whose later calls are chosen before any
-/// result has come back. The ceiling is a grammar bound, not a target — a turn
-/// making one call remains perfectly ordinary, because the loop's other arm is
-/// always the turn terminator.
-pub const MAX_TOOL_CALLS_PER_TURN: usize = 4;
+/// Five covers the common fan-out — list a directory, then read the handful of
+/// files it names — without letting one turn commit to a long speculative run
+/// whose later calls are all chosen before any result has come back. The
+/// ceiling is a grammar bound, not a target: a turn making one call remains
+/// perfectly ordinary, because the loop's other arm is always the turn
+/// terminator.
+pub const MAX_TOOL_CALLS_PER_TURN: usize = 5;
 
 /// Compile a tool catalog into a [`TreeSpec`].  Errors on an empty catalog or a
 /// name/enum collision the trie rejects.
