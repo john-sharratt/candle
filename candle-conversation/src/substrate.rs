@@ -55,8 +55,8 @@ use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
 };
 use crate::persistence::record::{
-    DebugIdPayload, DistillMode, DistillPayload, RecordType, TombstonePayload, TreeMetadataPayload,
-    TurnCouplingPayload,
+    DebugIdPayload, DistillMode, DistillPayload, RecordType, SectionTombstonePayload,
+    TombstonePayload, TreeMetadataPayload, TurnCouplingPayload,
 };
 use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
@@ -296,6 +296,18 @@ pub struct Substrate {
     /// tokens, and [`Self::retire_section`] removes them outright. See
     /// [`Self::mark_section_transient`]. In-memory only.
     transient_sections: HashSet<SectionId>,
+    /// Section streams flagged by [`RecordType::SectionTombstone`] as
+    /// logically deleted — the section counterpart of
+    /// [`Self::tombstoned_timelines`]. Set by the reactive repair that
+    /// confirms a section's persisted per-layer chunks disagree across
+    /// layers (`candle-conversation/src/scheduler/mod.rs`'s
+    /// `snapshot_sequence_per_layer` failure hook). [`Self::section_exists`]
+    /// and `Conversation::section_stream_is_persisted` both read this so a
+    /// tombstoned section is neither "already present" nor "restorable" on
+    /// the next ingest triage — the request falls through to a fresh
+    /// prefill instead of reloading the corrupted chunks, in this same
+    /// process as well as after a restart.
+    tombstoned_sections: HashSet<StreamId>,
     /// Individual `(timeline, turn_index)` turns flagged dead by a **turn-scoped**
     /// [`RecordType::Tombstone`] (`turn_index = Some`), leaving the rest of their
     /// timeline live. Written by the per-layer `drop_turn` corrupt-turn policy.
@@ -3793,6 +3805,64 @@ impl Substrate {
         }
     }
 
+    /// Mark the section stream `stream_id` as tombstoned in-RAM — the
+    /// section counterpart of [`Self::tombstone_timeline`]. Callers writing
+    /// the matching [`RecordType::SectionTombstone`] record to the redo log
+    /// invoke this to keep the live ingest triage in sync — without it the
+    /// section would only read as gone on the next reload, and a request in
+    /// this same process would restore the corrupted chunks again.
+    ///
+    /// Releases any hot/warm VRAM a currently-registered section pointing at
+    /// this stream holds. A tombstoned section is never legitimately read
+    /// again, so there is nothing later that depends on keeping its resident
+    /// bytes around — unlike an ordinary LRU eviction, this is not something
+    /// a future projection will need back.
+    pub fn tombstone_section(&mut self, stream_id: StreamId) {
+        self.tombstoned_sections.insert(stream_id);
+        let residences: Vec<ResidenceIndex> = self
+            .sections
+            .values()
+            .map(|e| e.residence)
+            .filter(|&r| self.residence[r.0].stream_id == stream_id)
+            .collect();
+        for r in residences {
+            self.release_dead_residence(r);
+        }
+    }
+
+    /// Whether the section stream `stream_id` has been tombstoned.
+    pub fn is_section_tombstoned(&self, stream_id: StreamId) -> bool {
+        self.tombstoned_sections.contains(&stream_id)
+    }
+
+    /// Direct read of the tombstoned-section-stream set. Used by the
+    /// compactor to re-emit one [`RecordType::SectionTombstone`] marker per
+    /// entry (the same role [`Self::tombstoned_timelines`] plays for
+    /// timeline tombstones) and by a future boot-time integrity pass that
+    /// wants the same set the reactive repair maintains.
+    pub fn tombstoned_sections(&self) -> &HashSet<StreamId> {
+        &self.tombstoned_sections
+    }
+
+    /// Apply a decoded [`SectionTombstonePayload`] read back from the redo
+    /// log. Sets the in-RAM flag only — replay runs before anything is
+    /// restored, so there is no VRAM to release the way the live
+    /// [`Self::tombstone_section`] does mid-process.
+    pub fn apply_section_tombstone(
+        &mut self,
+        stream_id: StreamId,
+        payload: &SectionTombstonePayload,
+    ) {
+        if let Some(reason) = &payload.reason {
+            tracing::debug!(
+                stream_id = stream_id.0,
+                reason = %reason,
+                "replaying section tombstone with recorded reason",
+            );
+        }
+        self.tombstoned_sections.insert(stream_id);
+    }
+
     /// Mark `timeline`'s durable state as **ephemeral**: nothing will ever read
     /// it back from disk, so neither its KV nor its recurrent snapshot is
     /// written. Flags residences already allocated; `append_complete` flags
@@ -4028,14 +4098,17 @@ impl Substrate {
         &self.distilled_timelines
     }
 
-    /// On-disk bytes held by streams of tombstoned timelines — dead
-    /// weight the header-keyed accounting can't see (a tombstone names
-    /// its timeline in the payload, and the doomed records were live
-    /// appends at write time).  Summed from the in-RAM stream index, no
-    /// disk I/O; the compaction trigger adds this to the incremental
-    /// dead-byte counter.
+    /// On-disk bytes held by streams of tombstoned timelines and tombstoned
+    /// section streams — dead weight the header-keyed accounting can't see
+    /// (a tombstone names its target in the payload, not the header, and the
+    /// doomed records were live appends at write time). Summed from the
+    /// in-RAM stream index, no disk I/O; the compaction trigger adds this to
+    /// the incremental dead-byte counter.
     pub fn tombstoned_stream_bytes(&self) -> u64 {
-        if self.tombstoned_timelines.is_empty() && self.tombstoned_turns.is_empty() {
+        if self.tombstoned_timelines.is_empty()
+            && self.tombstoned_turns.is_empty()
+            && self.tombstoned_sections.is_empty()
+        {
             return 0;
         }
         self.streams
@@ -4047,7 +4120,10 @@ impl Substrate {
                             || self.tombstoned_turns.contains(&(tl, t.turn_index))
                     })
                 }
-                _ => false,
+                Some(decl @ StreamDecl::PromptSection(_)) => {
+                    self.tombstoned_sections.contains(&decl.stream_id())
+                }
+                None => false,
             })
             .map(|s| {
                 s.chunks.values().map(|c| c.record_size).sum::<u64>()
@@ -4203,6 +4279,11 @@ impl Substrate {
             RecordType::Tombstone => {
                 if let Ok(payload) = TombstonePayload::decode(&entry.record.payload) {
                     self.apply_tombstone(&payload);
+                }
+            }
+            RecordType::SectionTombstone => {
+                if let Ok(payload) = SectionTombstonePayload::decode(&entry.record.payload) {
+                    self.apply_section_tombstone(stream_id, &payload);
                 }
             }
             RecordType::Distilled => {
@@ -5398,8 +5479,20 @@ impl Substrate {
     /// it to hot.  Used by the ingest loop to skip re-issuing a
     /// `RestoreSection` for a section the substrate already knows
     /// about (preventing duplicate residence allocations).
+    ///
+    /// A tombstoned section (see [`Self::tombstone_section`]) reads as
+    /// absent here even though its entry is still in [`Self::sections`] —
+    /// mirroring how a tombstoned timeline stays in [`Self::timelines`] and
+    /// is filtered at every read site instead of being purged. The next
+    /// triage that asks for this section id falls through to the ingest
+    /// path, which re-prefills fresh and overwrites the tombstoned entry.
     pub fn section_exists(&self, section: SectionId) -> bool {
-        self.sections.contains_key(&section)
+        match self.sections.get(&section) {
+            Some(entry) => !self
+                .tombstoned_sections
+                .contains(&self.residence[entry.residence.0].stream_id),
+            None => false,
+        }
     }
 
     /// Per-layer chunk count for the section's hot residence, or
@@ -8131,6 +8224,62 @@ mod tests {
             sub.tombstoned_stream_bytes(),
             8192 + 4096,
             "only the tombstoned timeline's chunk + tokens bytes count"
+        );
+    }
+
+    /// The section counterpart of [`tombstoned_stream_bytes_sums_dead_timelines`]
+    /// — a tombstoned section's on-disk bytes must count as dead weight too,
+    /// or the compaction trigger never sees the corrupted chunks a reactive
+    /// repair leaves behind.
+    #[test]
+    fn tombstoned_stream_bytes_sums_dead_sections() {
+        use crate::persistence::content_hash::ContentHash;
+        use crate::persistence::streams::{ContentAddress, SectionDecl};
+
+        let mut sub = Substrate::new();
+        let decl_for = |lo: u64| {
+            StreamDecl::PromptSection(SectionDecl {
+                address: ContentAddress {
+                    prefix_hash: ContentHash { lo: 1, hi: 0 },
+                    section_hash: ContentHash { lo, hi: 0 },
+                },
+                debug_name: "tool_catalog".to_string(),
+            })
+        };
+        let dead_decl = decl_for(7);
+        let live_decl = decl_for(8);
+        let dead_sid = dead_decl.stream_id();
+        let live_sid = live_decl.stream_id();
+        for (sid, decl) in [(dead_sid, dead_decl), (live_sid, live_decl)] {
+            sub.apply_stream_decl(sid, decl);
+            sub.apply_chunk_loc(
+                sid,
+                0,
+                ChunkLoc {
+                    segment: FIRST_SEGMENT,
+                    offset: 4096,
+                    payload_len: 100,
+                    record_size: 8192,
+                    token_count: 32,
+                    format: 4,
+                },
+            );
+            sub.apply_tokens_loc(
+                sid,
+                RecordLoc {
+                    segment: FIRST_SEGMENT,
+                    offset: 20_480,
+                    payload_len: 64,
+                    record_size: 4096,
+                },
+            );
+        }
+        assert_eq!(sub.tombstoned_stream_bytes(), 0, "nothing tombstoned yet");
+        sub.tombstone_section(dead_sid);
+        assert_eq!(
+            sub.tombstoned_stream_bytes(),
+            8192 + 4096,
+            "only the tombstoned section's chunk + tokens bytes count"
         );
     }
 

@@ -25,6 +25,8 @@
 
 use std::path::Path;
 
+use zend_tools::state::vfs::PAGE_LINES;
+
 use crate::code_read::carve::{file_header_end, split_long_lines};
 use crate::code_read::{compute_line_offsets, slice_lines};
 use crate::repo_scan::types::{FileEntry, Language};
@@ -40,18 +42,26 @@ pub const MAX_ANCHOR_LINES: u32 = 200;
 const ANCHOR_NAMES: &[&str] = &["readme.md", "lib.rs", "main.rs", "mod.rs"];
 
 /// A directory's chosen anchor excerpt, ready to render.
+///
+/// `start_line`/`end_line`/`body` are the CONTAINING PAGE's bounds
+/// ([`zend_tools::state::vfs::PAGE_LINES`]-line stride), not the narrower
+/// meaningful excerpt [`pick`] found — `file_read` only ever returns a whole
+/// page, and a prefilled response has to be what a live call would actually
+/// return. In practice the excerpt (capped at [`MAX_ANCHOR_LINES`], almost
+/// always starting at line 1) sits well inside page 0, so this is page 0's
+/// full content the overwhelming majority of the time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Anchor {
     /// Workspace-relative path of the anchor file.
     pub path: String,
-    /// First line of the excerpt, 1-based.
+    /// First line of the containing page, 1-based.
     pub start_line: u32,
-    /// Last line of the excerpt, 1-based inclusive.
+    /// Last line of the containing page, 1-based inclusive.
     pub end_line: u32,
     /// Total lines in the file, so the excerpt header can say `of N` when the
-    /// excerpt is a slice — the same continuation signal `file_read` emits.
+    /// page is a slice — the same continuation signal `file_read` emits.
     pub total_lines: u32,
-    /// The excerpt's source text.
+    /// The containing page's source text.
     pub body: String,
     pub language: Language,
 }
@@ -78,22 +88,54 @@ pub fn pick(files: &[&FileEntry], workspace: &Path) -> Option<Anchor> {
         return None;
     }
 
+    let (start_line, end_line) = excerpt_bounds(&bytes, file.language, total_lines);
+    // The meaningful excerpt decided WHICH page to anchor on; what gets
+    // rendered is that whole page, matching what a live `file_read` call
+    // would actually return (see the struct doc). `excerpt_bounds` can select
+    // a run wider than the page holds — a module doc starting in a page's
+    // back half and continuing past it — so the emptiness check below is
+    // clamped to the page too: it must ask whether what the render actually
+    // contains is meaningful, not whether the wider, uncapped selection was.
+    let page = start_line.saturating_sub(1) / PAGE_LINES;
+    let page_start = page * PAGE_LINES + 1;
+    let page_end = ((page + 1) * PAGE_LINES).min(total_lines);
+    let excerpt = slice_lines(&bytes, &offsets, start_line, end_line.min(page_end));
+    if excerpt.trim().is_empty() {
+        return None;
+    }
+    let body = slice_lines(&bytes, &offsets, page_start, page_end);
+    Some(Anchor {
+        path: file.path.clone(),
+        start_line: page_start,
+        end_line: page_end,
+        total_lines,
+        body,
+        language: file.language,
+    })
+}
+
+/// The meaningful excerpt's own bounds — a README's head, a module doc block,
+/// a leading comment, or (failing all of those) the doc comment on the first
+/// item — capped at [`MAX_ANCHOR_LINES`]. This is the "which page to anchor
+/// on" decision; [`pick`] widens the result to that page's full content
+/// afterward, since `file_read` only ever returns a whole page.
+fn excerpt_bounds(bytes: &[u8], language: Language, total_lines: u32) -> (u32, u32) {
     // Markdown has no comment syntax to peel — a README's opening IS the
     // description, so the excerpt is simply its head.
-    let (start_line, end) = if file.language == Language::Markdown {
+    let (start_line, end) = if language == Language::Markdown {
         (1, total_lines)
-    } else if let Some(run) = module_doc_run(&bytes, file.language) {
+    } else if let Some(run) = module_doc_run(bytes, language) {
         // The file says what it is in its own words — take exactly that, and
         // nothing of the licence header or lint rationale that may sit above it.
         run
     } else {
-        let header = file_header_end(&bytes, file.language);
+        let header = file_header_end(bytes, language);
         let end = if header > 0 {
             header
         } else {
             // No leading block: the file opens with code (imports, attributes).
             // Its description, if any, is the doc comment on the first item.
-            doc_block_after_head(&bytes, file.language).unwrap_or(total_lines)
+            doc_block_after_head(bytes, language).unwrap_or(total_lines)
         };
         (1, end)
     };
@@ -101,18 +143,7 @@ pub fn pick(files: &[&FileEntry], workspace: &Path) -> Option<Anchor> {
         .min(start_line + MAX_ANCHOR_LINES - 1)
         .min(total_lines)
         .max(start_line);
-    let body = slice_lines(&bytes, &offsets, start_line, end_line);
-    if body.trim().is_empty() {
-        return None;
-    }
-    Some(Anchor {
-        path: file.path.clone(),
-        start_line,
-        end_line,
-        total_lines,
-        body,
-        language: file.language,
-    })
+    (start_line, end_line)
 }
 
 /// Inclusive line range of the file's module-doc block — the `//!` run
@@ -314,19 +345,27 @@ mod tests {
         assert!(a.body.contains("What this folder does."));
     }
 
-    /// A module root contributes its `//!` block, not the code beneath it.
+    /// A module root's excerpt SELECTION takes its `//!` block, not the code
+    /// beneath it — `pick` then widens whatever that selection found to a
+    /// whole page, so a small fixture like this one ends up rendering the
+    /// entire (5-line) file anyway. See [`excerpt_bounds`] for the narrow
+    /// selection this widening starts from.
     #[test]
     fn takes_only_the_module_doc_block() {
-        let (_d, root) = workspace(&[(
-            "a/mod.rs",
-            "//! Line one.\n//! Line two.\n\nuse std::fmt;\npub fn x() {}\n",
-        )]);
+        let src = b"//! Line one.\n//! Line two.\n\nuse std::fmt;\npub fn x() {}\n";
+        assert_eq!(
+            excerpt_bounds(src, Language::Rust, 5),
+            (1, 2),
+            "the selection itself is just the doc block"
+        );
+
+        let (_d, root) = workspace(&[("a/mod.rs", std::str::from_utf8(src).unwrap())]);
         let files = [entry("a/mod.rs", Language::Rust)];
         let refs: Vec<&FileEntry> = files.iter().collect();
         let a = pick(&refs, &root).expect("anchor");
-        assert_eq!((a.start_line, a.end_line), (1, 2));
+        assert_eq!((a.start_line, a.end_line), (1, 5), "widened to page 0");
         assert_eq!(a.total_lines, 5);
-        assert_eq!(a.body, "//! Line one.\n//! Line two.\n");
+        assert_eq!(a.body, std::str::from_utf8(src).unwrap());
     }
 
     /// A crate root whose `//!` block sits BELOW a lint-rationale comment and the
@@ -336,9 +375,7 @@ mod tests {
     /// lint suppressions"; the module doc is what says what the crate is.
     #[test]
     fn the_module_doc_outranks_a_lint_preamble_above_it() {
-        let (_d, root) = workspace(&[(
-            "a/lib.rs",
-            "// Several clippy lints are systemic in this crate.\n\
+        let src = "// Several clippy lints are systemic in this crate.\n\
              // * `type_complexity` — nested tuples by design.\n\
              #![allow(clippy::type_complexity)]\n\
              \n\
@@ -346,15 +383,24 @@ mod tests {
              //!\n\
              //! Manages multi-turn dialogue with streaming generation.\n\
              \n\
-             mod config;\n",
-        )]);
+             mod config;\n";
+        assert_eq!(
+            excerpt_bounds(src.as_bytes(), Language::Rust, 9),
+            (5, 7),
+            "the selection is the module doc, not the preamble"
+        );
+
+        let (_d, root) = workspace(&[("a/lib.rs", src)]);
         let files = [entry("a/lib.rs", Language::Rust)];
         let refs: Vec<&FileEntry> = files.iter().collect();
         let a = pick(&refs, &root).expect("anchor");
-        assert_eq!((a.start_line, a.end_line), (5, 7));
+        // Widened to the whole (9-line) page 0 — `file_read` only ever
+        // returns whole pages, so the rendered excerpt necessarily includes
+        // the preamble the selection itself correctly skipped past.
+        assert_eq!((a.start_line, a.end_line), (1, 9));
         assert_eq!(a.total_lines, 9);
-        assert!(a.body.starts_with("//! Turn-based conversation engine."));
-        assert!(!a.body.contains("clippy"), "the preamble is not the anchor");
+        assert!(a.body.starts_with("// Several clippy lints"));
+        assert!(a.body.contains("//! Turn-based conversation engine."));
     }
 
     /// Same shape, spelled as a `/* … */` licence header — the form vendored and
@@ -363,9 +409,7 @@ mod tests {
     /// reaching the module doc.
     #[test]
     fn the_module_doc_outranks_a_block_comment_licence_header() {
-        let (_d, root) = workspace(&[(
-            "a/lib.rs",
-            "/*\n\
+        let src = b"/*\n\
              * Copyright 2026 Example Corp.\n\
              * Licensed under the Apache License, Version 2.0.\n\
              */\n\
@@ -374,35 +418,39 @@ mod tests {
              //!\n\
              //! Manages multi-turn dialogue with streaming generation.\n\
              \n\
-             mod config;\n",
-        )]);
+             mod config;\n";
+        assert_eq!(
+            excerpt_bounds(src, Language::Rust, 10),
+            (6, 8),
+            "the selection is the module doc, not the licence"
+        );
+
+        let (_d, root) = workspace(&[("a/lib.rs", std::str::from_utf8(src).unwrap())]);
         let files = [entry("a/lib.rs", Language::Rust)];
         let refs: Vec<&FileEntry> = files.iter().collect();
         let a = pick(&refs, &root).expect("anchor");
-        assert_eq!((a.start_line, a.end_line), (6, 8));
-        assert!(a.body.starts_with("//! Turn-based conversation engine."));
-        assert!(
-            !a.body.contains("Copyright"),
-            "the licence is not the anchor"
-        );
+        // Widened to the whole (10-line) page 0.
+        assert_eq!((a.start_line, a.end_line), (1, 10));
+        assert!(a.body.starts_with("/*\n"));
+        assert!(a.body.contains("//! Turn-based conversation engine."));
     }
 
     /// A block comment opened and closed on one line is still a prelude line.
     #[test]
     fn a_one_line_block_comment_does_not_end_the_prelude() {
-        let (_d, root) = workspace(&[(
-            "a/lib.rs",
-            "/* generated by build.rs — do not edit */\n\
+        let src = "/* generated by build.rs — do not edit */\n\
              \n\
              //! Generated bindings.\n\
              \n\
-             pub struct X;\n",
-        )]);
+             pub struct X;\n";
+        assert_eq!(excerpt_bounds(src.as_bytes(), Language::Rust, 5), (3, 3));
+
+        let (_d, root) = workspace(&[("a/lib.rs", src)]);
         let files = [entry("a/lib.rs", Language::Rust)];
         let refs: Vec<&FileEntry> = files.iter().collect();
         let a = pick(&refs, &root).expect("anchor");
-        assert_eq!((a.start_line, a.end_line), (3, 3));
-        assert!(a.body.starts_with("//! Generated bindings."));
+        assert_eq!((a.start_line, a.end_line), (1, 5), "widened to page 0");
+        assert!(a.body.contains("//! Generated bindings."));
     }
 
     /// Code sharing the closing line of a block comment ends the prelude — a
@@ -458,57 +506,122 @@ mod tests {
     /// the `//!` rule adds a preference, it does not remove the fallbacks.
     #[test]
     fn a_file_with_no_module_doc_keeps_its_leading_comment_block() {
-        let (_d, root) = workspace(&[(
-            "a/mod.rs",
-            "// Copyright the authors.\n// Licensed under MIT.\npub fn x() {}\n",
-        )]);
+        let src = b"// Copyright the authors.\n// Licensed under MIT.\npub fn x() {}\n";
+        assert_eq!(excerpt_bounds(src, Language::Rust, 3), (1, 2));
+
+        let (_d, root) = workspace(&[("a/mod.rs", std::str::from_utf8(src).unwrap())]);
         let files = [entry("a/mod.rs", Language::Rust)];
         let refs: Vec<&FileEntry> = files.iter().collect();
         let a = pick(&refs, &root).expect("anchor");
-        assert_eq!((a.start_line, a.end_line), (1, 2));
+        assert_eq!((a.start_line, a.end_line), (1, 3), "widened to page 0");
         assert!(a.body.contains("Copyright the authors."));
     }
 
     /// The excerpt cap counts lines of excerpt, not lines of file, so a module
-    /// doc that starts deep in the prelude still gets a full page.
+    /// doc that starts deep in the prelude is still capped at
+    /// [`MAX_ANCHOR_LINES`] worth of SELECTION — independent of `pick`'s
+    /// separate page-width cap, which is what actually bounds the rendered
+    /// body here (`PAGE_LINES` < the file's own length).
     #[test]
     fn the_line_cap_applies_from_the_excerpts_own_start() {
         let doc: String = (1..=300).map(|i| format!("//! doc {i}\n")).collect();
         let body = format!("// preamble\n// preamble\n#![allow(unused)]\n{doc}mod x;\n");
+        assert_eq!(
+            excerpt_bounds(body.as_bytes(), Language::Rust, 304),
+            (4, 4 + MAX_ANCHOR_LINES - 1),
+        );
+
         let (_d, root) = workspace(&[("a/lib.rs", body.as_str())]);
         let files = [entry("a/lib.rs", Language::Rust)];
         let refs: Vec<&FileEntry> = files.iter().collect();
         let a = pick(&refs, &root).expect("anchor");
-        assert_eq!(a.start_line, 4);
-        assert_eq!(a.end_line, 4 + MAX_ANCHOR_LINES - 1);
-        assert_eq!(a.body.lines().count(), MAX_ANCHOR_LINES as usize);
+        assert_eq!((a.start_line, a.end_line), (1, 300), "widened to page 0");
+        assert_eq!(a.body.lines().count(), 300);
     }
 
     /// The fallback: no leading block, but the first item is documented.
     #[test]
     fn falls_back_to_the_doc_run_after_the_opening_code() {
-        let (_d, root) = workspace(&[(
-            "a/lib.rs",
-            "use std::fmt;\n\n/// Does the thing.\n/// In detail.\npub fn x() {}\n",
-        )]);
+        let src = b"use std::fmt;\n\n/// Does the thing.\n/// In detail.\npub fn x() {}\n";
+        assert_eq!(
+            excerpt_bounds(src, Language::Rust, 5),
+            (1, 4),
+            "through the end of the /// run"
+        );
+
+        let (_d, root) = workspace(&[("a/lib.rs", std::str::from_utf8(src).unwrap())]);
         let files = [entry("a/lib.rs", Language::Rust)];
         let refs: Vec<&FileEntry> = files.iter().collect();
         let a = pick(&refs, &root).expect("anchor");
-        assert_eq!(a.end_line, 4, "through the end of the /// run");
+        assert_eq!((a.start_line, a.end_line), (1, 5), "widened to page 0");
         assert!(a.body.contains("Does the thing."));
     }
 
     /// Nothing documented at all — the head of the file is still better than
-    /// nothing, bounded by the cap.
+    /// nothing, bounded by the selection cap. The rendered page is wider
+    /// still (`PAGE_LINES` > `MAX_ANCHOR_LINES`), since `pick` widens to the
+    /// whole page regardless of how the selection itself was bounded.
     #[test]
     fn falls_back_to_the_file_head_when_undocumented() {
         let body: String = (1..=400).map(|i| format!("pub fn f{i}() {{}}\n")).collect();
+        assert_eq!(
+            excerpt_bounds(body.as_bytes(), Language::Rust, 400),
+            (1, MAX_ANCHOR_LINES),
+        );
+
         let (_d, root) = workspace(&[("a/mod.rs", body.as_str())]);
         let files = [entry("a/mod.rs", Language::Rust)];
         let refs: Vec<&FileEntry> = files.iter().collect();
         let a = pick(&refs, &root).expect("anchor");
-        assert_eq!(a.end_line, MAX_ANCHOR_LINES);
+        assert_eq!(
+            a.end_line, 300,
+            "capped at the page width, not the selection width"
+        );
         assert_eq!(a.total_lines, 400);
+    }
+
+    /// A module doc starting in a page's back half can run past the page
+    /// boundary — `excerpt_bounds` selected it as a whole, but `pick` still
+    /// widens to (and caps at) the page, exactly as it does for a selection
+    /// narrower than the page: the render is always one page, never a wider
+    /// one stretched to fit the whole selection.
+    #[test]
+    fn a_module_doc_straddling_a_page_boundary_is_capped_at_the_page() {
+        let mut src = String::new();
+        for i in 1..=259 {
+            src.push_str(&format!("// filler {i}\n"));
+        }
+        for i in 1..=60 {
+            src.push_str(&format!("//! doc line {i}\n"));
+        }
+        src.push_str("pub fn x() {}\n");
+        let total_lines = 320;
+
+        let (start_line, end_line) = excerpt_bounds(src.as_bytes(), Language::Rust, total_lines);
+        assert_eq!(
+            (start_line, end_line),
+            (260, 319),
+            "the doc block runs past line 300",
+        );
+
+        let (_d, root) = workspace(&[("a/mod.rs", src.as_str())]);
+        let files = [entry("a/mod.rs", Language::Rust)];
+        let refs: Vec<&FileEntry> = files.iter().collect();
+        let a = pick(&refs, &root).expect("the excerpt's page-0 portion is still non-empty");
+        assert_eq!(
+            (a.start_line, a.end_line),
+            (1, 300),
+            "widened to (and capped at) page 0",
+        );
+        assert!(
+            a.body.contains("doc line 40"),
+            "the doc's page-0 portion is shown"
+        );
+        assert!(
+            !a.body.contains("doc line 60"),
+            "its tail past line 300 is not — the page is what a live file_read \
+             returns, never more",
+        );
     }
 
     #[test]

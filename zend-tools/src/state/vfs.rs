@@ -81,15 +81,43 @@ impl std::fmt::Display for VfsError {
     }
 }
 
-/// One entry in a listing: normalised path, byte size, line count.
+/// One entry in a directory listing: normalised path, byte size. No line
+/// count — that would cost opening every file in the walk to compute (see the
+/// history on [`VfsStore::list_lower_dir`]), and a listing that never opens a
+/// file is the whole point of `file_list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListEntry {
     pub path: String,
-    pub bytes: usize,
-    pub lines: usize,
+    /// `None` for a directory entry — a directory has no size of its own.
+    pub bytes: Option<usize>,
+    /// `true` when this entry is a subdirectory rather than a file. A listing
+    /// is one level deep, so a subdirectory appears as itself — never
+    /// expanded into the files it holds.
+    pub dir: bool,
     /// `true` when the entry is the session's own copy (upper layer) rather than
-    /// a file read straight off the workspace.
+    /// a file read straight off the workspace. Always `false` for a directory
+    /// entry: a directory is not itself written, only the files inside it.
     pub modified: bool,
+}
+
+/// Lines per [`VfsStore::read_page`] page.
+pub const PAGE_LINES: u32 = 300;
+
+/// One page of a file's lines, 0-based.
+#[derive(Debug)]
+pub struct PageResult {
+    /// The page actually returned. Clamped into range the same way
+    /// [`crate::tools::file::Paging`] clamps a listing page: a request past
+    /// the end yields the last page rather than an empty one.
+    pub page: u32,
+    /// First line of the page, 1-based.
+    pub start_line: u32,
+    /// Last line of the page, 1-based and inclusive. `0` for an empty file.
+    pub end_line: u32,
+    pub total_lines: u32,
+    pub total_pages: u32,
+    /// The page's lines, joined by `\n` — never the whole file.
+    pub body: String,
 }
 
 #[derive(Default)]
@@ -167,46 +195,131 @@ impl VfsStore {
         self.read_lower(&norm)
     }
 
-    /// Union listing under `prefix`, upper layer shadowing the workspace.
-    /// Whiteouted paths are omitted. Sorted by path.
-    pub fn list(&self, prefix: &str) -> Vec<ListEntry> {
-        let norm_prefix = Self::normalize(prefix);
+    /// One [`PAGE_LINES`]-line page of a file, resolved through the overlay the
+    /// same way [`Self::read`] is. `Ok(None)` means the path does not exist in
+    /// either layer.
+    ///
+    /// Bounded memory regardless of file size: the workspace layer streams the
+    /// file line by line rather than materialising it (`file_read` used to read
+    /// the whole file into a `String` and a `Vec<&str>` slice of it just to
+    /// return 300 lines). The upper layer is already resident (session writes
+    /// are capped at 10 MiB total), so it pages from a cursor over the same
+    /// string rather than a second copy.
+    pub fn read_page(&self, path: &str, page: u32) -> Result<Option<PageResult>, VfsError> {
+        let norm = Self::normalize(path);
+        {
+            let guard = self.upper.read().unwrap();
+            if let Some(v) = guard.files.get(&norm) {
+                return Self::paginate(std::io::Cursor::new(v.as_bytes()), page)
+                    .map(Some)
+                    .map_err(|e| VfsError::Unreadable(format!("{norm} could not be read: {e}")));
+            }
+            if guard.whiteouts.contains(&norm) {
+                return Ok(None);
+            }
+        }
+        self.read_lower_page(&norm, page)
+    }
+
+    /// One level of `dir`'s contents, upper layer shadowing the workspace:
+    /// the files and subdirectories directly inside it, never a deeper file
+    /// flattened up into its listing. Whiteouted paths are omitted. Sorted by
+    /// path. `Ok(None)` means `dir` does not resolve to a directory in either
+    /// layer — a missing path, or one that names a file.
+    pub fn list_dir(&self, dir: &str) -> Result<Option<Vec<ListEntry>>, VfsError> {
+        let norm = Self::normalize(dir);
+        // `norm` resolving as a file rules out a directory listing outright —
+        // checked first, and independently of the walk below, because a
+        // conflicting write elsewhere in the upper layer (e.g. a file at
+        // `"a/b.rs/c.rs"` alongside a real file at `"a/b.rs"`) would otherwise
+        // make `upper_has_children` true for `"a/b.rs"` and this would
+        // silently resolve a file path as a directory.
+        if self.resolves_as_file(&norm) {
+            return Ok(None);
+        }
         let mut out: Vec<ListEntry> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
+        // Keyed on `(path, is_dir)`, not just `path`: a plain file at `"a"`
+        // and another upper file at `"a/b.rs"` (which collapses to a
+        // directory entry also named `"a"`) are two genuinely different
+        // things sharing one name — deduping on the name alone would drop
+        // whichever the map happened to iterate second, silently hiding it
+        // from the listing rather than just looking odd.
+        let mut seen: HashSet<(String, bool)> = HashSet::new();
+        let mut upper_has_children = false;
 
         {
             let guard = self.upper.read().unwrap();
             for (k, v) in guard.files.iter() {
-                if !Self::matches_prefix(k, &norm_prefix) {
+                let Some((child, is_dir)) = Self::immediate_child(&norm, k) else {
+                    continue;
+                };
+                upper_has_children = true;
+                if !seen.insert((child.clone(), is_dir)) {
                     continue;
                 }
-                seen.insert(k.clone());
-                out.push(ListEntry {
-                    path: k.clone(),
-                    bytes: v.len(),
-                    lines: v.lines().count(),
-                    modified: true,
+                out.push(if is_dir {
+                    ListEntry {
+                        path: child,
+                        bytes: None,
+                        dir: true,
+                        modified: false,
+                    }
+                } else {
+                    ListEntry {
+                        path: child,
+                        bytes: Some(v.len()),
+                        dir: false,
+                        modified: true,
+                    }
                 });
             }
             for w in guard.whiteouts.iter() {
-                seen.insert(w.clone());
+                seen.insert((w.clone(), false));
             }
         }
 
-        for (path, bytes, lines) in self.list_lower(&norm_prefix) {
-            if seen.contains(&path) {
-                continue;
+        let lower_is_dir = self.lower_dir_exists(&norm);
+        if !lower_is_dir && !upper_has_children && !norm.is_empty() {
+            return Ok(None);
+        }
+
+        if lower_is_dir || norm.is_empty() {
+            for (path, bytes, is_dir) in self.list_lower_dir(&norm) {
+                if seen.contains(&(path.clone(), is_dir)) {
+                    continue;
+                }
+                seen.insert((path.clone(), is_dir));
+                out.push(ListEntry {
+                    path,
+                    bytes,
+                    dir: is_dir,
+                    modified: false,
+                });
             }
-            out.push(ListEntry {
-                path,
-                bytes,
-                lines,
-                modified: false,
-            });
         }
 
         out.sort_by(|a, b| a.path.cmp(&b.path));
-        out
+        Ok(Some(out))
+    }
+
+    /// Whether `norm` resolves to a file in either layer — key/metadata
+    /// existence only, never a content read (matching `list_dir`'s "never
+    /// opens a file" contract). Upper-first, respecting whiteouts, the same
+    /// precedence `read` uses.
+    fn resolves_as_file(&self, norm: &str) -> bool {
+        if norm.is_empty() {
+            return false;
+        }
+        {
+            let guard = self.upper.read().unwrap();
+            if guard.whiteouts.contains(norm) {
+                return false;
+            }
+            if guard.files.contains_key(norm) {
+                return true;
+            }
+        }
+        self.lower_exists(norm)
     }
 
     /// Remove a path from the overlay. An upper-layer file is dropped; a
@@ -289,24 +402,149 @@ impl VfsStore {
             .map_err(|_| VfsError::Unreadable(format!("{norm} is not valid UTF-8 text")))
     }
 
-    /// Walk the workspace under `norm_prefix`, honouring every ignore file the
-    /// `ignore` crate knows. Returns `(normalised path, bytes, lines)`.
+    /// [`Self::read_page`]'s workspace half: open the file and stream it rather
+    /// than reading it whole, so a 4 MiB file costs [`PAGE_LINES`] lines of
+    /// memory, not 4 MiB.
+    fn read_lower_page(&self, norm: &str, page: u32) -> Result<Option<PageResult>, VfsError> {
+        let Some(abs) = self.lower_path(norm) else {
+            return Ok(None);
+        };
+        let Ok(meta) = std::fs::metadata(&abs) else {
+            return Ok(None);
+        };
+        if !meta.is_file() {
+            return Ok(None);
+        }
+        if meta.len() > MAX_LOWER_FILE_BYTES {
+            return Err(VfsError::Unreadable(format!(
+                "{norm} is {} bytes, above the {MAX_LOWER_FILE_BYTES}-byte workspace read limit",
+                meta.len(),
+            )));
+        }
+        let file = std::fs::File::open(&abs)
+            .map_err(|e| VfsError::Unreadable(format!("{norm} could not be read: {e}")))?;
+        Self::paginate(std::io::BufReader::new(file), page)
+            .map(Some)
+            .map_err(|e| VfsError::Unreadable(format!("{norm} is not valid UTF-8 text: {e}")))
+    }
+
+    /// Stream `reader` line by line and return page `requested_page`
+    /// ([`PAGE_LINES`]-line strides, 0-based), without ever holding more than
+    /// two pages' worth of lines at once.
     ///
-    /// Line counts require reading each file, so they are only computed for files
-    /// within [`MAX_LOWER_FILE_BYTES`] that parse as UTF-8; anything else reports
-    /// `0` lines alongside its true byte size.
-    fn list_lower(&self, norm_prefix: &str) -> Vec<(String, usize, usize)> {
+    /// A request past the end clamps to the last page — the same "over-shoot
+    /// reads as the tail, not an error" rule [`crate::tools::file::Paging::of`]
+    /// applies to `file_list` — which is why the last [`PAGE_LINES`] lines are
+    /// held in `tail` the whole way through: by the time EOF says the request
+    /// was out of range, the candidate page's lines are long gone, and a
+    /// second pass would cost exactly the whole-file read this exists to avoid.
+    fn paginate(
+        mut reader: impl std::io::BufRead,
+        requested_page: u32,
+    ) -> std::io::Result<PageResult> {
+        let want_start = u64::from(requested_page) * u64::from(PAGE_LINES);
+        let want_end = want_start + u64::from(PAGE_LINES);
+
+        let mut candidate: Vec<String> = Vec::new();
+        let mut tail: std::collections::VecDeque<String> =
+            std::collections::VecDeque::with_capacity(PAGE_LINES as usize + 1);
+        let mut total_lines: u64 = 0;
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            // `read_line` requires valid UTF-8 (an `io::Error` otherwise), which
+            // is the same "the whole file must be text" contract `read_lower`
+            // enforces up front — just discovered while streaming instead of
+            // before returning anything.
+            let n = reader.read_line(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            // Split on '\n' only, matching `file_read`'s old `content.split('\n')`
+            // exactly: a trailing '\r' on a CRLF file stays part of the line.
+            let line = buf.strip_suffix('\n').unwrap_or(&buf).to_string();
+            if total_lines >= want_start && total_lines < want_end {
+                candidate.push(line.clone());
+            }
+            tail.push_back(line);
+            if tail.len() as u32 > PAGE_LINES {
+                tail.pop_front();
+            }
+            total_lines += 1;
+        }
+
+        if total_lines == 0 {
+            return Ok(PageResult {
+                page: 0,
+                start_line: 1,
+                end_line: 0,
+                total_lines: 0,
+                total_pages: 0,
+                body: String::new(),
+            });
+        }
+
+        let total_pages = ((total_lines - 1) / u64::from(PAGE_LINES) + 1) as u32;
+        let (page, start_line_0, lines) = if want_start < total_lines {
+            (requested_page, want_start, candidate)
+        } else {
+            // `tail` holds the last (up to) `PAGE_LINES` lines seen, which is
+            // wider than the last page whenever the file's length is not an
+            // exact multiple of the stride — take only the suffix the last
+            // page actually covers, not the whole buffer.
+            let last_page = total_pages - 1;
+            let last_start = u64::from(last_page) * u64::from(PAGE_LINES);
+            let need = (total_lines - last_start) as usize;
+            let skip = tail.len().saturating_sub(need);
+            (
+                last_page,
+                last_start,
+                tail.into_iter().skip(skip).collect::<Vec<_>>(),
+            )
+        };
+
+        let start_line = (start_line_0 + 1) as u32;
+        let end_line = start_line + (lines.len() as u32).saturating_sub(1);
+        Ok(PageResult {
+            page,
+            start_line,
+            end_line,
+            total_lines: total_lines as u32,
+            total_pages,
+            body: lines.join("\n"),
+        })
+    }
+
+    /// `true` when `norm` names a real directory in the workspace — the empty
+    /// path (the root) always does, when there is a workspace at all.
+    fn lower_dir_exists(&self, norm: &str) -> bool {
+        let Some(root) = self.workspace.as_ref() else {
+            return false;
+        };
+        if norm.is_empty() {
+            root.is_dir()
+        } else {
+            root.join(norm).is_dir()
+        }
+    }
+
+    /// One level of the workspace directory `norm`: its immediate file and
+    /// subdirectory children, honouring every ignore file the `ignore` crate
+    /// knows. Bounded to depth 1, so a listing costs one directory's worth of
+    /// `readdir`, never a walk of a whole subtree — what makes `file_list`
+    /// cheap on a large repository no matter how deep `norm` is. Returns
+    /// `(normalised path, bytes, is_dir)`; `bytes` is `None` for a
+    /// subdirectory and metadata-only for a file — never a file open, which is
+    /// what makes a listing cheap even where it does open a directory (see the
+    /// history in [`Self::read_lower_page`]'s sibling doc).
+    fn list_lower_dir(&self, norm: &str) -> Vec<(String, Option<usize>, bool)> {
         let Some(root) = self.workspace.as_ref() else {
             return Vec::new();
         };
-        // Walking from the prefix directory (when it is one) keeps a narrow
-        // listing cheap on a large repository; otherwise walk the root and filter,
-        // which is what a partial-segment prefix like `src/ma` needs.
-        let prefix_dir = root.join(norm_prefix);
-        let (walk_root, filter) = if !norm_prefix.is_empty() && prefix_dir.is_dir() {
-            (prefix_dir, None)
+        let walk_root = if norm.is_empty() {
+            root.clone()
         } else {
-            (root.clone(), Some(norm_prefix))
+            root.join(norm)
         };
 
         let mut out = Vec::new();
@@ -318,48 +556,64 @@ impl VfsStore {
             .ignore(true)
             .require_git(false)
             .parents(true)
+            .max_depth(Some(1))
             .build();
         for entry in walker.flatten() {
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
+            // Depth 0 is `walk_root` itself, not a child of it.
+            if entry.depth() == 0 {
                 continue;
             }
-            let Ok(rel) = entry.path().strip_prefix(root) else {
+            let file_type = entry.file_type();
+            let is_dir = file_type.is_some_and(|t| t.is_dir());
+            let is_file = file_type.is_some_and(|t| t.is_file());
+            if !is_dir && !is_file {
                 continue;
+            }
+            let name = entry.file_name().to_string_lossy();
+            let path = if norm.is_empty() {
+                name.into_owned()
+            } else {
+                format!("{norm}/{name}")
             };
-            let key = rel
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
-            if let Some(p) = filter {
-                if !Self::matches_prefix(&key, p) {
-                    continue;
-                }
+            if is_dir {
+                out.push((path, None, true));
+                continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
-            let bytes = meta.len();
-            let lines = if bytes <= MAX_LOWER_FILE_BYTES {
-                std::fs::read(entry.path())
-                    .ok()
-                    .and_then(|b| String::from_utf8(b).ok())
-                    .map(|s| s.lines().count())
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            out.push((key, bytes as usize, lines));
+            out.push((path, Some(meta.len() as usize), false));
         }
         out
     }
 
     // ── Path handling ────────────────────────────────────────────────────────
 
-    /// `true` when `key` is under `prefix`. Plain string-prefix semantics, as the
-    /// tool's `prefix` parameter documents — so `src/` and `src` and even the
-    /// partial `src/ma` all select `src/main.rs`. An empty prefix matches
-    /// everything.
-    fn matches_prefix(key: &str, prefix: &str) -> bool {
-        prefix.is_empty() || key.starts_with(prefix)
+    /// What a one-level listing of `dir` shows for `key`, given `key` lives
+    /// somewhere under `dir` (or `dir` is the empty root prefix): `key` itself
+    /// when it is a direct child, or the immediate subdirectory's own path when
+    /// `key` is deeper — collapsed rather than flattened all the way down, the
+    /// same way a real directory listing never expands a subdirectory's
+    /// contents into itself. `None` when `key` is not under `dir` at all.
+    fn immediate_child(dir: &str, key: &str) -> Option<(String, bool)> {
+        let remainder = if dir.is_empty() {
+            key
+        } else {
+            key.strip_prefix(dir)?.strip_prefix('/')?
+        };
+        if remainder.is_empty() {
+            return None;
+        }
+        Some(match remainder.find('/') {
+            None => (key.to_string(), false),
+            Some(slash) => {
+                let first = &remainder[..slash];
+                let path = if dir.is_empty() {
+                    first.to_string()
+                } else {
+                    format!("{dir}/{first}")
+                };
+                (path, true)
+            }
+        })
     }
 
     /// Canonical overlay key for a caller-supplied path. See the module docs.
@@ -408,8 +662,14 @@ mod tests {
         std::fs::write(p, body).unwrap();
     }
 
-    fn listed(store: &VfsStore, prefix: &str) -> Vec<String> {
-        store.list(prefix).into_iter().map(|e| e.path).collect()
+    fn listed(store: &VfsStore, dir: &str) -> Vec<String> {
+        store
+            .list_dir(dir)
+            .unwrap()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| e.path)
+            .collect()
     }
 
     // ── normalize ────────────────────────────────────────────────────────────
@@ -474,14 +734,41 @@ mod tests {
     }
 
     #[test]
-    fn matches_prefix_is_plain_string_prefix() {
-        assert!(VfsStore::matches_prefix("src/main.rs", ""));
-        assert!(VfsStore::matches_prefix("src/main.rs", "src"));
-        assert!(VfsStore::matches_prefix("src/main.rs", "src/"));
-        assert!(VfsStore::matches_prefix("src/main.rs", "src/ma"));
-        assert!(VfsStore::matches_prefix("src/main.rs", "src/main.rs"));
-        assert!(!VfsStore::matches_prefix("src/main.rs", "srcx"));
-        assert!(!VfsStore::matches_prefix("src/main.rs", "docs/"));
+    fn immediate_child_collapses_deeper_paths_to_their_subdirectory() {
+        assert_eq!(
+            VfsStore::immediate_child("", "README.md"),
+            Some(("README.md".to_string(), false)),
+        );
+        assert_eq!(
+            VfsStore::immediate_child("", "src/main.rs"),
+            Some(("src".to_string(), true)),
+        );
+        assert_eq!(
+            VfsStore::immediate_child("src", "src/main.rs"),
+            Some(("src/main.rs".to_string(), false)),
+        );
+        assert_eq!(
+            VfsStore::immediate_child("src", "src/util/helper.rs"),
+            Some(("src/util".to_string(), true)),
+        );
+        assert_eq!(
+            VfsStore::immediate_child("src", "src/util/deep/leaf.rs"),
+            Some(("src/util".to_string(), true)),
+            "three levels down still collapses to the immediate subdirectory, not the leaf",
+        );
+    }
+
+    /// A directory boundary, not a string prefix: `src` must not falsely match
+    /// `srcx/…` the way a plain `starts_with` would.
+    #[test]
+    fn immediate_child_respects_the_directory_boundary() {
+        assert_eq!(VfsStore::immediate_child("src", "srcx/file.rs"), None);
+        assert_eq!(VfsStore::immediate_child("src", "docs/readme.md"), None);
+        assert_eq!(
+            VfsStore::immediate_child("src", "src"),
+            None,
+            "src is dir itself, not a child of it"
+        );
     }
 
     // ── Upper layer alone ────────────────────────────────────────────────────
@@ -533,7 +820,8 @@ mod tests {
             s.read("./src/../src/main.rs").unwrap().as_deref(),
             Some("two")
         );
-        assert_eq!(listed(&s, ""), vec!["src/main.rs"]);
+        assert_eq!(listed(&s, ""), vec!["src"], "one collapsed entry, not two");
+        assert_eq!(listed(&s, "src"), vec!["src/main.rs"]);
         assert_eq!(s.total_bytes(), 3, "one entry, not two");
     }
 
@@ -613,12 +901,137 @@ mod tests {
         assert_eq!(s.read("").unwrap(), None, "the root itself is not a file");
     }
 
+    // ── read_page ────────────────────────────────────────────────────────────
+
+    /// `n` lines, each its own line number so a page's content is checkable
+    /// without re-deriving it — line `k` (1-based) is the string `k`.
+    fn numbered_lines(n: u32) -> String {
+        (1..=n)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    #[test]
+    fn a_short_file_is_entirely_page_0() {
+        let (_dir, s) = store_with_tree();
+        let p = s.read_page("src/main.rs", 0).unwrap().unwrap();
+        assert_eq!(p.page, 0);
+        assert_eq!(p.total_pages, 1);
+        assert_eq!(p.start_line, 1);
+        assert_eq!(p.end_line, 1);
+        assert_eq!(p.total_lines, 1);
+        assert_eq!(p.body, "fn main() {}");
+    }
+
+    #[test]
+    fn a_file_of_exactly_650_lines_pages_at_300_line_strides() {
+        let (dir, s) = store_with_tree();
+        put(dir.path(), "big.txt", &numbered_lines(650));
+
+        let p0 = s.read_page("big.txt", 0).unwrap().unwrap();
+        assert_eq!(p0.page, 0);
+        assert_eq!(p0.total_pages, 3);
+        assert_eq!(p0.start_line, 1);
+        assert_eq!(p0.end_line, 300);
+        assert_eq!(p0.total_lines, 650);
+        assert_eq!(p0.body.lines().next(), Some("1"));
+        assert_eq!(p0.body.lines().last(), Some("300"));
+
+        let p1 = s.read_page("big.txt", 1).unwrap().unwrap();
+        assert_eq!(p1.page, 1);
+        assert_eq!(p1.start_line, 301);
+        assert_eq!(p1.end_line, 600);
+        assert_eq!(p1.body.lines().next(), Some("301"));
+        assert_eq!(p1.body.lines().last(), Some("600"));
+
+        let p2 = s.read_page("big.txt", 2).unwrap().unwrap();
+        assert_eq!(p2.page, 2);
+        assert_eq!(p2.start_line, 601);
+        assert_eq!(p2.end_line, 650);
+        assert_eq!(p2.body.lines().next(), Some("601"));
+        assert_eq!(p2.body.lines().last(), Some("650"));
+    }
+
+    /// A page past the end clamps to the last one — the same "over-shoot reads
+    /// as the tail, not an error" rule `file_list`'s own paging applies.
+    #[test]
+    fn a_page_past_the_end_clamps_to_the_last_page() {
+        let (dir, s) = store_with_tree();
+        put(dir.path(), "big.txt", &numbered_lines(650));
+        let clamped = s.read_page("big.txt", 99).unwrap().unwrap();
+        let last = s.read_page("big.txt", 2).unwrap().unwrap();
+        assert_eq!(clamped.page, last.page);
+        assert_eq!(clamped.start_line, last.start_line);
+        assert_eq!(clamped.end_line, last.end_line);
+        assert_eq!(clamped.body, last.body);
+    }
+
+    #[test]
+    fn an_empty_file_reports_page_0_of_0() {
+        let (dir, s) = store_with_tree();
+        put(dir.path(), "empty.txt", "");
+        let p = s.read_page("empty.txt", 0).unwrap().unwrap();
+        assert_eq!(p.page, 0);
+        assert_eq!(p.start_line, 1);
+        assert_eq!(p.end_line, 0);
+        assert_eq!(p.total_lines, 0);
+        assert_eq!(p.total_pages, 0);
+        assert_eq!(p.body, "");
+    }
+
+    #[test]
+    fn read_page_of_a_missing_path_is_none() {
+        let (_dir, s) = store_with_tree();
+        assert!(s.read_page("nope.rs", 0).unwrap().is_none());
+    }
+
+    /// The upper layer pages from the same in-memory string via a cursor —
+    /// no second copy, but the same page math as the workspace layer.
+    #[test]
+    fn upper_layer_files_page_too() {
+        let s = VfsStore::new();
+        s.write("big.txt", numbered_lines(650)).unwrap();
+        let p1 = s.read_page("big.txt", 1).unwrap().unwrap();
+        assert_eq!(p1.start_line, 301);
+        assert_eq!(p1.end_line, 600);
+        assert_eq!(p1.total_pages, 3);
+        assert_eq!(p1.body.lines().next(), Some("301"));
+    }
+
+    #[test]
+    fn oversize_lower_file_refuses_to_page() {
+        let (dir, s) = store_with_tree();
+        let big = (MAX_LOWER_FILE_BYTES + 1) as usize;
+        std::fs::write(dir.path().join("huge.txt"), vec![b'a'; big]).unwrap();
+        let err = s.read_page("huge.txt", 0).unwrap_err();
+        assert!(matches!(err, VfsError::Unreadable(_)), "{err:?}");
+    }
+
     #[test]
     fn non_utf8_lower_file_is_unreadable() {
         let (dir, s) = store_with_tree();
         std::fs::write(dir.path().join("blob.bin"), [0xff, 0xfe, 0x00]).unwrap();
         let err = s.read("blob.bin").unwrap_err();
         assert!(matches!(err, VfsError::Unreadable(_)), "{err:?}");
+    }
+
+    /// **`list_dir` never opens a file.** A listing that had to decode every
+    /// file's bytes to report on it would refuse exactly where `read` does; it
+    /// does not, because it never reads past `entry.metadata()` — the whole
+    /// point of dropping `ListEntry::lines`, which used to force exactly that
+    /// open.
+    #[test]
+    fn non_utf8_lower_file_still_lists() {
+        let (dir, s) = store_with_tree();
+        std::fs::write(dir.path().join("blob.bin"), [0xff, 0xfe, 0x00]).unwrap();
+        let entries = s.list_dir("").unwrap().unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.path == "blob.bin")
+            .expect("a non-UTF-8 file still lists");
+        assert_eq!(entry.bytes, Some(3));
     }
 
     #[test]
@@ -630,51 +1043,85 @@ mod tests {
         let err = s.read("huge.txt").unwrap_err();
         assert!(matches!(err, VfsError::Unreadable(_)), "{err:?}");
 
-        let entry = s
-            .list("huge.txt")
-            .into_iter()
-            .next()
+        let entries = s.list_dir("").unwrap().unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.path == "huge.txt")
             .expect("oversize files still list");
-        assert_eq!(entry.bytes, big, "with their true size");
-        assert_eq!(entry.lines, 0, "but no line count, since it is not read");
+        assert_eq!(entry.bytes, Some(big), "with their true size");
     }
 
     // ── Lower layer: listing ─────────────────────────────────────────────────
 
     #[test]
-    fn list_is_sorted_and_prefix_scoped() {
+    fn list_is_sorted_and_one_level_deep() {
         let (_dir, s) = store_with_tree();
-        assert_eq!(
-            listed(&s, ""),
-            vec!["README.md", "src/main.rs", "src/util/helper.rs"],
-        );
-        for prefix in ["src", "src/", "/workspace/src"] {
+        assert_eq!(listed(&s, ""), vec!["README.md", "src"]);
+        for dir in ["src", "src/", "/workspace/src"] {
             assert_eq!(
-                listed(&s, prefix),
-                vec!["src/main.rs", "src/util/helper.rs"],
-                "prefix {prefix:?}",
+                listed(&s, dir),
+                vec!["src/main.rs", "src/util"],
+                "dir {dir:?}",
             );
         }
         assert_eq!(listed(&s, "src/util"), vec!["src/util/helper.rs"]);
-        assert!(listed(&s, "nothing/here").is_empty());
-    }
-
-    /// A prefix naming a file rather than a directory still resolves — the walk
-    /// falls back to filtering from the root.
-    #[test]
-    fn list_accepts_a_file_or_partial_segment_as_prefix() {
-        let (_dir, s) = store_with_tree();
-        assert_eq!(listed(&s, "README.md"), vec!["README.md"]);
-        assert_eq!(listed(&s, "src/ma"), vec!["src/main.rs"]);
     }
 
     #[test]
-    fn list_reports_line_counts_and_sizes_from_disk() {
+    fn list_dir_of_a_missing_directory_is_not_found() {
         let (_dir, s) = store_with_tree();
-        let e = &s.list("src/main.rs")[0];
-        assert_eq!(e.bytes, "fn main() {}\n".len());
-        assert_eq!(e.lines, 1);
-        assert!(!e.modified);
+        assert_eq!(s.list_dir("nothing/here").unwrap(), None);
+    }
+
+    /// A real directory path only — the argument is a directory to list, not a
+    /// string prefix, so a partial segment or an exact file name no longer
+    /// resolves to anything.
+    #[test]
+    fn list_dir_of_a_file_path_is_not_found() {
+        let (_dir, s) = store_with_tree();
+        assert_eq!(s.list_dir("README.md").unwrap(), None);
+        assert_eq!(s.list_dir("src/ma").unwrap(), None);
+    }
+
+    /// A conflicting write elsewhere in the upper layer must not make a real
+    /// file resolve as a directory too — `"README.md"` stays `None` even
+    /// though `"README.md/notes.txt"` nonsensically implies it is one.
+    #[test]
+    fn list_dir_of_a_file_stays_not_found_despite_a_conflicting_deeper_write() {
+        let (_dir, s) = store_with_tree();
+        s.write("README.md/notes.txt", "oops".into()).unwrap();
+        assert_eq!(s.list_dir("README.md").unwrap(), None);
+    }
+
+    /// A plain upper file and another upper file that collapses to a
+    /// directory of the same name are two different things sharing one
+    /// name — both must survive the listing, not silently collide into one.
+    #[test]
+    fn a_file_and_a_same_named_collapsed_directory_both_list() {
+        let s = VfsStore::new();
+        s.write("src", "plain file".into()).unwrap();
+        s.write("src/foo.rs", "nested".into()).unwrap();
+        let entries = s.list_dir("").unwrap().unwrap();
+        let file = entries
+            .iter()
+            .find(|e| e.path == "src" && !e.dir)
+            .expect("the plain file at \"src\" must still be listed");
+        assert_eq!(file.bytes, Some("plain file".len()));
+        let dir = entries
+            .iter()
+            .find(|e| e.path == "src" && e.dir)
+            .expect("the collapsed directory named \"src\" must still be listed");
+        assert_eq!(dir.bytes, None);
+    }
+
+    #[test]
+    fn subdirectory_entries_carry_no_size() {
+        let (_dir, s) = store_with_tree();
+        let entries = s.list_dir("").unwrap().unwrap();
+        let src = entries.iter().find(|e| e.path == "src").unwrap();
+        assert!(src.dir);
+        assert_eq!(src.bytes, None);
+        assert!(!src.modified);
     }
 
     #[test]
@@ -682,7 +1129,7 @@ mod tests {
         let (_dir, s) = store_with_tree();
         s.write("src/main.rs", "fn main() { /* mine */ }\n".into())
             .unwrap();
-        let entries = s.list("src/");
+        let entries = s.list_dir("src").unwrap().unwrap();
         assert_eq!(
             entries.iter().filter(|e| e.path == "src/main.rs").count(),
             1,
@@ -690,14 +1137,10 @@ mod tests {
         );
         let main = entries.iter().find(|e| e.path == "src/main.rs").unwrap();
         assert!(main.modified);
-        assert_eq!(main.bytes, "fn main() { /* mine */ }\n".len());
-        assert!(
-            !entries
-                .iter()
-                .find(|e| e.path == "src/util/helper.rs")
-                .unwrap()
-                .modified
-        );
+        assert_eq!(main.bytes, Some("fn main() { /* mine */ }\n".len()));
+        let util = entries.iter().find(|e| e.path == "src/util").unwrap();
+        assert!(util.dir);
+        assert!(!util.modified, "a directory entry is never itself modified");
     }
 
     #[test]
@@ -705,9 +1148,19 @@ mod tests {
         let (_dir, s) = store_with_tree();
         s.write("src/scratch.rs", "// draft\n".into()).unwrap();
         assert_eq!(
-            listed(&s, "src/"),
-            vec!["src/main.rs", "src/scratch.rs", "src/util/helper.rs"],
+            listed(&s, "src"),
+            vec!["src/main.rs", "src/scratch.rs", "src/util"],
         );
+    }
+
+    /// A directory that exists only because the session wrote into it — never
+    /// present on disk — still lists, synthesised purely from the upper layer.
+    #[test]
+    fn a_session_only_directory_lists_even_without_a_workspace_counterpart() {
+        let (_dir, s) = store_with_tree();
+        s.write("gen/a.txt", "hi".into()).unwrap();
+        assert_eq!(listed(&s, "gen"), vec!["gen/a.txt"]);
+        assert!(listed(&s, "").contains(&"gen".to_string()));
     }
 
     // ── Whiteouts ────────────────────────────────────────────────────────────
@@ -763,7 +1216,7 @@ mod tests {
             "the workspace file must not resurface once the shadow is removed",
         );
         assert_eq!(s.total_bytes(), 0);
-        assert!(!listed(&s, "").contains(&"src/main.rs".to_string()));
+        assert!(!listed(&s, "src").contains(&"src/main.rs".to_string()));
     }
 
     /// Shadowing a lower file is an overwrite, not a creation — the path already
@@ -785,7 +1238,7 @@ mod tests {
         put(dir.path(), ".env", "TOKEN=1\n");
 
         let all = listed(&s, "");
-        assert!(!all.iter().any(|p| p.starts_with("ignored/")), "{all:?}");
+        assert!(!all.contains(&"ignored".to_string()), "{all:?}");
         assert!(!all.contains(&".env".to_string()), "{all:?}");
         assert!(!all.contains(&".gitignore".to_string()), "{all:?}");
 
@@ -864,7 +1317,7 @@ mod tests {
             (0..8).any(|t| final_value == format!("writer-{t}")),
             "torn value {final_value:?}",
         );
-        assert_eq!(store.list("").len(), 1);
+        assert_eq!(store.list_dir("").unwrap().unwrap().len(), 1);
         assert_eq!(store.total_bytes(), final_value.len());
     }
 

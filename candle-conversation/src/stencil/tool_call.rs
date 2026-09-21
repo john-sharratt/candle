@@ -120,10 +120,10 @@ impl ToolSpec {
     /// then optionals in the order the properties object declares them**, and
     /// the tree emits them in that order. The workspace builds `serde_json` with
     /// `preserve_order`, so the properties iterate as the schema's author wrote
-    /// them — `file_read`'s optional range is offered `start_line` before
-    /// `end_line`, where a sorted map would put the end first and a call written
-    /// in reading order could never reach it. A nested object's fields follow
-    /// the same rule.
+    /// them — two optionals meant to be read together (a range's start before
+    /// its end) stay offered in that order, where a sorted map would put the
+    /// second one first and a call written in reading order could never reach
+    /// it. A nested object's fields follow the same rule.
     pub fn from_json_schema(name: &str, schema: &Value) -> ToolSpec {
         ToolSpec {
             name: name.to_string(),
@@ -1031,34 +1031,31 @@ mod tests {
     /// split the grammar makes.
     ///
     /// The JSON arm used to quote every value, so a numeric argument rendered
-    /// `"start_line": "1"` while `build_value`'s `Number` arm emits `1`. Only
+    /// `"page": "1"` while `build_value`'s `Number` arm emits `1`. Only
     /// prose-valued callers existed, so nothing caught it until an ingest chain
-    /// needed to prefill a line range.
+    /// needed to prefill a page number.
     #[test]
     fn render_writes_numbers_bare_and_strings_quoted() {
         let json = ToolCallEnvelope::qwen3();
-        let out = json.render("file_read", &[("path", "a/mod.rs"), ("start_line", "1")]);
+        let out = json.render("file_read", &[("path", "a/mod.rs"), ("page", "1")]);
         assert!(
             out.contains(r#""path": "a/mod.rs""#),
             "a string argument stays quoted and escaped: {out}"
         );
         assert!(
-            out.contains(r#""start_line": 1"#),
+            out.contains(r#""page": 1"#),
             "a numeric argument is bare, as `build_value` emits it: {out}"
         );
 
         // A function block's values are raw whatever their type, so neither
         // gains quotes and the scalar question does not arise.
         let fb = ToolCallEnvelope::qwen35();
-        let out = fb.render("file_read", &[("path", "a/mod.rs"), ("start_line", "1")]);
+        let out = fb.render("file_read", &[("path", "a/mod.rs"), ("page", "1")]);
         assert!(
             out.contains("<parameter=path>\na/mod.rs</parameter>"),
             "{out}"
         );
-        assert!(
-            out.contains("<parameter=start_line>\n1</parameter>"),
-            "{out}"
-        );
+        assert!(out.contains("<parameter=page>\n1</parameter>"), "{out}");
         assert!(!out.contains('"'), "raw values carry no quotes: {out}");
     }
 
@@ -1741,9 +1738,9 @@ mod tests {
             r#"{
                 "type": "object",
                 "properties": {
-                    "start_line": {"type": "integer"},
+                    "width": {"type": "integer"},
                     "path": {"type": "string"},
-                    "end_line": {"type": "integer"},
+                    "height": {"type": "integer"},
                     "note": {"type": "string"},
                     "after": {"type": "string"}
                 },
@@ -1751,9 +1748,9 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let spec = ToolSpec::from_json_schema("file_read", &schema);
+        let spec = ToolSpec::from_json_schema("probe", &schema);
         let names: Vec<&str> = spec.params.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["path", "note", "start_line", "end_line", "after"]);
+        assert_eq!(names, ["path", "note", "width", "height", "after"]);
         assert!(spec.params[..2].iter().all(|p| p.required));
         assert!(spec.params[2..].iter().all(|p| !p.required));
     }

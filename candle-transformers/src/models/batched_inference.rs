@@ -5022,6 +5022,15 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
     }
 }
 
+/// The phrase [`assert_sealed_layers_aligned`]'s `bail!` names this fault
+/// with — `candle-conversation`'s reactive section-corruption repair
+/// (`scheduler::Scheduler::repair_section_if_window_divergence_confirmed`)
+/// matches on it to decide whether a seal failure is THIS fault before
+/// re-reading the substrate to confirm. A shared constant, not a duplicated
+/// literal on each side, so the two can't silently drift apart if this
+/// message is ever reworded.
+pub const WINDOW_DIVERGENCE_MARKER: &str = "different token windows";
+
 /// Refuse a per-layer snapshot whose layers describe different token windows.
 ///
 /// **This is the boundary between a recoverable skew and a permanent one.** A
@@ -5096,8 +5105,8 @@ fn assert_sealed_layers_aligned(
         .collect::<Vec<_>>()
         .join("; ");
     candle::bail!(
-        "{site}: refusing to seal sequence {idx} — the layers describe different token \
-         windows, so sealing would persist the skew into the substrate where no repair \
+        "{site}: refusing to seal sequence {idx} — the layers describe {WINDOW_DIVERGENCE_MARKER}, \
+         so sealing would persist the skew into the substrate where no repair \
          can reach it. First difference at chunk {at}: {split}. The live slot is still \
          intact and repairable; a wave that died mid-sweep is the usual producer, and \
          its rollback is what should have undone this."

@@ -193,6 +193,7 @@ impl Manifest {
             | RecordType::TreeMetadata
             | RecordType::DebugId
             | RecordType::Tombstone
+            | RecordType::SectionTombstone
             | RecordType::Distilled
             | RecordType::TurnCoupling
             | RecordType::ProjectionEvents

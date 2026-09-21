@@ -640,6 +640,50 @@ pub fn recover_section_cold_refs(
     Ok(Some(stored))
 }
 
+/// Re-read a persisted section stream's per-layer chunk **windows** —
+/// `(offset, token_count)` — straight from the redo log, for
+/// [`super::chunk_window_integrity::first_divergent_chunk`].
+///
+/// [`recover_section_cold_refs`] alone is not enough: its `StoredChunk` only
+/// carries what the manifest's header-level location map holds
+/// (`log_offset`, `record_len`, `token_count`), and `offset` — the "start of
+/// valid data within the chunk" half of the window — lives inside the
+/// `Chunk` record's decoded [`ChunkPayload`], not its header. Confirming a
+/// divergence against what is actually on disk therefore costs one record
+/// read per chunk (`SubstratePersistence::read_chunk`), not just a manifest
+/// lookup.
+///
+/// This runs only when a seal has already failed the live alignment check
+/// for a section — off any hot path — so reading every chunk's full payload
+/// (rather than a metadata-only decode) trades a few extra bytes per chunk
+/// for reusing the one `read_chunk` helper every other cold-read call site
+/// already relies on.
+///
+/// Returns `None` when the stream holds no durable chunks (nothing to
+/// confirm either way — matches [`recover_section_cold_refs`]'s `None`).
+pub fn read_persisted_section_windows(
+    p: &mut SubstratePersistence,
+    substrate: &Substrate,
+    stream_id: StreamId,
+    n_layers: usize,
+) -> Result<Option<Vec<Vec<(u16, u16)>>>> {
+    let Some(cold_refs) = recover_section_cold_refs(substrate, stream_id, n_layers)? else {
+        return Ok(None);
+    };
+    let chunks_per_layer = cold_refs.first().map(|s| s.chunks.len()).unwrap_or(0);
+    let mut per_layer = Vec::with_capacity(cold_refs.len());
+    for (layer, seq) in cold_refs.iter().enumerate() {
+        let mut windows = Vec::with_capacity(seq.chunks.len());
+        for (chunk, stored) in seq.chunks.iter().enumerate() {
+            let flat_index = (layer * chunks_per_layer + chunk) as u64;
+            let payload = p.read_chunk(substrate, stream_id, flat_index)?;
+            windows.push((payload.offset, stored.token_count));
+        }
+        per_layer.push(windows);
+    }
+    Ok(Some(per_layer))
+}
+
 /// Every turn stream in the recovered manifest, in `(timeline_id, turn_index)`
 /// order — the deterministic replay order a substrate reload walks.
 pub fn recovered_turn_decls(substrate: &Substrate) -> Vec<TurnDecl> {
@@ -1130,6 +1174,136 @@ mod tests {
             assert_eq!(
                 substrate.section_index_page(stream_id),
                 Some(payload.as_slice())
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// End-to-end exercise of the reactive section-corruption repair, at the
+    /// persistence/substrate layer — everything the scheduler's
+    /// `repair_section_if_window_divergence_confirmed` hook drives once it
+    /// has a `seal_error` and a `section_id`/`address` in hand, EXCEPT the
+    /// hook itself: reproducing the actual `snapshot_sequence_per_layer`
+    /// seal failure needs a live `BatchedInferenceSession` on a real model,
+    /// which this crate's unit tests cannot stand up (see the `tensor-assert`
+    /// / GPU-test guidance in `CLAUDE.md` — this suite runs CPU-only). What
+    /// this DOES cover, against real on-disk records rather than a
+    /// synthetic shape:
+    ///
+    /// 1. A section persisted with a genuine per-layer offset divergence —
+    ///    two layers agree, one does not — is detected by re-reading it off
+    ///    disk with [`read_persisted_section_windows`] and running the
+    ///    generic [`super::super::chunk_window_integrity::first_divergent_chunk`]
+    ///    against the result.
+    /// 2. Tombstoning it (the in-RAM [`Substrate::tombstone_section`] plus
+    ///    the durable [`SubstratePersistence::write_section_tombstone`]) makes
+    ///    [`Substrate::section_exists`] read the section as gone in THIS SAME
+    ///    process — no restart needed — which is what stops the very next
+    ///    ingest triage from restoring the same corrupted chunks again.
+    /// 3. The tombstone survives a simulated restart (a fresh
+    ///    `open_in_with_substrate` over the same directory): the corrupted
+    ///    section reads as gone on reload too, not just in the process that
+    ///    found it.
+    #[test]
+    fn reactive_repair_confirms_and_tombstones_a_diverged_section() {
+        use super::super::content_hash::ContentHash;
+        use super::super::streams::{ContentAddress, SectionDecl};
+        use crate::persistence::chunk_window_integrity::first_divergent_chunk;
+        use crate::projection::SectionId;
+
+        let dir = tmp_dir("section_window_divergence_repair");
+        let (n_layers, chunks_per_layer) = (3usize, 2usize);
+        let decl = StreamDecl::PromptSection(SectionDecl {
+            address: ContentAddress {
+                prefix_hash: ContentHash { lo: 0x55, hi: 0x66 },
+                section_hash: ContentHash { lo: 0x77, hi: 0x88 },
+            },
+            debug_name: "diverged_tool_catalog".to_string(),
+        });
+        let stream_id = decl.stream_id();
+
+        // Layers 0 and 1 agree on both chunks; layer 2's second chunk was
+        // written with a different offset — the "some layers ahead of the
+        // rest" signature a torn cold-tier write leaves behind, caught here
+        // exactly because it survived to disk rather than being refused
+        // live by `assert_sealed_layers_aligned`.
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            sp.declare_stream(&decl).unwrap();
+            for layer in 0..n_layers {
+                for chunk in 0..chunks_per_layer {
+                    let mut image = chunk_image((layer * 10 + chunk) as u8, 17);
+                    if layer == 2 && chunk == 1 {
+                        image.payload.offset = 5;
+                    }
+                    let flat = flat_chunk_index(layer, chunk, chunks_per_layer);
+                    sp.write_chunk(
+                        stream_id,
+                        flat,
+                        image.token_count as u64,
+                        image.payload.k_formats.first().copied().unwrap_or(0),
+                        Some(image.golden),
+                        &image.payload,
+                    )
+                    .unwrap();
+                }
+            }
+            sp.commit().unwrap();
+        }
+
+        // 1. Confirm the divergence from what is actually on disk.
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let windows = read_persisted_section_windows(&mut sp, &substrate, stream_id, n_layers)
+                .unwrap()
+                .expect("the stream has durable chunks");
+            let divergence =
+                first_divergent_chunk(&windows).expect("the offset divergence must be found");
+            assert_eq!(divergence.chunk_index, 1);
+            assert_eq!(
+                divergence.per_layer,
+                vec![Some((0, 17)), Some((0, 17)), Some((5, 17))],
+            );
+
+            // A section registered under this stream must be found before
+            // repair …
+            let section_id = SectionId::new(1);
+            substrate
+                .set_section_full(
+                    section_id,
+                    stream_id,
+                    34,
+                    std::sync::Arc::new(Vec::new()),
+                    |_| Ok(Vec::new()),
+                    std::sync::Arc::new(vec![1, 2, 3]),
+                )
+                .unwrap();
+            assert!(substrate.section_exists(section_id));
+            assert!(!substrate.is_section_tombstoned(stream_id));
+
+            // 2. Repair: tombstone in-RAM and durably.
+            let reason = divergence.describe();
+            substrate.tombstone_section(stream_id);
+            sp.write_section_tombstone(stream_id.0, Some(&reason))
+                .unwrap();
+            sp.commit().unwrap();
+
+            // … and gone after, in this SAME process, with no restart.
+            assert!(
+                !substrate.section_exists(section_id),
+                "a tombstoned section must read as absent so the next triage re-prefills fresh",
+            );
+        }
+
+        // 3. The tombstone is durable: a fresh reload sees it too.
+        {
+            let mut substrate = Substrate::new();
+            let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            assert!(
+                substrate.is_section_tombstoned(stream_id),
+                "the tombstone must survive a restart, or the corrupted section reloads again",
             );
         }
         std::fs::remove_dir_all(&dir).ok();

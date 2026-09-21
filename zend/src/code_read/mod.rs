@@ -50,6 +50,7 @@ use candle_conversation::projection::{Builder, GroupId, LayerId, TimelineId};
 use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::{ConversationEngine, SequenceConfig, TurnText};
 use sha2::{Digest, Sha256};
+use zend_tools::state::vfs::PAGE_LINES;
 
 use crate::ingest_report::Failures;
 use crate::loading::LoadProgress;
@@ -165,6 +166,9 @@ fn emit_file_turns<S: InsertTurnSink>(
     on_prefilled: crate::turn_sink::ScopeProgressFn,
 ) -> anyhow::Result<()> {
     let line_offsets = compute_line_offsets(bytes);
+    // Total line count, exactly [`zend_tools::state::vfs::VfsStore::read_page`]'s
+    // own — the last offset is `bytes.len()`, not a line start.
+    let total_lines = line_offsets.len().saturating_sub(1) as u32;
     // Gather-scope tags `["code", <path>]` scope every turn into a code-tagged
     // provenance gallery (and out of the untagged dialogue partition).
     let tags = vec!["code".to_string(), path.to_string()];
@@ -177,11 +181,41 @@ fn emit_file_turns<S: InsertTurnSink>(
     let prepared: Vec<(String, String, TurnText)> = scopes
         .iter()
         .map(|scope| {
-            let body = slice_lines(bytes, &line_offsets, scope.start_line, scope.end_line);
+            // `file_read` only ever returns a whole page, so the response has
+            // to render one too — the page CONTAINING the scope's start line,
+            // never just the scope's own (possibly narrower, possibly
+            // page-straddling) range. `page_start` always covers
+            // `scope.start_line` by construction (`page` is derived from it),
+            // but `scope.end_line` can run past `page_end` for a scope near a
+            // page boundary (`MAX_SCOPE_LINES` is exactly half of
+            // `PAGE_LINES`, so this is reachable, not just theoretical).
+            // `render_part_user_prompt`'s "Summarize (lines a-b)" is clamped
+            // to what the paired response actually shows — never claiming a
+            // range wider than the rendered page — so the request and the
+            // evidence it points at always agree.
+            let page = scope.start_line.saturating_sub(1) / PAGE_LINES;
+            let page_start = page * PAGE_LINES + 1;
+            let page_end = ((page + 1) * PAGE_LINES).min(total_lines);
+            let total_pages = if total_lines == 0 {
+                0
+            } else {
+                total_lines.div_ceil(PAGE_LINES)
+            };
+            let body = slice_lines(bytes, &line_offsets, page_start, page_end);
+            let claimed_end = scope.end_line.min(page_end);
             (
-                header::render_part_user_prompt(path, scope),
-                header::render_tool_call(path, scope),
-                header::render_tool_response(path, scope, language, &body),
+                header::render_part_user_prompt(path, scope.start_line, claimed_end),
+                header::render_tool_call(path, page),
+                header::render_tool_response(
+                    path,
+                    page,
+                    total_pages,
+                    page_start,
+                    page_end,
+                    total_lines,
+                    language,
+                    &body,
+                ),
             )
         })
         .collect();
@@ -1238,6 +1272,45 @@ pub(crate) fn slice_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::code_read::types::ChunkKind;
+    use crate::turn_sink::RecordingTurnSink;
+
+    /// A scope whose end line runs past the page containing its start line
+    /// (reachable: `MAX_SCOPE_LINES` is exactly half of `PAGE_LINES`, so a
+    /// scope starting in a page's back half can straddle the boundary) must
+    /// not have the summarise request claim more than the paired tool
+    /// response actually shows.
+    #[test]
+    fn a_scope_straddling_a_page_boundary_claims_only_what_the_page_shows() {
+        let bytes = (1..=400)
+            .map(|i| format!("line {i}\n"))
+            .collect::<String>()
+            .into_bytes();
+        let scope = Scope {
+            path: vec!["dummy".into()],
+            kind: ChunkKind::Function,
+            start_line: 250,
+            end_line: 350,
+        };
+        let mut sink = RecordingTurnSink::new();
+        emit_file_turns(
+            &mut sink,
+            "src/big.rs",
+            Language::Rust,
+            &[scope],
+            &bytes,
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        let (call_user, _, _) = &sink.turns[0];
+        // Page 0 is lines 1-300 — the scope's real end (350) is past it, so
+        // the claimed range must stop at 300, not restate the scope's own
+        // (wider) bound.
+        assert!(
+            call_user.starts_with("Summarize `src/big.rs` (lines 250-300)"),
+            "{call_user}"
+        );
+    }
 
     /// With `--max-depth 2`, a file past the bound (`src/deep/c.rs`) is frozen:
     /// it leaves the state the refresh compares, so a bounded walk that never

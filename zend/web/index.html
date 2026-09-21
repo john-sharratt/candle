@@ -490,7 +490,12 @@ import { estateSwitcher } from './common/lib/estate.js';
     if (!zmd) { render(); return; }   // not laid out yet — fall back to full render
     const open = !!S.thinkOpen[conv.id + ':' + idx];
     zmd.innerHTML = nodeHtml(m, open);
-    if (!S.narrow) applyProjSegments(zmd, m);
+    // The bars are measured against the DOM's current layout, which keeps
+    // shifting turn by turn while this message is still streaming — showing
+    // them mid-stream means they never line up with what they're pointing
+    // at. Skip while active; the completed-turn render below draws them once
+    // the layout has settled.
+    if (!S.narrow && !m.streaming) applyProjSegments(zmd, m);
     // Keep any live thinking ticker scrolled to its tail so the newest words sit at
     // the right and roll leftward through the fade as more stream in.
     zmd.querySelectorAll('.think-ticker').forEach((t) => { t.scrollLeft = t.scrollWidth; });
@@ -627,26 +632,39 @@ import { estateSwitcher } from './common/lib/estate.js';
     return { raw, isError, obj };
   }
   // A one-line account of what a call touched, for the collapsed header: the
-  // file or folder it named, then what came back — the excerpt's line range for
-  // a read, the entry count for a listing. Any other tool shows its first string
-  // argument. Either part is empty when there is nothing to say.
+  // file or folder it named, then what came back — the excerpt's page and line
+  // range for a read, the entry count for a listing. Any other tool shows its
+  // first string argument. Either part is empty when there is nothing to say.
   function toolSubject(name, args, resp) {
     let subject = '';
-    if (typeof args.path === 'string') subject = args.path;
-    else if ('prefix' in args || name === 'file_list') subject = args.prefix || 'project root';
-    else {
+    if (name === 'file_list') {
+      // Only file_list gives an empty path a meaning of its own ("the
+      // project root") — anything else with an empty path just has an
+      // empty subject, handled by the branch below like any other string.
+      subject = (typeof args.path === 'string' && args.path) ? args.path : 'project root';
+    } else if (typeof args.path === 'string') {
+      subject = args.path;
+    } else {
       const first = Object.values(args).find((v) => typeof v === 'string' && v);
       if (first) subject = first;
     }
+    // The call's own page, shown even before a response has come back —
+    // `file_read`'s `page` is a required argument, so it is always present.
+    // The wire value is zero-based (page 0 is the top of the file); shown
+    // as one-based here, matching file_list's `paging.page + 1` below —
+    // "page 0" reads as a computer's off-by-one to a human, not the top.
     let detail = '';
-    // file_read's excerpt header: `\npath (lines 1-900):` / `(lines 47-93 of 900)` / `(empty)`.
-    const hdr = resp && /^\s*\S[^\n]*? \((lines \d+-\d+(?: of \d+)?|empty)\):/.exec(resp.raw);
-    if (hdr) detail = hdr[1];
+    if (name === 'file_read' && typeof args.page === 'number') detail = 'page ' + (args.page + 1);
+    // file_read's excerpt header, once the response lands: `\npath (page 0 of
+    // 5, lines 301-600 of 1420):` / `(empty)` — richer than the call alone.
+    // The page number is captured on its own so it can be shown one-based
+    // too; the rest of the header (total pages, line range) passes through
+    // as the tool itself renders it.
+    const hdr = resp && /^\s*\S[^\n]*? \((?:page (\d+) (of \d+, lines \d+-\d+ of \d+)|(empty))\):/.exec(resp.raw);
+    if (hdr) detail = hdr[3] || ('page ' + (Number(hdr[1]) + 1) + ' ' + hdr[2]);
     else if (resp && resp.obj && resp.obj.paging && typeof resp.obj.paging.total === 'number') {
       const p = resp.obj.paging;
       detail = p.total + (p.total === 1 ? ' file' : ' files') + (p.pages > 1 ? ' · page ' + (p.page + 1) + '/' + p.pages : '');
-    } else if (args.start_line != null || args.end_line != null) {
-      detail = 'lines ' + (args.start_line != null ? args.start_line : 1) + '-' + (args.end_line != null ? args.end_line : 'end');
     }
     return { subject, detail };
   }
@@ -1744,8 +1762,11 @@ import { estateSwitcher } from './common/lib/estate.js';
         // the next frame because `zmd` isn't in the document yet (the scroller is
         // attached by the caller after buildChat returns), and getBoundingClientRect
         // needs it laid out. The live-stream path measures an already-attached
-        // node, so it calls applyProjSegments synchronously.
-        if (!S.narrow) applyProjSegments(zmd, m);
+        // node, so it calls applyProjSegments synchronously. Skipped for the
+        // turn still streaming — its layout keeps shifting token by token, so
+        // the bars would never stay aligned with what they're marking; it
+        // gets its bars once it finishes and this runs again as a settled turn.
+        if (!S.narrow && !m.streaming) applyProjSegments(zmd, m);
         scroller.appendChild(h('div', { 'data-msg': idx, class: 'z-turn z-selectable', style: 'display:flex; margin-bottom:2rem; padding-right:2rem;' }, zmd,
           turnCopyBtn(m, 'right:2rem;')));
       }

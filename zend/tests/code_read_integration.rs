@@ -107,8 +107,7 @@ fn code_read_call_turn_is_summarize_request_then_tool_call() {
     assert!(call_assistant.trim_end().ends_with("</tool_call>"));
     assert!(call_assistant.contains("\"name\":\"file_read\""));
     assert!(call_assistant.contains("\"path\":\"src/lib.rs\""));
-    assert!(call_assistant.contains("\"start_line\":"));
-    assert!(call_assistant.contains("\"end_line\":"));
+    assert!(call_assistant.contains("\"page\":"));
     // NO tool_response and NO baked role markers in the call turn.
     assert!(!call_assistant.contains("<tool_response>"));
     assert!(!call_assistant.contains("<|im_end|>"));

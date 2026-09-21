@@ -98,6 +98,11 @@ pub fn survival(rt: RecordType) -> Survival {
         // merely forget a deletion — the rewrite carries the turn's content
         // forward regardless, so the condemned turn returns on the next reload.
         RecordType::Tombstone => Survival::Resident,
+        // The section counterpart of `Tombstone`, re-emitted from
+        // `tombstoned_sections` for the same reason: losing this marker does
+        // not merely forget a deletion, it resurrects the corrupted chunks
+        // the marker exists to keep unread.
+        RecordType::SectionTombstone => Survival::Resident,
         // The exchange grouping for a tool round-trip, held in
         // `Timeline::couplings` and re-emitted from `live_couplings`.
         RecordType::TurnCoupling => Survival::Resident,
@@ -138,6 +143,7 @@ pub const WRITTEN_RECORD_TYPES: &[RecordType] = &[
     RecordType::BranchCheckpoint,
     RecordType::Npc,
     RecordType::TurnIndexPage,
+    RecordType::SectionTombstone,
 ];
 
 /// A per-record-type tally, for reporting what a store holds and what a rewrite
@@ -242,6 +248,7 @@ pub fn type_label(rt: RecordType) -> &'static str {
         RecordType::BranchCheckpoint => "branch_checkpoint",
         RecordType::Npc => "npc",
         RecordType::TurnIndexPage => "turn_index_page",
+        RecordType::SectionTombstone => "section_tombstone",
         RecordType::Unknown => "unknown",
     }
 }

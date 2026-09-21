@@ -108,10 +108,11 @@ fn each_directory_lists_before_it_reads() {
     assert!(src[2].1.is_empty(), "the folder summary is DECODED");
 }
 
-/// `src/lib.rs` carries a `//!` block, so the read is scoped to it rather than
-/// pulling the whole file.
+/// `src/lib.rs` carries a `//!` block, so the anchor is placed at it — the
+/// excerpt then widens to that block's containing page, which for a file this
+/// small is the whole file.
 #[test]
-fn the_anchor_excerpt_is_the_module_doc_block() {
+fn the_anchor_excerpt_is_the_module_docs_page() {
     let dir = small_workspace();
     let sink = record(dir.path());
     let excerpt = sink
@@ -121,14 +122,10 @@ fn the_anchor_excerpt_is_the_module_doc_block() {
         .map(|(u, _, _)| u.clone())
         .expect("the excerpt turn");
     assert!(
-        excerpt.contains("src/lib.rs (lines 1-2 of 3):"),
+        excerpt.contains("src/lib.rs (page 0 of 1, lines 1-3 of 3):"),
         "{excerpt}"
     );
     assert!(excerpt.contains("//! The demo crate."));
-    assert!(
-        !excerpt.contains("pub fn hello"),
-        "the code below the doc block is not the folder's description",
-    );
 }
 
 /// The listing is produced by running the real `file_list`, so it names the
@@ -210,9 +207,9 @@ fn state_moves_when_the_anchor_text_changes() {
     assert_eq!(before.changed_dirs(&after), vec!["src/".to_string()]);
 }
 
-/// `file_list` matches a path PREFIX, so the root folder's listing spans the
-/// whole tree: a file added under `src/` changes what BOTH folders show, and
-/// both must re-ingest or one of them keeps a summary of a repo that moved on.
+/// `file_list` is one level deep, so a folder's listing is only its own direct
+/// files — a file added under `src/` changes only `src/`'s hash. The root
+/// never showed `src/`'s files directly, so it has nothing to re-ingest.
 #[test]
 fn state_moves_when_a_file_is_added() {
     let dir = small_workspace();
@@ -220,10 +217,7 @@ fn state_moves_when_a_file_is_added() {
     write(dir.path(), "src/new_module.rs", b"pub fn n() {}\n");
     let after = units_of(dir.path());
     assert!(!before.equivalent_to(&after));
-    assert_eq!(
-        before.changed_dirs(&after),
-        vec![".".to_string(), "src/".to_string()],
-    );
+    assert_eq!(before.changed_dirs(&after), vec!["src/".to_string()]);
 }
 
 #[test]
@@ -232,11 +226,9 @@ fn a_removed_directory_is_reported_as_changed() {
     let before = DirState::from_units(&units_of(dir.path()));
     fs::remove_dir_all(dir.path().join("src")).unwrap();
     let after = units_of(dir.path());
-    // `src/` is gone entirely; the root's listing lost those files.
-    assert_eq!(
-        before.changed_dirs(&after),
-        vec![".".to_string(), "src/".to_string()],
-    );
+    // `src/`'s unit vanishes entirely; the root's own hash is untouched since
+    // it never listed `src/`'s files in the first place.
+    assert_eq!(before.changed_dirs(&after), vec!["src/".to_string()]);
 }
 
 #[test]

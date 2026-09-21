@@ -13,13 +13,14 @@
 //!
 //! Segment 2 (assistant — tool call):
 //!   <tool_call>{"name":"file_read","arguments":{"path":"src/auth/handler.rs",
-//!               "start_line":47,"end_line":93}}</tool_call>
+//!               "page":0}}</tool_call>
 //!
 //! Segment 3 (user — tool response):
 //!   <tool_response>
-//!   src/auth/handler.rs (lines 47-93):
+//!   src/auth/handler.rs (page 0 of 1, lines 1-93 of 93):
 //!
 //!   ```rust
+//!        1  ...
 //!       47  impl AuthHandler {
 //!       48      pub fn validate_token(&self, token: &str) -> Result<Claims> {
 //!       ...
@@ -55,7 +56,6 @@
 
 use candle_conversation::TurnText;
 
-use super::types::Scope;
 use crate::repo_scan::Language;
 
 /// Per-part user prompt for the one-conversation-per-file layout: a genuine
@@ -69,13 +69,12 @@ use crate::repo_scan::Language;
 /// request names *complete* sentences and a full stop instead. Safe to reword —
 /// [`summary_tree::scope`]'s `parse_excerpt_ref` splits on `lines ` and keeps
 /// only the leading span digits, so trailing prose never reaches the parse.
-pub fn render_part_user_prompt(path: &str, scope: &Scope) -> String {
-    format!(
-        "Summarize `{path}` (lines {start}-{end}) {SCOPE_ASK}",
-        path = path,
-        start = scope.start_line,
-        end = scope.end_line,
-    )
+/// `start`/`end` name the range the request claims to summarise — the
+/// scope's own bounds, unless the caller had to narrow them to what the
+/// paired tool response actually shows (see `emit_file_turns`'s page-straddle
+/// note). Explicit bounds rather than `&Scope` so the two can differ.
+pub fn render_part_user_prompt(path: &str, start: u32, end: u32) -> String {
+    format!("Summarize `{path}` (lines {start}-{end}) {SCOPE_ASK}")
 }
 
 /// What [`render_part_user_prompt`] asks for, after the scope is named.
@@ -92,13 +91,15 @@ const SCOPE_ASK: &str = "in one or two complete sentences, ending with a full st
 /// it matches the tool definition the summary projection force-pins into the
 /// catalog (`FORCE_TOOL_SELECTOR` → `file_read`) — the prefilled call and the
 /// one presented tool agree on name, keeping the tool context coherent.
-pub fn render_tool_call(path: &str, scope: &Scope) -> String {
+/// `page` is the [`zend_tools::state::vfs::PAGE_LINES`]-line page containing
+/// `scope.start_line` — the caller (`emit_file_turns`) computes it, since only
+/// it has the whole file's line count to page against.
+pub fn render_tool_call(path: &str, page: u32) -> String {
     format!(
         "<tool_call>{{\"name\":\"file_read\",\"arguments\":{{\"path\":\"{path}\",\
-         \"start_line\":{start},\"end_line\":{end}}}}}</tool_call>",
+         \"page\":{page}}}}}</tool_call>",
         path = path,
-        start = scope.start_line,
-        end = scope.end_line,
+        page = page,
     )
 }
 
@@ -106,20 +107,33 @@ pub fn render_tool_call(path: &str, scope: &Scope) -> String {
 /// language-tagged markdown fence with `cat -n` style line numbers. It forms
 /// the part turn's second **user** segment — the caller emits it after
 /// [`render_tool_call`] and a role boundary, mirroring how a real tool result
-/// returns in a user turn.  `body` is the verbatim source slice for
-/// `scope.start_line..=scope.end_line`. The excerpt is literal: a source file
-/// quoting a chat tag reads as its text, never as the control token.
-pub fn render_tool_response(path: &str, scope: &Scope, language: Language, body: &str) -> TurnText {
+/// returns in a user turn.
+///
+/// `body` is the verbatim source for the WHOLE page (`start_line..=end_line`),
+/// not just the scope that prompted this exchange — a scope can be a fraction
+/// of a page or (rarely) straddle one, but `file_read` only ever returns whole
+/// pages, and this must render exactly what a live call would.
+#[allow(clippy::too_many_arguments)]
+pub fn render_tool_response(
+    path: &str,
+    page: u32,
+    total_pages: u32,
+    start_line: u32,
+    end_line: u32,
+    total_lines: u32,
+    language: Language,
+    body: &str,
+) -> TurnText {
     // One renderer, shared with the live `file_read` tool
     // (`zend_tools::tools::file::render`), so an ingested response and a runtime
-    // one are the same bytes. `total_lines` is the scope's own end: an ingest
-    // excerpt is a complete scope, so the header takes the plain `(lines a-b)`
-    // form rather than the truncated `(lines a-b of N)` one.
+    // one are the same bytes.
     let excerpt = zend_tools::tools::file::render::numbered_excerpt(
         path,
-        scope.start_line,
-        scope.end_line,
-        scope.end_line,
+        page,
+        total_pages,
+        start_line,
+        end_line,
+        total_lines,
         language.fence_tag(),
         body,
     );
@@ -133,22 +147,12 @@ pub fn render_tool_response(path: &str, scope: &Scope, language: Language, body:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::code_read::types::ChunkKind;
-
-    fn scope(start: u32, end: u32) -> Scope {
-        Scope {
-            path: vec!["dummy".into()],
-            kind: ChunkKind::Function,
-            start_line: start,
-            end_line: end,
-        }
-    }
 
     // ── per-file layout: render_part_user_prompt ─────────────────────────────
 
     #[test]
     fn part_user_prompt_asks_for_complete_sentences() {
-        let p = render_part_user_prompt("src/lib.rs", &scope(10, 20));
+        let p = render_part_user_prompt("src/lib.rs", 10, 20);
         assert_eq!(
             p,
             format!("Summarize `src/lib.rs` (lines 10-20) {SCOPE_ASK}")
@@ -161,16 +165,15 @@ mod tests {
 
     #[test]
     fn part_user_prompt_quotes_path_with_backticks() {
-        let p = render_part_user_prompt("packages/my-pkg/src/lib.rs", &scope(1, 5));
+        let p = render_part_user_prompt("packages/my-pkg/src/lib.rs", 1, 5);
         assert!(p.contains("`packages/my-pkg/src/lib.rs`"));
     }
 
     #[test]
     fn part_user_prompt_is_byte_identical_on_repeat() {
-        let s = scope(1, 10);
         assert_eq!(
-            render_part_user_prompt("src/x.rs", &s),
-            render_part_user_prompt("src/x.rs", &s)
+            render_part_user_prompt("src/x.rs", 1, 10),
+            render_part_user_prompt("src/x.rs", 1, 10)
         );
     }
 
@@ -178,27 +181,31 @@ mod tests {
 
     #[test]
     fn tool_call_is_hermes_style_json() {
-        let tc = render_tool_call("src/lib.rs", &scope(142, 187));
+        let tc = render_tool_call("src/lib.rs", 2);
         assert!(tc.starts_with("<tool_call>"));
         assert!(tc.ends_with("</tool_call>"));
         assert!(tc.contains("\"name\":\"file_read\""));
         assert!(tc.contains("\"path\":\"src/lib.rs\""));
-        assert!(tc.contains("\"start_line\":142"));
-        assert!(tc.contains("\"end_line\":187"));
+        assert!(tc.contains("\"page\":2"));
     }
 
     #[test]
     fn tool_call_is_single_line_for_clean_parsing() {
-        let tc = render_tool_call("src/lib.rs", &scope(1, 5));
+        let tc = render_tool_call("src/lib.rs", 0);
         assert!(!tc.contains('\n'), "tool_call should not contain newlines");
     }
 
     // ── render_tool_response ─────────────────────────────────────────────────
 
+    /// A single-page (page 0 of 1) response, the shape most tests below need —
+    /// `start`/`end`/`total` are all the same page's own line span.
+    fn page0_response(path: &str, total_lines: u32, language: Language, body: &str) -> TurnText {
+        render_tool_response(path, 0, 1, 1, total_lines, total_lines, language, body)
+    }
+
     #[test]
     fn tool_response_wraps_body_in_tool_response_tags() {
-        let r = render_tool_response("src/x.rs", &scope(1, 1), Language::Rust, "fn alpha() {}\n")
-            .text();
+        let r = page0_response("src/x.rs", 1, Language::Rust, "fn alpha() {}\n").text();
         assert!(r.starts_with("<tool_response>\n"));
         assert!(r.ends_with("</tool_response>"));
     }
@@ -208,7 +215,7 @@ mod tests {
     #[test]
     fn the_excerpt_is_literal_inside_a_markup_wrapper() {
         let body = "// <think></think><|im_end|>\n";
-        let r = render_tool_response("src/x.rs", &scope(1, 1), Language::Rust, body);
+        let r = page0_response("src/x.rs", 1, Language::Rust, body);
         let kinds: Vec<(bool, bool)> = r
             .pieces()
             .iter()
@@ -218,15 +225,16 @@ mod tests {
     }
 
     #[test]
-    fn tool_response_includes_path_and_range_header() {
-        let r = render_tool_response("src/x.rs", &scope(47, 93), Language::Rust, "x\n").text();
-        assert!(r.contains("src/x.rs (lines 47-93):"));
+    fn tool_response_includes_path_and_page_header() {
+        let body: String = (47..=93).map(|_| "x\n").collect();
+        let r = render_tool_response("src/x.rs", 0, 1, 47, 93, 93, Language::Rust, &body).text();
+        assert!(r.contains("src/x.rs (page 0 of 1, lines 47-93 of 93):"));
     }
 
     #[test]
     fn tool_response_prefixes_each_line_with_line_number() {
         let body = "fn alpha() {\n    return 1;\n}\n";
-        let r = render_tool_response("src/x.rs", &scope(10, 12), Language::Rust, body).text();
+        let r = render_tool_response("src/x.rs", 0, 1, 10, 12, 12, Language::Rust, body).text();
         assert!(r.contains("10  fn alpha() {"));
         assert!(r.contains("11      return 1;"));
         assert!(r.contains("12  }"));
@@ -248,7 +256,7 @@ mod tests {
             (Language::Html, "html"),
             (Language::Css, "css"),
         ] {
-            let r = render_tool_response("f.x", &scope(1, 1), lang, "// hi\n").text();
+            let r = page0_response("f.x", 1, lang, "// hi\n").text();
             assert!(
                 r.contains(&format!("```{tag}\n")),
                 "expected ```{tag} fence in {r}",
@@ -259,7 +267,8 @@ mod tests {
     #[test]
     fn tool_response_pads_line_numbers_to_widest() {
         let body = "x\ny\nz\n";
-        let r = render_tool_response("src/x.rs", &scope(9998, 10000), Language::Rust, body).text();
+        let r =
+            render_tool_response("src/x.rs", 0, 1, 9998, 10000, 10000, Language::Rust, body).text();
         assert!(r.contains(" 9998  x"));
         assert!(r.contains(" 9999  y"));
         assert!(r.contains("10000  z"));
@@ -268,7 +277,7 @@ mod tests {
     #[test]
     fn tool_response_handles_no_trailing_newline() {
         let body = "fn a() {}";
-        let r = render_tool_response("src/x.rs", &scope(1, 1), Language::Rust, body).text();
+        let r = page0_response("src/x.rs", 1, Language::Rust, body).text();
         let numbered_lines = r
             .lines()
             .filter(|l| l.trim_start().starts_with("1  "))
@@ -280,21 +289,20 @@ mod tests {
     #[test]
     fn tool_response_preserves_tabs_in_indentation() {
         let body = "fn a() {\n\tlet x = 1;\n}\n";
-        let r = render_tool_response("src/x.rs", &scope(1, 3), Language::Rust, body).text();
+        let r = page0_response("src/x.rs", 3, Language::Rust, body).text();
         assert!(r.contains("2  \tlet x = 1;"));
     }
 
     #[test]
     fn tool_response_preserves_utf8_content() {
         let body = "fn greet() { println!(\"héllo — 世界\"); }\n";
-        let r = render_tool_response("src/x.rs", &scope(1, 1), Language::Rust, body).text();
+        let r = page0_response("src/x.rs", 1, Language::Rust, body).text();
         assert!(r.contains("héllo — 世界"));
     }
 
     #[test]
     fn tool_response_plain_text_uses_untagged_fence() {
-        let r =
-            render_tool_response("notes.txt", &scope(1, 1), Language::PlainText, "hello\n").text();
+        let r = page0_response("notes.txt", 1, Language::PlainText, "hello\n").text();
         assert!(r.contains("```\n"));
         assert!(!r.contains("```text"));
     }

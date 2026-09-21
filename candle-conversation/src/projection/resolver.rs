@@ -20,6 +20,7 @@ use super::schema::{
 use crate::cancel::ingest_cancelled;
 use crate::error::ConversationError;
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
+use crate::persistence::chunk_window_integrity::{first_divergent_chunk, WindowDivergence};
 use crate::persistence::content_hash::{
     branch_checkpoint_stream_id, snapshot_stream_id, turn_stream_id, ContentHash,
 };
@@ -29,7 +30,7 @@ use crate::persistence::record::{
     BranchCheckpointPayload, DistillMode, DistillPayload, RecordType, SnapshotPayload,
     TreeMetadataPayload,
 };
-use crate::persistence::resume::TurnChunkGrid;
+use crate::persistence::resume::{read_persisted_section_windows, TurnChunkGrid};
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::writer::{SubstrateWriter, WriteJob};
 use crate::persistence::{SharedSubstrate, SubstratePersistence};
@@ -3173,6 +3174,56 @@ impl Conversation {
         Ok(())
     }
 
+    /// Tombstone a section stream — the section counterpart of
+    /// [`Self::tombstone_timeline`]. Marks it logically deleted both in-RAM
+    /// (so the ingest triage's `section_exists` / `section_stream_is_persisted`
+    /// checks stop treating it as present or restorable on the very next
+    /// request, in this same process) and on disk (via a
+    /// [`crate::persistence::record::RecordType::SectionTombstone`] record,
+    /// so a restarted daemon doesn't reload the same corruption). The
+    /// compactor drops the underlying `Chunk`/`Tokens`/`StreamDecl` records
+    /// on the next compaction pass; ordinary reads never see them once this
+    /// lands.
+    pub fn tombstone_section(
+        &self,
+        stream_id: StreamId,
+        reason: Option<&str>,
+    ) -> candle::Result<()> {
+        self.write().tombstone_section(stream_id);
+        if self.read_only {
+            return Ok(());
+        }
+        let mut p = self.persistence.lock().unwrap();
+        p.write_section_tombstone(stream_id.0, reason)
+            .map_err(|e| candle::Error::Msg(format!("write_section_tombstone: {e}")))?;
+        Ok(())
+    }
+
+    /// Re-read a persisted section's per-layer chunk windows off disk and
+    /// run the generic [`first_divergent_chunk`] check against them —
+    /// confirmation from what is actually persisted, not a trust of a live
+    /// seal failure alone. Returns the first divergence found, or `None`
+    /// when the stream holds no durable chunks (nothing to confirm) or its
+    /// persisted layers agree (the seal failure that prompted the caller to
+    /// ask must have another cause — see the reactive hook at
+    /// `scheduler::Scheduler::perform_seal_and_write`).
+    ///
+    /// Read-only by design: this only answers the question. A caller that
+    /// wants to act on a confirmed divergence calls [`Self::tombstone_section`]
+    /// itself, so a caller that only wants the answer (a future boot-time
+    /// pass, a diagnostic) never also accepts the side effect.
+    pub fn check_section_window_integrity(
+        &self,
+        stream_id: StreamId,
+        n_layers: usize,
+    ) -> candle::Result<Option<WindowDivergence>> {
+        let mut p = self.persistence.lock().unwrap();
+        let substrate = self.read();
+        let windows = read_persisted_section_windows(&mut p, &substrate, stream_id, n_layers)
+            .map_err(|e| candle::Error::Msg(format!("check_section_window_integrity: {e}")))?;
+        Ok(windows.and_then(|w| first_divergent_chunk(&w)))
+    }
+
     /// Tombstone **one turn** of a live timeline — in-RAM and on disk — leaving
     /// the rest of the conversation untouched.
     ///
@@ -3791,10 +3842,20 @@ impl Conversation {
     /// address has been persisted and can be cold-loaded back into
     /// hot without re-prefilling.  The check matches the ingest
     /// loop's skip-if-present gate.
+    ///
+    /// A tombstoned stream (see [`Substrate::tombstone_section`]) always
+    /// reads `false` here, even though its `Chunk` records are still on
+    /// disk until the next compaction pass physically drops them — the
+    /// whole point of the tombstone is that those chunks must never be
+    /// restored again, so the triage that reads this must see "not
+    /// persisted" and fall through to a fresh prefill instead.
     pub fn section_stream_is_persisted(&self, stream_id: StreamId) -> bool {
         drop(self.persistence.lock().unwrap());
-        self.read()
-            .stream_of(stream_id)
+        let view = self.read();
+        if view.is_section_tombstoned(stream_id) {
+            return false;
+        }
+        view.stream_of(stream_id)
             .map(|s| s.committed_through.is_some() && !s.chunks.is_empty())
             .unwrap_or(false)
     }

@@ -83,7 +83,7 @@ use candle::{Device, Tensor};
 use candle_nn::kv_cache::{quantize_sealed_in_place, QuantFormat, SealedSequence};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{
-    BatchedInferenceSession, ManagedBatchedModel, ProvSignPacked,
+    BatchedInferenceSession, ManagedBatchedModel, ProvSignPacked, WINDOW_DIVERGENCE_MARKER,
 };
 use candle_transformers::models::delta_net::ExportedLayerState;
 
@@ -7981,6 +7981,111 @@ impl Scheduler {
         last
     }
 
+    /// React to a `snapshot_sequence_per_layer` seal failure that names a
+    /// per-layer token-window divergence — `assert_sealed_layers_aligned`'s
+    /// "refusing to seal … different token windows" family
+    /// (`candle-transformers/src/models/batched_inference.rs`). This is the
+    /// production symptom of a shared base-conversation section whose
+    /// persisted chunks disagree across layers at the same chunk index: the
+    /// forward fails, the sequence is dropped, and every conversation
+    /// forking that section hits the same wall on every attempt until
+    /// something removes the bad data.
+    ///
+    /// **Narrow by design**, per the standing decision to fix the error
+    /// handling rather than build a scanner: this fires on exactly this
+    /// error family, and only when the failed seal was for a section
+    /// (`SealAction::Section`) — a dialogue-turn seal failure is the
+    /// existing `CorruptTurnPolicy` / `reconstruct_from_log` machinery's
+    /// job and is untouched here.
+    ///
+    /// A live failure here is not by itself proof that the SEALING
+    /// section's own persisted data is bad — the same divergence can
+    /// originate in an already-resident PREFIX section this ingest
+    /// borrowed as context, in which case the section actually being
+    /// sealed has no persisted stream yet to be wrong. So rather than trust
+    /// the live failure, this re-reads the sealing section's own persisted
+    /// chunks off disk (`Conversation::check_section_window_integrity`,
+    /// built on the generic, reusable
+    /// `persistence::chunk_window_integrity::first_divergent_chunk`) and
+    /// only tombstones on a CONFIRMED divergence in that data. An
+    /// unconfirmed case (this section's own persisted data is clean, or it
+    /// has none yet) is logged and left alone — the check this calls is
+    /// generic precisely so a later, broader pass can reuse it against the
+    /// prefix chain without this narrow hook growing into one.
+    fn repair_section_if_window_divergence_confirmed(
+        &self,
+        seal_slot: SequenceId,
+        seal_action: &SealAction,
+        seal_error: &candle::Error,
+    ) {
+        let SealAction::Section {
+            section_id,
+            address,
+            ..
+        } = seal_action
+        else {
+            return;
+        };
+        // Matched on `assert_sealed_layers_aligned`'s own shared marker
+        // constant (not a duplicated literal) so an unrelated
+        // `snapshot_sequence_per_layer` failure (e.g. a slot that was never
+        // allocated) is left alone instead of treated as corruption — the
+        // trigger stays exactly this one error class, and the two sides
+        // can't silently drift apart if the message is ever reworded.
+        if !seal_error.to_string().contains(WINDOW_DIVERGENCE_MARKER) {
+            return;
+        }
+        let Some(conversation) = self.slot_conversations.get(&seal_slot).cloned() else {
+            tracing::warn!(
+                section_id = ?section_id,
+                seal_slot = seal_slot.0,
+                "section window-divergence repair: no conversation registered for the failed slot",
+            );
+            return;
+        };
+        let stream_id = section_stream_id(*address);
+        let n_layers = self.session.num_layers();
+        match conversation.check_section_window_integrity(stream_id, n_layers) {
+            Ok(Some(divergence)) => {
+                let reason = divergence.describe();
+                tracing::error!(
+                    section_id = ?section_id,
+                    stream_id = stream_id.0,
+                    seal_slot = seal_slot.0,
+                    divergence = %reason,
+                    "section window-divergence CONFIRMED on persisted data — tombstoning so \
+                     the next request re-prefills fresh instead of restoring the corrupted \
+                     chunks",
+                );
+                if let Err(e) = conversation.tombstone_section(stream_id, Some(&reason)) {
+                    tracing::error!(
+                        section_id = ?section_id,
+                        stream_id = stream_id.0,
+                        "section window-divergence repair: tombstone write failed: {e}",
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    section_id = ?section_id,
+                    stream_id = stream_id.0,
+                    seal_slot = seal_slot.0,
+                    "seal failed on a per-layer window divergence, but this section's own \
+                     persisted chunks read back clean (or it has none yet) — the divergence's \
+                     root chunk is most likely in an already-resident prefix section this \
+                     ingest borrowed, which this narrow hook does not trace; left unrepaired",
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    section_id = ?section_id,
+                    stream_id = stream_id.0,
+                    "section window-divergence repair: integrity re-read failed: {e}",
+                );
+            }
+        }
+    }
+
     /// `turn_content`, when `seal_action == SealAction::Turn`, carries
     /// the role / text / token IDs the substrate pins on the new turn
     /// entry so the on-disk record can be reconstructed later without
@@ -8057,6 +8162,7 @@ impl Scheduler {
                     seal_slot.0,
                     e,
                 );
+                self.repair_section_if_window_divergence_confirmed(seal_slot, seal_action, &e);
                 return Ok(None);
             }
         };

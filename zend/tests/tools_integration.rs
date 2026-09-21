@@ -302,13 +302,27 @@ mod tool_scenarios {
     // is sealed again, and its records supersede the last boot's — dead records
     // only compaction reclaims, which is how the suite's workspace once grew
     // ~140 MB a boot.
+    //
+    // The calibration collection (one section per tool, under
+    // `CALIB_SECTION_BASE`) is walked only when a calibration case's marker
+    // doesn't match an already-archived conversation (`session.rs`'s
+    // `to_run` filter) — a boot with nothing pending never submits it to
+    // `insert_section_collection_with_progress` at all, so it contributes
+    // zero to that boot's `SectionLoads` even though it is fully durable.
+    // An unmeasured warm-up boot settles calibration first, so both measured
+    // boots see an empty `to_run` and skip the collection identically —
+    // otherwise this test's pass/fail depended on whatever calibration
+    // staleness happened to be sitting in the shared workspace (e.g. right
+    // after an unrelated tool-definition wording edit, which changes a
+    // case's marker without changing the section content it walks).
 
     #[test]
     fn a_second_boot_restores_every_prompt_section() {
         init_tracing();
-        // Both boots under one scenario lock, so no other scenario runs on the
-        // shared workspace between them.
+        // All three boots under one scenario lock, so no other scenario runs
+        // on the shared workspace between them.
         let (first, second) = run_with_timeout(async {
+            boot_and_count_sections().await; // warm-up: settle calibration
             let first = boot_and_count_sections().await;
             (first, boot_and_count_sections().await)
         });

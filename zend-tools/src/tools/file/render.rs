@@ -10,32 +10,36 @@
 //!   conditioned on.
 //!
 //! ````text
-//! src/auth/handler.rs (lines 47-93):
+//! src/auth/handler.rs (page 0 of 3, lines 1-300 of 620):
 //!
 //! ```rust
-//!     47  impl AuthHandler {
-//!     48      pub fn validate_token(&self, token: &str) -> Result<Claims> {
-//!     93  }
+//!      1  impl AuthHandler {
+//!      2      pub fn validate_token(&self, token: &str) -> Result<Claims> {
+//!    300      // ...
 //! ```
 //! ````
 //!
 //! `cat -n` numbering, right-aligned to the widest line number, two spaces, then
-//! the source verbatim. The header names the file and the absolute line range —
-//! absolute so a follow-up read can ask for the next range directly.
+//! the source verbatim. The header names the file, which page this is (0-based,
+//! matching `file_read`'s own request parameter and `file_list`'s paging), and
+//! the absolute line range the page covers — absolute so a follow-up read
+//! lands on a page boundary without the model having to track one itself.
 
 /// Header + language-tagged fence + `cat -n` numbered body, as one string. The
 /// caller frames it in `<tool_response>` tags.
 ///
-/// `total_lines` lets the header say `(lines 1-200 of 1135)` when the excerpt is
-/// a slice of something longer — the continuation signal, carried in the text
-/// the model already reads rather than in a side-channel field it has to
-/// correlate. When the excerpt ends at the last line the header is the plain
-/// `(lines a-b)` form, matching the ingest corpus exactly.
+/// `total_pages` and `total_lines` are always known by the time this is
+/// called — [`super::super::state::vfs::VfsStore::read_page`] streams the
+/// whole file to compute them — so the header always states them, rather than
+/// only when the excerpt stops short of the end.
 ///
 /// `fence_tag` is the markdown language tag (`rust`, `python`, …); empty renders
 /// a bare fence.
+#[allow(clippy::too_many_arguments)]
 pub fn numbered_excerpt(
     path: &str,
+    page: u32,
+    total_pages: u32,
     start_line: u32,
     end_line: u32,
     total_lines: u32,
@@ -59,12 +63,11 @@ pub fn numbered_excerpt(
     }
 
     let range = if total_lines == 0 {
-        // An empty file has no range to state; "lines 1-0" reads as a bug.
+        // An empty file has no range or page to state; "page 0 of 0" reads as
+        // a bug the same way "lines 1-0" used to.
         "empty".to_string()
-    } else if end_line >= total_lines {
-        format!("lines {start_line}-{end_line}")
     } else {
-        format!("lines {start_line}-{end_line} of {total_lines}")
+        format!("page {page} of {total_pages}, lines {start_line}-{end_line} of {total_lines}")
     };
     let fence_open = if fence_tag.is_empty() {
         String::from("```\n")
@@ -123,30 +126,36 @@ mod tests {
 
     #[test]
     fn numbers_right_aligned_and_fenced() {
-        let out = numbered_excerpt("a.rs", 8, 10, 10, "rust", "one\ntwo\nthree\n");
+        let out = numbered_excerpt("a.rs", 0, 1, 8, 10, 10, "rust", "one\ntwo\nthree\n");
         assert_eq!(
             out,
-            "\na.rs (lines 8-10):\n\n```rust\n 8  one\n 9  two\n10  three\n```\n",
+            "\na.rs (page 0 of 1, lines 8-10 of 10):\n\n```rust\n 8  one\n 9  two\n10  three\n```\n",
         );
     }
 
-    /// A truncated excerpt says so in the header, so the model can ask for the
-    /// next range without being told the page size.
+    /// A page short of the last one says so in the header, so the model knows
+    /// to ask for `page + 1` without being told the stride.
     #[test]
-    fn a_partial_excerpt_reports_the_total() {
-        let out = numbered_excerpt("a.rs", 1, 2, 900, "rust", "one\ntwo\n");
-        assert!(out.starts_with("\na.rs (lines 1-2 of 900):\n"), "{out}");
+    fn a_partial_page_reports_the_total() {
+        let out = numbered_excerpt("a.rs", 0, 3, 1, 2, 900, "rust", "one\ntwo\n");
+        assert!(
+            out.starts_with("\na.rs (page 0 of 3, lines 1-2 of 900):\n"),
+            "{out}"
+        );
     }
 
     #[test]
     fn a_trailing_newline_does_not_invent_a_line() {
-        let out = numbered_excerpt("a.txt", 1, 1, 1, "", "only\n");
-        assert_eq!(out, "\na.txt (lines 1-1):\n\n```\n1  only\n```\n");
+        let out = numbered_excerpt("a.txt", 0, 1, 1, 1, 1, "", "only\n");
+        assert_eq!(
+            out,
+            "\na.txt (page 0 of 1, lines 1-1 of 1):\n\n```\n1  only\n```\n"
+        );
     }
 
     #[test]
     fn an_empty_file_says_so_instead_of_an_impossible_range() {
-        let out = numbered_excerpt("a.rs", 1, 0, 0, "rust", "");
+        let out = numbered_excerpt("a.rs", 0, 0, 1, 0, 0, "rust", "");
         assert_eq!(out, "\na.rs (empty):\n\n```rust\n```\n");
     }
 
@@ -154,15 +163,21 @@ mod tests {
     /// trailing-newline heuristic, decides how many lines an excerpt has.
     #[test]
     fn a_blank_last_line_inside_the_range_is_kept() {
-        let out = numbered_excerpt("a.rs", 1, 2, 2, "rust", "a\n");
-        assert_eq!(out, "\na.rs (lines 1-2):\n\n```rust\n1  a\n2  \n```\n");
+        let out = numbered_excerpt("a.rs", 0, 1, 1, 2, 2, "rust", "a\n");
+        assert_eq!(
+            out,
+            "\na.rs (page 0 of 1, lines 1-2 of 2):\n\n```rust\n1  a\n2  \n```\n"
+        );
     }
 
     /// A body whose last line has no trailing newline keeps that line.
     #[test]
     fn a_body_without_a_trailing_newline_keeps_its_last_line() {
-        let out = numbered_excerpt("a.rs", 1, 2, 2, "rust", "one\ntwo");
-        assert_eq!(out, "\na.rs (lines 1-2):\n\n```rust\n1  one\n2  two\n```\n");
+        let out = numbered_excerpt("a.rs", 0, 1, 1, 2, 2, "rust", "one\ntwo");
+        assert_eq!(
+            out,
+            "\na.rs (page 0 of 1, lines 1-2 of 2):\n\n```rust\n1  one\n2  two\n```\n"
+        );
     }
 
     #[test]

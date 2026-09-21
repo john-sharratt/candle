@@ -66,7 +66,11 @@ impl RecordAccounting {
             | RecordType::Snapshot
             // A branch checkpoint supersedes by the same rule: one live record
             // per branch, keyed by the branch's content prefix in the header.
-            | RecordType::BranchCheckpoint => (header.record_type, header.stream_id, 0),
+            | RecordType::BranchCheckpoint
+            // A section tombstone is keyed by the section's `StreamId` in the
+            // header too — one live marker per section, same mechanical
+            // supersession as `Npc` and the branch checkpoint.
+            | RecordType::SectionTombstone => (header.record_type, header.stream_id, 0),
             RecordType::ModelSpec | RecordType::Template | RecordType::Tokenizer => {
                 (header.record_type, 0, 0)
             }

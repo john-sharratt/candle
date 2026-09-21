@@ -6,21 +6,21 @@
 //! ````text
 //! Round-trip 1 — what is in here?
 //!   user       List the files in the `zend/src/code_read/` folder.
-//!   assistant  <tool_call>{"name":"file_list","arguments":{"prefix":"zend/src/code_read/"}}</tool_call>
-//!   user       <tool_response>{"files":[…],"paging":{…},"total_bytes":0}</tool_response>
+//!   assistant  <tool_call>{"name":"file_list","arguments":{"path":"zend/src/code_read/"}}</tool_call>
+//!   user       <tool_response>{"entries":[…],"paging":{…},"total_bytes":0}</tool_response>
 //!   assistant  ← DECODED: what the folder contains
 //!
 //! Round-trip 2 — what is it for?
 //!   user       Summarize the `zend/src/code_read/` folder in one or two complete
 //!              sentences, ending with a full stop. …
 //!   assistant  <tool_call>{"name":"file_read","arguments":{"path":"zend/src/code_read/mod.rs",
-//!                          "start_line":1,"end_line":24}}</tool_call>
+//!                          "page":0}}</tool_call>
 //!   user       <tool_response>
-//!              zend/src/code_read/mod.rs (lines 1-24 of 1135):
+//!              zend/src/code_read/mod.rs (page 0 of 4, lines 1-300 of 1135):
 //!
 //!              ```rust
 //!               1  //! `code_reading` layer ingestion.
-//!              24  //! …
+//!              …  //! …
 //!              ```
 //!              </tool_response>
 //!   assistant  ← DECODED: the two-sentence folder summary this layer retrieves
@@ -98,7 +98,7 @@ const SUMMARY_ASK: &str = "in one or two complete sentences, ending with a full 
 /// not something to show a reader — asked to summarize "the `.` folder" the model
 /// writes about "the `.()` directory".
 fn folder_phrase(unit: &DirUnit) -> String {
-    if unit.list_prefix().is_empty() {
+    if unit.list_path().is_empty() {
         "the root folder of this project".to_string()
     } else {
         format!("the `{}` folder", unit.label())
@@ -118,7 +118,7 @@ fn folder_phrase(unit: &DirUnit) -> String {
 /// answer to that question; see its note on a literal being "a second opinion
 /// about the checkpoint actually loaded".
 pub fn render_list_call(env: &ToolCallEnvelope, unit: &DirUnit) -> String {
-    env.render("file_list", &[("prefix", unit.list_prefix())])
+    env.render("file_list", &[("path", unit.list_path())])
 }
 
 /// Assistant-side `<tool_call>` reading the anchor excerpt, in the checkpoint's
@@ -128,17 +128,23 @@ pub fn render_read_call(env: &ToolCallEnvelope, anchor: &Anchor) -> String {
         "file_read",
         &[
             ("path", anchor.path.as_str()),
-            ("start_line", &anchor.start_line.to_string()),
-            ("end_line", &anchor.end_line.to_string()),
+            ("page", &anchor_page(anchor).to_string()),
         ],
     )
+}
+
+/// The page [`Anchor::start_line`] falls on — `Anchor` stores the containing
+/// page's own bounds (see its doc), so this is just the same page arithmetic
+/// `file_read`/`anchor::pick` use, inverted from the line back to the index.
+fn anchor_page(anchor: &Anchor) -> u32 {
+    anchor.start_line.saturating_sub(1) / zend_tools::state::vfs::PAGE_LINES
 }
 
 /// User-side `<tool_response>` for the listing — produced by running the real
 /// `file_list` against `ctx`, so the bytes are the tool's own. The listing is
 /// literal: a file name is the workspace's text, not markup.
 pub fn render_list_response(ctx: &ToolContext, unit: &DirUnit) -> TurnText {
-    let args = json!({ "prefix": unit.list_prefix() });
+    let args = json!({ "path": unit.list_path() });
     let value = zend_tools::run("file_list", "repo_map_prefill", &args, ctx);
     let body = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
     TurnText::markup("<tool_response>")
@@ -150,8 +156,17 @@ pub fn render_list_response(ctx: &ToolContext, unit: &DirUnit) -> TurnText {
 /// shape the live `file_read` returns and the `code_reading` ingest prefills.
 /// The excerpt is literal, so a file quoting a chat tag reads as its text.
 pub fn render_read_response(anchor: &Anchor) -> TurnText {
+    let total_pages = if anchor.total_lines == 0 {
+        0
+    } else {
+        anchor
+            .total_lines
+            .div_ceil(zend_tools::state::vfs::PAGE_LINES)
+    };
     let excerpt = numbered_excerpt(
         &anchor.path,
+        anchor_page(anchor),
+        total_pages,
         anchor.start_line,
         anchor.end_line,
         anchor.total_lines,
@@ -362,18 +377,18 @@ mod tests {
         let call = render_list_call(&env, &units[0]);
         assert_eq!(
             call,
-            "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"prefix\": \"a/\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"path\": \"a/\"}}\n</tool_call>",
         );
 
         let read = render_read_call(&env, units[0].anchor.as_ref().unwrap());
         assert_eq!(
             read,
             "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"a/mod.rs\", \
-             \"start_line\": 1, \"end_line\": 2}}\n</tool_call>",
+             \"page\": 0}}\n</tool_call>",
         );
         assert!(
-            read.contains("\"start_line\": 1"),
-            "a line number is a JSON number, as the grammar emits it: {read}"
+            read.contains("\"page\": 0"),
+            "a page number is a JSON number, as the grammar emits it: {read}"
         );
     }
 
@@ -402,7 +417,7 @@ mod tests {
         let env = ToolCallEnvelope::for_dialect(&Dialect::qwen35());
         assert_eq!(
             render_list_call(&env, &units[0]),
-            env.render("file_list", &[("prefix", units[0].list_prefix())]),
+            env.render("file_list", &[("path", units[0].list_path())]),
             "the listing call must be the dialect envelope's own rendering",
         );
         assert_eq!(
@@ -411,8 +426,7 @@ mod tests {
                 "file_read",
                 &[
                     ("path", anchor.path.as_str()),
-                    ("start_line", &anchor.start_line.to_string()),
-                    ("end_line", &anchor.end_line.to_string()),
+                    ("page", &anchor_page(anchor).to_string()),
                 ],
             ),
             "the read call must be the dialect envelope's own rendering",
@@ -423,7 +437,7 @@ mod tests {
         let lines = ToolCallEnvelope::for_dialect(&Dialect::llama3());
         assert_eq!(
             render_list_call(&lines, &units[0]),
-            lines.render("file_list", &[("prefix", units[0].list_prefix())]),
+            lines.render("file_list", &[("path", units[0].list_path())]),
         );
     }
 
@@ -467,7 +481,8 @@ mod tests {
         let response = render_read_response(units[0].anchor.as_ref().unwrap());
         assert_eq!(
             response.text(),
-            "<tool_response>\na/mod.rs (lines 1-2 of 3):\n\n```rust\n1  //! One.\n2  //! Two.\n```\n</tool_response>",
+            "<tool_response>\na/mod.rs (page 0 of 1, lines 1-3 of 3):\n\n```rust\n1  //! One.\n2  //! Two.\n3  fn x() {}\n```\n</tool_response>",
+            "the anchor is the CONTAINING PAGE (all 3 lines), not just the module doc excerpt — file_read only returns whole pages",
         );
         let kinds: Vec<bool> = response.pieces().iter().map(|p| p.literal).collect();
         assert_eq!(kinds, [false, true, false], "the excerpt is literal");

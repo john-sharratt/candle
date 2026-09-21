@@ -26,7 +26,7 @@ questions:
 - read back the notes file from this session
 category: Files
 mandatory: true
-description: 'Read a file, or a range of its lines. Resolves against this session''s edits first, then falls through to the project''s working directory, so real project files can be read directly. Use for: reading a source file from the project, looking at what was previously written, inspecting a file the user uploaded into the chat, checking the current state of a draft after edits. Give only path to read the whole file; add start_line and/or end_line to read part of it — start_line alone reads to the end, end_line alone reads from the top, and a named range asks for exactly those lines. Returns the lines as numbered source in a fenced block, headed by the path and the line range it covers; a partial read''s header reads `(lines 47-93 of 900)`. For remote filesystems use remote_fs_session_get to download first, then file_read.'
+description: 'Read a file, one 300-line page at a time. Resolves against this session''s edits first, then falls through to the project''s working directory, so real project files can be read directly. Use for: reading a source file from the project, looking at what was previously written, inspecting a file the user uploaded into the chat, checking the current state of a draft after edits. Both path and page are required — pass page 0 to read the top of the file (and a short file''s whole content). Page is zero-based, so page 1 is lines 301-600, page 2 is 601-900, and so on. Returns the page as numbered source in a fenced block, headed by the path, the page and total page count, and the line range covered — `(page 1 of 5, lines 301-600 of 1420)`. Keep incrementing page until the header''s page number stops advancing. For remote filesystems use remote_fs_session_get to download first, then file_read.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
@@ -34,18 +34,14 @@ parameters:
       description: Path of the file to read — a project file from the working directory, or one this session created (e.g. `src/main.rs`, or `/workspace/src/main.rs`). Required.
       minLength: 1
       type: string
-    start_line:
-      description: First line to return, 1-based. Omit to read from the top of the file.
+    page:
+      description: Zero-based page of the file to return, 300 lines a page. Required — pass 0 to read the top of the file. A page past the end clamps to the last one — read page 0 first, its header names the total, then keep incrementing until a response's own page number stops advancing.
       format: uint32
-      minimum: 1.0
-      type: integer
-    end_line:
-      description: Last line to return, 1-based and inclusive. Omit to read to the end of the file.
-      format: uint32
-      minimum: 1.0
+      minimum: 0.0
       type: integer
   required:
   - path
+  - page
   title: ReadRequest
   type: object
 examples:
@@ -53,109 +49,119 @@ examples:
   show me the contents of /workspace/Cargo.toml<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user wants to see /workspace/Cargo.toml. No range was named, so file_read takes only the path and returns the whole file.<|projection|> The header states the lines it covers.
+  The user wants to see /workspace/Cargo.toml. No specific location was named, so I start at page 0 — the top of the file, and all of it if it's short.<|projection|> file_read requires both path and page, so I pass 0 explicitly. The header states the page and the lines it covers.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/Cargo.toml"}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/Cargo.toml", "page": 0}}
   </tool_call><|projection|>
 - |-
   read the file /workspace/src/main.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  A direct read of /workspace/src/main.rs. With no range given, file_read needs only the path and returns the whole file,<|projection|> numbered so I can point at specific lines.
+  A direct read of /workspace/src/main.rs. No location was named, so I start at page 0,<|projection|> numbered so I can point at specific lines. If the header says there's more than one page I'll ask for the next.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/src/main.rs"}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/src/main.rs", "page": 0}}
   </tool_call><|projection|>
 - |-
   what's in /workspace/.gitignore<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user asks what /workspace/.gitignore contains. That is a whole-file read, so file_read with only the path — a .gitignore<|projection|> is short, and all of it is the answer.
+  The user asks what /workspace/.gitignore contains. That's a page-0 read, so file_read with path and page 0 — a .gitignore<|projection|> is short, and it's all on the first page.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/.gitignore"}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/.gitignore", "page": 0}}
   </tool_call><|projection|>
 - |-
   cat /workspace/docs/architecture.md for me<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  "cat" means show the whole file, which is what file_read returns when it is given only a path, so the call names /workspace/docs/architecture.md<|projection|> and no range.
+  "cat" means show the file, which is what file_read returns a page of. The call names /workspace/docs/architecture.md<|projection|> and page 0, since no specific spot was named.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/docs/architecture.md"}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/docs/architecture.md", "page": 0}}
   </tool_call><|projection|>
 - |-
   read src/main.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user wants the contents of src/main.rs. file_read resolves a path against this session's edits first and then falls through to the project's working directory, so it will return the<|projection|> real file. No range was named, so the path alone, and the whole file comes back.
+  The user wants the contents of src/main.rs. file_read resolves a path against this session's edits first and then falls through to the project's working directory, so it will return the<|projection|> real file's page 0. No location was named, so path plus page 0, and the top of the file comes back.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/main.rs"}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/main.rs", "page": 0}}
   </tool_call><|projection|>
 - |-
   what does the README say<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user is asking about the README's contents. That means actually reading it rather than guessing, so file_read on README.md.<|projection|> No range: the whole README comes back.
+  The user is asking about the README's contents. That means actually reading it rather than guessing, so file_read on README.md.<|projection|> Page 0, since nothing narrower was named — that's the whole README unless the header says there's more.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "README.md"}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "README.md", "page": 0}}
   </tool_call><|projection|>
 - |-
   show me the first 30 lines of src/lib.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Only the top of src/lib.rs is wanted, up to line 30. end_line alone reads from the start of the file,<|projection|> so the call gives path and end_line 30.
+  Only the top of src/lib.rs is wanted. Lines 1-30 sit inside page 0, which covers lines 1-300,<|projection|> so the call names path and page 0, and I'll read the first 30 numbered lines out of what comes back.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/lib.rs", "end_line": 30}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/lib.rs", "page": 0}}
   </tool_call><|projection|>
 - |-
   read lines 47 to 93 of src/auth/handler.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user named an exact range, so the call asks for exactly those lines: path src/auth/handler.rs, start_line 47, end_line 93.<|projection|> The excerpt comes back as numbered source, so I can refer to specific line numbers when I answer.
+  The user named a range. Lines 47-93 both fall inside page 0 — the first 300 lines — so page 0 covers them; file_read pages, it doesn't take an arbitrary range.<|projection|> The numbered lines in the response let me point at exactly 47-93 when I answer.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/auth/handler.rs", "start_line": 47, "end_line": 93}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/auth/handler.rs", "page": 0}}
   </tool_call><|projection|>
 - |-
-  what do lines 598-630 of zend/src/prompts/projection.yaml do<|im_end|>
+  what does line 450 of zend/src/prompts/projection.yaml do<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The question is about a specific range, so I read exactly lines 598 to 630 of zend/src/prompts/projection.yaml.<|projection|> Reading the whole file would bury the section among hundreds of other lines.
+  Line 450 is past the first 300-line page. Page 0 is lines 1-300, page 1 is lines 301-600 — 450 falls in page 1,<|projection|> so I ask for that page directly rather than paging through page 0 first.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "zend/src/prompts/projection.yaml", "start_line": 598, "end_line": 630}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "zend/src/prompts/projection.yaml", "page": 1}}
   </tool_call><|projection|>
 - |-
   the error mentions line 240 of src/server.rs, let me see it<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The error points at line 240, so I read a window around it rather than the whole file: lines 220 to 260 of src/server.rs.<|projection|> That shows the failing line with enough context to see what feeds it.
+  The error points at line 240, which is inside page 0 (lines 1-300),<|projection|> so reading page 0 shows the failing line with plenty of context around it.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/server.rs", "start_line": 220, "end_line": 260}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/server.rs", "page": 0}}
+  </tool_call><|projection|>
+- |-
+  what's around line 850 in that file<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Line 850 is well past the first two pages: page 0 covers 1-300, page 1 covers 301-600, page 2 covers 601-900 — 850 is in page 2.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/server.rs", "page": 2}}
   </tool_call><|projection|>
 - |-
   show me the rest of that file<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The previous excerpt covered lines 47-93 and its header reported a larger total, so the rest starts at line 94. start_line alone reads from there to the end of the file.<|projection|> The header will show where it stops.
+  The previous read was page 0 of src/auth/handler.rs and its header reported more pages after it, so "the rest" means the next page.<|projection|> I increment page by one and keep doing that until a response's own page number stops advancing.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/auth/handler.rs", "start_line": 94}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/auth/handler.rs", "page": 1}}
   </tool_call><|projection|>

@@ -62,12 +62,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::SystemTime;
 
+use super::content_hash::section_stream_id;
 use super::manifest::{
     encode_conv_state_payload, encode_label_payload, ChunkLoc, ConvState, RecordLoc,
 };
 use super::record::{
-    DebugIdPayload, DistillMode, DistillPayload, RecordHeader, RecordType, TombstonePayload,
-    TurnCouplingPayload,
+    DebugIdPayload, DistillMode, DistillPayload, RecordHeader, RecordType, SectionTombstonePayload,
+    TombstonePayload, TurnCouplingPayload,
 };
 use super::segment::SegmentId;
 use super::streams::{StreamDecl, StreamId};
@@ -203,8 +204,15 @@ pub fn pick_maintenance_op(stats: &[SegmentStat], force: bool) -> Option<Mainten
 /// and stopped only when the disk did.
 #[derive(Clone, Copy)]
 struct Shed {
-    /// The whole timeline is gone — the stream goes wholesale, unless it is
-    /// also distilled (the provenance corpus).
+    /// The whole timeline (or, for a section stream, the section itself) is
+    /// gone — the stream goes wholesale, unless it is also distilled (the
+    /// provenance corpus; sections are never distilled, so for a section
+    /// this field alone decides). Doubles for both kinds rather than adding
+    /// a parallel `section_dead` field because the two are mutually
+    /// exclusive per stream (`classify` sets it from whichever `StreamDecl`
+    /// variant the stream actually declares) and `dropped_wholesale` already
+    /// reduces to exactly this field when `distill` is `None`, which it
+    /// always is for a section.
     timeline_dead: bool,
     /// This one turn was retired from a timeline that is still live.
     turn_dead: bool,
@@ -234,6 +242,7 @@ fn classify(
     tombstoned: &HashSet<u64>,
     distilled: &HashMap<u64, DistillMode>,
     dead_turns: &HashSet<(u64, u32)>,
+    tombstoned_sections: &HashSet<u64>,
 ) -> Shed {
     match entry_decl {
         Some(StreamDecl::Turn(t)) => Shed {
@@ -241,7 +250,16 @@ fn classify(
             turn_dead: dead_turns.contains(&(t.timeline_id, t.turn_index)),
             distill: distilled.get(&t.timeline_id).copied(),
         },
-        _ => Shed {
+        // A tombstoned section drops wholesale, the same as a tombstoned
+        // timeline — its `Chunk`/`Tokens`/`StreamDecl` are the corrupted
+        // bytes the tombstone exists to keep unread, and a section carries
+        // no turn-numbering that a placeholder would need to preserve.
+        Some(StreamDecl::PromptSection(s)) => Shed {
+            timeline_dead: tombstoned_sections.contains(&section_stream_id(s.address).0),
+            turn_dead: false,
+            distill: None,
+        },
+        None => Shed {
             timeline_dead: false,
             turn_dead: false,
             distill: None,
@@ -390,11 +408,22 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
         .iter()
         .map(|(t, m)| (t.raw(), *m))
         .collect();
+    let tombstoned_sections: HashSet<u64> = substrate
+        .tombstoned_sections()
+        .iter()
+        .map(|s| s.0)
+        .collect();
 
     let mut out: Vec<Resident> = Vec::new();
     let dead_turns = dead_turns_of(substrate);
     for (stream_id, entry) in substrate.all_streams() {
-        let shed = classify(&entry.decl, &tombstoned, &distilled, &dead_turns);
+        let shed = classify(
+            &entry.decl,
+            &tombstoned,
+            &distilled,
+            &dead_turns,
+            &tombstoned_sections,
+        );
         // Tombstoned AND undistilled goes; tombstoned-but-distilled is the
         // provenance corpus and is retained by its mode. See the same gate in
         // `compaction::collect_live_records`.
@@ -594,6 +623,23 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
                 reason: None,
             }
             .encode(),
+        });
+    }
+    // Tombstoned section streams — the section counterpart of the two
+    // `Tombstone` loops above, and the incremental path's half of the same
+    // pair `compaction::collect_live_records` carries. Losing this on a
+    // relocation sweep is the exact bug this file's own history warns
+    // about (`Npc`, `TurnCoupling`): the corrupted section's `Chunk`
+    // records would still be shed here as ordinary dead weight, but with
+    // the marker gone the next reload would find no tombstone, treat the
+    // section as merely absent, and the next ingest would re-persist and
+    // eventually re-corrupt the same content address.
+    for &stream_id in substrate.tombstoned_sections() {
+        out.push(Resident {
+            rt: RecordType::SectionTombstone,
+            stream_id: stream_id.0,
+            chunk_index: 0,
+            payload: SectionTombstonePayload { reason: None }.encode(),
         });
     }
     // Tool-round-trip couplings — see the twin loop in
@@ -1147,17 +1193,30 @@ impl SubstratePersistence {
             .iter()
             .map(|(t, m)| (t.raw(), *m))
             .collect();
+        let tombstoned_sections: HashSet<u64> = substrate
+            .tombstoned_sections()
+            .iter()
+            .map(|s| s.0)
+            .collect();
         let in_target = |seg: SegmentId| targets.contains(&seg);
 
         let mut chunks: Vec<(StreamId, u64, ChunkLoc)> = Vec::new();
         let mut tokens: Vec<(StreamId, RecordLoc)> = Vec::new();
         let dead_turns = dead_turns_of(substrate);
         for (stream_id, entry) in substrate.all_streams() {
-            let shed = classify(&entry.decl, &tombstoned, &distilled, &dead_turns);
+            let shed = classify(
+                &entry.decl,
+                &tombstoned,
+                &distilled,
+                &dead_turns,
+                &tombstoned_sections,
+            );
             // Same rule as the re-emit path: a tombstoned-but-DISTILLED timeline
             // is the provenance corpus, so it is relocated by its mode (the
             // per-mode gates below already withhold its chunks/tokens) rather
             // than abandoned. Only an undistilled tombstone is skipped outright.
+            // A tombstoned section is never distilled, so it always takes this
+            // branch — its corrupted chunks are never relocated forward.
             if shed.dropped_wholesale() {
                 continue;
             }
@@ -1243,6 +1302,11 @@ impl SubstratePersistence {
             .iter()
             .map(|(t, m)| (t.raw(), *m))
             .collect();
+        let tombstoned_sections: HashSet<u64> = substrate
+            .tombstoned_sections()
+            .iter()
+            .map(|s| s.0)
+            .collect();
 
         let mut live: HashMap<SegmentId, u64> = HashMap::new();
         for loc in [
@@ -1269,7 +1333,13 @@ impl SubstratePersistence {
         let mut live_streams: HashSet<u64> = HashSet::new();
         let dead_turns = dead_turns_of(substrate);
         for (sid, entry) in substrate.all_streams() {
-            let shed = classify(&entry.decl, &tombstoned, &distilled, &dead_turns);
+            let shed = classify(
+                &entry.decl,
+                &tombstoned,
+                &distilled,
+                &dead_turns,
+                &tombstoned_sections,
+            );
             if shed.timeline_dead {
                 tombstoned_streams.insert(sid.0);
                 continue;

@@ -31,7 +31,7 @@ use std::sync::Arc;
 use candle::{Device, Tensor};
 use candle_nn::kv_cache::{SealedSequence, WriterTail};
 use candle_transformers::models::batched_inference::{
-    BatchedInferenceSession, ManagedBatchedModel, PendingGlue,
+    BatchedInferenceSession, ManagedBatchedModel, PendingGlue, WINDOW_DIVERGENCE_MARKER,
 };
 
 use crate::conversation::slice_per_layer_sealed;
@@ -1972,9 +1972,38 @@ pub(super) fn apply_segments_finish(
                 // Ranged snapshot: records only the island's own chunks on
                 // every layer (a whole-slot record per wave costs tens of ms
                 // at deep slots; the range costs microseconds).
+                //
+                // A window-divergence failure here is NOT the same case
+                // `Scheduler::repair_section_if_window_divergence_confirmed`
+                // handles: that hook tombstones the PERSISTED section a seal
+                // was writing. This range is glue tokens — ephemeral,
+                // in-memory-only cache entries (`state.glue_islands`), never
+                // written to the substrate — built on top of whatever this
+                // slot's prefix already holds, which may include an earlier
+                // injection of a corrupted persisted section. There is no
+                // single `SectionId` to confirm-and-tombstone at this point
+                // without walking back through the slot's own prefix history
+                // (the "prefix chain" tracing the reactive repair's own doc
+                // comment names as future scope, not attempted here) — so
+                // this only logs plainly instead of silently propagating a
+                // bare model error, to leave a trace pointing at the real
+                // mechanism instead of nothing.
                 let sealed = ctx
                     .session
                     .snapshot_sequence_blocks(parent_id.0, isl.start_block, isl.end_block)
+                    .inspect_err(|e| {
+                        if e.to_string().contains(WINDOW_DIVERGENCE_MARKER) {
+                            tracing::warn!(
+                                parent_id = parent_id.0,
+                                start_block = isl.start_block,
+                                end_block = isl.end_block,
+                                err = %e,
+                                "glue-island capture hit a per-layer window divergence — \
+                                 likely rooted in an earlier-injected section this slot's \
+                                 prefix already holds; not repaired from here (see comment)",
+                            );
+                        }
+                    })
                     .map_err(ConversationError::Model)?;
                 // **No page, and today that is provable rather than assumed.**
                 // An island exists only for a model that gap-fills, and

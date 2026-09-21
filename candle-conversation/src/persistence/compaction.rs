@@ -31,7 +31,7 @@ use super::log_file::LogFile;
 use super::manifest::{encode_conv_state_payload, ConvState, Manifest, RecordLoc};
 use super::record::{
     encode_record, DebugIdPayload, DistillMode, DistillPayload, RecordHeader, RecordType,
-    TombstonePayload, TurnCouplingPayload,
+    SectionTombstonePayload, TombstonePayload, TurnCouplingPayload,
 };
 use super::segment::{SegmentId, FIRST_SEGMENT};
 use super::streams::StreamId;
@@ -243,6 +243,16 @@ pub fn collect_live_records(
         .iter()
         .map(|(t, m)| (t.raw(), *m))
         .collect();
+    // Tombstoned section streams drop out the same way — their `StreamDecl` /
+    // `Chunk` / `Tokens` records are the corrupted bytes the tombstone exists
+    // to keep unread, so nothing here should carry them forward. A section has
+    // no turn-numbering to preserve (unlike a tombstoned turn, which keeps a
+    // placeholder `StreamDecl`), so the whole stream drops entirely.
+    let tombstoned_sections: std::collections::HashSet<u64> = substrate
+        .tombstoned_sections()
+        .iter()
+        .map(|s| s.0)
+        .collect();
 
     // Recurrent-state snapshots: one live tail per conversation, staged
     // verbatim (`Raw`, the `Tokens` shape — the payload is a multi-MB state
@@ -335,6 +345,9 @@ pub fn collect_live_records(
         // Without this gate a decl lost in a prior generation leaves its (huge)
         // KV chunks immortal on disk.
         if entry.decl.is_none() {
+            continue;
+        }
+        if tombstoned_sections.contains(&stream_id.0) {
             continue;
         }
         let mut turn_dead = false;
@@ -520,6 +533,29 @@ pub fn collect_live_records(
                 payload_len: payload.len() as u64,
                 crc: 0,
                 stream_id: 0,
+                chunk_index: 0,
+                token_count: 0,
+            },
+            payload,
+        ));
+    }
+    // Tombstoned section streams — re-emitted the same way turn-scoped
+    // tombstones are: the marker itself is what makes the drop permanent
+    // across reloads, so it must survive the rewrite that drops the
+    // section's now-dead `Chunk` / `Tokens` / `StreamDecl` records (those
+    // simply never appear in the live set above, since nothing here stages
+    // records for a stream this set names). Losing this marker would
+    // resurrect the corrupted chunks on the next boot that restores from an
+    // older segment still holding them.
+    for &stream_id in substrate.tombstoned_sections() {
+        let payload = SectionTombstonePayload { reason: None }.encode();
+        out.push(CompactItem::synth(
+            RecordHeader {
+                record_type: RecordType::SectionTombstone,
+                format: 0,
+                payload_len: payload.len() as u64,
+                crc: 0,
+                stream_id: stream_id.0,
                 chunk_index: 0,
                 token_count: 0,
             },
@@ -2358,6 +2394,14 @@ mod tests {
             }
             .encode(),
         ));
+        // A tombstoned section stream — the section counterpart of the
+        // turn-scoped `Tombstone` above.
+        blob.extend_from_slice(&record(
+            RecordType::SectionTombstone,
+            9_501,
+            0,
+            &SectionTombstonePayload { reason: None }.encode(),
+        ));
 
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
@@ -2423,6 +2467,50 @@ mod tests {
                 .encode(),
             ),
             "a turn-scoped tombstone must survive, or the dead turn returns",
+        );
+    }
+
+    /// A section tombstone survives compaction — the section counterpart of
+    /// [`collect_carries_turn_scoped_tombstones_forward`]. Losing it would
+    /// resurrect the corrupted chunks the reactive repair tombstoned.
+    #[test]
+    fn collect_carries_section_tombstones_forward() {
+        let stream_id = 55_001u64;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&record(
+            RecordType::SectionTombstone,
+            stream_id,
+            0,
+            &SectionTombstonePayload {
+                reason: Some(
+                    "chunk 4: (offset 0, 32 tokens) on layer(s) [0]; (offset 0, 0 \
+                              tokens) on layer(s) [1..47]"
+                        .to_string(),
+                ),
+            }
+            .encode(),
+        ));
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        assert!(
+            substrate.is_section_tombstoned(StreamId(stream_id)),
+            "replay must mark the stream tombstoned",
+        );
+
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        // The reason is diagnostic only and is not re-derived at compaction
+        // time — the same rule the turn-scoped tombstone's re-emit follows —
+        // so only the marker's presence (not its original reason text) is
+        // pinned here.
+        assert!(
+            has_synth(
+                &live,
+                RecordType::SectionTombstone,
+                &SectionTombstonePayload { reason: None }.encode(),
+            ),
+            "a section tombstone must survive, or the corrupted chunks return",
         );
     }
 }

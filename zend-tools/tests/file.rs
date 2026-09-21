@@ -34,7 +34,7 @@ fn file_write_unicode() {
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "uni.txt", "start_line": 1, "end_line": 1}),
+        json!({"path": "uni.txt", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&resp), content);
@@ -50,7 +50,7 @@ fn file_edit_not_found() {
 }
 
 #[test]
-fn file_list_prefix() {
+fn file_list_within_a_directory() {
     let ctx = ctx();
     harness::invoke_with_ctx(
         "write",
@@ -65,12 +65,12 @@ fn file_list_prefix() {
     harness::invoke_with_ctx("write", json!({"path": "beta/c.txt", "content": "3"}), &ctx);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"prefix": "alpha/"}),
+        json!({"path": "alpha"}),
         &ctx,
     ));
-    let files = resp["files"].as_array().unwrap();
-    assert_eq!(files.len(), 2);
-    for f in files {
+    let entries = resp["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    for f in entries {
         assert!(f["path"].as_str().unwrap().starts_with("alpha/"));
     }
 }
@@ -105,7 +105,7 @@ fn file_write_overwrite_created_false() {
     assert_eq!(r2["created"], false);
     let rd = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "ow.txt", "start_line": 1, "end_line": 1}),
+        json!({"path": "ow.txt", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&rd), "v2");
@@ -126,7 +126,7 @@ fn file_edit_round_trip() {
     ));
     let rd = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "rt.txt", "start_line": 1, "end_line": 1}),
+        json!({"path": "rt.txt", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&rd), "hello Rust");
@@ -142,7 +142,7 @@ fn file_write_read_roundtrip() {
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "hello.txt", "start_line": 1, "end_line": 1}),
+        json!({"path": "hello.txt", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&resp), "hello world");
@@ -167,10 +167,7 @@ fn file_write_creates_vs_overwrites() {
 
 #[test]
 fn file_read_not_found() {
-    let resp = harness::invoke(
-        "file_read",
-        json!({"path": "nosuchfile.txt", "start_line": 1, "end_line": 200}),
-    );
+    let resp = harness::invoke("file_read", json!({"path": "nosuchfile.txt", "page": 0}));
     harness::expect_error(&resp, "not_found");
 }
 
@@ -194,7 +191,7 @@ fn file_edit_success() {
     assert!(resp["bytes"].as_u64().unwrap() > 0);
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "edit.txt", "start_line": 1, "end_line": 1}),
+        json!({"path": "edit.txt", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&read), "foo qux baz");
@@ -227,39 +224,52 @@ fn file_list() {
     harness::invoke_with_ctx("write", json!({"path": "a/c.txt", "content": "2"}), &ctx);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"prefix": "a/"}),
+        json!({"path": "a"}),
         &ctx,
     ));
-    let files = resp["files"].as_array().unwrap();
-    assert_eq!(files.len(), 2);
+    let entries = resp["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
 }
 
-/// A context that has written nothing lists nothing, whatever the prefix — the
-/// VFS is scratch space, never seeded from the real filesystem. This is the
-/// exact response a model gets when it reaches for `file_list` expecting a
-/// project directory listing: `{"files":[],"total_bytes":0}`.
+/// The root always resolves, even from a context that has written nothing —
+/// the VFS is scratch space, never seeded from the real filesystem — so an
+/// empty session's root listing is `{"entries":[],"total_bytes":0}` rather
+/// than an error.
 #[test]
-fn file_list_is_empty_until_something_is_written() {
+fn file_list_root_is_empty_until_something_is_written() {
     let ctx = ctx();
-    for prefix in ["", "/", "/workspace/", "/workspace/src", "candle-examples/"] {
+    for path in ["", "/", "/workspace/"] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "prefix": prefix }),
+            json!({ "path": path }),
             &ctx,
         ));
         assert_eq!(
-            resp["files"].as_array().unwrap().len(),
+            resp["entries"].as_array().unwrap().len(),
             0,
-            "prefix {prefix:?} listed files from an unwritten VFS",
+            "path {path:?} listed entries from an unwritten VFS",
         );
         assert_eq!(resp["total_bytes"], 0);
     }
 }
 
-/// `/` normalizes to the empty prefix, so it lists the whole VFS rather than
-/// erroring or resolving to a real filesystem root.
+/// A directory nothing has ever written into does not resolve — `file_list`
+/// names a real directory to list, not a prefix that happens to match nothing.
 #[test]
-fn file_list_root_prefix_lists_everything() {
+fn file_list_of_an_unwritten_directory_is_not_found() {
+    let ctx = ctx();
+    for path in ["/workspace/src", "candle-examples/"] {
+        let resp = harness::invoke_with_ctx("file_list", json!({ "path": path }), &ctx);
+        harness::expect_error(&resp, "not_found");
+    }
+}
+
+/// `/` normalizes to the empty path, so it lists the workspace root rather
+/// than erroring or resolving to a real filesystem root. One level deep: the
+/// root-level file lists directly, the nested file's directory collapses to
+/// its own entry rather than reaching all the way down to the leaf.
+#[test]
+fn file_list_root_path_lists_one_level() {
     let ctx = ctx();
     harness::invoke_with_ctx("write", json!({"path": "a.txt", "content": "1"}), &ctx);
     harness::invoke_with_ctx(
@@ -267,16 +277,21 @@ fn file_list_root_prefix_lists_everything() {
         json!({"path": "nested/deep/b.txt", "content": "22"}),
         &ctx,
     );
-    for prefix in ["/", ""] {
+    for path in ["/", ""] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "prefix": prefix }),
+            json!({ "path": path }),
             &ctx,
         ));
+        let entries = resp["entries"].as_array().unwrap();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["a.txt", "nested"], "path {path:?}");
         assert_eq!(
-            resp["files"].as_array().unwrap().len(),
-            2,
-            "prefix {prefix:?}"
+            entries[1]["dir"], true,
+            "the nested file's directory, not the leaf itself"
         );
         assert_eq!(resp["total_bytes"], 3);
     }
@@ -284,11 +299,12 @@ fn file_list_root_prefix_lists_everything() {
 
 /// `/workspace` is the mount point of the working directory, so it normalises
 /// away: a path written as `/workspace/src/main.rs` and one written as
-/// `src/main.rs` are the same entry, and either spelling of the prefix selects
-/// it. This is what lets the tool definitions' `/workspace/...` examples address
-/// the same files as the bare repo-relative paths a model infers from a repo map.
+/// `src/main.rs` are the same entry, and either spelling of the directory
+/// path selects it. This is what lets the tool definitions' `/workspace/...`
+/// examples address the same files as the bare repo-relative paths a model
+/// infers from a repo map.
 #[test]
-fn workspace_mount_prefix_normalises_to_the_same_entry() {
+fn workspace_mount_path_normalises_to_the_same_entry() {
     let ctx = ctx();
     harness::invoke_with_ctx(
         "write",
@@ -300,21 +316,20 @@ fn workspace_mount_prefix_normalises_to_the_same_entry() {
         json!({"path": "README.md", "content": "# hi\n"}),
         &ctx,
     );
-    for prefix in ["/workspace/src", "src/", "/src"] {
+    for path in ["/workspace/src", "src/", "/src"] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "prefix": prefix }),
+            json!({ "path": path }),
             &ctx,
         ));
-        let files = resp["files"].as_array().unwrap();
-        assert_eq!(files.len(), 1, "prefix {prefix:?}");
-        assert_eq!(files[0]["path"], "src/main.rs");
-        assert_eq!(files[0]["lines"], 1);
+        let entries = resp["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "path {path:?}");
+        assert_eq!(entries[0]["path"], "src/main.rs");
     }
     // The same file resolves under either spelling.
     let bare = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs", "start_line": 1, "end_line": 1}),
+        json!({"path": "src/main.rs", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&bare), "fn main() {}");

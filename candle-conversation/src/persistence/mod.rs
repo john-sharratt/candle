@@ -18,12 +18,16 @@
 //! - [`recovery`] — chain-first recovery with a forward-walk fallback.
 //! - [`accounting`] — O(1) live/dead byte accounting for compaction.
 //! - [`survival`] — how each record type outlives a rewrite (exhaustive).
+//! - [`chunk_window_integrity`] — the generic per-layer chunk window-geometry
+//!   comparison, shared by every caller that needs to ask "do these layers
+//!   describe the same K/V windows".
 //! - [`inherit`] — multi-log inheritance and the shared cache.
 //!
 //! [`SubstratePersistence`] is the public API tying them together.
 
 pub mod accounting;
 pub mod chunk_plan;
+pub mod chunk_window_integrity;
 pub mod cold_load;
 pub mod compaction;
 pub mod content_hash;
@@ -64,7 +68,7 @@ use inherit::InheritedSubstrate;
 use manifest::{ChunkLoc, Manifest, RecordLoc};
 use record::{
     decode_record, encode_record, ChunkPayload, DebugIdPayload, NpcPayload, RecordHeader,
-    RecordType, TombstonePayload, TreeMetadataPayload,
+    RecordType, SectionTombstonePayload, TombstonePayload, TreeMetadataPayload,
 };
 use segment::SegmentId;
 use segmented_log::SegmentedLog;
@@ -1220,6 +1224,23 @@ impl SubstratePersistence {
         };
         let bytes = payload.encode();
         self.append_record(RecordType::Tombstone, 0, 0, 0, 0, 0, &bytes)?;
+        Ok(())
+    }
+
+    /// Append a [`RecordType::SectionTombstone`] record marking the
+    /// content-addressed section stream `stream_id` as logically deleted.
+    /// Walker replay applies it via [`Substrate::apply_section_tombstone`],
+    /// which reads as "not persisted" on the next ingest triage, so the
+    /// section re-prefills fresh instead of restoring the tombstoned chunks.
+    /// Idempotent — duplicate tombstones for the same stream replay into the
+    /// same set. `reason` is a diagnostic note (the confirmed divergence
+    /// detail); pass `None` when there is nothing more to say than "gone".
+    pub fn write_section_tombstone(&mut self, stream_id: u64, reason: Option<&str>) -> Result<()> {
+        let payload = SectionTombstonePayload {
+            reason: reason.map(str::to_string),
+        };
+        let bytes = payload.encode();
+        self.append_record(RecordType::SectionTombstone, 0, stream_id, 0, 0, 0, &bytes)?;
         Ok(())
     }
 

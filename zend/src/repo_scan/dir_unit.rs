@@ -1,9 +1,9 @@
 //! Per-directory ingest units for the `repo_map` layer.
 //!
 //! One directory, one conversation. The unit carries everything the folder's
-//! turns need: the files directly inside it, the walked paths under its prefix,
-//! the anchor excerpt that says what it is (see [`super::anchor`]), and a
-//! content hash driving the resume cache and the refresh decision.
+//! turns need: the files directly inside it, the walked paths one level deep
+//! under it, the anchor excerpt that says what it is (see [`super::anchor`]),
+//! and a content hash driving the resume cache and the refresh decision.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -25,19 +25,23 @@ pub struct DirUnit {
     /// from these — a folder is described by *its own* `README.md` / module root,
     /// never by one belonging to a subdirectory.
     pub files: Vec<FileEntry>,
-    /// The walked files under this directory's prefix — `file_list` matches a
-    /// path PREFIX, so the listing spans the whole subtree, and it is paged, so
-    /// this keeps the first [`LIST_PAGE_ENTRIES`] in path order. What the hash
-    /// covers, and an approximation of what the turn shows: see [`listed_paths`]
-    /// for where the two diverge.
+    /// The walked files directly inside this directory — `file_list` is one
+    /// level deep, so the listing never reaches into a subdirectory, and it is
+    /// paged, so this keeps the first [`LIST_PAGE_ENTRIES`] in path order. What
+    /// the hash covers, and an approximation of what the turn shows: see
+    /// [`listed_paths`] for where the two diverge.
     pub listed: Vec<String>,
     /// The excerpt describing the folder, when one of its files provides it.
     pub anchor: Option<Anchor>,
     /// SHA-256 over [`Self::listed`] plus the anchor excerpt's text. Hashing the
     /// evidence — rather than a proxy like the directory's own file names — is
-    /// what makes the cache exact in both directions: a file added deep in the
-    /// subtree changes the listing and must re-ingest, while an edit to a file
-    /// that is only named (never shown) leaves the summary accurate and must not.
+    /// what makes the cache exact in both directions: a file added or removed
+    /// directly inside this directory changes the listing and must re-ingest,
+    /// while an edit to a file that is only named (never shown) leaves the
+    /// summary accurate and must not. A change two levels deep or deeper moves
+    /// only the hash of the directory that actually holds it, not this one —
+    /// each directory has its own unit precisely so a deep change re-ingests
+    /// one folder, not every ancestor above it.
     ///
     /// Exact only as far as `listed` reaches. A file the walk cannot see — a
     /// `.cu` kernel, anything off the extension allowlist — appears in the
@@ -47,9 +51,9 @@ pub struct DirUnit {
 }
 
 impl DirUnit {
-    /// Prefix the folder's `file_list` call uses. The workspace root lists with
-    /// an empty prefix, matching how the live tool addresses it.
-    pub fn list_prefix(&self) -> &str {
+    /// The directory path the folder's `file_list` call uses. The workspace
+    /// root lists with an empty path, matching how the live tool addresses it.
+    pub fn list_path(&self) -> &str {
         if self.dir == "." {
             ""
         } else {
@@ -86,7 +90,7 @@ pub fn build_units(map: &RepoMap, workspace: &Path) -> Vec<DirUnit> {
         .into_iter()
         .map(|(dir, files)| {
             let anchor = anchor::pick(&files, workspace);
-            let listed = listed_paths(map, &dir);
+            let listed = listed_paths(&files);
             let content_hash = hash_unit(&listed, anchor.as_ref());
             DirUnit {
                 dir,
@@ -99,21 +103,25 @@ pub fn build_units(map: &RepoMap, workspace: &Path) -> Vec<DirUnit> {
         .collect()
 }
 
-/// The walked files under the directory's prefix, in path order, capped at one
-/// page — an approximation of what the folder's `file_list` turn shows.
+/// The walked files directly inside the directory, in path order, capped at
+/// one page — an approximation of what the folder's `file_list` turn shows.
 ///
-/// The two are NOT the same set. `file_list` walks the workspace itself, while
-/// this filters [`walk_workspace`]'s output, which drops files off the extension
-/// allowlist (`.cu`, `.cuh`, extensionless files), files above `MAX_FILE_BYTES`,
-/// and whole nested git repos / submodules. `candle-kernels/src/paged-decode/`
-/// shows eight files in its turn and contributes one here, because the kernels
-/// themselves are `.cu`. So this must not be read as the shown evidence: it is
-/// the walked evidence, which is what the hash and the refresh compare on.
-fn listed_paths(map: &RepoMap, dir: &str) -> Vec<String> {
-    let prefix = if dir == "." { "" } else { dir };
-    map.files
+/// `files` is the caller's own per-directory grouping (`build_units`'s
+/// `by_dir` entry), not a fresh scan of the whole map — every file here
+/// already passed the same `dir_of(path) == dir` test that produced the
+/// grouping, so there's nothing left to filter, just truncate.
+///
+/// The result is NOT the same set `file_list` shows. `file_list` walks the
+/// workspace itself, while this filters [`walk_workspace`]'s output, which
+/// drops files off the extension allowlist (`.cu`, `.cuh`, extensionless
+/// files), files above `MAX_FILE_BYTES`, and whole nested git repos /
+/// submodules. `candle-kernels/src/paged-decode/` shows eight files in its
+/// turn and contributes one here, because the kernels themselves are `.cu`.
+/// So this must not be read as the shown evidence: it is the walked
+/// evidence, which is what the hash and the refresh compare on.
+fn listed_paths(files: &[&FileEntry]) -> Vec<String> {
+    files
         .iter()
-        .filter(|f| f.path.starts_with(prefix))
         .take(LIST_PAGE_ENTRIES)
         .map(|f| f.path.clone())
         .collect()
@@ -128,11 +136,12 @@ fn dir_of(path: &str) -> String {
     }
 }
 
-/// Hash the walked paths under the unit's prefix plus its anchor text. A rename,
-/// addition or deletion anywhere in the walked page moves it (the listing
-/// changed); so does an edited module doc (the summary would be stale). An edit
-/// to a file that is only NAMED does not — the unit never showed that content, so
-/// re-summarising would decode the same answer at full cost.
+/// Hash the walked paths directly inside the unit's directory plus its anchor
+/// text. A rename, addition or deletion anywhere in the walked page moves it
+/// (the listing changed); so does an edited module doc (the summary would be
+/// stale). An edit to a file that is only NAMED does not — the unit never
+/// showed that content, so re-summarising would decode the same answer at
+/// full cost.
 fn hash_unit(listed: &[String], anchor: Option<&Anchor>) -> String {
     let mut h = Sha256::new();
     for n in listed {
@@ -306,23 +315,23 @@ mod tests {
         assert_eq!(units[1].files.len(), 2, "a/ holds both its files");
     }
 
-    /// The root lists with an empty prefix — the form the live tool takes.
+    /// The root lists with an empty path — the form the live tool takes.
     #[test]
-    fn the_root_unit_lists_with_an_empty_prefix() {
+    fn the_root_unit_lists_with_an_empty_path() {
         let m = map(&["top.rs"]);
         let d = empty_workspace();
         let units = build_units(&m, d.path());
         assert_eq!(units[0].dir, ".");
-        assert_eq!(units[0].list_prefix(), "");
+        assert_eq!(units[0].list_path(), "");
     }
 
     #[test]
-    fn a_nested_directory_lists_with_its_own_prefix() {
+    fn a_nested_directory_lists_with_its_own_path() {
         let m = map(&["zend/src/x.rs"]);
         let d = empty_workspace();
         let units = build_units(&m, d.path());
         assert_eq!(units[0].dir, "zend/src/");
-        assert_eq!(units[0].list_prefix(), "zend/src/");
+        assert_eq!(units[0].list_path(), "zend/src/");
     }
 
     #[test]
@@ -371,14 +380,13 @@ mod tests {
         assert_eq!(st.changed_dirs(&after), vec!["a/".to_string()]);
     }
 
-    /// `file_list` matches a path PREFIX, so a folder's listing spans its whole
-    /// subtree — a file added deep below it changes what the folder's turn shows,
-    /// and the hash must move with it or the summary goes stale.
+    /// `file_list` is one level deep, so a folder's listing is only its own
+    /// direct files — a file added two levels below moves the hash of the
+    /// directory that actually holds it, and leaves every ancestor's hash
+    /// alone, since none of their turns ever showed it.
     #[test]
-    fn a_file_added_deep_in_the_subtree_moves_the_ancestors_hashes() {
+    fn a_file_added_deep_in_the_subtree_moves_only_its_own_directory() {
         let d = empty_workspace();
-        // `top.rs` gives the workspace root a unit; its listing prefix is empty,
-        // so it spans the whole tree.
         let before = build_units(&map(&["top.rs", "a/x.rs", "a/b/c/y.rs"]), d.path());
         let after = build_units(
             &map(&["top.rs", "a/x.rs", "a/b/c/y.rs", "a/b/c/z.rs"]),
@@ -386,9 +394,7 @@ mod tests {
         );
         let st = DirState::from_units(&before);
         let changed = st.changed_dirs(&after);
-        assert!(changed.contains(&"a/b/c/".to_string()), "{changed:?}");
-        assert!(changed.contains(&"a/".to_string()), "{changed:?}");
-        assert!(changed.contains(&".".to_string()), "{changed:?}");
+        assert_eq!(changed, vec!["a/b/c/".to_string()], "{changed:?}");
     }
 
     /// The listing is PAGED, so only the first page is shown — and only what is
@@ -445,15 +451,10 @@ mod tests {
         );
 
         let ctx = zend_tools::ToolContext::with_workspace(d.path());
-        let shown = zend_tools::run(
-            "file_list",
-            "test",
-            &serde_json::json!({"prefix": "k/"}),
-            &ctx,
-        );
-        let listed_by_tool: Vec<&str> = shown["files"]
+        let shown = zend_tools::run("file_list", "test", &serde_json::json!({"path": "k"}), &ctx);
+        let listed_by_tool: Vec<&str> = shown["entries"]
             .as_array()
-            .expect("files array")
+            .expect("entries array")
             .iter()
             .map(|f| f["path"].as_str().expect("path"))
             .collect();

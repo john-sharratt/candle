@@ -669,47 +669,33 @@ fn hallucinated_parameter_is_masked() {
     );
 }
 
-// ── file_read's range is optional and ordered ───────────────────────────────
+// ── file_read's page is mandatory ───────────────────────────────────────────
 
-/// `file_read` may stop after any part of its range — the path alone reads the
-/// whole file, and either bound alone reads to the file's edge — and names what
-/// it gives in `path, start_line, end_line` order, the order its schema
-/// declares them in.
+/// `file_read` always names both `path` and `page` — the grammar forces both,
+/// the same way it forces any other required field.
 #[test]
-fn file_read_drives_any_part_of_its_range_in_declared_order() {
+fn file_read_always_drives_path_and_page() {
     let (tree, vocab) = build_tree();
-    for (args, start, end) in [
-        (r#""path": "a.rs""#, None, None),
-        (r#""path": "a.rs", "start_line": 94"#, Some(94), None),
-        (r#""path": "a.rs", "end_line": 30"#, None, Some(30)),
-        (
-            r#""path": "a.rs", "start_line": 598, "end_line": 630"#,
-            Some(598),
-            Some(630),
-        ),
-    ] {
+    for page in [0, 3] {
         let target = format!(
-            "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{{args}}}}}\n</tool_call>"
+            "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": \"a.rs\", \
+             \"page\": {page}}}}}\n</tool_call>"
         );
         let out = drive(Arc::clone(&tree), &target, &vocab)
-            .unwrap_or_else(|e| panic!("{args} must drive, got {e:?}"));
+            .unwrap_or_else(|e| panic!("page {page} must drive, got {e:?}"));
         let parsed: serde_json::Value = serde_json::from_str(json_body(&out)).unwrap();
         let arguments = &parsed["arguments"];
         assert_eq!(arguments["path"], "a.rs");
-        assert_eq!(arguments.get("start_line").and_then(|v| v.as_u64()), start);
-        assert_eq!(arguments.get("end_line").and_then(|v| v.as_u64()), end);
+        assert_eq!(arguments["page"], page);
     }
 }
 
-/// The bounds come start first. Optionals are offered in declared order, each
-/// at most once, so a tree that offered `end_line` first would strand a call
-/// written in reading order: once `start_line` is taken, the `end_line` gate
-/// is behind it. The reverse order is what cannot be expressed.
+/// Omitting `page` cannot be expressed — it is forced exactly like `path`.
 #[test]
-fn file_read_rejects_its_range_end_first() {
+fn file_read_rejects_a_call_missing_page() {
     let (tree, vocab) = build_tree();
-    let target = "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"a.rs\", \
-                  \"end_line\": 93, \"start_line\": 47}}\n</tool_call>";
+    let target =
+        "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"a.rs\"}}\n</tool_call>";
     let err = drive(tree, target, &vocab).unwrap_err();
     assert!(
         matches!(

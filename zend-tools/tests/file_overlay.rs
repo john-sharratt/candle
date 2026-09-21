@@ -62,7 +62,7 @@ fn excerpt_source(resp: &serde_json::Value) -> String {
 }
 
 fn paths(resp: &serde_json::Value) -> Vec<String> {
-    resp["files"]
+    resp["entries"]
         .as_array()
         .unwrap()
         .iter()
@@ -78,7 +78,7 @@ fn read_falls_through_to_the_workspace() {
     let ctx = ctx_for(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs", "start_line": 1, "end_line": 200}),
+        json!({"path": "src/main.rs", "page": 0}),
         &ctx,
     ));
     assert_eq!(
@@ -104,7 +104,7 @@ fn workspace_mount_prefix_is_an_alias_for_the_root() {
     ] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_read",
-            json!({ "path": path, "start_line": 1, "end_line": 200 }),
+            json!({ "path": path, "page": 0 }),
             &ctx,
         ));
         assert!(
@@ -118,11 +118,8 @@ fn workspace_mount_prefix_is_an_alias_for_the_root() {
 fn read_of_a_missing_workspace_path_is_not_found() {
     let dir = workspace();
     let ctx = ctx_for(&dir);
-    let resp = harness::invoke_with_ctx(
-        "file_read",
-        json!({"path": "src/nope.rs", "start_line": 1, "end_line": 200}),
-        &ctx,
-    );
+    let resp =
+        harness::invoke_with_ctx("file_read", json!({"path": "src/nope.rs", "page": 0}), &ctx);
     harness::expect_error(&resp, "not_found");
 }
 
@@ -133,7 +130,7 @@ fn parent_traversal_cannot_escape_the_workspace() {
     let ctx = ctx_for(&dir);
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "../../../../etc/passwd", "start_line": 1, "end_line": 200}),
+        json!({"path": "../../../../etc/passwd", "page": 0}),
         &ctx,
     );
     harness::expect_error(&resp, "not_found");
@@ -144,48 +141,48 @@ fn non_utf8_workspace_file_is_unreadable_not_missing() {
     let dir = workspace();
     std::fs::write(dir.path().join("blob.bin"), [0xffu8, 0xfe, 0x00, 0x01]).unwrap();
     let ctx = ctx_for(&dir);
-    let resp = harness::invoke_with_ctx(
-        "file_read",
-        json!({"path": "blob.bin", "start_line": 1, "end_line": 200}),
-        &ctx,
-    );
+    let resp = harness::invoke_with_ctx("file_read", json!({"path": "blob.bin", "page": 0}), &ctx);
     harness::expect_error(&resp, "unreadable");
 }
 
 // ── Listing ──────────────────────────────────────────────────────────────────
 
 #[test]
-fn list_enumerates_the_workspace_from_the_root() {
+fn list_enumerates_the_workspace_one_level_from_the_root() {
     let dir = workspace();
     let ctx = ctx_for(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"prefix": "/"}),
+        json!({"path": "/"}),
         &ctx,
     ));
-    assert_eq!(
-        paths(&resp),
-        vec!["README.md", "docs/guide.md", "src/lib.rs", "src/main.rs"],
-    );
+    assert_eq!(paths(&resp), vec!["README.md", "docs", "src"]);
+    let entries = resp["entries"].as_array().unwrap();
+    let dirs: Vec<&str> = entries
+        .iter()
+        .filter(|e| e["dir"].as_bool().unwrap_or(false))
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(dirs, vec!["docs", "src"], "subdirectories, not flattened");
     // Nothing has been written this session, so the budget is untouched even
     // though the listing is non-empty.
     assert_eq!(resp["total_bytes"], 0);
 }
 
 #[test]
-fn list_narrows_the_workspace_by_prefix() {
+fn list_narrows_the_workspace_by_directory() {
     let dir = workspace();
     let ctx = ctx_for(&dir);
-    for prefix in ["src", "src/", "/workspace/src"] {
+    for path in ["src", "src/", "/workspace/src"] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "prefix": prefix }),
+            json!({ "path": path }),
             &ctx,
         ));
         assert_eq!(
             paths(&resp),
             vec!["src/lib.rs", "src/main.rs"],
-            "prefix {prefix:?}",
+            "path {path:?}",
         );
     }
 }
@@ -199,7 +196,7 @@ fn list_omits_gitignored_and_hidden_paths() {
     let ctx = ctx_for(&dir);
     let listed = paths(&harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"prefix": ""}),
+        json!({"path": ""}),
         &ctx,
     )));
     assert!(
@@ -213,7 +210,7 @@ fn list_omits_gitignored_and_hidden_paths() {
     // (`/workspace/.gitignore`) depend on.
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "/workspace/.gitignore", "start_line": 1, "end_line": 200}),
+        json!({"path": "/workspace/.gitignore", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&resp), "target/\nsecret.txt");
@@ -230,13 +227,17 @@ fn list_marks_session_written_entries_as_modified() {
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"prefix": "src/"}),
+        json!({"path": "src"}),
         &ctx,
     ));
-    let files = resp["files"].as_array().unwrap();
-    assert_eq!(files.len(), 2, "the shadowed file must not be listed twice");
-    let main = files.iter().find(|f| f["path"] == "src/main.rs").unwrap();
-    let lib = files.iter().find(|f| f["path"] == "src/lib.rs").unwrap();
+    let entries = resp["entries"].as_array().unwrap();
+    assert_eq!(
+        entries.len(),
+        2,
+        "the shadowed file must not be listed twice"
+    );
+    let main = entries.iter().find(|f| f["path"] == "src/main.rs").unwrap();
+    let lib = entries.iter().find(|f| f["path"] == "src/lib.rs").unwrap();
     assert_eq!(main["modified"], true);
     assert_eq!(main["bytes"], 13);
     assert!(
@@ -262,7 +263,7 @@ fn edit_copies_the_workspace_file_up_and_leaves_disk_untouched() {
     // The session now sees the edited copy...
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs", "start_line": 1, "end_line": 200}),
+        json!({"path": "src/main.rs", "page": 0}),
         &ctx,
     ));
     assert_eq!(
@@ -287,11 +288,13 @@ fn edit_of_a_workspace_file_is_ambiguous_when_old_str_repeats() {
     // A rejected edit must not leave a copy-up behind that shadows the original.
     let listed = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"prefix": "dup.txt"}),
+        json!({"path": ""}),
         &ctx,
     ));
+    let entries = listed["entries"].as_array().unwrap();
+    let dup = entries.iter().find(|e| e["path"] == "dup.txt").unwrap();
     assert!(
-        listed["files"][0].get("modified").is_none(),
+        dup.get("modified").is_none(),
         "a rejected edit leaves the file unmodified",
     );
 }
@@ -333,14 +336,14 @@ fn delete_hides_a_workspace_file_without_erasing_it() {
     harness::expect_error(
         &harness::invoke_with_ctx(
             "file_read",
-            json!({"path": "docs/guide.md", "start_line": 1, "end_line": 200}),
+            json!({"path": "docs/guide.md", "page": 0}),
             &ctx,
         ),
         "not_found",
     );
     let listed = paths(&harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"prefix": ""}),
+        json!({"path": "docs"}),
         &ctx,
     )));
     assert!(!listed.contains(&"docs/guide.md".to_string()), "{listed:?}");
@@ -384,7 +387,7 @@ fn writing_over_a_whiteout_resurrects_the_path_as_a_creation() {
     );
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "README.md", "start_line": 1, "end_line": 200}),
+        json!({"path": "README.md", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&read), "# back");
@@ -439,10 +442,10 @@ fn list_caps_a_large_directory_to_one_page() {
 
     let first = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"prefix": "src/"}),
+        json!({"path": "src"}),
         &ctx,
     ));
-    assert_eq!(first["files"].as_array().unwrap().len(), 50);
+    assert_eq!(first["entries"].as_array().unwrap().len(), 50);
     assert_eq!(first["paging"]["total"], 175);
     assert_eq!(first["paging"]["pages"], 4);
     assert_eq!(first["paging"]["page"], 0);
@@ -452,7 +455,7 @@ fn list_caps_a_large_directory_to_one_page() {
     // The advertised next page continues exactly where the first stopped.
     let second = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"prefix": "src/", "page": 1}),
+        json!({"path": "src", "page": 1}),
         &ctx,
     ));
     assert_eq!(paths(&second)[0], "src/f050.rs");
@@ -461,10 +464,10 @@ fn list_caps_a_large_directory_to_one_page() {
     // The last page is partial and terminates the chain.
     let last = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"prefix": "src/", "page": 3}),
+        json!({"path": "src", "page": 3}),
         &ctx,
     ));
-    assert_eq!(last["files"].as_array().unwrap().len(), 25);
+    assert_eq!(last["entries"].as_array().unwrap().len(), 25);
     assert_eq!(paths(&last)[0], "src/f150.rs");
     assert!(last["paging"]["next_page"].is_null());
 }
@@ -480,12 +483,12 @@ fn list_page_past_the_end_clamps_to_the_last_page() {
     let ctx = ToolContext::with_workspace(dir.path());
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"prefix": "a/", "page": 99}),
+        json!({"path": "a", "page": 99}),
         &ctx,
     ));
     assert_eq!(resp["paging"]["page"], 1, "clamped to the last page");
-    assert_eq!(resp["files"].as_array().unwrap().len(), 10);
-    assert!(!resp["files"].as_array().unwrap().is_empty());
+    assert_eq!(resp["entries"].as_array().unwrap().len(), 10);
+    assert!(!resp["entries"].as_array().unwrap().is_empty());
 }
 
 /// A listing that fits reports a single page and no continuation.
@@ -495,11 +498,14 @@ fn list_within_one_page_reports_no_next_page() {
     let ctx = ctx_for(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"prefix": ""}),
+        json!({"path": ""}),
         &ctx,
     ));
     assert_eq!(resp["paging"]["pages"], 1);
-    assert_eq!(resp["paging"]["total"], 4);
+    assert_eq!(
+        resp["paging"]["total"], 3,
+        "one level: README.md, docs, src"
+    );
     assert!(resp["paging"]["next_page"].is_null());
 }
 
@@ -516,12 +522,12 @@ fn list_entries_omit_the_modified_flag_when_unchanged() {
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"prefix": "src/"}),
+        json!({"path": "src"}),
         &ctx,
     ));
-    let files = resp["files"].as_array().unwrap();
-    let main = files.iter().find(|f| f["path"] == "src/main.rs").unwrap();
-    let lib = files.iter().find(|f| f["path"] == "src/lib.rs").unwrap();
+    let entries = resp["entries"].as_array().unwrap();
+    let main = entries.iter().find(|f| f["path"] == "src/main.rs").unwrap();
+    let lib = entries.iter().find(|f| f["path"] == "src/lib.rs").unwrap();
     assert_eq!(main["modified"], true);
     assert!(lib.get("modified").is_none(), "unchanged entries stay lean");
 }
@@ -529,130 +535,87 @@ fn list_entries_omit_the_modified_flag_when_unchanged() {
 // ── file_read excerpt format ─────────────────────────────────────────────────
 
 /// A read returns the same shape the `code_reading` ingest prefills: header with
-/// path and absolute line range, then a language-tagged fence with `cat -n`
-/// numbering. Not JSON — the runner places a string result verbatim.
+/// path, page, and absolute line range, then a language-tagged fence with
+/// `cat -n` numbering. Not JSON — the runner places a string result verbatim.
 #[test]
 fn read_returns_a_numbered_fenced_excerpt() {
     let dir = workspace();
     let ctx = ctx_for(&dir);
-    let resp = harness::invoke_with_ctx(
-        "file_read",
-        json!({"path": "src/main.rs", "start_line": 1, "end_line": 3}),
-        &ctx,
-    );
+    let resp =
+        harness::invoke_with_ctx("file_read", json!({"path": "src/main.rs", "page": 0}), &ctx);
     let text = resp.as_str().expect("file_read returns a rendered string");
     assert_eq!(
         text,
-        "\nsrc/main.rs (lines 1-3):\n\n```rust\n1  fn main() {\n2      println!(\"hi\");\n3  }\n```\n",
+        "\nsrc/main.rs (page 0 of 1, lines 1-3 of 3):\n\n```rust\n1  fn main() {\n2      println!(\"hi\");\n3  }\n```\n",
     );
 }
 
-/// Without a range a read returns the whole file, however long, and the header
-/// states the full span — no `of N`, so the model knows it has all of it.
+/// Without a page a read returns page 0 — the top 300 lines, however long the
+/// file is — and the header states the total so the model knows to keep going.
 #[test]
-fn read_without_a_range_returns_the_whole_file() {
+fn read_without_a_page_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let body: String = (1..=900).map(|i| format!("line {i}\n")).collect();
     write_disk(dir.path(), "big.rs", &body);
     let ctx = ToolContext::with_workspace(dir.path());
 
     let resp = harness::invoke_with_ctx("file_read", json!({"path": "big.rs"}), &ctx);
-    let numbered: String = (1..=900).map(|i| format!("{i:3}  line {i}\n")).collect();
-    assert_eq!(
-        resp.as_str().expect("file_read returns a rendered string"),
-        format!("\nbig.rs (lines 1-900):\n\n```rust\n{numbered}```\n"),
-    );
+    harness::expect_error(&resp, "invalid_arguments");
 }
 
-/// A bound on its own reads to the file's edge: `start_line` alone to the end,
-/// `end_line` alone from the top. A read that stops short of the end says `of N`.
+/// Each page is exactly the requested 300-line stride, and a page number past
+/// the end clamps to the last page rather than failing.
 #[test]
-fn read_with_one_bound_reads_to_the_files_edge() {
-    let dir = workspace();
-    let ctx = ctx_for(&dir);
-    let tail = harness::invoke_with_ctx(
-        "file_read",
-        json!({"path": "src/main.rs", "start_line": 2}),
-        &ctx,
-    );
-    assert_eq!(
-        tail.as_str().unwrap(),
-        "\nsrc/main.rs (lines 2-3):\n\n```rust\n2      println!(\"hi\");\n3  }\n```\n",
-    );
-    let head = harness::invoke_with_ctx(
-        "file_read",
-        json!({"path": "src/main.rs", "end_line": 2}),
-        &ctx,
-    );
-    assert_eq!(
-        head.as_str().unwrap(),
-        "\nsrc/main.rs (lines 1-2 of 3):\n\n```rust\n1  fn main() {\n2      println!(\"hi\");\n```\n",
-    );
-}
-
-/// An explicit range is honoured exactly, and a range running past the end of
-/// the file clamps to it rather than failing.
-#[test]
-fn read_honours_a_line_range_and_clamps_a_wide_one() {
+fn read_returns_the_requested_page_and_clamps_one_past_the_end() {
     let dir = tempfile::tempdir().unwrap();
     let body: String = (1..=900).map(|i| format!("line {i}\n")).collect();
     write_disk(dir.path(), "big.rs", &body);
     let ctx = ToolContext::with_workspace(dir.path());
 
-    let exact = harness::invoke_with_ctx(
-        "file_read",
-        json!({"path": "big.rs", "start_line": 47, "end_line": 93}),
-        &ctx,
-    );
-    // Column width tracks the widest line number in the excerpt (93 → 2), the
-    // same rule the ingest renderer uses.
-    let numbered: String = (47..=93).map(|i| format!("{i}  line {i}\n")).collect();
+    let middle = harness::invoke_with_ctx("file_read", json!({"path": "big.rs", "page": 1}), &ctx);
+    let numbered: String = (301..=600).map(|i| format!("{i}  line {i}\n")).collect();
     assert_eq!(
-        exact.as_str().unwrap(),
-        format!("\nbig.rs (lines 47-93 of 900):\n\n```rust\n{numbered}```\n"),
+        middle.as_str().unwrap(),
+        format!("\nbig.rs (page 1 of 3, lines 301-600 of 900):\n\n```rust\n{numbered}```\n"),
     );
 
-    let wide = harness::invoke_with_ctx(
-        "file_read",
-        json!({"path": "big.rs", "start_line": 850, "end_line": 5000}),
-        &ctx,
-    );
-    let numbered: String = (850..=900).map(|i| format!("{i}  line {i}\n")).collect();
-    assert_eq!(
-        wide.as_str().unwrap(),
-        format!("\nbig.rs (lines 850-900):\n\n```rust\n{numbered}```\n"),
-    );
+    // 900 lines is exactly 3 pages, so page 2 is both the last real page and
+    // where an out-of-range request (page 99) clamps to.
+    let last = harness::invoke_with_ctx("file_read", json!({"path": "big.rs", "page": 2}), &ctx);
+    let clamped =
+        harness::invoke_with_ctx("file_read", json!({"path": "big.rs", "page": 99}), &ctx);
+    let numbered: String = (601..=900).map(|i| format!("{i}  line {i}\n")).collect();
+    let expected =
+        format!("\nbig.rs (page 2 of 3, lines 601-900 of 900):\n\n```rust\n{numbered}```\n");
+    assert_eq!(last.as_str().unwrap(), expected);
+    assert_eq!(clamped.as_str().unwrap(), expected, "clamps to page 2");
 }
 
-/// An out-of-range start clamps into the file rather than returning nothing,
-/// which a model would read as "the file is empty".
+/// A page past the end of a single-page file clamps to page 0 rather than
+/// returning nothing, which a model would read as "the file is empty".
 #[test]
 fn read_past_the_end_clamps_into_the_file() {
     let dir = workspace();
     let ctx = ctx_for(&dir);
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs", "start_line": 9999, "end_line": 9999}),
+        json!({"path": "src/main.rs", "page": 9999}),
         &ctx,
     );
     let text = resp.as_str().unwrap();
     assert!(
-        text.starts_with("\nsrc/main.rs (lines 3-3):\n"),
+        text.starts_with("\nsrc/main.rs (page 0 of 1, lines 1-3 of 3):\n"),
         "{text:.60}"
     );
 }
 
-/// An empty file reads as empty rather than as an impossible line range.
+/// An empty file reads as empty rather than as an impossible page.
 #[test]
 fn read_of_an_empty_file_reports_empty() {
     let dir = workspace();
     write_disk(dir.path(), "blank.rs", "");
     let ctx = ctx_for(&dir);
-    let resp = harness::invoke_with_ctx(
-        "file_read",
-        json!({"path": "blank.rs", "start_line": 1, "end_line": 200}),
-        &ctx,
-    );
+    let resp = harness::invoke_with_ctx("file_read", json!({"path": "blank.rs", "page": 0}), &ctx);
     assert_eq!(
         resp.as_str().unwrap(),
         "\nblank.rs (empty):\n\n```rust\n```\n"
