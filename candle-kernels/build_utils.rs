@@ -731,8 +731,75 @@ fn compute_kernel_hash(
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Check if a precompiled archive is valid by comparing aggregate hash
-fn is_archive_cache_valid(archive_name: &str, precompiled_dir: &Path, current_hash: &str) -> bool {
+/// Every source file `kernel_path`'s object depends on: the kernel itself and
+/// each file it reaches through `#include`.
+fn kernel_sources(
+    kernel_path: &str,
+    base_dir: &Path,
+    include_dirs: &[String],
+) -> Result<Vec<PathBuf>> {
+    let mut visited = HashSet::new();
+    collect_dependencies(
+        &base_dir.join(kernel_path),
+        base_dir,
+        include_dirs,
+        &mut visited,
+    )
+}
+
+/// Every source file any kernel of `group` depends on, without repeats.
+fn group_sources(group: &ArchiveGroup, base_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut all = Vec::new();
+    for kernel_path in &group.kernels {
+        all.extend(kernel_sources(kernel_path, base_dir, &group.include_dirs)?);
+    }
+    all.sort();
+    all.dedup();
+    Ok(all)
+}
+
+/// Whether `artifact` was built no earlier than the newest of `sources`.
+///
+/// **A matching hash sidecar cannot prove this, and trusting it alone shipped a
+/// stale kernel.** The sidecar says which source text an object is *labelled*
+/// as built from; anything that writes a sidecar without recompiling — the
+/// `kernel_tool` re-stamp commands, a build that overlapped a source change —
+/// can label an old object with the current hash, and every later build then
+/// reads that pair as a cache hit forever. Measured: 81 staged objects
+/// compiled before a source change carried sidecars written afterwards, so the
+/// `paged_prefill_int8` kernel launched from a RoPE-refactored Rust caller was
+/// the pre-refactor kernel — its argument list ended `rope_offsets, rope_cs`
+/// where the caller passed a 24-byte `RopeRungs` — and every pointer past
+/// `softmax_scale` read at the wrong offset. The result was a
+/// `CUDA_ERROR_ILLEGAL_ADDRESS` on every model, on a tree whose sources were
+/// correct.
+///
+/// An object older than a file it was compiled from is stale whatever its
+/// label says, so the modification time is checked as well. Unreadable
+/// metadata on either side counts as stale: a spurious rebuild costs minutes,
+/// a spurious hit costs a wrong kernel.
+fn artifact_is_fresh(artifact: &Path, sources: &[PathBuf]) -> bool {
+    let Ok(built) = fs::metadata(artifact).and_then(|m| m.modified()) else {
+        return false;
+    };
+    let mut newest = std::time::SystemTime::UNIX_EPOCH;
+    for source in sources {
+        match fs::metadata(source).and_then(|m| m.modified()) {
+            Ok(t) => newest = newest.max(t),
+            Err(_) => return false,
+        }
+    }
+    built >= newest
+}
+
+/// Check if a precompiled archive is valid: its aggregate hash matches, and the
+/// archive is no older than any source it was built from ([`artifact_is_fresh`]).
+fn is_archive_cache_valid(
+    archive_name: &str,
+    precompiled_dir: &Path,
+    current_hash: &str,
+    sources: &[PathBuf],
+) -> bool {
     let hash_file = precompiled_dir.join(format!("lib{}.a.sha256", archive_name));
     let gz_file = precompiled_dir.join(format!("lib{}.a.gz", archive_name));
 
@@ -740,10 +807,11 @@ fn is_archive_cache_valid(archive_name: &str, precompiled_dir: &Path, current_ha
         return false;
     }
 
-    if let Ok(stored_hash) = fs::read_to_string(&hash_file) {
-        stored_hash.trim() == current_hash
-    } else {
-        false
+    match fs::read_to_string(&hash_file) {
+        Ok(stored_hash) => {
+            stored_hash.trim() == current_hash && artifact_is_fresh(&gz_file, sources)
+        }
+        Err(_) => false,
     }
 }
 
@@ -1123,7 +1191,12 @@ fn create_archive(
 // ============================================================================
 
 /// Check if a staged .o file is valid for the given kernel hash
-fn is_staged_kernel_valid(staged_dir: &Path, kernel_name: &str, expected_hash: &str) -> bool {
+fn is_staged_kernel_valid(
+    staged_dir: &Path,
+    kernel_name: &str,
+    expected_hash: &str,
+    sources: &[PathBuf],
+) -> bool {
     let staged_o = staged_dir.join(format!("{}.o", kernel_name));
     let staged_hash = staged_dir.join(format!("{}.o.sha256", kernel_name));
 
@@ -1132,24 +1205,76 @@ fn is_staged_kernel_valid(staged_dir: &Path, kernel_name: &str, expected_hash: &
         && fs::read_to_string(&staged_hash)
             .map(|h| h.trim() == expected_hash)
             .unwrap_or(false)
+        && artifact_is_fresh(&staged_o, sources)
 }
 
-/// Save a compiled .o file to the staged cache with its hash
+/// Whether every staged object behind `group` is valid — the archive-level half
+/// of the freshness rule.
+///
+/// An archive is a product of the staged objects, so its own modification time
+/// says nothing about them: an archive re-linked *after* a source change, from
+/// objects compiled *before* it, is newer than the source and still holds the
+/// old kernel. That is how a stale `paged_prefill_int8` passed the archive's
+/// [`artifact_is_fresh`] check and kept launching. Each staged object that
+/// exists is therefore checked against its hash and its sources; an object that
+/// is absent is skipped, so an archive restored without its `staged/` directory
+/// still counts on its own hash.
+fn staged_objects_are_fresh(
+    group: &ArchiveGroup,
+    kernel_hashes: &[(String, String)],
+    staged_dir: &Path,
+    base_dir: &Path,
+) -> Result<bool> {
+    for kernel_path in &group.kernels {
+        let name = kernel_stem(kernel_path);
+        if !staged_dir.join(format!("{}.o", name)).exists() {
+            continue;
+        }
+        let hash = kernel_hashes
+            .iter()
+            .find(|(p, _)| p == kernel_path)
+            .map(|(_, h)| h.as_str())
+            .unwrap_or("");
+        let sources = kernel_sources(kernel_path, base_dir, &group.include_dirs)?;
+        if !is_staged_kernel_valid(staged_dir, &name, hash, &sources) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Save a compiled .o file to the staged cache with its hash.
+///
+/// Refuses an object that is missing or older than `sources` ([`artifact_is_fresh`]):
+/// labelling it would turn a stale kernel into a permanent cache hit. The build
+/// fails here, loudly, rather than linking it.
 fn save_to_staged_cache(
     build_dir: &Path,
     staged_dir: &Path,
     kernel_name: &str,
     hash: &str,
+    sources: &[PathBuf],
 ) -> Result<()> {
     let build_o = build_dir.join(format!("{}.o", kernel_name));
     let staged_o = staged_dir.join(format!("{}.o", kernel_name));
     let staged_hash = staged_dir.join(format!("{}.o.sha256", kernel_name));
-    if build_o.exists() {
-        fs::copy(&build_o, &staged_o)
-            .with_context(|| format!("Failed to copy {}.o to staged cache", kernel_name))?;
-        fs::write(&staged_hash, hash)
-            .with_context(|| format!("Failed to write staged hash for {}", kernel_name))?;
+    if !build_o.exists() {
+        anyhow::bail!(
+            "{kernel_name}: nvcc reported success but {} does not exist",
+            build_o.display()
+        );
     }
+    if !artifact_is_fresh(&build_o, sources) {
+        anyhow::bail!(
+            "{kernel_name}: {} is older than the sources it would be labelled as built \
+             from — refusing to stamp a stale object as current",
+            build_o.display()
+        );
+    }
+    fs::copy(&build_o, &staged_o)
+        .with_context(|| format!("Failed to copy {}.o to staged cache", kernel_name))?;
+    fs::write(&staged_hash, hash)
+        .with_context(|| format!("Failed to write staged hash for {}", kernel_name))?;
     Ok(())
 }
 
@@ -1479,5 +1604,253 @@ mod host_compiler_tests {
         let accepts = |ver: u32| range.is_none_or(|(low, high)| ver >= low && ver < high);
         assert!(accepts(1951));
         assert!(accepts(1944));
+    }
+}
+
+/// The cache trusts an artifact only if it is no older than its sources, on top
+/// of a matching hash — see [`artifact_is_fresh`] for the stale kernel that a
+/// hash-only check let through.
+///
+/// Every fixture is real files on disk with explicit modification times, and
+/// every assertion is on the resulting file state or the boolean it produces.
+#[cfg(test)]
+mod cache_freshness_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    /// Write `contents` to `path` and stamp its modification time.
+    fn write_at(path: &Path, contents: &[u8], mtime: SystemTime) {
+        fs::write(path, contents).unwrap();
+        let f = fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(mtime).unwrap();
+    }
+
+    fn t0() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+    }
+
+    fn later(secs: u64) -> SystemTime {
+        t0() + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn an_object_older_than_a_source_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("k.cuh");
+        let obj = dir.path().join("k.o");
+        write_at(&obj, b"old object", t0());
+        write_at(&src, b"edited source", later(60));
+        assert!(!artifact_is_fresh(&obj, &[src]));
+    }
+
+    #[test]
+    fn an_object_built_after_every_source_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.cu");
+        let b = dir.path().join("b.cuh");
+        let obj = dir.path().join("k.o");
+        write_at(&a, b"a", t0());
+        write_at(&b, b"b", later(10));
+        write_at(&obj, b"object", later(20));
+        assert!(artifact_is_fresh(&obj, &[a, b]));
+    }
+
+    /// One newer include among many older ones makes the object stale: the
+    /// newest source decides, not the first.
+    #[test]
+    fn the_newest_source_decides() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.cuh");
+        let new = dir.path().join("new.cuh");
+        let obj = dir.path().join("k.o");
+        write_at(&old, b"old", t0());
+        write_at(&obj, b"object", later(30));
+        write_at(&new, b"new", later(90));
+        assert!(!artifact_is_fresh(&obj, &[old, new]));
+    }
+
+    #[test]
+    fn equal_modification_times_count_as_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("k.cu");
+        let obj = dir.path().join("k.o");
+        write_at(&src, b"src", later(5));
+        write_at(&obj, b"object", later(5));
+        assert!(artifact_is_fresh(&obj, &[src]));
+    }
+
+    /// A missing artifact or a missing source both read as stale: a spurious
+    /// rebuild is cheap, a spurious hit is a wrong kernel.
+    #[test]
+    fn missing_metadata_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("k.cu");
+        let obj = dir.path().join("k.o");
+        write_at(&src, b"src", t0());
+        assert!(!artifact_is_fresh(&obj, std::slice::from_ref(&src)));
+        write_at(&obj, b"object", later(1));
+        assert!(!artifact_is_fresh(
+            &obj,
+            &[src, dir.path().join("deleted.cuh")]
+        ));
+    }
+
+    /// **The poisoned state itself:** an old object beside a sidecar carrying the
+    /// current hash. The hash matches, so the pair used to read as a hit.
+    #[test]
+    fn a_relabelled_stale_object_is_not_a_staged_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("k.cu");
+        write_at(&src, b"edited source", later(100));
+        let staged = dir.path().join("staged");
+        fs::create_dir(&staged).unwrap();
+        write_at(&staged.join("k.o"), b"compiled before the edit", t0());
+        write_at(&staged.join("k.o.sha256"), b"abc123", later(200));
+
+        assert!(!is_staged_kernel_valid(
+            &staged,
+            "k",
+            "abc123",
+            std::slice::from_ref(&src)
+        ));
+
+        // The same pair with the object rebuilt after the edit is a hit.
+        write_at(&staged.join("k.o"), b"compiled after the edit", later(150));
+        assert!(is_staged_kernel_valid(
+            &staged,
+            "k",
+            "abc123",
+            std::slice::from_ref(&src)
+        ));
+        // And a different hash is still a miss however fresh the object.
+        assert!(!is_staged_kernel_valid(&staged, "k", "other", &[src]));
+    }
+
+    #[test]
+    fn a_stale_object_is_refused_and_nothing_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let build = dir.path().join("build");
+        let staged = dir.path().join("staged");
+        fs::create_dir(&build).unwrap();
+        fs::create_dir(&staged).unwrap();
+        let src = dir.path().join("k.cu");
+        write_at(&src, b"edited source", later(100));
+        write_at(&build.join("k.o"), b"compiled before the edit", t0());
+
+        let err = save_to_staged_cache(&build, &staged, "k", "abc123", &[src])
+            .expect_err("a stale object must not be stamped");
+        assert!(err.to_string().contains("older than the sources"), "{err}");
+        assert!(!staged.join("k.o").exists());
+        assert!(!staged.join("k.o.sha256").exists());
+    }
+
+    #[test]
+    fn a_missing_object_is_an_error_not_a_silent_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let build = dir.path().join("build");
+        let staged = dir.path().join("staged");
+        fs::create_dir(&build).unwrap();
+        fs::create_dir(&staged).unwrap();
+        let src = dir.path().join("k.cu");
+        write_at(&src, b"src", t0());
+
+        let err = save_to_staged_cache(&build, &staged, "k", "abc123", &[src])
+            .expect_err("nvcc success without an object is a failure");
+        assert!(err.to_string().contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn a_fresh_object_is_copied_byte_for_byte_and_labelled_with_the_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let build = dir.path().join("build");
+        let staged = dir.path().join("staged");
+        fs::create_dir(&build).unwrap();
+        fs::create_dir(&staged).unwrap();
+        let src = dir.path().join("k.cu");
+        write_at(&src, b"src", t0());
+        write_at(&build.join("k.o"), b"\x7fELF fresh object", later(50));
+
+        save_to_staged_cache(&build, &staged, "k", "abc123", &[src]).unwrap();
+        assert_eq!(fs::read(staged.join("k.o")).unwrap(), b"\x7fELF fresh object");
+        assert_eq!(fs::read(staged.join("k.o.sha256")).unwrap(), b"abc123");
+    }
+
+    /// One kernel `k.cu` in a group, its source edited at `later(100)`.
+    fn one_kernel_group(dir: &Path) -> ArchiveGroup {
+        write_at(&dir.join("k.cu"), b"edited source", later(100));
+        ArchiveGroup {
+            name: "g".to_string(),
+            kernels: vec!["k.cu".to_string()],
+            compile_args: Vec::new(),
+            include_dirs: Vec::new(),
+        }
+    }
+
+    /// **The archive that looked fresh:** re-linked after the edit, so newer
+    /// than the source, from a staged object compiled before it. The archive's
+    /// own time passes; the object behind it is what fails.
+    #[test]
+    fn an_archive_relinked_from_a_stale_object_is_not_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = one_kernel_group(dir.path());
+        let staged = dir.path().join("staged");
+        fs::create_dir(&staged).unwrap();
+        write_at(&staged.join("k.o"), b"compiled before the edit", t0());
+        write_at(&staged.join("k.o.sha256"), b"h", later(200));
+        write_at(&dir.path().join("libg.a.gz"), b"relinked archive", later(210));
+        write_at(&dir.path().join("libg.a.sha256"), b"agg", later(210));
+        let hashes = [("k.cu".to_string(), "h".to_string())];
+        let sources = group_sources(&group, dir.path()).unwrap();
+
+        assert!(
+            is_archive_cache_valid("g", dir.path(), "agg", &sources),
+            "the archive alone reads as fresh: it is newer than the source"
+        );
+        assert!(!staged_objects_are_fresh(&group, &hashes, &staged, dir.path()).unwrap());
+    }
+
+    #[test]
+    fn an_archive_over_fresh_or_absent_objects_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = one_kernel_group(dir.path());
+        let staged = dir.path().join("staged");
+        fs::create_dir(&staged).unwrap();
+        let hashes = [("k.cu".to_string(), "h".to_string())];
+
+        // No staged directory contents: the archive stands on its own hash.
+        assert!(staged_objects_are_fresh(&group, &hashes, &staged, dir.path()).unwrap());
+
+        write_at(&staged.join("k.o"), b"compiled after the edit", later(150));
+        write_at(&staged.join("k.o.sha256"), b"h", later(160));
+        assert!(staged_objects_are_fresh(&group, &hashes, &staged, dir.path()).unwrap());
+
+        // A present object with the wrong hash is stale however new it is.
+        let other = [("k.cu".to_string(), "other".to_string())];
+        assert!(!staged_objects_are_fresh(&group, &other, &staged, dir.path()).unwrap());
+    }
+
+    #[test]
+    fn an_archive_older_than_its_sources_is_not_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("k.cu");
+        write_at(&src, b"edited source", later(100));
+        write_at(&dir.path().join("libg.a.gz"), b"archive", t0());
+        write_at(&dir.path().join("libg.a.sha256"), b"h1", later(200));
+
+        assert!(!is_archive_cache_valid(
+            "g",
+            dir.path(),
+            "h1",
+            std::slice::from_ref(&src)
+        ));
+
+        write_at(&dir.path().join("libg.a.gz"), b"archive", later(150));
+        assert!(is_archive_cache_valid(
+            "g",
+            dir.path(),
+            "h1",
+            std::slice::from_ref(&src)
+        ));
+        assert!(!is_archive_cache_valid("g", dir.path(), "h2", &[src]));
     }
 }
