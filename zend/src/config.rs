@@ -42,6 +42,15 @@ pub struct DaemonConfig {
     /// ingest pass and no watcher-driven refresh. The flag for "the corpus is
     /// built, stop re-reading the disk".
     pub skipped_layers: HashSet<String>,
+    /// Turn-sink layers to tombstone COMPLETELY before this load's registry is
+    /// seeded (`--wipe-layer <name>`, repeatable) — every conversation in the
+    /// layer, not just crashed partials, so the background ingest worker's
+    /// first pass re-ingests it from scratch. A targeted alternative to
+    /// [`Self`]-wide `--wipe-substrate`: every other layer's content (the live
+    /// dialogue, an unnamed ingest layer, uploads) survives untouched. A layer
+    /// also named by [`Self::disabled_layers`] is not wiped — a disabled layer
+    /// gets no cleanup of any kind. `Raw` layers are not wipeable this way.
+    pub wiped_layers: HashSet<String>,
     /// Content-root overrides for derived ingest layers (`--ingest-dir
     /// <layer>=<path>`, repeatable), keyed by layer name. Each replaces the
     /// folder that layer ingests from — relative to the workspace, or absolute.

@@ -4728,6 +4728,30 @@ impl Sequence {
         self.target.timeline
     }
 
+    /// Seed this sequence's recurrent memory from the nearest ancestor that has
+    /// a snapshot — the conversation it continues.
+    ///
+    /// Call it after recording the fork's lineage
+    /// (`ConversationEngine::set_forked_from`) and before its first turn. The
+    /// slot was seeded at creation from its own timeline, which a fresh fork
+    /// has no snapshot for; the pointer that says whose memory it inherits only
+    /// exists once the fork has returned, so the seed is asked for again here
+    /// rather than the fork being reordered around it.
+    ///
+    /// `Ok(false)` when the model carries no recurrent state, or no ancestor
+    /// has a snapshot yet — both ordinary, and both leave the sequence starting
+    /// from the sequence-start state.
+    pub fn seed_recurrent_from_lineage(&self) -> crate::Result<bool> {
+        let (tx, rx) = flume::bounded(1);
+        self.scheduler_tx
+            .send(SchedulerRequest::SeedRecurrentFromLineage {
+                sequence_id: self.id,
+                response_tx: tx,
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        rx.recv().map_err(|_| ConversationError::SchedulerGone)?
+    }
+
     /// Set this conversation's sidebar label, persisting it to the redo
     /// log. First-write-wins.
     pub fn set_conversation_label(&self, label: &str) -> crate::Result<()> {

@@ -27,9 +27,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use candle_conversation::memory_report::MemoryReport;
-use candle_conversation::projection::{self, GroupId, LayerId, TimelineId};
+use candle_conversation::projection::{self, TimelineId};
 use candle_conversation::stencil::{ThinkMode, ToolCallEnvelope, TriggerRegistry};
-use candle_conversation::{ConversationEngine, SequenceConfig};
+use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
 use zend_tools::ToolContext;
 
 use crate::ingest_report::{Failures, IngestReport};
@@ -475,55 +475,6 @@ pub(crate) fn utility_config(mut config: SequenceConfig) -> SequenceConfig {
     config
 }
 
-/// Top-level `repo_map` ingestion.
-///
-/// Walks `workspace`, builds one [`DirUnit`] per directory holding files, and
-/// runs the units through a bounded worker pool. Returns the walked [`RepoMap`]
-/// so a co-located `code_reading` pass doesn't re-walk, plus the [`DirState`]
-/// the refresh path compares against.
-///
-/// The closing decode is a summary *of the folder* because the request names the
-/// folder. The conversation itself frames on the shared prompt — the schema's
-/// own sections, injected by priming at the default branch (see
-/// [`shared_system_prompt`]) — and `disable_reprojection` (see
-/// [`utility_config`]) means it never re-projects, so nothing a runtime
-/// selection sets can change that framing.
-#[allow(clippy::too_many_arguments)]
-pub fn ingest_repo_map(
-    engine: &Mutex<ConversationEngine>,
-    proj_builder: projection::Builder,
-    workspace: &Path,
-    max_depth: Option<usize>,
-    config: SequenceConfig,
-    progress: &Arc<LoadProgress>,
-    layer_name: &str,
-    group_name: &str,
-) -> anyhow::Result<(RepoMap, DirState, IngestReport)> {
-    let map = walk_workspace(workspace, max_depth);
-    let units = build_units(&map, workspace);
-
-    tracing::info!(
-        n_files = map.files.len(),
-        n_dirs = units.len(),
-        n_anchored = units.iter().filter(|u| u.anchor.is_some()).count(),
-        skipped_extension = map.files_skipped_extension,
-        skipped_oversize = map.files_skipped_oversize,
-        skipped_binary = map.files_skipped_binary,
-        "repo map walk complete; ingesting one conversation per directory",
-    );
-
-    let plan = IngestPlan::new(engine, &proj_builder, &config, layer_name, group_name)?;
-    // Retire conversations for directories that no longer exist, then snapshot
-    // the surviving hashes once for O(1) per-unit resume-cache probes.
-    // Crashed partials are NOT swept here. The sweep has to run whether or not
-    // this pass does, so it belongs to the caller — see
-    // [`retire_crashed_partials`].
-    let present: HashSet<&str> = units.iter().map(|u| u.dir.as_str()).collect();
-    reconcile_deleted(engine, &map, &present);
-    let report = run_dir_pool(engine, &plan, workspace, &units, progress);
-    Ok((map, dir_state_from_substrate(engine), report))
-}
-
 /// Outcome of a [`refresh_repo_map`] call. `Replaced` carries only the new
 /// per-directory hash record — per-unit conversations are freed once their
 /// turns seal, so there is no live sequence to swap.
@@ -532,14 +483,16 @@ pub enum RefreshOutcome {
     Replaced { state: DirState },
 }
 
-/// Selective refresh of the `repo_map` layer.
-///
-/// Re-derives the units from `map` (which the caller already walked, usually
-/// once per filesystem-event burst and shared with the `code_reading` refresh)
-/// and returns `NoOp` when no directory's hash moved. Otherwise it runs the same
-/// reconcile + pool as [`ingest_repo_map`]: directories whose hash is unchanged
-/// hit the resume-cache snapshot and are skipped, so only changed, added, or
-/// removed directories cost anything.
+/// Sole entry point for `repo_map` ingestion — startup's first pass, every
+/// later filesystem-event-triggered pass, and (once seeded) a totally fresh
+/// install all call this the same way. Re-derives the units from `map` (which
+/// the caller already walked, usually once per pass and shared with the
+/// `code_reading` refresh) and returns `NoOp` when no directory's hash moved
+/// against `prior` — an empty `prior` (nothing durable yet) makes every unit
+/// read as changed, which is exactly the first-ever-boot behavior this
+/// function needs with no separate "ingest" variant. Directories whose hash
+/// is unchanged hit the resume-cache snapshot inside [`run_dir_pool`] and are
+/// skipped, so only changed, added, or removed directories cost anything.
 ///
 /// The engine mutex is taken only for the quick create/tombstone ops inside the
 /// pool — never across a decode — so chat consumers keep running throughout.
@@ -550,7 +503,7 @@ pub fn refresh_repo_map(
     prior: &DirState,
     progress: &Arc<LoadProgress>,
     layer_name: &str,
-    group_name: &str,
+    base: &Mutex<Sequence>,
 ) -> anyhow::Result<RefreshOutcome> {
     let units = build_units(map, workspace);
     let prior = prior.without_frozen(map);
@@ -564,34 +517,88 @@ pub fn refresh_repo_map(
         n_changed = changed.len(),
         sample_changed = ?changed.iter().take(5).collect::<Vec<_>>(),
         n_total_dirs = units.len(),
+        n_files = map.files.len(),
+        n_anchored = units.iter().filter(|u| u.anchor.is_some()).count(),
+        skipped_extension = map.files_skipped_extension,
+        skipped_oversize = map.files_skipped_oversize,
+        skipped_binary = map.files_skipped_binary,
         "repo map refresh: re-ingesting changed directories",
     );
 
-    let plan = IngestPlan::new(
-        ctx.engine,
-        &ctx.proj_builder,
-        &ctx.config,
-        layer_name,
-        group_name,
-    )?;
+    let plan = IngestPlan::new(ctx.engine, &ctx.proj_builder, &ctx.config, layer_name)?;
     let present: HashSet<&str> = units.iter().map(|u| u.dir.as_str()).collect();
     reconcile_deleted(ctx.engine, map, &present);
-    let report = run_dir_pool(ctx.engine, &plan, workspace, &units, progress);
+    let report = run_dir_pool(
+        ctx.engine,
+        base,
+        ctx.priming_chain_end,
+        &plan,
+        workspace,
+        &units,
+        progress,
+    );
     crate::ingest_report::publish(PASS_NAME, report);
     Ok(RefreshOutcome::Replaced {
         state: dir_state_from_substrate(ctx.engine),
     })
 }
 
-/// The per-pass constants every worker needs to mint its unit's conversation:
-/// the resolved layer/group ids, the shared system prompt, and the utility
-/// config. Assembled once so the pool's per-unit signature stays small.
+/// Ingest just the workspace root's own directory unit (`dir == "."`) —
+/// the priming chain's `root ls` link (`crate::priming_chain`). Resume-cache
+/// aware, exactly like a pool worker's own check: a "." conversation already
+/// tagged with the current content hash is reused as-is rather than
+/// re-ingested. `None` when the workspace has no top-level files at all, so
+/// there is no root unit to build.
+pub(crate) fn ingest_root_unit(
+    ctx: &RefreshContext<'_>,
+    workspace: &Path,
+    map: &RepoMap,
+    base: &Mutex<Sequence>,
+) -> anyhow::Result<Option<TimelineId>> {
+    let units = build_units(map, workspace);
+    let Some(root) = units.into_iter().find(|u| u.dir == ".") else {
+        return Ok(None);
+    };
+    let present_hashes = ctx
+        .engine
+        .lock()
+        .unwrap()
+        .conversation_metadata_values(HASH_KEY);
+    if !present_hashes.contains(&root.content_hash) {
+        let plan = IngestPlan::new(ctx.engine, &ctx.proj_builder, &ctx.config, "repo_map")?;
+        let tool_ctx = ToolContext::with_workspace(workspace);
+        let failures = Failures::new();
+        // Root ls is the HEAD of the chain — it has no parent of its own.
+        process_one_dir(ctx.engine, base, None, &plan, &tool_ctx, &root, &failures)?;
+        let report = failures.into_report(1);
+        if report.is_incomplete() {
+            anyhow::bail!(
+                "priming chain: root ls ingest failed: {}",
+                report
+                    .failures
+                    .first()
+                    .map(|f| f.error.as_str())
+                    .unwrap_or("unknown")
+            );
+        }
+    }
+    // The good (content_sha256-tagged) generation for "." — present whether
+    // this call just minted it or it was already there.
+    let e = ctx.engine.lock().unwrap();
+    let found = e
+        .find_conversations_by_metadata(DIR_KEY, ".")
+        .into_iter()
+        .find(|tl| {
+            e.conversation_metadata(*tl)
+                .is_some_and(|m| m.contains_key(HASH_KEY))
+        });
+    Ok(found)
+}
+
+/// The per-pass constants every worker needs to drive its unit's
+/// conversation. Assembled once so the pool's per-unit signature stays
+/// small.
 struct IngestPlan {
-    layer: LayerId,
-    group: GroupId,
-    proj_builder: projection::Builder,
-    system_prompt: String,
-    config: SequenceConfig,
     /// `<think>` bound to [`ThinkMode::Off`]'s tree, for every folder summary
     /// decode in the pass.
     ///
@@ -611,14 +618,10 @@ impl IngestPlan {
         proj_builder: &projection::Builder,
         config: &SequenceConfig,
         layer_name: &str,
-        group_name: &str,
     ) -> anyhow::Result<Self> {
         let layer = proj_builder
             .id_for_layer(layer_name)
             .ok_or_else(|| anyhow::anyhow!("projection schema missing '{layer_name}' layer"))?;
-        let group = proj_builder
-            .id_for_group(group_name)
-            .ok_or_else(|| anyhow::anyhow!("projection schema missing '{group_name}' group"))?;
         // Append-only ingest layer (in-memory flag, re-applied every load): folder
         // summaries score self-local during ingest, so a summary is grounded in its
         // own folder rather than derailed by cross-directory retrieval.
@@ -634,15 +637,7 @@ impl IngestPlan {
         };
         engine.lock().unwrap().mark_layer_append_only(layer);
         let envelope = ToolCallEnvelope::for_dialect(&config.dialect);
-        Ok(Self {
-            layer,
-            group,
-            proj_builder: proj_builder.clone(),
-            system_prompt: shared_system_prompt(proj_builder, layer_name, config),
-            config: utility_config(config.clone()),
-            triggers,
-            envelope,
-        })
+        Ok(Self { triggers, envelope })
     }
 }
 
@@ -698,16 +693,16 @@ fn reconcile_deleted(engine: &Mutex<ConversationEngine>, map: &RepoMap, present:
 ///
 /// Called ONCE per boot from the session's ingest pre-loop, for every layer the
 /// operator did not `--disable-layer` — so a `--skip-layer repo_map` boot, which
-/// runs no pass at all, still leaves with its debris retired. That is why the
-/// call does not live in [`ingest_repo_map`]: a sweep that only runs when the
-/// pass runs cannot clean up the one case that produces debris and then declines
-/// to re-ingest it.
+/// runs no pass at all (ever, not even in the background), still leaves with its
+/// debris retired. That is why the call does not live inside [`refresh_repo_map`]
+/// itself: a sweep that only runs when a pass runs cannot clean up the one case
+/// that produces debris and then declines to re-ingest it.
 ///
 /// Never called from [`refresh_repo_map`]. A refresh can overlap a pool that is
 /// mid-flight, and an in-flight unit is indistinguishable from a crashed one by
 /// metadata alone — both carry `dir` with no hash — so sweeping there would
 /// tombstone the conversation a worker is still building. The pre-loop runs
-/// before any pool starts, so nothing is in flight.
+/// before the background ingest worker is even woken, so nothing is in flight.
 pub(crate) fn retire_crashed_partials(engine: &Mutex<ConversationEngine>) {
     let e = engine.lock().unwrap();
     let mut retired = 0usize;
@@ -734,6 +729,38 @@ pub(crate) fn retire_crashed_partials(engine: &Mutex<ConversationEngine>) {
              so their half-built chains leave the provenance gather",
         );
     }
+}
+
+/// Tombstone EVERY `repo_map` conversation, committed or not — `--wipe-layer
+/// repo_map`'s targeted counterpart to [`retire_crashed_partials`], which only
+/// removes the never-committed half.
+///
+/// Called from the session's ingest pre-loop, before the registry is seeded
+/// from the substrate (`dir_state_from_substrate`) — so once this returns,
+/// that seed is empty and the background ingest worker's first pass reads
+/// every directory as new, exactly as it would on a truly fresh install. This
+/// is the "test the background ingest end to end without deleting the whole
+/// substrate" tool: unlike `--wipe-substrate`, every other layer's content
+/// (dialogue, `code_reading` unless it too is named) survives untouched.
+pub(crate) fn wipe_layer(engine: &Mutex<ConversationEngine>) {
+    let e = engine.lock().unwrap();
+    let mut wiped = 0usize;
+    for (tl, dir) in e.conversations_with_metadata_key(DIR_KEY) {
+        match e.tombstone_timeline(tl) {
+            Ok(()) => wiped += 1,
+            Err(err) => tracing::warn!(
+                target: "zend::repo_scan",
+                dir = %dir,
+                "--wipe-layer repo_map: tombstone failed: {err:#}",
+            ),
+        }
+    }
+    tracing::info!(
+        target: "zend::repo_scan",
+        wiped,
+        "--wipe-layer repo_map: every repo_map conversation tombstoned — the next \
+         pass re-ingests the whole layer",
+    );
 }
 
 /// Whether a `repo_map` conversation's ingest ever committed.
@@ -774,7 +801,12 @@ const HASH_KEY: &str = "content_sha256";
 /// map for the life of the workspace, while `process_one_dir` logs that it will
 /// be picked up next run. [`HASH_KEY`] is written only after a unit's ingest
 /// succeeds, so joining on it records exactly what is really there.
-fn dir_state_from_substrate(engine: &Mutex<ConversationEngine>) -> DirState {
+///
+/// `pub` because `session.rs` also calls this directly to seed the in-memory
+/// `IngestConv` registry at boot — an empty result on a fresh install is a
+/// valid seed, since [`refresh_repo_map`] correctly reads it as "everything
+/// changed" on its first pass.
+pub fn dir_state_from_substrate(engine: &Mutex<ConversationEngine>) -> DirState {
     let e = engine.lock().unwrap();
     let hashes: HashMap<TimelineId, String> = e
         .conversations_with_metadata_key(HASH_KEY)
@@ -800,6 +832,8 @@ fn dir_state_from_substrate(engine: &Mutex<ConversationEngine>) -> DirState {
 /// first hard error stops the rest).
 fn run_dir_pool(
     engine: &Mutex<ConversationEngine>,
+    base: &Mutex<Sequence>,
+    parent: Option<TimelineId>,
     plan: &IngestPlan,
     workspace: &Path,
     units: &[DirUnit],
@@ -815,6 +849,18 @@ fn run_dir_pool(
         .lock()
         .unwrap()
         .conversation_metadata_values(HASH_KEY);
+
+    // The GUI's merged background-ingest bar (`crate::ingest_backlog`) counts
+    // only units that will REALLY run — a resume-cache hit costs one hash
+    // lookup, not a place in the backlog. Counted from the same snapshot the
+    // workers probe below, so registration and the per-unit completions can
+    // never disagree.
+    let backlog_pending = units
+        .iter()
+        .filter(|u| !present_hashes.contains(&u.content_hash))
+        .count() as u64;
+    crate::ingest_backlog::add_pending(backlog_pending);
+    let backlog_done = AtomicUsize::new(0);
 
     let cursor = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
@@ -886,7 +932,8 @@ fn run_dir_pool(
                     // fully-cached restart every unit is a hit, which put ~700
                     // free lookups through a gate that admits a handful at a
                     // time.
-                    let result = if present_hashes.contains(&units[idx].content_hash) {
+                    let tracked = !present_hashes.contains(&units[idx].content_hash);
+                    let result = if !tracked {
                         tracing::debug!(
                             target: "zend::repo_scan",
                             dir = %units[idx].dir,
@@ -900,10 +947,18 @@ fn run_dir_pool(
                         // decide against this state, and an unwind cannot leak
                         // it from the process-global gauge.
                         let _slot = ScanSlot::reserve(&live_convs);
-                        process_one_dir(engine, plan, &ctx, &units[idx], &failures)
+                        process_one_dir(engine, base, parent, plan, &ctx, &units[idx], &failures)
                     };
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     progress.set_step_progress(d as u64, total as u64);
+                    // A registered unit is "done" on every exit — success or a
+                    // tolerated failure — so the backlog can never wedge
+                    // non-empty waiting on a unit that will just be retried
+                    // next pass.
+                    if tracked {
+                        backlog_done.fetch_add(1, Ordering::Relaxed);
+                        crate::ingest_backlog::item_done(&units[idx].dir);
+                    }
                     // An error escaping `process_one_dir` is an unexpected one
                     // (its own two failure modes record and return Ok). Record
                     // it the same way so it lands in the report rather than
@@ -926,6 +981,12 @@ fn run_dir_pool(
             h.join().expect("repo_map worker panicked");
         }
     });
+
+    // An abort or a shutdown cancel can leave units claimed but never run —
+    // hand them back, or the GUI's backlog bar never reaches zero.
+    crate::ingest_backlog::drop_pending(
+        backlog_pending.saturating_sub(backlog_done.load(Ordering::Relaxed) as u64),
+    );
 
     // Pin the bar to 100%: workers store from their own `done` snapshot without a
     // max, so the last stored value can settle a step short even though every
@@ -965,6 +1026,8 @@ fn run_dir_pool(
 /// the unit simply misses the resume cache next run and is retried.
 fn process_one_dir(
     engine: &Mutex<ConversationEngine>,
+    base: &Mutex<Sequence>,
+    parent: Option<TimelineId>,
     plan: &IngestPlan,
     ctx: &ToolContext,
     unit: &DirUnit,
@@ -1018,15 +1081,41 @@ fn process_one_dir(
                 );
             }
         }
-        let conv = e
-            .new_conversation_with_projection(
-                &plan.system_prompt,
-                plan.proj_builder.clone(),
-                plan.layer,
-                plan.group,
-                plan.config.clone(),
-            )
+        drop(e);
+        // Forks off `base` — this layer's prefilled template, `base_conv`'s
+        // exact counterpart for ingestion (see `InferenceState::ingest_bases`)
+        // — so this conversation shares the SAME already-computed prefix a
+        // live dialogue turn forks from, rather than this pool's workers each
+        // independently re-running the schema's "eager section ingestion"
+        // under concurrent load.
+        let conv = base
+            .lock()
+            .unwrap()
+            .fork()
             .map_err(|err| anyhow::anyhow!("repo_map conv create: {err}"))?;
+        // Record the priming chain as this conversation's parent BEFORE its
+        // own listing/summary starts, so its turns are projected with the
+        // anchor documents already in context — see
+        // `RefreshContext::priming_chain_end` and
+        // `Substrate::inherited_chain`. Metadata only: nothing is copied and
+        // the parent needs no residency of its own.
+        if let Some(parent) = parent {
+            engine
+                .lock()
+                .unwrap()
+                .set_forked_from(conv.timeline_id(), parent)
+                .map_err(|err| anyhow::anyhow!("repo_map priming-chain parent: {err}"))?;
+            // See the identical note in `code_read::process_one_file`: the slot
+            // was seeded before this pointer existed, so ask again.
+            if let Err(err) = conv.seed_recurrent_from_lineage() {
+                tracing::warn!(
+                    target: "zend::repo_scan",
+                    dir = %unit.dir,
+                    "seeding recurrent memory from the priming chain failed: {err:#}",
+                );
+            }
+        }
+        let e = engine.lock().unwrap();
         // The folder's closing turn is its own decoded summary, so the AVL
         // summariser must not compress these turns into a second summary tree.
         e.set_timeline_summarize(conv.timeline_id(), false);

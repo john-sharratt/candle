@@ -1,17 +1,17 @@
 //! Indirection between the workspace-ingestion paths and the
 //! underlying [`candle_conversation::Sequence`].
 //!
-//! Two operations are abstracted:
+//! One operation is abstracted:
 //!
 //! * **`insert_prefill_turn(user, assistant)`** — prefill a complete
 //!   user/assistant exchange with no decode. The prefilled halves of a tool
 //!   round-trip (the user-side request or `<tool_response>`, the assistant-side
 //!   `<tool_call>` echo) flow through this.
-//! * **`ingest_chain` / `ingest_scope_roundtrip`** — a tool round-trip whose
-//!   LAST assistant turn is DECODED: the `code_reading` layer's per-scope
-//!   summary (two turns) and the `repo_map` layer's per-folder summary (three).
-//!   Per-file summaries are NOT decoded here — they are the async summary
-//!   tree's rollup, built by the summariser over the recorded scope turns.
+//! * **`ingest_chain`** — a tool round-trip whose LAST assistant turn is
+//!   DECODED: the `repo_map` layer's per-folder summary. `code_reading` no
+//!   longer prefills anything — each file is a real hidden conversation (see
+//!   `crate::code_read::run_file_conversation`), driven directly through
+//!   `Sequence::submit_turn_with_options` rather than through this sink.
 //!
 //! Integration tests wire a [`RecordingTurnSink`] that captures every call
 //! into memory, so the conversation shape can be verified without loading a
@@ -20,19 +20,6 @@
 use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{Sequence, TurnText};
 use std::sync::Arc;
-
-/// Per-scope progress callback, invoked with a scope's ingested token count as it
-/// lands so the upload/code-read path can climb its progress bar per scope rather
-/// than only when the whole file completes. `Arc<dyn Fn>` so it's `'static` +
-/// `Send` and cheap to clone across a file's scopes.
-pub type ScopeProgressFn = Arc<dyn Fn(usize) + Send + Sync>;
-
-/// Concurrent scopes per chunk in the parallel per-file ingest
-/// ([`SequenceTurnSink::ingest_scopes`]). Chunks run sequentially, so this bounds
-/// both the concurrent fork/slot count (with [`crate::code_read::CODE_READ_PARALLELISM`]
-/// files in flight → `files × SCOPE_PARALLELISM` forks) and the window a fork's
-/// K/V must stay hot for the splice.
-const SCOPE_PARALLELISM: usize = 4;
 
 /// Accepts a structured `(user, assistant)` turn stream from the
 /// workspace-ingestion paths.
@@ -73,61 +60,6 @@ pub trait InsertTurnSink {
         }
         total += self.insert_prefill_turn(decode_user, "", tags)?;
         Ok(total)
-    }
-
-    /// Ingest one code scope as a TOOL ROUND-TRIP of two coupled turns — the
-    /// call (`user(request)` → `assistant(<tool_call>)`) and the response
-    /// (`user(<tool_response>)` → `assistant(summary)`). Recording it as two
-    /// coupled turns (not one baked exchange) keeps the inter-turn seams as
-    /// regenerated glue and the `/no_think` / `<think>` handling correct — see
-    /// [`candle_conversation::Sequence::ingest_scope_roundtrip`]. Returns the
-    /// tokens ingested.
-    ///
-    /// Default (model-less sinks, e.g. tests): record the two turns with an empty
-    /// response summary — no engine to decode it. Real engines override to decode
-    /// the summary under `/no_think` and couple the pair.
-    fn ingest_scope_roundtrip(
-        &mut self,
-        call_user: &str,
-        call_assistant: &str,
-        response_user: &TurnText,
-        tags: Vec<String>,
-        _max_summary_tokens: usize,
-    ) -> anyhow::Result<usize> {
-        let a =
-            self.insert_prefill_turn(&TurnText::from(call_user), call_assistant, tags.clone())?;
-        let b = self.insert_prefill_turn(response_user, "", tags)?;
-        Ok(a + b)
-    }
-
-    /// Ingest one file's scopes, each as a two-turn tool round-trip
-    /// ([`Self::ingest_scope_roundtrip`]). `prepared` holds the rendered
-    /// `(call_user, call_assistant, response_user)` per scope IN FILE ORDER;
-    /// `on_prefilled` fires per scope with its token count.
-    ///
-    /// Default: **serial** — the correct fallback for model-less sinks (tests),
-    /// where the round-trip has no engine to parallelise across. The production
-    /// [`SequenceTurnSink`] overrides this to fork each scope onto its own
-    /// timeline, run the round-trips CONCURRENTLY (co-batched on the wave engine),
-    /// and splice the sealed pairs back onto the file timeline in order.
-    fn ingest_scopes(
-        &mut self,
-        prepared: Vec<(String, String, TurnText)>,
-        tags: Vec<String>,
-        max_summary_tokens: usize,
-        on_prefilled: &crate::turn_sink::ScopeProgressFn,
-    ) -> anyhow::Result<()> {
-        for (call_user, call_assistant, response_user) in prepared {
-            let tokens = self.ingest_scope_roundtrip(
-                &call_user,
-                &call_assistant,
-                &response_user,
-                tags.clone(),
-                max_summary_tokens,
-            )?;
-            on_prefilled(tokens);
-        }
-        Ok(())
     }
 }
 
@@ -196,148 +128,6 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
             "insert_prefill_turn: returned",
         );
         result
-    }
-
-    fn ingest_scope_roundtrip(
-        &mut self,
-        call_user: &str,
-        call_assistant: &str,
-        response_user: &TurnText,
-        tags: Vec<String>,
-        max_summary_tokens: usize,
-    ) -> anyhow::Result<usize> {
-        self.inner
-            .ingest_scope_roundtrip(
-                call_user,
-                call_assistant,
-                response_user.clone(),
-                tags,
-                max_summary_tokens,
-                Arc::clone(&self.triggers),
-            )
-            .map_err(|e| anyhow::anyhow!("ingest_scope_roundtrip: {e}"))
-    }
-
-    /// Parallel per-file scope ingest: fork each scope onto its own timeline, run
-    /// the proven two-turn round-trips CONCURRENTLY in bounded chunks (co-batched
-    /// on the wave engine), then splice each fork's coupled pair onto the file
-    /// timeline IN ORDER (`splice_scope_turns`, which couples + tombstones the
-    /// fork). Chunks run sequentially so the concurrent fork count — and the
-    /// window in which a fork's K/V must stay HOT for the splice — stays bounded.
-    fn ingest_scopes(
-        &mut self,
-        prepared: Vec<(String, String, TurnText)>,
-        tags: Vec<String>,
-        max_summary_tokens: usize,
-        on_prefilled: &crate::turn_sink::ScopeProgressFn,
-    ) -> anyhow::Result<()> {
-        // Lifted out of the loop: the forks below borrow `self.inner`, so the
-        // spawn closures cannot reach `self` for the steering.
-        let triggers = Arc::clone(&self.triggers);
-        for chunk in prepared.chunks(SCOPE_PARALLELISM) {
-            // Cooperative shutdown: abandon the rest of THIS file's scopes at the
-            // chunk boundary, so a worker returns after its in-flight chunk (~4
-            // scopes) instead of waiting for the whole file's decode to finish —
-            // that in-flight wait is the shutdown-latency (the already-submitted
-            // scopes drain slowly under VRAM pressure). The file is left partial
-            // (no `content_sha256`), so `process_one_file` re-ingests it next run.
-            if candle_conversation::ingest_cancelled() {
-                break;
-            }
-            // Fork one throwaway timeline per scope in this chunk.
-            let mut forks: Vec<Sequence> = Vec::with_capacity(chunk.len());
-            for _ in chunk {
-                forks.push(
-                    self.inner
-                        .fork_scope()
-                        .map_err(|e| anyhow::anyhow!("fork_scope: {e}"))?,
-                );
-            }
-            // Run each fork's two-turn round-trip concurrently; the scheduler
-            // co-batches their prefills + summary decodes on the shared wave.
-            //
-            // A thread that panics is joined as an ERROR, not re-raised. Every
-            // fork is a splice source, exempt from every automatic hot-drop until
-            // it is tombstoned — so unwinding out of here would skip the cleanup
-            // below and pin those forks' K/V on the device for the life of the
-            // process. As an error it takes the same path as a failed round-trip.
-            let results: Vec<anyhow::Result<(u32, u32, usize)>> = std::thread::scope(|s| {
-                let handles: Vec<_> = forks
-                    .iter_mut()
-                    .zip(chunk.iter())
-                    .map(|(fork, (call_user, call_assistant, response_user))| {
-                        let tags = tags.clone();
-                        let triggers = Arc::clone(&triggers);
-                        s.spawn(move || {
-                            fork.ingest_scope_roundtrip_indices(
-                                call_user,
-                                call_assistant,
-                                response_user.clone(),
-                                tags,
-                                max_summary_tokens,
-                                triggers,
-                            )
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| match h.join() {
-                        Ok(res) => res.map_err(|e| anyhow::anyhow!("{e}")),
-                        Err(_) => Err(anyhow::anyhow!("scope ingest thread panicked")),
-                    })
-                    .collect()
-            });
-            // Splice the sealed pairs onto the file timeline in scope order. On the
-            // first failure (a scope round-trip that errored, or a splice that
-            // failed) STOP and tombstone every fork from that point on. The forks
-            // before it were adopted + tombstoned by `splice_scope_turns`, but the
-            // failing fork and every later one ran their round-trip WITHOUT being
-            // spliced — and `Sequence`'s `Drop` frees only the slot, leaving their
-            // registered timeline + sealed turns behind as orphaned, path-less
-            // "(untitled)" scope conversations. Tombstoning them means a failed
-            // chunk leaves nothing behind before the file is retried whole.
-            let mut spliced = 0usize;
-            let mut chunk_err: Option<anyhow::Error> = None;
-            for (fork, res) in forks.iter().zip(results) {
-                match res {
-                    Ok((call_idx, resp_idx, tokens)) => {
-                        match self.inner.splice_scope_turns(
-                            fork.timeline_id(),
-                            call_idx,
-                            resp_idx,
-                            tags.clone(),
-                        ) {
-                            Ok(_) => {
-                                spliced += 1;
-                                on_prefilled(tokens);
-                            }
-                            Err(e) => {
-                                chunk_err = Some(anyhow::anyhow!("splice_scope_turns: {e}"));
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        chunk_err = Some(anyhow::anyhow!("scope round-trip: {e}"));
-                        break;
-                    }
-                }
-            }
-            if let Some(e) = chunk_err {
-                // Every fork at or after `spliced` was never adopted onto the file
-                // timeline — tombstone so no orphan scope timeline survives.
-                for fork in forks.iter().skip(spliced) {
-                    self.inner.tombstone_fork(fork.timeline_id());
-                }
-                drop(forks);
-                return Err(e);
-            }
-            // All spliced → their timelines are already tombstoned by
-            // `splice_scope_turns`; dropping frees the scheduler slots.
-            drop(forks);
-        }
-        Ok(())
     }
 }
 

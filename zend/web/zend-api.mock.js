@@ -128,9 +128,28 @@
       return this._panelData();
     },
 
-    // GET /v1/status — the mock daemon is always ready (no model to load).
+    // GET /v1/status — the mock daemon is always ready (no model to load). A
+    // test sets `window.__ZEND_MOCK_INGEST_BACKLOG__ = true` before boot to
+    // exercise the background-ingestion bar: `total` grows once mid-drain (a
+    // file changing while the backlog drains is more work, not a bug) and the
+    // field goes back to `null` once `processed` catches `total`, matching
+    // the real daemon's counters (which reset to zero at that exact instant,
+    // so a client never observes a `processed === total` frame).
+    _ingestBacklogCalls: 0,
     getStatus() {
-      return Promise.resolve({ state: 'ready', started_at_ms: 0, detail: '', loading: null, build: 'mock' });
+      let ingest_backlog = null;
+      if (window.__ZEND_MOCK_INGEST_BACKLOG__) {
+        const n = ++this._ingestBacklogCalls;
+        const files = ['src/main.rs', 'src/session.rs', 'src/api/status.rs', 'src/ingest_backlog.rs'];
+        const total = n < 3 ? 5 : 7; // bumps from 5 to 7 on the 3rd poll
+        if (n < total) {
+          ingest_backlog = { processed: n, total, last_item: files[(n - 1) % files.length] };
+        }
+      }
+      return Promise.resolve({
+        state: 'ready', started_at_ms: 0, detail: '', loading: null, maintenance: null,
+        ingest_backlog, build: 'mock',
+      });
     },
 
     // GET /v1/me — the mock is an admin, so every tools mode is on the dial. A

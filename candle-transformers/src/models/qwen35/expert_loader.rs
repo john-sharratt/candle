@@ -158,6 +158,9 @@ pub fn build_expert_cache(
         mmap,
         int8mode,
         expert_pack_dir,
+        // The qwen35 quantized loader carries no progress hook of its own, so
+        // there is nothing to report the repack against here.
+        None,
     )
 }
 
@@ -176,6 +179,7 @@ pub fn build_expert_cache_for(
     mmap: Arc<memmap2::Mmap>,
     int8mode: candle::quantized::Int8Mode,
     expert_pack_dir: Option<&std::path::Path>,
+    progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<Option<Arc<ExpertCache>>> {
     use crate::models::expert_lre::{layer_geometries, slot_bytes_for};
     use candle_nn::kv_cache::{
@@ -268,7 +272,7 @@ pub fn build_expert_cache_for(
         experts_per_layer: n_expert,
         gguf_path,
         expert_pack_dir,
-        progress: None,
+        progress,
         int8mode,
     })?;
     let cache = Arc::new(cache);

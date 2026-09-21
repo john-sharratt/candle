@@ -1,14 +1,19 @@
-//! `notify`-backed workspace watcher that drives the repo_map and
-//! code_reading layer refresh paths.
+//! `notify`-backed workspace watcher that wakes the daemon's single
+//! background ingest worker (`crate::ingest_worker`) — it does not run a
+//! refresh itself.
 //!
 //! Filesystem events are noisy and bursty (an editor's "save" can fire
 //! create / modify / rename in quick succession; bulk operations like
 //! `git checkout` raise thousands of events at once).  The watcher
 //! debounces events into a single "something changed" pulse on a
-//! short window, then asks the session to re-walk and decide whether
-//! a refresh is actually warranted — content edits short-circuit on
-//! file-content hash equality, and repo-map refresh short-circuits
-//! on per-directory content-hash equality.
+//! short window, then fires the supplied callback, which wakes the ingest
+//! worker to re-walk and decide whether a refresh is actually warranted —
+//! content edits short-circuit on file-content hash equality, and repo-map
+//! refresh short-circuits on per-directory content-hash equality. Routing
+//! every wake through one worker (rather than each burst running its own
+//! refresh) is what keeps `repo_scan`'s per-pass pricing statics and
+//! `ingest_report`'s publish sound: two overlapping refreshes would corrupt
+//! both.
 //!
 //! Events that can't move either hash record (file access, pure
 //! permission / xattr changes) are filtered out before they reach
@@ -82,10 +87,10 @@ fn without_cur_dir(root: &Path) -> PathBuf {
 
 /// Spawn the watcher in the background.  Filesystem events that
 /// can move either the repo-map or code-reading hash record
-/// (create / remove / rename / content-modify) trigger a refresh on
-/// the supplied callback after `DEBOUNCE_WINDOW` of quiet, bounded
-/// by `MAX_DEBOUNCE_HOLD`.  Pure access events and metadata-only
-/// modifies are dropped at the filter.
+/// (create / remove / rename / content-modify) fire the supplied
+/// callback (which wakes the ingest worker) after `DEBOUNCE_WINDOW`
+/// of quiet, bounded by `MAX_DEBOUNCE_HOLD`.  Pure access events and
+/// metadata-only modifies are dropped at the filter.
 ///
 /// Returns the [`RecommendedWatcher`] so the caller can keep it
 /// alive for the daemon's lifetime; dropping it stops the watch.
@@ -145,8 +150,9 @@ pub fn spawn(
 /// bulk git operations emit their whole burst inside `DEBOUNCE_WINDOW`), capped
 /// by `MAX_DEBOUNCE_HOLD` from the first event so a long-running bulk operation
 /// can't defer the callback forever. Runs detached on the global executor; `cb`
-/// itself runs on the blocking pool since both the source refresh and the
-/// uploads reconcile do synchronous engine work.
+/// itself runs on the blocking pool — the uploads reconcile does synchronous
+/// engine work, and the source callback, though today just a cheap
+/// `Notify::notify_one`, costs nothing extra by running the same way.
 fn spawn_debounced(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     cb: Arc<dyn Fn() + Send + Sync + 'static>,

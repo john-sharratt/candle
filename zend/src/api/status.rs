@@ -32,6 +32,11 @@ pub async fn status(State(session): State<Arc<ZendSession>>) -> Json<StatusBody>
             last_op_unix: last.map(|(_, unix)| unix),
             running,
         });
+    let ingest_backlog = snap.ingest_backlog.map(|b| IngestBacklogBody {
+        processed: b.processed,
+        total: b.total,
+        last_item: b.last_item,
+    });
     Json(StatusBody {
         state: if loading.is_some() {
             "loading"
@@ -42,6 +47,7 @@ pub async fn status(State(session): State<Arc<ZendSession>>) -> Json<StatusBody>
         detail: snap.detail,
         loading,
         maintenance,
+        ingest_backlog,
         build: super::build_id(),
     })
 }
@@ -68,9 +74,26 @@ pub struct StatusBody {
     /// Segmented redo-log maintenance state — segment count and the last
     /// drop/compact/combine op. `null` until the engine is loaded.
     pub maintenance: Option<MaintenanceBody>,
+    /// Pending background ingest work, merged across every ingest layer (plus
+    /// uploads, which share the same per-file pool). `null` when nothing is
+    /// queued — the GUI hides its progress bar on this. `processed` counts
+    /// units (directories + files) actually ingested this batch; resume-cache
+    /// hits are not work and are not counted. Both counters reset to zero the
+    /// moment the queue drains, so the next batch starts fresh.
+    pub ingest_backlog: Option<IngestBacklogBody>,
     /// Hash of the embedded web build. The frontend captures this on load and
     /// force-reloads when it changes (daemon rebuilt with new UI assets).
     pub build: &'static str,
+}
+
+/// `StatusBody.ingest_backlog` — see the field doc.
+#[derive(Serialize)]
+pub struct IngestBacklogBody {
+    pub processed: u64,
+    pub total: u64,
+    /// Path of the most recently completed directory or file, workspace-
+    /// relative. `null` before the first unit of the current batch completes.
+    pub last_item: Option<String>,
 }
 
 /// Segmented redo-log maintenance view sent inside `StatusBody.maintenance` —

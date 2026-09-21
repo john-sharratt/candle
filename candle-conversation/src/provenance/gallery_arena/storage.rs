@@ -133,6 +133,11 @@ impl GalleryStorage {
             "page must be exactly page_u64 words"
         );
         let dev = self.cuda();
+        // The copy below is a raw driver call on a raw stream, so this thread
+        // needs the context current — `CudaDevice`'s own methods bind for their
+        // callers, but nothing has bound for us here. A warm-up running on the
+        // normalization pool's workers is the case that found this.
+        dev.bind_to_thread()?;
         let stream = dev.cuda_stream();
         let dst = self.page_addr(slab_idx, page_in_slab);
         // The destination is a raw address inside the reservation rather than a

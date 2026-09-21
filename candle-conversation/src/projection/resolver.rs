@@ -1468,7 +1468,9 @@ impl Conversation {
                 match self.fold_warm_probes(taught, &probes, arena) {
                     Some(true) => warm.gpu_probes += probes.len(),
                     Some(false) => {}
-                    // A shutdown asked: the warm-up must end with its session.
+                    // It did not complete — a shutdown asked, or the GPU scan
+                    // failed and the host cannot stand in for it. Either way the
+                    // warm-up ends here with whatever it has already learned.
                     None => return warm,
                 }
             }
@@ -1489,8 +1491,10 @@ impl Conversation {
     /// whole-turn scores against `taught`'s gallery, observed under the probe's
     /// stream id, exactly as the seal-time scan observes it. `Some(true)` when
     /// the GPU arena scored them, `Some(false)` for the CPU (no arena, a
-    /// non-additive law the arena does not scan, an empty gallery, or a launch
-    /// that failed), `None` when a shutdown stopped it part-way.
+    /// non-additive law the arena does not scan, or an empty gallery — the cases
+    /// that never reach a kernel and are cheap on the host), `None` when it did
+    /// not complete: a shutdown stopped it, or the GPU scan failed on a gallery
+    /// the host cannot finish.
     fn fold_warm_probes(
         &self,
         taught: &SectionCollection,
@@ -1536,7 +1540,6 @@ impl Conversation {
                     n_cases: n,
                 }];
                 let mut raw = Vec::with_capacity(queries.len());
-                let mut scanned = true;
                 for batch in queries.chunks(WARM_GPU_PROBE_BATCH) {
                     if ingest_cancelled() {
                         return None;
@@ -1544,16 +1547,38 @@ impl Conversation {
                     match arena.scan_weighted(&segments, batch, weights) {
                         Ok(out) => raw.extend(out),
                         Err(e) => {
+                            // **A failed GPU scan does NOT fall back to the CPU.**
+                            //
+                            // The CPU path below is a per-query walk of the whole
+                            // gallery. It is the right answer for the cheap cases
+                            // that never reach a kernel (no arena, an empty gallery,
+                            // a fusion law the arena does not scan) — but a gallery
+                            // big enough to want the GPU is one the host cannot
+                            // finish. Measured: a `CUDA_ERROR_INVALID_CONTEXT` here
+                            // put eight cores at 100% with the GPU idle and boot
+                            // never completed — 900 s and still going, which is the
+                            // same half-hour stall `warm_collection_normalization`
+                            // already records above.
+                            //
+                            // Warm-up is an optimisation: skipping it leaves this
+                            // collection's levels cold for the session, which costs
+                            // ranking quality. Hanging the boot costs everything.
                             tracing::warn!(
                                 target: "candle_conversation::provenance",
-                                "GPU warm-up scan unavailable, using CPU: {e}"
+                                collection = %taught.name,
+                                windows = windows.len(),
+                                probes = probes.len(),
+                                "GPU warm-up scan FAILED: {e} — abandoning this \
+                                 collection's warm-up rather than falling back to a \
+                                 host scan that cannot finish a gallery this size. \
+                                 Its hit levels stay COLD for this session, so its \
+                                 members' scores are not comparable to each other."
                             );
-                            scanned = false;
-                            break;
+                            return None;
                         }
                     }
                 }
-                scanned.then_some(raw)
+                Some(raw)
             }
             _ => None,
         };
@@ -1616,19 +1641,27 @@ impl Conversation {
         let t_warm = Instant::now();
         let mut warmed_timelines = 0usize;
         for layer in &schema.layers {
-            // Out of retrieval ⇒ nothing to warm. A hit level is a denominator
-            // for candidates this layer might return, and a non-gathered layer
-            // returns none, so warming it would spend the probe budget learning
-            // levels that can never be read. (`score_belief_groups` declines the
-            // same layer, so `warm_normalization_from_substrate` needs no guard
-            // of its own — it warms THROUGH that call.)
-            if !layer.gathered {
-                continue;
-            }
+            // This function only ever warms an append-only ingest layer — the
+            // loop body below is unreached otherwise, so this is the real
+            // filter; a leftover `!layer.gathered` check used to sit ahead of
+            // it and is deliberately gone (see below).
             let is_ingest = self.inner.read().unwrap().is_append_only_layer(layer.id);
             if !is_ingest {
                 continue;
             }
+            // `gathered = false` promises "no OTHER conversation draws from
+            // this layer" — it does NOT mean nothing reads it at all. An
+            // append-only layer's own conversations score self-local
+            // (`score_belief_groups` exempts a layer scoring its own target
+            // regardless of `gathered`, for the same reason this warm still
+            // has a reader to serve). A `!layer.gathered` skip here used to
+            // run ahead of the `is_ingest` check above, so it silently
+            // matched exactly the ingest layers this loop exists to warm —
+            // the moment one was taken out of cross-layer gather (`zend`'s
+            // provenance-injection exclusion for `code_reading`/`repo_map`),
+            // its own turns went cold forever: no later pass ever warmed
+            // them, so a conversation several turns into its own history
+            // could no longer retrieve its own earlier turns.
             for group in layer.groups.iter().filter(|g| is_warmable(g)) {
                 warmed_timelines += self.warm_group(layer, group);
             }
@@ -1797,7 +1830,24 @@ impl Conversation {
         // declines to score them, so they cannot be selected, which is the whole
         // of what the flag promises. Re-enabling restores them immediately; the
         // flag is a read-time filter, not a deletion.
-        if !layer.gathered {
+        //
+        // Exempt when `layer` IS the projection's own target — mirroring the
+        // assembly loop's `layer_is_target` exemption in `project.rs` ("the
+        // target layer is never skipped — that would leave the projection with
+        // nothing to emit"). `gathered = false` promises "no OTHER conversation
+        // draws from this layer"; it was never meant to promise "this layer's
+        // own conversations can't see their own history" too. An append-only
+        // ingest layer (`code_reading`, `repo_map`) scores self-local here —
+        // candidates scoped to `target.timeline` alone, never another
+        // conversation's — so honouring `!gathered` unconditionally silently
+        // zeroed every such layer's OWN turn-group candidates the moment it was
+        // taken out of cross-layer gather, with no way back in: a later turn
+        // in the very conversation that owns this layer could never again see
+        // turns from earlier in itself. Measured: a `code_reading` per-file
+        // conversation's closing turn, several `file_read` rounds deep, lost
+        // every earlier round in the same conversation and could not tell it
+        // had already read the whole file.
+        if !layer.gathered && layer.id != target.layer {
             return per_group;
         }
         // The substrate read guard is scoped to Phase A, never held across Phase
@@ -4360,7 +4410,19 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         // so a scope summary is grounded only in its own scope — the multi-timeline
         // scan (cross-file retrieval) belongs to dialogue, not ingest generation.
         if group == self.target.group || self.read.is_append_only_layer(self.target.layer) {
-            return turns_of(self.target.timeline).collect();
+            // "My own history" spans the fork lineage: a conversation forked
+            // from another continues it, so the ancestors' turns are its own
+            // opening, oldest first. Each key keeps its own timeline, so
+            // exchange partitioning, ordering and emission downstream are
+            // already multi-timeline and need no change — and an ancestor
+            // sitting warm or cold is elevated by the ordinary projection
+            // working-set path, which is why nothing has to be pinned hot.
+            return self
+                .read
+                .inherited_chain(self.target.timeline)
+                .into_iter()
+                .flat_map(turns_of)
+                .collect();
         }
         self.read
             .active_timelines_for_group(group)
@@ -4504,6 +4566,91 @@ mod tests {
 
     fn tags(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **A forked conversation's "own history" spans its lineage.**
+    ///
+    /// This is the projection half of `Substrate::inherited_chain`: the target
+    /// group is still masked to one conversation (a slot never sees a sibling
+    /// chat), but that conversation now opens with the turns of whatever it was
+    /// forked from, oldest first. It is what lets a dialogue start already
+    /// holding the priming chain's documents without a single turn being
+    /// copied onto it — and without the ancestor being pinned resident, since
+    /// each key keeps its own timeline and is elevated from whatever tier it is
+    /// on when selected.
+    #[test]
+    fn a_forked_conversation_opens_with_its_ancestors_turns() {
+        use crate::projection::ids::{TurnIndex, TurnKey};
+        use crate::projection::project::ProjectionTarget;
+        use crate::substrate::ContentResolver;
+
+        let conv = Conversation::ephemeral();
+        let layer = LayerId::from_raw(1).expect("layer id");
+        let group = GroupId::from_raw(1).expect("group id");
+        let grandparent = TimelineId::from_raw(21).expect("timeline id");
+        let parent = TimelineId::from_raw(22).expect("timeline id");
+        let child = TimelineId::from_raw(23).expect("timeline id");
+        for tl in [grandparent, parent, child] {
+            conv.register_timeline(tl, layer, group);
+        }
+        {
+            let mut w = conv.write();
+            w.append_with_blocks(grandparent, 8, 0, 1);
+            w.append_with_blocks(parent, 8, 1, 2);
+            w.append_with_blocks(child, 8, 2, 3);
+        }
+        for (c, p) in [(child, parent), (parent, grandparent)] {
+            conv.set_conversation_metadata(c, Substrate::FORKED_FROM_KEY, &p.raw().to_string())
+                .expect("record lineage");
+        }
+
+        let read = conv.read_for(ProjectionTarget {
+            layer,
+            group,
+            timeline: child,
+        });
+        assert_eq!(
+            ContentResolver::group_turns(&read, group),
+            vec![
+                TurnKey::new(grandparent, TurnIndex(0)),
+                TurnKey::new(parent, TurnIndex(0)),
+                TurnKey::new(child, TurnIndex(0)),
+            ],
+            "oldest ancestor first, the target's own turns last",
+        );
+    }
+
+    /// A conversation that never forked is unaffected — the masking that keeps
+    /// one chat out of another's projection is exactly as it was.
+    #[test]
+    fn an_unforked_conversation_still_sees_only_its_own_turns() {
+        use crate::projection::ids::{TurnIndex, TurnKey};
+        use crate::projection::project::ProjectionTarget;
+        use crate::substrate::ContentResolver;
+
+        let conv = Conversation::ephemeral();
+        let layer = LayerId::from_raw(1).expect("layer id");
+        let group = GroupId::from_raw(1).expect("group id");
+        let mine = TimelineId::from_raw(31).expect("timeline id");
+        let sibling = TimelineId::from_raw(32).expect("timeline id");
+        conv.register_timeline(mine, layer, group);
+        conv.register_timeline(sibling, layer, group);
+        {
+            let mut w = conv.write();
+            w.append_with_blocks(mine, 8, 0, 1);
+            w.append_with_blocks(sibling, 8, 1, 2);
+        }
+
+        let read = conv.read_for(ProjectionTarget {
+            layer,
+            group,
+            timeline: mine,
+        });
+        assert_eq!(
+            ContentResolver::group_turns(&read, group),
+            vec![TurnKey::new(mine, TurnIndex(0))],
+            "a sibling conversation stays masked out",
+        );
     }
 
     /// **A spliced turn keeps its index page.**
@@ -4834,8 +4981,14 @@ layers:
         assert!(warmable(b.schema(), dialogue, conversation).is_none());
     }
 
-    /// **A layer out of retrieval is not warmed**, whichever warm-up asks —
-    /// the single-group and single-timeline ones as well as the ingest one.
+    /// **A layer out of retrieval is not warmed** through `warmable()` — the
+    /// single-group and single-timeline warm-ups this gates. The BULK ingest
+    /// warm-up (`warm_ingest_normalization`) does NOT go through `warmable()`
+    /// and does not honour this flag for an append-only layer: see
+    /// `turn_belief_scan.rs`'s `warm_ingest_normalization_still_warms_an_append_only_layer_when_not_gathered`
+    /// for why — a `code_reading`/`repo_map`-shaped layer scores itself
+    /// regardless of `gathered`, since that flag promises only that no OTHER
+    /// conversation draws from it.
     #[test]
     fn a_group_in_a_layer_out_of_retrieval_is_not_warmable() {
         let mut b = Builder::from_yaml(WARM_YAML).unwrap();

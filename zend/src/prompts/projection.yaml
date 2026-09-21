@@ -715,17 +715,32 @@ layers:
   # ── Phase 2 — Code Reading ─────────────────────────────────────────────────
   - name: code_reading
     description: |
-      Raw scope-aware code chunks (Phase 2 of the trunk pipeline).  One turn
-      per (file × scope) chunk.  Highest token-density per turn — selection
-      trims aggressively.
-    # Loading-screen unit for this layer's startup ingest. NB: the progress
-    # counter is per code *scope* (file_progress_units = scopes.len()), so the
-    # N / M reflects scope counts, not file counts.
+      One hidden conversation per file, forked from the same base a live
+      dialogue turn forks from and driven exactly the same way: real
+      `file_read` tool calls, as many rounds as the file needs, closing in
+      its own decoded summary once the whole file has been read.
+    # Loading-screen unit for this layer's startup ingest.
     ingest_unit: files
-    # Out of tool rounds, like repo_map: each turn is a summarize-this-scope
+    # Out of tool rounds, like repo_map: each turn is a read-this-file
     # request, the competing question a tool round looks back for.
     in_tool_rounds: false
-    window: 6000
+    # Sized for a REAL `file_read` response, not the old pre-carved scope
+    # excerpt this layer used to hold: one 200-line chunk (`MAX_READ_LINES`
+    # in `zend-tools`) alone runs ~5500-6000 tokens, so the previous 6000
+    # window fit barely one round. `target_is_ingest_self` (`substrate.rs`)
+    # already selects a code-reading conversation's own earlier turns
+    # unconditionally — belief scoring is the wrong instrument for a
+    # conversation reading its own history — but the later flexbox pass
+    # still trims every group's picks down to `layer.window`
+    # (`project.rs`'s "flexbox pass below still trims to `layer.window`"),
+    # so a window sized for the old design silently dropped those turns
+    # again regardless. Measured: a `file_read` conversation several rounds
+    # into its own history answered as if no earlier turn had happened.
+    # 40000 covers ~6-7 rounds at that per-round size — comfortably past the
+    # common case; a file needing more is a good outcome trimmed, not a
+    # missing one, and `MAX_FILE_READ_ROUNDS`'s closing round still forces
+    # an answer on whatever was read if a file runs long enough to matter.
+    window: 40000
     score_threshold: 0.0
     budget:
       priority: 25
@@ -1164,11 +1179,23 @@ layers:
   # `conversation` rule: most recent N turns are inviolate; a further K
   # historical turns are pulled in by score for older context.  Emission is
   # insertion order so the dialogue reads chronologically.
+  #
+  # The window must also seat the INHERITED lineage, which is inviolate: a
+  # conversation forked from another carries its ancestors' turns (the priming
+  # chain's documents), and those are never dropped by score — see
+  # `select_conversation`. The budget pass subtracts everything inviolate
+  # before the historical pool gets a seat, so a window sized only for the
+  # recent window would leave score-based recall with nothing at all.
+  #
+  # Sized as `Substrate::INHERITED_CHAIN_TOKEN_CAP` (100k, the ceiling on what
+  # the lineage may contribute) plus the 16k this layer used to have for its
+  # own recent turns and historical recall. Lower the cap and this can follow
+  # it down; the two numbers are a pair.
   - name: dialogue
     description: |
       The active developer conversation served to the VS Code extension or
       web chat.
-    window: 16000
+    window: 116000
     score_threshold: 0.0
     # Continuous-fair-wave: the interactive layer, so protect its decode latency
     # most — a co-running background prefill is throttled to 1 layer of progress

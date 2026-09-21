@@ -632,10 +632,11 @@ pub fn format_tool_responses(results: &[ToolResult]) -> TurnText {
     // the same reason: a structured field beside a rendered string has to be
     // correlated with it, whereas a first line is read in passing.
     //
-    // **Only when there is more than one.** A single-call round keeps the exact
-    // bytes the `code_reading` ingest prefills, so a live response and the tens
-    // of thousands of conditioned ones stay the same object; the header appears
-    // precisely when order alone stops being unambiguous — and it must, because
+    // **Only when there is more than one.** A single-call round is the common
+    // case for both a live turn and `code_reading`'s hidden per-file
+    // conversation (which now runs this same function for its own real
+    // `file_read` calls, not a synthetic prefill) — so the header appears
+    // precisely when order alone stops being unambiguous, and it must, because
     // a failed call returns an error envelope rather than the shape its position
     // would imply.
     let label =
@@ -644,9 +645,8 @@ pub fn format_tool_responses(results: &[ToolResult]) -> TurnText {
         let body = match &r.response {
             // A string result is already rendered for the model — placed in the
             // block verbatim rather than JSON-encoded. `file_read` returns a
-            // numbered, fenced excerpt this way, so a live response is
-            // byte-identical to the `code_reading` ingest's prefilled ones;
-            // encoding it would collapse the source to one line of `\n` escapes.
+            // numbered, fenced excerpt this way; encoding it would collapse the
+            // source to one line of `\n` escapes.
             Value::String(rendered) => rendered.clone(),
             other => serde_json::to_string(other)
                 .unwrap_or_else(|_| "{\"error\":\"internal_error\"}".to_string()),

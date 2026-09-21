@@ -236,6 +236,20 @@
   }
   @media (max-width: 560px) { .z-dial-label { display: none !important; } }
   .z-chatscroll > div:last-child { margin-bottom: 2.5rem !important; }
+  /* The daemon's background ingestion backlog, under the chat and above the
+     composer (GET /v1/status -> `ingest_backlog`). Not the startup screen:
+     this is an already-ready daemon draining a repo-map + code-reading queue,
+     so it is a thin strip that takes its own height out of the chat's,
+     nothing more. `z-index` lifts it over the composer's fade-to-background
+     gradient, which is an absolute child reaching 2rem ABOVE the composer and
+     would otherwise paint across this strip. Fill + track copied from
+     .z-load-bar/.z-load-track so the two bars in this app read as the same bar. */
+  .z-ingest { flex-shrink: 0; position: relative; z-index: 1; display: flex; align-items: center; gap: .6rem; background: #1c1917; border-top: 1px solid #2a2622; }
+  .z-ingest-label { flex-shrink: 0; font-size: .7rem; font-weight: 650; letter-spacing: .07em; text-transform: uppercase; color: #8a7b6a; }
+  .z-ingest-track { flex: 1; min-width: 0; height: 6px; background: #2a2724; border-radius: 3px; overflow: hidden; }
+  .z-ingest-fill { height: 100%; background: linear-gradient(90deg, #c98a3e, #e0a85a); width: 0%; transition: width .25s ease-out; }
+  .z-ingest-item { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace,monospace; font-size: .7rem; color: #5e554c; }
+  .z-ingest-count { flex-shrink: 0; font-size: .72rem; color: #8a8074; font-variant-numeric: tabular-nums; }
   /* The open conversation's header: its title, which opens the conversation's
      own actions. The padding clears the floating Appearance button on the left
      and the top-right actions, which sit over the header's ends. */
@@ -463,6 +477,10 @@ import { estateSwitcher } from './common/lib/estate.js';
     fileView: null,
     thinkOpen: {},
     upload: null,
+    // The daemon's background ingestion backlog (GET /v1/status
+    // `ingest_backlog`) — `{ processed, total, last_item }`, or null when
+    // there is none to show.
+    ingestBacklog: null,
     // `connecting` until the daemon first answers (a quiet splash); the startup
     // card only when it reports that it is actually loading.
     boot: { state: 'connecting' },
@@ -1738,7 +1756,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     if (S.dragActive) dropZone.appendChild(buildDragOverlay());
 
     return h('div', { style: 'flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; background:#1c1917;' },
-      dropZone, buildComposer());
+      dropZone, buildIngestBar(), buildComposer());
   }
 
   // The open conversation's header: its title, which is also the button for
@@ -2168,6 +2186,71 @@ import { estateSwitcher } from './common/lib/estate.js';
   }
   function menuBtnStyle(activeOn) {
     return 'display:flex; align-items:center; justify-content:center; width:36px; height:32px; border-radius:8px; border:1px solid ' + (activeOn ? '#6a6258' : '#50493f') + '; background:' + (activeOn ? '#37322d' : '#2e2a26') + '; color:' + (activeOn ? '#ece8e4' : '#cfc8c0') + '; cursor:pointer; box-shadow:0 12px 30px rgba(0,0,0,0.72), 0 3px 8px rgba(0,0,0,0.5);';
+  }
+
+  // ── ingest backlog bar ───────────────────────────────────────────────────
+  // The daemon's background ingestion queue (repo map + code reading, plus
+  // uploads, which share the same pool) draining while the app is up and
+  // usable — not the startup overlay, which is a separate full-page gate for
+  // a daemon that is not ready yet. `null` (skipped by `h`, so the chat takes
+  // the height straight back) whenever the daemon reports no backlog:
+  // appearing and disappearing is the node being in the tree or not, like
+  // every other show/hide in this file.
+  //
+  // `total` climbs while the queue drains — a file changed mid-pass is more
+  // work, not a miscount — so the fill can slip backwards. That is the truth
+  // of the queue and is left visible; the readout on the right is what
+  // REMAINS, which is the number that only ever means one thing.
+  const INGEST_ITEM_MAX = 56;
+  function ingestView(b) {
+    const total = b.total || 0;
+    // `processed` is clamped so a poll that catches a grown total late can
+    // never render a fill past 100% or a negative remainder.
+    const processed = Math.min(b.processed || 0, total);
+    const item = b.last_item || '';
+    return {
+      total, processed,
+      pct: total > 0 ? Math.round((processed / total) * 100) : 0,
+      left: Math.max(0, total - processed).toLocaleString() + ' left',
+      item,
+      // A path's tail (the file) identifies it; its head is repeated
+      // boilerplate — clamp from the left. The CSS ellipsis then handles
+      // whatever the row still can't fit.
+      itemTxt: item.length > INGEST_ITEM_MAX ? '…' + item.slice(-(INGEST_ITEM_MAX - 1)) : item,
+    };
+  }
+  function buildIngestBar() {
+    const b = S.ingestBacklog;
+    if (!b) return null;
+    const v = ingestView(b);
+    // Narrow: the count alone, against the fill. There is no room for a path
+    // on a phone, and the eyebrow would cost more width than it explains.
+    return h('div', { id: 'zend-ingest', class: 'z-ingest', style: 'padding:0.3rem ' + (S.narrow ? '0.85rem' : '2rem') + ' 0.35rem;' },
+      S.narrow ? null : h('span', { class: 'z-ingest-label' }, 'Indexing'),
+      h('div', { class: 'z-ingest-track', role: 'progressbar', 'aria-label': 'Workspace indexing backlog', 'aria-valuemin': '0', 'aria-valuemax': String(v.total), 'aria-valuenow': String(v.processed) },
+        h('div', { class: 'z-ingest-fill', style: 'width:' + v.pct + '%;' })),
+      S.narrow ? null : h('span', { class: 'z-ingest-item', title: v.item || null }, v.itemTxt),
+      h('span', { class: 'z-ingest-count' }, v.left));
+  }
+  // A counter tick with the bar already on screen: move the fill and the
+  // labels in place rather than rebuilding the page. A full render every
+  // second would tear the chat down under a selection the user is mid-copy
+  // — the same reason streamed tokens patch their own bubble
+  // (`liveUpdateStreaming`) — and nothing outside this strip reads the
+  // backlog. Falls back to a full render if the strip isn't in the DOM
+  // (it just appeared or disappeared), exactly as the streaming patch does.
+  function patchIngestBar() {
+    const b = S.ingestBacklog;
+    const bar = document.getElementById('zend-ingest');
+    if (!b || !bar) { render(); return; }
+    const v = ingestView(b);
+    const track = bar.querySelector('.z-ingest-track');
+    track.setAttribute('aria-valuemax', String(v.total));
+    track.setAttribute('aria-valuenow', String(v.processed));
+    bar.querySelector('.z-ingest-fill').style.width = v.pct + '%';
+    bar.querySelector('.z-ingest-count').textContent = v.left;
+    const item = bar.querySelector('.z-ingest-item');
+    if (item) { item.textContent = v.itemTxt; item.setAttribute('title', v.item); }
   }
 
   // ── composer ─────────────────────────────────────────────────────────────
@@ -3351,7 +3434,17 @@ import { estateSwitcher } from './common/lib/estate.js';
   // way. `lastStartedAt` tracks the daemon's start stamp to detect restarts.
   let lastStartedAt = null;
   let reloadPolling = false;
+  // The sidebar's own refresh floor: `refreshConversationList` stays on a
+  // 5s cadence even when the status poll itself speeds up for the ingest
+  // bar below — the conversation list hasn't started changing any faster
+  // just because files are being indexed.
+  let lastListSync = 0;
   const LOADING_BOOT = (label) => ({ state: 'loading', detail: '', loading: { current: label, progress: 0, completed: [] } });
+  // Status-poll cadence: 5s at rest; 1s while a background ingestion backlog
+  // is draining, so the bar under the chat climbs continuously instead of in
+  // five-second steps — the cadence `pollStatus` already uses on this same
+  // endpoint during boot.
+  const SYNC_IDLE_MS = 5000, SYNC_BUSY_MS = 1000;
 
   // `prefetchedList`: see `initConversations`. Only the first poll has one — a
   // list fetched while the daemon was still loading would be empty.
@@ -3362,6 +3455,10 @@ import { estateSwitcher } from './common/lib/estate.js';
         reloadPolling = false;
         if (st.started_at_ms != null) lastStartedAt = st.started_at_ms;
         S.boot = null;
+        // A backlog is most likely right after startup: take it from the
+        // poll that unlocked the chat, so the bar is there on the first real
+        // paint instead of up to a cadence later.
+        S.ingestBacklog = st.ingest_backlog || null;
         initConversations(prefetchedList);
         loadToolSchemas();
       } else {
@@ -3407,7 +3504,7 @@ import { estateSwitcher } from './common/lib/estate.js';
   // and keep the sidebar in sync.
   function periodicSync() {
     if (reloadPolling) return;   // a reload poll already owns the loading screen
-    Promise.resolve(API.getStatus()).then((st) => {
+    return Promise.resolve(API.getStatus()).then((st) => {
       if (checkBuild(st)) return;   // build changed -> reloading
       if (!st || st.state !== 'ready') {
         // Daemon is mid-reload (restart / model reload). Drop back to the
@@ -3425,14 +3522,25 @@ import { estateSwitcher } from './common/lib/estate.js';
       const m = st.maintenance || null;
       const prevM = JSON.stringify(S.maintenance || null);
       if (JSON.stringify(m) !== prevM) S.maintenance = m;
+      // The background-ingestion bar under the chat, from the same poll.
+      // Presence changes the layout (the chat gives up the strip's height),
+      // so appearing or clearing needs the full rebuild; a counter tick does
+      // not.
+      const hadBacklog = !!S.ingestBacklog;
+      S.ingestBacklog = st.ingest_backlog || null;
+      const backlogToggled = hadBacklog !== !!S.ingestBacklog;
       if (lastStartedAt !== null && st.started_at_ms && st.started_at_ms !== lastStartedAt) {
         lastStartedAt = st.started_at_ms;
         S.loaded = {};
         initConversations();   // daemon restarted — reload from scratch
       } else {
         if (st.started_at_ms) lastStartedAt = st.started_at_ms;
-        refreshConversationList();
-        if (JSON.stringify(m) !== prevM) render();
+        // The sidebar keeps its own 5s cadence even when the status poll runs
+        // at 1s for the backlog bar: it is a second endpoint per tick, and
+        // the conversation list has not started changing any faster.
+        if (Date.now() - lastListSync >= SYNC_IDLE_MS) { lastListSync = Date.now(); refreshConversationList(); }
+        if (backlogToggled || JSON.stringify(m) !== prevM) render();
+        else if (S.ingestBacklog) patchIngestBar();
       }
     }).catch(() => {
       // Unreachable — daemon almost certainly restarting. Show the loading
@@ -3452,7 +3560,22 @@ import { estateSwitcher } from './common/lib/estate.js';
   // says so: one round trip to the first real paint, not two in a row.
   const firstList = Promise.resolve(API.seedConversations(now)).catch(() => null);
   pollStatus(firstList);
-  setInterval(periodicSync, 5000);
+  // One status poll in flight at a time: the next tick is scheduled when the
+  // last settles, so a slow daemon can never stack requests, and the wait is
+  // chosen fresh each time from `S.ingestBacklog` as THAT tick left it — a
+  // backlog that appears speeds the next tick up immediately rather than a
+  // cadence later. The one exception is the very first call: `pollStatus`'s
+  // own result (which is what actually sets `S.ingestBacklog` for the first
+  // time) hasn't landed yet at this synchronous point, so guessing from it
+  // here would default to the slow cadence even when a backlog already
+  // exists. Forcing the first tick to the busy cadence costs one redundant
+  // early poll at rest, and correctly picks up a real backlog within 1s
+  // instead of stalling on it for up to `SYNC_IDLE_MS`.
+  function scheduleSync(delay) {
+    const wait = delay != null ? delay : (S.ingestBacklog ? SYNC_BUSY_MS : SYNC_IDLE_MS);
+    setTimeout(() => { Promise.resolve(periodicSync()).then(scheduleSync, scheduleSync); }, wait);
+  }
+  scheduleSync(SYNC_BUSY_MS);
 })();
 </script>
 </body>

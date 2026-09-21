@@ -12,8 +12,10 @@
 //!
 //! What this test guards:
 //!
-//! 1. `ingest_repo_map` and `ingest_code_reading` complete without
-//!    error against a real engine.
+//! 1. `refresh_repo_map` and `refresh_code_reading` — the sole ingestion
+//!    entry points, also used by the daemon's background ingest worker —
+//!    complete without error against a real engine, starting from an
+//!    empty prior state (a fresh install).
 //! 2. The two foundational layers' turns are reachable from the
 //!    `dialogue` layer's BDP retrieval — a query that names a
 //!    unique identifier surfaces the file that defines it.
@@ -28,11 +30,13 @@ use std::sync::{Arc, Mutex};
 use candle::Device;
 use candle_conversation::models::Model;
 use candle_conversation::projection;
+use candle_conversation::stencil::ThinkMode;
 use candle_conversation::{ConversationEngine, SamplingConfig, Sequence, TurnEvent};
 
-use zend::code_read::CodeReadState;
+use zend::code_read::{CodeReadState, RefreshOutcome as CodeReadOutcome};
 use zend::loading::LoadProgress;
-use zend::repo_scan::DirState;
+use zend::refresh_ctx::RefreshContext;
+use zend::repo_scan::{DirState, RefreshOutcome as RepoMapOutcome};
 
 const PROJECTION_YAML: &str = include_str!("../src/prompts/projection.yaml");
 
@@ -167,6 +171,22 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     let proj_builder_code_read = proj_builder.clone();
 
     let formatted_prompt = builder.format_system_prompt();
+    // The same three pieces `InferenceState::load` compiles once and threads
+    // through `RefreshContext` — see `session.rs`. `code_reading`'s hidden
+    // per-file conversations use these to frame identically to `dialogue`.
+    let tool_stencil = engine
+        .compile_tool_stencil(zend::tools::tool_catalog())
+        .expect("tool stencil compile");
+    let think_steering = engine
+        .compile_think_steering()
+        .expect("think steering compile");
+    // `Quick`, not `Off` — see `RefreshContext::think_triggers`'s doc.
+    let think_triggers = match &think_steering {
+        Some(ts) => ts.registry_for(&tool_stencil, ThinkMode::Quick),
+        None => std::sync::Arc::clone(&tool_stencil),
+    };
+    let tool_host = zend::tools::ToolHost::new(workspace);
+    let tool_ctx = std::sync::Arc::clone(tool_host.context_for(zend::types::ToolMode::Restricted));
     let dialogue = engine
         .new_conversation_with_projection(
             &formatted_prompt,
@@ -181,38 +201,98 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         start.elapsed().as_secs_f64()
     );
 
+    // `base_conv`'s counterpart for ingestion — see `InferenceState::ingest_bases`
+    // in `session.rs`. `refresh_repo_map`/`refresh_code_reading` fork a unit's
+    // conversation off these instead of each independently re-running the
+    // schema's "eager section ingestion", exactly mirroring `dialogue` above.
+    let repo_map_layer = proj_builder_repo_map.id_for_layer("repo_map").unwrap();
+    let repo_map_group = proj_builder_repo_map.id_for_group("structure").unwrap();
+    let repo_map_base = Mutex::new(
+        engine
+            .new_conversation_with_projection(
+                &formatted_prompt,
+                proj_builder_repo_map.clone(),
+                repo_map_layer,
+                repo_map_group,
+                conv_config.clone(),
+            )
+            .expect("new repo_map ingest base"),
+    );
+    let code_read_layer = proj_builder_code_read.id_for_layer("code_reading").unwrap();
+    let code_read_group = proj_builder_code_read.id_for_group("scopes").unwrap();
+    let code_read_base = Mutex::new(
+        engine
+            .new_conversation_with_projection(
+                &formatted_prompt,
+                proj_builder_code_read.clone(),
+                code_read_layer,
+                code_read_group,
+                conv_config.clone(),
+            )
+            .expect("new code_reading ingest base"),
+    );
+
     let progress = Arc::new(LoadProgress::new());
-    // Both ingest passes lock the engine for their brief create/tombstone ops,
-    // so they take a `&Mutex<ConversationEngine>`. Mirror the daemon: wrap for
-    // the passes, then unwrap to hold on.
+    // Both refreshes lock the engine for their brief create/tombstone ops, so
+    // they take a `&Mutex<ConversationEngine>` via `RefreshContext`. Mirror
+    // the daemon's background ingest worker: wrap for the passes, then
+    // unwrap to hold on. `refresh_repo_map`/`refresh_code_reading` are the
+    // SOLE ingestion entry points now (see `zend::ingest_worker`) — called
+    // here exactly as the worker's first pass calls them, with an empty
+    // prior state standing in for a fresh install's seeded-but-empty
+    // registry entry.
     let engine = Mutex::new(engine);
-    let (walked, repo_map_state, _repo_map_report) = zend::repo_scan::ingest_repo_map(
-        &engine,
-        proj_builder_repo_map,
+    let walked = zend::repo_scan::walk_workspace(workspace, None);
+    let repo_map_ctx = RefreshContext {
+        engine: &engine,
+        proj_builder: proj_builder_repo_map,
+        config: conv_config.clone(),
+        formatted_prompt: &formatted_prompt,
+        think_triggers: std::sync::Arc::clone(&think_triggers),
+        tool_ctx: std::sync::Arc::clone(&tool_ctx),
+        priming_chain_end: None,
+    };
+    let repo_map_state = match zend::repo_scan::refresh_repo_map(
+        &repo_map_ctx,
         workspace,
-        None,
-        conv_config.clone(),
+        &walked,
+        &DirState::default(),
         &progress,
         "repo_map",
-        "structure",
+        &repo_map_base,
     )
-    .expect("repo map ingest");
+    .expect("repo map ingest")
+    {
+        RepoMapOutcome::Replaced { state } => state,
+        RepoMapOutcome::NoOp => panic!("empty prior state must always report changed directories"),
+    };
     eprintln!(
         "repo_map ingestion done ({:.1}s) — {} files walked",
         start.elapsed().as_secs_f64(),
         walked.files.len()
     );
-    let code_read_state = zend::code_read::ingest_code_reading(
-        &engine,
-        proj_builder_code_read,
+    let code_read_ctx = RefreshContext {
+        engine: &engine,
+        proj_builder: proj_builder_code_read,
+        config: conv_config,
+        formatted_prompt: &formatted_prompt,
+        think_triggers,
+        tool_ctx,
+        priming_chain_end: None,
+    };
+    let code_read_state = match zend::code_read::refresh_code_reading(
+        &code_read_ctx,
         workspace,
         &walked,
-        conv_config,
+        &CodeReadState::default(),
         &progress,
-        "code_reading",
-        "scopes",
+        &code_read_base,
     )
-    .expect("code reading ingest");
+    .expect("code reading ingest")
+    {
+        CodeReadOutcome::Replaced { state } => state,
+        CodeReadOutcome::NoOp => panic!("empty prior state must always report changed files"),
+    };
     let engine = engine.into_inner().expect("engine mutex not poisoned");
     eprintln!(
         "code_reading ingestion done ({:.1}s)",

@@ -1298,6 +1298,26 @@ fn inject_sealed_section(
     Ok(())
 }
 
+/// Whether a selected turn may be injected WHOLE, reasoning included.
+///
+/// Exactly one turn in a projection may: the newest turn of the timeline the
+/// slot is continuing. Every other turn — older turns of the same
+/// conversation, and every turn borrowed from another one — goes in with its
+/// `<think>` span windowed out.
+///
+/// `slot_timeline` is `None` for a projection with no slot identity (mocks,
+/// structural callers). That cannot be "the turn this slot is continuing", so
+/// nothing keeps its reasoning — the safe direction, since windowing only ever
+/// removes reasoning from the context.
+fn keeps_reasoning(
+    slot_timeline: Option<TimelineId>,
+    turn_timeline: TimelineId,
+    newest_of_turn_timeline: Option<TurnIndex>,
+    index: TurnIndex,
+) -> bool {
+    slot_timeline == Some(turn_timeline) && newest_of_turn_timeline == Some(index)
+}
+
 fn inject_sealed_turn(
     ctx: &mut ApplyContext<'_>,
     walker: &mut SegmentWalker,
@@ -1359,8 +1379,29 @@ fn inject_sealed_turn(
     let (sealed, page) = {
         let conv = ctx.conversation.read();
         let stored = resident.or_else(|| conv.index_page_blob(timeline, index).map(|b| b.to_vec()));
+        // **"Most recent" is the SLOT's most recent, not each timeline's.**
+        //
+        // A projection can span timelines — retrieval pulls in other
+        // conversations' turns, and a forked conversation inherits its
+        // ancestors' (`Substrate::inherited_chain`). `turn_indices(timeline)`
+        // answers "newest turn of ITS OWN timeline", so every foreign
+        // conversation contributed its last turn whole, reasoning included,
+        // and the rule above — reasoning attendable in exactly ONE subsequent
+        // projection — silently became "one per timeline".
+        //
+        // The model then reads someone else's `<think>` as its own most recent
+        // thought. Measured: an inherited block reading "The user wants me to
+        // read ARCHITECTURE.md — I already have lines 1-200 from a previous
+        // read" made the next conversation skip its own `file_read` and
+        // summarise the wrong file, and made a dialogue answer that inherited
+        // instruction instead of the question it was asked.
+        //
+        // Only the turn the slot is actually continuing may keep its
+        // reasoning. Single-timeline projections are unaffected: there the
+        // target IS the only timeline, which is the case this rule was written
+        // for and still behaves exactly as before.
         let newest = conv.turn_indices(timeline).max();
-        if newest == Some(index) {
+        if keeps_reasoning(ctx.slot_target.map(|t| t.timeline), timeline, newest, index) {
             (conv.turn_sealed_of(timeline, index), stored)
         } else {
             // An `Err` here is a turn whose reasoning cannot be windowed. It is
@@ -2237,6 +2278,61 @@ fn log_injected_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) {
 mod tests {
     use super::*;
     use crate::projection::{GroupId, LayerId, ResolvedSection, ResolvedTurn, TimelineId, TurnId};
+
+    fn tl(raw: u64) -> TimelineId {
+        TimelineId::from_raw(raw).expect("timeline id")
+    }
+
+    /// The turn the slot is continuing keeps its reasoning — the ordinary
+    /// single-conversation case, unchanged.
+    #[test]
+    fn the_slots_own_newest_turn_keeps_its_reasoning() {
+        let slot = tl(7);
+        assert!(keeps_reasoning(
+            Some(slot),
+            slot,
+            Some(TurnIndex(4)),
+            TurnIndex(4)
+        ));
+    }
+
+    #[test]
+    fn an_older_turn_of_the_slots_own_conversation_is_windowed() {
+        let slot = tl(7);
+        assert!(!keeps_reasoning(
+            Some(slot),
+            slot,
+            Some(TurnIndex(4)),
+            TurnIndex(2)
+        ));
+    }
+
+    /// **The regression this guards.** A projection that spans timelines —
+    /// retrieval, or a forked conversation inheriting its ancestors — must not
+    /// let a borrowed conversation's last turn arrive with its reasoning. Read
+    /// as the slot's own most recent thought, an inherited "I already read that
+    /// file" makes the next turn skip its own work.
+    #[test]
+    fn an_inherited_conversations_newest_turn_is_windowed() {
+        let slot = tl(7);
+        let ancestor = tl(3);
+        assert!(
+            !keeps_reasoning(Some(slot), ancestor, Some(TurnIndex(1)), TurnIndex(1)),
+            "the newest turn of a FOREIGN timeline is not the slot's live turn",
+        );
+    }
+
+    /// With no slot identity there is no turn being continued, so nothing keeps
+    /// its reasoning — windowing is the safe direction.
+    #[test]
+    fn without_a_slot_target_nothing_keeps_its_reasoning() {
+        assert!(!keeps_reasoning(
+            None,
+            tl(3),
+            Some(TurnIndex(1)),
+            TurnIndex(1)
+        ));
+    }
 
     /// The island cache's retention contract: an entry survives exactly
     /// [`GLUE_ISLAND_RETAIN_GENERATIONS`] capture passes untouched, and a

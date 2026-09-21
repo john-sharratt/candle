@@ -401,6 +401,25 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<bool, ConversationError>>,
     },
 
+    /// Re-run a slot's create-time recurrent seeding, now that its lineage is
+    /// known — see [`Substrate::FORKED_FROM_KEY`].
+    ///
+    /// `create_sequence` seeds from the timeline's own snapshot, and a fork is
+    /// minted on a FRESH timeline that has none. Its memory is its parent's,
+    /// but the `forked_from` pointer is recorded by the caller *after* the fork
+    /// returns — by which time the slot has already been seeded from nothing.
+    /// Rather than reorder the fork (the child's timeline does not exist until
+    /// it returns), the caller records the pointer and then asks for the seed
+    /// again. Like [`Self::InstallRecurrentState`], this lands on a slot that
+    /// exists and has not yet run a turn.
+    ///
+    /// Replies `Ok(false)` when the model carries no recurrent state, or no
+    /// ancestor has a snapshot to seed from.
+    SeedRecurrentFromLineage {
+        sequence_id: SequenceId,
+        response_tx: Sender<Result<bool, ConversationError>>,
+    },
+
     /// Advance a conversation's recurrent memory over tokens whose K/V it
     /// already holds — the catch-up after a splice adopts turns by reference.
     ///
@@ -4484,6 +4503,25 @@ impl Scheduler {
                 true
             }
 
+            SchedulerRequest::SeedRecurrentFromLineage {
+                sequence_id,
+                response_tx,
+            } => {
+                let seeded = match (
+                    self.slot_conversations.get(&sequence_id).cloned(),
+                    self.slot_targets.get(&sequence_id).copied(),
+                ) {
+                    (Some(conversation), Some(target)) => {
+                        self.restore_recurrent_state(sequence_id, &conversation, target.timeline)
+                    }
+                    // A scratch slot, or one already gone. Neither is an error:
+                    // there is no conversation whose memory this would be.
+                    _ => false,
+                };
+                let _ = response_tx.send(Ok(seeded));
+                true
+            }
+
             SchedulerRequest::InstallRecurrentState {
                 sequence_ids,
                 state,
@@ -6260,7 +6298,7 @@ impl Scheduler {
         // it must not be the *quiet* error path: each reason logs at WARN, and
         // the reasons are distinguishable.
         if let (Some(target), StateSeed::FromTimeline) = (target, seed) {
-            self.restore_recurrent_state(slot_id, &conversation, target.timeline);
+            let _ = self.restore_recurrent_state(slot_id, &conversation, target.timeline);
             self.restore_carried_belief(slot_id, &conversation, target.timeline);
         }
 
@@ -6389,33 +6427,70 @@ impl Scheduler {
     /// logs a **distinguishable** reason, because "resumed with no memory" and
     /// "resumed correctly" are indistinguishable from the outside — both read
     /// fluently, and only one of them is right.
+    ///
+    /// Returns whether a snapshot was found and an install attempted — `false`
+    /// means this slot starts from the sequence-start state.
     fn restore_recurrent_state(
         &mut self,
         slot_id: SequenceId,
         conversation: &Conversation,
         timeline: TimelineId,
-    ) {
-        let payload = match conversation.read_recurrent_snapshot(timeline) {
-            Ok(Some(p)) => p,
-            Ok(None) => {
+    ) -> bool {
+        // **The seed is resolved through the fork lineage, nearest ancestor
+        // first.**
+        //
+        // A conversation that continues another starts from where that one left
+        // off — that is what "forking the recurrent buffer" means. A forked
+        // conversation is minted on a FRESH timeline, so it has no snapshot of
+        // its own on its first turn; without this it would start from the
+        // sequence-start state and remember nothing of the documents its
+        // ancestors read, even though its K/V context carries their turns
+        // (`Substrate::inherited_chain`) — state and context disagreeing is the
+        // exact failure the rest of this function exists to prevent.
+        //
+        // Recursive, and bounded: `inherited_chain` walks `forked_from` all the
+        // way up, guards against a cycle, and stops at the token cap. It reads
+        // oldest-first, so reversing it asks the NEAREST ancestor first — the
+        // most specific memory available.
+        let lineage = conversation.read().inherited_chain(timeline);
+        let mut resolved = None;
+        for candidate in lineage.iter().rev() {
+            match conversation.read_recurrent_snapshot(*candidate) {
+                Ok(Some(p)) => {
+                    resolved = Some((p, *candidate));
+                    break;
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        "RECURRENT RESUME FAILED (unreadable) for timeline {candidate}: {e} — \
+                         the conversation will continue with NO recurrent memory of its \
+                         history. It will read fluently and have forgotten."
+                    );
+                    return false;
+                }
+            }
+        }
+        let (payload, snapshot_timeline) = match resolved {
+            Some(found) => found,
+            None => {
                 // Not an error and not always worth a warning: a model with no
                 // recurrent state never writes one, and a conversation whose
                 // first turn has not sealed has nothing to write yet.
                 tracing::debug!(
-                    "no recurrent snapshot for timeline {timeline}; starting from the \
-                     sequence-start state"
+                    "no recurrent snapshot for timeline {timeline} or any ancestor; \
+                     starting from the sequence-start state"
                 );
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "RECURRENT RESUME FAILED (unreadable) for timeline {timeline}: {e} — \
-                     the conversation will continue with NO recurrent memory of its \
-                     history. It will read fluently and have forgotten."
-                );
-                return;
+                return false;
             }
         };
+        if snapshot_timeline != timeline {
+            tracing::debug!(
+                "timeline {timeline} seeds its recurrent state from ancestor \
+                 {snapshot_timeline} (turn {})",
+                payload.turn_index,
+            );
+        }
 
         // **The torn-shutdown check, and the reason the seal writes in the order
         // it does.**
@@ -6434,18 +6509,24 @@ impl Scheduler {
         // shedding the turn the snapshot was taken at leaves the index
         // unreachable, and this rejects it without the tombstone path needing to
         // know about snapshots at all.
-        let recovered_turns = conversation.read().turn_count(timeline);
+        // Judged against the timeline the snapshot BELONGS to, not the one
+        // being seeded. The check asks "does this snapshot describe a turn that
+        // actually survived?" — a question about the conversation that wrote
+        // it. Measuring an ancestor's snapshot against a fresh fork's own
+        // (zero) turn count would reject every inherited seed on sight, which
+        // is the quiet failure this whole path exists to remove.
+        let recovered_turns = conversation.read().turn_count(snapshot_timeline);
         if !snapshot_within_recovered_history(payload.turn_index, recovered_turns) {
             tracing::warn!(
                 "RECURRENT RESUME REJECTED (snapshot is newer than the recovered \
-                 history) for timeline {timeline}: the snapshot was taken at turn {} \
-                 but only {recovered_turns} turn(s) recovered — a torn shutdown \
+                 history) for timeline {snapshot_timeline}: the snapshot was taken at \
+                 turn {} but only {recovered_turns} turn(s) recovered — a torn shutdown \
                  between the snapshot and the turn's records. Installing it would \
                  put the recurrent layers a turn ahead of the K/V. The conversation \
                  continues with NO recurrent memory of its history.",
                 payload.turn_index,
             );
-            return;
+            return false;
         }
 
         let layers: Vec<ExportedLayerState> = payload
@@ -6505,6 +6586,7 @@ impl Scheduler {
         // and the delta-rule import failing on geometry says nothing about
         // whether this blob is installable.
         self.restore_aux_from_payload(slot_id, timeline, payload.turn_index, &payload.aux);
+        true
     }
 
     /// Install a snapshot's model-opaque blob, reporting what happened.

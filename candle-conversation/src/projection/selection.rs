@@ -50,7 +50,7 @@
 //!   emission:  insertion order
 //! ```
 
-use super::ids::TurnKey;
+use super::ids::{TimelineId, TurnKey};
 use super::schema::SelectionRule;
 
 /// Apply a selection rule to a group's turns.
@@ -87,6 +87,7 @@ pub fn apply_selection(
     turns: &[(TurnKey, f32)],
     budget_tokens: Option<usize>,
     token_counts: &dyn Fn(TurnKey) -> usize,
+    own_timeline: Option<TimelineId>,
 ) -> Vec<TurnKey> {
     match rule {
         SelectionRule::AlwaysVisible => {
@@ -110,6 +111,7 @@ pub fn apply_selection(
             turns,
             budget_tokens,
             token_counts,
+            own_timeline,
         ),
     }
 }
@@ -220,7 +222,29 @@ fn select_conversation(
     turns: &[(TurnKey, f32)],
     budget_tokens: Option<usize>,
     token_counts: &dyn Fn(TurnKey) -> usize,
+    own_timeline: Option<TimelineId>,
 ) -> Vec<TurnKey> {
+    // **Inherited turns are inviolate, all the way up the ancestry.**
+    //
+    // A turn on a timeline other than this conversation's own is here because
+    // the lineage put it here (`Substrate::inherited_chain` walks `forked_from`
+    // recursively, so this covers every ancestor, not just the immediate
+    // parent). That is a structural statement — "this conversation continues
+    // those" — not a retrieval guess, so it must not be re-litigated by score.
+    //
+    // Without this they age out: they sort oldest-first, so once the
+    // conversation passes `recent` turns they fall into the historical pool,
+    // where `*s > 0.0` drops an unscored turn outright. A conversation would
+    // silently forget the documents it was founded on, part-way through.
+    //
+    // The count is bounded by `Substrate::INHERITED_CHAIN_TOKEN_CAP`, which is
+    // what keeps "never dropped" from being "unbounded".
+    let (inherited, own): (Vec<(TurnKey, f32)>, Vec<(TurnKey, f32)>) = match own_timeline {
+        Some(own_tl) => turns.iter().partition(|(key, _)| key.timeline != own_tl),
+        None => (Vec::new(), turns.to_vec()),
+    };
+    let turns: &[(TurnKey, f32)] = &own;
+
     // Split: last `recent` turns are inviolate regardless of score.
     let split_at = turns.len().saturating_sub(recent);
     let (older, inviolate) = turns.split_at(split_at);
@@ -242,10 +266,15 @@ fn select_conversation(
     });
     historical.truncate(historical_top_k);
 
-    // Budget pass: trim historical (lowest-scored first), inviolate is never dropped.
+    // Budget pass: trim historical (lowest-scored first); neither the recent
+    // window nor the inherited lineage is ever dropped.
     if let Some(budget) = budget_tokens {
-        let inviolate_tokens: usize = inviolate.iter().map(|(idx, _)| token_counts(*idx)).sum();
-        let remaining = budget.saturating_sub(inviolate_tokens);
+        let kept_tokens: usize = inviolate
+            .iter()
+            .chain(inherited.iter())
+            .map(|(idx, _)| token_counts(*idx))
+            .sum();
+        let remaining = budget.saturating_sub(kept_tokens);
         trim_to_budget_low_score_first(&mut historical, remaining, token_counts);
     }
 
@@ -254,6 +283,7 @@ fn select_conversation(
         .iter()
         .map(|(idx, _)| *idx)
         .chain(inviolate.iter().map(|(idx, _)| *idx))
+        .chain(inherited.iter().map(|(idx, _)| *idx))
         .collect();
     selected.sort();
     selected
@@ -299,17 +329,124 @@ mod tests {
         10
     } // uniform 10 tokens each
 
+    /// The conversation being projected.
+    fn own() -> TimelineId {
+        TimelineId::for_test(1)
+    }
+
+    /// A turn on an ANCESTOR's timeline — inherited through `forked_from`.
+    fn anc(tl: u64, n: u32) -> TurnKey {
+        TurnKey::new(TimelineId::for_test(tl), TurnIndex(n))
+    }
+
+    /// An inherited turn survives even with a zero score and no seat in the
+    /// recent window — the case that silently dropped the priming chain once a
+    /// conversation grew past `recent`.
+    #[test]
+    fn an_inherited_turn_outranks_the_recent_window_and_the_score_filter() {
+        let turns = vec![
+            (anc(9, 0), 0.0),
+            (t(0), 0.9),
+            (t(1), 0.9),
+            (t(2), 0.9),
+            (t(3), 0.9),
+        ];
+        let r = apply_selection(
+            &SelectionRule::Sequence {
+                recent: 2,
+                historical_top_k: 0,
+            },
+            0.0,
+            &turns,
+            None,
+            &tc,
+            Some(own()),
+        );
+        assert!(
+            r.contains(&anc(9, 0)),
+            "a zero-scored ancestor turn is structural, not a retrieval candidate: {r:?}",
+        );
+        assert!(r.contains(&t(2)) && r.contains(&t(3)), "recent window kept");
+    }
+
+    /// Recursive: every ancestor in the lineage is inviolate, not just the
+    /// nearest one.
+    #[test]
+    fn every_ancestor_in_the_lineage_is_inviolate() {
+        let turns = vec![
+            (anc(7, 0), 0.0),
+            (anc(8, 0), 0.0),
+            (anc(9, 0), 0.0),
+            (t(0), 0.9),
+            (t(1), 0.9),
+        ];
+        let r = apply_selection(
+            &SelectionRule::Sequence {
+                recent: 1,
+                historical_top_k: 0,
+            },
+            0.0,
+            &turns,
+            None,
+            &tc,
+            Some(own()),
+        );
+        for a in [anc(7, 0), anc(8, 0), anc(9, 0)] {
+            assert!(r.contains(&a), "ancestor {a:?} dropped from {r:?}");
+        }
+    }
+
+    /// The budget trims the historical pool, never the lineage.
+    #[test]
+    fn a_tight_budget_trims_history_before_touching_the_lineage() {
+        let turns = vec![(anc(9, 0), 0.0), (t(0), 0.4), (t(1), 0.5), (t(2), 0.9)];
+        let r = apply_selection(
+            &SelectionRule::Sequence {
+                recent: 1,
+                historical_top_k: 8,
+            },
+            0.0,
+            &turns,
+            // Room for the ancestor and the recent turn only.
+            Some(20),
+            &tc,
+            Some(own()),
+        );
+        assert!(r.contains(&anc(9, 0)), "lineage kept under budget: {r:?}");
+        assert!(r.contains(&t(2)), "recent window kept under budget: {r:?}");
+        assert!(!r.contains(&t(0)), "historical trimmed first: {r:?}");
+    }
+
+    /// With no target timeline every turn is treated as the conversation's
+    /// own — the single-timeline behaviour the other rules are defined against.
+    #[test]
+    fn without_a_target_timeline_nothing_is_treated_as_inherited() {
+        let turns = vec![(t(0), 0.0), (t(1), 0.9), (t(2), 0.9)];
+        let r = apply_selection(
+            &SelectionRule::Sequence {
+                recent: 1,
+                historical_top_k: 0,
+            },
+            0.0,
+            &turns,
+            None,
+            &tc,
+            None,
+        );
+        assert_eq!(r, vec![t(2)], "only the recent window survives: {r:?}");
+    }
+
     #[test]
     fn always_visible_all_pass() {
         let turns = vec![(t(0), 0.5), (t(1), 0.8), (t(2), 0.3)];
-        let r = apply_selection(&SelectionRule::AlwaysVisible, 0.0, &turns, None, &tc);
+        let r = apply_selection(&SelectionRule::AlwaysVisible, 0.0, &turns, None, &tc, None);
         assert_eq!(r, vec![t(0), t(1), t(2)]);
     }
 
     #[test]
     fn always_visible_threshold_filters() {
         let turns = vec![(t(0), 0.5), (t(1), 0.8), (t(2), 0.1)];
-        let r = apply_selection(&SelectionRule::AlwaysVisible, 0.3, &turns, None, &tc);
+        let r = apply_selection(&SelectionRule::AlwaysVisible, 0.3, &turns, None, &tc, None);
         assert_eq!(r, vec![t(0), t(1)]);
     }
 
@@ -317,7 +454,14 @@ mod tests {
     fn always_visible_budget_trims_lowest_score() {
         let turns = vec![(t(0), 0.9), (t(1), 0.5), (t(2), 0.3)];
         // 3 * 10 = 30; budget 20 → drop lowest-scored (t(2))
-        let r = apply_selection(&SelectionRule::AlwaysVisible, 0.0, &turns, Some(20), &tc);
+        let r = apply_selection(
+            &SelectionRule::AlwaysVisible,
+            0.0,
+            &turns,
+            Some(20),
+            &tc,
+            None,
+        );
         assert_eq!(r, vec![t(0), t(1)]);
     }
 
@@ -331,12 +475,12 @@ mod tests {
     #[test]
     fn zero_score_is_never_selectable_by_evidence_rules() {
         let turns = vec![(t(0), 0.0), (t(1), 0.0), (t(2), 0.0)];
-        let r = apply_selection(&SelectionRule::TopK { k: 3 }, 0.0, &turns, None, &tc);
+        let r = apply_selection(&SelectionRule::TopK { k: 3 }, 0.0, &turns, None, &tc, None);
         assert!(
             r.is_empty(),
             "TopK over all-zero scores must select nothing"
         );
-        let r = apply_selection(&SelectionRule::Single, 0.0, &turns, None, &tc);
+        let r = apply_selection(&SelectionRule::Single, 0.0, &turns, None, &tc, None);
         assert!(
             r.is_empty(),
             "Single over all-zero scores must select nothing"
@@ -344,7 +488,7 @@ mod tests {
 
         // Mixed: only the evidenced member seats.
         let turns = vec![(t(0), 0.0), (t(1), 0.4), (t(2), 0.0)];
-        let r = apply_selection(&SelectionRule::TopK { k: 3 }, 0.0, &turns, None, &tc);
+        let r = apply_selection(&SelectionRule::TopK { k: 3 }, 0.0, &turns, None, &tc, None);
         assert_eq!(r, vec![t(1)]);
 
         // Sequence: the historical seats are evidence-ranked too — all-zero
@@ -354,7 +498,7 @@ mod tests {
             recent: 1,
             historical_top_k: 2,
         };
-        let r = apply_selection(&rule, 0.0, &turns, None, &tc);
+        let r = apply_selection(&rule, 0.0, &turns, None, &tc, None);
         assert_eq!(
             r,
             vec![t(3)],
@@ -363,14 +507,14 @@ mod tests {
 
         // ...while an evidenced older turn still earns a historical seat.
         let turns = vec![(t(0), 0.0), (t(1), 0.4), (t(2), 0.0), (t(3), 0.0)];
-        let r = apply_selection(&rule, 0.0, &turns, None, &tc);
+        let r = apply_selection(&rule, 0.0, &turns, None, &tc, None);
         assert_eq!(r, vec![t(1), t(3)]);
     }
 
     #[test]
     fn top_k_basic() {
         let turns = vec![(t(0), 0.3), (t(1), 0.9), (t(2), 0.6)];
-        let r = apply_selection(&SelectionRule::TopK { k: 2 }, 0.0, &turns, None, &tc);
+        let r = apply_selection(&SelectionRule::TopK { k: 2 }, 0.0, &turns, None, &tc, None);
         // top 2: t(1)=0.9, t(2)=0.6 → emission insertion order
         assert_eq!(r, vec![t(1), t(2)]);
     }
@@ -378,14 +522,14 @@ mod tests {
     #[test]
     fn top_k_ties_earlier_wins() {
         let turns = vec![(t(0), 0.7), (t(1), 0.7), (t(2), 0.7)];
-        let r = apply_selection(&SelectionRule::TopK { k: 2 }, 0.0, &turns, None, &tc);
+        let r = apply_selection(&SelectionRule::TopK { k: 2 }, 0.0, &turns, None, &tc, None);
         assert_eq!(r, vec![t(0), t(1)]);
     }
 
     #[test]
     fn top_k_threshold_gate() {
         let turns = vec![(t(0), 0.9), (t(1), 0.1), (t(2), 0.8)];
-        let r = apply_selection(&SelectionRule::TopK { k: 3 }, 0.5, &turns, None, &tc);
+        let r = apply_selection(&SelectionRule::TopK { k: 3 }, 0.5, &turns, None, &tc, None);
         assert_eq!(r, vec![t(0), t(2)]);
     }
 
@@ -393,21 +537,28 @@ mod tests {
     fn top_k_budget_trims_low_end() {
         let turns = vec![(t(0), 0.9), (t(1), 0.7), (t(2), 0.5)];
         // top 3, budget 20 → keep t(0)+t(1)
-        let r = apply_selection(&SelectionRule::TopK { k: 3 }, 0.0, &turns, Some(20), &tc);
+        let r = apply_selection(
+            &SelectionRule::TopK { k: 3 },
+            0.0,
+            &turns,
+            Some(20),
+            &tc,
+            None,
+        );
         assert_eq!(r, vec![t(0), t(1)]);
     }
 
     #[test]
     fn single_picks_highest() {
         let turns = vec![(t(0), 0.3), (t(1), 0.9), (t(2), 0.6)];
-        let r = apply_selection(&SelectionRule::Single, 0.0, &turns, None, &tc);
+        let r = apply_selection(&SelectionRule::Single, 0.0, &turns, None, &tc, None);
         assert_eq!(r, vec![t(1)]);
     }
 
     #[test]
     fn single_tie_lower_index_wins() {
         let turns = vec![(t(0), 0.7), (t(1), 0.7)];
-        let r = apply_selection(&SelectionRule::Single, 0.0, &turns, None, &tc);
+        let r = apply_selection(&SelectionRule::Single, 0.0, &turns, None, &tc, None);
         assert_eq!(r, vec![t(0)]);
     }
 
@@ -415,14 +566,14 @@ mod tests {
     fn single_budget_overflow_drops() {
         let turns = vec![(t(0), 0.9)];
         let tc_big = |_: TurnKey| 100usize;
-        let r = apply_selection(&SelectionRule::Single, 0.0, &turns, Some(50), &tc_big);
+        let r = apply_selection(&SelectionRule::Single, 0.0, &turns, Some(50), &tc_big, None);
         assert!(r.is_empty());
     }
 
     #[test]
     fn single_threshold_all_below() {
         let turns = vec![(t(0), 0.3), (t(1), 0.1)];
-        let r = apply_selection(&SelectionRule::Single, 0.5, &turns, None, &tc);
+        let r = apply_selection(&SelectionRule::Single, 0.5, &turns, None, &tc, None);
         assert!(r.is_empty());
     }
 
@@ -438,7 +589,7 @@ mod tests {
             recent: 2,
             historical_top_k: 1,
         };
-        let r = apply_selection(&rule, 0.5, &turns, None, &tc);
+        let r = apply_selection(&rule, 0.5, &turns, None, &tc, None);
         // t(0) below threshold, t(1) top-1 historical, t(2)+t(3) inviolate
         assert_eq!(r, vec![t(1), t(2), t(3)]);
     }
@@ -457,7 +608,7 @@ mod tests {
         };
         // 4 * 10 = 40; budget 30; inviolate = 20; remaining for historical = 10
         // historical: t(0) 10 tokens fits, t(1) would be 20 total → drop t(1)
-        let r = apply_selection(&rule, 0.0, &turns, Some(30), &tc);
+        let r = apply_selection(&rule, 0.0, &turns, Some(30), &tc, None);
         assert_eq!(r, vec![t(0), t(2), t(3)]);
     }
 
@@ -469,7 +620,7 @@ mod tests {
             recent: 2,
             historical_top_k: 1,
         };
-        let r = apply_selection(&rule, 0.0, &turns, Some(5), &tc);
+        let r = apply_selection(&rule, 0.0, &turns, Some(5), &tc, None);
         assert_eq!(r, vec![t(0), t(1)]);
     }
 
@@ -485,7 +636,7 @@ mod tests {
             recent: 2,
             historical_top_k: 2,
         };
-        let r = apply_selection(&rule, 0.0, &turns, None, &tc);
+        let r = apply_selection(&rule, 0.0, &turns, None, &tc, None);
         // Must be insertion order: t(0), t(1), t(2), t(3)
         assert_eq!(r, vec![t(0), t(1), t(2), t(3)]);
     }
