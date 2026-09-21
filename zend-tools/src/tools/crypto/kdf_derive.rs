@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::{decode_data, encode_output, normalize_algorithm, CryptoError};
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct KdfRequest {
@@ -54,6 +54,11 @@ impl Tool for KdfDerive {
     type Request = KdfRequest;
     type Response = KdfResponse;
     type Error = CryptoError;
+
+    /// Pure cryptography over its arguments — no state and no I/O.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(_ctx: &ToolContext, req: KdfRequest) -> Result<KdfResponse, CryptoError> {
         let salt_enc = req.salt_encoding.as_deref().unwrap_or("text");

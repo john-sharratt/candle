@@ -28,6 +28,8 @@ use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
 use crate::models::delta_net::ExportedLayerState;
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
+use crate::models::rope_schedule::rung_of;
+use crate::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
 use candle::quantized::pinned_staging::Generation;
 #[cfg(feature = "cuda")]
 use candle::quantized::pinned_staging::GpuBuf;
@@ -620,6 +622,11 @@ pub struct BatchedInferenceSession {
     /// `seq_indices` order). Taken + cleared inside `forward_batched`, which
     /// routes HD128 glue to the paged-glue kernel.
     pending_glue: Option<Vec<PendingGlue>>,
+    /// The model's RoPE rung ceilings, ascending — what every header writer
+    /// picks a sequence's `SlotHeader.rope_rung` by, from its reach
+    /// (`docs/progressive_yarn.md` §8). One unbounded rung until the model sets
+    /// its schedule's: the latent kernels read no rung.
+    rope_ceilings: Vec<usize>,
 }
 
 /// Per-slot reprojection-glue descriptor staged on the session for one gap-fill
@@ -697,7 +704,55 @@ impl BatchedInferenceSession {
             layer_seal_cap: vec![None; num_layers],
             device: device.clone(),
             pending_glue: None,
+            rope_ceilings: vec![usize::MAX],
         })
+    }
+
+    /// Set the RoPE rung ceilings the headers pick each sequence's rung by —
+    /// the model's schedule's, from its `RopeRungs::ceilings`.
+    pub fn set_rope_ceilings(&mut self, ceilings: Vec<usize>) -> Result<()> {
+        if ceilings.is_empty() || ceilings.windows(2).any(|w| w[0] >= w[1]) {
+            candle::bail!("rope ceilings must be non-empty and ascending, got {ceilings:?}");
+        }
+        self.rope_ceilings = ceilings;
+        Ok(())
+    }
+
+    /// The RoPE rung a sequence reaching `reach` positions rotates by; a reach
+    /// past the schedule's supported maximum is refused.
+    pub fn rope_rung_for(&self, reach: usize) -> Result<u32> {
+        rung_of(&self.rope_ceilings, reach)
+    }
+
+    /// The rung ceilings, for a header writer outside the session.
+    pub fn rope_ceilings(&self) -> &[usize] {
+        &self.rope_ceilings
+    }
+
+    /// The deepest reach, in positions, any sequence may have: the last
+    /// ceiling. A sequence that would write past it is refused.
+    pub fn rope_reach(&self) -> usize {
+        self.rope_ceilings.last().copied().unwrap_or(0)
+    }
+
+    /// Refuse a forward whose model rotates from rungs other than the ones
+    /// this session's headers pick by.
+    ///
+    /// Decode headers take a sequence's rung from the session's ceilings while
+    /// prefill, glue and the QSA indexer take it from the model's rung set, so
+    /// the two must be one schedule: a session opened before the model's
+    /// schedule was replaced, or one whose ceilings were never set, would name
+    /// rungs the set does not hold — a kernel trap — or disagree with prefill
+    /// about a sequence's rung.
+    pub fn expect_rope_ceilings(&self, model: &[usize]) -> Result<()> {
+        if self.rope_ceilings != model {
+            candle::bail!(
+                "rope: this session picks rungs by ceilings {:?} but the model rotates from \
+                 {model:?} — the session was opened under another schedule",
+                self.rope_ceilings
+            );
+        }
+        Ok(())
     }
 
     /// Hold one layer's seals at or below `max_level`, whatever the rest of the
@@ -765,6 +820,7 @@ impl BatchedInferenceSession {
             layer_seal_cap: vec![None; num_layers],
             device: device.clone(),
             pending_glue: None,
+            rope_ceilings: vec![usize::MAX],
         }
     }
 
@@ -1084,8 +1140,7 @@ impl BatchedInferenceSession {
             .map(|s| snapshot_seqs.contains(s))
             .collect();
 
-        // 24-byte SlotHeader: n_slices, write_slice, slices_ptr, position_map_ptr.
-        let header_stride = n_active * 24;
+        let header_stride = n_active * SLOT_HEADER_BYTES;
         let mut all_headers: Vec<u8> = Vec::with_capacity(group.len() * header_stride);
 
         // Pre-compute per-sequence offsets once (same for all layers).
@@ -1105,6 +1160,12 @@ impl BatchedInferenceSession {
                 (seq_idx, offset)
             })
             .collect();
+        // Each sequence's rung, from the reach this step writes: its offset
+        // plus the decoded token. Layer-invariant, so taken once.
+        let rungs: Vec<u32> = seq_offsets
+            .iter()
+            .map(|&(_, offset)| self.rope_rung_for(offset + 1))
+            .collect::<Result<_>>()?;
 
         // `(slice count, write slice)` per sequence, read from the group's
         // FIRST layer. The decode kernels address the write chunk through
@@ -1194,8 +1255,8 @@ impl BatchedInferenceSession {
             saw_slot_reuse |= sync_stats.reuses > 0;
             saw_slot_rebuild |= sync_stats.rebuilds > 0;
 
-            // Append this layer's headers (24 bytes × n_active; the position
-            // map field is 0 — see `slot_shape` above).
+            // Append this layer's headers (one `SlotHeader` per sequence; the
+            // position map field is 0 — see `slot_shape` above).
             for (i, &(ptr, n_slices, write_slice)) in seq_ptrs.iter().enumerate() {
                 // The kernel SCATTERS the new token through this layer's own
                 // `write_slice`. A layer whose block table disagrees with the
@@ -1216,10 +1277,14 @@ impl BatchedInferenceSession {
                         layers.start
                     )
                 }
-                all_headers.extend_from_slice(&n_slices.to_le_bytes());
-                all_headers.extend_from_slice(&write_slice.to_le_bytes());
-                all_headers.extend_from_slice(&ptr.to_le_bytes());
-                all_headers.extend_from_slice(&0u64.to_le_bytes());
+                SlotHeaderHost {
+                    n_slices,
+                    write_slice,
+                    slices_ptr: ptr,
+                    position_map_ptr: 0,
+                    rope_rung: rungs[i],
+                }
+                .write(&mut all_headers);
             }
         }
 
@@ -1288,8 +1353,17 @@ impl BatchedInferenceSession {
         let new_idx = self.create_sequence()?;
 
         // Fork in all backings
-        for backing in &self.backings {
-            backing.fork_sequence(source_idx, new_idx, seq_len)?;
+        for (i, backing) in self.backings.iter().enumerate() {
+            backing
+                .fork_sequence(source_idx, new_idx, seq_len)
+                .map_err(|e| {
+                    candle::Error::Msg(format!(
+                        "fork_sequence: layer {i} of {} refused forking sequence {source_idx} \
+                     (seq_len {seq_len}) into {new_idx} after {i} earlier layer(s) already \
+                     forked theirs — the new sequence's layers now disagree on its length: {e}",
+                        self.backings.len(),
+                    ))
+                })?;
         }
 
         // Set the offset to match source
@@ -1319,6 +1393,53 @@ impl BatchedInferenceSession {
                 self.backings.len()
             );
         }
+        // A section can be sealed once, while a windowed creep prefill left a
+        // later window's layers one empty writer chunk behind an earlier
+        // window's (`reconcile_block_counts`), and then never re-sealed again
+        // — every future injection of that persisted record would otherwise
+        // bake the same skew into a fresh live sequence on first use. Heal it
+        // here instead, the same way a live divergence is already healed
+        // (`heal_tail_divergence`'s "truncate every layer to the shortest"):
+        // truncate every layer's copy of this section to the token count its
+        // shortest layer actually holds before injecting any of it.
+        let layer_tokens: Vec<usize> = sealed_per_layer
+            .iter()
+            .map(|s| s.chunks.iter().map(|c| c.token_count as usize).sum())
+            .collect();
+        let min_tokens = layer_tokens.iter().copied().min().unwrap_or(0);
+        let truncated;
+        let sealed_per_layer: &[candle_nn::kv_cache::SealedSequence] =
+            if layer_tokens.iter().all(|&t| t == min_tokens) {
+                sealed_per_layer
+            } else {
+                tracing::error!(
+                    seq = seq_idx,
+                    layer_tokens = ?layer_tokens,
+                    min_tokens,
+                    "inject_sealed_at_tail: this section's persisted layers disagree on token \
+                     count — truncating every layer to the shortest ({min_tokens} tokens) before \
+                     injecting, instead of baking the skew into a live sequence",
+                );
+                truncated = sealed_per_layer
+                    .iter()
+                    .map(|s| truncate_sealed_to_tokens(s, min_tokens))
+                    .collect::<Vec<_>>();
+                &truncated
+            };
+        // **Append onto content, never onto a layer's empty writer chunk.**
+        // The token-count check above cannot see this one: the layers agree on
+        // how many tokens this record holds and still disagree on where the
+        // append lands, because a layer carrying a trailing empty chunk takes
+        // the injected content one block further along than a layer without
+        // one. That is how a silent, lossless block-count skew (padding from
+        // `reconcile_block_counts`, or a creep's phantom writer chunk — both
+        // benign while the extra block is empty) becomes an *interior* hole the
+        // instant anything is appended, and an interior hole is precisely what
+        // `heal_tail_divergence` refuses to repair. Trimming first is lossless
+        // for the same reason the padding was: an empty chunk holds no token,
+        // so no position moves. The caller pushes a fresh writer chunk after an
+        // inject when it needs one (`push_empty_if_sealed`).
+        self.trim_empty_tail_chunks(seq_idx)?;
         let mut range = (0usize, 0usize);
         let mut tokens_added: usize = 0;
         for (i, (backing, sealed)) in self
@@ -1327,7 +1448,22 @@ impl BatchedInferenceSession {
             .zip(sealed_per_layer.iter())
             .enumerate()
         {
-            let r = backing.inject_sealed_at_tail(seq_idx, sealed)?;
+            let r = backing
+                .inject_sealed_at_tail(seq_idx, sealed)
+                .map_err(|e| {
+                    candle::Error::Msg(format!(
+                        "inject_sealed_at_tail: layer {i} of {} refused seq {seq_idx} ({} \
+                     chunk(s), {} token(s)) after {i} earlier layer(s) already committed \
+                     theirs — the layers now disagree on this sequence's length: {e}",
+                        self.backings.len(),
+                        sealed.chunks.len(),
+                        sealed
+                            .chunks
+                            .iter()
+                            .map(|c| c.token_count as usize)
+                            .sum::<usize>(),
+                    ))
+                })?;
             if i == 0 {
                 range = r;
                 tokens_added = sealed
@@ -1361,46 +1497,64 @@ impl BatchedInferenceSession {
         Ok(())
     }
 
-    /// Reserve an in-place glue gap of `n_tokens` slots at the slot tail across
-    /// every layer, advance the session offset, and return the gap's block index
-    /// (identical across layers). The glue forward later fills the gap by
-    /// explicit `(slice, in_blk)` write target; until then its K/V is
-    /// uninitialised but never read (the kernel scatters before it streams).
+    /// Drop every layer's trailing empty (0-token) chunks from `seq_idx`, so
+    /// each layer ends flush with the last token it actually holds.
     ///
-    /// This is the interleaved-glue primitive: because the gap is a real chunk
-    /// with `usage = n_tokens` sitting at its logical position, the
-    /// cumulative-usage `rope_base` of every later chunk equals its true
-    /// sequence position — so decode and glue share one positional convention
-    /// (`slice_rope`) with no `col_actual_pos` side channel.
-    /// Reserve a full-by-construction glue gap across every layer's backing.
-    /// Returns `(gap_block_index, in_blk_base)` — the block index (identical
-    /// across layers) and the first valid slot of the gap's tail window, into
-    /// which the glue forward scatters the island's K/V.
-    pub fn reserve_glue_gap(&mut self, seq_idx: usize, n_tokens: u32) -> Result<(usize, u32)> {
-        // `reserve_glue_gap_chunk` MUTATES each layer (pushes a gap chunk + a writer
-        // chunk). This loop must therefore be ATOMIC: if it bails mid-way — because a
-        // later layer's gap index diverges, or a per-layer reservation errors — the
-        // layers already pushed must be ROLLED BACK, or the slot is left one chunk
-        // longer on those layers and EVERY subsequent reservation diverges harder,
-        // permanently wedging the sequence. Each layer's returned `idx` is its
-        // PRE-push block count (gap_idx = block_count-1 taken right after the gap
-        // push), so truncating a pushed layer back to `idx` blocks restores it
-        // exactly. (The primary fix is deferring the pinned working set from the
-        // warm→cold gather so a live slot's layers stay uniform; this keeps a
-        // residual divergence a clean, retryable turn error instead of corruption.)
-        // Reconcile per-layer block counts BEFORE reserving. During a windowed creep
-        // prefill, layer 0 pushes an empty (0-token) writer chunk for the next window
-        // ahead of the layers still pending resume, so the layers' block counts differ
-        // by one even though their materialised token counts match (cf. dcd075e0, which
-        // fixed the same incremental-fill skew for `sequence_backing_tokens`). A section
-        // unit sealed while a slot was mid-creep persists that skew, so even a FRESH
-        // conversation re-injecting it hits uneven layers at its very first glue
-        // reservation ("layer gap index diverged 33 != 32"). The reservation needs ONE
-        // gap index across every layer, so first pad each lagging layer up to the max
-        // with the SAME empty writer chunk: it carries 0 tokens, so it shifts no
-        // position (contributes 0 to every later chunk's cumulative-usage `rope_base`)
-        // and only equalises the block count. Truncating the ahead layer instead would
-        // drop a writer chunk a co-batched decode may target, so pad-to-max is safer.
+    /// The inverse of [`Self::reconcile_block_counts`], and the one the layers
+    /// need before anything is **appended**. Padding equalises the block count
+    /// of a slot that is about to be read as one uniform thing; it is the wrong
+    /// move before a write, because the pad then sits between the old content
+    /// and the new on exactly the layers that were short. Trimming is lossless
+    /// by the same argument that makes padding lossless — an empty chunk holds
+    /// no token, so no position moves — and it leaves every layer's next
+    /// append at the same block index by construction.
+    pub fn trim_empty_tail_chunks(&mut self, seq_idx: usize) -> Result<()> {
+        for backing in &self.backings {
+            let Some(blocks) = backing.sequence_block_count(seq_idx) else {
+                continue;
+            };
+            // `block_usage` is always exactly `max_blocks` wide, so a slot
+            // reporting more blocks than that is a real invariant violation
+            // — the sequence has outgrown the arena's own capacity — not a
+            // shape we can silently absorb by keeping everything.
+            let usage = backing.block_usage(seq_idx);
+            let Some(usage) = usage.get(..blocks) else {
+                candle::bail!(
+                    "trim_empty_tail_chunks: seq {seq_idx} reports {blocks} block(s) but its \
+                     backing's block_usage is only {} wide",
+                    usage.len()
+                );
+            };
+            let keep = usage.iter().rposition(|&u| u != 0).map_or(0, |i| i + 1);
+            if keep < blocks {
+                backing.truncate_sequence_to_blocks(seq_idx, keep)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pad every lagging layer's block count up to the max with an empty
+    /// (0-token) writer chunk, so every layer of `seq_idx` agrees on how many
+    /// blocks it holds.
+    ///
+    /// **During a windowed creep prefill, a layer in an earlier window pushes
+    /// an empty writer chunk for the next window ahead of layers in a later
+    /// window still pending resume**, so the layers' block counts differ by
+    /// one even though their materialised token counts match (cf. dcd075e0,
+    /// which fixed the same incremental-fill skew for
+    /// `sequence_backing_tokens`). Left unreconciled, that skew is exactly
+    /// what [`Self::sequence_block_count`]'s doc assumes never survives past
+    /// a phantom empty chunk — but nothing stops a LATER write from landing
+    /// in that chunk on the ahead layers while the lagging layers are still
+    /// behind, at which point the "extra block" is no longer empty and the
+    /// layers permanently disagree on token content, not just block count.
+    /// **Any caller about to treat a sequence's per-layer view as uniform and
+    /// then persist or reuse that view — capturing a `CapturedSpan`, sealing
+    /// a turn, reserving a glue gap — must reconcile first**, while the extra
+    /// blocks are still genuinely empty and padding is lossless. Padding
+    /// (not truncating) the ahead layer is what's safe: truncating would drop
+    /// a writer chunk a co-batched decode may target.
+    pub fn reconcile_block_counts(&mut self, seq_idx: usize) -> Result<()> {
         let max_blocks = (0..self.backings.len())
             .filter_map(|li| self.backings[li].sequence_block_count(seq_idx))
             .max()
@@ -1416,6 +1570,38 @@ impl BatchedInferenceSession {
                 self.backings[li].push_empty_writer_chunk(seq_idx)?;
             }
         }
+        Ok(())
+    }
+
+    /// Reserve a full-by-construction glue gap across every layer's backing.
+    /// Returns `(gap_block_index, in_blk_base)` — the block index (identical
+    /// across layers) and the first valid slot of the gap's tail window, into
+    /// which the glue forward scatters the island's K/V. The glue forward
+    /// later fills the gap by explicit `(slice, in_blk)` write target; until
+    /// then its K/V is uninitialised but never read (the kernel scatters
+    /// before it streams).
+    ///
+    /// This is the interleaved-glue primitive: because the gap is a real
+    /// chunk with `usage = n_tokens` sitting at its logical position, the
+    /// cumulative-usage `rope_base` of every later chunk equals its true
+    /// sequence position — so decode and glue share one positional
+    /// convention (`slice_rope`) with no `col_actual_pos` side channel.
+    pub fn reserve_glue_gap(&mut self, seq_idx: usize, n_tokens: u32) -> Result<(usize, u32)> {
+        // `reserve_glue_gap_chunk` MUTATES each layer (pushes a gap chunk + a writer
+        // chunk). This loop must therefore be ATOMIC: if it bails mid-way — because a
+        // later layer's gap index diverges, or a per-layer reservation errors — the
+        // layers already pushed must be ROLLED BACK, or the slot is left one chunk
+        // longer on those layers and EVERY subsequent reservation diverges harder,
+        // permanently wedging the sequence. Each layer's returned `idx` is its
+        // PRE-push block count (gap_idx = block_count-1 taken right after the gap
+        // push), so truncating a pushed layer back to `idx` blocks restores it
+        // exactly. (The primary fix is deferring the pinned working set from the
+        // warm→cold gather so a live slot's layers stay uniform; this keeps a
+        // residual divergence a clean, retryable turn error instead of corruption.)
+        // Reconcile per-layer block counts BEFORE reserving — see
+        // `reconcile_block_counts`. The reservation needs ONE gap index across
+        // every layer, so a lagging layer must be padded up first.
+        self.reconcile_block_counts(seq_idx)?;
 
         let mut gap: Option<(usize, u32)> = None;
         let mut pre_counts: Vec<usize> = Vec::with_capacity(self.backings.len());
@@ -1894,9 +2080,17 @@ impl BatchedInferenceSession {
         let mut borrowed_block_count = 0;
         let mut borrowed_token_count = 0;
         let mut first = true;
-        for backing in &self.backings {
-            let (n_blks, n_toks) =
-                backing.create_view_sequence(view_idx, parent_idx, visible_block_ranges)?;
+        for (i, backing) in self.backings.iter().enumerate() {
+            let (n_blks, n_toks) = backing
+                .create_view_sequence(view_idx, parent_idx, visible_block_ranges)
+                .map_err(|e| {
+                    candle::Error::Msg(format!(
+                        "create_view_sequence: layer {i} of {} refused a view of sequence \
+                         {parent_idx} into {view_idx} after {i} earlier layer(s) already \
+                         created theirs — the view's layers now disagree on its length: {e}",
+                        self.backings.len(),
+                    ))
+                })?;
             if first {
                 borrowed_block_count = n_blks;
                 borrowed_token_count = n_toks;
@@ -1995,10 +2189,45 @@ impl BatchedInferenceSession {
         // the TOKEN reader (`sequence_backing_tokens`) to the min for the same skew;
         // the block-count reader was left on layer 0 and is the residual half of it.
         // Returns None only when the slot is unallocated on every layer.
-        self.backings
+        let counts: Vec<Option<usize>> = self
+            .backings
             .iter()
-            .filter_map(|b| b.sequence_block_count(idx))
-            .min()
+            .map(|b| b.sequence_block_count(idx))
+            .collect();
+        let min = counts.iter().filter_map(|c| *c).min();
+        if let Some(min) = min {
+            // The comment above only holds if the extra block past `min` on an
+            // ahead layer is genuinely empty. When it is not, this is not the
+            // routine mid-creep skew — it is the same shape as the divergence
+            // `heal_tail_divergence` refuses to trust, caught here instead of
+            // silently truncated away by the `min()` this function returns.
+            for (i, (backing, count)) in self.backings.iter().zip(&counts).enumerate() {
+                let Some(count) = *count else { continue };
+                if count <= min {
+                    continue;
+                }
+                let usage = backing.block_usage(idx);
+                let extra_usage: Vec<u32> = usage
+                    .get(min..count)
+                    .map(<[u32]>::to_vec)
+                    .unwrap_or_default();
+                if extra_usage.iter().any(|&u| u != 0) {
+                    tracing::error!(
+                        seq = idx,
+                        layer = i,
+                        layer_count = count,
+                        min_count = min,
+                        extra_block_usage = ?extra_usage,
+                        all_counts = ?counts,
+                        "sequence_block_count: layer {i} holds {count} blocks against a {min}-block \
+                         minimum, and the block(s) past {min} are NOT empty (usage {extra_usage:?}) — \
+                         real content is being dropped from this layer's view by the min-clamp, not \
+                         just a phantom writer chunk",
+                    );
+                }
+            }
+        }
+        min
     }
 
     /// Get mutable access to a sequence's KvCaches.
@@ -3002,11 +3231,25 @@ impl BatchedInferenceSession {
     ) -> Result<Vec<candle_nn::kv_cache::SealedSequence>> {
         let mut out = Vec::with_capacity(self.backings.len());
         for backing in &self.backings {
-            out.push(
-                backing
-                    .record_turn(idx)
-                    .map_err(|e| candle::Error::Msg(format!("snapshot_sequence_per_layer: {e}")))?,
-            );
+            let mut seq = backing
+                .record_turn(idx)
+                .map_err(|e| candle::Error::Msg(format!("snapshot_sequence_per_layer: {e}")))?;
+            // **A trailing empty chunk is structure, not content, and it does
+            // not travel.** `record_turn` takes every block a layer holds, the
+            // empty writer chunk included, and the layers do not agree on
+            // whether they have one: `reconcile_block_counts` pads a lagging
+            // layer with exactly such a chunk, and a windowed creep leaves one
+            // on the layers of an earlier window. Captured, that difference is
+            // harmless only until something is appended after it — then the
+            // empty chunk is *interior*, the layers' token windows are offset
+            // by one chunk against each other, and no repair downstream can
+            // tell which side is right (`heal_tail_divergence` refuses it as
+            // mid-history corruption). Dropping it here loses nothing (an
+            // empty chunk adds nothing to the cumulative count, so no position
+            // moves) and is what the batched seal path has always done before
+            // persisting — see `SealedSequence::drop_empty_tail`.
+            seq.drop_empty_tail();
+            out.push(seq);
         }
         assert_sealed_layers_aligned(&out, idx, "snapshot_sequence_per_layer")?;
         Ok(out)
@@ -4681,6 +4924,13 @@ pub trait ManagedBatchedModel {
         Ok(next)
     }
 
+    /// The RoPE rung ceilings a session's headers pick each sequence's rung by
+    /// — the model's schedule's (`docs/progressive_yarn.md` §8). One unbounded
+    /// rung for a model whose kernels read none.
+    fn rope_ceilings(&self) -> Vec<usize> {
+        vec![usize::MAX]
+    }
+
     /// Create a batched inference session configured for this model.
     fn create_batched_session(&self, config: BatchedConfig) -> Result<BatchedInferenceSession> {
         let mut config = config;
@@ -4689,7 +4939,7 @@ pub trait ManagedBatchedModel {
         config.k_low_error_threshold_factor *= props.k_low_error_threshold_factor;
         config.v_hi_error_threshold_factor *= props.v_hi_error_threshold_factor;
         config.v_low_error_threshold_factor *= props.v_low_error_threshold_factor;
-        let session = BatchedInferenceSession::new(
+        let mut session = BatchedInferenceSession::new(
             // The default stack has no draft head; a model that carries one
             // overrides this and declares its head's layer.
             KvLayers::stream_only(props.num_layers),
@@ -4698,6 +4948,7 @@ pub trait ManagedBatchedModel {
             self.device(),
             config,
         )?;
+        session.set_rope_ceilings(self.rope_ceilings())?;
         // Materialise the norm weights for this session's activation dtype, here
         // rather than at each call site. A session is where the dtype is decided,
         // it is created outside any wave, and the forward *refuses* a mismatch —
@@ -4731,7 +4982,9 @@ pub trait ManagedBatchedModel {
         config.v_hi_error_threshold_factor *= props.v_hi_error_threshold_factor;
         config.v_low_error_threshold_factor *= props.v_low_error_threshold_factor;
         let backings = source.backings().to_vec();
-        let session = BatchedInferenceSession::new_with_backings(backings, config, source.device());
+        let mut session =
+            BatchedInferenceSession::new_with_backings(backings, config, source.device());
+        session.set_rope_ceilings(self.rope_ceilings())?;
         // The other way a session comes into being, and it decides an activation
         // dtype just as `create_batched_session` does — so it materialises the
         // norm weights the same way.
@@ -4892,6 +5145,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         self.model().wave_geometry(act_dtype)
     }
 
+    fn rope_ceilings(&self) -> Vec<usize> {
+        self.rope().ceilings().to_vec()
+    }
+
     fn maybe_change_dtype(&self, dtype: DType) -> Result<()> {
         self.model().maybe_change_dtype(dtype)
     }
@@ -4966,6 +5223,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         layer_end: usize,
         residual_in: Option<Tensor>,
     ) -> Result<WaveResult> {
+        session.expect_rope_ceilings(self.rope().ceilings())?;
         drive_wave(
             self,
             session,
@@ -5111,6 +5369,58 @@ fn assert_sealed_layers_aligned(
          intact and repairable; a wave that died mid-sweep is the usual producer, and \
          its rollback is what should have undone this."
     )
+}
+
+/// Truncate a sealed sequence's chunks to the leading run whose cumulative
+/// token count does not exceed `target_tokens` — a whole-chunk truncation,
+/// never a split chunk.
+///
+/// The counterpart to [`assert_sealed_layers_aligned`]'s refusal: that check
+/// stops a *new* seal from persisting a per-layer skew, but a record already
+/// on disk from before the check existed (or from a seal path that predates
+/// it) carries the skew forever otherwise. Used by
+/// [`BatchedInferenceSession::inject_sealed_at_tail`] to heal such a record
+/// on read — the same "truncate every layer to the shortest" a live
+/// divergence is already healed with, applied here so it never becomes a
+/// live divergence in the first place.
+/// Truncate a sealed sequence to exactly `target_tokens`, splitting the chunk
+/// straddling the boundary rather than dropping it whole.
+///
+/// A `SealedChunk` is already a *window* onto its physical chunk — `offset` +
+/// `token_count`, not a copy of the bytes — so shrinking `token_count` from
+/// the tail costs nothing and needs no re-rotation (`SealedChunk`'s own docs:
+/// RoPE is applied at read time, never stored). Dropping the straddling chunk
+/// instead of splitting it used to leave `running < target_tokens` whenever
+/// `target_tokens` didn't land on one of *this* layer's own chunk boundaries
+/// — manufacturing a fresh cross-layer skew out of the call meant to heal one.
+fn truncate_sealed_to_tokens(
+    seq: &candle_nn::kv_cache::SealedSequence,
+    target_tokens: usize,
+) -> candle_nn::kv_cache::SealedSequence {
+    let mut running = 0usize;
+    let mut chunks = Vec::with_capacity(seq.chunks.len());
+    for c in &seq.chunks {
+        let remaining = target_tokens - running;
+        if remaining == 0 {
+            break;
+        }
+        if c.token_count as usize <= remaining {
+            running += c.token_count as usize;
+            chunks.push(c.clone());
+        } else {
+            let mut partial = c.clone();
+            partial.token_count = remaining as u16;
+            chunks.push(partial);
+            running = target_tokens;
+            break;
+        }
+    }
+    candle_nn::kv_cache::SealedSequence {
+        chunks,
+        token_count: running,
+        chunk_size: seq.chunk_size,
+        location: seq.location,
+    }
 }
 
 /// A uniform transformer's half of a wave: the same layer body at every index.
@@ -5283,5 +5593,71 @@ mod slab_tests {
     fn slack_is_a_quarter_of_the_cap() {
         assert_eq!(prefill_slack_cap(8192), 10240);
         assert_eq!(prefill_slack_cap(100), 125);
+    }
+}
+
+#[cfg(test)]
+mod truncate_sealed_tests {
+    use super::truncate_sealed_to_tokens;
+    use candle_nn::kv_cache::{ArenaLocation, SealedChunk, SealedSequence};
+
+    fn sequence(chunks: Vec<SealedChunk>) -> SealedSequence {
+        let token_count = chunks.iter().map(|c| c.token_count as usize).sum();
+        SealedSequence {
+            chunks,
+            token_count,
+            chunk_size: 32,
+            location: ArenaLocation::Gpu,
+        }
+    }
+
+    /// The target falls inside the second chunk, not on either layer's own
+    /// chunk boundary — exactly the shape a shorter sibling layer produces.
+    /// The old whole-chunk-or-drop-it logic landed on 32, short of the 40
+    /// asked for; the fix must split the straddling chunk instead.
+    #[test]
+    fn target_inside_a_chunk_splits_it_instead_of_dropping_it() {
+        let seq = sequence(vec![
+            SealedChunk::for_test(0, 32),
+            SealedChunk::for_test(1, 32),
+            SealedChunk::for_test(2, 8),
+        ]);
+
+        let truncated = truncate_sealed_to_tokens(&seq, 40);
+
+        assert_eq!(truncated.token_count, 40);
+        let counts: Vec<u16> = truncated.chunks.iter().map(|c| c.token_count).collect();
+        assert_eq!(counts, vec![32, 8]);
+    }
+
+    /// A target that already lands on a chunk boundary is unaffected — no
+    /// split, no dropped chunk.
+    #[test]
+    fn target_on_a_chunk_boundary_is_unchanged() {
+        let seq = sequence(vec![
+            SealedChunk::for_test(0, 32),
+            SealedChunk::for_test(1, 8),
+        ]);
+
+        let truncated = truncate_sealed_to_tokens(&seq, 32);
+
+        assert_eq!(truncated.token_count, 32);
+        let counts: Vec<u16> = truncated.chunks.iter().map(|c| c.token_count).collect();
+        assert_eq!(counts, vec![32]);
+    }
+
+    /// Truncating to the sequence's own exact total keeps every chunk intact.
+    #[test]
+    fn target_at_full_length_keeps_every_chunk() {
+        let seq = sequence(vec![
+            SealedChunk::for_test(0, 32),
+            SealedChunk::for_test(1, 8),
+        ]);
+
+        let truncated = truncate_sealed_to_tokens(&seq, 40);
+
+        assert_eq!(truncated.token_count, 40);
+        let counts: Vec<u16> = truncated.chunks.iter().map(|c| c.token_count).collect();
+        assert_eq!(counts, vec![32, 8]);
     }
 }

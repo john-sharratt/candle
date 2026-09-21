@@ -17,6 +17,7 @@ use super::schema::{
     CorruptTurnPolicy, GroupSchema, LayerSchema, Schema, SectionCollection, SystemPromptItem,
     SystemPromptSchema,
 };
+use super::warm_pool;
 use crate::cancel::ingest_cancelled;
 use crate::error::ConversationError;
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
@@ -941,8 +942,8 @@ impl Conversation {
                         match arena.scan_weighted(&[make_segment()], &[p], w) {
                             Ok(mut out) => Some(out.pop().unwrap_or_default()),
                             Err(e) => {
-                                tracing::debug!(
-                                    target: "provenance",
+                                tracing::warn!(
+                                    target: "candle_conversation::provenance",
                                     "GPU collection scan unavailable, using CPU: {e}"
                                 );
                                 None
@@ -1159,12 +1160,12 @@ impl Conversation {
         }
         self.ensure_normalization_warm(schema, target);
         // Collections (the tool catalog) live in the shared system prompt.
-        let t_coll = std::time::Instant::now();
+        let t_coll = Instant::now();
         scores =
             self.score_belief_collections(&schema.system_prompt, probe, probe_q, observe, arena);
         let coll_us = t_coll.elapsed().as_micros() as u64;
         // Belief-driven turn groups live across every layer.
-        let t_groups = std::time::Instant::now();
+        let t_groups = Instant::now();
         for layer in &schema.layers {
             candidates.extend(self.score_belief_groups(
                 layer,
@@ -1231,7 +1232,7 @@ impl Conversation {
         let this = self.clone();
         let schema = schema.clone();
         std::thread::spawn(move || {
-            this.warm_normalization_from_substrate(&schema, target);
+            warm_pool::run(|| this.warm_normalization_from_substrate(&schema, target));
         });
     }
 
@@ -1255,6 +1256,7 @@ impl Conversation {
     /// the hot path, reading the substrate under a shared lock and briefly locking
     /// the normalization cache per group, so it coexists with live reprojections.
     fn warm_normalization_from_substrate(&self, schema: &Schema, target: ProjectionTarget) {
+        let t_warm = Instant::now();
         let mut probes: Vec<(u64, u32, Vec<WideQSig>)> = {
             let sub = self.inner.read().unwrap();
             sub.all_streams()
@@ -1293,7 +1295,10 @@ impl Conversation {
             let _ =
                 self.score_belief_collections(&schema.system_prompt, probe, None, observe, None);
             for layer in &schema.layers {
-                // Background warm-up runs off the hot path → CPU (no device).
+                // Background warm-up runs off the hot path → CPU (no device),
+                // on the warm pool (`warm_pool::run` at the spawn) so its
+                // parallel scoring never occupies the global pool a live turn
+                // tallies on.
                 let _ = self.score_belief_groups(
                     layer,
                     target,
@@ -1305,6 +1310,15 @@ impl Conversation {
                 );
             }
         }
+        // Its cost depends on which stored turns it replays, so it is logged:
+        // a warm-up runs beside live turns and is invisible otherwise.
+        tracing::info!(
+            target: "candle_conversation::provenance",
+            probes = probes.len() - start,
+            probe_windows = probes[start..].iter().map(|(_, _, p)| p.len()).sum::<usize>(),
+            elapsed_ms = t_warm.elapsed().as_millis() as u64,
+            "normalization warm-up: replayed dialogue turns"
+        );
     }
 
     /// Warm every belief-driven section COLLECTION's hit levels from its own
@@ -1350,6 +1364,27 @@ impl Conversation {
         schema: &Schema,
         arena: Option<&GalleryArena>,
     ) -> CollectionWarm {
+        // How long the job waited for the warm pool, logged as it starts: one
+        // post-recalibration boot sat in this step for over half an hour with
+        // every pool thread busy and the GPU idle, and the line says whether a
+        // recurrence is the queue or the work.
+        let queued_at = Instant::now();
+        warm_pool::run(|| {
+            tracing::info!(
+                target: "candle_conversation::provenance",
+                queued_ms = queued_at.elapsed().as_millis() as u64,
+                "normalization warm-up: started on the warm pool",
+            );
+            self.warm_collection_normalization_on_pool(schema, arena)
+        })
+    }
+
+    /// [`Self::warm_collection_normalization`]'s body, run on the warm pool.
+    fn warm_collection_normalization_on_pool(
+        &self,
+        schema: &Schema,
+        arena: Option<&GalleryArena>,
+    ) -> CollectionWarm {
         let mut warm = CollectionWarm::default();
         let sp = &schema.system_prompt;
         for item in &sp.items {
@@ -1368,6 +1403,7 @@ impl Conversation {
             // the same derivation the gallery itself uses to map turn → slot.
             let member_names: HashSet<&str> =
                 coll.sections.iter().map(|s| s.name.as_str()).collect();
+            let planned_at = Instant::now();
             // Plan first (cheap, from declarations only), then fetch signatures for
             // exactly the turns the plan keeps — the cap does not pay to decode
             // signatures it discards.
@@ -1403,6 +1439,14 @@ impl Conversation {
                     .filter(|(_, sig)| !sig.is_empty())
                     .collect()
             };
+            tracing::info!(
+                target: "candle_conversation::provenance",
+                collection = %coll.name,
+                members = plan.len(),
+                probes = probes.len(),
+                plan_and_fetch_ms = planned_at.elapsed().as_millis() as u64,
+                "normalization warm-up: probes planned and fetched",
+            );
             if probes.is_empty() {
                 continue;
             }
@@ -1455,8 +1499,18 @@ impl Conversation {
     ) -> Option<bool> {
         let n = taught.sections.len();
         let slot_of = |name: &str| taught.sections.iter().position(|s| s.name == name);
+        let gallery_started = Instant::now();
         let (windows, slots, sids) =
             self.belief_gallery(&taught.name, &taught.policy.tags, slot_of);
+        tracing::info!(
+            target: "candle_conversation::provenance",
+            collection = %taught.name,
+            windows = windows.len(),
+            probes = probes.len(),
+            gallery_ms = gallery_started.elapsed().as_millis() as u64,
+            gpu = arena.is_some() && taught.policy.scan.fusion == FusionMode::Additive,
+            "normalization warm-up: gallery assembled, scoring probes",
+        );
         if windows.is_empty() {
             return Some(false);
         }
@@ -1490,8 +1544,8 @@ impl Conversation {
                     match arena.scan_weighted(&segments, batch, weights) {
                         Ok(out) => raw.extend(out),
                         Err(e) => {
-                            tracing::debug!(
-                                target: "provenance",
+                            tracing::warn!(
+                                target: "candle_conversation::provenance",
                                 "GPU warm-up scan unavailable, using CPU: {e}"
                             );
                             scanned = false;
@@ -1552,6 +1606,14 @@ impl Conversation {
     /// a promiscuous low-entropy file (a class/language list whose repetitive tokens
     /// agree with almost any probe) tops every query.
     pub fn warm_ingest_normalization(&self, schema: &Schema) {
+        warm_pool::run(|| self.warm_ingest_normalization_on_pool(schema))
+    }
+
+    /// [`Self::warm_ingest_normalization`]'s body, run on the warm pool. It runs
+    /// after `ready`, in the reconcile thread, while conversations are being
+    /// served — the case the warm pool exists for.
+    fn warm_ingest_normalization_on_pool(&self, schema: &Schema) {
+        let t_warm = Instant::now();
         let mut warmed_timelines = 0usize;
         for layer in &schema.layers {
             // Out of retrieval ⇒ nothing to warm. A hit level is a denominator
@@ -1573,6 +1635,7 @@ impl Conversation {
         }
         tracing::info!(
             timelines = warmed_timelines,
+            elapsed_ms = t_warm.elapsed().as_millis() as u64,
             "normalization warm-up: learned per-file hit levels for ingest-layer timelines \
              (0 ⇒ no append-only ingest layer marked — belief levels stay cold)"
         );
@@ -1590,6 +1653,11 @@ impl Conversation {
     /// Returns how many timelines were warmed; `0` when the group is not in
     /// the schema or not [`is_warmable`].
     pub fn warm_group_normalization(&self, schema: &Schema, group: GroupId) -> usize {
+        warm_pool::run(|| self.warm_group_normalization_on_pool(schema, group))
+    }
+
+    /// [`Self::warm_group_normalization`]'s body, run on the warm pool.
+    fn warm_group_normalization_on_pool(&self, schema: &Schema, group: GroupId) -> usize {
         let Some(layer) = schema
             .layers
             .iter()
@@ -1608,6 +1676,11 @@ impl Conversation {
     /// the one member scored on a different scale from the rest. `false` when
     /// the timeline is unknown or its group is not [`is_warmable`].
     pub fn warm_timeline_normalization(&self, schema: &Schema, timeline: TimelineId) -> bool {
+        warm_pool::run(|| self.warm_timeline_normalization_on_pool(schema, timeline))
+    }
+
+    /// [`Self::warm_timeline_normalization`]'s body, run on the warm pool.
+    fn warm_timeline_normalization_on_pool(&self, schema: &Schema, timeline: TimelineId) -> bool {
         let Some((layer, group)) = self.timeline_target(timeline) else {
             return false;
         };
@@ -1755,6 +1828,15 @@ impl Conversation {
             if !group.is_belief_driven() {
                 continue;
             }
+            // Per-group phase split. `groups_us` in the caller covers a whole
+            // layer's worth of this loop, which is one level too coarse to
+            // attribute a slow scan: assembling the candidate set (host, walks
+            // every turn of every timeline in the group) and scoring it (one
+            // batched GPU launch) are different costs with different fixes, and
+            // a scan that has grown to tens of seconds looks identical from
+            // outside whichever one it is. Timed per group so the group that
+            // grew is named, not just the layer.
+            let t_select = Instant::now();
             let sub = self.inner.read().unwrap();
             // Score EVERY conversation in the group, not just the first. A belief
             // group like `code_reading` declares one timeline per file; scoring
@@ -1803,6 +1885,10 @@ impl Conversation {
                 // Real sig tokens per exchange slot — the Concept A.4 size input.
                 ex_tokens: Vec<usize>,
             }
+            let select_us = t_select.elapsed().as_micros() as u64;
+            let n_timelines = timelines.len();
+            let t_assemble = Instant::now();
+            let mut turns_walked = 0usize;
             let mut files: Vec<FileScan> = Vec::new();
             for timeline in timelines {
                 // Enumerate the group's turns exactly as selection does — the whole
@@ -1810,6 +1896,7 @@ impl Conversation {
                 // of scanning `all_streams()` per group (which is O(all timelines'
                 // streams) on the reproject hot path).
                 let count = sub.turn_count(timeline);
+                turns_walked += count as usize;
                 // Per candidate turn: its full sig plus the self-referencing sub-window
                 // seams recorded on it. A turn with no seams scores as one whole-turn
                 // window (the prior behaviour); a turn with N seams scores as N+1
@@ -1931,9 +2018,12 @@ impl Conversation {
             // `FileScan` owns its data (`arcs_kept` holds `Arc`s), so nothing
             // below borrows the guard.
             drop(sub);
+            let assemble_us = t_assemble.elapsed().as_micros() as u64;
+            let n_windows: usize = files.iter().map(|f| f.windows.len()).sum();
             if files.is_empty() {
                 continue;
             }
+            let t_scan = Instant::now();
 
             // ── Phase B: score every file. GPU = ONE paged segmented launch over the
             // resident gallery arena (per-file z / margin / needle gate, numerically
@@ -1993,9 +2083,26 @@ impl Conversation {
                                     .collect(),
                             )
                         }
+                        // WARN, and on the crate-qualified target — both
+                        // deliberate.
+                        //
+                        // The target must fall under one of the host's
+                        // `EnvFilter` directives (`zend=`, `candle_conversation=`,
+                        // `candle_transformers=`, `candle_nn=`); a bare
+                        // `provenance` matches none, so the fallback could never
+                        // be printed and its absence from a log would read as
+                        // proof it had not happened.
+                        //
+                        // And on a CUDA host a declined GPU scan is not a debug
+                        // detail: the CPU per-file path is orders of magnitude
+                        // slower over a large corpus, so the symptom is a daemon
+                        // that has quietly become slow rather than one that
+                        // reports a fault. The CPU path stays — a host without
+                        // CUDA has no other way to score beliefs — but taking it
+                        // on a machine that has a GPU is worth saying out loud.
                         Err(e) => {
-                            tracing::debug!(
-                                target: "provenance",
+                            tracing::warn!(
+                                target: "candle_conversation::provenance",
                                 "paged GPU belief scan unavailable, using CPU per-file scan: {e}"
                             );
                             None
@@ -2093,6 +2200,12 @@ impl Conversation {
                 _ => None,
             };
 
+            // Phase B ends here. Split from Phase C because the boundary scan is
+            // the only one that also observes into the normalization levels
+            // under a shared lock, so scoring time and lock time are reported
+            // apart.
+            let score_us = t_scan.elapsed().as_micros() as u64;
+            let t_normalize = Instant::now();
             // ── Phase C: per-file normalize → Q-fuse → locality → stamp ──────────
             // Normalize the raw scores against each EXCHANGE's learned hit level so
             // selection compares candidates on a common 0-1000 band, not a shared
@@ -2201,9 +2314,39 @@ impl Conversation {
                     group.policy.scan.mass_rho,
                 ),
             );
+            // Where this group's scan time went, and what it walked to spend it.
+            // `assemble_us` is host work proportional to the group's turns;
+            // `score_us` is the batched launch (plus the CPU fallback when the
+            // arena declines); `normalize_us` is Phase C, which takes the
+            // normalization lock and — on the seal scan only — observes into the
+            // hit levels. The counts say whether a phase grew because the corpus
+            // did.
+            tracing::debug!(
+                target: "candle_conversation::provenance",
+                layer = %layer.name,
+                group = group.id.raw(),
+                timelines = n_timelines,
+                turns = turns_walked,
+                windows = n_windows,
+                seal = observe.source().is_some(),
+                select_us,
+                assemble_us,
+                score_us,
+                normalize_us = t_normalize.elapsed().as_micros() as u64,
+                "belief group scan"
+            );
             per_group.push((group.id, cands));
         }
         per_group
+    }
+
+    /// A turn's role as its `TurnDecl` carries it.
+    fn decl_role(role: Role) -> u8 {
+        match role {
+            Role::System => 0,
+            Role::User => 1,
+            Role::Assistant => 2,
+        }
     }
 
     /// Atomically append a turn to the substrate.
@@ -2246,11 +2389,7 @@ impl Conversation {
             turn_index: idx.0,
             turn_id_day: 0,
             turn_id_seq: idx.0 + 1,
-            role: match role {
-                Role::System => 0,
-                Role::User => 1,
-                Role::Assistant => 2,
-            },
+            role: Self::decl_role(role),
             block_start,
             block_end,
             layer_id,
@@ -4039,7 +4178,7 @@ impl Conversation {
                 //    the scheduler's Sync bucket so a multi-second compaction shows
                 //    as Sync (a persistence wait) rather than unattributed Blocked,
                 //    and log it so the op's cost is visible on its own line.
-                let t_exec = std::time::Instant::now();
+                let t_exec = Instant::now();
                 let result = {
                     let mut p = self.persistence.lock().unwrap();
                     p.execute_maintenance(&plan).map_err(|e| {

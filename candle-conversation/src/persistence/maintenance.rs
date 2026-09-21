@@ -750,9 +750,28 @@ impl SubstratePersistence {
         for r in &resident {
             resident_census.record(r.rt);
         }
+        // Why the op ran: its targets' sizes, so a store that keeps compacting
+        // the same data can be read straight off the log.
+        let (target_bytes, target_live, target_age) =
+            stats.iter().filter(|s| op.targets().contains(&s.id)).fold(
+                (0u64, 0u64, None),
+                |(t, l, a): (u64, u64, Option<u64>), s| {
+                    let age = a.map_or(s.age_secs, |a| a.min(s.age_secs));
+                    (t + s.total_bytes, l + s.live_bytes, Some(age))
+                },
+            );
+        // An op with no matching targets has no age; log 0 rather than a
+        // sentinel that reads as a number.
+        let target_age = target_age.unwrap_or(0);
         tracing::info!(
             target: "candle_conversation::persistence::census",
             op = op.label(),
+            target_bytes,
+            target_live,
+            target_dead_pct = (target_bytes.saturating_sub(target_live) * 100)
+                .checked_div(target_bytes)
+                .unwrap_or(0),
+            target_age_secs = target_age,
             reemit = resident_census.total(),
             chunks = chunk_relocs.len(),
             tokens = token_relocs.len(),
@@ -1319,18 +1338,28 @@ impl SubstratePersistence {
         {
             *live.entry(loc.segment).or_default() += loc.record_size;
         }
-        // Stream ids whose timeline is tombstoned — their records (chunks, tokens,
-        // AND metadata) are all dead weight the maintenance reclaims, so exclude
-        // their metadata from the live count below (else the tombstoned segment
-        // never looks reclaimable).
-        let mut tombstoned_streams: HashSet<u64> = HashSet::new();
-        // Streams with a live `StreamDecl` — the reconstructible ones. A stream
-        // WITHOUT a decl is an orphan (its decl was lost in a prior generation):
-        // its turn can never be rebuilt on reload, so none of its records count
-        // as live weight — mirroring the `collect_live_records` orphan gate — and
-        // the segments holding only its records become reclaimable instead of
-        // pinned forever.
-        let mut live_streams: HashSet<u64> = HashSet::new();
+        // Streams maintenance carries forward, mapped to whether their signature
+        // records (`ProjectionEvents` / `WideQSig` / `TurnIndexPage`) go with
+        // them — the exact rule `gather_resident_set` and `gather_relocations`
+        // carry by. Every record counted live here must be one maintenance
+        // carries, and every record it carries must be counted live: a record
+        // carried but counted dead makes the segment it lands in look
+        // reclaimable, so the next pass carries it again, forever.
+        //
+        // That is not hypothetical. A tombstoned-but-distilled timeline — the
+        // calibration corpus, some thousands of turns — is carried by its
+        // distill mode, signatures included, and was counted wholly dead here.
+        // Every pass re-emitted the corpus's signatures into a fresh segment,
+        // which then read ≥10% dead and was compacted a minute later: ~4 GB
+        // rewritten every ~75 s, indefinitely.
+        //
+        // A stream missing from the map carries nothing: a timeline dropped
+        // wholesale (tombstoned and undistilled), or an orphan with no
+        // `StreamDecl` (its decl was lost in a prior generation, so its turn can
+        // never be rebuilt on reload — mirroring the `collect_live_records`
+        // orphan gate — and the segments holding only its records become
+        // reclaimable instead of pinned forever).
+        let mut carried: HashMap<u64, bool> = HashMap::new();
         let dead_turns = dead_turns_of(substrate);
         for (sid, entry) in substrate.all_streams() {
             let shed = classify(
@@ -1340,17 +1369,13 @@ impl SubstratePersistence {
                 &dead_turns,
                 &tombstoned_sections,
             );
-            if shed.timeline_dead {
-                tombstoned_streams.insert(sid.0);
-                continue;
-            }
-            if entry.decl.is_none() {
+            if shed.dropped_wholesale() || entry.decl.is_none() {
                 continue;
             }
             // A turn-dead stream keeps its `StreamDecl` — the compactor emits it
             // as a placeholder so the timeline's turn indexing survives — so it
-            // stays a live stream here and only its bulk stops counting.
-            live_streams.insert(sid.0);
+            // stays a carried stream here and only its bulk stops counting.
+            carried.insert(sid.0, shed.keep_sig());
             if shed.keep_chunks() {
                 for loc in entry.chunks.values() {
                     *live.entry(loc.segment).or_default() += loc.record_size;
@@ -1363,16 +1388,21 @@ impl SubstratePersistence {
             }
         }
         // Per-stream metadata records (`StreamDecl` / `ProjectionEvents` /
-        // `WideQSig` / `Commit`) carry no location in the substrate index, so they
-        // are counted from the persistence-side `metadata_locs` map instead —
-        // last-writer-wins, so only the CURRENT copy of each is here; superseded
-        // copies are absent and correctly read as dead. Without this the segment
-        // holding a stream's live metadata reads as reclaimable and gets
-        // re-emitted-forward every maintenance pass (the periodic-compaction churn).
-        // Tombstoned streams and orphans (no live decl) are skipped so their
-        // residual metadata never pins a segment that should be reclaimed.
-        for ((_rt, stream_id), loc) in &self.metadata_locs {
-            if tombstoned_streams.contains(stream_id) || !live_streams.contains(stream_id) {
+        // `WideQSig` / `TurnIndexPage` / `Commit`) carry no location in the
+        // substrate index, so they are counted from the persistence-side
+        // `metadata_locs` map instead — last-writer-wins, so only the CURRENT
+        // copy of each is here; superseded copies are absent and correctly read
+        // as dead. Counted by the carry rule above: the decl and commit always,
+        // the signature records only when the stream keeps its signature.
+        for (&(rt, stream_id), loc) in &self.metadata_locs {
+            let Some(&keep_sig) = carried.get(&stream_id) else {
+                continue;
+            };
+            let is_signature = matches!(
+                rt,
+                RecordType::ProjectionEvents | RecordType::WideQSig | RecordType::TurnIndexPage
+            );
+            if is_signature && !keep_sig {
                 continue;
             }
             *live.entry(loc.segment).or_default() += loc.record_size;
@@ -1403,8 +1433,9 @@ impl SubstratePersistence {
 mod tests {
     use super::*;
     use crate::persistence::record::ChunkPayload;
-    use crate::persistence::streams::StreamId;
+    use crate::persistence::streams::{StreamDecl, StreamId, TurnDecl};
     use crate::persistence::{SubstratePersistence, SUBSTRATE_DIR};
+    use crate::projection::TimelineId;
     use crate::substrate::Substrate;
     use std::path::PathBuf;
 
@@ -2051,11 +2082,11 @@ mod tests {
     fn a_turn_coupling_is_in_the_resident_set() {
         let mut substrate = Substrate::new();
         substrate.register_timeline(
-            crate::projection::TimelineId::from_raw(9).unwrap(),
+            TimelineId::from_raw(9).unwrap(),
             crate::projection::LayerId::from_raw(1).unwrap(),
             crate::projection::GroupId::from_raw(1).unwrap(),
         );
-        substrate.couple_turn(crate::projection::TimelineId::from_raw(9).unwrap(), 4);
+        substrate.couple_turn(TimelineId::from_raw(9).unwrap(), 4);
 
         let resident = gather_resident_set(&substrate);
         let coupling = resident
@@ -2080,7 +2111,7 @@ mod tests {
     #[test]
     fn a_retired_turns_tombstone_survives_a_maintenance_sweep() {
         let mut substrate = Substrate::new();
-        let tl = crate::projection::TimelineId::from_raw(9001).unwrap();
+        let tl = TimelineId::from_raw(9001).unwrap();
         substrate.tombstone_turn(tl, 7);
         substrate.tombstone_turn(tl, 8);
 
@@ -2112,7 +2143,7 @@ mod tests {
         };
 
         let mut substrate = Substrate::new();
-        let tl = crate::projection::TimelineId::from_raw(5150).unwrap();
+        let tl = TimelineId::from_raw(5150).unwrap();
         substrate.tombstone_turn(tl, 1);
         substrate.tombstone_turn(tl, 2);
         substrate.tombstone_timeline(tl);
@@ -2129,7 +2160,7 @@ mod tests {
         // direction subsumed, the in-RAM set would depend on arrival order and
         // a sweep would carry marks a reload would not.
         let mut backwards = Substrate::new();
-        let tl = crate::projection::TimelineId::from_raw(5151).unwrap();
+        let tl = TimelineId::from_raw(5151).unwrap();
         backwards.tombstone_timeline(tl);
         backwards.tombstone_turn(tl, 1);
         backwards.tombstone_turn(tl, 2);
@@ -2204,7 +2235,7 @@ mod tests {
         assert!(before > 0, "a live turn's chunk is live weight");
 
         // Exactly what `retention::retire_expired` does to a tail turn.
-        substrate.tombstone_turn(crate::projection::TimelineId::from_raw(4242).unwrap(), 0);
+        substrate.tombstone_turn(TimelineId::from_raw(4242).unwrap(), 0);
 
         let after: u64 = sp.segment_liveness(&substrate).values().sum();
         assert!(
@@ -2280,6 +2311,79 @@ mod tests {
             let live: u64 = sp.segment_liveness(&substrate).values().sum();
             assert!(live > 0, "metadata liveness must survive a reload");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **What maintenance carries counts as live, and nothing else.** A
+    /// tombstoned-but-distilled timeline — the calibration corpus — keeps its
+    /// decl and, under `ProvenanceOnly`, its signatures, and every maintenance
+    /// pass re-emits them; so they must count live, or the segment each pass
+    /// writes them into reads dead and is compacted by the next pass, forever.
+    /// A timeline tombstoned without distillation carries nothing and counts
+    /// nothing.
+    #[test]
+    fn a_distilled_corpus_counts_as_live_weight() {
+        let decl = |timeline_id: u64| {
+            StreamDecl::Turn(TurnDecl {
+                timeline_id,
+                turn_index: 0,
+                turn_id_day: 0,
+                turn_id_seq: 1,
+                role: 2,
+                block_start: 0,
+                block_end: 1,
+                layer_id: 1,
+                group_id: 1,
+                anchored_prefix: Vec::new(),
+                view: Vec::new(),
+                segments: Vec::new(),
+                tags: Vec::new(),
+            })
+        };
+        let dir = tmp_dir("distilled_live");
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let live_of = |sp: &SubstratePersistence, substrate: &Substrate| -> u64 {
+            sp.segment_liveness(substrate).values().sum()
+        };
+        let corpus = decl(9001);
+        let sid = corpus.stream_id();
+        sp.declare_stream(&corpus).unwrap();
+        substrate.apply_stream_decl(sid, corpus.clone());
+        sp.append_wide_q_sigs(sid, &[7u8; 4096]).unwrap();
+        sp.commit().unwrap();
+        let with_sig = live_of(&sp, &substrate);
+
+        let tl = TimelineId::from_raw(9001).unwrap();
+        substrate.distill_timeline(tl, DistillMode::ProvenanceOnly);
+        substrate.tombstone_timeline(tl);
+        assert_eq!(
+            live_of(&sp, &substrate),
+            with_sig,
+            "the corpus's decl and signature are carried, so they count live"
+        );
+
+        // TextOnly drops the signature, keeps the decl.
+        substrate.distill_timeline(tl, DistillMode::TextOnly);
+        let text_only = live_of(&sp, &substrate);
+        assert!(
+            text_only > 0 && text_only < with_sig,
+            "a TextOnly corpus keeps its decl but not its signature: {text_only} of {with_sig}"
+        );
+
+        // An undistilled tombstone carries nothing.
+        let retired = decl(9002);
+        let retired_sid = retired.stream_id();
+        sp.declare_stream(&retired).unwrap();
+        substrate.apply_stream_decl(retired_sid, retired);
+        sp.append_wide_q_sigs(retired_sid, &[9u8; 4096]).unwrap();
+        sp.commit().unwrap();
+        substrate.tombstone_timeline(TimelineId::from_raw(9002).unwrap());
+        assert_eq!(
+            live_of(&sp, &substrate),
+            text_only,
+            "a retired conversation's records count nothing"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2475,7 +2579,6 @@ mod tests {
     #[test]
     fn tombstone_marker_survives_a_segment_drop() {
         use crate::persistence::streams::{StreamDecl, TurnDecl};
-        use crate::projection::TimelineId;
 
         let dir = tmp_dir("tomb");
         let tid = 777u64;
@@ -2560,8 +2663,6 @@ mod tests {
     /// every exchange had come apart into independent turns.
     #[test]
     fn couplings_survive_a_segment_compaction() {
-        use crate::projection::TimelineId;
-
         let dir = tmp_dir("couple");
         let tid = 424u64;
         // A three-turn repo_map chain; the first two couple.
@@ -2622,8 +2723,6 @@ mod tests {
     /// with the corruption the `drop_turn` policy condemned it for.
     #[test]
     fn turn_scoped_tombstone_survives_a_segment_compaction() {
-        use crate::projection::TimelineId;
-
         let dir = tmp_dir("turntomb");
         let tid = 525u64;
         let live = turn_decl(tid, 0);

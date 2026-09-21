@@ -1,32 +1,32 @@
 name: file_read
 questions:
+- show me lines 120 through 180 of candle-nn/src/kv_cache/chunked/compress.rs
+- print the opening of candle-kernels/build.rs where the archive groups are registered
+- the panic points at line 512, show me the code around it
+- show me that file from line 900 onward
+- I only need the impl block, not the whole two-thousand-line module
+- give me a window around line 47 so I can see the surrounding context
+- continue from where that excerpt stopped
+- something matched at line 214, show me the function it belongs to
+- what do lines 598 to 630 actually do
+- open src/lib.rs but only the top where the modules are declared
+- that excerpt cut off mid-function, show me the next stretch
+- skip ahead to line 300 and read from there
 - cat zend/src/session.rs
 - print docs/kv_tier_migration.md
 - open the Dockerfile so I can check the base image
 - show me what's in .gitignore
-- what does the build script actually do
-- does that module still import the old helper
 - what version is pinned in the lockfile
-- how long is that source file
-- I want to review the code before we change it
-- need to see the current config to know what to override
 - checking whether my earlier edit actually landed
-- the error mentions line 240, let me see the file
 - read it
 - print that file's contents
-- open the file and show me the text
-- let's look at the source
 - show me the contents of src/main.rs
 - read that config file for me
 - what's in README.md
-- open the file I wrote earlier and print it
-- let me see what's inside Cargo.toml
-- print the contents of the log file
-- pull up that source file so I can look at it
 - read back the notes file from this session
 category: Files
 mandatory: true
-description: 'Read a file, one 300-line page at a time. Resolves against this session''s edits first, then falls through to the project''s working directory, so real project files can be read directly. Use for: reading a source file from the project, looking at what was previously written, inspecting a file the user uploaded into the chat, checking the current state of a draft after edits. Both path and page are required — pass page 0 to read the top of the file (and a short file''s whole content). Page is zero-based, so page 1 is lines 301-600, page 2 is 601-900, and so on. Returns the page as numbered source in a fenced block, headed by the path, the page and total page count, and the line range covered — `(page 1 of 5, lines 301-600 of 1420)`. Keep incrementing page until the header''s page number stops advancing. For remote filesystems use remote_fs_session_get to download first, then file_read.'
+description: 'Read a file, one 200-line page at a time. Resolves against this session''s edits first, then falls through to the project''s working directory, so real project files can be read directly. Use for: reading a source file from the project, looking at what was previously written, inspecting a file the user uploaded into the chat, checking the current state of a draft after edits. Both path and page are required — pass page 0 to read the top of the file (and a short file''s whole content). Page is zero-based, so page 1 is lines 201-400, page 2 is 401-600, and so on. Returns the page as numbered source in a fenced block, headed by the path, the page and total page count, and the line range covered — `(page 1 of 5, lines 201-400 of 940)`. Keep incrementing page until the header''s page number stops advancing. There is no need to find a file''s length before reading it: read page 0 and the header reports it. To find the line worth reading, use file_grep rather than paging a large file looking for it. For remote filesystems use remote_fs_session_get to download first, then file_read.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
@@ -35,7 +35,7 @@ parameters:
       minLength: 1
       type: string
     page:
-      description: Zero-based page of the file to return, 300 lines a page. Required — pass 0 to read the top of the file. A page past the end clamps to the last one — read page 0 first, its header names the total, then keep incrementing until a response's own page number stops advancing.
+      description: Zero-based page of the file to return, 200 lines a page. Required — pass 0 to read the top of the file. A page past the end clamps to the last one — read page 0 first, its header names the total, then keep incrementing until a response's own page number stops advancing.
       format: uint32
       minimum: 0.0
       type: integer
@@ -109,7 +109,7 @@ examples:
   show me the first 30 lines of src/lib.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Only the top of src/lib.rs is wanted. Lines 1-30 sit inside page 0, which covers lines 1-300,<|projection|> so the call names path and page 0, and I'll read the first 30 numbered lines out of what comes back.
+  Only the top of src/lib.rs is wanted. Lines 1-30 sit inside page 0, which covers lines 1-200,<|projection|> so the call names path and page 0, and I'll read the first 30 numbered lines out of what comes back.
   </think>
 
   <tool_call>
@@ -119,7 +119,7 @@ examples:
   read lines 47 to 93 of src/auth/handler.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user named a range. Lines 47-93 both fall inside page 0 — the first 300 lines — so page 0 covers them; file_read pages, it doesn't take an arbitrary range.<|projection|> The numbered lines in the response let me point at exactly 47-93 when I answer.
+  The user named a range. Lines 47-93 both fall inside page 0 — the first 200 lines — so page 0 covers them; file_read pages, it doesn't take an arbitrary range.<|projection|> The numbered lines in the response let me point at exactly 47-93 when I answer.
   </think>
 
   <tool_call>
@@ -129,31 +129,31 @@ examples:
   what does line 450 of zend/src/prompts/projection.yaml do<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Line 450 is past the first 300-line page. Page 0 is lines 1-300, page 1 is lines 301-600 — 450 falls in page 1,<|projection|> so I ask for that page directly rather than paging through page 0 first.
+  Line 450 is past the first 200-line page. Page 0 is lines 1-200, page 1 is lines 201-400, page 2 is lines 401-600 — 450 falls in page 2,<|projection|> so I ask for that page directly rather than paging through pages 0 and 1 first.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "zend/src/prompts/projection.yaml", "page": 1}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "zend/src/prompts/projection.yaml", "page": 2}}
   </tool_call><|projection|>
 - |-
   the error mentions line 240 of src/server.rs, let me see it<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The error points at line 240, which is inside page 0 (lines 1-300),<|projection|> so reading page 0 shows the failing line with plenty of context around it.
+  The error points at line 240, which is inside page 1 (lines 201-400),<|projection|> so reading page 1 shows the failing line with plenty of context around it.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/server.rs", "page": 0}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/server.rs", "page": 1}}
   </tool_call><|projection|>
 - |-
   what's around line 850 in that file<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Line 850 is well past the first two pages: page 0 covers 1-300, page 1 covers 301-600, page 2 covers 601-900 — 850 is in page 2.<|projection|>
+  Line 850 is well past the first few pages: page 0 covers 1-200, page 1 covers 201-400, page 2 covers 401-600, page 3 covers 601-800, page 4 covers 801-1000 — 850 is in page 4.<|projection|>
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/server.rs", "page": 2}}
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/server.rs", "page": 4}}
   </tool_call><|projection|>
 - |-
   show me the rest of that file<|im_end|>
@@ -164,4 +164,63 @@ examples:
 
   <tool_call>
   <|projection|>{"name": "file_read", "arguments": {"path": "src/auth/handler.rs", "page": 1}}
+  </tool_call><|projection|>
+- |-
+  what does zend/src/session.rs set up at startup<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Nobody named a page, so I choose one from what the question is about. session.rs is one of the largest modules in the daemon and startup lives at the top — the module doc,<|projection|> the imports and the constants — so page 0 is where the answer should be. The header reports the file's total pages, so if it is not there I know how much is left and can read on.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "zend/src/session.rs", "page": 0}}
+  </tool_call><|projection|>
+- |-
+  so what does that function actually do<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The search above put reconcile_wave_offsets at line 412 of candle-conversation/src/wave/stager.rs. (412 - 1) / 200 is page 2, so that page catches the signature and the body<|projection|> — page 0 or 1 would miss it entirely. If the body runs past the page the header's total will say so and I can read on.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "candle-conversation/src/wave/stager.rs", "page": 2}}
+  </tool_call><|projection|>
+- |-
+  that page cut off before the match arm, show me more<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Page 2 covered lines 401-600 of 1,240 and the match it belongs to continues past line 600, so the arm is on the next page.<|projection|> Pages are fixed strides, not a range I can widen, so I read on rather than re-asking for a wider window.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "candle-conversation/src/wave/stager.rs", "page": 3}}
+  </tool_call><|projection|>
+- |-
+  compare src/main.rs, src/lib.rs and Cargo.toml for me<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Three files, all named, and none of the reads depends on another's result — so they are one reply with three calls, not three replies. Each is likely short, so page 0 of each;<|projection|> any header that reports more pages tells me where to read on.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "src/main.rs", "page": 0}}
+  </tool_call>
+  <tool_call>
+  {"name": "file_read", "arguments": {"path": "src/lib.rs", "page": 0}}
+  </tool_call>
+  <tool_call>
+  {"name": "file_read", "arguments": {"path": "Cargo.toml", "page": 0}}
+  </tool_call><|projection|>
+- |-
+  so how do the two parsers in that listing differ<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The listing above named zend/src/code_read/parsers/rust.rs and zend/src/code_read/parsers/python.rs. Comparing them needs both, and I already know both paths, so I read them together rather than one now and the other next turn.<|projection|> The top of each file is where the parser's entry point and its types are declared, so page 0 of each.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_read", "arguments": {"path": "zend/src/code_read/parsers/rust.rs", "page": 0}}
+  </tool_call>
+  <tool_call>
+  {"name": "file_read", "arguments": {"path": "zend/src/code_read/parsers/python.rs", "page": 0}}
   </tool_call><|projection|>

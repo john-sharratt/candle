@@ -20,6 +20,26 @@ pub enum Terminator {
     /// rewritten as its escape, an escape JSON does not have as a literal
     /// backslash, a short `\u` padded — so the string always parses.
     JsonString,
+    /// A JSON string value **including its opening quote** — the span starts
+    /// at the field's colon, the model writes ` "` (or ` ""`) itself, and the
+    /// span ends at the first unescaped `"` after that opening one, consumed.
+    ///
+    /// Exists because the opening quote is not the grammar's to write. Qwen's
+    /// tokenizer spells an empty string as ONE token, ` ""`, and a non-empty
+    /// one as ` "` followed by content, so a grammar that prefills ` "` has
+    /// already chosen "non-empty" on the model's behalf. Asked for an empty
+    /// value from there, the model writes the token that follows ` ""` in its
+    /// training — `}}` — and a [`Terminator::JsonString`] span swallows it,
+    /// the call's own close with it, as string content. A live turn produced
+    /// `{"prefix": "}}\n</tool_call>"}}` exactly that way and ended silently.
+    ///
+    /// Before the opening quote only whitespace belongs to the value. Any other
+    /// byte there — a `}}` where the value belonged, or bare text with no
+    /// quote in front of it — ends the span with the token rewritten as a whole
+    /// empty value, so the call's structure stays the grammar's. Were bare text
+    /// let through, its first later `"` would open the string instead and the
+    /// call's own close would be swallowed as content.
+    JsonStringValue,
     /// A JSON number value: lookahead-terminated at the first byte that cannot
     /// extend a number.  The terminator byte is NOT consumed — it belongs to the
     /// following node.  `integer_only` drops `.`/`e`/`E`.
@@ -89,6 +109,7 @@ impl Terminator {
             in_string: false,
             escaped: false,
             started: false,
+            spaced: false,
             matched: 0,
             json: match self {
                 Terminator::JsonString => Some(JsonLexer::string()),
@@ -112,6 +133,10 @@ pub struct TerminatorState {
     /// `Balanced` has seen its first `open` (so a later return to depth 0 is a
     /// real close, not the pre-open state).
     started: bool,
+    /// [`Terminator::JsonStringValue`]: whitespace has been written ahead of the
+    /// opening quote, so an empty value written in its place needs no space of
+    /// its own.
+    spaced: bool,
     /// [`Terminator::Until`]: how many bytes of the marker match so far.
     ///
     /// Carried on the state rather than recomputed per token because a marker
@@ -119,7 +144,8 @@ pub struct TerminatorState {
     /// at the end of one token must survive into the next.
     matched: usize,
     /// [`Terminator::JsonString`] / [`Terminator::JsonValue`]: the value's
-    /// full JSON state.
+    /// full JSON state. [`Terminator::JsonStringValue`] gains it at its opening
+    /// quote, so `None` there means the value has not opened.
     json: Option<JsonLexer>,
 }
 
@@ -150,11 +176,19 @@ impl TerminatorState {
         self.kind
     }
 
+    /// Whether the value this span lexes has opened — its opening quote seen,
+    /// for [`Terminator::JsonStringValue`]. Every other terminator's value is
+    /// open from its first byte, so this is `true` for them unconditionally.
+    pub fn opened(&self) -> bool {
+        self.kind != Terminator::JsonStringValue || self.json.is_some()
+    }
+
     /// Feed one token's decoded bytes.  Returns `Close` the moment the
     /// terminator fires, with the count of bytes that belong to the span.
     pub fn feed(&mut self, bytes: &[u8]) -> Feed {
         match self.kind {
             Terminator::JsonString | Terminator::JsonValue => self.feed_json(bytes),
+            Terminator::JsonStringValue => self.feed_string_value(bytes),
             Terminator::JsonNumber { integer_only } => self.feed_number(bytes, integer_only),
             Terminator::Balanced { open, close } => self.feed_balanced(bytes, open, close),
             // No byte pattern ever closes this span — only a close token, EOS,
@@ -190,6 +224,13 @@ impl TerminatorState {
     pub fn completion(&self) -> Vec<u8> {
         match (self.kind, &self.json) {
             (_, Some(json)) => json.completion(),
+            // Cut short before its opening quote, a string value holds no
+            // string at all: a lone `"` would open one that never closes, so it
+            // is finished as a whole empty value.
+            (Terminator::JsonStringValue, None) => match self.spaced {
+                true => b"\"\"".to_vec(),
+                false => b" \"\"".to_vec(),
+            },
             (Terminator::Until { marker }, _) => marker.as_bytes().to_vec(),
             (Terminator::Balanced { close, .. }, _) => vec![close; self.depth.max(1) as usize],
             _ => Vec::new(),
@@ -332,6 +373,59 @@ impl TerminatorState {
         Feed::Continue
     }
 
+    /// See [`Terminator::JsonStringValue`]. Before the opening quote only
+    /// whitespace is the value's; from the quote on, the value is an ordinary
+    /// JSON string and [`JsonLexer::string`] lexes it exactly as it lexes a
+    /// [`Terminator::JsonString`] — escapes rewritten, completion computed.
+    fn feed_string_value(&mut self, bytes: &[u8]) -> Feed {
+        if self.json.is_some() {
+            return self.feed_json(bytes);
+        }
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b' ' | b'\t' | b'\n' | b'\r' => self.spaced = true,
+                b'"' => {
+                    self.json = Some(JsonLexer::string());
+                    // The rest of this token is string content, with its
+                    // offsets and any rewrite shifted past the opening quote.
+                    let head = i + 1;
+                    return match self.feed_json(&bytes[head..]) {
+                        Feed::Continue => Feed::Continue,
+                        Feed::Close { consumed } => Feed::Close {
+                            consumed: head + consumed,
+                        },
+                        Feed::Rewrite {
+                            bytes: tail,
+                            closed,
+                        } => {
+                            let mut out = bytes[..head].to_vec();
+                            out.extend(tail);
+                            Feed::Rewrite { bytes: out, closed }
+                        }
+                    };
+                }
+                // **The model skipped the value.** The token cannot stay —
+                // nothing can be written in front of it once it is in the
+                // sequence, and after it the call reads `"prefix":}}`, not
+                // JSON — so it is replaced by the whitespace it opened with and
+                // a whole empty string, and the model decides again at the
+                // successor.
+                _ => {
+                    let mut out = bytes[..i].to_vec();
+                    if !self.spaced {
+                        out.push(b' ');
+                    }
+                    out.extend_from_slice(b"\"\"");
+                    return Feed::Rewrite {
+                        bytes: out,
+                        closed: true,
+                    };
+                }
+            }
+        }
+        Feed::Continue
+    }
+
     fn feed_number(&mut self, bytes: &[u8], integer_only: bool) -> Feed {
         for (i, &b) in bytes.iter().enumerate() {
             if !is_number_byte(b, integer_only) {
@@ -395,6 +489,99 @@ mod tests {
             }
         }
         (chunks.len(), None)
+    }
+
+    // ── JsonStringValue ─────────────────────────────────────────────────────
+
+    /// The empty string as Qwen spells it — ` ""`, one token — closes on its
+    /// second quote. This is the case the prefilled opening quote made
+    /// unreachable.
+    #[test]
+    fn string_value_empty_as_one_token() {
+        assert_eq!(run(Terminator::JsonStringValue, &[b" \"\""]), (0, Some(3)));
+    }
+
+    /// A non-empty string: ` "` then content, closing on a quote merged with
+    /// the call's own closers — the tail belongs to the next node.
+    #[test]
+    fn string_value_nonempty_with_merged_close() {
+        assert_eq!(
+            run(Terminator::JsonStringValue, &[b" \"", b"src", b"\"}}"]),
+            (2, Some(1))
+        );
+    }
+
+    /// The opening quote is not the close: a span that ended on it would read
+    /// every string as empty.
+    #[test]
+    fn string_value_opening_quote_does_not_close() {
+        assert_eq!(
+            run(Terminator::JsonStringValue, &[b" \"", b"a\\\"b", b"\""]),
+            (2, Some(1))
+        );
+    }
+
+    /// **Anything but whitespace before the opening quote is a skipped value.**
+    /// The failure this terminator exists for — `}}` where the value belonged
+    /// — is replaced by a whole empty string instead of being swallowed, with
+    /// the call's own close, as the contents of one. Bare text is as unopened
+    /// as a delimiter: let through, its first later quote would open the string
+    /// and swallow the call's close.
+    #[test]
+    fn string_value_skipped_before_open_is_written_empty() {
+        let cases: [(&[u8], &[u8]); 5] = [
+            (b"}}", b" \"\""),
+            (b" ,", b" \"\""),
+            (b"]", b" \"\""),
+            (b"src", b" \"\""),
+            (b" src/main.rs", b" \"\""),
+        ];
+        for (chunk, written) in cases {
+            let mut st = Terminator::JsonStringValue.start();
+            assert_eq!(
+                st.feed(chunk),
+                Feed::Rewrite {
+                    bytes: written.to_vec(),
+                    closed: true
+                },
+                "{chunk:?}"
+            );
+        }
+        // Whitespace committed by an earlier token is not doubled.
+        let mut st = Terminator::JsonStringValue.start();
+        assert_eq!(st.feed(b" "), Feed::Continue);
+        assert_eq!(
+            st.feed(b"}}"),
+            Feed::Rewrite {
+                bytes: b"\"\"".to_vec(),
+                closed: true
+            }
+        );
+        // Once the quote is out the value is open, and a delimiter is content.
+        let mut st = Terminator::JsonStringValue.start();
+        assert_eq!(st.feed(b" \"}}"), Feed::Continue);
+        assert!(st.opened());
+    }
+
+    /// Cut short before its quote, the value completes as a whole empty
+    /// string; after it, as the string lexer completes any open string.
+    #[test]
+    fn string_value_completion_depends_on_whether_it_opened() {
+        let st = Terminator::JsonStringValue.start();
+        assert!(!st.opened());
+        assert_eq!(st.completion(), b" \"\"");
+        let mut st = Terminator::JsonStringValue.start();
+        assert_eq!(st.feed(b" \"ab"), Feed::Continue);
+        assert_eq!(st.completion(), b"\"");
+    }
+
+    /// Delimiters INSIDE the string are content, as in any JSON string.
+    #[test]
+    fn string_value_delimiters_inside_are_content() {
+        assert_eq!(
+            run(Terminator::JsonStringValue, &[b" \"a,}b]", b"\""]),
+            (1, Some(1))
+        );
     }
 
     // ── JsonString ──────────────────────────────────────────────────────────

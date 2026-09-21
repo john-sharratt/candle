@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::{NotesError, MAX_NOTE_BYTES};
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct WriteRequest {
@@ -39,6 +39,12 @@ impl Tool for NotesWrite {
     type Request = WriteRequest;
     type Response = WriteResponse;
     type Error = NotesError;
+
+    /// Stores the note the call carries under the key it names, so writing it
+    /// again leaves the same entry.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(ctx: &ToolContext, req: WriteRequest) -> Result<WriteResponse, NotesError> {
         if req.key.len() > 256 {

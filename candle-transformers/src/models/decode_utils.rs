@@ -6,32 +6,6 @@ pub fn offsets_to_u32_tensor(offsets: &[usize], device: &Device) -> Result<Tenso
     Tensor::from_vec(offsets_u32, offsets.len(), device)
 }
 
-/// Build a device tensor of per-sequence cache lengths (u32), computed as offset + 1.
-pub fn cache_lens_to_u32_tensor(offsets: &[usize], device: &Device) -> Result<Tensor> {
-    let cache_lens_u32: Vec<u32> = offsets.iter().map(|&o| (o + 1) as u32).collect();
-    Tensor::from_vec(cache_lens_u32, offsets.len(), device)
-}
-
-/// Build a device tensor of per-block canonical RoPE start positions (i32) for chunked decode.
-///
-/// Shape: `[batch_size * max_blocks]`, row-major. Block B gets position
-/// B * chunk_size.  K is stored un-rotated; the decode kernel applies RoPE
-/// at this position + within + rope_offsets.
-///
-/// Stored as `u32` (Candle doesn't support `i32`); the raw bits are reinterpreted
-/// as `i32` at the FFI boundary since i32 and u32 have identical layout.
-pub fn chunk_rope_positions_to_i32_tensor(
-    positions: &[i32],
-    batch_size: usize,
-    max_blocks: usize,
-    device: &Device,
-) -> Result<Tensor> {
-    assert_eq!(positions.len(), batch_size * max_blocks);
-    // Reinterpret i32 -> u32 for Candle tensor storage (same bit pattern).
-    let as_u32: Vec<u32> = positions.iter().map(|&s| s as u32).collect();
-    Tensor::from_vec(as_u32, (batch_size, max_blocks), device)
-}
-
 /// Zero-row `(cos, sin)` shaped like a gather's result, allocating nothing.
 ///
 /// A wave assembles decode, prefill and glue attention params on every step,
@@ -85,90 +59,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_chunk_rope_positions_basic() {
-        let positions = vec![0i32, 0, 100, 0, 100, 0]; // 2 batch, 3 blocks
-        let t = chunk_rope_positions_to_i32_tensor(&positions, 2, 3, &Device::Cpu).unwrap();
-        // Stored as u32, check shape
-        assert_eq!(t.dims(), &[2, 3]);
-        let vals = t.to_vec2::<u32>().unwrap();
-        // 100 as i32 -> 100 as u32 (positive values are identical)
-        assert_eq!(vals[0], vec![0, 0, 100]);
-        assert_eq!(vals[1], vec![0, 100, 0]);
-    }
-
-    #[test]
-    fn test_chunk_rope_positions_negative_value_bitcast() {
-        // Verify negative i32 is correctly bitcast to u32
-        let positions = vec![-1i32];
-        let t = chunk_rope_positions_to_i32_tensor(&positions, 1, 1, &Device::Cpu).unwrap();
-        let vals = t.to_vec2::<u32>().unwrap();
-        assert_eq!(vals[0][0], u32::MAX); // -1i32 as u32 = 0xFFFFFFFF
-    }
-
-    #[test]
-    fn test_chunk_rope_positions_all_zero() {
-        let positions = vec![0i32; 6];
-        let t = chunk_rope_positions_to_i32_tensor(&positions, 2, 3, &Device::Cpu).unwrap();
-        let flat: Vec<u32> = t.flatten_all().unwrap().to_vec1().unwrap();
-        assert!(flat.iter().all(|&v| v == 0));
-    }
-
-    #[test]
     fn test_offsets_basic() {
         let t = offsets_to_u32_tensor(&[0, 5, 100], &Device::Cpu).unwrap();
         let vals = t.to_vec1::<u32>().unwrap();
         assert_eq!(vals, vec![0, 5, 100]);
-    }
-
-    #[test]
-    fn test_cache_lens_basic() {
-        let t = cache_lens_to_u32_tensor(&[0, 5, 100], &Device::Cpu).unwrap();
-        let vals = t.to_vec1::<u32>().unwrap();
-        assert_eq!(vals, vec![1, 6, 101]);
-    }
-
-    /// Realistic canonical positions: 3 batches × 4 blocks where
-    /// positions[b][i] = i * chunk_size for allocated blocks, 0 otherwise.
-    #[test]
-    fn test_chunk_rope_positions_canonical_layout() {
-        let chunk_size = 64i32;
-        let batch_size = 3;
-        let max_blocks = 4;
-        // batch 0: 3 blocks allocated, batch 1: 1 block, batch 2: 4 blocks
-        let mut positions = vec![0i32; batch_size * max_blocks];
-        // batch 0: blocks 0,1,2 — batch 0's row starts at offset 0
-        for i in 0..3 {
-            positions[i] = (i as i32) * chunk_size;
-        }
-        // batch 1: block 0 only
-        positions[max_blocks] = 0;
-        // batch 2: all 4 blocks
-        for i in 0..4 {
-            positions[2 * max_blocks + i] = (i as i32) * chunk_size;
-        }
-
-        let t =
-            chunk_rope_positions_to_i32_tensor(&positions, batch_size, max_blocks, &Device::Cpu)
-                .unwrap();
-        assert_eq!(t.dims(), &[3, 4]);
-        let vals = t.to_vec2::<u32>().unwrap();
-
-        // Batch 0: [0, 64, 128, 0]
-        assert_eq!(vals[0], vec![0, 64, 128, 0]);
-        // Batch 1: [0, 0, 0, 0]
-        assert_eq!(vals[1], vec![0, 0, 0, 0]);
-        // Batch 2: [0, 64, 128, 192]
-        assert_eq!(vals[2], vec![0, 64, 128, 192]);
-    }
-
-    /// Verify that the tensor shape assertion holds: positions.len() must
-    /// equal batch_size * max_blocks.
-    #[test]
-    #[should_panic]
-    fn test_chunk_rope_positions_shape_mismatch_panics() {
-        // 5 elements but batch_size=2, max_blocks=3 expects 6
-        let positions = vec![0i32; 5];
-        let _ = chunk_rope_positions_to_i32_tensor(&positions, 2, 3, &Device::Cpu).unwrap();
     }
 }
 
@@ -193,7 +87,9 @@ mod tests {
 mod cuda_tests {
     #![allow(clippy::needless_range_loop)]
 
-    use crate::models::prefill_utils::{compute_rope_cs, paged_decode_attn};
+    use crate::models::prefill_utils::paged_decode_attn;
+    use crate::models::rope_schedule::{RopeRungs, RopeSchedule};
+    use crate::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
     use candle::quantized::pinned_staging::PinnedStager;
     use candle::{DType, Device, Result, Tensor};
     use candle_nn::kv_cache::ChunkedKvBacking;
@@ -271,32 +167,17 @@ mod cuda_tests {
     // RoPE table helpers (same theta=10000 convention as prefill_utils)
     // ------------------------------------------------------------------
 
-    fn make_test_inv_freq(head_dim: usize, device: &Device) -> Result<Tensor> {
-        let half = head_dim / 2;
-        let v: Vec<f32> = (0..half)
+    fn make_test_rope(head_dim: usize, device: &Device) -> Result<RopeRungs> {
+        let v: Vec<f32> = (0..head_dim / 2)
             .map(|i| 1.0f32 / 10000.0f32.powf(2.0 * i as f32 / head_dim as f32))
             .collect();
-        Tensor::from_vec(v, (half,), device)
+        RopeRungs::new(&RopeSchedule::stated(v, usize::MAX)?, device)
     }
 
-    fn make_zero_inv_freq(head_dim: usize, device: &Device) -> Result<Tensor> {
-        Tensor::zeros((head_dim / 2,), DType::F32, device)
-    }
-
-    fn make_test_rope_cs(head_dim: usize, max_blocks: usize, device: &Device) -> Result<Tensor> {
-        compute_rope_cs(
-            &make_test_inv_freq(head_dim, device)?,
-            max_blocks,
-            head_dim,
-            device,
-        )
-    }
-
-    fn make_zero_rope_cs(head_dim: usize, max_blocks: usize, device: &Device) -> Result<Tensor> {
-        compute_rope_cs(
-            &make_zero_inv_freq(head_dim, device)?,
-            max_blocks,
-            head_dim,
+    /// Zero frequencies: the identity rotation at every position.
+    fn make_zero_rope(head_dim: usize, device: &Device) -> Result<RopeRungs> {
+        RopeRungs::new(
+            &RopeSchedule::stated(vec![0.0; head_dim / 2], usize::MAX)?,
             device,
         )
     }
@@ -400,7 +281,7 @@ mod cuda_tests {
         n_kv_head: usize,
         head_dim: usize,
         arena_dtype: DType,
-        rope_cs: &Tensor,
+        rope: &RopeRungs,
     ) -> Result<Tensor> {
         let device = q.device();
         let history_len = history.map(|(k, _)| k.dim(2)).transpose()?.unwrap_or(0);
@@ -427,7 +308,7 @@ mod cuda_tests {
         let (ptrs, _pins, _) = backing.sync_decode_gpu_chunks(&[(0, seq_offset)], &arena_info)?;
         let (ptr, n_slices, write_slice) = ptrs[0];
 
-        // Stage the 16-byte SlotHeader to GPU.
+        // Stage the SlotHeader to GPU.
         //
         // IMPORTANT: `gen` must stay alive until after `paged_decode_attn` returns.
         // GpuBuf arena buffers point into the stager's pinned GPU-mapped arena;
@@ -435,11 +316,16 @@ mod cuda_tests {
         // before the kernel runs causes CUDA_ERROR_ILLEGAL_ADDRESS.
         let stager = PinnedStager::new(device.as_cuda_device()?);
         let gen = stager.begin_generation();
-        let mut hdr = [0u8; 16];
-        hdr[..4].copy_from_slice(&n_slices.to_le_bytes());
-        hdr[4..8].copy_from_slice(&write_slice.to_le_bytes());
-        hdr[8..16].copy_from_slice(&ptr.to_le_bytes());
-        let mut pinned = gen.alloc(16)?;
+        let mut hdr = Vec::with_capacity(SLOT_HEADER_BYTES);
+        SlotHeaderHost {
+            n_slices,
+            write_slice,
+            slices_ptr: ptr,
+            position_map_ptr: 0,
+            rope_rung: 0,
+        }
+        .write(&mut hdr);
+        let mut pinned = gen.alloc(SLOT_HEADER_BYTES)?;
         pinned.copy_from_slice(&hdr);
         let _gpu_buf = gen.submit(pinned)?;
         let headers_ptr = _gpu_buf.dev_ptr();
@@ -468,7 +354,7 @@ mod cuda_tests {
             softmax_scale,
             &k_c,
             &v_c,
-            rope_cs,
+            rope,
             false, // rope_interleaved
             None,  // no QSA selection: the full causal read
         )?;
@@ -537,11 +423,16 @@ mod cuda_tests {
 
         let stager = PinnedStager::new(device.as_cuda_device()?);
         let gen = stager.begin_generation();
-        let mut hdr = [0u8; 16];
-        hdr[..4].copy_from_slice(&n_slices.to_le_bytes());
-        hdr[4..8].copy_from_slice(&write_slice.to_le_bytes());
-        hdr[8..16].copy_from_slice(&ptr.to_le_bytes());
-        let mut pinned = gen.alloc(16)?;
+        let mut hdr = Vec::with_capacity(SLOT_HEADER_BYTES);
+        SlotHeaderHost {
+            n_slices,
+            write_slice,
+            slices_ptr: ptr,
+            position_map_ptr: 0,
+            rope_rung: 0,
+        }
+        .write(&mut hdr);
+        let mut pinned = gen.alloc(SLOT_HEADER_BYTES)?;
         pinned.copy_from_slice(&hdr);
         let _gpu_buf = gen.submit(pinned)?;
         let headers_ptr = _gpu_buf.dev_ptr();
@@ -555,7 +446,7 @@ mod cuda_tests {
         let q_c = q.to_dtype(compute_dtype)?;
         let k_c = k_new.to_dtype(compute_dtype)?.contiguous()?;
         let v_c = v_new.to_dtype(compute_dtype)?.contiguous()?;
-        let rope_cs = make_zero_rope_cs(head_dim, 16, device)?;
+        let rope = make_zero_rope(head_dim, device)?;
 
         let result = paged_decode_attn(
             None,
@@ -568,7 +459,7 @@ mod cuda_tests {
             softmax_scale,
             &k_c,
             &v_c,
-            &rope_cs,
+            &rope,
             false,
             None,
         )?;
@@ -665,11 +556,11 @@ mod cuda_tests {
         n_kv_head: usize,
         head_dim: usize,
         dtype: DType,
-        rope_cs: &Tensor,
+        rope: &RopeRungs,
         label: &str,
     ) -> Result<()> {
         let int8 = run_paged_decode(
-            history, k_new, v_new, q, n_head, n_kv_head, head_dim, dtype, rope_cs,
+            history, k_new, v_new, q, n_head, n_kv_head, head_dim, dtype, rope,
         )?
         .to_dtype(DType::F32)?;
 
@@ -727,7 +618,7 @@ mod cuda_tests {
             n_kv_head,
             head_dim,
             dtype,
-            &make_zero_rope_cs(head_dim, 16, &device)?,
+            &make_zero_rope(head_dim, &device)?,
         )?;
         assert_eq!(out.dims(), &[1, n_head, head_dim]);
         let max_abs = out
@@ -768,7 +659,7 @@ mod cuda_tests {
             n_kv_head,
             head_dim,
             DType::F8E4M3,
-            &make_zero_rope_cs(head_dim, 16, &device)?,
+            &make_zero_rope(head_dim, &device)?,
         )?;
         assert_eq!(out.dims(), &[1, n_head, head_dim]);
         let max_abs = out
@@ -810,7 +701,7 @@ mod cuda_tests {
             n_kv_head,
             head_dim,
             DType::F8E4M3,
-            &make_zero_rope_cs(head_dim, 16, &device)?,
+            &make_zero_rope(head_dim, &device)?,
         )?;
         assert_eq!(out.dims(), &[1, n_head, head_dim]);
         let max_abs = out
@@ -847,7 +738,7 @@ mod cuda_tests {
             n_kv_head,
             head_dim,
             DType::F8E4M3,
-            &make_zero_rope_cs(head_dim, 16, &device)?,
+            &make_zero_rope(head_dim, &device)?,
         )?;
         assert_eq!(out.dims(), &[1, n_head, head_dim]);
         let max_abs = out
@@ -900,7 +791,7 @@ mod cuda_tests {
                 n_kv_head,
                 head_dim,
                 dtype,
-                &make_zero_rope_cs(head_dim, 16, &device)?,
+                &make_zero_rope(head_dim, &device)?,
             )?;
 
             // Reference: single KV token — attend over k_new/v_new only.
@@ -953,7 +844,7 @@ mod cuda_tests {
                 n_kv_head,
                 head_dim,
                 dtype,
-                &make_zero_rope_cs(head_dim, 16, &device)?,
+                &make_zero_rope(head_dim, &device)?,
             )?;
 
             let full_k = k_new.unsqueeze(2)?;
@@ -1034,7 +925,7 @@ mod cuda_tests {
                 n_kv_head,
                 head_dim,
                 dtype,
-                &make_zero_rope_cs(head_dim, 16, &device)?,
+                &make_zero_rope(head_dim, &device)?,
                 label,
             )?;
         }
@@ -1073,7 +964,7 @@ mod cuda_tests {
                 n_kv_head,
                 head_dim,
                 dtype,
-                &make_zero_rope_cs(head_dim, 16, &device)?,
+                &make_zero_rope(head_dim, &device)?,
                 label,
             )?;
         }
@@ -1122,7 +1013,7 @@ mod cuda_tests {
                 n_kv_head,
                 head_dim,
                 dtype,
-                &make_zero_rope_cs(head_dim, 16, &device)?,
+                &make_zero_rope(head_dim, &device)?,
                 label,
             )?;
         }
@@ -1154,7 +1045,7 @@ mod cuda_tests {
             Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
         let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
 
-        let rope_cs = make_zero_rope_cs(head_dim, 16, &device)?;
+        let rope = make_zero_rope(head_dim, &device)?;
         let int8 = run_paged_decode(
             Some((&hk, &hv)),
             &k_new,
@@ -1164,7 +1055,7 @@ mod cuda_tests {
             n_kv_head,
             head_dim,
             dtype,
-            &rope_cs,
+            &rope,
         )?
         .to_dtype(DType::F32)?;
 
@@ -1219,7 +1110,7 @@ mod cuda_tests {
             n_kv_head,
             head_dim,
             dtype,
-            &make_zero_rope_cs(head_dim, 16, &device)?,
+            &make_zero_rope(head_dim, &device)?,
         )?;
         assert_eq!(out.dims(), &[1, n_head, head_dim]);
         let max_abs = out
@@ -1266,7 +1157,7 @@ mod cuda_tests {
             n_kv_head,
             head_dim,
             dtype,
-            &make_zero_rope_cs(head_dim, 16, &device)?,
+            &make_zero_rope(head_dim, &device)?,
         )?;
 
         let out_real = run_paged_decode(
@@ -1278,7 +1169,7 @@ mod cuda_tests {
             n_kv_head,
             head_dim,
             dtype,
-            &make_test_rope_cs(head_dim, 16, &device)?,
+            &make_test_rope(head_dim, &device)?,
         )?;
 
         let zero_f32 = out_zero.to_dtype(DType::F32)?;
@@ -1333,7 +1224,7 @@ mod cuda_tests {
             n_kv_head,
             head_dim,
             dtype,
-            &make_zero_rope_cs(head_dim, 16, &device)?,
+            &make_zero_rope(head_dim, &device)?,
         )?;
 
         // Branch B: manually rotate Q and K at pos=0 (identity), then reference decode.

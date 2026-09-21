@@ -443,11 +443,23 @@ pub const QWEN3_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactor
 };
 
 /// Tuned for Qwen3-8B.
+///
+/// Re-derived 2026-09-20: the factored RoPE table build (`rope_schedule::table`)
+/// removed a bogus 1.25x linear-scaling factor that `infer_rope_scaling_factor`
+/// had been reading out of this model's `context_length: 40960` and feeding into
+/// the paged kernels via `new_with_inv_freq`. `v_hi`/`v_low` were calibrated
+/// against that miscalculated RoPE, so once corrected they no longer covered one
+/// sweep session (`quantized_qwen3::tests::test_parallel_batched_forwarding`,
+/// C9/C10). `k_hi`/`k_low` are unaffected — `v_hi: 0.900 -> 0.899`,
+/// `v_low: 2.600 -> 2.598` is the smallest step off the committed row (found by
+/// bisecting between the committed value and a much larger, unnecessary cut) that
+/// passes the gate twice in a row; C9 moves 5.47x -> 5.46x, C10 is unchanged at
+/// 5.84x.
 pub const QWEN3_8B_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
     k_hi: 0.900,
     k_low: 1.450,
-    v_hi: 0.900,
-    v_low: 2.600,
+    v_hi: 0.899,
+    v_low: 2.598,
 };
 
 /// Llama 3.x family. Currently identity but kept as a named constant so the

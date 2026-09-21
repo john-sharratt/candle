@@ -7,7 +7,7 @@
 //
 // Byte layouts must match the Rust serialization in slot_state.rs exactly.
 //
-// SlotState header (24 bytes, fixed):
+// SlotState header (32 bytes, fixed — one sector):
 //   [0..4)   uint32_t n_slices
 //   [4..8)   uint32_t write_slice
 //   [8..16)  uint64_t slices_ptr       (device pointer into slices tensor)
@@ -18,10 +18,14 @@
 //                                        Only the prefill and glue kernels
 //                                        walk positions through it, via
 //                                        `resolve_pos`, so only the prefill
-//                                        upload (`upload_slot_headers`)
+//                                        upload (`build_slot_headers`)
 //                                        builds one; decode headers carry 0
 //                                        here and the decode kernels walk
 //                                        the slice table directly.)
+//   [24..28) uint32_t rope_rung        (the sequence's RoPE rung: which of
+//                                        the launch's `RopeRungs` tables this
+//                                        slot rotates by; see rope_table.cuh)
+//   [28..32) uint32_t _pad
 //
 // TokenSlice (16 bytes, fixed stride):
 //   [0..2)   uint16_t offset
@@ -47,6 +51,7 @@
 //   [HD/2+88..HD/2+104) float    v_scale[4]  (outer scale per V palette, default 1.0; same convention as k_scale)
 // ============================================================================
 
+#include <stddef.h>
 #include <stdint.h>
 
 // ============================================================================
@@ -60,12 +65,17 @@ struct SlotHeader {
     uint64_t position_map_ptr;  // device pointer into per-slot
                                 // position_map: u32[total_tokens],
                                 // entry = (slice_idx << 16) | in_blk.
+    uint32_t rope_rung;         // index into the launch's RopeRungs
+    uint32_t _pad;
 };
-static_assert(sizeof(SlotHeader) == 24, "SlotHeader must be 24 bytes");
+static_assert(sizeof(SlotHeader) == 32, "SlotHeader must be 32 bytes");
+static_assert(offsetof(SlotHeader, slices_ptr) == 8, "SlotHeader.slices_ptr at 8");
+static_assert(offsetof(SlotHeader, position_map_ptr) == 16, "SlotHeader.position_map_ptr at 16");
+static_assert(offsetof(SlotHeader, rope_rung) == 24, "SlotHeader.rope_rung at 24");
 
 // Read the SlotHeader for a given slot index from the headers tensor.
 __device__ __forceinline__ const SlotHeader& get_slot_header(const uint8_t* headers, int slot_idx) {
-    return *reinterpret_cast<const SlotHeader*>(headers + (int64_t)slot_idx * 24);
+    return *reinterpret_cast<const SlotHeader*>(headers + (int64_t)slot_idx * sizeof(SlotHeader));
 }
 
 // Resolve a cum_token position to (slice_idx, in_blk) via the slot's

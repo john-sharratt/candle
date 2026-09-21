@@ -35,16 +35,18 @@ parameters:
       minLength: 1
       type: string
     max_hops:
-      description: Maximum number of hops to probe. Defaults to 30.
+      description: Maximum number of hops to probe (1-64). Defaults to 30.
       format: uint32
-      minimum: 0.0
+      maximum: 64.0
+      minimum: 1.0
       type:
       - integer
       - 'null'
     timeout_sec:
-      description: Per-hop probe timeout in seconds. Uses the OS default if omitted.
+      description: Per-hop probe timeout in seconds (1-60). Uses the OS default if omitted.
       format: uint32
-      minimum: 0.0
+      maximum: 60.0
+      minimum: 1.0
       type:
       - integer
       - 'null'

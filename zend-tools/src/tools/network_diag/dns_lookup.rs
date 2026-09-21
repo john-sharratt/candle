@@ -7,12 +7,13 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::DiagError;
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::net;
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct DnsRequest {
     /// Hostname to look up (for A/AAAA) or IP address (for PTR reverse lookup).
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1, max = 253))]
     pub host: String,
     /// Record type: "A" (IPv4), "AAAA" (IPv6), or "PTR" (reverse). Case-insensitive.
     /// MX/TXT/NS are not supported and return not_supported. Default: "A".
@@ -44,12 +45,18 @@ impl Tool for DnsLookup {
     type Response = DnsResponse;
     type Error = DiagError;
 
-    fn run(_ctx: &ToolContext, req: DnsRequest) -> Result<DnsResponse, DiagError> {
+    /// A read-only lookup: the answer is served by a resolver, not changed in
+    /// one.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
+
+    fn run(ctx: &ToolContext, req: DnsRequest) -> Result<DnsResponse, DiagError> {
         let record_type = req.record_type.as_deref().unwrap_or("A").to_uppercase();
 
         match record_type.as_str() {
             "A" | "AAAA" => {
-                let ips = dns_lookup::lookup_host(&req.host)
+                let ips = net::lookup_host(ctx.grants(), &req.host)
                     .map_err(|e| DiagError::HostNotFound(format!("{}: {}", req.host, e)))?;
                 let records: Vec<String> = ips
                     .into_iter()
@@ -72,7 +79,7 @@ impl Tool for DnsLookup {
                 let ip: IpAddr = req.host.parse().map_err(|_| {
                     DiagError::HostNotFound(format!("{} is not an IP address", req.host))
                 })?;
-                let name = dns_lookup::lookup_addr(&ip)
+                let name = net::lookup_addr(ctx.grants(), &ip)
                     .map_err(|e| DiagError::HostNotFound(e.to_string()))?;
                 Ok(DnsResponse {
                     host: req.host,

@@ -25,7 +25,7 @@
 //!
 //! `telnet_send` confirms every call.  Open, list, and close do not.
 
-use crate::ToolError;
+use crate::{NotPermitted, ToolError};
 use thiserror::Error;
 
 pub mod close;
@@ -48,6 +48,8 @@ pub enum TelnetError {
     SendFailed(String),
     #[error("timeout")]
     Timeout,
+    #[error(transparent)]
+    NotPermitted(#[from] NotPermitted),
 }
 
 impl ToolError for TelnetError {
@@ -57,6 +59,7 @@ impl ToolError for TelnetError {
             TelnetError::SessionNotFound(_) => "session_not_found",
             TelnetError::SendFailed(_) => "send_failed",
             TelnetError::Timeout => "timeout",
+            TelnetError::NotPermitted(_) => NotPermitted::CODE,
         }
     }
 }

@@ -47,8 +47,11 @@
 
 mod builder;
 mod dialect;
+mod gguf_rope;
 mod hermes3;
 pub mod overrides;
+#[cfg(test)]
+mod preset_rope_tests;
 mod qwen2;
 mod qwen3;
 mod qwen35_dense;
@@ -62,6 +65,7 @@ pub use dialect::*;
 use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
 use candle::DType;
+pub use candle_transformers::models::rope_schedule::RopePreset;
 use std::path::Path;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -156,6 +160,20 @@ impl ModelArch {
             // rest, with a gate ladder that runs BF16.
             Self::Qwen35Hybrid | Self::Qwen35Dense | Self::Qwen4Exp => Some(DType::BF16),
             Self::Qwen3 | Self::Qwen3Moe | Self::Qwen2 | Self::Llama | Self::DeepSeekV4 => None,
+        }
+    }
+
+    /// The RoPE preset a checkpoint of this arch runs when no preset names one — a
+    /// GGUF handed over from a local directory.
+    ///
+    /// The architectures whose loaders carry their schedule get it; a GQA file gets
+    /// what it states, since nothing outside the file says which release it is.
+    pub fn file_rope(self) -> RopePreset {
+        match self {
+            Self::Qwen35Hybrid | Self::Qwen35Dense | Self::Qwen4Exp | Self::DeepSeekV4 => {
+                RopePreset::Lineage
+            }
+            Self::Qwen3 | Self::Qwen3Moe | Self::Qwen2 | Self::Llama => RopePreset::FileStated,
         }
     }
 }
@@ -282,6 +300,7 @@ pub enum Model {
     ///     eos_token: "<|im_end|>".into(),
     ///     default_system_prompt: "You are a helpful assistant.".into(),
     ///     max_seq_len: 8192,
+    ///     rope: RopePreset::FileStated,
     ///     default_sampling: SamplingConfig::top_p(0.9, 0.7),
     /// };
     /// let engine = Model::custom(spec)
@@ -440,6 +459,13 @@ pub struct ModelSpec {
     pub default_system_prompt: String,
     /// Maximum sequence length for KV cache allocation.
     pub max_seq_len: usize,
+    /// Where the checkpoint's RoPE schedule comes from (`docs/progressive_yarn.md` §2).
+    ///
+    /// The published GGUFs carry no YaRN keys, so a schedule the vendor publishes beside
+    /// the weights — Qwen3's 64K/128K factors over its 32K window — is named here, with
+    /// the checkpoint. [`RopePreset::FileStated`] runs what the file states;
+    /// [`RopePreset::Lineage`] marks an architecture whose loader carries its own.
+    pub rope: RopePreset,
     /// Recommended default sampling strategy for this model family.
     pub default_sampling: SamplingConfig,
     /// Whether this model supports thinking/reasoning mode (`<think>` blocks).

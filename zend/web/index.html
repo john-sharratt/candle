@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>Zend — a coding assistant that keeps the whole project in mind</title>
 <!-- Metadata on an application shell. The console renders itself, so this will
      never rank on content; what it does is make the link render when somebody
@@ -122,6 +122,21 @@
   .zmd .tool-prefill-bar::after { content: ''; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255,238,205,0.6), transparent); transform: translateX(-100%); animation: zsheen 1.4s ease-in-out infinite; animation-delay: var(--zsheen, 0ms); }
   .zmd .tool-prefill .tool-call-icon { display: inline-block; animation: zspin 2.4s linear infinite; animation-delay: var(--zgear, 0ms); }
   @media (prefers-reduced-motion: reduce) { .zmd .tool-prefill-bar::after, .zmd .tool-prefill .tool-call-icon { animation: none; } }
+  /* A tool call writing a long value — a file's content — shown as it decodes:
+     the tool card's chrome, the file it is going to on top, and the text so far
+     in a box pinned to its newest line. `column-reverse` keeps the scroll at
+     the bottom with no script, so a redraw on every token never jumps. */
+  .zmd .tool-author { margin: .5rem 0; background: #26231f; border: 1px solid #38342f; border-left: 3px solid #8c5f28; border-radius: 8px; overflow: hidden; font-family: "Cascadia Code","Fira Code","JetBrains Mono",Consolas,monospace; font-size: .82rem; }
+  .zmd .tool-author-head { display: flex; align-items: center; flex-wrap: wrap; gap: .2rem .5rem; padding: .4rem .75rem; background: #1e1b19; border-bottom: 1px solid #2e2b27; }
+  .zmd .tool-author-icon { color: #e0a85a; animation: zpulse 1.5s ease-in-out infinite; }
+  .zmd .tool-author-label { font-weight: 600; color: #c98a3e; letter-spacing: .02em; }
+  .zmd .tool-author-file { color: #e6ddd0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .zmd .tool-author-meta { margin-left: auto; color: #7d766e; font-size: .76rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .zmd .tool-author-body { display: flex; flex-direction: column-reverse; max-height: 18rem; overflow: auto; background: #1a1816; }
+  .zmd .tool-author-body pre { margin: 0; padding: .5rem .75rem; color: #c7bdb0; font-size: .78rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+  .zmd .tool-author-more { color: #5a5652; }
+  .zmd .tool-author-caret { display: inline-block; width: .5em; height: 1em; margin-left: 1px; vertical-align: -.12em; background: #e0a85a; animation: zblink 1s steps(1) infinite; }
+  @media (prefers-reduced-motion: reduce) { .zmd .tool-author-icon, .zmd .tool-author-caret { animation: none; } }
   /* An expanded tool card's output header: the label, and on the right the
      output's length in tokens as it sits in the context. */
   .zmd .tool-call-out-label { display: flex; align-items: baseline; justify-content: space-between; gap: .5rem; }
@@ -277,6 +292,7 @@
 <script src="zend-api.mock.js"></script>
 <script src="zend-api.live.js"></script>
 <script src="zend-api.js"></script>
+<script src="partial-call.js"></script>
 <script type="module">
 /* ============================================================================
  * Zend UI — vanilla single-file app (plain DOM, no framework).
@@ -361,6 +377,42 @@ import { estateSwitcher } from './common/lib/estate.js';
   function saveDialPref(key, value) {
     try { localStorage.setItem(key, String(value)); } catch (_) {}
   }
+  // The tools modes, by wire id, in dial order — a mode's level is its index.
+  const TOOL_MODE_IDS = ['none', 'restricted', 'comprehensive', 'mutable'];
+  // Which of those this caller may use, and the one it starts at: from
+  // GET /v1/me (`loadAccess`). Until that answers the page assumes the least —
+  // the daemon holds a mode above the caller's role to Restricted regardless,
+  // so this only decides what the dial offers.
+  const ACCESS = { modes: ['none', 'restricted'], dflt: 'restricted' };
+  function toolsAllowed(level) { return ACCESS.modes.indexOf(TOOL_MODE_IDS[level]) !== -1; }
+  function toolsDefaultLevel() { return Math.max(0, TOOL_MODE_IDS.indexOf(ACCESS.dflt)); }
+  // The tools level a turn actually uses: the one asked for when this caller
+  // may use it, else the caller's default. `S.toolsLevel` holds what was ASKED
+  // for — a saved preference, a conversation's recorded dial, or null for none
+  // — unclamped, because the role arrives after the first render: clamping on
+  // the way in would pin an admin's saved choice to the anonymous default.
+  // Everything that shows or sends the level reads it through here.
+  function clampTools(level) { return (typeof level === 'number' && toolsAllowed(level)) ? level : toolsDefaultLevel(); }
+  function toolsPref() { return dialPref('zend.tools', null); }
+  // The dials a conversation was last run at, adopted when it opens so the
+  // composer shows what its next turn will actually use. Deliberately NOT
+  // written to localStorage: that preference is the starting point for NEW
+  // conversations, and opening an old one must not redefine it.
+  function adoptDials(d) {
+    // A conversation that has never taken a turn records no dials. It opens at
+    // the user's OWN defaults — the same starting point `newConv` uses — not at
+    // whatever the conversation they just closed happened to be held at, which
+    // is what leaving the composer untouched would have shown them.
+    if (!d) {
+      S.effortLevel = dialPref('zend.effort', 2);
+      S.verbosityLevel = dialPref('zend.verbosity', 2);
+      S.toolsLevel = toolsPref();
+      return;
+    }
+    if (typeof d.effort === 'number') S.effortLevel = d.effort;
+    if (typeof d.verbosity === 'number') S.verbosityLevel = d.verbosity;
+    if (typeof d.tools === 'number') S.toolsLevel = d.tools;
+  }
 
   const S = {
     conversations: [],   // filled by the async seed at boot (mock is sync, live fetches)
@@ -387,7 +439,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     // with the user's last-chosen settings rather than a hardcoded default.
     effortLevel: dialPref('zend.effort', 2),
     verbosityLevel: dialPref('zend.verbosity', 2),
-    toolsLevel: dialPref('zend.tools', 2),
+    toolsLevel: toolsPref(),
     openMenu: null,
     theme: (function () { try { return localStorage.getItem('zend.theme') || 'dark'; } catch (_) { return 'dark'; } })(),
     themeMenuOpen: false,
@@ -684,17 +736,55 @@ import { estateSwitcher } from './common/lib/estate.js';
       row(k, hasDefault(props[k]) ? show(props[k].default) + ' (default)' : 'default', true));
     return passed.concat(omitted).join('');
   }
+  // Argument names that hold where a call writes, not what — shown as the
+  // writing box's file, and never themselves the "content" being written.
+  const TARGET_KEYS = ['path', 'file_path', 'filename', 'file', 'name'];
+  // A call still being decoded. Once it is writing a value other than its
+  // target — a file's content, typically thousands of tokens — the text is
+  // shown as it arrives, under the tool and the file it is going to, so a long
+  // write reads as work in progress rather than a frozen "Calling tool…".
+  function pendingCallCard(json) {
+    const call = window.ZendPartialCall ? window.ZendPartialCall.parse(json) : { name: null, args: {}, writing: null };
+    if (call.writing && TARGET_KEYS.indexOf(call.writing) === -1) return authoringCard(call);
+    const label = call.name ? 'Calling ' + esc(call.name) + '…' : 'Calling tool…';
+    return '<div class="tool-call-card pending"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">' + label + '</span></div></div>';
+  }
+  // The live writing box: the value being written, pinned to its newest lines.
+  // Only the tail is drawn — the card is redrawn on every token, and a file can
+  // run to tens of thousands of characters.
+  function authoringCard(call) {
+    const text = call.args[call.writing] || '';
+    const key = TARGET_KEYS.find((k) => k !== 'name' && typeof call.args[k] === 'string');
+    const target = key ? call.args[key] : '';
+    const lines = text ? text.split('\n').length : 0;
+    const TAIL = 6000;
+    const shown = text.length > TAIL ? text.slice(-TAIL) : text;
+    return '<div class="tool-author" aria-live="off">' +
+      '<div class="tool-author-head"><span class="tool-author-icon">✎</span>' +
+      '<span class="tool-author-label">Writing</span>' +
+      (target ? '<span class="tool-author-file">' + esc(target) + '</span>' : '') +
+      '<span class="tool-author-meta">' + esc(call.name || 'tool') + ' · ' + esc(call.writing) + ' · ' +
+      lines.toLocaleString() + (lines === 1 ? ' line · ' : ' lines · ') + text.length.toLocaleString() + ' chars</span></div>' +
+      '<div class="tool-author-body"><pre>' + (text.length > TAIL ? '<span class="tool-author-more">…</span>' : '') +
+      esc(shown) + '<span class="tool-author-caret"></span></pre></div></div>';
+  }
   // An expandable tool-call block: header (name, what it touched, result
   // badge), then every parameter and — when the matching `<tool_response>` is
-  // paired in — the tool output.
+  // paired in — the tool output. A call still being decoded is drawn by
+  // `pendingCallCard` instead.
   // `tokens`: the output's length in tokens as it sits in the context, when
   // the daemon reported it.
   function toolCard(json, complete, output, running, tokens) {
-    if (!complete) return '<div class="tool-call-card pending"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">Calling tool…</span></div></div>';
+    if (!complete) return pendingCallCard(json);
     let parsed;
     try { parsed = JSON.parse(json.trim()); } catch (e) { parsed = null; }
-    const name = (parsed && parsed.name) || 'tool call';
+    // A call that is not JSON — cut off, or malformed — still names its tool
+    // and usually its path in its text; the daemon answers it with an error
+    // result, and the card should say which call that error belongs to.
+    const textField = (key) => { const m = new RegExp('"' + key + '"\\s*:\\s*"([^"\\\\]+)"').exec(json); return m ? m[1] : null; };
+    const name = (parsed && parsed.name) || textField('name') || 'tool call';
     let args = (parsed && (parsed.arguments || parsed.parameters || parsed.params)) || {};
+    if (!parsed && textField('path')) args = { path: textField('path') };
     // Some calls carry their arguments as a JSON-encoded string.
     if (typeof args === 'string') { try { args = JSON.parse(args); } catch (_) { args = { arguments: args }; } }
     if (!args || typeof args !== 'object' || Array.isArray(args)) args = {};
@@ -927,6 +1017,11 @@ import { estateSwitcher } from './common/lib/estate.js';
     // Before the render, so the first frame already shows the conversation
     // loading — not the home page its still-empty history would draw.
     hydrateIfNeeded(id);
+    // A conversation already hydrated this session gets its dials here: no
+    // hydrate will land to do it. A first open adopts them in `hydrateConv`,
+    // once the daemon has said what they are.
+    const conv = S.conversations.find((c) => c.id === id);
+    if (conv) adoptDials(conv.dials);
     setState({ activeId: id, sidebarDrawer: false, convMenuOpen: false }, () => { scrollChat(); if (!S.narrow) focusPrompt(); });
   }
   function hydrateIfNeeded(id) {
@@ -969,7 +1064,14 @@ import { estateSwitcher } from './common/lib/estate.js';
       // Recovered upload events hydrate the files pane (and the inline
       // history tiles ride along in `history` as role:"upload" messages).
       if (full.uploads) patch.files = full.uploads;
+      // The dials the daemon holds for this conversation, kept on it so a later
+      // re-open adopts them without another fetch.
+      if (full.dials) patch.dials = full.dials;
       S.conversations = S.conversations.map((c) => c.id === id ? Object.assign({}, c, patch) : c);
+      // Only on the OPEN hydrate. The one that follows a completed turn must
+      // leave the dials alone: the user may already have moved one for the turn
+      // they are about to send.
+      if (first && S.activeId === id) adoptDials(full.dials);
       render();
       if (S.activeId === id) scrollChat();
     }).catch((e) => {
@@ -978,7 +1080,15 @@ import { estateSwitcher } from './common/lib/estate.js';
       render();
     });
   }
-  function newConv() { writeHashConv(null); setState({ activeId: null, promptValue: '', sidebarDrawer: false, convMenuOpen: false }, focusPrompt); }
+  function newConv() {
+    // A new conversation starts at the user's own defaults, not at whatever the
+    // conversation they just closed was held at.
+    S.effortLevel = dialPref('zend.effort', 2);
+    S.verbosityLevel = dialPref('zend.verbosity', 2);
+    S.toolsLevel = toolsPref();
+    writeHashConv(null);
+    setState({ activeId: null, promptValue: '', sidebarDrawer: false, convMenuOpen: false }, focusPrompt);
+  }
   function archiveConv(id, e) {
     if (e) e.stopPropagation();
     // Archiving is one-way and lossy: the KV cache is discarded and the
@@ -1126,7 +1236,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     // conversation — putting us back to a blank failure.
     let failed = false;
     const conv = S.conversations.find((c) => c.id === convId);
-    const opts = { think: S.effortLevel !== 0, effort: S.effortLevel, verbosity: S.verbosityLevel, tools: ['none', 'restricted', 'comprehensive'][S.toolsLevel] };
+    const opts = { think: S.effortLevel !== 0, effort: S.effortLevel, verbosity: S.verbosityLevel, tools: TOOL_MODE_IDS[clampTools(S.toolsLevel)] };
     stream = API.streamChatCompletion(conv, userText, opts, {
       onStatus: (s) => patchStream(convId, (m) => { m.status = s; }),
       onToken: (delta) => { patchStream(convId, (m) => { m.content += delta; m.status = ''; m.prefill = null; }); },
@@ -1458,11 +1568,14 @@ import { estateSwitcher } from './common/lib/estate.js';
     promptEl = chatEl = logEl = filesListEl = substrateEl = null;
 
     const themeFilter = S.theme === 'light' ? 'invert(1) hue-rotate(180deg)' : S.theme === 'vivid' ? 'saturate(1.75) contrast(1.06)' : 'none';
-    // 100dvh (dynamic viewport) not 100vh: on mobile 100vh is the tall viewport
-    // with the address bar hidden, which pushes the composer under the browser's
-    // bottom bar and lets the top pills drift as the bar shows/hides. dvh tracks
-    // the actually-visible height; the vh line is a fallback for old browsers.
-    const layout = h('div', { style: 'display:flex; height:100vh; height:100dvh; width:100vw; overflow:hidden; filter:' + themeFilter + ';' });
+    // The shell is pinned to the visible area. `--zvt`/`--zvh` are the visual
+    // viewport's top and height (`fitVisualViewport`), so when a phone keyboard
+    // opens the shell shrinks to what is left above it instead of being panned
+    // off the top. Without them it is 100dvh (dynamic viewport), not 100vh: on
+    // mobile 100vh is the tall viewport with the address bar hidden, which
+    // pushes the composer under the browser's bottom bar; the vh line is a
+    // fallback for old browsers.
+    const layout = h('div', { style: 'display:flex; position:fixed; left:0; top:var(--zvt,0px); height:100vh; height:var(--zvh,100dvh); width:100vw; overflow:hidden; filter:' + themeFilter + ';' });
 
     if (!S.sidebarCollapsed && !S.narrow) { layout.appendChild(buildSidebarExpanded()); layout.appendChild(buildResizer('l')); }
     else layout.appendChild(buildSidebarRail());
@@ -1509,7 +1622,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     // Drawer mode (narrow): a fixed overlay sized to the phone rather than a docked
     // column, closed via the collapse button or the backdrop.
     const w = drawer ? Math.min(300, Math.round((typeof window !== 'undefined' ? window.innerWidth : 360) * 0.82)) : S.sidebarW;
-    const pos = drawer ? 'position:fixed; top:0; left:0; bottom:0; z-index:41; box-shadow:0 6px 44px rgba(0,0,0,0.65);' : 'height:100%;';
+    const pos = drawer ? 'position:fixed; top:var(--zvt,0px); left:0; height:var(--zvh,100dvh); z-index:41; box-shadow:0 6px 44px rgba(0,0,0,0.65);' : 'height:100%;';
     const closeSidebar = drawer ? () => setState({ sidebarDrawer: false }) : () => setState({ sidebarCollapsed: true });
     const rows = convs.map((c) => {
       const active = c.id === S.activeId;
@@ -2120,11 +2233,13 @@ import { estateSwitcher } from './common/lib/estate.js';
   const DIALS = {
     effort: { label: 'Thinking effort', names: ['Off', 'Quick', 'Balanced', 'Deep', 'Exhaustive'], subs: ['no thinking', 'a moment', 'default pace', 'careful reasoning', 'leave nothing out'], key: 'effortLevel', pref: 'zend.effort', ticksGrow: true, glyph: GLYPH_BRAIN },
     verbosity: { label: 'Response length', names: ['Terse', 'Concise', 'Standard', 'Detailed', 'Comprehensive'], subs: ['a line or two', 'just essentials', 'balanced detail', 'full explanation', 'exhaustive depth'], key: 'verbosityLevel', pref: 'zend.verbosity', ticksGrow: false, glyph: GLYPH_LINES },
-    tools: { label: 'Tools', names: ['None', 'Restricted', 'Comprehensive'], subs: ['no tools', 'safe tools only', 'every tool'], key: 'toolsLevel', pref: 'zend.tools', ticksGrow: false, icon: HAMMER_SVG, glyph: HAMMER_SVG, zeroable: true },
+    // `allowed` limits the menu to the levels this caller may use, and `clamp`
+    // turns the level asked for into the one a turn will use (GET /v1/me).
+    tools: { label: 'Tools', names: ['None', 'Restricted', 'Comprehensive', 'Mutable'], subs: ['no tools', 'safe tools only', 'every tool', 'every tool, edits files on disk'], key: 'toolsLevel', pref: 'zend.tools', ticksGrow: false, icon: HAMMER_SVG, glyph: HAMMER_SVG, zeroable: true, allowed: toolsAllowed, clamp: clampTools },
   };
   function buildDial(which) {
     const d = DIALS[which];
-    const lvl = S[d.key];
+    const lvl = d.clamp ? d.clamp(S[d.key]) : S[d.key];
     const open = S.openMenu === which;
     const onToggle = () => setState({ openMenu: open ? null : which });
     let btn;
@@ -2154,7 +2269,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     if (open) {
       wrap.appendChild(h('div', { style: 'position:absolute; bottom:calc(100% + 7px); left:0; min-width:200px; background:#26231f; border:1px solid #4a443e; border-radius:10px; box-shadow:0 -10px 30px rgba(0,0,0,0.55); padding:5px;' },
         h('div', { style: 'font-size:0.62rem; text-transform:uppercase; letter-spacing:0.07em; color:#7c736a; padding:5px 8px 4px;' }, d.label),
-        d.names.map((name, i) => h('button', { onClick: () => { saveDialPref(d.pref, i); setState({ ['' + d.key]: i, openMenu: null }); }, style: 'display:flex; align-items:center; gap:9px; width:100%; padding:7px 9px; border:none; background:' + (i === lvl ? 'rgba(201,138,62,0.16)' : 'transparent') + '; color:' + (i === lvl ? ACCENT : '#cfc8c0') + '; border-radius:6px; cursor:pointer; font:inherit; font-size:0.78rem; text-align:left; white-space:nowrap;' },
+        d.names.map((name, i) => (d.allowed && !d.allowed(i)) ? null : h('button', { onClick: () => { saveDialPref(d.pref, i); setState({ ['' + d.key]: i, openMenu: null }); }, style: 'display:flex; align-items:center; gap:9px; width:100%; padding:7px 9px; border:none; background:' + (i === lvl ? 'rgba(201,138,62,0.16)' : 'transparent') + '; color:' + (i === lvl ? ACCENT : '#cfc8c0') + '; border-radius:6px; cursor:pointer; font:inherit; font-size:0.78rem; text-align:left; white-space:nowrap;' },
           h('span', { style: 'width:7px; height:7px; border-radius:50%; background:' + (i === lvl ? ACCENT : '#3a352f') + ';' }),
           h('span', { style: 'flex:1;' }, name),
           h('span', { style: 'font-size:0.66rem; color:#7c736a;' }, d.subs[i])))));
@@ -3126,6 +3241,34 @@ import { estateSwitcher } from './common/lib/estate.js';
     // No reposition needed: the bar gutter is align-self:stretch, so when a
     // think block expands/collapses the bars re-flow by CSS % automatically.
   }, true);
+  // The on-screen keyboard. iOS Safari keeps the layout viewport — and dvh — at
+  // full height when the keyboard opens and pans the visible area down to the
+  // focused composer, which scrolls the top of the app (the rail with the
+  // conversation list, the header) off-screen. The shell follows the visual
+  // viewport instead: its top tracks the visible area and its height is what the
+  // keyboard leaves. Android resizes the layout viewport itself
+  // (`interactive-widget=resizes-content`), so there the figures agree. Under a
+  // pinch-zoom the visual viewport is the zoomed region, not a keyboard, so the
+  // shell keeps its full size.
+  function fitVisualViewport() {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const root = document.documentElement.style;
+    if (Math.abs((vv.scale || 1) - 1) > 0.01) {
+      root.removeProperty('--zvh');
+      root.removeProperty('--zvt');
+      return;
+    }
+    root.setProperty('--zvh', vv.height + 'px');
+    root.setProperty('--zvt', vv.offsetTop + 'px');
+    // iOS also scrolls the document to reveal the input, overflow:hidden or not.
+    if (window.scrollY !== 0) window.scrollTo(0, 0);
+  }
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', fitVisualViewport);
+    window.visualViewport.addEventListener('scroll', fitVisualViewport);
+    fitVisualViewport();
+  }
   window.addEventListener('resize', () => {
     const narrow = window.innerWidth < NARROW_W;
     const wide = window.innerWidth >= WIDE_W;
@@ -3160,6 +3303,12 @@ import { estateSwitcher } from './common/lib/estate.js';
       if (S.activeId) {
         const a = S.conversations.find((c) => c.id === S.activeId);
         S.loaded[S.activeId] = !!(a && a.history && a.history.length);
+        // A restored conversation carries its own dials into the composer, the
+        // same as one opened by hand. When the seed arrived with its history
+        // there is no hydrate to do it, and the seed is also the only place the
+        // dials can come from; when there is a hydrate, it adopts them once the
+        // daemon has said what they are.
+        if (a) adoptDials(a.dials);
       }
       // Before the first render, so a restored conversation shows loading.
       if (S.activeId && !S.loaded[S.activeId]) hydrateIfNeeded(S.activeId);
@@ -3183,6 +3332,19 @@ import { estateSwitcher } from './common/lib/estate.js';
       render();
     }).catch(() => {});
   }
+
+  // What this caller may do (GET /v1/me): which tools modes the dial offers and
+  // where it starts. `/v1/me` needs no loaded model, so this runs at boot. The
+  // held tools level is left as asked; the redraw shows it clamped to the role.
+  function loadAccess() {
+    Promise.resolve(API.getMe()).then((me) => {
+      if (!me || !Array.isArray(me.tool_modes)) return;
+      ACCESS.modes = me.tool_modes;
+      ACCESS.dflt = me.default_tools || 'restricted';
+      render();
+    }).catch(() => {});
+  }
+  loadAccess();
 
   // Boot/reload state. `reloadPolling` is true while pollStatus owns the screen
   // (initial load OR a detected daemon reload), so periodicSync stays out of the

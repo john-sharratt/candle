@@ -45,8 +45,10 @@ use candle_nn::kv_cache::{
     SealedSequence, CHUNK_SIZE,
 };
 use candle_transformers::models::prefill_utils::{
-    compute_rope_cs, paged_decode_attn, paged_glue_attn, paged_prefill_batched,
+    paged_decode_attn, paged_glue_attn, paged_prefill_batched,
 };
+use candle_transformers::models::rope_schedule::{RopeRungs, RopeSchedule};
+use candle_transformers::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 // These tests share one GPU and the process-global quantized arena table, so
@@ -256,18 +258,9 @@ fn prefill_position_map_hoist_is_byte_exact() -> Result<()> {
     let segments: &[usize] = &[40, 40, 24];
     let total: usize = segments.iter().sum();
     let (q_master, k_master, v_master) = make_qkv(total, &device, 0xB17E_EAC7)?;
-    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, &device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, &device)?;
-    let rope_offsets_b1 = Tensor::zeros(1, DType::U32, &device)?;
+    let rope = identity_rope(&device)?;
     let (backing, cache) = build_segmented_slot(
-        segments,
-        &q_master,
-        &k_master,
-        &v_master,
-        &rope_cs,
-        &rope_offsets_b1,
-        &stager,
-        &device,
+        segments, &q_master, &k_master, &v_master, &rope, &stager, &device,
     )?;
 
     // `build_segmented_slot` deliberately truncates the trailing empty writer
@@ -366,29 +359,13 @@ fn run_decode_case(
 ) -> Result<f32> {
     let total: usize = segments.iter().sum();
     let (q_master, k_master, v_master) = make_qkv(total, device, hash_str(case_name))?;
-    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, device)?;
-    let rope_offsets_b1 = Tensor::zeros(1, DType::U32, device)?;
+    let rope = identity_rope(device)?;
 
     let (backing_a, mut cache_a) = build_control_slot(
-        total,
-        &q_master,
-        &k_master,
-        &v_master,
-        &rope_cs,
-        &rope_offsets_b1,
-        stager,
-        device,
+        total, &q_master, &k_master, &v_master, &rope, stager, device,
     )?;
     let (backing_b, cache_b) = build_segmented_slot(
-        segments,
-        &q_master,
-        &k_master,
-        &v_master,
-        &rope_cs,
-        &rope_offsets_b1,
-        stager,
-        device,
+        segments, &q_master, &k_master, &v_master, &rope, stager, device,
     )?;
 
     assert_slot_layouts(&cache_a, &cache_b, total, segments, case_name);
@@ -400,10 +377,10 @@ fn run_decode_case(
     let v_new_2d = v_new.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
 
     let out_a = decode_one_slot(
-        &backing_a, &cache_a, &q_dec_2d, &k_new_2d, &v_new_2d, &rope_cs, stager, device,
+        &backing_a, &cache_a, &q_dec_2d, &k_new_2d, &v_new_2d, &rope, stager, device,
     )?;
     let out_b = decode_one_slot(
-        &backing_b, &cache_b, &q_dec_2d, &k_new_2d, &v_new_2d, &rope_cs, stager, device,
+        &backing_b, &cache_b, &q_dec_2d, &k_new_2d, &v_new_2d, &rope, stager, device,
     )?;
 
     // Suppress unused warnings for cache_a — we keep it alive via the
@@ -430,29 +407,13 @@ fn run_prefill_case(
 ) -> Result<f32> {
     let total: usize = segments.iter().sum();
     let (q_master, k_master, v_master) = make_qkv(total, device, hash_str(case_name))?;
-    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, device)?;
-    let rope_offsets_b1 = Tensor::zeros(1, DType::U32, device)?;
+    let rope = identity_rope(device)?;
 
     let (backing_a, mut cache_a) = build_control_slot(
-        total,
-        &q_master,
-        &k_master,
-        &v_master,
-        &rope_cs,
-        &rope_offsets_b1,
-        stager,
-        device,
+        total, &q_master, &k_master, &v_master, &rope, stager, device,
     )?;
     let (backing_b, mut cache_b) = build_segmented_slot(
-        segments,
-        &q_master,
-        &k_master,
-        &v_master,
-        &rope_cs,
-        &rope_offsets_b1,
-        stager,
-        device,
+        segments, &q_master, &k_master, &v_master, &rope, stager, device,
     )?;
     assert_slot_layouts(&cache_a, &cache_b, total, segments, case_name);
 
@@ -467,8 +428,7 @@ fn run_prefill_case(
         &k_ext,
         &v_ext,
         EXTRA_PREFILL_TOKENS,
-        &rope_cs,
-        &rope_offsets_b1,
+        &rope,
         stager,
         device,
     )?;
@@ -478,8 +438,7 @@ fn run_prefill_case(
         &k_ext,
         &v_ext,
         EXTRA_PREFILL_TOKENS,
-        &rope_cs,
-        &rope_offsets_b1,
+        &rope,
         stager,
         device,
     )?;
@@ -509,8 +468,7 @@ fn build_control_slot(
     q_master: &Tensor,
     k_master: &Tensor,
     v_master: &Tensor,
-    rope_cs: &Tensor,
-    rope_offsets_b1: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<(ChunkedKvBacking, KvCache)> {
@@ -519,17 +477,7 @@ fn build_control_slot(
     let q = q_master.narrow(2, 0, total)?.contiguous()?;
     let k = k_master.narrow(2, 0, total)?.contiguous()?;
     let v = v_master.narrow(2, 0, total)?.contiguous()?;
-    let _ = run_prefill(
-        &mut cache,
-        &q,
-        &k,
-        &v,
-        total,
-        rope_cs,
-        rope_offsets_b1,
-        stager,
-        device,
-    )?;
+    let _ = run_prefill(&mut cache, &q, &k, &v, total, rope, stager, device)?;
     Ok((backing, cache))
 }
 
@@ -544,8 +492,7 @@ fn build_segmented_slot(
     q_master: &Tensor,
     k_master: &Tensor,
     v_master: &Tensor,
-    rope_cs: &Tensor,
-    rope_offsets_b1: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<(ChunkedKvBacking, KvCache)> {
@@ -566,8 +513,7 @@ fn build_segmented_slot(
             &k_seg,
             &v_seg,
             seg_len,
-            rope_cs,
-            rope_offsets_b1,
+            rope,
             stager,
             device,
         )?;
@@ -639,6 +585,24 @@ fn fresh_backing(device: &Device) -> Result<ChunkedKvBacking> {
     ChunkedKvBacking::new(4, N_KV_HEAD, HEAD_DIM, DType::F16, device, MAX_BLOCKS)
 }
 
+/// RoPE rungs with every frequency zero: the identity rotation at every
+/// position, so a comparison isolates chunk addressing from position math.
+fn identity_rope(device: &Device) -> Result<RopeRungs> {
+    RopeRungs::new(
+        &RopeSchedule::stated(vec![0f32; HEAD_DIM / 2], usize::MAX)?,
+        device,
+    )
+}
+
+/// RoPE rungs over the standard geometric frequencies (base 10000), so the
+/// per-token position every read path computes is exercised too.
+fn geometric_rope(device: &Device) -> Result<RopeRungs> {
+    let inv_freq: Vec<f32> = (0..HEAD_DIM / 2)
+        .map(|i| 1.0f32 / 10000f32.powf(2.0 * i as f32 / HEAD_DIM as f32))
+        .collect();
+    RopeRungs::new(&RopeSchedule::stated(inv_freq, usize::MAX)?, device)
+}
+
 fn bind_kv_cache(backing: &ChunkedKvBacking, batch_idx: usize) -> Result<KvCache> {
     let mut cache = KvCache::new(2, 64);
     cache.force_dtype(DType::F16);
@@ -663,8 +627,7 @@ fn run_prefill(
     k: &Tensor,
     v: &Tensor,
     seq_len: usize,
-    rope_cs: &Tensor,
-    rope_offsets: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<Tensor> {
@@ -694,8 +657,7 @@ fn run_prefill(
         N_KV_HEAD,
         HEAD_DIM,
         None,
-        rope_offsets,
-        rope_cs,
+        rope,
         false,
         &generation,
         &std::cell::RefCell::new(None),
@@ -720,7 +682,7 @@ fn decode_one_slot(
     q: &Tensor,
     k_new: &Tensor,
     v_new: &Tensor,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<Tensor> {
@@ -806,13 +768,15 @@ fn decode_one_slot(
         p
     };
 
-    let mut hdr = Vec::with_capacity(24);
-    let n_slices = slot.slices.len() as u32;
-    let write_slice = slot.write_slice;
-    hdr.extend_from_slice(&n_slices.to_le_bytes());
-    hdr.extend_from_slice(&write_slice.to_le_bytes());
-    hdr.extend_from_slice(&slices_base_ptr.to_le_bytes());
-    hdr.extend_from_slice(&pm_base_ptr.to_le_bytes());
+    let mut hdr = Vec::with_capacity(SLOT_HEADER_BYTES);
+    SlotHeaderHost {
+        n_slices: slot.slices.len() as u32,
+        write_slice: slot.write_slice,
+        slices_ptr: slices_base_ptr,
+        position_map_ptr: pm_base_ptr,
+        rope_rung: 0,
+    }
+    .write(&mut hdr);
 
     let generation = stager.begin_generation();
     let mut pinned = generation.alloc(hdr.len())?;
@@ -832,7 +796,7 @@ fn decode_one_slot(
         softmax_scale,
         k_new,
         v_new,
-        rope_cs,
+        rope,
         false,
         None,
     )?;
@@ -1020,32 +984,19 @@ fn run_offset_window_case(
     // rope=false (inv_freq=0) isolates chunk-read addressing; rope=true uses a
     // real geometric inv_freq so the per-token RoPE position the offset>0 read
     // computes (`slice_rope + (within - off)`) is exercised too.
-    let inv_freq = if with_rope {
-        let f: Vec<f32> = (0..HEAD_DIM / 2)
-            .map(|i| 1.0f32 / 10000f32.powf(2.0 * i as f32 / HEAD_DIM as f32))
-            .collect();
-        Tensor::from_vec(f, HEAD_DIM / 2, device)?
+    let rope = if with_rope {
+        geometric_rope(device)?
     } else {
-        Tensor::zeros(HEAD_DIM / 2, DType::F32, device)?
+        identity_rope(device)?
     };
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, device)?;
-    let rope_offsets_b1 = Tensor::zeros(1, DType::U32, device)?;
     let win_len = total - window_start;
 
     // Reference slot C: fresh offset-0 prefill of master[window_start..total].
     let q_suf = q_master.narrow(2, window_start, win_len)?.contiguous()?;
     let k_suf = k_master.narrow(2, window_start, win_len)?.contiguous()?;
     let v_suf = v_master.narrow(2, window_start, win_len)?.contiguous()?;
-    let (backing_c, cache_c) = build_control_slot(
-        win_len,
-        &q_suf,
-        &k_suf,
-        &v_suf,
-        &rope_cs,
-        &rope_offsets_b1,
-        stager,
-        device,
-    )?;
+    let (backing_c, cache_c) =
+        build_control_slot(win_len, &q_suf, &k_suf, &v_suf, &rope, stager, device)?;
 
     // Test slot B: full prefill into scratch, seal, window [window_start,
     // total] (offset>0 first chunk), inject into slot 0.
@@ -1061,8 +1012,7 @@ fn run_offset_window_case(
         &k_all,
         &v_all,
         total,
-        &rope_cs,
-        &rope_offsets_b1,
+        &rope,
         stager,
         device,
     )?;
@@ -1086,10 +1036,10 @@ fn run_offset_window_case(
     let v_new_2d = v_new.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
 
     let out_c = decode_one_slot(
-        &backing_c, &cache_c, &q_dec_2d, &k_new_2d, &v_new_2d, &rope_cs, stager, device,
+        &backing_c, &cache_c, &q_dec_2d, &k_new_2d, &v_new_2d, &rope, stager, device,
     )?;
     let out_b = decode_one_slot(
-        &backing_b, &cache_b, &q_dec_2d, &k_new_2d, &v_new_2d, &rope_cs, stager, device,
+        &backing_b, &cache_b, &q_dec_2d, &k_new_2d, &v_new_2d, &rope, stager, device,
     )?;
 
     let diff = max_abs_diff_f32(&out_c.to_dtype(DType::F32)?, &out_b.to_dtype(DType::F32)?)?;
@@ -1182,7 +1132,7 @@ fn inject_and_decode(
     q: &Tensor,
     k_new: &Tensor,
     v_new: &Tensor,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<Tensor> {
@@ -1192,7 +1142,7 @@ fn inject_and_decode(
     // sealed windows so the decode's write never lands in a shared chunk.
     backing.push_empty_writer_chunk(slot)?;
     cache.set_current_seq_len(sealed.token_count)?;
-    let out = decode_one_slot(backing, &cache, q, k_new, v_new, rope_cs, stager, device)?;
+    let out = decode_one_slot(backing, &cache, q, k_new, v_new, rope, stager, device)?;
     // Force any async kernel fault to surface here so the caller's stage
     // markers attribute the crash to the right decode.
     device.synchronize()?;
@@ -1212,9 +1162,7 @@ fn run_offset_window_quant_case(
     // rope cancels in the quant-vs-fp16 comparison (both apply the same
     // position math to the same logical tokens); keep it off to isolate the
     // dequant of the windowed sub-block.
-    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, device)?;
-    let rope_offsets_b1 = Tensor::zeros(1, DType::U32, device)?;
+    let rope = identity_rope(device)?;
 
     // Backing with the warm-protected adaptive candidate arenas for `level`,
     // mirroring the substrate engine's startup wiring.
@@ -1241,8 +1189,7 @@ fn run_offset_window_quant_case(
         &k_all,
         &v_all,
         total,
-        &rope_cs,
-        &rope_offsets_b1,
+        &rope,
         stager,
         device,
     )?;
@@ -1279,16 +1226,12 @@ fn run_offset_window_quant_case(
     let vn = v_new.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
 
     // Four decodes on fresh slots: fp16/quant × full/window.
-    let out_fp16_full =
-        inject_and_decode(&backing, 1, &src, &q2, &kn, &vn, &rope_cs, stager, device)?;
-    let out_q_full =
-        inject_and_decode(&backing, 2, &warm, &q2, &kn, &vn, &rope_cs, stager, device)?;
-    let out_fp16_win = inject_and_decode(
-        &backing, 3, &src_win, &q2, &kn, &vn, &rope_cs, stager, device,
-    )?;
-    let out_q_win = inject_and_decode(
-        &backing, 4, &warm_win, &q2, &kn, &vn, &rope_cs, stager, device,
-    )?;
+    let out_fp16_full = inject_and_decode(&backing, 1, &src, &q2, &kn, &vn, &rope, stager, device)?;
+    let out_q_full = inject_and_decode(&backing, 2, &warm, &q2, &kn, &vn, &rope, stager, device)?;
+    let out_fp16_win =
+        inject_and_decode(&backing, 3, &src_win, &q2, &kn, &vn, &rope, stager, device)?;
+    let out_q_win =
+        inject_and_decode(&backing, 4, &warm_win, &q2, &kn, &vn, &rope, stager, device)?;
 
     let baseline = max_abs_diff_f32(
         &out_q_full.to_dtype(DType::F32)?,
@@ -1319,11 +1262,9 @@ fn build_quant_pair(
     level: u8,
     device: &Device,
     stager: &PinnedStager,
-) -> Result<(ChunkedKvBacking, SealedSequence, SealedSequence, Tensor)> {
+) -> Result<(ChunkedKvBacking, SealedSequence, SealedSequence, RopeRungs)> {
     let (q_master, k_master, v_master) = make_qkv(total, device, 0xA11CE)?;
-    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, device)?;
-    let rope_offsets_b1 = Tensor::zeros(1, DType::U32, device)?;
+    let rope = identity_rope(device)?;
     let policy = CompressionPolicy::new(level);
     let backing = ChunkedKvBacking::new_with_format_adaptive(
         4,
@@ -1345,8 +1286,7 @@ fn build_quant_pair(
         &k_all,
         &v_all,
         total,
-        &rope_cs,
-        &rope_offsets_b1,
+        &rope,
         stager,
         device,
     )?;
@@ -1365,7 +1305,7 @@ fn build_quant_pair(
     copy_stream
         .synchronize()
         .map_err(|e| candle::Error::Msg(format!("quant sync: {e}")))?;
-    Ok((backing, src, warm.into_iter().next().unwrap(), rope_cs))
+    Ok((backing, src, warm.into_iter().next().unwrap(), rope))
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1471,28 +1411,15 @@ fn run_offset_window_glue_case(
     // Real geometric inv_freq so the glue's RoPE position — sourced from
     // `col_actual_pos`, the one path decode does not share — is exercised on
     // the offset>0 prefix read, not just the chunk addressing.
-    let f: Vec<f32> = (0..HEAD_DIM / 2)
-        .map(|i| 1.0f32 / 10000f32.powf(2.0 * i as f32 / HEAD_DIM as f32))
-        .collect();
-    let inv_freq = Tensor::from_vec(f, HEAD_DIM / 2, device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, device)?;
-    let rope_offsets_b1 = Tensor::zeros(1, DType::U32, device)?;
+    let rope = geometric_rope(device)?;
     let win_len = total - window_start;
 
     // Reference slot C: fresh offset-0 prefill of master[window_start..total].
     let q_suf = q_master.narrow(2, window_start, win_len)?.contiguous()?;
     let k_suf = k_master.narrow(2, window_start, win_len)?.contiguous()?;
     let v_suf = v_master.narrow(2, window_start, win_len)?.contiguous()?;
-    let (backing_c, mut cache_c) = build_control_slot(
-        win_len,
-        &q_suf,
-        &k_suf,
-        &v_suf,
-        &rope_cs,
-        &rope_offsets_b1,
-        stager,
-        device,
-    )?;
+    let (backing_c, mut cache_c) =
+        build_control_slot(win_len, &q_suf, &k_suf, &v_suf, &rope, stager, device)?;
 
     // Test slot B: full prefill into scratch, seal, window [window_start,
     // total] (offset>0 first chunk), inject, prime writer.
@@ -1508,8 +1435,7 @@ fn run_offset_window_glue_case(
         &k_all,
         &v_all,
         total,
-        &rope_cs,
-        &rope_offsets_b1,
+        &rope,
         stager,
         device,
     )?;
@@ -1547,7 +1473,7 @@ fn run_offset_window_glue_case(
         &gw_slice,
         &gw_in_blk,
         &fwd_ahead,
-        &rope_cs,
+        &rope,
         false,
         &gen_c,
         &std::cell::RefCell::new(None),
@@ -1569,7 +1495,7 @@ fn run_offset_window_glue_case(
         &gw_slice,
         &gw_in_blk,
         &fwd_ahead,
-        &rope_cs,
+        &rope,
         false,
         &gen_b,
         &std::cell::RefCell::new(None),
@@ -1602,7 +1528,7 @@ fn glue_over(
     qgf: &Tensor,
     kgf: &Tensor,
     vgf: &Tensor,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<Tensor> {
@@ -1629,7 +1555,7 @@ fn glue_over(
         &gw_slice,
         &gw_in_blk,
         &fwd_ahead,
-        rope_cs,
+        rope,
         false,
         &gen,
         &std::cell::RefCell::new(None),
@@ -1654,22 +1580,21 @@ fn kernel_layout_quantized_glue_offset_window() -> Result<()> {
         ("qglue_off50", 128, 50),
     ] {
         let r = (|| -> Result<(f32, f32)> {
-            let (backing, src, warm, rope_cs) = build_quant_pair(total, 3, &device, &stager)?;
+            let (backing, src, warm, rope) = build_quant_pair(total, 3, &device, &stager)?;
             let (qg, kg, vg) = make_qkv(GLUE_TOKENS, &device, 0x6C0E)?;
             let (qgf, kgf, vgf) = flatten_qkv(&qg, &kg, &vg)?;
             let src_win = window_suffix(&src, ws);
             let warm_win = window_suffix(&warm, ws);
-            let o_fp16_full = glue_over(
-                &backing, 1, &src, &qgf, &kgf, &vgf, &rope_cs, &stager, &device,
-            )?;
+            let o_fp16_full =
+                glue_over(&backing, 1, &src, &qgf, &kgf, &vgf, &rope, &stager, &device)?;
             let o_q_full = glue_over(
-                &backing, 2, &warm, &qgf, &kgf, &vgf, &rope_cs, &stager, &device,
+                &backing, 2, &warm, &qgf, &kgf, &vgf, &rope, &stager, &device,
             )?;
             let o_fp16_win = glue_over(
-                &backing, 3, &src_win, &qgf, &kgf, &vgf, &rope_cs, &stager, &device,
+                &backing, 3, &src_win, &qgf, &kgf, &vgf, &rope, &stager, &device,
             )?;
             let o_q_win = glue_over(
-                &backing, 4, &warm_win, &qgf, &kgf, &vgf, &rope_cs, &stager, &device,
+                &backing, 4, &warm_win, &qgf, &kgf, &vgf, &rope, &stager, &device,
             )?;
             let base = max_abs_diff_f32(
                 &o_q_full.to_dtype(DType::F32)?,
@@ -1792,28 +1717,15 @@ fn run_multiseg_case(
     stager: &PinnedStager,
 ) -> Result<f32> {
     let (qm, km, vm) = make_qkv(total, device, hash_str(name))?;
-    let f: Vec<f32> = (0..HEAD_DIM / 2)
-        .map(|i| 1.0f32 / 10000f32.powf(2.0 * i as f32 / HEAD_DIM as f32))
-        .collect();
-    let inv_freq = Tensor::from_vec(f, HEAD_DIM / 2, device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, device)?;
-    let rope_offsets_b1 = Tensor::zeros(1, DType::U32, device)?;
+    let rope = geometric_rope(device)?;
 
     let q_all = qm.narrow(2, 0, total)?.contiguous()?;
     let k_all = km.narrow(2, 0, total)?.contiguous()?;
     let v_all = vm.narrow(2, 0, total)?.contiguous()?;
 
     // Reference slot: one fresh prefill of the whole logical sequence.
-    let (backing_ref, cache_ref) = build_control_slot(
-        total,
-        &q_all,
-        &k_all,
-        &v_all,
-        &rope_cs,
-        &rope_offsets_b1,
-        stager,
-        device,
-    )?;
+    let (backing_ref, cache_ref) =
+        build_control_slot(total, &q_all, &k_all, &v_all, &rope, stager, device)?;
 
     // Test slot: prefill+seal once, derive two windows sharing the boundary
     // chunk, inject both back-to-back.
@@ -1826,8 +1738,7 @@ fn run_multiseg_case(
         &k_all,
         &v_all,
         total,
-        &rope_cs,
-        &rope_offsets_b1,
+        &rope,
         stager,
         device,
     )?;
@@ -1866,11 +1777,11 @@ fn run_multiseg_case(
         &q2,
         &kn,
         &vn,
-        &rope_cs,
+        &rope,
         stager,
         device,
     )?;
-    let out_test = decode_one_slot(&backing, &cache, &q2, &kn, &vn, &rope_cs, stager, device)?;
+    let out_test = decode_one_slot(&backing, &cache, &q2, &kn, &vn, &rope, stager, device)?;
 
     let diff = max_abs_diff_f32(
         &out_test.to_dtype(DType::F32)?,
@@ -1940,25 +1851,15 @@ fn run_glue_interspersed_case(
 ) -> Result<f32> {
     let total = la + g + lb;
     let (qm, km, vm) = make_qkv(total, device, hash_str(name))?;
-    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, device)?; // isolate ordering, not rope
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, device)?;
-    let rope_offsets_b1 = Tensor::zeros(1, DType::U32, device)?;
+    let rope = identity_rope(device)?; // isolate ordering, not rope
     let q_all = qm.narrow(2, 0, total)?.contiguous()?;
     let k_all = km.narrow(2, 0, total)?.contiguous()?;
     let v_all = vm.narrow(2, 0, total)?.contiguous()?;
 
     // Reference slot: fresh prefill of the whole logical sequence [A|glue|B],
     // then one decode step.
-    let (backing_ref, cache_ref) = build_control_slot(
-        total,
-        &q_all,
-        &k_all,
-        &v_all,
-        &rope_cs,
-        &rope_offsets_b1,
-        stager,
-        device,
-    )?;
+    let (backing_ref, cache_ref) =
+        build_control_slot(total, &q_all, &k_all, &v_all, &rope, stager, device)?;
 
     // Test slot: inject A=[0,la) and B=[la+g, total) (both sealed), then a glue
     // forward writes the glue [la, la+g) — logically between A and B, physically
@@ -1972,8 +1873,7 @@ fn run_glue_interspersed_case(
         &k_all,
         &v_all,
         total,
-        &rope_cs,
-        &rope_offsets_b1,
+        &rope,
         stager,
         device,
     )?;
@@ -2013,7 +1913,7 @@ fn run_glue_interspersed_case(
         &gw_slice,
         &gw_in_blk,
         &fwd_ahead,
-        &rope_cs,
+        &rope,
         false,
         &gen,
         &std::cell::RefCell::new(None),
@@ -2031,11 +1931,11 @@ fn run_glue_interspersed_case(
         &q2,
         &kn,
         &vn,
-        &rope_cs,
+        &rope,
         stager,
         device,
     )?;
-    let out_test = decode_one_slot(&backing, &cache, &q2, &kn, &vn, &rope_cs, stager, device)?;
+    let out_test = decode_one_slot(&backing, &cache, &q2, &kn, &vn, &rope, stager, device)?;
     let diff = max_abs_diff_f32(
         &out_test.to_dtype(DType::F32)?,
         &out_ref.to_dtype(DType::F32)?,

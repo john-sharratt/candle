@@ -1,9 +1,11 @@
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
+    http::HeaderMap,
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Json, Response,
@@ -11,9 +13,12 @@ use axum::{
 };
 use futures::{Stream, StreamExt};
 
-use candle_conversation::{FinishReason, OptionalState, SelectionState, NO_THINK_SELECTOR};
+use candle_conversation::{
+    FinishReason, OptionalState, SelectionState, NO_THINK_SELECTOR, TOOL_ROUND_SELECTOR,
+};
 
 use super::chat_frames::{call_id, finish_reason, Framer, Framing};
+use crate::access;
 use crate::openai_tools::{self, wire_function};
 use crate::passthrough::PASSTHROUGH_MODEL;
 use crate::reasoning_split;
@@ -54,7 +59,9 @@ pub fn apply_tools_dial(selection: &mut SelectionState, tools_mode: ToolMode) {
 
 /// The selection for a tool round — a turn whose user message is the results
 /// of the calls the turn before it made: the reply's own selection, less the
-/// worked demonstration.
+/// worked demonstration, and marked as a tool round
+/// ([`TOOL_ROUND_SELECTOR`]) so the layers that declare `in_tool_rounds: false`
+/// sit it out.
 ///
 /// The demonstration is there to teach the call's shape, and by a tool round
 /// the model has already made its call. What it does instead there is supply a
@@ -65,17 +72,26 @@ pub fn apply_tools_dial(selection: &mut SelectionState, tools_mode: ToolMode) {
 /// the demonstration instead, four rounds in, with the request still in its
 /// context. The code_reading ingest had failed the same way and leaves the
 /// demonstration out for the same reason (see `projection.yaml`).
+///
+/// The repo_map layer's turns supplied the same competing question: each is a
+/// request — "Summarize the root folder of this project in one or two complete
+/// sentences" — and a chat that had fetched a crate's docs to list its modules
+/// described the workspace instead, two runs of two.
 pub fn tool_round_selection(selection: &SelectionState) -> SelectionState {
     let mut round = selection.clone();
     round.set_optional(TOOL_EXAMPLE_SELECTOR, OptionalState::Absent);
+    round.set_optional(TOOL_ROUND_SELECTOR, OptionalState::Present);
     round
 }
 
 /// `POST /v1/chat/completions`
 pub async fn completions(
     State(session): State<Arc<ZendSession>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
+    let peer = peer.map(|ConnectInfo(a)| a.ip());
     let model = req.model.clone().unwrap_or_else(|| "zen-code".into());
     let id = format!("chatcmpl-{}", unix_ms());
     let created = unix_secs();
@@ -104,12 +120,11 @@ pub async fn completions(
     let assistant_prefill = req.assistant_prefill;
     let lossless_kv = req.lossless_kv;
     // Composer "tools" dial — which slice of the catalog this conversation
-    // projects. Absent → Comprehensive (full catalog).
-    let tools_mode = req
-        .tools
-        .as_ref()
-        .and_then(RequestTools::mode)
-        .unwrap_or_default();
+    // projects, and whether its file tools change the disk. Resolved against
+    // the caller's role (`crate::access`): absent is the role's default, and a
+    // mode above the role runs as Restricted.
+    let role = access::role(&headers, peer, session.gateways(), session.roles());
+    let tools_mode = access::effective_mode(role, req.tools.as_ref().and_then(RequestTools::mode));
     // A client that runs its own tools sends their definitions instead.
     let client_tools = match req.tools {
         Some(RequestTools::Functions(tools)) => tools,
@@ -172,6 +187,13 @@ pub async fn completions(
 /// A turn's reply as the session streams it.
 type TokenStream = Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>>;
 
+/// The `thinking_effort` option each effort level selects, in level order.
+pub const EFFORT_OPTIONS: [&str; 5] = ["off", "quick", "balanced", "deep", "exhaustive"];
+
+/// The `response_length` option each verbosity level selects, in level order.
+pub const RESPONSE_LENGTH_OPTIONS: [&str; 5] =
+    ["terse", "concise", "standard", "detailed", "comprehensive"];
+
 /// Map the composer dials to the dialogue section-tree selection.  Only the
 /// dials the request actually carries are set; any omitted selector falls back
 /// to the schema's authored default (so a new conversation defaults naturally).
@@ -182,13 +204,14 @@ type TokenStream = Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send 
 ///
 /// Public so a harness driving the session directly selects exactly what the
 /// HTTP API would for the same dials, rather than restating the mapping.
+///
+/// [`EFFORT_OPTIONS`] and [`RESPONSE_LENGTH_OPTIONS`] are the dial's option ids
+/// in level order, so a stored id can be read back as the level that chose it.
 pub fn dial_selection(
     effort: Option<u8>,
     verbosity: Option<u8>,
     think: Option<bool>,
 ) -> SelectionState {
-    const EFFORT: [&str; 5] = ["off", "quick", "balanced", "deep", "exhaustive"];
-    const LENGTH: [&str; 5] = ["terse", "concise", "standard", "detailed", "comprehensive"];
     let mut sel = SelectionState::new();
     // A thinking-off turn — effort 0, or the `think` toggle explicitly off —
     // must carry BOTH halves of the same decision. The steering has to match the
@@ -207,13 +230,15 @@ pub fn dial_selection(
     } else if let Some(e) = effort {
         sel.select(
             "thinking_effort",
-            *EFFORT.get(e as usize).unwrap_or(&"exhaustive"),
+            *EFFORT_OPTIONS.get(e as usize).unwrap_or(&"exhaustive"),
         );
     }
     if let Some(v) = verbosity {
         sel.select(
             "response_length",
-            *LENGTH.get(v as usize).unwrap_or(&"comprehensive"),
+            *RESPONSE_LENGTH_OPTIONS
+                .get(v as usize)
+                .unwrap_or(&"comprehensive"),
         );
     }
     if effort.is_some() || think.is_some() {
@@ -492,6 +517,12 @@ mod dial_tests {
             round.optional(TOOLS_ENABLED_SELECTOR),
             Some(OptionalState::Present)
         );
+        assert_eq!(
+            round.optional(TOOL_ROUND_SELECTOR),
+            Some(OptionalState::Present),
+            "a tool round is marked, so ingest layers sit it out"
+        );
+        assert_eq!(reply.optional(TOOL_ROUND_SELECTOR), None);
         assert_eq!(round.get("thinking_effort"), Some("balanced"));
         assert_eq!(round.get("response_length"), Some("detailed"));
         assert_eq!(

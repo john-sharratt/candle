@@ -16,12 +16,17 @@
 #![allow(dead_code)] // Helpers are pulled into per-tool test binaries selectively.
 
 use serde_json::{json, Value};
-use zend_tools::ToolContext;
+use zend_tools::{Grants, ToolContext};
 
-/// Invoke a tool by name with default `ToolContext`.
+/// A fresh context granted every capability — these tests exercise what a
+/// tool does, not whether it may; the refusals are tested beside the grants.
+pub fn granted() -> ToolContext {
+    ToolContext::new().granting(Grants::ALL)
+}
+
+/// Invoke a tool by name with a fresh [`granted`] context.
 pub fn invoke(tool: &str, args: Value) -> Value {
-    let ctx = ToolContext::new();
-    invoke_with_ctx(tool, args, &ctx)
+    invoke_with_ctx(tool, args, &granted())
 }
 
 /// Invoke a tool by name, threading a caller-supplied context.
@@ -33,6 +38,12 @@ pub fn invoke_with_ctx(tool: &str, args: Value, ctx: &ToolContext) -> Value {
 /// Confirmation details (if any) for a tool call. Mirrors the runtime call.
 pub fn confirmation(tool: &str, args: Value) -> Option<zend_tools::ConfirmationDetails> {
     zend_tools::confirmation(tool, &args)
+}
+
+/// Whether a call may be re-issued when a turn resumes after a restart.
+/// Mirrors the runtime call.
+pub fn replay(tool: &str, args: Value) -> zend_tools::Replay {
+    zend_tools::replay(tool, &args)
 }
 
 // ── Assertions ────────────────────────────────────────────────────────────────

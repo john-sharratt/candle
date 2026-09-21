@@ -1,7 +1,7 @@
 #pragma once
 // ============================================================================
 // decode_helpers.cuh - shared decode helpers.
-//   vec2 load, cp.async commit/wait, RoPE (rope_cos_sin / apply_rope_*),
+//   vec2 load, cp.async commit/wait, RoPE (apply_rope_* over a RopeView),
 //   arena scatter (write_regs_to_arena / write_regs_to_r16), and the
 //   write-length commit kernel. Shared by the INT8 decode kernel and the
 //   legacy V2 paged-decode kernel.
@@ -20,6 +20,7 @@
 #include "../simple/warp_reduce.cuh"
 #include "../convert/convert_all.cuh"
 #include "slot_types.cuh"           // Slot buffer byte-layout accessors
+#include "../rope/rope_table.cuh"   // RopeRungs / RopeView — the factored RoPE table
 #include "pal_iter.cuh"             // PalIter — palette-aware dimension iterator
 
 // ============================================================================
@@ -87,17 +88,11 @@ __device__ __forceinline__ void cp_async_commit() {
     }
 }
 
-template <int HEAD_DIM>
-__device__ __forceinline__ void rope_cos_sin(
-    int pos, int d_idx, const float* __restrict__ rope_cs, float& cos_v, float& sin_v
-) {
-    const float* entry = rope_cs + (int64_t)pos * HEAD_DIM + d_idx * 2;
-    cos_v = __ldg(entry);
-    sin_v = __ldg(entry + 1);
-}
-
+// RoPE over a warp's register row. `rope` is the sequence's view of its rung
+// (`rope_table.cuh`): a K rotation passes the view as built, a Q rotation its
+// `for_q()`, which carries the rung's m² on the rotary pairs.
 template <int VEC, int HEAD_DIM>
-__device__ __forceinline__ void apply_rope_rotary_f32(float* regs, int lane, int pos, const float* __restrict__ rope_cs) {
+__device__ __forceinline__ void apply_rope_rotary_f32(float* regs, int lane, int pos, const RopeView& rope) {
     const int pair_lane = lane ^ 16;
     float pair_regs[VEC];
     #pragma unroll
@@ -106,17 +101,17 @@ __device__ __forceinline__ void apply_rope_rotary_f32(float* regs, int lane, int
     #pragma unroll
     for (int j = 0; j < VEC; ++j) {
         float cos_v, sin_v;
-        rope_cos_sin<HEAD_DIM>(pos, (lane & 15) * VEC + j, rope_cs, cos_v, sin_v);
+        rope_cs_at(rope, pos, (lane & 15) * VEC + j, cos_v, sin_v);
         regs[j] = regs[j] * cos_v + sign * pair_regs[j] * sin_v;
     }
 }
 
 template <int VEC, int HEAD_DIM>
-__device__ __forceinline__ void apply_rope_interleaved_f32(float* regs, int lane, int pos, const float* __restrict__ rope_cs) {
+__device__ __forceinline__ void apply_rope_interleaved_f32(float* regs, int lane, int pos, const RopeView& rope) {
     const int base_idx = lane * VEC;
     if constexpr (VEC == 1) {
         float cos_v, sin_v;
-        rope_cos_sin<HEAD_DIM>(pos, lane / 2, rope_cs, cos_v, sin_v);
+        rope_cs_at(rope, pos, lane / 2, cos_v, sin_v);
         float partner = __shfl_sync(0xffffffff, regs[0], lane ^ 1);
         const float sign = (lane & 1) ? 1.f : -1.f;
         regs[0] = regs[0] * cos_v + sign * partner * sin_v;
@@ -127,7 +122,7 @@ __device__ __forceinline__ void apply_rope_interleaved_f32(float* regs, int lane
         for (int j = 0; j < VEC; j += 2) {
             int pair_idx = (base_idx + j) / 2;
             float cos_v, sin_v;
-            rope_cos_sin<HEAD_DIM>(pos, pair_idx, rope_cs, cos_v, sin_v);
+            rope_cs_at(rope, pos, pair_idx, cos_v, sin_v);
             float x = regs[j], y = regs[j + 1];
             regs[j]     = x * cos_v - y * sin_v;
             regs[j + 1] = x * sin_v + y * cos_v;

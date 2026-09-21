@@ -156,8 +156,7 @@ fn hkdf_extract_with_salt() {
 
 #[test]
 fn signature_sign_verify_ed25519() {
-    use zend_tools::ToolContext;
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
 
     // Save an Ed25519 private key credential
     // This is a known test private key in PKCS#8 PEM format (all-zero seed)

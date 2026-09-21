@@ -50,7 +50,7 @@ impl Tool for CodeSessionOpen {
                 alive: true,
             },
             language: "javascript".to_string(),
-            history: String::new(),
+            history: Vec::new(),
         });
 
         Ok(SessionOpenResp {

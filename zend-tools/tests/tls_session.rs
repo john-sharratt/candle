@@ -1,7 +1,6 @@
 mod harness;
 
 use serde_json::json;
-use zend_tools::ToolContext;
 
 #[test]
 fn tls_session_list_empty() {
@@ -51,7 +50,7 @@ fn tls_session_list_returns_sessions_field() {
 
 #[test]
 fn tls_session_empty_in_fresh_context() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let list = harness::expect_success(harness::invoke_with_ctx(
         "tls_session_list",
         json!({}),

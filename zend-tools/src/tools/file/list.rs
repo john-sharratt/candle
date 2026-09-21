@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::{FileError, Paging};
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 /// Entries per page. A listing goes into the conversation verbatim, so an
 /// unbounded one is a context hazard: `zend/src/` alone is 175 files ≈ 5.7k
@@ -26,7 +26,10 @@ pub struct ListRequest {
 #[derive(Serialize)]
 pub struct FileEntry {
     pub path: String,
-    /// Omitted for a subdirectory entry — a directory has no size of its own.
+    /// Size from the directory entry's metadata — the only measure of a file a
+    /// listing can give without opening it. There is deliberately no line count
+    /// beside it: see [`crate::state::vfs::ListEntry`]. Omitted for a
+    /// subdirectory entry — a directory has no size of its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes: Option<usize>,
     /// `true` when this entry is a subdirectory. List it in turn to see what's
@@ -65,13 +68,20 @@ impl Tool for FileList {
          resolve. Ignored paths (per .gitignore and friends) never appear. \
          Results are paged: the response's `paging` reports the total and, \
          when more remain, a `next_page` to pass back as `page`. Returns names \
-         and sizes, not file contents; a file entry carries `modified: true` \
-         when this session has changed it. Use file_read to get a file's \
-         contents.";
+         and byte sizes, not file contents or line counts; a file entry carries \
+         `modified: true` when this session has changed it. Use file_read to \
+         get a file's contents — read page 0 and its header reports the \
+         file's length in pages, so there is no need to size a file before \
+         reading it.";
 
     type Request = ListRequest;
     type Response = ListResponse;
     type Error = FileError;
+
+    /// Lists a directory; writes nothing.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(ctx: &ToolContext, req: ListRequest) -> Result<ListResponse, FileError> {
         let path = req.path.as_deref().unwrap_or("");

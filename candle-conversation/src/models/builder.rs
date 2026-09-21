@@ -1,7 +1,8 @@
 //! Fluent builder for configuring and constructing a
 //! [`ConversationEngine`](crate::ConversationEngine).
 
-use super::{Model, ModelArch, ModelSpec};
+use super::gguf_rope::gguf_rope;
+use super::{Model, ModelArch, ModelSpec, RopePreset};
 use crate::config::{
     pick_max_hot_turns, DecodeHealthConfig, EngineConfig, SamplingConfig, SchedulerConfig,
     SequenceConfig,
@@ -15,7 +16,7 @@ use crate::tree::ConversationTreeConfig;
 use candle::{DType, Device};
 use candle_nn::kv_cache::{class_for_format, elems_per_chunk, KvFormat, SizeClass, N_PALETTE};
 use candle_nn::CHUNK_SIZE;
-use candle_transformers::models::batched_model::BatchedInference;
+use candle_transformers::models::batched_model::{BatchedInference, BatchedModelCore};
 use candle_transformers::models::qwen35::TensorOverride;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -45,6 +46,14 @@ struct GgufInfo {
     has_thinking: bool,
     /// Detected dialect from the chat template.
     dialect: Option<DialectType>,
+}
+
+/// The frequencies a GQA loader built from its file, or the refusal to go on
+/// without them.
+fn stated_inv_freq(inv: Option<Vec<f32>>) -> crate::Result<Vec<f32>> {
+    inv.ok_or_else(|| {
+        ConversationError::Model(candle::Error::Msg("model missing rope inv_freq".into()))
+    })
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -455,6 +464,7 @@ impl ModelBuilder {
             tokenizer_rev: String::new(),
             default_system_prompt: "You are a helpful, accurate, and concise assistant.".into(),
             max_seq_len: info.context_length.unwrap_or(8192),
+            rope: arch.file_rope(),
             default_sampling: info.sampling.clone(),
             supports_thinking: info.has_thinking,
             non_thinking_sampling: info.non_thinking.clone(),
@@ -844,6 +854,40 @@ impl ModelBuilder {
         .into_bytes()
     }
 
+    /// Wrap a GQA checkpoint in the RoPE schedule its preset names over the
+    /// frequencies the file states (`docs/progressive_yarn.md` §2).
+    ///
+    /// θ is the file's `{arch}.rope.freq_base` and the declaration its
+    /// `{arch}.rope.scaling.*`; the file-stated reach is the builder's
+    /// `max_seq_len`, which is the file's `context_length` when it declares
+    /// one.
+    fn wrap_gqa<M: BatchedModelCore>(
+        &self,
+        raw: M,
+        stated_inv: Vec<f32>,
+        model_path: &Path,
+        device: &Device,
+    ) -> crate::Result<BatchedInference<M>> {
+        let ct = gguf_header(model_path).map_err(ConversationError::Model)?;
+        let (theta, declared) = gguf_rope(&ct.metadata).map_err(ConversationError::Model)?;
+        let schedule = self
+            .spec
+            .rope
+            .gqa_schedule(stated_inv, theta, declared, self.max_seq_len)
+            .map_err(ConversationError::Model)?;
+        tracing::info!(
+            "RoPE schedule: {:?}, rung ceilings {:?}",
+            self.spec.rope,
+            schedule.ceilings()
+        );
+        Ok(BatchedInference::new_with_schedule(
+            raw,
+            &schedule,
+            self.max_seq_len,
+            device,
+        )?)
+    }
+
     /// Load quantised model weights from a local GGUF file.
     ///
     /// Uses the builder's `max_seq_len` for KV cache sizing.
@@ -880,6 +924,16 @@ impl ModelBuilder {
                 )));
             }
         }
+        // **A lineage's schedule is its loader's.** A preset naming another for
+        // one would be silently ignored, so it is refused.
+        if self.spec.arch.file_rope() == RopePreset::Lineage
+            && self.spec.rope != RopePreset::Lineage
+        {
+            return Err(ConversationError::Other(format!(
+                "{:?} carries its RoPE schedule in its loader, and this spec names {:?}",
+                self.spec.arch, self.spec.rope
+            )));
+        }
         match self.spec.arch {
             ModelArch::Qwen3 => {
                 use candle_transformers::models::quantized_qwen3::ModelWeights;
@@ -888,14 +942,8 @@ impl ModelBuilder {
                 // arch's loader to enable it.
                 let _ = progress;
                 let raw = ModelWeights::from_gguf_by_path(model_path, device)?;
-                let inv = raw.rope_inv_freq().ok_or_else(|| {
-                    ConversationError::Model(candle::Error::Msg(
-                        "model missing rope inv_freq".into(),
-                    ))
-                })?;
-                Ok(Box::new(BatchedInference::new_with_inv_freq(
-                    raw, inv, max_seq, device,
-                )?))
+                let inv = stated_inv_freq(raw.rope_inv_freq())?;
+                Ok(Box::new(self.wrap_gqa(raw, inv, model_path, device)?))
             }
             ModelArch::Qwen3Moe => {
                 use candle_transformers::models::quantized_qwen3_moe::{
@@ -912,28 +960,16 @@ impl ModelBuilder {
                         expert_pack_dir: self.expert_pack_dir.clone(),
                     },
                 )?;
-                let inv = raw.rope_inv_freq().ok_or_else(|| {
-                    ConversationError::Model(candle::Error::Msg(
-                        "model missing rope inv_freq".into(),
-                    ))
-                })?;
-                Ok(Box::new(BatchedInference::new_with_inv_freq(
-                    raw, inv, max_seq, device,
-                )?))
+                let inv = stated_inv_freq(raw.rope_inv_freq())?;
+                Ok(Box::new(self.wrap_gqa(raw, inv, model_path, device)?))
             }
             ModelArch::Qwen2 => {
                 use candle_transformers::models::quantized_qwen2::ModelWeights;
                 // Per-layer progress not yet wired for this arch.
                 let _ = progress;
                 let raw = ModelWeights::from_gguf_by_path(model_path, device)?;
-                let inv = raw.rope_inv_freq().ok_or_else(|| {
-                    ConversationError::Model(candle::Error::Msg(
-                        "model missing rope inv_freq".into(),
-                    ))
-                })?;
-                Ok(Box::new(BatchedInference::new_with_inv_freq(
-                    raw, inv, max_seq, device,
-                )?))
+                let inv = stated_inv_freq(raw.rope_inv_freq())?;
+                Ok(Box::new(self.wrap_gqa(raw, inv, model_path, device)?))
             }
             ModelArch::Llama => {
                 use candle_transformers::models::quantized_llama::ModelWeights;
@@ -944,14 +980,8 @@ impl ModelBuilder {
                 // `ModelArch` split onto `from_gguf_by_path_v2` before it can
                 // load through the daemon.
                 let raw = ModelWeights::from_gguf_by_path_v3(model_path, device)?;
-                let inv = raw.rope_inv_freq().ok_or_else(|| {
-                    ConversationError::Model(candle::Error::Msg(
-                        "model missing rope inv_freq".into(),
-                    ))
-                })?;
-                Ok(Box::new(BatchedInference::new_with_inv_freq(
-                    raw, inv, max_seq, device,
-                )?))
+                let inv = stated_inv_freq(raw.rope_inv_freq())?;
+                Ok(Box::new(self.wrap_gqa(raw, inv, model_path, device)?))
             }
             ModelArch::DeepSeekV4 => {
                 use candle::quantized::Int8Mode;
@@ -1119,6 +1149,10 @@ impl ModelBuilder {
                             arch
                         );
                         self.spec.arch = arch;
+                        // The preset's RoPE schedule belonged to the checkpoint
+                        // it named; this file is another, so it runs what it
+                        // states (or its lineage's own).
+                        self.spec.rope = arch.file_rope();
                     }
                 }
 

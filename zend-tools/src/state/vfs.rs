@@ -42,17 +42,55 @@
 //! Files above [`MAX_LOWER_FILE_BYTES`] are listed but refuse to read, as do files
 //! whose bytes are not valid UTF-8; both surface as [`VfsError::Unreadable`].
 //!
+//! # Protected paths
+//!
+//! Any path with a [`PROTECTED_SEGMENT`] component is refused outright, in both
+//! layers and by every operation: [`VfsError::Forbidden`]. That covers
+//! `secrets/tools.yaml`, `web/secrets/auth.yaml`, and anything else a deployment
+//! keeps in a `secrets/` directory.
+//!
+//! **This is not the same protection as `.gitignore`, and the difference is the
+//! whole point.** The ignore rules are consulted by the listing walk and by
+//! nothing else — a read resolves a normalised key straight to a path under the
+//! root and opens it. So before this guard existed, a gitignored secret was
+//! invisible to `file_list` and served in full by `file_read`, which is the
+//! worst of both worlds: hidden from the operator auditing what the model can
+//! see, and one call away from the transcript.
+//!
+//! The refusal is enforced in [`VfsStore::lower_path`], the single funnel every
+//! lower-layer read goes through, rather than at each call site — a guard that
+//! has to be remembered at N call sites is a guard that is missing at one of
+//! them. Normalisation runs first, so alternate spellings (`/secrets/x`,
+//! `a/../secrets/x`, `workspace/secrets/x`, backslashes) all collapse onto the
+//! same key before the check sees it.
+//!
 //! # Size cap
 //!
 //! The upper layer is capped at 10 MiB per store (enforced on each `write`).
 //! Reading through to the workspace costs nothing against the cap because nothing
 //! is retained; a copy-up does, and returns [`VfsError::Full`] if it would not fit.
+//!
+//! # Direct mode
+//!
+//! [`VfsStore::direct`] is the same store with no upper layer: a write lands in
+//! the workspace on disk, a delete removes the file, and every read therefore
+//! sees what is on disk. It backs the daemon's Mutable tools mode, for a caller
+//! entitled to change the project itself rather than a session copy of it.
+//! Everything else holds unchanged — path normalisation (so `..` still cannot
+//! leave the root) and the protected-path refusal in particular, which in this
+//! mode is what stops a tool overwriting a deployment's secrets.
+//!
+//! A direct write goes to a sibling temporary file first and is renamed over
+//! the target, so a write interrupted partway leaves the old file whole rather
+//! than truncated.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::RwLock;
 
 use ignore::WalkBuilder;
+
+use crate::grants::DiskWriteGrant;
 
 const MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
@@ -64,12 +102,28 @@ pub const MAX_LOWER_FILE_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
 /// Stripped during normalisation so `/workspace/src` and `src` are one key.
 const MOUNT_SEGMENT: &str = "workspace";
 
+/// Path segment marking a directory the tools may not touch.
+///
+/// A deployment's secrets live in a `secrets/` directory — `secrets/tools.yaml`
+/// for the daemon's own API keys, `web/secrets/auth.yaml` for the gateway's
+/// sign-in config. One name, matched at any depth, so a new secrets directory is
+/// protected the day it is created rather than the day someone remembers to add
+/// it to a list.
+pub const PROTECTED_SEGMENT: &str = "secrets";
+
 #[derive(Debug)]
 pub enum VfsError {
     Full,
     /// A workspace file exists but cannot be served as text — too large, or not
     /// valid UTF-8.
     Unreadable(String),
+    /// The path is under a [`PROTECTED_SEGMENT`] directory. Refused whether or
+    /// not it exists: saying "not found" for a real file and "forbidden" for a
+    /// missing one would turn the error into an oracle for what is there.
+    Forbidden(String),
+    /// A [`VfsStore::direct`] write could not reach the disk — a permission, a
+    /// full volume, a path that names a directory.
+    Unwritable(String),
 }
 
 impl std::fmt::Display for VfsError {
@@ -77,14 +131,48 @@ impl std::fmt::Display for VfsError {
         match self {
             VfsError::Full => write!(f, "VFS storage limit exceeded (10 MiB)"),
             VfsError::Unreadable(why) => write!(f, "{why}"),
+            VfsError::Forbidden(path) => write!(
+                f,
+                "{path} is under a {PROTECTED_SEGMENT}/ directory and cannot be \
+                 read, written or listed by tools"
+            ),
+            VfsError::Unwritable(why) => write!(f, "{why}"),
         }
     }
+}
+
+/// One matching line from [`VfsStore::grep`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrepHit {
+    pub path: String,
+    /// 1-based line number within the file.
+    pub line_no: u32,
+    /// The matching line, with trailing `\r` and whitespace trimmed.
+    pub line: String,
+    /// `true` when the hit came from this session's own copy of the file.
+    pub modified: bool,
+}
+
+/// What a [`VfsStore::grep`] pass found.
+#[derive(Debug, Default)]
+pub struct GrepOutcome {
+    pub hits: Vec<GrepHit>,
+    /// Files whose contents were actually scanned — the denominator that tells a
+    /// caller whether "no matches" means "searched a lot and found nothing" or
+    /// "the prefix matched nothing to search".
+    pub files_searched: usize,
+    /// `true` when the scan stopped at its hit ceiling, so the result is a
+    /// prefix of what is there rather than all of it.
+    pub truncated: bool,
 }
 
 /// One entry in a directory listing: normalised path, byte size. No line
 /// count — that would cost opening every file in the walk to compute (see the
 /// history on [`VfsStore::list_lower_dir`]), and a listing that never opens a
-/// file is the whole point of `file_list`.
+/// file is the whole point of `file_list`. A file's length reaches the model
+/// through `file_read`'s own header instead (`(page 0 of 13, lines 1-200 of
+/// 2499)`), which is exact, costs nothing extra, and arrives at the moment the
+/// number is actually needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListEntry {
     pub path: String,
@@ -101,7 +189,21 @@ pub struct ListEntry {
 }
 
 /// Lines per [`VfsStore::read_page`] page.
-pub const PAGE_LINES: u32 = 300;
+///
+/// The same size the rest of the system already treats as one excerpt, so a
+/// live read and the prefilled excerpts the model was conditioned on are the
+/// same kind of object — a scope, not a module. `zend`'s `repo_scan::anchor`
+/// bounds its anchor excerpts at 200 by the identical `start + LIMIT - 1`
+/// clamp, and the `code_reading` ingest carves scopes at 150
+/// (`MAX_SCOPE_LINES`), so every `file_read` exchange in the corpus already
+/// fits inside this cap and none had to be re-cut for it.
+///
+/// Chosen this small on measurement, not guesswork: one `file_read` of a
+/// 2,499-line module at a wider size put 144 KB into a live conversation, and
+/// three such reads made the next turn a 53,288-token prefill — three minutes
+/// and fifty seconds of wall clock for one turn with the KV pool ratcheted 6
+/// GB against a card already at 99%.
+pub const PAGE_LINES: u32 = 200;
 
 /// One page of a file's lines, 0-based.
 #[derive(Debug)]
@@ -129,12 +231,24 @@ struct Upper {
     whiteouts: HashSet<String>,
 }
 
-/// Union-mount of a session-private in-memory layer over the read-only workspace.
+/// Where a store's writes land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Layering {
+    /// In the in-memory upper layer, over a read-only workspace.
+    #[default]
+    Overlay,
+    /// On disk, in the workspace itself — see the module's "Direct mode".
+    Direct,
+}
+
+/// Union-mount of a session-private in-memory layer over the read-only workspace
+/// — or, built with [`VfsStore::direct`], the workspace itself.
 #[derive(Default)]
 pub struct VfsStore {
     upper: RwLock<Upper>,
     /// Lower layer root. `None` leaves the store upper-only.
     workspace: Option<PathBuf>,
+    layering: Layering,
 }
 
 impl VfsStore {
@@ -148,7 +262,27 @@ impl VfsStore {
         Self {
             upper: RwLock::new(Upper::default()),
             workspace: Some(root.into()),
+            layering: Layering::Overlay,
         }
+    }
+
+    /// The workspace at `root` with no overlay: writes and deletes change the
+    /// files on disk. See the module's "Direct mode".
+    ///
+    /// Takes the [`DiskWriteGrant`] only [`Grants::disk_write`](crate::Grants::disk_write)
+    /// makes, so a store that writes the disk exists only where that capability
+    /// was granted.
+    pub fn direct(root: impl Into<PathBuf>, _grant: DiskWriteGrant) -> Self {
+        Self {
+            upper: RwLock::new(Upper::default()),
+            workspace: Some(root.into()),
+            layering: Layering::Direct,
+        }
+    }
+
+    /// Whether writes and deletes change the workspace on disk.
+    pub fn is_direct(&self) -> bool {
+        self.layering == Layering::Direct
     }
 
     /// The configured lower-layer root, if any.
@@ -161,8 +295,19 @@ impl VfsStore {
     /// workspace file for the first time counts as an overwrite, not a creation,
     /// because the path already resolved before the call. Writing over a whiteout
     /// *is* a creation: the path did not resolve while the whiteout stood.
+    ///
+    /// On a [`direct`](Self::direct) store the file is written on disk instead,
+    /// and `true` means it did not exist there before.
     pub fn write(&self, path: &str, content: String) -> Result<bool, VfsError> {
         let norm = Self::normalize(path);
+        // Refused in both modes. On an overlay nothing reaches disk, so this
+        // stops a session planting a decoy at a protected path that later reads
+        // would then find; on a direct store it is what keeps a tool from
+        // overwriting the deployment's secrets.
+        Self::guard(&norm)?;
+        if self.is_direct() {
+            return self.write_disk(&norm, &content);
+        }
         let in_lower = self.lower_exists(&norm);
         let mut guard = self.upper.write().unwrap();
         let whiteouted = guard.whiteouts.contains(&norm);
@@ -183,6 +328,7 @@ impl VfsStore {
     /// `Ok(None)` means the path does not exist in either layer (or is whiteouted).
     pub fn read(&self, path: &str) -> Result<Option<String>, VfsError> {
         let norm = Self::normalize(path);
+        Self::guard(&norm)?;
         {
             let guard = self.upper.read().unwrap();
             if let Some(v) = guard.files.get(&norm) {
@@ -325,8 +471,19 @@ impl VfsStore {
     /// Remove a path from the overlay. An upper-layer file is dropped; a
     /// workspace-backed file gets a whiteout so it stops resolving. Returns
     /// whether the path resolved before the call. The workspace is never touched.
+    ///
+    /// On a [`direct`](Self::direct) store the file is removed from disk, and the
+    /// result is whether it existed and was removed.
     pub fn delete(&self, path: &str) -> bool {
         let norm = Self::normalize(path);
+        if Self::is_protected(&norm) {
+            return false;
+        }
+        if self.is_direct() {
+            return self
+                .lower_path(&norm)
+                .is_some_and(|abs| abs.is_file() && std::fs::remove_file(abs).is_ok());
+        }
         let in_lower = self.lower_exists(&norm);
         let mut guard = self.upper.write().unwrap();
         if guard.whiteouts.contains(&norm) {
@@ -363,6 +520,41 @@ impl VfsStore {
         Ok(())
     }
 
+    // ── Direct-mode helpers ──────────────────────────────────────────────────
+
+    /// Write `content` to `norm` on disk, creating its parent directories.
+    /// Returns whether the file did not exist before.
+    ///
+    /// Through a sibling temporary file renamed over the target: a rename
+    /// replaces the file in one step, so a write cut short leaves the old
+    /// content whole rather than a truncated file.
+    fn write_disk(&self, norm: &str, content: &str) -> Result<bool, VfsError> {
+        let abs = self.lower_path(norm).ok_or_else(|| {
+            VfsError::Unwritable(format!("{norm:?} does not name a file in the workspace"))
+        })?;
+        let fail = |what: &str, e: std::io::Error| {
+            VfsError::Unwritable(format!("{norm} could not be written ({what}: {e})"))
+        };
+        let existed = abs.is_file();
+        if abs.is_dir() {
+            return Err(VfsError::Unwritable(format!("{norm} is a directory")));
+        }
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| fail("creating its directory", e))?;
+        }
+        let file_name = abs
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let temp = abs.with_file_name(format!(".{file_name}.zend-write"));
+        std::fs::write(&temp, content).map_err(|e| fail("writing", e))?;
+        if let Err(e) = std::fs::rename(&temp, &abs) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(fail("replacing the file", e));
+        }
+        Ok(!existed)
+    }
+
     // ── Lower-layer helpers ──────────────────────────────────────────────────
 
     /// Absolute path of `norm` under the workspace, or `None` when there is no
@@ -372,7 +564,76 @@ impl VfsStore {
         if norm.is_empty() {
             return None;
         }
+        // The single funnel for lower-layer access. Guarding here rather than at
+        // each caller is what makes the protection total: `read_lower`,
+        // `lower_exists`, and anything added later inherit it without knowing it
+        // exists.
+        if Self::is_protected(norm) {
+            return None;
+        }
+        Self::under(root, norm)
+    }
+
+    /// `root.join(norm)`, only when the result stays under `root`.
+    ///
+    /// Normalisation removes `..` and leading separators, but not a Windows
+    /// drive or device prefix: `C:/Users/x/.ssh/id_rsa` normalises to itself,
+    /// and joining a path that carries a prefix *replaces* the root — so a
+    /// `file_read`, a script's `vfs.read`, or a direct write reached any file on
+    /// the host. A segment with a `:` in it is a drive (`C:`), a device path
+    /// (`\\?\C:\`), or an NTFS alternate stream (`notes.txt:hidden`), and none
+    /// of those names a workspace file; the component check refuses anything
+    /// else that is not a plain name.
+    ///
+    /// So is any other spelling Windows would resolve to a different name: a
+    /// segment ending in a dot or a space (both dropped when the name is
+    /// opened), and an 8.3 short name (`SECRET~1`), which opens the long name
+    /// it abbreviates — `secrets/` included — past every check made on the
+    /// spelling.
+    fn under(root: &Path, norm: &str) -> Option<PathBuf> {
+        if !Self::addressable(norm) {
+            return None;
+        }
+        if !Path::new(norm)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+        {
+            return None;
+        }
         Some(root.join(norm))
+    }
+
+    /// Whether every segment of `norm` is a name [`Self::under`] accepts — no
+    /// `:`, no trailing `.` or space, no 8.3 short-name tail.
+    ///
+    /// The workspace walks apply it too, so a listing never shows a file the
+    /// store cannot open. A Linux workspace can hold `logs/12:00.txt` or
+    /// `notes~2.md`; listed but refused by every read, the model was shown a
+    /// file it could name and never read.
+    fn addressable(norm: &str) -> bool {
+        !norm
+            .split('/')
+            .any(|s| s.contains(':') || s.ends_with('.') || s.ends_with(' ') || is_short_name(s))
+    }
+
+    /// Whether a normalised key names something under a protected directory.
+    ///
+    /// Compared the way Windows resolves a name — case-insensitively, with
+    /// trailing dots and spaces dropped — so `Secrets/`, `SECRETS/` and
+    /// `secrets./` are the directory they open, not three unprotected ones.
+    pub fn is_protected(norm: &str) -> bool {
+        norm.split('/').any(|s| {
+            s.trim_end_matches(['.', ' '])
+                .eq_ignore_ascii_case(PROTECTED_SEGMENT)
+        })
+    }
+
+    /// `Err(Forbidden)` for a protected key, `Ok(())` otherwise.
+    fn guard(norm: &str) -> Result<(), VfsError> {
+        if Self::is_protected(norm) {
+            return Err(VfsError::Forbidden(norm.to_string()));
+        }
+        Ok(())
     }
 
     fn lower_exists(&self, norm: &str) -> bool {
@@ -536,7 +797,11 @@ impl VfsStore {
     /// `(normalised path, bytes, is_dir)`; `bytes` is `None` for a
     /// subdirectory and metadata-only for a file — never a file open, which is
     /// what makes a listing cheap even where it does open a directory (see the
-    /// history in [`Self::read_lower_page`]'s sibling doc).
+    /// history in [`Self::read_lower_page`]'s sibling doc). A protected entry
+    /// (see [`PROTECTED_SEGMENT`]) is dropped rather than listed — the same
+    /// silence `secrets/` gets everywhere else — so listing the protected
+    /// directory itself, or a parent that contains one, comes back empty of
+    /// it rather than erroring, and never names it.
     fn list_lower_dir(&self, norm: &str) -> Vec<(String, Option<usize>, bool)> {
         let Some(root) = self.workspace.as_ref() else {
             return Vec::new();
@@ -548,17 +813,7 @@ impl VfsStore {
         };
 
         let mut out = Vec::new();
-        let walker = WalkBuilder::new(&walk_root)
-            .hidden(true)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .ignore(true)
-            .require_git(false)
-            .parents(true)
-            .max_depth(Some(1))
-            .build();
-        for entry in walker.flatten() {
+        for entry in Self::lower_walker(&walk_root, Some(1)).flatten() {
             // Depth 0 is `walk_root` itself, not a child of it.
             if entry.depth() == 0 {
                 continue;
@@ -575,12 +830,175 @@ impl VfsStore {
             } else {
                 format!("{norm}/{name}")
             };
+            if Self::is_protected(&path) {
+                continue;
+            }
             if is_dir {
                 out.push((path, None, true));
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
             out.push((path, Some(meta.len() as usize), false));
+        }
+        out
+    }
+
+    /// The ignore-driven walker both lower-layer passes use.
+    ///
+    /// One builder, so a listing and a search can never disagree about what is
+    /// visible — a file hidden from `file_list` but reachable by `file_grep`
+    /// would be the same class of hole as the read path that ignored these
+    /// rules entirely. `max_depth` is `Some(1)` for a one-level directory
+    /// listing and `None` for a search, which walks the whole subtree.
+    fn lower_walker(root: &Path, max_depth: Option<usize>) -> ignore::Walk {
+        WalkBuilder::new(root)
+            .hidden(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .ignore(true)
+            .require_git(false)
+            .parents(true)
+            .max_depth(max_depth)
+            .build()
+    }
+
+    /// Where a lower-layer walk for `norm_prefix` starts, and the prefix filter
+    /// its keys still need.
+    ///
+    /// Walking from the prefix directory (when it is one under the root) keeps
+    /// a narrow listing cheap on a large repository; otherwise the walk covers
+    /// the root and filters, which is what a partial-segment prefix like
+    /// `src/ma` needs — and what a prefix naming somewhere outside the root
+    /// gets, so it lists nothing rather than walking another drive.
+    fn walk_start<'p>(root: &Path, norm_prefix: &'p str) -> (PathBuf, Option<&'p str>) {
+        match Self::under(root, norm_prefix) {
+            Some(dir) if !norm_prefix.is_empty() && dir.is_dir() => (dir, None),
+            _ => (root.to_path_buf(), Some(norm_prefix)),
+        }
+    }
+
+    /// Normalised keys of the workspace files under `norm_prefix`.
+    ///
+    /// Deliberately stats nothing and reads nothing: this backs path search and
+    /// the candidate list for a content search, which need only the names.
+    fn walk_lower_paths(&self, norm_prefix: &str) -> Vec<String> {
+        let Some(root) = self.workspace.as_ref() else {
+            return Vec::new();
+        };
+        let (walk_root, filter) = Self::walk_start(root, norm_prefix);
+
+        let mut out = Vec::new();
+        for entry in Self::lower_walker(&walk_root, None).flatten() {
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let Ok(rel) = entry.path().strip_prefix(root) else {
+                continue;
+            };
+            let key = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            if Self::is_protected(&key) || !Self::addressable(&key) {
+                continue;
+            }
+            if let Some(p) = filter {
+                if !Self::matches_prefix(&key, p) {
+                    continue;
+                }
+            }
+            out.push(key);
+        }
+        out
+    }
+
+    // ── Search ───────────────────────────────────────────────────────────────
+
+    /// Every path visible under `prefix`, upper layer shadowing the workspace.
+    ///
+    /// Unlike [`VfsStore::list`] this reads no file contents, so it stays cheap
+    /// over a whole repository — line counts are what make a full listing
+    /// expensive, and a path search does not need them.
+    pub fn paths(&self, prefix: &str) -> Vec<String> {
+        let norm_prefix = Self::normalize(prefix);
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out: Vec<String> = Vec::new();
+        {
+            let guard = self.upper.read().unwrap();
+            for k in guard.files.keys() {
+                if Self::matches_prefix(k, &norm_prefix) && !Self::is_protected(k) {
+                    seen.insert(k.clone());
+                    out.push(k.clone());
+                }
+            }
+            for w in guard.whiteouts.iter() {
+                seen.insert(w.clone());
+            }
+        }
+        for path in self.walk_lower_paths(&norm_prefix) {
+            if !seen.contains(&path) {
+                out.push(path);
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Scan file contents under `prefix` for `re`.
+    ///
+    /// Files that cannot be scanned — oversize, not UTF-8, vanished between the
+    /// walk and the read — are skipped rather than failing the pass: a single
+    /// binary blob in a tree must not turn a whole search into an error.
+    pub fn grep(
+        &self,
+        re: &regex::Regex,
+        prefix: &str,
+        max_per_file: usize,
+        max_total: usize,
+    ) -> GrepOutcome {
+        let mut out = GrepOutcome::default();
+        for path in self.paths(prefix) {
+            let (content, modified) = {
+                let guard = self.upper.read().unwrap();
+                match guard.files.get(&path) {
+                    Some(v) => (Some(v.clone()), true),
+                    None => (None, false),
+                }
+            };
+            let content = match content {
+                Some(c) => c,
+                None => match self.read_lower(&path) {
+                    Ok(Some(c)) => c,
+                    _ => continue,
+                },
+            };
+            out.files_searched += 1;
+
+            let mut in_file = 0usize;
+            for (idx, line) in content.lines().enumerate() {
+                if !re.is_match(line) {
+                    continue;
+                }
+                if out.hits.len() >= max_total {
+                    out.truncated = true;
+                    return out;
+                }
+                out.hits.push(GrepHit {
+                    path: path.clone(),
+                    line_no: idx as u32 + 1,
+                    line: line.trim_end().to_string(),
+                    modified,
+                });
+                in_file += 1;
+                if in_file >= max_per_file {
+                    // One file monopolising the budget would hide every other
+                    // file that matches, which is the answer the caller wants.
+                    out.truncated = true;
+                    break;
+                }
+            }
         }
         out
     }
@@ -616,6 +1034,14 @@ impl VfsStore {
         })
     }
 
+    /// `true` when `key` is under `prefix`. Plain string-prefix semantics, as
+    /// the search tools' `prefix` parameter documents — so `src/` and `src`
+    /// and even the partial `src/ma` all select `src/main.rs`. An empty
+    /// prefix matches everything.
+    fn matches_prefix(key: &str, prefix: &str) -> bool {
+        prefix.is_empty() || key.starts_with(prefix)
+    }
+
     /// Canonical overlay key for a caller-supplied path. See the module docs.
     pub fn normalize(path: &str) -> String {
         let path = path.trim_start_matches('/');
@@ -637,6 +1063,15 @@ impl VfsStore {
     }
 }
 
+/// Whether `segment` has the shape of a Windows 8.3 short name's tilde tail —
+/// a `~` followed by a digit (`SECRET~1`, `PROGRA~2.TXT`).
+fn is_short_name(segment: &str) -> bool {
+    segment
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0] == b'~' && w[1].is_ascii_digit())
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -646,6 +1081,8 @@ mod tests {
     use std::path::Path;
 
     use tempfile::TempDir;
+
+    use crate::grants::Grants;
 
     fn store_with_tree() -> (TempDir, VfsStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -670,6 +1107,211 @@ mod tests {
             .into_iter()
             .map(|e| e.path)
             .collect()
+    }
+
+    // ── direct mode ──────────────────────────────────────────────────────────
+
+    fn granted() -> DiskWriteGrant {
+        Grants::ALL.disk_write().unwrap()
+    }
+
+    /// **A direct write is a file on disk**, created with its directories, and
+    /// every read — this store's and the filesystem's — sees it.
+    #[test]
+    fn a_direct_write_lands_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = VfsStore::direct(dir.path(), granted());
+        assert!(s.is_direct());
+
+        assert!(
+            s.write("docs/new/note.md", "hello\n".into()).unwrap(),
+            "created"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("docs/new/note.md")).unwrap(),
+            "hello\n"
+        );
+        assert_eq!(
+            s.read("docs/new/note.md").unwrap().as_deref(),
+            Some("hello\n")
+        );
+        assert_eq!(s.total_bytes(), 0, "nothing is held in memory");
+
+        // Overwriting is not a creation, and replaces the content.
+        assert!(!s
+            .write("/workspace/docs/new/note.md", "bye\n".into())
+            .unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("docs/new/note.md")).unwrap(),
+            "bye\n"
+        );
+        // No temporary file is left beside it.
+        let names: Vec<String> = std::fs::read_dir(dir.path().join("docs/new"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["note.md"]);
+    }
+
+    /// A direct delete removes the file from disk; a missing one reports false.
+    #[test]
+    fn a_direct_delete_removes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "gone.txt", "x");
+        let s = VfsStore::direct(dir.path(), granted());
+        assert!(s.delete("gone.txt"));
+        assert!(!dir.path().join("gone.txt").exists());
+        assert!(!s.delete("gone.txt"), "nothing left to delete");
+    }
+
+    /// **The guards hold on disk.** A protected path is refused and left
+    /// untouched, and `..` cannot climb out of the workspace — normalisation
+    /// pins it to the root, so the write lands inside it.
+    #[test]
+    fn a_direct_store_cannot_touch_secrets_or_leave_the_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("ws");
+        put(&root, "secrets/tools.yaml", "key: real\n");
+        let s = VfsStore::direct(&root, granted());
+
+        assert!(matches!(
+            s.write("secrets/tools.yaml", "key: planted\n".into()),
+            Err(VfsError::Forbidden(_))
+        ));
+        assert!(!s.delete("secrets/tools.yaml"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("secrets/tools.yaml")).unwrap(),
+            "key: real\n"
+        );
+
+        s.write("../../escaped.txt", "x".into()).unwrap();
+        assert!(!outer.path().join("escaped.txt").exists());
+        assert!(root.join("escaped.txt").exists());
+    }
+
+    /// **A host path is not a workspace path.** An absolute path to a file
+    /// outside the workspace — on Windows a drive-prefixed one, which a join
+    /// would have taken in place of the root — reads nothing and writes nothing
+    /// there, and neither does a drive-relative path or an alternate stream.
+    #[test]
+    fn a_host_path_cannot_reach_outside_the_workspace() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        put(outer.path(), "outside.txt", "host secret\n");
+        let outside = outer.path().join("outside.txt");
+        let planted = outer.path().join("planted.txt");
+
+        let overlay = VfsStore::with_workspace(&root);
+        assert_eq!(
+            overlay.read(&outside.to_string_lossy()).unwrap(),
+            None,
+            "an absolute host path reads nothing"
+        );
+        assert!(listed(&overlay, &outer.path().to_string_lossy()).is_empty());
+
+        let direct = VfsStore::direct(&root, granted());
+        assert_eq!(direct.read(&outside.to_string_lossy()).unwrap(), None);
+        let _ = direct.write(&planted.to_string_lossy(), "x".into());
+        assert!(!planted.exists(), "a direct write left the workspace");
+        for path in [
+            "C:x.txt",
+            "C:/x.txt",
+            r"\\?\C:\x.txt",
+            "notes.txt:hidden",
+            "SECRET~1/tools.yaml",
+            "docs~2/x.md",
+        ] {
+            assert!(
+                matches!(direct.write(path, "x".into()), Err(VfsError::Unwritable(_))),
+                "{path:?} was written"
+            );
+        }
+    }
+
+    /// **Another spelling of `secrets/` is still `secrets/`.** Windows opens a
+    /// name case-insensitively and drops trailing dots and spaces, so each of
+    /// these reaches the protected directory there and is refused everywhere.
+    #[test]
+    fn every_spelling_of_the_protected_directory_is_protected() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("ws");
+        put(&root, "secrets/tools.yaml", "key: real\n");
+        let s = VfsStore::direct(&root, granted());
+        for path in [
+            "Secrets/tools.yaml",
+            "SECRETS/tools.yaml",
+            "secrets./tools.yaml",
+            "secrets /tools.yaml",
+        ] {
+            assert!(
+                VfsStore::is_protected(&VfsStore::normalize(path)),
+                "{path:?}"
+            );
+            assert!(s.write(path, "key: planted\n".into()).is_err(), "{path:?}");
+            assert!(
+                !matches!(s.read(path), Ok(Some(_))),
+                "{path:?} read the protected file"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("secrets/tools.yaml")).unwrap(),
+            "key: real\n"
+        );
+        assert!(!VfsStore::is_protected("docs/secretsauce.md"));
+    }
+
+    /// **A listing shows only files a read can open.** `notes~2.md` has the
+    /// shape of a Windows short name, so reads refuse it — and the listing,
+    /// the path search and grep leave it out rather than show a file that
+    /// cannot be read.
+    #[test]
+    fn a_file_the_store_cannot_open_is_not_listed() {
+        let (dir, store) = store_with_tree();
+        put(dir.path(), "notes~2.md", "tilde\n");
+        assert_eq!(store.read("notes~2.md").unwrap(), None);
+        assert!(!listed(&store, "").contains(&"notes~2.md".to_string()));
+        assert!(!store.paths("").contains(&"notes~2.md".to_string()));
+        assert!(store.paths("").contains(&"src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn a_short_name_is_a_tilde_and_a_digit() {
+        assert!(is_short_name("SECRET~1"));
+        assert!(is_short_name("PROGRA~2.TXT"));
+        assert!(!is_short_name("notes~"));
+        assert!(!is_short_name("~draft.md"));
+        assert!(!is_short_name("plain.rs"));
+    }
+
+    /// Writing where a directory stands is an error the model can read, not a
+    /// silent success.
+    #[test]
+    fn a_direct_write_over_a_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "src/main.rs", "fn main() {}\n");
+        let s = VfsStore::direct(dir.path(), granted());
+        assert!(matches!(
+            s.write("src", "x".into()),
+            Err(VfsError::Unwritable(_))
+        ));
+    }
+
+    /// The overlay, by contrast, never touches the disk — the property Mutable
+    /// is the explicit exception to.
+    #[test]
+    fn an_overlay_write_never_reaches_disk() {
+        let (dir, s) = store_with_tree();
+        assert!(!s.is_direct());
+        s.write("new.txt", "x".into()).unwrap();
+        s.write("README.md", "changed".into()).unwrap();
+        assert!(s.delete("src/main.rs"));
+        assert!(!dir.path().join("new.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("README.md")).unwrap(),
+            "# project\n"
+        );
+        assert!(dir.path().join("src/main.rs").exists());
     }
 
     // ── normalize ────────────────────────────────────────────────────────────

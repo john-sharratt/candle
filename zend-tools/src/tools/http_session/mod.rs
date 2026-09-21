@@ -40,7 +40,7 @@
 //! | `session_limit_exceeded` | 5-session-per-user cap reached |
 //! | `credential_not_found` | Named credential not in store |
 
-use crate::ToolError;
+use crate::{NotPermitted, ToolError};
 use thiserror::Error;
 
 pub mod close;
@@ -71,6 +71,8 @@ pub enum HttpSessionError {
     SessionLimitExceeded,
     #[error("credential not found: {0}")]
     CredentialNotFound(String),
+    #[error(transparent)]
+    NotPermitted(#[from] NotPermitted),
 }
 
 impl ToolError for HttpSessionError {
@@ -84,6 +86,7 @@ impl ToolError for HttpSessionError {
             HttpSessionError::InvalidCredentialType(_) => "invalid_credential_type",
             HttpSessionError::SessionLimitExceeded => "session_limit_exceeded",
             HttpSessionError::CredentialNotFound(_) => "credential_not_found",
+            HttpSessionError::NotPermitted(_) => NotPermitted::CODE,
         }
     }
 }

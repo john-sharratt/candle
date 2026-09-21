@@ -22,10 +22,9 @@ use super::linear::shared_int8_pair;
 use std::sync::Arc;
 
 use super::paged::{
-    build_rope_table, paged_latent_decode_raw, CorpusCache, LatentWorkspace, HEAD_DIM, NOPE_BANDS,
-    NOPE_DIM, ROPE_DIM,
+    paged_latent_decode_raw, CorpusCache, LatentWorkspace, HEAD_DIM, NOPE_BANDS, NOPE_DIM, ROPE_DIM,
 };
-use super::rope::{yarn_freqs, RotaryCache};
+use super::rope::RotaryCache;
 
 /// Recall shortlist width for the two-stage selection: 2× the Indexer's
 /// top-k, capped at the device argsort's 1024-column rescore limit.
@@ -39,8 +38,9 @@ pub fn shortlist_m(top_k: usize) -> usize {
 pub struct KernelLayerStatic {
     /// Per-head sink logits `[n_heads]` f32, device.
     sinks: Tensor,
-    /// Factored RoPE cos/sin table `[ROPE_TAB_LEN]` f32, device — built from
-    /// the layer-kind YaRN frequencies by `build_rope_table` at load.
+    /// Factored RoPE cos/sin table `[ROPE_TAB_LEN]` f32, device — the layer
+    /// kind's, shared with every layer of that kind
+    /// ([`LatentRopeTables`](super::rope_tables::LatentRopeTables)).
     rope_tab: Tensor,
     /// Split-KV partial workspace, ONE per model shared by every layer (the
     /// wave thread launches sequentially on one stream). Host-immutable —
@@ -99,34 +99,15 @@ impl KernelLayerStatic {
         )
     }
 
-    // `theta`/`original_seq_len`/`rope_factor`/`beta_fast`/`beta_slow` are the
-    // five YaRN knobs, read straight off the checkpoint config; grouping them
-    // would add a type that exists only to satisfy an argument count.
-    #[allow(clippy::too_many_arguments)]
+    /// `rope_tab` is the layer kind's shared table
+    /// ([`LatentRopeTables`](super::rope_tables::LatentRopeTables)).
     pub fn new(
         a: &Attention,
-        theta: f64,
-        original_seq_len: usize,
-        rope_factor: f64,
-        beta_fast: f64,
-        beta_slow: f64,
+        rope_tab: Tensor,
         ws: Arc<LatentWorkspace>,
         device: &candle::Device,
     ) -> Result<Self> {
         let sinks = a.attn_sink().to_dtype(DType::F32)?.to_device(device)?;
-        let freqs_v: Vec<f32> = yarn_freqs(
-            ROPE_DIM,
-            theta,
-            original_seq_len,
-            rope_factor,
-            beta_fast,
-            beta_slow,
-        )
-        .into_iter()
-        .map(|f| f as f32)
-        .collect();
-        let freqs = Tensor::from_vec(freqs_v, ROPE_DIM / 2, device)?;
-        let rope_tab = build_rope_table(&freqs)?;
         Ok(Self {
             sinks,
             rope_tab,
@@ -223,31 +204,17 @@ impl KernelLayerSeqState {
 }
 
 impl KernelAttnLayer {
-    // Forwards `KernelLayerStatic::new`'s YaRN knobs plus the indexer width —
-    // see the note there.
-    #[allow(clippy::too_many_arguments)]
+    /// `rope_tab` is the layer kind's shared table
+    /// ([`LatentRopeTables`](super::rope_tables::LatentRopeTables)).
     pub fn new(
         a: &Attention,
-        theta: f64,
-        original_seq_len: usize,
-        rope_factor: f64,
-        beta_fast: f64,
-        beta_slow: f64,
+        rope_tab: Tensor,
         index_head_dim: usize,
         ws: Arc<LatentWorkspace>,
         device: &candle::Device,
     ) -> Result<Self> {
         Ok(Self {
-            st: KernelLayerStatic::new(
-                a,
-                theta,
-                original_seq_len,
-                rope_factor,
-                beta_fast,
-                beta_slow,
-                ws,
-                device,
-            )?,
+            st: KernelLayerStatic::new(a, rope_tab, ws, device)?,
             seq: KernelLayerSeqState::new(a, index_head_dim, device)?,
         })
     }

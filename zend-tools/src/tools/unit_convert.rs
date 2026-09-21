@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext, ToolError};
+use crate::{RegisteredTool, Replay, Tool, ToolContext, ToolError};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct Request {
@@ -192,6 +192,11 @@ impl Tool for UnitConvertTool {
     type Request = Request;
     type Response = Response;
     type Error = UnitError;
+
+    /// Pure conversion over a static table.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(_ctx: &ToolContext, req: Request) -> Result<Response, UnitError> {
         let (from_dim, from_factor, from_offset) =

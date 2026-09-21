@@ -1,7 +1,5 @@
 //! udp_session_open tool.
 
-use std::net::UdpSocket;
-
 use chrono::Utc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -9,6 +7,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::UdpError;
+use crate::net;
 use crate::state::sessions::{SessionMeta, UdpEntry};
 use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
@@ -51,7 +50,8 @@ impl Tool for UdpSessionOpen {
 
     fn run(ctx: &ToolContext, req: OpenRequest) -> Result<OpenResponse, UdpError> {
         let bind = req.bind_addr.as_deref().unwrap_or("0.0.0.0:0");
-        let socket = UdpSocket::bind(bind).map_err(|e| UdpError::BindFailed(e.to_string()))?;
+        let socket =
+            net::udp_bind(ctx.grants(), bind).map_err(|e| UdpError::BindFailed(e.to_string()))?;
 
         let default_peer = req.default_peer.clone().unwrap_or_default();
         if !default_peer.is_empty() {

@@ -1,7 +1,6 @@
 mod harness;
 
 use serde_json::json;
-use zend_tools::ToolContext;
 
 #[test]
 fn http_session_list_empty() {
@@ -20,7 +19,7 @@ fn http_session_request_no_session() {
 
 #[test]
 fn http_session_open_returns_session_id() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "http_session_open",
         json!({"base_url": "https://example.com"}),
@@ -32,7 +31,7 @@ fn http_session_open_returns_session_id() {
 
 #[test]
 fn http_session_open_list_close() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let open = harness::expect_success(harness::invoke_with_ctx(
         "http_session_open",
         json!({"base_url": "https://api.example.com"}),
@@ -82,7 +81,7 @@ fn http_session_open_credential_not_found() {
 
 #[test]
 fn http_session_open_no_base_url() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "http_session_open",
         json!({}),

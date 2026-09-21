@@ -41,10 +41,10 @@ use std::time::Instant;
 
 use candle::{Device, Result, Tensor};
 use candle_transformers::models::delta_net::mix::SeqSpan;
-use candle_transformers::models::qwen35::attention::RopeTables;
 use candle_transformers::models::qwen4exp::config::IndexerConfig;
 use candle_transformers::models::qwen4exp::indexer::{select_layer, IndexCache};
 use candle_transformers::models::qwen4exp::qsa::IndexerWeights;
+use candle_transformers::models::rope_schedule::{plain_inv_freq, FactoredRope};
 
 /// The released geometry (`the_published_geometry_parses`): 4 indexer heads of
 /// 128, a 2048-position budget, hidden 2560, ratio 4 — so the selection is the
@@ -121,7 +121,7 @@ impl Wave {
         depth: usize,
         rows_per_seq: usize,
         w: &IndexerWeights,
-        rope: &RopeTables,
+        rope: &FactoredRope,
         dev: &Device,
     ) -> Result<Self> {
         let mut caches: HashMap<usize, Vec<IndexCache>> = HashMap::new();
@@ -179,7 +179,7 @@ impl Wave {
     }
 
     /// One layer's selection — exactly the call the wave engine makes.
-    fn run(&mut self, w: &IndexerWeights, rope: &RopeTables, dev: &Device) -> Result<bool> {
+    fn run(&mut self, w: &IndexerWeights, rope: &FactoredRope, dev: &Device) -> Result<bool> {
         let counter = AtomicU64::new(0);
         let sel = select_layer(
             0,
@@ -201,9 +201,10 @@ impl Wave {
     }
 }
 
-/// `rope` must span every block position either regime will rotate at.
-fn rope_for(depth: usize, dev: &Device) -> Result<RopeTables> {
-    RopeTables::new(ROPE_DIM, ROPE_THETA, (depth + 4096).max(4096), dev)
+/// The indexer's factored table — it covers every position below its reach, so
+/// no depth sizes it.
+fn rope_for(dev: &Device) -> Result<FactoredRope> {
+    FactoredRope::new(&plain_inv_freq(ROPE_DIM, ROPE_THETA), dev)
 }
 
 /// Time `iters` steps, each one wave's worth of selection for one layer.
@@ -213,7 +214,7 @@ fn rope_for(depth: usize, dev: &Device) -> Result<RopeTables> {
 fn time_steps(
     wave: &mut Wave,
     w: &IndexerWeights,
-    rope: &RopeTables,
+    rope: &FactoredRope,
     dev: &Device,
     warm: usize,
     iters: usize,
@@ -254,7 +255,7 @@ fn bench_qsa_select_cost_vs_width() -> Result<()> {
     let _gpu = gpu_serial();
     let dev = Device::new_cuda(0)?;
     let w = weights(&dev)?;
-    let rope = rope_for(4096, &dev)?;
+    let rope = rope_for(&dev)?;
 
     println!("\n  QSA selection — SHORT context (identity regime), cost vs wave width");
     println!(
@@ -297,7 +298,7 @@ fn bench_qsa_select_cost_vs_depth() -> Result<()> {
     );
     let mut base = 0f64;
     for (i, &depth) in [4096usize, 8192, 32768, 131_072].iter().enumerate() {
-        let rope = rope_for(depth, &dev)?;
+        let rope = rope_for(&dev)?;
         let mut wave = Wave::build(1, depth, 5, &w, &rope, &dev)?;
         let (ms, engaged) = time_steps(&mut wave, &w, &rope, &dev, 2, 10)?;
         if i == 0 {
@@ -321,7 +322,7 @@ fn bench_qsa_select_deep_and_wide() -> Result<()> {
     let dev = Device::new_cuda(0)?;
     let w = weights(&dev)?;
     let depth = 8192;
-    let rope = rope_for(depth, &dev)?;
+    let rope = rope_for(&dev)?;
 
     println!("\n  QSA selection — engaged, cost vs wave width at depth {depth}");
     println!(

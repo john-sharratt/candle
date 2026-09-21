@@ -1099,6 +1099,13 @@ fn run_pass(
         );
         // The whole batch's GPU work is suspect — don't install any of it.
         installs.clear();
+    } else {
+        // This runs on a fixed cadence regardless of load (see the pass-timing
+        // log below, which fires even with nothing to migrate), so it is the
+        // daemon's most reliable "the device is still alive" heartbeat —
+        // closing any out-of-memory streak `gpu_poison` is tracking before a
+        // resolved episode gets mistaken for a still-open one much later.
+        candle::gpu_poison::note_device_ok();
     }
     let sync_post_ms = t_sync_post.elapsed().as_millis() as u64;
     // Migrate GPU work has retired (the sync above) — release the guard so the

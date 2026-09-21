@@ -2,6 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use candle_conversation::models::Model;
+use web::auth::Roles;
+
+use crate::access::Gateways;
 
 /// Runtime configuration for the zend daemon.
 #[derive(Clone, Debug, Default)]
@@ -73,6 +76,25 @@ pub struct DaemonConfig {
     /// judged against. Refused at load for a model whose attention does not
     /// select, and for a budget the selection kernel cannot run.
     pub qsa_selection_budget: Option<usize>,
+    /// `--summarize`: let conversations launch background tree summaries.
+    /// Off by default — every conversation the daemon opens is built from a
+    /// config with every summarization trigger disabled
+    /// (`ConversationTreeConfig::disable_summarization`).
+    ///
+    /// Off because a summary is not free to the conversation it summarizes: it
+    /// re-reads its whole window from scratch as one more prefill on the same
+    /// scheduler, and it runs ahead of the live turn. Measured on a tool-heavy
+    /// conversation, the eighth turn launched a 23.8k-token summary prefill and
+    /// the user's next tool round waited behind it — 18 s on one conversation,
+    /// most of a minute on another.
+    pub summarize: bool,
+    /// Who is an admin — the table [`crate::access`] resolves a caller's tools
+    /// modes from. Empty (nobody) unless the daemon supplies one, so a harness
+    /// that builds a default config grants no admin mode over HTTP.
+    pub roles: Roles,
+    /// The peers whose identity headers are believed — see
+    /// [`crate::access::Gateways`]. Loopback only unless the daemon names more.
+    pub gateways: Gateways,
 }
 
 /// Which model a daemon runs.

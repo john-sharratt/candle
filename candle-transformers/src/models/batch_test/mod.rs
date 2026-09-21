@@ -13,7 +13,18 @@
 #[cfg(test)]
 pub mod long_context;
 pub mod ruler_gen;
+/// The StoryRewrite comparison form: whitespace collapsed, gendered words
+/// neutralised at any word boundary.
+#[cfg(test)]
+pub mod story_normalize;
 #[cfg(test)]
 pub mod test_helpers;
 #[cfg(test)]
 pub mod utils;
+/// The YaRN gates run on the models whose rungs they back.
+#[cfg(test)]
+mod yarn_gate_models;
+/// The progressive-YaRN gates: a needle read back past the trained window,
+/// against the model on rung-1 extrapolation.
+#[cfg(test)]
+pub mod yarn_gates;

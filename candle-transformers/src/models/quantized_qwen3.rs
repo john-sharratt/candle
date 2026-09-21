@@ -15,6 +15,7 @@ use super::dense_span;
 use super::kv_cache_utils::{new_kv_caches, KvCaches, SequenceContext};
 use super::quantized_matmul::QMatMul;
 use super::quantized_mlp::QuantizedMlp;
+use super::rope_schedule::DeclaredScaling;
 use super::rope_tables::CisPrecomputations;
 use crate::models::batched_layer::WaveRef;
 use crate::models::wave_buffers::wave_root;
@@ -41,35 +42,6 @@ pub const MAX_ROPE_SEQ_LEN: usize = 0;
 pub const ROPE_EXTEND_CHUNK: usize = 1024;
 
 type SharedCis = Arc<RwLock<CisPrecomputations>>;
-
-/// Native context length for Qwen3 models (per model cards).
-///
-/// If a GGUF advertises a larger `context_length` but does not include an explicit
-/// RoPE scaling factor, we infer a single-factor scaling as `context_length / native`.
-const QWEN3_NATIVE_CONTEXT_LEN: usize = 32_768;
-
-fn infer_rope_scaling_factor(context_length: usize, explicit: Option<f32>) -> Option<f32> {
-    if let Some(f) = explicit {
-        return Some(f);
-    }
-    if context_length > QWEN3_NATIVE_CONTEXT_LEN {
-        let f = context_length as f32 / QWEN3_NATIVE_CONTEXT_LEN as f32;
-        if f.is_finite() && f > 0.0 {
-            return Some(f);
-        }
-    }
-    None
-}
-
-fn qwen_inv_freq(head_dim: usize, rope_theta: f32, rope_scaling_factor: Option<f32>) -> Vec<f32> {
-    // Apply a single RoPE scaling factor the same way as common GGUF exporters:
-    // inv_freq = 1 / (factor * theta^(i/d))  (equivalently inv_freq /= factor).
-    let factor = rope_scaling_factor.unwrap_or(1.0);
-    (0..head_dim)
-        .step_by(2)
-        .map(|i| 1f32 / (factor * rope_theta.powf(i as f32 / head_dim as f32)))
-        .collect()
-}
 
 struct Gguf<R: Read + Seek> {
     ct: gguf_file::Content,
@@ -107,15 +79,21 @@ struct RotaryEmbedding {
 }
 
 impl RotaryEmbedding {
+    /// The file's own RoPE: only a scaling it declares, never one inferred —
+    /// a `context_length` beyond the trained window is not a factor. Qwen3's
+    /// released files declare 40,960 while training at 32,768, and a factor
+    /// inferred from that ratio compressed every position 1.25× at every
+    /// length. Qwen3 extends by YaRN, per slot, from its preset's schedule
+    /// (`docs/progressive_yarn.md` §3.1).
     fn new(
         _dtype: DType,
         head_dim: usize,
         _max_position_embeddings: usize,
         rope_theta: f64,
-        rope_scaling_factor: Option<f32>,
+        declared: DeclaredScaling,
         dev: &Device,
     ) -> Result<Self> {
-        let inv_freq = qwen_inv_freq(head_dim, rope_theta as f32, rope_scaling_factor);
+        let inv_freq = declared.inv_freq(head_dim, rope_theta as f32)?;
         Ok(Self {
             cis: Arc::new(RwLock::new(CisPrecomputations::new_growable_with_inv_freq(
                 inv_freq,
@@ -697,14 +675,7 @@ impl ModelWeights {
             .or_else(|| md_opt_f32("rope.theta"))
             .unwrap_or(1_000_000f32) as f64;
 
-        let rope_scaling_factor = md_opt_f32("qwen3.rope.scaling.factor")
-            .or_else(|| md_opt_f32("qwen3.rope.scale_factor"))
-            .or_else(|| md_opt_f32("rope.scaling.factor"))
-            .or_else(|| md_opt_f32("rope.scale_factor"))
-            .filter(|f| *f > 0.0);
-
-        let rope_scaling_factor =
-            infer_rope_scaling_factor(max_position_embeddings, rope_scaling_factor);
+        let declared = DeclaredScaling::from_gguf(gg.metadata(), "qwen3")?;
 
         // Extract model's native dtype from metadata
         let dtype = match gg.metadata().get("general.dtype") {
@@ -726,7 +697,7 @@ impl ModelWeights {
             head_dim,
             max_position_embeddings,
             rope_freq_base,
-            rope_scaling_factor,
+            declared,
             device,
         )?);
 
@@ -879,14 +850,7 @@ impl ModelWeights {
             .or_else(|| md_opt_f32("rope.theta"))
             .unwrap_or(1_000_000f32) as f64;
 
-        let rope_scaling_factor = md_opt_f32("qwen3.rope.scaling.factor")
-            .or_else(|| md_opt_f32("qwen3.rope.scale_factor"))
-            .or_else(|| md_opt_f32("rope.scaling.factor"))
-            .or_else(|| md_opt_f32("rope.scale_factor"))
-            .filter(|f| *f > 0.0);
-
-        let rope_scaling_factor =
-            infer_rope_scaling_factor(max_position_embeddings, rope_scaling_factor);
+        let declared = DeclaredScaling::from_gguf(&ct.metadata, "qwen3")?;
 
         // Extract model's native dtype from metadata
         let dtype = match ct.metadata.get("general.dtype") {
@@ -926,7 +890,7 @@ impl ModelWeights {
             head_dim,
             max_position_embeddings,
             rope_freq_base,
-            rope_scaling_factor,
+            declared,
             device,
         )?);
 
@@ -1151,8 +1115,8 @@ impl ModelWeights {
     /// Returns the RoPE inverse frequency vector used by this model.
     ///
     /// This includes any RoPE scaling (e.g., for extended context) that was
-    /// configured when the model was loaded. Required when wrapping the model
-    /// in `BatchedInference` to ensure the RoPE tables match.
+    /// configured when the model was loaded — the file-stated frequencies a
+    /// `RopeSchedule` is built over.
     pub fn rope_inv_freq(&self) -> Option<Vec<f32>> {
         self.layers.first().and_then(|l| {
             l.self_attn
@@ -1170,8 +1134,26 @@ mod tests {
     use super::*;
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
     use crate::models::batched_inference::InferenceMode;
+    use crate::models::batched_model::BatchedInference;
     use crate::models::dialect::Dialect;
+    use crate::models::rope_schedule::RopePreset;
     use candle::quantized::gguf_file;
+
+    /// A Qwen3 checkpoint wrapped for batched inference on the schedule its
+    /// presets run: Qwen's progressive YaRN over the file's plain θ = 10⁶
+    /// frequencies, trained to 32K, declared to 40,960.
+    fn batched(
+        model: ModelWeights,
+        max_seq_len: usize,
+        device: &Device,
+    ) -> Result<BatchedInference<ModelWeights>> {
+        let inv = model
+            .rope_inv_freq()
+            .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
+        let schedule =
+            RopePreset::qwen3().gqa_schedule(inv, Some(1e6), DeclaredScaling::None, 40_960)?;
+        BatchedInference::new_with_schedule(model, &schedule, max_seq_len, device)
+    }
 
     #[test]
     #[ignore] // Run manually with: cargo test benchmark_large_model_sequential --release --features cuda -- --ignored --nocapture
@@ -1540,10 +1522,6 @@ mod tests {
             },
         ];
 
-        // Create a logits processor for sampling
-        // Use BatchedInference wrapper type
-        use crate::models::batched_model::BatchedInference;
-
         // Inference numeric mode, selected by INT8MODE (default Performance; "off"/"prec").
         let int8mode = match std::env::var("INT8MODE").ok().as_deref() {
             Some("off") => Int8Mode::Off,
@@ -1552,14 +1530,10 @@ mod tests {
         };
         println!("int8 mode = {int8mode:?}\n");
 
-        // Load the model wrapped in BatchedInference with proper inv_freq
         let load_model = || {
             let model = ModelWeights::from_gguf_by_path_with_int8(&model_path, &device, int8mode)?;
             println!("✓ Model loaded\n");
-            let inv_freq = model
-                .rope_inv_freq()
-                .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-            BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+            batched(model, 4096, &device)
         };
 
         params.with_int8mode(int8mode).run(configs, load_model)?;
@@ -1580,7 +1554,6 @@ mod tests {
                 -- --ignored --nocapture --test-threads=1"]
     fn long_context_8b() -> Result<()> {
         use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
-        use crate::models::batched_model::BatchedInference;
 
         let api = crate::models::batch_test::test_helpers::api()
             .map_err(|e| candle::Error::Msg(format!("HF API: {e}")))?;
@@ -1621,10 +1594,7 @@ mod tests {
             || {
                 let model =
                     ModelWeights::from_gguf_by_path_with_int8(&model_path, &device, int8mode)?;
-                let inv_freq = model
-                    .rope_inv_freq()
-                    .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-                BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+                batched(model, 4096, &device)
             },
         )
     }
@@ -1638,11 +1608,6 @@ mod tests {
         use crate::models::batch_test::test_helpers::{
             download_hf_gguf, load_hf_tokenizer, open_gguf,
         };
-        use crate::models::batched_inference::InferenceMode;
-        use crate::models::batched_model::BatchedInference;
-
-        #[cfg(not(feature = "cuda"))]
-        println!("⚠  No CUDA — performance will be poor");
 
         // Change GGUF_VARIANT to swap model weight quantisation (Q4_0 < Q4_K_M by ~240 MB).
         const GGUF_VARIANT: &str = "Q6_K"; // options: Q4_0, Q4_K_M, Q5_K_M, Q6_K, Q8_0
@@ -1656,10 +1621,7 @@ mod tests {
         let (content, mut file) = open_gguf(&model_path)?;
         let weights = ModelWeights::from_gguf(content, &mut file, &device)?;
         println!("✓ Model loaded");
-        let inv_freq = weights
-            .rope_inv_freq()
-            .ok_or_else(|| candle::Error::Msg("no inv_freq".into()))?;
-        let model = BatchedInference::new_with_inv_freq(weights, inv_freq, 98_304, &device)?;
+        let model = batched(weights, 98_304, &device)?;
 
         // Phase A: 4K context, high concurrency (budget = 24×4096 = 98304).
         // Target batches: Q8→24, C5→~64, C8→~115, C9/C10→higher.

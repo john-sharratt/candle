@@ -7,9 +7,10 @@
 //! leading/trailing comma is ever produced.
 //!
 //! Value handling by type:
-//! - `string` — a free-text span closed at the unescaped closing quote.
+//! - `string` — a free-text span (`Terminator::JsonStringValue`) that includes
+//!   its own opening quote and ends at the unescaped closing one.
 //! - `boolean` — a `true`/`false` branch.
-//! - string `enum` — a branch over the allowed strings.
+//! - string `enum` — a branch over the allowed strings, each arm quoted.
 //! - `object` with `properties` — written by the grammar: `{`, the keys and
 //!   separators under the same required/optional rules as the arguments
 //!   themselves, then `}`. The model decodes only the field values.
@@ -25,15 +26,21 @@
 //!   grammar writes the structure the model got wrong. This guarantees valid
 //!   JSON structure without strictly enforcing the scalar type.
 //!
-//! **A key stops where the model's own token begins.** A value with a lead-in
-//! (a string's opening `"`) is keyed through it — `"path": "` ends on the ` "`
-//! token the model writes there anyway, as are a guided array's ` [` and a
-//! guided object's ` {`. A value with none is keyed up to `":`
-//! and no further, so the model writes ` [`, ` ["`, ` 5` or ` true` as the one
-//! token it was trained on. A key ending in a bare space leaves the model
-//! mid-token: grammar-written calls came out `"commands":  [` with the space
-//! doubled, and on one Cline turn the first token for the value was a space
-//! and a closer, which ended it empty — `{"commands":  }}`, not a call.
+//! **A key stops where the model's own token begins.** A guided array or
+//! object is keyed through its lead-in — ` [` and ` {` are the grammar's, since
+//! it writes the container — and every other value is keyed up to `":` and no
+//! further, so the model writes ` "`, ` ""`, ` [`, ` ["`, ` 5` or ` true` as the
+//! one token it was trained on.
+//!
+//! A string is keyed only to its colon because which token opens it depends on
+//! the value: Qwen spells an empty string ` ""` as one token and a non-empty one
+//! ` "` then content, so a grammar that prefilled ` "` would choose "non-empty"
+//! before the model chose anything — asked for an empty `prefix`, the model
+//! writes `}}` and the string swallows the call's own close. A key ending in a
+//! bare space fails the same way from the other side: grammar-written calls
+//! came out `"commands":  [` with the space doubled, and on one Cline turn the
+//! first token for the value was a space and a closer — `{"commands":  }}`, not
+//! a call.
 
 use std::collections::HashMap;
 
@@ -286,6 +293,17 @@ pub struct ToolCallEnvelope {
     /// trigger to fire, so the grammar has to offer the marker as the arm that
     /// means "act again".
     pub marker: String,
+    /// What the chat template writes between one call's `close` and the next
+    /// call's `marker`, when a message carries several — `"\n"` for both Qwen
+    /// shapes, whose templates emit a newline before every call after the
+    /// first.
+    ///
+    /// [`compile_tool_call_loop`]'s "act again" arm is this followed by the
+    /// marker. The marker glued straight onto the previous close would mask
+    /// the one token a model trained on the template writes to continue, and
+    /// offered only that or the turn terminator, the model ends the turn — a
+    /// grammar permitting four calls would produce one.
+    pub between_calls: String,
 }
 
 impl ToolCallEnvelope {
@@ -300,6 +318,7 @@ impl ToolCallEnvelope {
             args_open: ", \"arguments\": {".to_string(),
             close: "}}\n</tool_call>".to_string(),
             marker: "<tool_call>".to_string(),
+            between_calls: "\n".to_string(),
             name_close: "\"".to_string(),
             param_open: String::new(),
             param_name_close: String::new(),
@@ -340,6 +359,7 @@ impl ToolCallEnvelope {
             // call and the model is never required to produce one.
             close: "\n</function>\n</tool_call>".to_string(),
             marker: "<tool_call>".to_string(),
+            between_calls: "\n".to_string(),
             name_close: ">".to_string(),
             param_open: "\n<parameter=".to_string(),
             param_name_close: ">\n".to_string(),
@@ -471,6 +491,40 @@ impl ToolCallEnvelope {
             ..base
         }
     }
+
+    /// [`Self::for_assistant_turn`]'s sibling for a turn that may make **several**
+    /// calls ([`compile_tool_call_loop`]): the marker comes off the front for the
+    /// same reason, and the turn terminator stays **off** the close.
+    ///
+    /// That is the whole difference, and it is structural rather than stylistic.
+    /// A single-call tree ends the turn unconditionally, so its close may carry
+    /// the terminator. A loop must decide *after* each call whether to open
+    /// another or stop, so the terminator is the loop's other arm — baked into
+    /// `close` it would end the turn before that choice exists, and the tree
+    /// would be the single-call tree with extra nodes.
+    ///
+    /// [`Self::turn_close`] is the terminator to pass alongside it, so the two
+    /// halves of the split come from one place.
+    pub fn for_assistant_calls(d: &Dialect) -> Self {
+        let base = Self::for_dialect(d);
+        Self {
+            open: base
+                .open
+                .strip_prefix(&base.marker)
+                .unwrap_or(&base.open)
+                .to_string(),
+            ..base
+        }
+    }
+
+    /// The assistant-turn terminator, trimmed to end exactly ON the EOS — the
+    /// `close_turn` argument [`compile_tool_call_loop`] finishes a turn with.
+    /// Trimmed for the reason [`Self::for_assistant_turn`] records: a dialect's
+    /// `assistant_end` carries a trailing newline, and an EOS one slot from the
+    /// end is an EOS nothing sees.
+    pub fn turn_close(d: &Dialect) -> String {
+        d.assistant_end.trim_end().to_string()
+    }
 }
 
 /// One argument value as JSON: a number or boolean verbatim, anything else as a
@@ -489,6 +543,23 @@ fn json_scalar(v: &str) -> String {
 /// suppression, the in-call reprojection freeze at first-token promotion), so
 /// the label is a shared constant rather than a string literal in each place.
 pub const TOOL_CALL_TREE_LABEL: &str = "tool_call";
+
+/// How many tool calls one assistant turn may make.
+///
+/// **A turn that can only call once pays a full round-trip per call.** Reading
+/// four files it already knows it wants costs four reasoning blocks, four
+/// prefills of a growing context, four reprojections and four belief scans — and
+/// measured on a codebase tour, fifteen such rounds were the bulk of the wall
+/// clock while the calls themselves ran in milliseconds. Batching what the model
+/// already knows it needs collapses those round-trips into one.
+///
+/// Four is a starting point, not a tuned constant: it covers the common fan-out
+/// (list a directory, read the two or three files it names) without letting one
+/// turn commit to a long speculative run whose later calls are chosen before any
+/// result has come back. The ceiling is a grammar bound, not a target — a turn
+/// making one call remains perfectly ordinary, because the loop's other arm is
+/// always the turn terminator.
+pub const MAX_TOOL_CALLS_PER_TURN: usize = 4;
 
 /// Compile a tool catalog into a [`TreeSpec`].  Errors on an empty catalog or a
 /// name/enum collision the trie rejects.
@@ -677,10 +748,14 @@ pub fn compile_action_loop(
         });
 
         // What the *previous* level's close leads to: go again, or finish. The
-        // continuation arm carries the marker the model would have emitted to
-        // start another call, so choosing it is choosing to act again.
+        // continuation arm carries what the template writes between two calls
+        // and then the marker — exactly the text the model would have emitted
+        // to start another call — so choosing it is choosing to act again.
         after_call = b.spec.push(NodeSpec::Branch {
-            arms: vec![(env.marker.clone(), open), (close_turn.to_string(), end)],
+            arms: vec![
+                (format!("{}{}", env.between_calls, env.marker), open),
+                (close_turn.to_string(), end),
+            ],
         });
         if level == 0 {
             root_open = Some(open);
@@ -881,9 +956,36 @@ impl<'a> ToolTreeBuilder<'a> {
             });
             return Ok((String::new(), span));
         }
+        // **A plain string's opening quote is the model's.** The key stops at
+        // the colon, because which token opens a string depends on the value:
+        // Qwen writes an empty string as the single token ` ""` and a non-empty
+        // one as ` "` then content, so a prefilled ` "` has chosen "non-empty"
+        // before the model has chosen anything. See `Terminator::JsonStringValue`.
+        //
+        // A nullable string cannot be a choice between ` "` and ` null` for the
+        // same reason — the ` "` arm is that prefill — so it is a free JSON
+        // value instead, where ` ""`, ` "src"` and ` null` are each the model's
+        // own tokens and a skipped value is written `null`. That is the common
+        // case, not an edge: an `Option<String>` argument such as `file_list`'s
+        // `prefix` is nullable in its schema. An array element's quote stays
+        // the separator arm's (`, "`) — see [`Self::value_arms`].
+        if p.ty == ParamType::String && p.enum_values.is_none() {
+            if p.nullable {
+                return Ok((String::new(), self.free_value(next)));
+            }
+            let span = self.spec.push(NodeSpec::FreeText {
+                term: Terminator::JsonStringValue,
+                eos_ends: false,
+                limits: FreeTextLimits::json_string(),
+                close_token: None,
+                suppress_close: false,
+                next,
+            });
+            return Ok((String::new(), span));
+        }
         match self.value_arms(p, next)? {
-            // One way to begin — a string's `"`, an object's `{`: it is the
-            // lead-in, folded into the key (`"path": "`).
+            // One way to begin — an object's `{`, an array's `[`, a one-value
+            // enum: it is the lead-in, folded into the key (`"filter": {`).
             Some(mut arms) if arms.len() == 1 => Ok(arms.remove(0)),
             // A choice — `true`/`false`, an enum, a value or `null`. The key
             // ends at the colon, so each arm carries its space.
@@ -1608,7 +1710,7 @@ mod tests {
     }
 
     /// A closed set compiles to a choice, with `null` among the arms exactly
-    /// when the schema allows it.
+    /// when the schema allows it. A string is not a closed set.
     #[test]
     fn a_closed_set_compiles_to_a_choice() {
         let arms_for = |value: serde_json::Value| {
@@ -1633,10 +1735,10 @@ mod tests {
             [" \"x\"", " \"y\"", " null"]
         );
         assert_eq!(arms_for(json!({"enum": ["x", "y"]})), [" \"x\"", " \"y\""]);
-        assert_eq!(
-            arms_for(json!({"anyOf": [{"type": "string"}, {"type": "null"}]})),
-            [" \"", " null"]
-        );
+        // A nullable string is not a closed set: it is a free value, so the
+        // model's own ` ""` and ` null` tokens are both reachable and no arm
+        // prefills its opening quote.
+        assert!(arms_for(json!({"anyOf": [{"type": "string"}, {"type": "null"}]})).is_empty());
         // An enum value is written as JSON, escapes and all.
         assert_eq!(
             arms_for(json!({"enum": ["say \"x\"", "b"]})),

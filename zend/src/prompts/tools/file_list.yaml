@@ -26,7 +26,7 @@ questions:
 - what files can you see right now
 category: Files
 mandatory: true
-description: 'List one directory''s immediate contents, as visible to this session: the project''s working directory plus anything written or edited during the session, which shadows the file of the same path on disk. Omit `path` to list the project root; give a directory path to list inside it. A listing is one level deep — a subdirectory appears as its own entry (`dir: true`), never expanded, so list it in turn to go further. `path` must name a real directory; a file path does not resolve. Ignored paths (per .gitignore and friends) never appear, and hidden dotfiles are omitted the way `ls` omits them though they still read fine by exact path. Results are paged: the response''s `paging` reports the total and, when more remain, a `next_page` to pass back as `page`. Returns names and sizes, not file contents; a file entry carries `modified: true` when this session has changed it. Use file_read to get a file''s contents.'
+description: 'List one directory''s immediate contents, as visible to this session: the project''s working directory plus anything written or edited during the session, which shadows the file of the same path on disk. Omit `path` to list the project root; give a directory path to list inside it. A listing is one level deep — a subdirectory appears as its own entry (`dir: true`), never expanded, so list it in turn to go further. `path` must name a real directory; a file path does not resolve. Ignored paths (per .gitignore and friends) never appear, and hidden dotfiles are omitted the way `ls` omits them though they still read fine by exact path. Results are paged: the response''s `paging` reports the total and, when more remain, a `next_page` to pass back as `page`. Returns names and byte sizes, not file contents or line counts; a file entry carries `modified: true` when this session has changed it. Use file_read to get a file''s contents — read page 0 and its header reports the file''s length in pages, so there is no need to size a file before reading it. This tool ENUMERATES a directory you already know; to FIND a file whose directory you do not know, use file_search, and to find code by its contents use file_grep. Do not guess directory names here instead: an empty listing looks identical whether the directory is empty or the guess was wrong, so guessing never converges, while one file_search or file_grep covers the whole project at once.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
@@ -143,7 +143,7 @@ examples:
   <|projection|><think>
   Okay, the user wants to see the root directory of the project. Looking at the available tools, file_list is the one that lists directories — it enumerates the project's working directory plus anything written or edited during this<|projection|> session. The path parameter names which directory to list, and omitting it lists the project root, which is exactly what is being asked for.
 
-  So I call file_list with no path and get the file names, sizes,<|projection|> and subfolder entries directly at the top of the project — a subfolder comes back as its own entry, not expanded.
+  So I call file_list with no path and get the file names, byte sizes,<|projection|> and subfolder entries directly at the top of the project — a subfolder comes back as its own entry, not expanded.
   </think>
 
   <tool_call>

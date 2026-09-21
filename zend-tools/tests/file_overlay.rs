@@ -256,7 +256,10 @@ fn edit_copies_the_workspace_file_up_and_leaves_disk_untouched() {
 
     harness::expect_success(harness::invoke_with_ctx(
         "file_edit",
-        json!({"path": "src/main.rs", "old_str": "hi", "new_str": "hello"}),
+        json!({
+            "path": "src/main.rs",
+            "patch": "@@ -2 +2 @@\n-    println!(\"hi\");\n+    println!(\"hello\");\n"
+        }),
         &ctx,
     ));
 
@@ -275,13 +278,13 @@ fn edit_copies_the_workspace_file_up_and_leaves_disk_untouched() {
 }
 
 #[test]
-fn edit_of_a_workspace_file_is_ambiguous_when_old_str_repeats() {
+fn edit_of_a_workspace_file_is_ambiguous_when_the_hunk_matches_twice() {
     let dir = workspace();
-    write_disk(dir.path(), "dup.txt", "aa\naa\n");
+    write_disk(dir.path(), "dup.txt", "aa\nbb\naa\n");
     let ctx = ctx_for(&dir);
     let resp = harness::invoke_with_ctx(
         "file_edit",
-        json!({"path": "dup.txt", "old_str": "aa", "new_str": "bb"}),
+        json!({"path": "dup.txt", "patch": "@@ -2 +2 @@\n-aa\n+cc\n"}),
         &ctx,
     );
     harness::expect_error(&resp, "ambiguous");
@@ -405,7 +408,10 @@ fn edit_after_delete_reports_not_found() {
     harness::expect_error(
         &harness::invoke_with_ctx(
             "file_edit",
-            json!({"path": "src/lib.rs", "old_str": "util", "new_str": "helper"}),
+            json!({
+                "path": "src/lib.rs",
+                "patch": "@@ -1 +1 @@\n-pub mod util;\n+pub mod helper;\n"
+            }),
             &ctx,
         ),
         "not_found",
@@ -550,7 +556,7 @@ fn read_returns_a_numbered_fenced_excerpt() {
     );
 }
 
-/// Without a page a read returns page 0 — the top 300 lines, however long the
+/// Without a page a read returns page 0 — the top 200 lines, however long the
 /// file is — and the header states the total so the model knows to keep going.
 #[test]
 fn read_without_a_page_is_rejected() {
@@ -563,7 +569,7 @@ fn read_without_a_page_is_rejected() {
     harness::expect_error(&resp, "invalid_arguments");
 }
 
-/// Each page is exactly the requested 300-line stride, and a page number past
+/// Each page is exactly the requested 200-line stride, and a page number past
 /// the end clamps to the last page rather than failing.
 #[test]
 fn read_returns_the_requested_page_and_clamps_one_past_the_end() {
@@ -573,22 +579,22 @@ fn read_returns_the_requested_page_and_clamps_one_past_the_end() {
     let ctx = ToolContext::with_workspace(dir.path());
 
     let middle = harness::invoke_with_ctx("file_read", json!({"path": "big.rs", "page": 1}), &ctx);
-    let numbered: String = (301..=600).map(|i| format!("{i}  line {i}\n")).collect();
+    let numbered: String = (201..=400).map(|i| format!("{i}  line {i}\n")).collect();
     assert_eq!(
         middle.as_str().unwrap(),
-        format!("\nbig.rs (page 1 of 3, lines 301-600 of 900):\n\n```rust\n{numbered}```\n"),
+        format!("\nbig.rs (page 1 of 5, lines 201-400 of 900):\n\n```rust\n{numbered}```\n"),
     );
 
-    // 900 lines is exactly 3 pages, so page 2 is both the last real page and
-    // where an out-of-range request (page 99) clamps to.
-    let last = harness::invoke_with_ctx("file_read", json!({"path": "big.rs", "page": 2}), &ctx);
+    // 900 lines is 5 pages of 200, so page 4 is both the last real page
+    // (100 lines) and where an out-of-range request (page 99) clamps to.
+    let last = harness::invoke_with_ctx("file_read", json!({"path": "big.rs", "page": 4}), &ctx);
     let clamped =
         harness::invoke_with_ctx("file_read", json!({"path": "big.rs", "page": 99}), &ctx);
-    let numbered: String = (601..=900).map(|i| format!("{i}  line {i}\n")).collect();
+    let numbered: String = (801..=900).map(|i| format!("{i}  line {i}\n")).collect();
     let expected =
-        format!("\nbig.rs (page 2 of 3, lines 601-900 of 900):\n\n```rust\n{numbered}```\n");
+        format!("\nbig.rs (page 4 of 5, lines 801-900 of 900):\n\n```rust\n{numbered}```\n");
     assert_eq!(last.as_str().unwrap(), expected);
-    assert_eq!(clamped.as_str().unwrap(), expected, "clamps to page 2");
+    assert_eq!(clamped.as_str().unwrap(), expected, "clamps to page 4");
 }
 
 /// A page past the end of a single-page file clamps to page 0 rather than
@@ -607,6 +613,46 @@ fn read_past_the_end_clamps_into_the_file() {
         text.starts_with("\nsrc/main.rs (page 0 of 1, lines 1-3 of 3):\n"),
         "{text:.60}"
     );
+}
+
+/// **The read header is the only place a file's length is reported, so it has to
+/// be right for every shape of ending.**
+///
+/// A listing carries no line count, so the header's `of N` is the single source
+/// of a file's length — the number the model pages against — and an off-by-one over
+/// a trailing newline would misplace the last range of every file.
+#[test]
+fn the_read_header_reports_the_files_true_length() {
+    let dir = tempfile::tempdir().unwrap();
+    // Each shape that has ever made a line count ambiguous.
+    let cases = [
+        ("trailing.rs", "a\nb\n", 2),
+        ("no_trailing.rs", "a\nb", 2),
+        ("blank_last.rs", "a\n\n", 2),
+        ("just_newline.rs", "\n", 1),
+        ("one_line.rs", "only", 1),
+        ("crlf.rs", "a\r\nb\r\n", 2),
+    ];
+    for (name, body, _) in cases {
+        write_disk(dir.path(), name, body);
+    }
+    let ctx = ToolContext::with_workspace(dir.path());
+
+    for (name, _, expected) in cases {
+        // Every case fits on page 0, so this is always the whole file — the
+        // header's `of N` is stated unconditionally either way.
+        let resp = harness::invoke_with_ctx("file_read", json!({"path": name, "page": 0}), &ctx);
+        let text = resp.as_str().unwrap();
+        let total: i64 = text
+            .split_once(" of ")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(n, _)| n.parse().unwrap())
+            .unwrap_or_else(|| panic!("{name}: header carries no `of N`: {text:?}"));
+        assert_eq!(
+            total, expected,
+            "{name}: header total {total} != true length {expected}",
+        );
+    }
 }
 
 /// An empty file reads as empty rather than as an impossible page.

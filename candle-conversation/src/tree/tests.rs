@@ -350,6 +350,37 @@ fn make_summarising_tree(turns: u32, segments: u32, day_boundary: bool) -> Conve
     .with_time_source(Arc::new(FixedTimeSource::at_day(0)))
 }
 
+/// **A config with summarization disabled has nothing ever due** — not at the
+/// turn count, not at the segment count, not across a day boundary. Each
+/// trigger is exercised past the point it would fire on the default config.
+#[test]
+fn disabled_summarization_is_never_due() {
+    let mut config = ConversationTreeConfig {
+        summarize_every: 2,
+        segment_summarize_every: 2,
+        summarize_on_day_boundary: true,
+        ..ConversationTreeConfig::default()
+    };
+    assert!(config.summarizes());
+    config.disable_summarization();
+    assert!(!config.summarizes());
+
+    let mut tree = ConversationTree::with_config("sys", config)
+        .with_time_source(Arc::new(FixedTimeSource::at_day(0)));
+    let t1 = tree.finish_turn("a", "b", TurnType::Reality, vec![], None);
+    let t2 = tree.finish_turn("c", "d", TurnType::Reality, vec![], None);
+    let t3 = tree.finish_turn("e", "f", TurnType::Reality, vec![], None);
+    let t4 = tree.finish_turn("g", "h", TurnType::Reality, vec![], None);
+    tree.apply_patch(segment_patch(t1, t2));
+    tree.apply_patch(segment_patch(t3, t4));
+    let mut tree = tree.with_time_source(Arc::new(FixedTimeSource::at_day(1)));
+    tree.finish_turn("i", "j", TurnType::Reality, vec![], None);
+    tree.finish_turn("k", "l", TurnType::Reality, vec![], None);
+
+    assert!(tree.owed_day_boundary.is_none());
+    assert!(tree.due_summaries().is_empty());
+}
+
 /// A day boundary crossed while a summary is still running is owed, not lost.
 ///
 /// The boundary trigger fires on one turn only — the first of the new day. If a

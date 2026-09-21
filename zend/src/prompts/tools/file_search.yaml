@@ -1,0 +1,147 @@
+name: file_search
+questions:
+- find the file called quantized_qwen36_moe.rs
+- which file holds the CompressionPolicy implementation
+- where does web_search.rs live in this repo
+- locate every mod.rs beneath candle-nn/src
+- is there a build.rs anywhere in the workspace
+- find every yaml file in the prompts folder
+- I need the path to the tokenizer config, not its contents
+- I know it is called something like arena_table but not where it sits
+- the stack trace names batched_model.rs, where is that file
+- trying to remember the filename of the sweep skill
+- filename lookup for the deployment doc
+- glob for *_test.rs
+- path of Cargo.lock
+- any file with kv_cache in its path
+- what is the full path of the projection schema
+- find the .cuh headers in candle-kernels
+- which directory contains projection.yaml
+- search filenames for anything starting with quantized_
+- I cannot remember whether it is called tool_def or tooldef
+- point me at the file named deepseek4.rs
+- does a file named CHANGELOG exist here
+- get me the path for the gitignore
+- hunt down the file that ends with _moe.rs
+- what is the location of the substrate persistence module
+category: Files
+mandatory: true
+description: 'Find files by NAME or PATH anywhere in the project, without knowing which directory they are in. Give a filename (`config.rs`), a stem (`compress`), an extension (`.toml`), a path fragment (`kv_cache/chunked`), or a glob (`*_test.rs`, `src/*/mod.rs`); matching is case-insensitive over the whole path and `*` spans directory separators, so one pattern reaches any depth. Use for: locating a file whose name you know but whose directory you do not, checking whether a module exists at all, finding every file of a kind, discovering where a subsystem lives before reading it. Returns paths only, shortest first (the shortest path bearing a name is usually the definition rather than a vendored copy), paged via `paging.next_page`. THIS IS THE TOOL FOR FINDING A FILE: do not guess directory names and call file_list repeatedly, because an empty listing looks the same whether the directory is empty or the guess was wrong, so the guessing never converges. One file_search covers the whole project. Use file_grep to search file CONTENTS for a string or symbol; use file_list to enumerate a directory you have already located; use file_read once you have the path.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    page:
+      description: Zero-based page of results to return. Defaults to 0. When the response's `paging.next_page` is set, pass it here to read the following page.
+      format: uint32
+      minimum: 0.0
+      type:
+      - integer
+      - 'null'
+    prefix:
+      description: Restrict the search to paths beginning with this prefix (e.g. `candle-nn/src/`). Omit to search the whole project.
+      type:
+      - string
+      - 'null'
+    query:
+      description: What to look for in the file's path — a bare name (`main.rs`), a stem (`compress`), an extension (`.toml`), a directory fragment (`kv_cache/chunked`), or a glob using `*` (`*.rs`, `src/*/mod.rs`). Case-insensitive, matched against the whole path. Required.
+      minLength: 1
+      type: string
+  required:
+  - query
+  title: SearchRequest
+  type: object
+examples:
+- |-
+  where is the web_search tool implemented<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user wants to know where a specific file lives. I do not know the directory, only part of the name, so this is file_search rather than file_list — file_list would need me to<|projection|> guess a directory first, and a wrong guess comes back empty and tells me nothing.
+
+  The query should be the distinctive part of the name, "web_search". Matching is over the whole path and case-insensitive, so that will find it wherever<|projection|> it sits.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_search", "arguments": {"query": "web_search"}}
+  </tool_call><|projection|>
+- |-
+  is there a build.rs anywhere in this workspace<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  This is an existence question about a filename, which file_search answers directly: if the query matches nothing the result is an empty files array with total 0, which is a<|projection|> clean "no" rather than an error.
+
+  No directory was named, so I leave prefix off and search the whole project with the query "build.rs".
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_search", "arguments": {"query": "build.rs"}}
+  </tool_call><|projection|>
+- |-
+  find every mod.rs under candle-nn/src<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Two parts here: the name to match, "mod.rs", and a directory to stay inside, "candle-nn/src". file_search takes exactly that pair — query for the name, prefix to<|projection|> bound the search.
+
+  Results come back shortest path first, so the shallower modules lead, which is usually the order the user wants to read them in.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_search", "arguments": {"query": "mod.rs", "prefix": "candle-nn/src"}}
+  </tool_call><|projection|>
+- |-
+  show me all the toml files in the repo<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user wants files by extension rather than by name. file_search accepts a glob, and "*.toml" is the right spelling: the leading star matches any prefix and the trailing<|projection|> literal must end the path, so it will not also match something like a.toml.bak.
+
+  No prefix, because they asked about the whole repository.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_search", "arguments": {"query": "*.toml"}}
+  </tool_call><|projection|>
+- |-
+  the panic mentions batched_model.rs but I do not know where it is<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  They have a filename from a stack trace and need its path before they can open it. That is the case file_search exists for — I have the name and not the directory.<|projection|>
+
+  I will search for "batched_model.rs" across the project, and once I have the path I can file_read it.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_search", "arguments": {"query": "batched_model.rs"}}
+  </tool_call><|projection|>
+- |-
+  I cannot remember the exact name, something like arena_table<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A partial name is enough: a query with no star is a case-insensitive substring test over the whole path, so "arena_table" will match arena_table.rs and anything else carrying<|projection|> that stem.
+
+  This is better than listing directories one at a time, because I do not have to know where to start looking.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_search", "arguments": {"query": "arena_table"}}
+  </tool_call><|projection|>
+- |-
+  find the integration tests in this project<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Integration tests live in tests/ directories by convention, so a path glob is the precise way to ask: "tests/*.rs" anchors the literal "tests/" and lets the star span<|projection|> the rest.
+
+  Because a star spans directory separators, this reaches tests directories at any depth rather than only a top-level one.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_search", "arguments": {"query": "tests/*.rs"}}
+  </tool_call><|projection|>
+- |-
+  which directory holds projection.yaml<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The question is about location, and the answer is the file's path, so file_search with the filename as the query is exactly right. The response is paths only, which is<|projection|> all that is being asked for — no need to read the file.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_search", "arguments": {"query": "projection.yaml"}}
+  </tool_call><|projection|>

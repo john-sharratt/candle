@@ -12,24 +12,26 @@
 // nothing left in it needs one — see `paged_decode_hd_bf16.cuh`.
 #include <cstdint>
 
+#include "../rope/rope_table.cuh"   // RopeRungs
+
 extern "C" {
 int32_t run_paged_decode_fp16_hd64(const void*, const uint8_t*, void*, int32_t, int32_t,
-                                   int32_t, float, const void*, const void*, const float*,
+                                   int32_t, float, const void*, const void*, const RopeRungs,
                                    int32_t, void*, void*, const void*, int64_t,
                                    const uint32_t*, const uint32_t*, const uint2*,
                                    const uint2*, int32_t, int32_t);
 int32_t run_paged_decode_fp16_hd96(const void*, const uint8_t*, void*, int32_t, int32_t,
-                                   int32_t, float, const void*, const void*, const float*,
+                                   int32_t, float, const void*, const void*, const RopeRungs,
                                    int32_t, void*, void*, const void*, int64_t,
                                    const uint32_t*, const uint32_t*, const uint2*,
                                    const uint2*, int32_t, int32_t);
 int32_t run_paged_decode_fp16_hd128(const void*, const uint8_t*, void*, int32_t, int32_t,
-                                    int32_t, float, const void*, const void*, const float*,
+                                    int32_t, float, const void*, const void*, const RopeRungs,
                                     int32_t, void*, void*, const void*, int64_t,
                                     const uint32_t*, const uint32_t*, const uint2*,
                                    const uint2*, int32_t, int32_t);
 int32_t run_paged_decode_fp16_hd256(const void*, const uint8_t*, void*, int32_t, int32_t,
-                                    int32_t, float, const void*, const void*, const float*,
+                                    int32_t, float, const void*, const void*, const RopeRungs,
                                     int32_t, void*, void*, const void*, int64_t,
                                     const uint32_t*, const uint32_t*, const uint2*,
                                    const uint2*, int32_t, int32_t);
@@ -48,7 +50,7 @@ extern "C" int32_t run_paged_decode_fp16(
     float softmax_scale,
     const void* k_new,
     const void* v_new,
-    const float* rope_cs,
+    const RopeRungs rungs,
     int32_t rope_interleaved,
     void* stream_ptr,
     const uint32_t* sel_entries,
@@ -62,7 +64,7 @@ extern "C" int32_t run_paged_decode_fp16(
     #define LAUNCH_INT8(HD) \
         return run_paged_decode_fp16_hd##HD( \
             q_ptr, headers_ptr, o_ptr, num_active_slots, n_q_head, n_kv_head, \
-            softmax_scale, k_new, v_new, rope_cs, rope_interleaved, stream_ptr, \
+            softmax_scale, k_new, v_new, rungs, rope_interleaved, stream_ptr, \
             nullptr, nullptr, 0, sel_entries, sel_cnt, sel_pages, sel_page_win, sel_stride, sel_ratio)
     switch (head_dim) {
         case 64:  LAUNCH_INT8(64);
@@ -96,7 +98,7 @@ extern "C" int32_t run_paged_decode_fp16_q8(
     float softmax_scale,
     const void* k_new,
     const void* v_new,
-    const float* rope_cs,
+    const RopeRungs rungs,
     int32_t rope_interleaved,
     void* stream_ptr,
     const uint32_t* sel_entries,
@@ -110,7 +112,7 @@ extern "C" int32_t run_paged_decode_fp16_q8(
     #define LAUNCH_Q8(HD)                                                                  \
         return run_paged_decode_fp16_hd##HD(                                               \
             q_ptr, headers_ptr, nullptr, num_active_slots, n_q_head, n_kv_head,            \
-            softmax_scale, k_new, v_new, rope_cs, rope_interleaved, stream_ptr,            \
+            softmax_scale, k_new, v_new, rungs, rope_interleaved, stream_ptr,            \
             q8_out, gate, gate_slot_stride, sel_entries, sel_cnt, sel_pages, sel_page_win, sel_stride, sel_ratio)
     switch (head_dim) {
         case 128: LAUNCH_Q8(128);

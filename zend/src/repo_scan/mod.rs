@@ -460,8 +460,7 @@ fn dir_tags(unit: &DirUnit) -> Vec<String> {
 /// without blocking ingest, and provenance scans expand the compressed nodes on
 /// retrieval.
 pub(crate) fn utility_config(mut config: SequenceConfig) -> SequenceConfig {
-    config.tree.summarize_every = 0;
-    config.tree.segment_summarize_every = 0;
+    config.tree.disable_summarization();
     // Utility ingests (repo_map, code_reading) are append-only cumulative
     // trunks — each turn just extends the layer. Skip the per-turn projection
     // rebuild (reset + re-project the whole trunk, which is O(n²) and serial on

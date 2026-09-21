@@ -1353,7 +1353,15 @@ impl BackendDevice for CudaDevice {
     }
 
     fn synchronize(&self) -> Result<()> {
-        self.stream.synchronize().map_err(crate::Error::wrap)?;
+        // `.w()` (not `Error::wrap`) so a sticky fault or a sustained
+        // out-of-memory streak on THIS call is visible to `gpu_poison` —
+        // `Error::wrap`'s generic `Display` wrapping bypasses that detection
+        // entirely. This call is the daemon's most frequent, unconditional
+        // device round-trip (the persistence thread's hot→warm sync runs on a
+        // fixed cadence regardless of load), which is exactly why a poisoned
+        // context showed up here as an endless identical retry with nothing
+        // ever noticing.
+        self.stream.synchronize().w()?;
         Ok(())
     }
 }

@@ -19,7 +19,7 @@ fn make_sql_cred(ctx: &ToolContext) -> &'static str {
 
 #[test]
 fn sql_session_create_table_and_query() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let cred = make_sql_cred(&ctx);
 
     let open = harness::expect_success(harness::invoke_with_ctx(
@@ -58,7 +58,7 @@ fn sql_session_create_table_and_query() {
 
 #[test]
 fn sql_session_open_list_close() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let cred = make_sql_cred(&ctx);
 
     let open = harness::expect_success(harness::invoke_with_ctx(
@@ -91,7 +91,7 @@ fn sql_session_open_list_close() {
 
 #[test]
 fn sql_session_parameterized_query() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let cred = make_sql_cred(&ctx);
 
     let open = harness::expect_success(harness::invoke_with_ctx(
@@ -141,7 +141,7 @@ fn sql_session_missing_credential() {
 fn sql_session_open_without_credential() {
     // SQLite needs no credential: opening :memory: with no credential_name
     // succeeds and returns a usable session.
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let open = harness::expect_success(harness::invoke_with_ctx(
         "sql_session_open",
         json!({"database": ":memory:"}),
@@ -159,7 +159,7 @@ fn sql_session_open_without_credential() {
 
 #[test]
 fn sql_session_wrong_credential_type() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     harness::expect_success(harness::invoke_with_ctx(
         "credential_save",
         json!({"name": "api-k", "type": "api_key", "secret": "xyz"}),
@@ -184,7 +184,7 @@ fn sql_session_close_nonexistent_returns_false() {
 
 #[test]
 fn sql_session_multiple_rows() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let cred = make_sql_cred(&ctx);
 
     let open = harness::expect_success(harness::invoke_with_ctx(
@@ -217,7 +217,7 @@ fn sql_session_multiple_rows() {
 
 #[test]
 fn sql_session_syntax_error() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let cred = make_sql_cred(&ctx);
     let open = harness::expect_success(harness::invoke_with_ctx(
         "sql_session_open",
@@ -236,7 +236,7 @@ fn sql_session_syntax_error() {
 
 #[test]
 fn sql_session_null_params() {
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let cred = make_sql_cred(&ctx);
     let open = harness::expect_success(harness::invoke_with_ctx(
         "sql_session_open",

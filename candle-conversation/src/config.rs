@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use candle_nn::kv_cache::{KvFormat, QuantFormat};
 use candle_transformers::models::batched_inference::BatchedConfig;
 
+use crate::line_ends::line_end_token_ids;
 use crate::models::Dialect;
 use crate::persistence::SharedSubstrate;
 use crate::projection::{CorruptTurnPolicy, LayerId};
@@ -199,11 +201,22 @@ pub struct SamplingConfig {
     /// as the hard backstop.
     pub graceful_segment_close_after: i32,
 
-    /// Token IDs that count as sentence-end boundaries for `graceful_segment_close_after`.
-    ///
-    /// Resolved automatically from the tokenizer at engine startup (looks up
-    /// `.`, `!`, `?`, `\n`).  If empty, `graceful_segment_close_after` is a no-op.
+    /// Token IDs that end a sentence (`.`, `!`, `?`) — the boundaries the
+    /// graceful EOS waits for, together with [`Self::line_end_token_ids`].
+    /// Resolved from the tokenizer at engine startup.
     pub sentence_end_token_ids: Vec<i32>,
+
+    /// Every token ID whose text ends a line (decodes to something ending in
+    /// `\n`), ascending. The boundary `graceful_segment_close_after` waits for.
+    ///
+    /// A thinking block is closed at the end of a line, not of a sentence: a
+    /// `.` also appears inside numbers, addresses and paths, and a close fired
+    /// there cut a security review mid-thought at `169.` of `169.254.169.254` —
+    /// the model carried on reasoning where its answer belonged and never gave
+    /// one. Reasoning breaks into lines every few dozen tokens, well inside the
+    /// window between the graceful and forced closes. Resolved once, by scanning
+    /// the vocabulary at engine startup; empty makes the graceful close a no-op.
+    pub line_end_token_ids: Arc<[i32]>,
 
     /// Closer phrase played when the HARD segment cap
     /// (`force_segment_close_after`) fires mid-sentence: a canned
@@ -311,6 +324,7 @@ impl Default for SamplingConfig {
             force_segment_close_after: 0,
             graceful_segment_close_after: 0,
             sentence_end_token_ids: Vec::new(),
+            line_end_token_ids: Arc::from([]),
             segment_close_script: Vec::new(),
             graceful_eos_after: 0,
             forced_eos_after: 0,
@@ -983,10 +997,9 @@ impl SamplingConfig {
             self.tool_call_open_token_id = id as i32;
             tracing::trace!("Resolved <tool_call> token ID: {}", id);
         }
-        // Resolve sentence-end token IDs for graceful_segment_close_after.
-        // We probe both the bare character and common BPE compound forms.
+        // Resolve sentence-end token IDs for the graceful EOS.
         self.sentence_end_token_ids.clear();
-        for boundary in [".", "\n", ".\n", "!\n", "?\n", "!", "?"] {
+        for boundary in [".", "!", "?"] {
             if let Some(id) = tokenizer.token_to_id(boundary) {
                 let id = id as i32;
                 if !self.sentence_end_token_ids.contains(&id) {
@@ -994,10 +1007,15 @@ impl SamplingConfig {
                 }
             }
         }
-        tracing::trace!(
-            "Resolved {} sentence-end token IDs: {:?}",
-            self.sentence_end_token_ids.len(),
-            self.sentence_end_token_ids
+        // The line ends are a vocabulary scan; a config that already carries
+        // them (every per-turn clone of the engine's) keeps what it has.
+        if self.line_end_token_ids.is_empty() {
+            self.line_end_token_ids = line_end_token_ids(tokenizer);
+        }
+        tracing::debug!(
+            sentence_ends = self.sentence_end_token_ids.len(),
+            line_ends = self.line_end_token_ids.len(),
+            "resolved sampling boundary tokens",
         );
 
         // Resolve the reflection-marker family (`Wait`/`Hmm`/`Alternatively`/

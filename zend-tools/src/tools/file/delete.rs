@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::FileError;
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct DeleteRequest {
@@ -36,6 +36,13 @@ impl Tool for FileDelete {
     type Request = DeleteRequest;
     type Response = DeleteResponse;
     type Error = FileError;
+
+    /// The path is gone either way. A restart empties the overlay, so the
+    /// re-issued delete re-tombstones the workspace copy exactly as the first
+    /// one did rather than reaching anything the first one spared.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(ctx: &ToolContext, req: DeleteRequest) -> Result<DeleteResponse, FileError> {
         let deleted = ctx.vfs.delete(&req.path);

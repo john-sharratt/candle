@@ -35,8 +35,10 @@ use candle::quantized::pinned_staging::PinnedStager;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{ChunkedKvBacking, KvCache, CHUNK_SIZE};
 use candle_transformers::models::prefill_utils::{
-    compute_rope_cs, paged_decode_attn, paged_decode_attn_q8, paged_prefill_batched,
+    paged_decode_attn, paged_decode_attn_q8, paged_prefill_batched,
 };
+use candle_transformers::models::rope_schedule::{RopeRungs, RopeSchedule};
+use candle_transformers::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
 use half::{bf16, f16};
 use std::sync::{Mutex, MutexGuard};
 
@@ -110,7 +112,7 @@ fn make_qkv(
 fn build_history_slot(
     g: Geom,
     seed: u64,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<(ChunkedKvBacking, KvCache)> {
@@ -125,7 +127,6 @@ fn build_history_slot(
     // admission before the forward; the prefill entry neither resets nor
     // allocates).
     backing.ensure_for_batch_entries(&[(0, 0)], HISTORY_TOKENS)?;
-    let rope_offsets = Tensor::zeros(1, DType::U32, device)?;
     let generation = stager.begin_generation();
     {
         let mut caches_arr: [&mut KvCache; 1] = [&mut cache];
@@ -142,8 +143,7 @@ fn build_history_slot(
             g.n_kv_head,
             g.head_dim,
             None,
-            &rope_offsets,
-            rope_cs,
+            rope,
             false,
             &generation,
             &std::cell::RefCell::new(None),
@@ -176,7 +176,7 @@ fn decode_one_slot(
     q: &Tensor,
     k_new: &Tensor,
     v_new: &Tensor,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     emit: DecodeEmit<'_>,
     stager: &PinnedStager,
     device: &Device,
@@ -253,13 +253,15 @@ fn decode_one_slot(
         p
     };
 
-    let mut hdr = Vec::with_capacity(24);
-    let n_slices = slot.slices.len() as u32;
-    let write_slice = slot.write_slice;
-    hdr.extend_from_slice(&n_slices.to_le_bytes());
-    hdr.extend_from_slice(&write_slice.to_le_bytes());
-    hdr.extend_from_slice(&slices_base_ptr.to_le_bytes());
-    hdr.extend_from_slice(&pm_base_ptr.to_le_bytes());
+    let mut hdr = Vec::with_capacity(SLOT_HEADER_BYTES);
+    SlotHeaderHost {
+        n_slices: slot.slices.len() as u32,
+        write_slice: slot.write_slice,
+        slices_ptr: slices_base_ptr,
+        position_map_ptr: pm_base_ptr,
+        rope_rung: 0,
+    }
+    .write(&mut hdr);
 
     let generation = stager.begin_generation();
     let mut pinned = generation.alloc(hdr.len())?;
@@ -280,7 +282,7 @@ fn decode_one_slot(
             softmax_scale,
             k_new,
             v_new,
-            rope_cs,
+            rope,
             false,
             None,
         )?,
@@ -295,7 +297,7 @@ fn decode_one_slot(
             softmax_scale,
             k_new,
             v_new,
-            rope_cs,
+            rope,
             false,
             gate,
             None,
@@ -398,10 +400,12 @@ fn check_q8_parity(g: Geom, seed: u64) -> Result<()> {
     let stager = PinnedStager::new_from_device(&device);
 
     // Identity RoPE (zero frequencies) — rotation is out of scope here.
-    let inv_freq = Tensor::zeros(g.head_dim / 2, DType::F32, &device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, g.head_dim, &device)?;
+    let rope = RopeRungs::new(
+        &RopeSchedule::stated(vec![0.0f32; g.head_dim / 2], usize::MAX)?,
+        &device,
+    )?;
 
-    let (backing, cache) = build_history_slot(g, seed, &rope_cs, &stager, &device)?;
+    let (backing, cache) = build_history_slot(g, seed, &rope, &stager, &device)?;
 
     let (q_dec, k_new, v_new) = make_qkv(g, 1, seed ^ 0xD3C0DE, &device)?;
 
@@ -435,7 +439,7 @@ fn check_q8_parity(g: Geom, seed: u64) -> Result<()> {
         &q_dec,
         &k_new,
         &v_new,
-        &rope_cs,
+        &rope,
         DecodeEmit::Float,
         &stager,
         &device,
@@ -453,7 +457,7 @@ fn check_q8_parity(g: Geom, seed: u64) -> Result<()> {
             &q_dec,
             &k_new,
             &v_new,
-            &rope_cs,
+            &rope,
             DecodeEmit::Q8 { gate: gate_arg },
             &stager,
             &device,

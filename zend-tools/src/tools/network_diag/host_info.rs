@@ -5,12 +5,13 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::DiagError;
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::net;
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct HostInfoRequest {
     /// Hostname or IP address to profile.
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1, max = 253))]
     pub host: String,
 }
 
@@ -34,14 +35,21 @@ impl Tool for HostInfo {
     type Response = HostInfoResponse;
     type Error = DiagError;
 
-    fn run(_ctx: &ToolContext, req: HostInfoRequest) -> Result<HostInfoResponse, DiagError> {
-        let ips = dns_lookup::lookup_host(&req.host)
+    /// Reports this host's own configuration; writes nothing and reaches no
+    /// peer.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
+
+    fn run(ctx: &ToolContext, req: HostInfoRequest) -> Result<HostInfoResponse, DiagError> {
+        let grants = ctx.grants();
+        let ips = net::lookup_host(grants, &req.host)
             .map_err(|e| DiagError::HostNotFound(e.to_string()))?;
 
         let ip_strings: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
         let mut reverse_dns = Vec::new();
         for ip in &ips {
-            if let Ok(name) = dns_lookup::lookup_addr(ip) {
+            if let Ok(name) = net::lookup_addr(grants, ip) {
                 reverse_dns.push(name);
             }
         }

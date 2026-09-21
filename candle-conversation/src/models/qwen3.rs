@@ -4,7 +4,7 @@
 //! `<|im_end|>` as the EOS token, and sampling defaults from
 //! [`SamplingConfig::for_gguf_architecture`].
 
-use super::{ModelArch, ModelSpec};
+use super::{ModelArch, ModelSpec, RopePreset};
 use crate::{config::SamplingConfig, models::DialectType};
 
 const PROMPT: &str = "You are a helpful, accurate, and concise assistant.";
@@ -37,6 +37,7 @@ pub(super) fn qwen3_8b_q4() -> ModelSpec {
         tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 8192,
+        rope: RopePreset::qwen3(),
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen3"),
@@ -67,6 +68,7 @@ pub(super) fn qwen3_8b_q6() -> ModelSpec {
         tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 8192,
+        rope: RopePreset::qwen3(),
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen3"),
@@ -98,6 +100,7 @@ pub(super) fn qwen3_14b_q4() -> ModelSpec {
         tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 8192,
+        rope: RopePreset::qwen3(),
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen3"),
@@ -125,6 +128,7 @@ pub(super) fn qwen3_14b_q5() -> ModelSpec {
         tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 8192,
+        rope: RopePreset::qwen3(),
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen3"),
@@ -152,6 +156,7 @@ pub(super) fn qwen3_14b_q6() -> ModelSpec {
         tokenizer_rev: String::new(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 8192,
+        rope: RopePreset::qwen3(),
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen3"),

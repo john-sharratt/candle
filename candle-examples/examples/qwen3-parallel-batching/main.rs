@@ -22,6 +22,7 @@ use candle_transformers::models::batched_inference::{
 };
 use candle_transformers::models::batched_model::BatchedInference;
 use candle_transformers::models::quantized_qwen3::ModelWeights;
+use candle_transformers::models::rope_schedule::{DeclaredScaling, RopePreset};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 
 /// Generation steps timed in each of the two decode regimes.
@@ -50,7 +51,11 @@ fn main() -> Result<()> {
     let inv_freq = inner
         .rope_inv_freq()
         .ok_or_else(|| candle::Error::Msg("model has no RoPE inv_freq".into()))?;
-    let model = BatchedInference::new_with_inv_freq(inner, inv_freq, 4096, &device)?;
+    // Qwen3's production schedule: progressive YaRN over the file's plain
+    // θ = 1e6 frequencies, as the engine runs it. This file declares no scaling.
+    let schedule =
+        RopePreset::qwen3().gqa_schedule(inv_freq, Some(1e6), DeclaredScaling::None, 40_960)?;
+    let model = BatchedInference::new_with_schedule(inner, &schedule, 4096, &device)?;
     println!("Loaded in {:.2}s\n", t0.elapsed().as_secs_f64());
 
     let tok_path = api

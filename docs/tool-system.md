@@ -4,15 +4,38 @@
 
 The backend serves two clients with different tool semantics over the same OpenAI-compatible `/v1/chat/completions` endpoint. Continue passes its own `tools` array in each request, and the backend treats those as client-executed: emit `tool_calls` in the response, return immediately, and let Continue post the results back as `role: "tool"` messages. The web chat passes no tools, so the backend injects its own server-registered tool set, executes any tool calls itself in a loop, and streams only the final assistant text to the client.
 
-This document specifies ninety-three server-registered tools. Seven are shared between both clients — `web_search`, `web_fetch`, `datetime`, `calculator`, `unit_convert`, `random`, and `weather` — and augment Continue's own file and terminal tools without Continue having to know about them. Eighty-six additional tools are exposed only to the web chat client: six virtual-filesystem tools (`file_*`), four notes tools (`notes_*`) for cross-conversation persistent memory, three credential tools (`credential_*`), six SSH session tools (open, exec, exec_async, poll, list, close), four Telnet session tools, four HTTP session tools, five TCP session tools, five UDP session tools, five TLS session tools (`tls_session_*`), four SQL session tools, ten remote-filesystem session tools (`remote_fs_session_*`), six network diagnostic tools (`dns_lookup`, `ping_icmp`, `trace_route`, `port_scan`, `ip_scan`, `host_info`), three security utilities (`hash_scan`, `hash_compute`, `totp_generate`), eight cryptographic primitives (AEAD encrypt/decrypt, HMAC, signature verify/sign, KDF derive, HKDF extract, HKDF-Expand-Label), three running-hash-state tools (`hash_state_*`), four byte-encoding utilities (`bytes_transcode`, `bytes_pack`, `bytes_unpack`, `bytes_xor`), five code execution tools (`code_run`, `code_session_*`), and one subagent tool (`subagent_run`). The web-chat-only tools would either conflict with Continue's native capabilities, depend on the credential or notes store, or have orchestrator-state requirements (sessions, sandboxes, subagents, hash states) that don't fit Continue's tool model.
+This document specifies ninety-five server-registered tools. Seven are shared between both clients — `web_search`, `web_fetch`, `datetime`, `calculator`, `unit_convert`, `random`, and `weather` — and augment Continue's own file and terminal tools without Continue having to know about them. Eighty-eight additional tools are exposed only to the web chat client: eight virtual-filesystem tools (`file_*`, including `file_search` to find a file by name and `file_grep` to find code by content), four notes tools (`notes_*`) for cross-conversation persistent memory, three credential tools (`credential_*`), six SSH session tools (open, exec, exec_async, poll, list, close), four Telnet session tools, four HTTP session tools, five TCP session tools, five UDP session tools, five TLS session tools (`tls_session_*`), four SQL session tools, ten remote-filesystem session tools (`remote_fs_session_*`), six network diagnostic tools (`dns_lookup`, `ping_icmp`, `trace_route`, `port_scan`, `ip_scan`, `host_info`), three security utilities (`hash_scan`, `hash_compute`, `totp_generate`), eight cryptographic primitives (AEAD encrypt/decrypt, HMAC, signature verify/sign, KDF derive, HKDF extract, HKDF-Expand-Label), three running-hash-state tools (`hash_state_*`), four byte-encoding utilities (`bytes_transcode`, `bytes_pack`, `bytes_unpack`, `bytes_xor`), five code execution tools (`code_run`, `code_session_*`), and one subagent tool (`subagent_run`). The web-chat-only tools would either conflict with Continue's native capabilities, depend on the credential or notes store, or have orchestrator-state requirements (sessions, sandboxes, subagents, hash states) that don't fit Continue's tool model.
 
 The remote-filesystem tools deliberately collapse what would otherwise be four protocol-specific tool groups (SCP, FTP, NFS, SMB) into a single URI-addressed group. The model picks an operation; the URI scheme carries the protocol. This trades a small amount of expressiveness (no protocol-specific operations like FTP's transfer mode toggling) for a much smaller selection problem and uniform semantics across protocols.
 
 The transport-layer surface deliberately offers two paths to encryption. `tls_session_*` is for the common case — TLS-protected non-HTTP services (LDAPS, IMAPS, SMTPS, MQTTS, custom application protocols over TLS) where the model wants to talk to the application above the encryption. `tcp_session_*` plus the cryptographic primitives, hash-state, and byte-packing tools is for the protocol-archaeology case — investigating TLS handshake bugs, off-spec counterparty behaviour, or any situation where the model needs byte-level control over the encrypted layer itself. The TCP path is slower and more work; it earns its slot when the encrypted layer is what's broken.
 
-`subagent_run` and the code execution tools are qualitatively different from the rest of the surface. `subagent_run` spawns a nested agent loop with its own context, message history, and tool subset, optionally targeting a remote OpenAI-compatible inference endpoint. The code execution tools (`code_run`, `code_session_*`) run code in a sandboxed Firecracker microVM or gVisor container — fully isolated from the orchestrator's network, credentials, and other sessions, with optional VFS mounting at `/work` for artefact flow. Both are individual tools (or small groups) with substantial orchestrator infrastructure behind them.
+`subagent_run` and the code execution tools are qualitatively different from the rest of the surface. `subagent_run` spawns a nested agent loop with its own context, message history, and tool subset, optionally targeting a remote OpenAI-compatible inference endpoint. The code execution tools (`code_run`, `code_session_*`) run JavaScript on the embedded `boa_engine` VM — no subprocess, network or credential access from the script, files only through a `vfs` global over the conversation's file store, and loop/recursion limits on runaway code. Both are individual tools (or small groups) with substantial orchestrator infrastructure behind them.
 
-Ninety-three tools is more than fits comfortably in a single static prompt. Selection at this scale is handled by the inference engine's dynamic tool surface, which presents the model with a tiered view — full schema for the tool currently being constructed, descriptions for nearby candidates, names only for everything else — that adapts during decode. The mechanism is specified separately; from the tool author's perspective, what matters is that each tool has three description forms (name, description, full), covered in the Tool Description Format subsection under System Prompt Format below. Tool descriptions also include explicit cross-references where overlap is most likely (`web_search` → `dns_lookup` / `web_fetch`; `web_fetch` → `http_session_*`; `tcp_session_*` → `tls_session_*` / `http_session_*`; `aead_encrypt` → `tls_session_*`; `hash_compute` → `hash_scan` / `hash_state_init`; `ssh_session_exec` → `ssh_session_exec_async`; VFS file tools → `notes_*` for persistence) so the description tier carries the disambiguation anchors the surface needs.
+## Capabilities and grants
+
+Every tool call runs in a `ToolContext` that carries **grants** — a subset of four capabilities, set by the daemon from the caller's tools mode and never by the call itself (`zend-tools/src/grants.rs`):
+
+| Capability | Covers |
+|---|---|
+| `disk_write` | changing files on the host's disk — the direct file store and SQLite connections |
+| `network` | any outbound connection — HTTP, sockets, DNS, ICMP |
+| `exec` | running programs on this host — subprocesses, sub-agents |
+| `sandbox` | running model-written JavaScript in the embedded boa VM, whose only filesystem is the context's file store (`vfs.read` / `vfs.write` / `vfs.list`) |
+| `secrets` | reading or changing stored credentials |
+
+A context grants nothing unless its builder grants it, and the check is made twice, independently:
+
+1. **At dispatch.** Each registered tool declares what it needs (`registry::register_all`), and `RegisteredTool::call` refuses a call whose context lacks it before the arguments are parsed.
+2. **At the primitive.** Tools reach sockets, name resolution and HTTP clients only through `zend_tools::net`, subprocesses only through `zend_tools::exec`, SQLite only through `zend_tools::disk`, the credential store only through `ToolContext::credentials`, the shared HTTP client only through `ToolContext::http`, and the JS VM only through a `run_js` that takes the grants. A disk-writing file store can only be built from a `DiskWriteGrant`, which only a context holding `disk_write` can produce. Source-scanning tests fail the build if a tool module names a raw socket, process, HTTP-client, database or file-writing constructor.
+
+So a tool whose declaration is wrong, or a call the model makes for a tool its mode never offered, still cannot act. The refusal is an ordinary tool error the model reads: `{"error":"not_permitted","detail":"this action needs the `network` permission, which this conversation does not have; nothing was done"}`.
+
+In `zend` the grants follow the tools mode (`zend/src/access.rs`): `none` and `restricted` grant nothing, `comprehensive` grants `network`, `sandbox` and `secrets`, and `mutable` grants everything. Host execution (`exec`) is Mutable-only, because the overlay that keeps Comprehensive's file changes off the disk cannot stand in front of a program; the JS sandbox can, since the overlay is the only filesystem it has. SSH and telnet run their commands on the remote host and need only `network`. Each mode offers exactly the tools its grants cover, and Restricted also drops the high-risk ones.
+
+`web_fetch` additionally refuses private and local addresses — literal, resolved, and redirect targets — and connects through a resolver that applies the same rule, so a name cannot pass the check with a public address and connect with a private one.
+
+Ninety-five tools is more than fits comfortably in a single static prompt. Selection at this scale is handled by the inference engine's dynamic tool surface, which presents the model with a tiered view — full schema for the tool currently being constructed, descriptions for nearby candidates, names only for everything else — that adapts during decode. The mechanism is specified separately; from the tool author's perspective, what matters is that each tool has three description forms (name, description, full), covered in the Tool Description Format subsection under System Prompt Format below. Tool descriptions also include explicit cross-references where overlap is most likely (`web_search` → `dns_lookup` / `web_fetch`; `web_fetch` → `http_session_*`; `tcp_session_*` → `tls_session_*` / `http_session_*`; `aead_encrypt` → `tls_session_*`; `hash_compute` → `hash_scan` / `hash_state_init`; `ssh_session_exec` → `ssh_session_exec_async`; VFS file tools → `notes_*` for persistence; `file_list` → `file_search` / `file_grep` for *finding* rather than enumerating, and `file_grep` → `file_read` for the surrounding lines of a hit) so the description tier carries the disambiguation anchors the surface needs.
 
 ## System Prompt Format
 
@@ -139,6 +162,48 @@ The example above shows the full web-chat system prompt with all ninety-three to
 
 The example is shown as a flat enumeration for documentation clarity. At runtime the `<tools>` block is rendered dynamically by the inference engine's tool surface mechanism — full schemas for the tool currently being constructed, descriptions for nearby candidates, names only for everything else — and adapts during decode. The mechanism is specified separately; what matters here is the authored content each tool provides, covered in the next subsection.
 
+### Several calls in one turn
+
+One assistant turn may make up to `MAX_TOOL_CALLS_PER_TURN` (4) calls — OpenAI's *parallel function calling* expressed in the Hermes text format: one `<tool_call>` block per call, in one reply, with nothing but calls in it.
+
+```
+<tool_call>
+{"name": "file_read", "arguments": {"path": "src/main.rs", "start_line": 1, "end_line": 200}}
+</tool_call>
+<tool_call>
+{"name": "file_read", "arguments": {"path": "Cargo.toml", "start_line": 1, "end_line": 200}}
+</tool_call>
+```
+
+**Why.** A turn that can call only once pays a full round-trip per call — a reasoning block, a prefill of the growing context, a reprojection and a belief scan — while the calls themselves run in milliseconds. Measured on a codebase tour: fifteen single-call rounds, most of the conversation's non-answer wall clock. A model that already knows it wants three files should ask for them together.
+
+**The grammar enforces the shape.** `Engine::compile_tool_stencil` compiles `compile_tool_call_loop`: after each call the only continuations are the `<tool_call>` marker (another call) or the assistant-turn terminator. So the decoder is never free between a call and whatever follows it — no prose after a call, no answer to a result not yet seen — and a fifth call is off-grammar rather than counted and refused downstream. The envelope is `ToolCallEnvelope::for_assistant_calls`, which keeps the turn terminator *off* the call's close: the single-call envelope baked it in, which would end the turn before the loop could choose.
+
+The compiler memoises shared successors (`stencil::compile`). A loop spec is a DAG — every tool's arguments at level `k` end at the same "call again or stop" branch — and lowering it as a tree copies level `k+1` once per path through level `k`. Over the 95-tool catalog that never finished compiling; memoised it is 902 / 1,805 / 2,707 / 3,609 nodes for one to four calls.
+
+**Results are correlated in the text.** OpenAI pairs a result with its call by `tool_call_id`. Here each result's `<tool_response>` block opens with `[n/total tool_name]` when a turn made more than one call — explicit rather than positional, because a failed call returns an error envelope instead of the shape its position would suggest. A single-call round carries no label, so it stays byte-identical to the `code_reading` ingest's prefilled rounds. The label is literal text, so `tool_round_text` rebuilds a stored round into exactly the pieces it was submitted as.
+
+**Dispatch is sequential.** `tool_round::run` runs a turn's calls in order. The file tools run in milliseconds, so the round-trips batching removes are the whole win; concurrent execution would add ordering hazards for the stateful session tools (`ssh_session_open` → `ssh_session_exec`) for no measurable gain.
+
+**The model must be taught it.** The prompt invites batching explicitly, and `file_read` carries two batched trajectories. A permission the corpus never demonstrates is one the model does not use.
+
+### A call that cannot be read
+
+A `<tool_call>` block whose JSON does not parse is **answered, not dropped**. `tool_round::plan` walks every block in the answer, in order: a call that parses runs; one that does not gets an ordinary error result in its place and nothing runs:
+
+| Error | When | Detail tells the model |
+|---|---|---|
+| `call_cut_off` | The JSON ends before the call does — no `</tool_call>`, or a value that never closes | Nothing ran; split a large value across smaller calls |
+| `malformed_call` | The call is complete but not valid JSON, or names no tool | Nothing ran; issue it again as one JSON object |
+
+Because it is a normal `{"error", "detail"}` result, the round continues: the model reads it in the next turn like any failed tool, and the GUI pairs it with the call's card (by position, which is why refused calls keep their place in the round) and renders it as an error. A card whose JSON does not parse takes its tool name and path from the call's text. When the turn stopped inside a call, the daemon writes the missing `</tool_call>` to the stream so the card ends where the call did.
+
+Silently skipping such a block — the behaviour this replaces — left no call, so the turn read as a final answer: the loop ended, nothing ran, and neither the model nor the user was told.
+
+### How long a call may be
+
+A string argument is as often a whole file as a name, so each string value may run to `MAX_STRING_VALUE_TOKENS` (32,768) before the grammar closes it. The turn's prose budgets do not apply inside a call: while the tool-call stencil is steering (`SequenceSamplingState::writing_call`) the EOS ramp and the graceful and forced EOS failsafes stand down, because an EOS inside a call is intercepted and closes the value where it stands. The call is bounded by its grammar, and the turn by zend's `MAX_TURN_TOKENS` (65,536), which holds the longest think block plus one full value.
+
 ### Tool Description Format
 
 Each tool has three authored forms — name, description, and full — corresponding to the tiers of the dynamic tool surface. Tool authors provide all three; the surface mechanism selects which tier to render at any given decode step.
@@ -199,7 +264,18 @@ Search the web for information using a query string and return ranked results wi
 }
 ```
 
-**Implementation.** Backed by Tavily (`POST https://api.tavily.com/search` with `search_depth: "basic"` and `include_answer: false` — the local model synthesises its own answer). The provider is abstracted behind a `trait SearchProvider` so Brave, Exa, or Serper can be swapped in without touching the tool. Results are cached by `(query, max_results)` for one hour to avoid duplicate API hits within a session, and a per-session rate limit caps usage at ten calls per minute.
+**Implementation.** Backed by Tavily (`POST https://api.tavily.com/search` with `search_depth: "basic"` and `include_answer: false` — the local model synthesises its own answer).
+
+The API key comes from `secrets/tools.yaml` under the daemon's working directory, read once at startup into `ToolSecrets` and reached through `ctx.secrets`:
+
+```yaml
+# secrets/tools.yaml
+tavily_api_key: tvly-...
+```
+
+Absent key ⇒ `search_unavailable` naming the file to edit; the tool never reaches the network. The key is deliberately **not** read from the process environment: that would require whatever launches the daemon to export it, and every child process would inherit it.
+
+That path is gitignored *and* refused by the `file_*` tools — `VfsStore` rejects any path with a `secrets` segment, because a read resolves straight to disk and never consults the ignore rules, so `.gitignore` alone would leave the file hidden from `file_list` and served in full by `file_read`.
 
 **Errors.** Provider HTTP errors return `{"error": "search_unavailable", "detail": "..."}` rather than panicking, so the model can decide whether to retry or proceed with what it has. Empty queries are rejected by schema validation before the provider is called.
 
@@ -522,7 +598,9 @@ Create a new file or overwrite an existing one in the in-memory virtual filesyst
 
 ### `file_read`
 
-Read a file, or a range of its lines, from the session VFS. Use for: looking at what was previously written, inspecting a file the user uploaded into the chat, retrieving content the model needs to reference for editing or summarising, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what's in", "open the file", "cat", "display the contents of". Only `path` is required: given alone it returns the whole file, and `start_line` / `end_line` narrow the read to part of it. Returns the excerpt as numbered source in a fenced block, headed by the path and the line range it covers. Limited to files in the in-memory VFS — for remote filesystems use `remote_fs_session_get` to download first, then `file_read`.
+Read a range of lines from a file in the session VFS. Use for: looking at what was previously written, inspecting a file the user uploaded into the chat, retrieving content the model needs to reference for editing or summarising, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what's in", "open the file", "cat", "display the contents of". **`path`, `start_line` and `end_line` are all required, and a call returns at most `MAX_READ_LINES` (200) lines — there is no whole-file read.** Returns the excerpt as numbered source in a fenced block, headed by the path and the line range it covers. Limited to files in the in-memory VFS — for remote filesystems use `remote_fs_session_get` to download first, then `file_read`.
+
+**Why the range is mandatory rather than merely encouraged.** An unbounded read is not a slower read; it is a different failure, and it is one that guidance does not prevent. With the range optional, a single live conversation made nine `file_read` calls and all nine asked for whole files — 9,534 lines, including one 2,499-line module that arrived as 144 KB of `<tool_response>`. Three such reads made the following turn a 53,288-token prefill, which the scheduler delivered in 8,192-token chunks while the KV pool ratcheted 6 GB against a card already at 99% occupancy: one turn, three minutes and fifty seconds, with the per-chunk cost rising as the prefill went on (12.3 s → 23.0 s for identical work at identical depth). An emphatic description had been in place for that entire conversation. The schema is what holds, because `required` drives the constrained-decode stencil: a call with no range is not discouraged, it is undecodable.
 
 **Parameters**
 
@@ -534,15 +612,15 @@ Read a file, or a range of its lines, from the session VFS. Use for: looking at 
     "start_line": {
       "type": "integer",
       "minimum": 1,
-      "description": "First line to return, 1-based. Omit to read from the top of the file."
+      "description": "First line of the range to return, 1-based. Required."
     },
     "end_line": {
       "type": "integer",
       "minimum": 1,
-      "description": "Last line to return, 1-based and inclusive. Omit to read to the end of the file."
+      "description": "Last line of the range, 1-based and inclusive. Required. At most 200 lines come back per call."
     }
   },
-  "required": ["path"]
+  "required": ["path", "start_line", "end_line"]
 }
 ```
 
@@ -560,17 +638,19 @@ src/main.rs (lines 1-3):
 ```
 ````
 
-A missing bound is the file's own edge: with no range the whole file comes back, `start_line` alone reads to the end, and `end_line` alone reads from the top. A given `start_line` is clamped into `[1, total]` and `end_line` into `[start_line, total]`. When the excerpt stops before the end of the file the header reads `(lines 47-93 of 900)`, which is the signal to continue with `start_line` 94; otherwise it reads `(lines a-b)`. An empty file reads as `(empty)`.
+`start_line` is clamped into `[1, total]` and `end_line` into `[start_line, total]`, so a range running past the end of the file ends at the file rather than failing, and a transposed pair collapses to a one-line read rather than costing a round trip. The span cap applies last, to whatever the clamps produced: `end` becomes at most `start_line + 199`.
 
-The properties are declared `path, start_line, end_line`, and the constrained decoder offers optional parameters in declared order (the workspace builds `serde_json` with `preserve_order`), so a call names its range start first.
+**A range wider than the cap is served, not refused.** Asking for lines 1-900 of a 900-line file returns lines 1-200, and because the excerpt now stops short of the end the header reads `(lines 1-200 of 900)` — which states both that it was cut and where to resume. Returning `invalid_arguments` would spend a whole turn conveying what the header already carries. When the excerpt does reach the end of the file the header is the plain `(lines a-b)`, which is how the model knows there is nothing further to fetch. An empty file reads as `(empty)`.
 
-**Errors.** Missing file returns `{"error": "not_found", "path": "..."}`. A call missing `path` returns `{"error": "invalid_arguments", ...}`.
+The `required` list is declared `path, start_line, end_line`, and the constrained decoder emits required parameters in that order, so a call reads in the order it is written.
+
+**Errors.** Missing file returns `{"error": "not_found", "path": "..."}`. A call missing `path`, `start_line` or `end_line` returns `{"error": "invalid_arguments", ...}` naming the absent field. A path under a `secrets/` directory returns `{"error": "forbidden"}` — note that argument validation runs before the tool, so a malformed call to a protected path reports the malformation first; the guard is unaffected, since neither call reads anything.
 
 ---
 
 ### `file_edit`
 
-Make a targeted edit to an existing VFS file by replacing a unique substring. Use for: changing a value in a config, updating a function body, fixing a typo, modifying one line in a long file without rewriting the whole thing, applying small surgical changes. The `old_str` must appear exactly once in the file — if it appears multiple times the call returns an `ambiguous` error and asks for more surrounding context. Triggered by "change X to Y in the file", "edit the file to replace", "update this line", "modify the part where it says", "fix the value of". Returns path and new byte count. For full rewrites of a file use `file_write`.
+Apply a unified diff to an existing VFS file. The patch is one or more `@@ -old,count +new,count @@` hunks, each line prefixed with a space for context, `-` for a removed line, `+` for an added one. Use for: changing a value in a config, editing several places in one file at once, updating a function body, fixing a typo. Hunks are located by their context rather than by their line numbers, so the numbers need only be close; a hunk whose context matches in several places returns an `ambiguous` error and asks for more surrounding context, and a hunk whose change is already in the file is reported as already applied rather than applied twice. Either every hunk lands or none does. Triggered by "change X to Y in the file", "apply this diff", "edit the file to replace", "update these lines", "fix the value of". Returns path, per-hunk counts, and new byte count. For full rewrites of a file use `file_write`.
 
 **Parameters**
 
@@ -579,32 +659,30 @@ Make a targeted edit to an existing VFS file by replacing a unique substring. Us
   "type": "object",
   "properties": {
     "path": {"type": "string"},
-    "old_str": {
+    "patch": {
       "type": "string",
-      "description": "Exact substring to find. Must appear exactly once in the file."
-    },
-    "new_str": {
-      "type": "string",
-      "description": "Replacement text. May be empty to delete."
+      "description": "Unified-diff body: one or more `@@ -old,count +new,count @@` hunks whose lines are prefixed with a space (context), `-` (removed) or `+` (added). Give every hunk at least one context or removed line."
     }
   },
-  "required": ["path", "old_str", "new_str"]
+  "required": ["path", "patch"]
 }
 ```
 
 **Returns**
 
 ```json
-{"path": "src/main.rs", "bytes": 1289}
+{"path": "src/main.rs", "hunks_applied": 2, "hunks_already_applied": 0, "bytes": 1289}
 ```
 
-**Implementation.** Reads the file, counts occurrences of `old_str`. If zero, returns `{"error": "not_found", "detail": "old_str does not appear in file"}`. If more than one, returns `{"error": "ambiguous", "count": 3, "detail": "old_str appears 3 times; include more surrounding context to disambiguate"}`. If exactly one, performs the replacement and writes back. The uniqueness requirement matches Claude Code's `str_replace` and Cursor's edit semantics for the same reason: it forces the model to provide enough context to identify a single edit site, which is more reliable than line numbers and prevents accidental multi-edits.
+**Implementation.** `zend-tools`' `tools/file/patch.rs`, which parses the diff and applies it to the file read through the overlay. A hunk is found by its **pre-image** — its context and removed lines, matched as a run of whole lines, with no fuzz and never as a substring of a line. The `@@` numbers are a hint used only to choose between equal matches; the occurrence nearest the hinted position wins and a tie returns `{"error": "ambiguous", "detail": "hunk 1 (@@ -3 +3 @@) matches in more than one place..."}`. When a pre-image is absent the engine looks for the hunk's **post-image** (its context and added lines): finding it means the change is already in the file, so the hunk counts as already applied and nothing is written for it. That is what makes re-sending a patch a no-op — and why `-retries = 3` / `+retries = 30` cannot compound into `retries = 300`, since whole-line matching does not see `retries = 3` inside `retries = 30`. A hunk that is neither applicable nor already applied returns `{"error": "not_found", "detail": "hunk 2 (@@ -3,2 +3,2 @@) does not apply..."}` and **nothing is written at all**: the patched copy is built to one side and stored only once every hunk has landed, so a half-patched file never reaches the VFS. Locating by content rather than by line number is the point — it is what lets a model patch a file whose line numbers have moved since it read it, and what makes a retry after an unclear result safe.
 
 ---
 
 ### `file_list`
 
-List files currently in the session VFS, optionally filtered by a path prefix like `src/`. Use for: seeing what files have been created during the session, finding a file when the path is uncertain, getting an overview of session contents, checking what was uploaded by the user. Triggered by "list files", "what files do I have", "show me what's in", "ls", "what's been created so far". Returns array of files with path, byte size, and line count, plus total bytes used. For listing remote directories use `remote_fs_session_list_dir`.
+Enumerate the files in a directory you already know the name of — the project's working directory unioned with anything this session has written, which shadows the file of the same path on disk. Use for: seeing what is in a specific directory, checking what the session has created, getting an overview of a subtree you have already located. Triggered by "list files", "what files are in", "show me what's in", "ls", "what's been created so far". Returns path and byte size per entry, paged. **No line count** — for the reason `file_search` gives below: the walk has each entry's size from its directory metadata, but a line count means opening and decoding the file, and the listing then pages down to 50 entries and discards the rest. On this workspace that was ~2,900 files read to fill fifty rows. A file's length reaches the model through `file_read`'s header instead (`(lines 1-200 of 2499)`), which is exact and arrives when the number is actually needed. Ignored paths (`.gitignore` and friends) never appear, and neither does anything under a `secrets/` directory.
+
+**To *find* a file rather than enumerate one, use `file_search`; to find code by its contents, use `file_grep`.** Calling `file_list` on a guessed directory name is the slow way to answer either question — an empty result is indistinguishable from a wrong guess. For listing remote directories use `remote_fs_session_list_dir`.
 
 **Parameters**
 
@@ -627,15 +705,147 @@ List files currently in the session VFS, optionally filtered by a path prefix li
 ```json
 {
   "files": [
-    {"path": "Cargo.toml", "bytes": 142, "lines": 8},
-    {"path": "src/lib.rs", "bytes": 312, "lines": 18},
-    {"path": "src/main.rs", "bytes": 1289, "lines": 47}
+    {"path": "Cargo.toml", "bytes": 142},
+    {"path": "src/lib.rs", "bytes": 312},
+    {"path": "src/main.rs", "bytes": 1289, "modified": true}
   ],
+  "paging": {"page": 0, "pages": 1, "per_page": 50, "total": 3, "next_page": null},
   "total_bytes": 1743
 }
 ```
 
-**Implementation.** Linear scan of the VFS map filtered by prefix; results sorted alphabetically by path. Stateless beyond reading the session VFS.
+**Implementation.** Union of the session layer with an `ignore`-driven walk of the working directory (the crate ripgrep uses, so `.gitignore`, `.ignore`, git's global excludes and hidden-file rules all apply), the session layer shadowing the workspace, sorted by path and paged at 50 entries. `modified: true` marks an entry the session has changed; it is omitted when false. `total_bytes` is the session layer's 10 MiB budget denominator — workspace files are read on demand and cost nothing against it.
+
+---
+
+### `file_search`
+
+Find files by **name or path** anywhere in the project, without knowing which directory they are in. Use for: locating a file whose name you know but whose directory you do not, checking whether a module exists, finding every file of a kind, discovering where a subsystem lives before reading it. Triggered by "where is", "find the file", "which file is", "locate", "is there a file called", "what files are named", "show me all the .rs files". Returns matching paths, shortest first, paged.
+
+**This is the tool for finding a file.** Guessing directory names at `file_list` until one answers is the failure mode it exists to remove.
+
+**Parameters**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "Name, stem, extension, path fragment, or glob with '*'. Case-insensitive, matched against the whole path."
+    },
+    "prefix": {
+      "type": "string",
+      "description": "Optional path prefix to search within (e.g. 'candle-nn/src/')."
+    },
+    "page": {
+      "type": "integer",
+      "description": "Zero-based page of results. Defaults to 0.",
+      "default": 0
+    }
+  },
+  "required": ["query"]
+}
+```
+
+**Returns**
+
+```json
+{
+  "files": ["zend-tools/src/tools/web_search.rs", "zend-tools/src/tools/web_fetch.rs"],
+  "paging": {"page": 0, "pages": 1, "per_page": 60, "total": 2, "next_page": null}
+}
+```
+
+**Examples**
+
+| Question | Call |
+|---|---|
+| "where is the web search tool?" | `{"query": "web_search"}` |
+| "find every mod.rs under the KV cache" | `{"query": "mod.rs", "prefix": "candle-nn/src/kv_cache/"}` |
+| "what TOML files are in this repo?" | `{"query": "*.toml"}` |
+| "is there a config.rs anywhere?" | `{"query": "config.rs"}` |
+| "find the integration tests" | `{"query": "tests/*.rs"}` |
+
+**Implementation.** Walks the same ignore-driven union as `file_list` but reads no file contents — a path search does not need line counts, and computing them would mean reading every file in the repository to discard the number. A query with no `*` is a case-insensitive substring test over the whole path; with `*` it is an anchored wildcard where `*` spans `/`, so a leading literal must start the path and a trailing literal must end it (`*.rs` does not match `a.rs.bak`). Results sort shortest-path-first, then alphabetically: the shortest path bearing a name is usually the definition rather than a vendored or generated copy. Paged at 60.
+
+**Errors.** None of its own — an unmatched query is an empty `files` array with `total: 0`, not an error.
+
+---
+
+### `file_grep`
+
+Search the **contents** of every file in the project for a string or regular expression, returning matching lines with their paths and line numbers. Use for: finding where a function, type, constant or error message is defined or used; checking whether something exists in the codebase at all; tracing callers of an API; locating a config key, a magic string, or a TODO. Triggered by "where is X defined", "who calls", "find all uses of", "search the code for", "does the codebase contain", "grep for", "which file has", "find the string".
+
+**This is the tool for finding code by content**, and the line numbers it returns feed straight into `file_read`'s `start_line`.
+
+**Parameters**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "pattern": {
+      "type": "string",
+      "description": "Regular expression (Rust regex syntax). A plain string matches itself."
+    },
+    "prefix": {
+      "type": "string",
+      "description": "Optional path prefix to search within (e.g. 'candle-nn/src/')."
+    },
+    "ignore_case": {
+      "type": "boolean",
+      "description": "Match without regard to case. Defaults to false.",
+      "default": false
+    },
+    "page": {
+      "type": "integer",
+      "description": "Zero-based page of results. Defaults to 0.",
+      "default": 0
+    }
+  },
+  "required": ["pattern"]
+}
+```
+
+**Returns**
+
+```json
+{
+  "matches": [
+    {"path": "zend-tools/src/tools/web_search.rs", "line": 66, "text": "let Some(api_key) = ctx.secrets.tavily_api_key() else {"}
+  ],
+  "paging": {"page": 0, "pages": 1, "per_page": 40, "total": 1, "next_page": null},
+  "files_searched": 4127
+}
+```
+
+**Examples**
+
+| Question | Call |
+|---|---|
+| "where is TAVILY_API_KEY read?" | `{"pattern": "TAVILY_API_KEY"}` |
+| "who calls `forward_wave`?" | `{"pattern": "forward_wave\\("}` |
+| "find the public functions in this crate" | `{"pattern": "^pub fn ", "prefix": "zend-tools/src/"}` |
+| "any TODOs or FIXMEs left?" | `{"pattern": "TODO\|FIXME"}` |
+| "find the error string, whatever its case" | `{"pattern": "connection refused", "ignore_case": true}` |
+
+**Implementation.** Candidate paths come from the same walk as `file_search`; each is read (session layer first, then the workspace) and scanned line by line. Files that cannot be scanned — oversize, not UTF-8, deleted between the walk and the read — are skipped rather than failing the pass, so one binary blob cannot turn a whole search into an error. Capped at 20 hits per file and 600 overall, with `truncated: true` when a ceiling is reached: one generated file with a thousand matches would otherwise hide every other file that matched, and "which files contain this" is usually the real question. Lines over 400 characters are clipped on a character boundary. `files_searched` is reported so that an empty result is unambiguous — "scanned 4,127 files and it is genuinely absent" reads differently from "the prefix matched nothing to scan".
+
+**Errors.** `invalid_arguments` when the pattern is not a valid regular expression, carrying the regex crate's own message (which names the offending position). An unmatched pattern is an empty `matches` array, not an error.
+
+---
+
+### Choosing between the file tools
+
+| You know | You want | Tool |
+|---|---|---|
+| a path | the contents | `file_read` |
+| a directory | what is in it | `file_list` |
+| part of a name | the path | `file_search` |
+| a string or symbol | where it appears | `file_grep` |
+
+The two search tools cover the whole project in one call. Reaching for `file_list` on a guessed directory name is the failure this table exists to prevent: an empty listing looks identical whether the directory is empty or the guess was wrong, so the guessing does not converge.
 
 ---
 

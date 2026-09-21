@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext, ToolError};
+use crate::{RegisteredTool, Replay, Tool, ToolContext, ToolError};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct Request {
@@ -110,6 +110,12 @@ impl Tool for WeatherTool {
     type Response = Response;
     type Error = WeatherError;
 
+    /// Reads a public forecast API that takes no key and holds no account, so
+    /// a second read spends nothing.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
+
     fn run(ctx: &ToolContext, req: Request) -> Result<Response, WeatherError> {
         let units = req.units.as_deref().unwrap_or("metric");
         let forecast_days = req.forecast_days.unwrap_or(0);
@@ -119,8 +125,10 @@ impl Tool for WeatherTool {
             "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=en&format=json",
             urlencoding::encode(&req.location)
         );
-        let geo_resp = ctx
-            .http_client
+        let http = ctx
+            .http()
+            .map_err(|e| WeatherError::WeatherUnavailable(e.to_string()))?;
+        let geo_resp = http
             .get(&geo_url)
             .send()
             .map_err(|e| WeatherError::WeatherUnavailable(e.to_string()))?;
@@ -160,8 +168,7 @@ impl Tool for WeatherTool {
              &temperature_unit={temp_unit}"
         );
 
-        let w_resp = ctx
-            .http_client
+        let w_resp = http
             .get(&weather_url)
             .send()
             .map_err(|e| WeatherError::WeatherUnavailable(e.to_string()))?;

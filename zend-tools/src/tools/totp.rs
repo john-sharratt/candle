@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext, ToolError};
+use crate::{NotPermitted, RegisteredTool, Replay, Tool, ToolContext, ToolError};
 
 #[derive(Debug, Error)]
 pub enum TotpError {
@@ -15,6 +15,8 @@ pub enum TotpError {
     InvalidCredentialType(String),
     #[error("TOTP generation failed: {0}")]
     TotpFailed(String),
+    #[error(transparent)]
+    NotPermitted(#[from] NotPermitted),
 }
 
 impl ToolError for TotpError {
@@ -23,6 +25,7 @@ impl ToolError for TotpError {
             TotpError::CredentialNotFound(_) => "credential_not_found",
             TotpError::InvalidCredentialType(_) => "invalid_credential_type",
             TotpError::TotpFailed(_) => "totp_failed",
+            TotpError::NotPermitted(_) => NotPermitted::CODE,
         }
     }
 }
@@ -66,9 +69,14 @@ impl Tool for TotpGenerate {
     type Response = Response;
     type Error = TotpError;
 
+    /// Derives a code from the secret and the clock; nothing is spent.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
+
     fn run(ctx: &ToolContext, req: Request) -> Result<Response, TotpError> {
         let cred = ctx
-            .credentials
+            .credentials()?
             .get_by_name(&req.credential_name)
             .ok_or_else(|| TotpError::CredentialNotFound(req.credential_name.clone()))?;
 

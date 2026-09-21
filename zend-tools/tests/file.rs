@@ -44,9 +44,28 @@ fn file_write_unicode() {
 fn file_edit_not_found() {
     let resp = harness::invoke(
         "file_edit",
-        json!({"path": "nonexistent.txt", "old_str": "x", "new_str": "y"}),
+        json!({"path": "nonexistent.txt", "patch": "@@ -1 +1 @@\n-x\n+y\n"}),
     );
-    harness::expect_error(&resp, "not_found");
+    let detail = harness::expect_error(&resp, "not_found");
+    // The refusal names the way to create the file, not only the fault.
+    assert!(detail.contains("nonexistent.txt"), "{detail}");
+    assert!(detail.contains("call `write`"), "{detail}");
+}
+
+/// A URL is not a file: the refusal names `web_fetch` rather than reporting a
+/// missing path the model would retry under other spellings.
+#[test]
+fn file_read_of_a_url_points_to_web_fetch() {
+    let resp = harness::invoke(
+        "file_read",
+        json!({"path": "https://docs.rs/serde/latest/serde/", "page": 0}),
+    );
+    let detail = harness::expect_error(&resp, "invalid_arguments");
+    assert!(
+        detail.contains("https://docs.rs/serde/latest/serde/"),
+        "{detail}"
+    );
+    assert!(detail.contains("`web_fetch`"), "{detail}");
 }
 
 #[test]
@@ -121,7 +140,7 @@ fn file_edit_round_trip() {
     );
     harness::expect_success(harness::invoke_with_ctx(
         "file_edit",
-        json!({"path": "rt.txt", "old_str": "world", "new_str": "Rust"}),
+        json!({"path": "rt.txt", "patch": "@@ -1 +1 @@\n-hello world\n+hello Rust\n"}),
         &ctx,
     ));
     let rd = harness::expect_success(harness::invoke_with_ctx(
@@ -183,12 +202,13 @@ fn file_edit_success() {
         "file_edit",
         json!({
             "path": "edit.txt",
-            "old_str": "bar",
-            "new_str": "qux"
+            "patch": "@@ -1 +1 @@\n-foo bar baz\n+foo qux baz\n"
         }),
         &ctx,
     ));
-    assert!(resp["bytes"].as_u64().unwrap() > 0);
+    assert_eq!(resp["bytes"], 11);
+    assert_eq!(resp["hunks_applied"], 1);
+    assert_eq!(resp["hunks_already_applied"], 0);
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
         json!({"path": "edit.txt", "page": 0}),
@@ -202,19 +222,154 @@ fn file_edit_ambiguous() {
     let ctx = ctx();
     harness::invoke_with_ctx(
         "write",
-        json!({"path": "dup.txt", "content": "aa bb aa"}),
+        json!({"path": "dup.txt", "content": "aa\nbb\naa\n"}),
         &ctx,
     );
+    // `aa` stands one line either side of the hunk's stated position, so the
+    // line numbers cannot pick between them.
     let resp = harness::invoke_with_ctx(
         "file_edit",
         json!({
             "path": "dup.txt",
-            "old_str": "aa",
-            "new_str": "xx"
+            "patch": "@@ -2 +2 @@\n-aa\n+xx\n"
         }),
         &ctx,
     );
     harness::expect_error(&resp, "ambiguous");
+}
+
+/// The tool end to end over a real workspace: the patch lands in the session,
+/// the file on disk is untouched, and sending the same patch a second time is a
+/// no-op that reports the hunk as already applied instead of applying it again.
+#[test]
+fn file_edit_patches_through_the_overlay_and_leaves_disk_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let on_disk = "fn main() {\n    let retries = 3;\n    run(retries);\n}\n";
+    std::fs::write(dir.path().join("src/main.rs"), on_disk).unwrap();
+    let ctx = ToolContext::with_workspace(dir.path());
+
+    let patch = "@@ -1,3 +1,3 @@\n fn main() {\n-    let retries = 3;\n+    let retries = 30;\n     run(retries);\n";
+    let first = harness::expect_success(harness::invoke_with_ctx(
+        "file_edit",
+        json!({"path": "src/main.rs", "patch": patch}),
+        &ctx,
+    ));
+    assert_eq!(first["path"], "src/main.rs");
+    assert_eq!(first["hunks_applied"], 1);
+    assert_eq!(first["hunks_already_applied"], 0);
+    assert_eq!(first["bytes"], 54);
+
+    let patched = "fn main() {\n    let retries = 30;\n    run(retries);\n}\n";
+    let read = harness::expect_success(harness::invoke_with_ctx(
+        "file_read",
+        json!({"path": "src/main.rs", "page": 0}),
+        &ctx,
+    ));
+    assert_eq!(excerpt_source(&read), patched.trim_end());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
+        on_disk,
+        "the file on disk must be byte-for-byte what it was",
+    );
+
+    // The same patch again: the addition contains the removal, so a
+    // substring-replacing edit would leave `retries = 300` here.
+    let second = harness::expect_success(harness::invoke_with_ctx(
+        "file_edit",
+        json!({"path": "src/main.rs", "patch": patch}),
+        &ctx,
+    ));
+    assert_eq!(second["hunks_applied"], 0);
+    assert_eq!(second["hunks_already_applied"], 1);
+    assert_eq!(second["bytes"], 54);
+    let reread = harness::expect_success(harness::invoke_with_ctx(
+        "file_read",
+        json!({"path": "src/main.rs", "page": 0}),
+        &ctx,
+    ));
+    assert_eq!(excerpt_source(&reread), patched.trim_end());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
+        on_disk,
+    );
+}
+
+/// A patch that is entirely already applied writes nothing at all — a workspace
+/// file must not be copied up on account of an edit that did not happen.
+#[test]
+fn file_edit_already_applied_does_not_copy_the_file_up() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "[net]\nport = 9090\n").unwrap();
+    let ctx = ToolContext::with_workspace(dir.path());
+
+    let resp = harness::expect_success(harness::invoke_with_ctx(
+        "file_edit",
+        json!({
+            "path": "config.toml",
+            "patch": "@@ -1,2 +1,2 @@\n [net]\n-port = 8080\n+port = 9090\n"
+        }),
+        &ctx,
+    ));
+    assert_eq!(resp["hunks_applied"], 0);
+    assert_eq!(resp["hunks_already_applied"], 1);
+
+    let listed = harness::expect_success(harness::invoke_with_ctx("file_list", json!({}), &ctx));
+    let entry = listed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "config.toml")
+        .expect("config.toml is listed");
+    assert!(
+        entry.get("modified").is_none(),
+        "nothing was written, so nothing was copied up",
+    );
+}
+
+/// One failing hunk abandons the whole patch: the hunk that would have applied
+/// leaves no trace, and the error names the one that failed.
+#[test]
+fn file_edit_writes_nothing_when_one_hunk_fails() {
+    let ctx = ctx();
+    let before = "alpha\nbeta\ngamma\ndelta\n";
+    harness::invoke_with_ctx("write", json!({"path": "all.txt", "content": before}), &ctx);
+    let resp = harness::invoke_with_ctx(
+        "file_edit",
+        json!({
+            "path": "all.txt",
+            "patch": "@@ -1,2 +1,2 @@\n alpha\n-beta\n+BETA\n@@ -3,2 +3,2 @@\n gamma\n-absent\n+new\n"
+        }),
+        &ctx,
+    );
+    let detail = harness::expect_error(&resp, "not_found");
+    assert!(
+        detail.starts_with("hunk 2 (@@ -3,2 +3,2 @@) does not apply"),
+        "{detail}",
+    );
+    let read = harness::expect_success(harness::invoke_with_ctx(
+        "file_read",
+        json!({"path": "all.txt", "page": 0}),
+        &ctx,
+    ));
+    assert_eq!(
+        excerpt_source(&read),
+        before.trim_end(),
+        "the first hunk must not have landed",
+    );
+}
+
+/// A patch that is not a diff is rejected as bad arguments, not read as content.
+#[test]
+fn file_edit_rejects_a_patch_that_is_not_a_diff() {
+    let ctx = ctx();
+    harness::invoke_with_ctx("write", json!({"path": "p.txt", "content": "a\n"}), &ctx);
+    let resp = harness::invoke_with_ctx(
+        "file_edit",
+        json!({"path": "p.txt", "patch": "just change a into b"}),
+        &ctx,
+    );
+    harness::expect_error(&resp, "invalid_arguments");
 }
 
 #[test]

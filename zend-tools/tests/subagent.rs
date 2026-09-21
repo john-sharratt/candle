@@ -2,7 +2,7 @@ mod harness;
 
 use serde_json::json;
 use std::sync::{Arc, Mutex};
-use zend_tools::{SubagentRequest, SubagentResponse, SubagentRunner, ToolContext};
+use zend_tools::{SubagentRequest, SubagentResponse, SubagentRunner};
 
 // ── Reusable mock runners ─────────────────────────────────────────────────────
 
@@ -50,7 +50,7 @@ fn subagent_not_configured() {
 
 #[test]
 fn subagent_with_mock_runner() {
-    let ctx = ToolContext::new().with_subagent_runner(Arc::new(EchoRunner));
+    let ctx = harness::granted().with_subagent_runner(Arc::new(EchoRunner));
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "sub_run",
         json!({"instruction": "test task"}),
@@ -63,14 +63,14 @@ fn subagent_with_mock_runner() {
 
 #[test]
 fn subagent_runner_failed() {
-    let ctx = ToolContext::new().with_subagent_runner(Arc::new(FailRunner));
+    let ctx = harness::granted().with_subagent_runner(Arc::new(FailRunner));
     let resp = harness::invoke_with_ctx("sub_run", json!({"instruction": "fail please"}), &ctx);
     harness::expect_error(&resp, "subagent_failed");
 }
 
 #[test]
 fn subagent_runner_error_detail_contains_message() {
-    let ctx = ToolContext::new().with_subagent_runner(Arc::new(FailRunner));
+    let ctx = harness::granted().with_subagent_runner(Arc::new(FailRunner));
     let resp = harness::invoke_with_ctx("sub_run", json!({"instruction": "trigger failure"}), &ctx);
     let detail = harness::expect_error(&resp, "subagent_failed");
     assert!(detail.contains("model crashed"), "detail was: {detail}");
@@ -94,7 +94,7 @@ fn subagent_max_turns_default() {
         }
     }
 
-    let ctx = ToolContext::new().with_subagent_runner(Arc::new(TurnsCapture));
+    let ctx = harness::granted().with_subagent_runner(Arc::new(TurnsCapture));
     harness::invoke_with_ctx("sub_run", json!({"instruction": "x"}), &ctx);
     assert_eq!(CAPTURED.load(std::sync::atomic::Ordering::Relaxed), 10);
 }
@@ -102,7 +102,7 @@ fn subagent_max_turns_default() {
 #[test]
 fn subagent_custom_max_turns() {
     let runner = Arc::new(CapturingRunner::default());
-    let ctx = ToolContext::new().with_subagent_runner(runner.clone());
+    let ctx = harness::granted().with_subagent_runner(runner.clone());
     harness::invoke_with_ctx(
         "sub_run",
         json!({"instruction": "short task", "max_turns": 3}),
@@ -116,7 +116,7 @@ fn subagent_custom_max_turns() {
 
 #[test]
 fn subagent_empty_instruction_rejected() {
-    let ctx = ToolContext::new().with_subagent_runner(Arc::new(EchoRunner));
+    let ctx = harness::granted().with_subagent_runner(Arc::new(EchoRunner));
     let resp = harness::invoke_with_ctx("sub_run", json!({"instruction": ""}), &ctx);
     harness::expect_error(&resp, "invalid_arguments");
 }
@@ -124,7 +124,7 @@ fn subagent_empty_instruction_rejected() {
 #[test]
 fn subagent_instruction_too_long_accepted_by_validator() {
     // validator only checks min=1; long instructions should succeed
-    let ctx = ToolContext::new().with_subagent_runner(Arc::new(EchoRunner));
+    let ctx = harness::granted().with_subagent_runner(Arc::new(EchoRunner));
     let long = "x".repeat(4096);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "sub_run",
@@ -139,7 +139,7 @@ fn subagent_instruction_too_long_accepted_by_validator() {
 #[test]
 fn subagent_tool_filter_passed_to_runner() {
     let runner = Arc::new(CapturingRunner::default());
-    let ctx = ToolContext::new().with_subagent_runner(runner.clone());
+    let ctx = harness::granted().with_subagent_runner(runner.clone());
     harness::invoke_with_ctx(
         "sub_run",
         json!({"instruction": "use files", "tools": ["write", "file_read"]}),
@@ -153,7 +153,7 @@ fn subagent_tool_filter_passed_to_runner() {
 #[test]
 fn subagent_default_tools_is_none() {
     let runner = Arc::new(CapturingRunner::default());
-    let ctx = ToolContext::new().with_subagent_runner(runner.clone());
+    let ctx = harness::granted().with_subagent_runner(runner.clone());
     harness::invoke_with_ctx(
         "sub_run",
         json!({"instruction": "no tools specified"}),
@@ -166,7 +166,7 @@ fn subagent_default_tools_is_none() {
 #[test]
 fn subagent_model_override_passed_to_runner() {
     let runner = Arc::new(CapturingRunner::default());
-    let ctx = ToolContext::new().with_subagent_runner(runner.clone());
+    let ctx = harness::granted().with_subagent_runner(runner.clone());
     harness::invoke_with_ctx(
         "sub_run",
         json!({"instruction": "use big model", "model": "claude-opus-4-7"}),
@@ -182,7 +182,7 @@ fn subagent_model_override_passed_to_runner() {
 #[test]
 fn subagent_default_model_is_none() {
     let runner = Arc::new(CapturingRunner::default());
-    let ctx = ToolContext::new().with_subagent_runner(runner.clone());
+    let ctx = harness::granted().with_subagent_runner(runner.clone());
     harness::invoke_with_ctx("sub_run", json!({"instruction": "default model"}), &ctx);
     let captured = runner.captured.lock().unwrap();
     assert!(captured.as_ref().unwrap().model.is_none());
@@ -191,7 +191,7 @@ fn subagent_default_model_is_none() {
 #[test]
 fn subagent_endpoint_override_passed_to_runner() {
     let runner = Arc::new(CapturingRunner::default());
-    let ctx = ToolContext::new().with_subagent_runner(runner.clone());
+    let ctx = harness::granted().with_subagent_runner(runner.clone());
     harness::invoke_with_ctx(
         "sub_run",
         json!({"instruction": "custom endpoint", "endpoint": "https://custom.api/v1"}),
@@ -208,7 +208,7 @@ fn subagent_endpoint_override_passed_to_runner() {
 
 #[test]
 fn subagent_result_is_string() {
-    let ctx = ToolContext::new().with_subagent_runner(Arc::new(EchoRunner));
+    let ctx = harness::granted().with_subagent_runner(Arc::new(EchoRunner));
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "sub_run",
         json!({"instruction": "return string"}),
@@ -219,7 +219,7 @@ fn subagent_result_is_string() {
 
 #[test]
 fn subagent_turns_and_tool_calls_present() {
-    let ctx = ToolContext::new().with_subagent_runner(Arc::new(EchoRunner));
+    let ctx = harness::granted().with_subagent_runner(Arc::new(EchoRunner));
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "sub_run",
         json!({"instruction": "check fields"}),
@@ -241,7 +241,7 @@ fn subagent_many_tool_calls_propagated() {
             })
         }
     }
-    let ctx = ToolContext::new().with_subagent_runner(Arc::new(HighUsageRunner));
+    let ctx = harness::granted().with_subagent_runner(Arc::new(HighUsageRunner));
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "sub_run",
         json!({"instruction": "complex task"}),
@@ -268,8 +268,8 @@ fn subagent_contexts_are_independent() {
         }
     }
 
-    let ctx_a = ToolContext::new().with_subagent_runner(Arc::new(IdRunner { id: "runner_A" }));
-    let ctx_b = ToolContext::new().with_subagent_runner(Arc::new(IdRunner { id: "runner_B" }));
+    let ctx_a = harness::granted().with_subagent_runner(Arc::new(IdRunner { id: "runner_A" }));
+    let ctx_b = harness::granted().with_subagent_runner(Arc::new(IdRunner { id: "runner_B" }));
 
     let a = harness::expect_success(harness::invoke_with_ctx(
         "sub_run",
@@ -288,7 +288,7 @@ fn subagent_contexts_are_independent() {
 #[test]
 fn subagent_no_runner_in_default_context() {
     // A fresh ToolContext without with_subagent_runner must return not_configured
-    let ctx = ToolContext::new();
+    let ctx = harness::granted();
     let resp = harness::invoke_with_ctx("sub_run", json!({"instruction": "anything"}), &ctx);
     harness::expect_error(&resp, "not_configured");
 }
@@ -298,7 +298,7 @@ fn subagent_no_runner_in_default_context() {
 #[test]
 fn subagent_instruction_roundtrip() {
     let runner = Arc::new(CapturingRunner::default());
-    let ctx = ToolContext::new().with_subagent_runner(runner.clone());
+    let ctx = harness::granted().with_subagent_runner(runner.clone());
     let instruction = "process the dataset and produce a summary";
     harness::invoke_with_ctx("sub_run", json!({"instruction": instruction}), &ctx);
     let captured = runner.captured.lock().unwrap();

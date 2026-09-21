@@ -1,10 +1,17 @@
 // =============================================================================
-// QSA index-cache append: pool → RMS-norm → RoPE → store, for a whole wave
+// QSA index-cache append: pool → RMS-norm → store, for a whole wave
 // =============================================================================
 // `IndexCache::append` prepares one indexer key per `ratio` tokens. A completed
 // block's key is a function of the block alone — the mean of its `ratio` raw
-// projected rows, the indexer's `k_norm`, and a rotation at the block's FIRST
-// absolute position — so it is computed once and stored ready to score.
+// projected rows, then the indexer's `k_norm` — so it is computed once and
+// stored.
+//
+// **Stored un-rotated.** The reference ropes a pooled key at its block's first
+// position when it reads it, and so does this engine: the scorer rotates each
+// key as it loads it (`qsa_score_paged.cu`). A stored row therefore carries no
+// position and no RoPE frequencies, which is what lets a page move between
+// projections, and a slot change RoPE schedule, without rewriting a byte of it
+// (`docs/progressive_yarn.md` §7).
 //
 // Eagerly that is roughly THIRTY launches per sequence per layer per wave, and
 // `nsys` over the selection microbenchmark says what they are: a `cat` of the
@@ -46,7 +53,6 @@
 //                              not straddle)
 //     [2] n0     rows taken from segment 0; segment 1 supplies `ratio − n0`
 //     [3] src1   const float*  second segment's base row
-//     [4] pos    the block's first absolute position — its rotation angle
 //
 // ---- Shape ------------------------------------------------------------------
 //
@@ -73,20 +79,19 @@
 // The expression is the eager chain's, in the eager chain's order: the mean
 // before the norm, `x / sqrt(mean(x²) + eps) · w` with a true divide rather
 // than `rsqrtf` (the archive compiles `--use_fast_math`, and `rsqrtf` is a
-// different, and differently-rounded, function), then the NeoX half-split
-// rotation. It is not bit-exact to the eager chain and should not be expected
-// to be: fusing keeps the intermediates in registers where the eager path
-// rounded each one out to memory. `qsa_index_append_matches_host` gates it the
-// way `compressor_pool` gates its own fusion — against exact host arithmetic,
-// asserting the kernel is at least as faithful as the chain it replaces.
+// different, and differently-rounded, function). It is not bit-exact to the
+// eager chain and should not be expected to be: fusing keeps the intermediates
+// in registers where the eager path rounded each one out to memory.
+// `stored_rows_are_the_pooled_normed_unrotated_key` (`indexer.rs`) gates it
+// against host arithmetic.
 
 #include <cuda_runtime.h>
 #include <stdint.h>
 
-#define QSA_APPEND_JOB_WORDS 5
+#define QSA_APPEND_JOB_WORDS 4
 #define QSA_APPEND_CARRY_WORDS 3
-/// i64 words per flush job: `{dst, src, count, pos}`.
-#define QSA_FLUSH_JOB_WORDS 4
+/// i64 words per flush job: `{dst, src, count}`.
+#define QSA_FLUSH_JOB_WORDS 3
 
 namespace qsa_index_append {
 
@@ -119,16 +124,10 @@ __device__ __forceinline__ float block_sum(float v, float* scratch) {
 }
 
 // One completing block key per CUDA block.
-//
-// `cos`/`sin` are the rope tables, `[max_pos, rope_dim/2]` row-major, so a
-// block reads its own row at `pos`.
 __global__ __launch_bounds__(MAX_D) void append_kernel(
     const long long* __restrict__ jobs,
     const float* __restrict__ k_norm,
-    const float* __restrict__ cos_tab,
-    const float* __restrict__ sin_tab,
     int d,
-    int rope_dim,
     int ratio,
     float eps,
     int n_jobs
@@ -142,7 +141,6 @@ __global__ __launch_bounds__(MAX_D) void append_kernel(
     const float* src0 = (const float*)(uintptr_t)job[1];
     const int n0 = (int)job[2];
     const float* src1 = (const float*)(uintptr_t)job[3];
-    const int pos = (int)job[4];
 
     // ---- pool: the mean of the block's `ratio` raw rows -----------------
     float acc = 0.0f;
@@ -163,27 +161,7 @@ __global__ __launch_bounds__(MAX_D) void append_kernel(
     const float ss = block_sum(x * x, sv);
     // `mean_keepdim` then `+ eps` then `sqrt`, then a divide — the eager form.
     x = x / sqrtf(ss / (float)d + (float)eps);
-    x = x * k_norm[c];
-
-    // ---- RoPE, NeoX half-split ------------------------------------------
-    // Channel `c < half` pairs with `c + half`; `[rope_dim, d)` passes through.
-    sv[c] = x;
-    __syncthreads();
-    const int half = rope_dim >> 1;
-    float out;
-    if (c < half) {
-        const float co = cos_tab[(long long)pos * half + c];
-        const float si = sin_tab[(long long)pos * half + c];
-        out = sv[c] * co - sv[c + half] * si;
-    } else if (c < rope_dim) {
-        const int k = c - half;
-        const float co = cos_tab[(long long)pos * half + k];
-        const float si = sin_tab[(long long)pos * half + k];
-        out = sv[c] * co + sv[k] * si;
-    } else {
-        out = sv[c];
-    }
-    dst[c] = out;
+    dst[c] = x * k_norm[c];
 }
 
 // ============================================================================
@@ -207,14 +185,11 @@ __global__ __launch_bounds__(MAX_D) void append_kernel(
 // table carries each page's `last_cells`, and the candidate prefix is derived
 // from the widths rather than assumed uniform).
 //
-// One job per flushed layer: `{dst, src, count, pos}`.
+// One job per flushed layer: `{dst, src, count}`.
 __global__ __launch_bounds__(MAX_D) void flush_kernel(
     const long long* __restrict__ jobs,
     const float* __restrict__ k_norm,
-    const float* __restrict__ cos_tab,
-    const float* __restrict__ sin_tab,
     int d,
-    int rope_dim,
     float eps,
     int n_jobs
 ) {
@@ -226,7 +201,6 @@ __global__ __launch_bounds__(MAX_D) void flush_kernel(
     float* dst = (float*)(uintptr_t)job[0];
     const float* src = (const float*)(uintptr_t)job[1];
     const int count = (int)job[2];
-    const int pos = (int)job[3];
     if (count <= 0) return;
 
     // The mean over the rows that are ACTUALLY there — the one line that
@@ -238,25 +212,7 @@ __global__ __launch_bounds__(MAX_D) void flush_kernel(
     extern __shared__ float sv[];
     const float ss = block_sum(x * x, sv);
     x = x / sqrtf(ss / (float)d + (float)eps);
-    x = x * k_norm[c];
-
-    sv[c] = x;
-    __syncthreads();
-    const int half = rope_dim >> 1;
-    float out;
-    if (c < half) {
-        const float co = cos_tab[(long long)pos * half + c];
-        const float si = sin_tab[(long long)pos * half + c];
-        out = sv[c] * co - sv[c + half] * si;
-    } else if (c < rope_dim) {
-        const int k = c - half;
-        const float co = cos_tab[(long long)pos * half + k];
-        const float si = sin_tab[(long long)pos * half + k];
-        out = sv[c] * co + sv[k] * si;
-    } else {
-        out = sv[c];
-    }
-    dst[c] = out;
+    dst[c] = x * k_norm[c];
 }
 
 // Carry the wave's trailing rows — the ones that do not complete a block — into
@@ -287,10 +243,7 @@ __global__ void carry_kernel(
 extern "C" void run_qsa_index_append(
     const long long* jobs,
     const float* k_norm,
-    const float* cos_tab,
-    const float* sin_tab,
     int32_t d,
-    int32_t rope_dim,
     int32_t ratio,
     float eps,
     int32_t n_jobs,
@@ -300,7 +253,7 @@ extern "C" void run_qsa_index_append(
     const unsigned shmem = (unsigned)d * (unsigned)sizeof(float);
     qsa_index_append::append_kernel<<<(unsigned)n_jobs, (unsigned)d, shmem,
                                      (cudaStream_t)stream>>>(
-        jobs, k_norm, cos_tab, sin_tab, d, rope_dim, ratio, eps, n_jobs);
+        jobs, k_norm, d, ratio, eps, n_jobs);
 }
 
 extern "C" void run_qsa_index_carry(
@@ -317,10 +270,7 @@ extern "C" void run_qsa_index_carry(
 extern "C" void run_qsa_index_flush(
     const long long* jobs,
     const float* k_norm,
-    const float* cos_tab,
-    const float* sin_tab,
     int32_t d,
-    int32_t rope_dim,
     float eps,
     int32_t n_jobs,
     void* stream
@@ -329,5 +279,5 @@ extern "C" void run_qsa_index_flush(
     const size_t shmem = (size_t)d * sizeof(float);
     qsa_index_append::flush_kernel<<<(unsigned)n_jobs, (unsigned)d, shmem,
                                      (cudaStream_t)stream>>>(
-        jobs, k_norm, cos_tab, sin_tab, d, rope_dim, eps, n_jobs);
+        jobs, k_norm, d, eps, n_jobs);
 }

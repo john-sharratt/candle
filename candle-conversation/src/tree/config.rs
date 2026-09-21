@@ -137,6 +137,28 @@ impl Default for ConversationTreeConfig {
 }
 
 impl ConversationTreeConfig {
+    /// Turn off every trigger that launches a background summarization: the
+    /// turn count, the segment count and the day boundary.
+    ///
+    /// All three together, because each alone still launches one — a config
+    /// that zeroes the counts but keeps `summarize_on_day_boundary` summarizes
+    /// the whole window the first time a conversation crosses midnight UTC.
+    /// A summarization re-reads its window as a fresh prefill on the scheduler,
+    /// so a conversation that is not meant to be summarized must not be able to
+    /// reach any of them.
+    pub fn disable_summarization(&mut self) {
+        self.summarize_every = 0;
+        self.segment_summarize_every = 0;
+        self.summarize_on_day_boundary = false;
+    }
+
+    /// Whether any trigger can launch a background summarization.
+    pub fn summarizes(&self) -> bool {
+        self.summarize_every > 0
+            || self.segment_summarize_every > 0
+            || self.summarize_on_day_boundary
+    }
+
     /// Resolve the [`KvFormat`] for a storage tier.
     ///
     /// Returns `None` for [`StorageTier::Cold`] — Cold nodes are disk-only;

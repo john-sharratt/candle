@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::NotesError;
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SearchRequest {
@@ -45,6 +45,11 @@ impl Tool for NotesSearch {
     type Request = SearchRequest;
     type Response = SearchResponse;
     type Error = NotesError;
+
+    /// Searches the note store; writes nothing.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(ctx: &ToolContext, req: SearchRequest) -> Result<SearchResponse, NotesError> {
         let query = req.query.as_deref().unwrap_or("");

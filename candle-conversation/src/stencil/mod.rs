@@ -36,6 +36,7 @@ mod error;
 mod function_block;
 mod json_lexer;
 mod mask;
+mod named_arm;
 mod session;
 mod sim;
 mod spec;
@@ -59,6 +60,7 @@ pub use driver::{Healed, PathStats, StencilDriver, StepMask};
 pub use error::{BuildError, WalkError};
 pub use function_block::function_blocks_to_json;
 pub use mask::{ban, boost, AllowedSet};
+pub use named_arm::{arm_name, named_arm};
 pub use session::{Observe, StencilAction, StencilSession};
 pub use sim::{lowest_arm_policy, simulate, Oracle, SimError, SimRun};
 pub use spec::{LabeledNode, LabeledTree, NodeSpec, SpecId, TreeSpec};
@@ -66,14 +68,16 @@ pub use terminator::{Feed, Terminator, TerminatorState};
 pub use think::{compile_think_tree, ThinkMode, ThinkSteerEnvelope};
 pub use tool_call::{
     compile_action_loop, compile_tool_call_loop, compile_tool_call_tree, parse_tools, Param,
-    ParamType, ToolCallEnvelope, ToolSpec, TOOL_CALL_TREE_LABEL,
+    ParamType, ToolCallEnvelope, ToolSpec, MAX_TOOL_CALLS_PER_TURN, TOOL_CALL_TREE_LABEL,
 };
 // `ToolCallEnvelope::style` is public, so a consumer has to be able to name its
 // type to match on it — and `npcd` does, to describe the call format in a
 // character's prompt. Re-exported here rather than making every such caller
 // depend on `candle-transformers` for one enum.
 pub use candle_transformers::models::dialect::CallStyle;
-pub use tree::{FreeTextLimits, FreeTextSpan, NodeId, StencilNode, StencilTree};
+pub use tree::{
+    FreeTextLimits, FreeTextSpan, NodeId, StencilNode, StencilTree, MAX_STRING_VALUE_TOKENS,
+};
 pub use trie::{Step, TokenTrie, TrieNodeId};
 pub use trigger::TriggerRegistry;
 pub use vocab::{HfVocab, TestVocab, TokenId, Vocab};

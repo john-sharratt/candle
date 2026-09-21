@@ -25,7 +25,8 @@ questions:
 - find articles about this from the last month
 - look this up on the web, I need current information
 category: Utilities & web
-description: 'Search the web for information using a query string and return ranked results with title, URL, snippet, and relevance score. Use for: looking up current information, finding articles or documentation, researching a topic, locating a URL when only the topic is known, getting recent news, identifying who or what something is. Triggered by "search for", "look up", "find information about", "what is X", "who is", "recent news on", "google", "search the web". Returns up to 10 ranked results. For DNS records use dns_lookup; for fetching a specific URL already known, use web_fetch; for authenticated API calls use http_session_*.'
+mandatory: true
+description: 'Search the web for information using a query string and return ranked results with title, URL, snippet, and relevance score. Use for: looking up current information, finding articles or documentation, researching a topic, locating a URL when only the topic is known, getting recent news, identifying who or what something is. Triggered by "search for", "look up", "find information about", "what is X", "who is", "recent news on", "google", "search the web". Returns up to 10 ranked results and searched_on, today''s date: judge "latest" against it, prefer the newest result, and put no year in a query the user did not give one. For DNS records use dns_lookup; for fetching a specific URL already known, use web_fetch; for authenticated API calls use http_session_*.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:

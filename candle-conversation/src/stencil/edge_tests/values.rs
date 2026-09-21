@@ -49,7 +49,12 @@ fn run_pack(v: &TestVocab, value: &[Step]) -> String {
 fn an_empty_value_becomes_null() {
     let v = TestVocab::new();
     let with = |tail: &[&'static str]| {
-        let mut steps = vec![T("read_files\""), T("{"), T("a\""), T(", \"start_line\":")];
+        let mut steps = vec![
+            T("read_files\""),
+            T("{"),
+            T(" \"a\""),
+            T(", \"start_line\":"),
+        ];
         steps.extend(tail.iter().map(|t| T(t)));
         run(&v, &steps).0
     };
@@ -96,7 +101,14 @@ fn trailing_bytes_after_a_complete_value_are_left_to_the_grammar() {
 #[test]
 fn bytes_that_cannot_extend_a_complete_scalar_end_it() {
     let v = TestVocab::new();
-    let head = || vec![T("read_files\""), T("{"), T("a\""), T(", \"start_line\":")];
+    let head = || {
+        vec![
+            T("read_files\""),
+            T("{"),
+            T(" \"a\""),
+            T(", \"start_line\":"),
+        ]
+    };
 
     let mut steps = head();
     steps.extend([T(" 5 "), T("6"), T("}"), T("]")]);

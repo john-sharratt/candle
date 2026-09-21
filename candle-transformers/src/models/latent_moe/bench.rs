@@ -34,7 +34,7 @@ use super::paged::{
     paged_latent_prefill, CorpusCache, LatentWorkspace, SyntheticSlots, HEAD_DIM, NOPE_DIM,
     ROPE_DIM, ROPE_HI_DIM, ROPE_LO_BITS, ROPE_LO_DIM,
 };
-use super::rope::yarn_freqs;
+use crate::models::rope_schedule::yarn_freqs;
 
 /// Query heads (DeepSeek-V4-Flash config default).
 const N_HEADS: usize = 64;

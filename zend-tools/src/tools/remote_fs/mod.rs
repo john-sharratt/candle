@@ -38,7 +38,7 @@
 //! `mkdir`, `rename`) confirm every call.  Read operations (`get`, `list_dir`,
 //! `stat`) and management operations (`list`, `close`) do not confirm.
 
-use crate::ToolError;
+use crate::{NotPermitted, ToolError};
 use thiserror::Error;
 
 pub mod close;
@@ -83,6 +83,8 @@ pub enum RemoteFsError {
     VfsError(String),
     #[error("session limit exceeded")]
     SessionLimitExceeded,
+    #[error(transparent)]
+    NotPermitted(#[from] NotPermitted),
 }
 
 impl ToolError for RemoteFsError {
@@ -97,6 +99,7 @@ impl ToolError for RemoteFsError {
             RemoteFsError::NotFound(_) => "not_found",
             RemoteFsError::VfsError(_) => "vfs_error",
             RemoteFsError::SessionLimitExceeded => "session_limit_exceeded",
+            RemoteFsError::NotPermitted(_) => NotPermitted::CODE,
         }
     }
 }

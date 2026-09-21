@@ -35,6 +35,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 pub mod cookie;
+pub mod forwarded;
 pub mod oidc;
 pub mod role;
 pub mod session;

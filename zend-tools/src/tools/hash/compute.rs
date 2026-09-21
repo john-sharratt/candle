@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::{compute_hash, decode_data, encode_output, HashError};
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ComputeRequest {
@@ -43,6 +43,11 @@ impl Tool for HashCompute {
     type Request = ComputeRequest;
     type Response = ComputeResponse;
     type Error = HashError;
+
+    /// Pure digest over its arguments.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(_ctx: &ToolContext, req: ComputeRequest) -> Result<ComputeResponse, HashError> {
         let encoding = req.data_encoding.as_deref().unwrap_or("text");

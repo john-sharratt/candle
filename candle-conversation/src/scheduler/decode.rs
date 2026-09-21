@@ -1,3 +1,4 @@
+use super::named_tool::steer_to_named_tool;
 use super::spec_chooser::SpecChooser;
 use super::*;
 use crate::recorded_reply::{departure, replayed_step};
@@ -1112,7 +1113,7 @@ impl Scheduler {
                         }
                     }
                     None => {
-                        if let Some(driver) = state.triggers.driver_for(token) {
+                        if let Some(mut driver) = state.triggers.driver_for(token) {
                             // A trigger token (e.g. `<tool_call>`) opened a grammar:
                             // steer the rest of this call to the catalog's shape.
                             // A once-trigger (the think block) is spent by firing,
@@ -1127,6 +1128,21 @@ impl Scheduler {
                                 trigger = token,
                                 "stencil steering started (trigger token decoded)",
                             );
+                            // The call writes the tool its reasoning named.
+                            if driver.tree().label() == TOOL_CALL_TREE_LABEL {
+                                if let Some(name) = steer_to_named_tool(
+                                    &self.tokenizer,
+                                    &state.generated_tokens,
+                                    &mut driver,
+                                ) {
+                                    tracing::debug!(
+                                        target: "candle_conversation::stencil",
+                                        seq_id = seq_id.0,
+                                        tool = %name,
+                                        "tool name steered to the tool the reasoning named",
+                                    );
+                                }
+                            }
                             state.stencil = Some(driver);
                         }
                     }
@@ -1200,7 +1216,8 @@ impl Scheduler {
                 .get(&seq_id)
                 .is_some_and(|s| s.free_tool_calls_from_penalties);
             let in_stencil = freed && label.is_some();
-            let in_tool_call = freed && label == Some(super::TOOL_CALL_TREE_LABEL);
+            let writing_call = label == Some(super::TOOL_CALL_TREE_LABEL);
+            let in_tool_call = freed && writing_call;
             if let Some(ss) = self.sampling_states.get_mut(&seq_id) {
                 if in_stencil && !ss.dry_suppressed {
                     ss.enter_tool_call();
@@ -1208,6 +1225,9 @@ impl Scheduler {
                     ss.exit_tool_call();
                 }
                 ss.in_tool_call = in_tool_call;
+                // Unconditional, unlike the penalty lift: the length budget is
+                // a prose answer's and never a call's, whoever the caller is.
+                ss.writing_call = writing_call;
             }
         }
 

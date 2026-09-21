@@ -9,6 +9,8 @@
 
 use core::ffi::c_void;
 
+use crate::rope::RopeRungsFfi;
+
 extern "C" {
     /// FP16 glue attention. Inputs are FLAT-packed in `cu_seqlens_q` order:
     ///   `q_ptr`   : glue Q  `[total_q, n_q_head, head_dim]`
@@ -44,7 +46,7 @@ extern "C" {
         softmax_scale: f32,
         k_new: *const c_void,
         v_new: *const c_void,
-        rope_cs: *const f32,
+        rungs: RopeRungsFfi,
         rope_interleaved: i32,
         cu_seqlens_q: *const u32,
         q_lens: *const u32,
@@ -82,7 +84,7 @@ extern "C" {
         softmax_scale: f32,
         k_new: *const c_void,
         v_new: *const c_void,
-        rope_cs: *const f32,
+        rungs: RopeRungsFfi,
         rope_interleaved: i32,
         cu_seqlens_q: *const u32,
         q_lens: *const u32,

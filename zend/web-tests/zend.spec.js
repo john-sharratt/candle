@@ -148,6 +148,26 @@ test.describe('1.3 streaming', () => {
   });
 });
 
+test.describe('1.3a a long write shows as it is written', () => {
+  test('the writing box shows the file and its text mid-call, then gives way to the card', async ({ page }) => {
+    await boot(page);
+    await page.getByTitle('Expand sidebar').click();
+    await page.getByText('Why is decode latency spiking under load?').click();
+    const ta = page.locator('#zend-prompt');
+    await ta.fill('write up the redo log as a doc');
+    await ta.press('Enter');
+    const last = page.locator('[data-msg]').last();
+    // Mid-call: the box names the file and carries the content decoded so far.
+    const box = last.locator('.tool-author');
+    await expect(box).toBeVisible({ timeout: 10000 });
+    await expect(box.locator('.tool-author-file')).toHaveText('docs/redo_log.md');
+    await expect(box.locator('.tool-author-body')).toContainText('The redo log');
+    // Once the call closes, the finished tool card replaces the box.
+    await expect(last.locator('.tool-call-card .tool-call-name')).toHaveText('write', { timeout: 15000 });
+    await expect(last.locator('.tool-author')).toHaveCount(0);
+  });
+});
+
 test.describe('1.3b a failed send', () => {
   async function sendFailing(page, failure) {
     await boot(page);
@@ -177,6 +197,59 @@ test.describe('1.3b a failed send', () => {
     await expect(page.getByRole('button', { name: 'Try again' })).toHaveCount(0);
     await page.getByRole('button', { name: 'Reload conversation' }).click();
     await expect(page.locator('.zerr')).toHaveCount(0);
+  });
+});
+
+test.describe('1.5b dials follow the conversation', () => {
+  // The dials are asserted through the composer buttons, which carry the level
+  // name — the state object is deliberately not exposed to the page, and a hook
+  // added only for a test would be a production seam nothing else needs.
+  const dialNames = (page) => page.evaluate(() => {
+    const names = ['Off', 'Quick', 'Balanced', 'Deep', 'Exhaustive']
+      .concat(['Terse', 'Concise', 'Standard', 'Detailed', 'Comprehensive'])
+      .concat(['None', 'Restricted']);
+    return [...document.querySelectorAll('button')]
+      .map((b) => b.textContent.trim())
+      .filter((t) => names.includes(t));
+  });
+
+  test('opening a conversation adopts the dials it last ran at', async ({ page }) => {
+    await boot(page);
+    await page.getByTitle('Expand sidebar').click();
+    await page.getByText('Why is decode latency spiking under load?').click();
+    await expect(page.locator('.zmd').first()).toBeVisible();
+    // The mock reports effort 3 / verbosity 1 / tools 1 for every conversation.
+    await expect.poll(() => dialNames(page)).toEqual(['Deep', 'Concise', 'Restricted']);
+  });
+
+  test('a new conversation returns to the composer defaults', async ({ page }) => {
+    await boot(page);
+    await page.getByTitle('Expand sidebar').click();
+    await page.getByText('Why is decode latency spiking under load?').click();
+    await expect.poll(() => dialNames(page)).toEqual(['Deep', 'Concise', 'Restricted']);
+    await page.getByTitle('New conversation').first().click();
+    await expect.poll(() => dialNames(page)).toEqual(['Balanced', 'Standard', 'Comprehensive']);
+  });
+});
+
+test.describe('1.5c the tools dial follows the caller role', () => {
+  const toolsMenu = async (page) => {
+    await page.getByTitle('Tools').click();
+    return page.evaluate(() => [...document.querySelectorAll('button span')]
+      .map((s) => s.textContent.trim())
+      .filter((t) => ['None', 'Restricted', 'Comprehensive', 'Mutable'].includes(t)));
+  };
+
+  test('an admin is offered every mode, Mutable included', async ({ page }) => {
+    await boot(page);
+    await expect.poll(() => toolsMenu(page)).toEqual(['None', 'Restricted', 'Comprehensive', 'Mutable']);
+  });
+
+  test('a non-admin is offered None and Restricted, and starts at Restricted', async ({ page }) => {
+    await page.addInitScript(() => { window.__ZEND_MOCK_ROLE__ = 'user'; });
+    await boot(page);
+    await expect(page.getByTitle('Tools')).toContainText('Restricted');
+    await expect.poll(() => toolsMenu(page)).toEqual(['None', 'Restricted']);
   });
 });
 
@@ -472,6 +545,48 @@ test.describe('1.13 phone chrome', () => {
     await expect(page.getByText('Starting up')).toHaveCount(0);
     await page.waitForFunction(() => window.__ZEND_READY__ === true);
     await expect(page.getByText('Starting up')).toHaveCount(0);
+  });
+
+  // iOS keeps the layout viewport at full height when the keyboard opens and
+  // pans the visible area; only `visualViewport` reports it. A stand-in for it
+  // is installed before the page loads, then moved the way iOS moves it.
+  async function fakeVisualViewport(page) {
+    await page.addInitScript(() => {
+      const vv = new EventTarget();
+      Object.assign(vv, { width: 390, height: 844, offsetLeft: 0, offsetTop: 0, scale: 1 });
+      Object.defineProperty(window, 'visualViewport', { configurable: true, get: () => vv });
+      window.__fakeVV = vv;
+    });
+  }
+  const railBox = (page) => page.evaluate(() => {
+    const r = document.querySelector('.z-rail').getBoundingClientRect();
+    return { top: Math.round(r.top), height: Math.round(r.height) };
+  });
+
+  test('the rail stays in the visible area when the keyboard opens', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await fakeVisualViewport(page);
+    await boot(page);
+    expect(await railBox(page)).toEqual({ top: 0, height: 844 });
+    // The keyboard takes the bottom 336px and iOS pans the visible area down by as much.
+    await page.evaluate(() => {
+      const vv = window.__fakeVV;
+      vv.height = 508; vv.offsetTop = 336;
+      vv.dispatchEvent(new Event('resize'));
+    });
+    expect(await railBox(page)).toEqual({ top: 336, height: 508 });
+  });
+
+  test('a pinch-zoom leaves the shell at full size', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await fakeVisualViewport(page);
+    await boot(page);
+    await page.evaluate(() => {
+      const vv = window.__fakeVV;
+      vv.scale = 2; vv.height = 422; vv.offsetTop = 200;
+      vv.dispatchEvent(new Event('resize'));
+    });
+    expect(await railBox(page)).toEqual({ top: 0, height: 844 });
   });
 });
 

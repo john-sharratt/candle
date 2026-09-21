@@ -1,12 +1,14 @@
 //! Public dispatch entry points used by the `zend` orchestrator.
 //!
-//! The orchestrator calls these two functions and nothing else from this crate:
+//! The orchestrator calls these three functions and nothing else from this crate:
 //!
 //! - [`run`] — look up the tool, parse + validate args, execute, return the JSON
 //!   response.  Always returns a value; never panics.
 //! - [`confirmation`] — return the confirmation prompt for a tool call, or `None`
 //!   if no confirmation is needed.  The orchestrator calls this *before* `run` to
 //!   decide whether to pause for user approval.
+//! - [`replay`] — whether a call may be re-issued when a turn resumes after a
+//!   restart.  Consulted only on that path; a live turn runs what it is asked to.
 //!
 //! Both functions are synchronous.  If a tool needs async I/O (network, subprocess),
 //! the orchestrator wraps the call in `tokio::task::spawn_blocking`.
@@ -16,7 +18,7 @@ use serde_json::{json, Value};
 use crate::context::ToolContext;
 use crate::numfmt;
 use crate::registry;
-use crate::tool::ConfirmationDetails;
+use crate::tool::{ConfirmationDetails, Replay};
 
 /// Execute a tool by name and return the JSON the orchestrator should
 /// place inside the `<tool_response>...</tool_response>` block.
@@ -39,7 +41,7 @@ pub fn run(tool_name: &str, tool_call_id: &str, args: &Value, ctx: &ToolContext)
     };
 
     tracing::debug!("dispatch start");
-    let mut result = (tool.run)(ctx, args);
+    let mut result = tool.call(ctx, args);
     tracing::debug!(success = !is_error_response(&result), "dispatch complete");
     // Annotate large/tiny numeric fields with `<key>_display` renderings
     // (digit-grouped, magnitude-tagged) so the model quotes magnitudes instead
@@ -57,6 +59,18 @@ pub fn run(tool_name: &str, tool_call_id: &str, args: &Value, ctx: &ToolContext)
 pub fn confirmation(tool_name: &str, args: &Value) -> Option<ConfirmationDetails> {
     let tool = registry::find(tool_name)?;
     (tool.confirmation)(args)
+}
+
+/// Whether this call may be re-issued when a turn resumes after a restart —
+/// see [`crate::Tool::replay`].
+///
+/// A name no tool answers to is [`Replay::Safe`]: re-issuing it produces the
+/// same `unknown_tool` envelope [`run`] already returns, and nothing else.
+pub fn replay(tool_name: &str, args: &Value) -> Replay {
+    match registry::find(tool_name) {
+        Some(tool) => (tool.replay)(args),
+        None => Replay::Safe,
+    }
 }
 
 /// Heuristic: is this response value an error envelope?

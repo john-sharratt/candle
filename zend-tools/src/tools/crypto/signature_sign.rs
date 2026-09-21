@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::{decode_data, normalize_algorithm, CryptoError};
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SigSignRequest {
@@ -44,9 +44,14 @@ impl Tool for SignatureSign {
     type Response = SigSignResponse;
     type Error = CryptoError;
 
+    /// Pure cryptography over its arguments — no state and no I/O.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
+
     fn run(ctx: &ToolContext, req: SigSignRequest) -> Result<SigSignResponse, CryptoError> {
         let cred = ctx
-            .credentials
+            .credentials()?
             .get_by_name(&req.credential_name)
             .ok_or_else(|| CryptoError::CredentialNotFound(req.credential_name.clone()))?;
 

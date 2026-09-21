@@ -8,7 +8,7 @@ use serde_json::Value;
 use thiserror::Error;
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext, ToolError};
+use crate::{RegisteredTool, Replay, Tool, ToolContext, ToolError};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct Request {
@@ -73,6 +73,12 @@ impl Tool for RandomTool {
     type Request = Request;
     type Response = Response;
     type Error = RandomError;
+
+    /// Draws fresh entropy. The first draw went down with the turn and was
+    /// never shown to anyone, so this one has no earlier value to match.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(_ctx: &ToolContext, req: Request) -> Result<Response, RandomError> {
         let count = req.count.unwrap_or(1) as usize;

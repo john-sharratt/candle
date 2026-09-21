@@ -28,6 +28,7 @@ use crate::models::prefill_utils::{
 use crate::models::profile::{gpu_span, pipeline_record, profile_now, span};
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::quantized_matmul::QMatMul;
+use crate::models::rope_schedule::RopeRungs;
 use crate::utils::repeat_kv;
 
 #[cfg(feature = "cuda")]
@@ -69,7 +70,7 @@ pub enum DecodeHeaders {
         /// (`SlotHeader[n_active]` per layer, packed contiguously).
         /// Layer `i` starts at byte offset `i * stride`.
         buf: Option<GpuBuf>,
-        /// Byte stride between successive layers (`n_active * 16`).
+        /// Byte stride between successive layers (`n_active * SLOT_HEADER_BYTES`).
         stride: u64,
     },
 }
@@ -87,12 +88,9 @@ pub struct BatchedAttentionParams<'a> {
     pub rope_sin: &'a Tensor,
     /// Whether RoPE uses interleaved format.
     pub rope_interleaved: bool,
-    /// Per-dimension inverse frequencies for the CUDA paged-attention kernels.
-    /// Shape: [head_dim/2], dtype F32, stored on the model device.
-    pub inv_freq_device: &'a Tensor,
-    /// Precomputed cos/sin table for decode RoPE, shape [max_pos, head_dim], dtype F32.
-    /// Computed once from inv_freq at model level and cached.
-    pub rope_cs: &'a Tensor,
+    /// The model's RoPE rungs: every paged kernel rotates each sequence by the
+    /// rung its `SlotHeader` names (`docs/progressive_yarn.md` §6).
+    pub rope: &'a RopeRungs,
     /// Whether this is a prefill or decode pass, and — for decode — the GPU buffer
     /// of per-layer slot headers packed contiguously with constant byte stride.
     pub decode_headers: DecodeHeaders,
@@ -119,8 +117,7 @@ impl<'a> BatchedAttentionParams<'a> {
         cos: &'a Tensor,
         sin: &'a Tensor,
         rope_interleaved: bool,
-        inv_freq_device: &'a Tensor,
-        rope_cs: &'a Tensor,
+        rope: &'a RopeRungs,
         decode_headers: DecodeHeaders,
         q_lens: &'a [usize],
         generation: &'a Generation,
@@ -130,8 +127,7 @@ impl<'a> BatchedAttentionParams<'a> {
             rope_cos: cos,
             rope_sin: sin,
             rope_interleaved,
-            inv_freq_device,
-            rope_cs,
+            rope,
             decode_headers,
             q_lens,
             generation,
@@ -640,8 +636,7 @@ pub fn forward_attn_batched<'w, L: BatchedAttentionLayer>(
             params.rope_cos,
             params.rope_sin,
             params.rope_interleaved,
-            params.inv_freq_device,
-            params.rope_cs,
+            params.rope,
             params.generation,
             match &params.decode_headers {
                 DecodeHeaders::Decode {
@@ -674,7 +669,7 @@ pub fn forward_attn_batched<'w, L: BatchedAttentionLayer>(
             params.rope_interleaved,
             prefill_meta,
             glue_meta,
-            params.rope_cs,
+            params.rope,
             params.generation,
             params.shared_prefill_pm,
             qsa,
@@ -694,8 +689,7 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
     cos: &Tensor,
     sin: &Tensor,
     rope_interleaved: bool,
-    #[allow(unused_variables)] inv_freq_device: &Tensor,
-    #[allow(unused_variables)] rope_cs: &Tensor,
+    rope: &RopeRungs,
     #[allow(unused_variables)] generation: &Generation,
     #[allow(unused_variables)] decode_headers_ptr: u64,
     #[allow(unused_variables)] qsa: Option<&QsaSelection>,
@@ -732,8 +726,8 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
     g_qkv.end();
 
     // Check for chunked (paged) KV cache BEFORE applying model-side RoPE.
-    // For the paged path the decode kernel handles RoPE internally (via zeros rope_offsets
-    // meaning natural positions), so we must NOT pre-rotate Q/K here.
+    // For the paged path the decode kernel rotates Q and K internally, at their
+    // own positions under the slot's rung, so we must NOT pre-rotate Q/K here.
     let use_paged = caches
         .first()
         .and_then(|c| c.k_cache().chunked_arena_chunks())
@@ -745,6 +739,9 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
         // Kernel will rotate; skip model-side rotation.
         (q, k)
     } else {
+        // The model-side cos/sin are rung 0's frequencies; a slot the schedule
+        // has moved up a rung rotates only in the paged kernels.
+        refuse_rung_past_zero(rope, offsets, 1)?;
         // Validate RoPE cos/sin for non-paged path
         if cos.dtype() != q.dtype() || sin.dtype() != q.dtype() {
             candle::bail!(
@@ -803,7 +800,7 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
             n_head,
             n_kv_head,
             head_dim,
-            rope_cs,
+            rope,
             rope_interleaved,
             generation,
             decode_headers_ptr,
@@ -861,7 +858,7 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     rope_interleaved: bool,
     prefill_meta: Option<(&Tensor, &Tensor, &Tensor)>,
     glue_meta: Option<&GlueMeta>,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     generation: &Generation,
     shared_pm: &std::cell::RefCell<Option<SharedPm>>,
     qsa: Option<&QsaSelection>,
@@ -921,6 +918,9 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     let (q, k) = if is_cuda_paged {
         (q, k)
     } else {
+        // Model-side cos/sin are rung 0's; see `refuse_rung_past_zero`.
+        let reach: Vec<usize> = offsets.iter().zip(q_lens).map(|(o, l)| o + l).collect();
+        refuse_rung_past_zero(rope, &reach, 0)?;
         let q4 = q
             .reshape((1, total_q, n_head, head_dim))?
             .transpose(1, 2)?
@@ -951,7 +951,6 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     // both, for every layer, before the forward began. Nothing on this path may
     // claim a chunk — the transient tier is placed against the arena frontier
     // and a claim here would move it (`docs/archived/elastic_vram_partition.md` §7).
-    let rope_zeros = Tensor::zeros(n_seqs, DType::U32, q.device())?;
     // Flat attention output: [total_q, n_head, head_dim]. A reprojection-glue
     // forward (HD128, chunked) routes to the paged-glue kernel — it streams the
     // quantized slot once and reuses it across all glue rows (dequant-once),
@@ -1021,7 +1020,7 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
             &g.glue_write_slice,
             &g.glue_write_in_blk,
             &g.fwd_ahead,
-            rope_cs,
+            rope,
             rope_interleaved,
             generation,
             shared_pm,
@@ -1043,7 +1042,7 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
                 n_head,
                 n_kv_head,
                 head_dim,
-                rope_cs,
+                rope,
                 rope_interleaved,
             )?
         }
@@ -1066,8 +1065,7 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
             n_kv_head,
             head_dim,
             prefill_meta,
-            &rope_zeros,
-            rope_cs,
+            rope,
             rope_interleaved,
             generation,
             shared_pm,
@@ -1109,8 +1107,9 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
 /// - K/V are written to the chunked cache **unrotated** — the arena
 ///   convention every paged reader (decode, glue, reprojection) depends on.
 ///   Rotation happens locally, for this call's own attention only.
-/// - RoPE comes from the same shared `rope_cs` table the kernels read
-///   (cos/sin interleaved per frequency, rows indexed by absolute position).
+/// - RoPE comes from the same rungs the kernels read: each sequence rotates by
+///   the rung its reach selects, K at unit scale and Q with the rung's `m²`,
+///   through the host mirror of the kernels' lookup.
 ///
 /// Takes the flat-packed varlen operands (`q [total_q, n_head, head_dim]`,
 /// `k`/`v [total_q, n_kv_head, head_dim]`) and returns the flat-packed
@@ -1126,7 +1125,7 @@ fn paged_prefill_float_fallback(
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     rope_interleaved: bool,
 ) -> Result<Tensor> {
     // Pool copies: this path feeds `chunked_write_kv` and plain tensor math,
@@ -1137,33 +1136,42 @@ fn paged_prefill_float_fallback(
     let n_rep = n_head / n_kv_head;
     let half = head_dim / 2;
 
-    // The cos/sin planes, split from the shared interleaved table once for the
-    // longest prefix any sequence here reaches — the table never changes
-    // within a forward, so deriving it per sequence (narrow → reshape →
-    // to_dtype → two contiguous copies, per call, per layer) was pure rework.
+    // The cos/sin planes for the longest prefix any sequence here reaches,
+    // built once per rung present and per scale (K at 1, Q at the rung's
+    // `m²`) — not per sequence. Full width on purpose: a pass-through
+    // frequency is exactly `(cos 1, sin 0)`, unscaled, so rotating all
+    // `head_dim/2` pairs is the identity on the non-rotary dims, as the kernels
+    // leave them.
     let max_total = q_lens
         .iter()
         .zip(offsets.iter())
         .map(|(&l, &o)| o + l)
         .max()
         .unwrap_or(0);
-    let cs_full = rope_cs
-        .narrow(0, 0, max_total)?
-        .reshape((max_total, half, 2))?
-        .to_dtype(q.dtype())?;
-    let cos_full = cs_full.narrow(2, 0, 1)?.squeeze(2)?.contiguous()?;
-    let sin_full = cs_full.narrow(2, 1, 1)?.squeeze(2)?.contiguous()?;
+    let dtype = q.dtype();
+    let device = q.device().clone();
+    let planes = |rung: u32, scale: f32| -> Result<(Tensor, Tensor)> {
+        let mut cos = Vec::with_capacity(max_total * half);
+        let mut sin = Vec::with_capacity(max_total * half);
+        for pos in 0..max_total {
+            for f in 0..half {
+                let (c, s) = rope.cos_sin(rung, pos, f);
+                let k = if f < rope.pairs() { scale } else { 1.0 };
+                cos.push(c * k);
+                sin.push(s * k);
+            }
+        }
+        Ok((
+            Tensor::from_vec(cos, (max_total, half), &device)?.to_dtype(dtype)?,
+            Tensor::from_vec(sin, (max_total, half), &device)?.to_dtype(dtype)?,
+        ))
+    };
+    // (rung, K planes, Q planes), one entry per rung this call needs.
+    type CosSin = (Tensor, Tensor);
+    let mut by_rung: Vec<(u32, CosSin, CosSin)> = Vec::new();
 
     // Rotate `x [1, h, len, d]` at absolute positions `start..start + len`.
-    //
-    // Full-width rotation on purpose: the table's row covers every frequency
-    // pair of the head, and on partial-rotary models `RotaryLayout::rope_table`
-    // fills the pass-through pairs with exact `(cos 1, sin 0)` — rotation by
-    // zero — so rotating all `head_dim/2` pairs is the identity on the
-    // non-rotary dims. That padding IS the contract this fallback relies on;
-    // a table with real frequencies in those rows would rotate dims the
-    // kernels leave alone.
-    let rot = |x: &Tensor, start: usize, len: usize| -> Result<Tensor> {
+    let rot = |x: &Tensor, (cos_full, sin_full): &(Tensor, Tensor), start: usize, len: usize| {
         let cos = cos_full.narrow(0, start, len)?;
         let sin = sin_full.narrow(0, start, len)?;
         if rope_interleaved {
@@ -1239,8 +1247,17 @@ fn paged_prefill_float_fallback(
         let t_rope = profile_now();
         expect_dtype(&k_all, qs.dtype(), "prefill fallback: K vs Q")?;
         expect_dtype(&v_all, qs.dtype(), "prefill fallback: V vs Q")?;
-        let k_rot = rot(&k_all, 0, total)?;
-        let q_rot = rot(&qs, offset, len)?;
+        let rung = rope.rung_for(total)?;
+        let at = match by_rung.iter().position(|(r, _, _)| *r == rung) {
+            Some(i) => i,
+            None => {
+                by_rung.push((rung, planes(rung, 1.0)?, planes(rung, rope.q_scale(rung))?));
+                by_rung.len() - 1
+            }
+        };
+        let (_, k_planes, q_planes) = &by_rung[at];
+        let k_rot = rot(&k_all, k_planes, 0, total)?;
+        let q_rot = rot(&qs, q_planes, offset, len)?;
         let k_rep = repeat_kv(k_rot, n_rep)?;
         let v_rep = repeat_kv(v_all, n_rep)?;
         pipeline_record("prefill_fb:rope_repeat", t_rope);
@@ -1399,7 +1416,7 @@ fn paged_decode_attention<'w>(
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     rope_interleaved: bool,
     _generation: &Generation,
     decode_headers_ptr: u64,
@@ -1539,7 +1556,7 @@ fn paged_decode_attention<'w>(
                 softmax_scale,
                 &k_kernel,
                 &v_kernel,
-                rope_cs,
+                rope,
                 rope_interleaved,
                 gate_kernel.as_ref(),
                 qsa,
@@ -1556,7 +1573,7 @@ fn paged_decode_attention<'w>(
                 softmax_scale,
                 &k_kernel,
                 &v_kernel,
-                rope_cs,
+                rope,
                 rope_interleaved,
                 qsa,
             )?
@@ -1641,6 +1658,31 @@ pub fn reset_caches_at_zero(caches: &mut [&mut KvCache], offsets: &[usize]) {
     }
 }
 
+/// Refuse a non-paged attention over any row the RoPE schedule has moved past
+/// its first rung, or whose first rung carries a temperature.
+///
+/// The non-paged paths rotate with the model-level cos/sin, which are rung
+/// 0's frequencies at unit scale; only the paged kernels read a sequence's
+/// rung from its header and put the rung's `m²` on Q. A row past rung 0, or
+/// on a rung 0 with `m² ≠ 1` (a file's static declared YaRN), answered here
+/// would rotate by the wrong frequencies or miss the scale — a wrong number,
+/// not a slow one. `ahead` is how far past each offset in `reach` the step
+/// writes.
+fn refuse_rung_past_zero(rope: &RopeRungs, reach: &[usize], ahead: usize) -> Result<()> {
+    for &r in reach {
+        let rung = rope.rung_for(r + ahead)?;
+        if rung != 0 || rope.q_scale(rung) != 1.0 {
+            candle::bail!(
+                "non-paged attention at a reach of {} positions: the schedule puts it on rope \
+                 rung {rung} (Q scale {}), which only the paged kernels rotate by",
+                r + ahead,
+                rope.q_scale(rung)
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Validate that cache and offset counts match the batch size.
 pub fn validate_batch_sizes(
     caches_len: usize,
@@ -1676,6 +1718,49 @@ fn ensure_contiguous<'w>(t: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::rope_schedule::{plain_inv_freq, DeclaredScaling, RopeSchedule, Rung};
+
+    /// The non-paged paths answer a row only on an unscaled rung 0: past the
+    /// first ceiling they refuse, and so does a first rung carrying a
+    /// temperature (a file's static YaRN), which they could not apply.
+    #[test]
+    fn non_paged_rows_stay_on_an_unscaled_first_rung() {
+        let progressive = RopeSchedule::yarn(
+            64,
+            1e7,
+            100,
+            vec![
+                Rung {
+                    ceiling: 100,
+                    factor: 1.0,
+                },
+                Rung {
+                    ceiling: 200,
+                    factor: 2.0,
+                },
+            ],
+            true,
+        )
+        .unwrap();
+        let rope = RopeRungs::new(&progressive, &Device::Cpu).unwrap();
+        // Offsets 0 and 98 writing two rows reach 2 and 100: rung 0.
+        assert!(refuse_rung_past_zero(&rope, &[0, 98], 2).is_ok());
+        // Offset 99 writing two rows reaches 101: rung 1.
+        assert!(refuse_rung_past_zero(&rope, &[0, 99], 2).is_err());
+
+        let declared = DeclaredScaling::Yarn {
+            factor: 4.0,
+            original: 32,
+        };
+        let static_yarn = declared.schedule(64, 1e7, 1_000).unwrap();
+        let rope = RopeRungs::new(&static_yarn, &Device::Cpu).unwrap();
+        assert!(rope.q_scale(0) > 1.0);
+        assert!(refuse_rung_past_zero(&rope, &[0], 1).is_err());
+
+        let plain = RopeSchedule::stated(plain_inv_freq(64, 1e7), 1_000).unwrap();
+        let rope = RopeRungs::new(&plain, &Device::Cpu).unwrap();
+        assert!(refuse_rung_past_zero(&rope, &[0, 500], 1).is_ok());
+    }
 
     #[test]
     fn prefill_meta_ragged_builds_varlen_layout() {
@@ -1715,7 +1800,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn float_fallback_prefill_hd256_matches_reference() -> Result<()> {
-        use crate::models::prefill_utils::compute_rope_cs;
+        use crate::models::rope_schedule::RopeSchedule;
         use candle::DType;
         use candle_nn::kv_cache::ChunkedKvBacking;
 
@@ -1747,8 +1832,7 @@ mod tests {
         let inv_freq: Vec<f32> = (0..head_dim / 2)
             .map(|i| 1f32 / 1e6f32.powf(2.0 * i as f32 / head_dim as f32))
             .collect();
-        let inv_freq_t = Tensor::from_vec(inv_freq, (head_dim / 2,), &device)?;
-        let rope_cs = compute_rope_cs(&inv_freq_t, 4, head_dim, &device)?;
+        let rope = RopeRungs::new(&RopeSchedule::stated(inv_freq.clone(), 1 << 20)?, &device)?;
 
         let q_live = q.clone();
         let k_live = k.clone();
@@ -1763,28 +1847,27 @@ mod tests {
             n_head,
             n_kv_head,
             head_dim,
-            &rope_cs,
+            &rope,
             false,
         )?;
         assert_eq!(out.dims(), &[total_q, n_head, head_dim]);
 
-        // Reference: per sequence, rotate q/k at absolute positions and run
-        // plain causal attention over bf16-rounded values.
+        // Reference: per sequence, rotate q/k at absolute positions — from
+        // f64 angles, not from the table under test — and run plain causal
+        // attention over bf16-rounded values.
         let half = head_dim / 2;
-        let cs_ref = rope_cs.reshape((rope_cs.dim(0)?, half, 2))?;
         let rot_ref = |x: &Tensor, len: usize| -> Result<Tensor> {
-            let cos = cs_ref
-                .narrow(0, 0, len)?
-                .narrow(2, 0, 1)?
-                .squeeze(2)?
-                .to_dtype(DType::BF16)?
-                .contiguous()?;
-            let sin = cs_ref
-                .narrow(0, 0, len)?
-                .narrow(2, 1, 1)?
-                .squeeze(2)?
-                .to_dtype(DType::BF16)?
-                .contiguous()?;
+            let mut cos = Vec::with_capacity(len * half);
+            let mut sin = Vec::with_capacity(len * half);
+            for pos in 0..len {
+                for w in &inv_freq {
+                    let a = pos as f64 * *w as f64;
+                    cos.push(a.cos() as f32);
+                    sin.push(a.sin() as f32);
+                }
+            }
+            let cos = Tensor::from_vec(cos, (len, half), &device)?.to_dtype(DType::BF16)?;
+            let sin = Tensor::from_vec(sin, (len, half), &device)?.to_dtype(DType::BF16)?;
             candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
         };
         let mut row_start = 0usize;

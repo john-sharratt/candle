@@ -267,9 +267,11 @@ which is ordinary file editing. `zend-tools` already implements it —
 `file_read`, `file_edit`, `file_write`, `file_list`, `file_delete` over a session
 overlay that copies a workspace file up on first edit and records a whiteout on
 delete. Its own documentation states the alignment that matters here: `file_edit`
-replaces `old_str` only where it appears exactly once, which *"matches Claude
-Code's `str_replace` semantics and forces the model to provide enough context to
-identify a single edit site."*
+applies a unified diff whose hunks are *"located by their content, never by the
+`@@` line numbers"*, so a hunk matching in several places is refused as ambiguous
+rather than guessed at, and one whose change is already in the file is counted as
+already applied — which forces the model to provide enough context to identify a
+single edit site, and makes re-sending a patch safe.
 
 It is a workspace member with no candle dependency, so `npcd` can depend on it
 directly. Reusing it costs one dependency and buys names the model already has a

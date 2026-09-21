@@ -12,6 +12,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::Instant;
 
 use candle::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
 use candle::{Device, Result};
@@ -292,22 +293,38 @@ impl GalleryArena {
         // Reuse the cached index if the same segment set is rescanned under an
         // unchanged residency generation (the common within-turn case) — this
         // pins the turns. Otherwise rebuild (which also pins) and cache it.
+        let t_index = Instant::now();
         let fp = fingerprint_segments(segments);
-        let idx = match self.reuse_index(fp) {
-            Some(idx) => idx,
+        let (idx, reused) = match self.reuse_index(fp) {
+            Some(idx) => (idx, true),
             None => {
                 let built = Arc::new(self.build_index(segments)?);
                 let gen = self.residency_gen();
                 self.store_index(fp, gen, built.clone());
-                built
+                (built, false)
             }
         };
+        let index_us = t_index.elapsed().as_micros() as u64;
+        let t_launch = Instant::now();
         let result = self.launch_paged(&idx, probes, group_weights, force);
+        let launch_us = t_launch.elapsed().as_micros() as u64;
         // Release the scan's pins whether or not the launch succeeded — the pages
         // are no longer being read once the launch has synchronized (or failed).
         for &sid in &idx.pinned_sids {
             self.unpin(sid);
         }
+        // Index (reuse or rebuild, which pins pages resident) versus launch
+        // (which synchronizes and tallies on the host). They have unrelated
+        // costs, so a slow scan is attributed to one or the other.
+        tracing::debug!(
+            target: "candle_conversation::provenance::gallery_arena",
+            probes = probes.len(),
+            segments = segments.len(),
+            reused,
+            index_us,
+            launch_us,
+            "arena scan"
+        );
         result
     }
 

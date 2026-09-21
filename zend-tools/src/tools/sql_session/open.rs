@@ -6,6 +6,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::SqlError;
+use crate::disk;
 use crate::state::sessions::{SessionMeta, SqlConn, SqlEntry};
 use crate::{RegisteredTool, Tool, ToolContext};
 
@@ -57,7 +58,7 @@ impl Tool for SqlSessionOpen {
         let cred = match &req.credential_name {
             Some(name) => {
                 let cred = ctx
-                    .credentials
+                    .credentials()?
                     .get_by_name(name)
                     .ok_or_else(|| SqlError::CredentialNotFound(name.clone()))?;
                 if cred.cred_type != "sql_password" {
@@ -82,7 +83,8 @@ impl Tool for SqlSessionOpen {
             return Err(SqlError::SessionLimitExceeded);
         }
 
-        let conn = rusqlite::Connection::open(&db_path)
+        let grant = ctx.grants().disk_write()?;
+        let conn = disk::sqlite_open(&grant, &db_path)
             .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?;
 
         let sid = format!("sess_{}", Uuid::new_v4().simple());

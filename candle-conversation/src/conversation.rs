@@ -3179,6 +3179,9 @@ impl Sequence {
         // than the summary, so by the time the closing period is sampled the
         // window holds the model's own prose rather than a directory listing.
         summary_sampling.repeat_last_n = 64;
+        // The line ends are a whole-vocabulary scan the engine's config already
+        // carries; a fresh `compression()` config would repeat it per summary.
+        summary_sampling.line_end_token_ids = Arc::clone(&self.config.sampling.line_end_token_ids);
         summary_sampling.apply_think_mode(ThinkMode::Off, &self.tokenizer, max_summary_tokens);
         let mut opts = TurnOptions {
             max_tokens: Some(max_summary_tokens),

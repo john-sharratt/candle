@@ -1489,12 +1489,10 @@ mod tests {
     /// * **which proposal position first misses** — position 0 missing means
     ///   the head is reading bad state; only later positions missing means the
     ///   walk's own recurrence;
-    /// * **the rope depth each level hands the drafter**, and the head layer's
-    ///   block count against the trunk's. `draft_walk`'s module docs call out
-    ///   that a rope table which does not cover the drafted positions is
-    ///   "silent wrong RoPE on every drafted position … it could only ever
-    ///   surface as acceptance quietly collapsing", which is this symptom
-    ///   exactly.
+    /// * **the head layer's block count against the trunk's** — a head layer
+    ///   standing at a different length from the trunk rotates its drafted
+    ///   positions wrongly, which could only ever surface as acceptance quietly
+    ///   collapsing: this symptom exactly.
     ///
     /// A short prompt cannot see any of it: chunks are 32 tokens, so nothing is
     /// compressed until they fill, and C5 and C6 are then the same run.
@@ -1505,7 +1503,6 @@ mod tests {
                 -- --ignored --nocapture --test-threads=1"]
     fn test_drafter_c5_vs_c6() -> Result<()> {
         use crate::models::batched_inference::{BatchedConfig, InferenceMode, ManagedBatchedModel};
-        use crate::models::draft_walk::draft_rope_depth;
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
         use candle::IndexOp;
@@ -1619,7 +1616,6 @@ mod tests {
                     next = plain(&mut session, next)?;
                     done += 1;
                 }
-                let depth = draft_rope_depth(&session, &[seq], head_kv)?;
                 let caches = session.sequence_caches(seq).expect("live slot");
                 let trunk_blocks = caches.caches[0].k_cache().chunked_max_blocks();
                 let head_blocks = caches.caches[head_kv].k_cache().chunked_max_blocks();
@@ -1645,7 +1641,7 @@ mod tests {
                     .take_while(|(a, b)| a == b)
                     .count();
                 println!(
-                    "  +{mark:<3} offset {offset:<4} rope {depth}blk trunk {trunk_blocks} \
+                    "  +{mark:<3} offset {offset:<4} trunk {trunk_blocks} \
                      head {head_blocks} | accepted {matched}/{DRAFT}  drafted {drafted:?} \
                      truth {truth:?}"
                 );
