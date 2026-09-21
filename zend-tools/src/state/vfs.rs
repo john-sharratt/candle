@@ -353,6 +353,7 @@ impl VfsStore {
     /// string rather than a second copy.
     pub fn read_page(&self, path: &str, page: u32) -> Result<Option<PageResult>, VfsError> {
         let norm = Self::normalize(path);
+        Self::guard(&norm)?;
         {
             let guard = self.upper.read().unwrap();
             if let Some(v) = guard.files.get(&norm) {
@@ -785,7 +786,7 @@ impl VfsStore {
         if norm.is_empty() {
             root.is_dir()
         } else {
-            root.join(norm).is_dir()
+            Self::under(root, norm).is_some_and(|p| p.is_dir())
         }
     }
 
@@ -801,7 +802,9 @@ impl VfsStore {
     /// (see [`PROTECTED_SEGMENT`]) is dropped rather than listed — the same
     /// silence `secrets/` gets everywhere else — so listing the protected
     /// directory itself, or a parent that contains one, comes back empty of
-    /// it rather than erroring, and never names it.
+    /// it rather than erroring, and never names it. An entry [`Self::addressable`]
+    /// refuses (a `:` in the name, an 8.3 short-name tail, …) is dropped too —
+    /// a listing never shows a file the store cannot open.
     fn list_lower_dir(&self, norm: &str) -> Vec<(String, Option<usize>, bool)> {
         let Some(root) = self.workspace.as_ref() else {
             return Vec::new();
@@ -809,7 +812,10 @@ impl VfsStore {
         let walk_root = if norm.is_empty() {
             root.clone()
         } else {
-            root.join(norm)
+            let Some(p) = Self::under(root, norm) else {
+                return Vec::new();
+            };
+            p
         };
 
         let mut out = Vec::new();
@@ -830,7 +836,7 @@ impl VfsStore {
             } else {
                 format!("{norm}/{name}")
             };
-            if Self::is_protected(&path) {
+            if Self::is_protected(&path) || !Self::addressable(&path) {
                 continue;
             }
             if is_dir {
@@ -1568,32 +1574,32 @@ mod tests {
     }
 
     #[test]
-    fn a_file_of_exactly_650_lines_pages_at_300_line_strides() {
+    fn a_file_of_exactly_650_lines_pages_at_200_line_strides() {
         let (dir, s) = store_with_tree();
         put(dir.path(), "big.txt", &numbered_lines(650));
 
         let p0 = s.read_page("big.txt", 0).unwrap().unwrap();
         assert_eq!(p0.page, 0);
-        assert_eq!(p0.total_pages, 3);
+        assert_eq!(p0.total_pages, 4);
         assert_eq!(p0.start_line, 1);
-        assert_eq!(p0.end_line, 300);
+        assert_eq!(p0.end_line, 200);
         assert_eq!(p0.total_lines, 650);
         assert_eq!(p0.body.lines().next(), Some("1"));
-        assert_eq!(p0.body.lines().last(), Some("300"));
+        assert_eq!(p0.body.lines().last(), Some("200"));
 
         let p1 = s.read_page("big.txt", 1).unwrap().unwrap();
         assert_eq!(p1.page, 1);
-        assert_eq!(p1.start_line, 301);
-        assert_eq!(p1.end_line, 600);
-        assert_eq!(p1.body.lines().next(), Some("301"));
-        assert_eq!(p1.body.lines().last(), Some("600"));
+        assert_eq!(p1.start_line, 201);
+        assert_eq!(p1.end_line, 400);
+        assert_eq!(p1.body.lines().next(), Some("201"));
+        assert_eq!(p1.body.lines().last(), Some("400"));
 
-        let p2 = s.read_page("big.txt", 2).unwrap().unwrap();
-        assert_eq!(p2.page, 2);
-        assert_eq!(p2.start_line, 601);
-        assert_eq!(p2.end_line, 650);
-        assert_eq!(p2.body.lines().next(), Some("601"));
-        assert_eq!(p2.body.lines().last(), Some("650"));
+        let p3 = s.read_page("big.txt", 3).unwrap().unwrap();
+        assert_eq!(p3.page, 3);
+        assert_eq!(p3.start_line, 601);
+        assert_eq!(p3.end_line, 650);
+        assert_eq!(p3.body.lines().next(), Some("601"));
+        assert_eq!(p3.body.lines().last(), Some("650"));
     }
 
     /// A page past the end clamps to the last one — the same "over-shoot reads
@@ -1603,7 +1609,7 @@ mod tests {
         let (dir, s) = store_with_tree();
         put(dir.path(), "big.txt", &numbered_lines(650));
         let clamped = s.read_page("big.txt", 99).unwrap().unwrap();
-        let last = s.read_page("big.txt", 2).unwrap().unwrap();
+        let last = s.read_page("big.txt", 3).unwrap().unwrap();
         assert_eq!(clamped.page, last.page);
         assert_eq!(clamped.start_line, last.start_line);
         assert_eq!(clamped.end_line, last.end_line);
@@ -1636,10 +1642,10 @@ mod tests {
         let s = VfsStore::new();
         s.write("big.txt", numbered_lines(650)).unwrap();
         let p1 = s.read_page("big.txt", 1).unwrap().unwrap();
-        assert_eq!(p1.start_line, 301);
-        assert_eq!(p1.end_line, 600);
-        assert_eq!(p1.total_pages, 3);
-        assert_eq!(p1.body.lines().next(), Some("301"));
+        assert_eq!(p1.start_line, 201);
+        assert_eq!(p1.end_line, 400);
+        assert_eq!(p1.total_pages, 4);
+        assert_eq!(p1.body.lines().next(), Some("201"));
     }
 
     #[test]

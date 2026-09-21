@@ -749,7 +749,7 @@ fn file_read_always_drives_path_and_page() {
     for page in [0, 3] {
         let target = format!(
             "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": \"a.rs\", \
-             \"page\": {page}}}}}\n</tool_call>"
+             \"page\": {page}}}}}\n</tool_call><|im_end|>"
         );
         let out = drive(Arc::clone(&tree), &target, &vocab)
             .unwrap_or_else(|e| panic!("page {page} must drive, got {e:?}"));

@@ -1289,8 +1289,8 @@ mod tests {
         let scope = Scope {
             path: vec!["dummy".into()],
             kind: ChunkKind::Function,
-            start_line: 250,
-            end_line: 350,
+            start_line: 150,
+            end_line: 250,
         };
         let mut sink = RecordingTurnSink::new();
         emit_file_turns(
@@ -1303,11 +1303,11 @@ mod tests {
         )
         .unwrap();
         let (call_user, _, _) = &sink.turns[0];
-        // Page 0 is lines 1-300 — the scope's real end (350) is past it, so
-        // the claimed range must stop at 300, not restate the scope's own
+        // Page 0 is lines 1-200 — the scope's real end (250) is past it, so
+        // the claimed range must stop at 200, not restate the scope's own
         // (wider) bound.
         assert!(
-            call_user.starts_with("Summarize `src/big.rs` (lines 250-300)"),
+            call_user.starts_with("Summarize `src/big.rs` (lines 150-200)"),
             "{call_user}"
         );
     }

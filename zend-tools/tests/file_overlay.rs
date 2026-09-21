@@ -643,8 +643,10 @@ fn the_read_header_reports_the_files_true_length() {
         // header's `of N` is stated unconditionally either way.
         let resp = harness::invoke_with_ctx("file_read", json!({"path": name, "page": 0}), &ctx);
         let text = resp.as_str().unwrap();
+        // The header is "(page P of N, lines a-b of total)" — the LAST " of "
+        // before the closing paren names the file's true length.
         let total: i64 = text
-            .split_once(" of ")
+            .rsplit_once(" of ")
             .and_then(|(_, rest)| rest.split_once(')'))
             .map(|(n, _)| n.parse().unwrap())
             .unwrap_or_else(|| panic!("{name}: header carries no `of N`: {text:?}"));

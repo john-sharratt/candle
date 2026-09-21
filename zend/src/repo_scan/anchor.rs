@@ -535,8 +535,8 @@ mod tests {
         let files = [entry("a/lib.rs", Language::Rust)];
         let refs: Vec<&FileEntry> = files.iter().collect();
         let a = pick(&refs, &root).expect("anchor");
-        assert_eq!((a.start_line, a.end_line), (1, 300), "widened to page 0");
-        assert_eq!(a.body.lines().count(), 300);
+        assert_eq!((a.start_line, a.end_line), (1, 200), "widened to page 0");
+        assert_eq!(a.body.lines().count(), 200);
     }
 
     /// The fallback: no leading block, but the first item is documented.
@@ -558,9 +558,11 @@ mod tests {
     }
 
     /// Nothing documented at all — the head of the file is still better than
-    /// nothing, bounded by the selection cap. The rendered page is wider
-    /// still (`PAGE_LINES` > `MAX_ANCHOR_LINES`), since `pick` widens to the
-    /// whole page regardless of how the selection itself was bounded.
+    /// nothing, bounded by the selection cap. `pick` then widens the
+    /// selection to the whole page it falls on, regardless of how the
+    /// selection itself was bounded — `MAX_ANCHOR_LINES` and `PAGE_LINES`
+    /// happen to share a value, so this case cannot show the two caps
+    /// disagree, but it still pins the number `pick` actually returns.
     #[test]
     fn falls_back_to_the_file_head_when_undocumented() {
         let body: String = (1..=400).map(|i| format!("pub fn f{i}() {{}}\n")).collect();
@@ -574,7 +576,7 @@ mod tests {
         let refs: Vec<&FileEntry> = files.iter().collect();
         let a = pick(&refs, &root).expect("anchor");
         assert_eq!(
-            a.end_line, 300,
+            a.end_line, 200,
             "capped at the page width, not the selection width"
         );
         assert_eq!(a.total_lines, 400);
@@ -588,20 +590,20 @@ mod tests {
     #[test]
     fn a_module_doc_straddling_a_page_boundary_is_capped_at_the_page() {
         let mut src = String::new();
-        for i in 1..=259 {
+        for i in 1..=179 {
             src.push_str(&format!("// filler {i}\n"));
         }
         for i in 1..=60 {
             src.push_str(&format!("//! doc line {i}\n"));
         }
         src.push_str("pub fn x() {}\n");
-        let total_lines = 320;
+        let total_lines = 240;
 
         let (start_line, end_line) = excerpt_bounds(src.as_bytes(), Language::Rust, total_lines);
         assert_eq!(
             (start_line, end_line),
-            (260, 319),
-            "the doc block runs past line 300",
+            (180, 239),
+            "the doc block runs past line 200",
         );
 
         let (_d, root) = workspace(&[("a/mod.rs", src.as_str())]);
@@ -610,16 +612,16 @@ mod tests {
         let a = pick(&refs, &root).expect("the excerpt's page-0 portion is still non-empty");
         assert_eq!(
             (a.start_line, a.end_line),
-            (1, 300),
+            (1, 200),
             "widened to (and capped at) page 0",
         );
         assert!(
-            a.body.contains("doc line 40"),
+            a.body.contains("doc line 10"),
             "the doc's page-0 portion is shown"
         );
         assert!(
-            !a.body.contains("doc line 60"),
-            "its tail past line 300 is not — the page is what a live file_read \
+            !a.body.contains("doc line 30"),
+            "its tail past line 200 is not — the page is what a live file_read \
              returns, never more",
         );
     }
