@@ -156,6 +156,16 @@ pub struct Substrate {
     /// workspace corpus). Maintained on section install (overwrite-aware).
     section_token_total: usize,
 
+    /// Per-conversation fast-path injections, most recently admitted first.
+    ///
+    /// A tool call that resolves to content the corpus has already read injects
+    /// that ingest conversation here instead of re-reading the file, and the
+    /// projection then carries it as if this conversation had read it
+    /// ([`Self::fast_path_injections`]). In-memory only and derived: it is
+    /// rebuilt by replaying the conversation's own tool calls, so losing it
+    /// costs a re-read, never correctness.
+    fast_path: HashMap<TimelineId, Vec<TimelineId>>,
+
     /// Hot-tier LRU list, most-recently-used at the front.
     /// `front()` = MRU, `back()` = next eviction victim. Membership
     /// mirrors `residence[idx].hot.is_some()` for every index in the
@@ -2889,6 +2899,89 @@ impl Substrate {
             return None;
         }
         Some(parent)
+    }
+
+    // ── fast-path tool reads ────────────────────────────────────────────────
+
+    /// Admit `injected` to `target`'s fast-path set and evict from the tail
+    /// until the set fits `budget_tokens`.
+    ///
+    /// Most-recently-admitted first, so eviction drops what the conversation
+    /// touched longest ago. Re-admitting something already present moves it to
+    /// the front rather than duplicating it — the same file resolved twice is
+    /// one injection, which is what makes the content hash a dedupe key.
+    ///
+    /// `target` itself always stays out of its own set; a conversation does not
+    /// inject itself.
+    ///
+    /// Returns whether `injected` is in the set afterwards. `false` means it
+    /// alone exceeds the budget, and the caller must fall back to a real read —
+    /// admitting it would evict everything and still not fit.
+    pub fn fast_path_admit(
+        &mut self,
+        target: TimelineId,
+        injected: TimelineId,
+        budget_tokens: usize,
+    ) -> bool {
+        if injected == target {
+            return false;
+        }
+        // Refuse anything that cannot actually deliver its content. The caller
+        // tells the model the file is already in context on the strength of
+        // this answer, so a tombstoned, archived or empty conversation must
+        // read as a miss and send it to a real read — being told it has a file
+        // it does not have is worse than reading the file twice.
+        if self.tombstoned_timelines.contains(&injected) {
+            return false;
+        }
+        if !self
+            .timelines
+            .get(&injected)
+            .map(|e| !e.archived)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        if Substrate::turn_count(self, injected) == 0 {
+            return false;
+        }
+        let cost = |tl: &TimelineId| self.timeline_token_totals.get(tl).copied().unwrap_or(0);
+        if cost(&injected) > budget_tokens {
+            return false;
+        }
+        let entry = self.fast_path.entry(target).or_default();
+        entry.retain(|tl| *tl != injected);
+        entry.insert(0, injected);
+
+        let mut spent = 0usize;
+        let mut keep = 0usize;
+        for tl in entry.iter() {
+            let c = self.timeline_token_totals.get(tl).copied().unwrap_or(0);
+            if spent + c > budget_tokens {
+                break;
+            }
+            spent += c;
+            keep += 1;
+        }
+        self.fast_path
+            .get_mut(&target)
+            .expect("just inserted")
+            .truncate(keep);
+        true
+    }
+
+    /// The conversations `target` has fast-path injected, most recent first.
+    pub fn fast_path_injections(&self, target: TimelineId) -> &[TimelineId] {
+        self.fast_path
+            .get(&target)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Drop `target`'s fast-path set — the conversation is going away, or its
+    /// set is about to be rebuilt from its own history.
+    pub fn fast_path_clear(&mut self, target: TimelineId) {
+        self.fast_path.remove(&target);
     }
 
     /// `tl` together with the ancestors it inherits, **oldest first**.
@@ -6079,6 +6172,130 @@ mod tests {
             parent.raw().to_string(),
         );
         sub.merge_custom(child, &kv);
+    }
+
+    // ── fast-path tool reads ────────────────────────────────────────────────
+
+    /// A conversation plus `n` ingest conversations of `tokens_each`, none of
+    /// them related — the fast path joins conversations that never forked from
+    /// one another.
+    fn fast_path_fixture(n: usize, tokens_each: usize) -> (Substrate, TimelineId, Vec<TimelineId>) {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let mut sub = Substrate::new();
+        let target = alloc.next();
+        sub.register_timeline(target, layer, group);
+        let mut reads = Vec::new();
+        for _ in 0..n {
+            let tl = alloc.next();
+            sub.register_timeline(tl, layer, group);
+            sub.append_with_blocks(tl, tokens_each, 0, 1);
+            reads.push(tl);
+        }
+        (sub, target, reads)
+    }
+
+    #[test]
+    fn an_admitted_read_is_injected_most_recent_first() {
+        let (mut sub, target, reads) = fast_path_fixture(3, 10);
+        for r in &reads {
+            assert!(sub.fast_path_admit(target, *r, 1000));
+        }
+        assert_eq!(
+            sub.fast_path_injections(target),
+            vec![reads[2], reads[1], reads[0]],
+        );
+    }
+
+    /// The same file resolved twice is one injection — what makes the content
+    /// hash a dedupe key rather than an append log.
+    #[test]
+    fn re_admitting_the_same_read_moves_it_to_the_front_without_duplicating() {
+        let (mut sub, target, reads) = fast_path_fixture(3, 10);
+        for r in &reads {
+            sub.fast_path_admit(target, *r, 1000);
+        }
+        sub.fast_path_admit(target, reads[0], 1000);
+        assert_eq!(
+            sub.fast_path_injections(target),
+            vec![reads[0], reads[2], reads[1]],
+            "re-admitted entry leads, and appears exactly once",
+        );
+    }
+
+    #[test]
+    fn the_budget_evicts_from_the_tail() {
+        let (mut sub, target, reads) = fast_path_fixture(4, 100);
+        for r in &reads {
+            sub.fast_path_admit(target, *r, 250);
+        }
+        assert_eq!(
+            sub.fast_path_injections(target),
+            vec![reads[3], reads[2]],
+            "two 100-token reads fit a 250 budget; the older two are dropped",
+        );
+    }
+
+    /// A read too big for the budget is refused rather than admitted — it would
+    /// evict every other entry and still not fit, and the caller needs to know
+    /// so it can do a real read instead.
+    #[test]
+    fn a_read_larger_than_the_budget_is_refused_and_disturbs_nothing() {
+        let (mut sub, target, reads) = fast_path_fixture(2, 100);
+        assert!(sub.fast_path_admit(target, reads[0], 250));
+        let huge = TimelineAllocator::new().next();
+        sub.register_timeline(huge, LayerId::for_test(1), GroupId::for_test(1));
+        sub.append_with_blocks(huge, 5_000, 0, 1);
+        assert!(!sub.fast_path_admit(target, huge, 250));
+        assert_eq!(
+            sub.fast_path_injections(target),
+            vec![reads[0]],
+            "the refused read left the existing set intact",
+        );
+    }
+
+    /// A retired conversation reads as a miss. Its turns are gone, so serving
+    /// it would tell the model it has a file that nothing will deliver.
+    #[test]
+    fn a_tombstoned_read_is_refused() {
+        let (mut sub, target, reads) = fast_path_fixture(1, 10);
+        sub.tombstone_timeline(reads[0]);
+        assert!(!sub.fast_path_admit(target, reads[0], 1000));
+        assert!(sub.fast_path_injections(target).is_empty());
+    }
+
+    #[test]
+    fn an_archived_read_is_refused() {
+        let (mut sub, target, reads) = fast_path_fixture(1, 10);
+        sub.set_archived(reads[0], true);
+        assert!(!sub.fast_path_admit(target, reads[0], 1000));
+    }
+
+    /// A registered conversation that never sealed a turn carries nothing.
+    #[test]
+    fn a_read_with_no_turns_is_refused() {
+        let (mut sub, target, _) = fast_path_fixture(0, 0);
+        let empty = TimelineAllocator::new().next();
+        sub.register_timeline(empty, LayerId::for_test(1), GroupId::for_test(1));
+        assert!(!sub.fast_path_admit(target, empty, 1000));
+    }
+
+    #[test]
+    fn a_conversation_never_injects_itself() {
+        let (mut sub, target, _) = fast_path_fixture(1, 10);
+        assert!(!sub.fast_path_admit(target, target, 1000));
+        assert!(sub.fast_path_injections(target).is_empty());
+    }
+
+    #[test]
+    fn clearing_drops_the_set_for_a_rebuild() {
+        let (mut sub, target, reads) = fast_path_fixture(2, 10);
+        for r in &reads {
+            sub.fast_path_admit(target, *r, 1000);
+        }
+        sub.fast_path_clear(target);
+        assert!(sub.fast_path_injections(target).is_empty());
     }
 
     #[test]

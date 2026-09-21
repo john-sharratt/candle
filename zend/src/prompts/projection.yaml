@@ -741,6 +741,19 @@ layers:
     # missing one, and `MAX_FILE_READ_ROUNDS`'s closing round still forces
     # an answer on whatever was read if a file runs long enough to matter.
     window: 40000
+    # Tokens of already-read files a conversation may carry from the fast path.
+    #
+    # A `file_read` whose content hash matches a file this layer has already
+    # read injects that conversation instead of reading the file again: no
+    # prefill, no decode, the K/V is already in the substrate. This bounds how
+    # much one conversation accumulates that way, evicted least-recently-used,
+    # so a long session re-reading many files keeps the ones it touched last.
+    #
+    # ~300k is roughly fifty whole-file reads at the measured per-file size —
+    # generous because the saving is the prefill, not the room. A single file
+    # estimated past `MAX_FAST_PATH_FILE_TOKENS` is never carried at all, so
+    # this cannot be spent on one read.
+    fast_path_window: 300000
     score_threshold: 0.0
     budget:
       priority: 25

@@ -942,6 +942,55 @@ impl ConversationEngine {
         self.conversation.find_timelines_by_metadata(key, value)
     }
 
+    /// Inject `read` into `target`'s fast-path set — the conversation that
+    /// already read this content, standing in for reading it again.
+    ///
+    /// `budget_tokens` is the reading layer's `fast_path_window`; the set is
+    /// evicted least-recently-used down to it. `false` means the read did not
+    /// fit and the caller must do the real read.
+    pub fn fast_path_admit(
+        &self,
+        target: TimelineId,
+        read: TimelineId,
+        budget_tokens: usize,
+    ) -> bool {
+        self.conversation
+            .write()
+            .fast_path_admit(target, read, budget_tokens)
+    }
+
+    /// The conversations `target` currently carries from the fast path, most
+    /// recently admitted first.
+    pub fn fast_path_injections(&self, target: TimelineId) -> Vec<TimelineId> {
+        self.conversation
+            .read()
+            .fast_path_injections(target)
+            .to_vec()
+    }
+
+    /// Forget `target`'s fast-path set, so the next call rebuilds it from the
+    /// conversation's own history.
+    pub fn fast_path_clear(&self, target: TimelineId) {
+        self.conversation.write().fast_path_clear(target);
+    }
+
+    /// Every assistant turn's text on `timeline`, oldest first.
+    ///
+    /// The durable record of what a conversation asked for: the `<tool_call>`
+    /// blocks it wrote are in here verbatim, which is what lets a resumed
+    /// conversation replay its own calls without any of them having been
+    /// recorded a second time as metadata.
+    pub fn assistant_turn_texts(&self, timeline: TimelineId) -> Vec<String> {
+        let view = self.conversation.read();
+        let mut indices: Vec<_> = view.turn_indices(timeline).collect();
+        indices.sort_by_key(|i| i.0);
+        indices
+            .into_iter()
+            .map(|idx| view.assistant_text_of(timeline, idx))
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
     /// [`Self::find_conversations_by_metadata`] plus tombstoned conversations
     /// that carry a distillation mode — the provenance corpus, whose designed
     /// end state is archived + distilled + tombstoned. Ordinary tombstones stay
