@@ -13,6 +13,7 @@
 //! norm weights apply as a plain broadcast.
 
 use candle::{Result, Tensor};
+use candle_nn::kv_cache::WaveGeneration;
 
 /// Microbench + `ncu` target for the three fused kernels, with its own
 /// correctness gate (§0.4 rule 4).
@@ -78,12 +79,17 @@ impl HcWeights {
 /// the hot half of the eager Gated-Residual cost. The `[hc_dim]` gain cannot
 /// ride the kernel's alpha (that is per-`n_embd`), so it applies as one flat
 /// broadcast after.
-pub fn hc_grouped_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+pub fn hc_grouped_norm(
+    x: &Tensor,
+    weight: &Tensor,
+    eps: f64,
+    wave: Option<&WaveGeneration>,
+) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if matches!(x.device(), candle::Device::Cuda(_)) {
         // One launch: the reduction and the per-(stream, column) gain in a
         // single pass.
-        return cuda_fused::norm(x, weight, eps);
+        return cuda_fused::norm(x, weight, eps, wave);
     }
     eager_grouped_norm(x, weight, eps)
 }
@@ -103,11 +109,21 @@ fn eager_grouped_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
 /// The read half: collapse the wide residual `[T, hc, n_embd]` into the block
 /// input `[T, n_embd]`, and produce the `[T, hc]` write weights for
 /// [`hc_combine`] when the module carries an `inject`.
-pub fn hc_mix(x: &Tensor, w: &HcWeights, eps: f64) -> Result<(Tensor, Option<Tensor>)> {
+/// `wave`, when present, is the open layer phase this mix's transients belong
+/// to. Everything it produces is consumed before that phase closes — the block
+/// input by the mixer or the FFN, the inject weights by [`hc_combine`] — which
+/// is what makes rooting them on the span sound. The residual `hc_combine`
+/// returns is deliberately NOT on it: that crosses every phase boundary.
+pub fn hc_mix(
+    x: &Tensor,
+    w: &HcWeights,
+    eps: f64,
+    wave: Option<&WaveGeneration>,
+) -> Result<(Tensor, Option<Tensor>)> {
     let (t, hc, n_embd) = x.dims3()?;
     let dev = x.device();
     let g = crate::models::profile::gpu_span("hc_mix:norm", dev);
-    let xn = hc_grouped_norm(x, &w.norm, eps)?;
+    let xn = hc_grouped_norm(x, &w.norm, eps, wave)?;
     let xn_flat = xn.reshape((t, hc * n_embd))?;
     g.end();
 
@@ -150,7 +166,7 @@ pub fn hc_mix(x: &Tensor, w: &HcWeights, eps: f64) -> Result<(Tensor, Option<Ten
             // registers. `gate` arrives RAW from the up-projection here — the
             // kernel applies the sigmoid, so the eager path's separate pass
             // over `[t, hc·n_embd]` disappears with it.
-            cuda_fused::mix(&xn, &gate_raw, hc, n_embd)?
+            cuda_fused::mix(&xn, &gate_raw, hc, n_embd, wave)?
         } else {
             eager_gate_mean(&xn_flat, &gate_raw, t, hc, n_embd)?
         }
@@ -200,12 +216,22 @@ fn eager_gate_mean(
 /// The write half: scatter the block output back across the streams.
 /// `2·sigmoid(inject/hc)` centres the weights on 1, so a zero injection is a
 /// plain residual add on every stream.
-pub fn hc_combine(res: &Tensor, block_out: &Tensor, inject: &Tensor) -> Result<Tensor> {
+/// `dst` is the residual's other half. The sweep reserves both on the
+/// forward-scoped span before the layer loop and alternates them, so the wide
+/// stream is allocated twice for a whole forward rather than twice per layer —
+/// and the kernel never reads and writes one buffer. `None` allocates, which is
+/// what the reference path and the tests want.
+pub fn hc_combine(
+    res: &Tensor,
+    block_out: &Tensor,
+    inject: &Tensor,
+    dst: Option<&Tensor>,
+) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if matches!(res.device(), candle::Device::Cuda(_)) {
         // One launch, one read and one write of the wide buffer, against the
         // eager chain's four passes below.
-        return cuda_fused::combine(res, block_out, inject);
+        return cuda_fused::combine(res, block_out, inject, dst);
     }
     eager_combine(res, block_out, inject)
 }
@@ -265,7 +291,7 @@ mod tests {
         let res = lcg_tensor(&[t, hc, n_embd], 21, &dev);
         let out = lcg_tensor(&[t, n_embd], 22, &dev);
         let zero_inject = Tensor::zeros((t, hc), DType::F32, &dev).unwrap();
-        let got = hc_combine(&res, &out, &zero_inject).unwrap();
+        let got = hc_combine(&res, &out, &zero_inject, None).unwrap();
         let want = res
             .broadcast_add(&out.reshape((t, 1, n_embd)).unwrap())
             .unwrap();
@@ -297,7 +323,7 @@ mod tests {
             .unwrap()
             .contiguous()
             .unwrap();
-        let (mixed, inject) = hc_mix(&wide, &w, 1e-6).unwrap();
+        let (mixed, inject) = hc_mix(&wide, &w, 1e-6, None).unwrap();
         assert_eq!(mixed.dims(), &[t, n_embd]);
         assert_eq!(inject.unwrap().dims(), &[t, hc]);
         // The four streams were identical but the [hc_dim] norm gamma is not,
@@ -342,7 +368,7 @@ mod tests {
         let inj = lcg_tensor(&[hc, hc_dim], 65, &dev).affine(0.3, 0.).unwrap();
 
         // The two-projection form this change replaces, written out in full.
-        let xn = hc_grouped_norm(&x, &norm, eps).unwrap();
+        let xn = hc_grouped_norm(&x, &norm, eps, None).unwrap();
         let xn_flat = xn.reshape((t, hc_dim)).unwrap();
         let lo = (xn_flat.matmul(&down.t().unwrap()).unwrap() * (1.0 / hc as f64)).unwrap();
         let lo = lo
@@ -366,7 +392,7 @@ mod tests {
             "the stacked weight must report inject"
         );
         assert_eq!(w.low_rank().unwrap(), lr);
-        let (got_mixed, got_inject) = hc_mix(&x, &w, eps).unwrap();
+        let (got_mixed, got_inject) = hc_mix(&x, &w, eps, None).unwrap();
         let got_inject = got_inject.expect("a stacked module injects");
 
         let gap = |a: &Tensor, b: &Tensor| -> f32 {
@@ -390,7 +416,7 @@ mod tests {
         let dev = dev();
         let w = tiny(4, 6, 3, false, &dev);
         let x = lcg_tensor(&[2, 4, 6], 41, &dev);
-        let (_, inject) = hc_mix(&x, &w, 1e-6).unwrap();
+        let (_, inject) = hc_mix(&x, &w, 1e-6, None).unwrap();
         assert!(inject.is_none());
     }
 
@@ -466,7 +492,7 @@ mod tests {
             let x = lcg_tensor(&[t, hc, d], 71, &gpu);
             let w = lcg_tensor(&[hc * d], 72, &gpu).affine(0.2, 1.0).unwrap();
             let want = eager_grouped_norm(&x, &w, 1e-6).unwrap();
-            let got = cuda_fused::norm(&x, &w, 1e-6).unwrap();
+            let got = cuda_fused::norm(&x, &w, 1e-6, None).unwrap();
             let gap = rel_gap(&got, &want);
             assert!(gap < GAP, "norm parity {t}x{hc}x{d}: rel gap {gap}");
         }
@@ -485,7 +511,7 @@ mod tests {
                 .unwrap();
             let want =
                 eager_gate_mean(&xn.reshape((t, hc * d)).unwrap(), &gate_raw, t, hc, d).unwrap();
-            let got = cuda_fused::mix(&xn, &gate_raw, hc, d).unwrap();
+            let got = cuda_fused::mix(&xn, &gate_raw, hc, d, None).unwrap();
             let gap = rel_gap(&got, &want);
             assert!(gap < GAP, "mix parity {t}x{hc}x{d}: rel gap {gap}");
         }
@@ -500,7 +526,7 @@ mod tests {
             let out = lcg_tensor(&[t, d], 76, &gpu);
             let inj = lcg_tensor(&[t, hc], 77, &gpu);
             let want = eager_combine(&res, &out, &inj).unwrap();
-            let got = cuda_fused::combine(&res, &out, &inj).unwrap();
+            let got = cuda_fused::combine(&res, &out, &inj, None).unwrap();
             let gap = rel_gap(&got, &want);
             assert!(gap < GAP, "combine parity {t}x{hc}x{d}: rel gap {gap}");
         }
@@ -516,10 +542,55 @@ mod tests {
         let res = lcg_tensor(&[t, hc, d], 77, &gpu);
         let out = lcg_tensor(&[t, d], 78, &gpu);
         let zero = Tensor::zeros((t, hc), DType::F32, &gpu).unwrap();
-        let got = hc_combine(&res, &out, &zero).unwrap();
+        let got = hc_combine(&res, &out, &zero, None).unwrap();
         let want = res.broadcast_add(&out.reshape((t, 1, d)).unwrap()).unwrap();
         let gap = rel_gap(&got, &want);
         assert!(gap < 1e-6, "zero-inject identity broken on device: {gap}");
+    }
+
+    /// **The flip target is written, and it is the value returned.**
+    ///
+    /// The sweep reserves two residual halves on the forward span and alternates
+    /// them, so `combine` must write the caller's buffer rather than one of its
+    /// own — otherwise the reservation is paid for and ignored, and the returned
+    /// residual is pool memory again.
+    #[test]
+    fn combine_writes_the_supplied_flip_target() {
+        let Some(gpu) = cuda() else { return };
+        let (t, hc, d) = (3usize, 4usize, 2560usize);
+        let res = lcg_tensor(&[t, hc, d], 91, &gpu);
+        let blk = lcg_tensor(&[t, d], 92, &gpu);
+        let zero = Tensor::zeros((t, hc), DType::F32, &gpu).unwrap();
+        let dst = Tensor::zeros((t, hc, d), DType::F32, &gpu).unwrap();
+
+        let got = hc_combine(&res, &blk, &zero, Some(&dst)).unwrap();
+        let want = res.broadcast_add(&blk.reshape((t, 1, d)).unwrap()).unwrap();
+        assert!(
+            rel_gap(&got, &want) < 1e-6,
+            "flip target holds the wrong value"
+        );
+        // The returned tensor IS the target, not a copy of it: reading `dst`
+        // afterwards must show the same content.
+        assert!(
+            rel_gap(&dst, &want) < 1e-6,
+            "combine returned a value the caller's buffer does not hold"
+        );
+    }
+
+    /// Reading and writing one buffer is refused rather than raced.
+    #[test]
+    fn combine_refuses_a_flip_target_that_is_the_residual() {
+        let Some(gpu) = cuda() else { return };
+        let (t, hc, d) = (2usize, 4usize, 2560usize);
+        let res = lcg_tensor(&[t, hc, d], 93, &gpu);
+        let blk = lcg_tensor(&[t, d], 94, &gpu);
+        let zero = Tensor::zeros((t, hc), DType::F32, &gpu).unwrap();
+        let err = hc_combine(&res, &blk, &zero, Some(&res))
+            .expect_err("aliasing the residual must be refused");
+        assert!(
+            err.to_string().contains("same buffer"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Operands that start part-way into their storage.
@@ -570,7 +641,7 @@ mod tests {
             let dense = Tensor::from_vec(host[skip..].to_vec(), (t, hc, d), &gpu).unwrap();
             let w = lcg_tensor(&[hc * d], 82, &gpu).affine(0.2, 1.0).unwrap();
             let want = eager_grouped_norm(&dense, &w, 1e-6).unwrap();
-            let got = cuda_fused::norm(&view, &w, 1e-6).unwrap();
+            let got = cuda_fused::norm(&view, &w, 1e-6, None).unwrap();
             let gap = rel_gap(&got, &want);
             assert!(gap < GAP, "offset-{skip} norm parity: rel gap {gap}");
         }
@@ -585,8 +656,8 @@ mod tests {
         let (t, hc, d, lr) = (4usize, 4usize, 2560usize, 8usize);
         let w = tiny(hc, d, lr, true, &gpu);
         let x = lcg_tensor(&[t, hc, d], 79, &gpu);
-        let a = hc_mix(&x, &w, 1e-6).unwrap().0.flatten_all().unwrap();
-        let b = hc_mix(&x, &w, 1e-6).unwrap().0.flatten_all().unwrap();
+        let a = hc_mix(&x, &w, 1e-6, None).unwrap().0.flatten_all().unwrap();
+        let b = hc_mix(&x, &w, 1e-6, None).unwrap().0.flatten_all().unwrap();
         assert_eq!(
             a.to_vec1::<f32>().unwrap(),
             b.to_vec1::<f32>().unwrap(),
@@ -601,12 +672,12 @@ mod tests {
         let (t, hc, n_embd) = (1usize, 2usize, 8usize);
         let w = Tensor::ones(hc * n_embd, DType::F32, &dev).unwrap();
         let x = lcg_tensor(&[t, hc, n_embd], 51, &dev);
-        let base = hc_grouped_norm(&x, &w, 1e-6).unwrap();
+        let base = hc_grouped_norm(&x, &w, 1e-6, None).unwrap();
         // Double stream 0, keep stream 1.
         let s0 = x.narrow(1, 0, 1).unwrap().affine(2.0, 0.).unwrap();
         let s1 = x.narrow(1, 1, 1).unwrap();
         let x2 = Tensor::cat(&[s0, s1], 1).unwrap();
-        let bumped = hc_grouped_norm(&x2, &w, 1e-6).unwrap();
+        let bumped = hc_grouped_norm(&x2, &w, 1e-6, None).unwrap();
         let d = base
             .narrow(1, 1, 1)
             .unwrap()

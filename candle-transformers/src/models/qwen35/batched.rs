@@ -1134,7 +1134,10 @@ impl HybridBatched {
     }
 
     pub fn wave_geometry(&self, act_dtype: DType) -> ModelGeometry {
-        wave_geometry(&self.model.cfg, act_dtype)
+        // The session's int8 mode, not the config's: the KO twins are chosen at
+        // load and decide what each norm's fused epilogue emits, which is a real
+        // difference in what the span holds.
+        wave_geometry(&self.model.cfg, act_dtype, self.int8mode())
     }
 
     /// Re-materialise every norm weight in the session's activation dtype.

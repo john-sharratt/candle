@@ -685,7 +685,7 @@ fn both_tail_routes_match_the_oracle() -> Result<()> {
         start: 0,
         rows: tail_tokens,
     }];
-    append_wave(&mut work, &raw, &w, RATIO, 1e-6)?;
+    append_wave(&mut work, &raw, &w, RATIO, 1e-6, None)?;
 
     // The oracle's view: the pages, then the tail's stored rows where they sit.
     let tail_rows = cache.live_rows()?;
@@ -719,6 +719,7 @@ fn both_tail_routes_match_the_oracle() -> Result<()> {
                 n,
                 0,
                 |_, _| route,
+                None,
             )?;
             let got = out.flatten_all()?.to_vec1::<f32>()?;
             // Columns past a row's candidates are the scorer's to leave alone on
@@ -869,7 +870,7 @@ fn bench_tail_routes() -> Result<()> {
             start: 0,
             rows: tokens,
         }];
-        append_wave(&mut work, &raw, &w, RATIO, 1e-6)?;
+        append_wave(&mut work, &raw, &w, RATIO, 1e-6, None)?;
         let n = cache.live_blocks();
         for &t in &[1usize, 8, 32, 64, 128, 256, 512, 1024, 2048, 4096] {
             if t * n * 4 > 2 << 30 {
@@ -880,7 +881,19 @@ fn bench_tail_routes() -> Result<()> {
             let out = Tensor::zeros((t, n), DType::F32, &dev)?;
             let run = |route| {
                 cache
-                    .score_rows_routed(&q, &qpos, &cfg, RATIO, &table, 0, &out, n, 0, |_, _| route)
+                    .score_rows_routed(
+                        &q,
+                        &qpos,
+                        &cfg,
+                        RATIO,
+                        &table,
+                        0,
+                        &out,
+                        n,
+                        0,
+                        |_, _| route,
+                        None,
+                    )
                     .map(|_| ())
             };
             let (paged, _) = time_ms(&dev, 30, || run(TailRoute::Paged))?;

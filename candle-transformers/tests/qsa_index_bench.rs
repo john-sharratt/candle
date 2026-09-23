@@ -158,6 +158,7 @@ impl Wave {
                 EPS,
                 dev,
                 &counter,
+                None,
             )?;
         }
 
@@ -196,6 +197,7 @@ impl Wave {
             EPS,
             dev,
             &counter,
+            None,
         )?;
         Ok(sel.is_some())
     }

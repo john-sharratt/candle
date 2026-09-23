@@ -231,6 +231,7 @@ impl SparseMoeBlock {
         &self,
         acts: DynamicActs<'w>,
         out_dtype: DType,
+        decode_tokens: usize,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         let (b_size, seq_len, hidden_dim) = match &acts {
@@ -329,6 +330,7 @@ impl SparseMoeBlock {
             k,
             num_experts,
             t,
+            decode_tokens,
             wave.map(|g| g.ticket()),
         )
     }
@@ -791,6 +793,7 @@ impl SparseMoeBlock {
         k: usize,
         num_experts: usize,
         _routing_start: ProfileMark,
+        decode_tokens: usize,
         wave: Option<WaveTicket>,
     ) -> Result<Tensor> {
         // ── 2. Group assignments by expert — the shared grouped-GEMM dispatch
@@ -837,6 +840,7 @@ impl SparseMoeBlock {
             out_dtype,
             &weights_flat,
             assignments,
+            decode_tokens,
             wave,
         )?;
 
@@ -1044,6 +1048,7 @@ impl BatchedAttentionLayer for LayerWeights {
         acts: DynamicActs<'w>,
         work_dtype: DType,
         out_dtype: DType,
+        decode_tokens: usize,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         match &self.ffn {
@@ -1057,7 +1062,7 @@ impl BatchedAttentionLayer for LayerWeights {
                 // router logits and the device dispatch share that one dtype —
                 // so this path narrows on return. Giving the combine its own
                 // store width is the same change one level down.
-                let mut out = m.forward_dynamic(acts, work_dtype, wave)?;
+                let mut out = m.forward_dynamic(acts, work_dtype, decode_tokens, wave)?;
                 out.to_dtype_mut(out_dtype)?;
                 Ok(out)
             }
@@ -1602,6 +1607,9 @@ impl ModelWeights {
             Err(_) => gg.tensor("token_embd.weight")?,
         };
         let lm_head = QMatMul::from_weights(lm_head_tensor.into())?;
+        // Read before the struct takes ownership: the forward phase holds the
+        // head's logits, one row per scored row and `vocab` wide.
+        let vocab = lm_head.weight_dims().first().copied().unwrap_or(0);
 
         Ok(Self {
             embeddings: Some(embeddings),
@@ -1621,6 +1629,9 @@ impl ModelWeights {
                 intermediate: expert_ffn_size,
                 experts_per_tok: n_expert_used,
                 n_experts: n_expert,
+                vocab,
+                head_qk_norm: true,
+                qkv_bias: false,
             },
             device: device.clone(),
             // Reader path keeps every projection in FP16; int8 dense repack is only wired on the
@@ -2177,6 +2188,8 @@ impl ModelWeights {
             Err(_) => load_tensor("token_embd.weight")?,
         };
         let lm_head = QMatMul::from_weights_with_mode(lm_head_tensor.into(), int8mode)?;
+        // Read before the struct takes ownership — see the reader path above.
+        let vocab = lm_head.weight_dims().first().copied().unwrap_or(0);
 
         // ── Reserve the span, then build the expert cache into it ──
         //
@@ -2398,6 +2411,9 @@ impl ModelWeights {
                 intermediate: expert_ffn_size,
                 experts_per_tok: n_expert_used,
                 n_experts: n_expert,
+                vocab,
+                head_qk_norm: true,
+                qkv_bias: false,
             },
             device: device.clone(),
             int8mode,

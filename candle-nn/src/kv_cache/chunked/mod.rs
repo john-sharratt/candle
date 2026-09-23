@@ -157,7 +157,7 @@ pub use region_pool::{
 };
 #[cfg(feature = "cuda")]
 pub use slot_state_arena::stats as slot_state_stats;
-pub use wave_spans::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES};
+pub use wave_spans::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES, WAVE_SPAN_BYTES};
 // Accurate KV VRAM budget query for the scheduler's budget-aware eviction.
 // Defined in both configurations — `None` when there is no CUDA device to
 // budget — so the export is unconditional too.

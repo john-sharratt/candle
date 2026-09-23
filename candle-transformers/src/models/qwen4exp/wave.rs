@@ -32,7 +32,11 @@ use std::sync::RwLock;
 use candle::quantized::cuda::to_dynamic;
 use candle::{DType, Device, Result, Tensor};
 use candle_kernels::simple::qsa_topk::MAX_KEEP;
-use candle_nn::kv_cache::{KvCache, ModelGeometry, QWEN4EXP_KV_FACTORS};
+use candle_nn::kv_cache::{
+    begin_forward, begin_wave, end_wave_transient, ffn_work_dtype, plan_wave_transient,
+    DeltaNetWidths, HyperWidths, KvCache, LayerPhase, ModelGeometry, SharedExpertWidths, WavePlan,
+    WaveWidth, QWEN4EXP_KV_FACTORS,
+};
 
 use super::batched_attention::Qwen4ExpAttentionLayer;
 use super::coverage::coverage_disagreements;
@@ -60,10 +64,13 @@ use crate::models::delta_net::{
     RecurrentStateStore, SeqSpan, ZGate,
 };
 use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
+use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::qsa_selection::QsaSelection;
+use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
 use crate::models::qwen35::spec::split_block_rows;
 use crate::models::rope_schedule::{FactoredRope, RopeRungs, RopeSchedule};
+use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
 
 use super::rope::flash_next_schedule;
 use crate::models::tensor_cat::TensorCat;
@@ -1351,21 +1358,65 @@ impl Qwen4ExpBatched {
 }
 
 impl ManagedBatchedModel for Qwen4ExpBatched {
-    fn wave_geometry(&self, act_dtype: DType) -> ModelGeometry {
+    fn wave_geometry(&self, _act_dtype: DType) -> ModelGeometry {
+        // The Gated Residual carries F32 throughout, so the wave's own dtype is
+        // not what the spans are priced in.
+        let act_dtype = DType::F32;
         let cfg = &self.model.cfg;
+        let int8 = self.model.lm_head.int8mode().is_int8();
         ModelGeometry {
             hidden: cfg.hidden_size,
+            vocab: cfg.vocab_size,
             intermediate: cfg.moe.expert_ffn_size,
             n_head: cfg.num_attention_heads,
             n_kv_head: cfg.num_kv_heads,
             head_dim: cfg.attn_head_dim,
             experts_per_tok: cfg.moe.n_experts_used.max(1),
             n_experts: cfg.moe.n_experts.max(1),
+            // The 3:1 hybrid's DeltaNet mixer carves from the attention arena,
+            // so its widths are priced beside the attention chain.
+            delta_net: cfg
+                .layer_kinds
+                .iter()
+                .any(|k| matches!(k, LayerKind::DeltaNet))
+                .then_some(DeltaNetWidths {
+                    conv_dim: cfg.delta_net.conv_dim(),
+                    value_dim: cfg.delta_net.value_dim(),
+                    n_v_heads: cfg.delta_net.n_v_heads,
+                }),
+            // Every MoE layer adds an always-active shared expert to the routed
+            // block, its gate projection stored padded to one KO tile.
+            shared_expert: Some(SharedExpertWidths {
+                intermediate: cfg.moe.shared_expert_ffn_size,
+                gate_cols: SHARED_GATE_TILE,
+            }),
             act_dtype,
-            accum_dtype: DType::F32,
-            projection_accum_roundtrip: false,
+            accum_dtype: if int8 {
+                DType::F32
+            } else {
+                ffn_work_dtype(act_dtype)
+            },
+            packed_norm: int8,
+            packed_head: int8,
+            // The Qwen3.5 lineage's attention: an interleaved `[q | gate]` Q
+            // weight that does not pack with K and V, per-head Q/K norms, and a
+            // wave flattened to `[rows, hidden]` before the sweep.
             gated_qkv: true,
-            partial_rotary: true,
+            fused_qkv: false,
+            // No Q/K/V biases in this lineage.
+            qkv_bias: false,
+            // The fused q8 decode combine serves this head dim on an int8
+            // session, through the same predicate the dispatch asks.
+            decode_q8_context: int8 && paged_decode_q8_head_dim(cfg.attn_head_dim),
+            head_qk_norm: true,
+            head_norm_reshapes: false,
+            partial_rotary: cfg.rope_dim < cfg.attn_head_dim,
+            // The hyper-connection streams — what made the Gated Residual's
+            // transients unpriceable before this geometry carried them.
+            hyper: Some(HyperWidths {
+                streams: cfg.hc.count,
+                low_rank: cfg.hc.low_rank,
+            }),
         }
     }
 
@@ -1960,6 +2011,20 @@ impl WaveSweep for Qwen4ExpBatched {
         if layer_start > layer_end || layer_end > num_layers {
             candle::bail!("qwen4exp wave: bad layer range [{layer_start}, {layer_end})");
         }
+
+        // Hand back the PREVIOUS wave's transient tier, here rather than at the
+        // end of the wave that placed it. `end_wave_transient` gates on
+        // `live_generations`, a host-side count: when a sweep returns its
+        // generations are dropped but its kernels are still in flight, so
+        // releasing there would hand ground back while the GPU is still reading
+        // it. What makes this point safe is the work in between, which drains
+        // the wave that placed it. It also has to precede `ensure_seq_state`
+        // below, which claims span regions for any store it creates — and a
+        // claim under a standing tier is refused outright.
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(d) = &m.device {
+            end_wave_transient(&d.cuda_stream());
+        }
         let n_glue = seq_ids.len() - n_decode - n_prefill;
         if n_glue > 0 || pending_glue.is_some() {
             candle::bail!(
@@ -1996,15 +2061,115 @@ impl WaveSweep for Qwen4ExpBatched {
                 stride: 0,
             }
         };
-        let prefill_headers =
-            DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(pre_off, pre_q, &m.device)?);
-
+        // Read before the contexts borrow the session: the tier pricing below
+        // needs it, and `assemble_wave_contexts` holds a mutable borrow across
+        // everything that follows.
+        let tier_act_dtype = session.activation_dtype();
         let mut contexts = assemble_wave_contexts(session, seq_ids, inputs)?;
         let contexts = contexts.as_mut_slice();
 
         // Admit: claim every KV chunk this wave writes, over the KV range.
         let (kv_start, kv_end) = self.kv_layer_range(layer_start, layer_end);
         admit_wave_kv(contexts, n_decode, n_prefill, kv_start, kv_end)?;
+
+        // **Price and reserve this wave's transient tier**, sized to this wave
+        // rather than to the widest one the engine can run — after the KV claim
+        // above, so the arena frontier is final when the tier is placed against
+        // it, and before `begin_forward` below, because the placement may buy
+        // ground from the weight side and `set_weight_floor` refuses while a
+        // forward is open.
+        #[cfg(feature = "cuda")]
+        if total_rows > 0 {
+            if let Device::Cuda(d) = &m.device {
+                let plan = WavePlan::new(self.wave_geometry(tier_act_dtype));
+                // The wave's composition, not just its row count: the chains
+                // price a prefill row, a decode row and a scored row
+                // differently, and the Gated Residual's streams are carried by
+                // `ModelGeometry::hyper` so its wide intermediates are priced
+                // rather than overflowing into the pool.
+                //
+                // **Scored rows are not all rows.** The head runs every decode
+                // row and the LAST row of each prefill span — a verifying span
+                // excepted, where every row is a prediction to compare a
+                // proposal against (see the head section below). Pricing
+                // `HeadLogits` at `total_rows × vocab` buys roughly a gigabyte
+                // of tier for a logits block three orders of magnitude smaller,
+                // and takes it from the weight side every wave.
+                //
+                // A wave that stops short of the last layer returns its residual
+                // and runs no head, so it scores no rows at all.
+                let verify_seqs: Vec<usize> = self
+                    .verify
+                    .read()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|c| c.seqs.keys().copied().collect()))
+                    .unwrap_or_default();
+                let scored_prefill: usize = pre_q
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &l)| {
+                        if verify_seqs.contains(&seq_ids[n_decode + k]) {
+                            l
+                        } else {
+                            1
+                        }
+                    })
+                    .sum();
+                let width = WaveWidth {
+                    prefill_rows: pre_rows,
+                    decode_rows: n_decode,
+                    scored_rows: if layer_end == num_layers {
+                        n_decode + scored_prefill
+                    } else {
+                        0
+                    },
+                    // A one-row prefill group takes the decode kernels, so it
+                    // carves no span-table entry and, alone, no scan transient.
+                    prefill_spans: pre_q.iter().filter(|&&l| l > 1).count(),
+                    staged_rows: 0,
+                    staged_spans: 0,
+                };
+                let per_phase = [
+                    plan.phase_bytes(LayerPhase::Attention, width),
+                    plan.phase_bytes(LayerPhase::Ffn, width),
+                    plan.phase_bytes(LayerPhase::Forward, width),
+                ];
+                plan_wave_transient(&d.cuda_stream(), per_phase)?;
+            }
+        }
+
+        // From here the forward owns the span partition: the tier is placed and
+        // must not move under it.
+        #[cfg(feature = "cuda")]
+        let _forward_open = match &m.device {
+            Device::Cuda(d) => Some(begin_forward(&d.cuda_stream())),
+            _ => None,
+        };
+
+        // **The forward-scoped span**, held for the whole sweep rather than per
+        // layer: it carries the metadata a forward builds once and every layer
+        // reads — ragged prefill offsets, page and candidate tables, RoPE
+        // tables, gathered position ids — which is exactly what
+        // `WAVE_FORWARD_BYTES` describes. Its ticket travels instead of the
+        // guard, because the builders are deep in the sweep and a `Copy`
+        // coordinate reaches them without changing any signature's lifetime.
+        #[cfg(feature = "cuda")]
+        let fwd_span = match &m.device {
+            Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Forward)?),
+            _ => None,
+        };
+        #[cfg(feature = "cuda")]
+        let fwd_ticket = fwd_span.as_ref().map(|g| g.ticket());
+        #[cfg(not(feature = "cuda"))]
+        let fwd_ticket: Option<candle::cuda_backend::wave_provenance::WaveTicket> = None;
+
+        // Built AFTER the span opens, so its three tables land on it. They are
+        // the wave's ragged prefill offsets — read by every layer, written once
+        // — which is the forward span's stated purpose. Nothing above needs
+        // them, so moving the construction down costs only this comment.
+        let prefill_headers = DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(
+            pre_off, pre_q, &m.device, fwd_ticket,
+        )?);
 
         // ── Carried state: ensure (reset at offset 0), open the GDN wave,
         // snapshot the PLE states for the failure bracket. ──
@@ -2083,6 +2248,7 @@ impl WaveSweep for Qwen4ExpBatched {
             (decode_headers, prefill_headers),
             generation,
             eps,
+            fwd_ticket,
         );
 
         // Close the wave: commit on success, rewind everything on failure. A
@@ -2212,6 +2378,7 @@ impl Qwen4ExpBatched {
         idx_map: &mut HashMap<usize, Vec<IndexCache>>,
         capture: Option<&mut SpecCapture>,
         total_rows: usize,
+        fwd_ticket: Option<candle::cuda_backend::wave_provenance::WaveTicket>,
     ) -> Result<Option<QsaSelection>> {
         select_layer(
             kv,
@@ -2228,6 +2395,7 @@ impl Qwen4ExpBatched {
             self.model.cfg.rms_norm_eps,
             &self.model.device,
             &self.qsa_rows,
+            fwd_ticket,
         )
     }
 
@@ -2247,6 +2415,9 @@ impl Qwen4ExpBatched {
         headers: (DecodeHeaders, DecodeHeaders),
         generation: &candle::quantized::pinned_staging::Generation,
         eps: f64,
+        // The forward-scoped span's ticket — the home for every per-wave table
+        // built below. `None` off CUDA, or when no tier was placed.
+        fwd_ticket: Option<candle::cuda_backend::wave_provenance::WaveTicket>,
     ) -> Result<(WavePhase, Option<WaveGuard>)> {
         let (dec_off, dec_q, pre_off, pre_q) = offs;
         let (total_rows, pre_rows) = rows;
@@ -2274,7 +2445,7 @@ impl Qwen4ExpBatched {
             for t in inputs {
                 flat_ids.extend(Self::token_ids(t)?);
             }
-            let ids = Tensor::from_vec(flat_ids, (total_rows,), dev)?;
+            let ids = wave_from_vec_ticketed(flat_ids, (total_rows,), dev, fwd_ticket)?;
             // The table is stored BF16 (a load-time storage width); the gather
             // widens the wave's rows to the Gated Residual's F32.
             Some(m.embed.index_select(&ids, 0)?.to_dtype(DType::F32)?)
@@ -2294,6 +2465,39 @@ impl Qwen4ExpBatched {
                     .contiguous()?
             }
         };
+
+        // **The residual's two halves, reserved once for the whole forward.**
+        //
+        // `hc_combine` reads the current residual and writes the next, so the
+        // two cannot be one buffer. Allocating a fresh `[rows, hc, hidden]` F32
+        // per call meant 2 × layers of the widest buffer in the sweep, all of it
+        // from the pool — the residual crosses every phase reset, so no layer
+        // span can hold it. Both halves live on the forward-scoped span, which
+        // is reset once per forward and therefore exactly its lifetime, and
+        // `WaveBuffer::GrResidualPair` prices them there.
+        //
+        // Reserved AFTER the tier is placed and BEFORE the layer loop, which is
+        // the only window in which the span exists and nothing has carved from
+        // it yet. `res` above is the entry residual and is not one of the pair;
+        // the first combine writes half 0, the next half 1, and so on.
+        // **Only when this sweep runs the head.** A windowed sweep
+        // (`layer_end < num_layers`) hands its residual back as
+        // `WavePhase::Residual` for the next wave to resume from, so that
+        // residual outlives this forward — and the forward span is reclaimed by
+        // the next wave's `end_wave_transient`, which runs at the top of `sweep`
+        // BEFORE `x_in` is read. Carving it from the span would hand the caller
+        // ground the next wave re-carves, and it could alias `gr_flip[0]` and
+        // make `hc_combine` read and write one buffer. A windowed sweep
+        // therefore keeps the pool's residual, which is exactly its lifetime.
+        let gr_flip: Option<[Tensor; 2]> = match fwd_ticket {
+            Some(_) if layer_end == num_layers => {
+                let half =
+                    |_| wave_empty_ticketed((total_rows, hc, n_embd), DType::F32, dev, fwd_ticket);
+                Some([half(0)?, half(1)?])
+            }
+            _ => None,
+        };
+        let mut gr_next = 0usize;
 
         // Per-sequence host token ids (the PLE hash side) + row spans.
         let seq_tokens: Vec<Vec<u32>> = inputs
@@ -2431,8 +2635,22 @@ impl Qwen4ExpBatched {
             }
 
             // ── Token mixer under the first HC module. ──
+            //
+            // The mixer's transients — the Gated Residual's wide intermediates,
+            // the projections' q8a128 operands, the DeltaNet scan buffers —
+            // belong to this phase's arena span. Opened here and dropped before
+            // the FFN phase below, because `begin_wave` refuses a phase that is
+            // already open: the two spans are reused in turn, not held at once.
+            #[cfg(feature = "cuda")]
+            let mix_wave = match dev {
+                Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?),
+                _ => None,
+            };
             let g_pre = crate::models::profile::gpu_span("q4e:gr_pre", dev);
-            let (h, inject) = hc_mix(&res, &layer.hc_attn, eps)?;
+            #[cfg(feature = "cuda")]
+            let (h, inject) = hc_mix(&res, &layer.hc_attn, eps, mix_wave.as_ref())?;
+            #[cfg(not(feature = "cuda"))]
+            let (h, inject) = hc_mix(&res, &layer.hc_attn, eps, None)?;
             let inject = inject.expect("layer HC modules carry an inject");
             g_pre.end();
             #[cfg(feature = "tensor-assert")]
@@ -2520,6 +2738,17 @@ impl Qwen4ExpBatched {
                         &mut idx_map,
                         cap_map.as_mut(),
                         total_rows,
+                        // **The mixer's span, not the forward's.** These tables
+                        // are rebuilt for every attention layer and dead by the
+                        // end of it, so the forward-scoped span — sized for the
+                        // handful of kilobytes a wave builds ONCE — filled up
+                        // partway through the sweep and the rest fell back to
+                        // the pool. A per-layer span resets under them, which is
+                        // exactly their lifetime.
+                        #[cfg(feature = "cuda")]
+                        mix_wave.as_ref().map(|g| g.ticket()),
+                        #[cfg(not(feature = "cuda"))]
+                        None,
                     )?;
                     g_sel.end();
                     let dec_sel = match &qsa {
@@ -2591,16 +2820,29 @@ impl Qwen4ExpBatched {
             #[cfg(feature = "tensor-assert")]
             probe(li, "mix.y", &y);
             let g_comb = crate::models::profile::gpu_span("q4e:gr_combine", dev);
-            res = hc_combine(&res, &y, &inject)?;
+            res = hc_combine(&res, &y, &inject, gr_flip.as_ref().map(|p| &p[gr_next]))?;
+            gr_next ^= 1;
             g_comb.end();
             #[cfg(feature = "tensor-assert")]
             probe(li, "post_mix.res", &res);
+            // The mixer's span is done with: `res` is the residual, which lives
+            // outside the tier, and nothing below reads a mixer transient.
+            #[cfg(feature = "cuda")]
+            drop(mix_wave);
 
             // ── MoE under the second HC module. The machinery consumes the
             // flat `[1, rows, hidden]` activation layout every FFN path feeds
             // it (the fused SwiGLU kernels are written for it). ──
+            #[cfg(feature = "cuda")]
+            let ffn_wave = match dev {
+                Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Ffn)?),
+                _ => None,
+            };
             let g_pre2 = crate::models::profile::gpu_span("q4e:gr_pre_ffn", dev);
-            let (h2, inject2) = hc_mix(&res, &layer.hc_ffn, eps)?;
+            #[cfg(feature = "cuda")]
+            let (h2, inject2) = hc_mix(&res, &layer.hc_ffn, eps, ffn_wave.as_ref())?;
+            #[cfg(not(feature = "cuda"))]
+            let (h2, inject2) = hc_mix(&res, &layer.hc_ffn, eps, None)?;
             let inject2 = inject2.expect("layer HC modules carry an inject");
             g_pre2.end();
             let candle::Device::Cuda(cuda) = dev else {
@@ -2631,18 +2873,27 @@ impl Qwen4ExpBatched {
                 )?;
                 probe(li, "moe.shared", &sh);
             }
+            #[cfg(feature = "cuda")]
+            let moe_wave = ffn_wave.as_ref();
+            #[cfg(not(feature = "cuda"))]
+            let moe_wave = None;
             let y2 = layer
                 .moe
-                .forward_dynamic(acts, DType::F32, None)?
+                .forward_dynamic(acts, DType::F32, n_decode, moe_wave)?
                 .to_owned_tensor()?
                 .reshape((total_rows, n_embd))?;
             #[cfg(feature = "tensor-assert")]
             probe(li, "moe.y2", &y2);
             let g_comb2 = crate::models::profile::gpu_span("q4e:gr_combine_ffn", dev);
-            res = hc_combine(&res, &y2, &inject2)?;
+            res = hc_combine(&res, &y2, &inject2, gr_flip.as_ref().map(|p| &p[gr_next]))?;
+            gr_next ^= 1;
             g_comb2.end();
             #[cfg(feature = "tensor-assert")]
             probe(li, "post_moe.res", &res);
+            // Same reasoning as the mixer's drop above: `res` has left the span,
+            // and the next layer's mixer phase needs this one closed.
+            #[cfg(feature = "cuda")]
+            drop(ffn_wave);
         }
         // ── The draft head, in the same wave over the same rows. ──
         //
@@ -2702,7 +2953,7 @@ impl Qwen4ExpBatched {
 
         // ── Head: the final mix IS the output norm; score decode rows + each
         // prefill's last row through the LM head in one GEMM. ──
-        let (mixed, _) = hc_mix(&res, &m.out_hc, eps)?;
+        let (mixed, _) = hc_mix(&res, &m.out_hc, eps, None)?;
         // Decode rows, then each prefill span's LAST row — except a verifying
         // span, where EVERY row is scored.
         //
@@ -2729,7 +2980,7 @@ impl Qwen4ExpBatched {
             acc += l as u32;
         }
         let r_total = sel.len();
-        let idx = Tensor::from_vec(sel, r_total, dev)?;
+        let idx = wave_from_vec_ticketed(sel, r_total, dev, fwd_ticket)?;
         let scored = mixed.index_select(&idx, 0)?.contiguous()?;
         let acts = {
             let candle::Device::Cuda(cuda) = dev else {

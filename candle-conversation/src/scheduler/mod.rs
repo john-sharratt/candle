@@ -16,6 +16,21 @@
 //! `/v1/phases`), `profile.rs` (feature-gated zero-cost span timer), and
 //! `kv_zero_check.rs` (feature `kv-zero-check`, audits live K/V slots).
 mod admission;
+/// Rate-based wave budgeting — **compiled and tested, not yet wired.**
+///
+/// Admission today is [`admission`]: a wave is accepted when its bytes fit the
+/// span. This module is the throughput-based replacement being brought up
+/// alongside it — [`admit::rate`] models what a wave will actually achieve
+/// (`RateModel`, `DecodeModel`, `ExpertGeometry`) and the rest prices and orders
+/// candidates against that model rather than against free bytes.
+///
+/// Nothing in the live prefill or decode path calls into here. It is imported
+/// so it compiles and its unit tests run against every change to the types it
+/// borrows, which is what keeps the port honest while the measurements it needs
+/// are still being taken. The two admission paths are not alternatives a flag
+/// chooses between: when the rate path is ready it replaces `admission`, and
+/// this comment goes with it.
+mod admit;
 mod decode;
 pub mod exported_state;
 mod guest_room;
@@ -10937,9 +10952,19 @@ mod tests {
                 n_experts: 1,
                 act_dtype,
                 accum_dtype: DType::F32,
-                projection_accum_roundtrip: false,
+                vocab: 64,
+                delta_net: None,
+                shared_expert: None,
+                packed_norm: false,
+                packed_head: false,
                 gated_qkv: false,
+                fused_qkv: false,
+                qkv_bias: false,
+                head_qk_norm: false,
+                head_norm_reshapes: false,
                 partial_rotary: false,
+                decode_q8_context: false,
+                hyper: None,
             }
         }
         fn device(&self) -> &candle::Device {

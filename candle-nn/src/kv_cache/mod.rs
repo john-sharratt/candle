@@ -62,7 +62,9 @@ pub use chunked::slot_state_stats;
 /// worst defects were geometry, and none of them needed a GPU to find.
 pub use chunked::span_geometry;
 pub use chunked::wave_plan::{
-    BufferShape, Encoding, LayerPhase, ModelGeometry, WaveBuffer, WavePlan, BUMP_ALIGNMENT,
+    ffn_work_dtype, BufferShape, Chain, DeltaNetWidths, Encoding, HyperWidths, LayerPhase,
+    ModelGeometry, SharedExpertWidths, WaveBuffer, WavePlan, WaveWidth, BUMP_ALIGNMENT,
+    DELTA_NET_SCAN_CHUNK,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
@@ -93,7 +95,7 @@ pub use chunked::{
 };
 /// The wave arena's phase spans. Measurements, so they are available whether or
 /// not the crate was built with a GPU backend.
-pub use chunked::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES};
+pub use chunked::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES, WAVE_SPAN_BYTES};
 
 #[cfg(feature = "cuda")]
 pub use chunked::migrate::HostSealedChunk;

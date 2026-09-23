@@ -37,7 +37,7 @@ use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
     ChunkedKvBacking, CompressionPolicy, GpuArenaClassStats, HeadGids, KvCache, KvFormat,
-    ModelGeometry, QuantFormat, WavePlan, WAVE_FFN_BYTES,
+    ModelGeometry, QuantFormat, WavePlan, WaveWidth, WAVE_FFN_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -3770,7 +3770,10 @@ pub trait ManagedBatchedModel {
     /// a forward that can still run.
     fn prefill_width_cap(&self, act_dtype: DType) -> usize {
         let mut cap = MAX_PREFILL_TOKENS;
-        let fits = WavePlan::new(self.wave_geometry(act_dtype)).max_rows_within(WAVE_FFN_BYTES);
+        // Priced from an empty wave: this cap is the model's own bound, asked
+        // before any wave is composed, so there is no head to widen from.
+        let fits = WavePlan::new(self.wave_geometry(act_dtype))
+            .max_rows_within(WAVE_FFN_BYTES, WaveWidth::default());
         if fits > 0 {
             cap = cap.min(fits);
         }

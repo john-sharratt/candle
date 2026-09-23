@@ -440,6 +440,9 @@ impl BatchedAttentionLayer for LayerWeights {
         acts: DynamicActs<'w>,
         work_dtype: DType,
         out_dtype: DType,
+        // A dense MLP has no expert cache to score, so the decode/prefill row
+        // split says nothing here.
+        _decode_tokens: usize,
         // A dense MLP allocates its own output, so nothing here is
         // wave-scoped; the parameter is the trait's, for the MoE case.
         _wave: Option<&'w WaveGeneration>,
@@ -544,6 +547,9 @@ impl BatchedModelCore for ModelWeights {
             intermediate,
             experts_per_tok: 1,
             n_experts: 1,
+            vocab: self.lm_head.weight_dims().first().copied().unwrap_or(0),
+            head_qk_norm: true,
+            qkv_bias: false,
         }
     }
 

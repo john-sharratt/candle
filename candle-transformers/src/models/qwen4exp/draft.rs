@@ -182,7 +182,7 @@ impl Qwen4ExpBatched {
             );
         };
 
-        let (h, _) = hc_mix(&x_head, &head.block.hc_attn, eps)?;
+        let (h, _) = hc_mix(&x_head, &head.block.hc_attn, eps, None)?;
 
         // QSA over the head's OWN cache. The head selects exactly as a trunk
         // attention layer does — same indexer weights, same budget — because a
@@ -203,6 +203,9 @@ impl Qwen4ExpBatched {
             // and leave the thirteenth holding the rejected tokens' keys.
             capture.as_deref_mut(),
             total_rows,
+            // The draft head runs outside the trunk's forward-scoped span, so
+            // its tables take the ordinary upload.
+            None,
         )?;
         let dec_sel = match &qsa {
             Some(s) if w.n_decode > 0 => Some(s.rows_slice(0, w.n_decode)?),
@@ -354,7 +357,7 @@ impl Qwen4ExpBatched {
         let mut res = head.block_input(embeds, prev_wide, eps)?;
 
         // ── Attention half. ──
-        let (h, inject) = hc_mix(&res, &head.block.hc_attn, eps)?;
+        let (h, inject) = hc_mix(&res, &head.block.hc_attn, eps, None)?;
         let inject = inject.expect("a block's HC modules carry an inject");
         // One decode row per sequence, so the spans are one row each. The span
         // names the SEQUENCE, not the row: `layer_selection` keys each
@@ -382,6 +385,8 @@ impl Qwen4ExpBatched {
             // partially and nothing to capture.
             None,
             n,
+            // As above: no forward-scoped span is open on this path.
+            None,
         )?;
         let alayer = Qwen4ExpAttentionLayer {
             w: aw,
@@ -407,10 +412,10 @@ impl Qwen4ExpBatched {
         let y = forward_attn_batched(&alayer, caches, &x_g, at, params, 0, sel.as_ref(), None)?
             .to_owned_tensor()?
             .reshape((n, n_embd))?;
-        res = hc_combine(&res, &y, &inject)?;
+        res = hc_combine(&res, &y, &inject, None)?;
 
         // ── MoE half. ──
-        let (h2, inject2) = hc_mix(&res, &head.block.hc_ffn, eps)?;
+        let (h2, inject2) = hc_mix(&res, &head.block.hc_ffn, eps, None)?;
         let inject2 = inject2.expect("a block's HC modules carry an inject");
         let candle::Device::Cuda(cuda) = dev else {
             candle::bail!("qwen4exp draft runs on CUDA");
@@ -428,10 +433,13 @@ impl Qwen4ExpBatched {
         let y2 = head
             .block
             .moe
-            .forward_dynamic(acts, DType::F32, None)?
+            // A draft head only ever runs behind a decode step — there is no
+            // prefill/prompt traffic through one — so all `n` rows are
+            // decode-attributed.
+            .forward_dynamic(acts, DType::F32, n, None)?
             .to_owned_tensor()?
             .reshape((n, n_embd))?;
-        res = hc_combine(&res, &y2, &inject2)?;
+        res = hc_combine(&res, &y2, &inject2, None)?;
 
         // ── The shared head. ──
         let narrow = head.to_shared_head(&res, eps)?;

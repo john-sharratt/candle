@@ -50,6 +50,9 @@ use super::spec::SpecCapture;
 use crate::models::delta_net::mix::SeqSpan;
 use crate::models::operand_guard::expect_dense;
 use crate::models::qsa_selection::QsaSelection;
+use crate::models::wave_buffers::wave_from_vec_ticketed;
+use candle::cuda_backend::wave_provenance::WaveTicket;
+
 use crate::models::rope_schedule::FactoredRope;
 
 /// Rows of scores computed in one tile.
@@ -799,6 +802,7 @@ impl IndexCache {
         out: &Tensor,
         out_stride: usize,
         row_base: usize,
+        ticket: Option<WaveTicket>,
     ) -> Result<Vec<u32>> {
         self.score_rows_routed(
             q,
@@ -811,6 +815,7 @@ impl IndexCache {
             out_stride,
             row_base,
             TailRoute::for_span,
+            ticket,
         )
     }
 
@@ -830,6 +835,7 @@ impl IndexCache {
         out_stride: usize,
         row_base: usize,
         route: impl FnOnce(usize, usize) -> TailRoute,
+        ticket: Option<WaveTicket>,
     ) -> Result<Vec<u32>> {
         let (t, qh, qd) = q.dims3()?;
         if t != qpos.len() {
@@ -912,6 +918,7 @@ impl IndexCache {
                 out,
                 out_stride,
                 row_base,
+                ticket,
             )?;
         }
         if tail_in_paged || live_cols == 0 {
@@ -1004,6 +1011,9 @@ impl IndexCache {
         out: &Tensor,
         out_stride: usize,
         row_base: usize,
+        // The span the page/candidate tables below belong to — rebuilt per
+        // scored layer and dead once the launch is issued.
+        ticket: Option<WaveTicket>,
     ) -> Result<()> {
         use candle_kernels::simple::qsa_score_paged::{run_qsa_score_paged, PAGE_WORDS};
 
@@ -1063,9 +1073,9 @@ impl IndexCache {
             first.push((span + self.n_blocks) as u32);
         }
         let n_desc = desc.len();
-        let pages_tbl = Tensor::from_vec(desc, (n_desc,), &device)?;
-        let first_tbl = Tensor::from_vec(first, (n_pages + 1,), &device)?;
-        let cnt_t = Tensor::from_vec(cand.to_vec(), (t,), &device)?;
+        let pages_tbl = wave_from_vec_ticketed(desc, (n_desc,), &device, ticket)?;
+        let first_tbl = wave_from_vec_ticketed(first, (n_pages + 1,), &device, ticket)?;
+        let cnt_t = wave_from_vec_ticketed(cand.to_vec(), (t,), &device, ticket)?;
         let table = rope.table(rung)?;
 
         let candle::Device::Cuda(cuda) = &device else {
@@ -1577,6 +1587,10 @@ pub fn append_wave(
     w: &IndexerWeights,
     ratio: usize,
     rms_eps: f64,
+    // The span the job and carry tables belong to — rebuilt per call and dead
+    // once the launches below are issued, so a per-layer phase is their
+    // lifetime. `None` falls back to an ordinary upload.
+    ticket: Option<WaveTicket>,
 ) -> Result<()> {
     use candle_kernels::simple::qsa_index_append::{
         run_qsa_index_append, run_qsa_index_carry, CARRY_WORDS, JOB_WORDS, MAX_D,
@@ -1661,10 +1675,10 @@ pub fn append_wave(
         let n_carry = carries.len() / CARRY_WORDS;
         // Kept alive until the launches are issued.
         let jobs_t = (!jobs.is_empty())
-            .then(|| Tensor::from_vec(jobs, (n_jobs * JOB_WORDS,), &device))
+            .then(|| wave_from_vec_ticketed(jobs, (n_jobs * JOB_WORDS,), &device, ticket))
             .transpose()?;
         let carries_t = (!carries.is_empty())
-            .then(|| Tensor::from_vec(carries, (n_carry * CARRY_WORDS,), &device))
+            .then(|| wave_from_vec_ticketed(carries, (n_carry * CARRY_WORDS,), &device, ticket))
             .transpose()?;
         if let Some(t) = jobs_t.as_ref() {
             let k_norm = tensor_ptr(&w.k_norm)?;
@@ -1776,6 +1790,9 @@ pub fn select_layer(
     eps: f64,
     device: &Device,
     qsa_rows: &AtomicU64,
+    // The forward-scoped span's ticket, for the per-wave page and window
+    // tables built below. `None` falls back to an ordinary upload.
+    fwd_ticket: Option<WaveTicket>,
 ) -> Result<Option<QsaSelection>> {
     if compress_ratio == 0 {
         return Ok(None);
@@ -1875,7 +1892,7 @@ pub fn select_layer(
             work.len()
         );
     }
-    append_wave(&mut work, &k_all, indexer, compress_ratio, eps)?;
+    append_wave(&mut work, &k_all, indexer, compress_ratio, eps, fwd_ticket)?;
 
     // **Place any page that is carrying no placement, before anything scores.**
     //
@@ -1948,6 +1965,7 @@ pub fn select_layer(
                     &scores,
                     widest,
                     span.start,
+                    fwd_ticket,
                 )
                 .map_err(|e| candle::Error::Msg(format!("kv layer {kv}, seq {}: {e}", span.seq)))?;
             cand[span.start..span.start + span.len].copy_from_slice(&span_cand);
@@ -2001,8 +2019,8 @@ pub fn select_layer(
         }
     }
     let n_pages = pages.len() / 2;
-    let pages_t = Tensor::from_vec(pages, (n_pages, 2), device)?;
-    let win_t = Tensor::from_vec(win, (total_rows, 2), device)?;
+    let pages_t = wave_from_vec_ticketed(pages, (n_pages, 2), device, fwd_ticket)?;
+    let win_t = wave_from_vec_ticketed(win, (total_rows, 2), device, fwd_ticket)?;
     Ok(Some(sel.with_pages(pages_t, win_t)?))
 }
 
@@ -2473,7 +2491,7 @@ mod tests {
         fn append(&self, cache: &mut IndexCache, start: usize, rows: usize) -> Result<()> {
             cache.ensure_capacity(start + rows, self.ratio)?;
             let mut work = [AppendSpan { cache, start, rows }];
-            append_wave(&mut work, &self.keys, &self.w, self.ratio, self.eps)
+            append_wave(&mut work, &self.keys, &self.w, self.ratio, self.eps, None)
         }
 
         /// A cache holding the first `tokens` tokens, appended in waves whose
@@ -2527,7 +2545,7 @@ mod tests {
             )?;
             let scores = Tensor::empty((t, widest), DType::F32, &self.device)?;
             let cand = cache.score_rows(
-                &q, qpos, &self.cfg, self.ratio, &self.rope, 0, &scores, widest, 0,
+                &q, qpos, &self.cfg, self.ratio, &self.rope, 0, &scores, widest, 0, None,
             )?;
             let mut table = SelectionTable::new(t, self.ratio, self.cfg.top_k, &self.device)?;
             let tail: Vec<u32> = qpos
@@ -2814,8 +2832,9 @@ mod tests {
             RowRungs::Uniform(0),
             rig.eps,
         )?;
-        let refused =
-            child.score_rows(&q, &qpos, &rig.cfg, ratio, &rig.rope, 0, &scores, widest, 0);
+        let refused = child.score_rows(
+            &q, &qpos, &rig.cfg, ratio, &rig.rope, 0, &scores, widest, 0, None,
+        );
         assert!(
             refused.is_err(),
             "an unplaced fork scored without complaint — it has no placement to \
@@ -3172,7 +3191,7 @@ mod tests {
                 start: at,
                 rows,
             }];
-            append_wave(&mut work, &k_all, &w_gpu, ratio, eps)?;
+            append_wave(&mut work, &k_all, &w_gpu, ratio, eps, None)?;
             at += rows;
             assert_eq!(cache.len(ratio), at, "cache length after {at} tokens");
         }
@@ -3190,8 +3209,9 @@ mod tests {
         let mut table = SelectionTable::new(t, ratio, cfg.top_k, &device)?;
         let widest = t.div_ceil(ratio).max(1);
         let scores = Tensor::empty((t, widest), DType::F32, &device)?;
-        let cand =
-            cache.score_rows(&q_all, &qpos, &cfg, ratio, &rope_gpu, 0, &scores, widest, 0)?;
+        let cand = cache.score_rows(
+            &q_all, &qpos, &cfg, ratio, &rope_gpu, 0, &scores, widest, 0, None,
+        )?;
         let tail: Vec<u32> = qpos.iter().map(|&p| cache.tail_len(p, ratio)).collect();
         table.fill_rows(&scores, &cand, &qpos, &tail, ratio, cfg.top_k, 0)?;
 

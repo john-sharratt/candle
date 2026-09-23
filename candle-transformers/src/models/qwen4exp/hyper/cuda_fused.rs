@@ -26,7 +26,10 @@ use candle::cuda_backend::cudarc::driver::{CudaStream, DevicePtr};
 use candle::{DType, Result, Tensor};
 use candle_kernels::simple::gr_hyper::{run_gr_combine, run_gr_mix, run_gr_norm, GR_MAX_HC};
 
+use candle_nn::kv_cache::WaveGeneration;
+
 use crate::models::operand_guard::expect_dtype;
+use crate::models::wave_buffers::wave_empty_ticketed;
 
 /// A dense F32 operand resolved to a device pointer.
 struct Operand {
@@ -70,7 +73,7 @@ fn with_operand<R>(t: &Tensor, what: &str, f: impl FnOnce(Operand, &CudaStream) 
 }
 
 /// `xn = grouped_rms(x) ⊙ gain`, one launch over `[n, hc, d]`.
-pub fn norm(x: &Tensor, gain: &Tensor, eps: f64) -> Result<Tensor> {
+pub fn norm(x: &Tensor, gain: &Tensor, eps: f64, wave: Option<&WaveGeneration>) -> Result<Tensor> {
     let (n, hc, d) = x.dims3()?;
     if gain.elem_count() != hc * d {
         candle::bail!(
@@ -80,7 +83,13 @@ pub fn norm(x: &Tensor, gain: &Tensor, eps: f64) -> Result<Tensor> {
         );
     }
     // Fully overwritten by the kernel (hot-path invariant 6).
-    let xn = Tensor::empty((n, hc, d), DType::F32, x.device())?;
+    // **The seed of the Gated Residual's provenance.** The residual itself is
+    // pool-backed by design — it outlives every phase reset — so nothing in this
+    // chain has an operand to inherit an arena from. Rooting the norm's output
+    // on the open phase gives the rest of `hc_mix` a ticketed operand, and the
+    // eager ops after it (the low-rank GEMMs, the silu, the collapse) inherit it
+    // the ordinary way. Without a wave this is `Tensor::empty` exactly as before.
+    let xn = wave_empty_ticketed((n, hc, d), DType::F32, x.device(), wave.map(|g| g.ticket()))?;
     with_operand(x, "gr norm: residual stream", |xo, stream| {
         with_operand(gain, "gr norm: gain", |go, _| {
             with_operand(&xn, "gr norm: out", |oo, _| {
@@ -106,7 +115,13 @@ pub fn norm(x: &Tensor, gain: &Tensor, eps: f64) -> Result<Tensor> {
 }
 
 /// `mixed[t,j] = mean_s( xn[t,s,j] · sigmoid(gate_raw[t,s,j]) )`, one launch.
-pub fn mix(xn: &Tensor, gate_raw: &Tensor, hc: usize, d: usize) -> Result<Tensor> {
+pub fn mix(
+    xn: &Tensor,
+    gate_raw: &Tensor,
+    hc: usize,
+    d: usize,
+    wave: Option<&WaveGeneration>,
+) -> Result<Tensor> {
     let n = xn.elem_count() / (hc * d);
     if gate_raw.elem_count() != xn.elem_count() {
         candle::bail!(
@@ -115,7 +130,8 @@ pub fn mix(xn: &Tensor, gate_raw: &Tensor, hc: usize, d: usize) -> Result<Tensor
             xn.elem_count()
         );
     }
-    let mixed = Tensor::empty((n, d), DType::F32, xn.device())?;
+    // The block input, consumed inside the phase that produced it.
+    let mixed = wave_empty_ticketed((n, d), DType::F32, xn.device(), wave.map(|g| g.ticket()))?;
     with_operand(xn, "gr mix: xn", |xo, stream| {
         with_operand(gate_raw, "gr mix: gate", |go, _| {
             with_operand(&mixed, "gr mix: out", |oo, _| {
@@ -143,7 +159,16 @@ pub fn mix(xn: &Tensor, gate_raw: &Tensor, hc: usize, d: usize) -> Result<Tensor
 ///
 /// One read and one write of the wide buffer, where the eager chain took four
 /// passes (sigmoid, scale, broadcast-multiply, add).
-pub fn combine(res: &Tensor, block_out: &Tensor, inject: &Tensor) -> Result<Tensor> {
+/// `dst`, when given, is the residual's other half — the sweep's flip target.
+/// The kernel reads `res` and writes `dst`, which is why the two must be
+/// different buffers; with `None` this allocates a fresh one, as the reference
+/// path and the tests do.
+pub fn combine(
+    res: &Tensor,
+    block_out: &Tensor,
+    inject: &Tensor,
+    dst: Option<&Tensor>,
+) -> Result<Tensor> {
     let (n, hc, d) = res.dims3()?;
     // The kernel holds its per-stream weights in a fixed register array and
     // returns without launching above that width. `out` below is allocated
@@ -168,11 +193,38 @@ pub fn combine(res: &Tensor, block_out: &Tensor, inject: &Tensor) -> Result<Tens
         );
     }
     // Fully overwritten by the kernel (hot-path invariant 6).
-    let out = Tensor::empty((n, hc, d), DType::F32, res.device())?;
+    let out = match dst {
+        Some(t) => {
+            let (dn, dhc, dd) = t.dims3()?;
+            if (dn, dhc, dd) != (n, hc, d) {
+                candle::bail!(
+                    "gr combine: flip target is [{dn}, {dhc}, {dd}], residual is [{n}, {hc}, {d}]"
+                );
+            }
+            t.clone()
+        }
+        None => Tensor::empty((n, hc, d), DType::F32, res.device())?,
+    };
     with_operand(res, "gr combine: residual", |ro, stream| {
         with_operand(block_out, "gr combine: block output", |bo, _| {
             with_operand(inject, "gr combine: inject", |io, _| {
                 with_operand(&out, "gr combine: out", |oo, _| {
+                    // **The kernel reads the residual and writes the target**,
+                    // so one buffer for both is a read-write race across the
+                    // whole wide stream — not a wasted copy. The sweep
+                    // alternates halves and cannot do this; a later caller that
+                    // passes one buffer twice would see it as a wrong number
+                    // many layers downstream, which is the class of fault the
+                    // span partition is written to avoid. Compared at the
+                    // device pointer, which is the only thing that settles it
+                    // for two views over the same allocation.
+                    if oo.ptr == ro.ptr {
+                        candle::bail!(
+                            "gr combine: the flip target and the residual are \
+                             the same buffer at {:#x}",
+                            ro.ptr
+                        );
+                    }
                     // `inject` is [n, hc] and read scalar-wise, so its own
                     // alignment does not gate the vector path; the three wide
                     // operands do.
@@ -191,9 +243,10 @@ pub fn combine(res: &Tensor, block_out: &Tensor, inject: &Tensor) -> Result<Tens
                             stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
+                    Ok(())
                 })
             })
         })
-    })????;
+    })?????;
     Ok(out)
 }

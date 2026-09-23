@@ -66,6 +66,36 @@ use std::sync::Arc;
 /// and the zone may never retract below it.
 pub const PINNED_LAYERS: usize = 2;
 
+/// Score credit for a prefill-attributed hit on an already-resident expert.
+///
+/// Far below [`ExpertCacheInner::record_hit`]'s +1.0: a prefill row's own
+/// reuse of a specific expert across waves is close to zero (a long prefill
+/// sweep touches most of the table roughly once each), so treating a prefill
+/// hit as equally valuable as a decode hit let a diverse enough prefill
+/// out-bid decode's genuinely-reused residents for warm/hot slots — decode
+/// then had to re-earn its own working set from a cache full of prefill's
+/// one-shot leftovers. This still lets an expert that prefill itself reuses
+/// often (a broadly-useful "generalist") earn some protection, just far less
+/// than a resident decode actually depends on.
+pub const PREFILL_HIT_SCORE: f32 = 0.1;
+
+/// Score penalty applied when a prefill row causes a *fresh* elevation (a
+/// cold miss that streams an expert in), as opposed to a hit on something
+/// already resident.
+///
+/// Negative, not merely small: the expert a prefill row just paid a full DMA
+/// to load is, on the evidence, the LEAST likely thing in the zone to be
+/// touched again before the pass wraps — the layer it serves has just been
+/// left behind, and prefill's own within-sweep reuse of one specific expert
+/// is close to zero. Pushing its score negative (rather than leaving it at
+/// whatever it decayed to from an earlier, unrelated occupancy) makes it the
+/// eviction scan's preferred victim immediately, freeing the slot for the
+/// layer about to run instead of leaving it to be found by the normal
+/// low-score-first scan. `slot_eviction_score`'s `position_factor` stays
+/// positive ([0.5, 1.0]), so a negative `base_score` only ever lowers the
+/// product — nothing here can invert eviction order for a non-negative score.
+pub const PREFILL_ELEVATE_PENALTY: f32 = -0.1;
+
 /// How many layers this model actually pins.
 ///
 /// [`PINNED_LAYERS`], except for a model with fewer MoE layers than that — in
@@ -479,6 +509,33 @@ impl ExpertCacheInner {
         self.expert_scores[idx] += 1.0;
     }
 
+    /// Record a prefill-attributed hit on an already-resident expert:
+    /// [`PREFILL_HIT_SCORE`] (+0.1) rather than the full decode weight.
+    #[inline]
+    pub(crate) fn record_prefill_hit(&mut self, layer: usize, expert: usize) {
+        let idx = self.score_idx(layer, expert);
+        self.expert_scores[idx] += PREFILL_HIT_SCORE;
+    }
+
+    /// Record a prefill-attributed elevation (a fresh cold load, not a hit):
+    /// [`PREFILL_ELEVATE_PENALTY`] (−0.1), biasing it toward the next
+    /// eviction scan rather than leaving its score at whatever an earlier,
+    /// unrelated occupancy left behind.
+    ///
+    /// **Assigned, not accumulated.** `install` does not clear `expert_scores`,
+    /// so the slot's previous tenant's score is still standing when a fresh
+    /// expert lands on it. Adding the penalty to that leaves a formerly
+    /// decode-hot expert at, say, 11.9 — comfortably protected, which is the
+    /// opposite of what an elevation means and exactly the "earlier, unrelated
+    /// occupancy" the constant's doc says this must not inherit. An elevation is
+    /// one event with one meaning: this expert was just paid for and is the
+    /// least likely thing in the zone to be wanted again.
+    #[inline]
+    pub(crate) fn record_prefill_elevate(&mut self, layer: usize, expert: usize) {
+        let idx = self.score_idx(layer, expert);
+        self.expert_scores[idx] = PREFILL_ELEVATE_PENALTY;
+    }
+
     /// Record a successful speculative prediction: +0.3.
     #[inline]
     pub(crate) fn record_prediction_hit(&mut self, layer: usize, expert: usize) {
@@ -525,7 +582,24 @@ impl ExpertCacheInner {
             let n = self.num_moe_layers;
             let dist = self.forward_distance(layer, current_layer);
             let position_factor = 1.0 - 0.5 * (dist as f32 / n as f32);
-            base * position_factor * self.reload_cost(layer, expert)
+            // Both factors mean "how much this slot is worth protecting", so a
+            // larger one must always raise the score. `position_factor` is
+            // [0.5, 1.0] and `reload_cost` is 1.0 or `COLD_RELOAD_PENALTY`, so
+            // the product is never zero and the sign is carried entirely by
+            // `base`.
+            let protect = position_factor * self.reload_cost(layer, expert);
+            // **A negative base inverts a multiply.** `record_prefill_elevate`
+            // drives a freshly prefill-loaded expert below zero precisely so it
+            // is evicted first; multiplying that by a protection factor makes it
+            // *more* negative, so the pack-only expert (×4) would be taken
+            // before the warm-backed one (×1) and the far-ahead slot before the
+            // near one — both exactly backwards. Dividing keeps "larger factor
+            // ⇒ better protected" true on both sides of zero.
+            if base < 0.0 {
+                base / protect
+            } else {
+                base * protect
+            }
         } else {
             0.0
         }
@@ -1005,6 +1079,90 @@ mod tests {
         let (slot, evicted_key) = inner.allocate_slot(20, &Default::default()).unwrap();
         assert_eq!(evicted_key, Some((10, 102)));
         assert_eq!(slot, 2);
+    }
+
+    #[test]
+    fn record_prefill_hit_bumps_by_the_small_credit_only() {
+        let mut inner = cache(1);
+        occupy(&mut inner, 0, 10, 100, 1, 0.0);
+        inner.record_prefill_hit(10, 100);
+        assert_eq!(inner.score(10, 100), 0.1);
+        inner.record_prefill_hit(10, 100);
+        assert_eq!(inner.score(10, 100), 0.2);
+    }
+
+    #[test]
+    fn record_hit_still_bumps_by_the_full_decode_credit() {
+        let mut inner = cache(1);
+        occupy(&mut inner, 0, 10, 100, 1, 0.0);
+        inner.record_hit(10, 100);
+        assert_eq!(inner.score(10, 100), 1.0);
+    }
+
+    #[test]
+    fn record_prefill_elevate_pushes_the_score_negative() {
+        let mut inner = cache(1);
+        occupy(&mut inner, 0, 10, 100, 1, 0.0);
+        inner.record_prefill_elevate(10, 100);
+        assert_eq!(inner.score(10, 100), -0.1);
+    }
+
+    /// **A previous tenant's score is not inherited.** `install` leaves
+    /// `expert_scores` alone, so a slot that held a decode-hot expert still
+    /// carries its score when a prefill miss lands a different expert on it.
+    /// Adding the penalty there would leave the newcomer protected at 11.9;
+    /// assigning it states what an elevation actually means.
+    #[test]
+    fn a_prefill_elevation_does_not_inherit_a_hot_predecessors_score() {
+        let mut inner = cache(1);
+        occupy(&mut inner, 0, 10, 100, 1, 0.0);
+        let idx = inner.score_idx(10, 100);
+        inner.expert_scores[idx] = 12.0;
+        inner.record_prefill_elevate(10, 100);
+        assert_eq!(inner.score(10, 100), -0.1);
+    }
+
+    /// The negative score must survive both eviction multipliers.
+    ///
+    /// `slot_eviction_score` scales by a position factor and a reload cost,
+    /// both of which mean "worth protecting". Multiplying a negative base by
+    /// them inverts that: the pack-only expert (×4) would sort below the
+    /// warm-backed one and be evicted first. Pinned here because the inversion
+    /// is invisible — it produces a plausible number, just the wrong order.
+    #[test]
+    fn a_prefill_elevated_pack_only_expert_is_not_evicted_before_a_warm_one() {
+        let mut inner = cache(2);
+        occupy(&mut inner, 0, 10, 100, 1, 0.0);
+        occupy(&mut inner, 1, 10, 101, 2, 0.0);
+        inner.record_prefill_elevate(10, 100);
+        inner.record_prefill_elevate(10, 101);
+        // 100 keeps a warm copy; 101 lives only in the pack, so reloading it
+        // costs `COLD_RELOAD_PENALTY` and it is the one worth keeping.
+        inner.set_warm_backed(&[(10, 100)]);
+        let warm = inner.slot_eviction_score(0, 20);
+        let pack_only = inner.slot_eviction_score(1, 20);
+        assert!(
+            warm < pack_only,
+            "the warm-backed expert must be the cheaper victim, got warm={warm} \
+             pack_only={pack_only}"
+        );
+    }
+
+    /// **A prefill-elevated expert is evicted before any hit, decode or
+    /// prefill, once the pass has moved past its layer.** This is the whole
+    /// point of the negative score: a fresh prefill load at layer 10 must not
+    /// out-survive genuinely reused experts once the sweep is at layer 20.
+    #[test]
+    fn prefill_elevated_expert_is_the_preferred_victim_over_any_hit() {
+        let mut inner = cache(3);
+        occupy(&mut inner, 0, 10, 100, 1, 0.0); // freshly prefill-elevated
+        inner.record_prefill_elevate(10, 100);
+        occupy(&mut inner, 1, 10, 101, 2, 0.1); // one prefill hit
+        occupy(&mut inner, 2, 10, 102, 3, 1.0); // one decode hit
+
+        let (slot, evicted_key) = inner.allocate_slot(20, &Default::default()).unwrap();
+        assert_eq!(evicted_key, Some((10, 100)));
+        assert_eq!(slot, 0);
     }
 
     #[test]

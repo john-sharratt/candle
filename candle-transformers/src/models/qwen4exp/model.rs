@@ -317,7 +317,7 @@ impl Qwen4ExpModel {
             }
 
             // ── Token mixer under the first HC module ────────────────────
-            let (h, inject) = hc_mix(&res_hc, &layer.hc_attn, eps)?;
+            let (h, inject) = hc_mix(&res_hc, &layer.hc_attn, eps, None)?;
             let inject = inject.expect("layer HC modules carry an inject");
 
             let y = match &layer.mix {
@@ -396,18 +396,18 @@ impl Qwen4ExpModel {
                     Tensor::cat(&parts, 0)?.matmul(&attn.wo.t()?)?
                 }
             };
-            res_hc = hc_combine(&res_hc, &y, &inject)?;
+            res_hc = hc_combine(&res_hc, &y, &inject, None)?;
 
             // ── MoE under the second HC module ───────────────────────────
-            let (h2, inject2) = hc_mix(&res_hc, &layer.hc_ffn, eps)?;
+            let (h2, inject2) = hc_mix(&res_hc, &layer.hc_ffn, eps, None)?;
             let inject2 = inject2.expect("layer HC modules carry an inject");
             let y2 = self.moe_forward(li, &h2)?;
-            res_hc = hc_combine(&res_hc, &y2, &inject2)?;
+            res_hc = hc_combine(&res_hc, &y2, &inject2, None)?;
         }
 
         // The head mix IS the output norm; logits over packed rows, then
         // split back per session.
-        let (mixed, _) = hc_mix(&res_hc, &self.out_hc, eps)?;
+        let (mixed, _) = hc_mix(&res_hc, &self.out_hc, eps, None)?;
         let logits = mixed.matmul(&self.lm_head.t()?)?;
         spans
             .iter()

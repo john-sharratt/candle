@@ -46,6 +46,7 @@ pub fn quantized_delta_net_ffn(
     act_dtype: DType,
     orig_dtype: DType,
     lora: LayerLora<'_>,
+    decode_tokens: usize,
 ) -> Result<()> {
     // MLP intermediates can exceed F16's range, so accumulate in BF16 there.
     let mlp_dtype = if act_dtype == DType::F16 {
@@ -84,7 +85,8 @@ pub fn quantized_delta_net_ffn(
         match &layer.ffn {
             QuantFfn::Dense(m) => m.forward_dynamic_adapted(&acts, mlp_dtype, orig_dtype, lora)?,
             QuantFfn::Moe(m) => {
-                let mut out = m.forward_dynamic(acts, mlp_dtype, ffn_wave.as_ref())?;
+                let mut out =
+                    m.forward_dynamic(acts, mlp_dtype, decode_tokens, ffn_wave.as_ref())?;
                 // Straddles the narrowing. The FFN computes its intermediates
                 // in a promoted dtype precisely because "MLP intermediates can
                 // exceed F16's range", and whether narrowing back is lossless

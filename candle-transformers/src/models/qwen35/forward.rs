@@ -35,7 +35,7 @@ use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
     begin_forward, begin_wave, end_wave_transient, plan_wave_transient, LayerPhase, WavePlan,
-    REGION_BYTES, WAVE_FORWARD_BYTES,
+    WaveWidth,
 };
 
 use super::batched::HybridBatched;
@@ -885,6 +885,9 @@ fn sweep_layers(
         pre_off,
         pre_q,
         model.device(),
+        // This path builds its headers before the forward's span opens; the
+        // qwen4exp sweep moved the construction down so it could use one.
+        None,
     )?);
     g_meta.end();
 
@@ -920,11 +923,45 @@ fn sweep_layers(
     if total_rows > 0 {
         if let Device::Cuda(d) = dev {
             let plan = WavePlan::new(model.wave_geometry(embed_dtype));
-            let pad = |b: usize| b + REGION_BYTES;
+            // **Scored rows are not all rows.** The head runs every decode row
+            // and the LAST row of each prefill span — a verifying span excepted,
+            // where each row is a prediction to compare a proposal against.
+            // Pricing `HeadLogits` at `total_rows × vocab` buys ~1 GB of tier
+            // for a 248 KB logits block on a 2,048-row prefill, taken from the
+            // weight side every wave.
+            //
+            // A wave that stops short of the last layer returns its residual and
+            // runs no head, so it scores no rows at all.
+            let verify_seqs = model.verify_row_seqs()?;
+            let scored_prefill: usize = pre_q
+                .iter()
+                .enumerate()
+                .map(|(k, &l)| {
+                    if verify_seqs.contains(&seq_ids[n_decode + k]) {
+                        l
+                    } else {
+                        1
+                    }
+                })
+                .sum();
+            let width = WaveWidth {
+                prefill_rows: pre_rows,
+                decode_rows: n_decode,
+                scored_rows: if layer_end == num_layers {
+                    n_decode + scored_prefill
+                } else {
+                    0
+                },
+                // A one-row prefill group takes the decode kernels, so it carves
+                // no span-table entry and, alone, no scan transient.
+                prefill_spans: pre_q.iter().filter(|&&l| l > 1).count(),
+                staged_rows: 0,
+                staged_spans: 0,
+            };
             let per_phase = [
-                pad(plan.phase_bytes(LayerPhase::Attention, total_rows)),
-                pad(plan.phase_bytes(LayerPhase::Ffn, total_rows)),
-                WAVE_FORWARD_BYTES,
+                plan.phase_bytes(LayerPhase::Attention, width),
+                plan.phase_bytes(LayerPhase::Ffn, width),
+                plan.phase_bytes(LayerPhase::Forward, width),
             ];
             plan_wave_transient(&d.cuda_stream(), per_phase)?;
         }
@@ -1275,7 +1312,7 @@ fn sweep_layers(
                     &[],
                     capture_dev,
                 )?;
-                quantized_delta_net_ffn(&layer, &mut x, embed_dtype, orig, layer_lora)?;
+                quantized_delta_net_ffn(&layer, &mut x, embed_dtype, orig, layer_lora, n_decode)?;
             }
         }
         // The layer's result. Reaching this on a bad value means the mixer's

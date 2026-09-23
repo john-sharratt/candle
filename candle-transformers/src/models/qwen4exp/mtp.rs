@@ -201,7 +201,8 @@ impl MtpHead {
         // state; if you do mean pooling first, the acceptance rate drops
         // catastrophically" (llama.cpp#27836) — and measured here it did
         // exactly that: plausible tokens that were never the trunk's.
-        let hn = hc_grouped_norm(residual, &self.input.hnorm, eps)?.reshape((n * hc, n_embd))?;
+        let hn =
+            hc_grouped_norm(residual, &self.input.hnorm, eps, None)?.reshape((n * hc, n_embd))?;
         // **Embedding first, hidden second**: `eh_proj` fuses the checkpoint's
         // `fc_embedding` and `fc_hidden` side by side, so the one matmul
         // computes `fc_embedding @ e + fc_hidden @ h`. One `[n_embd, 2·n_embd]`
@@ -230,8 +231,8 @@ impl MtpHead {
     /// own output mix followed by the shared `lm_head`. The head carries the
     /// norm and borrows the rest, exactly as it borrows the embedding table.
     pub fn to_shared_head(&self, block_out: &Tensor, eps: f64) -> Result<Tensor> {
-        let normed = hc_grouped_norm(block_out, &self.head_norm, eps)?;
-        let (narrow, _) = hc_mix(&normed, &self.mixer, eps)?;
+        let normed = hc_grouped_norm(block_out, &self.head_norm, eps, None)?;
+        let (narrow, _) = hc_mix(&normed, &self.mixer, eps, None)?;
         Ok(narrow)
     }
 
