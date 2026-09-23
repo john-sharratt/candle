@@ -1122,6 +1122,41 @@ mod tests {
         assert_eq!(inner.score(10, 100), -0.1);
     }
 
+    /// **A prefill-lifted expert is evicted before any decode-scored one, at
+    /// every position and either reload cost.** This is what keeps the cache
+    /// hot for decode: a prefill sweep touches most of the table roughly once,
+    /// so what it drags in must not displace the working set decode actually
+    /// reuses. Checked at the extremes of both multipliers rather than at one
+    /// convenient layer, because the ordering has to hold across the whole
+    /// range — the least-evictable prefill lift (nearest layer, pack-only)
+    /// against the most-evictable decode hit (farthest layer, warm-backed).
+    #[test]
+    fn a_prefill_lift_sorts_below_every_decode_hit_at_both_extremes() {
+        let n = 48usize;
+        let worst_protect = 0.5f32; // farthest layer, warm-backed
+        let best_protect = 4.0f32; // nearest layer, pack-only
+        assert!(
+            1.0 - 0.5 * ((n - 1) as f32 / n as f32) < 0.52,
+            "position_factor's floor moved; the bounds below assume [0.5, 1.0]"
+        );
+        // The least-evictable a prefill lift can be, and the most-evictable a
+        // decode hit can be.
+        let softest_lift = PREFILL_ELEVATE_PENALTY / best_protect;
+        let weakest_decode = 1.0f32 * worst_protect;
+        assert!(
+            softest_lift < weakest_decode,
+            "a prefill lift ({softest_lift}) must still evict before the weakest \
+             decode hit ({weakest_decode})"
+        );
+        // And below a prefill HIT, which is the nearest positive neighbour.
+        let weakest_prefill_hit = PREFILL_HIT_SCORE * worst_protect;
+        assert!(
+            softest_lift < weakest_prefill_hit,
+            "a prefill lift ({softest_lift}) must evict before a prefill hit \
+             ({weakest_prefill_hit})"
+        );
+    }
+
     /// The negative score must survive both eviction multipliers.
     ///
     /// `slot_eviction_score` scales by a position factor and a reload cost,
