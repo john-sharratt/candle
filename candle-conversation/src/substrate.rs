@@ -4177,8 +4177,27 @@ impl Substrate {
     /// flat, so the garbage was moved into host RAM rather than released. That
     /// 7.2 GiB is what pushed the box to 0.9 GiB free and 1,302 pages/sec.
     ///
-    /// The cold copy is left alone: the compactor sheds it with the record, and
-    /// a transient timeline never had one.
+    /// **The cold REFERENCE goes with them, because the compactor sheds the
+    /// record it names.** `keep_chunks` is `distill.is_none()`, so every chunk
+    /// this residence points at is dropped from the log on the next pass — and
+    /// nothing else ever removes the reference. Maintenance repoints relocated
+    /// records and has no notion of a dropped one; the in-RAM stream index is
+    /// insert-only. So a cold ref left standing here does not become stale
+    /// later, it becomes a pointer into a segment that gets unlinked, and it
+    /// still reads as a cold copy to everything that asks.
+    ///
+    /// That is not theoretical. An archived conversation is marked `TextOnly`,
+    /// which keeps its tokens and sheds its chunks — so its turns kept a
+    /// non-zero `token_count` and a cold tier that no longer existed. Selection
+    /// chose them on the strength of both, `elevate_to_hot` answered
+    /// `cold-load found no chunks`, `apply_projection` dropped them, and the
+    /// whole thing repeated on the next turn and every turn after, because
+    /// nothing had changed. Clearing it here makes the turn tier-less, which is
+    /// what it is: the projection then skips it on the branch that already
+    /// exists for K/V-less turns instead of failing a load to discover it.
+    ///
+    /// `released` still counts only hot and warm — it reports memory handed
+    /// back, and a cold ref is not memory.
     fn release_distilled_kv(&mut self, timeline: TimelineId) -> usize {
         let residences: Vec<ResidenceIndex> = match self.timelines.get(&timeline) {
             Some(entry) => entry.turns.values().map(|t| t.content.residence).collect(),
@@ -4204,6 +4223,7 @@ impl Substrate {
             if self.residence[r.0].warm.take().is_some() {
                 Self::remove_from_lru(&mut self.warm_lru, r);
             }
+            self.residence[r.0].cold = None;
         }
         released
     }
@@ -8433,6 +8453,54 @@ mod tests {
             other_cold[0].chunks[0].log_offset, 777_216,
             "residence without an active-index stream stays untouched"
         );
+    }
+
+    /// Distillation sheds the cold REFERENCE, not just the resident copies.
+    ///
+    /// The compactor drops the chunk records a distilled timeline's turns point
+    /// at (`keep_chunks = distill.is_none()`), and nothing removes the in-RAM
+    /// reference to them: maintenance repoints relocated records and the stream
+    /// index is insert-only. A ref left behind therefore names a segment that
+    /// gets unlinked while still reading as a cold copy — which is how an
+    /// archived conversation (`TextOnly`: tokens kept, chunks shed) kept being
+    /// selected, failing `cold-load found no chunks`, and repeating every turn.
+    #[test]
+    fn distillation_clears_the_cold_reference_it_makes_dangling() {
+        for mode in [DistillMode::TextOnly, DistillMode::ProvenanceOnly] {
+            let (_, _, timeline, mut sub) = make_timeline();
+            let cold = vec![StoredSequence {
+                chunks: vec![StoredChunk {
+                    log_offset: 4096,
+                    record_len: 4096,
+                    token_count: 32,
+                }],
+                token_count: 32,
+            }];
+            let idx = sub.restore_turn(
+                timeline,
+                TurnLayout::default(),
+                TokenBuffer::default(),
+                32,
+                Some(cold),
+                0,
+                1,
+            );
+            assert_eq!(
+                sub.turn_tier_state(timeline, idx).map(|t| t.cold),
+                Some(true),
+                "{mode:?}: the turn starts with a cold copy"
+            );
+
+            sub.distill_timeline(timeline, mode);
+
+            assert_eq!(
+                sub.turn_tier_state(timeline, idx).map(|t| t.cold),
+                Some(false),
+                "{mode:?}: a distilled turn must not advertise a cold copy the \
+                 compactor is about to shed — selection chases it, the load \
+                 fails, and nothing ever clears it"
+            );
+        }
     }
 
     /// A timeline in an append-only ingest layer (repo_map, code_reading)
