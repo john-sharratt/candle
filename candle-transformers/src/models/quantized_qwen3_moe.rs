@@ -37,7 +37,6 @@ use crate::models::routing_capture;
 use crate::models::wave_buffers::wave_empty;
 use crate::models::wave_buffers::wave_root;
 use crate::quantized_nn::RmsNorm;
-use candle::cuda_backend::wave_provenance::WaveTicket;
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::{
     fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_qmatmul_dev_q8a128,
@@ -47,6 +46,7 @@ use candle::quantized::cuda::{
 #[cfg(feature = "cuda")]
 use candle::quantized::get_vram_info;
 use candle::quantized::{gguf_file, Int8Mode, QTensor, SumScale};
+use candle::wave_provenance::WaveTicket;
 use candle::LiveTensor;
 use candle::{DType, Device, Result, Tensor};
 #[cfg(feature = "cuda")]

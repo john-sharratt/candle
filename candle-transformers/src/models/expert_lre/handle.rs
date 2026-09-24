@@ -69,8 +69,8 @@ fn log_dispatch_refusal(reason: &'static str, detail: impl FnOnce() -> String) {
         }
     }
 }
-use candle::cuda_backend::wave_provenance::WaveTicket;
 use candle::quantized::Int8Mode;
+use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::WeightZone;
 #[cfg(feature = "cuda")]

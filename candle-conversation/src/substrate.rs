@@ -5307,14 +5307,25 @@ impl Substrate {
         true
     }
 
-    /// Every recovered timeline that has a `conv_id` recorded, paired
+    /// Every **live** timeline that has a `conv_id` recorded, paired
     /// with `(conv_id, label, archived)`. Drives the daemon's sidebar:
     /// `label` is empty during the brief window between first-submit
     /// and titler-completion, `archived` is the lifecycle filter the
     /// sidebar applies before rendering.
+    ///
+    /// **Tombstoned timelines are excluded**, like every other listing here
+    /// ([`Self::live_timeline_ids`], [`Self::conversations_with_conv_id_prefix`]).
+    /// This used to return them, on the reasoning that excluding them was each
+    /// caller's job — which made `DELETE /v1/conversations/{id}` a no-op from
+    /// the only place a user can see: the row came back on the next sidebar
+    /// hydrate, for the life of the log, because a tombstone marks a timeline
+    /// for reclamation rather than removing its registry entry. Archived is the
+    /// flag a caller filters on; deleted is not a flag, and nothing outside
+    /// maintenance has any use for a deleted conversation.
     pub fn known_conversations(&self) -> Vec<(TimelineId, String, String, bool, u64)> {
         self.timelines
             .iter()
+            .filter(|(tl, _)| !self.tombstoned_timelines.contains(tl))
             .filter_map(|(tl, entry)| {
                 let conv_id = entry.conv_id.clone()?;
                 let label = entry.label.clone().unwrap_or_default();
@@ -5327,15 +5338,12 @@ impl Substrate {
     /// `(timeline, conv_id)`.
     ///
     /// [`Self::known_conversations`] answers the same question by materialising
-    /// every conversation the workspace has *ever* held — tombstoned ones
-    /// included, since the sidebar lists them — and cloning two strings for
+    /// every live conversation the workspace holds and cloning two strings for
     /// each. A caller that wants one character's handful out of that pays for
-    /// the whole history of the log, and that history only grows: retirement
-    /// bounds the live set, not the registry.
+    /// the whole registry, and the registry only grows: retirement bounds the
+    /// live set, not the entries.
     ///
-    /// Filtering inside the read lock allocates for the matches alone, and
-    /// dropping tombstoned entries here means the caller is not handed
-    /// conversations whose only remaining use is to be skipped.
+    /// Filtering inside the read lock allocates for the matches alone.
     pub fn conversations_with_conv_id_prefix(&self, prefix: &str) -> Vec<(TimelineId, String)> {
         self.timelines
             .iter()
@@ -8744,14 +8752,39 @@ mod tests {
         assert!(*archived);
     }
 
+    /// A tombstoned conversation leaves the listing, so deleting one actually
+    /// removes it from the sidebar.
+    ///
+    /// The regression this pins: a tombstone marks a timeline for reclamation
+    /// but leaves its registry entry in place, so a lister that filtered only
+    /// on `archived` kept serving the deleted row on every hydrate — `DELETE`
+    /// answered 204 and the conversation never went away.
+    #[test]
+    fn a_tombstoned_conversation_is_not_listed() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        sub.set_conv_id(timeline, "abc");
+        sub.set_label(timeline, "tour");
+        assert_eq!(sub.known_conversations().len(), 1);
+
+        sub.tombstone_timeline(timeline);
+        assert!(
+            sub.known_conversations().is_empty(),
+            "a deleted conversation must not survive in the listing"
+        );
+        // Archived is a lifecycle flag the caller filters on; deleted is not,
+        // so it is gone even when the caller asked to see archived rows.
+        sub.set_archived(timeline, true);
+        assert!(sub.known_conversations().is_empty());
+    }
+
     /// **A prefix lookup answers "which are this scheme's?" without the
     /// registry.**
     ///
-    /// `known_conversations` materialises every conversation the workspace has
-    /// ever held, tombstoned ones included, because it feeds a sidebar.
-    /// Retirement bounds the live set and not the registry, so a caller that
-    /// wants one naming scheme's members — npcd's `npc-<id>-day-*` — would pay
-    /// for the whole history of the log on every open, forever.
+    /// `known_conversations` materialises every live conversation the workspace
+    /// holds, because it feeds a sidebar. Retirement bounds the live set and not
+    /// the registry, so a caller that wants one naming scheme's members —
+    /// npcd's `npc-<id>-day-*` — would pay for the whole registry on every
+    /// open, forever.
     ///
     /// Two properties, and the second is the one with teeth: a tombstoned
     /// conversation is not returned, which is what lets the caller treat

@@ -42,10 +42,30 @@
 //! permutation exists only because those kernels hard-code the pairing at
 //! `head_dim/2`.
 
-use candle::cuda_backend::wave_provenance::WaveTicket;
+use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, LiveTensor, Result, Tensor};
 
+#[cfg(feature = "cuda")]
 use crate::models::wave_buffers::wave_from_vec_ticketed;
+#[cfg(not(feature = "cuda"))]
+use candle::{Shape, WithDType};
+
+/// The upload with no wave arena to put it on — an ordinary transfer.
+///
+/// The CUDA build's [`wave_from_vec_ticketed`] already falls back to exactly
+/// this whenever the device is not CUDA or the ticket's generation has closed.
+/// Off CUDA that is the only case there is, and the arena machinery the real one
+/// is built from does not compile, so this is the same answer reached directly
+/// rather than a second policy.
+#[cfg(not(feature = "cuda"))]
+fn wave_from_vec_ticketed<D: WithDType, S: Into<Shape>>(
+    data: Vec<D>,
+    shape: S,
+    device: &Device,
+    _ticket: Option<WaveTicket>,
+) -> Result<Tensor> {
+    Tensor::from_vec(data, shape, device)
+}
 
 /// The head-dim permutation and matching RoPE table for one geometry.
 #[derive(Debug, Clone)]

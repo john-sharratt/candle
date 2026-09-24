@@ -78,7 +78,9 @@ GET    /ws/logs                          WebSocket log tail (backlog replay + li
 
 Anything not matched falls back to the embedded `web/` frontend (`GET /`, `/perf`, `/substrate`, `/project`, resolved to their `.html` files).
 
-`POST /v1/chat/completions` accepts the standard OpenAI `messages`/`stream`/`max_tokens` fields plus `zend` extensions: `conv_id`, `tools` (a `ToolMode` dial — `none`/`restricted`/`comprehensive`/`mutable`), `identity`, `effort`, `verbosity`, `think`, `assistant_prefill`, `force_high_resolution`, `lossless_kv`.
+`POST /v1/chat/completions` accepts the standard OpenAI `messages`/`stream`/`max_tokens` fields plus `zend` extensions: **`conv_id` (required)**, `tools` (a `ToolMode` dial — `none`/`restricted`/`comprehensive`/`mutable`), `identity`, `effort`, `verbosity`, `think`, `assistant_prefill`, `force_high_resolution`, `lossless_kv`.
+
+Every conversation is addressed by its own `conv_id`; there is no default conversation for unaddressed turns to accumulate on, so a request that omits it or sends it blank is refused with `400 missing_conv_id`. The one exception is `model: "passthrough"`, which runs the client's own context and never reaches the substrate.
 
 ### Tools modes and who may use them
 

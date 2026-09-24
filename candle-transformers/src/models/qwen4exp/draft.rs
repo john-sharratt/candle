@@ -428,8 +428,11 @@ impl Qwen4ExpBatched {
         //
         // [`Self::head_wave_pass`] passes the absolute index for the opposite
         // reason: it rides the wave's own metadata, which covers every layer.
+        // No wave is open on this path, so the projection's output is ordinary
+        // owned memory and owning it again was a straight `[n, n_embd]` copy.
+        // The compiler is what keeps that honest: were a generation passed
+        // above, `'w` would bind and the combine would have to stay inside it.
         let y = forward_attn_batched(&alayer, caches, &x_g, at, params, 0, sel.as_ref(), None)?
-            .to_owned_tensor()?
             .reshape((n, n_embd))?;
         res = hc_combine(&res, &y, &inject, None)?;
 
@@ -456,7 +459,6 @@ impl Qwen4ExpBatched {
             // prefill/prompt traffic through one — so all `n` rows are
             // decode-attributed.
             .forward_dynamic(acts, DType::F32, n, None)?
-            .to_owned_tensor()?
             .reshape((n, n_embd))?;
         res = hc_combine(&res, &y2, &inject2, None)?;
 
@@ -564,18 +566,6 @@ impl Qwen4ExpBatched {
             }
         }
 
-        // **A draft walk is a forward, and has to be bracketed like one.**
-        //
-        // `forward_attn_batched` opens a wave per phase, but a wave only *lays
-        // out* spans inside a tier someone else placed — `plan_wave_transient`
-        // is what buys that ground, and `begin_forward` is what freezes the
-        // partition while the walk runs on it. Skip the bracket and the head's
-        // attention writes into whatever tenant owns the address instead, which
-        // is hot-path invariant 7 and surfaces as an illegal access inside the
-        // out-projection rather than anywhere near the cause.
-        //
-        // Priced for this walk: one decode row per sequence, the same way the
-        // forward prices its own rows.
         // **The walk opens no forward of its own, deliberately.**
         //
         // A forward's transient tier is not released when the forward ends — it
@@ -593,13 +583,12 @@ impl Qwen4ExpBatched {
         // reaches it. Uncompressed runs survive only because every key they
         // touch already exists; C8 does not.
         //
-        // This bracket was originally added to fix a `CUDA_ERROR_ILLEGAL_ADDRESS`
-        // in the head's out-projection. It did not: the run after adding it
-        // failed identically. What fixed that was passing the GROUP-RELATIVE
-        // slot-header index (`0`, not the absolute KV layer) — see
-        // `head_draft_step`. The bracket was credited for a fix it had no part
-        // in, and then cost every compressed rung.
-        let open_forward = || Ok(());
+        // A bracket here was originally added to fix a
+        // `CUDA_ERROR_ILLEGAL_ADDRESS` in the head's out-projection. It did not:
+        // the run after adding it failed identically. What fixed that was
+        // passing the GROUP-RELATIVE slot-header index (`0`, not the absolute KV
+        // layer) — see `head_draft_step`. The bracket was credited for a fix it
+        // had no part in, and then cost every compressed rung.
 
         // **The walk rolls back the KV; the index cache is ours to roll back.**
         //
@@ -672,7 +661,6 @@ impl Qwen4ExpBatched {
             committed,
             &seed_block,
             max_len,
-            open_forward,
             &mut step,
         );
         for (&s, snap) in seqs.iter().zip(&snaps) {

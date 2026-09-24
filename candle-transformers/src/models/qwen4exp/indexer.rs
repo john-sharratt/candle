@@ -51,7 +51,7 @@ use crate::models::delta_net::mix::SeqSpan;
 use crate::models::operand_guard::expect_dense;
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::wave_buffers::wave_from_vec_ticketed;
-use candle::cuda_backend::wave_provenance::WaveTicket;
+use candle::wave_provenance::WaveTicket;
 
 use crate::models::rope_schedule::FactoredRope;
 

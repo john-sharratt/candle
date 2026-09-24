@@ -5,8 +5,8 @@
 
 use super::compute::QMatMul;
 use crate::models::profile::{ProfileMark, ProfileSnapshot};
-use candle::cuda_backend::wave_provenance::WaveTicket;
 use candle::quantized::GgmlDType;
+use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};

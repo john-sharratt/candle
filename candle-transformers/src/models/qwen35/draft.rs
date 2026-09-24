@@ -404,10 +404,6 @@ pub fn draft_cohort(
         committed,
         &seed_block,
         max_len,
-        // Nothing to open: this head's block runs through
-        // `forward_layer_batched_mixed`, which lays its spans out in whatever
-        // tier is already placed rather than wanting one of its own.
-        || Ok(()),
         &mut step,
     )
 }

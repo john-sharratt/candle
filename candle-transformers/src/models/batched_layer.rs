@@ -39,7 +39,7 @@ use candle::LiveTensor;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::WaveGeneration;
 
-use candle::cuda_backend::wave_provenance::WaveTicket;
+use candle::wave_provenance::WaveTicket;
 
 use crate::models::wave_buffers::wave_from_vec_ticketed;
 

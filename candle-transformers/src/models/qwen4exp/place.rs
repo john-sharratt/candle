@@ -10,7 +10,7 @@
 //! it loads it, at the key's own position, so a page's placement is the same
 //! wherever it sits and whatever RoPE schedule reads it.
 
-use candle::cuda_backend::wave_provenance::WaveTicket;
+use candle::wave_provenance::WaveTicket;
 use candle::{DType, Result, Tensor};
 
 use super::indexer::{i64_ptr, tensor_ptr};

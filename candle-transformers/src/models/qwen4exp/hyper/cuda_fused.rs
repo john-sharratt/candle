@@ -23,7 +23,7 @@
 
 use candle::backend::BackendStorage;
 use candle::cuda_backend::cudarc::driver::{CudaStream, DevicePtr};
-use candle::{DType, Result, Tensor};
+use candle::{DType, LiveTensor, Result, Tensor};
 use candle_kernels::simple::gr_hyper::{run_gr_combine, run_gr_mix, run_gr_norm, GR_MAX_HC};
 
 use candle_nn::kv_cache::WaveGeneration;
@@ -45,7 +45,11 @@ struct Operand {
 /// Contiguity is required (the kernels index `row · d + j` with no stride
 /// metadata) but a nonzero start offset is not: it is added to the pointer
 /// here and folded into `vec_ok`.
-fn with_operand<R>(t: &Tensor, what: &str, f: impl FnOnce(Operand, &CudaStream) -> R) -> Result<R> {
+fn with_operand<R>(
+    t: &LiveTensor<'_>,
+    what: &str,
+    f: impl FnOnce(Operand, &CudaStream) -> R,
+) -> Result<R> {
     expect_dtype(t, DType::F32, what)?;
     if !t.is_contiguous() {
         candle::bail!(
@@ -163,9 +167,17 @@ pub fn mix(
 /// The kernel reads `res` and writes `dst`, which is why the two must be
 /// different buffers; with `None` this allocates a fresh one, as the reference
 /// path and the tests do.
+///
+/// `block_out` is borrowed at the caller's wave lifetime rather than taken as an
+/// owned `Tensor`, because it is the mixer's or the MoE's output and still sits
+/// on that phase's arena span. Requiring a `Tensor` here is what used to force
+/// every call site to `to_owned_tensor` first — a full `[rows, n_embd]` copy
+/// *and* a pool allocation, per layer, per wave, to hand this kernel bytes it
+/// only reads. The result is unaffected: it is `dst` or a fresh allocation, so
+/// it never aliases `block_out` and stays owned.
 pub fn combine(
     res: &Tensor,
-    block_out: &Tensor,
+    block_out: &LiveTensor<'_>,
     inject: &Tensor,
     dst: Option<&Tensor>,
 ) -> Result<Tensor> {

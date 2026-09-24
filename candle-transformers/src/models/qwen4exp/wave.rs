@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use candle::quantized::cuda::to_dynamic;
-use candle::{DType, Device, Result, Tensor};
+use candle::{DType, Device, LiveTensor, Result, Tensor};
 use candle_kernels::simple::qsa_topk::MAX_KEEP;
 use candle_nn::kv_cache::{
     begin_forward, begin_wave, end_wave_transient, ffn_work_dtype, plan_wave_transient,
@@ -2583,7 +2583,7 @@ impl Qwen4ExpBatched {
         // Sub-block finiteness probes for the layer bisect — sync readbacks,
         // so they exist only in `tensor-assert` diagnostic builds.
         #[cfg(feature = "tensor-assert")]
-        fn probe(li: usize, name: &str, t: &Tensor) {
+        fn probe(li: usize, name: &str, t: &LiveTensor<'_>) {
             let m = t
                 .abs()
                 .and_then(|a| a.flatten_all())
@@ -2727,7 +2727,7 @@ impl Qwen4ExpBatched {
                     if let Some(c) = cap_map.as_mut() {
                         c.delta.filled[ord] = true;
                     }
-                    mixed.to_owned_tensor()?
+                    mixed
                 }
                 GpuLayerMix::Attention {
                     w,
@@ -2781,7 +2781,25 @@ impl Qwen4ExpBatched {
                         head_dim: cfg.attn_head_dim,
                         rotary: &m.rotary,
                     };
-                    let mut parts: Vec<Tensor> = Vec::with_capacity(2);
+                    // The two branches' outputs stay on the mixer's span. They
+                    // are read once, by the combine below, inside the same
+                    // phase — so owning them was a full `[rows, n_embd]` copy
+                    // into a fresh pool allocation, per branch, per layer, per
+                    // wave, to hand a kernel bytes it only reads. A pure-decode
+                    // wave now copies nothing at all here; a mixed one pays only
+                    // the `cat`.
+                    //
+                    // The generation is handed to the projection rather than
+                    // left as `None`: the attention phase's plan already prices
+                    // this layer's Q/K/V splits and out-projection output
+                    // (`WaveBuffer::{QSplit, KSplit, VContiguous, OProjOutput}`,
+                    // all of which name `LayerPhase::Attention`), so passing
+                    // nothing spent that ground on the pool instead. It is also
+                    // what binds `'w` here — without it these outputs type as
+                    // `'static` while the provenance they inherit from `h` puts
+                    // them on the span regardless, which is a lifetime the
+                    // compiler cannot police.
+                    let mut parts: Vec<LiveTensor<'_>> = Vec::with_capacity(2);
                     let mut cache_refs: Vec<&mut KvCache> = contexts
                         .iter_mut()
                         .map(|c| &mut c.kv_caches.caches[kv])
@@ -2802,9 +2820,9 @@ impl Qwen4ExpBatched {
                             &dec_params,
                             kv,
                             dec_sel.as_ref(),
-                            None,
+                            mix_wave.as_ref(),
                         )?;
-                        parts.push(out.to_owned_tensor()?.reshape((n_decode, n_embd))?);
+                        parts.push(out.reshape((n_decode, n_embd))?);
                     }
                     if pre_rows > 0 {
                         let x_g = TensorCat::from_cat_tensor(
@@ -2821,14 +2839,22 @@ impl Qwen4ExpBatched {
                             &pre_params,
                             kv,
                             pre_sel.as_ref(),
-                            None,
+                            mix_wave.as_ref(),
                         )?;
-                        parts.push(out.to_owned_tensor()?.reshape((pre_rows, n_embd))?);
+                        parts.push(out.reshape((pre_rows, n_embd))?);
                     }
                     if parts.len() == 1 {
                         parts.pop().unwrap()
                     } else {
-                        Tensor::cat(&parts, 0)?
+                        // `LiveTensor::cat`, not `Tensor::cat`. `Tensor` is
+                        // `LiveTensor<'static>`, so spelling it that way makes
+                        // the bound `AsRef<LiveTensor<'static>>` and forces the
+                        // elements to `'static` — the `Vec<LiveTensor<'_>>`
+                        // above becomes an inert annotation, and `cat` then
+                        // allocates the concatenation on the ticket it inherits
+                        // from `parts[0]` under a same-generation premise the
+                        // call site is no longer supplying.
+                        LiveTensor::cat(&parts, 0)?
                     }
                 }
             };
@@ -2842,6 +2868,13 @@ impl Qwen4ExpBatched {
             probe(li, "post_mix.res", &res);
             // The mixer's span is done with: `res` is the residual, which lives
             // outside the tier, and nothing below reads a mixer transient.
+            //
+            // `y` borrows this guard, and that borrow is what the compiler
+            // polices — not by forcing a drop here (the borrow ends at `y`'s
+            // last use, which is the combine above), but by refusing any *later*
+            // read of it. Moving the combine below this line does not compile,
+            // which is the property that matters: a phase output cannot be named
+            // after the generation that reclaims its range.
             #[cfg(feature = "cuda")]
             drop(mix_wave);
 
@@ -2892,10 +2925,12 @@ impl Qwen4ExpBatched {
             let moe_wave = ffn_wave.as_ref();
             #[cfg(not(feature = "cuda"))]
             let moe_wave = None;
+            // On the FFN span, like the mixer's output above: the combine below
+            // reads it inside the same phase, so owning it was a full
+            // `[rows, n_embd]` copy into a pool allocation on *every* layer.
             let y2 = layer
                 .moe
                 .forward_dynamic(acts, DType::F32, n_decode, moe_wave)?
-                .to_owned_tensor()?
                 .reshape((total_rows, n_embd))?;
             #[cfg(feature = "tensor-assert")]
             probe(li, "moe.y2", &y2);
@@ -2906,7 +2941,8 @@ impl Qwen4ExpBatched {
             #[cfg(feature = "tensor-assert")]
             probe(li, "post_moe.res", &res);
             // Same reasoning as the mixer's drop above: `res` has left the span,
-            // and the next layer's mixer phase needs this one closed.
+            // `y2`'s borrow ended at the combine, and the next layer's mixer
+            // phase needs this one closed.
             #[cfg(feature = "cuda")]
             drop(ffn_wave);
         }

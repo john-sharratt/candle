@@ -19,7 +19,7 @@ use candle_kernels::delta_net::{
 use super::mix::{DeltaNetLayerTable, DeltaNetSeq, DeltaNetSpanTable, SeqSpan};
 use super::state_store::RecurrentStateStore;
 use crate::models::wave_buffers::{wave_from_vec, wave_from_vec_ticketed};
-use candle::cuda_backend::wave_provenance::WaveTicket;
+use candle::wave_provenance::WaveTicket;
 use candle_nn::kv_cache::WaveGeneration;
 
 /// The wave tensors every fused DeltaNet kernel reads through strides, plus

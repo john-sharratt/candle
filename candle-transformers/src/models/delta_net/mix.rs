@@ -43,7 +43,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use candle::cuda_backend::wave_provenance::WaveTicket;
+use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, DeviceLocation, LiveTensor, Result, Tensor};
 
 use super::types::{DeltaNetDims, ZGate};

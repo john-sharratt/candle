@@ -62,7 +62,7 @@ echo "[harness] ready — opening the conversation."
 # 2) One streaming conversation.
 resp=$(curl -s -N -m 180 -X POST "${BASE}/v1/chat/completions" \
   -H 'Content-Type: application/json' \
-  -d "{\"model\":\"zen-code\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"${PROMPT}\"}]}" 2>&1)
+  -d "{\"model\":\"zen-code\",\"stream\":true,\"conv_id\":\"repro-cuda-fault\",\"messages\":[{\"role\":\"user\",\"content\":\"${PROMPT}\"}]}" 2>&1)
 
 # 3) Verdict.
 sleep 1

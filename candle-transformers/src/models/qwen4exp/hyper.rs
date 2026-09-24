@@ -12,7 +12,7 @@
 //! contiguously exactly as ggml's `[n_embd, hc, T]` does, and the `[hc_dim]`
 //! norm weights apply as a plain broadcast.
 
-use candle::{Result, Tensor};
+use candle::{LiveTensor, Result, Tensor};
 use candle_nn::kv_cache::WaveGeneration;
 
 /// Microbench + `ncu` target for the three fused kernels, with its own
@@ -221,9 +221,14 @@ fn eager_gate_mean(
 /// stream is allocated twice for a whole forward rather than twice per layer —
 /// and the kernel never reads and writes one buffer. `None` allocates, which is
 /// what the reference path and the tests want.
+///
+/// `block_out` is the mixer's or the MoE's output, which is still on that
+/// phase's arena span, so it is borrowed at the phase's lifetime rather than
+/// taken as an owned `Tensor`. The returned residual is not: it is `dst` or a
+/// fresh allocation, and it crosses every phase boundary.
 pub fn hc_combine(
     res: &Tensor,
-    block_out: &Tensor,
+    block_out: &LiveTensor<'_>,
     inject: &Tensor,
     dst: Option<&Tensor>,
 ) -> Result<Tensor> {
@@ -237,11 +242,18 @@ pub fn hc_combine(
 }
 
 /// The scatter as eager ops — the reference [`cuda_fused::combine`] reproduces.
-fn eager_combine(res: &Tensor, block_out: &Tensor, inject: &Tensor) -> Result<Tensor> {
+fn eager_combine(res: &Tensor, block_out: &LiveTensor<'_>, inject: &Tensor) -> Result<Tensor> {
     let (t, hc, _n_embd) = res.dims3()?;
     let w = (candle_nn::ops::sigmoid(&(inject * (1.0 / hc as f64))?)? * 2.0)?;
     let w = w.reshape((t, hc, 1))?;
-    res.add(&block_out.unsqueeze(1)?.broadcast_mul(&w)?)
+    // The scatter term is computed at `block_out`'s lifetime and then taken
+    // owned, because the residual this returns outlives the phase. That copy is
+    // free of the hot path by construction: this is the CPU oracle and the
+    // parity reference — `hc_combine` routes every CUDA device to the fused
+    // kernel above — and off CUDA there is no arena, so `block_out` is ordinary
+    // owned memory whose lifetime is a formality.
+    let scattered = block_out.unsqueeze(1)?.broadcast_mul(&w)?;
+    res.add(&scattered.to_owned_tensor()?)
 }
 
 #[cfg(test)]

@@ -4027,11 +4027,10 @@ fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>
     tokio::spawn(async move {
         // Passthrough conversations are the client's own turns and are not
         // resumable here; the titler's timeline is not a conversation; an
-        // archived one has been distilled and must not take another turn; a
-        // deleted one must stay deleted — `known_conversations` lists
-        // tombstoned timelines, because the sidebar shows them, so excluding
-        // them is this filter's job and not the lister's. An ingest layer
-        // carries no `conv_id` at all and is never listed here to begin with.
+        // archived one has been distilled and must not take another turn. A
+        // deleted one is already absent — `known_conversations` excludes
+        // tombstoned timelines. An ingest layer carries no `conv_id` at all and
+        // is never listed here to begin with.
         let candidates: Vec<(TimelineId, String)> = {
             let engine = state.engine.lock().unwrap();
             let titler = state.titler_timeline;
@@ -4039,10 +4038,7 @@ fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>
                 .known_conversations()
                 .into_iter()
                 .filter(|(tl, conv_id, _, archived, _)| {
-                    *tl != titler
-                        && !*archived
-                        && !engine.is_timeline_tombstoned(*tl)
-                        && !conv_id.starts_with(passthrough::CONV_ID_PREFIX)
+                    *tl != titler && !*archived && !conv_id.starts_with(passthrough::CONV_ID_PREFIX)
                 })
                 .map(|(tl, conv_id, _, _, _)| (tl, conv_id))
                 .collect()
