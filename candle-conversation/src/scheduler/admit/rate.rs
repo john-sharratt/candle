@@ -103,6 +103,11 @@ pub struct ExpertGeometry {
 
 impl ExpertGeometry {
     /// Qwen3.6-35B-A3B as the expert cache opened it on 2026-09-08.
+    ///
+    /// The fixture every test in this module is derived through. Production
+    /// reads the live geometry from the model rather than a recorded one — a
+    /// constant here would be a second answer to a question the engine can ask.
+    #[cfg(test)]
     pub const QWEN36_35B_A3B: Self = Self {
         moe_layers: 41,
         experts_per_layer: 256,
@@ -356,6 +361,7 @@ pub enum Admit {
 }
 
 impl Admit {
+    #[cfg(test)]
     pub fn is_admitted(&self) -> bool {
         matches!(self, Admit::Admitted { .. })
     }
@@ -501,6 +507,10 @@ impl WaveRate {
 
     /// Change the dampening. `alpha` in `(0, 1]`; 1 believes every observation
     /// outright.
+    ///
+    /// A test dial: production runs [`Self::DEFAULT_ALPHA`], sized to this
+    /// machine's ~2x run-to-run band.
+    #[cfg(test)]
     pub fn with_alpha(mut self, alpha: f64) -> Self {
         assert!(alpha > 0.0 && alpha <= 1.0, "alpha must be in (0, 1]");
         self.alpha = alpha;
@@ -509,6 +519,10 @@ impl WaveRate {
 
     /// Change the minimum relative gain an admission must buy. Zero admits
     /// anything that does not make the rate worse.
+    ///
+    /// A test dial, like [`Self::with_alpha`]: production runs
+    /// [`Self::DEFAULT_MIN_GAIN`].
+    #[cfg(test)]
     pub fn with_min_gain(mut self, min_gain: f64) -> Self {
         assert!(min_gain >= 0.0, "a minimum gain cannot be negative");
         self.min_gain = min_gain;
@@ -595,6 +609,10 @@ impl WaveRate {
     /// The prefill rate ceiling as width goes to infinity with residency held:
     /// every row still costs its compute, and nothing else. What an admission
     /// dislodges is the caller's figure and lowers the real ceiling by it.
+    ///
+    /// Asserted against rather than decided with: the fill judges each offer on
+    /// the gain it buys, never against a ceiling.
+    #[cfg(test)]
     pub fn asymptotic_rate(&self) -> f64 {
         1.0 / self.model.compute_secs_per_token
     }
@@ -662,6 +680,7 @@ impl WaveRate {
     /// the first is always admitted. When the routed set saturates the layer
     /// the copy stops growing with decodes, and if that copy fits the answer is
     /// the cap alone (`usize::MAX`).
+    #[cfg(test)]
     pub fn decode_bus_limit(&self, draft: usize, resident: u64) -> usize {
         let per = self.experts_per_decode(draft).max(1);
         let per_expert_secs = self.geometry.slot_bytes as f64 * self.streamed_fraction(resident)
@@ -705,6 +724,7 @@ impl WaveRate {
 
     /// Whether the wave reached a limit this pass. Latched by the first
     /// refusal of either kind; cleared by reset.
+    #[cfg(test)]
     pub fn is_full(&self) -> bool {
         self.full
     }
@@ -721,22 +741,26 @@ impl WaveRate {
     }
 
     /// Prefill rows admitted into the wave since the last reset.
+    #[cfg(test)]
     pub fn tokens(&self) -> usize {
         self.tokens
     }
 
     /// Decodes admitted into the wave since the last reset.
+    #[cfg(test)]
     pub fn decodes(&self) -> usize {
         self.decodes
     }
 
     /// Experts the admitted decodes route to per layer, before the layer cap.
+    #[cfg(test)]
     pub fn routed_per_layer(&self) -> usize {
         self.routed_per_layer
     }
 
     /// Resident weights as the wave stands: the reset figure, then the last
     /// admitted offer's `weights_after`.
+    #[cfg(test)]
     pub fn resident_now(&self) -> u64 {
         self.resident_now
     }
@@ -856,6 +880,14 @@ impl WaveRate {
     ///
     /// A refusal does not latch the wave: this turn is being turned away, not
     /// the ones behind it.
+    ///
+    /// **Not yet on the admission path.** `super::admit_ground` offers prefills
+    /// and charges decodes as continuations; nothing calls this. Wiring it means
+    /// a finished prefill can be *refused* its promotion and held as a finished
+    /// prefill until residency improves, which is a behaviour this engine has
+    /// never run and a wedge if residency never does improve. It wants its own
+    /// change and its own verification, not a line added at the end of another.
+    #[cfg(test)]
     pub fn judge_promotion(
         &mut self,
         draft: usize,
@@ -1142,11 +1174,6 @@ impl WaveRate {
     /// The hit coefficient the model currently believes.
     pub fn hit_rate(&self) -> f64 {
         self.decode.hit_rate
-    }
-
-    /// Every expert's bytes — the denominator of the resident fraction.
-    pub fn expert_total_bytes(&self) -> u64 {
-        self.geometry.total_bytes()
     }
 
     /// Seconds of compute the model currently believes one prefill row costs.

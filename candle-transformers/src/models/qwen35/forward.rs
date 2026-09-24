@@ -62,7 +62,7 @@ use crate::models::batched_layer::{
     WaveAttnGroup,
 };
 use crate::models::batched_model::{WaveGuard, WavePhase};
-use crate::models::expert_lre::{PipelineStats, ProfileSnapshot};
+use crate::models::expert_lre::{PipelineStats, ProfileSnapshot, WeightPlan};
 use crate::models::prefill_utils::SharedPm;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_admit::admit_wave_kv;
@@ -623,6 +623,10 @@ impl ManagedBatchedModel for HybridBatched {
         {
             None
         }
+    }
+
+    fn weight_plan(&self) -> Option<WeightPlan> {
+        WeightPlan::from_stats(&self.expert_stats()?)
     }
 
     fn layer_stream_stats(&self) -> Option<[usize; 7]> {

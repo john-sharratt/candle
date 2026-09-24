@@ -26,6 +26,7 @@
 
 use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
+use super::expert_lre::WeightPlan;
 use crate::models::delta_net::ExportedLayerState;
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
 use crate::models::rope_schedule::rung_of;
@@ -3783,6 +3784,27 @@ pub trait ManagedBatchedModel {
         cap
     }
 
+    /// The wave transient tier a prefill of `rows` rows across `sequences`
+    /// would need, in bytes.
+    ///
+    /// **The same function the tier is actually placed from**, not an estimate
+    /// of it: admission judges an offer on the residency it dislodges, and the
+    /// tier dislodges weights exactly as a region claim does. Pricing it any
+    /// other way lets the two figures drift, and the one that drifts is the one
+    /// the placement then refuses.
+    ///
+    /// The tier is superlinear in *spans*, not only in rows — the mixer's span
+    /// tables hold an entry per span and the prefill scan's transients turn on
+    /// with the first — so `sequences` is not decoration, and a caller that
+    /// prices N admissions as N separate one-sequence waves understates the wave
+    /// they compose.
+    fn wave_tier_bytes(&self, rows: usize, sequences: usize, act_dtype: DType) -> Option<u64> {
+        Some(
+            WavePlan::new(self.wave_geometry(act_dtype))
+                .tier_bytes(WaveWidth::prefill(rows, sequences.max(1))) as u64,
+        )
+    }
+
     /// Rows the KV side has room to admit, or `None` when it cannot say.
     ///
     /// Every token writes one K and one V element per KV head per layer, so the
@@ -5048,6 +5070,17 @@ pub trait ManagedBatchedModel {
         None
     }
 
+    /// The weight side as the wave rate planner prices it — MoE geometry, and
+    /// the range the expert zone may move in.
+    ///
+    /// `None` for a dense model, for a cache that has not yet run a classify,
+    /// and off CUDA. Admission then plans nothing and falls through to its width
+    /// backstop, which is the right answer: a stack with no expert residency has
+    /// no residency to trade a wave's rows against.
+    fn weight_plan(&self) -> Option<WeightPlan> {
+        None
+    }
+
     /// Reservation bytes held by per-sequence recurrent state, for the same
     /// decomposition.
     ///
@@ -5268,6 +5301,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn resident_weight_bytes(&self) -> Option<usize> {
         self.model().resident_weight_bytes()
+    }
+
+    fn weight_plan(&self) -> Option<WeightPlan> {
+        self.model().weight_plan()
     }
 
     fn recurrent_reserved_bytes(&self) -> usize {

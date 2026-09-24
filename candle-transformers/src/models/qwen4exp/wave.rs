@@ -64,6 +64,7 @@ use crate::models::delta_net::{
     RecurrentStateStore, SeqSpan, ZGate,
 };
 use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
+use crate::models::expert_lre::WeightPlan;
 use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::qsa_selection::QsaSelection;
@@ -1885,6 +1886,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
 
     fn expert_stats(&self) -> Option<crate::models::expert_lre::PipelineStats> {
         Some(self.model.experts.expert_stats())
+    }
+
+    fn weight_plan(&self) -> Option<WeightPlan> {
+        WeightPlan::from_stats(&self.model.experts.expert_stats())
     }
 
     /// The PLE row cache's hit/miss/eviction counters (§0.1). The table is

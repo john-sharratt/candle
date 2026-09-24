@@ -268,6 +268,23 @@ impl Scheduler {
     /// wait a whole decode slice when there's no decode work yet.
     pub fn run(&mut self) {
         tracing::info!("scheduler started");
+        // **A seed, deliberately not the measurement.**
+        //
+        // The figure is exact only with nothing in flight, and the idle branch
+        // below is where that is true — every region live there is permanent
+        // (the system prompt, the tool catalog, the resident corpus) and none of
+        // it is the wave's to give back. Here at entry none of that has been
+        // prefilled yet, so this reads a near-empty card and over-states what the
+        // zone can reach; the hold taken from it then defends a residency the
+        // catalog makes unreachable, and every offer refuses on the floor.
+        //
+        // It is still taken, because the alternative is worse: nothing else
+        // writes the static, so an engine that never reaches the idle branch —
+        // a sustained ingest, which never empties all five queues at once —
+        // would read `achievable_weight_now() == None`, a hold of zero, and
+        // admission defending nothing at all. A first pass that is too tight
+        // self-corrects at the first idle; one that defends nothing does not.
+        super::interleave::reseed_achievable_weight();
         // One-time snapshot of the governor's budget partition (capacity C, KV
         // floor, ladder thresholds, per-class reserved, live headroom) so a run's
         // starting VRAM state is visible in the log before any waves.
@@ -392,6 +409,9 @@ impl Scheduler {
                 && self.active_section_ingests.is_empty()
                 && self.deferred_glue_fires.is_empty()
             {
+                // Nothing is in flight, so everything resident is permanent:
+                // the one moment the achievable weight residency is exact.
+                super::interleave::reseed_achievable_weight();
                 // Time ONLY the recv block (not the request handling) — this is the
                 // scheduler idle between requests, attributed to the Idle phase so it
                 // isn't mislabeled as Blocked in the GUI.
@@ -725,6 +745,30 @@ impl Scheduler {
                     );
                 }
                 self.log_kv_memory();
+                // **Is the planner still running on its seeds?** Every figure
+                // it decides with is learned, and the seeds are a measurement of
+                // one card with one checkpoint — the decode one was found 26x
+                // optimistic. A run that admits oddly is asked this first, and
+                // without the line the answer is unobtainable after the fact.
+                if let Some(r) = self.wave_rate.as_ref() {
+                    tracing::debug!(
+                        target: "candle_conversation::scheduler::admission",
+                        link_gbps = r.link_bytes_per_s() / 1e9,
+                        effective_gbps = r.effective_bytes_per_s() / 1e9,
+                        link_fraction = r.link_fraction(),
+                        compute_us_per_row = r.compute_secs_per_token() * 1e6,
+                        layer_us = r.layer_secs() * 1e6,
+                        hit_coefficient = r.hit_rate(),
+                        // The two-cost fit only answers once the observations
+                        // have enough spread to separate the copy from the
+                        // compute; until then both are seeds.
+                        fit_converged = r.cost_fit_converged(),
+                        prefill_samples = r.samples(),
+                        decode_samples = r.decode_samples(),
+                        hit_samples = r.hit_samples(),
+                        "wave rate planner",
+                    );
+                }
                 // Wake the sealing pass now that its ground exists, rather
                 // than leaving it to the 5 s tick. Guarded on there being work —
                 // an atomic load — so an idle engine is not woken once per wave

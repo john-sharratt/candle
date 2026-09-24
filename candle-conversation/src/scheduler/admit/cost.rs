@@ -26,7 +26,9 @@
 //! `active_kv_formats`, and the distinction is the whole reason the function
 //! takes them as an argument rather than reading config.
 
-use candle_nn::kv_cache::{CHUNK_SIZE, REGION_BYTES};
+#[cfg(test)]
+use candle_nn::kv_cache::CHUNK_SIZE;
+use candle_nn::kv_cache::REGION_BYTES;
 
 /// What one admission would take, split by tenant so a refusal can say which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -132,6 +134,14 @@ impl Cost {
 ///
 /// Blocks are 32 tokens, so a sequence part-way through a block pays nothing
 /// for the rest of it: the cost is the blocks the advance actually opens.
+/// Not on the admission path: a turn is priced whole at admission
+/// ([`super::super::admission::prefill_cost_bytes`]), because admitting it
+/// commits the engine to feeding all of it. This prices an *advance* on a
+/// sequence that already holds tokens, which is the question a per-step charge
+/// asks — and run BV is what pricing decodes by the step costs: 95 slots open on
+/// admissions that each cost zero, because thirty-one steps in thirty-two open
+/// no block.
+#[cfg(test)]
 pub(crate) fn kv_bytes_for_advance(held: usize, tokens: usize, per_block: u64) -> u64 {
     if tokens == 0 {
         return 0;

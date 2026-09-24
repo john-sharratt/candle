@@ -1523,11 +1523,24 @@ impl PipelineState {
                 .capacity()
                 .saturating_sub(self.inner.zone.min_capacity())
                 * self.inner.zone.slot_bytes();
+            // The zone's own bounds, in the same currency. The wave rate planner
+            // weighs an admission against the residency it dislodges, so it needs
+            // where the zone stands and the range it may move in — and those are
+            // the zone's to say, not the KV side's, which can only observe what
+            // it was conceded after the fact.
+            let slot_bytes = self.inner.zone.slot_bytes();
+            let zone_bytes = self.inner.zone.capacity() * slot_bytes;
+            let zone_min_bytes = self.inner.zone.min_capacity() * slot_bytes;
+            let zone_max_bytes = self.inner.zone.limit() * slot_bytes;
             if let Ok(mut s) = self.stats.lock() {
                 s.expert_hits += num_hits;
                 s.expert_misses += num_loaded;
                 s.dma_loads += num_loaded;
                 s.zone_cedeable_bytes = cedeable;
+                s.zone_bytes = zone_bytes;
+                s.zone_min_bytes = zone_min_bytes;
+                s.zone_max_bytes = zone_max_bytes;
+                s.expert_slot_bytes = slot_bytes;
                 #[cfg(feature = "cuda")]
                 {
                     s.resident_vram_bytes = resident_vram;

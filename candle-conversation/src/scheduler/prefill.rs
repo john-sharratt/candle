@@ -1,8 +1,9 @@
 use super::admission::{
-    admit_quantum, backlog_admit_action, budget_notches, decode_reserve_bytes, evidence_admit_grow,
-    evidence_ticks_for, per_block_kv_bytes, plan_admission, prefill_cost_bytes, BacklogAction,
-    BandParams, ThrottleReason,
+    admit_quantum, backlog_admit_action, budget_notches, evidence_admit_grow, evidence_ticks_for,
+    per_block_kv_bytes, BacklogAction, ThrottleReason,
 };
+use super::admit;
+use super::admit_ground::AdmitPass;
 use super::*;
 use crate::persistence::thread::effective_turn_policy;
 use crate::recorded_reply::replayed_step;
@@ -59,27 +60,6 @@ fn env_regions(var: &str) -> Option<usize> {
         .filter(|&n| n > 0)
 }
 
-/// Per-**sequence** transient-activation reserve for a LOAD-phase (prefill /
-/// ingest) forward, in bytes. The reserve band grows by this coefficient for
-/// each sequence co-batched into the imminent forward (see `vram_band_for`),
-/// so a wide batch — which a large card admits — reserves in proportion to its
-/// peak instead of a flat card fraction. Default 384 MiB: a prefill/ingest
-/// sequence's activation buffers plus its share of the MoE expert gather.
-/// Override with `CANDLE_VRAM_PER_SEQ_LOAD_MB` (the true value depends on the
-/// model's per-token activation footprint and prefill width). Cached on first read.
-const DEFAULT_VRAM_PER_SEQ_LOAD_MB: usize = 384;
-fn per_seq_load_bytes() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        let mb = std::env::var("CANDLE_VRAM_PER_SEQ_LOAD_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&mb| mb > 0)
-            .unwrap_or(DEFAULT_VRAM_PER_SEQ_LOAD_MB);
-        mb * 1024 * 1024
-    })
-}
-
 /// The region quantum in bytes.
 fn region_bytes() -> u64 {
     candle_nn::kv_cache::REGION_BYTES as u64
@@ -132,13 +112,6 @@ const RELIEF_OVERSHOOT_REGIONS: usize = 8;
 /// wedge still backs off, one halving per grace period. Device-OOM shrinks at
 /// its own site instantly.
 const PROMOTE_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// Minimum wall-clock between "admitted nothing" throttle traces. The admission
-/// pass runs many times a second, and a queue the budget won't take reproduces
-/// the same line every iteration until the budget or the queue moves — without a
-/// cooldown a single throttled ingest floods the log at the loop rate. Passes
-/// that DID admit are never suppressed: their rate is bounded by real work.
-const ADMIT_STARVED_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn env_pct(var: &str, default: usize, max: usize) -> usize {
     std::env::var(var)
@@ -459,7 +432,35 @@ impl Scheduler {
         } else {
             emit!(debug);
         }
+        // **Relief that shed something is an admission opportunity too.** Unlike
+        // a completion it can happen with nothing finishing at all, and a pass
+        // gated only on completions would leave that ground unoffered until the
+        // next slot ended — which on a stalled engine is never.
+        if acted {
+            self.settled_since_admit = true;
+        }
         still
+    }
+
+    /// Rows the next wave already carries before admission adds anything: the
+    /// held creep group, which rides that wave whole.
+    ///
+    /// **Charged to the wave before any offer is judged**, for two reasons. The
+    /// offers behind it are then priced against the forward that will actually
+    /// run rather than an empty one — a cohort already in flight is most of the
+    /// copy those offers would otherwise look like they were amortising alone.
+    /// And it denies the head waiver: the model carries its first offer
+    /// unconditionally so a slot too large to ever fit cannot block the queue
+    /// forever, and a wave already carrying a cohort is not that case.
+    pub(super) fn standing_rows(&self) -> usize {
+        self.wave_prefill_members
+            .iter()
+            .map(|m| match m {
+                WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => {
+                    *advance
+                }
+            })
+            .sum()
     }
 
     /// Bytes one 32-token KV block costs across the whole model, in the formats
@@ -492,7 +493,7 @@ impl Scheduler {
     /// A transient double-occupancy is a *reserve* — a fixed pool the compressor
     /// draws on — not a per-block tariff. That is what §7 means and it is still
     /// unbuilt.
-    fn per_block_kv_bytes(&self) -> u64 {
+    pub(super) fn per_block_kv_bytes(&self) -> u64 {
         let (k, v) = self.session.active_kv_formats();
         per_block_kv_bytes(
             self.session.num_layers(),
@@ -533,52 +534,32 @@ impl Scheduler {
     /// the relief pass ahead of admission actually evicts it. Measured, not
     /// forecast, which is why nothing has to be added back or discounted.
     pub(super) fn admit_budget_ceiling(&self) -> u64 {
-        // No forward reserve is subtracted here: it is width-dependent, and
-        // `plan_admission` holds it back at the width it is choosing. See
-        // `admit_band_params`. The setpoint IS subtracted — those regions are
-        // the relief pass's working room, not admission's to spend.
+        // No forward reserve is subtracted here: admission holds the tier back
+        // itself, at the width it is choosing (`Scheduler::admit_headroom`). The
+        // setpoint IS subtracted — those regions are the relief pass's working
+        // room, not admission's to spend.
         let Some((free, setpoint)) = self.kv_region_state(VramPhase::Load) else {
             return 0;
         };
         (free.saturating_sub(setpoint) as u64).saturating_mul(region_bytes())
     }
 
-    /// Bytes the work already in flight will still allocate this pass: every
-    /// active prefill's *remaining* tokens, plus the amortised per-step growth of
-    /// the live decodes. This is charged against the budget before anything new
-    /// is admitted — committed work is never displaced by a fresh candidate.
-    fn in_flight_cost_bytes(&self, per_block: u64) -> u64 {
-        // KV only. The transient share of in-flight sequences is priced by the
-        // reserve, which `plan_admission` evaluates at `live_width + n`.
-        let prefill: u64 = self
-            .active_prefills
-            .iter()
-            .filter(|p| p.error.is_none())
-            .map(|p| prefill_cost_bytes(p.work.tokens.len().saturating_sub(p.offset), per_block))
-            .sum();
-        let sections: u64 = self
-            .active_section_ingests
-            .iter()
-            .filter(|s| s.error.is_none())
-            .map(|s| prefill_cost_bytes(s.tokens.len().saturating_sub(s.offset), per_block))
-            .sum();
-        prefill
-            .saturating_add(sections)
-            .saturating_add(decode_reserve_bytes(self.decode_width(), per_block))
-    }
-
-    /// Admit queued prefills against the VRAM byte budget.
+    /// Admit queued prefills against what they do to the wave's throughput.
     ///
     /// A burst of small parallel scopes (code_read's worker count), a bulk
     /// collection ingest's per-section prefills, or a batch of calibration cases
-    /// all arrive here. What coalesces into one ragged forward is whatever fits
-    /// the budget: the largest queued candidate that fits, then the rest of the
-    /// queue in submission order (see [`plan_admission`]).
+    /// all arrive here. What coalesces into one ragged forward is whatever makes
+    /// the wave *faster* carrying it: offers are taken in priority order
+    /// ([`admit::order`]), priced against the state the eviction pass just
+    /// settled ([`admit::cost`]), and admitted while the rate improves
+    /// ([`admit::rate`]) without crossing the residency the engine defends
+    /// ([`admit::gate`]).
     ///
     /// [`Scheduler::MAX_PREFILL_WIDTH`] is a backstop above this, not the
-    /// control; [`Scheduler::MIN_PREFILL_WIDTH`] keeps ≥1 in flight regardless,
-    /// so an oversized lone turn still runs and is bounded by the per-arena VRAM
-    /// gate (which compacts or fails fast rather than spilling to host memory).
+    /// control. The keep-one-alive rule below is what guarantees progress: a
+    /// pass that admits nothing with nothing in flight takes the queue head
+    /// regardless, so an oversized lone turn still runs and is bounded by the
+    /// per-arena VRAM gate rather than by a refusal it can never clear.
     pub(super) fn promote_new_prefills(&mut self) {
         if self.prefill_queue.is_empty() {
             return;
@@ -626,147 +607,183 @@ impl Scheduler {
             return;
         }
 
-        let per_block = self.per_block_kv_bytes();
-        // Two independent limits — see `plan_admission`. `available` is what the
-        // card has and the forward reserve comes out of it; `setpoint` caps how
-        // much KV admission may add. Do not pre-combine them.
-        let available = self.admit_budget_ceiling();
-        let setpoint = self.admit_budget;
-        let live = self.in_flight_cost_bytes(per_block);
-        let live_width = self.prefill_width() + self.section_ingest_width();
-        let band = self.admit_band_params();
-        let costs: Vec<u64> = self
-            .prefill_queue
-            .iter()
-            .map(|w| prefill_cost_bytes(w.tokens.len(), per_block))
-            .collect();
-        let room = Self::MAX_PREFILL_WIDTH - in_flight;
-
-        let mut plan = plan_admission(available, setpoint, live, live_width, &costs, room, &band);
-        // Keep at least one prefill in flight even when nothing fits: an engine
-        // that admits nothing makes no progress, and the alternative to a lone
-        // oversized turn running is it never running at all. A turn forced
-        // through here is still bounded by the per-arena VRAM gate, which
-        // compacts or fails fast rather than spilling to host memory.
+        // **The decision is a rate, not a fit.**
         //
-        // The forced pick is the QUEUE HEAD, not the cheapest candidate.
-        // Cheapest-first looks attractive — it fits the most work into a floored
-        // budget — but under a budget that stays at the floor it becomes a
-        // starvation loop: the expensive directories are never the cheapest, so
-        // they are passed over on every pass while cheap ones keep arriving.
-        // Measured on this workload with the budget pinned at 256 MiB and a
-        // 384 MiB head: every forced admission took a 12-54 MiB candidate and no
-        // large directory ever ran. FIFO bounds each item's wait by the queue
-        // ahead of it.
-        if plan.admitted.is_empty() && in_flight < Self::MIN_PREFILL_WIDTH && !costs.is_empty() {
-            plan.spent = costs[0];
-            plan.admitted.push(0);
-            plan.skipped -= 1;
-        }
-
-        // Trace the pass whenever it admitted something — a real event, bounded in
-        // rate by how fast work actually drains. A pass that admitted NOTHING is
-        // the more interesting signal (queued work the budget won't take) but it
-        // repeats every loop iteration until the budget or the queue moves, so it
-        // is rate-limited to one line per [`ADMIT_STARVED_LOG_INTERVAL`].
-        let starved = plan.admitted.is_empty();
-        let due = self
-            .last_admit_starved_log
-            .is_none_or(|t| t.elapsed() >= ADMIT_STARVED_LOG_INTERVAL);
-        if !starved || due {
-            if starved {
-                self.last_admit_starved_log = Some(std::time::Instant::now());
+        // Admission used to ask whether an offer's bytes fitted the ground
+        // standing free above the weight floor. That question has no answer in
+        // tokens a second: a wave of 250 rows and a wave of 2,000 pay the *same*
+        // expert copy — a prefill forward needs every expert, resident or
+        // streamed — so the narrow one is not cheaper, it is slower per row. A
+        // gate that admits by fit stops widening the moment the bytes run out,
+        // which on this card measured ~470 tok/s against a modelled 1,210 at the
+        // same residency.
+        //
+        // The bytes have not gone away: they are what the offer *costs*, read by
+        // the model as the residency it dislodges, which is what makes a wide
+        // wave stop being worth it. They are one term in a throughput comparison
+        // now rather than the whole question.
+        let Some(mut rate) = self.take_planner() else {
+            // No weight side to trade rows against — a dense stack, or an expert
+            // cache that has not published its gauges yet (which is every engine
+            // before its first classify). There is no rate question to ask, so
+            // the queue head goes in and the width backstop is the only bound.
+            // Without this an engine would never take the first prefill that
+            // makes the cache describe itself.
+            if let Some(work) = self.prefill_queue.pop_front() {
+                self.begin_prefill(work);
             }
-            const MIB: u64 = 1 << 20;
+            return;
+        };
+        let mut pass = AdmitPass::new(self);
+        let filled = admit::fill(&mut pass, &mut rate);
+        self.wave_rate = Some(rate);
+        // **Keep one prefill in flight, whatever the model says.**
+        //
+        // The engine's deadlock-freedom rule, and the one guarantee no
+        // throughput judgement may override: an engine that admits nothing makes
+        // no progress, and nothing completes, so nothing frees the ground the
+        // refusal was about. The wave then refuses the same turn on the same
+        // grounds forever.
+        //
+        // `fill` has its own version of this — it carries its first offer
+        // unconditionally — but that waiver is keyed on the *wave* being empty,
+        // and a wave is not empty while a decode is still stepping. So a turn
+        // arriving behind a decode is judged on its merits, which is right, and
+        // if it is refused while nothing is prefilling there is nothing left to
+        // create the conditions for it to be admitted later.
+        //
+        // This is the rule the byte-fit planner carried as `MIN_PREFILL_WIDTH`,
+        // restored after its absence wedged a live daemon: two turns queued,
+        // nothing in flight, `stopped_on_weights` on every pass, and the loop
+        // spinning in relief that could not help because the ground it wanted
+        // was not the ground being refused.
+        //
+        // FIFO, not the cheapest that fits: under a budget stuck at its floor,
+        // cheapest-first starves the expensive work permanently, and the
+        // expensive work is never the cheapest.
+        if filled.prefills == 0 && self.active_prefills.is_empty() {
+            if let Some(work) = self.prefill_queue.pop_front() {
+                tracing::debug!(
+                    target: "candle_conversation::scheduler::throttle",
+                    queued = self.prefill_queue.len() + 1,
+                    stopped_on_weights = filled.stopped_on_weights,
+                    stopped_on_rate = filled.stopped_on_rate,
+                    "admission refused every offer with nothing in flight; \
+                     forcing the queue head so the engine makes progress",
+                );
+                self.begin_prefill(work);
+            }
+        }
+        // The pass acted on the completions that opened it; the next one waits
+        // for its own.
+        self.settled_since_admit = false;
+        if filled.prefills > 0
+            || filled.stopped_on_weights
+            || filled.stopped_on_rate
+            || !self.prefill_queue.is_empty()
+        {
             tracing::debug!(
                 target: "candle_conversation::scheduler::throttle",
-                available_mib = available / MIB,
-                setpoint_mib = setpoint / MIB,
-                live_mib = live / MIB,
-                spent_mib = plan.spent / MIB,
-                admitted = plan.admitted.len(),
-                skipped = plan.skipped,
+                admitted = filled.prefills,
                 in_flight,
-                head_cost_mib = costs.iter().copied().max().unwrap_or(0) / MIB,
-                reserve_mib = super::admission::reserve_for_width(
-                    live_width + plan.admitted.len(),
-                    &band,
-                ) / MIB,
+                queued = self.prefill_queue.len(),
+                // **The one field that distinguishes "refused" from "never
+                // asked".** A pass that skips admits nothing and refuses
+                // nothing, which reads identically to a pass that judged every
+                // offer and turned it down — and the two call for opposite
+                // fixes.
+                skipped = filled.skipped,
+                // Which of the two ends a pass stopped at is the signal worth
+                // having: weights means the device is the bound and the producer
+                // should hear about it, rate means the engine is working well and
+                // the queue simply rides the next wave.
+                stopped_on_weights = filled.stopped_on_weights,
+                stopped_on_rate = filled.stopped_on_rate,
                 "admission pass"
             );
         }
-
-        // Remove by descending index so earlier positions stay valid as we take
-        // them out of the queue.
-        let mut take = plan.admitted;
-        take.sort_unstable_by(|a, b| b.cmp(a));
-        let mut admitted: Vec<PrefillWork> = take
-            .into_iter()
-            .filter_map(|i| self.prefill_queue.remove(i))
-            .collect();
-        // …then restore submission order among the admitted set.
-        admitted.reverse();
-
-        for work in admitted {
-            let total = work.tokens.len();
-            let _ = work
-                .event_tx
-                .send(TurnEvent::Prefill(work.prefill_text.clone()));
-            let _ = work.event_tx.send(TurnEvent::PrefillProgress {
-                tokens_done: 0,
-                tokens_total: total,
-            });
-            let error = if total == 0 {
-                Some(ConversationError::Channel(
-                    "prefill received zero tokens".into(),
-                ))
-            } else {
-                None
-            };
-            // No index cut here. Admission is not a unit boundary — it is the
-            // moment work leaves the queue, which happens once per unit but says
-            // nothing about where that unit's tokens start. The boundary was
-            // taken with the unit's K/V anchor (`Scheduler::close_unit_boundary`),
-            // and a second cut on this slot would close whatever the unit has
-            // already forwarded into a page of its own.
-            self.active_prefills.push(ActivePrefill {
-                work,
-                offset: 0,
-                next_projection: 0,
-                final_logits: None,
-                error,
-                prefill_start: None,
-            });
-        }
     }
 
-    /// The load-phase band's terms, for admission to evaluate at the width it is
-    /// choosing rather than the width already in flight. Same `base`, `per_seq`
-    /// and capacity clamp the pressure/relief gates use via
-    /// [`Self::vram_band_for`] — one reserve law, two evaluation points.
+    /// The planner, built on first use and taken for the duration of a pass.
     ///
-    /// Splitting `per_seq` into a shared term (the MoE expert gather, which the
-    /// whole batch pays once) plus a smaller marginal one is a measured dead end,
-    /// however physical the argument sounds. At 512 MiB shared + 128 MiB
-    /// marginal on the 16 GiB card it changed whole-phase calibration by 0.5%
-    /// (981s → 976s, 472 → 475 tok/s) — inside run-to-run noise, because a wider
-    /// batch holds more KV and `available` is measured after that KV lands, so
-    /// width re-equilibrates at the same place. The same pass then lost 9 of 314
-    /// directories to arena refusals where the unsplit law lost none.
+    /// Taken rather than borrowed because the pass borrows the whole scheduler:
+    /// [`admit::fill`] needs `&mut` on both the ground and the planner, and they
+    /// live in the same struct. It goes back the moment the pass ends.
     ///
-    /// The trap that makes it look like a win: throughput decays as the substrate
-    /// fills (the baseline's own halves run 595 then 329 tok/s), so a sample
-    /// taken from the first minutes of calibration reads ~2x a sample taken from
-    /// the middle. Compare whole phases, never windows.
-    fn admit_band_params(&self) -> BandParams {
-        BandParams {
-            per_seq: per_seq_load_bytes() as u64,
-            capacity: self
-                .session
-                .vram_governor()
-                .map(|g| g.capacity())
-                .unwrap_or(0),
+    /// `None` while the model cannot describe its weight side — see
+    /// [`ManagedBatchedModel::weight_plan`].
+    fn take_planner(&mut self) -> Option<admit::WaveRate> {
+        if self.wave_rate.is_none() {
+            let p = self.model.weight_plan()?;
+            let geometry = admit::rate::ExpertGeometry {
+                moe_layers: p.moe_layers,
+                experts_per_layer: p.experts_per_layer,
+                slot_bytes: p.slot_bytes,
+            };
+            // Measured on the device the experts actually stream over, so the
+            // 4090 Mobile, the 3090 behind PCIe 3.0 and the Blackwell each seed
+            // from their own bus rather than from a datasheet.
+            let rate = match admit::WaveRate::measure(
+                &self.device,
+                geometry,
+                admit::rate::RateModel::default(),
+                admit::rate::DecodeModel::default(),
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("wave rate planner: link probe failed: {e}");
+                    return None;
+                }
+            };
+            tracing::info!(
+                target: "candle_conversation::scheduler::admission",
+                moe_layers = p.moe_layers,
+                experts_per_layer = p.experts_per_layer,
+                slot_mib = p.slot_bytes >> 20,
+                link_gbps = rate.link_bytes_per_s() / 1e9,
+                "wave rate planner armed",
+            );
+            self.wave_rate = Some(rate);
         }
+        self.wave_rate.take()
+    }
+
+    /// Put one admitted turn into flight.
+    ///
+    /// The tail of admission, and the whole of what admitting a prefill *does*:
+    /// announce it to its caller and move it onto `active_prefills`. Separate
+    /// from the pass that chooses it so the choosing can be replaced without
+    /// touching what the choice means.
+    pub(super) fn begin_prefill(&mut self, work: PrefillWork) {
+        let total = work.tokens.len();
+        let _ = work
+            .event_tx
+            .send(TurnEvent::Prefill(work.prefill_text.clone()));
+        let _ = work.event_tx.send(TurnEvent::PrefillProgress {
+            tokens_done: 0,
+            tokens_total: total,
+        });
+        let error = if total == 0 {
+            Some(ConversationError::Channel(
+                "prefill received zero tokens".into(),
+            ))
+        } else {
+            None
+        };
+        // No index cut here. Admission is not a unit boundary — it is the moment
+        // work leaves the queue, which happens once per unit but says nothing
+        // about where that unit's tokens start. The boundary was taken with the
+        // unit's K/V anchor (`Scheduler::close_unit_boundary`), and a second cut
+        // on this slot would close whatever the unit has already forwarded into
+        // a page of its own.
+        self.active_prefills.push(ActivePrefill {
+            work,
+            offset: 0,
+            next_projection: 0,
+            final_logits: None,
+            error,
+            prefill_start: None,
+        });
     }
 
     /// Free KV regions right now, and the setpoint for `phase` — the two
@@ -783,7 +800,7 @@ impl Scheduler {
     /// `None` before the reservation exists, which the callers read as "no
     /// pressure, nothing to spend": there is no KV on the device yet to be
     /// under pressure about.
-    fn kv_region_state(&self, phase: VramPhase) -> Option<(usize, usize)> {
+    pub(super) fn kv_region_state(&self, phase: VramPhase) -> Option<(usize, usize)> {
         let stats = self.kv_regions()?;
         Some((
             stats.free + stats.blocked,
@@ -1598,6 +1615,9 @@ impl Scheduler {
                 continue;
             }
             let s = self.active_section_ingests.swap_remove(i);
+            // A sealed section hands its scratch slot back — a completion like
+            // any other, and an admission opportunity.
+            self.settled_since_admit = true;
             if let Some(e) = s.error {
                 let _ = s.response_tx.send(Err(e));
                 continue;
@@ -2458,6 +2478,18 @@ impl Scheduler {
             if sc_seqs > 0 {
                 self.wave_stats.record_section(sc_seqs, sc_tok, sc_kv, ms);
             }
+            // **Teach the planner what this machine actually did.** A forward is
+            // `T = X/bw + W·c` — non-resident expert bytes over the bus, plus
+            // compute for the rows — so one observation is one equation in two
+            // unknowns and a set of them at different widths and residencies
+            // determines both. Without this the model runs on its seeds forever,
+            // and the seeds are a measurement of one card with one checkpoint:
+            // the decode one was found 26x optimistic, which is why the model
+            // refuses to judge on it until it has samples.
+            //
+            // Prefill and section rows are both prefill rows to the model — the
+            // copy is per forward, and they rode the same one.
+            self.observe_prefill_forward(pf_tok + sc_tok, t_seg2.elapsed().as_micros() as u64);
             // Every completed wave forward is OOM-free prefill throughput —
             // the progress signal the stall-grace gate and evidence reopen
             // read. Without this, pump-driven phases (scope ingest, section
@@ -2563,6 +2595,24 @@ impl Scheduler {
     /// `finalise_prefill` (which samples the first token and inserts into
     /// `active_decodes`).
     pub(super) fn promote_finished_prefills_to_decodes(&mut self) {
+        // **A prefill leaving this list is an admission opportunity.**
+        //
+        // It is the most common completion an ingest workload has — many short
+        // turns that prefill, decode a summary and end — and it frees a prefill
+        // slot under the width backstop, which is the definition the settled
+        // gate is written to: nothing new can fit that did not fit before
+        // unless something freed ground, and this freed some.
+        //
+        // Without it the engine pins at one prefill in flight. The pass clears
+        // the flag, the prefill finishes, nothing sets it again, so the next
+        // pass takes `fill`'s fast path and the keep-one-alive guard forces a
+        // single head — which is then in flight, so the pass after that admits
+        // nothing at all until an unrelated event. The rate model never gets
+        // consulted and the queue drains one turn at a time through the
+        // deadlock guard, which is the opposite of filling a wave.
+        if !self.active_prefills.is_empty() {
+            self.settled_since_admit = true;
+        }
         // Use swap_remove for efficiency; iterate from the back.
         let mut i = 0;
         while i < self.active_prefills.len() {

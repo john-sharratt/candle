@@ -1,43 +1,36 @@
 //! Admission: who runs next, what it costs, and whether the wave is better off
 //! carrying it.
 //!
-//! # Status: compiled and tested, not yet reached
+//! # Status: this is the admission path
 //!
-//! No live prefill or decode path calls into this module — [`super::admission`]
-//! is still what admits a wave. Everything here is built so that the rate model
-//! and its costing can be iterated against real measurements before they decide
-//! anything, and so that the types it borrows from the scheduler cannot drift
-//! away from it unnoticed: it compiles on every build and its unit tests run on
-//! every test pass.
+//! [`fill`] is what admits a wave — `super::prefill::promote_new_prefills`
+//! calls it, and `super::admit_ground::AdmitPass` is the engine's answer to
+//! [`Ground`]. The byte-fit planner it replaced is gone rather than kept
+//! alongside: there is one admission path in this crate at any time.
 //!
-//! That is why the `dead_code` allow below is the whole module rather than a
-//! scattering of per-item ones. It is a statement about the port's stage, not a
-//! license for unused code to accumulate, and it comes off in the same change
-//! that makes [`fill`] the admission path — at which point every item here is
-//! reached and the allow is simply wrong. It is deliberately NOT a feature flag
-//! or a second live path: there is one admission path in this crate at any time.
+//! What it offers is prefills. Decodes reach a wave as continuations, charged
+//! to it before the first offer and never re-judged; sections are still pushed
+//! straight into flight when their request is drained, which is the next thing
+//! to bring inside the gate. See `super::admit_ground` for both.
 //!
-//! ## One defect carried in, found by review and not yet fixed
+//! ## Two things checked and NOT defects, so they are not re-raised
 //!
-//! **A busy engine with no standing prefill rows still takes one un-judged
-//! prefill per pass.** [`fill`] charges the wave before any offer so that an
-//! engine with slots in flight cannot take a free admission under the
-//! deadlock-freedom floor — but when `standing == 0` and only decodes are
-//! active it charges `Admission::Prefill { tokens: 0 }`, which leaves
-//! `WaveRate::tokens` at zero. `rate::WaveRate::judge_prefill` gates
-//! `judge_gain` on `tokens > 0`, so the first real offer is judged against
-//! nothing, which is precisely what the charge exists to prevent.
+//! **A busy engine with no standing prefill rows charges
+//! `Admission::Prefill { tokens: 0 }`**, which leaves `WaveRate::tokens` at zero
+//! and so skips `judge_prefill`'s gain comparison. That was recorded here as a
+//! defect and is not one. What the charge exists to deny is the *head waiver*,
+//! and it denies it by marking the wave non-empty rather than by the token
+//! count — so the first offer is still floor-checked, and
+//! [`rate::WaveRate::decode_would_carry`] still judges the turn it will become,
+//! because the continuations were charged. The comparison that is skipped has
+//! nothing to compare against: a wave carrying no prefill rows has a prefill
+//! rate of zero, against which every positive rate is an unbounded gain.
+//! Pinned by `a_busy_engine_with_no_standing_rows_is_still_judged_by_the_decode_model`.
 //!
-//! It is recorded rather than patched because the fix is a decision about what
-//! a busy-but-prefill-idle wave should be judged against — the decode charge
-//! that follows prices decodes, not tokens — and that cannot be settled without
-//! running the model against live waves. It is the first thing to settle when
-//! this module is wired.
-//!
-//! Checked and NOT a defect, so it is not re-raised: `starting_decodes` is
-//! latched before the band loop. Admissions land in the fill's taken set and
-//! never in the engine's active set, so `Ground::decodes_active` cannot change
-//! under the loop — see the comment at its binding.
+//! **`starting_decodes` is latched before the band loop.** Admissions land in
+//! the fill's taken set and never in the engine's active set, so
+//! [`Ground::decodes_active`] cannot change under the loop — see the comment at
+//! its binding.
 //!
 //! Four concerns, four files, no overlap:
 //!
@@ -85,10 +78,6 @@
 //! reads [`Ground::headroom`]. So [`cost`] is never estimating against a
 //! hypothetical: the free lists it prices against are the ones eviction just
 //! produced.
-
-// Reached only by this module's own tests until `fill` becomes the admission
-// path — see the status section above.
-#![allow(dead_code)]
 
 pub(crate) mod cost;
 pub(crate) mod gate;
@@ -791,6 +780,96 @@ mod tests {
         assert_eq!(f.resident, FLOOR, "the floor held");
     }
 
+    /// **A busy engine with no standing rows is still judged by both models.**
+    ///
+    /// The charge is `Prefill { tokens: 0 }` there, which leaves
+    /// `WaveRate::tokens` at zero and so skips `judge_prefill`'s gain
+    /// comparison — the thing this module's header recorded as a defect. It is
+    /// not one, and this pins why: what the charge exists to deny is the head
+    /// waiver, and it denies it by marking the wave non-empty, not by the token
+    /// count. So the first offer is still floor-checked, and the decode model
+    /// still judges the turn it will become.
+    ///
+    /// The comparison that is skipped has nothing to compare against: a wave
+    /// carrying no prefill rows has a prefill rate of zero, so every positive
+    /// rate is an unbounded gain. The judgement that matters on such a wave is
+    /// the decode one, and that is live — the continuations were charged, so
+    /// `decode_would_carry` has a `decodes > 0` to weigh against.
+    #[test]
+    fn a_busy_engine_with_no_standing_rows_is_still_judged_by_the_decode_model() {
+        // A planner whose decode side has been measured — below
+        // `MIN_DECODE_SAMPLES` the second judge abstains by design. The default
+        // minimum gain, not the zero the other tests use: a bus-bound decode
+        // wave's rate is *flat* in the number of decodes (the copy grows with
+        // the routed set, so the step grows with it), and flat is refused as
+        // `Saturated` rather than as `Worse`.
+        let mut rate = WaveRate::with_link_rate(
+            25e9,
+            ExpertGeometry::QWEN36_35B_A3B,
+            RateModel::default(),
+            DecodeModel::default(),
+        );
+        for _ in 0..WaveRate::MIN_DECODE_SAMPLES {
+            rate.observe_decode(1, 0, u64::MAX, 0.5);
+        }
+        assert!(rate.decode_samples() >= WaveRate::MIN_DECODE_SAMPLES);
+
+        // Room to spare, so nothing here is a floor refusal: the decode model
+        // is the only thing that can say no.
+        struct Decoding(Fake);
+        impl Ground for Decoding {
+            fn active(&self) -> usize {
+                self.0.active()
+            }
+            fn decodes_active(&self) -> usize {
+                self.0.decodes_active()
+            }
+            fn settled(&self) -> bool {
+                self.0.settled()
+            }
+            fn headroom(&self) -> Headroom {
+                self.0.headroom()
+            }
+            fn budget(&self) -> Budget {
+                self.0.budget()
+            }
+            fn resident_weights(&self) -> u64 {
+                self.0.resident_weights()
+            }
+            fn standing_rows(&self) -> usize {
+                self.0.standing_rows()
+            }
+            fn peek(&mut self, kind: Kind, prio: DecodePriority) -> Option<Cost> {
+                // The turn this prefill becomes goes on to decode, which is
+                // what puts the second judge in play.
+                self.0.peek(kind, prio).map(|c| Cost {
+                    decodes_after: true,
+                    ..c
+                })
+            }
+            fn admit(&mut self, kind: Kind, prio: DecodePriority, cost: Cost) -> bool {
+                self.0.admit(kind, prio, cost)
+            }
+        }
+
+        // Residency far above the floor, so nothing here can be a weight
+        // refusal: whatever stops the band is a rate judgement.
+        let mut f = Fake::new(Vec::new(), vec![REGION; 8], 60 << 30);
+        f.active = 4;
+        f.decodes_active = 4;
+        f.standing = 0;
+        let mut g = Decoding(f);
+        let got = fill(&mut g, &mut rate);
+        assert!(
+            got.stopped_on_rate,
+            "the decode model must be what stops the band: {got:?}"
+        );
+        assert!(
+            !got.stopped_on_weights,
+            "with the floor nowhere near, no weight rule may fire: {got:?}"
+        );
+    }
+
     /// **A held creep group is charged before anything is offered.** It rides
     /// the next wave whole, so the offers behind it are judged against a wave
     /// that already carries its rows — and it too denies the head waiver.
@@ -1009,6 +1088,112 @@ mod tests {
         assert_eq!(got.prefills, 2);
         assert!(got.stopped_on_weights);
         assert!(!got.stopped_on_rate);
+    }
+
+    /// **A `Ground` whose `admit` claims nothing must still defend the floor
+    /// across a whole pass.**
+    ///
+    /// Every other test here uses a `Fake` that subtracts the dislodge on
+    /// admit, so residency falls as the pass proceeds and the floor bites on its
+    /// own. The production ground does not: its K/V is claimed per chunk by the
+    /// forward, not by admission, so the live region count the zone is derived
+    /// from stands still for the whole pass. Read naively, `before` is then
+    /// identical for the first offer and the tenth, each one is measured against
+    /// a floor it clears alone, and a pass admits ten times the ground it
+    /// checked for once.
+    ///
+    /// So the production ground carries the running total itself. This pins the
+    /// property that makes that necessary: with residency frozen, the fill must
+    /// still stop.
+    #[test]
+    fn a_ground_that_claims_nothing_still_stops_at_the_floor() {
+        /// Residency that never moves, with the pass's own commitment netted off
+        /// — `AdmitPass::committed` in miniature.
+        struct Frozen {
+            inner: Fake,
+            resident: u64,
+            committed: u64,
+        }
+        impl Ground for Frozen {
+            fn active(&self) -> usize {
+                self.inner.active()
+            }
+            fn decodes_active(&self) -> usize {
+                self.inner.decodes_active()
+            }
+            fn settled(&self) -> bool {
+                self.inner.settled()
+            }
+            fn headroom(&self) -> Headroom {
+                self.inner.headroom()
+            }
+            fn budget(&self) -> Budget {
+                Budget {
+                    resident: self.resident,
+                    ..self.inner.budget()
+                }
+            }
+            fn resident_weights(&self) -> u64 {
+                self.resident.saturating_sub(self.committed)
+            }
+            fn standing_rows(&self) -> usize {
+                self.inner.standing_rows()
+            }
+            fn peek(&mut self, kind: Kind, prio: DecodePriority) -> Option<Cost> {
+                self.inner.peek(kind, prio)
+            }
+            fn admit(&mut self, kind: Kind, prio: DecodePriority, cost: Cost) -> bool {
+                // The production shape: the engine's own residency is untouched
+                // by admitting. Only the pass's tally moves.
+                if !self.inner.admit(kind, prio, cost) {
+                    return false;
+                }
+                self.committed = self.committed.saturating_add(cost.dislodged_bytes());
+                true
+            }
+        }
+
+        // Eight region-sized turns against four regions of room above the floor.
+        let resident = FLOOR + 4 * REGION;
+        let mut g = Frozen {
+            inner: Fake::new(Vec::new(), vec![REGION; 8], resident),
+            resident,
+            committed: 0,
+        };
+        g.inner.active = 1;
+        g.inner.decodes_active = 1;
+        let got = fill(&mut g, &mut planner());
+
+        assert!(
+            got.prefills <= 4,
+            "a frozen ground must not admit past the floor: {got:?}",
+        );
+        assert!(
+            got.stopped_on_weights,
+            "and must stop because of it, not run out of queue: {got:?}",
+        );
+    }
+
+    /// **A deep queue on a roomy card fills the wave, not one turn per pass.**
+    ///
+    /// The shape a live daemon produced when the integration went in: a dozen
+    /// conversations arriving at once, nothing in flight, and a card with room
+    /// to spare. Filling the wave is the entire point — a pass that takes one
+    /// item and leaves eleven queued is the byte-fit planner's behaviour, which
+    /// is what this replaced.
+    #[test]
+    fn a_deep_queue_on_a_roomy_card_fills_the_wave() {
+        let mut f = Fake::new(Vec::new(), vec![REGION; 12], FLOOR + 400 * REGION);
+        f.prefill_prio = DecodePriority::High;
+        let got = fill_once(&mut f);
+        assert!(
+            got.prefills > 1,
+            "one admission per pass leaves the queue standing: {got:?}"
+        );
+        assert!(
+            !got.skipped,
+            "a settled engine must offer its queue: {got:?}"
+        );
     }
 
     /// **FIFO, not cheapest-first.** An item the budget cannot take ends its

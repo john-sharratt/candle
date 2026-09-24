@@ -881,6 +881,7 @@ impl ExpertCache {
                 s.resident_vram_bytes = seeded;
                 s.warm_slots = warm.num_slots();
                 s.total_experts = num_moe_layers * experts_per_layer;
+                s.moe_layers = num_moe_layers;
                 // Which MoE path this cache will take, as a reported gauge.
                 // `all_resident` is the whole of it: a streaming cache's slot
                 // addresses move, so the device tables cannot be captured and

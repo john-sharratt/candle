@@ -28,12 +28,10 @@
 //!   [`prefill_cost_bytes`], the block-rounded token count times
 //!   [`per_block_kv_bytes`].
 //! - **Decode** advances one token per sequence per forward, so it allocates a
-//!   new block only every [`CHUNK_SIZE`] steps. Its cost is a *rate*, charged
-//!   amortised — one thirty-second of a block per sequence per pass
-//!   ([`decode_reserve_bytes`]) rather than a full block at the boundary. The
-//!   boundary spike is real but small, and a relief pass answers it far faster
-//!   than a setpoint could; charging it up front would reserve 32x what decodes
-//!   hold and starve prefill outright.
+//!   new block only every [`CHUNK_SIZE`] steps — a *rate*, not a stock. It is
+//!   not charged here at all: a decode is a continuation whose ground was bought
+//!   when its slot was admitted, and `super::admit::fill` prices the rows it
+//!   puts in the wave rather than the bytes it will eventually open.
 //!
 //! KV that is already resident is *not* modelled here — it is already absent
 //! from the live headroom measurement. Only growth is charged.
@@ -48,28 +46,20 @@
 //! count describes what this process has claimed and not yet spent, and needs
 //! neither.
 //!
-//! # The forward reserve
+//! # What is left here, and what moved
 //!
-//! A prefill forward's transient peak — dominated by the MoE expert gather, which
-//! the whole batch shares — is held back by [`reserve_for_width`]:
-//! `width x per_seq`, clamped to a third of the card. This is the one place a
-//! reserve is still expressed in bytes against capacity, because it is about
-//! *transient activations*, not KV — the KV side's own headroom is the
-//! free-region setpoint. It must be evaluated at the width admission is
-//! *choosing*, not the width already in flight, which is why
-//! [`plan_admission`] re-evaluates the reserve at every candidate count it
-//! considers. Evaluating it once — at an in-flight width that is typically zero
-//! when admission runs — reserves nothing for the batch about to be formed, and
-//! is what let nine sequences through and OOMed a 16 GB card.
+//! **The decision moved.** `super::admit::fill` is the admission path: an offer
+//! joins the wave while the wave goes *faster* carrying it, judged by
+//! `super::admit::rate`, and the bytes below are one term in that comparison
+//! rather than the whole question. A gate that admitted by fit stopped widening
+//! the moment the bytes ran out, which measured ~470 tok/s against a modelled
+//! 1,210 at the same residency — a wave of 250 rows and one of 2,000 pay the
+//! same expert copy, so the narrow one is not cheaper, only slower per row.
 //!
-//! # Admission order
-//!
-//! [`plan_admission`] admits the largest candidate that fits first, then walks
-//! the whole queue in submission order fitting whatever else it can. Largest
-//! first is the anti-starvation rule: a purely greedy in-order walk lets a
-//! stream of small scopes keep a large one permanently un-admitted, because
-//! there is never a pass where the remaining budget happens to be large enough.
-//! The in-order sweep afterwards is what packs the pass full.
+//! What remains here is the arithmetic that survived it: the per-block and
+//! per-prefill costing the new path still prices offers with, the AIMD setpoint
+//! the *ingest* regulator moves, and the pass budget bounding one forward's
+//! width.
 
 use candle_nn::kv_cache::KvFormat;
 use candle_nn::kv_cache::CHUNK_SIZE;
@@ -160,53 +150,6 @@ pub(super) fn per_block_kv_bytes(
 /// [`admission_cost_bytes`].
 pub(super) fn prefill_cost_bytes(tokens: usize, per_block: u64) -> u64 {
     (tokens.div_ceil(CHUNK_SIZE) as u64).saturating_mul(per_block)
-}
-
-/// The forward-transient reserve, as a function of co-batched width.
-///
-/// Mirrors the band the pressure and relief gates hold: `max(base, width x
-/// per_seq)`, clamped to a third of the card so a width spike can never strand
-/// the whole device. The terms combine with **max, not sum** — the MoE expert
-/// gather dominates a prefill forward's transient peak and is shared by the
-/// whole batch, so the first few sequences ride inside `base` for free and width
-/// only begins to bind once `width x per_seq` overtakes it.
-///
-/// Admission evaluates this at the width it is CHOOSING. The pressure and relief
-/// gates evaluate the same function at the width already in flight — which is
-/// the right question for them and the wrong one for admission, where it is
-/// typically zero at the moment of decision.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct BandParams {
-    /// Marginal transient cost attributed to each co-batched sequence.
-    pub(super) per_seq: u64,
-    /// Measured resident capacity, for the one-third clamp.
-    pub(super) capacity: u64,
-}
-
-/// The reserve to hold back when `width` sequences are co-batched: the marginal
-/// transient cost per sequence, clamped to a third of the card so a width spike
-/// can never strand the whole device.
-///
-/// **Deliberately carries no card-fraction base.** A flat base of
-/// `max(capacity/10, 2 GiB)` once sat under this, borrowed from the VRAM
-/// pressure gate's band. It starved the scheduler: with ~1150 MiB available and
-/// a 2048 MiB base, `available - reserve` saturated to zero at EVERY width, so
-/// nothing could be admitted and only the keep-one-alive fallback ran. Decode
-/// width never grew past ~3, and a MoE forward amortised over 3 sequences
-/// decodes at ~3 tok/s. Forwards run fine at those widths with that much free,
-/// which is the evidence the base was never a requirement — it was a policy
-/// threshold about when to start shedding, borrowed as if it were a physical
-/// one. The per-sequence term is the real transient estimate, and it is all
-/// that remains.
-pub(super) fn reserve_for_width(width: usize, p: &BandParams) -> u64 {
-    (width as u64).saturating_mul(p.per_seq).min(p.capacity / 3)
-}
-
-/// Bytes the live decodes will allocate over one forward pass — the amortised
-/// charge described in the module header: each of `width` sequences advances one
-/// token, which is one [`CHUNK_SIZE`]th of a block.
-pub(super) fn decode_reserve_bytes(width: usize, per_block: u64) -> u64 {
-    (width as u64).saturating_mul(per_block) / CHUNK_SIZE as u64
 }
 
 /// Multiplicative decrease of the budget: halve, but never below `floor`.
@@ -315,130 +258,6 @@ pub(super) fn evidence_ticks_for(notches: usize) -> usize {
     EVIDENCE_GROW_TICKS.saturating_mul(notches.max(1))
 }
 
-/// What one admission pass decided: which queue positions to admit, how many it
-/// could not fit, and what the admitted set costs.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct AdmissionPlan {
-    /// Queue positions to admit, in the order they were chosen (largest-fitting
-    /// first, then submission order).
-    pub(super) admitted: Vec<usize>,
-    /// Candidates walked but not admitted this pass.
-    pub(super) skipped: usize,
-    /// Total cost of `admitted`.
-    pub(super) spent: u64,
-}
-
-/// Choose what to admit from `costs` (KV bytes per queued prefill).
-///
-/// The two limits are **separate quantities and must stay separate**:
-///
-/// - `available` — what the card physically has (free + evictable − pinned).
-///   The forward's [`reserve_for_width`] comes out of *this*.
-/// - `budget` — the regulated setpoint, a cap on how much KV admission may add.
-///
-/// So the room for KV is `min(available − reserve(n), budget) − live_kv`.
-/// Subtracting the reserve from the *setpoint* instead is wrong and silently
-/// wedges admission: once a throttled setpoint falls below the base reserve —
-/// 768 MiB against a 2048 MiB band, observed live — the difference saturates to
-/// zero, nothing ever fits, and every pass falls through to the keep-one-alive
-/// path admitting exactly one sequence while dozens queue.
-///
-/// The reserve is re-evaluated at **every candidate count considered**, not
-/// once: admitting the n-th sequence has to leave `reserve_for_width(live_width
-/// + n)` free, so width prices itself as the batch grows. Evaluating the band
-/// once — at the width already in flight, which is usually zero when admission
-/// runs — is what let nine sequences through a ceiling that had reserved nothing
-/// for the forward they were about to share, and OOMed the card.
-///
-/// Largest-fitting first, then the whole queue in submission order — see the
-/// module header for why the two passes are not the same rule applied twice.
-/// The walk is over the entire queue rather than a bounded prefix: a bounded
-/// prefix reintroduces exactly the head-of-line blocking the largest-first rule
-/// exists to remove, one level deeper.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn plan_admission(
-    available: u64,
-    budget: u64,
-    live_kv: u64,
-    live_width: usize,
-    costs: &[u64],
-    max_count: usize,
-    band: &BandParams,
-) -> AdmissionPlan {
-    let mut admitted: Vec<usize> = Vec::new();
-    let mut spent = 0u64;
-    if max_count == 0 || costs.is_empty() {
-        return AdmissionPlan {
-            admitted,
-            skipped: costs.len(),
-            spent,
-        };
-    }
-
-    // Bytes still free for KV if we admit `n` more sequences on top of what is
-    // already in flight — the reserve grows with the width being chosen, and the
-    // setpoint caps the result independently.
-    let headroom_for = |n: usize| -> u64 {
-        available
-            .saturating_sub(reserve_for_width(live_width + n, band))
-            .min(budget)
-            .saturating_sub(live_kv)
-    };
-    let fits = |n_admitted: usize, spent: u64, cost: u64| -> bool {
-        spent.saturating_add(cost) <= headroom_for(n_admitted + 1)
-    };
-
-    // Largest candidate that fits, earliest on a tie so equal-cost work still
-    // drains in submission order.
-    let head = costs
-        .iter()
-        .enumerate()
-        .filter(|&(_, &c)| fits(0, 0, c))
-        .max_by_key(|&(i, &c)| (c, std::cmp::Reverse(i)))
-        .map(|(i, _)| i);
-    if let Some(i) = head {
-        spent += costs[i];
-        admitted.push(i);
-    }
-
-    // Then pack the pass full in submission order.
-    for (i, &c) in costs.iter().enumerate() {
-        if admitted.len() >= max_count {
-            break;
-        }
-        if Some(i) == head {
-            continue;
-        }
-        if fits(admitted.len(), spent, c) {
-            spent += c;
-            admitted.push(i);
-        }
-    }
-
-    AdmissionPlan {
-        skipped: costs.len() - admitted.len(),
-        admitted,
-        spent,
-    }
-}
-
-/// Tokens one prefill forward may carry: the configured target, bounded by what the
-/// model can run in one forward.
-///
-/// **Two numbers for two different reasons, and the narrower wins.** The target is a
-/// throughput choice — a wave's fixed cost is paid per forward, so a deployment that
-/// keeps many prefills queued raises it (npcd runs 8,192). The model's cap is a
-/// correctness bound: the widest wave whose transient tier its geometry prices inside
-/// the span, which on a routed model is several times narrower than on a dense one
-/// because the expert chain carries `experts_per_tok` rows per token. The target read
-/// without the cap sized npcd's world ingest on the routed Qwen3.6-35B-A3B for a
-/// 3.3 GB tier its partition did not have, and every turn in the wave failed.
-///
-/// Never zero: a budget that admits nothing makes no progress.
-pub(super) fn prefill_pass_budget(target: usize, model_cap: usize) -> usize {
-    target.min(model_cap).max(1)
-}
-
 /// How many of `lens`, taken in order, one forward carries within `budget` tokens.
 ///
 /// In order, so nothing queued behind a long turn skips ahead of it; and at least
@@ -468,33 +287,6 @@ mod tests {
     use candle_nn::kv_cache::QuantFormat;
 
     const MIB: u64 = 1 << 20;
-
-    /// A zero reserve, for the planner tests that exercise fit/order logic in
-    /// isolation rather than the width-reserve interaction.
-    const NO_BAND: BandParams = BandParams {
-        per_seq: 0,
-        capacity: 0,
-    };
-
-    /// **The narrower of the target and the model's cap, and never zero.**
-    #[test]
-    fn the_pass_budget_is_the_narrower_of_target_and_cap() {
-        assert_eq!(
-            prefill_pass_budget(8192, 3072),
-            3072,
-            "a routed model's cap binds"
-        );
-        assert_eq!(
-            prefill_pass_budget(2048, 8192),
-            2048,
-            "the target binds when it is the narrower"
-        );
-        assert_eq!(
-            prefill_pass_budget(0, 0),
-            1,
-            "a zero budget would never make progress"
-        );
-    }
 
     /// **In order, up to the budget, and always at least one.**
     #[test]
@@ -595,161 +387,6 @@ mod tests {
         let large = prefill_cost_bytes(5980, per_block);
         assert_eq!(small, 2000);
         assert_eq!(large, 187_000);
-    }
-
-    /// The reserve must be evaluated at the width being CHOSEN — the regression
-    /// this exists to prevent.
-    ///
-    /// Replays the measured failure. Available 2901 MiB, base reserve 2048 MiB,
-    /// 384 MiB per co-batched sequence, ten cheap 200-token scopes. Evaluating
-    /// the reserve once at the in-flight width (zero) leaves 853 MiB and admits
-    /// nine — then the forward those nine share peaks against a reserve nobody
-    /// held, and the card OOMs.
-    #[test]
-    fn the_reserve_is_evaluated_at_the_width_being_chosen() {
-        const MIB: u64 = 1 << 20;
-        let per_block = 6_291_456; // 48L x 4H x 128D, R16 K+V
-        let band = BandParams {
-            per_seq: 384 * MIB,
-            capacity: 16375 * MIB,
-        };
-        let available = 2901 * MIB;
-        let costs: Vec<u64> = (0..10)
-            .map(|_| prefill_cost_bytes(200, per_block))
-            .collect();
-
-        // What the broken model did: subtract the reserve ONCE at width 0, then
-        // fit KV against the remainder.
-        let flat = available - reserve_for_width(0, &band);
-        let naive = costs.iter().take_while(|&&c| c <= flat).count();
-        assert!(naive >= 9, "flat reserve admits {naive}, the OOM path");
-
-        // Width-aware: the reserve grows as the batch does, so it stops short.
-        let plan = plan_admission(available, u64::MAX, 0, 0, &costs, 24, &band);
-        assert_eq!(plan.admitted.len(), 6);
-        // …and what it admitted genuinely fits alongside the reserve it implies.
-        assert!(plan.spent + reserve_for_width(plan.admitted.len(), &band) <= available);
-    }
-
-    /// The setpoint and the availability limit are SEPARATE — the reserve comes
-    /// out of availability, never out of the setpoint.
-    ///
-    /// This is the wedge that made every admission pass admit exactly one
-    /// sequence while dozens queued: a setpoint throttled to 768 MiB, a 2048 MiB
-    /// base reserve, and 3340 MiB genuinely available. Subtracting the reserve
-    /// from the setpoint saturates to zero and nothing can ever fit, no matter
-    /// how much room the card has.
-    #[test]
-    fn the_reserve_comes_out_of_availability_not_the_setpoint() {
-        const MIB: u64 = 1 << 20;
-        let band = BandParams {
-            per_seq: 384 * MIB,
-            capacity: 16375 * MIB,
-        };
-        let available = 3340 * MIB;
-        let setpoint = 768 * MIB;
-        // Costs from the observed queue: one large head plus cheap scopes.
-        let mut costs = vec![564 * MIB];
-        costs.extend(std::iter::repeat_n(12 * MIB, 22));
-
-        let plan = plan_admission(available, setpoint, 0, 0, &costs, 24, &band);
-
-        // available - base reserve = 1292 MiB, capped by the 768 MiB setpoint.
-        // The 564 MiB head fits, and cheap scopes pack the rest.
-        assert!(
-            plan.admitted.len() > 1,
-            "must admit more than the keep-one-alive fallback, got {}",
-            plan.admitted.len()
-        );
-        assert!(plan.admitted.contains(&0), "the large head must get in");
-        assert!(
-            plan.spent <= setpoint,
-            "spend {} exceeded setpoint {setpoint}",
-            plan.spent
-        );
-        // Sanity: the two limits are independent — the setpoint caps spend, the
-        // reserve comes out of availability. Neither is subtracted from the other.
-        assert!(plan.spent <= setpoint);
-        assert!(plan.spent + reserve_for_width(plan.admitted.len(), &band) <= available);
-    }
-
-    /// The setpoint really does cap spend even when the card has room to spare.
-    #[test]
-    fn the_setpoint_caps_spend_below_availability() {
-        const MIB: u64 = 1 << 20;
-        let band = BandParams {
-            per_seq: 0,
-            capacity: 0,
-        };
-        let costs = [100 * MIB; 10];
-        let plan = plan_admission(u64::MAX, 250 * MIB, 0, 0, &costs, 24, &band);
-        assert_eq!(plan.admitted.len(), 2);
-        assert_eq!(plan.spent, 200 * MIB);
-    }
-
-    /// The admission reserve is purely width-scaled — no policy floor.
-    ///
-    /// This is the starvation regression. The relief band's card-fraction base
-    /// (2048 MiB here) is a "start shedding below this" threshold, NOT a
-    /// requirement to run a forward. Using it as an admission floor meant that
-    /// with ~1150 MiB available the reserve exceeded availability at EVERY
-    /// width, KV headroom saturated to zero, and only the keep-one-alive
-    /// fallback ever admitted — which starved decode down to ~3 tok/s.
-    #[test]
-    fn the_reserve_is_width_scaled_with_no_policy_floor() {
-        const MIB: u64 = 1 << 20;
-        let band = BandParams {
-            per_seq: 384 * MIB,
-            capacity: 16375 * MIB,
-        };
-        assert_eq!(reserve_for_width(0, &band), 0, "no width, no reserve");
-        assert_eq!(reserve_for_width(1, &band), 384 * MIB);
-        assert_eq!(reserve_for_width(3, &band), 3 * 384 * MIB);
-        // Still clamped to a third of the card so a spike cannot strand it.
-        assert_eq!(reserve_for_width(1000, &band), 16375 * MIB / 3);
-
-        // The measured starvation: 1151 MiB available.
-        let avail = 1151 * MIB;
-        assert_eq!(
-            avail.saturating_sub(2048 * MIB),
-            0,
-            "with the old policy base, nothing could ever be admitted"
-        );
-        assert!(
-            avail.saturating_sub(reserve_for_width(1, &band)) > 700 * MIB,
-            "width-scaled reserve must leave real room for KV"
-        );
-    }
-
-    /// In-flight width counts toward the reserve: a pass that already has six
-    /// sequences running prices the seventh at the wider band.
-    #[test]
-    fn in_flight_width_raises_the_reserve_for_new_admits() {
-        const MIB: u64 = 1 << 20;
-        let band = BandParams {
-            per_seq: 384 * MIB,
-            capacity: 16375 * MIB,
-        };
-        let costs = [16 * MIB; 4];
-        // Idle: 3000 MiB available, reserve stays at base for the first few.
-        let idle = plan_admission(3000 * MIB, u64::MAX, 0, 0, &costs, 24, &band);
-        assert_eq!(idle.admitted.len(), 4);
-        // Six already in flight: the seventh sequence costs 7 x 384 = 2688 MiB of
-        // reserve, leaving 312 MiB — still enough for the cheap KV here…
-        let busy = plan_admission(3000 * MIB, u64::MAX, 0, 6, &costs, 24, &band);
-        assert!(busy.admitted.len() < 4, "in-flight width must bite");
-    }
-
-    /// A decode step is charged one token, not one block — the amortisation.
-    #[test]
-    fn decode_reserve_is_amortised_over_a_block() {
-        let per_block = 6_291_456;
-        assert_eq!(decode_reserve_bytes(0, per_block), 0);
-        assert_eq!(decode_reserve_bytes(1, per_block), per_block / 32);
-        assert_eq!(decode_reserve_bytes(64, per_block), 64 * per_block / 32);
-        // 64 concurrent decodes cost far less than one 5980-token prefill, which
-        // is the whole point: decodes grow slowly, prefills land whole.
-        assert!(decode_reserve_bytes(64, per_block) < prefill_cost_bytes(5980, per_block));
     }
 
     /// The device-unreserved clamp is what stops admission spending the pool's
@@ -891,91 +528,6 @@ mod tests {
         assert_eq!(backlog_admit_action(0, target, b, ceil, true), Hold);
         // But a high backlog still shrinks even under VRAM pressure.
         assert_eq!(backlog_admit_action(9000, target, b, ceil, true), Shrink);
-    }
-
-    #[test]
-    fn plan_admits_largest_first_then_packs_in_order() {
-        // Budget 100. Largest fitting is 60 (index 2), then the in-order sweep
-        // takes 10 and 30, exactly exhausting the budget and leaving the 20 at
-        // index 3 unaffordable — submission order, not best-fit, after the head.
-        let costs = [10, 30, 60, 20];
-        let plan = plan_admission(100, u64::MAX, 0, 0, &costs, 16, &NO_BAND);
-        assert_eq!(plan.admitted, vec![2, 0, 1]);
-        assert_eq!(plan.spent, 100);
-        assert_eq!(plan.skipped, 1);
-    }
-
-    /// The starvation case the largest-first rule exists for: a long queue of
-    /// cheap work must not permanently exclude one expensive item.
-    #[test]
-    fn a_large_candidate_is_not_starved_by_cheap_ones() {
-        let mut costs = vec![50]; // the expensive one, at the back
-        costs.splice(0..0, std::iter::repeat_n(10u64, 20)); // 20 cheap ones ahead
-        let plan = plan_admission(100, u64::MAX, 0, 0, &costs, 16, &NO_BAND);
-        assert!(
-            plan.admitted.contains(&20),
-            "the expensive candidate must be admitted first: {:?}",
-            plan.admitted
-        );
-        assert_eq!(plan.admitted[0], 20);
-        // …and the pass is still packed with the cheap work behind it.
-        assert_eq!(plan.spent, 100);
-        assert_eq!(plan.admitted.len(), 6);
-    }
-
-    #[test]
-    fn plan_respects_the_count_backstop() {
-        let costs = [1, 1, 1, 1, 1];
-        let plan = plan_admission(u64::MAX, u64::MAX, 0, 0, &costs, 3, &NO_BAND);
-        assert_eq!(plan.admitted.len(), 3);
-        assert_eq!(plan.skipped, 2);
-        // A zero backstop admits nothing at all.
-        let none = plan_admission(u64::MAX, u64::MAX, 0, 0, &costs, 0, &NO_BAND);
-        assert!(none.admitted.is_empty());
-        assert_eq!(none.skipped, 5);
-    }
-
-    #[test]
-    fn plan_skips_what_cannot_fit_and_keeps_walking() {
-        // Only the 5s fit; the 400 is skipped, not treated as a stop signal.
-        let costs = [400, 5, 400, 5];
-        let plan = plan_admission(12, u64::MAX, 0, 0, &costs, 16, &NO_BAND);
-        assert_eq!(plan.admitted, vec![1, 3]);
-        assert_eq!(plan.spent, 10);
-        assert_eq!(plan.skipped, 2);
-    }
-
-    #[test]
-    fn plan_admits_nothing_when_nothing_fits() {
-        let costs = [400, 500];
-        let plan = plan_admission(12, u64::MAX, 0, 0, &costs, 16, &NO_BAND);
-        assert!(plan.admitted.is_empty());
-        assert_eq!(plan.spent, 0);
-        assert_eq!(plan.skipped, 2);
-        // An empty queue is not an error.
-        let empty = plan_admission(12, u64::MAX, 0, 0, &[], 16, &NO_BAND);
-        assert!(empty.admitted.is_empty());
-        assert_eq!(empty.skipped, 0);
-    }
-
-    /// Equal-cost candidates drain in submission order — the largest-first rule
-    /// must not reorder a uniform queue.
-    #[test]
-    fn equal_costs_keep_submission_order() {
-        let costs = [7, 7, 7, 7];
-        let plan = plan_admission(21, u64::MAX, 0, 0, &costs, 16, &NO_BAND);
-        assert_eq!(plan.admitted, vec![0, 1, 2]);
-        assert_eq!(plan.skipped, 1);
-    }
-
-    /// Zero-cost work (an empty prefill that must be admitted to report its own
-    /// error) is always admissible, even at zero budget.
-    #[test]
-    fn zero_cost_work_is_admitted_at_zero_budget() {
-        let costs = [0, 0];
-        let plan = plan_admission(0, u64::MAX, 0, 0, &costs, 16, &NO_BAND);
-        assert_eq!(plan.admitted.len(), 2);
-        assert_eq!(plan.spent, 0);
     }
 
     #[test]

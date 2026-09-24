@@ -56,6 +56,7 @@ use super::batched_layer::{
 };
 use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
+use super::expert_lre::WeightPlan;
 use super::prefill_utils::SharedPm;
 use super::quantized_matmul::QMatMul;
 use super::rope_schedule::{RopeRungs, RopeSchedule};
@@ -349,6 +350,34 @@ pub trait BatchedModelCore {
     /// Snapshot expert pipeline telemetry counters (if this model has an expert cache).
     fn expert_stats(&self) -> Option<PipelineStats> {
         None
+    }
+
+    /// The wave transient tier a prefill of `rows` rows across `sequences`
+    /// would need, in bytes.
+    ///
+    /// **The same function the tier is actually placed from**, not an estimate
+    /// of it: admission judges an offer on the residency it dislodges, and the
+    /// tier dislodges weights exactly as a region claim does. Pricing it any
+    /// other way lets the two figures drift, and the one that drifts is the one
+    /// the placement then refuses.
+    ///
+    /// `None` for a model that cannot price a wave — the caller then charges no
+    /// tier, which is what it did before this existed.
+    fn wave_tier_bytes(&self, _rows: usize, _sequences: usize, _act_dtype: DType) -> Option<u64> {
+        None
+    }
+
+    /// The weight side as the wave rate planner prices it — MoE geometry, and
+    /// the range the expert zone may move in.
+    ///
+    /// Derived from [`Self::expert_stats`] rather than plumbed separately, so a
+    /// model that reports its cache reports this too and the two can never
+    /// describe different moments. `None` for a dense model, for a cache that
+    /// has not yet run a classify, and off CUDA — see
+    /// [`WeightPlan::from_stats`], which refuses a partial gauge set outright
+    /// because every missing field makes a routed expert look free.
+    fn weight_plan(&self) -> Option<WeightPlan> {
+        WeightPlan::from_stats(&self.expert_stats()?)
     }
 
     /// Snapshot the layer-streaming counters, if this model's weights are slot

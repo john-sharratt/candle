@@ -615,6 +615,19 @@ impl Scheduler {
         // sequence, and pricing it as one row each would understate the wave.
         self.wave_stats
             .record(false, seq_ids.len(), wave_rows, kv_len, fwd_ms);
+        // What this step cost, taught to the planner. A bus-bound step says
+        // nothing about the layer time and the model discards it; a
+        // compute-bound one is the only thing that can move an estimate the
+        // decode side was seeded 26x optimistic on. The hit coefficient rides
+        // the same moment because it is read from the counters this forward just
+        // moved.
+        // Microseconds, not the truncated millisecond the stats line uses: the
+        // truncation is a floor, so it teaches the model that every forward was
+        // faster than it was — a 1.4 ms step reads as 1.0, and a sub-millisecond
+        // one as zero and is dropped entirely. That bias lands straight on
+        // `layer_secs`, which is the estimate this wiring exists to correct.
+        self.observe_decode_forward(seq_ids.len(), fwd_us);
+        self.observe_expert_hit_rate();
 
         // Reads the scored rows back and advances each sequence by what the wave
         // actually wrote — the walk below rolls the rejected tail off again.
