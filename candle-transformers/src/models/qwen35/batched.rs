@@ -487,6 +487,26 @@ impl HybridBatched {
             .unwrap_or(0)
     }
 
+    /// What one sequence's state costs, whether or not one is standing.
+    ///
+    /// **Priced from the geometry, never from residency.** Every store this
+    /// model builds has the same shape, so the config answers for all of them —
+    /// and it answers at the one moment residency cannot, which is the moment
+    /// admission actually asks. See
+    /// [`RecurrentStateStore::reserved_bytes_for`] for why a mean over the live
+    /// stores is not a substitute: it divides a sum over every store the
+    /// process holds by a count of what is merely in flight, so it climbs with
+    /// the number of *idle* conversations.
+    ///
+    /// This takes no lock, which is the other half of its value here —
+    /// admission asks on the scheduler thread while forwards hold the map.
+    pub fn recurrent_store_bytes(&self) -> usize {
+        RecurrentStateStore::reserved_bytes_for(
+            &self.model.cfg.layer_kinds,
+            &self.model.cfg.delta_net,
+        )
+    }
+
     /// The turn loop carves a child slot per turn and decodes on it, borrowing
     /// the parent's KV blocks zero-copy. State cannot be borrowed the same way
     /// — the child advances it — so it is copied device-to-device

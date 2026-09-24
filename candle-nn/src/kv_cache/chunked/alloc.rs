@@ -281,7 +281,7 @@ impl BackingInner {
         if key.location == ArenaLocation::Cpu {
             return Ok(None);
         }
-        enter_arena_window(&cd.cuda_stream()).map(Some)
+        enter_arena_window(&cd.cuda_stream(), "a KV arena").map(Some)
     }
 
     /// The same gate for an operation that **cannot be refused part-way**.

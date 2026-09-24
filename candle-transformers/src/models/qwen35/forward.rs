@@ -691,6 +691,10 @@ impl ManagedBatchedModel for HybridBatched {
         HybridBatched::recurrent_reserved_bytes(self)
     }
 
+    fn recurrent_store_bytes(&self) -> usize {
+        HybridBatched::recurrent_store_bytes(self)
+    }
+
     fn reset_expert_stats(&self) {
         #[cfg(feature = "cuda")]
         if let Some(c) = self.model().experts.as_ref() {

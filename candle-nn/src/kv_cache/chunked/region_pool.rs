@@ -2464,14 +2464,17 @@ impl std::fmt::Debug for SpanRegion {
 ///
 /// So a span tenant is bound by the same rule as an arena: **allocate between
 /// forwards.** Inside one, this refuses rather than corrupts.
-pub fn claim_span_region(device: &candle::Device) -> Result<Option<SpanRegion>> {
+pub fn claim_span_region(
+    device: &candle::Device,
+    tenant: &'static str,
+) -> Result<Option<SpanRegion>> {
     let candle::Device::Cuda(cuda) = device else {
         candle::bail!("claim_span_region: the reservation is a CUDA allocation");
     };
     let stream = cuda.cuda_stream();
     // Held across the claim, so a forward cannot open between the gate and the
     // frontier moving.
-    let _window = super::bump_arena::enter_arena_window(&stream)?;
+    let _window = super::bump_arena::enter_arena_window(&stream, tenant)?;
     Ok(claim_region(&stream)?.map(|inner| SpanRegion { inner }))
 }
 
@@ -2497,12 +2500,12 @@ pub struct SpanClaims {
 impl SpanClaims {
     /// Open the window. Refuses inside a forward, for the reason on
     /// [`claim_span_region`].
-    pub fn open(device: &candle::Device) -> Result<Self> {
+    pub fn open(device: &candle::Device, tenant: &'static str) -> Result<Self> {
         let candle::Device::Cuda(cuda) = device else {
             candle::bail!("SpanClaims: the reservation is a CUDA allocation");
         };
         let stream = cuda.cuda_stream();
-        let _window = super::bump_arena::enter_arena_window(&stream)?;
+        let _window = super::bump_arena::enter_arena_window(&stream, tenant)?;
         Ok(Self { stream, _window })
     }
 

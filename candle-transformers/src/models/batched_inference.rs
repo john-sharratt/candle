@@ -5096,6 +5096,17 @@ pub trait ManagedBatchedModel {
         0
     }
 
+    /// What **one** sequence's carried state costs, from the model's geometry.
+    ///
+    /// The admission figure, and not derivable from
+    /// [`Self::recurrent_reserved_bytes`]: that total is zero before the first
+    /// store is built, and dividing it by the sequences in flight answers with
+    /// a number that climbs as conversations go idle, since the sum counts
+    /// every store held and the divisor only those in flight.
+    fn recurrent_store_bytes(&self) -> usize {
+        0
+    }
+
     /// Reset expert pipeline telemetry counters to zero.
     fn reset_expert_stats(&self) {}
 
@@ -5309,6 +5320,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn recurrent_reserved_bytes(&self) -> usize {
         self.model().recurrent_reserved_bytes()
+    }
+
+    fn recurrent_store_bytes(&self) -> usize {
+        self.model().recurrent_store_bytes()
     }
 
     fn reset_expert_stats(&self) {

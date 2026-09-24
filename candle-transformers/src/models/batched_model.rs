@@ -446,6 +446,21 @@ pub trait BatchedModelCore {
         0
     }
 
+    /// What **one** sequence's recurrent state costs, priced from the model's
+    /// geometry rather than from what is resident.
+    ///
+    /// This is the admission figure. [`Self::recurrent_reserved_bytes`] is a
+    /// total for the whole-card decomposition and cannot stand in for it: it
+    /// answers zero before the first store exists — pricing a claim that is
+    /// about to arrive as free — and dividing it by the sequences in flight
+    /// gives a number that grows with the idle ones, because the sum and the
+    /// divisor range over different populations.
+    ///
+    /// Zero on a stack with no recurrent layers, which is the true cost there.
+    fn recurrent_store_bytes(&self) -> usize {
+        0
+    }
+
     /// Reset expert pipeline telemetry counters to zero.
     fn reset_expert_stats(&self) {}
 

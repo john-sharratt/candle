@@ -11273,6 +11273,13 @@ mod tests {
         /// matters is that a restore under a *different* one is refused.
         const SCHEDULE_HASH: u64 = 0xD0D0_1234_5678_9ABC;
 
+        /// One sequence's recurrent store, the size a hybrid stack really runs.
+        const STORE_BYTES: usize = 126 * 1024 * 1024;
+
+        /// What the process holds with ten conversations' stores standing —
+        /// the figure admission must **not** reach for, whole or divided.
+        const RESERVED_TOTAL: usize = 10 * Self::STORE_BYTES;
+
         fn new() -> Self {
             Self {
                 inner: DummyModel::new(),
@@ -11435,6 +11442,17 @@ mod tests {
                 entry.closed.push(width);
             }
             Ok(width as usize)
+        }
+
+        /// What one store costs, and what the process is holding — deliberately
+        /// far apart, because the difference is what admission used to divide
+        /// by an unrelated count.
+        fn recurrent_store_bytes(&self) -> usize {
+            DummyRecurrentModel::STORE_BYTES
+        }
+
+        fn recurrent_reserved_bytes(&self) -> usize {
+            DummyRecurrentModel::RESERVED_TOTAL
         }
 
         fn positional_coverage(&self, seq: usize) -> Option<usize> {
@@ -12458,6 +12476,41 @@ mod tests {
             !probe.is_seeded(slot.0),
             "nothing was restored, so nothing may claim to be seeded — a stale \
              seeded mark would suppress this slot's next genuine reset"
+        );
+    }
+
+    /// **One turn is priced at one store, whatever the engine is holding.**
+    ///
+    /// The price comes from the model's geometry, so nothing about the
+    /// scheduler's occupancy can enter it. Both answers the old arithmetic gave
+    /// are asserted against by name, because both were wrong in production and
+    /// either would come back if someone reached for the total again:
+    ///
+    /// * `total / live` with nothing in flight divided by zero and answered
+    ///   **0** — a 126 MiB claim priced as free, admitted, and refused by the
+    ///   span on contact.
+    /// * the same expression with one sequence in flight answered the **whole
+    ///   total**, which is how a 41-row turn came to be priced at 4,450 MiB and
+    ///   refused as throughput-worse with seven turns queued behind it.
+    ///
+    /// A `live.max(1)` patch is caught by the second assertion too — it returns
+    /// the total here rather than one store.
+    #[test]
+    fn one_turn_is_priced_at_one_store_however_many_are_parked() {
+        let (sched, _tx, _probe) = make_test_scheduler_recurrent();
+        let store = DummyRecurrentModel::STORE_BYTES as u64;
+        let total = DummyRecurrentModel::RESERVED_TOTAL as u64;
+
+        assert_eq!(
+            sched.recurrent_cost(),
+            store,
+            "one store, from the geometry"
+        );
+        assert_ne!(sched.recurrent_cost(), 0, "priced free with nothing live");
+        assert_ne!(
+            sched.recurrent_cost(),
+            total,
+            "billed for every store the process holds"
         );
     }
 

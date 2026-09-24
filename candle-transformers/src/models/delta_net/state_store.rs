@@ -252,7 +252,7 @@ impl RegionBump {
     fn new(device: &Device) -> Result<Self> {
         Ok(Self {
             device: device.clone(),
-            claims: SpanClaims::open(device)?,
+            claims: SpanClaims::open(device, "a sequence's recurrent store")?,
             regions: Vec::new(),
             // Forces the first `take` to claim, so there is no empty-vec case.
             cursor: SpanRegion::bytes(),
@@ -730,6 +730,74 @@ impl RecurrentStateStore {
         }
         #[cfg(not(feature = "cuda"))]
         {
+            0
+        }
+    }
+
+    /// What one sequence's store **will** reserve, from the geometry alone —
+    /// [`Self::reserved_bytes`] for a store that does not exist yet.
+    ///
+    /// **This is the figure admission needs, and it is the one a live store
+    /// cannot give.** A store is priced before it is built, and at that moment
+    /// there may be none in the process to measure: the first sequence of a
+    /// session, or the first after a seal evicted every store.
+    ///
+    /// Deriving it from residency instead — summing the live stores and
+    /// dividing by what the scheduler has in flight — is not a per-sequence
+    /// figure at all, because the two counts range over different populations.
+    /// The sum covers every store the process holds, parked conversations
+    /// included; the divisor covers only what is in flight, and admission runs
+    /// *between* forwards, where that is 0 or 1. The quotient therefore rises
+    /// with the number of idle conversations and peaks when the engine is
+    /// quiet, which is precisely when admission should be cheapest. Measured on
+    /// a 72 GB card: a 41-row turn priced at 4,450 MiB and refused as
+    /// throughput-worse on fifteen consecutive passes, seven turns queued
+    /// behind it and 20 GiB standing free above the floor.
+    ///
+    /// The packing is [`RegionBump::take`]'s, restated as arithmetic: each
+    /// DeltaNet layer lays `s` then its conv tail for the live state and again
+    /// for the backup, each 256-aligned, and a buffer that would cross the
+    /// region's end starts a fresh region rather than splitting across two.
+    /// Nothing here reads the device, so it answers on any backend and at any
+    /// moment.
+    ///
+    /// A zero-length half costs no reservation here, where [`RegionBump::take`]
+    /// refuses it outright: `take` has no address to hand back for no bytes and
+    /// must say so, but a buffer of no bytes genuinely occupies nothing. Store
+    /// construction stays the authority that rejects such a geometry — this
+    /// only declines to invent a price for it.
+    pub fn reserved_bytes_for(layer_kinds: &[LayerKind], dims: &DeltaNetDims) -> usize {
+        #[cfg(feature = "cuda")]
+        {
+            let (s_bytes, conv_bytes) = DeltaNetState::byte_sizes(dims);
+            let cap = SpanRegion::bytes();
+            let mut regions = 0usize;
+            // The bump starts its cursor at `cap` so that the first take claims
+            // rather than reading the base of a region nobody holds.
+            let mut cursor = cap;
+            let layers = layer_kinds
+                .iter()
+                .filter(|k| **k == LayerKind::DeltaNet)
+                .count();
+            for _ in 0..layers {
+                for bytes in [s_bytes, conv_bytes, s_bytes, conv_bytes] {
+                    if bytes == 0 {
+                        continue;
+                    }
+                    let aligned = cursor.next_multiple_of(256);
+                    if aligned + bytes > cap {
+                        regions += 1;
+                        cursor = bytes;
+                    } else {
+                        cursor = aligned + bytes;
+                    }
+                }
+            }
+            regions * cap
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (layer_kinds, dims);
             0
         }
     }
@@ -1389,5 +1457,68 @@ mod tests {
         let mut d2 = dims();
         d2.conv_kernel = 4;
         assert_ne!(h, schedule_hash(&kinds(), &d2), "dims change");
+    }
+
+    /// The whole point of the geometry price: it answers the same for a process
+    /// holding no stores as for one holding a hundred, because it never looks at
+    /// them. Three DeltaNet layers of 256 B halves is 3,072 B of takes, which is
+    /// one 16 MiB region.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_store_is_priced_from_geometry_not_from_what_is_resident() {
+        let (s_bytes, conv_bytes) = DeltaNetState::byte_sizes(&dims());
+        assert_eq!((s_bytes, conv_bytes), (256, 256), "the fixture's halves");
+
+        let priced = RecurrentStateStore::reserved_bytes_for(&kinds(), &dims());
+        assert_eq!(priced, 16 * 1024 * 1024, "one region");
+
+        // Nothing in the call depends on a store existing, so building some
+        // cannot move it. This is the property the scheduler relies on.
+        let _live: Vec<_> = (0..4)
+            .map(|_| RecurrentStateStore::new(&kinds(), &dims(), &Device::Cpu).unwrap())
+            .collect();
+        assert_eq!(
+            RecurrentStateStore::reserved_bytes_for(&kinds(), &dims()),
+            priced,
+            "four live stores must not change what one store costs"
+        );
+    }
+
+    /// A half that would cross the region end starts a fresh region rather than
+    /// splitting, and a zero-length half costs nothing. With `conv_kernel = 1`
+    /// the conv tail is empty, so each layer is two 6 MiB takes: two fit in a
+    /// 16 MiB region, the third starts the second region.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn an_oversized_half_starts_a_region_and_an_empty_half_costs_nothing() {
+        let d = DeltaNetDims {
+            head_dim: 64,
+            n_k_heads: 1,
+            n_v_heads: 384,
+            conv_kernel: 1,
+        };
+        let (s_bytes, conv_bytes) = DeltaNetState::byte_sizes(&d);
+        assert_eq!((s_bytes, conv_bytes), (6 * 1024 * 1024, 0), "6 MiB, empty");
+
+        let one = vec![LayerKind::DeltaNet];
+        assert_eq!(
+            RecurrentStateStore::reserved_bytes_for(&one, &d),
+            16 * 1024 * 1024,
+            "two 6 MiB takes share one region"
+        );
+
+        let two = vec![LayerKind::DeltaNet, LayerKind::DeltaNet];
+        assert_eq!(
+            RecurrentStateStore::reserved_bytes_for(&two, &d),
+            32 * 1024 * 1024,
+            "the third take crosses the end and claims"
+        );
+
+        // An attention-only stack carries no recurrent state and costs nothing.
+        assert_eq!(
+            RecurrentStateStore::reserved_bytes_for(&[LayerKind::Attention], &d),
+            0,
+            "no DeltaNet layers, no reservation"
+        );
     }
 }

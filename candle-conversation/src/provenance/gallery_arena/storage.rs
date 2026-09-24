@@ -106,7 +106,7 @@ impl GalleryStorage {
                 SpanRegion::bytes(),
             )));
         }
-        let Some(region) = claim_span_region(&self.device)? else {
+        let Some(region) = claim_span_region(&self.device, "the provenance gallery")? else {
             return Err(candle::Error::Msg(
                 "gallery slab: the reservation has no free region — the KV side is \
                  full, so the gallery grows no further this pass"

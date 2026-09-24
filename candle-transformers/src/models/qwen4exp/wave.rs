@@ -1069,6 +1069,25 @@ impl Qwen4ExpBatched {
         gdn + idx
     }
 
+    /// What admitting **one** more sequence costs in carried state.
+    ///
+    /// The GDN store alone, priced from the geometry
+    /// ([`RecurrentStateStore::reserved_bytes_for`]) — every store this model
+    /// builds has the same shape, so the config answers for all of them, and it
+    /// answers before the first one exists, which is when admission asks.
+    ///
+    /// **The index caches are deliberately not in it.** They are the other half
+    /// of [`Self::recurrent_reserved_bytes`], but their size is
+    /// `capacity_blocks()` — it grows with the context the sequence has already
+    /// decoded, so a *new* sequence brings none. Charging a fresh turn for the
+    /// index a long conversation has accumulated would price arrivals by the
+    /// depth of the sequences already resident, which is the mistake this
+    /// function exists to end.
+    pub fn recurrent_store_bytes(&self) -> usize {
+        let cfg = &self.model.cfg;
+        RecurrentStateStore::reserved_bytes_for(&cfg.layer_kinds, &cfg.delta_net)
+    }
+
     pub fn new(model: Qwen4ExpGpu) -> Result<Self> {
         let schedule = flash_next_schedule(&model.cfg)?;
         let rope = RopeRungs::new(&schedule, &model.device)?;
@@ -1478,6 +1497,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
 
     fn recurrent_reserved_bytes(&self) -> usize {
         Qwen4ExpBatched::recurrent_reserved_bytes(self)
+    }
+
+    fn recurrent_store_bytes(&self) -> usize {
+        Qwen4ExpBatched::recurrent_store_bytes(self)
     }
 
     /// A view carve. The child borrows the parent's K/V; its carried state has
@@ -2078,6 +2101,34 @@ impl WaveSweep for Qwen4ExpBatched {
         let (kv_start, kv_end) = self.kv_layer_range(layer_start, layer_end);
         admit_wave_kv(contexts, n_decode, n_prefill, kv_start, kv_end)?;
 
+        // ── Carried state: ensure (reset at offset 0), open the GDN wave,
+        // snapshot the PLE states for the failure bracket. ──
+        //
+        // **A claim, so it belongs with the other claims — before the tier is
+        // placed and before the forward opens.** A sequence entering the wave
+        // without a store builds one here, and a store is a span tenant: it
+        // carves reservation regions through `RegionBump`, which takes the same
+        // arena window `admit_wave_kv` does. Run after `begin_forward` this asks
+        // the partition for ground while holding the window that decides who
+        // gets it, and the refusal is the unrecoverable one — the thread that
+        // would have to end the wave is the thread asking.
+        //
+        // It sat below `begin_forward` and was invisible for as long as every
+        // sequence in a wave already had its store: the lazy branch only fires
+        // for a slot that has never run one, or one starting over. A deeper
+        // `repo_map` walk (`--max-depth 3`) put the boot priming chain's own
+        // ingest into exactly that shape, and the daemon failed to load with
+        // "creating a KV arena from inside the forward that owns the partition".
+        //
+        // Above `plan_wave_transient` as well as `begin_forward`, and that order
+        // is load-bearing in both directions: the tier is placed against the
+        // arena frontier as it stands, so a region claimed after the placement
+        // moves the frontier under a tier already standing on it (hot-path
+        // invariant 7).
+        for ((&seq, &off), &q) in seq_ids.iter().zip(&offsets).zip(&q_lens) {
+            self.ensure_seq_state(seq, off, off + q, layer_start)?;
+        }
+
         // **Price and reserve this wave's transient tier**, sized to this wave
         // rather than to the widest one the engine can run — after the KV claim
         // above, so the arena frontier is final when the tier is placed against
@@ -2177,11 +2228,6 @@ impl WaveSweep for Qwen4ExpBatched {
             pre_off, pre_q, &m.device, fwd_ticket,
         )?);
 
-        // ── Carried state: ensure (reset at offset 0), open the GDN wave,
-        // snapshot the PLE states for the failure bracket. ──
-        for ((&seq, &off), &q) in seq_ids.iter().zip(&offsets).zip(&q_lens) {
-            self.ensure_seq_state(seq, off, off + q, layer_start)?;
-        }
         let index_snapshot: Vec<(usize, Vec<IndexSnapshot>)> = {
             let idx = self
                 .index

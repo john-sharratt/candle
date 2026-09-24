@@ -96,8 +96,8 @@ pub(super) struct AdmitPass<'a> {
     budget: Budget,
     /// Bytes one 32-token KV block costs, in the formats a live sequence holds.
     per_block: u64,
-    /// The store one more sequence costs, measured at the open — see
-    /// [`Scheduler::recurrent_cost`] for why it may not be re-read per offer.
+    /// The store one more sequence costs, read at the open. A constant of the
+    /// model's geometry — see [`Scheduler::recurrent_cost`].
     recurrent: u64,
     /// Residency this pass has already committed, summed over what it admitted.
     ///
@@ -379,37 +379,30 @@ impl Scheduler {
     /// The recurrent store **one** new sequence needs, or zero on a stack that
     /// carries none.
     ///
-    /// **The mean, because the model reports a total.**
-    /// `recurrent_reserved_bytes` sums every live sequence's state — it exists
-    /// for the whole-card VRAM decomposition, not for pricing an admission — so
-    /// charging it whole to each new turn bills that turn for every store the
-    /// engine already holds. That over-charge *compounds*: each live sequence
-    /// makes the next admission look more expensive, so a busy engine prices a
-    /// single turn at tens of gigabytes and refuses it on a card with room to
-    /// spare. Measured: two turns queued against a 72 GB card with nothing in
-    /// flight, refused on every pass.
+    /// **Priced from the model's geometry, never from what is resident.** Every
+    /// store the model builds has the same shape, so it can say what one costs
+    /// without a store existing to measure — which matters, because admission
+    /// prices a claim precisely before it is made.
     ///
-    /// One state is one state, so the total over the count is what adding one
-    /// more costs. With nothing live there is no measurement and nothing to
-    /// divide: zero, which is also correct, because the first sequence's store
-    /// comes out of a reservation the engine sized at load rather than out of
-    /// this admission.
+    /// This was a mean over the live stores, and a mean is the one thing it
+    /// could not be: `recurrent_reserved_bytes` sums every store the process
+    /// holds, parked conversations included, while the only count available to
+    /// divide by is what the scheduler has *in flight* — and admission runs
+    /// between forwards, where that is 0 or 1. The two range over different
+    /// populations, so the quotient is not a per-sequence figure but roughly
+    /// the whole engine's carried state, and it climbs as conversations go
+    /// idle. It therefore peaked exactly when admission should have been
+    /// cheapest. Measured on a 72 GB card: a 41-row turn priced at 4,450 MiB
+    /// and refused as throughput-worse on fifteen consecutive passes, seven
+    /// turns queued behind it and 20 GiB standing free above the floor.
     ///
-    /// **Read once per pass, not once per offer** — see
-    /// [`AdmitPass::recurrent`]. A newly admitted prefill joins
-    /// `active_prefills` immediately but does not allocate its store until its
-    /// first forward, so calling this per offer grows the denominator while the
-    /// numerator stands still: a pass admitting ten turns against one standing
-    /// store would charge them 160, 80, 53, 40 MiB and so on down, which is a
-    /// decay rather than a price.
-    ///
-    /// It takes no sequence, and that is the honest signature: it is a
-    /// whole-engine mean, and a parameter would promise a per-slot answer it
-    /// does not compute.
+    /// Being a constant, it is also immune to the per-offer decay that made the
+    /// old figure read 160, 80, 53, 40 MiB down a single pass as newly admitted
+    /// prefills joined the denominator before allocating anything. It is still
+    /// read once at [`AdmitPass::open`], because nothing in a pass can change
+    /// it and re-reading would only take the lock again.
     pub(super) fn recurrent_cost(&self) -> u64 {
-        let total = self.model.recurrent_reserved_bytes() as u64;
-        let live = (self.active_decodes.len() + self.active_prefills.len()) as u64;
-        total.checked_div(live).unwrap_or(0)
+        self.model.recurrent_store_bytes() as u64
     }
 
     /// Fold one completed prefill forward into the planner.
