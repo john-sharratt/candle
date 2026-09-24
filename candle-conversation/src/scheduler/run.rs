@@ -594,6 +594,34 @@ impl Scheduler {
             self.wave_stats
                 .add_housekeeping(t_house.elapsed().as_micros() as u64);
 
+            // **Create what a refused forward asked for — every gap, not every
+            // telemetry window.**
+            //
+            // A forward that needs an arena it could not have pre-claimed is
+            // refused outright: it runs on the thread that owns the partition,
+            // so there is no "come back later" it can act on. The refusal
+            // records the size class, and this is the only thing that acts on
+            // that record. The format a seal picks comes from the data it just
+            // wrote, so `admit_wave_kv` cannot claim it ahead of time and the
+            // demand is not rare.
+            //
+            // It used to sit inside the 2 s summary block below, which made
+            // recovery a side effect of logging: a wave refused an arena, and
+            // the turns of the next two seconds were refused the same arena for
+            // the same reason before the window came round. Nothing about the
+            // creation wants that cadence — it is cheap when there is no demand
+            // (one lock, an empty `Vec`), and the wave loop is the gap on every
+            // iteration, not one in every few hundred.
+            match self.session.create_deferred_arenas() {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(
+                    target: "candle_conversation::scheduler::vram_relief",
+                    arenas_created = n,
+                    "created arenas a refused pass asked for"
+                ),
+                Err(e) => tracing::warn!("deferred arena creation failed: {e}"),
+            }
+
             // Flush the wave summary + phase breakdown if its 2 s window
             // elapsed — even when no forward ran this iteration, so stalls still
             // surface their phase split. (The expert-DMA delta and cumulative
@@ -697,34 +725,7 @@ impl Scheduler {
                     );
                 }
                 self.log_kv_memory();
-                // **Create what the sealing thread was refused — here, because
-                // this is the gap.**
-                //
-                // A pass refused mid-wave records the size class it wanted, and
-                // the first version had the persistence thread act on that
-                // record at the top of its own next pass. That never fired: the
-                // sealing thread has to *find* a gap, and the gap between one
-                // wave and the next is narrower than a sealing pass. Measured —
-                // the `1088 B` class frozen at 49 arenas with 75 regions
-                // claimable, the hot→warm drain stuck at 634 MiB, and
-                // `alloc_chunk_run_for_key` reporting "unsatisfied after 4 fresh
-                // arenas … VRAM exhaustion" every few hundred milliseconds while
-                // the reservation was a fifth empty.
-                //
-                // The wave loop does not have to find the gap; it *is* the gap.
-                // This runs on the thread that owns the forward, between two of
-                // them, so no wave generation is live and the creation cannot be
-                // refused for the reason the sealing thread's was.
-                match self.session.create_deferred_arenas() {
-                    Ok(0) => {}
-                    Ok(n) => tracing::debug!(
-                        target: "candle_conversation::scheduler::vram_relief",
-                        arenas_created = n,
-                        "created arenas a wave-deferred sealing pass asked for"
-                    ),
-                    Err(e) => tracing::warn!("deferred arena creation failed: {e}"),
-                }
-                // And wake the sealing pass now that its ground exists, rather
+                // Wake the sealing pass now that its ground exists, rather
                 // than leaving it to the 5 s tick. Guarded on there being work —
                 // an atomic load — so an idle engine is not woken once per wave
                 // to find nothing. The trigger coalesces on a one-slot channel,
