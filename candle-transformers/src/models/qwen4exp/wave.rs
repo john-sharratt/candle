@@ -2703,6 +2703,10 @@ impl Qwen4ExpBatched {
                         eps,
                         None,
                         ZGate::Sigmoid,
+                        #[cfg(feature = "cuda")]
+                        mix_wave.as_ref(),
+                        #[cfg(not(feature = "cuda"))]
+                        None,
                     )?;
                     drop(seqs);
                     // Allocated is not written: a sweep split into layer windows

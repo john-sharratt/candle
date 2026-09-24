@@ -407,10 +407,16 @@ pub trait BatchedAttentionLayer {
     /// - Q shape: (batch, seq_len, n_head * head_dim)
     /// - K shape: (batch, seq_len, n_kv_head * head_dim)
     /// - V shape: (batch, seq_len, n_kv_head * head_dim)
+    ///
+    /// `wave` is the open attention phase, for the one case the operand cannot
+    /// supply: a `Float` activation is the residual cloned rather than a fresh
+    /// allocation, so on a stack whose residual is pool-backed the projection
+    /// group has no ticket to inherit and its split block fell to the pool.
     fn project_qkv<'w>(
         &self,
         acts: &DynamicActs<'w>,
         out_dtype: DType,
+        wave: WaveRef<'w>,
     ) -> Result<QkvProjection<'w>>;
 
     /// The output-projection weight (`attention_wo` / `self_attn.o_proj`). Backs the generalized
@@ -744,7 +750,7 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
     let kv_dtype = attention_operand_dtype(caches, x_tensor.dtype());
     let QkvProjection { q, k, v, gate } = {
         let acts = layer.attention_norm(x_tensor, layer.int8mode(), wave)?;
-        layer.project_qkv(&acts, kv_dtype)?
+        layer.project_qkv(&acts, kv_dtype, wave)?
     };
 
     // Reshape for attention: (B, seq_len, H*D) -> (B, H, seq_len, D)
@@ -926,7 +932,7 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     let kv_dtype = attention_operand_dtype(caches, x_tensor.dtype());
     let QkvProjection { q, k, v, gate } = {
         let acts = layer.attention_norm(x_tensor, layer.int8mode(), wave)?;
-        layer.project_qkv(&acts, kv_dtype)?
+        layer.project_qkv(&acts, kv_dtype, wave)?
     };
 
     let n_head = layer.n_head();

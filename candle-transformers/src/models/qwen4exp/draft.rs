@@ -67,7 +67,7 @@ use crate::models::prefill_utils::SharedPm;
 use crate::models::rope_schedule::FactoredRope;
 use crate::models::tensor_cat::TensorCat;
 use candle::quantized::cuda::to_dynamic;
-use candle_nn::kv_cache::KvCache;
+use candle_nn::kv_cache::{begin_wave, KvCache, LayerPhase};
 
 /// Each sequence's last wide residual, carried between waves so the head's
 /// first row has the `h(t-1)` the wave before it produced.
@@ -125,6 +125,25 @@ impl Qwen4ExpBatched {
         let dev = &self.model.device;
         let (total_rows, hc, n_embd) = res.dims3()?;
         let g = crate::models::profile::gpu_span("q4e:mtp_head", dev);
+
+        // **The head's own phase.** It runs one layer's worth of work after the
+        // trunk's loop has closed its phases, and until now it ran with none
+        // open at all — so its projections, its DeltaNet scan buffers and the
+        // split block under `project_qkv` all went to the pool, which is where
+        // the largest remaining allocations were.
+        //
+        // Safe because the head already escapes the arena where it must: the
+        // seeds it carries forward are taken with `to_owned_tensor`
+        // specifically so a generation reset cannot reclaim what the next wave
+        // reads (see the carry below). Everything else it allocates dies with
+        // the pass.
+        #[cfg(feature = "cuda")]
+        let head_wave = match dev {
+            candle::Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?),
+            _ => None,
+        };
+        #[cfg(not(feature = "cuda"))]
+        let head_wave: Option<()> = None;
 
         // ── The shift, as one gather. ──
         //
@@ -245,7 +264,7 @@ impl Qwen4ExpBatched {
                 w.dec_params,
                 w.kv_layer,
                 dec_sel.as_ref(),
-                None,
+                head_wave.as_ref(),
             )?;
         }
         if w.pre_rows > 0 {
@@ -263,7 +282,7 @@ impl Qwen4ExpBatched {
                 w.pre_params,
                 w.kv_layer,
                 pre_sel.as_ref(),
-                None,
+                head_wave.as_ref(),
             )?;
         }
 

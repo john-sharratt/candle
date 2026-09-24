@@ -180,6 +180,7 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
         &self,
         acts: &DynamicActs<'w>,
         out_dtype: DType,
+        wave: WaveRef<'w>,
     ) -> Result<QkvProjection<'w>> {
         project_qkv_gated(
             self.attn()?,
@@ -190,6 +191,7 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
             acts,
             out_dtype,
             self.lora,
+            wave,
         )
     }
 
@@ -250,6 +252,10 @@ pub fn project_qkv_gated<'w>(
     acts: &DynamicActs<'w>,
     out_dtype: DType,
     lora: LayerLora<'_>,
+    // The open attention phase. Used only when the projections' own outputs
+    // carry no ticket — a `Float` activation is the residual cloned, so on a
+    // stack whose residual is pool-backed there is nothing to inherit from.
+    wave: Option<&'w WaveGeneration>,
 ) -> Result<QkvProjection<'w>> {
     // The adapter reads the same post-norm activation the base projections do,
     // and adds to their raw output — before the q/k norms and before the rotary
@@ -279,6 +285,7 @@ pub fn project_qkv_gated<'w>(
         outs,
         &[w.q_rows, w.kv_rows, w.kv_rows],
         "attention q/k/v projections",
+        wave,
     )?
     .into_iter();
     let qg = parts.next().expect("three parts requested");

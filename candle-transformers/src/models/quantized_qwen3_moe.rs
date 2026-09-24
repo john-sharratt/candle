@@ -977,6 +977,8 @@ impl BatchedAttentionLayer for LayerWeights {
         &self,
         acts: &DynamicActs<'w>,
         out_dtype: DType,
+        // As llama: separate q/k/v weights, no stacked group to split.
+        _wave: WaveRef<'w>,
     ) -> Result<QkvProjection<'w>> {
         let (b_sz, seq_len) = match acts {
             DynamicActs::Float(t) => {

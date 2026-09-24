@@ -18,6 +18,8 @@ use candle::{LiveTensor, Result, Tensor};
 // Not CUDA-gated: `gpu_span` is defined in both configurations and is a
 // zero-sized no-op without `profile` + `cuda`, so the call sites need no `cfg`
 // of their own.
+use candle_nn::kv_cache::WaveGeneration;
+
 use crate::models::profile::gpu_span;
 use crate::models::quantized_matmul::QMatMul;
 use crate::models::stacked_proj::project_grouped;
@@ -84,8 +86,10 @@ pub fn quantized_delta_net_layer_forward<'w>(
         out,
         stash: None,
     }];
+    // The single-sequence convenience path, used off the sweep, so no phase is
+    // open for its projections to root on.
     let mixed =
-        quantized_delta_net_layer_forward_spans(x, w, dims, &mut one, rms_eps, None, zgate)?;
+        quantized_delta_net_layer_forward_spans(x, w, dims, &mut one, rms_eps, None, zgate, None)?;
     let [seq] = one;
     seq.state.absorb_solo(&seq.out)?;
     Ok(mixed)
@@ -116,6 +120,7 @@ pub fn quantized_delta_net_layer_forward<'w>(
 /// takes F32 natively — while storing the dtype the residual stream wants.
 /// Every conversion on this path is a kernel's own store; none is a pass over a
 /// tensor (hot-path invariant 1).
+#[allow(clippy::too_many_arguments)]
 pub fn quantized_delta_net_layer_forward_spans<'w>(
     x: &LiveTensor<'w>,
     w: &QuantDeltaNetWeights,
@@ -124,6 +129,8 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
     rms_eps: f64,
     table: Option<&DeltaNetLayerTable>,
     zgate: ZGate,
+    // The open layer phase, for the projection block when `x` carries no ticket.
+    wave: Option<&'w WaveGeneration>,
 ) -> Result<LiveTensor<'w>> {
     let act = x.dtype();
     // `forward_live`, not `Module::forward`: the input is the layer's own
@@ -148,6 +155,7 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
         &widths,
         candle::DType::F32,
         "delta-net input projections",
+        wave,
     )?
     .into_iter();
     let p = DeltaNetProjections {

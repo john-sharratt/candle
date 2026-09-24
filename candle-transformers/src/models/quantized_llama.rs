@@ -545,6 +545,9 @@ impl BatchedAttentionLayer for LayerWeights {
         &self,
         acts: &DynamicActs<'w>,
         out_dtype: DType,
+        // This family projects each of q/k/v from its own weight, so there is
+        // no stacked group to split and nothing here needs a root.
+        _wave: WaveRef<'w>,
     ) -> Result<QkvProjection<'w>> {
         let q_dim = self.n_head * self.head_dim;
         let kv_dim = self.n_kv_head * self.head_dim;

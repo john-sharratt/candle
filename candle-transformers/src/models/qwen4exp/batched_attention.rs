@@ -102,6 +102,7 @@ impl BatchedAttentionLayer for Qwen4ExpAttentionLayer<'_> {
         &self,
         acts: &DynamicActs<'w>,
         out_dtype: DType,
+        wave: WaveRef<'w>,
     ) -> Result<QkvProjection<'w>> {
         // Unadapted: qwen4exp's sweep runs its layers under the Gated Residual,
         // which has no adapter plumbing of its own, so no LoRA reaches here.
@@ -114,6 +115,7 @@ impl BatchedAttentionLayer for Qwen4ExpAttentionLayer<'_> {
             acts,
             out_dtype,
             LayerLora::default(),
+            wave,
         )
     }
 
