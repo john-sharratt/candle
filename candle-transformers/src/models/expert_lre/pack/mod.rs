@@ -858,9 +858,38 @@ pub(crate) fn open_or_create(spec: PackSpec<'_>) -> Result<PackSource> {
                 %why,
                 "expert pack: building"
             );
-            Ok(PackSource::Build(PackWriter::create(
-                &path, header, ephemeral,
-            )?))
+            match PackWriter::create(&path, header.clone(), ephemeral) {
+                Ok(w) => Ok(PackSource::Build(w)),
+                // **A checkpoint directory that cannot be written is a slower
+                // load, not a failed one.**
+                //
+                // The pack lives beside the checkpoint so it outlives the
+                // process, but the checkpoint can sit somewhere this process may
+                // only read: a read-only mount, a share the service account has
+                // no write on, a full volume. Before the pack had a persistent
+                // home at all, that case loaded — slowly, repacking every boot —
+                // and it must still load. Falling back to the temp directory
+                // gives exactly the old behaviour, marked `ephemeral` so nothing
+                // later mistakes the leftover for a reusable pack.
+                //
+                // Only when a home was asked for: an already-ephemeral writer
+                // that cannot create has no second place to try.
+                Err(e) if !ephemeral => {
+                    let tmp_home = std::env::temp_dir().join(&name);
+                    tracing::warn!(
+                        target: "candle_transformers::expert_lre",
+                        beside = %path.display(),
+                        fallback = %tmp_home.display(),
+                        "expert pack: cannot write beside the checkpoint ({e}) — building an \
+                         ephemeral pack in the temp directory instead, which means a repack \
+                         every boot until that directory is writable"
+                    );
+                    Ok(PackSource::Build(PackWriter::create(
+                        &tmp_home, header, true,
+                    )?))
+                }
+                Err(e) => Err(e),
+            }
         }
     }
 }

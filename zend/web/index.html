@@ -476,6 +476,18 @@ import { estateSwitcher } from './common/lib/estate.js';
     lastUploadedId: null,
     fileView: null,
     thinkOpen: {},
+    // Which tool cards the reader has opened, keyed conv:msg:toolIndex.
+    //
+    // A `<details>` keeps its own open state, and that state lives only in the
+    // element — so every rebuild dropped it. The card is re-emitted from a
+    // string with no `open` attribute by `render()`, by `hydrateConv()`, and,
+    // the one that made it look spontaneous, by `liveUpdateStreaming()`: a
+    // reader opens a finished tool card while the next tool runs, and the next
+    // stream event a few seconds later replaces the bubble's innerHTML and the
+    // card shuts. `thinkOpen` already did this for think blocks; tool cards were
+    // never wired up. Keyed per card rather than per message, so opening one
+    // does not open its siblings.
+    toolOpen: {},
     upload: null,
     // The daemon's background ingestion backlog (GET /v1/status
     // `ingest_backlog`) — `{ processed, total, last_item }`, or null when
@@ -559,7 +571,14 @@ import { estateSwitcher } from './common/lib/estate.js';
     const zmd = row && row.querySelector('.zmd');
     if (!zmd) { render(); return; }   // not laid out yet — fall back to full render
     const open = !!S.thinkOpen[conv.id + ':' + idx];
+    // The hover popover is parented to `<body>` and hidden by the bar's own
+    // `mouseleave`. The write below destroys the hovered bar outright, so that
+    // event never fires and the popover is left floating at fixed coordinates —
+    // over and past the block it described — until the next full `render()`.
+    // `render()` hides it for exactly this reason; the streaming patch did not.
+    hideProjPopover();
     zmd.innerHTML = nodeHtml(m, open);
+    restoreToolOpen(zmd, conv.id, idx);
     if (!S.narrow) applyProjSegments(zmd, m);
     // Keep any live thinking ticker scrolled to its tail so the newest words sit at
     // the right and roll leftward through the fade as more stream in.
@@ -774,7 +793,12 @@ import { estateSwitcher } from './common/lib/estate.js';
   // `pendingCallCard` instead.
   // `tokens`: the output's length in tokens as it sits in the context, when
   // the daemon reported it.
-  function toolCard(json, complete, output, running, tokens) {
+  // `idx` is the card's position among the tool cards of its own message, and
+  // becomes its identity for the open state `restoreToolOpen` puts back after a
+  // rebuild. It is emitted as `data-tool` rather than resolved to an `open`
+  // attribute here, so the memoised HTML string stays independent of who has
+  // opened what.
+  function toolCard(json, complete, output, running, tokens, idx) {
     if (!complete) return pendingCallCard(json);
     let parsed;
     try { parsed = JSON.parse(json.trim()); } catch (e) { parsed = null; }
@@ -808,7 +832,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     const sub = toolSubject(name, args, resp);
     const subHtml = (sub.subject ? '<span class="tool-call-subject">' + esc(sub.subject) + '</span>' : '') +
       (sub.detail ? '<span class="tool-call-detail">' + esc(sub.detail) + '</span>' : '');
-    return '<details class="tool-call-card">' +
+    return '<details class="tool-call-card" data-tool="' + idx + '">' +
       '<summary class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">' + esc(name) + '</span>' + subHtml + badge +
       '<svg class="tool-call-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></summary>' +
       (argsHtml ? '<div class="tool-call-args">' + argsHtml + '</div>' : '') + outHtml + '</details>';
@@ -900,7 +924,7 @@ import { estateSwitcher } from './common/lib/estate.js';
       else {
         const s = segs[parseInt(parts[i], 10)];
         if (s.kind === 'think') { html += renderThink(s, open); }
-        else { html += toolCard(s.json, s.complete, toolOutputs ? toolOutputs[toolIdx] : null, running, toolTokens ? toolTokens[toolIdx] : null); toolIdx++; }
+        else { html += toolCard(s.json, s.complete, toolOutputs ? toolOutputs[toolIdx] : null, running, toolTokens ? toolTokens[toolIdx] : null, toolIdx); toolIdx++; }
       }
     }
     return html;
@@ -934,6 +958,31 @@ import { estateSwitcher } from './common/lib/estate.js';
     if (msg.streaming && msg.prefill && msg.toolOutputs && msg.toolOutputs.length) html += prefillCard(msg.prefill);
     if (msg.streaming) html += '<span class="zcursor"></span>';
     return html;
+  }
+  // A tool card's identity across rebuilds: the conversation, the message it
+  // sits in, and its position among that message's cards. Per card rather than
+  // per message — `thinkOpen` keys only to the message, so every think block in
+  // a bubble shares one flag, and repeating that here would make opening one
+  // tool card open its siblings.
+  function toolOpenKey(convId, msgIdx, toolIdx) {
+    return convId + ':' + msgIdx + ':' + toolIdx;
+  }
+  // Put back what the reader had opened, after any rebuild of a bubble.
+  //
+  // Called wherever `.zmd` innerHTML is written — the full render, and the
+  // streaming patch. Synchronous with the write, so the card never paints shut
+  // first. A card the reader has not touched has no entry and stays closed.
+  //
+  // The message index is passed rather than read from an enclosing
+  // `[data-msg]`: `buildChat` restores into a `zmd` it has not attached yet —
+  // the wrapper carrying `data-msg` is created around it on the next line — so
+  // a `closest` here would find nothing and silently restore nothing.
+  function restoreToolOpen(zmd, convId, msgIdx) {
+    const cards = zmd.querySelectorAll('details.tool-call-card');
+    for (let i = 0; i < cards.length; i++) {
+      const key = toolOpenKey(convId, msgIdx, cards[i].getAttribute('data-tool') || '0');
+      if (S.toolOpen[key]) cards[i].open = true;
+    }
   }
   // Memoized `nodeHtml` for FINISHED messages: a full render re-parses the whole
   // transcript's markdown otherwise, so a menu toggle or a 5s sync re-parses every
@@ -1876,6 +1925,7 @@ import { estateSwitcher } from './common/lib/estate.js';
         // attached by the caller after buildChat returns), and getBoundingClientRect
         // needs it laid out. The live-stream path measures an already-attached
         // node, so it calls applyProjSegments synchronously.
+        restoreToolOpen(zmd, conv.id, idx);
         if (!S.narrow) applyProjSegments(zmd, m);
         scroller.appendChild(h('div', { 'data-msg': idx, class: 'z-turn z-selectable', style: 'display:flex; margin-bottom:2rem; padding-right:2rem;' }, zmd,
           turnCopyBtn(m, 'right:2rem;')));
@@ -1983,17 +2033,49 @@ import { estateSwitcher } from './common/lib/estate.js';
     const spans = (m.spans || []).slice().sort((a, b) => (a.start_token || 0) - (b.start_token || 0));
     if (!spans.length) return;
     const isCursor = (el) => el.classList && el.classList.contains('zcursor');
+    // Blocks the projection count never saw, so they must not be indexed as if
+    // it had. `blockCountFor` counts `renderContent` alone; `nodeHtml` appends
+    // the prefill card and the error notice after it, and a `_blockEnd` frozen
+    // against the smaller universe then points past its own block.
+    const isExtra = (el) => el.classList
+      && (el.classList.contains('tool-prefill') || el.classList.contains('zerr'));
     const all = Array.from(zmd.children);
     const cursor = all.find(isCursor);
-    const blocks = all.filter((el) => !isCursor(el));
-    if (!blocks.length) return;
+    // Held aside, NOT dropped: this function rebuilds `zmd` from `blocks`, so
+    // anything filtered out and not put back is destroyed — which for `.zerr`
+    // means a failed turn losing the only thing that says it failed. Both are
+    // trailing elements (`nodeHtml` appends them after the content), so they go
+    // back after the segments and before the cursor.
+    const extras = all.filter(isExtra);
+    const blocks = all.filter((el) => !isCursor(el) && !isExtra(el));
+    if (!blocks.length) {
+      return;
+    }
     // Projections are POINTS at `start_token`; projection i governs `[start_i,
     // start_{i+1})`. Its bar therefore ends at the NEXT projection's position (the
     // last runs to the end). `maxTok` approximates the turn's total by the last
     // projection's position, so the tail past it maps coarsely.
     const maxTok = Math.max(1, ...spans.map((s) => s.start_token || 0));
     const boundTok = (i) => (i + 1 < spans.length ? (spans[i + 1].start_token || 0) : maxTok);
-    const boundary = (i) => spans[i]._blockEnd != null ? spans[i]._blockEnd : Math.round(boundTok(i) / maxTok * blocks.length);
+    // **Frozen bounds are used only while they still describe this block list.**
+    //
+    // `_blockEnd` is recorded per projection while the turn streams, against the
+    // block count at that moment. The count can then SHRINK: `onDone` re-renders
+    // with `streaming` false, which drops an unterminated `<think>` outright and
+    // folds an unterminated `<tool_call>` into one finished card. Every frozen
+    // bound is then past the end, `projOf` finds its first candidate for every
+    // block, and one bar is stretched over the whole bubble.
+    //
+    // Clamping each bound to `blocks.length` does NOT fix that, which is worth
+    // stating because it looks like it should: `projOf` only ever asks
+    // `boundary(i) > bi` for `bi < blocks.length`, so a bound at the length and a
+    // bound past it answer identically for every block. The bounds have to be
+    // abandoned, not trimmed — and all of them together, since a mix of frozen
+    // and estimated bounds is not a partition of anything.
+    const stale = spans.some((s) => s._blockEnd != null && s._blockEnd > blocks.length);
+    const boundary = (i) => (!stale && spans[i]._blockEnd != null)
+      ? spans[i]._blockEnd
+      : Math.round(boundTok(i) / maxTok * blocks.length);
     const projOf = (bi) => { for (let i = 0; i < spans.length; i++) { if (boundary(i) > bi) return i; } return -1; };
     // Points → intervals: stash each projection's governed length + throughput on
     // the span so the hover popover and panel header (which see one span at a time)
@@ -2012,6 +2094,11 @@ import { estateSwitcher } from './common/lib/estate.js';
     // whole-block bar. Needs `_charEnd` (live decode); reloaded turns lack it, so
     // they stay coarse. Incomplete (still-decoding) thinks have no range, so they
     // never split — that's what keeps the active bar from shrinking.
+    // A block that owns its bar outright: it is a unit the reader sees as one
+    // thing, so a bar shared with the prose around it reads as overflowing it.
+    const ownSegment = (el) => el.classList && (
+      el.classList.contains('think-block') || el.classList.contains('think-streaming')
+      || el.classList.contains('tool-call-card') || el.classList.contains('tool-author'));
     const clen = Math.max(1, (m.content || '').length);
     const subBars = (el) => {
       if (!(el.dataset && el.dataset.c0 != null)) return null;
@@ -2068,7 +2155,21 @@ import { estateSwitcher } from './common/lib/estate.js';
       // (top→bottom). The run stops at a splittable think so it gets its own seg.
       const a = projOf(gi);
       let gj = gi;
-      while (gj < blocks.length && projOf(gj) === a && !subBars(blocks[gj])) gj++;
+      // A run never crosses a think block or a tool card, whether or not that
+      // block can be split into sub-bars.
+      //
+      // `subBars` returns null for anything without a `data-c0/c1` range, and
+      // only a COMPLETED think block carries one — a streaming think has none,
+      // and a tool card never has one at all. So while the model was thinking,
+      // the live block was absorbed into the run of whatever projection owned
+      // the prose around it, and that run's single top-to-bottom bar visibly ran
+      // past the block at both ends. It came right on its own once the turn
+      // settled, because the finished think then split and took its own segment
+      // — which is exactly the "fine once everything finishes" in the report.
+      do { gj++; } while (
+        gj < blocks.length && projOf(gj) === a
+        && !subBars(blocks[gj]) && !ownSegment(blocks[gj]) && !ownSegment(blocks[gj - 1])
+      );
       const seg = h('div', { style: 'position:relative; padding-left:1.15rem;' });
       if (a >= 0) {
         const bar = barFor(spans[a], a);
@@ -2083,6 +2184,15 @@ import { estateSwitcher } from './common/lib/estate.js';
       gi = gj;
     }
     for (let si = 0; si < segs.length - 1; si++) segs[si].style.marginBottom = '0.6rem';
+    // In the same gutter as every segment, so the prefill card and the error
+    // notice line up with the blocks above them instead of sitting a bar's width
+    // to their left. They carry no bar of their own — no projection governs
+    // them, which is why they are out of `blocks` in the first place.
+    if (extras.length) {
+      const tail = h('div', { style: 'padding-left:1.15rem;' });
+      for (let i = 0; i < extras.length; i++) tail.appendChild(extras[i]);
+      frag.appendChild(tail);
+    }
     if (cursor) frag.appendChild(cursor);
     zmd.innerHTML = '';
     zmd.appendChild(frag);
@@ -3299,6 +3409,16 @@ import { estateSwitcher } from './common/lib/estate.js';
     if (det && det.classList && det.classList.contains('think-block')) {
       const turn = det.closest('[data-msg]');
       if (turn) { const key = S.activeId + ':' + turn.getAttribute('data-msg'); S.thinkOpen = Object.assign({}, S.thinkOpen, { [key]: det.open }); }
+    }
+    // The same for a tool card, which had no such record and so lost its open
+    // state to every rebuild — including the streaming patch that runs while
+    // the reader is looking at it.
+    if (det && det.classList && det.classList.contains('tool-call-card')) {
+      const turn = det.closest('[data-msg]');
+      if (turn) {
+        const key = toolOpenKey(S.activeId, turn.getAttribute('data-msg'), det.getAttribute('data-tool') || '0');
+        S.toolOpen = Object.assign({}, S.toolOpen, { [key]: det.open });
+      }
     }
     // No reposition needed: the bar gutter is align-self:stretch, so when a
     // think block expands/collapses the bars re-flow by CSS % automatically.

@@ -163,9 +163,19 @@ fn list_enumerates_the_workspace_from_the_root() {
         json!({"prefix": "/"}),
         &ctx,
     ));
-    assert_eq!(
-        paths(&resp),
-        vec!["README.md", "docs/guide.md", "src/lib.rs", "src/main.rs"],
+    // The root's own file, and the two directories beneath it named rather than
+    // walked — `docs/guide.md` and the `src/` files belong to their own listings.
+    assert_eq!(paths(&resp), vec!["README.md", "docs/", "src/"]);
+    let docs = resp["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "docs/")
+        .expect("docs/ is listed");
+    assert_eq!(docs["dir"], true);
+    assert!(
+        docs.get("bytes").is_none(),
+        "a directory reports no size: {docs}",
     );
     // Nothing has been written this session, so the budget is untouched even
     // though the listing is non-empty.
@@ -341,9 +351,12 @@ fn delete_hides_a_workspace_file_without_erasing_it() {
         ),
         "not_found",
     );
+    // Listed from `docs/`, not from the root: a root listing holds no path with
+    // a `/` in it at all now, so asserting the file's absence there would pass
+    // whether or not whiteouts were honoured.
     let listed = paths(&harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"prefix": ""}),
+        json!({"prefix": "docs/"}),
         &ctx,
     )));
     assert!(!listed.contains(&"docs/guide.md".to_string()), "{listed:?}");
@@ -505,7 +518,9 @@ fn list_within_one_page_reports_no_next_page() {
         &ctx,
     ));
     assert_eq!(resp["paging"]["pages"], 1);
-    assert_eq!(resp["paging"]["total"], 4);
+    // `README.md`, `docs/`, `src/` — the root's three entries, not the four
+    // files the tree holds in total.
+    assert_eq!(resp["paging"]["total"], 3);
     assert!(resp["paging"]["next_page"].is_null());
 }
 
@@ -812,13 +827,18 @@ fn every_spelling_of_a_directory_prefix_lists_the_same_files() {
         assert_eq!(paths(&resp), expected, "prefix {prefix:?}");
     }
 
-    // The root, however it is spelled, lists everything.
+    // The root, however it is spelled, lists the two crate directories — and
+    // none of the four files, every one of which lives below them.
     for prefix in ["", "/", "workspace", "/workspace/"] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
             json!({ "prefix": prefix }),
             &ctx,
         ));
-        assert_eq!(paths(&resp).len(), 4, "prefix {prefix:?}");
+        assert_eq!(
+            paths(&resp),
+            vec!["candle-core/", "zend/"],
+            "prefix {prefix:?}",
+        );
     }
 }

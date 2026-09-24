@@ -181,6 +181,12 @@ pub struct ListEntry {
     /// `true` when the entry is the session's own copy (upper layer) rather than
     /// a file read straight off the workspace.
     pub modified: bool,
+    /// A subdirectory of the listed directory, named so the caller can list it
+    /// in turn. Its `path` carries a trailing `/` — the convention the ingest
+    /// units use for the same thing — and its `bytes` is 0, because a directory
+    /// has no size a listing can give without walking into it, which is the one
+    /// thing a listing of one level must not do.
+    pub dir: bool,
 }
 
 #[derive(Default)]
@@ -306,13 +312,25 @@ impl VfsStore {
     /// Whiteouted paths are omitted. Sorted by path.
     pub fn list(&self, prefix: &str) -> Vec<ListEntry> {
         let norm_prefix = Self::normalize(prefix);
+        let (dir_key, name_filter) = self.listing_scope(&norm_prefix);
         let mut out: Vec<ListEntry> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        // Subdirectories are named once however many entries sit under them,
+        // and a directory the session has written into is the same directory
+        // the workspace has — so both layers fold into one set of names.
+        let mut dirs: HashSet<String> = HashSet::new();
 
         {
             let guard = self.upper.read().unwrap();
             for (k, v) in guard.files.iter() {
-                if !Self::matches_prefix(k, &norm_prefix) {
+                let Some((name, is_dir)) = Self::listed_as(k, &dir_key) else {
+                    continue;
+                };
+                if !name.starts_with(name_filter) {
+                    continue;
+                }
+                if is_dir {
+                    dirs.insert(name);
                     continue;
                 }
                 seen.insert(k.clone());
@@ -320,6 +338,7 @@ impl VfsStore {
                     path: k.clone(),
                     bytes: v.len(),
                     modified: true,
+                    dir: false,
                 });
             }
             for w in guard.whiteouts.iter() {
@@ -327,7 +346,19 @@ impl VfsStore {
             }
         }
 
-        for (path, bytes) in self.list_lower(&norm_prefix) {
+        for (path, bytes, is_dir) in self.list_lower(&dir_key, name_filter) {
+            if is_dir {
+                // The name, not the key: `listed_key` puts the trailing slash on
+                // below, and the upper layer stores the same name without one.
+                dirs.insert(
+                    path.trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                        .to_string(),
+                );
+                continue;
+            }
             if seen.contains(&path) {
                 continue;
             }
@@ -335,8 +366,16 @@ impl VfsStore {
                 path,
                 bytes,
                 modified: false,
+                dir: false,
             });
         }
+
+        out.extend(dirs.into_iter().map(|name| ListEntry {
+            path: Self::listed_key(&dir_key, &name, true),
+            bytes: 0,
+            modified: false,
+            dir: true,
+        }));
 
         out.sort_by(|a, b| a.path.cmp(&b.path));
         out
@@ -544,6 +583,16 @@ impl VfsStore {
     /// would be the same class of hole as the read path that ignored these
     /// rules entirely.
     fn lower_walker(root: &Path) -> ignore::Walk {
+        Self::lower_walker_depth(root, None)
+    }
+
+    /// [`Self::lower_walker`] bounded to `max_depth` levels below `root`.
+    ///
+    /// A listing takes `Some(1)` — the directory's own entries and nothing
+    /// under them — and a search takes `None`, because it is looking for a file
+    /// whose location is what the caller does not know. Same builder either way,
+    /// so the two cannot disagree about what is visible.
+    fn lower_walker_depth(root: &Path, max_depth: Option<usize>) -> ignore::Walk {
         WalkBuilder::new(root)
             .hidden(true)
             .git_ignore(true)
@@ -552,6 +601,7 @@ impl VfsStore {
             .ignore(true)
             .require_git(false)
             .parents(true)
+            .max_depth(max_depth)
             .build()
     }
 
@@ -568,6 +618,82 @@ impl VfsStore {
             Some(dir) if !norm_prefix.is_empty() && dir.is_dir() => (dir, None),
             _ => (root.to_path_buf(), Some(norm_prefix)),
         }
+    }
+
+    /// The **one directory** a listing covers, and the name filter within it.
+    ///
+    /// A listing shows one level: the files of a directory and the names of its
+    /// subdirectories. So a prefix has to be resolved to a directory plus, when
+    /// it ends mid-name, the partial name to match there — `src/ma` lists `src`
+    /// filtered to `ma`, while `src` lists `src` unfiltered.
+    ///
+    /// The distinction is made by asking the workspace, not by looking for a
+    /// trailing slash: [`Self::normalize`] drops it, so `src/` and `src` arrive
+    /// identical, and a caller naming a directory should get its contents either
+    /// way. A prefix that is not a directory falls back to "the parent, filtered
+    /// by the last segment", which is also what an empty prefix wants — the root,
+    /// unfiltered.
+    ///
+    /// Returns `(dir_key, name_filter)`, where `dir_key` is `""` for the root.
+    fn listing_scope<'p>(&self, norm_prefix: &'p str) -> (String, &'p str) {
+        let on_disk = || {
+            self.workspace
+                .as_ref()
+                .and_then(|root| Self::under(root, norm_prefix))
+                .is_some_and(|p| p.is_dir())
+        };
+        // **A directory the session invented is still a directory.** The upper
+        // layer holds keys, not directories, so one that exists only there — a
+        // run of `gen/…` writes with nothing of that name on disk — has no entry
+        // to stat. Asking the workspace alone would take it for a partial name
+        // and list the root filtered by `gen`, answering a listing of four
+        // hundred session files with the single entry `gen/`.
+        let in_session = || {
+            let with_slash = format!("{norm_prefix}/");
+            let guard = self.upper.read().unwrap();
+            guard.files.keys().any(|k| k.starts_with(&with_slash))
+        };
+        let is_dir = !norm_prefix.is_empty() && (on_disk() || in_session());
+        if is_dir {
+            return (norm_prefix.to_string(), "");
+        }
+        match norm_prefix.rfind('/') {
+            Some(cut) => (norm_prefix[..cut].to_string(), &norm_prefix[cut + 1..]),
+            None => (String::new(), norm_prefix),
+        }
+    }
+
+    /// The entry `key` contributes to a listing of `dir_key`, if any.
+    ///
+    /// `Some((name, is_dir))` where `name` is the entry's own name within the
+    /// directory — a file directly in it, or the first segment of a path that
+    /// continues below it, which is the subdirectory the caller is told about
+    /// instead of its contents.
+    fn listed_as(key: &str, dir_key: &str) -> Option<(String, bool)> {
+        let rest = if dir_key.is_empty() {
+            key
+        } else {
+            key.strip_prefix(dir_key)?.strip_prefix('/')?
+        };
+        match rest.split_once('/') {
+            Some((head, _)) if !head.is_empty() => Some((head.to_string(), true)),
+            _ if rest.is_empty() => None,
+            _ => Some((rest.to_string(), false)),
+        }
+    }
+
+    /// A listed entry's full key: the directory it sits in plus its own name,
+    /// with the trailing `/` that marks a subdirectory.
+    fn listed_key(dir_key: &str, name: &str, is_dir: bool) -> String {
+        let mut key = if dir_key.is_empty() {
+            name.to_string()
+        } else {
+            format!("{dir_key}/{name}")
+        };
+        if is_dir {
+            key.push('/');
+        }
+        key
     }
 
     /// Normalised keys of the workspace files under `norm_prefix`.
@@ -606,23 +732,42 @@ impl VfsStore {
         out
     }
 
-    /// Walk the workspace under `norm_prefix`, honouring every ignore file the
-    /// `ignore` crate knows. Returns `(normalised path, bytes)`.
+    /// One directory's entries — its files, and the names of its subdirectories
+    /// — as `(normalised path, bytes, is_dir)`, honouring every ignore file the
+    /// `ignore` crate knows. A subdirectory's path carries a trailing `/` and its
+    /// `bytes` is 0.
     ///
     /// **Metadata only — nothing here opens a file.** `bytes` is the directory
     /// entry's own length, so the cost of a listing is the walk. A line count
     /// would mean a `read` plus a UTF-8 decode of every file the walk touches —
     /// on this workspace ~2,900 files, for a listing that pages down to fifty
     /// rows.
-    fn list_lower(&self, norm_prefix: &str) -> Vec<(String, usize)> {
+    ///
+    /// **Bounded to one level, which is what a listing is.** It used to walk the
+    /// whole tree and keep every key matching the prefix as a plain string, so an
+    /// empty prefix — the documented way to ask for the project root — enumerated
+    /// every file in the repository. Paged at fifty entries and sorted, the reply
+    /// to "list the root" was fifty files from whatever sorted first and not one
+    /// of the root's own.
+    fn list_lower(&self, dir_key: &str, name_filter: &str) -> Vec<(String, usize, bool)> {
         let Some(root) = self.workspace.as_ref() else {
             return Vec::new();
         };
-        let (walk_root, filter) = Self::walk_start(root, norm_prefix);
+        let Some(walk_root) = Self::under(root, dir_key) else {
+            return Vec::new();
+        };
+        if !walk_root.is_dir() {
+            return Vec::new();
+        }
 
         let mut out = Vec::new();
-        for entry in Self::lower_walker(&walk_root).flatten() {
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
+        for entry in Self::lower_walker_depth(&walk_root, Some(1)).flatten() {
+            // The walk yields its own root first; a directory does not list itself.
+            if entry.depth() == 0 {
+                continue;
+            }
+            let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+            if !is_dir && !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
             let Ok(rel) = entry.path().strip_prefix(root) else {
@@ -633,16 +778,26 @@ impl VfsStore {
                 .map(|c| c.as_os_str().to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
-            if Self::is_protected(&key) || !Self::addressable(&key) {
+            if Self::is_protected(&key) {
                 continue;
             }
-            if let Some(p) = filter {
-                if !Self::matches_prefix(&key, p) {
-                    continue;
-                }
+            // A subdirectory is a name to list next, not a file to read, so the
+            // addressability rule that governs reads does not apply to it.
+            if !is_dir && !Self::addressable(&key) {
+                continue;
+            }
+            let Some((name, _)) = Self::listed_as(&key, dir_key) else {
+                continue;
+            };
+            if !name.starts_with(name_filter) {
+                continue;
+            }
+            if is_dir {
+                out.push((Self::listed_key(dir_key, &name, true), 0, true));
+                continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
-            out.push((key, meta.len() as usize));
+            out.push((key, meta.len() as usize, false));
         }
         out
     }
@@ -1133,7 +1288,9 @@ mod tests {
             s.read("./src/../src/main.rs").unwrap().as_deref(),
             Some("two")
         );
-        assert_eq!(listed(&s, ""), vec!["src/main.rs"]);
+        // The root names the directory; the file itself lists one level down.
+        assert_eq!(listed(&s, ""), vec!["src/"]);
+        assert_eq!(listed(&s, "src/"), vec!["src/main.rs"]);
         assert_eq!(s.total_bytes(), 3, "one entry, not two");
     }
 
@@ -1240,22 +1397,42 @@ mod tests {
 
     // ── Lower layer: listing ─────────────────────────────────────────────────
 
+    /// **One directory per listing, subdirectories named rather than walked.**
+    ///
+    /// The root answers with its own file and `src/`, not with everything under
+    /// `src/` — which is what it used to do, and what made "list the project
+    /// root" return fifty files from the bottom of the tree and none from the
+    /// top.
     #[test]
-    fn list_is_sorted_and_prefix_scoped() {
+    fn list_covers_one_directory_and_names_its_subdirectories() {
         let (_dir, s) = store_with_tree();
-        assert_eq!(
-            listed(&s, ""),
-            vec!["README.md", "src/main.rs", "src/util/helper.rs"],
-        );
+        assert_eq!(listed(&s, ""), vec!["README.md", "src/"]);
         for prefix in ["src", "src/", "/workspace/src"] {
             assert_eq!(
                 listed(&s, prefix),
-                vec!["src/main.rs", "src/util/helper.rs"],
+                vec!["src/main.rs", "src/util/"],
                 "prefix {prefix:?}",
             );
         }
         assert_eq!(listed(&s, "src/util"), vec!["src/util/helper.rs"]);
         assert!(listed(&s, "nothing/here").is_empty());
+    }
+
+    /// A subdirectory entry carries the trailing slash and no size, and is
+    /// exactly what the caller passes back to descend.
+    #[test]
+    fn a_subdirectory_entry_is_a_prefix_to_descend_with() {
+        let (_dir, s) = store_with_tree();
+        let root = s.list("");
+        let sub = root.iter().find(|e| e.dir).expect("src/ is listed");
+        assert_eq!(sub.path, "src/");
+        assert_eq!(sub.bytes, 0, "a directory has no size a listing can give");
+        assert!(!sub.modified);
+        assert_eq!(listed(&s, &sub.path), vec!["src/main.rs", "src/util/"]);
+        assert!(
+            root.iter().all(|e| e.dir || !e.path.contains('/')),
+            "no file from below the listed directory: {root:?}",
+        );
     }
 
     /// A prefix naming a file rather than a directory still resolves — the walk
@@ -1311,13 +1488,12 @@ mod tests {
         let main = entries.iter().find(|e| e.path == "src/main.rs").unwrap();
         assert!(main.modified);
         assert_eq!(main.bytes, "fn main() { /* mine */ }\n".len());
-        assert!(
-            !entries
-                .iter()
-                .find(|e| e.path == "src/util/helper.rs")
-                .unwrap()
-                .modified
-        );
+        // The untouched sibling is a level down, so what `src/` shows of it is
+        // the directory holding it — never marked modified, because a listing
+        // does not walk into one to find out.
+        let util = entries.iter().find(|e| e.path == "src/util/").unwrap();
+        assert!(util.dir && !util.modified);
+        assert!(!s.list("src/util/")[0].modified, "and nor is the file");
     }
 
     #[test]
@@ -1326,7 +1502,26 @@ mod tests {
         s.write("src/scratch.rs", "// draft\n".into()).unwrap();
         assert_eq!(
             listed(&s, "src/"),
-            vec!["src/main.rs", "src/scratch.rs", "src/util/helper.rs"],
+            vec!["src/main.rs", "src/scratch.rs", "src/util/"],
+        );
+    }
+
+    /// A directory that exists only in the session lists its own files.
+    ///
+    /// The upper layer holds keys, not directories, so there is nothing to stat
+    /// for one the workspace has never seen. Read from the workspace alone it
+    /// looks like a partial name, and the listing collapses to the single
+    /// subdirectory entry the root would show for it.
+    #[test]
+    fn a_directory_that_exists_only_in_the_session_lists_its_files() {
+        let (_dir, s) = store_with_tree();
+        s.write("gen/a.rs", "// a\n".into()).unwrap();
+        s.write("gen/b.rs", "// b\n".into()).unwrap();
+        assert_eq!(listed(&s, "gen/"), vec!["gen/a.rs", "gen/b.rs"]);
+        assert_eq!(listed(&s, "gen"), vec!["gen/a.rs", "gen/b.rs"]);
+        assert!(
+            listed(&s, "").contains(&"gen/".to_string()),
+            "and the root names it",
         );
     }
 

@@ -27,7 +27,7 @@ use super::pipeline::prewarm_expert_cache;
 #[cfg(feature = "cuda")]
 use super::pipeline::{
     slot_bytes_for, slot_offsets, startup_from_pack, startup_repack, ColdStaging, StartupTargets,
-    COLD_STAGING_BUFFERS,
+    COLD_STAGING_BUFFERS, PACK_TAIL_STEPS,
 };
 use super::pipeline::{spawn_pipeline_thread, PipelineState};
 use super::transition::TransitionMatrix;
@@ -813,7 +813,27 @@ impl ExpertCache {
                     }
                     PackSource::Build(mut writer) => {
                         startup_repack(targets, &mut writer, cuda_dev, progress)?;
-                        writer.finish()?
+                        // Publishing flushes and `fsync`s the whole pack — tens
+                        // of gigabytes, and the single largest thing that used
+                        // to happen behind a bar already reading 100%. It is
+                        // charged here, where it is paid, against the room
+                        // `startup_repack` left for it.
+                        let total = num_moe_layers * experts_per_layer;
+                        let t_publish = std::time::Instant::now();
+                        let pack = writer.finish()?;
+                        // Timed and named, because the next line printed used to
+                        // be the residency gauge's and the whole flush was read
+                        // off the log as the gauge being slow. The gauge is three
+                        // arithmetic operations.
+                        tracing::info!(
+                            target: "candle_transformers::expert_lre",
+                            secs = t_publish.elapsed().as_secs_f64(),
+                            "expert pack: published (flush + fsync + reopen)"
+                        );
+                        if let Some(cb) = progress {
+                            cb(total + 1, total + PACK_TAIL_STEPS);
+                        }
+                        pack
                     }
                 };
 
@@ -877,6 +897,12 @@ impl ExpertCache {
                 resident_gib = seeded as f64 / 1e9,
                 "expert cache: seeded resident-VRAM gauge"
             );
+            // The last of the tail: the cache is built and reporting itself, so
+            // the bar lands on its total here rather than at the last expert.
+            if let Some(cb) = progress {
+                let total = num_moe_layers * experts_per_layer;
+                cb(total + PACK_TAIL_STEPS, total + PACK_TAIL_STEPS);
+            }
             if let Ok(mut s) = stats.lock() {
                 s.resident_vram_bytes = seeded;
                 s.warm_slots = warm.num_slots();

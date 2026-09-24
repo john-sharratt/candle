@@ -15,7 +15,9 @@ pub const LIST_PAGE_ENTRIES: usize = 50;
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ListRequest {
-    /// Path prefix to filter results (e.g. `src/`). Defaults to "" — the project root.
+    /// Directory to list (e.g. `src/`), or a partial name within one (`src/ma`)
+    /// to filter it. Defaults to "" — the project root. Only this directory is
+    /// listed; its subdirectories come back as names to list in turn.
     pub prefix: Option<String>,
     /// Zero-based page of results to return. Defaults to 0. When the response's
     /// `paging.next_page` is set, pass it here to read the following page.
@@ -28,12 +30,20 @@ pub struct FileEntry {
     /// Size from the directory entry's metadata — the only measure of a file a
     /// listing can give without opening it. There is deliberately no line count
     /// beside it: see [`crate::state::vfs::ListEntry`].
-    pub bytes: usize,
+    ///
+    /// Omitted for a subdirectory, which has no size that does not require
+    /// walking into it — the one thing a listing of a single level must not do.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<usize>,
     /// `true` when this session has written or edited the file, so the content
     /// differs from what is on disk in the workspace. Omitted when false, which
     /// is the common case — it would otherwise be a third of the payload.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub modified: bool,
+    /// `true` for a subdirectory of the listed directory. Its `path` ends in `/`
+    /// and is what to pass back as `prefix` to list it in turn.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dir: bool,
 }
 
 #[derive(Serialize)]
@@ -51,16 +61,22 @@ pub struct FileList;
 impl Tool for FileList {
     const NAME: &'static str = "file_list";
     const DESCRIPTION: &'static str =
-        "List the files visible to this session: the project's working directory \
-         plus anything written or edited during the session, which shadows the \
-         file of the same path on disk. Optionally narrowed to a path prefix — \
-         omit it to list from the project root. Ignored paths (per .gitignore and \
-         friends) never appear. Results are paged: the response's `paging` reports \
-         the total and, when more remain, a `next_page` to pass back as `page`. \
-         Returns names and byte sizes, not file contents or line counts; an entry \
-         carries `modified: true` when this session has changed it. Use file_read \
-         to get a file's contents — read from line 1 and its header reports the \
-         file's length, so there is no need to size a file before reading it.";
+        "List ONE directory visible to this session: the project's working \
+         directory plus anything written or edited during the session, which \
+         shadows the file of the same path on disk. Omit `prefix` for the project \
+         root, or give a directory to list that one instead. Like `ls`, the reply \
+         covers that directory only — its files, and its immediate subdirectories \
+         as entries with `dir: true` and a trailing `/`, which you pass back as \
+         `prefix` to descend. Files under a subdirectory are NOT included; list it \
+         to see them, or use file_search when you do not know where a file is. A \
+         prefix ending mid-name (`src/ma`) filters that directory by the partial \
+         name. Ignored paths (per .gitignore and friends) never appear. Results \
+         are paged: the response's `paging` reports the total and, when more \
+         remain, a `next_page` to pass back as `page`. Returns names and byte \
+         sizes, not file contents or line counts; an entry carries \
+         `modified: true` when this session has changed it. Use file_read to get \
+         a file's contents — read from line 1 and its header reports the file's \
+         length, so there is no need to size a file before reading it.";
 
     type Request = ListRequest;
     type Response = ListResponse;
@@ -82,8 +98,9 @@ impl Tool for FileList {
             .take(LIST_PAGE_ENTRIES)
             .map(|e| FileEntry {
                 path: e.path,
-                bytes: e.bytes,
+                bytes: (!e.dir).then_some(e.bytes),
                 modified: e.modified,
+                dir: e.dir,
             })
             .collect();
         Ok(ListResponse {

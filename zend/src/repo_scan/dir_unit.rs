@@ -25,11 +25,12 @@ pub struct DirUnit {
     /// from these — a folder is described by *its own* `README.md` / module root,
     /// never by one belonging to a subdirectory.
     pub files: Vec<FileEntry>,
-    /// The walked files under this directory's prefix — `file_list` matches a
-    /// path PREFIX, so the listing spans the whole subtree, and it is paged, so
-    /// this keeps the first [`LIST_PAGE_ENTRIES`] in path order. What the hash
-    /// covers, and an approximation of what the turn shows: see [`listed_paths`]
-    /// for where the two diverge.
+    /// The walked entries of this directory — its own files, plus the NAME of
+    /// each subdirectory holding anything, which is exactly the shape
+    /// `file_list` returns for one level. Paged, so this keeps the first
+    /// [`LIST_PAGE_ENTRIES`] in path order. What the hash covers, and an
+    /// approximation of what the turn shows: see [`listed_paths`] for where the
+    /// two diverge.
     pub listed: Vec<String>,
     /// The excerpt describing the folder, when one of its files provides it.
     pub anchor: Option<Anchor>,
@@ -99,24 +100,53 @@ pub fn build_units(map: &RepoMap, workspace: &Path) -> Vec<DirUnit> {
         .collect()
 }
 
-/// The walked files under the directory's prefix, in path order, capped at one
-/// page — an approximation of what the folder's `file_list` turn shows.
+/// The walked entries OF the directory — its own files, plus one name per
+/// subdirectory — in path order, capped at one page: an approximation of what
+/// the folder's `file_list` turn shows.
 ///
-/// The two are NOT the same set. `file_list` walks the workspace itself, while
-/// this filters [`walk_workspace`]'s output, which drops files off the extension
-/// allowlist (`.cu`, `.cuh`, extensionless files), files above `MAX_FILE_BYTES`,
-/// and whole nested git repos / submodules. `candle-kernels/src/paged-decode/`
-/// shows eight files in its turn and contributes one here, because the kernels
-/// themselves are `.cu`. So this must not be read as the shown evidence: it is
-/// the walked evidence, which is what the hash and the refresh compare on.
+/// **One level, because the turn is one level.** `file_list` lists a single
+/// directory and names its subdirectories rather than descending into them, so a
+/// hash taken over the whole subtree would answer a question the turn never
+/// asks. It did, when the tool matched a plain path prefix: a file added three
+/// levels down moved this directory's hash *and* every ancestor's, re-decoding
+/// summaries whose listings were byte-identical.
+///
+/// The two are still NOT the same set. `file_list` walks the workspace itself,
+/// while this filters [`walk_workspace`]'s output, which drops files off the
+/// extension allowlist (`.cu`, `.cuh`, extensionless files), files above
+/// `MAX_FILE_BYTES`, and whole nested git repos / submodules.
+/// `candle-kernels/src/paged-decode/` shows eight files in its turn and
+/// contributes one here, because the kernels themselves are `.cu`. So this must
+/// not be read as the shown evidence: it is the walked evidence, which is what
+/// the hash and the refresh compare on. A subdirectory whose every file is off
+/// the allowlist is invisible here and named in the turn — the same divergence,
+/// now reachable a level up as well.
 fn listed_paths(map: &RepoMap, dir: &str) -> Vec<String> {
     let prefix = if dir == "." { "" } else { dir };
-    map.files
-        .iter()
-        .filter(|f| f.path.starts_with(prefix))
-        .take(LIST_PAGE_ENTRIES)
-        .map(|f| f.path.clone())
-        .collect()
+    let mut out: Vec<String> = Vec::new();
+    let mut subdirs: Vec<String> = Vec::new();
+    for f in map.files.iter() {
+        let Some(rest) = f.path.strip_prefix(prefix) else {
+            continue;
+        };
+        match rest.split_once('/') {
+            // Below this directory: the turn shows the subdirectory's NAME, so
+            // that is what the hash covers. Once each, however many files are
+            // under it — which is also what stops a file added three levels down
+            // from re-summarising every folder above it.
+            Some((head, _)) if !head.is_empty() => {
+                let name = format!("{prefix}{head}/");
+                if !subdirs.contains(&name) {
+                    subdirs.push(name);
+                }
+            }
+            _ => out.push(f.path.clone()),
+        }
+    }
+    out.append(&mut subdirs);
+    out.sort();
+    out.truncate(LIST_PAGE_ENTRIES);
+    out
 }
 
 /// Directory of a workspace-relative file path, with a trailing slash; `"."` for
@@ -371,14 +401,22 @@ mod tests {
         assert_eq!(st.changed_dirs(&after), vec!["a/".to_string()]);
     }
 
-    /// `file_list` matches a path PREFIX, so a folder's listing spans its whole
-    /// subtree — a file added deep below it changes what the folder's turn shows,
-    /// and the hash must move with it or the summary goes stale.
+    /// **A file added deep below a folder re-summarises that folder and nothing
+    /// above it.**
+    ///
+    /// `file_list` lists ONE directory and names its subdirectories rather than
+    /// descending, so `a/`'s turn shows `a/x.rs` and `a/b/` before and after —
+    /// byte-identical — and its stored summary is still true. Only `a/b/c/`,
+    /// whose own listing gained an entry, is stale.
+    ///
+    /// It used to move every ancestor's hash, because the tool matched a plain
+    /// path prefix and a folder's listing really did span its whole subtree. On
+    /// this workspace that made any edit three levels down re-decode every folder
+    /// above it, up to and including the root.
     #[test]
-    fn a_file_added_deep_in_the_subtree_moves_the_ancestors_hashes() {
+    fn a_file_added_deep_re_summarises_its_own_folder_only() {
         let d = empty_workspace();
-        // `top.rs` gives the workspace root a unit; its listing prefix is empty,
-        // so it spans the whole tree.
+        // `top.rs` gives the workspace root a unit of its own.
         let before = build_units(&map(&["top.rs", "a/x.rs", "a/b/c/y.rs"]), d.path());
         let after = build_units(
             &map(&["top.rs", "a/x.rs", "a/b/c/y.rs", "a/b/c/z.rs"]),
@@ -386,9 +424,21 @@ mod tests {
         );
         let st = DirState::from_units(&before);
         let changed = st.changed_dirs(&after);
-        assert!(changed.contains(&"a/b/c/".to_string()), "{changed:?}");
+        assert_eq!(changed, vec!["a/b/c/".to_string()], "{changed:?}");
+    }
+
+    /// A NEW subdirectory does move its parent's hash: the parent's listing gains
+    /// the subdirectory's name, so what that turn shows really did change.
+    #[test]
+    fn a_new_subdirectory_moves_the_parents_hash() {
+        let d = empty_workspace();
+        let before = build_units(&map(&["top.rs", "a/x.rs"]), d.path());
+        let after = build_units(&map(&["top.rs", "a/x.rs", "a/b/y.rs"]), d.path());
+        let st = DirState::from_units(&before);
+        let changed = st.changed_dirs(&after);
         assert!(changed.contains(&"a/".to_string()), "{changed:?}");
-        assert!(changed.contains(&".".to_string()), "{changed:?}");
+        // The root is untouched — it showed `top.rs` and `a/` before and after.
+        assert!(!changed.contains(&".".to_string()), "{changed:?}");
     }
 
     /// The listing is PAGED, so only the first page is shown — and only what is

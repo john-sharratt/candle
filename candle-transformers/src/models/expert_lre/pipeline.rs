@@ -235,6 +235,22 @@ pub(crate) struct StartupTargets<'a> {
     pub host_refs: &'a [Vec<MmapExpertRef>],
 }
 
+/// Units the startup reports **after** the last expert, so the bar keeps moving
+/// through work that used to happen behind a full one.
+///
+/// The repack is the visible part of loading this model and it is not the last
+/// part: publishing the pack flushes and `fsync`s tens of gigabytes, and seeding
+/// the residency gauge follows it. Measured on a 72 GB card, the bar filled at
+/// 140 s into a 181 s step and the remaining 26 s read as a hang — 11.6 s of it
+/// in the `fsync` alone, which the log then attributed to the gauge, because the
+/// gauge's line is the next one printed.
+///
+/// Two, and they are charged where they are done: [`startup_repack`] leaves room
+/// for them, and the caller that publishes the pack and seeds the gauge reports
+/// each as it finishes.
+#[cfg(feature = "cuda")]
+pub(crate) const PACK_TAIL_STEPS: usize = 2;
+
 /// Repack every expert out of the GGUF, write the pack, and fill both resident
 /// tiers from the bytes as they pass through.
 ///
@@ -248,6 +264,9 @@ pub(crate) struct StartupTargets<'a> {
 /// and installed in VRAM here like any other, and then dropped rather than
 /// written — the pack's invariant is that it holds every expert *that can be
 /// evicted*, and storing the rest is dead disk and a dead warm slot.
+///
+/// Progress is reported against `total_experts + PACK_TAIL_STEPS`, leaving room
+/// for the publish and the gauge seed its caller performs after it returns.
 #[cfg(feature = "cuda")]
 pub(crate) fn startup_repack(
     t: StartupTargets<'_>,
@@ -322,7 +341,10 @@ pub(crate) fn startup_repack(
             }
             t.residency[moe_idx][expert_idx] = res;
             if let Some(cb) = progress {
-                cb(moe_idx * num_experts + expert_idx + 1, total_experts);
+                cb(
+                    moe_idx * num_experts + expert_idx + 1,
+                    total_experts + PACK_TAIL_STEPS,
+                );
             }
         }
         if (moe_idx + 1) % 8 == 0 || moe_idx + 1 == num_moe_layers {
@@ -487,8 +509,15 @@ pub(crate) fn startup_from_pack(
             t.inner.install(slot_idx, moe_idx, expert_idx, slot);
             t.residency[moe_idx][expert_idx].vram = Some(slot_idx);
             vram_count += 1;
+            // The same denominator as the repack path, because the gauge seed
+            // that lands the bar is shared by both and a denominator that
+            // changed at the final callback would make the reported total move
+            // under anything reading the raw pair.
             if let Some(cb) = progress {
-                cb(moe_idx * num_experts + expert_idx + 1, total_experts);
+                cb(
+                    moe_idx * num_experts + expert_idx + 1,
+                    total_experts + PACK_TAIL_STEPS,
+                );
             }
         }
     }
@@ -496,9 +525,12 @@ pub(crate) fn startup_from_pack(
     // is about to drop.
     stream.synchronize().map_err(candle::Error::wrap)?;
     // The fill stops as soon as VRAM is full, so the remaining experts never
-    // reach the progress callback. Land it on the total so a UI bar completes.
+    // reach the progress callback. Land it on the experts so the bar is where
+    // the repack path's is at the same point — there is no pack to publish here,
+    // so that unit is simply already behind us, and the gauge seed reports the
+    // last one.
     if let Some(cb) = progress {
-        cb(total_experts, total_experts);
+        cb(total_experts + 1, total_experts + PACK_TAIL_STEPS);
     }
 
     tracing::info!(
