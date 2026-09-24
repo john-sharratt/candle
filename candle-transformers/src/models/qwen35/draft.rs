@@ -375,7 +375,9 @@ pub fn draft_cohort(
                     generation: &Generation|
      -> Result<(Tensor, Tensor)> {
         let pos: Vec<u32> = at.iter().map(|&p| p as u32).collect();
-        let (cos, sin) = model.rotary().rope_cos_sin(&pos, theta, rope_dtype, dev)?;
+        let (cos, sin) = model
+            .rotary()
+            .rope_cos_sin(&pos, theta, rope_dtype, dev, None)?;
         let pm: RefCell<Option<SharedPm>> = RefCell::new(None);
         let params = BatchedAttentionParams::new(
             &cos,

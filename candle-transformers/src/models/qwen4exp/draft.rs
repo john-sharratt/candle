@@ -635,7 +635,7 @@ impl Qwen4ExpBatched {
                         generation: &Generation|
          -> Result<(Tensor, Tensor)> {
             let pos: Vec<u32> = at.iter().map(|&p| p as u32).collect();
-            let (cos, sin) = m.rotary.rope_cos_sin(&pos, theta, DType::F32, dev)?;
+            let (cos, sin) = m.rotary.rope_cos_sin(&pos, theta, DType::F32, dev, None)?;
             let pm: RefCell<Option<SharedPm>> = RefCell::new(None);
             let params = BatchedAttentionParams::new(
                 &cos,

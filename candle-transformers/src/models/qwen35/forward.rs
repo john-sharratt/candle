@@ -1007,8 +1007,8 @@ fn sweep_layers(
     } else {
         embed_dtype
     };
-    let dec_rope = rot.rope_cos_sin(&dec_pos, theta, rope_dtype, dev)?;
-    let (pre_cos, pre_sin) = rot.rope_cos_sin(&pre_pos, theta, rope_dtype, dev)?;
+    let dec_rope = rot.rope_cos_sin(&dec_pos, theta, rope_dtype, dev, None)?;
+    let (pre_cos, pre_sin) = rot.rope_cos_sin(&pre_pos, theta, rope_dtype, dev, None)?;
     // Prefill's activation is the flat batch-of-one `[1, total, …]`, so its
     // tables carry the same leading axis.
     let half = q.cfg.attn_head_dim / 2;

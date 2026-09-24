@@ -180,7 +180,16 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
         norm: &w.norm,
     };
     let g_mix = gpu_span("dn:mix", x.device());
-    let gated = delta_net_mix_spans(&p, &c, dims, seqs, rms_eps, table, zgate)?;
+    let gated = delta_net_mix_spans(
+        &p,
+        &c,
+        dims,
+        seqs,
+        rms_eps,
+        table,
+        zgate,
+        wave.map(|g| g.ticket()),
+    )?;
     g_mix.end();
 
     let g_out = gpu_span("dn:out_proj", x.device());

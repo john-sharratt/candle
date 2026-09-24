@@ -18,7 +18,8 @@ use candle_kernels::delta_net::{
 
 use super::mix::{DeltaNetLayerTable, DeltaNetSeq, DeltaNetSpanTable, SeqSpan};
 use super::state_store::RecurrentStateStore;
-use crate::models::wave_buffers::wave_from_vec;
+use crate::models::wave_buffers::{wave_from_vec, wave_from_vec_ticketed};
+use candle::cuda_backend::wave_provenance::WaveTicket;
 use candle_nn::kv_cache::WaveGeneration;
 
 /// The wave tensors every fused DeltaNet kernel reads through strides, plus
@@ -299,7 +300,12 @@ pub fn build_wave_table<'w>(
 /// A single layer's table built straight from the mixer's spans — the form
 /// the reference path and unit tests use when no wave table was supplied.
 /// Same layout, same kernels; the upload merely happens closer to the launch.
-pub fn build_layer_table(seqs: &[DeltaNetSeq<'_>]) -> Result<DeltaNetLayerTable<'static>> {
+/// `ticket` is the open layer phase: the table is rebuilt per layer and dead
+/// once its launches are issued, so a per-layer span is exactly its lifetime.
+pub fn build_layer_table(
+    seqs: &[DeltaNetSeq<'_>],
+    ticket: Option<WaveTicket>,
+) -> Result<DeltaNetLayerTable<'static>> {
     let decode: Vec<&DeltaNetSeq<'_>> = seqs.iter().filter(|s| s.len == 1).collect();
     if decode.is_empty() {
         candle::bail!("delta_net cuda: no decode spans to table");
@@ -327,8 +333,8 @@ pub fn build_layer_table(seqs: &[DeltaNetSeq<'_>]) -> Result<DeltaNetLayerTable<
     let rows: Vec<u32> = decode.iter().map(|s| s.start as u32).collect();
     let dev = decode[0].state.s.device().clone();
     Ok(DeltaNetLayerTable {
-        ptrs: Tensor::from_vec(ptrs, (4, n), &dev)?,
-        rows: Tensor::from_vec(rows, n, &dev)?,
+        ptrs: wave_from_vec_ticketed(ptrs, (4, n), &dev, ticket)?,
+        rows: wave_from_vec_ticketed(rows, n, &dev, ticket)?,
     })
 }
 

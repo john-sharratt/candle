@@ -42,7 +42,10 @@
 //! permutation exists only because those kernels hard-code the pairing at
 //! `head_dim/2`.
 
+use candle::cuda_backend::wave_provenance::WaveTicket;
 use candle::{DType, Device, LiveTensor, Result, Tensor};
+
+use crate::models::wave_buffers::wave_from_vec_ticketed;
 
 /// The head-dim permutation and matching RoPE table for one geometry.
 #[derive(Debug, Clone)]
@@ -181,6 +184,10 @@ impl RotaryLayout {
         theta: f32,
         dtype: DType,
         dev: &Device,
+        // The forward-scoped span these tables belong to: built once per wave,
+        // read by every layer, which is exactly what that span is described as
+        // holding. `None` uploads them the ordinary way.
+        ticket: Option<WaveTicket>,
     ) -> Result<(Tensor, Tensor)> {
         let half = self.head_dim / 2;
         let r_half = self.rope_dim / 2;
@@ -201,8 +208,8 @@ impl RotaryLayout {
         }
         let shape = (positions.len(), half);
         Ok((
-            Tensor::from_vec(cos, shape, dev)?.to_dtype(dtype)?,
-            Tensor::from_vec(sin, shape, dev)?.to_dtype(dtype)?,
+            wave_from_vec_ticketed(cos, shape, dev, ticket)?.to_dtype(dtype)?,
+            wave_from_vec_ticketed(sin, shape, dev, ticket)?.to_dtype(dtype)?,
         ))
     }
 }

@@ -2516,8 +2516,12 @@ impl Qwen4ExpBatched {
                 pre_pos.push((o + i) as u32);
             }
         }
-        let dec_rope = m.rotary.rope_cos_sin(&dec_pos, theta, DType::F32, dev)?;
-        let (pre_cos, pre_sin) = m.rotary.rope_cos_sin(&pre_pos, theta, DType::F32, dev)?;
+        let dec_rope = m
+            .rotary
+            .rope_cos_sin(&dec_pos, theta, DType::F32, dev, fwd_ticket)?;
+        let (pre_cos, pre_sin) =
+            m.rotary
+                .rope_cos_sin(&pre_pos, theta, DType::F32, dev, fwd_ticket)?;
         let half = cfg.attn_head_dim / 2;
         let pre_rope = (
             pre_cos.reshape((1, pre_rows, half))?,

@@ -43,6 +43,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use candle::cuda_backend::wave_provenance::WaveTicket;
 use candle::{DType, Device, DeviceLocation, LiveTensor, Result, Tensor};
 
 use super::types::{DeltaNetDims, ZGate};
@@ -1322,7 +1323,8 @@ pub fn delta_net_mix<'w>(
         out,
         stash: None,
     }];
-    let mixed = delta_net_mix_spans(p, c, dims, &mut one, rms_eps, None, zgate)?;
+    // The single-sequence reference path, off the sweep: no phase is open.
+    let mixed = delta_net_mix_spans(p, c, dims, &mut one, rms_eps, None, zgate, None)?;
     let [seq] = one;
     seq.state.absorb_solo(&seq.out)?;
     Ok(mixed)
@@ -1350,6 +1352,7 @@ pub fn delta_net_mix<'w>(
 // `table` is the pre-uploaded per-sequence pointer table the batched decode
 // kernel reads; without `cuda` there is no kernel to hand it to.
 #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+#[allow(clippy::too_many_arguments)]
 pub fn delta_net_mix_spans<'w>(
     p: &DeltaNetProjections<'w>,
     c: &DeltaNetConstants<'_>,
@@ -1358,6 +1361,8 @@ pub fn delta_net_mix_spans<'w>(
     rms_eps: f64,
     table: Option<&DeltaNetLayerTable>,
     zgate: ZGate,
+    // The open layer phase, for the per-layer tables built below.
+    ticket: Option<WaveTicket>,
 ) -> Result<LiveTensor<'w>> {
     let (t, _) = p.qkv.dims2()?;
     let (h_k, h_v, d) = (dims.n_k_heads, dims.n_v_heads, dims.head_dim);
@@ -1428,7 +1433,9 @@ pub fn delta_net_mix_spans<'w>(
         // the upload merely happens closer to the launch.
         let local = match table {
             Some(_) => None,
-            None if seqs.iter().any(|s| s.len == 1) => Some(super::cuda::build_layer_table(seqs)?),
+            None if seqs.iter().any(|s| s.len == 1) => {
+                Some(super::cuda::build_layer_table(seqs, ticket)?)
+            }
             None => None,
         };
         let table = table.or(local.as_ref());
@@ -1715,7 +1722,7 @@ pub fn delta_net_advance_spans(
         }];
         // The activations — and with them the z-gate — are discarded; only the
         // advanced state is wanted, so the gate kind cannot matter here.
-        let _ = delta_net_mix_spans(&view, c, dims, &mut one, rms_eps, None, ZGate::Silu)?;
+        let _ = delta_net_mix_spans(&view, c, dims, &mut one, rms_eps, None, ZGate::Silu, None)?;
     }
     Ok(())
 }
@@ -2143,8 +2150,8 @@ mod tests {
                     stash: None,
                 },
             ];
-            let mixed =
-                delta_net_mix_spans(&p, &c, &dims, &mut seqs, eps, None, ZGate::Silu).unwrap();
+            let mixed = delta_net_mix_spans(&p, &c, &dims, &mut seqs, eps, None, ZGate::Silu, None)
+                .unwrap();
             for s in seqs.iter_mut() {
                 s.state.absorb_solo(&s.out).unwrap();
             }
@@ -2236,7 +2243,7 @@ mod tests {
             // with the same capture it would have made.
             let slot = seqs[0].stash.as_ref().unwrap();
             slot.ops.capture(&p, 0, slot.row, block).unwrap();
-            delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu).unwrap();
+            delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None).unwrap();
         }
 
         // The replay: `kept` rows, from the entering state, into a fresh half.
@@ -2251,7 +2258,7 @@ mod tests {
                 out: replayed.write_half(),
                 stash: None,
             }];
-            delta_net_mix_spans(&pr, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu).unwrap();
+            delta_net_mix_spans(&pr, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None).unwrap();
         }
 
         // The oracle: the same `kept` rows, nothing else, same entering state.
@@ -2276,7 +2283,7 @@ mod tests {
                 out: want.write_half(),
                 stash: None,
             }];
-            delta_net_mix_spans(&po, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu).unwrap();
+            delta_net_mix_spans(&po, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None).unwrap();
         }
 
         assert_close(&replayed.s, &want.s, 1e-6, "replayed state");
@@ -2422,8 +2429,8 @@ mod tests {
                 out: want.write_half(),
                 stash: None,
             }];
-            let _ =
-                delta_net_mix_spans(&view, &c, &dims, &mut one, 1e-6, None, ZGate::Silu).unwrap();
+            let _ = delta_net_mix_spans(&view, &c, &dims, &mut one, 1e-6, None, ZGate::Silu, None)
+                .unwrap();
 
             let got_s = batched_outs[i].write_half().s;
             let got_t = batched_outs[i].write_half().conv_tail;
@@ -2492,7 +2499,7 @@ mod tests {
                     stash: None,
                 },
             ];
-            delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu).map(|_| ())
+            delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None).map(|_| ())
         };
 
         // A gap: rows 5..6 belong to nobody.

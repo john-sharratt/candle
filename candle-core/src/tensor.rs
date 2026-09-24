@@ -400,8 +400,18 @@ impl<'w> LiveTensor<'w> {
     /// model line that built the tensor — with no stack walk and no symbol
     /// resolution, and correct under inlining. The detector is armed only around
     /// a wave, so this is one relaxed load everywhere else.
+    /// **Device allocations only**, which is the module's stated scope: "Host
+    /// allocations are out of scope." Without the check a CPU tensor is
+    /// reported exactly like a pool allocation, and the report is read as a
+    /// work list — the warm tier's 16 MiB host slab
+    /// (`kv_cache::chunked::alloc::claim_slab`, the `ArenaLocation::Cpu` arm)
+    /// showed up as the single largest "forbidden allocation" in a live
+    /// inventory while touching no VRAM at all.
     #[track_caller]
-    fn note_ticketless(what: &'static str, bytes: usize) {
+    fn note_ticketless(what: &'static str, bytes: usize, device: &Device) {
+        if !device.is_cuda() {
+            return;
+        }
         crate::forbidden_alloc::record_at(std::panic::Location::caller(), what, bytes);
     }
 
@@ -417,7 +427,11 @@ impl<'w> LiveTensor<'w> {
     #[track_caller]
     pub fn ones<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
         let shape = shape.into();
-        Self::note_ticketless("Tensor::ones", shape.elem_count() * dtype.size_in_bytes());
+        Self::note_ticketless(
+            "Tensor::ones",
+            shape.elem_count() * dtype.size_in_bytes(),
+            device,
+        );
         Self::ones_impl(shape, dtype, device, false)
     }
 
@@ -473,7 +487,11 @@ impl<'w> LiveTensor<'w> {
     #[track_caller]
     pub fn zeros<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
         let shape = shape.into();
-        Self::note_ticketless("Tensor::zeros", shape.elem_count() * dtype.size_in_bytes());
+        Self::note_ticketless(
+            "Tensor::zeros",
+            shape.elem_count() * dtype.size_in_bytes(),
+            device,
+        );
         Self::zeros_impl(shape, dtype, device, false)
     }
 
@@ -656,7 +674,7 @@ impl<'w> LiveTensor<'w> {
         // element size is not knowable until the storage exists. Reporting the
         // element *count* as bytes instead was 4x under for F32 — in the very
         // report the rest of this work is justified by.
-        Self::note_ticketless("Tensor::new", n * storage.dtype().size_in_bytes());
+        Self::note_ticketless("Tensor::new", n * storage.dtype().size_in_bytes(), device);
         let none = BackpropOp::none();
         Ok(from_storage(storage, shape, none, is_variable))
     }
@@ -689,6 +707,7 @@ impl<'w> LiveTensor<'w> {
         Self::note_ticketless(
             "Tensor::full",
             shape.elem_count() * D::DTYPE.size_in_bytes(),
+            device,
         );
         let mut storage = unsafe { device.alloc_uninit(&shape, D::DTYPE)? };
         let layout = Layout::contiguous(shape.clone());
@@ -781,7 +800,7 @@ impl<'w> LiveTensor<'w> {
                 }
             }
             if let Some(storage) = device.arange_int_native(D::DTYPE, start_bits, step_bits, len)? {
-                Self::note_ticketless("Tensor::arange", len * D::DTYPE.size_in_bytes());
+                Self::note_ticketless("Tensor::arange", len * D::DTYPE.size_in_bytes(), device);
                 return Ok(from_storage(storage, len, BackpropOp::none(), false));
             }
         }
@@ -799,7 +818,7 @@ impl<'w> LiveTensor<'w> {
             }
         }
         let len = data.len();
-        Self::note_ticketless("Tensor::arange", len * D::DTYPE.size_in_bytes());
+        Self::note_ticketless("Tensor::arange", len * D::DTYPE.size_in_bytes(), device);
         Self::from_vec_impl(data, len, device, false)
     }
 
@@ -834,7 +853,11 @@ impl<'w> LiveTensor<'w> {
         shape: S,
         device: &Device,
     ) -> Result<Self> {
-        Self::note_ticketless("Tensor::from_vec", data.len() * D::DTYPE.size_in_bytes());
+        Self::note_ticketless(
+            "Tensor::from_vec",
+            data.len() * D::DTYPE.size_in_bytes(),
+            device,
+        );
         Self::from_vec_impl(data, shape, device, false)
     }
 
@@ -863,6 +886,7 @@ impl<'w> LiveTensor<'w> {
             Self::note_ticketless(
                 "from_vec_beside on an operand with no wave ticket",
                 data.len() * D::DTYPE.size_in_bytes(),
+                self.device(),
             );
         }
         let shape = shape.into_shape(data.len())?;
