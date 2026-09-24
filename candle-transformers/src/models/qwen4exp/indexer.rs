@@ -338,6 +338,8 @@ impl IndexCache {
         w: &IndexerWeights,
         ratio: usize,
         rms_eps: f64,
+        // The open layer phase, for the flush job table.
+        ticket: Option<WaveTicket>,
     ) -> Result<Option<usize>> {
         use candle_kernels::simple::qsa_index_append::{run_qsa_index_flush, FLUSH_WORDS};
 
@@ -356,7 +358,7 @@ impl IndexCache {
             candle::bail!("qsa index flush runs on CUDA");
         };
         let stream = cuda.cuda_stream();
-        let jobs_t = Tensor::from_vec(jobs, (FLUSH_WORDS,), &device)?;
+        let jobs_t = wave_from_vec_ticketed(jobs, (FLUSH_WORDS,), &device, ticket)?;
         candle::set_kernel_breadcrumb("run_qsa_index_flush", file!(), line!());
         unsafe {
             run_qsa_index_flush(
@@ -408,7 +410,8 @@ impl IndexCache {
         ratio: usize,
         rms_eps: f64,
     ) -> Result<usize> {
-        let cells = self.flush_open_block(w, ratio, rms_eps)?;
+        // Closing a page is index maintenance, not a forward: no phase is open.
+        let cells = self.flush_open_block(w, ratio, rms_eps, None)?;
         if self.n_blocks == 0 {
             return Ok(0);
         }
@@ -565,7 +568,8 @@ impl IndexCache {
             .iter()
             .map(|p| PlacePage { keys: &p.page.keys })
             .collect();
-        let placement = Placement::plan(&jobs)?;
+        // Placement runs between forwards, so there is no span to carve from.
+        let placement = Placement::plan(&jobs, None)?;
         placement.run(PLACE_TILE_R)?;
         self.placed.push(placement);
         self.placed_pages = self.pages.len();
@@ -939,6 +943,7 @@ impl IndexCache {
             },
             RowRungs::Uniform(rung),
             RotSide::Key,
+            ticket,
         )?;
         // Only narrowed when pages actually sit ahead of the tail. With none,
         // `page_cols` is 0 and the narrow is the whole buffer — a view that
@@ -1163,6 +1168,8 @@ pub fn rotate_rows(
     positions: RowPositions<'_>,
     rungs: RowRungs<'_>,
     side: RotSide,
+    // The open layer phase, for the position and rung tables below.
+    ticket: Option<WaveTicket>,
 ) -> Result<Tensor> {
     use candle_kernels::simple::qsa_rope_rows::run_qsa_rope_rows;
 
@@ -1195,7 +1202,11 @@ pub fn rotate_rows(
                 );
             }
             let v: Vec<u32> = p.iter().map(|&x| x as u32).collect();
-            (Some(Tensor::from_vec(v, (p.len(),), src.device())?), 0, 0)
+            (
+                Some(wave_from_vec_ticketed(v, (p.len(),), src.device(), ticket)?),
+                0,
+                0,
+            )
         }
         RowPositions::Affine { base, step } => (None, base, step),
     };
@@ -1208,7 +1219,12 @@ pub fn rotate_rows(
                 );
             }
             (
-                Some(Tensor::from_vec(r.to_vec(), (r.len(),), src.device())?),
+                Some(wave_from_vec_ticketed(
+                    r.to_vec(),
+                    (r.len(),),
+                    src.device(),
+                    ticket,
+                )?),
                 0,
             )
         }
@@ -1450,6 +1466,7 @@ pub fn project_keys(h: &Tensor, w: &IndexerWeights) -> Result<Tensor> {
 /// frequencies. Each row rotates at its sequence's rung (`rungs`), and takes
 /// that rung's `m²` as the attention's queries do (§12).
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub fn project_queries(
     h: &Tensor,
     w: &IndexerWeights,
@@ -1458,6 +1475,8 @@ pub fn project_queries(
     positions: &[usize],
     rungs: RowRungs<'_>,
     rms_eps: f64,
+    // The open layer phase, for the rotation's position and rung tables.
+    ticket: Option<WaveTicket>,
 ) -> Result<Tensor> {
     let rows = h.dim(0)?;
     let q = h
@@ -1471,6 +1490,7 @@ pub fn project_queries(
         RowPositions::PerGroup(positions),
         rungs,
         RotSide::Query,
+        ticket,
     )?
     .reshape((rows, cfg.n_heads, cfg.head_dim))
 }
@@ -1790,9 +1810,13 @@ pub fn select_layer(
     eps: f64,
     device: &Device,
     qsa_rows: &AtomicU64,
-    // The forward-scoped span's ticket, for the per-wave page and window
-    // tables built below. `None` falls back to an ordinary upload.
-    fwd_ticket: Option<WaveTicket>,
+    // The open LAYER phase's ticket, for the page, window, job and rotation
+    // tables built below. Every one of them is rebuilt for each attention layer
+    // and dead by the end of it, so a per-layer span is their lifetime — the
+    // forward-scoped span, sized for the few kilobytes a wave builds once,
+    // filled up partway through the sweep when they were put there instead.
+    // `None` falls back to an ordinary upload.
+    ticket: Option<WaveTicket>,
 ) -> Result<Option<QsaSelection>> {
     if compress_ratio == 0 {
         return Ok(None);
@@ -1842,7 +1866,7 @@ pub fn select_layer(
                 _ => RowRungs::PerGroup(&row_rungs),
             };
             Some(project_queries(
-                h, indexer, idx_cfg, rope, &positions, rungs, eps,
+                h, indexer, idx_cfg, rope, &positions, rungs, eps, ticket,
             )?)
         }
         None => None,
@@ -1892,7 +1916,7 @@ pub fn select_layer(
             work.len()
         );
     }
-    append_wave(&mut work, &k_all, indexer, compress_ratio, eps, fwd_ticket)?;
+    append_wave(&mut work, &k_all, indexer, compress_ratio, eps, ticket)?;
 
     // **Place any page that is carrying no placement, before anything scores.**
     //
@@ -1965,7 +1989,7 @@ pub fn select_layer(
                     &scores,
                     widest,
                     span.start,
-                    fwd_ticket,
+                    ticket,
                 )
                 .map_err(|e| candle::Error::Msg(format!("kv layer {kv}, seq {}: {e}", span.seq)))?;
             cand[span.start..span.start + span.len].copy_from_slice(&span_cand);
@@ -2019,8 +2043,8 @@ pub fn select_layer(
         }
     }
     let n_pages = pages.len() / 2;
-    let pages_t = wave_from_vec_ticketed(pages, (n_pages, 2), device, fwd_ticket)?;
-    let win_t = wave_from_vec_ticketed(win, (total_rows, 2), device, fwd_ticket)?;
+    let pages_t = wave_from_vec_ticketed(pages, (n_pages, 2), device, ticket)?;
+    let win_t = wave_from_vec_ticketed(win, (total_rows, 2), device, ticket)?;
     Ok(Some(sel.with_pages(pages_t, win_t)?))
 }
 
@@ -2542,6 +2566,7 @@ mod tests {
                 qpos,
                 RowRungs::Uniform(0),
                 self.eps,
+                None,
             )?;
             let scores = Tensor::empty((t, widest), DType::F32, &self.device)?;
             let cand = cache.score_rows(
@@ -2831,6 +2856,7 @@ mod tests {
             &qpos,
             RowRungs::Uniform(0),
             rig.eps,
+            None,
         )?;
         let refused = child.score_rows(
             &q, &qpos, &rig.cfg, ratio, &rig.rope, 0, &scores, widest, 0, None,
@@ -3205,6 +3231,7 @@ mod tests {
             &qpos,
             RowRungs::Uniform(0),
             eps,
+            None,
         )?;
         let mut table = SelectionTable::new(t, ratio, cfg.top_k, &device)?;
         let widest = t.div_ceil(ratio).max(1);
@@ -3278,6 +3305,7 @@ mod tests {
                 RowPositions::PerGroup(&pos),
                 RowRungs::Uniform(0),
                 RotSide::Key,
+                None,
             )?
             .to_vec2::<f32>()?;
             for (r, &p) in pos.iter().enumerate() {
@@ -3340,6 +3368,7 @@ mod tests {
             RowPositions::PerGroup(&pos),
             RowRungs::PerGroup(&row_rung),
             RotSide::Query,
+            None,
         )?
         .to_vec2::<f32>()?;
         for (g, (&p, &r)) in pos.iter().zip(&row_rung).enumerate() {
@@ -3356,6 +3385,7 @@ mod tests {
                 RowPositions::PerGroup(&[p]),
                 RowRungs::Uniform(r),
                 RotSide::Query,
+                None,
             )?
             .to_vec2::<f32>()?;
             let key = rotate_rows(
@@ -3365,6 +3395,7 @@ mod tests {
                 RowPositions::PerGroup(&[p]),
                 RowRungs::Uniform(r),
                 RotSide::Key,
+                None,
             )?
             .to_vec2::<f32>()?;
             let m2 = rungs.q_scale(r);
@@ -3402,6 +3433,7 @@ mod tests {
             RowPositions::PerGroup(&pos),
             RowRungs::Uniform(3),
             RotSide::Key,
+            None,
         )
         .is_err());
         Ok(())
@@ -3423,6 +3455,7 @@ mod tests {
             RowPositions::Affine { base: 0, step: 1 },
             RowRungs::Uniform(0),
             RotSide::Key,
+            None,
         )
         .is_err());
         Ok(())

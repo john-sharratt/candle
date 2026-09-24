@@ -444,7 +444,8 @@ impl Qwen4ExpBatched {
                 });
                 continue;
             }
-            let cells = c.flush_open_block(w, ratio, cfg.rms_norm_eps)?;
+            // Sealing is not a forward: no phase is open to carve from.
+            let cells = c.flush_open_block(w, ratio, cfg.rms_norm_eps, None)?;
             pages.push(SealedIndex {
                 page: seal_page(&c.live_rows()?, cells.unwrap_or(ratio))?,
                 // The flush consumed the carried rows, so the page IS the whole
@@ -548,7 +549,7 @@ impl Qwen4ExpBatched {
                     .saturating_sub(c.page_row_span())
             };
             let mut fork = c.fork()?;
-            let cells = fork.flush_open_block(w, ratio, cfg.rms_norm_eps)?;
+            let cells = fork.flush_open_block(w, ratio, cfg.rms_norm_eps, None)?;
             let rows = fork.live_rows()?;
             let n = rows.dim(0)?;
             if first > n {
@@ -710,7 +711,7 @@ impl Qwen4ExpBatched {
                     continue;
                 }
                 let mut fork = c.fork()?;
-                let cells = fork.flush_open_block(w, ratio, cfg.rms_norm_eps)?;
+                let cells = fork.flush_open_block(w, ratio, cfg.rms_norm_eps, None)?;
                 layer_pages.push(SealedIndex {
                     page: seal_page(&fork.live_rows()?, cells.unwrap_or(ratio))?,
                     open: fork.open_rows()?,
@@ -2618,7 +2619,13 @@ impl Qwen4ExpBatched {
                     let rows_in = res.narrow(0, span.start, span.len)?;
                     // A verifying span stashes the rows it appends to the conv
                     // history; every other span captures nothing.
-                    let mut rows_out = Tensor::zeros(0, DType::F32, dev)?;
+                    //
+                    // Zero elements, so there is nothing to initialise and
+                    // nothing to copy — but it is still a storage, and asking
+                    // the driver for one per span per layer per wave is a round
+                    // trip for a placeholder. On the mixer's span it is a
+                    // pointer bump.
+                    let mut rows_out = wave_empty_ticketed(0, DType::F32, dev, fwd_ticket)?;
                     let capture = cap_map
                         .as_ref()
                         .is_some_and(|c| c.seqs.contains_key(&span.seq))

@@ -10,9 +10,11 @@
 //! it loads it, at the key's own position, so a page's placement is the same
 //! wherever it sits and whatever RoPE schedule reads it.
 
+use candle::cuda_backend::wave_provenance::WaveTicket;
 use candle::{DType, Result, Tensor};
 
 use super::indexer::{i64_ptr, tensor_ptr};
+use crate::models::wave_buffers::wave_from_vec_ticketed;
 
 /// Rows per block in [`Placement::run`].
 ///
@@ -67,7 +69,9 @@ impl Placement {
     /// Allocate the placements and build the descriptor table that addresses
     /// them.
     #[cfg(feature = "cuda")]
-    pub fn plan(pages: &[PlacePage<'_>]) -> Result<Self> {
+    /// `ticket` is the open layer phase: the job table is rebuilt per placement
+    /// pass and dead once its launch is issued.
+    pub fn plan(pages: &[PlacePage<'_>], ticket: Option<WaveTicket>) -> Result<Self> {
         use candle_kernels::simple::qsa_page_place::PLACE_JOB_WORDS;
 
         if pages.is_empty() {
@@ -132,7 +136,7 @@ impl Placement {
             at += rows;
         }
         let n_jobs = pages.len();
-        let jobs = Tensor::from_vec(jobs, (n_jobs * PLACE_JOB_WORDS,), &device)?;
+        let jobs = wave_from_vec_ticketed(jobs, (n_jobs * PLACE_JOB_WORDS,), &device, ticket)?;
         Ok(Self {
             staged,
             jobs,
@@ -191,7 +195,7 @@ impl Placement {
 /// Returns one `[head_dim/4, rows, 4]` F32 tensor per input page, in order.
 #[cfg(feature = "cuda")]
 pub fn place_pages(pages: &[PlacePage<'_>], tile_r: usize) -> Result<Vec<Tensor>> {
-    let placement = Placement::plan(pages)?;
+    let placement = Placement::plan(pages, None)?;
     placement.run(tile_r)?;
     Ok(placement.into_staged())
 }
