@@ -941,6 +941,9 @@ fn sweep_layers(
             // A wave that stops short of the last layer returns its residual and
             // runs no head, so it scores no rows at all.
             let verify_seqs = model.verify_row_seqs()?;
+            // Armed before the forward opened (`begin_verify_stash`), so it is
+            // readable here and describes exactly what a rewind would stage.
+            let staged = model.verify_stash_width()?;
             let scored_prefill: usize = pre_q
                 .iter()
                 .enumerate()
@@ -963,8 +966,24 @@ fn sweep_layers(
                 // A one-row prefill group takes the decode kernels, so it carves
                 // no span-table entry and, alone, no scan transient.
                 prefill_spans: pre_q.iter().filter(|&&l| l > 1).count(),
-                staged_rows: 0,
-                staged_spans: 0,
+                // **The rewind this wave may owe.** A verify wave's accept can
+                // reject proposals, and the replay that rewinds the recurrence
+                // then carves the cohort stash's four operands per recurrent
+                // layer off THIS span (`replay_accepted_prefixes`). These two
+                // units are what price that chain; left at zero it prices to
+                // nothing, and the span this forward reserves has no room for a
+                // replay that arrives behind it.
+                //
+                // Measured on the 35B-A3B gate at 16 contexts: `ReplayQkv`
+                // asking 1,572,864 B of a 240,384 B span — this wave's own
+                // attention price, *smaller* than the one-context case, because
+                // `staged_rows` was 0. Reserved by the forward rather than
+                // re-planned at accept time: the tier is one three-phase
+                // reservation replaced wholesale, so re-planning it for the
+                // replay alone zeroes the Ffn and Forward spans the next wave
+                // needs (measured: `wave-ffn … exceeds the 0 B budget`).
+                staged_rows: staged.map_or(0, |(rows, _)| rows),
+                staged_spans: staged.map_or(0, |(_, spans)| spans),
             };
             let per_phase = [
                 plan.phase_bytes(LayerPhase::Attention, width),

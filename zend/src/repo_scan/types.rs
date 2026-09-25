@@ -1,12 +1,9 @@
 //! Data types shared by the workspace walker and the per-directory unit builder.
 
-/// Languages we recognise by extension.  Each variant either maps to
-/// a tree-sitter grammar (proper scope-aware carving) or to a
-/// header-based / fixed-window fallback (see
-/// [`crate::code_read::carve`]).  Adding a language: add the enum
-/// variant, plug it into [`Self::label`] / [`Self::from_extension`],
-/// and either wire it into the tree-sitter dispatch or rely on the
-/// header / fallback tier.
+/// Languages we recognise by extension — what the walker uses to decide a file
+/// is source at all, and what a `code_read` conversation reports as its
+/// `lang` tag.  Adding a language: add the enum variant and plug it into
+/// [`Self::label`] / [`Self::from_extension`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,
@@ -102,13 +99,23 @@ impl Language {
 /// inline next to the file name in the repo-map tree:
 ///
 /// ```text
-/// Cargo.toml (workspace: 3 members)
+/// Cargo.toml (Cargo workspace root)
 /// package.json (name: my-app)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModuleHint {
-    /// Cargo workspace root — carries the number of member crates.
-    CargoWorkspace { members: usize },
+    /// Cargo workspace root.
+    ///
+    /// **Carries no member count, deliberately.** It used to render
+    /// `workspace: 15 members`, and a count is the one thing in this enum that
+    /// does not generalize: it is a magnitude of *this* checkout, not a
+    /// structural fact, so a sealed ingest turn taught the model a number that
+    /// is wrong everywhere else and stale here the moment a crate is added.
+    /// It leaked, too — a conversation whose only content was "hello" cited
+    /// "a project with 11 members" unprompted (see the `score_threshold` note
+    /// in `projection.yaml`'s repo_map group). What the request needs to convey
+    /// is the folder's ROLE, which the words alone carry.
+    CargoWorkspace,
     /// Cargo crate manifest with a `[package]` section.
     CargoPackage { name: String },
     /// npm-style manifest.
@@ -126,7 +133,7 @@ impl ModuleHint {
     /// from a `Cargo.toml` in the listing.
     pub fn render(&self) -> String {
         match self {
-            ModuleHint::CargoWorkspace { members } => format!("workspace: {members} members"),
+            ModuleHint::CargoWorkspace => "Cargo workspace root".to_string(),
             ModuleHint::CargoPackage { name } => format!("crate: {name}"),
             ModuleHint::NodePackage { name } => format!("name: {name}"),
             ModuleHint::PythonProject { name } => format!("project: {name}"),

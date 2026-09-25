@@ -50,7 +50,7 @@ fn small_workspace() -> tempfile::TempDir {
 
 /// Walk + build the units the daemon would ingest.
 fn units_of(root: &Path) -> Vec<DirUnit> {
-    build_units(&walk_workspace(root, None), root)
+    build_units(&walk_workspace(root, None))
 }
 
 /// Run every unit's chain through a recording sink, exactly as
@@ -86,11 +86,11 @@ fn one_unit_per_directory_holding_files() {
     assert_eq!(dirs, vec![".".to_string(), "src/".to_string()]);
 }
 
-/// One chain per folder: request → list → read → DECODE. It lists BEFORE it
-/// reads — a `file_read` naming `lib.rs` before anything revealed the file
-/// exists would teach the model to guess paths.
+/// One chain per folder, and it is ONE pair: request → `file_list` /
+/// listing → DECODED summary. A folder is described from names and paths alone,
+/// so nothing in the chain reads a file — the listing is the whole evidence.
 #[test]
-fn each_directory_lists_before_it_reads() {
+fn each_directory_lists_once_and_then_summarises() {
     let dir = small_workspace();
     let sink = record(dir.path());
     let src = sink
@@ -98,37 +98,30 @@ fn each_directory_lists_before_it_reads() {
         .iter()
         .filter(|(_, _, tags)| tags[1] == "src/")
         .collect::<Vec<_>>();
-    assert_eq!(src.len(), 3, "request+list, listing+read, excerpt+summary");
+    assert_eq!(src.len(), 2, "request+list, then listing+summary");
 
     assert!(src[0].0.starts_with("Summarize the `src/` folder"));
     assert!(src[0].1.contains("\"name\": \"file_list\""));
     assert!(src[1].0.starts_with("<tool_response>{"), "the listing");
-    assert!(src[1].1.contains("\"name\": \"file_read\""));
-    assert!(src[2].0.contains("```rust"), "the anchor excerpt");
-    assert!(src[2].1.is_empty(), "the folder summary is DECODED");
+    assert!(src[1].1.is_empty(), "the folder summary is DECODED");
 }
 
-/// `src/lib.rs` carries a `//!` block, so the read is scoped to it rather than
-/// pulling the whole file.
+/// No folder turn reads a file or carries file content. The read round-trip and
+/// its fenced excerpt were removed: a folder is summarised from its listing, and
+/// prefilling a `file_read` taught the model to read a file per folder.
 #[test]
-fn the_anchor_excerpt_is_the_module_doc_block() {
+fn no_folder_turn_reads_a_file() {
     let dir = small_workspace();
-    let sink = record(dir.path());
-    let excerpt = sink
-        .turns
-        .iter()
-        .find(|(u, _, tags)| tags[1] == "src/" && u.contains("```"))
-        .map(|(u, _, _)| u.clone())
-        .expect("the excerpt turn");
-    assert!(
-        excerpt.contains("src/lib.rs (lines 1-2 of 3):"),
-        "{excerpt}"
-    );
-    assert!(excerpt.contains("//! The demo crate."));
-    assert!(
-        !excerpt.contains("pub fn hello"),
-        "the code below the doc block is not the folder's description",
-    );
+    for (user, assistant, tags) in &record(dir.path()).turns {
+        assert!(
+            !assistant.contains("file_read"),
+            "{tags:?} prefilled a file_read: {assistant}",
+        );
+        assert!(
+            !user.contains("```"),
+            "{tags:?} carries a file excerpt: {user}",
+        );
+    }
 }
 
 /// The listing is produced by running the real `file_list`, so it names the
@@ -195,35 +188,64 @@ fn state_is_stable_when_an_unshown_file_changes() {
     assert!(before.equivalent_to(&units_of(dir.path())));
 }
 
+/// Rewriting `src/lib.rs`'s module doc does NOT re-ingest. It used to: the doc
+/// block was the folder's anchor excerpt and part of the hash. The chain no
+/// longer shows it, so the sealed summary still answers the request this unit
+/// renders, and re-decoding would pay full cost for the same answer.
 #[test]
-fn state_moves_when_the_anchor_text_changes() {
+fn state_is_stable_when_the_former_anchor_text_changes() {
     let dir = small_workspace();
     let before = DirState::from_units(&units_of(dir.path()));
-    // The module doc IS the summary's evidence — editing it must re-ingest.
     write(
         dir.path(),
         "src/lib.rs",
         b"//! The demo crate, rewritten.\n//! Now says goodbye.\npub fn hello() {}\n",
     );
-    let after = units_of(dir.path());
-    assert!(!before.equivalent_to(&after));
-    assert_eq!(before.changed_dirs(&after), vec!["src/".to_string()]);
+    assert!(before.equivalent_to(&units_of(dir.path())));
 }
 
-/// `file_list` matches a path PREFIX, so the root folder's listing spans the
-/// whole tree: a file added under `src/` changes what BOTH folders show, and
-/// both must re-ingest or one of them keeps a summary of a repo that moved on.
+/// A unit's hash covers ONE level, because its turn shows one level: adding
+/// `src/new_module.rs` moves `src/` and leaves the root alone, whose listing
+/// still names `src/` and nothing else about it. Under the old subtree hash a
+/// file three levels down moved every ancestor and re-decoded the whole spine.
 #[test]
-fn state_moves_when_a_file_is_added() {
+fn a_new_file_moves_only_its_own_directory() {
     let dir = small_workspace();
     let before = DirState::from_units(&units_of(dir.path()));
     write(dir.path(), "src/new_module.rs", b"pub fn n() {}\n");
     let after = units_of(dir.path());
     assert!(!before.equivalent_to(&after));
-    assert_eq!(
-        before.changed_dirs(&after),
-        vec![".".to_string(), "src/".to_string()],
+    assert_eq!(before.changed_dirs(&after), vec!["src/".to_string()]);
+}
+
+/// A new SUBDIRECTORY does move its parent — the parent's listing names one
+/// entry per subdirectory, so the entry is new content in the turn the parent
+/// shows. This is the boundary of the one-level rule above.
+#[test]
+fn a_new_subdirectory_moves_its_parent() {
+    let dir = small_workspace();
+    let before = DirState::from_units(&units_of(dir.path()));
+    write(dir.path(), "src/inner/deep.rs", b"pub fn d() {}\n");
+    let after = units_of(dir.path());
+    assert!(before.changed_dirs(&after).contains(&"src/".to_string()));
+}
+
+/// The module hint is spliced into the request the model reads, so it is part of
+/// what the turn shows and therefore part of the hash. A `[workspace]` table
+/// added to the root manifest changes the question — `(Cargo workspace root)`
+/// appears — without changing the listing, and the resume cache must not report
+/// a hit on a summary that answered the older request.
+#[test]
+fn state_moves_when_the_module_hint_changes() {
+    let dir = small_workspace();
+    let before = DirState::from_units(&units_of(dir.path()));
+    write(
+        dir.path(),
+        "Cargo.toml",
+        b"[workspace]\nmembers = [\"a\", \"b\"]\n",
     );
+    let after = units_of(dir.path());
+    assert_eq!(before.changed_dirs(&after), vec![".".to_string()]);
 }
 
 #[test]

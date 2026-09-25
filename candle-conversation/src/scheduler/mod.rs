@@ -4201,13 +4201,13 @@ impl Scheduler {
                 self.sampling_states.remove(&sequence_id);
                 // Drop the conversation handle and projection target
                 // bound to this slot.
-                self.slot_conversations.remove(&sequence_id);
+                let freed_conversation = self.slot_conversations.remove(&sequence_id);
                 let freed_target = self.slot_targets.remove(&sequence_id);
                 self.ephemeral_slots.remove(&sequence_id);
                 self.ephemeral_sigs.remove(&sequence_id);
                 self.carried_beliefs.remove(&sequence_id);
                 self.slot_tokens.remove(&sequence_id);
-                self.slot_projection_state.remove(&sequence_id);
+                self.retire_slot_projection_state(sequence_id, freed_conversation);
                 // Purge any DEFERRED glue plan for this slot. A queued gap-fill
                 // must never outlive the slot layout it was planned against: the
                 // freed id is recycled immediately (the code_read scope workers
@@ -5913,7 +5913,16 @@ impl Scheduler {
         }
         let block_count = self.session.sequence_block_count(slot.0).unwrap_or(0);
         let sealed_gpu = match self.session.snapshot_sequence_per_layer(slot.0) {
-            Ok(snap) => slice_per_layer_sealed(&snap, 0, block_count),
+            Ok(snap) => match slice_per_layer_sealed(&snap, 0, block_count) {
+                Ok(sliced) => sliced,
+                Err(e) => {
+                    let _ = pending.response_tx.send(Err(ProbeError::Soft(format!(
+                        "SubmitSummaryProbe: reproject slice: {e}"
+                    ))));
+                    self.free_summary_slot(slot);
+                    return;
+                }
+            },
             Err(e) => {
                 let _ = pending.response_tx.send(Err(ProbeError::Soft(format!(
                     "SubmitSummaryProbe: reproject snapshot: {e}"
@@ -6219,10 +6228,10 @@ impl Scheduler {
     fn free_summary_slot(&mut self, slot: SequenceId) {
         let _ = self.session.free_sequence(slot.0);
         let _ = self.model.release_sequence(slot.0);
-        self.slot_conversations.remove(&slot);
+        let freed_conversation = self.slot_conversations.remove(&slot);
         let freed_target = self.slot_targets.remove(&slot);
         self.sampling_states.remove(&slot);
-        self.slot_projection_state.remove(&slot);
+        self.retire_slot_projection_state(slot, freed_conversation);
         self.compression_event_sinks.remove(&slot);
         // A queued glue plan must not outlive the slot layout it was planned
         // against (see the FreeSequence handler's purge).
@@ -6243,9 +6252,9 @@ impl Scheduler {
     /// parent's whole projected prefix borrowed for the daemon's lifetime, and
     /// a failed wave never gave that KV back.
     fn discard_turn_view(&mut self, view_id: SequenceId) {
-        if self.turn_views.remove(&view_id).is_none() {
+        let Some(view_state) = self.turn_views.remove(&view_id) else {
             return;
-        }
+        };
         if let Err(e) = self.session.free_sequence(view_id.0) {
             tracing::warn!("failed to free turn view {}: {}", view_id, e);
         }
@@ -6258,7 +6267,10 @@ impl Scheduler {
         }
         self.sampling_states.remove(&view_id);
         self.slot_tokens.remove(&view_id);
-        self.slot_projection_state.remove(&view_id);
+        // A view's working set is recorded under its PARENT, so the parent's
+        // conversation is the substrate this republishes on.
+        let parent_conversation = self.slot_conversations.get(&view_state.parent_id).cloned();
+        self.retire_slot_projection_state(view_id, parent_conversation);
         self.purge_freed_slot_scheduling_state(view_id);
     }
 
@@ -8340,7 +8352,7 @@ impl Scheduler {
                     layout,
                     token_ids,
                 } = turn_content.unwrap_or_default();
-                let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
+                let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to)?;
                 // Snapshot what the resume path needs before the substrate
                 // consumes `delta_gpu` / `token_ids` (§16.12 seal-time gather).
                 let persist_token_ids: Vec<u32> = token_ids[..].to_vec();
@@ -8709,7 +8721,7 @@ impl Scheduler {
                 debug_name,
                 in_collection,
             } => {
-                let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
+                let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to)?;
                 let stream_id = section_stream_id(*address);
                 let policy_active = self.session.compression_policy().is_some();
                 {
@@ -9533,6 +9545,49 @@ impl Scheduler {
         conversation
             .write()
             .set_working_set_pins(&keep_turns, &keep_sections);
+    }
+
+    /// Drop `slot`'s projection working set and republish the keep-set without
+    /// it, on that slot's own substrate.
+    ///
+    /// **A pin outliving its slot wedges durability, not just eviction.** The
+    /// keep-set is defined as the union of every *live* slot's working set, but
+    /// [`Self::publish_working_set_pins`] only ever runs from an elevate — so a
+    /// slot that goes away between elevates leaves its pins standing, and
+    /// nothing recomputes the union until some other slot happens to elevate.
+    /// `Substrate::snapshot_pending_cold` skips a pinned residence, so a turn
+    /// still named by a dead slot's working set is never appended to the redo
+    /// log at all: it sits hot+warm and un-durable for the rest of the
+    /// daemon's life. It is silent in every gauge, because `pending_cold_count`
+    /// mirrors the same pin filter and therefore reports nothing pending, and
+    /// the shutdown drain clears the pins wholesale before its final pass — so
+    /// a graceful stop writes the turn through and only a hard kill loses it.
+    ///
+    /// Measured on a `repo_map` unit: the summary decode's last reprojection
+    /// selects exactly the unit's first turn, whose slot is then freed, so
+    /// **every** folder conversation carried a turn with token_ids, a block
+    /// range and no `Chunk` records — `MISSING KV` from the inspector, with no
+    /// error on any path.
+    ///
+    /// Republished on the freed slot's OWN substrate: the scheduler hosts
+    /// conversations on many substrates at once and the pin set lives per
+    /// substrate, so the handle has to come from the slot being retired.
+    ///
+    /// This is the only place [`Self::slot_projection_state`] is removed from,
+    /// which is what makes "a removal is always followed by a republish" hold
+    /// by construction rather than by every caller remembering. Keep it that
+    /// way: a bare `remove` elsewhere re-opens the wedge silently.
+    fn retire_slot_projection_state(
+        &mut self,
+        slot: SequenceId,
+        conversation: Option<Conversation>,
+    ) {
+        if self.slot_projection_state.remove(&slot).is_none() {
+            return;
+        }
+        if let Some(conversation) = conversation {
+            self.publish_working_set_pins(&conversation, &[], &[]);
+        }
     }
 
     fn elevate_projection_working_set(

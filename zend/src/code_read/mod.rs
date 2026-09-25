@@ -23,8 +23,6 @@
 //! sequences, exactly like any other batch of concurrent conversations the
 //! engine wave-batches together.
 
-pub mod carve;
-
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -193,7 +191,30 @@ fn opening_prompt(path: &str) -> String {
 /// must stay under the model's sequence-slot capacity with headroom for the
 /// non-ingest slots the engine also needs concurrently: the live dialogue
 /// session, the async summariser's compression passes, etc.
-pub const CODE_READ_PARALLELISM: usize = 12;
+///
+/// **16, and the ceiling here is VRAM rather than throughput.** Each worker is
+/// serialised on its own file's whole turn — a prefill that attends over the
+/// inherited priming chain (~32k KV, ~9.4 s) and then a decode — so the pool
+/// width, not the wave, is what bounds the file phase.
+///
+/// Measured on the 72 GB card over the same corpus:
+///
+///   12   0.58 files/min   stable for three hours
+///   32   1.66 files/min   K/V ran 13.9 GB against a 2.5 GB budget, the weight
+///                         zone slid to 30.6 GB against a 28.8 GB floor, and the
+///                         daemon died after ~30 minutes — no panic, no poison,
+///                         the log simply stops
+///
+/// A file conversation is not a directory conversation: it carries 876k KV per
+/// decode forward against a directory's 25k, so a width that is comfortable for
+/// `repo_map` exhausts the card here. 16 keeps most of the gain over 12 with
+/// margin against the floor, which matters more than rate — a dead daemon
+/// ingests nothing.
+pub const CODE_READ_PARALLELISM: usize = 16;
+
+/// Metadata key a `code_reading` conversation is identified by — the file's
+/// workspace-relative path. The `repo_map` twin of it is `repo_scan::DIR_KEY`.
+pub(crate) const PATH_KEY: &str = "path";
 
 /// Worker count for the parallel ingest — [`CODE_READ_PARALLELISM`].
 fn parallelism() -> usize {
@@ -1132,44 +1153,6 @@ pub fn refresh_code_reading(
     Ok(RefreshOutcome::Replaced { state: next })
 }
 
-/// Byte offset of the start of each line.  `offsets[i]` is the start
-/// of line `i + 1` (1-indexed).  Final entry is the source length.
-///
-/// Kept for [`crate::repo_scan::anchor`], which slices a folder's anchor
-/// excerpt the same way — no longer used inside this module (the model reads
-/// files for itself now, rather than a pre-sliced excerpt being shown to it).
-pub(crate) fn compute_line_offsets(bytes: &[u8]) -> Vec<usize> {
-    let mut offsets = Vec::with_capacity(bytes.len() / 40 + 1);
-    offsets.push(0);
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'\n' {
-            offsets.push(i + 1);
-        }
-    }
-    if offsets.last().copied() != Some(bytes.len()) {
-        offsets.push(bytes.len());
-    }
-    offsets
-}
-
-pub(crate) fn slice_lines(
-    bytes: &[u8],
-    offsets: &[usize],
-    start_line: u32,
-    end_line: u32,
-) -> String {
-    // 1-indexed inclusive.  Last entry of `offsets` is bytes.len().
-    let lines_total = offsets.len().saturating_sub(1) as u32;
-    if lines_total == 0 || start_line > lines_total {
-        return String::new();
-    }
-    let start_idx = (start_line as usize - 1).min(offsets.len() - 1);
-    let end_idx = (end_line as usize).min(offsets.len() - 1);
-    let start_byte = offsets[start_idx];
-    let end_byte = offsets[end_idx];
-    String::from_utf8_lossy(&bytes[start_byte..end_byte]).to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1223,30 +1206,6 @@ mod tests {
         // Path-qualified: same content at a different path → different hash
         // (so a move/rename re-ingests, and per-path invalidation is exact).
         assert_ne!(h, file_content_hash("src/b.rs", b"fn x() {}"));
-    }
-
-    #[test]
-    fn slice_lines_returns_exact_line_range() {
-        let src = b"alpha\nbeta\ngamma\ndelta\n";
-        let offsets = compute_line_offsets(src);
-        let s = slice_lines(src, &offsets, 2, 3);
-        assert_eq!(s, "beta\ngamma\n");
-    }
-
-    #[test]
-    fn slice_lines_handles_no_trailing_newline() {
-        let src = b"alpha\nbeta\ngamma";
-        let offsets = compute_line_offsets(src);
-        let s = slice_lines(src, &offsets, 2, 3);
-        assert_eq!(s, "beta\ngamma");
-    }
-
-    #[test]
-    fn slice_lines_clips_at_eof() {
-        let src = b"alpha\nbeta\n";
-        let offsets = compute_line_offsets(src);
-        let s = slice_lines(src, &offsets, 1, 100);
-        assert_eq!(s, "alpha\nbeta\n");
     }
 
     #[test]

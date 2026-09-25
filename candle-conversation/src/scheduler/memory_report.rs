@@ -63,6 +63,17 @@ pub struct WeightSection {
     pub base_bytes: Option<u64>,
     /// Expert slots currently resident in VRAM — moves as experts page.
     pub resident_expert_bytes: Option<u64>,
+    /// The weight zone's floor: ground the weight side must keep, and therefore
+    /// ground **K/V may not plan against**. `None` off a device reservation.
+    ///
+    /// Reported because a consumer sizing a batch of new conversations has to
+    /// subtract it and had no way to see it. The `repo_map` pool sized itself
+    /// from the governor's whole capacity, so at 96 conversations its K/V grew
+    /// to 48 GB and squeezed the weight zone from 53.5 GB to 10.9 GB — 19 GB
+    /// under this floor. Admission then refused every prefill, correctly and
+    /// permanently: residency was below the floor, and refusing prefills is not
+    /// a thing that gives K/V back.
+    pub floor_bytes: Option<u64>,
 }
 
 /// The provenance gallery arena's VRAM slabs.
@@ -561,6 +572,7 @@ impl Scheduler {
                 .resident_weight_bytes()
                 .map(|total| (total as u64).saturating_sub(resident_expert_bytes.unwrap_or(0))),
             resident_expert_bytes,
+            floor_bytes: super::interleave::optimal_weight_bytes(),
         };
 
         // ── Gallery arena ───────────────────────────────────────────────────
@@ -750,6 +762,10 @@ mod tests {
                 // regression that wires both fields to the zone pass.
                 base_bytes: Some(1_100_000_000),
                 resident_expert_bytes: Some(5_100_000_000),
+                // Below the resident experts above, as a floor must be: it is
+                // the ground the zone may not fall under, not the ground it
+                // holds.
+                floor_bytes: Some(4_000_000_000),
             },
             gallery: GallerySection {
                 resident_bytes: 268_435_456,

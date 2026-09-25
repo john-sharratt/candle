@@ -207,7 +207,7 @@ pub(super) fn achievable_weight_now() -> Option<u64> {
 /// `None` until a reservation has been read at all (a CPU device or a unit
 /// test), which is the generality case: nothing to defend, so admission is
 /// bounded only by what the allocators will give.
-pub(super) fn optimal_weight_bytes() -> Option<u64> {
+pub(crate) fn optimal_weight_bytes() -> Option<u64> {
     let achievable = achievable_weight_now()?;
     Some((achievable as f64 * HOLD) as u64)
 }

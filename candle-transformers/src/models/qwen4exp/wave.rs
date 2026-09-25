@@ -2161,6 +2161,22 @@ impl WaveSweep for Qwen4ExpBatched {
                     .ok()
                     .and_then(|g| g.as_ref().map(|c| c.seqs.keys().copied().collect()))
                     .unwrap_or_default();
+                // **The rewind this wave may owe.** `replay_accepted_prefixes`
+                // — the same one the hybrid runs — carves the cohort stash's
+                // operands off THIS Attention span at accept time, and these two
+                // units are what price that chain. Left at zero it prices to
+                // nothing and the span is short by the whole stash. Rows are the
+                // stash's CAPACITY, not this cohort's total: the buffers only
+                // grow and `stage_on_wave` stages each operand's full shape.
+                let staged: Option<(usize, usize)> = self
+                    .verify
+                    .read()
+                    .ok()
+                    .and_then(|g| {
+                        g.as_ref()
+                            .map(|c| c.delta.capacity().map(|rows| (rows, c.delta.spans.len())))
+                    })
+                    .transpose()?;
                 let scored_prefill: usize = pre_q
                     .iter()
                     .enumerate()
@@ -2183,8 +2199,8 @@ impl WaveSweep for Qwen4ExpBatched {
                     // A one-row prefill group takes the decode kernels, so it
                     // carves no span-table entry and, alone, no scan transient.
                     prefill_spans: pre_q.iter().filter(|&&l| l > 1).count(),
-                    staged_rows: 0,
-                    staged_spans: 0,
+                    staged_rows: staged.map_or(0, |(rows, _)| rows),
+                    staged_spans: staged.map_or(0, |(_, spans)| spans),
                 };
                 let per_phase = [
                     plan.phase_bytes(LayerPhase::Attention, width),

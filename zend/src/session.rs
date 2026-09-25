@@ -2160,6 +2160,26 @@ impl InferenceState {
             // is in flight at this point, which is why the sweep lives here and not
             // inside the ingest passes (those run only when the read runs, which is
             // precisely not the `--skip-layer` case that needs it).
+            // Superseded duplicates first. The order is not load-bearing:
+            // `superseded` elects the newest COMMITTED generation, so a crashed
+            // partial cannot win the vote and unseat the good generation it was
+            // replacing, whichever sweep runs first. It used to vote on timeline
+            // id alone, which made the order load-bearing in the worst way —
+            // this sweep tombstoned the last good summary and the next one took
+            // the partial, leaving the unit with nothing.
+            match il.mode {
+                IngestMode::Folders => crate::repo_scan::retire_superseded(
+                    &engine,
+                    crate::repo_scan::DIR_KEY,
+                    &il.name,
+                ),
+                IngestMode::Files => crate::repo_scan::retire_superseded(
+                    &engine,
+                    crate::code_read::PATH_KEY,
+                    &il.name,
+                ),
+                IngestMode::Raw => 0,
+            };
             match il.mode {
                 IngestMode::Folders => crate::repo_scan::retire_crashed_partials(&engine),
                 IngestMode::Files => crate::code_read::retire_crashed_partials(&engine),

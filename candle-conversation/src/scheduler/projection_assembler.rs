@@ -1864,7 +1864,7 @@ fn drive_prefill_and_capture(
             .session
             .snapshot_sequence_per_layer(parent_id.0)
             .map_err(ConversationError::Model)?;
-        slice_per_layer_sealed(&full, start_block, end_block)
+        slice_per_layer_sealed(&full, start_block, end_block)?
     };
     // The index rows this forward just built, taken as a page so a later
     // re-inject of the same K/V can hand them over with it. Without this the

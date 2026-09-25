@@ -225,12 +225,11 @@ fn manifest_hint(path: &Path, bytes: &[u8], language: Language) -> Option<Module
 }
 
 fn cargo_hint(body: &str) -> Option<ModuleHint> {
-    // Workspace detection: a `[workspace]` table whose `members` array
-    // we can count.  We don't pull in toml::Value here — a tiny
-    // hand-roll keeps the dep tree slim and is sufficient for the
-    // common shapes Cargo emits.
-    if let Some(members) = parse_workspace_members(body) {
-        return Some(ModuleHint::CargoWorkspace { members });
+    // Workspace detection: a `[workspace]` table carrying a `members` array.
+    // We don't pull in toml::Value here — a tiny hand-roll keeps the dep tree
+    // slim and is sufficient for the common shapes Cargo emits.
+    if has_workspace_members(body) {
+        return Some(ModuleHint::CargoWorkspace);
     }
     if let Some(name) = parse_cargo_package_name(body) {
         return Some(ModuleHint::CargoPackage { name });
@@ -238,20 +237,22 @@ fn cargo_hint(body: &str) -> Option<ModuleHint> {
     None
 }
 
-fn parse_workspace_members(body: &str) -> Option<usize> {
-    let ws_start = body.find("[workspace]")?;
+/// Whether `body` is a workspace manifest: a `[workspace]` table followed by a
+/// `members` array. The array is only ever *detected*, never counted — see
+/// [`ModuleHint::CargoWorkspace`] for why the count does not travel.
+fn has_workspace_members(body: &str) -> bool {
+    let Some(ws_start) = body.find("[workspace]") else {
+        return false;
+    };
     let after = &body[ws_start + "[workspace]".len()..];
-    let members_idx = after.find("members")?;
+    let Some(members_idx) = after.find("members") else {
+        return false;
+    };
     let after_members = &after[members_idx..];
-    let array_start = after_members.find('[')?;
-    let array_end = after_members[array_start..].find(']')?;
-    let inside = &after_members[array_start + 1..array_start + array_end];
-    let count = inside
-        .split(',')
-        .map(|s| s.trim().trim_matches('"'))
-        .filter(|s| !s.is_empty())
-        .count();
-    Some(count)
+    let Some(array_start) = after_members.find('[') else {
+        return false;
+    };
+    after_members[array_start..].contains(']')
 }
 
 fn parse_cargo_package_name(body: &str) -> Option<String> {
@@ -570,9 +571,14 @@ members = ["a", "b", "c"]
 
         let map = walk_workspace(&root, None);
         let entry = map.files.iter().find(|f| f.path == "Cargo.toml").unwrap();
+        assert_eq!(entry.module_hint, Some(ModuleHint::CargoWorkspace));
+        // The member array is detected, never counted: the rendered hint states
+        // the folder's role and carries nothing specific to this checkout.
         assert_eq!(
-            entry.module_hint,
-            Some(ModuleHint::CargoWorkspace { members: 3 })
+            ModuleHint::CargoWorkspace.render(),
+            "Cargo workspace root",
+            "a workspace hint must not carry a member count — it does not \
+             generalize and it leaked into unrelated dialogue",
         );
     }
 

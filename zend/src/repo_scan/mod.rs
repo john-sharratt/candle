@@ -14,7 +14,6 @@
 //! after its turns seal into the substrate. [`DirState`] records those hashes so
 //! a filesystem event re-ingests only the directories that actually changed.
 
-pub mod anchor;
 pub mod binary_sniff;
 pub mod dir_unit;
 pub mod render;
@@ -165,7 +164,34 @@ fn max_live_conversations() -> Option<usize> {
         kv,
         SCAN_KV_BASELINE.load(Ordering::Relaxed),
         SCAN_LIVE_CONVS.load(Ordering::Relaxed),
+        // Zero when the model reports no zone to defend — a dense checkpoint or
+        // a CPU device, where the weight side has no elastic boundary and
+        // nothing is taken from it by a K/V claim.
+        report.weights.floor_bytes.unwrap_or(0),
+        weights_now(&report.weights),
     ))
+}
+
+/// What the weight side is holding right now, in the units the floor is
+/// expressed in.
+///
+/// **A zone figure, not base + zone.** `floor_bytes` is
+/// `interleave::optimal_weight_bytes` — a fraction of the achievable residency
+/// of the *elastic expert zone*, measured inside a span that is the KV regions
+/// plus that zone and nothing else. Dense base weights are allocated outside
+/// that span and no concession can ever release them, so counting them here
+/// reports ground the scan cannot have: `(base + zone) − zone_floor`, halved by
+/// the caller, overstates the concession by `base_bytes / 2`. It read correct on
+/// this card only because a wave stack reports no separate base at all.
+///
+/// With no floor to defend the answer is UNBOUNDED rather than zero: a stack
+/// that reports no zone has none for K/V to take from, so capacity alone is the
+/// bound and the caller's `min` must not clamp it to nothing.
+fn weights_now(weights: &candle_conversation::memory_report::WeightSection) -> u64 {
+    match weights.floor_bytes {
+        Some(_) => weights.resident_expert_bytes.unwrap_or(0),
+        None => u64::MAX,
+    }
 }
 
 /// Total reserved KV arena bytes in a memory report — the quantity the arena
@@ -213,6 +239,7 @@ fn kv_reserved(report: &MemoryReport) -> u64 {
 /// back the scratch margin instead spends the room the governor already reserved
 /// for KV — while [`SCAN_CONV_KV_MIN`] keeps the resulting width on the safe
 /// side of that point.
+#[allow(clippy::too_many_arguments)]
 fn scan_width(
     capacity: u64,
     scratch_margin: u64,
@@ -220,12 +247,51 @@ fn scan_width(
     kv: u64,
     baseline: u64,
     live: usize,
+    weight_floor: u64,
+    weights_now: u64,
 ) -> usize {
     let fixed = pool_used.saturating_sub(kv);
+    // **The scan may take what the weight zone can concede, and not a byte
+    // more.**
+    //
+    // `capacity` is the governor's balloon-measured resident capacity — the
+    // whole elastic span, not a K/V-only share — and the weight zone lives in
+    // that same span. Ground K/V claims is ground the weight side loses, so a
+    // width planned from capacity alone plans to evict the model.
+    //
+    // It did. At 96 directory conversations the pool's K/V reached 48 GB, the
+    // weight zone fell from 53.5 GB to 10.9 GB — 19 GB below its floor — and
+    // admission refused every prefill for the rest of the run, which is both
+    // correct and unrecoverable: the floor check compares residency against the
+    // floor, and no number of refusals hands K/V back.
+    //
+    // The bound is `weights_now - floor`, not `capacity - floor`. Subtracting
+    // the floor from capacity charges the scan for ground the weights are
+    // already standing on, which it can never take anyway; measured, that cut
+    // the pool from 96 to 7 on a card with 21 GB genuinely available and left
+    // admission idle at `queued=0` while decode ran at the pool's width.
+    // **Half of what it could concede, because the floor is a limit and not an
+    // optimum.**
+    //
+    // Conceding weight ground is permitted down to the floor and is not free on
+    // the way there: a smaller expert zone pages more, and the paging costs the
+    // forwards the extra conversations were opened to fill. Measured on the
+    // 72 GB card, over the same directory corpus:
+    //
+    //   pool 7   zone stable at 50.2 GB   12.2 units/min
+    //   pool 53  zone pinned at the floor  ~9.0 units/min   decode width 50
+    //
+    // The wide pool got everything it asked for — decode ran 50 sequences to the
+    // narrow pool's 4-7 — and still finished less work, because the zone spent
+    // the run at 28 GB. Taking half leaves the expert cache its working set and
+    // still opens several times the conversations a capacity-minus-floor bound
+    // allowed.
+    let concedeable = weights_now.saturating_sub(weight_floor) / 2;
     let for_kv = capacity
         .saturating_sub(scratch_margin)
         .saturating_sub(fixed)
-        .saturating_sub(baseline);
+        .saturating_sub(baseline)
+        .min(concedeable);
     let per_conv = per_conversation_kv(kv, baseline, live);
     ((for_kv / per_conv.max(1)) as usize).clamp(1, REPO_MAP_PARALLELISM)
 }
@@ -505,7 +571,7 @@ pub fn refresh_repo_map(
     layer_name: &str,
     base: &Mutex<Sequence>,
 ) -> anyhow::Result<RefreshOutcome> {
-    let units = build_units(map, workspace);
+    let units = build_units(map);
     let prior = prior.without_frozen(map);
     if prior.equivalent_to(&units) {
         tracing::trace!("repo map refresh: no directory hash changed, skipping refresh");
@@ -518,7 +584,6 @@ pub fn refresh_repo_map(
         sample_changed = ?changed.iter().take(5).collect::<Vec<_>>(),
         n_total_dirs = units.len(),
         n_files = map.files.len(),
-        n_anchored = units.iter().filter(|u| u.anchor.is_some()).count(),
         skipped_extension = map.files_skipped_extension,
         skipped_oversize = map.files_skipped_oversize,
         skipped_binary = map.files_skipped_binary,
@@ -555,7 +620,7 @@ pub(crate) fn ingest_root_unit(
     map: &RepoMap,
     base: &Mutex<Sequence>,
 ) -> anyhow::Result<Option<TimelineId>> {
-    let units = build_units(map, workspace);
+    let units = build_units(map);
     let Some(root) = units.into_iter().find(|u| u.dir == ".") else {
         return Ok(None);
     };
@@ -731,6 +796,122 @@ pub(crate) fn retire_crashed_partials(engine: &Mutex<ConversationEngine>) {
     }
 }
 
+/// Retire superseded duplicates: where several live conversations describe the
+/// same unit, keep the newest and tombstone the rest.
+///
+/// **A unit is one conversation, and the substrate does not enforce that.**
+/// Every ingest writes a fresh timeline and tags it with its identity — `dir`
+/// for a folder, `path` for a file — and supersedes its own previous
+/// generation. A generation that is never superseded stays live: a boot that
+/// dies between minting the conversation and retiring the old one, a
+/// `--wipe-layer` whose tombstones land after a pass has already re-ingested, an
+/// `--ingest-dir` run that rewrites a subtree the previous root also covered.
+/// Measured on this substrate, the `repo_map` root existed **three times** — two
+/// of them sharing a content hash, which is the resume cache's whole reason for
+/// existing.
+///
+/// Duplicates are not merely untidy. Each one carries its own `WideQSig`s, so
+/// every copy competes separately in the provenance gather, and a folder listing
+/// matches almost any probe — the same promiscuity that makes a crashed partial
+/// worth retiring eagerly.
+///
+/// **The newest COMMITTED generation wins**, by timeline id. A `TimelineId` is
+/// `max(now_micros, last_issued + 1)` — strictly monotonic, so it *is* the
+/// creation time and ordering them needs no extra record.
+///
+/// Committed-ness has to be part of the vote, not left to the crashed-partial
+/// sweep that runs beside this one. A boot that dies mid-ingest leaves a partial
+/// that is *newer* than the good generation it was replacing, so a vote on id
+/// alone elects the partial and tombstones the last summary the folder had; the
+/// partial is then swept too, and the unit is left with nothing. Ordinarily it
+/// re-ingests on the next pass, but under `--skip-layer` nothing re-reads the
+/// layer and the loss is permanent. Deciding it here means the rule is right on
+/// its own terms rather than by the order two sweeps happen to run in.
+///
+/// A unit with no committed generation at all falls back to newest-wins; the
+/// crashed-partial sweep takes the survivor, which is the intended outcome.
+///
+/// Only conversations carrying `key` are considered, which is what keeps this
+/// away from real conversations: a dialogue has no `dir` and no `path`, so it is
+/// not in the map at all. Called once per boot, beside the crashed-partial
+/// sweep, with nothing in flight.
+/// The timelines to retire, given every live `(timeline, unit id)` pair: for
+/// each unit, all but the newest.
+///
+/// Split out from [`retire_superseded`] so the rule can be tested without an
+/// engine — the rule is the part worth pinning, and standing one up needs a
+/// model and a card.
+fn superseded(live: Vec<(TimelineId, String, bool)>) -> Vec<(TimelineId, String)> {
+    // Per unit: the newest committed generation, else the newest of any kind.
+    // `(committed, tl)` orders `false < true`, so a committed generation beats
+    // every partial regardless of age, and ties break on recency.
+    let mut winner: HashMap<&str, (bool, TimelineId)> = HashMap::new();
+    for (tl, id, committed) in &live {
+        let cand = (*committed, *tl);
+        if winner.get(id.as_str()).is_none_or(|kept| cand > *kept) {
+            winner.insert(id.as_str(), cand);
+        }
+    }
+    let keep: HashSet<(TimelineId, &str)> = winner
+        .iter()
+        .map(|(id, (_, tl))| (*tl, *id))
+        .collect::<HashSet<_>>();
+    live.iter()
+        .filter(|(tl, id, _)| !keep.contains(&(*tl, id.as_str())))
+        .map(|(tl, id, _)| (*tl, id.clone()))
+        .collect()
+}
+
+pub(crate) fn retire_superseded(
+    engine: &Mutex<ConversationEngine>,
+    key: &str,
+    layer: &str,
+) -> usize {
+    let e = engine.lock().unwrap();
+    // `HASH_KEY` is written only after a unit's ingest succeeds, so its presence
+    // is exactly "this generation committed" — the same test `process_one_dir`
+    // uses to decide whether a prior generation is worth deferring.
+    let live: Vec<(TimelineId, String, bool)> = e
+        .conversations_with_metadata_key(key)
+        .into_iter()
+        .map(|(tl, id)| {
+            let committed = e
+                .conversation_metadata(tl)
+                .is_some_and(|m| m.contains_key(HASH_KEY));
+            (tl, id, committed)
+        })
+        .collect();
+    let units = live
+        .iter()
+        .map(|(_, id, _)| id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    let older = superseded(live);
+    let mut retired = 0usize;
+    for (tl, id) in older {
+        match e.tombstone_timeline(tl) {
+            Ok(()) => retired += 1,
+            Err(err) => tracing::warn!(
+                target: "zend::repo_scan",
+                layer,
+                unit = %id,
+                "tombstone of superseded conversation failed: {err:#}",
+            ),
+        }
+    }
+    if retired > 0 {
+        tracing::info!(
+            target: "zend::repo_scan",
+            layer,
+            retired,
+            units,
+            "retired superseded duplicate conversations — the newest generation \
+             of each unit is kept, the rest leave the provenance gather",
+        );
+    }
+    retired
+}
+
 /// Tombstone EVERY `repo_map` conversation, committed or not — `--wipe-layer
 /// repo_map`'s targeted counterpart to [`retire_crashed_partials`], which only
 /// removes the never-committed half.
@@ -783,7 +964,7 @@ fn ingest_committed(meta: &BTreeMap<String, String>) -> bool {
 /// Metadata key holding a unit's directory — the invalidation-scan key. Distinct
 /// from `code_read`'s `path` so the two layers' reconcile sweeps never touch each
 /// other's conversations.
-const DIR_KEY: &str = "dir";
+pub(crate) const DIR_KEY: &str = "dir";
 
 /// Metadata key holding a unit's content hash — the resume-cache key, written
 /// only after the unit's ingest succeeds.
@@ -1222,9 +1403,6 @@ fn process_one_dir(
     tags.insert(DIR_KEY.to_string(), unit.dir.clone());
     tags.insert(HASH_KEY.to_string(), unit.content_hash.clone());
     tags.insert("files".to_string(), unit.files.len().to_string());
-    if let Some(a) = &unit.anchor {
-        tags.insert("anchor".to_string(), a.path.clone());
-    }
     // The tag write is what commits the new generation. If it fails, this
     // attempt has to go: keeping the prior generation live is right, but keeping
     // BOTH is not — the untagged replacement is invisible to the resume cache
@@ -1371,6 +1549,132 @@ mod tests {
     use super::*;
     use crate::repo_scan::types::Language;
 
+    fn tl(n: u64) -> TimelineId {
+        TimelineId::from_raw(n).expect("non-zero")
+    }
+
+    /// **One unit, one live conversation — the newest wins.**
+    ///
+    /// A `TimelineId` is `max(now_micros, last_issued + 1)`, so it is the
+    /// creation time and comparing them is how "old" is decided. Measured on a
+    /// real substrate before this existed: the `repo_map` root was live three
+    /// times over, two of them sharing a content hash.
+    #[test]
+    fn every_generation_but_the_newest_is_superseded() {
+        let live = vec![
+            (tl(100), ".".to_string(), true),
+            (tl(300), ".".to_string(), true),
+            (tl(200), ".".to_string(), true),
+            (tl(150), "src/".to_string(), true),
+        ];
+        let mut out = superseded(live);
+        out.sort();
+        assert_eq!(
+            out,
+            vec![(tl(100), ".".to_string()), (tl(200), ".".to_string())],
+            "the newest of each unit is kept and a sole generation is untouched",
+        );
+    }
+
+    /// Nothing to retire is the common case, and it must retire nothing —
+    /// a sweep that tombstones a unique generation destroys the layer.
+    #[test]
+    fn distinct_units_are_never_superseded() {
+        let live = vec![
+            (tl(10), "a/".to_string(), true),
+            (tl(20), "b/".to_string(), true),
+            (tl(30), "c/".to_string(), true),
+        ];
+        assert!(superseded(live).is_empty());
+    }
+
+    /// **The concession is measured against the ZONE, never base + zone.**
+    ///
+    /// `floor_bytes` is a fraction of the elastic expert zone's achievable
+    /// residency, and dense base weights live outside the span it is measured
+    /// in — no concession can release them. Counting them overstated the ground
+    /// a scan could take by `base_bytes / 2`, and `scan_width`'s own tests
+    /// cannot see it because the unit is chosen at the call site.
+    #[test]
+    fn what_the_weight_side_holds_is_the_zone_not_the_dense_base() {
+        use candle_conversation::memory_report::WeightSection;
+        let section = |base: Option<u64>, floor: Option<u64>| WeightSection {
+            base_bytes: base,
+            resident_expert_bytes: Some(40 << 30),
+            floor_bytes: floor,
+        };
+        assert_eq!(
+            weights_now(&section(Some(20 << 30), Some(30 << 30))),
+            40 << 30,
+            "the dense base is not the zone's and is not conceded",
+        );
+        assert_eq!(
+            weights_now(&section(None, Some(30 << 30))),
+            40 << 30,
+            "a stack reporting no base reads the same — which is why this was latent",
+        );
+        assert_eq!(
+            weights_now(&section(Some(20 << 30), None)),
+            u64::MAX,
+            "no floor to defend ⇒ unbounded, so the caller's `min` cannot clamp \
+             the width to nothing",
+        );
+    }
+
+    /// **A crashed partial must not unseat the committed generation it was
+    /// replacing, however much newer it is.** A boot that dies mid-ingest leaves
+    /// exactly this pair. Voting on timeline id alone elected the partial and
+    /// retired the folder's last good summary; the crashed-partial sweep then
+    /// took the partial too, and under `--skip-layer` nothing re-read the layer,
+    /// so the unit was gone for good.
+    #[test]
+    fn a_crashed_partial_never_supersedes_a_committed_generation() {
+        let live = vec![
+            (tl(100), ".".to_string(), true),  // committed, older
+            (tl(300), ".".to_string(), false), // crashed partial, newer
+        ];
+        assert_eq!(
+            superseded(live),
+            vec![(tl(300), ".".to_string())],
+            "the partial is retired and the committed generation is kept",
+        );
+    }
+
+    /// With nothing committed there is no better answer than recency, and the
+    /// survivor is then the crashed-partial sweep's to take.
+    #[test]
+    fn with_no_committed_generation_the_newest_partial_survives() {
+        let live = vec![
+            (tl(100), ".".to_string(), false),
+            (tl(300), ".".to_string(), false),
+            (tl(200), ".".to_string(), false),
+        ];
+        let mut out = superseded(live);
+        out.sort();
+        assert_eq!(
+            out,
+            vec![(tl(100), ".".to_string()), (tl(200), ".".to_string())],
+        );
+    }
+
+    /// Committed-ness beats recency, but among committed generations recency
+    /// still decides — otherwise a re-ingest would never replace its predecessor.
+    #[test]
+    fn among_committed_generations_the_newest_still_wins() {
+        let live = vec![
+            (tl(100), ".".to_string(), true),
+            (tl(400), ".".to_string(), true),
+            (tl(300), ".".to_string(), false),
+        ];
+        let mut out = superseded(live);
+        out.sort();
+        assert_eq!(
+            out,
+            vec![(tl(100), ".".to_string()), (tl(300), ".".to_string())],
+            "tl(400) is the newest committed generation and is kept",
+        );
+    }
+
     /// The completion protocol the crashed-partial sweep rests on: the directory
     /// tag is written at creation, the content hash only on success, so `dir`
     /// without a hash is the signature of an attempt that never finished.
@@ -1420,7 +1724,6 @@ mod tests {
                 module_hint: None,
             }],
             listed: vec![format!("{dir}x.rs")],
-            anchor: None,
             content_hash: "abc".to_string(),
         }
     }
@@ -1540,7 +1843,7 @@ mod tests {
     #[test]
     fn the_inherited_corpus_is_not_free_room() {
         const EXTRA: u64 = 2 * 1024 * 1024 * 1024;
-        let base = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2);
+        let base = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2, 0, u64::MAX);
         let with_corpus = scan_width(
             CAPACITY,
             SCRATCH,
@@ -1548,6 +1851,8 @@ mod tests {
             KV + EXTRA,
             PRE_SCAN + EXTRA,
             2,
+            0,
+            u64::MAX,
         );
         assert!(with_corpus < base, "{with_corpus} vs {base}");
     }
@@ -1566,9 +1871,68 @@ mod tests {
         let by_fraction = (((CAPACITY as f64) * 0.70) as u64)
             .saturating_sub(POOL_USED - KV + PRE_SCAN)
             / per_conv;
-        let by_governor = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2) as u64;
+        let by_governor =
+            scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2, 0, u64::MAX) as u64;
         assert_eq!(by_fraction, 0);
         assert_eq!(by_governor, 6);
+    }
+
+    /// **The weight zone's floor is not room the scan may plan against.**
+    ///
+    /// K/V and the model's weights share one span, so every region the pool
+    /// claims is ground the weight side loses. A width computed from capacity
+    /// alone therefore plans to evict the model — and did: 96 directory
+    /// conversations grew 48 GB of K/V, drove the weight zone from 53.5 GB to
+    /// 10.9 GB against a 28.8 GB floor, and left admission refusing every
+    /// prefill from then on, because the floor check compares residency to the
+    /// floor and refusing a prefill gives no K/V back.
+    #[test]
+    fn the_scan_may_take_only_what_the_weight_zone_can_concede() {
+        let unbounded = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2, 0, u64::MAX);
+        // A zone holding 9 GiB over an 8 GiB floor may concede 1 GiB, which is
+        // less than the capacity arithmetic would have allowed.
+        let defended = scan_width(
+            CAPACITY,
+            SCRATCH,
+            POOL_USED,
+            KV,
+            PRE_SCAN,
+            2,
+            8 * 1024 * 1024 * 1024,
+            9 * 1024 * 1024 * 1024,
+        );
+        assert!(defended < unbounded, "{defended} vs {unbounded}");
+        // A zone already at its floor concedes nothing, and the pool still does
+        // not reach zero: one conversation has to be able to run, or the ingest
+        // cannot make progress at all.
+        assert_eq!(
+            scan_width(
+                CAPACITY,
+                SCRATCH,
+                POOL_USED,
+                KV,
+                PRE_SCAN,
+                2,
+                8 * 1024 * 1024 * 1024,
+                8 * 1024 * 1024 * 1024,
+            ),
+            1,
+        );
+        // Ground the weights already hold is not charged to the scan: a zone
+        // far above its floor is bounded by capacity, exactly as before.
+        assert_eq!(
+            scan_width(
+                CAPACITY,
+                SCRATCH,
+                POOL_USED,
+                KV,
+                PRE_SCAN,
+                2,
+                8 * 1024 * 1024 * 1024,
+                u64::MAX,
+            ),
+            unbounded,
+        );
     }
 
     /// The floor charges a conversation for RESERVED arena, not for the live
@@ -1642,11 +2006,17 @@ mod tests {
     /// exceeds the thread count the pool actually spawns.
     #[test]
     fn the_width_stays_between_one_and_the_pool_ceiling() {
-        assert_eq!(scan_width(CAPACITY, SCRATCH, 14_000_000_000, 0, 0, 0), 1);
-        // A margin wider than the card leaves nothing, and still not zero.
-        assert_eq!(scan_width(CAPACITY, 2 * CAPACITY, 0, 0, 0, 0), 1);
         assert_eq!(
-            scan_width(1024 * 1024 * 1024 * 1024, SCRATCH, 0, 0, 0, 0),
+            scan_width(CAPACITY, SCRATCH, 14_000_000_000, 0, 0, 0, 0, u64::MAX),
+            1,
+        );
+        // A margin wider than the card leaves nothing, and still not zero.
+        assert_eq!(
+            scan_width(CAPACITY, 2 * CAPACITY, 0, 0, 0, 0, 0, u64::MAX),
+            1,
+        );
+        assert_eq!(
+            scan_width(1024 * 1024 * 1024 * 1024, SCRATCH, 0, 0, 0, 0, 0, u64::MAX),
             REPO_MAP_PARALLELISM,
         );
     }

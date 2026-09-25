@@ -1,17 +1,19 @@
 //! Per-directory ingest units for the `repo_map` layer.
 //!
 //! One directory, one conversation. The unit carries everything the folder's
-//! turns need: the files directly inside it, the walked paths under its prefix,
-//! the anchor excerpt that says what it is (see [`super::anchor`]), and a
-//! content hash driving the resume cache and the refresh decision.
+//! turns need: the files directly inside it, the one-level listing its
+//! `file_list` turn shows, and a content hash driving the resume cache and the
+//! refresh decision.
+//!
+//! **No anchor excerpt.** A folder used to be described by reading its
+//! `README`/module doc; the chain is now a single `file_list` round-trip and the
+//! summary, so names and paths are the whole evidence.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
 
 use sha2::{Digest, Sha256};
 use zend_tools::tools::file::list::LIST_PAGE_ENTRIES;
 
-use super::anchor::{self, Anchor};
 use super::types::{FileEntry, ModuleHint, RepoMap};
 
 /// One directory's ingest unit.
@@ -21,9 +23,7 @@ pub struct DirUnit {
     /// or `"."` for the workspace root — the form used as the gather-scope tag
     /// and the resume-cache key.
     pub dir: String,
-    /// Files directly inside the directory, in path order. The anchor is chosen
-    /// from these — a folder is described by *its own* `README.md` / module root,
-    /// never by one belonging to a subdirectory.
+    /// Files directly inside the directory, in path order.
     pub files: Vec<FileEntry>,
     /// The walked entries of this directory — its own files, plus the NAME of
     /// each subdirectory holding anything, which is exactly the shape
@@ -32,9 +32,7 @@ pub struct DirUnit {
     /// approximation of what the turn shows: see [`listed_paths`] for where the
     /// two diverge.
     pub listed: Vec<String>,
-    /// The excerpt describing the folder, when one of its files provides it.
-    pub anchor: Option<Anchor>,
-    /// SHA-256 over [`Self::listed`] plus the anchor excerpt's text. Hashing the
+    /// SHA-256 over [`Self::listed`]. Hashing the
     /// evidence — rather than a proxy like the directory's own file names — is
     /// what makes the cache exact in both directions: a file added deep in the
     /// subtree changes the listing and must re-ingest, while an edit to a file
@@ -77,7 +75,7 @@ impl DirUnit {
 /// Deterministic: directories in sorted order, files in walk (path) order, so
 /// two runs over an unchanged tree produce byte-identical units and the resume
 /// cache hits.
-pub fn build_units(map: &RepoMap, workspace: &Path) -> Vec<DirUnit> {
+pub fn build_units(map: &RepoMap) -> Vec<DirUnit> {
     let mut by_dir: BTreeMap<String, Vec<&FileEntry>> = BTreeMap::new();
     for file in &map.files {
         by_dir.entry(dir_of(&file.path)).or_default().push(file);
@@ -86,14 +84,14 @@ pub fn build_units(map: &RepoMap, workspace: &Path) -> Vec<DirUnit> {
     by_dir
         .into_iter()
         .map(|(dir, files)| {
-            let anchor = anchor::pick(&files, workspace);
+            let files: Vec<FileEntry> = files.into_iter().cloned().collect();
             let listed = listed_paths(map, &dir);
-            let content_hash = hash_unit(&listed, anchor.as_ref());
+            let hint = files.iter().find_map(|f| f.module_hint.as_ref());
+            let content_hash = hash_unit(&listed, hint);
             DirUnit {
                 dir,
-                files: files.into_iter().cloned().collect(),
+                files,
                 listed,
-                anchor,
                 content_hash,
             }
         })
@@ -158,22 +156,33 @@ fn dir_of(path: &str) -> String {
     }
 }
 
-/// Hash the walked paths under the unit's prefix plus its anchor text. A rename,
-/// addition or deletion anywhere in the walked page moves it (the listing
-/// changed); so does an edited module doc (the summary would be stale). An edit
-/// to a file that is only NAMED does not — the unit never showed that content, so
-/// re-summarising would decode the same answer at full cost.
-fn hash_unit(listed: &[String], anchor: Option<&Anchor>) -> String {
+/// Hash the walked entries of the directory. A rename, addition or deletion
+/// among them moves it (the listing changed); an edit to a file that is only
+/// NAMED does not — the unit never showed that content, so re-summarising would
+/// decode the same answer at full cost.
+///
+/// **The anchor's text is no longer part of it**, because the anchor is no
+/// longer part of the turn: the chain is one `file_list` round-trip and the
+/// summary. Hashing an excerpt the conversation never shows would re-decode
+/// every folder whose README was touched, for a listing that did not change —
+/// the rule here is that the hash covers what the turn shows, and nothing else.
+///
+/// **The module hint is part of what the turn shows**, so by that same rule it
+/// belongs here: `render_request` splices it into the request the model reads
+/// (`Summarize the \`candle-nn/\` folder (crate: candle-nn) …`). Left out, a
+/// manifest edit that changes the hint without changing the listing — a crate
+/// renamed in its `Cargo.toml`, a `[workspace]` table added — moved the question
+/// while the resume cache still reported a hit, so the sealed summary answered a
+/// request that is no longer the one this unit renders.
+fn hash_unit(listed: &[String], hint: Option<&ModuleHint>) -> String {
     let mut h = Sha256::new();
     for n in listed {
         h.update(n.as_bytes());
         h.update(b"\n");
     }
-    if let Some(a) = anchor {
-        h.update(b"\0anchor\0");
-        h.update(a.path.as_bytes());
-        h.update(b"\0");
-        h.update(a.body.as_bytes());
+    if let Some(hint) = hint {
+        h.update(hint.render().as_bytes());
+        h.update(b"\n");
     }
     let digest = h.finalize();
     let mut out = String::with_capacity(digest.len() * 2);
@@ -329,8 +338,10 @@ mod tests {
     #[test]
     fn one_unit_per_directory_in_sorted_order() {
         let m = map(&["b/x.rs", "a/y.rs", "a/z.rs", "top.rs"]);
-        let d = empty_workspace();
-        let units = build_units(&m, d.path());
+        // Held, not used: `build_units` reads the map, but the workspace must
+        // outlive the call or the TempDir is removed under it.
+        let _d = empty_workspace();
+        let units = build_units(&m);
         let dirs: Vec<&str> = units.iter().map(|u| u.dir.as_str()).collect();
         assert_eq!(dirs, vec![".", "a/", "b/"]);
         assert_eq!(units[1].files.len(), 2, "a/ holds both its files");
@@ -340,8 +351,10 @@ mod tests {
     #[test]
     fn the_root_unit_lists_with_an_empty_prefix() {
         let m = map(&["top.rs"]);
-        let d = empty_workspace();
-        let units = build_units(&m, d.path());
+        // Held, not used: `build_units` reads the map, but the workspace must
+        // outlive the call or the TempDir is removed under it.
+        let _d = empty_workspace();
+        let units = build_units(&m);
         assert_eq!(units[0].dir, ".");
         assert_eq!(units[0].list_prefix(), "");
     }
@@ -349,8 +362,10 @@ mod tests {
     #[test]
     fn a_nested_directory_lists_with_its_own_prefix() {
         let m = map(&["zend/src/x.rs"]);
-        let d = empty_workspace();
-        let units = build_units(&m, d.path());
+        // Held, not used: `build_units` reads the map, but the workspace must
+        // outlive the call or the TempDir is removed under it.
+        let _d = empty_workspace();
+        let units = build_units(&m);
         assert_eq!(units[0].dir, "zend/src/");
         assert_eq!(units[0].list_prefix(), "zend/src/");
     }
@@ -358,8 +373,10 @@ mod tests {
     #[test]
     fn state_round_trips_and_detects_no_change() {
         let m = map(&["a/x.rs"]);
-        let d = empty_workspace();
-        let units = build_units(&m, d.path());
+        // Held, not used: `build_units` reads the map, but the workspace must
+        // outlive the call or the TempDir is removed under it.
+        let _d = empty_workspace();
+        let units = build_units(&m);
         let st = DirState::from_units(&units);
         assert!(st.equivalent_to(&units));
         assert!(st.changed_dirs(&units).is_empty());
@@ -371,8 +388,10 @@ mod tests {
     /// filesystem event.
     #[test]
     fn state_is_compared_as_a_set_not_pairwise() {
-        let d = empty_workspace();
-        let units = build_units(&map(&["a/x.rs", "b/y.rs", "c/z.rs"]), d.path());
+        // Held, not used: `build_units` reads the map, but the workspace must
+        // outlive the call or the TempDir is removed under it.
+        let _d = empty_workspace();
+        let units = build_units(&map(&["a/x.rs", "b/y.rs", "c/z.rs"]));
         let mut st = DirState::from_units(&units);
         st.units.reverse();
         assert!(st.equivalent_to(&units), "{:?}", st.units);
@@ -383,8 +402,10 @@ mod tests {
     /// written) must read as changed — that is what gets it retried.
     #[test]
     fn a_directory_absent_from_the_state_is_changed() {
-        let d = empty_workspace();
-        let units = build_units(&map(&["a/x.rs", "b/y.rs"]), d.path());
+        // Held, not used: `build_units` reads the map, but the workspace must
+        // outlive the call or the TempDir is removed under it.
+        let _d = empty_workspace();
+        let units = build_units(&map(&["a/x.rs", "b/y.rs"]));
         let mut st = DirState::from_units(&units);
         let dropped = st.units.pop().expect("two units").dir;
         assert!(!st.equivalent_to(&units));
@@ -393,9 +414,11 @@ mod tests {
 
     #[test]
     fn adding_a_file_changes_only_the_directories_that_show_it() {
-        let d = empty_workspace();
-        let before = build_units(&map(&["a/x.rs", "b/y.rs"]), d.path());
-        let after = build_units(&map(&["a/x.rs", "a/new.rs", "b/y.rs"]), d.path());
+        // Held, not used: `build_units` reads the map, but the workspace must
+        // outlive the call or the TempDir is removed under it.
+        let _d = empty_workspace();
+        let before = build_units(&map(&["a/x.rs", "b/y.rs"]));
+        let after = build_units(&map(&["a/x.rs", "a/new.rs", "b/y.rs"]));
         let st = DirState::from_units(&before);
         assert!(!st.equivalent_to(&after));
         assert_eq!(st.changed_dirs(&after), vec!["a/".to_string()]);
@@ -415,13 +438,12 @@ mod tests {
     /// above it, up to and including the root.
     #[test]
     fn a_file_added_deep_re_summarises_its_own_folder_only() {
-        let d = empty_workspace();
+        // Held, not used: `build_units` reads the map, but the workspace must
+        // outlive the call or the TempDir is removed under it.
+        let _d = empty_workspace();
         // `top.rs` gives the workspace root a unit of its own.
-        let before = build_units(&map(&["top.rs", "a/x.rs", "a/b/c/y.rs"]), d.path());
-        let after = build_units(
-            &map(&["top.rs", "a/x.rs", "a/b/c/y.rs", "a/b/c/z.rs"]),
-            d.path(),
-        );
+        let before = build_units(&map(&["top.rs", "a/x.rs", "a/b/c/y.rs"]));
+        let after = build_units(&map(&["top.rs", "a/x.rs", "a/b/c/y.rs", "a/b/c/z.rs"]));
         let st = DirState::from_units(&before);
         let changed = st.changed_dirs(&after);
         assert_eq!(changed, vec!["a/b/c/".to_string()], "{changed:?}");
@@ -431,9 +453,11 @@ mod tests {
     /// the subdirectory's name, so what that turn shows really did change.
     #[test]
     fn a_new_subdirectory_moves_the_parents_hash() {
-        let d = empty_workspace();
-        let before = build_units(&map(&["top.rs", "a/x.rs"]), d.path());
-        let after = build_units(&map(&["top.rs", "a/x.rs", "a/b/y.rs"]), d.path());
+        // Held, not used: `build_units` reads the map, but the workspace must
+        // outlive the call or the TempDir is removed under it.
+        let _d = empty_workspace();
+        let before = build_units(&map(&["top.rs", "a/x.rs"]));
+        let after = build_units(&map(&["top.rs", "a/x.rs", "a/b/y.rs"]));
         let st = DirState::from_units(&before);
         let changed = st.changed_dirs(&after);
         assert!(changed.contains(&"a/".to_string()), "{changed:?}");
@@ -446,19 +470,21 @@ mod tests {
     /// the turn, so re-decoding the same summary would be pure cost.
     #[test]
     fn a_file_past_the_shown_page_leaves_the_hash_alone() {
-        let d = empty_workspace();
+        // Held, not used: `build_units` reads the map, but the workspace must
+        // outlive the call or the TempDir is removed under it.
+        let _d = empty_workspace();
         let full: Vec<String> = (0..LIST_PAGE_ENTRIES)
             .map(|i| format!("a/f{i:03}.rs"))
             .collect();
         let refs: Vec<&str> = full.iter().map(|s| s.as_str()).collect();
-        let before = build_units(&map(&refs), d.path());
+        let before = build_units(&map(&refs));
         assert_eq!(before[0].listed.len(), LIST_PAGE_ENTRIES, "a full page");
 
         // `zz.rs` sorts after every `f###.rs`, so it lands on page two.
         let mut with_extra = full.clone();
         with_extra.push("a/zz.rs".to_string());
         let refs2: Vec<&str> = with_extra.iter().map(|s| s.as_str()).collect();
-        let after = build_units(&map(&refs2), d.path());
+        let after = build_units(&map(&refs2));
         assert_eq!(before[0].content_hash, after[0].content_hash);
     }
 
@@ -486,7 +512,7 @@ mod tests {
         std::fs::write(d.path().join("k/LICENSE"), "MIT\n").unwrap();
 
         let walked = walk_workspace(d.path(), None);
-        let units = build_units(&walked, d.path());
+        let units = build_units(&walked);
         let k = units.iter().find(|u| u.dir == "k/").expect("k/ has a unit");
         assert_eq!(
             k.listed,
@@ -519,54 +545,58 @@ mod tests {
     /// never carries a folder with nothing of its own to describe.
     #[test]
     fn an_intermediate_directory_with_no_files_gets_no_unit() {
-        let d = empty_workspace();
-        let units = build_units(&map(&["a/b/c/y.rs"]), d.path());
+        // Held, not used: `build_units` reads the map, but the workspace must
+        // outlive the call or the TempDir is removed under it.
+        let _d = empty_workspace();
+        let units = build_units(&map(&["a/b/c/y.rs"]));
         let dirs: Vec<&str> = units.iter().map(|u| u.dir.as_str()).collect();
         assert_eq!(dirs, vec!["a/b/c/"]);
     }
 
     #[test]
     fn a_removed_directory_is_reported() {
-        let d = empty_workspace();
-        let before = build_units(&map(&["a/x.rs", "b/y.rs"]), d.path());
-        let after = build_units(&map(&["a/x.rs"]), d.path());
+        // Held, not used: `build_units` reads the map, but the workspace must
+        // outlive the call or the TempDir is removed under it.
+        let _d = empty_workspace();
+        let before = build_units(&map(&["a/x.rs", "b/y.rs"]));
+        let after = build_units(&map(&["a/x.rs"]));
         let st = DirState::from_units(&before);
         assert_eq!(st.changed_dirs(&after), vec!["b/".to_string()]);
     }
 
-    /// The excerpt is the point of the unit, so editing it must re-ingest even
-    /// though the file names are unchanged.
+    /// **Editing a file's CONTENT leaves the hash alone**, now that the turn
+    /// shows only the listing.
+    ///
+    /// It used to move the hash, because the unit read an anchor file and the
+    /// excerpt was hashed with the names. With the read gone the excerpt is not
+    /// evidence any more, and re-summarising a folder whose listing is byte-for
+    /// -byte identical would decode the same sentence at full cost — on this
+    /// workspace, every folder whose README was touched.
     #[test]
-    fn editing_the_anchor_text_moves_the_hash() {
+    fn editing_a_files_content_leaves_the_hash_alone() {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("a")).unwrap();
         std::fs::write(d.path().join("a/mod.rs"), "//! One.\n//! Two.\nfn x() {}\n").unwrap();
         let m = map(&["a/mod.rs"]);
-        let before = build_units(&m, d.path());
+        let before = build_units(&m);
 
         std::fs::write(
             d.path().join("a/mod.rs"),
             "//! Changed.\n//! Two.\nfn x() {}\n",
         )
         .unwrap();
-        let after = build_units(&m, d.path());
-        assert_ne!(before[0].content_hash, after[0].content_hash);
+        let after = build_units(&m);
+        assert_eq!(before[0].content_hash, after[0].content_hash);
     }
 
-    /// A README is the other kind of anchor, and it reaches the excerpt by a
-    /// different branch of [`anchor::pick`] than a module doc does — Markdown has
-    /// no comment syntax to peel, so its head IS the description. Editing it must
-    /// re-ingest the folder just the same, or a rewritten README leaves the
-    /// layer describing the folder as it used to be.
+    /// A rewritten README leaves the hash alone too — it is a file like any
+    /// other now, named in the listing and never shown.
     #[test]
-    fn editing_a_readme_moves_the_hash() {
+    fn rewriting_a_readme_leaves_the_hash_alone() {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("a")).unwrap();
         std::fs::write(d.path().join("a/x.rs"), "fn x() {}\n").unwrap();
         std::fs::write(d.path().join("a/README.md"), "# a\n\nHolds the widgets.\n").unwrap();
-        // Typed as Markdown so `pick` takes the README branch, not the
-        // module-doc one — the helper's default of Rust would silently test the
-        // wrong path.
         let readme = FileEntry {
             language: Language::Markdown,
             ..entry("a/README.md")
@@ -575,25 +605,15 @@ mod tests {
             files: vec![readme, entry("a/x.rs")],
             ..Default::default()
         };
-        let before = build_units(&m, d.path());
-        let anchor = before[0]
-            .anchor
-            .as_ref()
-            .expect("README anchors the folder");
-        assert_eq!(anchor.path, "a/README.md");
-        assert_eq!(anchor.language, Language::Markdown);
-        assert!(anchor.body.contains("Holds the widgets."));
+        let before = build_units(&m);
 
         std::fs::write(
             d.path().join("a/README.md"),
             "# a\n\nHolds the gadgets now.\n",
         )
         .unwrap();
-        let after = build_units(&m, d.path());
-        assert_ne!(
-            before[0].content_hash, after[0].content_hash,
-            "a rewritten README must re-summarise the folder",
-        );
+        let after = build_units(&m);
+        assert_eq!(before[0].content_hash, after[0].content_hash);
     }
 
     /// An edit elsewhere in the directory does not — the unit never showed it,
@@ -605,10 +625,10 @@ mod tests {
         std::fs::write(d.path().join("a/mod.rs"), "//! One.\n//! Two.\nfn x() {}\n").unwrap();
         std::fs::write(d.path().join("a/other.rs"), "fn a() {}\n").unwrap();
         let m = map(&["a/mod.rs", "a/other.rs"]);
-        let before = build_units(&m, d.path());
+        let before = build_units(&m);
 
         std::fs::write(d.path().join("a/other.rs"), "fn b() {}\n").unwrap();
-        let after = build_units(&m, d.path());
+        let after = build_units(&m);
         assert_eq!(before[0].content_hash, after[0].content_hash);
     }
 }

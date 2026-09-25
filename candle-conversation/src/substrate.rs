@@ -5281,15 +5281,74 @@ impl Substrate {
     }
 
     /// The set of distinct `custom[key]` values across all **live**
-    /// (non-tombstoned) timelines. A one-pass snapshot so callers can
-    /// probe membership in O(1) instead of an O(timelines) scan per probe
-    /// (e.g. the code_read resume cache over thousands of files).
+    /// (non-tombstoned) timelines whose own K/V is intact. A one-pass snapshot
+    /// so callers can probe membership in O(1) instead of an O(timelines) scan
+    /// per probe (e.g. the code_read resume cache over thousands of files).
+    ///
+    /// **Intactness is part of the answer, because this set is a resume cache.**
+    /// Its whole purpose is "has this content already been ingested, so the work
+    /// can be skipped" — and a conversation that lost its K/V has not been
+    /// usefully ingested, however complete its metadata looks. Keyed on the
+    /// source hash alone, such a unit matched, was skipped, and was therefore
+    /// never repaired: the hash describes the *input*, so it keeps matching
+    /// forever while the stored answer stays a hole. Nothing else noticed
+    /// either — `validate` only checks the chunk grid of turns that *have* one,
+    /// and the crashed-partial sweep looks for a missing hash, which this unit
+    /// has. Measured: `ARCHITECTURE.md`, a priming-chain anchor in every
+    /// conversation's ancestry, sat with 104 blocks of a turn's K/V absent for
+    /// days across many boots.
+    ///
+    /// A hash survives here if *any* intact timeline carries it, so this only
+    /// drops a value when every conversation holding it is damaged — which is
+    /// exactly when the unit needs re-ingesting.
     pub fn metadata_values_for_key(&self, key: &str) -> std::collections::HashSet<String> {
         self.timelines
             .iter()
             .filter(|(tid, _)| !self.tombstoned_timelines.contains(tid))
+            .filter(|(tid, _)| self.timeline_kv_intact(**tid))
             .filter_map(|(_, tl)| tl.custom.get(key).cloned())
             .collect()
+    }
+
+    /// Whether every turn **this timeline owns** still holds its K/V in some
+    /// tier (hot, warm or cold).
+    ///
+    /// **Own turns only — never the inherited chain.** A fork's ancestors are
+    /// resolved live at projection time ([`Self::inherited_chain`]), so a hole
+    /// in an ancestor is that ancestor's to repair and is fixed for every
+    /// descendant at once when it is. Walking the chain here would instead mark
+    /// every descendant damaged: each `code_read` file hangs off the priming
+    /// chain's end, so one damaged anchor would condemn the entire corpus and
+    /// re-ingest the whole workspace.
+    ///
+    /// **K/V that was deliberately reclaimed is not damage**, so an ARCHIVED or
+    /// DISTILLED timeline always reads as intact. A tool-calibration exemplar
+    /// ends archived + distilled(`ProvenanceOnly`): [`Self::release_distilled_kv`]
+    /// drops its chunks on purpose, because its `WideQSig`s are all the belief
+    /// scan still needs from it. Counting that as damage would be wrong twice
+    /// over — it describes 876 of this store's 1,467 conversations, and a
+    /// re-ingest is not the repair for content nobody ingests. Tombstoned
+    /// timelines never reach here; [`Self::metadata_values_for_key`] drops them
+    /// first.
+    ///
+    /// A turn spanning no blocks holds no K/V by construction and is skipped —
+    /// it is not damage either. An unknown timeline reads as NOT intact, which
+    /// fails toward doing the work rather than trusting a conversation that is
+    /// not there.
+    pub fn timeline_kv_intact(&self, timeline: TimelineId) -> bool {
+        let Some(entry) = self.timelines.get(&timeline) else {
+            return false;
+        };
+        if entry.archived || self.is_distilled(timeline) {
+            return true;
+        }
+        entry.turns.values().all(|turn| {
+            if turn.block_range.1 <= turn.block_range.0 {
+                return true;
+            }
+            let slot = &self.residence[turn.content.residence.0];
+            slot.hot.is_some() || slot.warm.is_some() || slot.cold.is_some()
+        })
     }
 
     /// All **live** (non-tombstoned) timelines that carry `key` in their
@@ -8226,6 +8285,206 @@ mod tests {
             sub.residence[a.0].hot.is_none(),
             "A left the working set → eviction resumes"
         );
+    }
+
+    /// A sealed turn spanning REAL blocks, hot + warm installed — the shape a
+    /// live ingest unit has once its seal lands. Unlike `install_hot_and_warm`
+    /// this sets `block_end`, which is what makes the turn one that *should*
+    /// hold K/V: a zero-block turn holds none by construction and intactness
+    /// rightly ignores it.
+    fn install_blocked_turn(
+        sub: &mut Substrate,
+        timeline: TimelineId,
+        blocks: u64,
+    ) -> ResidenceIndex {
+        let idx = sub
+            .append_complete(
+                timeline,
+                TurnPartWrite {
+                    sealed_gpu: Some(Arc::new(vec![minimal_sealed_layer()])),
+                    block_end: blocks,
+                    token_count: 32,
+                    ..Default::default()
+                },
+                identity_migrate,
+            )
+            .unwrap();
+        let residence = sub.turn_residence(timeline, idx).unwrap();
+        sub.install_warm(residence, vec![minimal_sealed_layer()]);
+        residence
+    }
+
+    /// Drop every tier's copy — the pin-wedge end state, and also what
+    /// `release_distilled_kv` leaves behind: a turn with token_ids and a block
+    /// range and no chunks anywhere.
+    fn reclaim_all_tiers(sub: &mut Substrate, residence: ResidenceIndex) {
+        sub.residence[residence.0].hot = None;
+        sub.residence[residence.0].warm = None;
+        sub.residence[residence.0].cold = None;
+    }
+
+    /// The resume cache is a claim about a stored ANSWER, not just about the
+    /// input hash: a live conversation that lost a turn's K/V must stop matching
+    /// so the unit re-ingests, or its hash keeps matching forever and the hole
+    /// is never repaired.
+    #[test]
+    fn a_damaged_conversation_leaves_the_resume_cache() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let intact = alloc.next();
+        let damaged = alloc.next();
+        let mut sub = Substrate::new();
+        sub.register_timeline(intact, layer, group);
+        sub.register_timeline(damaged, layer, group);
+        install_blocked_turn(&mut sub, intact, 3);
+        let broken = install_blocked_turn(&mut sub, damaged, 3);
+        let hash_meta = |v: &str| BTreeMap::from([("content_sha256".to_string(), v.to_string())]);
+        sub.merge_custom(intact, &hash_meta("aaa"));
+        sub.merge_custom(damaged, &hash_meta("bbb"));
+
+        assert!(sub.timeline_kv_intact(intact));
+        assert!(sub.timeline_kv_intact(damaged));
+        assert_eq!(
+            sub.metadata_values_for_key("content_sha256"),
+            ["aaa".to_string(), "bbb".to_string()].into(),
+        );
+
+        reclaim_all_tiers(&mut sub, broken);
+        assert!(
+            !sub.timeline_kv_intact(damaged),
+            "a chunkless live turn is damage"
+        );
+        assert_eq!(
+            sub.metadata_values_for_key("content_sha256"),
+            ["aaa".to_string()].into(),
+            "the damaged unit's hash must stop matching so it re-ingests",
+        );
+    }
+
+    /// **Deliberately reclaimed K/V is not damage.** A tool-calibration exemplar
+    /// ends archived + distilled(`ProvenanceOnly`) with its chunks dropped on
+    /// purpose, and must keep matching the resume cache — re-ingesting the
+    /// calibration corpus because its K/V is legitimately gone would be a far
+    /// worse bug than the one this predicate exists to catch.
+    #[test]
+    fn deliberately_reclaimed_kv_still_counts_as_intact() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        for (archived, distilled) in [(true, false), (false, true), (true, true)] {
+            let tl = alloc.next();
+            let mut sub = Substrate::new();
+            sub.register_timeline(tl, layer, group);
+            let r = install_blocked_turn(&mut sub, tl, 3);
+            // Content reclaimed, exactly as `release_distilled_kv` leaves it.
+            reclaim_all_tiers(&mut sub, r);
+            assert!(
+                !sub.timeline_kv_intact(tl),
+                "guard precondition: this turn IS chunkless, so the archived / \
+                 distilled exemption below is what has to carry it",
+            );
+            if archived {
+                assert!(sub.set_archived(tl, true));
+            }
+            if distilled {
+                sub.distill_timeline(tl, DistillMode::ProvenanceOnly);
+            }
+            assert!(
+                sub.timeline_kv_intact(tl),
+                "archived={archived} distilled={distilled}: reclaimed content is not damage",
+            );
+        }
+    }
+
+    /// Intactness is scoped to a timeline's OWN turns. A fork whose ancestor is
+    /// damaged is itself fine: ancestors resolve live through
+    /// `inherited_chain`, so the hole is repaired once, in the ancestor, for
+    /// every descendant. Walking the chain here would condemn the whole corpus
+    /// — every `code_read` file hangs off the priming chain's end.
+    #[test]
+    fn a_damaged_ancestor_does_not_dirty_its_descendants() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let ancestor = alloc.next();
+        let child = alloc.next();
+        let mut sub = Substrate::new();
+        sub.register_timeline(ancestor, layer, group);
+        sub.register_timeline(child, layer, group);
+        let broken = install_blocked_turn(&mut sub, ancestor, 3);
+        install_blocked_turn(&mut sub, child, 3);
+        sub.merge_custom(
+            child,
+            &BTreeMap::from([(
+                Substrate::FORKED_FROM_KEY.to_string(),
+                ancestor.raw().to_string(),
+            )]),
+        );
+        assert_eq!(
+            sub.parent_timeline(child),
+            Some(ancestor),
+            "the fork pointer is what a descendant resolves through",
+        );
+
+        reclaim_all_tiers(&mut sub, broken);
+
+        assert!(!sub.timeline_kv_intact(ancestor), "the ancestor is damaged");
+        assert!(
+            sub.timeline_kv_intact(child),
+            "the child owns intact turns — an ancestor's hole is not its own",
+        );
+    }
+
+    /// A pinned warm residence is withheld from the warm→cold work list, and
+    /// returns to it as soon as the keep-set is republished without it.
+    ///
+    /// The durability half of [`set_working_set_pins_replaces_wholesale`],
+    /// which covers only eviction. `snapshot_pending_cold`'s pin skip defers a
+    /// *redo-log append*, so a pin that outlives the slot which published it
+    /// does not merely delay reclaiming VRAM — the turn stays hot+warm and is
+    /// never written, and `pending_cold_count` reports nothing pending because
+    /// it mirrors the same filter. That is how a `repo_map` unit's first turn
+    /// came to persist with token_ids, a block range and zero `Chunk` records.
+    #[test]
+    fn a_pinned_warm_turn_is_withheld_from_cold_until_unpinned() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (pinned_idx, pinned) = install_hot_and_warm(&mut sub, timeline, 10);
+        let (_, other) = install_hot_and_warm(&mut sub, timeline, 10);
+
+        let queued = |sub: &Substrate| -> Vec<ResidenceIndex> {
+            sub.snapshot_pending_cold()
+                .into_iter()
+                .map(|(idx, _, _)| idx)
+                .collect()
+        };
+
+        sub.set_working_set_pins(&[TurnKey::new(timeline, pinned_idx)], &[]);
+        let pending = queued(&sub);
+        assert!(
+            !pending.contains(&pinned),
+            "a pinned turn is not gathered warm→cold"
+        );
+        assert!(
+            pending.contains(&other),
+            "an unpinned warm turn still is — the skip is per-residence"
+        );
+        assert_eq!(
+            sub.pending_cold_count(),
+            1,
+            "the count mirrors the filter, so the withheld turn reports as \
+             nothing pending — this is why the wedge was silent"
+        );
+
+        // The slot that published the pin goes away; the scheduler republishes
+        // the union of what is still live (`retire_slot_projection_state`).
+        sub.set_working_set_pins(&[], &[]);
+        let pending = queued(&sub);
+        assert!(
+            pending.contains(&pinned),
+            "unpinned → the turn is gathered for its redo-log append"
+        );
+        assert_eq!(sub.pending_cold_count(), 2);
     }
 
     /// A zero target evicts nothing — there's no incoming load to make room

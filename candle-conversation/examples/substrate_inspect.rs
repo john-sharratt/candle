@@ -52,7 +52,8 @@ use candle_conversation::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, Manifest,
 };
 use candle_conversation::persistence::record::{
-    ChunkPayload, DistillMode, DistillPayload, Record, RecordType, TurnCouplingPayload,
+    ChunkPayload, DistillMode, DistillPayload, Record, RecordType, TombstonePayload,
+    TurnCouplingPayload,
 };
 use candle_conversation::persistence::recovery;
 use candle_conversation::persistence::resume::decode_token_ids;
@@ -177,6 +178,69 @@ struct ConvRow {
     /// Distill mode + `(segment_id, offset)` of the most recent `Distilled` marker.
     distilled: Option<(DistillMode, u64, u64)>,
     distill_count: usize,
+    /// `(segment_id, offset)` of a whole-timeline `Tombstone`, and how many.
+    ///
+    /// **A tombstoned conversation is dead, and the view said `active`.** The
+    /// fold read `Label` / `ConvState` / `Distilled` and ignored record type 14,
+    /// so a retired timeline kept printing as live — which is exactly the
+    /// question a duplicate hunt asks. Turn-level tombstones (`turn_index`
+    /// present) are not counted here: they kill one turn, not the conversation.
+    tombstoned: Option<(u64, u64)>,
+    tombstone_count: usize,
+    /// The Label record's free-form `custom` map — `ConvMeta::custom`.
+    ///
+    /// **This is how an ingest unit is addressed.** A `repo_map` folder or a
+    /// `code_reading` file carries no conv_id and its label is a path, but the
+    /// daemon finds it by metadata (`dir`, `path`, `content_sha256`) through
+    /// `Substrate::find_timelines_by_metadata`. The map was decoded here and
+    /// dropped, so the one view that could resolve those conversations offline
+    /// showed everything about them except the fields they are keyed on.
+    custom: BTreeMap<String, String>,
+}
+
+impl ConvRow {
+    /// Whether `filter` selects this row.
+    ///
+    /// `key=value` matches the Label's `custom` map exactly on the key and by
+    /// substring on the value — `dir=.` finds the `repo_map` root and nothing
+    /// else, where a bare `.` would match most of the substrate. Any other
+    /// string is a substring test across conv_id, label, the timeline id in
+    /// decimal and hex, and every metadata key and value.
+    fn matches(&self, tl: u64, filter: &str) -> bool {
+        if let Some((k, v)) = filter.split_once('=') {
+            return self
+                .custom
+                .get(k)
+                .is_some_and(|got| got == v || got.contains(v));
+        }
+        self.conv_id.contains(filter)
+            || self.label.contains(filter)
+            || format!("{tl}").contains(filter)
+            || format!("{tl:#x}").contains(filter)
+            || self
+                .custom
+                .iter()
+                .any(|(k, v)| k.contains(filter) || v.contains(filter))
+    }
+
+    /// The metadata a reader needs to recognise the conversation, longest-lived
+    /// keys first. Hashes are truncated: they identify a unit, and the full 64
+    /// hex characters push everything else off the line.
+    fn custom_summary(&self) -> String {
+        if self.custom.is_empty() {
+            return String::new();
+        }
+        let mut parts: Vec<String> = Vec::with_capacity(self.custom.len());
+        for (k, v) in &self.custom {
+            let v = if v.len() > 16 && v.chars().all(|c| c.is_ascii_hexdigit()) {
+                format!("{}…", &v[..16])
+            } else {
+                v.clone()
+            };
+            parts.push(format!("{k}={v}"));
+        }
+        parts.join(" ")
+    }
 }
 
 /// Walk one segment read-only and fold its `Label`/`ConvState`/`Distilled`
@@ -189,59 +253,119 @@ fn fold_conversations(
 ) -> Result<()> {
     let (entries, _outcome) = walker::collect(log, FIRST_SEGMENT, SUPERBLOCK_SIZE)?;
     for e in &entries {
-        match e.record.header.record_type {
-            RecordType::Label => {
-                let (tl, meta) = decode_label_payload(&e.record.payload)?;
-                let row = rows.entry(tl).or_default();
-                row.conv_id = meta.conv_id;
-                row.label = meta.label;
-                row.label_loc = Some((seg_id, e.offset));
-            }
-            RecordType::ConvState => {
-                let (tl, st) = decode_conv_state_payload(&e.record.payload)?;
-                let row = rows.entry(tl).or_default();
-                row.archived = st.archived;
-                row.state_loc = Some((seg_id, e.offset));
-                row.state_count += 1;
-            }
-            RecordType::Distilled => {
-                let p: DistillPayload = serde_json::from_slice(&e.record.payload)
-                    .with_context(|| "decoding Distilled payload")?;
-                let row = rows.entry(p.timeline_id).or_default();
-                row.distilled = Some((p.mode, seg_id, e.offset));
-                row.distill_count += 1;
-            }
-            _ => {}
-        }
+        fold_one_conversation_record(
+            seg_id,
+            e.offset,
+            &e.record.header.record_type,
+            &e.record.payload,
+            rows,
+        )?;
     }
     Ok(())
 }
 
-fn print_conversations(rows: &BTreeMap<u64, ConvRow>, filter: Option<&str>) {
-    let mut shown = 0usize;
-    for (tl, row) in rows {
-        if let Some(f) = filter {
-            let hit = row.conv_id.contains(f)
-                || row.label.contains(f)
-                || format!("{tl}").contains(f)
-                || format!("{tl:#x}").contains(f);
-            if !hit {
-                continue;
+/// Fold one `Label` / `ConvState` / `Distilled` payload into `rows`; ignore
+/// anything else. Shared by the indexed and forward-walking paths so the two
+/// can never disagree about what a record means.
+fn fold_one_conversation_record(
+    seg_id: u64,
+    offset: u64,
+    record_type: &RecordType,
+    payload: &[u8],
+    rows: &mut BTreeMap<u64, ConvRow>,
+) -> Result<()> {
+    match record_type {
+        RecordType::Label => {
+            let (tl, meta) = decode_label_payload(payload)?;
+            let row = rows.entry(tl).or_default();
+            row.conv_id = meta.conv_id;
+            row.label = meta.label;
+            row.label_loc = Some((seg_id, offset));
+            // Merged, not replaced: `set_conversation_metadata_many` rewrites
+            // the whole Label record from the keys it read a moment earlier,
+            // but a segment boundary can still split one conversation's
+            // tagging across records, and the later record is not guaranteed
+            // to carry every earlier key.
+            row.custom.extend(meta.custom);
+        }
+        RecordType::ConvState => {
+            let (tl, st) = decode_conv_state_payload(payload)?;
+            let row = rows.entry(tl).or_default();
+            row.archived = st.archived;
+            row.state_loc = Some((seg_id, offset));
+            row.state_count += 1;
+        }
+        RecordType::Distilled => {
+            let p: DistillPayload =
+                serde_json::from_slice(payload).with_context(|| "decoding Distilled payload")?;
+            let row = rows.entry(p.timeline_id).or_default();
+            row.distilled = Some((p.mode, seg_id, offset));
+            row.distill_count += 1;
+        }
+        RecordType::Tombstone => {
+            let p: TombstonePayload =
+                serde_json::from_slice(payload).with_context(|| "decoding Tombstone payload")?;
+            // Whole-timeline only. A `turn_index` tombstone drops one turn under
+            // the corrupt-turn policy and leaves the conversation alive.
+            if p.turn_index.is_none() {
+                let row = rows.entry(p.timeline_id).or_default();
+                row.tombstoned = Some((seg_id, offset));
+                row.tombstone_count += 1;
             }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn print_conversations(rows: &BTreeMap<u64, ConvRow>, filters: &[String], limit: usize) {
+    let mut shown = 0usize;
+    let mut matched = 0usize;
+    for (tl, row) in rows {
+        if !filters.iter().all(|f| row.matches(*tl, f)) {
+            continue;
         }
         // A timeline with neither a conv_id nor any ConvState/Distilled is an
         // internal (base / section) timeline — not a user conversation.
-        if row.conv_id.is_empty() && row.state_count == 0 && row.distill_count == 0 {
+        //
+        // **Unless it carries metadata**, which is what an ingest unit is made
+        // of: a `repo_map` folder or a `code_reading` file has no conv_id, no
+        // ConvState and no Distilled marker — it is keyed by `dir` / `path` /
+        // `content_sha256` in the Label's `custom` map, and the daemon resolves
+        // it through `find_timelines_by_metadata`. Without this clause the view
+        // discarded every one of them as internal: on this substrate, 380
+        // directory units and 361 file units, leaving 5 visible conversations
+        // out of 1,023 timelines.
+        if row.conv_id.is_empty()
+            && row.state_count == 0
+            && row.distill_count == 0
+            && row.custom.is_empty()
+        {
             continue;
         }
-        let arch = if row.archived { "ARCHIVED" } else { "active  " };
+        // Counted before the cap so the footer can say how many matched, not
+        // just how many were printed — a capped listing that cannot tell you it
+        // was capped is the one that gets mistaken for a complete answer.
+        matched += 1;
+        if shown >= limit {
+            continue;
+        }
+        // Tombstoned outranks archived: the timeline is gone, not merely hidden.
+        let arch = match (&row.tombstoned, row.archived) {
+            (Some(_), _) => "DEAD    ",
+            (None, true) => "ARCHIVED",
+            (None, false) => "active  ",
+        };
         let state = match row.state_loc {
             Some((s, o)) => format!("seg{s}@{o}×{}", row.state_count),
             None => "none".to_string(),
         };
-        let distill = match &row.distilled {
-            Some((m, s, o)) => format!("{m:?}@seg{s}:{o}×{}", row.distill_count),
-            None => "-".to_string(),
+        let distill = match (&row.distilled, &row.tombstoned) {
+            // Where the tombstone lives answers "which pass killed this", which
+            // is the next question after "is it dead".
+            (_, Some((s, o))) => format!("tombstone@seg{s}:{o}×{}", row.tombstone_count),
+            (Some((m, s, o)), None) => format!("{m:?}@seg{s}:{o}×{}", row.distill_count),
+            (None, None) => "-".to_string(),
         };
         let label = if row.label.is_empty() {
             "(untitled)"
@@ -252,9 +376,19 @@ fn print_conversations(rows: &BTreeMap<u64, ConvRow>, filter: Option<&str>) {
             "tl={tl:<18} {arch}  conv={:<38}  convstate={state:<22}  distill={distill:<26}  {label}",
             if row.conv_id.is_empty() { "-" } else { &row.conv_id },
         );
+        let meta = row.custom_summary();
+        if !meta.is_empty() {
+            println!("                     meta: {meta}");
+        }
         shown += 1;
     }
-    println!("\n{shown} conversation timeline(s)");
+    if matched > shown {
+        println!(
+            "\n{shown} of {matched} matching conversation timeline(s) — raise --limit for the rest"
+        );
+    } else {
+        println!("\n{shown} conversation timeline(s)");
+    }
 }
 
 /// Directory-mode `conversations`: fold every segment in ascending id order so
@@ -408,14 +542,92 @@ fn export_replay(
     Ok(())
 }
 
-fn segment_conversations(segs: &[(u64, PathBuf, bool)], filter: Option<&str>) -> Result<()> {
+fn segment_conversations(
+    segs: &[(u64, PathBuf, bool)],
+    filters: &[String],
+    limit: usize,
+) -> Result<()> {
     let mut rows: BTreeMap<u64, ConvRow> = BTreeMap::new();
+    let mut indexed = 0usize;
     for (id, path, _) in segs {
         let mut log = LogFile::open_read_only(path)?;
-        fold_conversations(*id, &mut log, &mut rows)?;
+        if fold_conversations_indexed(*id, &mut log, &mut rows)? {
+            indexed += 1;
+        } else {
+            fold_conversations(*id, &mut log, &mut rows)?;
+        }
     }
-    print_conversations(&rows, filter);
+    eprintln!(
+        "{indexed}/{} segment(s) read through the header index",
+        segs.len()
+    );
+    print_conversations(&rows, filters, limit);
     Ok(())
+}
+
+/// Fold one segment's conversation records using its `HeaderIndex` chain,
+/// reading **only** the metadata payloads. `false` when the segment has no
+/// trustworthy chain and the caller must forward-walk it instead.
+///
+/// **This is the difference between reading a few hundred KB and reading the
+/// whole log.** A segment is ~99% `Chunk` bytes — 97,669 of 97,703 records in
+/// one measured 4.3 GB segment — and a conversation listing needs none of them.
+/// The digests carry each record's type and offset, so the three types that
+/// matter can be fetched directly and everything else skipped without a read.
+/// Measured on a 148 GB / 35-segment substrate: 3m37s forward-walking, against a
+/// chain follow plus a few hundred small reads.
+fn fold_conversations_indexed(
+    seg_id: u64,
+    log: &mut LogFile,
+    rows: &mut BTreeMap<u64, ConvRow>,
+) -> Result<bool> {
+    let hint = log.superblock().last_index;
+    let Some(digests) = recovery::load_index_chain(log, hint)? else {
+        return Ok(false);
+    };
+    for d in &digests {
+        if !matches!(
+            d.record_type,
+            RecordType::Label
+                | RecordType::ConvState
+                | RecordType::Distilled
+                | RecordType::Tombstone
+        ) {
+            continue;
+        }
+        let rec = read_record_at(log, d.offset, d.record_size as u64)?;
+        fold_one_conversation_record(
+            seg_id,
+            d.offset,
+            &rec.header.record_type,
+            &rec.payload,
+            rows,
+        )?;
+    }
+    // **Then the un-indexed tail, which is where the newest records are.**
+    //
+    // The chain is flushed every `INDEX_FLUSH_ENTRIES` and completed at
+    // rotation, so a SEALED segment is fully covered — but the ACTIVE one ends
+    // in records no index has digested yet. Stopping at the last digest would
+    // silently drop them, and they are precisely the conversations a reader is
+    // most likely to be looking for: the ones just written. Recovery walks the
+    // same tail for the same reason.
+    let tail_from = digests
+        .last()
+        .map_or(SUPERBLOCK_SIZE, |d| d.offset + d.record_size as u64);
+    if tail_from < log.write_offset() {
+        let (entries, _outcome) = walker::collect(log, FIRST_SEGMENT, tail_from)?;
+        for e in &entries {
+            fold_one_conversation_record(
+                seg_id,
+                e.offset,
+                &e.record.header.record_type,
+                &e.record.payload,
+                rows,
+            )?;
+        }
+    }
+    Ok(true)
 }
 
 #[derive(Subcommand)]
@@ -499,10 +711,20 @@ enum Cmd {
     /// segments in ascending id order — so this answers "why does the reload
     /// think this conversation is archived, and where does that record live".
     Conversations {
-        /// Only show timelines whose conv_id, label, or timeline id contains this
-        /// substring (timeline id matched as decimal and `0x`-hex).
+        /// Narrow the listing. `key=value` matches the Label's `custom`
+        /// metadata — `--filter dir=.` resolves the `repo_map` root, `--filter
+        /// path=zend/src/session.rs` a `code_reading` unit — which is how an
+        /// ingest conversation is addressed, since it carries no conv_id.
+        /// Anything else is a substring test over conv_id, label, the timeline
+        /// id (decimal and `0x`-hex), and every metadata key and value.
+        ///
+        /// Repeatable, and every one must match (AND): `--filter kind=repo_map
+        /// --filter anchor=README.md` is the folders described by a README.
         #[arg(long)]
-        filter: Option<String>,
+        filter: Vec<String>,
+        /// Stop after this many matching conversations.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
     /// Prompt sections grouped by name, each variant with its content address
     /// (prefix + section hash) and a KV fingerprint. A section-tree's branch
@@ -949,8 +1171,8 @@ fn main() -> Result<()> {
         if matches!(cli.cmd, Cmd::Summary) {
             return segment_summary(&segs);
         }
-        if let Cmd::Conversations { filter } = &cli.cmd {
-            return segment_conversations(&segs, filter.as_deref());
+        if let Cmd::Conversations { filter, limit } = &cli.cmd {
+            return segment_conversations(&segs, filter, *limit);
         }
         // `dump` across ALL segments (holds every segment handle open) so a
         // conversation whose records the daemon rotated between segments is read
@@ -1029,11 +1251,13 @@ fn main() -> Result<()> {
         Cmd::Headers => headers(&mut log)?,
         Cmd::Validate { layers } => validate(&mut log, layers)?,
         Cmd::Streams => streams(&mut log)?,
-        Cmd::Conversations { filter } => {
+        Cmd::Conversations { filter, limit } => {
             let seg_id = segment_id_of(&log_path);
             let mut rows = BTreeMap::new();
-            fold_conversations(seg_id, &mut log, &mut rows)?;
-            print_conversations(&rows, filter.as_deref());
+            if !fold_conversations_indexed(seg_id, &mut log, &mut rows)? {
+                fold_conversations(seg_id, &mut log, &mut rows)?;
+            }
+            print_conversations(&rows, &filter, limit);
         }
         Cmd::Sections => sections(&mut log)?,
         Cmd::Chunks { stream_id, preview } => {

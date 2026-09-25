@@ -1,36 +1,26 @@
 //! Prefill rendering for the `repo_map` layer's per-directory conversation.
 //!
-//! A directory is explored as TWO `code_read`-shaped tool round-trips on one
-//! conversation, each `request → <tool_call> → <tool_response> → DECODED answer`:
+//! A directory is ONE `code_read`-shaped tool round-trip on one conversation —
+//! `request → <tool_call> → <tool_response> → DECODED answer`:
 //!
 //! ````text
-//! Round-trip 1 — what is in here?
-//!   user       List the files in the `zend/src/code_read/` folder.
+//!   user       Summarize the `zend/src/code_read/` folder in ONE complete
+//!              sentence, ending with a full stop. …
 //!   assistant  <tool_call>{"name":"file_list","arguments":{"prefix":"zend/src/code_read/"}}</tool_call>
 //!   user       <tool_response>{"files":[…],"paging":{…},"total_bytes":0}</tool_response>
-//!   assistant  ← DECODED: what the folder contains
-//!
-//! Round-trip 2 — what is it for?
-//!   user       Summarize the `zend/src/code_read/` folder in one or two complete
-//!              sentences, ending with a full stop. …
-//!   assistant  <tool_call>{"name":"file_read","arguments":{"path":"zend/src/code_read/mod.rs",
-//!                          "start_line":1,"end_line":24}}</tool_call>
-//!   user       <tool_response>
-//!              zend/src/code_read/mod.rs (lines 1-24 of 1135):
-//!
-//!              ```rust
-//!               1  //! `code_reading` layer ingestion.
-//!              24  //! …
-//!              ```
-//!              </tool_response>
-//!   assistant  ← DECODED: the two-sentence folder summary this layer retrieves
+//!   assistant  ← DECODED: the one-sentence folder summary this layer retrieves
 //! ````
 //!
-//! **List before read.** The listing round-trip comes first so the read is a
-//! discovery the conversation earned: a call naming `mod.rs` before anything
-//! revealed it exists teaches the model to guess paths. A directory with no
-//! anchor file is a single round-trip — the listing is the only evidence, and its
-//! answer is the summary.
+//! **The listing is the whole of the evidence, and that is deliberate.** A
+//! second round-trip used to read an "anchor" file — a `README.md` or module
+//! root — on the reasoning that a folder is best described by the file that
+//! describes it. Two things were wrong with it. The excerpt is a large file
+//! pasted into the turn, so the root folder's unit carried 9,315 characters to
+//! produce one sentence, paid again on every projection that selects it. And a
+//! prefilled `file_read` is a *suggestion*: the model answers the call it is
+//! shown, so given one it issued another, and the root's conversation spent all
+//! three turns reading `README.md` — the second time for its last five lines —
+//! and never wrote a summary at all.
 //!
 //! **Every decode answers a request one turn back** — see
 //! [`render_round_trips`] for why that invariant, and not the prose of any one
@@ -45,10 +35,8 @@
 use candle_conversation::stencil::ToolCallEnvelope;
 use candle_conversation::TurnText;
 use serde_json::json;
-use zend_tools::tools::file::render::numbered_excerpt;
 use zend_tools::ToolContext;
 
-use super::anchor::Anchor;
 use super::dir_unit::DirUnit;
 
 /// Tools whose definitions must be present for this chain's prefilled calls to
@@ -89,9 +77,9 @@ pub fn render_request(unit: &DirUnit) -> String {
 /// What [`render_request`] asks for, after the folder is named. A constant so
 /// the tests below assert the real string rather than a copy of it — a prompt
 /// this load-bearing should not be able to drift from its own assertions.
-const SUMMARY_ASK: &str = "in one or two complete sentences, ending with a full stop. \
-     Summarize from whatever the conversation has already shown you — file names and \
-     paths alone are enough; never reply that there is not enough information.";
+const SUMMARY_ASK: &str = "in ONE complete sentence, ending with a full stop. \
+     The file listing is the evidence — names and paths alone are enough; never reply \
+     that there is not enough information, and do not read any file.";
 
 /// How a request names the folder. A real directory is named by its path in
 /// backticks; the workspace root is named in words. `.` is the tag and cache key,
@@ -121,19 +109,6 @@ pub fn render_list_call(env: &ToolCallEnvelope, unit: &DirUnit) -> String {
     env.render("file_list", &[("prefix", unit.list_prefix())])
 }
 
-/// Assistant-side `<tool_call>` reading the anchor excerpt, in the checkpoint's
-/// own call syntax. See [`render_list_call`].
-pub fn render_read_call(env: &ToolCallEnvelope, anchor: &Anchor) -> String {
-    env.render(
-        "file_read",
-        &[
-            ("path", anchor.path.as_str()),
-            ("start_line", &anchor.start_line.to_string()),
-            ("end_line", &anchor.end_line.to_string()),
-        ],
-    )
-}
-
 /// User-side `<tool_response>` for the listing — produced by running the real
 /// `file_list` against `ctx`, so the bytes are the tool's own. The listing is
 /// literal: a file name is the workspace's text, not markup.
@@ -143,23 +118,6 @@ pub fn render_list_response(ctx: &ToolContext, unit: &DirUnit) -> TurnText {
     let body = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
     TurnText::markup("<tool_response>")
         .then_literal(body)
-        .then_markup("</tool_response>")
-}
-
-/// User-side `<tool_response>` for the anchor excerpt — the same numbered, fenced
-/// shape the live `file_read` returns and the `code_reading` ingest prefills.
-/// The excerpt is literal, so a file quoting a chat tag reads as its text.
-pub fn render_read_response(anchor: &Anchor) -> TurnText {
-    let excerpt = numbered_excerpt(
-        &anchor.path,
-        anchor.start_line,
-        anchor.end_line,
-        anchor.total_lines,
-        anchor.language.fence_tag(),
-        &anchor.body,
-    );
-    TurnText::markup("<tool_response>")
-        .then_literal(excerpt)
         .then_markup("</tool_response>")
 }
 
@@ -192,27 +150,29 @@ fn error_detail(turn: &str) -> Option<String> {
 /// throwaway "what is in here" decode whose chatty answer then set the style for
 /// the summary that followed.
 ///
-/// Two pairs when the folder has an anchor (list, then read), one when it does
-/// not — the listing is then the only evidence and the summary follows it.
+/// **One pair, always: the request and the folder's listing.** A folder is
+/// summarised from what is in it, and `file_list` is what says that.
+///
+/// It used to read an anchor file too — a `README.md` or a module root — as a
+/// second round-trip, on the reasoning that a folder is best described by the
+/// file that describes it. The cost was out of proportion to that: the anchor
+/// excerpt is the whole of a large file pasted into the turn, so the root
+/// folder's unit carried 9,315 characters of README to produce one sentence,
+/// and on a substrate where every unit inherits the priming chain that is paid
+/// again on every projection. Worse, the read is a *suggestion* — the model
+/// answers the tool call it is given, and given a `file_read` it would issue
+/// another, so the root's conversation spent all three of its turns reading
+/// `README.md` (twice, the second for its last five lines) and never wrote a
+/// summary at all.
 pub fn render_chain(
     ctx: &ToolContext,
     unit: &DirUnit,
     env: &ToolCallEnvelope,
 ) -> (Vec<(TurnText, String)>, TurnText) {
-    let listing = render_list_response(ctx, unit);
-    match &unit.anchor {
-        Some(anchor) => (
-            vec![
-                (render_request(unit).into(), render_list_call(env, unit)),
-                (listing, render_read_call(env, anchor)),
-            ],
-            render_read_response(anchor),
-        ),
-        None => (
-            vec![(render_request(unit).into(), render_list_call(env, unit))],
-            listing,
-        ),
-    }
+    (
+        vec![(render_request(unit).into(), render_list_call(env, unit))],
+        render_list_response(ctx, unit),
+    )
 }
 
 /// The tool-error detail carried by a rendered chain, if any of its tool
@@ -276,24 +236,30 @@ mod tests {
     fn request_names_the_folder_and_asks_for_complete_sentences() {
         let d = workspace(&[("a/x.rs", "fn x() {}\n")]);
         let m = map_of(d.path(), &[("a/x.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+        let units = build_units(&m);
         assert_eq!(
             render_request(&units[0]),
             format!("Summarize the `a/` folder {SUMMARY_ASK}"),
         );
     }
 
-    /// The two properties the ask exists to obtain, named so a reworded prompt
-    /// that drops either one fails here rather than in a substrate audit weeks
-    /// later: **complete** sentences with a terminal stop (31 of 61 summaries in
-    /// one pass ended with no full stop), and no refusal when the file listing is
-    /// the only evidence (which sealed "there isn't enough information available
-    /// here yet" as a folder's summary).
+    /// The three properties the ask exists to obtain, named so a reworded prompt
+    /// that drops one fails here rather than in a substrate audit weeks later: a
+    /// **complete** sentence with a terminal stop (31 of 61 summaries in one pass
+    /// ended with no full stop), no refusal when the listing is the only evidence
+    /// (which sealed "there isn't enough information available here yet" as a
+    /// folder's summary), and no file reading — the chain offers `file_list`
+    /// alone, and a model that asks for a `file_read` spends the unit's whole
+    /// budget on it and never writes the summary.
     #[test]
-    fn the_ask_demands_a_full_stop_and_forbids_a_refusal() {
+    fn the_ask_demands_one_full_stopped_sentence_and_no_reading() {
         assert!(
-            SUMMARY_ASK.contains("complete sentences") && SUMMARY_ASK.contains("full stop"),
+            SUMMARY_ASK.contains("ONE complete sentence") && SUMMARY_ASK.contains("full stop"),
             "the ask must require a terminated sentence: {SUMMARY_ASK}"
+        );
+        assert!(
+            SUMMARY_ASK.contains("do not read any file"),
+            "the ask must forbid reading: {SUMMARY_ASK}"
         );
         assert!(
             SUMMARY_ASK.contains("never reply that there is not enough information"),
@@ -317,7 +283,7 @@ mod tests {
 ",
         )]);
         let m = map_of(d.path(), &[("top.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+        let units = build_units(&m);
         assert_eq!(units[0].dir, ".", "the tag/cache key stays `.`");
 
         let request = render_request(&units[0]);
@@ -337,7 +303,7 @@ mod tests {
         m.files[0].module_hint = Some(ModuleHint::CargoPackage {
             name: "demo".to_string(),
         });
-        let units = build_units(&m, d.path());
+        let units = build_units(&m);
         assert_eq!(
             render_request(&units[0]),
             format!("Summarize the `a/` folder (crate: demo) {SUMMARY_ASK}"),
@@ -358,22 +324,11 @@ mod tests {
         let env = ToolCallEnvelope::for_dialect(&Dialect::chat_ml());
         let d = workspace(&[("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
         let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+        let units = build_units(&m);
         let call = render_list_call(&env, &units[0]);
         assert_eq!(
             call,
             "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"prefix\": \"a/\"}}\n</tool_call>",
-        );
-
-        let read = render_read_call(&env, units[0].anchor.as_ref().unwrap());
-        assert_eq!(
-            read,
-            "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"a/mod.rs\", \
-             \"start_line\": 1, \"end_line\": 2}}\n</tool_call>",
-        );
-        assert!(
-            read.contains("\"start_line\": 1"),
-            "a line number is a JSON number, as the grammar emits it: {read}"
         );
     }
 
@@ -390,8 +345,7 @@ mod tests {
     fn tool_calls_follow_the_dialects_call_style() {
         let d = workspace(&[("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
         let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
-        let anchor = units[0].anchor.as_ref().unwrap();
+        let units = build_units(&m);
 
         // What the ingest prefills must equal what the DIALECT's envelope
         // renders — asserted against the envelope rather than against a literal
@@ -405,19 +359,6 @@ mod tests {
             env.render("file_list", &[("prefix", units[0].list_prefix())]),
             "the listing call must be the dialect envelope's own rendering",
         );
-        assert_eq!(
-            render_read_call(&env, anchor),
-            env.render(
-                "file_read",
-                &[
-                    ("path", anchor.path.as_str()),
-                    ("start_line", &anchor.start_line.to_string()),
-                    ("end_line", &anchor.end_line.to_string()),
-                ],
-            ),
-            "the read call must be the dialect envelope's own rendering",
-        );
-
         // And it is the CHECKPOINT's envelope, not a hardcoded family: ask the
         // dialect for a different style and the rendering follows it.
         let lines = ToolCallEnvelope::for_dialect(&Dialect::llama3());
@@ -438,39 +379,25 @@ mod tests {
     /// `</parameter>` anywhere, and escaping is the whole of the question.
     #[test]
     fn a_path_with_json_metacharacters_stays_parseable() {
-        let anchor = Anchor {
-            path: "a/we\"ird\\dir/mod.rs".to_string(),
-            start_line: 1,
-            end_line: 2,
-            total_lines: 3,
-            body: "//! One.\n//! Two.\n".to_string(),
-            language: Language::Rust,
+        // The unit is built by hand rather than from a real directory: Windows
+        // refuses a filename containing `"`, and the escaping under test is the
+        // renderer's, not the filesystem's.
+        let unit = DirUnit {
+            dir: "we\"ird\\dir/".to_string(),
+            files: Vec::new(),
+            listed: Vec::new(),
+            content_hash: "abc".to_string(),
         };
         let env = ToolCallEnvelope::for_dialect(&Dialect::chat_ml());
-        let call = render_read_call(&env, &anchor);
+        let call = render_list_call(&env, &unit);
         let body = call
             .strip_prefix("<tool_call>")
             .and_then(|s| s.trim_end().strip_suffix("</tool_call>"))
             .map(str::trim_end)
             .expect("tag wrapper");
         let parsed: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
-        assert_eq!(parsed["name"], "file_read");
-        assert_eq!(parsed["arguments"]["path"], "a/we\"ird\\dir/mod.rs");
-    }
-
-    /// The excerpt response is the shared numbered/fenced format, framed in tags.
-    #[test]
-    fn read_response_is_the_shared_excerpt_format() {
-        let d = workspace(&[("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
-        let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
-        let response = render_read_response(units[0].anchor.as_ref().unwrap());
-        assert_eq!(
-            response.text(),
-            "<tool_response>\na/mod.rs (lines 1-2 of 3):\n\n```rust\n1  //! One.\n2  //! Two.\n```\n</tool_response>",
-        );
-        let kinds: Vec<bool> = response.pieces().iter().map(|p| p.literal).collect();
-        assert_eq!(kinds, [false, true, false], "the excerpt is literal");
+        assert_eq!(parsed["name"], "file_list");
+        assert_eq!(parsed["arguments"]["prefix"], "we\"ird\\dir/");
     }
 
     /// The listing response is the live tool's own bytes — the test asserts the
@@ -485,7 +412,7 @@ mod tests {
             d.path(),
             &[("a/mod.rs", Language::Rust), ("a/x.rs", Language::Rust)],
         );
-        let units = build_units(&m, d.path());
+        let units = build_units(&m);
         let ctx = ToolContext::with_workspace(d.path());
         let out = render_list_response(&ctx, &units[0]).text();
         assert!(out.starts_with("<tool_response>{"), "{out}");
@@ -497,33 +424,35 @@ mod tests {
     /// The chain lists BEFORE it reads: a `file_read` naming `mod.rs` before
     /// anything revealed the file exists teaches the model to guess paths.
     #[test]
-    fn a_folder_with_an_anchor_reads_after_it_lists() {
-        let d = workspace(&[(
-            "a/mod.rs",
-            "//! One.
-//! Two.
-fn x() {}
-",
-        )]);
-        let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+    fn a_folder_with_a_readme_still_only_lists() {
+        let d = workspace(&[
+            ("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n"),
+            ("a/README.md", "# a\n\nHolds the widgets.\n"),
+        ]);
+        let m = map_of(
+            d.path(),
+            &[
+                ("a/mod.rs", Language::Rust),
+                ("a/README.md", Language::Rust),
+            ],
+        );
+        let units = build_units(&m);
         let ctx = ToolContext::with_workspace(d.path());
         let (prefilled, decode_user) = render_chain(&ctx, &units[0], &env());
-        assert_eq!(prefilled.len(), 2, "request+list, listing+read");
+        assert_eq!(prefilled.len(), 1, "request+list, and nothing after it");
         assert!(prefilled[0]
             .0
             .text()
             .starts_with("Summarize the `a/` folder"));
         assert!(prefilled[0].1.contains("\"name\": \"file_list\""));
         assert!(
-            prefilled[1].0.text().starts_with("<tool_response>{"),
-            "the listing"
+            decode_user.text().starts_with("<tool_response>{"),
+            "the decode follows the listing",
         );
-        assert!(prefilled[1].1.contains("\"name\": \"file_read\""));
-        assert!(
-            decode_user.text().contains("```rust"),
-            "the decode follows the excerpt"
-        );
+        // The README is named and never opened — no excerpt reaches the turn.
+        let whole = format!("{}{}", prefilled[0].1, decode_user.text());
+        assert!(!whole.contains("file_read"), "no read call: {whole}");
+        assert!(!whole.contains("Holds the widgets"), "no excerpt: {whole}");
     }
 
     /// No anchor: one prefilled pair, and the listing is the last evidence.
@@ -535,7 +464,7 @@ fn x() {}
 ",
         )]);
         let m = map_of(d.path(), &[("a/x.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+        let units = build_units(&m);
         let ctx = ToolContext::with_workspace(d.path());
         let (prefilled, decode_user) = render_chain(&ctx, &units[0], &env());
         assert_eq!(prefilled.len(), 1);
@@ -554,7 +483,7 @@ fn x() {}
 ",
         )]);
         let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+        let units = build_units(&m);
         let ctx = ToolContext::with_workspace(d.path());
         let (prefilled, decode_user) = render_chain(&ctx, &units[0], &env());
         assert_eq!(chain_error(&prefilled, &decode_user), None);
@@ -579,23 +508,12 @@ fn x() {}
         );
     }
 
-    /// The excerpt response is raw numbered text, not JSON — it must never be
-    /// mistaken for a malformed error body.
-    #[test]
-    fn an_excerpt_response_is_not_an_error() {
-        let d = workspace(&[("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
-        let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
-        let excerpt = render_read_response(units[0].anchor.as_ref().unwrap());
-        assert_eq!(chain_error(&[], &excerpt), None);
-    }
-
     /// Rendering is deterministic — the resume cache depends on it.
     #[test]
     fn rendering_is_byte_identical_on_repeat() {
         let d = workspace(&[("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
         let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+        let units = build_units(&m);
         let ctx = ToolContext::with_workspace(d.path());
         assert_eq!(
             render_chain(&ctx, &units[0], &env()),

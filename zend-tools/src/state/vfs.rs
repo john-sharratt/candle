@@ -781,9 +781,17 @@ impl VfsStore {
             if Self::is_protected(&key) {
                 continue;
             }
-            // A subdirectory is a name to list next, not a file to read, so the
-            // addressability rule that governs reads does not apply to it.
-            if !is_dir && !Self::addressable(&key) {
+            // **Applies to subdirectories too.** It is tempting to exempt them —
+            // a directory is a name to list next, not a file to read — but
+            // `addressable` is what [`Self::under`] enforces, and `under` is how
+            // a listing of that subdirectory resolves. Exempted, a
+            // non-addressable directory is offered as descendable and then
+            // `listing_scope` cannot resolve it: `on_disk` fails, the prefix is
+            // split at its last `/`, and the parent is listed filtered by the
+            // directory's own name — re-emitting the very entry that was passed
+            // in, for as long as the model keeps trying. Same rule, same reason
+            // as for files: never show what the store cannot open.
+            if !Self::addressable(&key) {
                 continue;
             }
             let Some((name, _)) = Self::listed_as(&key, dir_key) else {
@@ -1432,6 +1440,36 @@ mod tests {
         assert!(
             root.iter().all(|e| e.dir || !e.path.contains('/')),
             "no file from below the listed directory: {root:?}",
+        );
+    }
+
+    /// **A subdirectory the store could not descend into is never listed.**
+    ///
+    /// `addressable` gates [`VfsStore::under`], which is how a listing of a
+    /// subdirectory resolves — so exempting directories from it offered a name
+    /// that `listing_scope` then could not resolve: the prefix fell back to its
+    /// parent filtered by that name, re-emitting the entry that was just passed
+    /// in, for as long as the caller kept descending. Same rule as for files:
+    /// never show what the store cannot open.
+    #[test]
+    fn a_subdirectory_the_store_cannot_descend_is_not_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "keep/a.rs", "fn a() {}\n");
+        // `~1` is an 8.3 short-name tail, which `addressable` refuses.
+        put(dir.path(), "gone~1/b.rs", "fn b() {}\n");
+        let s = VfsStore::with_workspace(dir.path());
+
+        let names = listed(&s, "");
+        assert!(names.contains(&"keep/".to_string()), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains("gone~1")),
+            "an undescendable directory must not be offered: {names:?}",
+        );
+        // And the loop it used to cause: descending re-listed the parent,
+        // handing back the same entry.
+        assert!(
+            !listed(&s, "gone~1/").iter().any(|n| n.contains("gone~1")),
+            "descending must not re-emit the prefix it was given",
         );
     }
 
