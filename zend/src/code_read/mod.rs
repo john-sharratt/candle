@@ -38,6 +38,7 @@ use candle_conversation::projection::{
 use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{ConversationEngine, Sequence, TurnOptions, TurnText};
 use sha2::{Digest, Sha256};
+use zend_tools::tools::file::read::MAX_READ_LINES;
 use zend_tools::ToolContext;
 
 use crate::ingest_report::Failures;
@@ -160,6 +161,18 @@ const MAX_FILE_READ_ROUNDS: usize = 24;
 /// file, and only this file" also heads off a model wandering into whatever
 /// else the workspace prompt might make it curious about.
 ///
+/// **It asks for the calls in PARALLEL, and that is a round-count decision.**
+/// `file_read` serves at most [`MAX_READ_LINES`] lines per call, so a long file
+/// needs several — and a round is one decode plus one tool dispatch, so reading
+/// a 2,000-line file one call per turn costs ten decodes where a single turn
+/// carrying ten calls costs one. The loop already supports it in full:
+/// `tool_round::plan` returns every call an answer makes, `tool_round::run`
+/// executes them in order, and `format_tool_responses` hands back one
+/// `<tool_response>` block per result, so the whole file arrives in the next
+/// turn's context together. Naming the cap in the prompt is what lets the model
+/// choose the ranges itself rather than discovering the cut one call at a time
+/// from the excerpt header.
+///
 /// A model losing track of its own earlier rounds several turns into a long
 /// file was once worked around here, with prose telling it no further
 /// question was coming — a symptom this prompt cannot fix, because the
@@ -173,10 +186,13 @@ const MAX_FILE_READ_ROUNDS: usize = 24;
 fn opening_prompt(path: &str) -> String {
     format!(
         "Read the entire contents of `{path}` — and only this file — using \
-         {FILE_READ_TOOL}, calling it as many times as needed to see all of it if \
-         it's long. Once you've read the whole thing, summarize what it contains: \
-         its purpose, its main structures or functions, and how it fits into the \
-         codebase."
+         {FILE_READ_TOOL}. Each call returns at most {MAX_READ_LINES} lines, so if \
+         the file is longer than that, issue SEVERAL {FILE_READ_TOOL} calls in the \
+         SAME reply — one per consecutive {MAX_READ_LINES}-line range, covering the \
+         whole file — instead of one call per reply. Every call you make in a reply \
+         is run together and all of their results come back to you at once. Once \
+         you've read the whole thing, summarize what it contains: its purpose, its \
+         main structures or functions, and how it fits into the codebase."
     )
 }
 
@@ -1229,6 +1245,33 @@ mod tests {
         assert!(
             p.contains("only this file"),
             "must scope the read to this file alone: {p:?}",
+        );
+    }
+
+    /// **The prompt must ask for the calls in ONE reply, and must name the cap.**
+    ///
+    /// A round is a decode plus a tool dispatch, so a file read one call per reply
+    /// costs a decode per {MAX_READ_LINES} lines — ten for a 2,000-line file where
+    /// one reply carrying ten calls costs one. The loop has always run every call
+    /// an answer makes (`tool_round::plan` → `tool_round::run`); it was the prompt
+    /// that asked for them one at a time. Naming the cap is what lets the model
+    /// pick the ranges up front instead of learning where the cut fell from each
+    /// excerpt header in turn.
+    #[test]
+    fn opening_prompt_asks_for_parallel_reads_and_names_the_cap() {
+        let p = opening_prompt("src/big.rs");
+        assert!(
+            p.contains(&MAX_READ_LINES.to_string()),
+            "must name the per-call line cap so ranges can be chosen up front: {p:?}",
+        );
+        assert!(
+            p.contains("SAME reply"),
+            "must ask for several calls in one reply: {p:?}",
+        );
+        assert!(
+            p.contains("instead of one call per reply"),
+            "must say what it is asking INSTEAD of — one call per reply is the \
+             behaviour this prompt exists to replace: {p:?}",
         );
     }
 }

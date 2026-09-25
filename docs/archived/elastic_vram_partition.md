@@ -1,9 +1,16 @@
 # The Elastic VRAM Partition
 
+> **Archived — this is the design argument, not the current description.** For how
+> the span is laid out and handed out today, and for the flow of weights,
+> transients and experts, read
+> [`../vram_span_partition.md`](../vram_span_partition.md) first. This document is
+> kept for its reasoning and for §14's design-versus-build ledger; some
+> identifiers in it no longer exist.
+
 **Status: partially built.** Supersedes the static-partition parts of
-[`vram_governor_design.md`](vram_governor_design.md) §7 and §11 (`kv_floor`,
+[`../vram_governor_design.md`](../vram_governor_design.md) §7 and §11 (`kv_floor`,
 `expert_budget`, both deleted) and extends the single reservation of
-[`docs/archived/arena_unification.md`](archived/arena_unification.md) §3 to cover
+[`arena_unification.md`](arena_unification.md) §3 to cover
 the expert cache as well as KV.
 
 §14 is the honest ledger of design-versus-build, and it is worth reading before

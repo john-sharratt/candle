@@ -79,6 +79,28 @@ use crate::models::verify_wave::VerifyPlan;
 use crate::models::wave_admit::admit_wave_kv;
 use crate::models::wave_driver::{assemble_wave_contexts, drive_wave, WaveGroups, WaveSweep};
 
+/// Pool ground reserved from the driver and not in use — what an eager transient
+/// can allocate without a fresh driver reservation.
+///
+/// The reserved-but-unused gap, deliberately, not the driver's free memory: the
+/// pool has already taken this ground, so an allocation inside it cannot fail for
+/// want of a reservation, while the driver's free figure is ground the expert zone
+/// and the span reservation are still competing for. `None` off CUDA, or when the
+/// pool declines to report.
+fn pool_cushion_bytes(device: &Device) -> Option<usize> {
+    #[cfg(feature = "cuda")]
+    {
+        if let Device::Cuda(d) = device {
+            if let (Ok(used), Ok(reserved)) = (d.pool_used_bytes(), d.pool_reserved_bytes()) {
+                return Some(reserved.saturating_sub(used));
+            }
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = device;
+    None
+}
+
 /// Seal `rows` into a **position-free** page.
 ///
 /// The rows are un-rotated, so they carry no position already — the record is
@@ -1448,13 +1470,44 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     ///
     /// What DOES bind is the eager GR chain itself: at its peak it holds ~6
     /// wide `[rows, hc·n_embd]` F32 intermediates — ~250 KB a row — in the
-    /// pool cushion the weight zone leaves (~2–3 GiB after the expert zone
-    /// opens). Bounding one forward's rows keeps the peak inside it; the
-    /// pure-prefill slab slicer turns a wider fleet into sequential slabs.
-    /// Fusing the GR (the §0.4 work the design doc records) removes this term.
+    /// pool cushion the weight zone leaves. Bounding one forward's rows keeps the
+    /// peak inside it; the pure-prefill slab slicer turns a wider fleet into
+    /// sequential slabs. Fusing the GR (the §0.4 work the design doc records)
+    /// removes this term.
+    ///
+    /// **Priced against the cushion, not fixed at a row count.** This was a flat
+    /// 2,048 — half a gigabyte of GR peak against a cushion the comment itself
+    /// described as "~2–3 GiB", so it bound the wave at a third of what the pool
+    /// could hold, and it bound it identically whether the weight zone had conceded
+    /// ground or not. On an ingest that is the whole throughput of the engine: the
+    /// wave's head is one repo-map unit of a couple of thousand tokens, it takes
+    /// the cap on the head waiver, and **every** sequence offered behind it is
+    /// refused `Cap` — measured on this daemon at `--max-depth 3`, an 82-row offer
+    /// refused against `max_rows=2048` with the weight floor 14.4 GiB away, waves
+    /// running `seqs max=1` at 260 t/s where the batched gate does ~1,800.
+    ///
+    /// Reading the live cushion makes the cap move the right way on its own: when
+    /// the weight side concedes for prefill the pool gap grows and the wave widens,
+    /// which is the trade this engine wants made at prefill time. Falls back to the
+    /// old constant when the pool cannot be read (a CPU device, a test), so the
+    /// bound is never absent.
     fn prefill_width_cap(&self, act_dtype: DType) -> usize {
-        const GR_EAGER_ROW_CAP: usize = 2048;
-        let mut cap = MAX_PREFILL_TOKENS.min(GR_EAGER_ROW_CAP);
+        /// The GR chain's peak per prefill row: ~6 wide `[rows, hc·n_embd]` F32
+        /// intermediates live at once. Measured as the ~250 KB a row the eager
+        /// path's own note records.
+        const GR_PEAK_BYTES_PER_ROW: usize = 250 * 1024;
+        /// Fraction of the free pool the GR chain may stand in. The cushion also
+        /// carries the wave's other pool allocations and the next KV claim, so the
+        /// chain takes half and leaves half.
+        const GR_CUSHION_SHARE: usize = 2;
+        /// The bound when the pool cannot be read — the value this cap held before
+        /// it was priced, so an unreadable pool is no worse than it was.
+        const GR_EAGER_ROW_FLOOR: usize = 2048;
+
+        let from_cushion = pool_cushion_bytes(&self.model.device)
+            .map(|cushion| cushion / GR_CUSHION_SHARE / GR_PEAK_BYTES_PER_ROW)
+            .unwrap_or(0);
+        let mut cap = MAX_PREFILL_TOKENS.min(from_cushion.max(GR_EAGER_ROW_FLOOR));
         if let Some(kv_fits) = self.kv_width_cap(act_dtype) {
             cap = cap.min(kv_fits);
         }
@@ -2886,8 +2939,7 @@ impl Qwen4ExpBatched {
                         // `fwd_routing_wait`'s sync collected them. The difference
                         // between this span and the kernel row inside it is that
                         // surrounding work.
-                        let g_attn =
-                            crate::models::profile::gpu_span("q4e:attn_decode", dev);
+                        let g_attn = crate::models::profile::gpu_span("q4e:attn_decode", dev);
                         let out = forward_attn_batched(
                             &alayer,
                             dec_c,
@@ -2908,8 +2960,7 @@ impl Qwen4ExpBatched {
                                 .contiguous()?,
                             0,
                         )?;
-                        let g_attn =
-                            crate::models::profile::gpu_span("q4e:attn_prefill", dev);
+                        let g_attn = crate::models::profile::gpu_span("q4e:attn_prefill", dev);
                         let out = forward_attn_batched(
                             &alayer,
                             pre_c,

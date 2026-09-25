@@ -29,6 +29,14 @@ pub(crate) struct Headroom {
     /// The floor it may not go under, and the residency it could reach.
     pub zone_min: u64,
     pub zone_max: u64,
+    /// The floor a **prefill** may go down to, below [`Self::zone_min`].
+    ///
+    /// A prefill's expert copy is once per forward and amortises over its rows, so
+    /// bytes buy rows at a good rate; a decode pays per layer per step against
+    /// `1 − hit(R)`, so the same byte is charged again on every step after. One
+    /// floor for both had to be the decode's, which is what starved prefill width.
+    /// See `interleave::PREFILL_HOLD`.
+    pub zone_min_prefill: u64,
 }
 
 /// Ground kept clear above the floor, so the expert cache always has something
@@ -55,6 +63,18 @@ impl Headroom {
     /// cache needs to stay evictable.
     pub(crate) fn floor(&self) -> u64 {
         self.zone_min.saturating_add(EVICTION_MARGIN)
+    }
+
+    /// The floor a prefill stops at — its lower hold, plus the same margin.
+    ///
+    /// **The margin is not negotiable even for a prefill.** It is not about
+    /// residency, it is about the cache having something left to evict: reaching a
+    /// floor with every remaining slot pinned by the wave that needs it fails the
+    /// forward outright (`Expert cache full, cannot evict (all pinned)`), rather
+    /// than degrading. Spending weights for rows is a trade; spending the last
+    /// evictable slot is a stall.
+    pub(crate) fn prefill_floor(&self) -> u64 {
+        self.zone_min_prefill.saturating_add(EVICTION_MARGIN)
     }
 }
 
@@ -90,6 +110,8 @@ mod tests {
             zone: 8 << 30,
             zone_min: 4 << 30,
             zone_max: 10 << 30,
+            // Half the decode hold, as `interleave::PREFILL_HOLD` sets it.
+            zone_min_prefill: 2 << 30,
         }
     }
 

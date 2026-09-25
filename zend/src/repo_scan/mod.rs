@@ -15,6 +15,7 @@
 //! a filesystem event re-ingests only the directories that actually changed.
 
 pub mod binary_sniff;
+pub mod converse;
 pub mod dir_unit;
 pub mod render;
 pub mod types;
@@ -34,7 +35,6 @@ use zend_tools::ToolContext;
 use crate::ingest_report::{Failures, IngestReport};
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
-use crate::turn_sink::{InsertTurnSink, SequenceTurnSink};
 
 pub use binary_sniff::is_binary_sample;
 pub use dir_unit::{build_units, DirRecord, DirState, DirUnit};
@@ -1327,24 +1327,22 @@ fn process_one_dir(
         }
     }
 
-    // One chain on this conversation: request → list → read → DECODE. The
-    // conversation projects its own turns (`target_is_ingest_self`), so the
-    // request is in the decode's context where it belongs, and there is no
+    // One conversation, seeded with request → list → response and then driven as
+    // a REAL tool loop until it answers — see `converse::run_folder_conversation`.
+    // The conversation projects its own turns (`target_is_ingest_self`), so the
+    // request is in every decode's context where it belongs, and there is no
     // throwaway intermediate decode to set the wrong style.
-    let force_tools: Vec<String> = render::CHAIN_TOOLS.iter().map(|t| t.to_string()).collect();
-    let emit = {
-        let mut sink = SequenceTurnSink::new(&mut conv, Arc::clone(&plan.triggers));
-        sink.ingest_chain(
-            &prefilled,
-            &decode_user,
-            dir_tags(unit),
-            FOLDER_SUMMARY_MAX_TOKENS,
-            &force_tools,
-        )
-    };
+    let emit = converse::run_folder_conversation(
+        &mut conv,
+        unit,
+        &prefilled,
+        decode_user,
+        Arc::clone(&plan.triggers),
+        ctx,
+    );
 
-    let tokens = match emit {
-        Ok(tokens) => tokens,
+    let summary = match emit {
+        Ok(summary) => summary,
         Err(e) => {
             // The deferred tombstone is the safety net: `superseded` was never
             // tombstoned, so the prior generation stays live and its resume hash
@@ -1470,7 +1468,8 @@ fn process_one_dir(
     tracing::debug!(
         target: "zend::repo_scan",
         dir = %unit.dir,
-        tokens,
+        tokens = summary.tokens,
+        tool_rounds = summary.tool_rounds,
         "directory ingested (chain prefilled + summary decoded)",
     );
     Ok(())

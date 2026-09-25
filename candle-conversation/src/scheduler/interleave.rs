@@ -212,6 +212,37 @@ pub(crate) fn optimal_weight_bytes() -> Option<u64> {
     Some((achievable as f64 * HOLD) as u64)
 }
 
+/// Fraction of the achievable residency a **prefill** may spend down to.
+///
+/// **A prefill buys rows with bytes, and the exchange rate is good.** Its copy is
+/// every expert once per forward whatever the width, so a dislodged byte is paid
+/// once and every row added amortises it further; the model's own
+/// `T_prefill = fixed + (E_total − R)/bw + W·c` says widening stays a gain all the
+/// way down. A decode pays per layer per step against `1 − hit(R)`, so the same
+/// byte is charged again on every step that follows — which is why [`HOLD`] is set
+/// where it is and why one floor for both had to be set for the decode case.
+///
+/// The cost of that compromise is on the record in [`HOLD`]'s own note: a run spent
+/// 13.5 minutes refusing prefills, 384 of them, for want of one recurrent store's
+/// worth of ground with the rows already queued behind it. During a bulk repo
+/// ingest — nearly all prefill, no interactive decode to protect — that is the
+/// whole throughput of the thing.
+///
+/// Half of [`HOLD`]: a quarter of achievable residency. Below the emergency zone
+/// the ingest once collapsed in (4.4 GiB of 9.4 achievable, ~0.47), which is
+/// deliberate — that collapse was decode streaming every layer of every step, the
+/// cost this floor exists to let a prefill pay on purpose. Decode is unaffected: it
+/// keeps [`HOLD`], refuses admission under it, and still runs as a wave's head at
+/// any residency, so it cannot be starved out.
+const PREFILL_HOLD: f64 = HOLD / 2.0;
+
+/// The floor a prefill admission may not take the weight side under — see
+/// [`PREFILL_HOLD`]. `None` on the same terms as [`optimal_weight_bytes`].
+pub(crate) fn prefill_weight_bytes() -> Option<u64> {
+    let achievable = achievable_weight_now()?;
+    Some((achievable as f64 * PREFILL_HOLD) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

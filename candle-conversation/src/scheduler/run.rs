@@ -777,12 +777,6 @@ impl Scheduler {
                 if self.persist_trigger.pending_warm_bytes() > 0 {
                     self.persist_trigger.fire();
                 }
-                // Last resort under heavy backlog: block the wave loop on a
-                // device sync so ingest stops outrunning the drain and the
-                // primary stream empties — letting the (short, batched) hot→warm
-                // pass run uncontended. Fires only well above the throttle
-                // target; no-op otherwise.
-                self.sync_if_backlog_critical();
             }
 
             // Livelock guard. If this wave had NO runnable forward work of any class,

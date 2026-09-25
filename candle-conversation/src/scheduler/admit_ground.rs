@@ -116,6 +116,9 @@ pub(super) struct AdmitPass<'a> {
     committed: u64,
     /// Rows a prefill chunk may carry into this wave.
     chunk_rows: usize,
+    /// Rows this pass has admitted, so each offer is sized to the room that is
+    /// still free rather than to the whole of [`Self::chunk_rows`]. See `peek`.
+    rows_taken: usize,
     /// The tier the wave already in flight reserves — see
     /// [`Scheduler::standing_tier_bytes`]. Read once: it describes committed
     /// work, so it cannot move under the pass.
@@ -145,6 +148,7 @@ impl<'a> AdmitPass<'a> {
             per_block,
             recurrent,
             committed: 0,
+            rows_taken: 0,
             chunk_rows,
             standing_tier,
             prefill_cursor: [0; 3],
@@ -233,7 +237,31 @@ impl Ground for AdmitPass<'_> {
             self.prefill_cursor[band] += 1;
         }
         let w = self.sched.prefill_queue.get(self.prefill_cursor[band])?;
-        let rows = w.tokens.len().min(self.chunk_rows);
+        // **Offer what is LEFT of the wave's rows, not the whole cap.**
+        //
+        // Clipping to `chunk_rows` made every offer the size of the entire budget,
+        // so the first turn long enough to fill it took the wave alone and the next
+        // one was refused `Cap` for exceeding a budget it was never shown. Measured
+        // on this daemon at `--max-depth 3`: a 2,646-row head admitted, the next
+        // turn offering its full 3,000 against a 4,880 cap, refused — the wave
+        // running 2,646 of 4,880 with sequences queued and every wave
+        // `seqs max=1`, at a fraction of the batched rate.
+        //
+        // Offered the remainder, a turn takes the room that is actually free and
+        // the wave fills with as many turns as it takes. A turn clipped short is
+        // not turned away, it advances by that much and is offered again next wave
+        // — which is how a prefill longer than one forward already progresses.
+        //
+        // Standing rows count: they are in the forward this fill is composing, and
+        // the rate model's own cap check counts them, so a clip that ignored them
+        // would offer ground that is already spoken for.
+        let room = self
+            .chunk_rows
+            .saturating_sub(self.sched.standing_rows().saturating_add(self.rows_taken));
+        if room == 0 {
+            return None;
+        }
+        let rows = w.tokens.len().min(room);
         Some(Cost {
             // The whole turn's K/V, not this chunk's: admitting the turn commits
             // the engine to feeding all of it, and a cost that priced only the
@@ -252,6 +280,9 @@ impl Ground for AdmitPass<'_> {
         if kind != Kind::Prefill {
             return false;
         }
+        // Spend the rows this offer took, so the next offer in this pass is sized
+        // to what is left — see `peek`.
+        self.rows_taken = self.rows_taken.saturating_add(cost.rows);
         let band = band_index(prio);
         // **Nothing is purchased here, and that is not an omission.**
         //
@@ -312,6 +343,7 @@ impl Scheduler {
             zone,
             zone_min: interleave::optimal_weight_bytes().unwrap_or(0),
             zone_max: interleave::achievable_weight_now().unwrap_or(u64::MAX),
+            zone_min_prefill: interleave::prefill_weight_bytes().unwrap_or(0),
         };
         Headroom {
             // **The spendable ground is one subtraction: how far residency
@@ -370,7 +402,10 @@ impl Scheduler {
             // The same line `headroom` nets out of the spendable ground: the
             // hold, the eviction margin that keeps the cache evictable, and a
             // useful forward's tier. The model enforces it as a hard refusal.
-            floor: room.floor().saturating_add(self.min_forward_tier_bytes()),
+            prefill_floor: room
+                .prefill_floor()
+                .saturating_add(self.min_forward_tier_bytes()),
+            decode_floor: room.floor().saturating_add(self.min_forward_tier_bytes()),
             max_rows: chunk_rows,
             max_decodes: Self::MAX_DECODE_WIDTH,
         }

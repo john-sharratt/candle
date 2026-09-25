@@ -400,7 +400,26 @@ pub struct WaveRate {
     /// Resident weights as the wave stands: the reset figure, then each
     /// admission's `weights_after`.
     resident_now: u64,
-    floor_bytes: u64,
+    /// The residency a **prefill** admission may not take the weight side under.
+    ///
+    /// **Lower than [`Self::decode_floor`] on purpose, because the two kinds pay
+    /// for weights on opposite schedules.** A prefill copies every expert once per
+    /// forward whatever its width, so the copy amortises over rows and a byte it
+    /// dislodges is paid once; the rows it buys are the whole gain. A decode's copy
+    /// is paid per layer per step and scales with `1 - hit(resident)`, so residency
+    /// the prefill spent is multiplied across every step of every decode that
+    /// follows. One floor for both had to be set for the worse case, and that is
+    /// what starved prefill width: `interleave::HOLD`'s own note records a run
+    /// spending 13.5 minutes refusing prefills — 384 of them — for want of one
+    /// recurrent store's ground, however wide the rows behind it.
+    ///
+    /// Driving residency down does not deadlock decode: the wave's head is carried
+    /// whatever it costs, so a decode always runs as the head of a wave and the
+    /// expert cache reloads under it.
+    prefill_floor: u64,
+    /// The residency a **decode** admission may not take the weight side under —
+    /// the residency the engine defends so decode does not stream every layer.
+    decode_floor: u64,
     max_tokens: usize,
     max_decodes: usize,
     tokens: usize,
@@ -494,7 +513,8 @@ impl WaveRate {
             hit_samples: 0,
             fit: CostFit::default(),
             resident_now: 0,
-            floor_bytes: 0,
+            prefill_floor: 0,
+            decode_floor: 0,
             max_tokens: 0,
             max_decodes: 0,
             tokens: 0,
@@ -701,18 +721,21 @@ impl WaveRate {
     // ── the budget ─────────────────────────────────────────────────────────
 
     /// Start composing a wave: `resident_bytes` is what the weight side holds
-    /// now, `floor_bytes` the residency it may not go under, `max_tokens` the
-    /// widest prefill the engine will run in one forward, `max_decodes` the
-    /// most decodes it will carry.
+    /// now, `prefill_floor` and `decode_floor` the residencies a prefill and a
+    /// decode may respectively not go under (see [`Self::prefill_floor`] for why
+    /// they differ), `max_tokens` the widest prefill the engine will run in one
+    /// forward, `max_decodes` the most decodes it will carry.
     pub fn reset(
         &mut self,
         resident_bytes: u64,
-        floor_bytes: u64,
+        prefill_floor: u64,
+        decode_floor: u64,
         max_tokens: usize,
         max_decodes: usize,
     ) {
         self.resident_now = resident_bytes;
-        self.floor_bytes = floor_bytes;
+        self.prefill_floor = prefill_floor;
+        self.decode_floor = decode_floor;
         self.max_tokens = max_tokens;
         self.max_decodes = max_decodes;
         self.tokens = 0;
@@ -838,10 +861,10 @@ impl WaveRate {
         if self.decode_samples < Self::MIN_DECODE_SAMPLES {
             return Ok(projected);
         }
-        if resident < self.floor_bytes {
+        if resident < self.decode_floor {
             return Err(Refusal::Floor {
                 resident_after: resident,
-                floor: self.floor_bytes,
+                floor: self.decode_floor,
             });
         }
         // Against the wave's decodes as they stand: if adding the decode this
@@ -982,10 +1005,10 @@ impl WaveRate {
                     max_tokens: self.max_tokens,
                 });
             }
-            if after < self.floor_bytes {
+            if after < self.prefill_floor {
                 return Err(Refusal::Floor {
                     resident_after: after,
-                    floor: self.floor_bytes,
+                    floor: self.prefill_floor,
                 });
             }
         }
@@ -1015,10 +1038,10 @@ impl WaveRate {
                     max_decodes: self.max_decodes,
                 });
             }
-            if after < self.floor_bytes {
+            if after < self.decode_floor {
                 return Err(Refusal::Floor {
                     resident_after: after,
-                    floor: self.floor_bytes,
+                    floor: self.decode_floor,
                 });
             }
         }
@@ -1355,6 +1378,14 @@ mod tests {
         p.try_admit(a, before, before.saturating_sub(dislodge))
     }
 
+    /// Offer `a` with the residency stated outright, before and after, rather than
+    /// derived from a dislodge. What the floor cases need: they are about the exact
+    /// side of a floor the result lands on, and computing that from a subtraction
+    /// puts arithmetic between the test and the line it is testing.
+    fn offer_at(p: &mut WaveRate, a: Admission, before: u64, after: u64) -> Admit {
+        p.try_admit(a, before, after)
+    }
+
     /// A planner whose layer time is both **set** and **learned**: past
     /// [`WaveRate::MIN_DECODE_SAMPLES`], so `judge_promotion` actually judges
     /// rather than taking the unlearned-estimate bypass.
@@ -1386,7 +1417,7 @@ mod tests {
     #[test]
     fn a_promotion_is_judged_even_after_the_wave_latched_full() {
         let mut p = planner_judging(20e-3);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         // The first offer after a reset takes the head bypass, so admit one to
         // clear it, then latch the wave on something that cannot fit.
         assert!(matches!(
@@ -1412,7 +1443,7 @@ mod tests {
     #[test]
     fn a_refused_promotion_does_not_latch_the_wave() {
         let mut p = planner_judging(20e-3);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         let after = p.resident_now();
         let refused = p.judge_promotion(2, after.saturating_add(DECODE_DISLODGE), FLOOR_16GB - 1);
         assert!(
@@ -1434,7 +1465,7 @@ mod tests {
     #[test]
     fn an_unlearned_layer_time_never_refuses_a_promotion() {
         let mut p = planner(LINK_4090_MOBILE);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         assert!(
             p.decode_samples() < WaveRate::MIN_DECODE_SAMPLES,
             "the estimate has not been learned"
@@ -1458,7 +1489,7 @@ mod tests {
     fn a_decode_that_could_not_be_carried_refuses_its_prefill() {
         let mut p = planner_judging(20e-3);
         // The floor is the wave's, so the question has to be asked of a wave.
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         // Residency under the floor: the decode side cannot stand there.
         assert!(matches!(
             p.decode_would_carry(0, FLOOR_16GB - 1),
@@ -1474,7 +1505,7 @@ mod tests {
     #[test]
     fn asking_whether_a_decode_fits_changes_no_counter() {
         let mut p = planner_judging(20e-3);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         let decodes = p.decodes();
         let resident = p.resident_now();
         for _ in 0..4 {
@@ -1493,7 +1524,7 @@ mod tests {
     #[test]
     fn an_unlearned_layer_time_never_refuses_a_prefill_on_its_decode() {
         let mut p = planner(LINK_4090_MOBILE);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         assert!(p.decode_samples() < WaveRate::MIN_DECODE_SAMPLES);
         assert!(
             p.decode_would_carry(0, FLOOR_16GB - 1).is_ok(),
@@ -1506,7 +1537,7 @@ mod tests {
     #[test]
     fn a_learned_layer_time_restores_the_refusal() {
         let mut p = planner_judging(20e-3);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         let after = p.resident_now();
         assert!(matches!(
             p.judge_promotion(2, after.saturating_add(DECODE_DISLODGE), FLOOR_16GB - 1),
@@ -1519,10 +1550,63 @@ mod tests {
     #[test]
     fn a_promotion_under_the_floor_is_refused() {
         let mut p = planner_judging(20e-3);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         let after = p.resident_now();
         match p.judge_promotion(2, after, FLOOR_16GB - 1) {
             Admit::Refused(Refusal::Floor { floor, .. }) => assert_eq!(floor, FLOOR_16GB),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **A prefill may spend weights a decode may not.**
+    ///
+    /// The two floors are the whole point of the split: a prefill's expert copy is
+    /// once per forward and amortises over its rows, so bytes buy rows at a good
+    /// rate; a decode's copy is charged per layer per step against
+    /// `1 − hit(resident)`, so the same byte is paid again on every step after. One
+    /// floor for both had to be the decode's, and that is what starved prefill
+    /// width — `interleave::HOLD`'s note records a run refusing 384 prefills over
+    /// 13.5 minutes for want of one store's ground.
+    ///
+    /// Ground that sits between the floors: a prefill lands on it, a decode is
+    /// refused on it and names the decode floor.
+    #[test]
+    fn ground_between_the_floors_takes_a_prefill_and_refuses_a_decode() {
+        let prefill_floor = FLOOR_16GB / 2;
+        let between = FLOOR_16GB - MIB;
+
+        let mut p = planner_judging(20e-3);
+        p.reset(RESIDENT_RUN15, prefill_floor, FLOOR_16GB, CAP, DECODE_CAP);
+        // Not the head — the head is carried whatever it costs, which would mask
+        // the floor entirely.
+        let _ = offer(&mut p, prefill(1), 0);
+        match offer_at(&mut p, prefill(1), RESIDENT_RUN15, between) {
+            Admit::Admitted { .. } => {}
+            other => panic!("a prefill may stand between the floors, got {other:?}"),
+        }
+
+        let mut d = planner_judging(20e-3);
+        d.reset(RESIDENT_RUN15, prefill_floor, FLOOR_16GB, CAP, DECODE_CAP);
+        let _ = offer(&mut d, decode(0), 0);
+        match offer_at(&mut d, decode(0), RESIDENT_RUN15, between) {
+            Admit::Refused(Refusal::Floor { floor, .. }) => assert_eq!(
+                floor, FLOOR_16GB,
+                "a decode is refused on the DECODE floor, not the prefill one",
+            ),
+            other => panic!("a decode may not stand between the floors, got {other:?}"),
+        }
+    }
+
+    /// The prefill floor is still a floor: under it, a prefill is refused too, and
+    /// the refusal names the prefill floor rather than the decode's.
+    #[test]
+    fn under_the_prefill_floor_a_prefill_is_refused_and_names_it() {
+        let prefill_floor = FLOOR_16GB / 2;
+        let mut p = planner_judging(20e-3);
+        p.reset(RESIDENT_RUN15, prefill_floor, FLOOR_16GB, CAP, DECODE_CAP);
+        let _ = offer(&mut p, prefill(1), 0);
+        match offer_at(&mut p, prefill(1), RESIDENT_RUN15, prefill_floor - 1) {
+            Admit::Refused(Refusal::Floor { floor, .. }) => assert_eq!(floor, prefill_floor),
             other => panic!("{other:?}"),
         }
     }
@@ -1677,7 +1761,7 @@ mod tests {
     #[test]
     fn prefill_admissions_stop_at_the_floor_and_say_so() {
         let mut p = planner_learned(LINK_4090_MOBILE, BW_RUN15);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         let (admitted, refusal) = fill_with(&mut p, prefill(EXEMPLAR), EXEMPLAR_DISLODGE);
         assert_eq!(
             admitted, 9,
@@ -1709,7 +1793,7 @@ mod tests {
     fn the_callers_dislodge_drives_the_decision() {
         // Nothing dislodged: the rate only climbs, the floor is never nearer.
         let mut p = planner_learned(LINK_4090_MOBILE, BW_RUN15).with_min_gain(0.0);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, 2_000, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, 2_000, DECODE_CAP);
         let (n, refusal) = fill_with(&mut p, prefill(EXEMPLAR), 0);
         assert_eq!(n, 8);
         assert!(matches!(refusal, Refusal::Cap { max_tokens: 2_000 }));
@@ -1718,7 +1802,7 @@ mod tests {
         // compute, on a wave already at 817 tok/s. Refused as worse, with two
         // GiB still above the floor.
         let mut p = planner_learned(LINK_4090_MOBILE, BW_RUN15).with_min_gain(0.0);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         assert!(offer(&mut p, prefill(1_000), 0).is_admitted());
         let (n, refusal) = fill_with(&mut p, prefill(32), GIB);
         assert_eq!(n, 0);
@@ -1738,7 +1822,7 @@ mod tests {
     #[test]
     fn an_admission_that_costs_more_copy_than_it_repays_is_refused_as_worse() {
         let mut p = planner_learned(LINK_4090_MOBILE, BW_RUN15).with_min_gain(0.0);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         assert!(offer(&mut p, prefill(1_000), 0).is_admitted());
         let current = p.rate(1_000, RESIDENT_RUN15);
         // 64 tokens that dislodge 2 GiB: 27 ms of tokens against 140 ms of copy.
@@ -1759,7 +1843,7 @@ mod tests {
     fn a_proportional_dislodge_never_makes_widening_worse() {
         let mut p = planner(2e6).with_min_gain(0.01);
         let resident = ExpertGeometry::QWEN36_35B_A3B.total_bytes() - 64 * MIB;
-        p.reset(resident, 0, 1 << 20, DECODE_CAP);
+        p.reset(resident, 0, 0, 1 << 20, DECODE_CAP);
         let mut last = 0.0;
         let refusal = loop {
             match offer(&mut p, prefill(64), 64 * MIB) {
@@ -1785,7 +1869,7 @@ mod tests {
     fn the_first_admission_after_a_reset_is_always_taken() {
         // A prefill that would dislodge past the floor and is over the cap.
         let mut p = planner(LINK_4090_MOBILE);
-        p.reset(FLOOR_16GB + GIB, FLOOR_16GB, 100, DECODE_CAP);
+        p.reset(FLOOR_16GB + GIB, FLOOR_16GB, FLOOR_16GB, 100, DECODE_CAP);
         assert!(offer(&mut p, prefill(5_000), 2 * GIB).is_admitted());
         assert!(!p.is_full());
         assert!(
@@ -1798,7 +1882,7 @@ mod tests {
         ));
         // A decode whose copy alone exceeds the layer time at the seed.
         let mut p = planner(LINK_4090_MOBILE);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         assert!(
             p.decode_copy_secs(24, RESIDENT_RUN15) > p.layer_secs(),
             "the seed cannot hide one drafted decode"
@@ -1807,7 +1891,7 @@ mod tests {
         assert_eq!(p.decodes(), 1);
         // A decode into a wave whose cap is zero.
         let mut p = planner(LINK_4090_MOBILE);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, 0);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, 0);
         assert!(offer(&mut p, decode(0), DECODE_DISLODGE).is_admitted());
         assert!(matches!(
             offer(&mut p, decode(0), DECODE_DISLODGE),
@@ -1820,7 +1904,13 @@ mod tests {
     #[test]
     fn a_card_at_the_floor_admits_what_fits_and_refuses_the_rest() {
         let mut p = planner(LINK_4090_MOBILE);
-        p.reset(FLOOR_16GB + 300 * MIB, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(
+            FLOOR_16GB + 300 * MIB,
+            FLOOR_16GB,
+            FLOOR_16GB,
+            CAP,
+            DECODE_CAP,
+        );
         assert!(offer(&mut p, prefill(EXEMPLAR), EXEMPLAR_DISLODGE).is_admitted());
         assert!(matches!(
             offer(&mut p, prefill(EXEMPLAR), EXEMPLAR_DISLODGE),
@@ -1833,7 +1923,13 @@ mod tests {
     #[test]
     fn the_floor_itself_is_reachable_and_not_crossable() {
         let mut p = planner(LINK_4090_MOBILE);
-        p.reset(FLOOR_16GB + 300 * MIB, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(
+            FLOOR_16GB + 300 * MIB,
+            FLOOR_16GB,
+            FLOOR_16GB,
+            CAP,
+            DECODE_CAP,
+        );
         assert!(offer(&mut p, prefill(EXEMPLAR), EXEMPLAR_DISLODGE).is_admitted());
         assert!(
             offer(&mut p, prefill(50), 50 * MIB).is_admitted(),
@@ -1852,7 +1948,7 @@ mod tests {
     #[test]
     fn a_card_under_the_floor_takes_only_its_head() {
         let mut p = planner(LINK_4090_MOBILE);
-        p.reset(FLOOR_16GB - MIB, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(FLOOR_16GB - MIB, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         assert!(offer(&mut p, prefill(200), 0).is_admitted());
         assert!(matches!(
             offer(&mut p, prefill(1), 0),
@@ -1865,7 +1961,7 @@ mod tests {
     #[test]
     fn the_cap_bounds_the_wave_whatever_the_rate_says() {
         let mut p = planner(LINK_4090_MOBILE).with_min_gain(0.0);
-        p.reset(9_600 * MIB, FLOOR_16GB, 1_024, DECODE_CAP);
+        p.reset(9_600 * MIB, FLOOR_16GB, FLOOR_16GB, 1_024, DECODE_CAP);
         assert!(offer(&mut p, prefill(1_000), 1_000 * MIB).is_admitted());
         assert!(matches!(
             offer(&mut p, prefill(25), 25 * MIB),
@@ -1880,12 +1976,12 @@ mod tests {
     fn reset_clears_the_budget_and_keeps_the_estimates() {
         let mut p = planner_with_layer(LINK_4090_MOBILE, BW_RUN15, 20e-3);
         let (bw, layer) = (p.effective_bytes_per_s(), p.layer_secs());
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         assert!(offer(&mut p, decode(2), DECODE_DISLODGE).is_admitted());
         assert!(offer(&mut p, prefill(500), 500 * MIB).is_admitted());
         let _ = fill_with(&mut p, prefill(500), 500 * MIB);
         assert!(p.is_full());
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         assert_eq!(p.tokens(), 0);
         assert_eq!(p.decodes(), 0);
         assert_eq!(p.routed_per_layer(), 0);
@@ -1903,7 +1999,7 @@ mod tests {
         // Blackwell: 20.3 GB of experts, 19.9 GB resident, fast bus.
         let mut p = planner(LINK_BLACKWELL).with_min_gain(0.01);
         let resident = 19_000 * MIB;
-        p.reset(resident, 8 * GIB, 65_536, DECODE_CAP);
+        p.reset(resident, 8 * GIB, 8 * GIB, 65_536, DECODE_CAP);
         let (admitted, refusal) = fill_with(&mut p, prefill(512), 512 * MIB);
         assert!(
             matches!(refusal, Refusal::Saturated { gain } if (0.0..0.01).contains(&gain)),
@@ -1919,7 +2015,7 @@ mod tests {
     #[test]
     fn with_no_minimum_gain_only_the_floor_or_cap_ends_the_wave() {
         let mut p = planner_learned(LINK_4090_MOBILE, BW_RUN15).with_min_gain(0.0);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         let (_, refusal) = fill_with(&mut p, prefill(128), 128 * MIB);
         assert!(matches!(refusal, Refusal::Floor { .. }), "{refusal:?}");
     }
@@ -2034,7 +2130,7 @@ mod tests {
     #[test]
     fn decodes_stop_when_another_would_lower_the_decode_rate() {
         let mut p = planner_with_layer(LINK_4090_MOBILE, BW_RUN15, 20e-3);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         let (admitted, refusal) = fill_with(&mut p, decode(2), DECODE_DISLODGE);
         assert_eq!(admitted, 9);
         assert_eq!(p.routed_per_layer(), 216);
@@ -2068,7 +2164,7 @@ mod tests {
     fn at_fixed_residency_the_bus_limit_saturates_the_decode_rate() {
         let mut p = planner_with_layer(LINK_4090_MOBILE, BW_RUN15, 18e-3);
         assert_eq!(p.decode_bus_limit(0, RESIDENT_RUN15), 24);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         let (admitted, refusal) = fill_with(&mut p, decode(0), 0);
         assert_eq!(admitted, 25);
         assert!(
@@ -2085,7 +2181,7 @@ mod tests {
     #[test]
     fn drafted_decodes_that_saturate_the_layer_run_to_the_cap_at_fixed_residency() {
         let mut p = planner_with_layer(LINK_4090_MOBILE, BW_RUN15, 20e-3);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, 40);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, 40);
         let (admitted, refusal) = fill_with(&mut p, decode(2), 0);
         assert_eq!(admitted, 40);
         assert!(
@@ -2106,14 +2202,14 @@ mod tests {
         let floor = 6 * GIB;
         let fixed = {
             let mut p = planner_with_layer(LINK_3090, 9.6e9, 20e-3);
-            p.reset(resident, floor, CAP, DECODE_CAP);
+            p.reset(resident, floor, floor, CAP, DECODE_CAP);
             let (n, refusal) = fill_with(&mut p, decode(2), 0);
             assert!(matches!(refusal, Refusal::Saturated { .. }), "{refusal:?}");
             n
         };
         let dislodging = {
             let mut p = planner_with_layer(LINK_3090, 9.6e9, 20e-3);
-            p.reset(resident, floor, CAP, DECODE_CAP);
+            p.reset(resident, floor, floor, CAP, DECODE_CAP);
             let (n, refusal) = fill_with(&mut p, decode(2), 512 * MIB);
             assert!(
                 matches!(refusal, Refusal::Worse { before, after } if after < before),
@@ -2139,6 +2235,7 @@ mod tests {
         p.reset(
             FLOOR_16GB + 3 * DECODE_DISLODGE,
             FLOOR_16GB,
+            FLOOR_16GB,
             CAP,
             DECODE_CAP,
         );
@@ -2153,7 +2250,7 @@ mod tests {
     #[test]
     fn a_decode_admission_reports_the_projected_decode_rate() {
         let mut p = planner_with_layer(LINK_4090_MOBILE, BW_RUN15, 20e-3);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         let mut last = 0.0;
         for n in 1..=8 {
             match offer(&mut p, decode(2), DECODE_DISLODGE) {
@@ -2209,7 +2306,7 @@ mod tests {
             usize::MAX,
             "nothing but the cap bounds it"
         );
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, 12);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, 12);
         let (admitted, refusal) = fill_with(&mut p, decode(7), 8 * MIB);
         assert_eq!(admitted, 12);
         assert!(
@@ -2273,7 +2370,7 @@ mod tests {
     #[test]
     fn a_decode_refusal_closes_the_wave_to_later_prefills() {
         let mut p = planner_with_layer(LINK_4090_MOBILE, BW_RUN15, 20e-3);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         let (nine, refusal) = fill_with(&mut p, decode(2), DECODE_DISLODGE);
         assert_eq!(nine, 9);
         assert!(matches!(refusal, Refusal::Worse { .. }));
@@ -2291,7 +2388,7 @@ mod tests {
     #[test]
     fn decodes_under_the_limit_leave_room_for_prefills() {
         let mut p = planner_with_layer(LINK_4090_MOBILE, BW_RUN15, 20e-3);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         for _ in 0..4 {
             assert!(offer(&mut p, decode(2), DECODE_DISLODGE).is_admitted());
         }
@@ -2312,7 +2409,7 @@ mod tests {
     #[test]
     fn a_prefill_floor_closes_the_wave_to_later_decodes() {
         let mut p = planner_with_layer(LINK_4090_MOBILE, BW_RUN15, 20e-3);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         let (_, refusal) = fill_with(&mut p, prefill(EXEMPLAR), EXEMPLAR_DISLODGE);
         assert!(matches!(refusal, Refusal::Floor { .. }));
         assert!(matches!(
@@ -2326,7 +2423,7 @@ mod tests {
     #[test]
     fn full_refuses_every_kind_until_reset() {
         let mut p = planner(LINK_4090_MOBILE);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, 100, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, 100, DECODE_CAP);
         assert!(offer(&mut p, prefill(100), 100 * MIB).is_admitted());
         assert!(matches!(
             offer(&mut p, prefill(1), 0),
@@ -2340,7 +2437,7 @@ mod tests {
             offer(&mut p, decode(0), 0),
             Admit::Refused(Refusal::Full)
         ));
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, 100, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, 100, DECODE_CAP);
         assert!(offer(&mut p, decode(0), DECODE_DISLODGE).is_admitted());
     }
 
@@ -2352,7 +2449,7 @@ mod tests {
     #[test]
     fn interleaved_offers_share_one_budget() {
         let mut p = planner_with_layer(LINK_4090_MOBILE, BW_RUN15, 20e-3).with_min_gain(0.0);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         for _ in 0..3 {
             assert!(offer(&mut p, decode(2), DECODE_DISLODGE).is_admitted());
             assert!(offer(&mut p, prefill(300), 300 * MIB).is_admitted());
@@ -2387,7 +2484,7 @@ mod tests {
         // 32-token admission takes it again: 70 ms of copy for 13 ms of
         // compute, worse than the wave stood.
         let mut p = planner_learned(LINK_4090_MOBILE, BW_RUN15).with_min_gain(0.0);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         assert!(offer(&mut p, prefill(1_000), 1_000 * MIB).is_admitted());
         assert_eq!(p.resident_now(), resident);
         match p.try_admit(prefill(32), resident + GIB, resident) {
@@ -2400,7 +2497,7 @@ mod tests {
         // Nothing moved since: the same 32 tokens to the same weights dislodge
         // nothing, and are admitted.
         let mut p = planner_learned(LINK_4090_MOBILE, BW_RUN15).with_min_gain(0.0);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         assert!(offer(&mut p, prefill(1_000), 1_000 * MIB).is_admitted());
         assert!(p.try_admit(prefill(32), resident, resident).is_admitted());
     }
@@ -2433,7 +2530,7 @@ mod tests {
         let total = ExpertGeometry::QWEN36_35B_A3B.total_bytes();
         assert_eq!(p.non_resident_bytes(total), 0);
         assert!(approx(p.forward_secs(1_000, total), 0.42, 1e-9));
-        p.reset(total, 8 * GIB, CAP, DECODE_CAP);
+        p.reset(total, 8 * GIB, 8 * GIB, CAP, DECODE_CAP);
         let (_, refusal) = fill_with(&mut p, prefill(1_024), 0);
         assert!(
             matches!(refusal, Refusal::Cap { max_tokens: CAP }),
@@ -2447,7 +2544,7 @@ mod tests {
     #[test]
     fn a_card_too_small_for_the_floor_takes_only_its_head() {
         let mut p = planner(LINK_4090_MOBILE);
-        p.reset(2 * GIB, 3 * GIB, CAP, DECODE_CAP);
+        p.reset(2 * GIB, 3 * GIB, 3 * GIB, CAP, DECODE_CAP);
         assert!(offer(&mut p, prefill(64), 64 * MIB).is_admitted());
         assert!(matches!(
             offer(&mut p, prefill(1), MIB),
@@ -2918,7 +3015,7 @@ mod tests {
     #[test]
     fn a_charge_is_never_refused_and_never_closes_the_wave() {
         let mut p = planner_with_layer(LINK_4090_MOBILE, BW_RUN15, 20e-3);
-        p.reset(FLOOR_16GB, FLOOR_16GB, 100, 2);
+        p.reset(FLOOR_16GB, FLOOR_16GB, FLOOR_16GB, 100, 2);
         // Over the cap and at the floor.
         p.charge(prefill(5_000), FLOOR_16GB - GIB);
         // Past the decode cap, and past the bus at that residency.
@@ -2939,14 +3036,26 @@ mod tests {
     fn a_charged_wave_judges_its_next_offer_instead_of_taking_it_as_the_head() {
         // Uncharged: the head is taken even though it crosses the floor.
         let mut p = planner_learned(LINK_4090_MOBILE, BW_RUN15);
-        p.reset(FLOOR_16GB + 100 * MIB, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(
+            FLOOR_16GB + 100 * MIB,
+            FLOOR_16GB,
+            FLOOR_16GB,
+            CAP,
+            DECODE_CAP,
+        );
         assert!(offer(&mut p, prefill(250), GIB).is_admitted());
         assert!(p.resident_now() < FLOOR_16GB);
 
         // Charged with a held creep first: the same offer is judged, and the
         // floor refuses it.
         let mut p = planner_learned(LINK_4090_MOBILE, BW_RUN15);
-        p.reset(FLOOR_16GB + 100 * MIB, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(
+            FLOOR_16GB + 100 * MIB,
+            FLOOR_16GB,
+            FLOOR_16GB,
+            CAP,
+            DECODE_CAP,
+        );
         p.charge(prefill(300), FLOOR_16GB + 100 * MIB);
         assert!(matches!(
             offer(&mut p, prefill(250), GIB),
@@ -2961,7 +3070,7 @@ mod tests {
     #[test]
     fn charged_decodes_are_the_baseline_the_next_offer_is_judged_against() {
         let mut p = planner_with_layer(LINK_4090_MOBILE, BW_RUN15, 20e-3);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         let mut resident = RESIDENT_RUN15;
         for n in 1..=9 {
             resident -= DECODE_DISLODGE;
@@ -2983,7 +3092,7 @@ mod tests {
     #[test]
     fn charging_reports_the_waves_projected_rate() {
         let mut p = planner_learned(LINK_4090_MOBILE, BW_RUN15);
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, CAP, DECODE_CAP);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         let projected = p.charge(prefill(474), RESIDENT_RUN15);
         assert!(approx(projected, 472.0, 0.02), "{projected}");
         assert_eq!(p.charge(prefill(0), RESIDENT_RUN15), projected);

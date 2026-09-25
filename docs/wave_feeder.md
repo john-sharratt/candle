@@ -1349,6 +1349,20 @@ exist, which is what makes the tenant bearable rather than what makes it right.
 
 ### 4.11.6 What the fill replaced, and what was still standing
 
+> **Status note — this subsection is a record of one deletion pass, and the code
+> has moved since.** Of the identifiers it lists as deleted, only
+> `plan_admission`, `reserve_for_width`, `residency_ok` and the `wave_trace`
+> machinery are actually gone. The byte budget and the evidence controller were
+> **rebuilt** afterwards and are live today: `admit_budget`, `admit_quantum`,
+> `budget_notches`, `cut_admit_budget`, `raise_admit_budget`,
+> `evidence_admit_grow`, `regulate_ingest_admission`,
+> `demote_cold_ingest_if_pressured` and `per_block_kv_bytes` all exist in
+> `scheduler/admission.rs` and `scheduler/prefill.rs`. The rate model that now
+> decides admission lives in `scheduler/admit/rate.rs`, and the span layout it
+> admits against is described in
+> [`vram_span_partition.md`](vram_span_partition.md). Read what follows as
+> history, not as the current call graph.
+
 The fill (§4.11.4) is the only admission path there is. Everything below it had
 survived as a second path taken when `optimal_weight_bytes()` returned `None` —
 that is, when there is no device reservation to defend, so on unit tests and CPU
@@ -1384,15 +1398,23 @@ everything only it reached are deleted:
   arc, whose trait default and only implementation had both decayed to
   `weight_bytes() > optimal`. The fill asks the zone directly again.
 
-**One behaviour goes with them.** `regulate_ingest_admission` was the *gentle*
-hot→warm backpressure: warm tier over its host budget, or the drain backlog over
-`ingest_warm_backlog_pct`, cut the setpoint. It has been unactuated since the
-fill landed, so nothing changes by deleting it, but the gap is now visible rather
-than hidden behind a busy control loop. What still applies backpressure is
-`sync_if_backlog_critical` (a device sync above `ingest_sync_ceiling_pct`, the
-harder stop) and `demote_cold_ingest_if_pressured`. If a gentle throttle is
-wanted back it needs a lever the engine actually reads — the wave width — not a
-byte setpoint.
+**One behaviour goes with them.** The *gentle* hot→warm backpressure of this era
+cut the setpoint on two signals: the warm tier exceeding its host budget, and the
+hot→warm drain backlog exceeding a percentage target. Both were unactuated once
+the fill landed.
+
+What applies hot→warm backpressure **today** is narrower and is the settled
+design. `regulate_ingest_admission` keeps exactly one cut — the warm tier over its
+host-RAM budget plus the drain pipeline's slack (`warm_over_budget`,
+`warm_pipeline_slack_bytes`) — alongside the evidence reopen, and
+`demote_cold_ingest_if_pressured` sheds the warm-backed tail. The drain-backlog
+controller and the device-sync stop above a backlog ceiling are **both gone, and
+deliberately so**: host RAM is a real constraint, whereas how far the drain
+happens to be behind is a pace, and pacing the engine against it put a throttle in
+front of the admission that was about to make the same decision better informed.
+A whole-device sync in particular was paid by every sequence in flight, including
+interactive ones, to pace a background layer — and its justification was
+contention, not correctness.
 
 ### 4.11.7 Every buyer but admission, and every gate but the fill
 

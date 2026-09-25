@@ -915,16 +915,11 @@ pub(super) fn drain_add_us(atom: &std::sync::atomic::AtomicU64, us: u64) {
     }
 }
 
-/// `device.synchronize()`, timed into [`WAIT_US`]. Use at every deliberate GPU
-/// drain on the scheduler thread so the wait surfaces as the Sync phase.
-fn timed_synchronize(device: &Device) {
-    let t = Instant::now();
-    let _ = device.synchronize();
-    WAIT_US.fetch_add(
-        t.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-}
+// `timed_synchronize` stood here — `device.synchronize()` timed into `WAIT_US`, so
+// a deliberate drain on the scheduler thread surfaced as the Sync phase. Its only
+// caller was the heavy-backlog stall, and with that released there is no deliberate
+// drain left on this thread to time. Re-add it with the next one rather than
+// keeping a timer for a wait nothing performs.
 
 /// Record a persistence-side stall into [`MAINT_US`] from another module (the
 /// segment-compaction I/O in `projection::resolver` holds the persistence lock
@@ -13509,10 +13504,21 @@ mod tests {
             "residency and the zone must be the same measurement",
         );
         assert!(
-            budget.floor >= room.zone_min,
-            "the floor may never sit under the hold: {} < {}",
-            budget.floor,
+            budget.decode_floor >= room.zone_min,
+            "the decode floor may never sit under the hold: {} < {}",
+            budget.decode_floor,
             room.zone_min,
+        );
+        // The prefill floor is deliberately lower — it is the ground a prefill may
+        // spend for rows — but never below its own hold, and never above the
+        // decode's.
+        assert!(
+            budget.prefill_floor >= room.zone_min_prefill
+                && budget.prefill_floor <= budget.decode_floor,
+            "the prefill floor sits between its own hold and the decode's: {} / {} / {}",
+            room.zone_min_prefill,
+            budget.prefill_floor,
+            budget.decode_floor,
         );
         // The spendable ground is one subtraction, never the free list added
         // beside the zone — that double-counts the same regions.
@@ -13535,9 +13541,17 @@ mod tests {
         let room = sched.admit_headroom(0);
         let budget = sched.admit_budget_terms(&room, 512);
         assert_eq!(
-            budget.floor,
+            budget.decode_floor,
             room.floor().saturating_add(sched.min_forward_tier_bytes()),
             "the floor is the hold, the eviction margin and a forward's tier",
+        );
+        // The prefill floor holds the tier back too: spending weights for rows is a
+        // trade, leaving no ground for the tier is a stall.
+        assert_eq!(
+            budget.prefill_floor,
+            room.prefill_floor()
+                .saturating_add(sched.min_forward_tier_bytes()),
+            "the prefill floor is its own hold, the margin and a forward's tier",
         );
     }
 

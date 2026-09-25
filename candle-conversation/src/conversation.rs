@@ -393,6 +393,25 @@ pub struct Sequence {
 
 /// The dialect's framing markers (`<|im_start|>system`, `<|im_end|>`, …) — the
 /// glue the projection assembler wraps around the system prompt and each turn.
+/// One decoded round of [`Sequence::ingest_roundtrip_chain`].
+///
+/// An ingest that gathers its own evidence needs all three of these: the `text`
+/// to decide whether the model answered or issued a `<tool_call>`, the
+/// `turn_index` to couple that call to the response the caller feeds back, and
+/// the `tokens` to accumulate across the loop into the unit's ingest stat.
+#[derive(Debug, Clone)]
+pub struct ChainRound {
+    /// The decoded assistant text — the unit's summary, or the `<tool_call>` the
+    /// model issued in place of one.
+    pub text: String,
+    /// Sealed index of the decoded turn. Deliberately NOT "the last turn": the
+    /// async summariser can append a turn between the seal and the caller's
+    /// [`Sequence::couple_turn`].
+    pub turn_index: u32,
+    /// Tokens prefilled plus decoded in this round.
+    pub tokens: usize,
+}
+
 /// Returned by [`Sequence::glue_markers`] so the projection panel can render the
 /// framing verbatim.
 #[derive(Debug, Clone)]
@@ -2948,7 +2967,19 @@ impl Sequence {
 
     /// [`Self::ingest_roundtrip_chain_indices`] for a caller that owns the
     /// timeline itself (the serial path): couples the chain here rather than
-    /// leaving it to a splice. Returns tokens ingested.
+    /// leaving it to a splice.
+    ///
+    /// **One round, not a whole ingest.** The decoded text comes back so the
+    /// caller can see whether the model answered or issued a `<tool_call>`, run
+    /// the tool, and submit the response as the next round's `decode_user` with
+    /// an EMPTY `prefilled` — which is how `repo_map` drives a real agentic loop
+    /// over a folder (`zend::repo_scan::converse`). The last turn is left
+    /// uncoupled for exactly that reason: a round that turns out to be a call
+    /// gets coupled to the response the caller then feeds back.
+    ///
+    /// `closing` bans the tool-call opener for this round, forcing an answer in
+    /// prose on whatever the conversation has already gathered — the caller's
+    /// round cap reaching its end.
     pub fn ingest_roundtrip_chain(
         &mut self,
         prefilled: &[(TurnText, String)],
@@ -2957,22 +2988,34 @@ impl Sequence {
         max_summary_tokens: usize,
         force_tools: &[String],
         triggers: Arc<TriggerRegistry>,
-    ) -> crate::Result<usize> {
-        let (indices, tokens) = self.ingest_roundtrip_chain_indices(
+        closing: bool,
+    ) -> crate::Result<ChainRound> {
+        let (indices, prefill_tokens, handle) = self.ingest_chain_submit(
             prefilled,
             decode_user,
             tags,
             max_summary_tokens,
             force_tools,
             triggers,
+            closing,
         )?;
+        let response = handle.wait_cancellable();
+        let (indices, tokens, text) =
+            self.ingest_chain_settle(indices, prefill_tokens, handle, response)?;
         // Couple every turn except the last: each prefilled turn belongs with the
         // one that answers it, so the summariser sees the whole exchange rather
         // than a call with no response.
         for idx in indices.iter().take(indices.len().saturating_sub(1)) {
             self.couple_turn(*idx)?;
         }
-        Ok(tokens)
+        let turn_index = *indices.last().ok_or_else(|| {
+            ConversationError::Channel("round-trip chain: no turns were sealed".into())
+        })?;
+        Ok(ChainRound {
+            text,
+            turn_index,
+            tokens,
+        })
     }
 
     /// Ingest an N-turn tool round-trip whose LAST assistant turn is decoded.
@@ -3009,6 +3052,7 @@ impl Sequence {
             max_summary_tokens,
             force_tools,
             triggers,
+            false,
         )?;
         // Interruptible wait: a graceful shutdown mid-ingest latches the cancel
         // flag, and this returns `IngestCancelled` instead of waiting out the
@@ -3016,7 +3060,9 @@ impl Sequence {
         // the scheduler's decode at its next step. The ingest caller unwinds this
         // as "cancelled", not a decode failure.
         let response = handle.wait_cancellable();
-        self.ingest_chain_settle(indices, prefill_tokens, handle, response)
+        let (indices, tokens, _) =
+            self.ingest_chain_settle(indices, prefill_tokens, handle, response)?;
+        Ok((indices, tokens))
     }
 
     /// [`Self::ingest_roundtrip_chain_indices`] awaited instead of blocked on —
@@ -3039,6 +3085,7 @@ impl Sequence {
             max_summary_tokens,
             force_tools,
             triggers,
+            false,
         )?;
         // Armed across the await like every async turn wait: dropping this
         // future drops the handle (the decode winds down scheduler-side) and
@@ -3046,21 +3093,24 @@ impl Sequence {
         // rejects every later turn with `TurnInFlight`.
         let armed = CancelClearsInFlight::arm(self);
         let response = handle.wait_cancellable_async().await;
-        armed
-            .disarm()
-            .ingest_chain_settle(indices, prefill_tokens, handle, response)
+        let (indices, tokens, _) =
+            armed
+                .disarm()
+                .ingest_chain_settle(indices, prefill_tokens, handle, response)?;
+        Ok((indices, tokens))
     }
 
     /// The tail both chain waits share: propagate the wait's verdict, read the
     /// sealed index off the response, and record the decoded turn with its
-    /// staged provenance events.
+    /// staged provenance events. Returns the sealed indices, the tokens, and the
+    /// decoded text.
     fn ingest_chain_settle(
         &mut self,
         mut indices: Vec<u32>,
         prefill_tokens: usize,
         handle: TurnHandle,
         response: crate::Result<TurnResponse>,
-    ) -> crate::Result<(Vec<u32>, usize)> {
+    ) -> crate::Result<(Vec<u32>, usize, String)> {
         let response = response?;
         let resp_tokens = response.token_ids.len();
         let resp_idx = response
@@ -3075,7 +3125,7 @@ impl Sequence {
         // Records the decoded turn + its staged provenance events.
         self.finish_turn_staged(handle, &response)?;
         indices.push(resp_idx);
-        Ok((indices, prefill_tokens + resp_tokens))
+        Ok((indices, prefill_tokens + resp_tokens, response.text))
     }
 
     /// The head both chain waits share: selection framing, the prefilled turns,
@@ -3089,6 +3139,7 @@ impl Sequence {
         max_summary_tokens: usize,
         force_tools: &[String],
         triggers: Arc<TriggerRegistry>,
+        closing: bool,
     ) -> crate::Result<(Vec<u32>, usize, TurnHandle)> {
         // A scope round-trip frames on the dialogue prompt itself — the persona is
         // deliberately left alone. The turns it seals are later borrowed into
@@ -3185,6 +3236,20 @@ impl Sequence {
         // carries; a fresh `compression()` config would repeat it per summary.
         summary_sampling.line_end_token_ids = Arc::clone(&self.config.sampling.line_end_token_ids);
         summary_sampling.apply_think_mode(ThinkMode::Off, &self.tokenizer, max_summary_tokens);
+        // The CLOSING round of an agentic ingest loop: ban the tool-call opener
+        // so a model still trying to gather evidence cannot open another call and
+        // has to answer on what it already has. Structural, for the same reason
+        // the `<think>` suppression above is: the request's prose asking for an
+        // answer is text the model may ignore, and a round that seals as a
+        // `<tool_call>` with nowhere to send it is the unit's whole budget spent
+        // on no summary at all. Mirrors the live dialogue loop's repeat-guard
+        // closing round.
+        if closing {
+            let open = self.config.sampling.tool_call_open_token_id;
+            if open >= 0 {
+                summary_sampling.banned_tokens.push(open);
+            }
+        }
         let mut opts = TurnOptions {
             max_tokens: Some(max_summary_tokens),
             sampling: Some(summary_sampling),

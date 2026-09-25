@@ -77,8 +77,7 @@ pub(super) fn admit_quantum() -> u64 {
 }
 
 /// Minimum wall-clock between budget cuts driven by a STANDING CONDITION —
-/// [`ThrottleReason::WarmOverBudget`], [`ThrottleReason::WarmBacklog`] — as opposed to
-/// a discrete failure. Sized to a drain pass: a cut lowers the seal rate, which
+/// [`ThrottleReason::WarmOverBudget`] — as opposed to a discrete failure. Sized to a drain pass: a cut lowers the seal rate, which
 /// takes about this long to show up in the signal that caused it, so cutting
 /// faster is deciding against stale evidence. See
 /// `Scheduler::cut_admit_budget_leveled`.
@@ -97,10 +96,6 @@ pub(super) enum ThrottleReason {
     /// The warm KV tier outgrew its host-RAM budget plus the drain pipeline's
     /// slack — admission slows so sealing stops outrunning the warm->cold drain.
     WarmOverBudget,
-    /// The hot->warm drain is falling behind the seal rate.
-    WarmBacklog,
-    /// The drain caught up with room to spare.
-    DrainCaughtUp,
     /// Forwards keep completing out-of-memory-free at the current budget.
     Throughput,
 }
@@ -113,8 +108,6 @@ impl ThrottleReason {
             Self::DeviceOom => "device_oom",
             Self::ReliefSurvived => "relief_survived",
             Self::WarmOverBudget => "warm_over_budget",
-            Self::WarmBacklog => "warm_backlog",
-            Self::DrainCaughtUp => "drain_caught_up",
             Self::Throughput => "throughput",
         }
     }
@@ -170,59 +163,29 @@ pub(super) fn budget_notches(budget: u64, quantum: u64) -> usize {
     (budget / quantum.max(1)) as usize
 }
 
-/// Admission action chosen by the drain-backlog controller.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum BacklogAction {
-    Shrink,
-    Grow,
-    Hold,
-}
-
-/// Pure decision core of the ingest admission regulator: from the live hot->warm
-/// `backlog`, its `target`, the current `budget`/`ceil`, and whether VRAM is
-/// under pressure, decide whether to narrow, widen, or hold ingest admission.
-/// Hysteresis — shrink above `target`, grow only below `target / 2`, hold in the
-/// deadband between — keeps the budget from flapping as the backlog jitters.
-pub(super) fn backlog_admit_action(
-    backlog: u64,
-    target: u64,
-    budget: u64,
-    ceil: u64,
-    vram_pressure: bool,
-) -> BacklogAction {
-    if backlog > target {
-        BacklogAction::Shrink
-    } else if backlog < target / 2 && budget < ceil && !vram_pressure {
-        BacklogAction::Grow
-    } else {
-        BacklogAction::Hold
-    }
-}
-
 /// Evidence-based reopen under chronic nominal VRAM pressure — the escape hatch
 /// from an admission wedge on a card whose steady state reads as "pressured"
 /// forever (a reserved-but-unreclaimable pool gap, a tight budget band). The
 /// AIMD contract says grow only when pressure clears; on such a card it never
 /// does, the budget pins at the floor, and prefill runs single-sequence
 /// mini-forwards at a fraction of batched throughput. The counter-evidence is
-/// throughput itself: when growth is blocked ONLY by the pressure bit (backlog
-/// low, budget below the ceiling) yet forwards keep completing out-of-memory-free
-/// tick after tick, the current budget is proven sustainable — after `need`
+/// throughput itself: when growth is blocked ONLY by the pressure bit — the
+/// budget is below its ceiling and forwards are progressing — yet they keep
+/// completing out-of-memory-free tick after tick, the current budget is proven
+/// sustainable. After `need`
 /// consecutive such ticks, grow one quantum and re-arm. A genuinely
 /// unsustainable budget surfaces as device-OOM or eviction survival, whose cut
 /// resets the streak (multiplicative decrease still wins instantly).
 ///
 /// Returns `(grow_now, new_streak)`.
 pub(super) fn evidence_admit_grow(
-    backlog: u64,
-    target: u64,
     budget: u64,
     ceil: u64,
     progressed: bool,
     streak: usize,
     need: usize,
 ) -> (bool, usize) {
-    if budget >= ceil || backlog >= target / 2 || !progressed {
+    if budget >= ceil || !progressed {
         return (false, 0);
     }
     let streak = streak + 1;
@@ -464,70 +427,29 @@ mod tests {
         let (ceil, need) = (24 * MIB, 3);
         let b = MIB;
         // Streak builds one tick at a time, grows on the third, then re-arms.
-        assert_eq!(
-            evidence_admit_grow(10, 100, b, ceil, true, 0, need),
-            (false, 1)
-        );
-        assert_eq!(
-            evidence_admit_grow(10, 100, b, ceil, true, 1, need),
-            (false, 2)
-        );
-        assert_eq!(
-            evidence_admit_grow(10, 100, b, ceil, true, 2, need),
-            (true, 0)
-        );
+        assert_eq!(evidence_admit_grow(b, ceil, true, 0, need), (false, 1));
+        assert_eq!(evidence_admit_grow(b, ceil, true, 1, need), (false, 2));
+        assert_eq!(evidence_admit_grow(b, ceil, true, 2, need), (true, 0));
         // No forward progress → evidence resets (a stalled pump proves nothing).
-        assert_eq!(
-            evidence_admit_grow(10, 100, b, ceil, false, 2, need),
-            (false, 0)
-        );
-        // Backlog out of the grow band → not a pressure-only block; reset.
-        assert_eq!(
-            evidence_admit_grow(60, 100, b, ceil, true, 2, need),
-            (false, 0)
-        );
+        assert_eq!(evidence_admit_grow(b, ceil, false, 2, need), (false, 0));
         // Budget already at the ceiling → nothing to reopen.
-        assert_eq!(
-            evidence_admit_grow(10, 100, ceil, ceil, true, 2, need),
-            (false, 0)
-        );
+        assert_eq!(evidence_admit_grow(ceil, ceil, true, 2, need), (false, 0));
     }
 
+    /// **The reopen is not gated on the drain backlog any more.**
+    ///
+    /// It was: growth required the hot→warm backlog to sit below half its target,
+    /// which made the drain's lag a veto on the engine's own width. That was the
+    /// ingest throttle, and it is released — completing forwards are the only proof
+    /// this controller needs, and the host-RAM guard is what still bounds the warm
+    /// tier. Pinned because re-adding a backlog term here would quietly restore the
+    /// throttle without touching `regulate_ingest_admission`.
     #[test]
-    fn backlog_admit_action_hysteresis() {
-        use BacklogAction::{Grow, Hold, Shrink};
-        let ceil = 24 * MIB;
-        let target = 8000;
-        let b = 4 * MIB;
-
-        // Above target → shrink, regardless of budget position.
-        assert_eq!(
-            backlog_admit_action(8001, target, ceil, ceil, false),
-            Shrink
-        );
-        assert_eq!(
-            backlog_admit_action(20000, target, MIB, ceil, false),
-            Shrink
-        );
-
-        // Deadband [target/2, target] → hold — no flapping as the backlog jitters.
-        assert_eq!(backlog_admit_action(target, target, b, ceil, false), Hold);
-        assert_eq!(
-            backlog_admit_action(target / 2, target, b, ceil, false),
-            Hold
-        );
-        assert_eq!(backlog_admit_action(5000, target, b, ceil, false), Hold);
-
-        // Below target/2 with headroom and no VRAM pressure → grow.
-        assert_eq!(backlog_admit_action(3999, target, b, ceil, false), Grow);
-        assert_eq!(backlog_admit_action(0, target, MIB, ceil, false), Grow);
-
-        // Grow is suppressed at the ceiling (nothing to reopen)…
-        assert_eq!(backlog_admit_action(0, target, ceil, ceil, false), Hold);
-        // …and while VRAM is under pressure (the hard floor wins over reopening).
-        assert_eq!(backlog_admit_action(0, target, b, ceil, true), Hold);
-        // But a high backlog still shrinks even under VRAM pressure.
-        assert_eq!(backlog_admit_action(9000, target, b, ceil, true), Shrink);
+    fn the_reopen_takes_no_backlog_argument() {
+        let (ceil, need) = (24 * MIB, 3);
+        // Progress alone carries the streak, whatever the drain is doing — there is
+        // no longer any input through which a backlog could refuse it.
+        assert_eq!(evidence_admit_grow(MIB, ceil, true, 2, need), (true, 0));
     }
 
     #[test]
@@ -536,8 +458,6 @@ mod tests {
             (ThrottleReason::DeviceOom, "device_oom"),
             (ThrottleReason::ReliefSurvived, "relief_survived"),
             (ThrottleReason::WarmOverBudget, "warm_over_budget"),
-            (ThrottleReason::WarmBacklog, "warm_backlog"),
-            (ThrottleReason::DrainCaughtUp, "drain_caught_up"),
             (ThrottleReason::Throughput, "throughput"),
         ] {
             assert_eq!(r.as_str(), tag);

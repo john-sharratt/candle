@@ -1,25 +1,24 @@
 //! Indirection between the workspace-ingestion paths and the
 //! underlying [`candle_conversation::Sequence`].
 //!
-//! One operation is abstracted:
+//! One operation is abstracted: **`insert_prefill_turn(user, assistant)`** —
+//! prefill a complete user/assistant exchange with no decode. The prefilled
+//! halves of a tool round-trip (the user-side request or `<tool_response>`, the
+//! assistant-side `<tool_call>` echo) flow through this.
 //!
-//! * **`insert_prefill_turn(user, assistant)`** — prefill a complete
-//!   user/assistant exchange with no decode. The prefilled halves of a tool
-//!   round-trip (the user-side request or `<tool_response>`, the assistant-side
-//!   `<tool_call>` echo) flow through this.
-//! * **`ingest_chain`** — a tool round-trip whose LAST assistant turn is
-//!   DECODED: the `repo_map` layer's per-folder summary. `code_reading` no
-//!   longer prefills anything — each file is a real hidden conversation (see
-//!   `crate::code_read::run_file_conversation`), driven directly through
-//!   `Sequence::submit_turn_with_options` rather than through this sink.
+//! **Nothing here decodes.** Both layers that decode — `code_reading` per file
+//! (`crate::code_read::run_file_conversation`) and `repo_map` per folder
+//! (`crate::repo_scan::converse::run_folder_conversation`) — are real agentic
+//! tool loops, which need to read each round's decoded text and couple the turn
+//! it sealed, so they drive the `Sequence` directly. A sink method that decoded
+//! one round could not carry a loop, and a sink that grew `couple_turn` beside it
+//! would only be mirroring `Sequence` behind a trait.
 //!
 //! Integration tests wire a [`RecordingTurnSink`] that captures every call
 //! into memory, so the conversation shape can be verified without loading a
 //! model.
 
-use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{Sequence, TurnText};
-use std::sync::Arc;
 
 /// Accepts a structured `(user, assistant)` turn stream from the
 /// workspace-ingestion paths.
@@ -35,32 +34,6 @@ pub trait InsertTurnSink {
         assistant: &str,
         tags: Vec<String>,
     ) -> anyhow::Result<usize>;
-
-    /// Ingest an N-turn tool round-trip chain whose LAST assistant turn is
-    /// DECODED — the `repo_map` folder shape. `prefilled` holds the verbatim
-    /// `(user, assistant)` pairs (a request or `<tool_response>` paired with the
-    /// `<tool_call>` it provokes); `decode_user` is the final tool response, whose
-    /// assistant half the model writes. `force_tools` names every tool the
-    /// prefilled calls refer to, so the projection carries their definitions.
-    /// Returns the tokens ingested.
-    ///
-    /// Default (model-less sinks, e.g. tests): record every turn with an empty
-    /// final assistant half — no engine to decode it.
-    fn ingest_chain(
-        &mut self,
-        prefilled: &[(TurnText, String)],
-        decode_user: &TurnText,
-        tags: Vec<String>,
-        _max_summary_tokens: usize,
-        _force_tools: &[String],
-    ) -> anyhow::Result<usize> {
-        let mut total = 0usize;
-        for (user, assistant) in prefilled {
-            total += self.insert_prefill_turn(user, assistant, tags.clone())?;
-        }
-        total += self.insert_prefill_turn(decode_user, "", tags)?;
-        Ok(total)
-    }
 }
 
 /// Sink that drives a live [`Sequence`] — the daemon's production
@@ -68,42 +41,15 @@ pub trait InsertTurnSink {
 /// pass.
 pub struct SequenceTurnSink<'a> {
     inner: &'a mut Sequence,
-    /// Decode steering for the summary turn: the `<think>` trigger bound to
-    /// [`ThinkMode::Off`]'s tree, so the block closes the token after it opens.
-    ///
-    /// Carried on the sink rather than added to the [`InsertTurnSink`] methods
-    /// because the model-less sinks below never decode — they have nothing to
-    /// steer, and a parameter they all had to ignore would say otherwise.
-    triggers: Arc<TriggerRegistry>,
 }
 
 impl<'a> SequenceTurnSink<'a> {
-    pub fn new(inner: &'a mut Sequence, triggers: Arc<TriggerRegistry>) -> Self {
-        Self { inner, triggers }
+    pub fn new(inner: &'a mut Sequence) -> Self {
+        Self { inner }
     }
 }
 
 impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
-    fn ingest_chain(
-        &mut self,
-        prefilled: &[(TurnText, String)],
-        decode_user: &TurnText,
-        tags: Vec<String>,
-        max_summary_tokens: usize,
-        force_tools: &[String],
-    ) -> anyhow::Result<usize> {
-        self.inner
-            .ingest_roundtrip_chain(
-                prefilled,
-                decode_user.clone(),
-                tags,
-                max_summary_tokens,
-                force_tools,
-                Arc::clone(&self.triggers),
-            )
-            .map_err(|e| anyhow::anyhow!("ingest_roundtrip_chain: {e}"))
-    }
-
     fn insert_prefill_turn(
         &mut self,
         user: &TurnText,

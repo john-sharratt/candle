@@ -1,6 +1,6 @@
 use super::admission::{
-    admit_quantum, backlog_admit_action, budget_notches, evidence_admit_grow, evidence_ticks_for,
-    per_block_kv_bytes, BacklogAction, ThrottleReason,
+    admit_quantum, budget_notches, evidence_admit_grow, evidence_ticks_for, per_block_kv_bytes,
+    ThrottleReason,
 };
 use super::admit;
 use super::admit_ground::AdmitPass;
@@ -128,28 +128,6 @@ fn env_pct(var: &str, default: usize, max: usize) -> usize {
 fn ingest_demote_pct() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_pct("CANDLE_INGEST_DEMOTE_PCT", 50, 95))
-}
-/// Target hot→warm drain backlog, as a % of resident capacity, above which
-/// ingest admission throttles down (and below half of which it reopens). This
-/// is the *leading* backpressure signal — it keeps `used` off the warm-starved
-/// climb before the lagging VRAM-pressure trip ever fires. Env
-/// `CANDLE_INGEST_WARM_BACKLOG_PCT`, default 12 (≈ one-to-two passes of headroom
-/// on a ~72 GiB card), clamped to 40.
-fn ingest_warm_backlog_pct() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_pct("CANDLE_INGEST_WARM_BACKLOG_PCT", 12, 40))
-}
-/// Backlog (as a % of resident capacity) above which the wave loop blocks on a
-/// device sync after its eviction callbacks — "heavy pressure". Draining the
-/// primary stream lets the (now cross-layer-batched, short) hot→warm pass run
-/// uncontended by ingest forwards, so it catches up instead of interleaving.
-/// Above the throttle target ([`ingest_warm_backlog_pct`]) so the gentle AIMD
-/// throttle acts first; the sync is the harder stop when that isn't enough. Env
-/// `CANDLE_INGEST_SYNC_CEILING_PCT`, default 25, clamped to 80. Set to a high
-/// value to effectively disable.
-fn ingest_sync_ceiling_pct() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_pct("CANDLE_INGEST_SYNC_CEILING_PCT", 25, 80))
 }
 /// Slack the warm PIPELINE may hold above the standing budget: hot→warm output
 /// that exists only while the drain moves it to cold. On a zero-budget machine
@@ -816,22 +794,6 @@ impl Scheduler {
         candle_nn::kv_cache::region_stats(gpu_id)
     }
 
-    /// The card's resident capacity C (bytes) — the balloon-measured limit
-    /// below which our footprint stays resident (no WDDM paging). Falls back to
-    /// the driver's physical total until the balloon has measured C
-    /// (`capacity()` is 0 then), so a threshold scaled by it is never a
-    /// spurious zero at startup. `None` when unavailable.
-    ///
-    /// Only the host-side warm-tier thresholds still scale by C; the KV side's
-    /// own pressure is counted in regions, not measured against the card.
-    fn resident_capacity(&self) -> Option<usize> {
-        self.session
-            .vram_governor()
-            .map(|g| g.capacity() as usize)
-            .filter(|&c| c > 0)
-            .or_else(|| self.session.vram_free_total().map(|(_, total)| total))
-    }
-
     /// True when the KV side has fewer free regions than the setpoint — the
     /// signal to shed, and failing that to stop admitting.
     ///
@@ -1077,24 +1039,39 @@ impl Scheduler {
                 .saturating_add(warm_pipeline_slack_bytes())
     }
 
+    /// **Ingest is not paced. The engine's own admission governs it.**
+    ///
+    /// This used to run an AIMD controller against the hot→warm backlog: cut the
+    /// admission budget when the drain fell behind the seal rate, reopen a quantum
+    /// when it caught up. That is a throttle on the *ingest*, and it was the wrong
+    /// place to put one. Whether a prefill belongs in the next wave is a question
+    /// the rate model already answers per offer, in the currency that decides it —
+    /// expert bytes over the bus against rows gained (`admit::rate`). The backlog
+    /// controller sat in front of that, cutting the width the model was about to
+    /// judge, on a signal (drain lag) that says nothing about whether the wave gets
+    /// faster. Measured effect: prefill spent long stretches running
+    /// single-sequence mini-forwards at a fraction of batched throughput while the
+    /// model would have admitted more.
+    ///
+    /// What remains is the one condition that is **not** a pacing decision: the
+    /// warm KV tier outgrowing its host-RAM budget. That is a host-OOM guard — it
+    /// has already aborted one full overnight load — and it is a hard cut, not a
+    /// controller. Slowing admission genuinely relieves it (less sealing → less
+    /// hot→warm output), and nothing else in the engine defends host memory.
+    ///
+    /// The reopen stays evidence-based and is no longer gated on the backlog:
+    /// forwards completing out-of-memory-free are proof the current width is
+    /// sustainable, and that is the only proof this controller needs. A device OOM
+    /// or an eviction survival still cuts instantly through
+    /// [`Self::cut_admit_budget_leveled`], which resets the streak.
     pub(super) fn regulate_ingest_admission(&mut self) {
         if self.ingest_timelines.is_empty() {
             return;
         }
-        // Host-tier backpressure: throttle only when the warm KV tier has
-        // outgrown its host-RAM budget plus the drain pipeline's slack — the one
-        // host condition slowing admission can actually relieve. (The old
-        // absolute available-RAM floor sat permanently tripped on any box whose
-        // weights fill RAM, ratcheting the setpoint against structure.)
         if self.warm_over_budget() {
             self.cut_admit_budget_leveled(ThrottleReason::WarmOverBudget);
             return;
         }
-        let Some(capacity) = self.resident_capacity() else {
-            return;
-        };
-        let target = (capacity / 100 * ingest_warm_backlog_pct()) as u64;
-        let backlog = self.persist_trigger.pending_warm_bytes();
         // "Is there room to reopen?" is asked against the STATIC bound, not the
         // live ceiling: this runs every wave, and the live ceiling costs a device
         // query plus a walk of the registered relievers. The live clamp still
@@ -1111,74 +1088,20 @@ impl Scheduler {
         if progressed {
             self.admit_ok_tokens_seen = ok_tokens;
         }
-        match backlog_admit_action(
-            backlog,
-            target,
+        let (grow, streak) = evidence_admit_grow(
             self.admit_budget,
             ceiling,
-            self.vram_under_pressure(),
-        ) {
-            // Drain falling behind the seal rate — throttle admission.
-            BacklogAction::Shrink => self.cut_admit_budget_leveled(ThrottleReason::WarmBacklog),
-            // Drain caught up and VRAM is clear — reopen a quantum.
-            BacklogAction::Grow => {
-                self.admit_grow_streak = 0;
-                self.raise_admit_budget(ThrottleReason::DrainCaughtUp);
-            }
-            // Deadband — or growth blocked only by the pressure bit. The
-            // evidence path reopens a wedged budget on proven OOM-free
-            // throughput (see `evidence_admit_grow`); a real spike still cuts
-            // instantly and resets the streak.
-            BacklogAction::Hold => {
-                let (grow, streak) = evidence_admit_grow(
-                    backlog,
-                    target,
-                    self.admit_budget,
-                    ceiling,
-                    progressed,
-                    self.admit_grow_streak,
-                    // Cost scales with the budget already held, so the climb
-                    // slows as it nears the budget that last collapsed instead
-                    // of charging it at constant speed.
-                    evidence_ticks_for(budget_notches(self.admit_budget, admit_quantum())),
-                );
-                self.admit_grow_streak = streak;
-                if grow {
-                    self.raise_admit_budget(ThrottleReason::Throughput);
-                }
-            }
-        }
-    }
-
-    /// Under **heavy** hot→warm backlog, block the wave loop on a device sync so
-    /// ingest stops racing ahead of the drain. This runs *after* the per-wave
-    /// eviction callbacks, so it also drains the primary stream: the persist
-    /// pass — now a handful of cross-layer-batched kernel launches — runs
-    /// uncontended by ingest forwards instead of interleaving with them on the
-    /// shared stream (the contention that inflates each pass on WDDM). A sync
-    /// only *adds* ordering, so there is no KV-before-copy hazard. No-op unless
-    /// ingesting and the backlog is over [`ingest_sync_ceiling_pct`].
-    pub(super) fn sync_if_backlog_critical(&mut self) {
-        if self.ingest_timelines.is_empty() {
-            return;
-        }
-        let Some(capacity) = self.resident_capacity() else {
-            return;
-        };
-        let ceiling = capacity / 100 * ingest_sync_ceiling_pct();
-        let backlog = self.persist_trigger.pending_warm_bytes() as usize;
-        if backlog <= ceiling {
-            return;
-        }
-        let t = std::time::Instant::now();
-        super::timed_synchronize(&self.device);
-        tracing::debug!(
-            target: "candle_conversation::scheduler::vram_relief",
-            backlog_mib = backlog / (1 << 20),
-            ceiling_mib = ceiling / (1 << 20),
-            stall_ms = t.elapsed().as_millis() as u64,
-            "heavy-backlog device sync (de-contend drain)"
+            progressed,
+            self.admit_grow_streak,
+            // Cost scales with the budget already held, so the climb slows as it
+            // nears the budget that last collapsed instead of charging it at
+            // constant speed.
+            evidence_ticks_for(budget_notches(self.admit_budget, admit_quantum())),
         );
+        self.admit_grow_streak = streak;
+        if grow {
+            self.raise_admit_budget(ThrottleReason::Throughput);
+        }
     }
 
     /// One pass of LRU-smart cold-ingest demotion across every live conversation,

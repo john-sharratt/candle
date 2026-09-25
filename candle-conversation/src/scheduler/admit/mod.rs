@@ -102,8 +102,13 @@ use crate::projection::DecodePriority;
 pub(crate) struct Budget {
     /// Resident weights as the wave opens.
     pub resident: u64,
-    /// The residency admission may not take them under.
-    pub floor: u64,
+    /// The residency a **prefill** admission may not take them under — lower than
+    /// [`Self::decode_floor`], because a prefill's copy amortises over its rows
+    /// while a decode's is charged per layer per step. See
+    /// `WaveRate::prefill_floor`.
+    pub prefill_floor: u64,
+    /// The residency a **decode** admission may not take them under.
+    pub decode_floor: u64,
     /// The widest wave whose transient tier the partition could place — the
     /// gap as it stands plus what the weight side could concede for it. A rate
     /// the tier cannot hold is not a rate the engine can run.
@@ -225,8 +230,11 @@ fn log_refusal(
         dislodged_mib = cost.dislodged_bytes() >> 20,
         resident_before_mib = before >> 20,
         resident_after_mib = after >> 20,
-        floor_mib = budget.floor >> 20,
-        room_mib = before.saturating_sub(budget.floor) >> 20,
+        // Both floors, because a refusal is read against the one its kind stands
+        // on and the gap between them is the prefill's extra room.
+        prefill_floor_mib = budget.prefill_floor >> 20,
+        decode_floor_mib = budget.decode_floor >> 20,
+        room_mib = before.saturating_sub(budget.prefill_floor) >> 20,
         max_rows = budget.max_rows,
         max_decodes = budget.max_decodes,
         refusal = ?refusal,
@@ -269,7 +277,8 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
     let budget = ground.budget();
     rate.reset(
         budget.resident,
-        budget.floor,
+        budget.prefill_floor,
+        budget.decode_floor,
         budget.max_rows,
         budget.max_decodes,
     );
@@ -584,12 +593,18 @@ mod tests {
                 zone: self.zone,
                 zone_min: 4 << 30,
                 zone_max: 10 << 30,
+                zone_min_prefill: 2 << 30,
             }
         }
         fn budget(&self) -> Budget {
             Budget {
                 resident: self.resident,
-                floor: FLOOR,
+                // One floor for both kinds here: these cases are about the rate
+                // model's gain arithmetic and its caps, not about the prefill /
+                // decode split, and giving them the same number keeps each
+                // assertion meaning exactly what it meant before the split.
+                prefill_floor: FLOOR,
+                decode_floor: FLOOR,
                 max_rows: 8_192,
                 max_decodes: 64,
             }

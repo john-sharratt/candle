@@ -11,14 +11,10 @@ use std::path::Path;
 
 use candle_conversation::models::Dialect;
 use candle_conversation::stencil::ToolCallEnvelope;
-use zend::repo_scan::render::{render_chain, CHAIN_TOOLS};
+use zend::repo_scan::render::render_chain;
 use zend::repo_scan::{build_units, walk_workspace, DirState, DirUnit};
 use zend::turn_sink::{InsertTurnSink, RecordingTurnSink};
 use zend_tools::ToolContext;
-
-/// Same budget the daemon passes; irrelevant to a model-less sink but keeps the
-/// call identical to the production one.
-const SUMMARY_TOKENS: usize = 200;
 
 fn write(root: &Path, rel: &str, body: &[u8]) {
     let path = root.join(rel);
@@ -53,26 +49,27 @@ fn units_of(root: &Path) -> Vec<DirUnit> {
     build_units(&walk_workspace(root, None))
 }
 
-/// Run every unit's chain through a recording sink, exactly as
-/// `process_one_dir` runs it through the live one.
+/// Record every unit's SEED chain — the prefilled request/`file_list` pair and
+/// the listing response whose assistant half `converse::run_folder_conversation`
+/// decodes. The decode and any follow-up tool round it drives need a model, so
+/// they are the live daemon's half; what is asserted here is the turn shape that
+/// reaches the conversation before the first decode, which is where every
+/// rendering defect lives.
 fn record(root: &Path) -> RecordingTurnSink {
     let ctx = ToolContext::with_workspace(root);
-    let force: Vec<String> = CHAIN_TOOLS.iter().map(|t| t.to_string()).collect();
     let mut sink = RecordingTurnSink::new();
     // ChatML's envelope, matching this suite's existing JSON-shaped
     // expectations; `render::tests::tool_calls_follow_the_dialects_call_style`
     // is what holds the other style.
     let env = ToolCallEnvelope::for_dialect(&Dialect::chat_ml());
     for unit in units_of(root) {
+        let tags = vec!["repo_map".to_string(), unit.dir.clone()];
         let (prefilled, decode_user) = render_chain(&ctx, &unit, &env);
-        sink.ingest_chain(
-            &prefilled,
-            &decode_user,
-            vec!["repo_map".to_string(), unit.dir.clone()],
-            SUMMARY_TOKENS,
-            &force,
-        )
-        .unwrap();
+        for (user, assistant) in &prefilled {
+            sink.insert_prefill_turn(user, assistant, tags.clone())
+                .unwrap();
+        }
+        sink.insert_prefill_turn(&decode_user, "", tags).unwrap();
     }
     sink
 }
