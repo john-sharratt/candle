@@ -2879,6 +2879,15 @@ impl Qwen4ExpBatched {
                                 .contiguous()?,
                             0,
                         )?;
+                        // The whole attention block, not just its kernel.
+                        // `decode:kernel` and `prefill:kernel` are reported by the
+                        // kernel wrappers themselves, so the projections, rope, KV
+                        // append and out-proj around them were unattributed — and
+                        // `fwd_routing_wait`'s sync collected them. The difference
+                        // between this span and the kernel row inside it is that
+                        // surrounding work.
+                        let g_attn =
+                            crate::models::profile::gpu_span("q4e:attn_decode", dev);
                         let out = forward_attn_batched(
                             &alayer,
                             dec_c,
@@ -2889,6 +2898,7 @@ impl Qwen4ExpBatched {
                             dec_sel.as_ref(),
                             mix_wave.as_ref(),
                         )?;
+                        g_attn.end();
                         parts.push(out.reshape((n_decode, n_embd))?);
                     }
                     if pre_rows > 0 {
@@ -2898,6 +2908,8 @@ impl Qwen4ExpBatched {
                                 .contiguous()?,
                             0,
                         )?;
+                        let g_attn =
+                            crate::models::profile::gpu_span("q4e:attn_prefill", dev);
                         let out = forward_attn_batched(
                             &alayer,
                             pre_c,
@@ -2908,6 +2920,7 @@ impl Qwen4ExpBatched {
                             pre_sel.as_ref(),
                             mix_wave.as_ref(),
                         )?;
+                        g_attn.end();
                         parts.push(out.reshape((pre_rows, n_embd))?);
                     }
                     if parts.len() == 1 {
@@ -2971,12 +2984,14 @@ impl Qwen4ExpBatched {
             // row is recorded §0.4 work.
             // Raw Σx — a language model's block sums stay far below f16's
             // ceiling. (`Off` produces no q8a128 here anyway.)
+            let g_acts = crate::models::profile::gpu_span("q4e:moe_acts", dev);
             let acts = to_dynamic(
                 &h2_3d,
                 candle::quantized::Int8Mode::Off,
                 cuda,
                 candle::quantized::SumScale::Raw,
             )?;
+            g_acts.end();
             #[cfg(feature = "tensor-assert")]
             {
                 use crate::models::qwen35::quantized_moe::shared_expert_contribution;
@@ -2995,10 +3010,20 @@ impl Qwen4ExpBatched {
             // On the FFN span, like the mixer's output above: the combine below
             // reads it inside the same phase, so owning it was a full
             // `[rows, n_embd]` copy into a pool allocation on *every* layer.
+            //
+            // **Spanned because the routing readback syncs.** This is 512 experts
+            // per layer and the largest block of device work in the model, and it
+            // had no span of its own — so its time was collected by
+            // `fwd_routing_wait`, which drains the stream and therefore charges
+            // itself for everything enqueued and unfinished ahead of it. That made
+            // the profile's largest row a measure of the queue rather than of the
+            // readback, and left the work that filled the queue unattributed.
+            let g_moe = crate::models::profile::gpu_span("q4e:moe_routed", dev);
             let y2 = layer
                 .moe
                 .forward_dynamic(acts, DType::F32, n_decode, moe_wave)?
                 .reshape((total_rows, n_embd))?;
+            g_moe.end();
             #[cfg(feature = "tensor-assert")]
             probe(li, "moe.y2", &y2);
             let g_comb2 = crate::models::profile::gpu_span("q4e:gr_combine_ffn", dev);

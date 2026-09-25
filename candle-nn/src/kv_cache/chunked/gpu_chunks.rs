@@ -25,7 +25,7 @@ use crate::kv_cache::arena_table::N_PALETTE;
 use candle::cuda_backend::cudarc::driver::result::memcpy_htod_async;
 use candle::cuda_backend::cudarc::driver::{CudaEvent, CudaStream};
 use candle::cuda_backend::WrapErr;
-use candle::quantized::pinned_staging::PinnedBuf;
+use candle::quantized::pinned_staging::{give_recycled_wc, take_recycled_wc, PinnedBuf};
 use std::sync::Arc;
 
 /// Cached host + device-side serialised slot-state for one sequence.
@@ -99,10 +99,24 @@ struct Staging {
 impl Staging {
     fn empty() -> Self {
         Self {
-            // alloc_owned(0) returns a zero-len Bump variant — no CUDA call.
-            buf: PinnedBuf::alloc_owned(0).expect("zero-len PinnedBuf alloc cannot fail"),
+            buf: Self::no_buf(),
             done: None,
         }
+    }
+
+    /// The zero-length placeholder a `Staging` holds before its first upload.
+    /// `alloc_owned(0)` returns a zero-len `Bump` variant — no CUDA call.
+    fn no_buf() -> PinnedBuf {
+        PinnedBuf::alloc_owned(0).expect("zero-len PinnedBuf alloc cannot fail")
+    }
+
+    /// Take the pinned buffer out, leaving the placeholder.
+    ///
+    /// The caller must have fenced this staging's copies first: the recycler hands
+    /// the same pages to the next taker, so a copy still reading them would read
+    /// another owner's bytes.
+    fn take_buf(&mut self) -> PinnedBuf {
+        std::mem::replace(&mut self.buf, Self::no_buf())
     }
 
     /// Whether a copy out of this buffer may still be waiting in the stream.
@@ -775,8 +789,19 @@ impl Drop for GpuChunksGuard<'_> {
         if staging.buf.len() < total {
             // No copy reads this buffer any more — it was free, or waited on
             // above — so replacing it frees nothing a copy still needs.
-            match slot_state_arena::class_bytes_for(total).and_then(PinnedBuf::alloc_owned) {
-                Ok(buf) => staging.buf = buf,
+            // **Through the recycler, because `cuMemHostAlloc` is ~1 ms.** Every
+            // `(layer, slot)` owns two of these and a prefill rebuilds each about
+            // once, so this branch was a first touch nearly every time it ran:
+            // measured on the Flash-Next gate at 16 slots, 416 allocations and
+            // 417 ms — 97.6% of the slot-state rebuild. Recycling takes it to 1.6 ms.
+            // The sizes come from `class_bytes_for`, so the recycler's exact-length
+            // keys are a short ladder that hits.
+            match slot_state_arena::class_bytes_for(total).and_then(take_recycled_wc) {
+                Ok(buf) => {
+                    // The buffer it replaces is idle by the same argument as above,
+                    // so it goes back for the next taker rather than to the driver.
+                    give_recycled_wc(std::mem::replace(&mut staging.buf, buf));
+                }
                 Err(e) => {
                     // No pinned memory to stage through. Upload straight from
                     // the host copy and drain the stream before returning, so
@@ -873,6 +898,13 @@ impl Drop for GpuChunks {
         // claims from immediately). Stream ordering covers the copies enqueued
         // before the handover, not one already in flight toward the slot.
         self.fence_uploads();
+        // The fence retired every copy out of these buffers, so their pages are
+        // idle and the next `(layer, slot)` needing this size can have them
+        // instead of paying `cuMemHostAlloc` again. Returned here and not in
+        // `clear`, which keeps the buffers on purpose for the next fill.
+        for s in self.staging.iter_mut() {
+            give_recycled_wc(s.take_buf());
+        }
         self.release_slot();
     }
 }

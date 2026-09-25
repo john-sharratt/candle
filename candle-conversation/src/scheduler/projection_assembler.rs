@@ -1227,20 +1227,36 @@ fn inject_sealed_section(
         }
     };
     inject_arc_sealed(ctx.session, parent_id, &sealed)?;
-    // Unconditional, because the interesting case is the one that logs nothing.
-    // A section reaching here with no blob takes the gap branch and says so; a
-    // section that never reaches here at all is invisible, and telling those two
-    // apart is the whole question when a slot ends up holding an unindexed
-    // prefix. `section_positional` is filled by `ingest_section` and by nothing
-    // else, so a RECOVERED section — one the substrate reload brought back
-    // rather than re-ingested — has no entry no matter how sound its K/V is.
-    tracing::debug!(
-        target: "candle_conversation::scheduler::reproject",
-        slot = parent_id.0,
-        section = sid.raw(),
-        has_page = ctx.section_positional.contains_key(&sid),
-        "apply_projection: injecting section K/V",
-    );
+    // **Only the anomaly earns a debug line.** The case worth seeing is a section
+    // that reaches here with no positional blob: `section_positional` is filled by
+    // `ingest_section` and by nothing else, so a RECOVERED section — one the
+    // substrate reload brought back rather than re-ingested — has no entry no
+    // matter how sound its K/V is, and that is what leaves a slot holding an
+    // unindexed prefix.
+    //
+    // This was unconditional, on the reasoning that a section which never reaches
+    // here at all is invisible and telling the two apart is the whole question.
+    // Measured over one daemon run, that cost 1,609 lines of a 4,315-line log —
+    // 37% of it — and the anomaly fired **zero** times, so the volume was paid
+    // entirely to restate the ordinary case. The count is not lost: the
+    // `reproject (zero-copy rebuild)` line already carries `sections`, so "did
+    // sections reach here" is answerable at debug without a line each.
+    let has_page = ctx.section_positional.contains_key(&sid);
+    if has_page {
+        tracing::trace!(
+            target: "candle_conversation::scheduler::reproject",
+            slot = parent_id.0,
+            section = sid.raw(),
+            "apply_projection: injecting section K/V",
+        );
+    } else {
+        tracing::debug!(
+            target: "candle_conversation::scheduler::reproject",
+            slot = parent_id.0,
+            section = sid.raw(),
+            "apply_projection: injecting section K/V with no positional page",
+        );
+    }
     // The rows that go with those chunks. Borrowing the K/V is what makes this
     // path cheap; the index cannot be borrowed the same way, because its keys
     // come from hidden states this slot never computed.

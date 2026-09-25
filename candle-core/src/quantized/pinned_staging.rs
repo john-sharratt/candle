@@ -362,6 +362,109 @@ impl PinnedBuf {
     }
 }
 
+/// Most bytes the recycler keeps pinned while idle.
+///
+/// Pinned pages are a scarce host-wide resource, so an unbounded pool would
+/// trade a latency problem for a footprint one. At this cap the pool holds the
+/// working set of a wide wave's slot-state staging (a few KiB per buffer, two per
+/// resident `(layer, slot)`) and hands the surplus back to the driver.
+const RECYCLER_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Idle write-combined buffers, keyed by exact byte length.
+///
+/// Exact length rather than a range because every caller sizes through
+/// `class_bytes_for`, so the keys are already a short doubling ladder and an
+/// exact match is both a hit and a perfect fit.
+struct RecyclerState {
+    by_len: std::collections::HashMap<usize, Vec<PinnedBuf>>,
+    bytes: usize,
+}
+
+impl RecyclerState {
+    /// An idle buffer of exactly `len` bytes, if one is held.
+    fn take(&mut self, len: usize) -> Option<PinnedBuf> {
+        let bufs = self.by_len.get_mut(&len)?;
+        let buf = bufs.pop()?;
+        self.bytes -= len;
+        Some(buf)
+    }
+
+    /// Keep `buf` for reuse, or return it (to be dropped) when that would put
+    /// the pool over [`RECYCLER_MAX_BYTES`].
+    fn give(&mut self, buf: PinnedBuf) -> Option<PinnedBuf> {
+        let len = buf.len();
+        if len == 0 || self.bytes + len > RECYCLER_MAX_BYTES {
+            return Some(buf);
+        }
+        self.bytes += len;
+        self.by_len.entry(len).or_default().push(buf);
+        None
+    }
+}
+
+fn recycler() -> &'static std::sync::Mutex<RecyclerState> {
+    static POOL: std::sync::OnceLock<std::sync::Mutex<RecyclerState>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        std::sync::Mutex::new(RecyclerState {
+            by_len: std::collections::HashMap::new(),
+            bytes: 0,
+        })
+    })
+}
+
+/// A write-combined pinned buffer of `len` bytes, recycled when one is idle.
+///
+/// **`cuMemHostAlloc` is not cheap and it is not amortised by holding the buffer.**
+/// It pins pages, and measured on the Flash-Next prefill gate it costs ~0.98 ms —
+/// which was **97.6%** of a KV slot-state rebuild and ~9% of prefill wall at 16
+/// slots. It looked amortised because each buffer is allocated once, but there are
+/// two per `(layer, slot)` and a prefill only rebuilds each a couple of times, so
+/// in practice almost every rebuild paid a first touch: 416 allocations at 16
+/// slots, 417 ms. Recycling turns that into two allocations and 414 pool hits.
+///
+/// Pairs with [`give_recycled_wc`], which is the only sanctioned way back. The
+/// pool is **write-combined only** — `alloc_owned`'s flags — because WC memory is
+/// fast for CPU writes and slow for CPU reads, so handing one to a reader would be
+/// a silent performance fault rather than an error.
+pub fn take_recycled_wc(len: usize) -> Result<PinnedBuf> {
+    if len > 0 {
+        if let Ok(mut pool) = recycler().lock() {
+            if let Some(buf) = pool.take(len) {
+                return Ok(buf);
+            }
+        }
+    }
+    PinnedBuf::alloc_owned(len)
+}
+
+/// Hand a buffer from [`take_recycled_wc`] back for reuse.
+///
+/// **The caller guarantees no copy is still reading it.** The pool hands the same
+/// pages to the next taker, so returning a buffer with a `memcpy_htod_async` in
+/// flight out of it would let that copy read another owner's bytes — silently,
+/// since both are valid pinned memory. Return it only after the fence that
+/// retires its copies.
+///
+/// Only [`PinnedBuf::Owned`] is kept: a `Bump` belongs to a stager arena, and a
+/// `Host` vector is cheap to reallocate and is not pinned.
+pub fn give_recycled_wc(buf: PinnedBuf) {
+    if !matches!(buf, PinnedBuf::Owned { .. }) {
+        return;
+    }
+    if let Ok(mut pool) = recycler().lock() {
+        // A refused buffer comes back and drops here, freeing its pages.
+        let _ = pool.give(buf);
+    }
+}
+
+/// Idle buffers held, and their total bytes.
+pub fn recycled_stats() -> (usize, usize) {
+    match recycler().lock() {
+        Ok(pool) => (pool.by_len.values().map(|v| v.len()).sum(), pool.bytes),
+        Err(_) => (0, 0),
+    }
+}
+
 impl Drop for PinnedBuf {
     fn drop(&mut self) {
         if let Self::Owned { ptr, len } = self {
@@ -1094,5 +1197,80 @@ mod fallible_alloc_tests {
     fn small_alloc_succeeds() {
         let b = PinnedBuf::alloc_default_or_host_fallible(4096).expect("4 KiB staging");
         assert!(b.len() >= 4096);
+    }
+
+    /// A stand-in buffer of `len` bytes. `Host`, so the recycler's bookkeeping is
+    /// testable with no CUDA context — `cuMemHostAlloc` is exactly what these
+    /// tests exist to avoid calling.
+    fn stub(len: usize) -> PinnedBuf {
+        PinnedBuf::Host {
+            data: vec![0u8; len],
+        }
+    }
+
+    fn empty_state() -> RecyclerState {
+        RecyclerState {
+            by_len: std::collections::HashMap::new(),
+            bytes: 0,
+        }
+    }
+
+    /// **A returned buffer comes back to the next taker of the same size**, which
+    /// is the whole point: the second take must not reach the allocator.
+    #[test]
+    fn a_returned_buffer_is_handed_to_the_next_taker() {
+        let mut pool = empty_state();
+        assert!(pool.take(4096).is_none(), "nothing held yet");
+        assert!(pool.give(stub(4096)).is_none(), "retained");
+        assert_eq!(pool.bytes, 4096);
+        let got = pool.take(4096).expect("the buffer comes back");
+        assert_eq!(got.len(), 4096);
+        assert_eq!(pool.bytes, 0, "taking it back un-counts the bytes");
+    }
+
+    /// **Sizes do not substitute for each other.** A 4 KiB buffer handed to a
+    /// caller that asked for 8 KiB would be short, and the copy out of it would
+    /// read past its end.
+    #[test]
+    fn a_different_size_is_not_a_hit() {
+        let mut pool = empty_state();
+        pool.give(stub(4096));
+        assert!(pool.take(8192).is_none(), "8 KiB is not served by 4 KiB");
+        assert!(pool.take(4096).is_some(), "its own size still hits");
+    }
+
+    /// **The pool is capped, and refuses by handing the buffer back.** Pinned
+    /// pages are host-wide, so an unbounded pool would trade this latency fix for
+    /// a footprint problem; a refusal returns the buffer so the caller's drop
+    /// frees it.
+    #[test]
+    fn the_cap_refuses_and_returns_the_buffer() {
+        let mut pool = empty_state();
+        let big = RECYCLER_MAX_BYTES;
+        assert!(pool.give(stub(big)).is_none(), "the first one fits exactly");
+        assert_eq!(pool.bytes, big);
+        let refused = pool.give(stub(4096)).expect("over the cap, handed back");
+        assert_eq!(refused.len(), 4096);
+        assert_eq!(pool.bytes, big, "a refusal does not count toward the pool");
+    }
+
+    /// A zero-length buffer is not worth a slot: `alloc_owned(0)` is already a
+    /// no-CUDA `Bump` and every `Staging` starts with one.
+    #[test]
+    fn a_zero_length_buffer_is_not_pooled() {
+        let mut pool = empty_state();
+        assert!(pool.give(stub(0)).is_some(), "handed back, not retained");
+        assert_eq!(pool.bytes, 0);
+    }
+
+    /// Only `Owned` is pooled. A `Bump` points into a stager arena that will reset
+    /// under it, and a `Host` vector is not pinned, so neither may be recycled as
+    /// though it were a pinned buffer this pool owns.
+    #[test]
+    fn the_public_return_path_keeps_only_owned_buffers() {
+        let (_, before) = recycled_stats();
+        give_recycled_wc(stub(4096));
+        let (_, after) = recycled_stats();
+        assert_eq!(after, before, "a Host buffer is not taken into the pool");
     }
 }

@@ -2370,7 +2370,13 @@ impl Conversation {
             // normalization lock and — on the seal scan only — observes into the
             // hit levels. The counts say whether a phase grew because the corpus
             // did.
-            tracing::debug!(
+            //
+            // `trace!`, because this is per group and there are ~17 of them per
+            // scan: it was 1,262 lines of a 4,315-line daemon log, and the
+            // `belief scan phase split` line above already carries the per-scan
+            // totals that answer "did a phase grow". Raise the target to trace
+            // when the question is which *group* grew.
+            tracing::trace!(
                 target: "candle_conversation::provenance",
                 layer = %layer.name,
                 group = group.id.raw(),
