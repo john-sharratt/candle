@@ -32,7 +32,13 @@ pub async fn me(
     headers: HeaderMap,
 ) -> Json<Me> {
     let peer = peer.map(|ConnectInfo(a)| a.ip());
-    let role = access::role(&headers, peer, session.gateways(), session.roles());
+    let role = access::role(
+        &headers,
+        peer,
+        session.gateways(),
+        session.roles(),
+        session.local_signin(),
+    );
     Json(Me {
         role,
         tool_modes: access::allowed_modes(role)

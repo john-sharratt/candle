@@ -4567,6 +4567,11 @@ impl ZendSession {
         &self.config.gateways
     }
 
+    /// `--local-signin`'s email, if set — see [`crate::access::role`].
+    pub fn local_signin(&self) -> Option<&str> {
+        self.config.local_signin.as_deref()
+    }
+
     pub fn new(config: DaemonConfig, log: Arc<LogBus>) -> Self {
         let projection_builder = build_projection_builder(&config.workspace);
         tracing::info!(workspace = %config.workspace.display(), "session initialised");

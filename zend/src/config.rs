@@ -104,6 +104,10 @@ pub struct DaemonConfig {
     /// The peers whose identity headers are believed — see
     /// [`crate::access::Gateways`]. Loopback only unless the daemon names more.
     pub gateways: Gateways,
+    /// `--local-signin <email>`: the identity a loopback caller with no
+    /// forwarded `x-tokera-*` headers is recognized as — see
+    /// [`crate::access::role`]. `None` unless the daemon was started with it.
+    pub local_signin: Option<String>,
 }
 
 /// Which model a daemon runs.

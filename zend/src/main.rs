@@ -211,6 +211,17 @@ struct Cli {
     /// machine that reaches the port directly cannot claim to be an admin.
     #[arg(long, value_name = "IP")]
     gateway: Vec<IpAddr>,
+
+    /// Recognize a loopback caller that sends no `x-tokera-*` headers as this
+    /// email, resolved against `zend.roles.yaml` — for running zend directly,
+    /// with no Tokera gateway in front of it, and still being seen as an
+    /// admin or creator on this machine. Never applies to a request that
+    /// carries a forwarded identity, or to a peer that is not genuine
+    /// loopback (a `--gateway` included). Off by default: any other local
+    /// process or account on this machine can also be recognized as this
+    /// email while it is set.
+    #[arg(long, value_name = "EMAIL")]
+    local_signin: Option<String>,
 }
 
 /// A `--model` value: the preset whose variant name it is.
@@ -465,6 +476,14 @@ async fn main() -> anyhow::Result<()> {
         trusted = %gateways,
         "identity headers are believed only from these peers; every other caller is anonymous",
     );
+    if let Some(email) = &cli.local_signin {
+        tracing::warn!(
+            email = %email,
+            "--local-signin: a loopback caller with no forwarded identity is recognized as \
+             this email — ANY other process or account on this machine can reach zend's port \
+             and be recognized the same way while this flag is set",
+        );
+    }
 
     let config = DaemonConfig {
         workspace: workspace.clone(),
@@ -483,6 +502,7 @@ async fn main() -> anyhow::Result<()> {
         summarize: cli.summarize,
         roles: access::roles(),
         gateways,
+        local_signin: cli.local_signin.clone(),
     };
 
     if !disabled_layers.is_empty() {
