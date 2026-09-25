@@ -2808,6 +2808,19 @@ mod tests {
                 num_repeats: 1,
                 test_mode: Some(TestMode::StoryRewrite),
             },
+            // C8 sits between two rungs that pass and was simply absent from this
+            // ladder — the one model in the sweep whose top rungs were never
+            // exercised contiguously, which is where a selection defect hides.
+            TestConfig {
+                mode: InferenceMode::C8,
+                use_batched: true,
+                #[cfg(feature = "huge-context")]
+                num_contexts: 10,
+                #[cfg(not(feature = "huge-context"))]
+                num_contexts: 2,
+                num_repeats: 1,
+                test_mode: Some(TestMode::StoryRewrite),
+            },
             TestConfig {
                 mode: InferenceMode::C9,
                 use_batched: true,
@@ -2818,16 +2831,16 @@ mod tests {
                 num_repeats: 1,
                 test_mode: Some(TestMode::StoryRewrite),
             },
-            /*
-            // C10 does not work on this model, the compression is just too much
             TestConfig {
                 mode: InferenceMode::C10,
                 use_batched: true,
-                num_contexts: 5,
+                #[cfg(feature = "huge-context")]
+                num_contexts: 10,
+                #[cfg(not(feature = "huge-context"))]
+                num_contexts: 2,
                 num_repeats: 1,
                 test_mode: Some(TestMode::StoryRewrite),
             },
-            */
             // BF16 single context (after everything is warm)
             TestConfig {
                 mode: InferenceMode::BF16,

@@ -435,9 +435,47 @@ impl KvErrorThresholdFactors {
 }
 
 /// Tuned for Qwen3-30B-A3B (MoE).
+///
+/// Re-derived 2026-09-25 (`k_low: 1.200 -> 1.000`) — the first time this row has
+/// been touched since it was imported, and the change that brings **C10 into the
+/// gate for this model at all**. Until now `quantized_qwen3_moe`'s C10 rung was
+/// commented out as "the compression is just too much"; it is measured here as a
+/// threshold, not a model limit.
+///
+/// **K was the aggressive side, not V, and the level's own doc comment is what
+/// hid it.** `InferenceMode::C10` is described as "K same as C9, V pushed
+/// further", which is true of the *candidate format list* and not of the
+/// thresholds: from C9 to C10 the shared tables move K high +14.5% and K low
+/// +20.7% against V high's +2.5%. V low does take the largest single step
+/// (+43.3%), which is why the V side looks like the obvious lever and is the
+/// wrong one here. This model is also the widest lo/hi clamp range in the table —
+/// `k_low/k_hi` = 29x, against Qwen3-8B's 18.5x — so a below-median block's K
+/// threshold could scale further out than on any other row.
+///
+/// Measured on the RTX PRO 5000, C10x2 StoryRewrite, sessions passing validation:
+///
+/// | side | value | C10 | mean C0-C9 ratio |
+/// |---|---|---|---|
+/// | K (chosen) | `k_low` 1.200 | 0/2 | 3.77x (baseline) |
+/// | K | `k_low` 1.100 | 1/2 | — |
+/// | K | `k_low` **1.000** | **2/2** | 3.75x (**-0.6%**) |
+/// | V (rejected) | `v_hi` 1.062 | 1/2 | — |
+/// | V (rejected) | `v_hi` 0.899 + `v_low` 2.598 | 2/2 | 3.59x (-4.7%) |
+///
+/// The graded 0/2 -> 1/2 -> 2/2 response is what identifies this as a threshold:
+/// a model-accuracy fault does not walk toward passing as the bound tightens.
+/// The V route reaches the same pass at eight times the cost and a *lower* top
+/// rung (C10 5.36x vs 5.50x), because tightening V spends ratio on all eleven
+/// levels to fix one. 1.000 sits one 0.100 step inside the measured edge, the
+/// same margin the C10 threshold note below uses, so ordinary upstream drift does
+/// not put the row back on an edge.
+///
+/// Cost at the rungs that already passed: C0 unchanged at 1.98x, C9 5.31x ->
+/// 5.24x, and C10 arrives at 5.50x — above the old C9, so the rung earns its
+/// place rather than merely existing.
 pub const QWEN3_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
     k_hi: 0.475,
-    k_low: 1.200,
+    k_low: 1.000,
     v_hi: 1.225,
     v_low: 2.700,
 };

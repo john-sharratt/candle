@@ -8919,9 +8919,18 @@ impl Scheduler {
                 .prefill_width_cap(self.session.activation_dtype()),
             // The KV side's own bound: the admit phase claims every chunk a
             // forward will write before it computes anything, so a chunk wider
-            // than the free regions can back fails part way through claiming.
-            self.kv_region_state(prefill::VramPhase::Load)
-                .map(|(free, _)| free.saturating_mul(CHUNK_SIZE)),
+            // than the free ground can back fails part way through claiming.
+            //
+            // Priced through `kv_token_cap`, which is the only thing here that
+            // knows the units. The KV side counts 16 MiB regions and this budget
+            // is in tokens; `vram_budget_available` is that same free count in
+            // bytes (`(free + blocked) × REGION_BYTES`, so it reads the ground a
+            // standing tier releases before these claims run, exactly as
+            // `kv_region_state` does), and the block price turns bytes into
+            // tokens.
+            self.session
+                .vram_budget_available()
+                .and_then(|free| admit::pass_budget::kv_token_cap(free, self.per_block_kv_bytes())),
             // A tier budget that prices to a single row would make no progress,
             // so the cap never falls below one chunk.
             CHUNK_SIZE,

@@ -4905,6 +4905,40 @@ fn orphans(segs: &[(u64, PathBuf, bool)]) -> Result<()> {
 /// (`n_chunks` a whole multiple of the turn's block span), Tokens present and
 /// decodable — and prints a per-turn verdict plus a summary of any problems, so a
 /// conversation can be hand-checked end to end.
+/// Conversation-metadata keys whose presence means "this timeline's K/V was
+/// never going to be on disk".
+///
+/// **Nothing else on disk can answer this.** A timeline marked
+/// `mark_timeline_transient` carries `SequenceResidence::no_cold_persist`, which
+/// is in-memory state with no record of its own — so a turn of one lands in the
+/// log with a decl, its tokens and a block range, and no `Chunk` records at all.
+/// On disk that is byte-for-byte what a turn looks like after a hard kill lost
+/// its K/V, and the two have opposite meanings. The marker its creator writes at
+/// creation (zend's calibration phase tags each exemplar so a half-finished case
+/// is findable on the next load) is the only durable thing that separates them.
+///
+/// Measured on a live 1,465-conversation store: 3,098 turns reported
+/// `MISSING KV`, across 883 timelines, 781 of them a single-turn tool
+/// calibration exemplar holding `n_tok=692` and zero chunks — every one of them
+/// intentional. The count is the problem, not the noise: real damage is a
+/// handful of turns, and it was invisible in a list of three thousand.
+///
+/// This names zend's key from candle-conversation's own inspector, which is a
+/// coupling worth stating: the substrate does not know what a calibration
+/// exemplar is, and until the transient mark is itself durable this is where the
+/// knowledge has to live. Listed rather than singular so a second producer of
+/// deliberately K/V-free conversations can be added beside it.
+const TRANSIENT_BY_DESIGN_KEYS: [&str; 1] = ["calib"];
+
+/// Whether `timeline` carries any [`TRANSIENT_BY_DESIGN_KEYS`] marker.
+fn is_transient_by_design(substrate: &Substrate, timeline: TimelineId) -> bool {
+    substrate.custom_of(timeline).is_some_and(|custom| {
+        TRANSIENT_BY_DESIGN_KEYS
+            .iter()
+            .any(|key| custom.contains_key(*key))
+    })
+}
+
 fn dump_merged(
     segs: &[(u64, PathBuf, bool)],
     only_timeline: Option<u64>,
@@ -4923,6 +4957,9 @@ fn dump_merged(
         /// Timeline tombstoned — logically deleted, so the compactor reclaims
         /// its content whatever its distill mode. See `dead`, below.
         tombstoned: bool,
+        /// Timeline whose K/V was never meant to reach the log, identified by the
+        /// durable marker its creator writes. See [`TRANSIENT_BY_DESIGN_KEYS`].
+        transient_by_design: bool,
         kind: TurnKind,
         children: Vec<u32>,
         proj: Option<Vec<u8>>,
@@ -4958,6 +4995,7 @@ fn dump_merged(
             // missing-record checks (mirrors `integrity::classify_turn`).
             distill: tl.and_then(|tl| substrate.distill_mode(tl)),
             tombstoned: tl.is_some_and(|tl| substrate.tombstoned_timelines().contains(&tl)),
+            transient_by_design: tl.is_some_and(|tl| is_transient_by_design(&substrate, tl)),
             kind,
             children,
             proj,
@@ -5065,7 +5103,13 @@ fn dump_merged(
                 issues.push("EMPTY TOKENS".into());
             }
             if n_chunks == 0 {
-                issues.push("MISSING KV".into());
+                // **The exemption covers the K/V only, not the tokens above.** A
+                // transient timeline sheds its K/V by design and keeps its text;
+                // a turn of one that has lost its tokens as well is real damage
+                // and is still reported.
+                if !t.transient_by_design {
+                    issues.push("MISSING KV".into());
+                }
             } else if n_chunks % blks != 0 {
                 issues.push(format!(
                     "KV GRID INCONSISTENT ({n_chunks} chunks / {blks} blocks)"
@@ -5082,11 +5126,12 @@ fn dump_merged(
             // no content because it was reclaimed reads identically to one that
             // never lost anything, and the difference is the whole question when
             // hunting for damage.
-            match (t.distill, dead) {
-                (Some(m), true) => format!("OK (distilled {m:?}, tombstoned)"),
-                (Some(m), false) => format!("OK (distilled {m:?})"),
-                (None, true) => "OK (tombstoned)".to_string(),
-                (None, false) => "OK".to_string(),
+            match (t.distill, dead, t.transient_by_design && n_chunks == 0) {
+                (Some(m), true, _) => format!("OK (distilled {m:?}, tombstoned)"),
+                (Some(m), false, _) => format!("OK (distilled {m:?})"),
+                (None, true, _) => "OK (tombstoned)".to_string(),
+                (None, false, true) => "OK (transient: no K/V by design)".to_string(),
+                (None, false, false) => "OK".to_string(),
             }
         } else {
             problems.push(format!(
@@ -6187,5 +6232,73 @@ fn compaction_hint(ratio: f32) -> &'static str {
         "(compaction would reclaim significant space)"
     } else {
         ""
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_transient_by_design, TRANSIENT_BY_DESIGN_KEYS};
+    use candle_conversation::projection::{GroupId, LayerId, TimelineId};
+    use candle_conversation::substrate::Substrate;
+    use std::collections::BTreeMap;
+
+    fn timeline(raw: u64) -> TimelineId {
+        TimelineId::from_raw(raw).expect("a valid timeline id")
+    }
+
+    fn registered(sub: &mut Substrate, raw: u64) -> TimelineId {
+        let tl = timeline(raw);
+        sub.register_timeline(
+            tl,
+            LayerId::from_raw(1).expect("layer"),
+            GroupId::from_raw(1).expect("group"),
+        );
+        tl
+    }
+
+    /// **The marker is what separates "shed by design" from "lost".**
+    ///
+    /// Both land in the log as a turn with a decl, tokens, a block range and no
+    /// `Chunk` records, so the metadata key is the whole of the difference.
+    #[test]
+    fn only_a_marked_timeline_is_transient_by_design() {
+        let mut sub = Substrate::new();
+        let marked = registered(&mut sub, 11);
+        let plain = registered(&mut sub, 22);
+
+        let mut custom = BTreeMap::new();
+        custom.insert(TRANSIENT_BY_DESIGN_KEYS[0].to_string(), "aes_gcm/3".into());
+        sub.merge_custom(marked, &custom);
+
+        assert!(
+            is_transient_by_design(&sub, marked),
+            "a calibration exemplar sheds its K/V by design"
+        );
+        assert!(
+            !is_transient_by_design(&sub, plain),
+            "an ordinary conversation with no K/V has lost it"
+        );
+    }
+
+    /// An unrelated metadata key is not the marker. The store's conversations
+    /// carry several (`identity`, `uploads`, the repo-map content hash), and
+    /// exempting on "has any metadata" would hide every real loss.
+    #[test]
+    fn unrelated_metadata_does_not_exempt_a_timeline() {
+        let mut sub = Substrate::new();
+        let tl = registered(&mut sub, 33);
+        let mut custom = BTreeMap::new();
+        custom.insert("identity".to_string(), "req-1".into());
+        custom.insert("hash".to_string(), "deadbeef".into());
+        sub.merge_custom(tl, &custom);
+        assert!(!is_transient_by_design(&sub, tl));
+    }
+
+    /// A timeline the log never registered cannot be exempt — an unknown
+    /// timeline is not evidence of intent.
+    #[test]
+    fn an_unknown_timeline_is_not_exempt() {
+        let sub = Substrate::new();
+        assert!(!is_transient_by_design(&sub, timeline(44)));
     }
 }
