@@ -745,6 +745,76 @@ impl Scheduler {
                     );
                 }
                 self.log_kv_memory();
+                // **How fragmented the KV pools are — measured where a compaction
+                // would run, at the cadence it would run at.**
+                //
+                // Deliberately beside `release_empty_arenas` above, because the two
+                // are the same job at different granularities and the contrast is
+                // the point: the sweep returns an arena whose LAST chunk has gone,
+                // and nothing moves a chunk between arenas, so an arena holding a
+                // handful of live chunks keeps its whole 16 MiB region indefinitely.
+                // `freeable` is the regions that are recoverable and that the sweep
+                // structurally cannot recover.
+                //
+                // This is the figure that is NOT region holes. A region freed below
+                // the arena frontier is taken by the next claim — the free list is
+                // lowest-index-first — so holes are self-correcting and measured to
+                // peak in the tens and settle at one. Sparsity does not
+                // self-correct, which is why it is what gets logged and what a
+                // compaction is judged by.
+                // **The frontier first, because the frontier is what costs
+                // weights.** The tier stands above the highest live arena and
+                // `weight_floor` is measured from there, so expert residency is
+                // set by that one index — not by how many arenas are live and not
+                // by how full they are. `could_be` is where the frontier would sit
+                // with everything packed, and the gap between them is the ground a
+                // perfect compaction hands back, split into its two causes: the
+                // holes that hold the frontier up, and the sparsity that fills it
+                // with air.
+                if let Some(g) = self.session.kv_ground_lost() {
+                    if g.total() > 0 {
+                        let mib = candle_nn::kv_cache::REGION_BYTES >> 20;
+                        tracing::debug!(
+                            target: "candle_conversation::scheduler::vram_relief",
+                            frontier = g.watermark,
+                            could_be = g.packed_arenas,
+                            live_arenas = g.live_arenas,
+                            arena_holes = g.arena_holes(),
+                            sparsity = g.sparsity(),
+                            denied_mib = g.total() * mib,
+                            // What reclaiming it would cost. Logged beside the
+                            // gain because the ratio is the only thing that says
+                            // whether a pass is worth its bandwidth: four arenas
+                            // for forty thousand copies is not.
+                            planned_moves = self.session.kv_planned_moves(),
+                            "kv ground denied to the weight side by fragmentation",
+                        );
+                    }
+                }
+                let frag = self.session.kv_fragmentation();
+                let freeable: usize = frag.iter().map(|(_, f)| f.freeable_arenas()).sum();
+                if freeable > 0 {
+                    let rows: Vec<String> = frag
+                        .iter()
+                        .filter(|(_, f)| f.freeable_arenas() > 0)
+                        .map(|(k, f)| {
+                            format!(
+                                "{}B={}a/{}pack({}%)",
+                                k.class.bytes(),
+                                f.arenas,
+                                f.packed_arenas,
+                                f.occupancy_pct(),
+                            )
+                        })
+                        .collect();
+                    tracing::debug!(
+                        target: "candle_conversation::scheduler::vram_relief",
+                        freeable_arenas = freeable,
+                        freeable_mib = freeable * (candle_nn::kv_cache::REGION_BYTES >> 20),
+                        "kv fragmentation (a perfect pack would return this): {}",
+                        rows.join(" "),
+                    );
+                }
                 // **Is the planner still running on its seeds?** Every figure
                 // it decides with is learned, and the seeds are a measurement of
                 // one card with one checkpoint — the decode one was found 26x

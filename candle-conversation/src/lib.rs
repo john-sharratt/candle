@@ -82,6 +82,9 @@ pub mod provenance;
 mod recorded_reply;
 mod recovered_message;
 pub(crate) mod scheduler;
+/// A throwaway substrate directory that removes itself on drop and sweeps the
+/// corpses of crashed runs — so a harness never attaches to the live store.
+pub mod scratch_substrate;
 mod sealed_turn;
 mod sequence_handle;
 mod stats;

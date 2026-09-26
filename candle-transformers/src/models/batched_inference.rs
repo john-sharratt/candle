@@ -37,8 +37,9 @@ use candle::quantized::pinned_staging::GpuBuf;
 use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
-    ChunkedKvBacking, CompressionPolicy, GpuArenaClassStats, HeadGids, KvCache, KvFormat,
-    ModelGeometry, QuantFormat, WavePlan, WaveWidth, WAVE_FFN_BYTES,
+    fragmentation, plan_pool, ArenaKey, ArenaLocation, ChunkedKvBacking, CompressionPolicy,
+    Fragmentation, GpuArenaClassStats, GroundLost, HeadGids, KvCache, KvFormat, ModelGeometry,
+    QuantFormat, SizeClass, WavePlan, WaveWidth, WAVE_FFN_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -2047,6 +2048,94 @@ impl BatchedInferenceSession {
     /// one backing is the whole model). `None` when there are no backings.
     pub fn kv_gpu_class_stats(&self) -> Option<GpuArenaClassStats> {
         self.backings.first().map(|b| b.gpu_arena_class_stats())
+    }
+
+    /// How fragmented every GPU KV pool is — the arenas a perfect pack would
+    /// empty, per size class.
+    ///
+    /// Reads layer 0's backing for the same reason [`Self::kv_gpu_class_stats`]
+    /// does: arenas pool globally across same-config layers, so one backing's view
+    /// is the whole model's.
+    ///
+    /// Returns `(key, fragmentation)` for every pool holding at least one arena,
+    /// so a caller can report the ladder without a row per empty rung.
+    pub fn kv_fragmentation(&self) -> Vec<(ArenaKey, Fragmentation)> {
+        let Some(b) = self.backings.first() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for class in SizeClass::all() {
+            let key = ArenaKey::new(class, ArenaLocation::Gpu);
+            let Ok(census) = b.compaction_census(key) else {
+                continue;
+            };
+            if census.is_empty() {
+                continue;
+            }
+            let f = fragmentation(&census, key);
+            if f.arenas > 0 {
+                out.push((key, f));
+            }
+        }
+        out
+    }
+
+    /// Chunk moves a perfect pack would cost, across every GPU pool.
+    ///
+    /// The other half of the fragmentation figure: [`Self::kv_fragmentation`] says
+    /// how much ground a pack would return, this says what it would cost to return
+    /// it. Both are wanted before running one — a pass that frees four arenas for
+    /// forty thousand copies is not worth its bandwidth, and the ratio is the only
+    /// thing that says so.
+    ///
+    /// Unbounded (`max_moves = 0`): this is the *whole* cost of reaching a gapless
+    /// prefix, which is the figure to compare a per-pass budget against.
+    pub fn kv_planned_moves(&self) -> usize {
+        let Some(b) = self.backings.first() else {
+            return 0;
+        };
+        let mut moves = 0;
+        for class in SizeClass::all() {
+            let key = ArenaKey::new(class, ArenaLocation::Gpu);
+            let Ok(census) = b.compaction_census(key) else {
+                continue;
+            };
+            if let Some(plan) = plan_pool(&census, key, 0) {
+                moves += plan.moves.len();
+            }
+        }
+        moves
+    }
+
+    /// Everything fragmentation denies the weight side, in regions.
+    ///
+    /// **The highest live arena is the marker.** The wave transient tier must stand
+    /// above it and `weight_floor` is measured from there, so the weight side's
+    /// ground — and therefore expert residency, and therefore decode — is set by
+    /// where the topmost live arena sits. Neither the live arena count nor the
+    /// occupancy ratio matters except through that one number.
+    ///
+    /// Sums the per-pool packed floor across the ladder and reads the frontier from
+    /// the region pool, which is device-global: regions are shared by every pool, so
+    /// the frontier is not a per-class quantity and cannot be derived from
+    /// [`Self::kv_fragmentation`] alone.
+    pub fn kv_ground_lost(&self) -> Option<GroundLost> {
+        // This session's own device ordinal, not a hardcoded 0: a second engine on
+        // a second card would otherwise report the first card's frontier.
+        let candle::DeviceLocation::Cuda { gpu_id } = self.device.location() else {
+            return None;
+        };
+        let stats = candle_nn::kv_cache::region_stats(gpu_id)?;
+        let packed_arenas = self
+            .kv_fragmentation()
+            .iter()
+            .map(|(_, f)| f.packed_arenas)
+            .sum();
+        Some(GroundLost {
+            watermark: stats.live_watermark,
+            live_arenas: stats.live,
+            packed_arenas,
+        })
     }
 
     /// Create a view sequence that borrows KV blocks from a parent.

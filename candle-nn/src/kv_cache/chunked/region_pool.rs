@@ -239,6 +239,17 @@ pub struct RegionStats {
     pub blocked: usize,
     /// Most regions ever live at once — how close the partition came to full.
     pub peak_live: usize,
+    /// One past the **highest live region index** — the arena frontier, in
+    /// regions, and the figure a compaction exists to reduce.
+    ///
+    /// `live_watermark - live` is the number of free regions stranded *below* the
+    /// frontier: ground the KV side owns and reports as available, which the wave
+    /// transient tier cannot use because it must stand above every live arena, and
+    /// which therefore pushes `weight_floor` right and costs expert residency.
+    /// Zero holes means `live_watermark == live`, which is what a perfect
+    /// compaction pass leaves behind and what a test can assert exactly — unlike a
+    /// throughput figure.
+    pub live_watermark: usize,
     /// Bytes the wave transient tier occupies **right now**, and the ceiling it
     /// imposes on the region count while it does.
     ///
@@ -2631,6 +2642,7 @@ pub fn region_stats(ordinal: usize) -> Option<RegionStats> {
         free: pool.free_count(),
         blocked: pool.ceiling_blocked(),
         peak_live: pool.peak_live,
+        live_watermark: pool.live_watermark(),
         transient_bytes: pool.transient_bytes,
         transient_ceiling: pool.region_ceiling(),
         fresh_claims_during_wave: pool.fresh_claims_during_wave,

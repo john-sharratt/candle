@@ -291,6 +291,25 @@ impl Arena {
         self.class.chunks_per_region()
     }
 
+    /// This arena's region index — its position in **physical address order**
+    /// inside the reservation, which is what a compaction packs toward.
+    ///
+    /// `None` for a CPU arena, whose slab is an ordinary host allocation and has
+    /// no region, and on a build without CUDA.
+    ///
+    /// Distinct from [`Self::index`], the gid namespace index: that is whatever
+    /// the pool handed out and is recycled when an arena is tombstoned, so the
+    /// two orders diverge as soon as anything is released. Ordering a compaction
+    /// by `index` packs into whichever end of the span the recycling happened to
+    /// favour — see `compact_plan::ArenaSlots::rank`.
+    #[inline]
+    pub(super) fn region_rank(&self) -> Option<usize> {
+        #[cfg(feature = "cuda")]
+        return self.region.as_ref().map(|r| r.index());
+        #[cfg(not(feature = "cuda"))]
+        return None;
+    }
+
     /// The raw byte slab.
     pub(super) fn byte_data(&self) -> &Tensor {
         &self.data

@@ -314,6 +314,14 @@ pub struct KvClassRow {
     pub arenas: usize,
     pub reserved_bytes: u64,
     pub live_bytes: u64,
+    /// Arenas this class's live chunks would occupy if they were packed.
+    pub packed_arenas: usize,
+    /// Arenas a perfect pack would empty — regions that are recoverable and that
+    /// the empty-arena sweep structurally cannot recover, because an arena keeps
+    /// its region until its *last* chunk goes and nothing moves chunks between
+    /// arenas. This is the fragmentation figure; region holes are not (they are
+    /// taken by the next claim, the free list being lowest-index-first).
+    pub freeable_arenas: usize,
 }
 
 /// One `(backing, format)` arena row.
@@ -473,6 +481,12 @@ impl Scheduler {
         });
 
         // ── KV arenas ───────────────────────────────────────────────────────
+        //
+        // Carries the fragmentation figure alongside the occupancy, from the one
+        // accessor the scheduler's own log line reads (`kv_fragmentation`), so the
+        // report, the log and any harness agree by construction rather than by
+        // three implementations of the same arithmetic.
+        let frag = self.session.kv_fragmentation();
         let classes = self
             .session
             .kv_gpu_class_stats()
@@ -480,11 +494,20 @@ impl Scheduler {
                 cs.classes
                     .iter()
                     .filter(|c| c.arenas > 0)
-                    .map(|c| KvClassRow {
-                        slot_bytes: c.slot_bytes,
-                        arenas: c.arenas,
-                        reserved_bytes: c.reserved_bytes as u64,
-                        live_bytes: c.live_bytes as u64,
+                    .map(|c| {
+                        let f = frag
+                            .iter()
+                            .find(|(k, _)| k.class.bytes() == c.slot_bytes)
+                            .map(|(_, f)| *f)
+                            .unwrap_or_default();
+                        KvClassRow {
+                            slot_bytes: c.slot_bytes,
+                            arenas: c.arenas,
+                            reserved_bytes: c.reserved_bytes as u64,
+                            live_bytes: c.live_bytes as u64,
+                            packed_arenas: f.packed_arenas,
+                            freeable_arenas: f.freeable_arenas(),
+                        }
                     })
                     .collect()
             })
@@ -713,6 +736,8 @@ mod tests {
                     arenas: 1,
                     reserved_bytes: 2,
                     live_bytes: 3,
+                    packed_arenas: 1,
+                    freeable_arenas: 0,
                 }],
                 arenas: vec![ArenaRow {
                     backing: 0,

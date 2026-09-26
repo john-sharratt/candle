@@ -15,10 +15,11 @@ use candle::quantized::pinned_staging::{Generation, PinnedStager};
 // `DType`, or the crate's own `Result` anywhere in this file.)
 use candle::{DType, Device, Result};
 
+use super::compact_plan::ArenaSlots;
 use super::head_gids::ChunkBands;
 use super::{
-    Arena, ArenaStorage, ArenaStorageState, BlockTableState, ChunkMeta, CompressionPolicy,
-    GpuArenaClassStats, LiveChunkRef, SealedChunk, StoragePolicy,
+    Arena, ArenaKey, ArenaStorage, ArenaStorageState, BlockTableState, ChunkMeta,
+    CompressionPolicy, GpuArenaClassStats, LiveChunkRef, SealedChunk, StoragePolicy,
 };
 // Only the CUDA-gated compress-eligibility helper needs the sealed-sequence type.
 use super::size_class::{class_for_payload, payload_bytes_for_tag, SizeClass};
@@ -1608,6 +1609,53 @@ impl ChunkedKvBacking {
     /// Get the number of arenas in backing storage.
     pub fn arena_count(&self) -> Result<usize> {
         self.inner.storage.arena_count()
+    }
+
+    /// The census one pool's compaction plans from — occupancy joined to physical
+    /// address order.
+    ///
+    /// Two halves, from two owners: the gid pool knows which slots are occupied
+    /// ([`ChunkGidPool::pool_occupancy`]) and the arena storage knows where each
+    /// arena physically sits ([`Arena::region_rank`]). Only the join is
+    /// plannable — occupancy alone cannot say which way is "down".
+    ///
+    /// **An arena with no region is skipped.** That is every CPU arena, whose
+    /// slab is an ordinary host allocation with no position in the reservation
+    /// and so nothing to pack toward. A pass over a host pool is therefore a
+    /// no-op rather than a plan over meaningless ranks, and the empty result says
+    /// so. (`plan_pool` filters by `ArenaKey`, so a host pool is never mixed into
+    /// a device one; this is the second, independent guard.)
+    ///
+    /// Taken under one `storage.read`, but the occupancy bitmaps are sampled
+    /// word by word — see [`ArenaRefcounts::occupied_slots`] for why a torn read
+    /// is tolerable and what finally refuses a slot the census got wrong.
+    pub fn compaction_census(&self, key: ArenaKey) -> Result<Vec<ArenaSlots>> {
+        let occupancy = self.inner.pool.pool_occupancy(key);
+        if occupancy.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.inner.storage.read(|s| {
+            let arenas = s.arenas();
+            let mut out = Vec::with_capacity(occupancy.len());
+            for (arena_idx, capacity, occupied) in &occupancy {
+                let Some(arena) = arenas.get(arena_idx) else {
+                    // Registered in the pool but gone from storage: a release
+                    // that has not finished propagating. Nothing to move.
+                    continue;
+                };
+                let Some(rank) = arena.region_rank() else {
+                    continue;
+                };
+                out.push(ArenaSlots {
+                    arena_idx: *arena_idx,
+                    key,
+                    rank,
+                    capacity: *capacity,
+                    occupied: occupied.clone(),
+                });
+            }
+            out
+        })
     }
 
     /// GPU arena occupancy split float vs quant across the pool this backing

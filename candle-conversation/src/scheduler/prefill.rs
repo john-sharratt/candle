@@ -585,6 +585,33 @@ impl Scheduler {
             return;
         }
 
+        // **The planner is consulted once per settling, not once per pass.**
+        //
+        // [`admit::fill`] refuses an unsettled ground itself (`Ground::settled`),
+        // but the machinery that *reaches* that refusal is not free:
+        // [`Self::take_planner`] arms the planner, and `AdmitPass::new` prices the
+        // standing tier, reads the region census and computes the headroom and the
+        // budget — every bit of it discarded the moment `fill` answers `skipped`.
+        // This pass runs from the top of the wave loop AND from every decode step
+        // (`Scheduler::mid_wave_admission`), so on an unsettled engine that setup,
+        // not the fill, is the whole cost.
+        //
+        // Nothing new can fit that did not fit before unless something freed
+        // ground, so the gate belongs in front of the pricing rather than behind
+        // it. What opens the next pass is a sequence finishing — a decode
+        // completing, a prefill promoting to decode, a section sealing, a slot
+        // terminally freed — plus the two events that can offer ground with
+        // nothing finishing at all: a turn arriving at an idle engine, which has
+        // never been offered and would otherwise wait for a completion that is
+        // never coming, and a relief pass that actually shed.
+        if !self.settled_since_admit {
+            // Skipping the pass must not skip the deadlock-freedom rule.
+            if self.active_prefills.is_empty() {
+                self.force_queue_head("admission is closed until something settles");
+            }
+            return;
+        }
+
         // **The decision is a rate, not a fit.**
         //
         // Admission used to ask whether an offer's bytes fitted the ground
@@ -640,17 +667,7 @@ impl Scheduler {
         // cheapest-first starves the expensive work permanently, and the
         // expensive work is never the cheapest.
         if filled.prefills == 0 && self.active_prefills.is_empty() {
-            if let Some(work) = self.prefill_queue.pop_front() {
-                tracing::debug!(
-                    target: "candle_conversation::scheduler::throttle",
-                    queued = self.prefill_queue.len() + 1,
-                    stopped_on_weights = filled.stopped_on_weights,
-                    stopped_on_rate = filled.stopped_on_rate,
-                    "admission refused every offer with nothing in flight; \
-                     forcing the queue head so the engine makes progress",
-                );
-                self.begin_prefill(work);
-            }
+            self.force_queue_head("admission refused every offer");
         }
         // The pass acted on the completions that opened it; the next one waits
         // for its own.
@@ -679,6 +696,37 @@ impl Scheduler {
                 stopped_on_rate = filled.stopped_on_rate,
                 "admission pass"
             );
+        }
+    }
+
+    /// Admit the queue head whatever the rate model would have said — the
+    /// engine's deadlock-freedom rule, and the one guarantee no throughput
+    /// judgement may override.
+    ///
+    /// An engine that admits nothing makes no progress, so nothing completes, so
+    /// nothing frees the ground the refusal was about, and the same turn is
+    /// refused on the same grounds forever. This is the rule the byte-fit planner
+    /// carried as `MIN_PREFILL_WIDTH`, restored after its absence wedged a live
+    /// daemon: two turns queued, nothing in flight, `stopped_on_weights` on every
+    /// pass, and the loop spinning in relief that could not help because the
+    /// ground it wanted was not the ground being refused.
+    ///
+    /// FIFO, not the cheapest that fits: under a budget stuck at its floor,
+    /// cheapest-first starves the expensive work permanently, and the expensive
+    /// work is never the cheapest.
+    ///
+    /// Callers apply it only with `active_prefills` empty. `why` names the path
+    /// that forced it, because a head admitted this way was never judged and a
+    /// reader has to be able to tell that from an admission that was.
+    fn force_queue_head(&mut self, why: &'static str) {
+        if let Some(work) = self.prefill_queue.pop_front() {
+            tracing::debug!(
+                target: "candle_conversation::scheduler::throttle",
+                queued = self.prefill_queue.len() + 1,
+                why,
+                "nothing in flight; forcing the queue head so the engine makes progress",
+            );
+            self.begin_prefill(work);
         }
     }
 

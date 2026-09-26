@@ -100,7 +100,8 @@ pub struct ArenaRefcounts {
     /// overlapped (refcount xor link) this is now the **authoritative** free/
     /// occupied discriminator (not just a scan hint): set on claim, cleared on
     /// the `1→0` last drop, `fetch_or`/`fetch_and` so different bits of a word
-    /// compose. Read by `live_gids` to enumerate live slots.
+    /// compose. Read by [`ArenaRefcounts::occupied_slots`] to enumerate live
+    /// slots for a compaction census.
     occupancy: Vec<AtomicU64>,
     /// Lock-free intrusive recycle stack of freed slots (Treiber). Links live
     /// in `counts` (a free slot's word = next-free index, or `arena_chunks` =
@@ -239,6 +240,40 @@ impl ArenaRefcounts {
     #[inline]
     fn is_full(&self) -> bool {
         self.live.load(Ordering::Acquire) >= self.arena_chunks
+    }
+
+    /// Occupied slot indices, ascending — the census a compaction plans from.
+    ///
+    /// Walks the [`Self::occupancy`] bitmap a word at a time and peels set bits
+    /// with `trailing_zeros`, so the cost is the bitmap's words plus the live
+    /// count rather than the arena's capacity. That matters at the bottom of the
+    /// ladder, where one arena holds 52,428 slots and a per-slot loop would
+    /// dominate a pass that has only a handful of chunks to move.
+    ///
+    /// **A snapshot, not a lock.** Each word is read independently, so a claim or
+    /// a drop landing mid-walk may or may not be seen. The caller compensates
+    /// structurally rather than by locking: a compaction runs inside the arena
+    /// window with no forward in flight, and the destination claim
+    /// (`allocate_from_arena`) is what finally refuses a slot the census believed
+    /// free. A stale *source* is harmless — the move is simply not worth making.
+    pub(crate) fn occupied_slots(&self) -> Vec<u32> {
+        let live = self.live.load(Ordering::Acquire);
+        let mut out = Vec::with_capacity(live);
+        for (w, word) in self.occupancy.iter().enumerate() {
+            let mut bits = word.load(Ordering::Acquire);
+            while bits != 0 {
+                let b = bits.trailing_zeros();
+                bits &= bits - 1;
+                let slot = w * 64 + b as usize;
+                // The last word is padded past `arena_chunks`; a padding bit is
+                // never set, but bounding here means a future change to the
+                // padding cannot hand a caller a slot the arena does not have.
+                if slot < self.arena_chunks {
+                    out.push(slot as u32);
+                }
+            }
+        }
+        out
     }
 
     /// Mark slot `i` occupied in the scan bitmap (set its bit).
@@ -1264,6 +1299,30 @@ impl ChunkGidPool {
             id,
             backing: GidBacking::Pooled(table),
         })
+    }
+
+    /// Per-arena occupancy for one pool — the gid-pool half of a compaction
+    /// census.
+    ///
+    /// Returns `(arena_idx, capacity, occupied slot indices ascending)` for every
+    /// registered arena of `key`, itself in ascending `arena_idx` order because
+    /// that is the `BTreeMap`'s order.
+    ///
+    /// **`arena_idx` order is not address order.** An index is whatever the pool
+    /// handed out and is recycled when an arena is tombstoned, so the caller must
+    /// join this against each arena's region index before planning anything —
+    /// packing by index instead of address is the mistake
+    /// `compact_plan::ArenaSlots::rank` exists to prevent, and it silently packs
+    /// into the wrong end of the span.
+    pub fn pool_occupancy(&self, key: ArenaKey) -> Vec<(usize, usize, Vec<u32>)> {
+        let Some(pool) = self.inner.pools.get(&key) else {
+            return Vec::new();
+        };
+        let tables = pool.tables.read().unwrap();
+        tables
+            .iter()
+            .map(|(&arena_idx, t)| (arena_idx, pool.arena_chunks, t.occupied_slots()))
+            .collect()
     }
 
     /// Convenience: allocate a gid using a default test key.

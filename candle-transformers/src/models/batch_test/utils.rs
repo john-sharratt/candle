@@ -60,14 +60,13 @@ use crate::models::profile::{
 /// The story a [`TestMode::StoryRewrite`] prompt asks the model to reproduce
 /// with its character renamed.
 ///
-/// Line endings are normalised here, once. The file is checked in with CRLF on
-/// Windows, and a prompt carrying `\r\n` tokenises differently from the same
-/// text with `\n` — so a second `include_str!` of it elsewhere would be a
-/// different prompt that merely looked identical in the source.
+/// Re-exported from [`super::fixtures`], which is outside `#[cfg(test)]` so that
+/// a harness in a crate above this one measures the same bytes. Kept as a
+/// function here because the gates already call it by this path, and because the
+/// alternative — a second `include_str!` — is a different prompt that merely
+/// looks identical in the source (see the fixtures module note).
 pub fn story_prompt() -> String {
-    include_str!("story.md")
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
+    super::fixtures::story_prompt()
 }
 
 /// Determines the validation strategy for the test harness.
@@ -178,9 +177,7 @@ impl TestParams {
             majority_pass_threshold: None,
             test_mode: TestMode::StoryRewrite,
             suppress_thinking: false,
-            prompt_system: include_str!("system.md")
-                .replace("\r\n", "\n")
-                .replace("\r", "\n"),
+            prompt_system: super::fixtures::system_prompt(),
             prompt_user: story_prompt(),
             per_config_prompts: Vec::new(),
             stop_on_eos: Vec::new(),

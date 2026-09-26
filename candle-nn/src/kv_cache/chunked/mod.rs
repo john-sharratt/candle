@@ -36,6 +36,7 @@ mod chunk_ops;
 // Quantize-on-evict drives the palette-4 selection/convert CUDA kernels end to
 // end — every one of its imports is already `cfg(cuda)`, and there is no CPU
 // form of it. Gated whole rather than shot through with per-item cfgs.
+pub mod compact_plan;
 #[cfg(feature = "cuda")]
 mod compress;
 mod compression_policy;
@@ -96,6 +97,9 @@ pub use backing::{global_arena_gpu_bytes, global_arena_memory_report, global_pri
 pub use backing::{is_device_oom, KV_DEVICE_OOM_MARKER};
 pub use chunk_ops::BlockAllocSpec;
 pub use chunk_ops::MIGRATION_STAGING_CAP_BYTES;
+pub use compact_plan::{
+    fragmentation, plan_pool, ArenaSlots, ChunkMove, CompactPlan, Fragmentation, GroundLost,
+};
 #[cfg(feature = "cuda")]
 pub use compress::{
     convert_deferred_descs, dequantize_sealed_in_place, quantize_layers_deferred,

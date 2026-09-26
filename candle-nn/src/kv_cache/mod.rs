@@ -115,6 +115,11 @@ pub use chunked::{
     convert_deferred_descs, dequantize_sealed_in_place, quantize_layers_deferred,
     quantize_sealed_in_place, quantize_sealed_in_place_deferred,
 };
+/// Arena sparsity — the arenas a perfect KV pack would empty, per pool. The
+/// figure compaction is judged by; see `chunked::compact_plan`.
+pub use chunked::{
+    fragmentation, plan_pool, ArenaSlots, ChunkMove, CompactPlan, Fragmentation, GroundLost,
+};
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use chunked::{is_device_oom, KV_DEVICE_OOM_MARKER};
 pub use chunked::{migrate_flight, migrate_in_flight, MigrateFlight};
