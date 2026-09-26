@@ -884,6 +884,45 @@ impl SequenceState {
         self.gpu_chunks.as_mut().clear();
     }
 
+    /// Rewrite every block's gids through a compaction sweep, and throw away the
+    /// cached decode buffer if anything moved.
+    ///
+    /// Returns whether this slot held anything the pass relocated.
+    ///
+    /// **The invalidation is inside this method on purpose.** The cached buffer is
+    /// reused whenever the chunk COUNT agrees (`sync_decode_gpu_chunks`), and a
+    /// compaction changes gids without ever changing a count — so a caller that
+    /// rewrote the block table and forgot to invalidate would hand the next forward
+    /// pre-compaction band addresses. That does not fault, because every address in
+    /// the reservation is mapped; it reads whatever now occupies the vacated slot.
+    /// Making the rewrite carry its own invalidation is what stops that from being
+    /// a step anyone can omit.
+    ///
+    /// The chunk keeps its `MetaGid`: the device record is *patched* through the
+    /// words the sweep accumulates, not rebuilt, which is sound because a
+    /// compaction moves each slot once for every holder at once.
+    pub(super) fn rewrite_for_compaction(
+        &mut self,
+        sweep: &mut super::compact_map::Sweep<'_>,
+    ) -> candle::Result<bool> {
+        let mut moved = false;
+        for cw in self.chunks.iter_mut() {
+            let Some(next) = sweep.rewrite_gids(&cw.gids)? else {
+                continue;
+            };
+            match cw.meta.as_ref() {
+                Some(meta) => sweep.emit_patch(meta.device_addr(), &next),
+                None => sweep.note_no_meta(),
+            }
+            cw.gids = next;
+            moved = true;
+        }
+        if moved {
+            self.invalidate_gpu_chunks();
+        }
+        Ok(moved)
+    }
+
     /// Whether a decode slot buffer is cached for this sequence. A sequence
     /// that has never decoded, or whose buffer a chunk-boundary append cleared,
     /// has none, and rebuilds it in full on its next sync.

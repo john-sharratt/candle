@@ -65,7 +65,10 @@ half = { workspace = true }
 hf-hub = { workspace = true }
 tempfile = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+# `env-filter` so a test can raise one target without raising every target: the
+# admission pass reports its verdict at debug, and reaching it through a fixed
+# `with_max_level(DEBUG)` would bury it under every other debug span in the engine.
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 clap.workspace = true
 clap-verbosity-flag.workspace = true
 term_size = { workspace = true }

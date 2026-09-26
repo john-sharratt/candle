@@ -36,6 +36,9 @@ mod chunk_ops;
 // Quantize-on-evict drives the palette-4 selection/convert CUDA kernels end to
 // end — every one of its imports is already `cfg(cuda)`, and there is no CPU
 // form of it. Gated whole rather than shot through with per-item cfgs.
+#[cfg(feature = "cuda")]
+pub mod compact;
+pub mod compact_map;
 pub mod compact_plan;
 #[cfg(feature = "cuda")]
 mod compress;
@@ -97,6 +100,12 @@ pub use backing::{global_arena_gpu_bytes, global_arena_memory_report, global_pri
 pub use backing::{is_device_oom, KV_DEVICE_OOM_MARKER};
 pub use chunk_ops::BlockAllocSpec;
 pub use chunk_ops::MIGRATION_STAGING_CAP_BYTES;
+#[cfg(feature = "cuda")]
+pub use compact::{
+    compact_backings, compaction_epoch, compaction_tally, CompactionRefused, CompactionReport,
+    CompactionTally,
+};
+pub use compact_map::{rewrite_sealed, CompactionMap, RecordGeometry, Sweep};
 pub use compact_plan::{
     fragmentation, plan_pool, ArenaSlots, ChunkMove, CompactPlan, Fragmentation, GroundLost,
 };
@@ -116,7 +125,10 @@ pub use compression_policy::{
 pub use gid_pool::{ChunkGid, ChunkGidPool, ClassOccupancy, GpuArenaClassStats};
 pub use head_gids::HeadGids;
 pub use meta_pool::MetaGid;
-pub use migrate_flight::{migrate_flight, migrate_in_flight, MigrateFlight};
+pub use migrate_flight::{
+    clear_compaction_waiting, migrate_in_flight, try_freeze_chunk_locations, try_migrate_flight,
+    LocationFreeze, MigrateFlight,
+};
 pub use size_class::{
     all_kv_formats, class_for_format, class_for_payload, elems_per_chunk, payload_bytes,
     payload_bytes_for_tag, SizeClass, GID_STRIDE, LADDER,

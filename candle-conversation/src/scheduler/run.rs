@@ -319,8 +319,12 @@ impl Scheduler {
             // `decode_forward_cobatched`.
             self.batch_drain_gap_fills = false;
             IN_DRAIN.store(false, std::sync::atomic::Ordering::Relaxed);
+            let drain_elapsed = t_drain.elapsed();
             self.wave_stats
-                .add_phase(WavePhase::Drain, t_drain.elapsed().as_millis() as u64);
+                .add_phase(WavePhase::Drain, drain_elapsed.as_millis() as u64);
+            // Non-forward wall clock, and therefore per-forward overhead the planner has
+            // to know about — the drain runs once per wave whatever the wave carries.
+            self.wave_overhead_us += drain_elapsed.as_micros() as u64;
             _g_drain.end();
             if !cont {
                 break; // Shutdown requested or channel closed.
@@ -481,6 +485,10 @@ impl Scheduler {
             // timed, so all of it fell into the unattributed remainder and drew
             // as "blocked" — which is what made that band large and unexplained.
             let t_house = Instant::now();
+            // The whole between-quanta block as one span, so the profile table can say
+            // what share of a wave is not the forward at all. Its parts are spanned
+            // individually below; this is the total they have to add up to.
+            let house_span = super::profile::span("loop:housekeeping");
             let (no_ticket, arena_full) = declines.bytes_since();
             publish_wave_declines(no_ticket, arena_full);
             #[cfg(feature = "forbidden_allocations")]
@@ -611,8 +619,30 @@ impl Scheduler {
             // Closed BEFORE the flush block: the flush is the window boundary
             // itself, and its own cost is already accounted (eviction/sync carve
             // out of the remainder), so folding it in here would double-count.
-            self.wave_stats
-                .add_housekeeping(t_house.elapsed().as_micros() as u64);
+            let house_us = t_house.elapsed().as_micros() as u64;
+            self.wave_stats.add_housekeeping(house_us);
+            self.wave_overhead_us += house_us;
+
+            // **Tell the rate planner what this wave cost outside its forwards.**
+            //
+            // The planner prices width by what width amortises, and it could only see the
+            // forward's own duration — so the loop's overhead, which is per forward and
+            // does not scale with rows, was worth nothing to it. On a resident card that
+            // left *nothing* for width to amortise and the wave stopped widening at 4 rows
+            // where the engine wanted 20. See `RateModel::overhead_secs`.
+            //
+            // Divided by the forwards this wave actually ran, and skipped when it ran
+            // none: a wave with no forwards has no per-forward cost, and reporting its
+            // whole housekeeping as one forward's overhead would teach the model that a
+            // forward costs an idle loop iteration.
+            if self.wave_forwards > 0 {
+                let per_forward = self.wave_overhead_us as f64 / 1e6 / self.wave_forwards as f64;
+                if let Some(rate) = self.wave_rate.as_mut() {
+                    rate.observe_overhead(per_forward);
+                }
+            }
+            self.wave_forwards = 0;
+            self.wave_overhead_us = 0;
 
             // **Create what a refused forward asked for — every gap, not every
             // telemetry window.**
@@ -632,6 +662,33 @@ impl Scheduler {
             // creation wants that cadence — it is cheap when there is no demand
             // (one lock, an empty `Vec`), and the wave loop is the gap on every
             // iteration, not one in every few hundred.
+            // **Pack the pools, then let the weight side take what packing released.**
+            // Both halves, here, in this order, because either alone buys nothing: a
+            // frontier that falls with nobody claiming the ground is invisible in
+            // every metric except decode, and a weight side asked to grow over a
+            // frontier nothing lowered has nothing to take.
+            //
+            // **Every wave, not once per telemetry window.** It sat inside the 2 s
+            // summary block, which made compaction a side effect of logging: the
+            // pools fragmented for two seconds between passes, and with the pass
+            // itself time-budgeted it never caught up — measured at 48–60% efficiency
+            // with every pass clipped. The gate in `compact_kv_if_fragmented` is a
+            // cheap counter read and a minimum interval, so being considered here
+            // costs the loop nothing on the iterations it declines.
+            //
+            // Legal here for the same reason `create_deferred_arenas` below is: the
+            // quanta are done, every forward's guards are dropped, and no wave
+            // generation is live — which is the condition `set_weight_floor` itself
+            // checks. `compact_kv` refuses rather than corrupts if that ever stops
+            // being true.
+            {
+                // The whole pass, including the gate that usually declines it — so the
+                // table shows what being *considered* every wave costs, not only what a
+                // pass costs when it runs. The phase breakdown is filed inside.
+                let _g = super::profile::span("loop:compact_kv");
+                self.compact_kv_if_fragmented();
+            }
+
             match self.session.create_deferred_arenas() {
                 Ok(0) => {}
                 Ok(n) => tracing::debug!(
@@ -649,6 +706,31 @@ impl Scheduler {
             // path out — dma_loads stays 0; the prefill cost is the attention
             // kernel, seen in the per-forward `code-read prefill` breakdown.)
             if self.wave_stats.due() {
+                // The 2 s telemetry window: the memory report, the class census, the
+                // fragmentation log. Cheap per wave only because it is rare, which is
+                // exactly the claim a span is needed to check.
+                let _g = super::profile::span("loop:telemetry");
+
+                // **What the rate planner currently believes a forward costs.**
+                //
+                // Published because every one of these was invisible while being wrong.
+                // The planner decides how wide a wave is, which is the whole of decode
+                // throughput, and it does so from four learned numbers — none of which
+                // appeared in any log. A zero `fixed`+`overhead` makes the projected rate
+                // flat in width and narrows every wave to one row, and that state was
+                // reached on a card whose only distinguishing feature was being large
+                // enough to hold the checkpoint. It read as healthy throughout.
+                if let Some(rate) = self.wave_rate.as_ref() {
+                    tracing::debug!(
+                        target: "candle_conversation::scheduler::throttle",
+                        fixed_ms = rate.fixed_secs() * 1e3,
+                        overhead_ms = rate.overhead_secs() * 1e3,
+                        compute_us_per_token = rate.compute_secs_per_token() * 1e6,
+                        link_gbps = rate.effective_bytes_per_s() / 1e9,
+                        samples = rate.samples(),
+                        "wave rate model",
+                    );
+                }
                 // Our eviction gate's own view of VRAM: the pool budget we
                 // defend (vram_budget_available) and pool_used — queried only
                 // on the wave we emit, not every iteration.
@@ -848,6 +930,10 @@ impl Scheduler {
                     self.persist_trigger.fire();
                 }
             }
+            // Closes here, not at end of scope: the livelock guard below can sleep, and a
+            // span that swallowed that sleep would report the wave's idle wait as
+            // housekeeping cost.
+            house_span.end();
 
             // Livelock guard. If this wave had NO runnable forward work of any class,
             // yet the idle `recv` above did not block (some queue is non-empty), then

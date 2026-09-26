@@ -908,6 +908,31 @@ impl ExpertCache {
                 s.warm_slots = warm.num_slots();
                 s.total_experts = num_moe_layers * experts_per_layer;
                 s.moe_layers = num_moe_layers;
+                // **The zone's shape, seeded here and not left to the first classify.**
+                //
+                // These four are what `WeightPlan::from_stats` needs, and it refuses the
+                // whole gauge set if any reads zero — correctly, since a zero slot size
+                // makes a routed expert look free. They used to be written only by
+                // `classify_and_load`, which on an all-resident cache does no loading
+                // worth the name: nothing streams, so nothing refreshed them, so they
+                // stayed at zero for the process lifetime.
+                //
+                // The consequence was an inversion. With no weight plan the scheduler's
+                // rate planner cannot be armed, and admission falls back to one prefill
+                // per pass — so a card *large enough to hold the whole checkpoint* ran
+                // waves one row wide, while a card small enough to stream experts
+                // published gauges, planned, and batched. Measured on the 30B-A3B at 72
+                // GiB: `decode seqs avg=1.0 max=1` and 32 t/s against a batched ceiling
+                // of 518.
+                //
+                // Every term is known here — the zone is carved before this point and
+                // `slot_bytes` is the same figure the resident gauge above is a multiple
+                // of — so there was never a reason to wait for a classify.
+                let zone_slot_bytes = inner.zone.slot_bytes();
+                s.expert_slot_bytes = zone_slot_bytes;
+                s.zone_bytes = inner.zone.capacity() * zone_slot_bytes;
+                s.zone_min_bytes = inner.zone.min_capacity() * zone_slot_bytes;
+                s.zone_max_bytes = inner.zone.limit() * zone_slot_bytes;
                 // Which MoE path this cache will take, as a reported gauge.
                 // `all_resident` is the whole of it: a streaming cache's slot
                 // addresses move, so the device tables cannot be captured and

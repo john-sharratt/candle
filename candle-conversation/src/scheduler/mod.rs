@@ -2868,6 +2868,22 @@ pub(crate) struct Scheduler {
     /// Starts `true`: nothing has completed on a fresh engine, and one that
     /// waited for a completion before its first admission would never take one.
     pub(super) settled_since_admit: bool,
+    /// When the last KV compaction pass ran, so the cheap per-wave gate can hold a
+    /// floor on the interval. `None` before the first pass.
+    pub(super) last_kv_compaction: Option<std::time::Instant>,
+    /// Forwards this wave iteration has run, of either kind.
+    ///
+    /// The divisor for the loop's per-forward overhead: a wave's non-forward wall clock
+    /// is amortised across the forwards it carried, and that quotient is what the rate
+    /// planner needs to price width correctly. See `WaveRate::observe_overhead`.
+    pub(super) wave_forwards: usize,
+    /// Microseconds this wave iteration spent **outside** its forwards.
+    ///
+    /// Every non-forward phase, not just the one that was easiest to reach. Feeding only
+    /// the housekeeping left the submission drain out — 7% of the run on its own — and the
+    /// planner then under-priced width in proportion to what was missing, which is the
+    /// same error as omitting the term altogether, only smaller.
+    pub(super) wave_overhead_us: u64,
     /// The engine's one wave throughput planner, carried across admission
     /// passes because what it learns — the effective copy rate, the decode
     /// layer time, the hit coefficient — is a property of the machine rather
@@ -3419,6 +3435,9 @@ impl Scheduler {
             prefill_queue: VecDeque::new(),
             // See the field: the first pass has nothing to wait for.
             settled_since_admit: true,
+            last_kv_compaction: None,
+            wave_forwards: 0,
+            wave_overhead_us: 0,
             wave_rate: None,
             expert_hits_seen: 0,
             expert_misses_seen: 0,
@@ -3651,6 +3670,13 @@ impl Scheduler {
                 free_tool_calls_from_penalties,
                 recorded_reply,
             } => {
+                // **The whole SubmitTurn handler, because it is the one that runs real
+                // work on the loop thread.** Its siblings are bookkeeping; this one
+                // projects the turn, elevates warm KV, carves a view and gap-fills. The
+                // drain it sits inside measured 23 ms per call against a decode kernel of
+                // a fraction of that, so the question "is that this handler or the
+                // channel" needs its own answer.
+                let _g = profile::span("drain:submit_turn");
                 // The sequence acts as the parent slot for a carved
                 // view inside this handler — rebind for clarity.
                 let parent_id = sequence_id;
@@ -3833,6 +3859,10 @@ impl Scheduler {
                         .cloned()
                         .unwrap_or_default();
                     carried_belief.decay_scores(CARRIED_BELIEF_TURN_DECAY);
+                    // Choosing the context: the provenance scan and the section-tree walk
+                    // that decide which turns this reply attends over. Pure selection —
+                    // no K/V has moved yet.
+                    let _g_project = profile::span("drain:project");
                     let projection = inputs.projection.project_with_mode_and_sink(
                         target,
                         &view,
@@ -4019,6 +4049,10 @@ impl Scheduler {
                     // residences NOT in the incoming projection), then batch
                     // select-promote the projected sections/turns into hot before
                     // `apply_projection` injects them.
+                    // Warm → hot for everything the projection selected that is not
+                    // already resident. A tier crossing, so it is bounded by PCIe rather
+                    // than by compute, and it runs before any forward can start.
+                    let _g = profile::span("drain:elevate");
                     self.elevate_projection_working_set(
                         &conversation,
                         &projected_sections,
@@ -4033,6 +4067,11 @@ impl Scheduler {
                 // reset it to empty, so it must be skipped here (not just fed
                 // empty segments, which is the RULER/summarisation reset path).
                 if !skip_projection {
+                    // Injecting the projected context into the parent slot: the K/V
+                    // scatter and the block-table writes for every selected segment. The
+                    // heaviest single step in the handler, and the one that scales with
+                    // how much context the projection chose.
+                    let _g = profile::span("drain:apply_projection");
                     if let Err(e) =
                         self.apply_projection(parent_id, BlockCount(0), &projected_segments)
                     {
@@ -13568,17 +13607,23 @@ mod tests {
 
     /// **A stack that cannot describe its weight side still admits.**
     ///
-    /// `weight_plan` is `None` for a dense model, and on a streaming MoE stack
-    /// until its cache has published a classify — which is *every engine before
-    /// its first forward*. An admission path that waited for the planner there
-    /// would never take the prefill that makes the cache describe itself, and
-    /// the daemon would never reach ready.
+    /// `weight_plan` is [`WeightPlanning::Dense`] for a model with no expert cache, and
+    /// such a stack has no residency to trade a wave's rows against — so admission
+    /// proceeds on its width backstop alone rather than waiting for a planner that will
+    /// never arm.
+    ///
+    /// The stub is `Dense` specifically, not merely "no plan": a routed model reporting
+    /// no plan is [`WeightPlanning::Incomplete`] and panics, because an unarmed planner
+    /// narrows every wave to one row. This test covers the case that is legitimate.
     #[test]
     fn an_engine_with_no_planner_still_takes_its_queue_head() {
         let mut sched = admission_scheduler();
         assert!(
-            sched.model.weight_plan().is_none(),
-            "the stub reports no weight side, which is the case under test",
+            matches!(
+                sched.model.weight_plan(),
+                candle_transformers::models::expert_lre::WeightPlanning::Dense
+            ),
+            "the stub reports no expert cache at all, which is the case under test",
         );
         let slot = sched.session.create_sequence().unwrap();
         sched

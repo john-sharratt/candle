@@ -1855,6 +1855,46 @@ impl Substrate {
     /// migrate, for residences flagged beforehand) never ran for them — nothing
     /// else drops their hot until the async, possibly-lagging cold write lands.
     /// Without this, completed files' hot KV piles up and fills the card mid-ingest.
+    /// Rewrite every resident sequence's gids through a KV compaction's map.
+    ///
+    /// The substrate's half of a compaction sweep. A chunk's gid *is* its physical
+    /// location, so a pass that relocates one must rewrite every holder of that
+    /// identity inside the same window — and the residences are the largest holder
+    /// outside the backing itself, invisible to any walk of the block tables.
+    ///
+    /// Both tiers are visited. `warm` gids are in the same `arena_idx` namespace as
+    /// hot ones (the pool is one index space; `ArenaKey` only selects which pool the
+    /// refcount table lives in), so leaving them out would be leaving real holders
+    /// stale — and the map's own two-level lookup rejects anything from an untouched
+    /// arena, so a host chunk simply misses.
+    ///
+    /// Returns how many sequences were rewritten, for the pass's log line.
+    pub fn rewrite_for_compaction(
+        &mut self,
+        sweep: &mut candle_nn::kv_cache::Sweep<'_>,
+    ) -> candle::Result<usize> {
+        let mut rewritten = 0usize;
+        for res in self.residence.iter_mut() {
+            let mut any = false;
+            if let Some(hot) = res.hot.as_ref() {
+                if let Some(next) = candle_nn::kv_cache::rewrite_sealed(hot, sweep)? {
+                    res.hot = Some(next);
+                    any = true;
+                }
+            }
+            if let Some(warm) = res.warm.as_ref() {
+                if let Some(next) = candle_nn::kv_cache::rewrite_sealed(warm, sweep)? {
+                    res.warm = Some(next);
+                    any = true;
+                }
+            }
+            if any {
+                rewritten += 1;
+            }
+        }
+        Ok(rewritten)
+    }
+
     pub fn mark_timeline_evict_when_cold(&mut self, timeline: TimelineId) -> usize {
         let Some(entry) = self.timelines.get(&timeline) else {
             return 0;

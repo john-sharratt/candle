@@ -89,6 +89,59 @@ pub(super) struct SlotState {
     pub(super) placed: usize,
 }
 
+impl SlotState {
+    /// Rewrite every sealed chunk this slot's caches hold through a compaction
+    /// sweep, returning the captured spans that moved.
+    ///
+    /// **These caches are holders, and the sweep did not know about them.** Both
+    /// `pending_user_part` and each cached glue island keep an
+    /// `Arc<Vec<SealedSequence>>` of K/V that a later projection Arc-injects into a
+    /// slot instead of recomputing it. A compaction relocates those chunks; unless
+    /// the cache is rewritten it goes on naming the slots the pass vacated, and the
+    /// pool hands that ground to the next claim. The injected span then decodes
+    /// against another sequence's K/V — finite, plausibly shaped and wrong, which
+    /// is why it surfaces as a NaN in the first attention layer rather than as a
+    /// fault, and why it took a completeness check to find rather than a crash.
+    ///
+    /// Shares the pass's one `Sweep`, like every other holder: these caches
+    /// routinely hold the very same `Arc<Vec<ChunkGid>>` allocation a residence
+    /// holds, and a second sweep would hand each its own equal-but-distinct
+    /// replacement, leaving refcounts that disagree with the sharing the cache
+    /// believes exists.
+    pub(super) fn rewrite_for_compaction(
+        &mut self,
+        sweep: &mut candle_nn::kv_cache::Sweep<'_>,
+    ) -> candle::Result<usize> {
+        let mut moved = 0usize;
+        if let Some(span) = self.pending_user_part.as_mut() {
+            moved += span.rewrite_for_compaction(sweep)?;
+        }
+        for (_, span) in self.glue_islands.values_mut() {
+            moved += span.rewrite_for_compaction(sweep)?;
+        }
+        Ok(moved)
+    }
+}
+
+impl CapturedSpan {
+    /// Install the sweep's replacement for this span's K/V, if any of it moved.
+    ///
+    /// The index page beside it is position-free and names no chunk, so a
+    /// relocation does not touch it.
+    fn rewrite_for_compaction(
+        &mut self,
+        sweep: &mut candle_nn::kv_cache::Sweep<'_>,
+    ) -> candle::Result<usize> {
+        match candle_nn::kv_cache::rewrite_sealed(&self.kv, sweep)? {
+            Some(next) => {
+                self.kv = Arc::new(next);
+                Ok(1)
+            }
+            None => Ok(0),
+        }
+    }
+}
+
 /// How many projections an unused cached glue island survives before it is
 /// dropped. Covers selection shapes that alternate every few reprojections
 /// while keeping the pinned-chunk footprint bounded (~shapes x islands).

@@ -1314,6 +1314,46 @@ impl ChunkGidPool {
     /// packing by index instead of address is the mistake
     /// `compact_plan::ArenaSlots::rank` exists to prevent, and it silently packs
     /// into the wrong end of the span.
+    /// `(arena_idx, capacity, live_count)` for every registered arena of `key` —
+    /// the **cheap** form of [`Self::pool_occupancy`].
+    ///
+    /// Occupancy's cost is `occupied_slots()`, which walks an arena's whole refcount
+    /// bitmap and materialises a `Vec<u32>` of its live slots: at the 320 B rung that
+    /// is 52,428 bits and up to 52,428 `u32`s per arena. A caller that only needs to
+    /// know *how much* is live — to decide which pool is worth censusing at all —
+    /// must not pay that, or the decision costs more than the thing it is deciding
+    /// about.
+    pub fn pool_arena_load(&self, key: ArenaKey) -> Vec<(usize, usize, usize)> {
+        let Some(pool) = self.inner.pools.get(&key) else {
+            return Vec::new();
+        };
+        let tables = pool.tables.read().unwrap();
+        tables
+            .iter()
+            .map(|(&arena_idx, t)| (arena_idx, pool.arena_chunks, t.live_count()))
+            .collect()
+    }
+
+    /// Arenas one pool holds, and how many it would need packed — the **cheap**
+    /// sparsity figure.
+    ///
+    /// `Fragmentation::packed_arenas` computes the same number from a full occupancy
+    /// census, and the difference matters because this one is a gate: a pass that
+    /// censuses the ladder to decide whether to census the ladder has already paid.
+    /// Every term here is a field read — the live count is an atomic the refcount
+    /// table maintains — so an idle engine can ask this on every wave.
+    ///
+    /// `(arenas_held, arenas_if_packed)`.
+    pub fn pool_sparsity(&self, key: ArenaKey) -> (usize, usize) {
+        let load = self.pool_arena_load(key);
+        if load.is_empty() {
+            return (0, 0);
+        }
+        let capacity = load[0].1.max(1);
+        let live: usize = load.iter().map(|(_, _, live)| *live).sum();
+        (load.len(), live.div_ceil(capacity))
+    }
+
     pub fn pool_occupancy(&self, key: ArenaKey) -> Vec<(usize, usize, Vec<u32>)> {
         let Some(pool) = self.inner.pools.get(&key) else {
             return Vec::new();

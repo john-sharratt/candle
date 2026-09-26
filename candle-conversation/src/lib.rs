@@ -57,6 +57,10 @@ pub mod conversation_log;
 mod decode_health;
 mod engine;
 mod error;
+/// The KV-fragmentation probe: the specification for the compaction pass, and the gate
+/// that keeps it honest. Reachable from both the integration tests and the
+/// `kv_fragmentation` example, which is why it is here rather than under `tests/`.
+pub mod fragmentation_probe;
 pub mod guest;
 mod handle;
 pub mod index_pages;

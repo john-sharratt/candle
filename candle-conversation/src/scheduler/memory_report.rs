@@ -304,6 +304,22 @@ pub struct KvSection {
     pub classes: Vec<KvClassRow>,
     /// Per-backing per-format rows from every registered `ChunkedKvBacking`.
     pub arenas: Vec<ArenaRow>,
+    /// One past the highest live region — the arena frontier, in regions.
+    ///
+    /// **The figure that costs weights, and the denominator of every efficiency
+    /// number computed from this report.** The wave transient tier stands above the
+    /// highest live arena and `weight_floor` is measured from there, so expert
+    /// residency is set by this one index rather than by how many arenas are live
+    /// or how full they are.
+    ///
+    /// Carried here rather than left to the consumer's own `region_stats` call so
+    /// that the frontier and the class rows are ONE sample. Read apart, they are up
+    /// to a publish interval out of step, and the mismatch does not look like skew:
+    /// it appears as regions the class rows cannot account for, which reads exactly
+    /// like a second tenant holding ground. Measured — 734 phantom regions.
+    pub frontier_regions: usize,
+    /// Regions held by a live arena at that same moment.
+    pub live_regions: usize,
 }
 
 /// One size class's share of the resident GPU arenas.
@@ -521,7 +537,15 @@ impl Scheduler {
                 bytes: bytes as u64,
             })
             .collect();
-        let kv = KvSection { classes, arenas };
+        // Sampled here, in the same breath as the class rows above, so a consumer
+        // dividing one by the other is dividing two halves of one snapshot.
+        let ground = self.session.kv_ground_lost().unwrap_or_default();
+        let kv = KvSection {
+            classes,
+            arenas,
+            frontier_regions: ground.watermark,
+            live_regions: ground.live_arenas,
+        };
 
         // ── Warm tier ───────────────────────────────────────────────────────
         let warm = WarmSection {
@@ -745,6 +769,11 @@ mod tests {
                     arenas: 2,
                     bytes: 256,
                 }],
+                // One live arena at the frontier, so the fixture is a pool with
+                // nothing stranded and nothing sparse — the shape a consumer dividing
+                // `packed_arenas` by the frontier should read as fully efficient.
+                frontier_regions: 1,
+                live_regions: 1,
             },
             warm: WarmSection {
                 resident_count: 7,

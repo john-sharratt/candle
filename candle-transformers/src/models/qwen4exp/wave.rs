@@ -64,7 +64,7 @@ use crate::models::delta_net::{
     RecurrentStateStore, SeqSpan, ZGate,
 };
 use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
-use crate::models::expert_lre::WeightPlan;
+use crate::models::expert_lre::{WeightPlan, WeightPlanning};
 use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::qsa_selection::QsaSelection;
@@ -1964,7 +1964,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Some(self.model.experts.expert_stats())
     }
 
-    fn weight_plan(&self) -> Option<WeightPlan> {
+    fn weight_plan(&self) -> WeightPlanning {
         WeightPlan::from_stats(&self.model.experts.expert_stats())
     }
 
@@ -2703,15 +2703,26 @@ impl Qwen4ExpBatched {
         // Sub-block finiteness probes for the layer bisect — sync readbacks,
         // so they exist only in `tensor-assert` diagnostic builds.
         #[cfg(feature = "tensor-assert")]
-        fn probe(li: usize, name: &str, t: &LiveTensor<'_>) {
-            let m = t
-                .abs()
-                .and_then(|a| a.flatten_all())
-                .and_then(|f| f.max(0))
-                .and_then(|m| m.to_dtype(DType::F32))
-                .and_then(|m| m.to_scalar::<f32>());
-            eprintln!("[q4e probe] L{li} {name}: {m:?}");
+        /// Fold one layer value into its assert slot.
+        ///
+        /// **Asynchronous, and it reports through the drain like everything else.**
+        /// This was an `eprintln!` of `max(abs(t))`, which cost a `to_scalar` — a
+        /// synchronous readback, per value, per layer, per wave — and printed to
+        /// stderr where nothing correlates it with the wave that produced it. Three
+        /// separate problems: the readback is the fence these faults stop
+        /// reproducing under, the print cannot say which site went bad *first*
+        /// because stderr has no ordering against the device, and a human reading
+        /// magnitudes is not a check.
+        ///
+        /// `assert_tensor` is one reduction kernel with no readback and no fence,
+        /// and `wave_driver`'s per-wave drain then reports every bad site ordered by
+        /// the kernel's own ticket — which is what makes "the first bad value in
+        /// this wave" a question with an answer.
+        fn probe(name: &'static str, t: &LiveTensor<'_>) {
+            candle::tensor_assert::assert_tensor(t, name);
         }
+        #[cfg(feature = "tensor-assert")]
+        use candle::tensor_assert::site;
 
         for li in layer_start..layer_end {
             let layer = &m.layers[li];
@@ -2786,8 +2797,8 @@ impl Qwen4ExpBatched {
             g_pre.end();
             #[cfg(feature = "tensor-assert")]
             {
-                probe(li, "hc_mix.h", &h);
-                probe(li, "hc_mix.inject", &inject);
+                probe(site("q4e.hc_mix.h.L", li), &h);
+                probe(site("q4e.hc_mix.inject.L", li), &inject);
             }
 
             let y = match &layer.mix {
@@ -2990,13 +3001,13 @@ impl Qwen4ExpBatched {
                 }
             };
             #[cfg(feature = "tensor-assert")]
-            probe(li, "mix.y", &y);
+            probe(site("q4e.mix.y.L", li), &y);
             let g_comb = crate::models::profile::gpu_span("q4e:gr_combine", dev);
             res = hc_combine(&res, &y, &inject, gr_flip.as_ref().map(|p| &p[gr_next]))?;
             gr_next ^= 1;
             g_comb.end();
             #[cfg(feature = "tensor-assert")]
-            probe(li, "post_mix.res", &res);
+            probe(site("q4e.post_mix.res.L", li), &res);
             // The mixer's span is done with: `res` is the residual, which lives
             // outside the tier, and nothing below reads a mixer transient.
             //
@@ -3027,6 +3038,18 @@ impl Qwen4ExpBatched {
             let candle::Device::Cuda(cuda) = dev else {
                 candle::bail!("qwen4exp wave runs on CUDA");
             };
+            // **The gap the first hunt could not see into.** `post_mix.res` was
+            // clean and `moe.shared_gated` was the first bad site in the wave, and
+            // everything between them — the pre-FFN HC module's output and its
+            // inject — was uninstrumented. The MoE's two halves share exactly one
+            // input, and they went non-finite with identical counts, which is what
+            // a bad input looks like and not what bad expert weights look like.
+            // So this is where the answer is.
+            #[cfg(feature = "tensor-assert")]
+            {
+                probe(site("q4e.hc_ffn.h2.L", li), &h2);
+                probe(site("q4e.hc_ffn.inject2.L", li), &inject2);
+            }
             let h2_3d = h2.reshape((1, total_rows, n_embd))?;
             // Float activations, deliberately: the int8 expert path gathers
             // token rows as q8a1024 (hidden must tile 1024) and 2560 does not.
@@ -3052,7 +3075,7 @@ impl Qwen4ExpBatched {
                     &acts,
                     DType::F32,
                 )?;
-                probe(li, "moe.shared", &sh);
+                probe(site("q4e.moe.shared.L", li), &sh);
             }
             #[cfg(feature = "cuda")]
             let moe_wave = ffn_wave.as_ref();
@@ -3076,13 +3099,13 @@ impl Qwen4ExpBatched {
                 .reshape((total_rows, n_embd))?;
             g_moe.end();
             #[cfg(feature = "tensor-assert")]
-            probe(li, "moe.y2", &y2);
+            probe(site("q4e.moe.y2.L", li), &y2);
             let g_comb2 = crate::models::profile::gpu_span("q4e:gr_combine_ffn", dev);
             res = hc_combine(&res, &y2, &inject2, gr_flip.as_ref().map(|p| &p[gr_next]))?;
             gr_next ^= 1;
             g_comb2.end();
             #[cfg(feature = "tensor-assert")]
-            probe(li, "post_moe.res", &res);
+            probe(site("q4e.post_moe.res.L", li), &res);
             // Same reasoning as the mixer's drop above: `res` has left the span,
             // `y2`'s borrow ended at the combine, and the next layer's mixer
             // phase needs this one closed.

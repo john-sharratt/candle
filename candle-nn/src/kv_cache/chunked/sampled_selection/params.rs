@@ -473,8 +473,42 @@ impl KvErrorThresholdFactors {
 /// Cost at the rungs that already passed: C0 unchanged at 1.98x, C9 5.31x ->
 /// 5.24x, and C10 arrives at 5.50x — above the old C9, so the rung earns its
 /// place rather than merely existing.
+///
+/// # Re-derived 2026-09-26 (`k_hi: 0.475 -> 0.425`) — C10 at the *daemon's* context
+///
+/// The row above was calibrated against the gate's declared context of 262,144. The
+/// engine declares whatever its profile asks for — 8,192 for the fragmentation probe —
+/// and a different declared context is a different RoPE table, so it is a different
+/// numeric configuration. C10 failed 1/2 there, reproducibly, while every other rung
+/// passed and the 262,144 gate stayed 2/2.
+///
+/// **`k_hi` is the lever at this context, and `k_low` is not.** Stepping `k_low` down was
+/// the obvious move — it is what the 2026-09-25 note above identifies as *the* K lever —
+/// and it is the wrong one here. Measured at 8,192, C10x2:
+///
+/// | side | value | C10 sessions | C10 ratio |
+/// |---|---|---|---|
+/// | `k_low` | 1.000 (as calibrated) | 1/2 | 5.46x |
+/// | `k_low` | 0.900 | 1/2 | 5.42x |
+/// | `k_low` | 0.800 | 1/2 | 5.37x |
+/// | `k_hi` | 0.475 (as calibrated) | 1/2 | 5.46x |
+/// | `k_hi` | **0.425** | **2/2** (twice) | 5.38x |
+///
+/// Three `k_low` steps cost 0.09x of ratio and moved the pass rate not at all — which is
+/// the diagnostic, and it is worth stating because it is the opposite of the graded
+/// 0/2 -> 1/2 -> 2/2 response that identified `k_low` at the other context. **Monotonic
+/// cost with a flat pass rate means the lever is not connected to the failure**; the
+/// failing block is above the median, so its K threshold scales by `k_hi`.
+///
+/// `k_low` is therefore left at its calibrated 1.000. 0.425 is one 0.050 step inside the
+/// measured edge, the same margin discipline the note above uses.
+///
+/// Cost, both contexts re-measured: at 8,192 C9 5.22x -> 5.16x and C10 5.46x -> 5.38x; at
+/// 262,144 C9 5.18x and C10 5.42x, every rung still passing. C0 unchanged at 1.98x in
+/// both. So the tightening is paid at the top two rungs only, and the published gate keeps
+/// a C10 above its own C9.
 pub const QWEN3_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 0.475,
+    k_hi: 0.425,
     k_low: 1.000,
     v_hi: 1.225,
     v_low: 2.700,

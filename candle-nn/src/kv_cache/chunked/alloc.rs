@@ -942,7 +942,7 @@ impl BackingInner {
     /// Without the rollback the pool would advertise free slots that storage
     /// cannot produce: every later claim into that arena fails the same way,
     /// and `total_arenas` inflates the occupancy diagnostic.
-    fn claim_fresh_region(&self, key: ArenaKey) -> Result<usize> {
+    pub(super) fn claim_fresh_region(&self, key: ArenaKey) -> Result<usize> {
         let arena_idx = self.pool.register_arena(key);
         if let Err(e) = self.ensure_arena_exists(arena_idx, key) {
             self.pool.force_release_arena(arena_idx);

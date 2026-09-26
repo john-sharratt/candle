@@ -110,19 +110,29 @@ pub use chunked::{
     all_kv_formats, class_for_format, class_for_payload, elems_per_chunk, payload_bytes,
     payload_bytes_for_tag, SizeClass, GID_STRIDE, LADDER,
 };
+pub use chunked::{
+    clear_compaction_waiting, migrate_in_flight, try_freeze_chunk_locations, try_migrate_flight,
+    LocationFreeze, MigrateFlight,
+};
+/// Arena sparsity — the arenas a perfect KV pack would empty, per pool. The
+/// figure compaction is judged by; see `chunked::compact_plan`. `compaction_tally`
+/// is the other half: every pass's outcome since boot, refusals included, counted
+/// at the source because a refusal is the one outcome that cannot log.
+#[cfg(feature = "cuda")]
+pub use chunked::{
+    compact_backings, compaction_epoch, compaction_tally, CompactionRefused, CompactionReport,
+    CompactionTally,
+};
 #[cfg(feature = "cuda")]
 pub use chunked::{
     convert_deferred_descs, dequantize_sealed_in_place, quantize_layers_deferred,
     quantize_sealed_in_place, quantize_sealed_in_place_deferred,
 };
-/// Arena sparsity — the arenas a perfect KV pack would empty, per pool. The
-/// figure compaction is judged by; see `chunked::compact_plan`.
 pub use chunked::{
     fragmentation, plan_pool, ArenaSlots, ChunkMove, CompactPlan, Fragmentation, GroundLost,
 };
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use chunked::{is_device_oom, KV_DEVICE_OOM_MARKER};
-pub use chunked::{migrate_flight, migrate_in_flight, MigrateFlight};
 pub use chunked::{
     production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta,
     ChunkedKvBacking, ClassOccupancy, CompressionPolicy, GpuArenaClassStats, HeadGids,
@@ -132,6 +142,7 @@ pub use chunked::{
     QWEN35_9B_KV_FACTORS, QWEN35_MOE_KV_FACTORS, QWEN36_MOE_KV_FACTORS, QWEN38_KV_FACTORS,
     QWEN3_8B_KV_FACTORS, QWEN3_MOE_KV_FACTORS, QWEN4EXP_KV_FACTORS,
 };
+pub use chunked::{rewrite_sealed, CompactionMap, RecordGeometry, Sweep};
 pub use chunked::{ArenaKey, StoragePolicy};
 pub use chunked::{LiveChunkRef, MetaGid, SealedChunk, SealedSequence, WriterTail, CHUNK_SIZE};
 pub use rotating::{

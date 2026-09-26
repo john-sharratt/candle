@@ -203,11 +203,241 @@ fn vram_compress_max() -> u64 {
 const VRAM_OFFLOAD_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Scheduler {
-    /// Promote up to `MAX_ACTIVE_PREFILLS - active_prefills.len()` newly
-    /// submitted PrefillWorks from the FIFO queue into the in-flight
-    /// `active_prefills` set. Emits the initial `Prefill` and
-    /// `PrefillProgress(0, total)` events so callers see their submission
-    /// was picked up.
+    /// Pack the KV pools if they are fragmented enough to be worth a pass, then ask
+    /// the weight side to take what packing released.
+    ///
+    /// **Gated on the gain, not run unconditionally.** A pass costs a device-wide
+    /// sync and a copy per relocated chunk, so it is only worth making when there is
+    /// real ground to recover: `MIN_FREEABLE_ARENAS` regions, which at 16 MiB each is
+    /// the point where the expert cache can actually do something with the result.
+    ///
+    /// **And the second half is not optional.** Lowering the frontier only makes it
+    /// *possible* for `weight_floor` to move left; `reclaim_spare_ground` is what
+    /// moves it. Without that call a pass hands back regions nobody claims, decode is
+    /// exactly as slow as before, and the work is invisible in every metric except
+    /// the one that matters — which is why the two are one method and not two.
+    pub(super) fn compact_kv_if_fragmented(&mut self) {
+        /// Regions recoverable before a pass is worth its sync and its copies.
+        const MIN_FREEABLE_ARENAS: usize = 8;
+        /// Wall-clock a single pass may spend **planning and claiming**. A budget
+        /// rather than a move cap: the ladder spans 320 B to 16 KiB, so the same
+        /// "one move" is fifty times the bandwidth at one rung and a count cannot
+        /// bound a duration.
+        ///
+        /// Generous, because the copies are one launch and the *walks* are what the
+        /// clock bounds — the occupancy census over every arena of every rung, then
+        /// the claims. At 8 ms the pass clipped on every run and handed back a single
+        /// arena with the frontier where it started; at 20 ms the census alone spent
+        /// the budget and 37 of 40 attempts claimed nothing. Both halves are now
+        /// separately bounded (see `compact_backings`), and this is sized so each has
+        /// room: the wave loop's own housekeeping already spends 40–66 ms on the
+        /// promote pass at this point, so a pass of this order is in proportion to
+        /// what the gap already costs.
+        /// Measured at 40 ms: 31 of 42 passes clipped, and the pools held 94–99%
+        /// except through the first mass eviction, where 24 conversations retiring at
+        /// once left one 1.5 s sample at 71%. A clipped pass is not wasted — it packs a
+        /// prefix and the next resumes closer — but through a burst the arrival rate is
+        /// what has to be matched, and clipping every pass means it never is.
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(80);
+
+        /// Shortest interval between passes.
+        ///
+        /// The gate below is cheap, but the pass behind it is not: its census walks
+        /// every arena's occupancy bitmap once per rung of the ladder. Running it on
+        /// every wave-loop iteration would put that walk between every pair of
+        /// forwards. This is what makes "every wave, cheap-signal gated" mean
+        /// *considered* every wave rather than *run* every wave.
+        const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+
+        // **A cheap gate, because this is consulted every wave.** `kv_ground_lost`
+        // is not cheap — it sums `packed_arenas` across the ladder, which is the
+        // census — so it cannot be the thing that decides whether to census.
+        //
+        // Both halves of the loss, because either alone misses the other's regime.
+        // Holes — free regions stranded below the frontier — are self-correcting
+        // under allocation, so a steadily-loaded pool reads zero holes with tens of
+        // sparse arenas beneath it; gating on holes alone ran 16 passes over 110 s of
+        // churn and left the pools at 82%. Sparsity alone would miss the burst, where
+        // a mass eviction strands the frontier over ground that is genuinely free.
+        // Standing down releases the hold a previous refusal put on the persistence
+        // thread. A refused pass tells migrates to step aside for it; if the gate has
+        // since closed — the pools packed themselves, nothing is fragmented — that
+        // promise has to be withdrawn or hot→warm defers for a pass that is never
+        // coming.
+        let stand_down = || candle_nn::kv_cache::clear_compaction_waiting();
+
+        // **Cheapest test first, and the interval before either counter.** This runs on
+        // every iteration of the wave loop, so the order of these three is itself a hot
+        // path: the interval is two loads, the hole count is a handful of field reads
+        // behind one lock, and the sparsity sum takes a read lock per rung of the ladder
+        // and walks that pool's arena map — cheap next to a census, not cheap next to
+        // nothing, and pointless on an iteration that has already decided not to run.
+        //
+        // The interval check returns without standing down deliberately: the pass it is
+        // deferring is still coming, so a refusal's hold on the persistence thread must
+        // survive it.
+        if self
+            .last_kv_compaction
+            .is_some_and(|t| t.elapsed() < MIN_INTERVAL)
+        {
+            return;
+        }
+        let Some(stats) = self.session.kv_region_stats() else {
+            stand_down();
+            return;
+        };
+        // Both halves of the loss, because either alone misses the other's regime.
+        // Holes — free regions stranded below the frontier — are self-correcting under
+        // allocation, so a steadily-loaded pool reads zero holes with tens of sparse
+        // arenas beneath it; gating on holes alone ran 16 passes over 110 s of churn and
+        // left the pools at 82%. Sparsity alone would miss the burst, where a mass
+        // eviction strands the frontier over ground that is genuinely free.
+        let holes = stats.live_watermark.saturating_sub(stats.live);
+        if holes < MIN_FREEABLE_ARENAS
+            && holes + self.session.kv_sparse_arenas() < MIN_FREEABLE_ARENAS
+        {
+            stand_down();
+            return;
+        }
+
+        // **Every registered conversation, not one.** Conversations in a workspace
+        // share a substrate, so sweeping one sweeps all its residences — but the
+        // scheduler can host conversations on more than one substrate, and a
+        // workspace left out keeps residences naming vacated slots. Sweeping them all
+        // is safe because a pass is idempotent under one `Sweep`: after a rewrite the
+        // residence holds NEW gids and the map is keyed on the old ones, so a second
+        // visit matches nothing.
+        let substrates: Vec<_> = self.slot_conversations.values().cloned().collect();
+        let mut swept = 0usize;
+        // **The projection caches are holders too.** Taken out for the duration so
+        // the closure can rewrite them while `self.session` is borrowed — two
+        // disjoint fields of `self`, which the borrow checker cannot split across a
+        // method call on one of them — and put back below whatever the pass returns.
+        //
+        // Without this they kept naming the slots a pass had vacated: a cached glue
+        // island or a pending user part is Arc-injected into a slot by a later
+        // projection instead of being recomputed, so the stale K/V is read as if it
+        // were the span's own. That is the incomplete holder set the pass's
+        // completeness check found — 129 of 6767 relocated slots named by nobody it
+        // reached — and the reason a compaction could poison a sequence that was not
+        // even resident when it ran.
+        let mut projections = std::mem::take(&mut self.slot_projection_state);
+        // The closure receives the pass's OWN `Sweep`, already carrying whatever the
+        // backings rewrote. Sharing it is what makes an allocation held by both a
+        // block table and a residence come back as one replacement.
+        let outcome = self.session.compact_kv(BUDGET, &mut |sweep| {
+            for s in &substrates {
+                swept += s.rewrite_for_compaction(sweep)?;
+            }
+            for state in projections.values_mut() {
+                swept += state.rewrite_for_compaction(sweep)?;
+            }
+            Ok(())
+        });
+        self.slot_projection_state = projections;
+        // **The interval is stamped by a pass that ran, never by one that was
+        // refused.** `MIN_INTERVAL` exists to bound the census, and a contended pass
+        // pays no census — it refuses on a `try_` acquisition and returns. Stamping
+        // ahead of the call made every refusal cost a quarter second of not trying
+        // again, and against a persistence thread that holds its migrate for the
+        // length of a hot→warm batch that meant 15 passes out of 52 attempts and the
+        // pools left at 69%. Now the next wave picks up the gap the moment the
+        // migrate lets go.
+        if !matches!(
+            outcome,
+            Err(candle_nn::kv_cache::CompactionRefused::WaveInFlight)
+                | Err(candle_nn::kv_cache::CompactionRefused::MigrateInFlight)
+        ) {
+            self.last_kv_compaction = Some(std::time::Instant::now());
+        }
+        // **The pass's own phase breakdown, filed where every other wave span lands.**
+        // `candle-nn` sits below the profiler, so the pass measures itself and this
+        // records it — see `CompactionReport::timings`. Recorded for a refusal too when
+        // one got far enough to plan, because "the census cost 30 ms and then the claims
+        // lost" is a diagnosis and "compaction was refused" is not.
+        if let Ok(report) = &outcome {
+            let t = report.timings;
+            super::profile::record("compact:quiesce", t.quiesce);
+            super::profile::record("compact:plan", t.plan);
+            super::profile::record("compact:claim", t.claim);
+            super::profile::record("compact:copy", t.copy);
+            super::profile::record("compact:barrier", t.barrier);
+            super::profile::record("compact:sweep", t.sweep);
+            super::profile::record("compact:patch", t.patch);
+            super::profile::record("compact:publish", t.publish);
+        }
+        match outcome {
+            Ok(report) if !report.is_empty() => {
+                // The weight side, immediately, while no wave generation is live.
+                let _g = super::profile::span("compact:reclaim_weights");
+                self.model.reclaim_spare_ground();
+                tracing::info!(
+                    target: "candle_conversation::scheduler::vram_relief",
+                    moves = report.moves,
+                    allocations = report.allocations_rewritten,
+                    patched = report.patched_words,
+                    arenas_released = report.arenas_released,
+                    frontier_before = report.frontier_before,
+                    frontier_after = report.frontier_after,
+                    reclaimed_mib =
+                        report.regions_reclaimed() * (candle_nn::kv_cache::REGION_BYTES >> 20),
+                    substrate_sequences = swept,
+                    clipped = report.clipped,
+                    // **What the pass waited for, beside what it did.** The pre-plan
+                    // drain is the one phase whose cost belongs to other work — it
+                    // waits for whatever was in flight when the pass began — and it
+                    // is outside the budget, so without it here a pass that spent
+                    // 60 ms waiting and 20 ms working is indistinguishable from one
+                    // that spent 80 ms working. Only visible through the profile
+                    // spans otherwise, and those compile to nothing by default.
+                    quiesce_us = report.timings.quiesce.as_micros(),
+                    // The relocation accounting. `patched` alone is not readable:
+                    // it sat 44% below `moves` for a whole run with three possible
+                    // causes and no way to tell them apart, only one of which is a
+                    // defect. `unwitnessed` is that one.
+                    unwitnessed = report.unwitnessed,
+                    patch_no_record = report.patch_no_record,
+                    patch_dup_record = report.patch_dup_record,
+                    "kv compaction packed the pools and handed the ground back",
+                );
+            }
+            Ok(_) => {}
+            Err(candle_nn::kv_cache::CompactionRefused::WaveInFlight) => {
+                // Ordinary contention. The next pass tries again.
+            }
+            // **A fault is reported, not declined.** Every other arm here is "not
+            // now" and belongs at `debug`, which is why this one cannot share the
+            // arm: a partition invariant that broke would have been a debug line
+            // nobody reads, on a pass that runs every wave.
+            //
+            // Every active turn fails, not one. The pass runs in the wave loop
+            // between forwards, so there is no turn whose call stack this is on —
+            // and the fault is not one turn's anyway: the arenas are pooled across
+            // sessions, so a plan that named ground no arena owns implicates
+            // whatever any of them is holding. Failing the turns that exist is what
+            // makes it visible at the only place a caller is watching.
+            Err(candle_nn::kv_cache::CompactionRefused::Fault(msg)) => {
+                let ids: Vec<_> = self.active_decodes.keys().copied().collect();
+                tracing::error!(
+                    target: "candle_conversation::scheduler::vram_relief",
+                    turns = ids.len(),
+                    "kv compaction found a broken partition invariant and abandoned \
+                     the pass: {msg}",
+                );
+                self.fail_all_decodes(
+                    &ids,
+                    &format!("kv compaction found a broken partition invariant: {msg}"),
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: "candle_conversation::scheduler::vram_relief",
+                    "kv compaction declined: {e:?}",
+                );
+            }
+        }
+    }
+
     /// Under VRAM pressure, shed until the free-region setpoint is met again,
     /// and report whether pressure **survived** the attempt.
     ///
@@ -634,7 +864,24 @@ impl Scheduler {
             // the queue head goes in and the width backstop is the only bound.
             // Without this an engine would never take the first prefill that
             // makes the cache describe itself.
+            //
+            // **And it says so, because this branch admits exactly one.** It used to
+            // return in silence, which makes it indistinguishable from a healthy engine
+            // in every log the scheduler emits: no admission pass line, no refusal, just
+            // a wave one row wide, forever. Measured on the 30B-A3B — twenty conversations
+            // queued, `decode seqs avg=1.0 max=1`, 32 t/s against a batched ceiling of
+            // 518 — and the only way to find it was to notice that the pass which should
+            // have logged never did. A path that quietly costs an order of magnitude is
+            // the one path that must not be quiet.
             if let Some(work) = self.prefill_queue.pop_front() {
+                tracing::debug!(
+                    target: "candle_conversation::scheduler::throttle",
+                    queued = self.prefill_queue.len(),
+                    in_flight,
+                    "no weight plan: admitting ONE prefill unjudged. The rate model cannot \
+                     run without the expert cache's gauges, so the wave stays as narrow as \
+                     this path makes it",
+                );
                 self.begin_prefill(work);
             }
             return;
@@ -740,7 +987,57 @@ impl Scheduler {
     /// [`ManagedBatchedModel::weight_plan`].
     fn take_planner(&mut self) -> Option<admit::WaveRate> {
         if self.wave_rate.is_none() {
-            let p = self.model.weight_plan()?;
+            // **The refusal names itself.** `WeightPlan::from_stats` declines a partial
+            // gauge set outright — any of `moe_layers`, `total_experts`,
+            // `expert_slot_bytes` or `zone_max_bytes` reading zero — and a bare `?` here
+            // turns that into an absent planner with no record of which gauge was missing.
+            // Since an absent planner collapses every wave to one row (see the caller),
+            // the distinction between "no expert cache at all" and "the cache has not
+            // described itself yet" is the difference between a dense model working as
+            // designed and a routed model silently running an order of magnitude slow.
+            // **A routed model with broken gauges is fatal, and a dense one is not.**
+            //
+            // These were one `None` until the conflation was measured: an absent plan
+            // collapses admission to one prefill per pass (see the caller), which is
+            // correct for a dense stack and an order of magnitude for a routed one. On the
+            // 30B-A3B at 72 GiB it read `decode seqs avg=1.0 max=1` and 32 t/s against a
+            // batched ceiling of 518, logged nothing, and inverted with card size — a card
+            // too small to hold the checkpoint streamed experts, published gauges and
+            // batched, while a card large enough held everything, published nothing, and
+            // ran one row wide.
+            //
+            // So the broken case panics. It is not recoverable by degrading: the engine
+            // would serve, slowly, with no signal distinguishable from a healthy narrow
+            // workload, and the only way it was ever found was noticing that a log line
+            // which should have appeared never did.
+            let p = match self.model.weight_plan() {
+                candle_transformers::models::expert_lre::WeightPlanning::Ready(p) => p,
+                candle_transformers::models::expert_lre::WeightPlanning::Dense => {
+                    tracing::debug!(
+                        target: "candle_conversation::scheduler::throttle",
+                        "dense stack: no expert residency to trade rows against, so the \
+                         width backstop is the only bound",
+                    );
+                    return None;
+                }
+                candle_transformers::models::expert_lre::WeightPlanning::Incomplete { field } => {
+                    let s = self.model.expert_stats();
+                    panic!(
+                        "the expert cache reports a routed model but its gauge set is \
+                         incomplete: `{field}` is zero. The wave rate planner cannot be \
+                         armed without it, and an unarmed planner silently narrows every \
+                         wave to one row — so this refuses to run rather than serve at a \
+                         fraction of the rate with no way to tell. Gauges: \
+                         moe_layers={:?} total_experts={:?} slot_bytes={:?} \
+                         zone_bytes={:?} zone_max_bytes={:?}",
+                        s.as_ref().map(|s| s.moe_layers),
+                        s.as_ref().map(|s| s.total_experts),
+                        s.as_ref().map(|s| s.expert_slot_bytes),
+                        s.as_ref().map(|s| s.zone_bytes),
+                        s.as_ref().map(|s| s.zone_max_bytes),
+                    );
+                }
+            };
             let geometry = admit::rate::ExpertGeometry {
                 moe_layers: p.moe_layers,
                 experts_per_layer: p.experts_per_layer,

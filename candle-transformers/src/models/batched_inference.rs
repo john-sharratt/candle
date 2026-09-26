@@ -26,7 +26,7 @@
 
 use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
-use super::expert_lre::WeightPlan;
+use super::expert_lre::WeightPlanning;
 use crate::models::delta_net::ExportedLayerState;
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
 use crate::models::rope_schedule::rung_of;
@@ -1960,6 +1960,29 @@ impl BatchedInferenceSession {
         Ok(total_freed)
     }
 
+    /// Pack the KV pools toward the lowest addresses so the arena frontier falls.
+    ///
+    /// Passes **every** backing, because the pool is shared but the block tables are
+    /// per-layer: a pass that rewrote one layer's view of a relocated chunk and not
+    /// the rest would be wrong attention on every other layer.
+    ///
+    /// `sweep` is where a caller with its own gid holders — a substrate residence, a
+    /// projection cache — applies the same relocation map. A caller whose only block
+    /// tables are these backings' passes a closure that does nothing.
+    ///
+    /// Only legal between forwards; refuses otherwise.
+    #[cfg(feature = "cuda")]
+    pub fn compact_kv(
+        &self,
+        budget: std::time::Duration,
+        sweep: &mut dyn FnMut(&mut candle_nn::kv_cache::Sweep<'_>) -> Result<()>,
+    ) -> std::result::Result<
+        candle_nn::kv_cache::CompactionReport,
+        candle_nn::kv_cache::CompactionRefused,
+    > {
+        candle_nn::kv_cache::compact_backings(&self.backings, budget, sweep)
+    }
+
     /// Create the arenas that mid-wave refusals recorded, and answer with how
     /// many were made.
     ///
@@ -2119,6 +2142,47 @@ impl BatchedInferenceSession {
     /// the region pool, which is device-global: regions are shared by every pool, so
     /// the frontier is not a per-class quantity and cannot be derived from
     /// [`Self::kv_fragmentation`] alone.
+    /// Regions a perfect pack would free, **cheaply** — the gate that decides
+    /// whether a compaction pass is worth its census.
+    ///
+    /// Sums `(arenas_held - arenas_if_packed)` over the GPU pools from the refcount
+    /// tables' live counters, with no occupancy bitmap walked. That distinction is
+    /// the whole point: the exact figure is [`Self::kv_ground_lost`], which *is* the
+    /// census, so it cannot be what decides whether to pay for one. The cheap
+    /// counterpart to the region pool's hole count, which
+    /// [`Self::kv_region_stats`] already gives for free.
+    ///
+    /// Holes alone are not a usable gate. They are self-correcting — the region free
+    /// list is lowest-index-first, so the next claim takes the lowest hole — and a
+    /// steadily-loaded pool sits at zero holes with tens of sparse arenas underneath.
+    /// Measured: 16 passes over 110 s of churn, because the gate read holes and holes
+    /// were zero on all but three samples while 50 arenas of air sat in the pools.
+    pub fn kv_sparse_arenas(&self) -> usize {
+        let Some(b) = self.backings.first() else {
+            return 0;
+        };
+        SizeClass::all()
+            .map(|class| {
+                let (held, packed) = b.pool_sparsity(ArenaKey::new(class, ArenaLocation::Gpu));
+                held.saturating_sub(packed)
+            })
+            .sum()
+    }
+
+    /// The region pool's own counters for this session's device.
+    ///
+    /// The **cheap** half of the fragmentation picture, and the reason it is exposed
+    /// separately from [`Self::kv_ground_lost`]: this is a handful of field reads
+    /// behind one lock, whereas `kv_ground_lost` sums `packed_arenas` across the
+    /// ladder, which means walking every arena's occupancy bitmap. A caller deciding
+    /// *whether* to pay for that walk cannot use the walk to decide.
+    pub fn kv_region_stats(&self) -> Option<candle_nn::kv_cache::RegionStats> {
+        let candle::DeviceLocation::Cuda { gpu_id } = self.device.location() else {
+            return None;
+        };
+        candle_nn::kv_cache::region_stats(gpu_id)
+    }
+
     pub fn kv_ground_lost(&self) -> Option<GroundLost> {
         // This session's own device ordinal, not a hardcoded 0: a second engine on
         // a second card would otherwise report the first card's frontier.
@@ -5162,12 +5226,15 @@ pub trait ManagedBatchedModel {
     /// The weight side as the wave rate planner prices it — MoE geometry, and
     /// the range the expert zone may move in.
     ///
-    /// `None` for a dense model, for a cache that has not yet run a classify,
-    /// and off CUDA. Admission then plans nothing and falls through to its width
-    /// backstop, which is the right answer: a stack with no expert residency has
-    /// no residency to trade a wave's rows against.
-    fn weight_plan(&self) -> Option<WeightPlan> {
-        None
+    /// [`WeightPlanning::Dense`] by default: a stack with no expert cache has no
+    /// residency to trade a wave's rows against, so not planning is the correct
+    /// answer and the width backstop is the only bound.
+    ///
+    /// A routed model overrides this, and the distinction between "nothing to plan"
+    /// and "the gauges are broken" lives in [`WeightPlanning`] rather than in an
+    /// `Option` — see that type for what the conflation cost.
+    fn weight_plan(&self) -> WeightPlanning {
+        WeightPlanning::Dense
     }
 
     /// Reservation bytes held by per-sequence recurrent state, for the same
@@ -5403,7 +5470,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         self.model().resident_weight_bytes()
     }
 
-    fn weight_plan(&self) -> Option<WeightPlan> {
+    fn weight_plan(&self) -> WeightPlanning {
         self.model().weight_plan()
     }
 

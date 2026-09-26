@@ -353,6 +353,24 @@ impl Scheduler {
             .filter(|id| !glue_pending.contains(&id.0))
             .collect();
 
+        // **Why this wave is as wide as it is, in the one place that decides.** A decode
+        // forward's width is the whole of decode throughput, and it is not a cap — it is
+        // whatever survives these filters. Reading it from the outside is guesswork: a
+        // width of four could be four sequences active, or twenty with sixteen held back,
+        // and those are unrelated problems. Every term that removed a row is named.
+        tracing::debug!(
+            target: "candle_conversation::scheduler::throttle",
+            active = self.active_decodes.len(),
+            finished = self
+                .active_decodes
+                .values()
+                .filter(|s| s.finished)
+                .count(),
+            glue_pending = glue_pending.len(),
+            selected = seq_ids.len(),
+            "decode row selection",
+        );
+
         // ── Interactive-decode priority ──────────────────────────────────────
         // A HIGH-priority (interactive dialogue) decode must not be trapped
         // behind a large bulk-INGEST co-batch — a single dialogue token stuck in
@@ -1898,7 +1916,7 @@ impl Scheduler {
     }
 
     /// Send an error to all active decodes and mark them finished.
-    fn fail_all_decodes(&mut self, seq_ids: &[SequenceId], msg: &str) {
+    pub(super) fn fail_all_decodes(&mut self, seq_ids: &[SequenceId], msg: &str) {
         for &id in seq_ids {
             if let Some(state) = self.active_decodes.get_mut(&id) {
                 let _ = state

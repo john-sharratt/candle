@@ -452,6 +452,10 @@ impl Scheduler {
         if rows == 0 || us == 0 {
             return;
         }
+        // Counted even when the model refuses to learn from it: the loop's overhead is
+        // amortised across forwards that *ran*, not across forwards wide enough to teach
+        // the copy rate.
+        self.wave_forwards += 1;
         let resident = residency_now(self.standing_tier_bytes());
         if let Some(rate) = self.wave_rate.as_mut() {
             rate.observe_prefill(rows, resident, us as f64 / 1e6);
@@ -468,6 +472,9 @@ impl Scheduler {
         if decodes == 0 || us == 0 {
             return;
         }
+        // Same reason as the prefill funnel: the loop's overhead is shared by every
+        // forward a wave ran, of either kind.
+        self.wave_forwards += 1;
         let resident = residency_now(self.standing_tier_bytes());
         if let Some(rate) = self.wave_rate.as_mut() {
             rate.observe_decode(decodes, 0, resident, us as f64 / 1e6);

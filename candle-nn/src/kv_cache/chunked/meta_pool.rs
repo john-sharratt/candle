@@ -73,6 +73,38 @@ pub(crate) fn chunk_record_bytes(n_kv_head: usize, head_dim: usize, n_palette: u
     n_kv_head * kv_head_record_bytes(head_dim, n_palette)
 }
 
+/// Byte offset of one band's 8-byte device pointer inside a chunk record.
+///
+/// The inverse of the pointer writes in [`serialize_kv_heads`], and the reason a
+/// KV compaction can **patch** a record instead of rebuilding it: given a moved
+/// band, this says which word of the resident record names it, so the fix is one
+/// 8-byte store per moved band rather than a fresh record serialized on the host
+/// and shipped over the bus.
+///
+/// `is_value` selects the V pointer over the K pointer. `p` is the band (palette)
+/// index; the gid that feeds this word is `gids[h * n_palette * 2 + p * 2 +
+/// is_value]`, which is the stride the record itself indexes at (see the note on
+/// the GID slice in [`serialize_kv_heads`] — it is `n_palette * 2` per head, not
+/// the global `GIDS_PER_HEAD`).
+///
+/// Held against the serializer by
+/// [`band_ptr_offset_agrees_with_the_serializer`](tests), which builds a real
+/// record and reads each pointer back through this — an independent copy of the
+/// layout arithmetic would be exactly the kind of second opinion that drifts.
+pub(crate) fn band_ptr_offset(
+    h: usize,
+    p: usize,
+    is_value: bool,
+    head_dim: usize,
+    n_palette: usize,
+) -> usize {
+    let pal_bytes = head_dim / 4;
+    // Per head: k_pal, v_pal, then k_ptr[n_palette], then v_ptr[n_palette].
+    h * kv_head_record_bytes(head_dim, n_palette)
+        + pal_bytes * 2
+        + (usize::from(is_value) * n_palette + p) * 8
+}
+
 /// One chunk's contribution to a `KvHead[n_kv_head]` record, borrowed from the
 /// chunk that owns it.
 ///
@@ -917,5 +949,120 @@ mod tests {
         let kptr1 = u64::from_le_bytes(dst[10..18].try_into().unwrap());
         assert_eq!(kptr0, 0x1000 + 256);
         assert_eq!(kptr1, 0x9000 + 2 * 128);
+    }
+
+    /// **[`band_ptr_offset`] must agree with the serializer, not with a copy of
+    /// its reasoning.**
+    ///
+    /// A KV compaction patches a resident record by storing 8 bytes at the offset
+    /// this function names. If the arithmetic drifts from `serialize_kv_heads` the
+    /// patch writes into a format tag or a scale — which does not fault, because
+    /// the record is valid memory, and surfaces as a decode reading quantized
+    /// bytes with the wrong tag. So the test builds a REAL record with a distinct
+    /// address per band and reads every band back through the offset.
+    ///
+    /// Several heads and a head_dim above the 4 of the tests above, because
+    /// `pal_bytes = head_dim / 4` is the term a per-head stride bug hides behind.
+    /// Run at **both** band counts, because the band count is per backing.
+    ///
+    /// `n_palette()` answers `N_PALETTE` for GQA and `LATENT_N_BANDS` for the single
+    /// latent, and it drives this record layout. A compaction that took the GQA
+    /// constant instead of asking the backing computed every offset for a quarter of
+    /// the bands on a latent backing — writing correct addresses into the wrong
+    /// words, over the palette, format and scale fields of an earlier head, and
+    /// leaving the upper bands naming vacated slots. Pinning only `N_PALETTE` here
+    /// is what let that pass: the arithmetic was right for the count the test used.
+    #[test]
+    fn band_ptr_offset_agrees_with_the_serializer() {
+        offsets_agree_at(N_PALETTE);
+    }
+
+    #[test]
+    fn band_ptr_offset_agrees_with_the_serializer_on_the_single_latent() {
+        offsets_agree_at(crate::kv_cache::arena_table::LATENT_N_BANDS);
+    }
+
+    fn offsets_agree_at(n_palette: usize) {
+        let head_dim = 128usize;
+        let n_kv_head = 3usize;
+        let rec = chunk_record_bytes(n_kv_head, head_dim, n_palette);
+        let stride = crate::kv_cache::chunked::types::GID_STRIDE as i64;
+
+        // One distinct arena per band slot, so every pointer in the record is
+        // unique and a swapped offset cannot coincidentally match.
+        let per_head = n_palette * 2;
+        let mut raw = vec![0i64; per_head * n_kv_head];
+        let mut arena_info = Vec::new();
+        for (slot, r) in raw.iter_mut().enumerate() {
+            // arena `slot`, chunk 1 — so the address is base + stride.
+            *r = slot as i64 * stride + 1;
+            arena_info.push(ResolvedArenaInfo {
+                base_ptr: 0x10_0000 + slot as u64 * 0x1000,
+                chunk_byte_stride: 64,
+                chunk_capacity: u32::MAX,
+            });
+        }
+        let gids = HeadGids::from_vec(raw.iter().map(|&r| ChunkGid::detached(r)).collect());
+        let k_fmt = vec![ArenaFormatTag::Q8_0.as_u8(); n_palette * n_kv_head];
+        let v_fmt = vec![ArenaFormatTag::Q8_0.as_u8(); n_palette * n_kv_head];
+        let mut dst = vec![0u8; rec];
+        serialize_kv_heads(
+            &mut dst,
+            &ChunkRecordSrc {
+                gids: &gids,
+                k_pal: &[],
+                v_pal: &[],
+                k_scale: &[],
+                v_scale: &[],
+                k_fmt: &k_fmt,
+                v_fmt: &v_fmt,
+            },
+            n_kv_head,
+            head_dim,
+            n_palette,
+            &arena_info,
+        );
+
+        for h in 0..n_kv_head {
+            for p in 0..n_palette {
+                for is_value in [false, true] {
+                    let slot = h * per_head + p * 2 + usize::from(is_value);
+                    let want = arena_info[slot].base_ptr + 64;
+                    let off = band_ptr_offset(h, p, is_value, head_dim, n_palette);
+                    assert!(
+                        off + 8 <= rec,
+                        "offset for (h{h}, p{p}, v{is_value}) at {n_palette} bands \
+                         runs past the record",
+                    );
+                    let got = u64::from_le_bytes(dst[off..off + 8].try_into().unwrap());
+                    assert_eq!(
+                        got, want,
+                        "band (h{h}, p{p}, is_value={is_value}) at {n_palette} bands \
+                         reads the wrong word: offset {off} holds {got:#x}, the \
+                         serializer put {want:#x} there",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every band offset is distinct and 8-byte aligned — the property the patch
+    /// kernel's sorted-scatter coalescing assumes, and which a stride bug that
+    /// happened to stay in bounds would break silently.
+    #[test]
+    fn band_ptr_offsets_are_distinct_and_aligned() {
+        let head_dim = 128usize;
+        let n_kv_head = 4usize;
+        let mut seen = std::collections::HashSet::new();
+        for h in 0..n_kv_head {
+            for p in 0..N_PALETTE {
+                for is_value in [false, true] {
+                    let off = band_ptr_offset(h, p, is_value, head_dim, N_PALETTE);
+                    assert_eq!(off % 8, 0, "band pointers must be 8-byte aligned");
+                    assert!(seen.insert(off), "offset {off} is claimed by two bands");
+                }
+            }
+        }
+        assert_eq!(seen.len(), n_kv_head * N_PALETTE * 2);
     }
 }

@@ -154,6 +154,9 @@ pub struct TestParams {
     /// you what the level did on average, never which member did it. Pinning
     /// one at a time turns that into an answerable question.
     pub override_k_quant: Option<QuantFormat>,
+    /// Rows the caller measured itself, appended below the harness's own in the
+    /// comparison table. See [`ExtraRow`] for why the table takes them.
+    pub extra_rows: Vec<ExtraRow>,
 }
 
 impl TestParams {
@@ -195,10 +198,21 @@ impl TestParams {
             lora: None,
             speculative_max_draft: DraftBudget::Adaptive,
             override_k_quant: None,
+            extra_rows: Vec::new(),
         })
     }
 
     /// Pin every sealed K block to `fmt` — see [`Self::override_k_quant`].
+    /// Append rows the caller measured, below the harness's own.
+    ///
+    /// Installed before [`Self::validate_and_print`], which is what prints them — so a
+    /// caller producing engine-driven rows measures its own after
+    /// [`Self::run_loaded_collect`] and hands them over here.
+    pub fn with_extra_rows(mut self, rows: Vec<ExtraRow>) -> Self {
+        self.extra_rows = rows;
+        self
+    }
+
     pub fn with_override_k_quant(mut self, fmt: Option<QuantFormat>) -> Self {
         self.override_k_quant = fmt;
         self
@@ -404,6 +418,44 @@ pub struct PhaseResults {
     pub min_ms: f64,
     pub max_ms: f64,
     pub runs_used: usize,
+}
+
+/// A row the caller measured itself, appended to the comparison table below the
+/// harness's own.
+///
+/// **Why the table takes foreign rows at all.** The rows this harness produces drive
+/// `forward_wave` on a session it constructs, from a clean slate, with nothing else
+/// running — which is the right way to measure *how fast the forward can go*, and the
+/// reason it is useless for measuring what a daemon sees. A daemon's throughput is
+/// shaped by admission, by the projection it runs per turn, by the persistence thread
+/// moving KV between tiers, and by whatever fragmentation the pool has accumulated —
+/// none of which exists in this crate. So the engine-driven rows are measured one crate
+/// up and handed here, and the two sit in one table because the comparison is the point:
+/// the harness rows are the ceiling, the engine rows are the delivery.
+///
+/// The fragmentation columns are `None` for a harness row, and that is not a gap. Those
+/// rows *cannot* fragment: every sequence is freed and every empty arena released
+/// between configs, with a gate asserting nothing is live before the next one starts.
+#[derive(Debug, Clone)]
+pub struct ExtraRow {
+    /// What produced this row, in the `KvMode` column's place — e.g. `Q8_0/eng`.
+    pub label: String,
+    /// Concurrent sequences.
+    pub contexts: usize,
+    pub prompt_tokens_per_sec: f64,
+    pub generate_tokens_per_sec: f64,
+    /// `(passed, total)` sessions, or `None` where the row does not validate content.
+    pub valid: Option<(usize, usize)>,
+    pub compression_ratio: Option<f64>,
+    pub peak_tokens: usize,
+    /// The arena frontier, in regions — one past the highest live region. **The figure
+    /// that costs weights**: the wave transient tier stands above it and `weight_floor`
+    /// is measured from there, so this one index sets expert residency and therefore
+    /// decode.
+    pub frontier_regions: Option<usize>,
+    /// `packed_arenas / frontier` as a percentage: of the ground denied to the weight
+    /// side, the share actually holding KV.
+    pub efficiency_pct: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -959,6 +1011,9 @@ impl TestParams {
     /// on these models: a 124 GB artifact takes minutes to open, so a
     /// five-budget sweep spends most of its wall clock re-reading weights that
     /// never changed.
+    // Sized, unlike the rest of the chain: this one *constructs* the model from a
+    // closure, and a closure cannot return an unsized value. A caller that already holds
+    // a boxed trait object uses `run_loaded` or `run_loaded_collect` instead.
     pub fn run<M>(self, configs: Vec<TestConfig>, load_model: impl Fn() -> Result<M>) -> Result<()>
     where
         M: ManagedBatchedModel,
@@ -974,7 +1029,17 @@ impl TestParams {
     /// not bring in.
     pub fn run_loaded<M>(mut self, configs: Vec<TestConfig>, model: &M) -> Result<()>
     where
-        M: ManagedBatchedModel,
+        M: ManagedBatchedModel + ?Sized,
+    {
+        let mut results = self.run_configs(configs, model)?;
+        self.validate_and_print_results(&mut results)
+    }
+
+    /// Measure every config, and return the rows. See [`Self::run_loaded_collect`] for
+    /// why measuring is separable from reporting.
+    fn run_configs<M>(&mut self, configs: Vec<TestConfig>, model: &M) -> Result<Vec<TestResults>>
+    where
+        M: ManagedBatchedModel + ?Sized,
     {
         // Under `verbose`, surface the engine's `tracing` events (expert-cache
         // sizing, warm-tier decisions, elastic-boundary moves) in the gate's
@@ -1190,14 +1255,43 @@ impl TestParams {
             );
         }
 
-        // Validate and print results
-        self.validate_and_print_results(&mut results)
+        Ok(results)
+    }
+
+    /// Run `configs` and hand back their results **without printing or validating**.
+    ///
+    /// The half of [`Self::run_loaded`] that measures. It exists so a caller one crate
+    /// up can put its own rows in the same table: the engine-driven rows have to be
+    /// produced *after* this model has been moved into a
+    /// `ConversationEngine`, and the table has to be printed after both — which is
+    /// impossible while running and printing are one call.
+    ///
+    /// [`Self::run_loaded`] is this followed by [`Self::validate_and_print`], so every
+    /// existing caller measures, validates and prints exactly as it did before.
+    pub fn run_loaded_collect<M>(
+        &mut self,
+        configs: Vec<TestConfig>,
+        model: &M,
+    ) -> Result<Vec<TestResults>>
+    where
+        M: ManagedBatchedModel + ?Sized,
+    {
+        self.run_configs(configs, model)
+    }
+
+    /// Validate `results` and print every table — the reporting half of
+    /// [`Self::run_loaded`].
+    ///
+    /// Public so a caller that used [`Self::run_loaded_collect`] can finish the job,
+    /// with its own [`TestParams::with_extra_rows`] already installed.
+    pub fn validate_and_print(&self, results: &mut [TestResults]) -> Result<()> {
+        self.validate_and_print_results(results)
     }
 
     /// Run a configuration in batched mode using BatchedInferenceSession
     fn run_batched_config<M>(&self, config: &TestConfig, model: &M) -> Result<TestResults>
     where
-        M: ManagedBatchedModel,
+        M: ManagedBatchedModel + ?Sized,
     {
         // Create the batch session from the model using the inference mode's KV format.
         let batch_config = BatchedConfig {
@@ -1930,7 +2024,7 @@ impl TestParams {
         max_draft: usize,
     ) -> Result<usize>
     where
-        M: ManagedBatchedModel,
+        M: ManagedBatchedModel + ?Sized,
     {
         let nl = model.num_layers();
         let max_tokens = self.generate_token_count;
@@ -2450,9 +2544,9 @@ impl TestParams {
         }
 
         println!("\n\n=== Performance Comparison ===");
-        println!("┌──────────┬──────┬─────────┬──────────┬───────┬────────────┬──────────────┬─────────────┬───────────────┬───────────┬──────────┬────────────┐");
-        println!("│ KvMode   │ int8 │ Batched │ Contexts │ Valid │ t/s (bulk) │ t/s (single) │ perf (bulk) │ perf (single) │ %Quantized│ Compress │ Peak Tokens│");
-        println!("├──────────┼──────┼─────────┼──────────┼───────┼────────────┼──────────────┼─────────────┼───────────────┼───────────┼──────────┼────────────┤");
+        println!("┌──────────┬──────┬─────────┬──────────┬───────┬────────────┬──────────────┬─────────────┬───────────────┬───────────┬──────────┬────────────┬──────────┬───────┐");
+        println!("│ KvMode   │ int8 │ Batched │ Contexts │ Valid │ t/s (bulk) │ t/s (single) │ perf (bulk) │ perf (single) │ %Quantized│ Compress │ Peak Tokens│ Frontier │ Eff%  │");
+        println!("├──────────┼──────┼─────────┼──────────┼───────┼────────────┼──────────────┼─────────────┼───────────────┼───────────┼──────────┼────────────┼──────────┼───────┤");
 
         // Baseline is the first config
         let baseline = &results[0];
@@ -2510,7 +2604,7 @@ impl TestParams {
             };
 
             println!(
-                "│ {:>8} │ {:>4} │ {} │ {:>8} │ {} │ {:>10.1} │ {:>12.1} │ {:>11} │ {:>13} │ {} │ {:>8} │ {:>10} │",
+                "│ {:>8} │ {:>4} │ {} │ {:>8} │ {} │ {:>10.1} │ {:>12.1} │ {:>11} │ {:>13} │ {} │ {:>8} │ {:>10} │ {:>8} │ {:>5} │",
                 mode_str,
                 int8_str,
                 batched_str,
@@ -2522,11 +2616,77 @@ impl TestParams {
                 generate_perf,
                 quant_str,
                 compress_str,
-                result.peak_tokens
+                result.peak_tokens,
+                // A harness row cannot fragment — every sequence is freed and every
+                // empty arena released between configs, with a gate asserting nothing
+                // is live before the next one starts. So these are not missing numbers,
+                // they are numbers the row's own construction rules out.
+                "-",
+                "-",
             );
         }
 
-        println!("└──────────┴──────┴─────────┴──────────┴───────┴────────────┴──────────────┴─────────────┴───────────────┴───────────┴──────────┴────────────┘");
+        // **The caller's rows, below the harness's, in the same table.** Measured one
+        // crate up through the real engine, so they carry admission, per-turn
+        // projection, the persistence thread and whatever fragmentation the pool has
+        // accumulated — everything the rows above exclude by design. Same baseline for
+        // the `perf` columns, because comparing the delivered rate against the ceiling
+        // is the whole reason they share a table.
+        for row in &self.extra_rows {
+            let valid_str = match row.valid {
+                None => "  -  ".to_string(),
+                Some((pass, total)) if pass == total => "  ✓  ".to_string(),
+                Some(_) => "  ✗  ".to_string(),
+            };
+            let prompt_perf = format!(
+                "{:+.1}%",
+                (row.prompt_tokens_per_sec / baseline_prompt_tps - 1.0) * 100.0
+            );
+            let generate_perf = format!(
+                "{:+.1}%",
+                (row.generate_tokens_per_sec / baseline_generate_tps - 1.0) * 100.0
+            );
+            let compress_str = match row.compression_ratio {
+                Some(ratio) => format!("{:>6.2}x", ratio),
+                None => "    -  ".to_string(),
+            };
+            let frontier_str = match row.frontier_regions {
+                Some(f) => f.to_string(),
+                None => "-".to_string(),
+            };
+            let eff_str = match row.efficiency_pct {
+                Some(e) => format!("{e}%"),
+                None => "-".to_string(),
+            };
+            // `%Quantized` has no meaning for an engine row: the workload chose its own
+            // formats per turn rather than running one mode, so there is no single figure
+            // to report and a number here would invite a comparison that is not available.
+            println!(
+                "│ {:>8} │  eng │  engine │ {:>8} │ {} │ {:>10.1} │ {:>12.1} │ {:>11} │ {:>13} │      -    │ {:>8} │ {:>10} │ {:>8} │ {:>5} │",
+                row.label,
+                row.contexts,
+                valid_str,
+                row.prompt_tokens_per_sec,
+                row.generate_tokens_per_sec,
+                prompt_perf,
+                generate_perf,
+                compress_str,
+                row.peak_tokens,
+                frontier_str,
+                eff_str,
+            );
+        }
+
+        println!("└──────────┴──────┴─────────┴──────────┴───────┴────────────┴──────────────┴─────────────┴───────────────┴───────────┴──────────┴────────────┴──────────┴───────┘");
+        if !self.extra_rows.is_empty() {
+            println!(
+                "  Rows marked `engine` run through the real ConversationEngine — admission, \
+                 per-turn projection,\n  the persistence thread, KV compaction — so they show \
+                 what a daemon delivers. The rows above\n  them drive `forward_wave` from a \
+                 clean slate and show how fast the forward itself can go.\n  Frontier is the \
+                 arena watermark in 16 MiB regions, Eff% the share of it holding KV."
+            );
+        }
         // **Here, not after the expert table.** The pinned-RAM report carries the
         // boundary's `Spare calc:` attribution — which of the four gates refused
         // the weight side ground — and it used to hang off

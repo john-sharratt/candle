@@ -2609,7 +2609,21 @@ impl PipelineState {
         let target = self.inner.zone.capacity_for_frontier(floor);
         if target == before {
             if growing {
-                grow_note(GrowOutcome::TargetUnchanged);
+                // **At the limit is not the same fact as nothing to take, and the
+                // ledger has to say which.** `capacity_for_frontier` clamps to the
+                // zone's limit — the slots the model actually has — so a cache
+                // holding every expert reports an unchanged target however much KV
+                // ground it is offered. Read as `target_unchanged`, that says the KV
+                // side's offer was not worth a slot; read as `at_limit`, it says the
+                // weight side has everything it can use and compaction's gain is
+                // real but unspendable *here*. Measured: 921 unchanged targets
+                // against 1,004,350 regions offered, which is the second fact
+                // wearing the first's name.
+                if before >= self.inner.zone.limit() {
+                    grow_note(GrowOutcome::AtLimit);
+                } else {
+                    grow_note(GrowOutcome::TargetUnchanged);
+                }
             }
             return Ok(0);
         }

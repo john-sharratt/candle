@@ -56,7 +56,7 @@ use super::batched_layer::{
 };
 use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
-use super::expert_lre::WeightPlan;
+use super::expert_lre::{WeightPlan, WeightPlanning};
 use super::prefill_utils::SharedPm;
 use super::quantized_matmul::QMatMul;
 use super::rope_schedule::{RopeRungs, RopeSchedule};
@@ -376,8 +376,13 @@ pub trait BatchedModelCore {
     /// has not yet run a classify, and off CUDA — see
     /// [`WeightPlan::from_stats`], which refuses a partial gauge set outright
     /// because every missing field makes a routed expert look free.
-    fn weight_plan(&self) -> Option<WeightPlan> {
-        WeightPlan::from_stats(&self.expert_stats()?)
+    fn weight_plan(&self) -> WeightPlanning {
+        // No expert cache at all is `Dense`, not a defect — the `?` would have made it
+        // indistinguishable from a cache whose gauges are zero.
+        match self.expert_stats() {
+            Some(s) => WeightPlan::from_stats(&s),
+            None => WeightPlanning::Dense,
+        }
     }
 
     /// Snapshot the layer-streaming counters, if this model's weights are slot

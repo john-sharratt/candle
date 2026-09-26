@@ -1699,11 +1699,25 @@ impl ModelBuilder {
     /// reads as protection.
     #[cfg(feature = "hub")]
     fn download_or_fail(&self) -> crate::Result<(PathBuf, PathBuf)> {
-        let model_path = self.resolve_repo_file(
-            &self.spec.model_repo,
-            &self.spec.model_rev,
-            &self.spec.model_filename,
-        )?;
+        // **A prepared artifact is never downloaded, and this resolver used to try
+        // anyway.** `ModelSpec::prepared_from_source` marks a checkpoint this codebase
+        // *builds* from a repository's published files — Flash-Next's merged GGUF is the
+        // case — and its own documentation says resolution therefore skips the network and
+        // looks in the local cache. That was implemented in `zend::download` and nowhere
+        // else, so the daemon loaded such a model and everything below it got a 404 on a
+        // filename that was never published. Any harness in this crate was simply unable
+        // to open the one architecture that carries per-sequence state outside the K/V.
+        let model_path = if self.spec.prepared_from_source {
+            prepared_artifact_path(&self.spec.model_repo, &self.spec.model_filename)?
+        } else {
+            self.resolve_repo_file(
+                &self.spec.model_repo,
+                &self.spec.model_rev,
+                &self.spec.model_filename,
+            )?
+        };
+        // The tokenizer is published even when the checkpoint is not, and it comes from
+        // its own repository — so it resolves normally either way.
         let tokenizer_path = self.resolve_repo_file(
             &self.spec.tokenizer_repo,
             &self.spec.tokenizer_rev,
@@ -1852,6 +1866,43 @@ fn cached_repo_file(
         .join(rev)
         .join(filename);
     snapshot.is_file().then_some(snapshot)
+}
+
+/// The cache directory prepared and downloaded artifacts share.
+///
+/// `~/.cache/zend/models`, so a prepared artifact sits beside the published ones and one
+/// layout covers both. Defined here, in the crate every loader goes through, because the
+/// alternative is what was there before: the convention written down in `zend::download`
+/// and nowhere else, so the daemon could open a prepared checkpoint and nothing below it
+/// could.
+pub fn model_cache_dir() -> PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    home.join(".cache").join("zend").join("models")
+}
+
+/// Locate an artifact this codebase **prepares** rather than downloads.
+///
+/// Layout is `<cache>/<repo-with-dashes>/<file>`, matching every downloaded artifact.
+/// What differs is the miss: there is no URL to fall back to, because the name was never
+/// published — so a miss is reported as the build step it actually is, rather than as a
+/// 404 on a file nobody ever uploaded.
+pub fn prepared_artifact_path(repo: &str, filename: &str) -> crate::Result<PathBuf> {
+    let path = model_cache_dir()
+        .join(repo.replace('/', "--"))
+        .join(filename);
+    if path.is_file() {
+        return Ok(path);
+    }
+    Err(ConversationError::Download(format!(
+        "{filename} is prepared from {repo}'s published files, not published under that \
+         name, and it is not in the cache at {}. Run the prepare step that builds it \
+         (see `candle_transformers::models::qwen4exp::convert` for Flash-Next) — there is \
+         no download for this file.",
+        path.display(),
+    )))
 }
 
 /// **The gap, named, so a green run cannot be read as a covered one.**

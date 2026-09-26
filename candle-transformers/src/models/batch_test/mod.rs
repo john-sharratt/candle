@@ -26,7 +26,18 @@ pub mod ruler_gen;
 pub mod story_normalize;
 #[cfg(test)]
 pub mod test_helpers;
-#[cfg(test)]
+/// The batched comparison harness: `TestParams`, the config ladder's row type, and the
+/// performance table.
+///
+/// Readable outside `#[cfg(test)]` for the same reason [`fixtures`] and
+/// [`story_normalize`] are, and it is the strongest instance of that reason. The rows
+/// this harness produces drive `forward_wave` from a clean slate — the *ceiling*. What a
+/// daemon delivers is shaped by admission, per-turn projection, the persistence thread
+/// and accumulated fragmentation, none of which exist in this crate. Those rows are
+/// measured one crate up and appended here through [`utils::TestParams::with_extra_rows`],
+/// so ceiling and delivery land in one table; a harness only reachable under `#[test]`
+/// could not be given them, and the two figures would have to be compared across two
+/// outputs that do not measure the same machine.
 pub mod utils;
 /// The YaRN gates run on the models whose rungs they back.
 #[cfg(test)]

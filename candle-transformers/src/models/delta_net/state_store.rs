@@ -598,8 +598,39 @@ impl RecurrentStateStore {
             slot.advanced = false;
         }
         self.open = true;
+        self.assert_state("gdn.entry.s.L", "gdn.entry.tail.L");
         Ok(())
     }
+
+    /// Fold every layer's live state into the assert slots under `prefix`.
+    ///
+    /// **Entry and exit, because the pair is what says who broke it.** A wave reads
+    /// `live` and writes `backup`, so the state at entry is whatever the last
+    /// committed wave left plus anything that has happened to the memory since. If
+    /// entry is bad while the previous exit was good, nothing computed it — the
+    /// bytes changed while the store sat idle, which is a foreign write into the
+    /// span. If exit is the first bad site, the wave computed it, and the cause is
+    /// upstream in the same forward.
+    ///
+    /// Asynchronous: one reduction kernel per buffer, no readback and no fence. The
+    /// per-wave drain in `wave_driver` reports the slots and names the first bad
+    /// site by the kernel's own ticket, so the ordering this depends on is the
+    /// device's, not the host's. That matters more than it looks — these faults stop
+    /// reproducing in a fenced build, so an instrument that synchronised here would
+    /// suppress the thing it is watching for.
+    #[cfg(feature = "tensor-assert")]
+    fn assert_state(&self, s_prefix: &'static str, tail_prefix: &'static str) {
+        use candle::tensor_assert::names::site;
+        for slot in &self.slots {
+            let l = slot.layer_index;
+            slot.live.s.assert(site(s_prefix, l));
+            slot.live.conv_tail.assert(site(tail_prefix, l));
+        }
+    }
+
+    #[cfg(not(feature = "tensor-assert"))]
+    #[inline]
+    fn assert_state(&self, _s_prefix: &'static str, _tail_prefix: &'static str) {}
 
     /// The wave's writes stand: every layer the wave advanced exchanges its two
     /// buffers, so what the wave wrote becomes the state and what the state was
@@ -621,6 +652,10 @@ impl RecurrentStateStore {
             }
         }
         self.open = false;
+        // After the swap, so this is the state the NEXT wave will read — the same
+        // buffers `gdn.entry` will fold on the way in. A pair that disagrees across
+        // the gap between two waves is a write nothing in the forward performed.
+        self.assert_state("gdn.exit.s.L", "gdn.exit.tail.L");
     }
 
     /// The wave never happened.

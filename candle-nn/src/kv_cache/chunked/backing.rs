@@ -226,7 +226,8 @@ impl BackingInner {
     /// Per-head band count for the arena/record layout: [`LATENT_N_BANDS`] on
     /// the single-latent path, [`N_PALETTE`] for GQA. Every band-count use in
     /// allocation, arena sub-band sizing, and record serialization goes through
-    /// this so the single-latent path can carry 8 bands while GQA stays at 4.
+    /// this so the single-latent path can carry [`LATENT_N_BANDS`] bands while GQA
+    /// stays at [`N_PALETTE`].
     pub(crate) fn n_palette(&self) -> usize {
         if self
             .single_latent
@@ -1609,6 +1610,48 @@ impl ChunkedKvBacking {
     /// Get the number of arenas in backing storage.
     pub fn arena_count(&self) -> Result<usize> {
         self.inner.storage.arena_count()
+    }
+
+    /// `(arenas_held, arenas_if_packed)` for one pool, from the refcount tables' live
+    /// counters — see [`ChunkGidPool::pool_sparsity`].
+    pub fn pool_sparsity(&self, key: ArenaKey) -> (usize, usize) {
+        self.inner.pool.pool_sparsity(key)
+    }
+
+    /// The highest region rank a live arena of `key` holds, and how many slots that
+    /// arena is holding — the cheap question "is this pool what is holding the
+    /// frontier up?".
+    ///
+    /// **Cheap on purpose.** A compaction pass is time-budgeted, and its budget is
+    /// spent on the occupancy census; a pass that censuses the ladder in class order
+    /// spends that budget on whichever rungs happen to come first and can run out
+    /// before reaching the pool that owns the topmost arena — which is the only pool
+    /// whose position costs the weight side anything. So the ordering decision has to
+    /// be answerable without the census, which is what
+    /// [`ChunkGidPool::pool_arena_load`] is for.
+    pub fn pool_top_rank(&self, key: ArenaKey) -> Option<(usize, usize)> {
+        let load = self.inner.pool.pool_arena_load(key);
+        if load.is_empty() {
+            return None;
+        }
+        self.inner
+            .storage
+            .read(|s| {
+                let arenas = s.arenas();
+                load.iter()
+                    .filter(|(_, _, live)| *live > 0)
+                    .filter_map(|(idx, _, live)| {
+                        arenas
+                            .get(idx)
+                            .and_then(|a| a.region_rank())
+                            .map(|r| (r, *live))
+                    })
+                    .max_by_key(|(rank, _)| *rank)
+            })
+            // A poisoned storage lock is not a ranking question; the pass falls back
+            // to ladder order, which is where it started.
+            .ok()
+            .flatten()
     }
 
     /// The census one pool's compaction plans from — occupancy joined to physical

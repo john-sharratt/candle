@@ -259,39 +259,123 @@ free regions (6,848 MiB) stranded below the watermark.
 
 ---
 
-## 6. The fix: continuously compact the left side
+## 6. The fix, as built: continuously compact the left side
 
-**The KV side must earn the packed-left property that the weight side already
-has.** Compaction runs continuously, so that live KV is always dense at low region
-indices, `live_watermark()` stays as low as the live byte count allows, the tier is
-placed low, and `weight_floor` can therefore sit as far left as possible —
-**making the weight side, and so expert residency, as large as it can be.**
+**The KV side earns the packed-left property that the weight side already has.**
+Compaction runs from the wave loop, so live KV stays dense at low region indices,
+`live_watermark()` stays as low as the live byte count allows, the tier is placed
+low, and `weight_floor` can sit as far left as possible — **making the weight side,
+and so expert residency, as large as it can be.**
 
-The target is the inflation ratio in §5: region space should approach the live KV
-bytes it holds, not 4.2× them.
+The code is `candle-nn/src/kv_cache/chunked/compact_plan.rs` (what to move),
+`compact_map.rs` (who holds the old identities), `compact.rs` (the pass), and
+`scheduler/prefill.rs::compact_kv_if_fragmented` (when). The harness that specified
+it, and still gates it, is `candle-conversation/examples/kv_fragmentation.rs`.
 
-Design constraints any implementation has to satisfy:
+### What the shape is, and why each part is that shape
 
-- **It must relocate, not merely release.** Emptying arenas is what
-  `release_empty_arenas()` already does, and it is not enough — the defect is a
-  *sparse* arena at a high index. Live chunks have to move down.
-  [`archived/arena-compact-kernel-design.md`](archived/arena-compact-kernel-design.md)
-  drafts the slot-level copy (a raw `memcpy` of `stride_bytes`, no dequantisation,
-  since equal-length moves within a size class); note that its description of
-  `compact_arenas()` predates the current code, where that function no longer
-  exists.
-- **It may only run between forwards.** An arena may not be created or moved while
-  a tier is placed, for exactly the reason `set_weight_floor` refuses then. The
-  scheduler loop's one legal window is the same one guest models use.
-- **It must be incremental.** A stop-the-world compaction on the scheduler thread
-  is a stall paid by every sequence in flight. Bounded work per wave, continuously,
-  is the shape.
-- **Lowering the watermark must actually be followed by lowering the floor.** The
-  weight side *taking back* ground the KV side no longer needs is listed as **open**
-  in the original design ledger; compaction that frees high regions without a path
-  for `weight_floor` to move back left buys nothing.
-- **Address capture must be re-checked.** Moving a chunk invalidates any cached
-  device address for it, by the same rule §4 states for expert slots.
+- **It relocates, it does not merely release.** `release_empty_arenas()` returns an
+  arena whose *last* chunk has gone; the defect is a *sparse* arena at a high index,
+  which that can never reach. `plan_pool` is a two-cursor walk over one pool's slots
+  in physical address order: every gap is filled with the last live chunk above it,
+  so when the cursors meet the pool is a gapless prefix. The move count is the
+  minimum for a perfect pack.
+- **Highest arena first.** The pass is time-budgeted, and the census — an occupancy
+  bitmap walk per arena, per rung — is most of its cost. Walked in ladder order it
+  spends the budget on whichever rungs come first and can never reach the pool that
+  owns the topmost arena, which is the only pool whose position costs the weight
+  side anything. `pool_top_rank` answers the ordering question without the census,
+  so deciding where to spend the budget does not spend it. Measured before the
+  ordering: nine seconds at 52–59% with the frontier pinned and 64 free regions
+  under it, every pass running and clipping on the low rungs.
+- **A fresh low arena for the pool at the top.** Packing is per pool, so each pool
+  converges onto *its own* lowest arenas — and the pool holding the highest arena in
+  the span may have no lower arena with room, in which case a perfect per-pool pack
+  leaves it exactly where it was. One fresh arena claims from the region free list,
+  which is lowest-index-first, so it lands in a hole below the frontier and gives the
+  walk a destination under the top arena. One per pass, and only while holes exist.
+- **Two CUDA calls for the whole pass.** The claims are a host walk producing three
+  `i64` arrays; one launch of the migration scatter/gather kernel copies every
+  relocated slot, and one launch of `kv_ptr_patch` stores every changed band pointer.
+  A per-chunk `memcpy_dtod_async` measured ~8 µs of launch overhead each, which put
+  1,024 moves in an 8 ms budget and left every pass clipped with the frontier exactly
+  where it started.
+- **It runs only between forwards, and it refuses rather than waits.** The pass takes
+  the arena window, for exactly the reason `set_weight_floor` refuses while a tier is
+  placed. It also takes an exclusive hold on chunk locations (`migrate_flight`),
+  because the arena window says nothing about the persistence thread — see below.
+- **It is incremental and budgeted.** A quarter of the budget plans, the rest claims,
+  and the first batch of claims is unconditional so a pass that planned always moves
+  something. A clipped pass is not a broken one: everything below the cursor is
+  packed and nothing moved upward, so the next pass resumes closer.
+- **Considered every wave, run on a cheap signal.** The gate is an interval floor,
+  then the region pool's hole count, then a sparsity sum from the refcount tables'
+  live counters — no bitmap walked. Both halves are needed: holes self-correct under
+  allocation, so a steadily-loaded pool reads zero holes with tens of sparse arenas
+  beneath it (gating on holes alone: 16 passes over 110 s, pools at 82%), and
+  sparsity alone misses the burst.
+- **Lowering the watermark is followed by lowering the floor.** A non-empty pass
+  calls `reclaim_spare_ground()` in the same method, while no wave generation is
+  live. The two are one method and not two precisely because either alone buys
+  nothing.
+- **Every holder of a relocated identity is rewritten, structurally.** A chunk's gid
+  *is* its location, so moving bytes changes identity. The holders span three crates
+  — the backings' block tables, the substrate's residences, the projection caches —
+  and `compact.rs` enumerates them and refuses the pass if any sweep fails. It does
+  not try to *discover* holders from a gid: there is no reverse index, and the
+  refcount cannot stand in for one, because `HeadGids` is `Arc<Vec<ChunkGid>>` with a
+  derived `Clone` and every sharing path shares the allocation. A prior branch tried
+  that and corrupted conversations.
+
+### The defect this work found, which is the one to remember
+
+**A pin keeps an arena alive and says nothing about which slot of it a chunk
+occupies.** The persistence thread's hot→warm migrate captures a device address per
+band from gids it has pinned, off the scheduler thread, with no arena window. A
+compaction relocating those chunks underneath it makes it copy whatever now sits in
+the vacated slot into the warm tier. It does not fault — every address in the
+reservation is mapped — and it surfaces much later as a sequence answering from
+another sequence's KV.
+
+`migrate_flight` is the exclusion. Both sides use `try_`, and **neither ever blocks**:
+each holds substrate and block-table locks while it works, so either side waiting on
+the other would need those lock orders to agree, and nothing waits, so there is
+nothing to agree about. The migrate takes and fences the guard *per group* rather
+than per batch, because a mass eviction is what produces both the fragmentation and
+the hot→warm work that must precede it — held batch-wide it starved compaction
+exactly when compaction was most needed. A refused pass sets a flag that makes the
+next migrate step aside once, because the long holder otherwise wins nearly every
+contest (78 refusals in 107 attempts).
+
+This is the general rule, of which §4's expert-slot caution is the other instance:
+**a captured device address is invalidated by anything that moves what it names, and
+a reference count is not a location.**
+
+### Where it stands
+
+On the 30B-A3B, driving the real engine through overlapping conversations with
+pinned residents and stragglers (`--churn-secs 90 --concurrency 24 --pinned 6
+--straggler-every 4 --batch 20`):
+
+| figure | before | after |
+|---|---|---|
+| VRAM efficiency, steady state | 82–89% | 97–99% |
+| VRAM efficiency, worst sustained | 48% | ≥ 90% (often unjudgeably good) |
+| frontier after a full drain | 1,727 of 1,999 | 13–120 |
+| ground handed back by one drain | 0 | up to 9,680 MiB |
+| story rewrites correct | 20/20 | 20/20 |
+
+The forward gate is unmoved: 10,210 t/s prefill and 565 t/s decode against a
+recorded 10,239.6 / 572.4, with C10 compression identical at 5.50×.
+
+**What remains, and it is the parked item.** The residual loss is a single-sample
+dip at a mass eviction: 24 conversations retiring at once frees ~85 regions below
+the frontier, and the top *live* arena keeps its high rank because an arena's rank is
+its region's. Chunk compaction cannot fix that — the chunks are live and packed. What
+would is **arena relocation**: swapping a high arena's region for a lower free one,
+which moves 16 MiB and changes no gid at all, only resolved addresses. The harness
+charges only losses that persist across two samples, for the reason stated there, so
+it passes without this; the burst dip is visible in its `worst single sample` row.
 
 ---
 
@@ -311,6 +395,10 @@ Each has been violated in production at least once.
 6. A boundary check must consult the **reservation**, never live occupancy. A check
    against a mid-wave `region_stats().transient_bytes` snapshot, or one comparing
    two figures derived from the same array, passes while the invariant is broken.
+7. A captured chunk address is invalidated by a compaction, and a pinned gid does not
+   protect it — the pin holds the arena, not the slot. Anything acting on captured
+   addresses off the scheduler thread must hold `migrate_flight`'s guard for as long
+   as it acts on them, and fence before releasing it. See §6.
 
 When a symptom looks like bad arithmetic — a NaN in a GEMM, an implausible
 magnitude — but the operands and weights are individually finite, **suspect the

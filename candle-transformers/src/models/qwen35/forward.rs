@@ -62,7 +62,7 @@ use crate::models::batched_layer::{
     WaveAttnGroup,
 };
 use crate::models::batched_model::{WaveGuard, WavePhase};
-use crate::models::expert_lre::{PipelineStats, ProfileSnapshot, WeightPlan};
+use crate::models::expert_lre::{PipelineStats, ProfileSnapshot, WeightPlan, WeightPlanning};
 use crate::models::prefill_utils::SharedPm;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_admit::admit_wave_kv;
@@ -625,8 +625,13 @@ impl ManagedBatchedModel for HybridBatched {
         }
     }
 
-    fn weight_plan(&self) -> Option<WeightPlan> {
-        WeightPlan::from_stats(&self.expert_stats()?)
+    fn weight_plan(&self) -> WeightPlanning {
+        // A dense checkpoint of this lineage has no expert cache, which is `Dense` and
+        // not a broken gauge set — see `WeightPlanning`.
+        match self.expert_stats() {
+            Some(s) => WeightPlan::from_stats(&s),
+            None => WeightPlanning::Dense,
+        }
     }
 
     fn layer_stream_stats(&self) -> Option<[usize; 7]> {

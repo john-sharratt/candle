@@ -237,4 +237,4 @@ pub(crate) use pipeline::slot_bytes_for;
 pub use types::{
     CopyBatchFence, ExpertSlot, MmapExpertRef, MoeInput, MoeWorkRequest, PipelineStats,
 };
-pub use weight_plan::WeightPlan;
+pub use weight_plan::{WeightPlan, WeightPlanning};

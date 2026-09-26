@@ -124,10 +124,25 @@ impl ExpertGeometry {
 /// The measured constants of one prefill forward that are not the copy.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RateModel {
-    /// Per-forward cost that neither width nor residency changes. Zero by
-    /// default: the estimator then attributes the whole fixed cost to the copy
-    /// and learns an *effective* rate, which is the number to plan with.
+    /// Per-forward cost *inside* the forward that neither width nor residency changes.
+    /// Zero by default and learned by [`CostFit`] from the engine's own forwards.
     pub fixed_secs: f64,
+    /// Per-forward cost **outside** the forward: what the wave loop pays around it.
+    ///
+    /// **A forward's own duration is not what a forward costs the engine.** The loop
+    /// drains submissions, promotes finished prefills, runs housekeeping and publishes
+    /// telemetry between forwards, and none of it scales with rows — so it is amortised by
+    /// width exactly as the expert copy is, and it is *larger* than the copy on a resident
+    /// card where the copy is zero. Measured on the 30B-A3B: `loop:housekeeping` 42 ms,
+    /// `drain:submit_turn` 27.6 ms, `loop:promote_finished` 12.3 ms per wave, against a
+    /// decode kernel of a fraction of that.
+    ///
+    /// [`CostFit`] cannot learn it, because it only ever sees `forward_secs` — the
+    /// interval the caller times around the forward itself. So the loop measures its own
+    /// overhead and reports it through [`WaveRate::observe_overhead`]. Without this term
+    /// the model prices width against the forward alone and stops widening far too early:
+    /// it chose 4 rows where the engine wanted 20.
+    pub overhead_secs: f64,
     /// Compute per token — see [`RateModel::SEED_COMPUTE_SECS_PER_TOKEN`].
     pub compute_secs_per_token: f64,
 }
@@ -171,6 +186,9 @@ impl Default for RateModel {
     fn default() -> Self {
         Self {
             fixed_secs: 0.0,
+            // Zero until the loop reports its own cost. A seed would be a guess about
+            // another machine's scheduler, and the loop can simply measure it.
+            overhead_secs: 0.0,
             compute_secs_per_token: Self::SEED_COMPUTE_SECS_PER_TOKEN,
         }
     }
@@ -244,13 +262,38 @@ impl Default for DecodeModel {
 /// forwards.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct CostFit {
-    /// Σ X², Σ X·W, Σ W² — the Gram matrix of the two features.
+    /// Σ X², Σ X·W, Σ W² — the Gram matrix of the two scaled features.
     xx: f64,
     xw: f64,
     ww: f64,
     /// Σ X·T, Σ W·T — the right-hand side.
     xt: f64,
     wt: f64,
+    /// Σ X, Σ W, Σ T, Σ 1 — the intercept's row and column of the Gram matrix.
+    ///
+    /// **The fixed per-forward cost is a third unknown, and leaving it out of the
+    /// model did not make it zero — it made it invisible.** A forward is
+    /// `T = f + X/bw + W·c`, and fitting only `X/bw + W·c` forces `f` into the other
+    /// two: with a streaming cache `X` is large and absorbs it harmlessly, but on a
+    /// fully resident card `X` is *zero*, so the projected rate collapses to
+    /// `W/(W·c) = 1/c` — flat in width.
+    ///
+    /// A flat rate is what broke admission. The fill admits an offer while the rate
+    /// improves by at least `min_gain`, and a rate that does not vary with width shows
+    /// a gain of zero at every width, so the second row of every wave was refused
+    /// `Saturated`. Measured on the 30B-A3B at 72 GiB: nine turns queued, nothing in
+    /// flight, one admitted, `decode seqs avg=1.0 max=1`, 32 t/s against a batched
+    /// ceiling of 518 — and the bigger the card, the worse it got, because residency is
+    /// what drives `X` to zero.
+    ///
+    /// The per-forward cost is real and large: the wave loop pays tens of milliseconds
+    /// per forward in housekeeping, submission drain and promotion, none of which
+    /// scales with rows. That is exactly what width amortises, and now it is in the
+    /// model that decides how much width to buy.
+    x1: f64,
+    w1: f64,
+    t1: f64,
+    one: f64,
     /// Observations folded in, for the conditioning guard.
     n: u64,
 }
@@ -281,6 +324,10 @@ impl CostFit {
         self.ww = self.ww * keep + w * w;
         self.xt = self.xt * keep + x * t;
         self.wt = self.wt * keep + w * t;
+        self.x1 = self.x1 * keep + x;
+        self.w1 = self.w1 * keep + w;
+        self.t1 = self.t1 * keep + t;
+        self.one = self.one * keep + 1.0;
         self.n += 1;
     }
 
@@ -293,26 +340,118 @@ impl CostFit {
     /// forward, a residency that moved mid-wave — is discarded rather than
     /// clamped, because a clamped nonsense answer is indistinguishable from a
     /// real one downstream.
-    fn solve(&self, link_bytes_per_s: f64) -> Option<(f64, f64)> {
+    /// Solve for `(bw, c, fixed)`, or `None` while the observations cannot separate
+    /// them.
+    ///
+    /// Three unknowns from `T = f + a·X + c·W` with `a = 1/bw`, by Cramer's rule on the
+    /// 3×3 normal equations. Every answer is checked for physical sense before being
+    /// returned — a copy rate positive and no faster than the link, a positive per-token
+    /// compute, and a **non-negative** fixed cost — because a clamped nonsense answer is
+    /// indistinguishable from a real one downstream.
+    ///
+    /// The fixed term is allowed to come back at exactly zero and is rejected only when
+    /// negative: a card whose per-forward overhead really is negligible should be able to
+    /// say so, and a negative intercept means the fit is describing noise rather than a
+    /// cost.
+    fn solve(&self, link_bytes_per_s: f64) -> Option<FitSolution> {
         if self.n < Self::MIN_SAMPLES {
             return None;
         }
-        let det = self.xx * self.ww - self.xw * self.xw;
-        if !(det.is_finite() && det > self.xx * self.ww * Self::MIN_CONDITION) {
+        // **A fully resident cache copies nothing, so the copy feature is identically
+        // zero and the 3×3 is singular by construction.** That is not a failure to
+        // observe — it is the card telling us there is no bandwidth term to learn, and
+        // waiting for one would leave `fixed` unlearned forever, which is the exact state
+        // that flattened the rate and refused every second row.
+        //
+        // So when `X` carries no variance, drop it and fit `T = f + c·W` on the two
+        // features that do. Bandwidth keeps its prior, which is right: a forward that
+        // copied no bytes is silent about the link, and inventing a figure from it would
+        // be worse than keeping the measured one.
+        let scale = self.xx * self.ww * self.one;
+        if !(scale.is_finite() && scale > 0.0) {
+            return self.solve_without_copy();
+        }
+        // Symmetric 3×3, ordered (a, c, f) over features (X, W, 1).
+        let m = [
+            [self.xx, self.xw, self.x1],
+            [self.xw, self.ww, self.w1],
+            [self.x1, self.w1, self.one],
+        ];
+        let rhs = [self.xt, self.wt, self.t1];
+        let det3 = |m: &[[f64; 3]; 3]| {
+            m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+        };
+        let det = det3(&m);
+        // **The conditioning guard scales with the whole Gram matrix, not a pair of
+        // its entries.** Zero determinant here means the observations lie on a plane —
+        // every forward at one width, or one residency, or a fixed ratio of the two —
+        // from which three costs cannot be separated however many there are.
+        if !(det.is_finite() && det.abs() > scale * Self::MIN_CONDITION) {
+            // Still separable in width alone, which is the half that matters for how wide
+            // to make a wave.
+            return self.solve_without_copy();
+        }
+        let mut sol = [0.0f64; 3];
+        for (i, s) in sol.iter_mut().enumerate() {
+            let mut mi = m;
+            for (row, r) in mi.iter_mut().zip(rhs.iter()) {
+                row[i] = *r;
+            }
+            *s = det3(&mi) / det;
+        }
+        let [a, c, fixed] = sol;
+        if !(a.is_finite() && c.is_finite() && fixed.is_finite()) {
             return None;
         }
-        // a = 1/bw, so the copy term is a·X.
-        let a = (self.ww * self.xt - self.xw * self.wt) / det;
-        let c = (self.xx * self.wt - self.xw * self.xt) / det;
-        if !(a.is_finite() && c.is_finite()) || a <= 0.0 || c <= 0.0 {
+        if a <= 0.0 || c <= 0.0 || fixed < 0.0 {
             return None;
         }
         let bw = 1.0 / a;
         if !bw.is_finite() || bw <= 0.0 {
             return None;
         }
-        Some((bw.min(link_bytes_per_s), c))
+        Some(FitSolution {
+            bw: Some(bw.min(link_bytes_per_s)),
+            compute_secs_per_token: c,
+            fixed_secs: fixed,
+        })
     }
+
+    /// Fit `T = f + c·W`, for observations that copied nothing.
+    ///
+    /// The ordinary least squares of time on width: slope is the per-token compute, and
+    /// the **intercept is the per-forward cost** — the figure width exists to amortise and
+    /// the one the model was missing. Well-conditioned exactly when the observed widths
+    /// varied, which is the only thing it needs to separate two terms.
+    fn solve_without_copy(&self) -> Option<FitSolution> {
+        let det = self.ww * self.one - self.w1 * self.w1;
+        // Zero when every forward ran at one width: two costs, one equation.
+        if !(det.is_finite() && det.abs() > self.ww * self.one * Self::MIN_CONDITION) {
+            return None;
+        }
+        let c = (self.one * self.wt - self.w1 * self.t1) / det;
+        let fixed = (self.ww * self.t1 - self.w1 * self.wt) / det;
+        if !(c.is_finite() && fixed.is_finite()) || c <= 0.0 || fixed < 0.0 {
+            return None;
+        }
+        Some(FitSolution {
+            // Silent about the link — see the caller.
+            bw: None,
+            compute_secs_per_token: c,
+            fixed_secs: fixed,
+        })
+    }
+}
+
+/// What a solved fit determined. `bw` is `None` when the observations copied nothing and
+/// so say nothing about the link.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FitSolution {
+    bw: Option<f64>,
+    compute_secs_per_token: f64,
+    fixed_secs: f64,
 }
 
 /// One candidate for the wave.
@@ -559,6 +698,36 @@ impl WaveRate {
         self.bw_bytes_per_s
     }
 
+    /// Learn what the wave loop costs per forward, from the loop's own clock.
+    ///
+    /// `secs` is the wall clock a wave spent **outside** its forwards, divided by the
+    /// forwards it ran — see [`RateModel::overhead_secs`] for why the model cannot get
+    /// this from a forward's own duration and why omitting it made every wave too narrow.
+    ///
+    /// Dampened by `alpha` like every other estimate, and ignored when it is not a finite
+    /// positive number: a wave that ran no forwards has no per-forward cost to report, and
+    /// dividing by its zero would poison the term permanently.
+    pub fn observe_overhead(&mut self, secs: f64) {
+        if !secs.is_finite() || secs <= 0.0 {
+            return;
+        }
+        self.model.overhead_secs += self.alpha * (secs - self.model.overhead_secs);
+    }
+
+    /// The learned per-forward loop overhead, in seconds.
+    pub fn overhead_secs(&self) -> f64 {
+        self.model.overhead_secs
+    }
+
+    /// The learned per-forward cost, in seconds — what width amortises.
+    ///
+    /// Zero until the fit has forwards with enough spread in width to separate it from the
+    /// per-token compute, and zero is then also the honest answer for an engine whose
+    /// per-forward overhead really is negligible.
+    pub fn fixed_secs(&self) -> f64 {
+        self.model.fixed_secs
+    }
+
     /// The effective rate as a fraction of the link — how much of the bus the
     /// expert path is actually getting.
     pub fn link_fraction(&self) -> f64 {
@@ -590,8 +759,13 @@ impl WaveRate {
 
     /// Projected time of a prefill forward of `tokens` rows with `resident`
     /// expert bytes on the card, in seconds.
+    /// **The wall clock a forward costs the engine**, not the duration of the forward.
+    /// The loop's own per-forward overhead is in here for the reason
+    /// [`RateModel::overhead_secs`] gives: it is amortised by width exactly as the copy
+    /// is, and on a resident card it is the only thing that is.
     pub fn forward_secs(&self, tokens: usize, resident: u64) -> f64 {
         self.model.fixed_secs
+            + self.model.overhead_secs
             + self.non_resident_bytes(resident) as f64 / self.bw_bytes_per_s
             + tokens as f64 * self.model.compute_secs_per_token
     }
@@ -1114,24 +1288,40 @@ impl WaveRate {
             return None;
         }
         let bytes = self.non_resident_bytes(resident_bytes);
-        if bytes == 0 {
-            return None;
-        }
-        // **Both unknowns come out of the same forwards.** A forward is
-        // `T = X/bw + W·c` with `X` the non-resident bytes, so one observation
-        // is one equation in two unknowns and a *set* of them at different
-        // widths and residencies determines both. Folding it in here, before
+        // **Every unknown comes out of the same forwards.** A forward is
+        // `T = f + X/bw + W·c` with `X` the non-resident bytes, so one observation
+        // is one equation in three unknowns and a *set* of them at different
+        // widths and residencies determines all three. Folding it in here, before
         // the copy is divided out, is what stops `c` being a constant somebody
         // measured on one card: `fit` carries the running normal equations and
         // solves them the moment the observations have enough spread to be
         // conditioned.
+        //
+        // **A forward that copied nothing is folded in too.** It used to be discarded
+        // here, on the reasoning that a zero-byte copy teaches nothing about the copy
+        // rate — which is true, and threw away everything it *does* teach. On a fully
+        // resident card every forward copies nothing, so the fit was fed no observations
+        // at all and the per-forward cost stayed at its zero seed; the projected rate was
+        // then flat in width and admission refused the second row of every wave as
+        // saturated. The copy rate keeps its prior in that regime (`FitSolution::bw` comes
+        // back `None`), and the two terms width actually trades against — the fixed cost
+        // and the per-token compute — are exactly what these forwards determine.
         self.fit
             .observe(bytes as f64, tokens as f64, forward_secs, self.alpha);
-        if let Some((bw, c)) = self.fit.solve(self.link_bytes_per_s) {
-            self.model.compute_secs_per_token = c;
-            self.bw_bytes_per_s = bw;
+        if let Some(sol) = self.fit.solve(self.link_bytes_per_s) {
+            self.model.compute_secs_per_token = sol.compute_secs_per_token;
+            // The per-forward cost width exists to amortise. Learned, not seeded: it is
+            // the wave loop's own overhead — housekeeping, the submission drain, promotion
+            // — which is a property of this engine on this machine and not of the model.
+            self.model.fixed_secs = sol.fixed_secs;
             self.samples += 1;
-            return Some(bw);
+            // A fit from forwards that copied nothing leaves the link estimate alone and
+            // reports no observation, rather than inventing one from zero bytes.
+            if let Some(bw) = sol.bw {
+                self.bw_bytes_per_s = bw;
+                return Some(bw);
+            }
+            return None;
         }
 
         let copy_secs = forward_secs
@@ -3097,6 +3287,52 @@ mod tests {
         assert!(approx(projected, 472.0, 0.02), "{projected}");
         assert_eq!(p.charge(prefill(0), RESIDENT_RUN15), projected);
         assert_eq!(p.tokens(), 474);
+    }
+
+    /// **A fully resident card still learns that width is worth buying.**
+    ///
+    /// The regression this exists for: with every expert resident the copy term is
+    /// identically zero, so `forward_secs` was `W·c` alone and `rate = W/(W·c) = 1/c` —
+    /// flat in width. A flat rate shows zero gain at every width, `judge_gain` refuses the
+    /// second offer as `Saturated`, and the wave stays one row wide however much is
+    /// queued. Measured on the 30B-A3B at 72 GiB: nine turns queued, one admitted,
+    /// `decode seqs avg=1.0 max=1`, 32 t/s against a batched ceiling of 518 — and worse on
+    /// a bigger card, since residency is what zeroes the copy.
+    ///
+    /// Feeding forwards that copy nothing, at varied widths, the fit must recover the
+    /// per-forward cost from the intercept and the rate must then rise with width.
+    #[test]
+    fn a_fully_resident_card_learns_the_per_forward_cost() {
+        let all_resident = ExpertGeometry::QWEN36_35B_A3B.total_bytes();
+        let fixed = 0.040;
+        let c = RateModel::SEED_COMPUTE_SECS_PER_TOKEN;
+        // The default alpha, deliberately: at `alpha = 1.0` the decay keeps nothing, so
+        // each observation replaces the running sums and the fit holds exactly one
+        // equation — which can never separate two costs however many forwards it sees.
+        let mut p = planner(LINK_4090_MOBILE);
+        assert_eq!(
+            p.non_resident_bytes(all_resident),
+            0,
+            "the case under test is a card that copies nothing",
+        );
+        // Widths spread so the intercept is separable; `T = fixed + W·c` exactly.
+        for rows in [200usize, 400, 600, 800, 1000, 1200, 1400, 1600] {
+            p.observe_prefill(rows, all_resident, fixed + rows as f64 * c);
+        }
+        assert!(
+            approx(p.fixed_secs(), fixed, 1e-6),
+            "the per-forward cost must come out of the intercept, got {}",
+            p.fixed_secs(),
+        );
+
+        // And the consequence: the rate now rises with width, so a second row shows a
+        // real gain instead of zero.
+        let narrow = p.rate(100, all_resident);
+        let wide = p.rate(1000, all_resident);
+        assert!(
+            wide > narrow * 1.5,
+            "width must buy throughput on a resident card: {narrow} -> {wide}",
+        );
     }
 
     /// The link probe needs a device; on the CPU it says so rather than

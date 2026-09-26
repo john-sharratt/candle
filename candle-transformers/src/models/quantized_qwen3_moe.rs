@@ -32,6 +32,13 @@ use super::quantized_matmul::QMatMul;
 use super::quantized_mlp::QuantizedMlp;
 use super::rope_schedule::DeclaredScaling;
 use super::rope_tables::CisPrecomputations;
+// `batch_test` is itself gated on `cuda` plus `test`-or-`ruler-bench`, so the ladder
+// expressed in its types carries the same gate. `candle-conversation` depends on this
+// crate with `ruler-bench` on, which is how it reaches the ladder.
+#[cfg(all(feature = "cuda", any(test, feature = "ruler-bench")))]
+use crate::models::batch_test::utils::{TestConfig, TestMode};
+#[cfg(all(feature = "cuda", any(test, feature = "ruler-bench")))]
+use crate::models::batched_inference::InferenceMode;
 use crate::models::batched_layer::WaveRef;
 use crate::models::routing_capture;
 use crate::models::wave_buffers::wave_empty;
@@ -2444,6 +2451,207 @@ impl ModelWeights {
     }
 }
 
+/// The batched forward gate's configuration ladder for this model.
+///
+/// **Public, and outside the test module, so the same ladder can be driven from above.**
+/// `candle-conversation` runs these rows to establish the *ceiling* — what the forward
+/// itself can do from a clean slate — and then appends rows measured through the real
+/// engine, so the two sit in one table. Duplicating the ladder there instead would let
+/// the two drift, and a ceiling measured against a different ladder is not a ceiling.
+///
+/// The rows are ordered deliberately: F16 first (it is the table's baseline), the warm
+/// BF16 and Q4_0 repeats last, so a reader can see what warming was worth.
+#[cfg(all(feature = "cuda", any(test, feature = "ruler-bench")))]
+pub fn batched_forward_configs() -> Vec<TestConfig> {
+    vec![
+        // F16 single context
+        TestConfig {
+            mode: InferenceMode::F16,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // BF16 single context
+        TestConfig {
+            mode: InferenceMode::BF16,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // BF16 multi-context
+        TestConfig {
+            mode: InferenceMode::BF16,
+            use_batched: true,
+            num_contexts: 10,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // Q8
+        TestConfig {
+            mode: InferenceMode::Q8_0,
+            use_batched: true,
+            num_contexts: 20,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        #[cfg(feature = "huge-context")]
+        TestConfig {
+            mode: InferenceMode::Q8_0,
+            use_batched: true,
+            num_contexts: 32,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // Q4
+        TestConfig {
+            mode: InferenceMode::Q4_0,
+            use_batched: true,
+            num_contexts: 4,
+            num_repeats: 1,
+            test_mode: Some(TestMode::Skip),
+        },
+        #[cfg(feature = "huge-context")]
+        TestConfig {
+            mode: InferenceMode::Q4_0,
+            use_batched: true,
+            num_contexts: 48,
+            num_repeats: 1,
+            test_mode: Some(TestMode::Skip),
+        },
+        TestConfig {
+            mode: InferenceMode::C0,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C1,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C2,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C3,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C4,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C5,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C6,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C7,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 48,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // C8 sits between two rungs that pass and was simply absent from this
+        // ladder — the one model in the sweep whose top rungs were never
+        // exercised contiguously, which is where a selection defect hides.
+        TestConfig {
+            mode: InferenceMode::C8,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C9,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C10,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // BF16 single context (after everything is warm)
+        TestConfig {
+            mode: InferenceMode::BF16,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // Q4_0 wide (after everything is warm)
+        TestConfig {
+            mode: InferenceMode::Q4_0,
+            use_batched: true,
+            num_contexts: 20,
+            num_repeats: 1,
+            test_mode: Some(TestMode::Skip),
+        },
+    ]
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2671,193 +2879,9 @@ mod tests {
         })?;
         println!("Using device: {:?}\n", device);
 
-        let configs = vec![
-            // F16 single context
-            TestConfig {
-                mode: InferenceMode::F16,
-                use_batched: true,
-                num_contexts: 1,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            // BF16 single context
-            TestConfig {
-                mode: InferenceMode::BF16,
-                use_batched: true,
-                num_contexts: 1,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            // BF16 multi-context
-            TestConfig {
-                mode: InferenceMode::BF16,
-                use_batched: true,
-                num_contexts: 10,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            // Q8
-            TestConfig {
-                mode: InferenceMode::Q8_0,
-                use_batched: true,
-                num_contexts: 20,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            #[cfg(feature = "huge-context")]
-            TestConfig {
-                mode: InferenceMode::Q8_0,
-                use_batched: true,
-                num_contexts: 32,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            // Q4
-            TestConfig {
-                mode: InferenceMode::Q4_0,
-                use_batched: true,
-                num_contexts: 4,
-                num_repeats: 1,
-                test_mode: Some(TestMode::Skip),
-            },
-            #[cfg(feature = "huge-context")]
-            TestConfig {
-                mode: InferenceMode::Q4_0,
-                use_batched: true,
-                num_contexts: 48,
-                num_repeats: 1,
-                test_mode: Some(TestMode::Skip),
-            },
-            TestConfig {
-                mode: InferenceMode::C0,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C1,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C2,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C3,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C4,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C5,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C6,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C7,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 48,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            // C8 sits between two rungs that pass and was simply absent from this
-            // ladder — the one model in the sweep whose top rungs were never
-            // exercised contiguously, which is where a selection defect hides.
-            TestConfig {
-                mode: InferenceMode::C8,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C9,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C10,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            // BF16 single context (after everything is warm)
-            TestConfig {
-                mode: InferenceMode::BF16,
-                use_batched: true,
-                num_contexts: 1,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            // Q8 (after everything is warm)
-            TestConfig {
-                mode: InferenceMode::Q4_0,
-                use_batched: true,
-                num_contexts: 20,
-                num_repeats: 1,
-                test_mode: Some(TestMode::Skip),
-            },
-        ];
+        // One ladder, shared with the engine-driven table one crate up — see
+        // `batched_forward_configs`.
+        let configs = super::batched_forward_configs();
 
         // Inference numeric mode for the whole model — dense projections AND MoE experts (KO
         // twins) — selected by the INT8MODE env var so a run picks a mode without recompiling.
